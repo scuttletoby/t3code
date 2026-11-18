@@ -18,7 +18,7 @@ _spec = importlib.util.spec_from_file_location('head_check_test', os.path.join(H
 T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)   # first: its guard puts a fake gh on PATH, drops tokens and isolates git
 
-import argparse, base64, io, json, shutil, tempfile, types, unittest, unittest.mock  # noqa: E402
+import argparse, base64, io, json, shutil, subprocess, tempfile, types, unittest, unittest.mock  # noqa: E402
 
 sys.path.insert(0, HERE)
 import head_check as H  # noqa: E402
@@ -967,6 +967,50 @@ class Judge(Files, unittest.TestCase):
         v = self.verdict()
         self.assertEqual((code, v['conclusion']), (0, 'failure'), out)
         self.assertIn('could not fetch the base and the head', v['title'])
+
+    def test_an_old_git_fails_the_head_before_anything_is_made_or_fetched(self):   # #457 item 4: as the notes say
+        view = T.pr([self.p.lens('correctness', self.read)], head=self.read)
+        old = 'git 2.43 or newer is needed (GIT_ATTR_SOURCE); found: git 2.42'
+        with unittest.mock.patch.object(G.pr_queue, 'git_problem', lambda *a: old), \
+                unittest.mock.patch.object(G, 'fetch', side_effect=AssertionError('fetched with an old git')):
+            for _ in range(2):   # runs again: the same failure
+                code, out, _ = self.judge(self.routes(self.read), view)
+                v = self.verdict()
+                self.assertEqual((code, v['conclusion']), (0, 'failure'), out)
+                self.assertIn('not judged: git 2.43 or newer', v['title'])
+                self.assertEqual(os.listdir(self.work), [], 'no repository made')
+
+    def test_a_remote_that_is_no_url_or_path_fails_the_head(self):   # #457 item 4: http hands the token over
+        view = T.pr([self.p.lens('correctness', self.read)], head=self.read)
+        for remote, says in (('http://github.com/o/r.git', 'plain http'), ('ext::sh -c id', 'remote helper')):
+            with self.subTest(remote), \
+                    unittest.mock.patch.object(G, 'fetch', side_effect=AssertionError('fetched')):
+                code, out, _ = self.judge(self.routes(self.read), view, remote=remote)
+                v = self.verdict()
+                self.assertEqual((code, v['conclusion']), (0, 'failure'), out)
+                self.assertIn('not judged', v['title'])
+                self.assertIn(says, v['title'] + v['summary'])
+                self.assertEqual(os.listdir(self.work), [])
+
+    def test_a_git_that_makes_another_format_fails_the_head(self):   # #457 item 3: git 3.0 defaults ignored
+        view = T.pr([self.p.lens('correctness', self.read)], head=self.read)
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            r = real(cmd, **kw)
+            if 'init' in cmd and r.returncode == 0:
+                with open(os.path.join(cmd[-1], 'config'), 'a') as f:
+                    f.write('[extensions]\n\trefStorage = reftable\n')
+            return r
+        with unittest.mock.patch.object(subprocess, 'run', run):
+            for _ in range(2):
+                code, out, _ = self.judge(self.routes(self.read), view)
+                v = self.verdict()
+                self.assertEqual((code, v['conclusion']), (0, 'failure'), out)
+                self.assertIn('git init made a repository with extensions.refStorage=reftable',
+                              v['title'] + v['summary'])
+        code, out, _ = self.judge(self.routes(self.read), view)   # a git that keeps the formats: judged again
+        self.assertEqual(self.verdict()['conclusion'], 'success', out)
 
     def test_a_fetch_with_no_login_says_so_by_name(self):   # #450 item 7: a private repository and no GH_TOKEN
         class NoLogin:
