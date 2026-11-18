@@ -3,6 +3,7 @@
  * review lens would run with; one button turns the recommended preset on, one turns it off. Every
  * write is an ordinary settings patch from the person at the screen; agents cannot change it.
  */
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
 import type { ReviewRules } from "@t3tools/contracts";
 import { useState } from "react";
 

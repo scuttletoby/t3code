@@ -16,6 +16,7 @@ import { writeLocalStorageValue } from "../../hooks/useLocalStorage";
 import type { MessageResolver } from "../../i18n/messages";
 import { commandLabel } from "./KeybindingsSettings.logic";
 import type { ResolvedSettingsScope } from "./settingsScope";
+import { FORK_SETTINGS_SEARCH_ITEMS } from "./forkSettingsSearchItems"; // Fork
 
 export type SettingsPath =
   | "/settings/projects"
@@ -481,31 +482,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/threads",
     searchTerms: [msg("usage quota rate limit reset recover continue")],
   },
-  // Fork: waits and agent slots.
-  {
-    id: "wait-for",
-    title: "Let agents wait for events",
-    to: "/settings/threads",
-    searchTerms: ["wait_for wake pull request checks merged file service unit timeout"],
-    environmentOnly: true,
-    scope: "environment-defaults",
-  },
-  {
-    id: "wait-checks",
-    title: "Wait checks",
-    to: "/settings/threads",
-    searchTerms: ["wait_for check command exit code poll condition"],
-    environmentOnly: true,
-    scope: "project-defaults",
-  },
-  {
-    id: "agent-slots",
-    title: "Limit running agents",
-    to: "/settings/threads",
-    searchTerms: ["agent slots delegate_task subagents limit memory per account machine"],
-    environmentOnly: true,
-    scope: "environment-defaults",
-  },
+  ...FORK_SETTINGS_SEARCH_ITEMS, // Fork: waits and agent slots.
   {
     id: "working-shelf",
     title: msg("Working section"),
