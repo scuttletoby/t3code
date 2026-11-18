@@ -253,7 +253,8 @@ jobs:
   # with persist-credentials: false fails on upstream's gitlinks); the script fetches the base commit.
   # fork-contracts.test.py pins this job (if, env, steps, no continue-on-error) and checks its worst case
   # fits the job timeout: the checkout step's own timeout + the wait cap (or the script's git calls, if
-  # longer) + one last poll (today 3 + 10 + 1 = 14 min of 15). The checkout's timeout makes a slow fetch fail
+  # longer) + one last poll + 1 min for the job's set-up (today 3 + 10 + 1 + 1 = 15 min of 15, #449; a worst case
+  # of exactly the timeout would be cancelled before the message). The checkout's timeout makes a slow fetch fail
   # as a timed-out Checkout step, not as a job cancelled before the script's message.
   # The checkout and the base fetch use no token, so this job works only in a public repository.
   fork_checks_ran:
