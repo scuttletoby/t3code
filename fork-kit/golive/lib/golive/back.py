@@ -20,7 +20,7 @@ its update (or its verify) is not redone: while the service state names its buil
 finds it verified) and runs the post hooks, so what T3 served since is never restored over. A back after a good
 back of the same way, with nothing unfinished since, finds the build that back verified running and does nothing.
 """
-import functools, http.client, json, os, re, subprocess, sys, urllib.error, urllib.request
+import functools, http.client, json, os, re, sys, urllib.error, urllib.request
 
 from golive import check as check_mod, coldcopy, journal, keptruntime, live, osadapter
 from golive.config import EXACT_VERSION
@@ -294,14 +294,13 @@ def _update(run, cfg, adapter, t3, version, say):
     old_pid = before['pid'] if before and before['version'] != version else 0
     with run.step('update', t3=t3, version=version) as facts:
         argv = [T3_STUB or t3, 'update', version, '--allow-downgrade', '--yes', '--base-dir', cfg.home]
-        try:
-            p = subprocess.run(argv, capture_output=True, text=True, errors='replace', timeout=UPDATE_TIMEOUT,
-                               stdin=subprocess.DEVNULL, cwd=cfg.home)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            raise RuntimeError(f'{t3} update failed: {e}') from None
-        facts['exit'] = p.returncode
-        if p.returncode != 0:
-            raise RuntimeError(f'{t3} update {version} exited {p.returncode}: {(p.stderr or p.stdout).strip()[-300:]}')
+        # the fixed environment (no release server can be pointed elsewhere), and the child dies with this run
+        code, out, err = live.run_t3(argv, UPDATE_TIMEOUT, cwd=cfg.home)
+        if code is None:
+            raise RuntimeError(f'{t3} update failed: {err.strip()[-300:]}')
+        facts['exit'] = code
+        if code != 0:
+            raise RuntimeError(f'{t3} update {version} exited {code}: {(err or out).strip()[-300:]}')
     return _verify(run, cfg, adapter, version, old_pid, say)
 
 

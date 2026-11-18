@@ -338,7 +338,8 @@ def main(argv, out=sys.stdout, err=sys.stderr):
                                    'Runs detached (a transient unit) unless --here.')
     p.add_argument('--owner-says-go', action='store_true',
                    help='do not wait for a quiet point (the owner says now is fine)')
-    p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p.add_argument('--here', action='store_true',
+                   help='what the detached unit runs: refused anywhere but inside its own t3-golive-switch unit')
     p = sub.add_parser('back', help='the way back from a fork build: say which of W1-W3 is possible, or take one',
                        description='Without --way: read only, says which way back is possible now and why. W1 '
                                    'restores the newest copy and goes back to the build it was taken under (loses '
@@ -346,7 +347,8 @@ def main(argv, out=sys.stdout, err=sys.stderr):
                                    'from; W3 to a newer upstream stable. Runs detached unless --here.')
     p.add_argument('--way', choices=('w1', 'w2', 'w3'))
     p.add_argument('--lose-work-since', metavar='TIME', help="W1 by hand: the copy's time, as `back` prints it")
-    p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p.add_argument('--here', action='store_true',
+                   help='what the detached unit runs: refused anywhere but inside its own t3-golive-switch unit')
     sub.add_parser('status', help='read only: is T3 up and right?', description='Read only: the light checks of '
                    'verify, the fork features that are on, and the copies on disk. Exit 0 only when all pass.')
     p = sub.add_parser('rehearse', help='try the target build on a clone of a copy, in its own home and port',
@@ -368,13 +370,17 @@ def main(argv, out=sys.stdout, err=sys.stderr):
                                    'puts T3 back if the run dies. Runs detached unless --here.')
     p.add_argument('--owner-says-go', action='store_true',
                    help='do not wait for a quiet point (the owner says now is fine)')
-    p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p.add_argument('--here', action='store_true',
+                   help='what the detached unit runs: refused anywhere but inside its own t3-golive-switch unit')
     p = sub.add_parser('switch-guard', help='after a switch run that died: put T3 back as its journal says',
                        description='What the switch guard runs (its unit and timer). Waits for the kit lock, then '
                                    'acts only if the given switch run is the last run and has no end line (it was '
                                    'killed): starts the old build again, or runs W1 once, never after a W1 stopped '
-                                   'T3. Going back by hand is `t3-golive back`.')
+                                   'T3. After a reboot it runs that W1 only with --lose-work-since (the target may '
+                                   'have served work since). Going back by hand is `t3-golive back`.')
     p.add_argument('--run', required=True, help='the switch run id (in the journal)')
+    p.add_argument('--lose-work-since', metavar='TIME',
+                   help="after a reboot, to let it run W1: the switch copy's time, as `t3-golive back` prints it")
     p.add_argument('--wait', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
@@ -399,7 +405,8 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     if args.command in ('switch', 'switch-guard'):
         from golive import switch
         if args.command == 'switch-guard':
-            switch.guard(cfg, adapter, args.run, args.wait, say=lambda line: print(line, file=out, flush=True))
+            switch.guard(cfg, adapter, args.run, args.wait, say=lambda line: print(line, file=out, flush=True),
+                         lose_work_since=args.lose_work_since)
             return 0
         return switch.main_switch(cfg, adapter, args.here, args.owner_says_go, out, err)
     if args.command in ('copy', 'guard'):

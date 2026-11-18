@@ -11,11 +11,18 @@ A guard (a second detached unit, `t3-golive switch-guard --run <id> --wait`, plu
 --wait) waits for the kit's lock and acts only on a switch run that was killed (no end line): it finishes what the
 journal says (the old build started again, or W1 once), runs the post hooks, and ends the run "failed". It never
 repeats a way back that ran: once W1 stopped T3, T3 stays stopped and is not started at boot until `t3-golive back
---way w1` ends ok (#397's W1 contract). A reboot ends both units; the journal then asks for `t3-golive back` by hand.
+--way w1` ends ok (#397's W1 contract). A reboot ends both units: the guard step journals the boot, and a guard run
+by hand on a later boot runs W1 only with --lose-work-since (the target may have served work since); else `t3-golive
+back` by hand.
+
+From the guard step on, SIGINT (Ctrl-C), SIGTERM and SIGHUP never end the run half-way: each is noted, the run stops
+at its next step and puts T3 back itself (_Stops). An interrupt that still gets through (it is not an Exception)
+leaves no end line, as a kill does, so the guard acts on it. `--here` runs only inside the kit's own switch unit,
+which gives a stop time to put T3 back; the `t3` children die with the run (live.run_t3).
 
 Every change is made inside a journalled step (journal.py); the refusals all come first.
 """
-import datetime, json, math, os, shutil, subprocess, sys, time, urllib.error, urllib.request
+import datetime, hashlib, json, math, os, re, shutil, signal, sys, time, urllib.error, urllib.request
 
 from golive import back as back_mod, check as check_mod, coldcopy, journal, keptruntime, live, osadapter
 
@@ -24,9 +31,10 @@ GUARD_MARGIN = 600  # the guard timer fires this long after the latest the run s
 FINAL = {'verify': 'verified', 'rolled-back': 'rolled back', 'back-start': 'old build runs'}
 INSTALL = '.golive-install-'  # not a version name: upstream's install and prune pass it by
 MB = coldcopy.MB
-# The update runs with this environment only: no T3CODE_RELEASE_BASE_URL (or anything else) can point it elsewhere.
-UPDATE_ENV = ('HOME', 'PATH', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TMPDIR', 'XDG_RUNTIME_DIR',
-              'DBUS_SESSION_BUS_ADDRESS', 'T3CODE_INSTALL_BIN_DIR')
+UPDATE_ENV = live.T3_ENV  # the update runs with this environment only (live.run_t3)
+BOOT_ID = '/proc/sys/kernel/random/boot_id'
+STOP_SIGNALS = ('SIGINT', 'SIGTERM', 'SIGHUP')
+SWITCH_UNIT = re.compile(r'^t3-golive-switch-[0-9a-z]+\.service$')  # main_switch's unit name, not the guard's
 W1_HOLDS = ('T3 stays stopped and is not started at boot, and background jobs stay paused (on purpose: the home may '
             'be half-restored), until `t3-golive back --way w1` ends ok; `t3-golive status` says where it stopped')
 
@@ -36,14 +44,63 @@ def _utcnow():
 
 
 def _t3(binary, args, timeout):
-    """(exit code, output) of a t3 build run directly (never from PATH). Tests replace it."""
-    env = {k: v for k, v in os.environ.items() if k in UPDATE_ENV}
+    """(exit code, output) of a t3 build run directly (never from PATH), with the fixed environment only; the child
+    dies with the run (live.run_t3). Tests replace it."""
+    code, out, err = live.run_t3([binary, *args], timeout)
+    return (-1 if code is None else code), out + err
+
+
+class Interrupted(RuntimeError):
+    """A noted SIGINT, SIGTERM or SIGHUP stopped the switch at its next step (it then puts T3 back)."""
+
+
+class _Stops:
+    """From the guard step on: SIGINT, SIGTERM and SIGHUP are noted (and said on stderr), never raised, so the run
+    finishes the step it is in, stops at its next one and puts T3 back. The old handlers come back on exit. Outside
+    the main thread no handler can be set: journal.Run.hold_end then keeps such a run open for its guard."""
+
+    def __init__(self):
+        self.got, self._old = [], {}
+
+    def __enter__(self):
+        for name in STOP_SIGNALS:
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                self._old[sig] = signal.signal(sig, self._note)
+            except ValueError:  # not the main thread
+                break
+        return self
+
+    def __exit__(self, *exc):
+        for sig, old in self._old.items():
+            signal.signal(sig, signal.SIG_DFL if old is None else old)
+        return False
+
+    def _note(self, signum, frame):
+        name = signal.Signals(signum).name
+        self.got.append(name)
+        try:
+            os.write(2, f't3-golive: {name}: the switch stops at its next step and puts T3 back first\n'.encode())
+        except OSError:
+            pass
+
+    def names(self, since=0):
+        return ', '.join(dict.fromkeys(self.got[since:]))
+
+    def check(self):
+        if self.got:
+            raise Interrupted(f'stopped by {self.names()}')
+
+
+def _boot_id():
+    """This boot's id (Linux), or None when it cannot be read."""
     try:
-        p = subprocess.run([binary, *args], capture_output=True, text=True, timeout=timeout, errors='replace',
-                           stdin=subprocess.DEVNULL, cwd='/', env=env)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return -1, str(e)
-    return p.returncode, p.stdout + p.stderr
+        with open(BOOT_ID, encoding='utf-8') as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
 
 
 def _report(binary, home):
@@ -143,10 +200,34 @@ def _identity(cfg, archive, sha):
     return []
 
 
+def _runtime_sum(runtime):
+    """sha256 of a runtime folder's entries (path, kind, content sha256 or link target; upstream's .install-complete
+    left out): what install-target journals after it checked the folder against the rehearsed archive."""
+    rows = [[e['path'], e['kind'], e.get('sha256', e.get('target'))] for e in keptruntime._entries(runtime)
+            if e['path'] != keptruntime.SENTINEL]
+    return hashlib.sha256(json.dumps(rows).encode()).hexdigest()
+
+
+def _installed_changed(cfg, version, build):
+    """[] when the home's runtime of `version` is still what install-target checked (build: its record
+    {'runtime', 'runtimeSha256'}), else what differs. Nothing in the run can make it right again."""
+    runtime = keptruntime.runtime_dir(cfg.home, version)
+    if keptruntime.installed_t3(cfg.home, version) is None:
+        return [f'{runtime} is not a whole runtime (.install-complete)']
+    try:
+        got = _runtime_sum(runtime)
+    except (OSError, ValueError) as e:
+        return [f'the installed target is not the rehearsed build any more: {e}']
+    if got != build.get('runtimeSha256'):
+        return [f'the installed target is not the rehearsed build any more: {runtime} changed since install-target '
+                'checked it against the rehearsed archive']
+    return []
+
+
 def _look(cfg, adapter, version, before, binary, build=None):
     """What is wrong with the live T3 now ([] when nothing): design 4.5, for `version`. The migrations must all have
     run, the counts must not shrink from the stopped home's before the update, the provider instances must be those,
-    and (build=(archive, sha)) the server must run the rehearsed build, byte for byte."""
+    and (build=install-target's record) the server must run the build install-target checked, byte for byte."""
     try:
         svc = adapter.service()
         if not svc['active']:
@@ -186,18 +267,26 @@ def _look(cfg, adapter, version, before, binary, build=None):
     changed = check_mod.server_changed(cfg, adapter, server)
     said += [changed] if changed else []
     if not said and build is not None:
-        said += _identity(cfg, *build)
+        said += _installed_changed(cfg, version, build)
     return said
 
 
-def verify(cfg, adapter, version, before, seconds, build=None):
-    """Look until all of design 4.5 holds or `seconds` pass: (True, facts) or (False, {'problems'})."""
-    binary = keptruntime.home_t3(cfg.home, version)  # the installed target: build= checks it is the rehearsed one
+def verify(cfg, adapter, version, before, seconds, build=None, stops=None):
+    """Look until all of design 4.5 holds or `seconds` pass: (True, facts) or (False, {'problems'}). build:
+    install-target's record; the installed runtime is checked against it first and once all else holds, and a
+    mismatch fails at once (it cannot heal). stops: the run's _Stops; a noted signal fails at once."""
+    binary = keptruntime.home_t3(cfg.home, version)  # the installed target: build= checks it is that build
+    wrong = _installed_changed(cfg, version, build) if build is not None else []
+    if wrong:
+        return False, {'problems': wrong}
     end = time.monotonic() + seconds
     while True:
-        said = _look(cfg, adapter, version, before, binary, build)
+        if stops is not None and stops.got:
+            return False, {'problems': [f'stopped by {stops.names()}']}
+        said = _look(cfg, adapter, version, before, binary)
         if not said:
-            return True, {'version': version}
+            wrong = _installed_changed(cfg, version, build) if build is not None else []
+            return (False, {'problems': wrong}) if wrong else (True, {'version': version})
         if time.monotonic() >= end:
             return False, {'problems': said[:8]}
         time.sleep(coldcopy.POLL)
@@ -247,7 +336,7 @@ def _install_target(run, cfg, archive, sha):
     v = cfg.target_version
     target, versions = keptruntime.runtime_dir(cfg.home, v), os.path.join(cfg.home, 'runtime', 'versions')
     if os.path.isdir(target) and not os.path.islink(target) and not _identity(cfg, archive, sha):
-        return {'runtime': target, 'installed': False}
+        return {'runtime': target, 'installed': False, 'runtimeSha256': _runtime_sum(target)}
     staging = os.path.join(versions, f'{INSTALL}{v}')
     if os.path.lexists(staging):  # this kit's own unfinished copy from an install that was stopped
         shutil.rmtree(staging)
@@ -271,6 +360,7 @@ def _install_target(run, cfg, archive, sha):
         facts['setAside'] = aside
     os.rename(staging, target)
     keptruntime._fsync_dir(versions)
+    facts['runtimeSha256'] = _runtime_sum(target)
     if _identity(cfg, archive, sha):
         raise RuntimeError(f'{target} is not the rehearsed build after the install: {_identity(cfg, archive, sha)}')
     return facts
@@ -295,21 +385,31 @@ def w1_holds(steps):
     return 'stop-service' in _started(steps) and 'rolled-back' not in done
 
 
-def _put_back(run, cfg, adapter, steps, say):
+def _put_back(run, cfg, adapter, steps, say, lose_work_since=None):
     """After a failed or killed switch: what its journal says it got to decides. Its update started: W1, once
-    (back.restore_and_downgrade, automatic); never again once a W1 stopped T3. Stopped before it: start the old
-    build again (nothing in the home was changed but the target's runtime folder). Returns what was done, or None
-    when T3 was never stopped."""
+    (back.restore_and_downgrade: automatic, or by hand with lose_work_since); never again once a W1 stopped T3,
+    unless that W1 got past its own update: then it is only verified again and recorded. Stopped before the update:
+    start the old build again (nothing in the home was changed but the target's runtime folder). Returns what was
+    done, or None when T3 was never stopped."""
     rec = next((s['data'] for s in steps if (s['step'], s['phase']) == ('stopping', 'started')), None)
     if rec is None:
         return None
     started = _started(steps)
     if 'stop-service' in started:
-        raise RuntimeError(f'the way back W1 already stopped T3 in this run and did not end ok, so it is not run '
-                           f'again from here: {W1_HOLDS}')
+        got = back_mod._w1_got([{'steps': steps}], rec['version'])
+        if got not in ('updated', 'verified'):
+            raise RuntimeError(f'the way back W1 already stopped T3 in this run and did not end ok, so it is not run '
+                               f'again from here: {W1_HOLDS}')
+        say(f'the way back W1 got past its {"verify" if got == "verified" else "update"}: verifying t3 '
+            f'{rec["version"]} again (no second stop or restore)')
+        again = back_mod._verify(run, cfg, adapter, rec['version'], 0, say)
+        with run.step('rolled-back', version=again['version'], copy=rec['copy']) as facts:
+            facts.update(version=again['version'], pid=again['pid'], result=FINAL['rolled-back'])
+        return f'rolled back to t3 {again["version"]} from {rec["copy"]} (its W1 had got past its {got})'
     if 'update' in started:  # the forward update (a W1 plan comes only after it)
         say(f'going back to t3 {rec["version"]} (W1: restore {rec["copy"]}, then downgrade)')
-        got = back_mod.restore_and_downgrade(run, cfg, adapter, rec['copy'], automatic=True, hooks=False, say=say)
+        got = back_mod.restore_and_downgrade(run, cfg, adapter, rec['copy'], automatic=lose_work_since is None,
+                                             lose_work_since=lose_work_since, hooks=False, say=say)
         with run.step('rolled-back', version=got['version'], copy=rec['copy']) as facts:
             facts.update(version=got['version'], pid=got['pid'], result=FINAL['rolled-back'])
         return f'rolled back to t3 {got["version"]} from {rec["copy"]}'
@@ -340,6 +440,13 @@ def guard_after(cfg, limit):
                + 2 * limit)
     way_back = coldcopy.STOP_WAIT + cfg.stop_limit_seconds + back_mod.UPDATE_TIMEOUT + coldcopy.START_WAIT
     return hooks + forward + way_back + GUARD_MARGIN
+
+
+def stop_grace(cfg):
+    """How long a stop of the switch's unit waits (TimeoutStopSec) before it kills it: the run, told by SIGTERM,
+    finishes its step and puts T3 back (W1 at its longest). Past it the unit is killed, the run has no end line,
+    and the guard (its own unit) acts."""
+    return guard_after(cfg, MIN_LIMIT)
 
 
 def _prechecks(cfg, adapter, owner_says_go, say, run):
@@ -412,8 +519,8 @@ def run_switch(cfg, adapter, owner_says_go=False, say=print):
         if p is None:
             say(f'the live T3 already runs {cfg.target_version}: nothing to do')
             return {'nothing': 'already-on-target'}
-        server, dest, rehearsal = p['server'], p['dest'], p['rehearsal']
-        old, build = server['version'], (p['archive'], p['sha'])
+        server, rehearsal = p['server'], p['rehearsal']
+        old = server['version']
         with run.step('keep-runtime', version=old) as facts:  # the update prunes the old runtime W1 needs
             try:
                 facts.update(keptruntime.keep(run, cfg, old))
@@ -421,11 +528,16 @@ def run_switch(cfg, adapter, owner_says_go=False, say=print):
                 facts['error'] = why = f'{type(e).__name__}: {e}'
         if 'error' in facts:
             raise journal.Refused(f'keeping the old build {old} failed: {why}; T3 was not stopped')
+        boot = _boot_id()
+        if boot is None:
+            raise journal.Refused(f'cannot read this boot\'s id ({BOOT_ID}): the guard could not tell a reboot (after '
+                                  'one, its W1 needs the owner\'s consent); T3 was not stopped')
         limit = max(MIN_LIMIT, 3 * rehearsal['seconds'])
-        rec = {'version': old, 'pid': server['pid'], 'copy': dest, 'limit': limit,
+        rec = {'version': old, 'pid': server['pid'], 'copy': p['dest'], 'limit': limit,
                'migrations': rehearsal['migrations'], 'targetSha256': p['sha']}
         with run.step('guard') as facts:
             unit = facts['unit'] = f't3-golive-switch-{os.getpid()}-{os.urandom(3).hex()}'
+            facts['boot'] = boot
             guard = [coldcopy.KIT_BIN, 'switch-guard', '--run', run.id]
             try:
                 adapter.run_detached(unit, guard + ['--wait'], guard_after_seconds=guard_after(cfg, limit),
@@ -436,106 +548,159 @@ def run_switch(cfg, adapter, owner_says_go=False, say=print):
         if not facts['waiting']:
             raise journal.Refused(f'the guard {unit} did not come up within {coldcopy.GUARD_WAIT} s'
                                   f'{": " + facts["error"] if "error" in facts else ""}; T3 was not stopped')
-        failed = coldcopy._hooks(run, 'pre-hooks', cfg.pre_hooks, cfg.home)
-        if failed is None and not owner_says_go:
-            ok, detail = coldcopy.quiet_now(cfg, old)
-            failed = None if ok else f'not quiet any more: {detail}'
-        failed = failed or check_mod.server_changed(cfg, adapter, server) or coldcopy._home_problem(cfg)
-        if failed is None and not coldcopy._guard_alive(adapter, unit):
-            failed = f'the guard {unit} is not running any more'
-        if failed is not None:
-            again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
-            if again:
-                raise RuntimeError(f'{failed}; T3 was not stopped; then a post hook failed: {again}')
-            raise journal.Refused(f'{failed}; T3 was not stopped')
-        say(f'stopping {osadapter.UNIT} (t3 {old}) to switch to {cfg.target_version}')
-        error, lock = None, None
-        try:
-            with run.step('stopping', **rec):
-                adapter.stop()
-                coldcopy._wait_stopped(adapter, server['pid'])
-                lock = coldcopy.hold_owner_lock(os.path.join(cfg.home, 'userdata'), coldcopy.STOP_WAIT)
-                coldcopy._same_after_stop(cfg, server)
-            deadline = coldcopy._clock() + cfg.stop_limit_seconds
-            with run.step('cold-copy', dest=dest, copy=dest) as facts:
-                entries, total, left_out = coldcopy.copy_userdata(run, cfg.home, dest, deadline)
-                extras = _copy_extras(cfg, adapter.service()['unitPath'], dest, deadline)
-                facts.update(bytes=total, leftOut=left_out, extras=len(extras))
-            with run.step('read-back'):
-                coldcopy.read_back(cfg.home, dest, entries, deadline)
-                for e in extras:
-                    for side in (os.path.join(dest, 'extra', e['path']), e['from']):
-                        if coldcopy._hash(side, deadline, drop_cache=True) != e['sha256']:
-                            raise RuntimeError(f'read-back: {side} differs from what the copy read')
-            with run.step('manifest'):
-                coldcopy.write_manifest(run, dest, {
-                    'manifestVersion': coldcopy.MANIFEST_VERSION, 'complete': True, 'createdAt': coldcopy._stamp(),
-                    'runId': run.id, 'home': cfg.home, 'liveVersion': old, 'bytes': total,
-                    'files': entries, 'leftOut': left_out, 'extras': extras})
-            with run.step('before') as facts:  # read now: nothing changed the home since the copy
-                facts.update(_before(cfg, p['binary'], rehearsal['migrations']))
-            before = {'counts': facts['reportCounts'], 'providers': facts['providers']}
-            with run.step('old-preflight') as facts:
-                with open(os.path.join(dest, 'extra', 'runtime', 'service-state.json'), encoding='utf-8') as f:
-                    protocol = json.load(f)['protocol']
-                code, out = _t3(server['binary'], ['__service-preflight', '--database-path',
-                                                   os.path.join(dest, 'userdata', live.DATABASE),
-                                                   '--launcher-protocol', str(protocol)], coldcopy.HOOK_TIMEOUT)
-                start = out.rfind('{"')
-                said = json.loads(out[start:]) if start >= 0 else {}
-                facts['status'] = said.get('status')
-                if said.get('status') != 'ready':
-                    raise RuntimeError(f'the old build\'s preflight on the copy says {said.get("status")} (exit '
-                                       f'{code}): {said.get("reason") or out.strip()[-200:]}')
-            with run.step('install-target', version=cfg.target_version, sha256=p['sha']) as facts:
-                facts.update(_install_target(run, cfg, *build))
+        run.hold_end = True  # from here an interrupt that gets through is a kill to the journal: the guard acts
+        with _Stops() as stops:
+            return _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops)
+
+
+def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
+    """run_switch from the guard step on: a noted signal (stops) refuses before the stop, or stops the run at its
+    next step and puts T3 back."""
+    server, dest, rehearsal, limit = p['server'], p['dest'], p['rehearsal'], rec['limit']
+    old, build = server['version'], (p['archive'], p['sha'])
+    failed = coldcopy._hooks(run, 'pre-hooks', cfg.pre_hooks, cfg.home)
+    if failed is None and not owner_says_go:
+        ok, detail = coldcopy.quiet_now(cfg, old)
+        failed = None if ok else f'not quiet any more: {detail}'
+    failed = failed or check_mod.server_changed(cfg, adapter, server) or coldcopy._home_problem(cfg)
+    if failed is None and not coldcopy._guard_alive(adapter, unit):
+        failed = f'the guard {unit} is not running any more'
+    if failed is None and stops.got:
+        failed = f'stopped by {stops.names()}'
+    if failed is not None:
+        again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
+        if again:
+            raise RuntimeError(f'{failed}; T3 was not stopped; then a post hook failed: {again}')
+        raise journal.Refused(f'{failed}; T3 was not stopped')
+    say(f'stopping {osadapter.UNIT} (t3 {old}) to switch to {cfg.target_version}')
+    error, lock, noted = None, None, 0
+    try:
+        with run.step('stopping', **rec):
+            adapter.stop()
+            coldcopy._wait_stopped(adapter, server['pid'])
+            lock = coldcopy.hold_owner_lock(os.path.join(cfg.home, 'userdata'), coldcopy.STOP_WAIT)
+            coldcopy._same_after_stop(cfg, server)
+        stops.check()
+        deadline = coldcopy._clock() + cfg.stop_limit_seconds
+        with run.step('cold-copy', dest=dest, copy=dest) as facts:
+            entries, total, left_out = coldcopy.copy_userdata(run, cfg.home, dest, deadline)
+            extras = _copy_extras(cfg, adapter.service()['unitPath'], dest, deadline)
+            facts.update(bytes=total, leftOut=left_out, extras=len(extras))
+        stops.check()
+        with run.step('read-back'):
+            coldcopy.read_back(cfg.home, dest, entries, deadline)
+            for e in extras:
+                for side in (os.path.join(dest, 'extra', e['path']), e['from']):
+                    if coldcopy._hash(side, deadline, drop_cache=True) != e['sha256']:
+                        raise RuntimeError(f'read-back: {side} differs from what the copy read')
+        stops.check()
+        with run.step('manifest'):
+            coldcopy.write_manifest(run, dest, {
+                'manifestVersion': coldcopy.MANIFEST_VERSION, 'complete': True, 'createdAt': coldcopy._stamp(),
+                'runId': run.id, 'home': cfg.home, 'liveVersion': old, 'bytes': total,
+                'files': entries, 'leftOut': left_out, 'extras': extras})
+        stops.check()
+        with run.step('old-preflight') as facts:
+            with open(os.path.join(dest, 'extra', 'runtime', 'service-state.json'), encoding='utf-8') as f:
+                protocol = json.load(f)['protocol']
+            code, out = _t3(server['binary'], ['__service-preflight', '--database-path',
+                                               os.path.join(dest, 'userdata', live.DATABASE),
+                                               '--launcher-protocol', str(protocol)], coldcopy.HOOK_TIMEOUT)
+            start = out.rfind('{"')
+            said = json.loads(out[start:]) if start >= 0 else {}
+            facts['status'] = said.get('status')
+            if said.get('status') != 'ready':
+                raise RuntimeError(f'the old build\'s preflight on the copy says {said.get("status")} (exit '
+                                   f'{code}): {said.get("reason") or out.strip()[-200:]}')
+        stops.check()
+        with run.step('install-target', version=cfg.target_version, sha256=p['sha']) as facts:
+            facts.update(_install_target(run, cfg, *build))
+        installed = facts
+        stops.check()
+        # Read now, under the owner lock (nothing changed the home since the copy), with the target build just
+        # installed and checked: never the stage, which nothing checked again since the prechecks.
+        with run.step('before') as facts:
+            facts.update(_before(cfg, keptruntime.home_t3(cfg.home, cfg.target_version), rehearsal['migrations']))
+        before = {'counts': facts['reportCounts'], 'providers': facts['providers']}
+        lock.close()
+        lock = None
+        stops.check()
+        with run.step('update', version=cfg.target_version) as facts:
+            _update(cfg, adapter, keptruntime.home_t3(cfg.home, cfg.target_version), cfg.target_version, limit)
+            facts['links'] = _repoint(run, cfg.home, cfg.target_version)
+        stops.check()
+        with run.step('verify', version=cfg.target_version) as facts:  # done only when verified
+            verified, found = verify(cfg, adapter, cfg.target_version, before, limit, installed, stops)
+            if not verified:
+                facts.update(found)
+                raise RuntimeError(f'verify failed: {"; ".join(found["problems"])}')
+            facts.update(found, sha256=p['sha'], result=FINAL['verify'])
+    except Exception as e:
+        error, noted = e, len(stops.got)
+    finally:
+        if lock is not None:
             lock.close()
-            lock = None
-            with run.step('update', version=cfg.target_version) as facts:
-                _update(cfg, adapter, keptruntime.home_t3(cfg.home, cfg.target_version), cfg.target_version, limit)
-                facts['links'] = _repoint(run, cfg.home, cfg.target_version)
-            with run.step('verify', version=cfg.target_version) as facts:  # done only when verified
-                verified, found = verify(cfg, adapter, cfg.target_version, before, limit, build)
-                if not verified:
-                    facts.update(found)
-                    raise RuntimeError(f'verify failed: {"; ".join(found["problems"])}')
-                facts.update(found, sha256=p['sha'], result=FINAL['verify'])
+    errors = [error] if error else []
+    if error is not None:
+        try:
+            did = _put_back(run, cfg, adapter, journal.read(cfg.state_dir)[0][-1]['steps'], say)
+            if did:
+                errors[0] = RuntimeError(f'{error}; {did}')
         except Exception as e:
-            error = e
-        finally:
-            if lock is not None:
-                lock.close()
-        errors = [error] if error else []
-        if error is not None:
-            try:
-                did = _put_back(run, cfg, adapter, journal.read(cfg.state_dir)[0][-1]['steps'], say)
-                if did:
-                    errors[0] = RuntimeError(f'{error}; {did}')
-            except Exception as e:
-                notes = ''.join(f'; {n}' for n in getattr(e, '__notes__', ()))
-                errors[0] = RuntimeError(f'{error}; then putting T3 back failed: {type(e).__name__}: {e}{notes}')
-            errors[0].__cause__ = error
-        if error is not None and w1_holds(journal.read(cfg.state_dir)[0][-1]['steps']):
-            errors[0].add_note(f'no post hook ran: {W1_HOLDS}')
-        else:
-            failed = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
-            if failed:
-                errors.append(RuntimeError(f'post hook failed: {failed}'))
+            notes = ''.join(f'; {n}' for n in getattr(e, '__notes__', ()))
+            errors[0] = RuntimeError(f'{error}; then putting T3 back failed: {type(e).__name__}: {e}{notes}')
+        errors[0].__cause__ = error
+    if error is not None and w1_holds(journal.read(cfg.state_dir)[0][-1]['steps']):
+        errors[0].add_note(f'no post hook ran: {W1_HOLDS}')
+    else:
+        failed = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
+        if failed:
+            errors.append(RuntimeError(f'post hook failed: {failed}'))
+    if stops.got[noted:]:
+        late = f'{stops.names(noted)} came while the switch finished; it finished first'
         if errors:
-            for later in errors[1:]:
-                errors[0].add_note(f'then: {type(later).__name__}: {later}')
-            raise errors[0]
-        say(f'verified: the live T3 runs {cfg.target_version}; the copy is {dest}')
-        return {'verified': cfg.target_version, 'copy': dest}
+            errors[0].add_note(late)
+        else:
+            say(late)
+    if errors:
+        for later in errors[1:]:
+            errors[0].add_note(f'then: {type(later).__name__}: {later}')
+        raise errors[0]
+    say(f'verified: the live T3 runs {cfg.target_version}; the copy is {dest}')
+    return {'verified': cfg.target_version, 'copy': dest}
 
 
-def guard(cfg, adapter, run_id, wait, say=print):
+def _needs_consent(cfg, run, lose_work_since):
+    """Why the guard must not run W1 for this killed run now, or None. W1 loses the work since the copy: on the boot
+    the switch journalled in its guard step, the switch's automatic W1 may do that (the target never got verified);
+    on another boot (or a journal with no boot) the target may have served work since, so it needs the owner's
+    --lose-work-since, as `t3-golive back --way w1` does."""
+    started = _started(run['steps'])
+    if lose_work_since is not None or final(run) or 'update' not in started or 'stop-service' in started:
+        return None
+    boot = next(((s['data'] or {}).get('boot') for s in run['steps'] if (s['step'], s['phase']) == ('guard', 'done')),
+                None)
+    if boot is not None and boot == _boot_id():
+        return None
+    rec = next((s['data'] for s in run['steps'] if (s['step'], s['phase']) == ('stopping', 'started')), {})
+    try:
+        at = coldcopy.read_manifest(rec.get('copy'), cfg.home)['createdAt']
+    except Exception:
+        at = '<the copy\'s time, as `t3-golive back` prints it>'
+    return (f'not done: the switch ran on another boot, so t3 {cfg.target_version} may have served work since; W1 '
+            f'restores the copy of {at} and loses that work, so it runs only by hand: `t3-golive switch-guard --run '
+            f'{run["id"]} --lose-work-since {at}` (or `t3-golive back --way w1 --lose-work-since {at}`); '
+            '`t3-golive status` says where T3 is')
+
+
+def guard(cfg, adapter, run_id, wait, say=print, lose_work_since=None):
     """The switch's guard (`t3-golive switch-guard`). It waits for the kit's lock (beside the run, and as the timer:
     a run, or a back, still going is waited for), then acts only on the switch run `run_id` if it is the last run
     and was killed (no end line; a run that ended put T3 back itself, or said loudly why not): it puts T3 back as
-    _put_back says (W1 at most once: never after a W1 stopped T3), runs the post hooks if the run paused the jobs
-    and no W1 holds them, and ends the run "failed". A journal it cannot read fails open: T3 is started if it is
-    not active, and the post hooks run. Logs to <stateDir>/guard.log; returns what it did."""
+    _put_back says (W1 at most once: never after a W1 stopped T3; on another boot only with lose_work_since), runs
+    the post hooks if the run paused the jobs and no W1 holds them, and ends the run "failed". A W1 it may not run
+    without consent leaves everything as it is (no end line). A journal it cannot read fails open: T3 is started if
+    it is not active, and the post hooks run. Logs to <stateDir>/guard.log; returns what it did."""
     if wait:
         try:
             coldcopy._guard_log(cfg.state_dir, {'run': run_id, 'waiting': True})
@@ -556,12 +721,15 @@ def guard(cfg, adapter, run_id, wait, say=print):
             mine = runs[-1] if runs and runs[-1]['id'] == run_id else None
             if runs is not None and (mine is None or mine['end'] is not None or mine['settled']):
                 did.append(f'nothing to do: run {run_id} ended, was settled or is not the last run')
+            elif mine is not None and _needs_consent(cfg, mine, lose_work_since):
+                did.append(_needs_consent(cfg, mine, lose_work_since))
             elif mine is not None:
                 r = journal.Run(cfg.state_dir, 'switch')
                 r.id = run_id
                 try:
                     if not final(mine):
-                        did.append(_put_back(r, cfg, adapter, mine['steps'], say) or 'T3 was never stopped')
+                        did.append(_put_back(r, cfg, adapter, mine['steps'], say, lose_work_since)
+                                   or 'T3 was never stopped')
                 except Exception as e:
                     notes = ''.join(f'; {n}' for n in getattr(e, '__notes__', ()))
                     did.append(f'putting T3 back failed: {type(e).__name__}: {e}{notes}')
@@ -587,12 +755,23 @@ def _resumed(run):
     return ('pre-hooks', 'started') not in steps or ('post-hooks', 'done') in steps
 
 
+def _said_to(out):
+    """say() for a terminal that may go away (SIGHUP): a failed write never stops the run."""
+    def say(line):
+        try:
+            print(line, file=out, flush=True)
+        except (OSError, ValueError):
+            pass
+    return say
+
+
 def main_switch(cfg, adapter, here, owner_says_go, out=sys.stdout, err=sys.stderr):
     if not here:
         unit = f't3-golive-switch-{coldcopy._stamp().lower()}'
-        try:
+        try:  # a stop of the unit: SIGTERM to the run only, and time to put T3 back before the unit is killed
             adapter.run_detached(unit, [coldcopy.KIT_BIN, 'switch', '--here']
-                                 + (['--owner-says-go'] if owner_says_go else []))
+                                 + (['--owner-says-go'] if owner_says_go else []),
+                                 properties=(f'TimeoutStopSec={stop_grace(cfg)}', 'KillMode=mixed'))
         except osadapter.AdapterError as e:
             print(f't3-golive: {e}', file=err)
             return 1
@@ -602,8 +781,14 @@ def main_switch(cfg, adapter, here, owner_says_go, out=sys.stdout, err=sys.stder
         print(f't3-golive: this runs inside {osadapter.UNIT}; stopping it would kill the switch half-way. Run '
               '`t3-golive switch` without --here (it runs detached).', file=err)
         return 1
+    own = adapter.own_unit()
+    if own is None or not SWITCH_UNIT.match(own):
+        print(f't3-golive: `switch --here` runs only inside its own unit (t3-golive-switch-<time>.service, which '
+              f'`t3-golive switch` starts; this runs in {own or "an unknown unit"}): there a stop gives the run time '
+              'to put T3 back. Run `t3-golive switch` without --here.', file=err)
+        return 1
     try:
-        result = run_switch(cfg, adapter, owner_says_go, say=lambda line: print(line, file=out, flush=True))
+        result = run_switch(cfg, adapter, owner_says_go, say=_said_to(out))
     except (journal.Refused, journal.Busy, journal.Unfinished, journal.Damaged) as e:
         print(f't3-golive: {e}', file=err)
         return 1

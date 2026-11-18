@@ -4,7 +4,7 @@ File names and shapes are upstream's (tests/contract.test.py checks they still e
 <home>/runtime/service-state.json, .restart-pending, .service-stopping, db-backup/<id>/.restore-pending,
 versions/<v>/t3; <home>/userdata/server-runtime.json and statev2.sqlite.
 """
-import glob, hashlib, json, os, platform, re, subprocess, sys, tarfile, tempfile
+import ctypes, glob, hashlib, json, os, platform, re, signal, subprocess, sys, tarfile, tempfile
 
 from golive.config import EXACT_VERSION
 
@@ -15,6 +15,61 @@ REPORT_TIMEOUT = 120
 
 class NotLive(Exception):
     pass
+
+
+# A t3 build the kit runs gets this environment only: no T3CODE_RELEASE_BASE_URL (or anything else) can point it
+# elsewhere.
+T3_ENV = ('HOME', 'PATH', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TMPDIR', 'XDG_RUNTIME_DIR',
+          'DBUS_SESSION_BUS_ADDRESS', 'T3CODE_INSTALL_BIN_DIR')
+PR_SET_PDEATHSIG = 1
+
+
+def t3_env():
+    return {k: v for k, v in os.environ.items() if k in T3_ENV}
+
+
+def _dies_with(parent):
+    """A preexec_fn: the child gets SIGKILL when the process that started it dies (Linux PR_SET_PDEATHSIG), and
+    exits at once if that already happened before the request took hold."""
+    prctl = ctypes.CDLL(None, use_errno=True).prctl if sys.platform.startswith('linux') else None
+
+    def preexec():
+        if prctl is not None and prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+            os._exit(126)
+        if os.getppid() != parent:
+            os._exit(126)
+    return preexec
+
+
+def _kill_group(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_t3(argv, timeout, cwd='/'):
+    """(exit code, stdout, stderr) of a t3 build run with T3_ENV only. The exit code is None when it could not run
+    or ran past `timeout` (then killed). The child runs in its own process group (a Ctrl-C in the terminal does not
+    reach it: the run decides) and dies with this process (a killed run never leaves a `t3 update` going beside the
+    guard's way back); anything raised while it runs kills its group first."""
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, errors='replace', cwd=cwd, env=t3_env(), start_new_session=True,
+                             preexec_fn=_dies_with(os.getpid()))
+    except OSError as e:
+        return None, '', str(e)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(p)
+        out, err = p.communicate()
+        return None, out, f'{err}\nkilled: still running after {timeout} s'
+    except BaseException:
+        _kill_group(p)
+        p.wait()
+        raise
+    return p.returncode, out, err
 
 
 def compare_versions(left, right):

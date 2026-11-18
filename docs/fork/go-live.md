@@ -51,7 +51,8 @@ of T3: the copy, the switch and every way back. Each must be safe to run twice.
 4. **Switch.** `t3-golive switch` (or `--owner-says-go`). It runs detached and prints how to follow it. At a
    quiet point T3 stops, its data is copied to a new `t3-switch-*` folder, the rehearsed build is installed
    from `stageDir` (upstream's `update` downloads nothing) and T3 is updated to it. If the new build does not
-   come up, the switch takes the way back W1 on its own, once. If that W1 fails, T3 stays down and disabled:
+   come up, the switch takes the way back W1 on its own, once. If that W1 fails after it stopped T3, T3 stays
+   down and disabled:
    follow **A killed or failed W1 leaves T3 down** below. Before its update, the switch keeps the old
    build's runtime in `<stateDir>/kept-runtimes/<old version>/`: every upstream `t3 update` removes old
    runtimes from the home, and W1 needs that one. Never delete the kept runtime while W1 may be needed.

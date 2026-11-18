@@ -6,7 +6,7 @@ target is not installed, migrates the database and prunes the other runtimes, as
 BaseException raised right after a journal line, with the run's end line then cut off, as a SIGKILL leaves it.
 Nothing here stops, starts or reads a real T3.
 python3 -I -B fork-kit/golive/tests/switch.test.py"""
-import datetime, hashlib, io, json, os, shutil, sys, tempfile, threading, time, unittest
+import datetime, hashlib, io, json, os, shutil, signal, sys, tempfile, threading, time, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,6 +23,34 @@ sys.exit(int(open({codes!r}).read()) if __import__('os').path.exists({codes!r}) 
 PROVIDERS = [{'id': 'claude-a', 'driver': 'claudeAgent'}, {'id': 'codex', 'driver': 'codex'}]
 SLEEP = shutil.which('sleep', path='/usr/bin:/bin')
 REAL_T3 = switch._t3  # SwitchBase replaces it
+
+
+def journal_rewrite(path, rows):
+    """Write journal rows again with their hash chain (journal.py's format), as an older kit left them."""
+    out, prev = [], ''
+    for row in rows:
+        raw = json.dumps({**row, 'prev': prev}, sort_keys=True).encode()
+        out.append(raw + b'\n')
+        prev = hashlib.sha256(raw).hexdigest()
+    with open(path, 'wb') as f:
+        f.write(b''.join(out))
+
+
+def ours(pid):
+    """True while pid is the test's own `sleep 297` (alive, not a zombie)."""
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            cmd = f.read()
+        with open(f'/proc/{pid}/stat', encoding='utf-8') as f:
+            state = f.read().rsplit(')', 1)[1].split()[0]
+    except OSError:
+        return False
+    return cmd == b'sleep\x00297\x00' and state != 'Z'
+
+
+def kill_if_ours(pid):
+    if ours(pid):
+        os.kill(pid, signal.SIGKILL)
 
 
 class Killed(BaseException):
@@ -72,6 +100,9 @@ class SwitchBase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.preflight, self.t3_calls, self.said, self.downloads, self.tamper = 'ready', [], [], [], False
+        boot = mock.patch.object(switch, 'BOOT_ID', self.m.write('boot_id', 'boot-one\n'), create=True)
+        boot.start()
+        self.addCleanup(boot.stop)
         self.db_before = sha(self.m.path('home/userdata/statev2.sqlite'))
         self.old_t3 = sha(self.m.path(f'home/runtime/versions/{fx.LIVE}/t3'))
 
@@ -174,9 +205,9 @@ class SwitchBase(unittest.TestCase):
         path = os.path.join(self.m.state, 'journal.jsonl')
         with open(path, 'rb') as f:
             lines = f.read().splitlines(keepends=True)
-        self.assertEqual(json.loads(lines[-1])['event'], 'end')
-        with open(path, 'wb') as f:
-            f.write(b''.join(lines[:-1]))
+        if json.loads(lines[-1])['event'] == 'end':  # from the guard step on, a kill leaves no end line by itself
+            with open(path, 'wb') as f:
+                f.write(b''.join(lines[:-1]))
         run = self.last_run()
         self.assertIsNone(run['end'])
         return run
@@ -218,7 +249,7 @@ class Switch(SwitchBase):
         result = self.switch()
         self.assertEqual(result['verified'], fx.TARGET)
         self.assertEqual(self.names(), ['keep-runtime', 'guard', 'pre-hooks', 'stopping', 'cold-copy', 'read-back',
-                                        'manifest', 'before', 'old-preflight', 'install-target', 'update', 'verify',
+                                        'manifest', 'old-preflight', 'install-target', 'before', 'update', 'verify',
                                         'post-hooks'])
         self.assertEqual(self.done('verify')[0]['result'], 'verified')
         self.assertEqual(self.last_run()['end']['result'], 'ok')
@@ -323,7 +354,7 @@ class Switch(SwitchBase):
         cfg, before = config.load(), self.done('before')[0]
         before = {'counts': before['reportCounts'], 'providers': before['providers']}
         binary = keptruntime.home_t3(cfg.home, fx.TARGET)
-        build = live.staged_archive(cfg.stage_dir, fx.TARGET)[0], live.staged_build(cfg.stage_dir, fx.TARGET)[1]
+        build = self.done('install-target')[0]  # its record: the runtime as checked against the rehearsed archive
 
         def look(version=fx.TARGET):
             return ' | '.join(switch._look(cfg, self.adapter, version, before, binary, build))
@@ -508,7 +539,7 @@ class Refusals(SwitchBase):
         self.rehearsed()
         real = check.server_changed
 
-        for where, hooks in (('_prechecks', []), ('run_switch', ['pre', 'post'])):
+        for where, hooks in (('_prechecks', []), ('_switch_on', ['pre', 'post'])):
             with self.subTest(where):  # check's own look passes; the switch's own look (there) sees the change
                 n = len(self.calls())
 
@@ -623,7 +654,8 @@ class WayBack(SwitchBase):
             self.assertEqual(switch._identity(cfg, archive, target_sha), [])
             with run.step('install-target') as again:
                 again.update(switch._install_target(run, cfg, archive, target_sha))
-            self.assertEqual(again, {'runtime': keptruntime.runtime_dir(cfg.home, fx.TARGET), 'installed': False})
+            self.assertEqual(again, {'runtime': keptruntime.runtime_dir(cfg.home, fx.TARGET), 'installed': False,
+                                     'runtimeSha256': facts['runtimeSha256']})
             with self.assertRaises(RuntimeError):
                 switch._install_target(run, cfg, archive, target_sha)  # outside a step
 
@@ -642,7 +674,7 @@ class WayBack(SwitchBase):
         with self.assertRaises(RuntimeError) as cm:
             self.switch()
         self.assertIn('gave no counts', str(cm.exception))
-        self.assertNotIn('install-target', self.names('started'))
+        self.assertNotIn('update', self.names('started'))
         self.assertEqual(self.server()['version'], fx.LIVE)
         self.assertEqual(self.calls()[-2:], ['start', 'post'])
 
@@ -659,7 +691,7 @@ class WayBack(SwitchBase):
                 with self.assertRaises(RuntimeError) as cm:
                     self.switch()
                 self.assertIn(words, str(cm.exception))
-                self.assertNotIn('install-target', self.names('started'))
+                self.assertNotIn('update', self.names('started'))
                 self.assertEqual(self.server()['version'], fx.LIVE)
 
     def test_extras_are_read_back(self):
@@ -974,6 +1006,384 @@ class Guard(SwitchBase):
                 self.assertEqual(self.last_run()['end']['result'], 'failed')
 
 
+class Interrupts(SwitchBase):
+    """Fork #422 round 2: a Ctrl-C (SIGINT), SIGTERM or SIGHUP from the guard step on never ends the run half-way.
+    The run notes it, stops at the next step and puts T3 back itself (or finishes its way back first). Python's
+    default SIGTERM and SIGHUP end the process; here they raise Killed instead (the test runner must live), so a run
+    that does not handle them fails these tests the same way."""
+
+    def setUp(self):
+        super().setUp()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            old = signal.signal(sig, self.die)
+            self.addCleanup(signal.signal, sig, old)
+
+    @staticmethod
+    def die(signum, frame):
+        raise Killed(signal.Signals(signum).name)
+
+    def interrupted(self, sig, patcher):
+        """Run the switch with `patcher` sending `sig` to this process; the run must end by itself (never Killed,
+        never a KeyboardInterrupt) with T3 put back, and say which signal stopped it."""
+        with patcher:
+            try:
+                self.switch()
+            except RuntimeError as e:
+                error = ' '.join([str(e), *getattr(e, '__notes__', ())])
+            except journal.Refused as e:
+                error = str(e)
+            except (KeyboardInterrupt, Killed) as e:
+                self.fail(f'the run ended half-way on {type(e).__name__}; T3: {self.adapter.service()}')
+            else:
+                self.fail('an interrupted switch ended ok')
+        self.assertIn(signal.Signals(sig).name, error)
+        run = self.last_run()
+        self.assertEqual(run['end']['result'], 'failed')
+        self.assertTrue(switch.final(run))
+        return run, error
+
+    def send(self, sig):
+        os.kill(os.getpid(), sig)
+
+    def at_copy(self, sig):
+        real = coldcopy.copy_userdata
+
+        def copy(*args):
+            self.send(sig)
+            return real(*args)
+        return mock.patch.object(coldcopy, 'copy_userdata', copy)
+
+    def after_step(self, sig, step, phase='done'):
+        real = journal.Run._append
+
+        def append(run, event, **fields):
+            real(run, event, **fields)
+            if event == 'step' and (fields.get('step'), fields.get('phase')) == (step, phase):
+                self.send(sig)
+        return mock.patch.object(journal.Run, '_append', append)
+
+    def check_started_again(self, run):
+        self.assertEqual(self.done('back-start', run)[0]['version'], fx.LIVE)
+        self.assertNotIn('update', self.names('started', run))
+        self.assertEqual(self.server()['version'], fx.LIVE)
+        self.assertEqual(self.calls()[-2:], ['start', 'post'])
+        self.assertIn('nothing to do', ' '.join(self.guard(run['id'])))
+
+    def test_sigint_during_the_copy_starts_the_old_build_again(self):
+        self.rehearsed()
+        run, _ = self.interrupted(signal.SIGINT, self.at_copy(signal.SIGINT))
+        self.assertEqual(self.done('cold-copy', run)[0]['bytes'] > 0, True)  # the copy itself was not cut
+        self.check_started_again(run)
+
+    def test_sigterm_during_the_copy_starts_the_old_build_again(self):
+        self.rehearsed()
+        run, _ = self.interrupted(signal.SIGTERM, self.at_copy(signal.SIGTERM))
+        self.check_started_again(run)
+
+    def test_sigint_after_the_update_goes_back_with_w1(self):
+        self.rehearsed()
+        run, _ = self.interrupted(signal.SIGINT, self.after_step(signal.SIGINT, 'update'))
+        self.assertNotIn('verify', [s for s, p in self.steps(run)[:self.steps(run).index(('plan', 'started'))]])
+        self.assert_rolled_back(run)
+
+    def test_sigterm_after_the_update_goes_back_with_w1(self):
+        self.rehearsed()
+        run, _ = self.interrupted(signal.SIGTERM, self.after_step(signal.SIGTERM, 'update'))
+        self.assert_rolled_back(run)
+
+    def test_sigint_mid_verify_goes_back_with_w1_at_once(self):
+        self.rehearsed()
+        self.mode = 'never'
+        real, began = switch._look, time.monotonic()
+
+        def look(*args, **kw):
+            self.send(signal.SIGINT)
+            return real(*args, **kw)
+        with mock.patch.object(switch, 'MIN_LIMIT', 60):
+            run, error = self.interrupted(signal.SIGINT, mock.patch.object(switch, '_look', look))
+        self.assertLess(time.monotonic() - began, 30)  # verify stopped at its next look, not at its 60 s limit
+        self.assertIn('verify failed', error)
+        self.assert_rolled_back(run)
+
+    def test_sigterm_and_sigint_during_w1_let_w1_finish(self):
+        self.rehearsed()
+        self.mode = 'never'
+        real = coldcopy.restore
+
+        def restore(*args, **kw):
+            self.send(signal.SIGTERM)
+            self.send(signal.SIGINT)
+            return real(*args, **kw)
+        run, error = self.interrupted(signal.SIGTERM, mock.patch.object(coldcopy, 'restore', restore))
+        self.assertIn('SIGINT', error)
+        self.assert_rolled_back(run)
+
+    def test_sighup_before_the_stop_runs_the_post_hooks_and_refuses(self):
+        self.rehearsed()
+        real = coldcopy._hooks
+
+        def hooks(run, step, *args):
+            if step == 'pre-hooks':
+                self.send(signal.SIGHUP)
+            return real(run, step, *args)
+        with mock.patch.object(coldcopy, '_hooks', hooks):
+            try:
+                self.switch()
+            except (KeyboardInterrupt, Killed) as e:
+                self.fail(f'the run ended half-way on {type(e).__name__}')
+            except journal.Refused as e:
+                error = str(e)
+        self.assertIn('SIGHUP', error)
+        self.assertNotIn('stop', self.calls())
+        self.assertEqual(self.calls()[-1], 'post')
+        self.assertEqual(self.server()['version'], fx.LIVE)
+
+    def test_the_old_signal_handlers_come_back_after_the_run(self):
+        self.rehearsed()
+        before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        self.switch()
+        self.assertEqual({s: signal.getsignal(s) for s in before}, before)
+
+    def test_a_keyboard_interrupt_after_the_stop_leaves_no_end_line_and_the_guard_puts_t3_back(self):
+        # The belt: an interrupt raised past the handlers (no main thread, or a KeyboardInterrupt from elsewhere) is
+        # a kill to the journal, so the waiting guard acts on it.
+        for i, (step, check) in enumerate((('cold-copy', self.check_started_again),
+                                           ('update', lambda run: self.assert_rolled_back(run)))):
+            with self.subTest(step), mock.patch.object(coldcopy, '_stamp', return_value=f'2099010{i + 1}T000000Z'):
+                if journal.unfinished(self.m.state):
+                    journal.settle(self.m.state, 'test: put right')
+                self.rehearsed()
+                real = journal.Run._append
+
+                def append(run, event, **fields):
+                    real(run, event, **fields)
+                    if event == 'step' and (fields.get('step'), fields.get('phase')) == (step, 'done'):
+                        raise KeyboardInterrupt
+                with mock.patch.object(journal.Run, '_append', append), self.assertRaises(KeyboardInterrupt):
+                    self.switch()
+                run = self.last_run()
+                self.assertIsNone(run['end'])
+                self.guard(run['id'], wait=True)
+                check(self.last_run())
+
+    def test_a_keyboard_interrupt_before_the_guard_still_ends_the_run(self):
+        self.rehearsed()
+        with mock.patch.object(keptruntime, 'keep', side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.switch()
+        self.assertEqual(self.last_run()['end']['result'], 'failed')
+        self.assertNotIn('stop', self.calls())
+
+
+class Round2(SwitchBase):
+    def test_an_installed_target_that_is_not_the_rehearsed_build_fails_verify_at_once(self):
+        self.rehearsed()
+        self.tamper = True
+        began = time.monotonic()
+        with mock.patch.object(switch, 'MIN_LIMIT', 60), self.assertRaises(RuntimeError) as cm:
+            self.switch()
+        self.assertLess(time.monotonic() - began, 30)  # the real clock: no polling to the 60 s limit
+        self.assertIn('not the rehearsed build', str(cm.exception))
+        self.assert_rolled_back()
+
+    def verify_after_a_switch(self, look, spoil_first=False):
+        """switch.verify run again on a switched home, with install-target's record and `look` in place of _look:
+        (ok, found, seconds it took on the real clock), with a 60 s limit."""
+        self.switch()
+        cfg, before = config.load(), self.done('before')[0]
+        before = {'counts': before['reportCounts'], 'providers': before['providers']}
+        if spoil_first:
+            self.spoil_runtime()
+        began = time.monotonic()
+        with mock.patch.object(switch, '_look', look):
+            ok, found = switch.verify(cfg, self.adapter, fx.TARGET, before, 60, self.done('install-target')[0])
+        return ok, found, time.monotonic() - began
+
+    def spoil_runtime(self):
+        with open(self.m.path(f'home/runtime/versions/{fx.TARGET}/lib/runtime.txt'), 'a') as f:
+            f.write('x')
+
+    def test_verify_checks_the_record_first_even_while_the_server_is_not_up(self):
+        # Fork #422 round 2 (state minor 2): a changed runtime cannot heal, so verify does not poll it to the limit.
+        self.rehearsed()
+        ok, found, took = self.verify_after_a_switch(lambda *a: ['nothing answers HTTP yet'], spoil_first=True)
+        self.assertLess(took, 30)  # the real clock
+        self.assertFalse(ok)
+        self.assertIn('not the rehearsed build', ' '.join(found['problems']))
+
+    def test_verify_checks_the_record_again_when_all_else_holds(self):
+        self.rehearsed()
+        calls = []
+
+        def look(*args):  # the runtime changes after verify's first check, while the server comes up
+            calls.append(1)
+            if len(calls) == 1:
+                self.spoil_runtime()
+                return ['nothing answers HTTP yet']
+            return []
+        ok, found, took = self.verify_after_a_switch(look)
+        self.assertFalse(ok)
+        self.assertIn('not the rehearsed build', ' '.join(found['problems']))
+        self.assertLess(took, 30)
+
+    def test_an_archive_restaged_after_the_install_does_not_fail_a_good_target(self):
+        self.rehearsed()
+        real = switch._update
+        t3 = self.m.path(f'stage/{fx.TARGET}/t3')
+
+        def restage_then(*args):
+            with open(t3, 'rb') as f:
+                self.m.stage_release(fx.TARGET, files={'t3': f.read(), 'lib/runtime.txt': 'another build'})
+            return real(*args)
+        with mock.patch.object(switch, '_update', restage_then):
+            self.assertEqual(self.switch()['verified'], fx.TARGET)
+
+    def test_a_home_folder_of_another_build_restaged_mid_run_is_never_reused(self):
+        self.rehearsed()  # the stage and the home's target folder both become one other, consistent build
+        real = coldcopy.copy_userdata
+        t3 = self.m.path(f'stage/{fx.TARGET}/t3')
+
+        def restage_then(*args):
+            with open(t3, 'rb') as f:
+                self.m.stage_release(fx.TARGET, files={'t3': f.read(), 'lib/runtime.txt': 'another build'})
+            dest = self.m.path(f'home/runtime/versions/{fx.TARGET}')
+            shutil.copytree(self.m.path(f'stage/{fx.TARGET}'), dest)
+            with open(os.path.join(dest, '.install-complete'), 'w') as f:
+                f.write(fx.TARGET)
+            return real(*args)
+        with mock.patch.object(coldcopy, 'copy_userdata', restage_then), self.assertRaises(RuntimeError) as cm:
+            self.switch()
+        self.assertIn('changed since the rehearsal', str(cm.exception))
+        self.assertNotIn('update', self.names('started'))
+        self.assertEqual(self.done('back-start')[0]['version'], fx.LIVE)
+
+    def test_before_runs_the_installed_target_never_the_stage(self):
+        self.rehearsed()
+        real, ran = switch._report, []
+        stage_t3 = self.m.path(f'stage/{fx.TARGET}/t3')
+        copy = coldcopy.copy_userdata
+
+        def report(binary, home):
+            ran.append(binary)
+            return real(binary, home)
+
+        def change_stage_then(*args):
+            with open(stage_t3, 'ab') as f:
+                f.write(b'changed after the checks')
+            return copy(*args)
+        with mock.patch.object(switch, '_report', report), \
+                mock.patch.object(coldcopy, 'copy_userdata', change_stage_then), self.assertRaises(RuntimeError):
+            self.switch()
+        self.assertNotIn(stage_t3, ran)
+        self.assertNotIn('before', self.names('started'))  # install-target refused the changed stage first
+        self.assertEqual(self.done('back-start')[0]['version'], fx.LIVE)
+        journal.settle(self.m.state, 'test: put right')
+        self.m.stage_release(fx.TARGET, files={'t3': open(SLEEP, 'rb').read(), 'lib/runtime.txt': 'runtime data'})
+        self.rehearsed()
+        ran.clear()
+        with mock.patch.object(switch, '_report', report), \
+                mock.patch.object(coldcopy, '_stamp', return_value='20990102T000000Z'):  # its own copy name
+            self.switch()
+        self.assertEqual(ran[0], keptruntime.home_t3(self.m.home, fx.TARGET))
+        self.assertNotIn(stage_t3, ran)
+
+    def test_the_way_back_downgrade_runs_with_a_fixed_environment(self):
+        self.rehearsed()
+        self.mode = 'never'
+        env_log = self.m.path('downgrade-env.txt')
+        wrapper = self.m.write('bin/t3-env-stub', f'#!/bin/sh\n/usr/bin/env > {env_log}\nexec {back.T3_STUB} "$@"\n',
+                               mode=0o755)
+        with mock.patch.dict(os.environ, {'T3CODE_RELEASE_BASE_URL': 'http://elsewhere.invalid/', 'SOME_TOKEN': 'x'}), \
+                mock.patch.object(back, 'T3_STUB', wrapper), self.assertRaises(RuntimeError):
+            self.switch()
+        with open(env_log, encoding='utf-8') as f:
+            seen = f.read()
+        self.assertNotIn('T3CODE_RELEASE_BASE_URL', seen)
+        self.assertNotIn('SOME_TOKEN', seen)
+        self.assertIn(f'HOME={self.m.root}', seen)
+        self.assert_rolled_back()
+
+    def test_killed_after_w1_verified_before_rolled_back_the_guard_records_it_and_runs_the_post_hooks(self):
+        self.rehearsed()
+        self.mode = 'never'
+        run = self.kill_after('verify', 'done')  # W1's verify: the forward one never got there
+        self.assertIn('stop-service', self.names('started', run))
+        did = ' '.join(self.guard(run['id']))
+        self.assertIn('rolled back', did)
+        self.assertNotIn('stays stopped', did)
+        self.assertEqual(len(self.downgrades()), 1)
+        self.assert_rolled_back()
+
+    def test_the_guard_step_journals_the_boot(self):
+        self.rehearsed()
+        self.switch()
+        self.assertEqual(self.done('guard')[0]['boot'], 'boot-one')
+
+    def test_an_unreadable_boot_id_refuses_before_the_stop(self):
+        self.rehearsed()
+        os.unlink(switch.BOOT_ID)
+        self.refused('boot')
+
+    def reboot(self):
+        with open(switch.BOOT_ID, 'w', encoding='utf-8') as f:
+            f.write('boot-two\n')
+
+    def test_after_a_reboot_the_guard_by_hand_needs_lose_work_since_for_w1(self):
+        self.rehearsed()
+        run = self.kill_after('update', 'done')
+        self.reboot()
+        n = len(self.calls())
+        did = ' '.join(self.guard(run['id']))
+        self.assertIn('--lose-work-since', did)
+        self.assertEqual(self.calls()[n:], [])  # no W1, no post hook
+        self.assertIsNone(self.last_run()['end'])  # still unfinished: status names it, the guard can be run again
+        self.assertEqual(self.server()['version'], fx.TARGET)
+        copy, at = self.copy_at(run)
+        did = ' '.join(switch.guard(config.load(), self.adapter, run['id'], False, say=self.said.append,
+                                    lose_work_since='20000101T000000Z'))
+        self.assertIn('putting T3 back failed', did)
+        self.assertEqual(self.downgrades(), [])
+        journal_runs = journal.read(self.m.state)[0]
+        self.assertEqual(journal_runs[-1]['end']['result'], 'failed')
+        journal.settle(self.m.state, 'test: wrong time given')
+
+    def test_after_a_reboot_the_guard_with_the_copy_time_runs_w1(self):
+        self.rehearsed()
+        run = self.kill_after('update', 'done')
+        self.reboot()
+        _, at = self.copy_at(run)
+        switch.guard(config.load(), self.adapter, run['id'], False, say=self.said.append, lose_work_since=at)
+        run = self.last_run()
+        self.assertEqual(self.started_data('plan', run)['automatic'], False)
+        self.assertEqual(self.done('rolled-back', run)[-1]['result'], 'rolled back')
+        self.assertEqual(self.server()['version'], fx.LIVE)
+        self.assertEqual(self.calls()[-1], 'post')
+
+    def test_after_a_reboot_the_guard_still_starts_the_old_build_when_no_update_ran(self):
+        self.rehearsed()
+        run = self.kill_after('cold-copy', 'done')
+        self.reboot()
+        self.guard(run['id'])
+        self.assertEqual(self.done('back-start')[0]['version'], fx.LIVE)
+        self.assertEqual(self.calls()[-2:], ['start', 'post'])
+
+    def test_a_journal_from_before_the_boot_was_kept_needs_the_copy_time_for_w1(self):
+        self.rehearsed()
+        run = self.kill_after('update', 'done')
+        path = os.path.join(self.m.state, 'journal.jsonl')
+        with open(path, encoding='utf-8') as f:
+            lines = f.read().splitlines(keepends=True)
+        # An older journal line has no boot; rewrite the chain the way journal.py writes it.
+        rows = [json.loads(line) for line in lines]
+        for row in rows:
+            if row.get('step') == 'guard' and row.get('phase') == 'done':
+                row['data'].pop('boot', None)
+        journal_rewrite(path, rows)
+        did = ' '.join(self.guard(run['id']))
+        self.assertIn('--lose-work-since', did)
+        self.assertEqual(self.downgrades(), [])
+
+
 class Pieces(unittest.TestCase):
     def test_t3_runs_with_a_fixed_environment_only(self):
         root = tempfile.mkdtemp()
@@ -1009,6 +1419,110 @@ class Pieces(unittest.TestCase):
         with mock.patch.object(adapter, 'inside_service', return_value=True):
             self.assertEqual(switch.main_switch(config.load(), adapter, True, False, out, err), 1)
         self.assertIn('without --here', err.getvalue())
+
+    def test_a_t3_child_dies_with_a_killed_run(self):
+        # Fork #422 round 2 (state minor 3): a run killed while its `t3` child runs takes the child with it, so the
+        # guard's W1 never runs beside a forward `t3 update` that is still going.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        pidfile = os.path.join(root, 'pid')
+        script = os.path.join(root, 't3')
+        with open(script, 'w', encoding='utf-8') as f:
+            f.write(f'#!/bin/sh\necho $$ > {pidfile}.tmp && mv {pidfile}.tmp {pidfile}\nexec sleep 297\n')
+        os.chmod(script, 0o755)
+        run = os.fork()
+        if run == 0:
+            try:
+                REAL_T3(script, ['update'], 300)
+            finally:
+                os._exit(0)
+        end = time.monotonic() + 20
+        while not os.path.exists(pidfile) and time.monotonic() < end:
+            time.sleep(0.02)
+        with open(pidfile, encoding='utf-8') as f:
+            child = int(f.read())
+        self.addCleanup(kill_if_ours, child)
+        time.sleep(0.2)  # the exec into sleep
+        self.assertTrue(ours(child))
+        os.kill(run, signal.SIGKILL)
+        os.waitpid(run, 0)
+        end = time.monotonic() + 5
+        while ours(child) and time.monotonic() < end:
+            time.sleep(0.02)
+        self.assertFalse(ours(child), 'the t3 child outlived the killed run')
+
+    def test_a_t3_child_is_killed_on_a_time_out_or_an_interrupt_in_the_run(self):
+        # Fork #422 round 2 (state minor 3): run_t3 kills the child's whole group when it runs too long or when
+        # anything is raised while it waits, so no `t3 update` is left going.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        pidfile = os.path.join(root, 'pid')
+        script = os.path.join(root, 't3')
+        with open(script, 'w', encoding='utf-8') as f:
+            f.write(f'#!/bin/sh\necho $$ > {pidfile}\nexec sleep 297\n')
+        os.chmod(script, 0o755)
+
+        def child():
+            with open(pidfile, encoding='utf-8') as f:
+                pid = int(f.read())
+            self.addCleanup(kill_if_ours, pid)
+            return pid
+        began = time.monotonic()
+        code, out, err = live.run_t3([script, 'update'], 1)
+        self.assertLess(time.monotonic() - began, 30)  # killed, not waited for (its sleep is 297 s)
+        self.assertIsNone(code)
+        self.assertIn('killed: still running after 1 s', err)
+        self.assertFalse(ours(child()))
+        os.unlink(pidfile)
+
+        def interrupt(signum, frame):
+            raise KeyboardInterrupt
+        old = signal.signal(signal.SIGALRM, interrupt)
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        signal.setitimer(signal.ITIMER_REAL, 1)
+        began = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            live.run_t3([script, 'update'], 300)
+        self.assertLess(time.monotonic() - began, 30)
+        self.assertFalse(ours(child()))
+
+    def test_the_cli_runs_here_only_inside_the_kits_own_switch_unit(self):
+        m = fx.Machine()
+        self.addCleanup(m.close)
+        m.standard()
+        adapter = fx.FakeAdapter(m.root, m)
+        out, err = io.StringIO(), io.StringIO()
+        cgroup = m.write('cgroup-terminal', '0::/user.slice/user-1000.slice/session-3.scope\n')
+        with mock.patch.object(switch.osadapter, 'CGROUP_FILE', cgroup), \
+                mock.patch.object(switch, 'run_switch', return_value={'verified': fx.TARGET}) as ran:
+            self.assertEqual(switch.main_switch(config.load(), adapter, True, False, out, err), 1)
+            self.assertIn('only inside its own unit', err.getvalue())
+            ran.assert_not_called()
+            unit = m.write('cgroup-unit', '0::/user.slice/user-1000.slice/user@1000.service/app.slice/'
+                                          't3-golive-switch-20990101t000000z.service\n')
+            switch.osadapter.CGROUP_FILE = unit
+            self.assertEqual(switch.main_switch(config.load(), adapter, True, False, out, err), 0)
+            ran.assert_called_once()
+
+    def test_the_switch_unit_may_finish_putting_t3_back_when_it_is_stopped(self):
+        m = fx.Machine()
+        self.addCleanup(m.close)
+        m.standard()
+        out, err = io.StringIO(), io.StringIO()
+        self.assertEqual(check.main(['switch'], out=out, err=err), 0, err.getvalue())
+        [call] = m.calls('systemd-run-calls.jsonl')
+        grace = switch.stop_grace(config.load())
+        self.assertIn(f'--property=TimeoutStopSec={grace}', call[:call.index('--')])
+        self.assertGreaterEqual(grace, back.UPDATE_TIMEOUT + coldcopy.START_WAIT)
+
+    def test_switch_guard_takes_lose_work_since(self):
+        m = fx.Machine()
+        self.addCleanup(m.close)
+        m.standard()
+        with mock.patch.object(switch, 'guard', return_value=[]) as g:
+            self.assertEqual(check.main(['switch-guard', '--run', 'r1', '--lose-work-since', '20990101T000000Z'],
+                                        out=io.StringIO(), err=io.StringIO()), 0)
+        self.assertEqual(g.call_args.kwargs['lose_work_since'], '20990101T000000Z')
 
     def test_the_command_line_wires_switch_and_switch_guard(self):
         m = fx.Machine()
