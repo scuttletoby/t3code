@@ -80,7 +80,7 @@ except FileNotFoundError:
 
 class Adapter(fx.FakeAdapter):
     """FakeAdapter plus disable(); a start the stub update asked for happens on the next look at the service (as
-    upstream's install enables and starts the unit)."""
+    upstream's install enables and starts the unit), unless the test says that build never starts."""
 
     def service(self):
         asked = os.path.join(self.root, 'start-requested')
@@ -90,6 +90,18 @@ class Adapter(fx.FakeAdapter):
                 self._svc(UnitFileState='enabled')
             self.start()
         return super().service()
+
+    def start(self):
+        """A build named in the test's `never-starts` file does not come up (a crash loop): the unit stays inactive."""
+        try:
+            with open(os.path.join(self.root, 'never-starts')) as f:
+                broken = f.read().split()
+        except FileNotFoundError:
+            broken = []
+        with open(os.path.join(self.root, 'home/runtime/service-state.json')) as f:
+            if json.load(f)['activeVersion'] in broken:
+                return self._record('start-failed')
+        super().start()
 
     def disable(self):
         self._svc(UnitFileState='disabled')
