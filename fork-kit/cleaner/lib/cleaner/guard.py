@@ -8,8 +8,8 @@ delete itself. A path may go only when every check here passes; a check that can
 import fnmatch, os, stat
 
 from .config import REGENERABLE, must_keep_match
-from .facts import (Processes, Unreadable, elsewhere, git, git_code, local_tags, lonely, present, remote_refs, remote_urls,
-                    remotes, worktree_list)
+from .facts import (Processes, Unreadable, elsewhere, git, git_code, local_tags, lonely, orphaned_worktree, present,
+                    remote_refs, remote_urls, remotes, worktree_list)
 
 LOCK_NAMES = ('*.lock', 'lock', '.lock', '*.lck')
 # Names that look like they hold a key, a token or a password. Compared without regard to upper and lower case.
@@ -284,6 +284,11 @@ def _check(cfg, facts, path, kind, look):
 
     if kind == 'path':
         for where, bare in gits:
+            gone = None if bare else orphaned_worktree(where)
+            if gone is not None:
+                # A worktree whose main repository is gone: git cannot judge it, now or later. It is kept, as
+                # "could not read" would keep it, but under its own name: it is no error, and no run will change it.
+                return Refusal('orphaned worktree', f'{os.path.relpath(where, path)}: its git folder {gone} is gone')
             refusal = _git_refusal(path, where, bare)
             if refusal is None and (bare or os.path.isdir(os.path.join(where, '.git'))):
                 refusal = modules_refusal(path, where if bare else os.path.join(where, '.git'))

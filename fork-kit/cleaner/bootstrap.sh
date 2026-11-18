@@ -1,0 +1,61 @@
+#!/bin/sh
+# fork-cleaner bootstrap: installs the cleaner kit of one release of this fork. Run as root:
+#
+#   sh fork-cleaner-bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA [--timer | --no-timer]
+#
+# --timer writes the daily user units fork-cleaner.service and fork-cleaner.timer to /etc/systemd/user (each user
+# enables the timer), --no-timer removes them (fork-kit/cleaner/sbin/fork-cleaner-install).
+#
+# It refuses a sha that is not a commit on the fork's protected release branch (ci-release), downloads exactly
+# that commit, prints the sha and the hash of what it downloaded, and runs its installer (safe to run again).
+# Needs: curl, tar, python3. Linux with systemd only.
+set -eu
+umask 022
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset TMPDIR CURL_HOME SSL_CERT_FILE SSL_CERT_DIR || true
+
+die() { echo "fork-cleaner-bootstrap: $*" >&2; exit 1; }
+
+repo='' sha='' timer='' branch='ci-release' api='https://api.github.com' codeload='https://codeload.github.com'
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) [ $# -ge 2 ] || die "--repo needs a value"; repo="$2"; shift 2 ;;
+    --sha) [ $# -ge 2 ] || die "--sha needs a value"; sha="$2"; shift 2 ;;
+    --release-branch) [ $# -ge 2 ] || die "--release-branch needs a value"; branch="$2"; shift 2 ;;
+    --timer|--no-timer) timer="$1"; shift ;;   # only these reach the installer: never a second --sha or --source
+    *) die "unknown option $1 (see the top of this file)" ;;
+  esac
+done
+printf '%s\n' "$repo" | grep -Eqx '[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}' || die "--repo must be OWNER/NAME"
+printf '%s\n' "$sha" | grep -Eqx '[0-9a-f]{40}' || die "--sha must be the full 40-character release commit"
+printf '%s\n' "$branch" | grep -Eqx '[A-Za-z0-9._/-]{1,100}' || die "bad --release-branch"
+[ "$(id -u)" = 0 ] || die "run this as root"
+
+work="$(mktemp -d /tmp/fork-cleaner-bootstrap.XXXXXXXX)"
+trap 'rm -rf "${work:?}"' EXIT
+trap 'exit 1' INT TERM HUP
+fetch() { curl -fsSL --proto '=https' --tlsv1.2 --max-redirs 0 -H 'Accept: application/vnd.github+json' -o "$2" "$1"; }
+
+fetch "$api/repos/$repo/branches/$branch" "$work/branch.json" || die "cannot read branch $branch of $repo"
+fetch "$api/repos/$repo/compare/$sha...$branch" "$work/compare.json" || die "cannot compare $sha with $branch"
+python3 -I -B - "$work/branch.json" "$work/compare.json" "$sha" <<'PY' || die "$sha is not a release: it must be a commit on the protected branch $branch"
+import json, sys
+branch, compare = (json.load(open(p, encoding='utf-8')) for p in sys.argv[1:3])
+# base_commit is always the sha asked for; merge_base_commit is the newest commit both share: it is the sha itself
+# only when the sha is on the branch
+ok = (branch.get('protected') is True and compare.get('status') in ('ahead', 'identical')
+      and (compare.get('merge_base_commit') or {}).get('sha') == sys.argv[3])
+sys.exit(0 if ok else 1)
+PY
+
+# codeload.github.com answers a commit tarball directly (no redirect)
+fetch "$codeload/$repo/tar.gz/$sha" "$work/kit.tar.gz" || die "cannot download $repo at $sha"
+mkdir "$work/src"
+tar -xzf "$work/kit.tar.gz" -C "$work/src" --no-same-owner --no-same-permissions
+top="$(find "$work/src" -mindepth 1 -maxdepth 1 -type d)"
+[ "$(printf '%s\n' "$top" | wc -l)" = 1 ] && [ -n "$top" ] || die "the download does not have one top folder"
+kit="$top/fork-kit/cleaner"
+[ -f "$kit/sbin/fork-cleaner-install" ] || die "release $sha has no fork-kit/cleaner installer (is it a release with the kit?)"
+echo "fork-cleaner-bootstrap: release $sha of $repo, download sha256 $(sha256sum "$work/kit.tar.gz" | cut -d' ' -f1)"
+python3 -I -B "$kit/sbin/fork-cleaner-install" install --source "$kit" --sha "$sha" ${timer:+"$timer"}
