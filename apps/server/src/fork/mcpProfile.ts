@@ -91,6 +91,7 @@ export const MCP_T3_TOOLKIT_GROUPS: Readonly<Record<string, McpT3ToolGroup | nul
   preview: "preview",
   previewControls: "preview",
   pullRequests: "pull-requests",
+  issues: "issues",
   thread: "threads",
   project: "projects",
   device: "device",
