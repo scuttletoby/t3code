@@ -5,7 +5,7 @@ repositories, how many days. It can make the cleaner keep more (mustKeep, longer
 no key takes a refusal away, and the floors below cannot be lowered. An empty section means every rule does nothing.
 KEY_KINDS says, for every key, which of these it is; a test fails for a key that is not in it.
 """
-import fnmatch, glob, os, pwd, re
+import fnmatch, glob, os, pwd, re, stat, tempfile
 
 import machine_file
 
@@ -38,6 +38,7 @@ CLASSES = (
     ('all docker volumes', 'rule:docker'),
     ('temp', 'rule:tmp'),
     ('cold folders', 'rule:compress-cold'),
+    ('agent scratch', 'rule:agent-scratch'),
     ('agent tool homes', AGENT_HOMES),
     ('T3 data', T3_DATA),
     ('build caches', None),
@@ -56,6 +57,25 @@ COMPRESS_NEVER = ('~/.claude*',)
 # Folder names compress-cold never takes or enters (#468: the log archive stays as it is). `repair-backups`, the
 # other must-keep name, may be compressed: #468 names it.
 COMPRESS_NEVER_NAMES = ('*log-archive*',)
+MIN_SCRATCH_DAYS = 3     # an agent session's scratch folder goes no sooner than this after anything in it changed
+MIN_KEEP_FILE_BYTES = 64 * 1024     # keep first: files up to at least this size are copied before a delete
+# Keep first (agentScratch.keepFirst): what is copied to the archive before a session's scratch folder goes. The
+# default is chosen from a survey of real scratch folders: the small text reports an agent writes directly in its
+# scratchpad, or one folder down (notes, results, verdicts), and not the clones and downloads deeper in it.
+KEEP_FIRST_PATTERNS = ('scratchpad/*.md', 'scratchpad/*.json', 'scratchpad/*.txt', 'scratchpad/*.tsv',
+                       'scratchpad/*.csv', 'scratchpad/*/*.md')
+# The full output of an agent's background commands (`tasks/<id>.output`; a transcript holds only what the agent
+# read back). Kept first up to maxFileBytes each; a larger one is not copied and does not hold the session, but the
+# manifest names it with its size and sha256.
+KEEP_FIRST_OUTPUTS = ('tasks/*.output',)
+# Where agent tools keep a session's transcript, as folders of `<id>.jsonl` files and `<id>/` folders. Only their
+# times are read. A link in the path is followed (a config folder that is a link), and every folder is used by its
+# real path.
+TRANSCRIPT_GLOBS = ('~/.claude*/projects/*',)
+# Never an agent-scratch root: the shared temp folders themselves (every user's and every program's entries are
+# directly in them). The root must be a folder of one user's own, such as /tmp/claude-<uid>. The user's own runtime
+# folder (/run/user/<uid>, $XDG_RUNTIME_DIR) is refused too: every program of the user keeps its entries there.
+SHARED_TEMP = ('/tmp', '/var/tmp', '/dev/shm', '/run/user', '/run/user/{uid}')
 # Folders any tool rebuilds, so an ignored one does not keep a worktree. A repository adds its own (regenerable).
 REGENERABLE = ('node_modules', '__pycache__', '.pytest_cache')
 
@@ -120,6 +140,26 @@ def _mode(value):
     return None if value in DAILY_MODES else f'must be one of {", ".join(DAILY_MODES)} (not {value!r})'
 
 
+def _globs_rel(value):
+    """Relative path patterns: parts split by /, * and ? within one part; no empty, . or .. part. At least one:
+    an empty list would turn keep first off, and no key may take that away."""
+    if not value:
+        return 'must name at least one pattern (keep first cannot be turned off)'
+    for v in value:
+        if not isinstance(v, str) or not v or v.startswith('/') or '\0' in v:
+            return f'every entry must be a relative path pattern such as scratchpad/*.md (not {v!r})'
+        if any(part in ('', '.', '..') for part in v.split('/')):
+            return f'every entry must name files without an empty, . or .. part (not {v!r})'
+    return None
+
+
+def _globs_abs(value):
+    """Folder patterns, absolute or from ~/, * and ? within one part. At least one."""
+    if not value:
+        return 'must name at least one folder pattern'
+    return next((problem for problem in map(_path, value) if problem), None)
+
+
 def _github(value):
     return None if GITHUB_NAME.match(value) else f'must be owner/name (not {value!r})'
 
@@ -131,6 +171,7 @@ SPEC = {
     'worktrees': (dict, {}, None),
     'docker': (dict, {}, None),
     'tmp': (dict, {}, None),
+    'agentScratch': (dict, {}, None),
     'daily': (dict, {}, None),
     'compressCold': (dict, {}, None),
 }
@@ -152,6 +193,23 @@ DOCKER_SPEC = {
 TMP_SPEC = {
     'root': (str, '/tmp', _path),
     'patterns': (dict, {}, _patterns),                  # name pattern -> days without a change; the first match counts
+}
+# The agent-scratch rule (rules.py): the scratch folders agent sessions leave in the temp folder, `<root>/<project>/
+# <session id>`. Off unless enabled. `{uid}` in root is the user's id (Claude Code's own folder is /tmp/claude-<uid>).
+SCRATCH_SPEC = {
+    'enabled': (bool, False, None),
+    'root': (str, '/tmp/claude-{uid}', _path),
+    'days': (int, MIN_SCRATCH_DAYS, _at_least(MIN_SCRATCH_DAYS)),
+    'transcripts': (list, TRANSCRIPT_GLOBS, _globs_abs),    # where the sessions' transcripts are (their times only)
+    'keepFirst': (dict, {}, None),
+}
+# What is copied out of a session's folder before it is deleted, and where to (rules.keep_first).
+KEEP_FIRST_SPEC = {
+    'archive': (str, '~/.local/state/fork-cleaner/kept', _path),
+    'patterns': (list, KEEP_FIRST_PATTERNS, _globs_rel),     # relative to the session folder; never empty
+    'outputs': (list, KEEP_FIRST_OUTPUTS, _globs_rel),       # command output: a larger one is only named
+    'maxFileBytes': (int, 256 * 1024, _at_least(MIN_KEEP_FILE_BYTES)),  # a larger file is not a small report
+    'maxSessionBytes': (int, 8 * 1024 * 1024, _at_least(0)),  # more than this to keep first: the session stays whole
 }
 # `fork-cleaner daily`, what the timer runs (daily.py). Without the section it plans, reports and compares.
 DAILY_SPEC = {
@@ -197,12 +255,38 @@ KEY_KINDS = {
     'compare.command': 'compare only', 'compare.pattern': 'compare only',
     'compressCold': 'picks', 'compressCold.folders': 'picks', 'compressCold.keepFreeGB': 'floor',
     'folders.path': 'picks', 'folders.days': 'floor',
+    # agentScratch: on, its folder and its days pick what it looks at. keepFirst only adds a copy before a delete:
+    # more patterns copy more; maxFileBytes has a floor; a session with more than maxSessionBytes to copy stays
+    # whole, so the cap picks which sessions the rule may take at all (every refusal still holds for them). The
+# transcript folders pick where a session's transcript is looked for; a folder pattern that matches nothing keeps
+# every session ("could not read"), so a wrong entry keeps more, but leaving a real folder out would not.
+    'agentScratch': 'picks', 'agentScratch.enabled': 'picks', 'agentScratch.root': 'picks',
+    'agentScratch.days': 'floor', 'agentScratch.keepFirst': 'picks', 'agentScratch.transcripts': 'picks',
+    'keepFirst.archive': 'own file', 'keepFirst.patterns': 'keeps more', 'keepFirst.outputs': 'keeps more',
+    'keepFirst.maxFileBytes': 'floor', 'keepFirst.maxSessionBytes': 'picks',
 }
 
 
 def _holds(folder, path):
     """True when `folder` is `path` or a folder above it."""
     return folder == '/' or path == folder or path.startswith(folder + '/')
+
+
+def _transcript_overlap(root, globs):
+    """The transcript folder (pattern, or a folder it matches now) that the agent-scratch root is, is inside or
+    holds, by its path and by its real path; None when there is none. Agent logs are never deleted (README)."""
+    real = os.path.realpath(root)
+    for pattern in globs:
+        want = pattern.strip('/').split('/')
+        for path in (root, real):
+            have = path.strip('/').split('/')
+            if all(fnmatch.fnmatchcase(a, b) for a, b in zip(have, want)):
+                return pattern
+        for folder in sorted(glob.glob(pattern)):
+            folder = os.path.realpath(folder)
+            if os.path.isdir(folder) and (_holds(real, folder) or _holds(folder, real)):
+                return folder
+    return None
 
 
 def must_keep_match(patterns, path):
@@ -282,6 +366,30 @@ class Config:
         # Without a pattern the rule does nothing and its folder is no root, so the folder is not judged either.
         self.tmp_root = self._root(tmp['root'], f'{where}.tmp.root') if self.tmp_patterns else self._expand(tmp['root'])
 
+        scratch = machine_file.fields(values['agentScratch'], SCRATCH_SPEC, f'{where}.agentScratch')
+        keep = machine_file.fields(scratch['keepFirst'], KEEP_FIRST_SPEC, f'{where}.agentScratch.keepFirst')
+        self.scratch_enabled, self.scratch_days = scratch['enabled'], scratch['days']
+        root_text = scratch['root'].replace('{uid}', str(os.getuid()))
+        if '{' in root_text or '}' in root_text:
+            raise machine_file.MachineFileError(f'{where}.agentScratch.root: only {{uid}} may stand in braces')
+        # Off, the rule looks at nothing and its folder is no root, so the folder is not judged either.
+        self.scratch_root = (self._scratch_root(root_text, f'{where}.agentScratch.root') if self.scratch_enabled
+                             else self._expand(root_text))
+        self.transcript_globs = tuple(self._expand(g) for g in scratch['transcripts'])
+        if self.scratch_enabled:
+            held = _transcript_overlap(self.scratch_root, self.transcript_globs)
+            if held is not None:
+                raise machine_file.MachineFileError(f'{where}.agentScratch.root: {root_text} overlaps the transcript '
+                                                    f'folder {held}: agent logs are never deleted')
+        self.keep_patterns = tuple(tuple(p.split('/')) for p in keep['patterns'])
+        self.keep_outputs = tuple(tuple(p.split('/')) for p in keep['outputs'])
+        self.keep_max_file, self.keep_max_session = keep['maxFileBytes'], keep['maxSessionBytes']
+        archive = self._expand(keep['archive'])
+        self.keep_archive = os.path.join(os.path.realpath(os.path.dirname(archive)), os.path.basename(archive))
+        if _holds(self.keep_archive, self.home):
+            raise machine_file.MachineFileError(f'{where}.agentScratch.keepFirst.archive: {keep["archive"]} is the '
+                                                'home folder or holds it')
+
         docker = machine_file.fields(values['docker'], DOCKER_SPEC, f'{where}.docker')
         self.docker_enabled, self.docker_days = docker['enabled'], docker['days']
 
@@ -310,16 +418,20 @@ class Config:
         if _holds(self.daily_dir, self.home):
             raise machine_file.MachineFileError(f'{where}.daily.outDir: {daily["outDir"]} is the home folder or holds it')
 
-        self.cold_folders = self._cold(values['compressCold'], f'{where}.compressCold', values['logFile'], daily['outDir'])
+        # The archive is written only while the rule is on: then it may not be where the cleaner deletes or
+        # compresses either.
+        archive = (('agentScratch.keepFirst.archive', keep['archive'], self.keep_archive),) if self.scratch_enabled else ()
+        self.cold_folders = self._cold(values['compressCold'], f'{where}.compressCold', values['logFile'], daily['outDir'],
+                                       archive)
 
-        for root in self.roots():
+        for root in self.roots() | ({self.scratch_root} if self.scratch_enabled else set()):
             for key, text, own in (('logFile', values['logFile'], self.log_file),
-                                   ('daily.outDir', daily['outDir'], self.daily_dir)):
+                                   ('daily.outDir', daily['outDir'], self.daily_dir)) + archive:
                 if _holds(root, own) or _holds(own, root):
                     raise machine_file.MachineFileError(f'{where}.{key}: {text} is inside {root}, a folder '
                                                         'the cleaner deletes from')
 
-    def _cold(self, section, where, log_text, out_text):
+    def _cold(self, section, where, log_text, out_text, archive=()):
         """The folders of compress-cold. A folder may be inside a must-keep path (the rule keeps every file's
         content), but never one of them whole or a folder above one (`~/.codex` holds logins and settings; name
         `~/.codex/sessions`), never in or above COMPRESS_NEVER, the cleaner's own files or a folder another rule
@@ -347,10 +459,11 @@ class Config:
             if held:
                 raise machine_file.MachineFileError(f'{at}.path: {text} is or holds the must-keep path /{"/".join(held[0])}: '
                                                     'name a folder inside it (its settings and logins stay as they are)')
-            for key, own_text, own in (('logFile', log_text, self.log_file), ('daily.outDir', out_text, self.daily_dir)):
+            # `archive`: the keep-first archive of agent-scratch while that rule is on, also one of the cleaner's own files.
+            for key, own_text, own in (('logFile', log_text, self.log_file), ('daily.outDir', out_text, self.daily_dir)) + archive:
                 if _holds(path, own) or _holds(own, path):
                     raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {key} {own_text}')
-            for root in self.roots():
+            for root in self.roots() | ({self.scratch_root} if self.scratch_enabled else set()):
                 if _holds(path, root) or _holds(root, path):
                     raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {root}, a folder '
                                                         'another rule deletes from')
@@ -385,12 +498,41 @@ class Config:
             raise machine_file.MachineFileError(f'{where}: {text} is the home folder or holds it')
         return root
 
+    def _scratch_root(self, text, where):
+        """The agent-scratch root: one user's own folder of project folders. Never a shared temp folder itself
+        (/tmp: every program's entries are directly in it), never / or home or above it, and, when it is there, a
+        real folder (not a link) that this user owns."""
+        root = self._root(text, where)
+        runtime = (os.environ.get('XDG_RUNTIME_DIR') or '/run/user/{uid}',)
+        shared = {os.path.normpath(t.replace('{uid}', str(os.getuid())))
+                  for t in SHARED_TEMP + runtime + (tempfile.gettempdir(),) if t.startswith('/')}
+        if root in shared or os.path.realpath(root) in shared:
+            raise machine_file.MachineFileError(f'{where}: {text} is a shared temp folder; name the folder of one '
+                                                'user in it (such as /tmp/claude-{uid})')
+        try:
+            st = os.lstat(root)
+        except FileNotFoundError:
+            return root
+        except OSError as ex:
+            raise machine_file.MachineFileError(f'{where}: {text}: {ex.strerror}') from None
+        if not stat.S_ISDIR(st.st_mode):
+            raise machine_file.MachineFileError(f'{where}: {text} is a link or not a folder')
+        if st.st_uid != os.getuid():
+            raise machine_file.MachineFileError(f'{where}: {text} is owned by uid {st.st_uid}, not by this user')
+        return root
+
     def roots(self):
-        """The folders whose direct entries may be deleted at all. Nothing else is ever a candidate."""
+        """The folders whose direct entries may be deleted at all, besides the session folders of agent scratch
+        (session_parent). Nothing else is ever a candidate."""
         roots = {repo.root for repo in self.repos}
         if self.tmp_patterns:
             roots.add(self.tmp_root)
         return frozenset(roots)
+
+    def session_parent(self, folder):
+        """True when `folder` is a project folder directly in the agent-scratch root (the rule is on): its direct
+        entries, the session folders, may go. The root itself is not one: a project folder never goes."""
+        return self.scratch_enabled and folder != self.scratch_root and os.path.dirname(folder) == self.scratch_root
 
 
 def matches(name, globs):
