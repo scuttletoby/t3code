@@ -71,7 +71,10 @@ def _upstream_t3(cfg, version):
 
 def copies(cfg):
     """Read only: [(folder, manifest)] of the finished copies of this home in backupDir, newest first: those of
-    `t3-golive copy` (t3-copy-*) and of the switch (t3-switch-*, taken while T3 was stopped for it)."""
+    `t3-golive copy` (t3-copy-*) and of the switch (t3-switch-*, taken while T3 was stopped for it). A copy's time
+    is a whole second: copies of the same second go by the place of their runs in the journal (the later run is
+    the newer copy; a run the journal does not hold counts as before every run it holds), then by folder name,
+    never by the order the folder happens to list them in (W1 restores the first one)."""
     try:
         names = [n for n in os.listdir(cfg.backup_dir) if n.startswith(('t3-copy-', 't3-switch-'))]
     except FileNotFoundError:
@@ -83,7 +86,12 @@ def copies(cfg):
                                                                                 cfg.home)))
         except (coldcopy.Incomplete, coldcopy.WrongCopy):
             pass
-    return sorted(found, key=lambda f: str(f[1].get('createdAt')), reverse=True)
+    try:
+        place = {r['id']: n for n, r in enumerate(journal.read(cfg.state_dir)[0])}
+    except journal.Damaged:
+        place = {}
+    return sorted(found, key=lambda f: (str(f[1].get('createdAt')), place.get(str(f[1].get('runId')), -1), f[0]),
+                  reverse=True)
 
 
 def ways(cfg, adapter, stuck=None):

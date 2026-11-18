@@ -176,6 +176,44 @@ class Ways(BackBase):
         self.assertEqual(back.copies(config.load()), [])
         self.assertIn('no finished copy of this home', back.ways(config.load(), self.adapter)['w1']['why'])
 
+    def test_copies_of_the_same_second_go_by_their_runs_in_the_journal_never_by_the_folder_listing(self):
+        # #479: a copy's time is a whole second. Two copies of one second were ordered by os.listdir alone, so W1
+        # restored whichever the folder listed first (the older copy, under an older build, in half the runs of
+        # the FollowStuckW1 test that takes two copies quickly). Here the clock even steps back between them, so
+        # the folder names sort the wrong way round: only the journal says which copy is the newer one.
+        with mock.patch.object(coldcopy, '_stamp', return_value='20261101T000001Z'):
+            first = self.take_copy()
+        with mock.patch.object(coldcopy, '_stamp', return_value='20261101T000000Z'):
+            second = self.take_copy()
+        path = os.path.join(second, coldcopy.MANIFEST)
+        with open(path) as f:
+            manifest = json.load(f)
+        with open(path, 'w') as f:
+            json.dump({**manifest, 'createdAt': '20261101T000001Z'}, f)
+        real = os.listdir
+
+        def listed(order):
+            """os.listdir with the backups folder in `order`, as one file system or another may list it."""
+            return mock.patch.object(os, 'listdir', lambda p='.': order(real(p)) if p == self.m.backups else real(p))
+
+        for order in (sorted, lambda names: sorted(names, reverse=True)):
+            with listed(order):
+                self.assertEqual(sorted(os.listdir(self.m.backups)), sorted(map(os.path.basename, (first, second))))
+                self.assertEqual([f for f, _ in back.copies(config.load())], [second, first])
+                self.assertEqual(back.ways(config.load(), self.adapter)['w1']['copy'], second)
+        # A manifest whose run the journal does not hold (here not even a run id) counts as before every run it holds.
+        with open(path, 'w') as f:
+            json.dump({**manifest, 'createdAt': '20261101T000001Z', 'runId': ['not', 'an', 'id']}, f)
+        self.assertEqual([f for f, _ in back.copies(config.load())], [first, second])
+        # Runs the journal does not hold (it was moved aside, or it cannot be read): one fixed order, by name.
+        journal_file = os.path.join(self.m.state, 'journal.jsonl')
+        for damage in (lambda: self.m.write('kit-state/journal.jsonl', 'not a journal line\n{}\n'),
+                       lambda: os.unlink(journal_file)):
+            damage()
+            for order in (sorted, lambda names: sorted(names, reverse=True)):
+                with listed(order):
+                    self.assertEqual([f for f, _ in back.copies(config.load())], [first, second])
+
     def test_an_install_complete_naming_another_version_is_not_a_whole_runtime(self):
         self.assertIsNotNone(back.installed_t3(self.m.home, fx.LIVE))
         self.m.write(f'home/runtime/versions/{fx.LIVE}/.install-complete', fx.TARGET)
