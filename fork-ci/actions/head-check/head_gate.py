@@ -284,6 +284,7 @@ def open_heads(repo, gh, base=None):
 def pull_head_by_git(repo, number, env):
     """(sha, None) or (None, why): refs/pull/N/head by git ls-remote (the job's token as a header from the
     environment, never on the command line), for when the REST API is down or rate limited. Up to READ_TRIES tries."""
+    # Not pr_queue.git_env: it drops GIT_CONFIG_COUNT/KEY_/VALUE_, which carry this call's own auth header.
     clean = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'TMPDIR')}
     clean.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
     token = env.get('GH_TOKEN', '')
@@ -662,7 +663,7 @@ def bare_repository(work, name):
 def fetch(checkout, base, head):
     """The base tip and the head, by sha, with their history, into refs only the gate names. None or why not."""
     r = checkout.git('-c', 'gc.auto=0', 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
-                     checkout.remote, f'{base}:refs/gate/base', f'{head}:refs/gate/head')
+                     checkout.remote, f'{base}:refs/gate/base', f'{head}:refs/gate/head', fetch=True)
     return None if r.returncode == 0 else f'git fetch failed: {r.stderr.strip()[:300]}'
 
 
