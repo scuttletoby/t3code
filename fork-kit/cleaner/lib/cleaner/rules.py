@@ -4,12 +4,12 @@ may go at all is the guard's answer (guard.py), and every rule asks it.
 `plan` reads and decides, and changes nothing. `recheck` reads everything about one item again, just before its
 delete. `delete` is the only code in the kit that removes anything.
 """
-import fnmatch, os, re, shutil, stat
+import errno, fnmatch, os, re, shutil, stat
 
 from . import guard
 from .config import matches
-from .facts import (Unreadable, git, git_code, lonely, merged_seconds, origin_url, present, reflog, remote_heads,
-                    remove_volume, remove_worktree, worktree_list)
+from .facts import (Unreadable, default_branch, git, git_code, local_tags, lonely, merged_seconds, origin_url, present, reflog,
+                    remote_refs, remove_volume, remove_worktree, worktree_list)
 from .guard import CREDENTIAL_NAMES, Refusal
 
 DAY = 86400
@@ -78,8 +78,10 @@ def tmp_answer(cfg, facts, path):
     pattern, days = match
     try:
         top = guard.changed(os.lstat(path))
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as ex:  # tmp entry
+        return '', guard.Look(Refusal('could not read', f'{path}: {ex.strerror}'))
     look = guard.examine(cfg, facts, path, 'path')
     age = facts.now - max(top, look.newest)       # a refusal stops the look early: then the entry's own time counts
     if age < days * DAY:
@@ -173,24 +175,30 @@ def some(names):
 
 
 def regenerable(repo, path, name):
-    """True when an entry git ignores is build output any tool makes again: a link (it holds nothing), or a name
-    on the repository's list. A credential-looking name is never build output, whatever the list says."""
+    """True when an entry git ignores is build output any tool makes again: a link (it holds nothing), or inside a
+    folder whose name is on the repository's list, exactly (the list holds plain folder names, never a pattern, so
+    no entry can make every ignored file build output). A credential-looking name is never build output."""
     parts = name.rstrip('/').split('/')
     if guard.matches(parts[-1], CREDENTIAL_NAMES):
         return False
     if os.path.islink(os.path.join(path, name.rstrip('/'))):
         return True
-    return any(matches(part, repo.regenerable) for part in parts)
+    folders = parts if name.endswith('/') else parts[:-1]
+    return any(part in repo.regenerable for part in folders)
 
 
 def tree_kind(path):
-    """'clone' for a folder with a .git folder, 'worktree' for one with a .git file, None for anything else."""
+    """'clone' for a folder with a .git folder, 'worktree' for one with a .git file, None for anything else.
+    Raises Unreadable when it cannot tell (a folder it may not read)."""
     try:
-        st, dot = os.lstat(path), os.lstat(os.path.join(path, '.git'))
-    except OSError:
-        return None
-    if not stat.S_ISDIR(st.st_mode):
-        return None
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        dot = os.lstat(os.path.join(path, '.git'))
+    except OSError as ex:
+        if ex.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise Unreadable(f'{ex.filename or path}: {ex.strerror}') from None
     return 'clone' if stat.S_ISDIR(dot.st_mode) else 'worktree' if stat.S_ISREG(dot.st_mode) else None
 
 
@@ -219,9 +227,17 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
     opened = [row for row in prs['open'] if row['headRefName'] == branch]
     if opened:
         return Refusal('open PR', numbers(opened))
-    merged = [row for row in prs['merged'] if row['headRefName'] == branch]
+    # A branch other pull requests merge into (main, or the lower branch of a stack) is not finished by one of them,
+    # and nor is GitHub's default branch, even when no pull request in the list merges into it.
+    if branch == default_branch(path):
+        return Refusal('base branch', f'{branch} is the default branch on GitHub')
+    based = [row for row in prs['open'] + prs['merged'] if row['baseRefName'] == branch]
+    if based:
+        return Refusal('base branch', f'pull requests merge into {branch}: {numbers(based)}')
+    # Only a pull request from this repository: a fork's "main" is not this repository's main.
+    merged = [row for row in prs['merged'] if row['headRefName'] == branch and not row['isCrossRepository']]
     if not merged:
-        return Refusal('no merged PR', f'no merged pull request has the branch {branch}')
+        return Refusal('no merged PR', f'no merged pull request of this repository has the branch {branch}')
     here = present(path, [row['headRefOid'] for row in prs['merged'] + prs['open']])
     holding = []
     for row in merged:
@@ -280,12 +296,18 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
     else:
         if git_code(path, 'rev-parse', '-q', '--verify', 'refs/stash') == 0:
             return Refusal('stash entries', 'git stash list')
-        # Removing a clone removes every branch, tag and log in it. GitHub has a commit when a branch there holds
-        # it right now or a pull request does; the clone's own remote-tracking refs may be stale and do not count.
-        has = sorted(here | present(path, remote_heads(path)))
+        # Removing a clone removes every branch, tag and log in it. GitHub has a commit when a branch or tag there
+        # holds it right now (`git ls-remote`) or a pull request does; the clone's own remote-tracking refs may be
+        # stale and do not count.
+        refs = remote_refs(path, 'origin', '--heads', '--tags')
+        has = sorted(here | present(path, refs.values()))
         alone = lonely(path, ['--all', '--reflog'], has)
         if alone:  # clone
             return Refusal('commits GitHub does not have', f'{alone[:10]} (git log --all --reflog)')
+        # A tag is more than its commit: an annotated tag has its own message and signature.
+        missing = sorted(ref[len('refs/tags/'):] for ref, oid in local_tags(path).items() if refs.get(ref) != oid)
+        if missing:
+            return Refusal('tags GitHub does not have', some(missing))
 
     look = guard.examine(cfg, facts, path, kind)
     out['look'] = look
@@ -295,8 +317,11 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
 def tree_answer(cfg, facts, repo, path):
     """(kind, refusal, why, size) for one entry of a repository's folder; None when it is not a worktree or clone
     of that repository, and so not this rule's."""
-    kind = tree_kind(path)
-    if kind is None or os.path.islink(path):
+    try:
+        kind = tree_kind(path)
+    except Unreadable as ex:
+        return 'folder', Refusal('could not read', str(ex)), '', 0
+    if kind is None:
         return None
     try:
         url = origin_url(path)
@@ -344,15 +369,15 @@ def recheck_tree(cfg, facts, item):
 
 
 def delete_worktree(item):
-    """Git removes it, without --force: git refuses on its own when a file changed after the last check. The local
-    branch stays in the clone."""
+    """Git removes it, without --force: git refuses on its own when a file changed after the last check, and then
+    raises Untouched (nothing removed). The local branch stays in the clone."""
     common = git(item.path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip()
     remove_worktree(common, item.path)
 
 
 def delete_clone(item):
-    """The working files first and .git last: a clone that is only half gone still has its history, and the next
-    run names it as kept (changed files, or git cannot read it) instead of passing over it."""
+    """The working files first and .git last, so a clone that is only half gone still has its history. The engine
+    notes the delete before it starts; a later run names a half-gone clone "half deleted" (engine.py)."""
     for name in sorted(os.listdir(item.path)):
         if name != '.git':
             target = os.path.join(item.path, name)

@@ -125,7 +125,8 @@ class Case(unittest.TestCase):
             del os.environ[name]
         self.section = {'logFile': self.path('state', 'cleaner.log')}
         self.merged, self.open = [], []
-        self.busy, self.unit_names, self.locks = set(), set(), set()
+        self.busy, self.unit_names, self.locks, self.texts = set(), set(), set(), []
+        self.mount_points = {'/'}
         # Tests set a file's age with its modification time. The kit also counts the inode change time, which no
         # test can set, so the tests read the modification time alone; one test puts the real reader back.
         self.real_changed = self.c.guard.changed
@@ -189,12 +190,12 @@ class Case(unittest.TestCase):
         return self.cfg(worktrees={'repos': [repo]}, **section)
 
     def processes(self):
-        return self.c.facts.Processes(busy=set(self.busy), locks=set(self.locks))
+        return self.c.facts.Processes(busy=set(self.busy), locks=set(self.locks), texts=list(self.texts))
 
     def facts(self, cfg, **over):
         readers = {'processes': self.processes, 'units': lambda: set(self.unit_names),
                    'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
-                   'dangling': lambda: [], 'now': self.now}
+                   'dangling': lambda: [], 'now': self.now, 'mounts': lambda: set(self.mount_points)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):
@@ -205,6 +206,15 @@ class Case(unittest.TestCase):
         lines = []
         code = self.c.engine.execute(cfg, self.facts(cfg, **over), really, say=lines.append)
         return code, lines
+
+    def delete_all(self, cfg, facts, items):
+        """(failed, lines) of the engine's delete loop as a run does it: with the log open and a journal."""
+        lines, log = [], self.c.engine.Log(cfg)
+        try:
+            failed = self.c.engine.delete_all(cfg, facts, items, True, lines.append, log, [])
+        finally:
+            log.close()
+        return failed, lines
 
     def assertDeletes(self, plan, path, rule=None):
         found = [i for i in plan.items if i.path == path]
@@ -269,11 +279,12 @@ class Case(unittest.TestCase):
     def push(self, tree):
         self.git(tree, 'push', '-q', '-u', 'origin', 'HEAD')
 
-    def pr(self, tree, number=7, hours=48, oid=None, state='merged'):
-        """A pull request row for the tree's branch as `gh pr list --json` prints it: merged `hours` ago, or open."""
+    def pr(self, tree, number=7, hours=48, oid=None, state='merged', base='main', fork=False, branch=None):
+        """A pull request row for the tree's branch as `gh pr list --json` prints it: merged `hours` ago, or open;
+        `fork`: its head branch is in a fork (isCrossRepository)."""
         when = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self.now - hours * HOUR))
-        row = {'number': number, 'headRefName': self.branch(tree), 'headRefOid': oid or self.head(tree),
-               'mergedAt': when if state == 'merged' else None}
+        row = {'number': number, 'headRefName': branch or self.branch(tree), 'headRefOid': oid or self.head(tree),
+               'mergedAt': when if state == 'merged' else None, 'baseRefName': base, 'isCrossRepository': fork}
         (self.merged if state == 'merged' else self.open).append(row)
         return row
 

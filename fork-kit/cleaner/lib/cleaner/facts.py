@@ -24,11 +24,23 @@ class Unreadable(Exception):
 
 
 # --- processes ---------------------------------------------------------------------------------------------------
-class Processes:
-    """`busy`: every path a process uses, and every folder above each. `locks`: the inodes with a held file lock."""
+# Before and after a path named inside longer text: what may stand next to a whole path, not inside a longer name.
+EDGE = r'\s"\'=:;,&|()<>`'
 
-    def __init__(self, busy=(), locks=()):
-        self.busy, self.locks = set(busy), set(locks)
+
+class Processes:
+    """`busy`: every path a process uses, and every folder above each. `locks`: the inodes with a held file lock.
+    `texts`: the command lines as text, so a path with a space in it (`sh -c 'cd "/tmp/my dir"'`) is seen too."""
+
+    def __init__(self, busy=(), locks=(), texts=()):
+        self.busy, self.locks, self.texts = set(busy), set(locks), list(texts)
+
+    def uses(self, path):
+        """True when a process uses `path` or something in it, or a command line names it."""
+        if path in self.busy:
+            return True
+        named = re.compile(f'(?:^|(?<=[{EDGE}]))' + re.escape(path) + f'(?=$|[/{EDGE}])')
+        return any(named.search(text.replace('\\ ', ' ')) for text in self.texts)
 
 
 def ancestors(path):
@@ -87,7 +99,7 @@ def read_processes(proc='/proc', me=None):
             socket_lines = f.read().splitlines()[1:]
     except OSError as ex:
         raise Unreadable(f'{ex.filename or proc}: {ex.strerror}') from None
-    paths, seen = set(), set()
+    paths, seen, texts = set(), set(), []
     for pid in pids:
         base = os.path.join(proc, pid)
         cwd = None
@@ -105,6 +117,7 @@ def read_processes(proc='/proc', me=None):
             with open(os.path.join(base, 'cmdline'), 'rb') as f:
                 args = [a.decode('utf-8', 'surrogateescape') for a in f.read().split(b'\0') if a]
             paths.update(_command_paths(args, cwd))
+            texts.append(' '.join(args))
         except OSError:
             pass
         try:
@@ -137,7 +150,32 @@ def read_processes(proc='/proc', me=None):
             found = LOCK_INODE.match(field)
             if found:
                 locks.add(int(found.group(1)))
-    return Processes(busy, locks)
+    return Processes(busy, locks, texts)
+
+
+# --- mounts -------------------------------------------------------------------------------------------------------
+def _unescape(field):
+    """A mountinfo path: space, tab, newline and backslash are written as \\040, \\011, \\012 and \\134."""
+    return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), field)
+
+
+def read_mounts(path='/proc/self/mountinfo'):
+    """Every mount point, bind mounts too: a bind mount of a folder on the same filesystem has the same device
+    number, so only this list shows it. Raises Unreadable when the list cannot be read or does not even hold /."""
+    try:
+        with open(path, errors='surrogateescape') as f:
+            lines = f.read().splitlines()
+    except OSError as ex:
+        raise Unreadable(f'{ex.filename or path}: {ex.strerror}') from None
+    points = set()
+    for line in lines:
+        fields = line.split(' ')
+        if len(fields) < 10 or '-' not in fields[6:]:
+            raise Unreadable(f'{path}: a line it cannot use: {line[:80]!r}')
+        points.add(os.path.normpath(_unescape(fields[4])))
+    if '/' not in points:
+        raise Unreadable(f'{path} does not name /')
+    return points
 
 
 # --- systemd units ------------------------------------------------------------------------------------------------
@@ -250,12 +288,12 @@ def origin_url(cwd):
     return url
 
 
-def present(cwd, oids):
+def present(cwd, oids, bare=False):
     """Those of `oids` that this repository has as objects."""
     oids = sorted(set(oids))
     if not oids:
         return set()
-    out = git(cwd, 'cat-file', '--batch-check', stdin='\n'.join(oids) + '\n').splitlines()
+    out = git(cwd, 'cat-file', '--batch-check', stdin='\n'.join(oids) + '\n', bare=bare).splitlines()
     if len(out) != len(oids):
         raise Unreadable('cat-file: did not answer for every commit')
     return {oid for oid, line in zip(oids, out) if not line.endswith(' missing')}
@@ -266,44 +304,96 @@ def reflog(cwd, *what):
     return sorted({line for line in git(cwd, 'log', '-g', '--format=%H', *what).split() if OID.match(line)})
 
 
-def remote_heads(cwd):
-    """The branch heads origin has right now: a live answer, not the clone's remote-tracking refs, which go stale."""
-    heads = set()
-    for line in git(cwd, 'ls-remote', '--heads', 'origin').splitlines():
-        oid = line.split('\t')[0]
-        if not OID.match(oid):
+def remote_refs(cwd, remote, *only, bare=False):
+    """{ref: oid} of what `remote` has right now (`git ls-remote`, `only` e.g. --heads --tags): a live answer, not
+    the clone's remote-tracking refs, which go stale. A peeled tag is its own entry (refs/tags/v1^{})."""
+    refs = {}
+    for line in git(cwd, 'ls-remote', *only, remote, bare=bare).splitlines():
+        oid, tab, ref = line.partition('\t')
+        if not OID.match(oid) or not tab or not ref:
             raise Unreadable(f'ls-remote: a line it cannot use: {line[:80]!r}')
-        heads.add(oid)
-    return heads
+        refs[ref] = oid
+    return refs
 
 
-def lonely(cwd, positive, negative):
+def default_branch(cwd, remote='origin'):
+    """The branch `remote`'s HEAD names right now (`git ls-remote --symref`): on GitHub, the default branch."""
+    for line in git(cwd, 'ls-remote', '--symref', remote, 'HEAD').splitlines():
+        if line.startswith('ref: refs/heads/') and line.endswith('\tHEAD'):
+            return line[len('ref: refs/heads/'):-len('\tHEAD')]
+    raise Unreadable(f'ls-remote: {remote} named no default branch')
+
+
+def local_tags(cwd, bare=False):
+    """{refs/tags/name: oid} of this repository's own tags (an annotated tag: the tag object)."""
+    tags = {}
+    for line in git(cwd, 'for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags', bare=bare).splitlines():
+        oid, _, ref = line.partition(' ')
+        if not OID.match(oid) or not ref.startswith('refs/tags/'):
+            raise Unreadable(f'for-each-ref: a line it cannot use: {line[:80]!r}')
+        tags[ref] = oid
+    return tags
+
+
+def remotes(cwd, bare=False):
+    """{name: url} of the remotes in the repository's own config (no insteadOf rewrite)."""
+    out = {}
+    for entry in git(cwd, 'config', '--local', '--null', '--list', bare=bare).split('\0'):
+        key, _, value = entry.partition('\n')
+        if key.startswith('remote.') and key.endswith('.url'):
+            out[key[len('remote.'):-len('.url')]] = value
+    return out
+
+
+def elsewhere(url):
+    """True for a remote on another machine (https://, ssh://, git@host:path). A folder on this machine, or a
+    file:// URL, may be what is being deleted, so what it has does not count as pushed."""
+    if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', url):
+        return not url.lower().startswith('file://')
+    return bool(re.match(r'^[^/:]+:', url)) and not url.startswith('.')
+
+
+def lonely(cwd, positive, negative, bare=False):
     """The first commit reachable from `positive` (revisions or options) and from nothing in `negative`; '' when
     there is none. Everything goes through standard input, so the lists may be long."""
     lines = [*positive, '--not', *negative]
-    return git(cwd, 'rev-list', '--max-count=1', '--stdin', stdin='\n'.join(lines) + '\n').strip()
+    return git(cwd, 'rev-list', '--max-count=1', '--stdin', stdin='\n'.join(lines) + '\n', bare=bare).strip()
+
+
+class Untouched(Unreadable):
+    """A delete that was refused before anything was removed."""
 
 
 def remove_worktree(common_dir, path):
-    """`git worktree remove`, never with --force: git itself refuses a worktree with changed or untracked files."""
-    git(common_dir, 'worktree', 'remove', path, bare=True)
+    """`git worktree remove`, never with --force: git itself refuses a worktree with changed or untracked files,
+    and then removes nothing (Untouched)."""
+    done = _git(common_dir, ('worktree', 'remove', path), True, None)
+    if done.returncode != 0:
+        # git checks everything before it removes a file and stops with exit 128 (fatal) when a check fails; a
+        # failure while removing says "failed to delete", and a killed git has no exit code of its own.
+        refused = done.returncode == 128 and 'failed to delete' not in done.stderr
+        raise (Untouched if refused else Unreadable)(f'worktree: exit {done.returncode}: {_first_line(done.stderr)}')
 
 
 # --- GitHub -------------------------------------------------------------------------------------------------------
+PR_FIELDS = 'number,headRefName,headRefOid,mergedAt,baseRefName,isCrossRepository'
+
+
 def valid_pr(row, state):
     return (isinstance(row, dict) and type(row.get('number')) is int and isinstance(row.get('headRefName'), str)
             and bool(row['headRefName']) and isinstance(row.get('headRefOid'), str) and bool(OID.match(row['headRefOid']))
+            and isinstance(row.get('baseRefName'), str) and type(row.get('isCrossRepository')) is bool
             and (state != 'merged' or isinstance(row.get('mergedAt'), str)))
 
 
 def github_prs(repo):
-    """{'merged': rows, 'open': rows} for one GitHub repository, each row with number, headRefName, headRefOid and
-    mergedAt. Raises Unreadable when gh fails, prints something else, or a list may be cut off: a missing open pull
+    """{'merged': rows, 'open': rows} for one GitHub repository, each row with the PR_FIELDS (isCrossRepository:
+    the head branch is in a fork, not in this repository). Raises Unreadable when gh fails, prints something else, or a list may be cut off: a missing open pull
     request would look like "no open pull request"."""
     out = {}
     for state in ('merged', 'open'):
         done = _run([GH, 'pr', 'list', '-R', repo, '--state', state, '--limit', str(PR_LIMIT),
-                     '--json', 'number,headRefName,headRefOid,mergedAt'], 'GitHub (gh)')
+                     '--json', PR_FIELDS], 'GitHub (gh)')
         if done.returncode != 0:  # gh
             raise Unreadable(f'GitHub (gh pr list: {_first_line(done.stderr)})')
         try:
@@ -379,18 +469,23 @@ def remove_volume(name):
 
 # --- one view of it all -------------------------------------------------------------------------------------------
 class Facts:
-    """What one run knows. The process list is read again when it is older than PROCESS_SECONDS, so the last check
-    before each delete sees the machine as it is then; units and pull request lists are read once per run. A
-    reader that failed keeps failing for as long as its answer would have been kept."""
+    """What one run knows. While planning, the process list and the mounts are read again when they are older than
+    PROCESS_SECONDS, and units and pull request lists are read once. `forget` drops every answer: the engine calls
+    it before the last check of each delete, so that check reads the process list, the mounts, the units, the pull
+    request lists and Docker's list anew. A reader that failed keeps failing until then."""
 
-    def __init__(self, cfg, processes=None, units=None, prs=None, dangling=None, now=None):
+    def __init__(self, cfg, processes=None, units=None, prs=None, dangling=None, now=None, mounts=None):
         self.cfg = cfg
         self.now = time.time() if now is None else now
         self._read_processes = processes or read_processes
+        self._read_mounts = mounts or read_mounts
         self._read_units = units or (lambda: read_units(home=cfg.home))
         self._read_prs = prs or github_prs
         self.dangling = dangling or docker_dangling
-        self._processes = self._units = None
+        self.forget()
+
+    def forget(self):
+        self._processes = self._mounts = self._units = None
         self._prs = {}
 
     @staticmethod
@@ -410,6 +505,11 @@ class Facts:
         if self._processes is None or time.monotonic() - self._processes[0] >= PROCESS_SECONDS:
             self._processes = (time.monotonic(), self._answer(self._read_processes))
         return self._give(self._processes[1])
+
+    def mounts(self):
+        if self._mounts is None or time.monotonic() - self._mounts[0] >= PROCESS_SECONDS:
+            self._mounts = (time.monotonic(), self._answer(self._read_mounts))
+        return self._give(self._mounts[1])
 
     def units(self):
         if self._units is None:

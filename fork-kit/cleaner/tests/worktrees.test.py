@@ -130,17 +130,30 @@ class Worktrees(Case):
         self.assertKept(plan, notes, 'ignored files', 'local/')
         self.assertKept(plan, log, 'ignored files', 'debug.log')
         self.assertDeletes(plan, built)
-        plan = self.plan(self.repo_cfg(regenerable=['*.log']))            # a project names its own build output
-        self.assertDeletes(plan, log)
+        plan = self.plan(self.repo_cfg(regenerable=['local']))            # a project names its own build folders
+        self.assertDeletes(plan, notes)
         self.assertDeletes(plan, built)                                   # ...on top of the built-in names
-        self.assertKept(plan, notes, 'ignored files')
+        self.assertKept(plan, log, 'ignored files')
+        plan = self.plan(self.repo_cfg(regenerable=['debug.log']))        # a name frees folders, never a file
+        self.assertKept(plan, log, 'ignored files', 'debug.log')
+
+    def test_the_list_takes_only_plain_names(self):
+        """The list can only free more: a pattern such as * would make every ignored file build output."""
+        for name in ('*', '*.log', '.*', 'a?', '[ab]', 'build/out', 'a\\b', ''):
+            with self.subTest(name=name), self.assertRaises(machine_file.MachineFileError):
+                self.repo_cfg(regenerable=[name])
+        self.assertIn('dist', self.repo_cfg(regenerable=['dist']).repos[0].regenerable)
 
     def test_no_list_makes_a_credential_looking_file_build_output(self):
         tree = self.finished()
         self.file(os.path.join(tree, '.env'), 'made up for the test\n')
         self.assertEqual(self.git(tree, 'status', '--porcelain'), '')         # git ignores it
-        for regenerable in (None, ['.env'], ['*'], ['.*']):
+        for regenerable in (None, ['.env']):
             self.assertKept(self.plan(self.repo_cfg(regenerable=regenerable)), tree, 'ignored files', '.env')
+        os.unlink(os.path.join(tree, '.env'))
+        self.file(os.path.join(tree, '.env', 'production'), 'made up for the test\n')     # a folder of them
+        self.assertEqual(self.git(tree, 'status', '--porcelain'), '')
+        self.assertKept(self.plan(self.repo_cfg(regenerable=['.env'])), tree, 'ignored files', '.env')
 
     def test_files_hidden_from_git_status_keep_it(self):
         for number, flag in enumerate(('--skip-worktree', '--assume-unchanged')):
@@ -228,11 +241,45 @@ class Worktrees(Case):
         facts = self.facts(cfg)
         plan = self.c.rules.plan(cfg, facts)
         self.file(os.path.join(tree, 'written-after-the-last-check.txt'))
-        lines = []
         with mock.patch.object(self.c.rules, 'recheck', lambda *a: None):          # as if the last check had passed
-            self.c.engine.delete_all(cfg, facts, plan.items, True, lines.append)
+            failed, lines = self.delete_all(cfg, facts, plan.items)
         self.assertTrue(os.path.isfile(os.path.join(tree, 'written-after-the-last-check.txt')))
         self.assertEqual([line.split()[0] for line in lines], ['FAILED'], lines)
+        self.assertNotIn('half deleted', lines[0])                     # git removed nothing: no note for the next run
+        self.assertFalse(os.path.exists(cfg.journal_file))
+
+    def test_a_fork_pull_request_with_the_same_branch_name_does_not_finish_it(self):
+        tree = self.finished()
+        self.merged[0]['isCrossRepository'] = True
+        self.assertKept(self.planned(), tree, 'no merged PR')
+
+    def test_a_branch_pull_requests_merge_into_is_kept(self):
+        lower = self.finished('lower', number=1)
+        self.finished('upper', number=2)
+        self.merged[1]['baseRefName'] = 'lower'
+        self.assertKept(self.planned(), lower, 'base branch', '#2')
+
+    def test_a_worktree_that_was_moved_is_kept(self):
+        tree = self.finished()
+        os.rename(tree, self.path('trees', 'moved'))
+        self.assertKept(self.planned(), self.path('trees', 'moved'), 'could not read', 'moved')
+
+    def test_the_last_check_wants_the_same_kind(self):
+        tree = self.finished()
+        cfg = self.repo_cfg()
+        self.assertIsNone(self.c.rules.recheck(cfg, self.facts(cfg), self.c.rules.Item('worktree', tree, 'worktrees', '', 0)))
+        refusal = self.c.rules.recheck(cfg, self.facts(cfg), self.c.rules.Item('clone', tree, 'worktrees', '', 0))
+        self.assertEqual(refusal.code, 'not a candidate')
+
+    def test_a_folder_it_cannot_read_is_kept_and_named(self):
+        tree = self.finished()
+        closed = self.mkdir('trees', 'closed', 'inner')
+        os.chmod(os.path.dirname(closed), 0)
+        cfg = self.repo_cfg()
+        self.assertKept(self.plan(cfg), os.path.dirname(closed), 'could not read', 'Permission denied')
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 1, lines)
+        self.assertFalse(os.path.exists(tree))
 
 
 class Clones(Case):
@@ -288,7 +335,46 @@ class Clones(Case):
         self.assertKept(plan, dirty, 'uncommitted or untracked')
         self.assertKept(plan, open_pr, 'open PR')
         self.assertKept(plan, no_pr, 'no merged PR')
-        self.assertKept(plan, on_main, 'no merged PR')
+        self.assertKept(plan, on_main, 'base branch')
+
+    def test_a_clone_of_the_default_branch_is_kept(self):
+        """A merged pull request whose head branch is main (from the same repository, into another branch) does not
+        finish a clone of main, even when no pull request in the list merges into main."""
+        on_main = self.clone('on-main')
+        self.pr(on_main, 40, base='release')
+        self.assertEqual(self.branch(on_main), 'main')
+        self.assertKept(self.planned(), on_main, 'base branch', 'default branch')
+        self.merged[0]['isCrossRepository'] = True                   # a fork's main
+        self.assertKept(self.planned(), on_main, 'base branch')
+
+    def test_a_locked_worktree_whose_folder_is_gone_keeps_the_clone(self):
+        clone = self.finished_clone()
+        tree = self.finished(clone=clone)
+        self.git(clone, 'worktree', 'lock', '--reason', 'on a removable disk', tree)
+        shutil.rmtree(tree)
+        self.assertKept(self.planned(), clone, 'worktrees hang off it')
+
+    def test_a_commit_only_a_stale_tracking_ref_names_keeps_the_clone(self):
+        """The branch was pushed, then deleted on GitHub: origin/side still names its commit, GitHub does not."""
+        clone = self.finished_clone()
+        work = self.branch(clone)
+        self.git(clone, 'checkout', '-q', '-b', 'side')
+        lost = self.commit(clone, 'side.txt')
+        self.push(clone)
+        self.git(clone, 'checkout', '-q', work)
+        self.git(clone, 'branch', '-q', '-D', 'side')
+        self.git(self.origin(), 'branch', '-q', '-D', 'side')
+        self.assertEqual(self.git(clone, 'rev-parse', 'origin/side'), lost)
+        self.assertKept(self.planned(), clone, 'commits GitHub does not have', lost[:10])
+
+    def test_tags_github_does_not_have_keep_the_clone(self):
+        for how in (('-a', '-m', 'notes only here'), ()):
+            with self.subTest(annotated=bool(how)):
+                clone = self.finished_clone(f'c{len(how)}', number=60 + len(how))
+                self.git(clone, 'tag', *how, f'v{len(how)}')
+                self.assertKept(self.planned(), clone, 'tags GitHub does not have', f'v{len(how)}')
+                self.git(clone, 'push', '-q', 'origin', f'v{len(how)}')
+                self.assertDeletes(self.planned(), clone)
 
     def test_stash_entries_keep_the_clone(self):
         clone = self.finished_clone()
@@ -303,7 +389,7 @@ class Clones(Case):
         lonely = self.commit(clone, 'idea.txt')
         self.git(clone, 'checkout', '-q', work)
         self.assertKept(self.planned(), clone, 'commits GitHub does not have', lonely[:10])
-        self.merged.append({'number': 30, 'headRefName': 'idea', 'headRefOid': lonely, 'mergedAt': self.merged[0]['mergedAt']})
+        self.merged.append({**self.merged[0], 'number': 30, 'headRefName': 'idea', 'headRefOid': lonely})
         self.assertDeletes(self.planned(), clone)               # it is a pull request's head: GitHub has it
 
     def test_a_commit_only_a_reflog_still_has_keeps_the_clone(self):
@@ -316,8 +402,10 @@ class Clones(Case):
 
 class GitHub(Case):
     """The reader of the pull request lists (facts.github_prs), against a stub `gh`."""
-    ROWS = {'merged': [{'number': 7, 'headRefName': 'fix-1', 'headRefOid': 'a' * 40, 'mergedAt': '2026-01-02T03:04:05Z'}],
-            'open': [{'number': 8, 'headRefName': 'fix-2', 'headRefOid': 'b' * 40, 'mergedAt': None}]}
+    ROWS = {'merged': [{'number': 7, 'headRefName': 'fix-1', 'headRefOid': 'a' * 40, 'mergedAt': '2026-01-02T03:04:05Z',
+                        'baseRefName': 'main', 'isCrossRepository': False}],
+            'open': [{'number': 8, 'headRefName': 'fix-2', 'headRefOid': 'b' * 40, 'mergedAt': None,
+                      'baseRefName': 'main', 'isCrossRepository': True}]}
 
     def gh(self, state):
         exe, self.state = self.stub('gh', fx.STUB_GH, state)
@@ -337,7 +425,9 @@ class GitHub(Case):
     def test_no_answer_or_a_strange_answer_means_keep(self):
         for state in ({'fail': True}, {'raw': 'not json'}, {'raw': '{"message": "rate limited"}'},
                       {'merged': [{'number': 7}], 'open': []}, {'merged': [], 'open': ['x']},
-                      {'merged': [{**self.ROWS['merged'][0], 'headRefOid': 'HEAD; rm'}], 'open': []}):
+                      {'merged': [{**self.ROWS['merged'][0], 'headRefOid': 'HEAD; rm'}], 'open': []},
+                      {'merged': [{**self.ROWS['merged'][0], 'isCrossRepository': 'no'}], 'open': []},
+                      {'merged': [{**self.ROWS['merged'][0], 'baseRefName': None}], 'open': []}):
             with self.subTest(state=state):
                 self.gh(state)
                 with self.assertRaises(self.c.facts.Unreadable):
@@ -384,11 +474,31 @@ MUTATIONS = {
     'another git folder inside': ('guard', 'if nested:', 'if False:', Worktrees, 'test_another_git_folder_inside_keeps_it'),
     'only the listed repository': ('rules', 'if not same_repo(url, repo.github):', 'if False:', Worktrees, 'test_only_folders_of_the_listed_repository_are_looked_at'),
     'the last check before a delete': ('engine', 'refusal = rules.recheck(cfg, facts, item)', 'refusal = None', Worktrees, 'test_everything_is_read_again_just_before_the_delete'),
-    'no --force': ('facts', "'worktree', 'remove', path,", "'worktree', 'remove', '--force', path,", Worktrees, 'test_git_removes_it_without_force'),
+    'no --force': ('facts', "('worktree', 'remove', path)", "('worktree', 'remove', '--force', path)", Worktrees, 'test_git_removes_it_without_force'),
+    'a refused git remove leaves no note': ('engine', 'if isinstance(ex, Untouched) or (', 'if (',
+                                            Worktrees, 'test_git_removes_it_without_force'),
+    'regenerable: plain names only': ('config', "or any(c in v for c in '*?[]\\\\')", '', Worktrees, 'test_the_list_takes_only_plain_names'),
+    'regenerable: a name frees folders only': ('rules', "folders = parts if name.endswith('/') else parts[:-1]", 'folders = parts',
+                                               Worktrees, 'test_ignored_files_that_are_not_build_output_keep_it'),
+    'a fork PR': ('rules', " and not row['isCrossRepository']", '', Worktrees, 'test_a_fork_pull_request_with_the_same_branch_name_does_not_finish_it'),
+    'a base branch': ('rules', 'if based:', 'if False:', Worktrees, 'test_a_branch_pull_requests_merge_into_is_kept'),
+    'the default branch': ('rules', 'if branch == default_branch(path):', 'if False:', Clones, 'test_a_clone_of_the_default_branch_is_kept'),
+    'a moved worktree': ('rules', "if len(mine) != 1 or (kind == 'clone') != (mine[0] is entries[0]) or 'bare' in entries[0]:",
+                         "if False:", Worktrees, 'test_a_worktree_that_was_moved_is_kept'),
+    'the last check: the same kind': ('rules', 'if answer is None or answer[0] != item.kind:', 'if answer is None:',
+                                      Worktrees, 'test_the_last_check_wants_the_same_kind'),
+    'a folder it cannot read': ('rules', "raise Unreadable(f'{ex.filename or path}: {ex.strerror}') from None", 'return None',
+                                Worktrees, 'test_a_folder_it_cannot_read_is_kept_and_named'),
     'clone: worktrees first': ('rules', 'if others:', 'if False:', Clones, 'test_a_clone_goes_only_after_its_worktrees'),
     'clone: a worktree outside the root': ('rules', 'if others:', 'if [o for o in others if os.path.dirname(o) == repo.root]:', Clones, 'test_a_worktree_anywhere_keeps_the_clone'),
     'clone: stash entries': ('rules', "if git_code(path, 'rev-parse', '-q', '--verify', 'refs/stash') == 0:", 'if False:', Clones, 'test_stash_entries_keep_the_clone'),
     'clone: commits GitHub does not have': ('rules', 'if alone:  # clone', 'if False:', Clones, 'test_a_commit_on_any_branch_that_github_does_not_have_keeps_the_clone'),
+    'clone: a locked worktree whose folder is gone': ('rules', "e.get('locked') is not None or os.path.lexists", 'os.path.lexists',
+                                                      Clones, 'test_a_locked_worktree_whose_folder_is_gone_keeps_the_clone'),
+    'clone: a live answer, not tracking refs': ('rules', 'has = sorted(here | present(path, refs.values()))',
+                                                "has = sorted(here | present(path, refs.values())) + ['--remotes']",
+                                                Clones, 'test_a_commit_only_a_stale_tracking_ref_names_keeps_the_clone'),
+    'clone: tags': ('rules', 'if missing:', 'if False:', Clones, 'test_tags_github_does_not_have_keep_the_clone'),
     'clone: reflog commits': ('rules', "lonely(path, ['--all', '--reflog'], has)", "lonely(path, ['--all'], has)", Clones, 'test_a_commit_only_a_reflog_still_has_keeps_the_clone'),
     'GitHub: a failed gh': ('facts', 'if done.returncode != 0:  # gh', 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
     'GitHub: a strange row': ('facts', 'if not valid_pr(row, state):', 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
