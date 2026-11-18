@@ -85,6 +85,18 @@ running it again after one that stopped half-way finishes it.
   the rerun does not stop T3 or restore again: it checks that the old build runs, then runs the post hooks.
   A W1 whose only failure was a post hook leaves T3 up and enabled; the rerun runs only the post hooks. Do not
   start T3 by hand.
+- **If the old build does not come up after W1.** When W1 got past its update but the old build does not start,
+  run the same W1 again: it only checks again (it never restores twice). When that check has finished and failed
+  twice (the check after the update, and the rerun's), W1 has nothing more it can do. `status` then says so,
+  and `t3-golive back --way w2` (or `--way w3`) may be taken next; before that, both are refused and say what is
+  still missing. A check that was cut off (the back was killed or stopped, or the machine went down) does not
+  count as failed: `status` says `was cut off`, the old build may still be coming up, and W1 is run again.
+  W2 or W3 taken this way restores nothing: it goes to the upstream build on the data W1 put back, and
+  background jobs go on once it ends ok. It is refused when that build is older than the build the copy was
+  taken under (a downgrade under newer data), and W3 does not go to the very build W1 could not start. This
+  holds for the W1 the switch runs by itself too. After W2 or W3 was begun this way, run that same way again if
+  it stops half-way; W1 and the other of the two are refused until it ends ok, and `t3-golive back` lists them
+  as not possible.
 - **No copy while W1 may still be needed.** W1 always restores the newest finished copy. A `t3-golive copy`
   taken after the switch is the newest one, taken under the fork build, so it hides the switch's own copy and
   `back` then refuses W1. Take no copy until you are sure you will not need W1.
