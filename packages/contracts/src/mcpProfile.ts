@@ -50,6 +50,7 @@ export const MCP_T3_TOOL_GROUPS = [
   "orchestration",
   "preview",
   "pull-requests",
+  "issues",
   "threads",
   "projects",
   "device",
