@@ -79,14 +79,21 @@ GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c'
 # two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
 GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
 # Never passed on to git (git_env): variables of the job that point git at another repository, object store, index,
-# config or pathspec rule than the call names. The job's environment is the owner's, but each git call says alone what
-# it reads.
+# config, attribute tree (GIT_ATTR_SOURCE: `* merge=union` makes merge-tree's conflict clean) or pathspec rule than
+# the call names, or run another diff program. The job's environment is the owner's, but each git call says alone
+# what it reads.
 GIT_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
             'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
             'GIT_REPLACE_REF_BASE', 'GIT_GRAFT_FILE', 'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH', 'GIT_PREFIX',
             'GIT_IMPLICIT_WORK_TREE', 'GIT_INTERNAL_SUPER_PREFIX', 'GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS',
-            'GIT_NOGLOB_PATHSPECS', 'GIT_ICASE_PATHSPECS')
+            'GIT_NOGLOB_PATHSPECS', 'GIT_ICASE_PATHSPECS', 'GIT_ATTR_SOURCE', 'GIT_EXTERNAL_DIFF')
 GIT_DROP_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+# The programs git runs and the transports it may use, as the job's environment chooses them. Dropped by git_env from
+# a call that reaches no remote, and (all but GIT_EXEC_PATH, where git finds its own https helper and index-pack) from
+# a fetch from an https URL: its login is GIT_AUTH's or none, and ssh, the git:// proxy and a protocol list are never
+# needed there. A fetch from another remote (a checkout's origin, an owner's ssh URL) keeps them: it may need them.
+GIT_RUN = ('GIT_EXEC_PATH', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS',
+           'GIT_ALLOW_PROTOCOL')
 GIT_READ_SECONDS = 60   # each git call of the config read
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
@@ -307,9 +314,16 @@ def no_token_env():
     return {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
 
 
-def git_env(env):
-    """`env` for a git call: without GIT_DROP, with GIT_ENV and no prompt. Tokens are the caller's to drop."""
-    return {**{k: v for k, v in env.items() if k not in GIT_DROP and not k.startswith(GIT_DROP_PREFIXES)},
+def git_env(env, remote=None):
+    """`env` for a git call: without GIT_DROP, with GIT_ENV and no prompt. `remote`: None for a call that reaches no
+    remote, else the URL or remote name it fetches from, which decides what of GIT_RUN it keeps. Tokens are the
+    caller's to drop."""
+    drop = set(GIT_DROP)
+    if remote is None:
+        drop.update(GIT_RUN)
+    elif remote.startswith('https://'):
+        drop.update(set(GIT_RUN) - {'GIT_EXEC_PATH'})
+    return {**{k: v for k, v in env.items() if k not in drop and not k.startswith(GIT_DROP_PREFIXES)},
             'GIT_TERMINAL_PROMPT': '0', **GIT_ENV}
 
 
@@ -381,10 +395,15 @@ def committed_config(path, run=None):
                                  '100755): make it a regular file')
     code, out, err = git(top, 'cat-file', 'blob', oid)
     if code != 0:
-        raise config.ConfigError(f'{path}: cannot read {rel} at {sha[:12]}: its blob {oid[:12]} is not in this checkout '
-                                 '(the queue fetches nothing). In a partial clone, check the config out: the '
-                                 'sparse-checkout pattern must match its name, which glob characters ([ ] * ?), a '
-                                 f'leading ! or #, a trailing space or a backslash keep it from doing ({err})')
+        # a partial clone (a sparse checkout's) leaves out the blobs its pattern does not check out
+        partial = git(top, 'config', '--get-regexp', r'^(extensions\.partialclone|remote\..*\.promisor)$')[0] == 0
+        if partial and git(top, 'cat-file', '-e', oid)[0] != 0:
+            raise config.ConfigError(f'{path}: cannot read {rel} at {sha[:12]}: its blob {oid[:12]} is not in this '
+                                     'checkout (the queue fetches nothing). In a partial clone, check the config out: '
+                                     'the sparse-checkout pattern must match its name, which glob characters '
+                                     f'([ ] * ?), a leading ! or #, a trailing space or a backslash keep it from doing '
+                                     f'({err})')
+        raise config.ConfigError(f'{path}: cannot read {rel} at {sha[:12]}: {err}')
     return config.parse(out, f'{path} at {sha[:12]}')
 
 
@@ -469,7 +488,7 @@ class Queue:
         token = self.read_token
         env = self.gh_env(token) if token else no_token_env()
         return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env=git_env(env))
+                              text=True, capture_output=True, env=git_env(env, self.remote))
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
