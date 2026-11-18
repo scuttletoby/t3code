@@ -18,7 +18,7 @@
 .github/scripts/fork-fleet-desk-seed.test.py ~10s
 .github/scripts/fork-fleet-desk.test.py ~8s
 .github/scripts/fork-fleet.test.py ~47s
-.github/scripts/fork-fleet-refresh.test.py ~13s
+.github/scripts/fork-fleet-refresh.test.py ~46s
 .github/scripts/fork-fleet-walls.test.py ~75s
 .github/scripts/fork-fleet-walls-contract.test.py ~100s
 .github/scripts/fork-fleet-walls-wsl2.test.py ~36s
