@@ -286,10 +286,10 @@ back).
 }
 ```
 
-| Key                           | Default  | Meaning                                                                                    |
-| ----------------------------- | -------- | ------------------------------------------------------------------------------------------ |
-| `compressCold.folders[].path` | required | a folder; files at any depth in it are looked at                                           |
-| `compressCold.folders[].days` | required | days without a change or a read (7 or more)                                                |
+| Key                           | Default  | Meaning                                                                                      |
+| ----------------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `compressCold.folders[].path` | required | a folder; files at any depth in it are looked at                                             |
+| `compressCold.folders[].days` | required | days without a change or a read (7 or more)                                                  |
 | `compressCold.keepFreeGB`     | 5        | GB the disk keeps free with a whole copy written (1 or more): a file that does not fit stays |
 
 **The order, for each file.** The copy is written under a hidden part name in the same folder
