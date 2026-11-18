@@ -214,6 +214,70 @@ check "plan: a conflict names the stopped patch and its file and aborts the reba
   eval 'has "fork: edit u3" "$root/report.md" && has "u3.txt" "$root/report.md" && [[ ! -d "$root/work/.git/rebase-merge" ]]'
 check "plan: the conflict advice says to start the follow workflow once after the manual push" \
   has "gh workflow run fork-follow.yml" "$root/report.md"
+check "plan: a conflict report quotes git's own words" \
+  eval 'has "What git said:" "$root/report.md" && has "CONFLICT (" "$root/report.md"'
+
+# #475: a pick that stops on a git error, not a conflict, leaves no unmerged file. The report names
+# the patch from the rebase's own state and quotes git, never "stopped at: unknown".
+new_fork v0.1.9
+(
+  cd "$root/work"
+  echo early > late.txt && git add -A && git commit -q -m "fork: add late" \
+    && git rm -q late.txt && git commit -q -m "fork: drop late" && git push -q origin main
+  echo untracked > late.txt
+) > /dev/null 2>&1
+plan
+check "plan: a pick stopped by a git error names the patch and quotes git" \
+  eval 'has "stopped at: [0-9a-f]* fork: add late" "$root/report.md" && has "not a conflict" "$root/report.md" \
+    && has "untracked working tree files would be overwritten" "$root/report.md" \
+    && hasnt "stopped at: unknown" "$root/report.md" && [[ ! -d "$root/work/.git/rebase-merge" ]]'
+rm -f "$root/work/late.txt"
+
+new_fork v0.1.9
+echo untracked > "$root/work/u3.txt"
+plan
+check "plan: a rebase git refuses to begin says so and quotes git" \
+  eval 'has "stopped at: its start" "$root/report.md" && has "u3.txt" "$root/report.md" \
+    && has "untracked working tree files would be overwritten" "$root/report.md" && hasnt "stopped at: unknown" "$root/report.md"'
+rm -f "$root/work/u3.txt"
+
+# #475: the workflow checks out a partial clone (--filter=blob:none), so git fetches a blob from
+# origin when it first reads it. On git 2.56 such a fetch made while a pick was applied asked for
+# the blob the pick had just merged, which origin cannot have, and the rebase stopped. The plan
+# fetches every blob the rebase reads before it starts; here origin refuses any fetch made while
+# the work tree is rebasing, and the plan still follows.
+partial_fork() { # partial_fork: the series of new_fork, checked out again as a partial clone
+  local bare="$root/gh/me/t3code.git"
+  git -C "$bare" config uploadpack.allowFilter true
+  git -C "$bare" config uploadpack.allowAnySHA1InWant true
+  cat > "$root/bin/upload-pack-not-while-rebasing" << EOF
+#!/usr/bin/env bash
+if [[ -d "$root/work/.git/rebase-merge" || -d "$root/work/.git/rebase-apply" ]]; then
+  echo "fetch while rebasing" >> "$root/refused"
+  echo "fatal: upload-pack: not our ref (a fetch while the rebase runs)" >&2
+  exit 1
+fi
+exec git upload-pack "\$@"
+EOF
+  chmod +x "$root/bin/upload-pack-not-while-rebasing"
+  rm -rf "$root/work" "$root/refused"
+  git clone -q --filter=blob:none --no-checkout "file://$bare" "$root/work" 2> /dev/null
+  work git config remote.origin.uploadpack "$root/bin/upload-pack-not-while-rebasing"
+  work git checkout -q --detach origin/main
+}
+new_fork v0.1.9
+(
+  cd "$root/work"
+  echo one > feature.txt && git add -A && git commit -q -m "fork: feature one"
+  echo two > feature.txt && git add -A && git commit -q -m "fork: feature two" && git push -q origin main
+) > /dev/null 2>&1
+partial_fork
+check "plan test: the partial clone lacks the blob the first pick needs" \
+  eval 'git -C "$root/work" rev-list --objects --missing=print HEAD~2..HEAD | grep -q "^?"'
+plan
+check "plan: a partial clone follows without fetching while it rebases (#475)" \
+  eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.10 ]] && [[ ! -e "$root/refused" ]] \
+    && [[ "$(git -C "$root/work" show HEAD:feature.txt)" == two ]]'
 
 new_fork main
 plan
@@ -490,7 +554,7 @@ fork_commit "fork: own u4" 'echo mine > u4.txt'
 before="$(work_head)"
 plan
 check "plan: a conflict on a listed file and an unlisted one is refused, naming the unlisted one" \
-  eval '[[ -z "$(out action)" ]] && has "u4.txt" "$root/report.md" && hasnt "\.github/workflows/ci.yml" "$root/report.md" && [[ ! -d "$root/work/.git/rebase-merge" && "$(work_head)" == "$before" ]]'
+  eval '[[ -z "$(out action)" ]] && has "u4.txt" "$root/report.md" && hasnt "^- \.github/workflows/ci.yml" "$root/report.md" && [[ ! -d "$root/work/.git/rebase-merge" && "$(work_head)" == "$before" ]]'
 
 # Upstream deleted the file itself (the fork's deleting patch has nothing left to do), then brings
 # it back: the plan deletes it again with one more commit.

@@ -427,10 +427,51 @@ fi
 # are dropped. A stop whose conflicts are all on listed (deleted) workflow files is resolved by
 # deleting them: upstream edited or brought back a file the fork deletes.
 before="$(git log --format=%s "$base..HEAD")"
+
+# The workflow checks out with --filter=blob:none, so git fetches a missing blob from the promisor
+# remote when it first reads it. While applying a pick, git 2.56 (the ubuntu-26.04 runners) asked
+# that remote in one batch for the blob the pick itself had just merged; no server has it, so the
+# fetch failed ("not our ref") and the pick stopped with a git error, not a conflict (#475). Before
+# the rebase, fetch in one batch every blob it reads: each patch's two sides, the series' own, and
+# the old base's side of every file upstream changed. The rebase then has nothing to fetch. Only
+# ids the remote can have are asked for (blobs of the series and the base, never a gitlink), and a
+# blob that is already here is not fetched again. The promisor is extensions.partialclone or, as
+# `git clone --filter` and `git fetch --filter` leave it, the remote marked `promisor = true`.
+prefetch_rebase_blobs() { # prefetch_rebase_blobs BASE TARGET
+  local promisor
+  promisor="$(git config --get extensions.partialclone || true)"
+  [[ -n "$promisor" ]] || promisor="$(git config --get-regexp '^remote\..*\.promisor$' \
+    | awk 'tolower($2) == "true" { sub(/^remote\./, "", $1); sub(/\.promisor$/, "", $1); print $1; exit }' || true)"
+  [[ -n "$promisor" ]] || return 0
+  # raw_blobs SIDES: the blob ids (not gitlinks) of `--raw` lines, on the old side or both.
+  raw_blobs() { awk -v both="$1" '/^:/ { if ($1 ~ /^:(100|120)/) print $3; if (both && $2 ~ /^(100|120)/) print $4 }'; }
+  {
+    git rev-list --objects --missing=print "$1..HEAD" | sed -n 's/^?//p'
+    git log --raw --no-renames --no-abbrev --format= "$1..HEAD" | raw_blobs 1
+    git diff-tree -r --no-renames "$1" "$2" | raw_blobs ""
+  } | awk '$0 !~ /^0+$/' | sort -u > "$logs/prefetch.wanted"
+  # Objects already here (listing them never fetches); only the rest is asked for.
+  git cat-file --batch-all-objects --batch-check='%(objectname)' | sort -u > "$logs/prefetch.here"
+  comm -23 "$logs/prefetch.wanted" "$logs/prefetch.here" > "$logs/prefetch.ids"
+  [[ -s "$logs/prefetch.ids" ]] || return 0
+  git -c fetch.negotiationAlgorithm=noop fetch --quiet "$promisor" --no-tags --no-write-fetch-head \
+    --recurse-submodules=no --filter=blob:none --stdin < "$logs/prefetch.ids" > "$logs/prefetch.log" 2>&1 \
+    || fail "Could not fetch the $(wc -l < "$logs/prefetch.ids") files the rebase from $base_tag onto $target_tag reads from $promisor (this checkout has no file contents of its own):" \
+      '```' "$(tail -n 20 "$logs/prefetch.log")" '```' "Nothing was rebased; the series was left as it is."
+}
+prefetch_rebase_blobs "$base" "$target"
+
+# Git's own words for a stop: the last rebase command's output without progress lines, its last
+# 20 lines. The output of earlier steps (a resolved listed file) stays in their own logs.
+git_said() {
+  tr '\r' '\n' < "$last_log" \
+    | awk '!/^(Rebasing \([0-9]+\/[0-9]+\)|Auto packing the repository|See "git help gc")/ && NF' | tail -n 20
+}
 as_fork() { git -c user.name=t3code-fork -c user.email=noreply@users.noreply.github.com "$@"; }
 rebasing() { [[ -d "$(git rev-parse --git-path rebase-merge)" || -d "$(git rev-parse --git-path rebase-apply)" ]]; }
 rebase_ok=0
-if as_fork rebase --empty=drop --onto "$target" "$base" > "$logs/rebase.log" 2>&1; then
+last_log="$logs/rebase.log"
+if as_fork rebase --empty=drop --onto "$target" "$base" > "$last_log" 2>&1; then
   rebase_ok=1
 fi
 steps=0
@@ -440,19 +481,36 @@ while ((!rebase_ok)) && rebasing && ((steps++ <= series_count)); do
     < <(git -c core.quotepath=off diff -z --name-only --diff-filter=U)
   ((${#unmerged[@]})) || break
   for path in "${unmerged[@]}"; do is_removed "$path" || break 2; done
-  git rm -q --ignore-unmatch -- "${unmerged[@]}" >> "$logs/rebase.log" 2>&1
+  last_log="$logs/rebase-step-$steps.log"
+  git rm -q --ignore-unmatch -- "${unmerged[@]}" > "$last_log" 2>&1
   if git diff --cached --quiet HEAD; then
-    GIT_EDITOR=true as_fork rebase --skip >> "$logs/rebase.log" 2>&1 && rebase_ok=1
+    GIT_EDITOR=true as_fork rebase --skip >> "$last_log" 2>&1 && rebase_ok=1
   else
-    GIT_EDITOR=true as_fork rebase --continue >> "$logs/rebase.log" 2>&1 && rebase_ok=1
+    GIT_EDITOR=true as_fork rebase --continue >> "$last_log" 2>&1 && rebase_ok=1
   fi
 done
 if ((!rebase_ok)); then
-  stopped="$(git log -1 --format='%h %s' REBASE_HEAD 2> /dev/null || echo unknown)"
+  # REBASE_HEAD names a patch that stopped on a conflict. A pick that stopped on a git error has
+  # none; the last line of the rebase's done list is then the patch it was applying.
+  if git rev-parse -q --verify REBASE_HEAD > /dev/null; then
+    stopped="$(git log -1 --format='%h %s' REBASE_HEAD)"
+  elif ! rebasing; then
+    stopped="its start: git did not begin the rebase, so no patch was applied"
+  else
+    picked="$(awk '$1 ~ /^(pick|p)$/ { c = $2 } END { print c }' "$(git rev-parse --git-path rebase-merge/done)" 2> /dev/null || true)"
+    stopped="$(git log -1 --format='%h %s' "${picked:-none}" 2> /dev/null)" \
+      || stopped="a patch git did not name (its output is below)"
+  fi
   conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- /')"
-  git rebase --abort || true
+  said="$(git_said)"
+  git rebase --abort > /dev/null 2>&1 || true
+  if [[ -n "$conflicts" ]]; then
+    why=("Conflicting files:" "$conflicts")
+  else
+    why=("Git stopped with an error, not a conflict: no file is left unmerged.")
+  fi
   fail "Rebasing the series from $base_tag onto $target_tag stopped at: $stopped" "" \
-    "Conflicting files:" "${conflicts:-(none listed; see the run log)}" "" \
+    "${why[@]}" "" "What git said:" '```' "${said:-(git printed nothing)}" '```' "" \
     "The series was left as it is. To follow by hand: \`git fetch https://github.com/$UPSTREAM.git tag $target_tag\`," \
     "\`git rebase --onto $target_tag $base_tag <series branch>\`, resolve, run the tests, then push the branch with" \
     "\`--force-with-lease\`, and start the follow workflow once (\`gh workflow run fork-follow.yml --repo $REPOSITORY\`):" \
