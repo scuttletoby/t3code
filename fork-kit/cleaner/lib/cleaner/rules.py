@@ -243,7 +243,7 @@ def volume_answer(cfg, facts, volume):
     return f'anonymous, no container uses it, made {days_text(int(age // DAY))} ago', None
 
 
-def plan_docker(cfg, facts, plan):
+def plan_docker(cfg, facts, plan, measure):
     kept = plan.kept
     if not cfg.docker_enabled:
         return
@@ -519,12 +519,16 @@ def delete_clone(item):
 
 
 # --- all rules ----------------------------------------------------------------------------------------------------
+# The rules, by the name each one writes on what it plans: the one list of them. The disk report (report.py) needs
+# a class for each (config.CLASSES), and report.test.py fails for a rule here that has none.
+RULES = {'worktrees': plan_worktrees, 'docker': plan_docker, 'tmp': plan_tmp}
+
+
 def plan(cfg, facts, measure=False):
     """What every rule wants gone (items) and what it looked at and keeps (kept). `measure` also sizes the kept."""
     out = Plan()
-    plan_worktrees(cfg, facts, out, measure)
-    plan_docker(cfg, facts, out)
-    plan_tmp(cfg, facts, out, measure)
+    for planner in RULES.values():
+        planner(cfg, facts, out, measure)
     return out
 
 

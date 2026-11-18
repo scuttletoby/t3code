@@ -5,7 +5,7 @@ RedCheck breaks each rule in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/report.test.py
 """
-import json, os, sys, time, unittest
+import contextlib, fcntl, json, os, shutil, sys, time, types, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,21 +30,21 @@ class Case(fx.Case):
             f.write(b'\1' * (mb * MB))
         return path
 
-    def classes(self, cfg, docker=None):
+    def classes(self, cfg, docker=None, mount_points=()):
         """{class: Sized} as one report measures them."""
-        sizer = self.c.report.Sizer()
+        sizer = self.c.report.Sizer(mount_points)
         return {name: self.c.report.measure(cfg, sizer, name, source, docker or self.no_docker)
                 for name, source in self.c.config.CLASSES}
 
     def no_docker(self):
         raise AssertionError('Docker was asked')
 
-    def report(self, cfg, docker=None, disk=(100 * GB, 200 * GB, None)):
+    def report(self, cfg, docker=None, disk=(100 * GB, 200 * GB, None), mounts=lambda: {'/'}):
         """(exit code, lines) of one report. `disk` is (used, size, device) of the home folder's disk; device None
-        means the home folder's own."""
+        means the home folder's own. `mounts` gives the mount points."""
         used, size, dev = disk
         lines = []
-        code = self.c.report.report(cfg, lines.append, docker=docker or self.no_docker, host=HOST,
+        code = self.c.report.report(cfg, lines.append, docker=docker or self.no_docker, host=HOST, mounts=mounts,
                                     disk_of=lambda cfg: (used, size, dev if dev is not None else os.stat(cfg.home).st_dev))
         return code, lines
 
@@ -87,11 +87,27 @@ class Classes(Case):
         self.assertEqual(sorted(s for s in sources if isinstance(s, str)), ['rule:docker', 'rule:tmp', 'rule:worktrees'])
         self.assertEqual(sorted(p for s in sources if isinstance(s, tuple) for p in s), sorted(cf.MUST_KEEP))
         self.assertEqual(cf.MUST_KEEP, cf.AGENT_HOMES + cf.T3_DATA)
-        # every rule plan() runs is one of these: a plan names only these rules
-        self.assertEqual(set(self.c.report.RULES), {'worktrees', 'docker', 'tmp'})
+        # Every rule of the rule list (rules.RULES, which plan() runs) has its class, and every class names a rule.
+        classed = {s[len('rule:'):] for s in sources if isinstance(s, str)}
+        self.assertEqual(sorted(set(self.c.rules.RULES) - classed), [], 'a rule without a class in config.CLASSES')
+        self.assertEqual(sorted(classed - set(self.c.rules.RULES)), [], 'a class of a rule that is not in rules.RULES')
+        self.assertEqual(set(self.c.report.RULES), set(self.c.rules.RULES))
         self.assertEqual(dict(cf.CLASSES)['build caches'], None)
         line = self.report(self.cfg())[1][0]
         self.assertEqual(self.part(line, 'build caches'), 'no rule yet')
+
+    @unittest.skipIf(os.geteuid() == 0, 'root reads every folder')
+    def test_every_rule_a_plan_runs_is_in_the_rule_list(self):
+        """A plan names only rules of rules.RULES (so each has a class): every rule here keeps something."""
+        os.chmod(self.trees, 0o300)
+        os.chmod(self.tmp, 0o300)
+        cfg = self.repo_cfg(docker={'enabled': True}, tmp={'root': self.tmp, 'patterns': {'job-*': 1}})
+
+        def dangling():
+            raise self.c.facts.Unreadable('Docker is down')
+        plan = self.plan(cfg, dangling=dangling)
+        named = {entry.rule for entry in plan.items + plan.kept}
+        self.assertEqual(named, set(self.c.rules.RULES))
 
     def test_worktrees_are_the_folders_the_rule_looks_at(self):
         clone = self.clone('base')
@@ -105,6 +121,24 @@ class Classes(Case):
         self.assertGreaterEqual(sized.total, 2 * MB)
         self.assertLess(sized.total, 3 * MB)
         self.assertEqual(self.classes(self.cfg())['worktrees'].total, 0)
+
+    def test_one_worktree_that_cannot_be_read_is_named_and_the_rest_still_count(self):
+        clone = self.clone('base')
+        tree = self.worktree(clone, 'fix-1')
+        self.big(os.path.join(tree, 'build.bin'), 2)
+        gone = self.clone('gone', into=self.mkdir('elsewhere'))
+        orphan = self.worktree(gone, 'fix-2')                          # its main repository is removed below
+        shutil.rmtree(gone)
+        sized = self.classes(self.repo_cfg())['worktrees']
+        self.assertEqual(sized.problems, [])
+        self.assertGreaterEqual(sized.total, 2 * MB)
+        self.assertEqual(len(sized.unread), 1, sized.unread)
+        self.assertTrue(sized.unread[0].startswith(orphan + ' ('), sized.unread)
+        code, lines = self.report(self.repo_cfg())
+        self.assertEqual(code, 1, lines)
+        text = self.part(lines[0], 'worktrees')
+        self.assertTrue(text.startswith('0.0 GB (could not read 1 worktree: ' + orphan + ' ('), text)
+        self.assertIn('(with what could not be read)', self.part(lines[0], 'everything else'))
 
     def test_temp_is_the_entries_a_pattern_takes(self):
         self.big(self.path('tmp', 'job-1', 'a.bin'), 2)                # taken by the pattern, whatever its age
@@ -122,8 +156,8 @@ class Classes(Case):
         self.big(self.path('home', '.t3', 'userdata', 'state.sqlite'), 3)
         self.big(self.path('home', '.t3', 'projects', 'big.bin'), 5)     # not T3's data: everything else
         got = self.classes(self.cfg())
-        self.assertGreaterEqual(got['agent transcripts'].total, 4 * MB)
-        self.assertLess(got['agent transcripts'].total, 5 * MB)
+        self.assertGreaterEqual(got['agent tool homes'].total, 4 * MB)
+        self.assertLess(got['agent tool homes'].total, 5 * MB)
         self.assertGreaterEqual(got['T3 data'].total, 3 * MB)
         self.assertLess(got['T3 data'].total, 4 * MB)
 
@@ -132,43 +166,43 @@ class Classes(Case):
                                                           'root': self.dir})
         with mock.patch.object(self.c.facts, 'DOCKER', exe):
             code, lines = self.report(self.cfg(), docker=self.c.facts.docker_volume_sizes)
-            self.assertEqual(self.part(lines[0], 'docker volumes'), 'off')
+            self.assertEqual(self.part(lines[0], 'all docker volumes'), 'off')
             self.assertEqual(self.calls(state), [])                     # off: Docker is not even asked
             code, lines = self.report(self.cfg(docker={'enabled': True}), docker=self.c.facts.docker_volume_sizes)
             self.assertEqual(code, 0, lines)
-            self.assertEqual(self.part(lines[0], 'docker volumes'), f'{2e9 / GB:.1f} GB')
+            self.assertEqual(self.part(lines[0], 'all docker volumes'), f'{2e9 / GB:.1f} GB')
             with open(state) as f:
                 broken = {**json.load(f), 'fail': True}
             with open(state, 'w') as f:
                 json.dump(broken, f)
             code, lines = self.report(self.cfg(docker={'enabled': True}), docker=self.c.facts.docker_volume_sizes)
         self.assertEqual(code, 1)
-        self.assertIn('could not read (Docker', self.part(lines[0], 'docker volumes'))
+        self.assertIn('could not read (Docker', self.part(lines[0], 'all docker volumes'))
 
     def test_a_size_docker_cannot_tell_is_could_not_read(self):
         exe, _ = self.stub('docker', fx.STUB_DOCKER, {'volumes': {fx.HEX: {'size': 'N/A'}}, 'root': self.dir})
         with mock.patch.object(self.c.facts, 'DOCKER', exe):
             code, lines = self.report(self.cfg(docker={'enabled': True}), docker=self.c.facts.docker_volume_sizes)
         self.assertEqual(code, 1)
-        self.assertIn('could not read', self.part(lines[0], 'docker volumes'))
+        self.assertIn('could not read', self.part(lines[0], 'all docker volumes'))
 
     def test_everything_else_is_the_rest_of_the_used_disk(self):
         cfg = self.cfg(docker={'enabled': True})
         docker = lambda: ({fx.HEX: 5 * GB}, self.dir)   # noqa: E731  (on the test folder's disk)
         line = self.report(cfg, docker=docker, disk=(10 * GB, 50 * GB, None))[1][0]
-        self.assertEqual(self.part(line, 'docker volumes'), '5.0 GB')
+        self.assertEqual(self.part(line, 'all docker volumes'), '5.0 GB')
         self.assertEqual(self.part(line, 'everything else'), '5.0 GB (10.0 GB of 50.0 GB used)')
         line = self.report(cfg, docker=docker, disk=(10 * GB, 50 * GB, -1))[1][0]
-        self.assertEqual(self.part(line, 'docker volumes'), '5.0 GB (on another disk)')
+        self.assertEqual(self.part(line, 'all docker volumes'), '5.0 GB (on another disk)')
         self.assertEqual(self.part(line, 'everything else'), '10.0 GB (10.0 GB of 50.0 GB used)')
 
         self.big(self.path('home', '.claude', 'a.jsonl'), 2)
-        counted = self.classes(self.cfg())['agent transcripts'].total
+        counted = self.classes(self.cfg())['agent tool homes'].total
         line = self.report(self.cfg(), disk=(10 * GB, 50 * GB, None))[1][0]
         self.assertEqual(self.part(line, 'everything else'), f'{(10 * GB - counted) / GB:.1f} GB (10.0 GB of 50.0 GB used)')
         # A class on another disk is shown, and not taken off this disk's rest.
         line = self.report(self.cfg(), disk=(10 * GB, 50 * GB, -1))[1][0]
-        self.assertEqual(self.part(line, 'agent transcripts'), '0.0 GB (on another disk)')
+        self.assertEqual(self.part(line, 'agent tool homes'), '0.0 GB (on another disk)')
         self.assertEqual(self.part(line, 'everything else'), '10.0 GB (10.0 GB of 50.0 GB used)')
 
     def test_the_report_deletes_and_changes_nothing(self):
@@ -193,7 +227,7 @@ class Sizes(Case):
         os.makedirs(self.path('home', '.t3'))
         os.symlink(self.path('elsewhere'), self.path('home', '.t3', 'userdata'))
         got = self.classes(self.cfg())
-        self.assertLess(got['agent transcripts'].total, MB)
+        self.assertLess(got['agent tool homes'].total, MB)
         self.assertLess(got['T3 data'].total, MB)
         os.symlink(self.path('elsewhere'), self.path('home', '.t3x'))             # a link in the middle of a pattern
         os.makedirs(self.path('elsewhere', 'userdata'))
@@ -206,8 +240,8 @@ class Sizes(Case):
         os.makedirs(self.path('home', '.t3', 'userdata'))
         os.link(one, self.path('home', '.t3', 'userdata', 'c.bin'))
         got = self.classes(self.cfg())
-        self.assertGreaterEqual(got['agent transcripts'].total, 4 * MB)
-        self.assertLess(got['agent transcripts'].total, 5 * MB)
+        self.assertGreaterEqual(got['agent tool homes'].total, 4 * MB)
+        self.assertLess(got['agent tool homes'].total, 5 * MB)
         self.assertLess(got['T3 data'].total, MB)                      # counted in the first class that reached it
 
     @unittest.skipIf(os.geteuid() == 0, 'root reads every folder')
@@ -219,7 +253,7 @@ class Sizes(Case):
         self.assertEqual(code, 1, lines)
         self.assertIn('could not read', self.part(lines[0], 'T3 data'))
         self.assertIn('Permission denied', self.part(lines[0], 'T3 data'))
-        self.assertTrue(self.part(lines[0], 'agent transcripts').endswith(' GB'))
+        self.assertTrue(self.part(lines[0], 'agent tool homes').endswith(' GB'))
         self.assertIn('(with what could not be read)', self.part(lines[0], 'everything else'))
         self.assertIn('freed', lines[0])
 
@@ -240,6 +274,52 @@ class Sizes(Case):
             self.assertNotEqual(self.classes(self.cfg())['T3 data'].problems, [])
         finally:
             os.chmod(self.home, 0o755)
+
+    def scandir_with_device(self, path, dev):
+        """os.scandir, but the entry at `path` says it is on device `dev` (another filesystem mounted there)."""
+        real = os.scandir
+
+        @contextlib.contextmanager
+        def scandir(folder):
+            with real(folder) as it:
+                entries = list(it)
+            yield [types.SimpleNamespace(name=e.name, path=e.path, stat=self.stat_on(e, dev) if e.path == path else e.stat)
+                   for e in entries]
+        return mock.patch.object(os, 'scandir', scandir)
+
+    @staticmethod
+    def stat_on(entry, dev):
+        def stat(follow_symlinks=True):
+            st = entry.stat(follow_symlinks=follow_symlinks)
+            return types.SimpleNamespace(st_mode=st.st_mode, st_nlink=st.st_nlink, st_ino=st.st_ino,
+                                         st_blocks=st.st_blocks, st_dev=dev)
+        return stat
+
+    def test_another_filesystem_is_not_entered(self):
+        self.big(self.path('home', '.claude', 'disk', 'big.bin'), 4)
+        self.assertGreaterEqual(self.classes(self.cfg())['agent tool homes'].total, 4 * MB)
+        with self.scandir_with_device(self.path('home', '.claude', 'disk'), os.stat(self.home).st_dev + 1):
+            self.assertLess(self.classes(self.cfg())['agent tool homes'].total, MB)
+
+    def test_a_mount_point_inside_is_not_entered(self):
+        """A bind mount of a folder of the same disk has the same device number: only the mount list shows it."""
+        self.big(self.path('home', '.claude', 'bound', 'big.bin'), 4)
+        self.assertGreaterEqual(self.classes(self.cfg())['agent tool homes'].total, 4 * MB)
+        got = self.classes(self.cfg(), mount_points={'/', self.path('home', '.claude', 'bound')})
+        self.assertLess(got['agent tool homes'].total, MB)
+
+    def test_the_report_uses_the_mount_list_and_says_when_it_cannot_read_it(self):
+        seen, real = [], self.c.report.Sizer
+        with mock.patch.object(self.c.report, 'Sizer', lambda points=(): seen.append(set(points)) or real(points)):
+            code, lines = self.report(self.cfg(), mounts=lambda: {'/', '/x'})
+        self.assertEqual((code, seen), (0, [{'/', '/x'}]), lines)
+        self.assertIn('/', self.c.report.mount_points())                # the default reads this machine's list
+
+        def broken():
+            raise self.c.facts.Unreadable('/proc/self/mountinfo: Permission denied')
+        code, lines = self.report(self.cfg(), mounts=broken)
+        self.assertEqual(code, 1, lines)
+        self.assertIn('; the mount list could not be read (/proc/self/mountinfo: Permission denied)', lines[0])
 
     def test_a_folder_that_is_gone_counts_nothing(self):
         self.assertEqual(self.c.report.Sizer().size(self.path('no-such')), (0, None, []))
@@ -283,10 +363,34 @@ class Freed(Case):
         log += [self.deleted('/tmp/b', '3.0 GB'), f'{stamp()} total: deleted 1 (3.0 GB), kept 0, failed 0']
         self.write_log(cfg, log)
         self.assertIn(' 3.0 GB (1 delete)', self.report(cfg)[1][0])
-        # The log was trimmed past the last report's line: every line left is newer than that report.
+        self.assertNotIn('trimmed', line)
+        # The log was trimmed past the last report's line: every line left is newer than that report, and deletes
+        # trimmed away with that line were never counted, so the figure is a floor and says so.
         log = [self.deleted('/tmp/c', '1.0 GB'), self.deleted('/tmp/d', '1.0 GB')]
         self.write_log(cfg, log)
-        self.assertIn(' 2.0 GB (2 deletes)', self.report(cfg)[1][0])
+        line = self.report(cfg)[1][0]
+        self.assertIn(' at least 2.0 GB (2 deletes); log trimmed since the last report', line)
+        self.assertNotIn('trimmed', self.report(cfg)[1][0])             # the next report has its line again
+
+    def test_two_reports_at_once_the_second_waits_its_turn(self):
+        """A second report while one runs says so, exits 1 and leaves the mark: the deletes are counted once."""
+        cfg = self.cfg()
+        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB')])
+        self.assertIn(' 2.0 GB (1 delete)', self.report(cfg)[1][0])
+        with open(cfg.report_file) as f:
+            mark = f.read()
+        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB'), self.deleted('/tmp/b', '3.0 GB')])
+        fd = os.open(cfg.report_lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)              # the first report, still running
+            code, lines = self.report(cfg)
+        finally:
+            os.close(fd)
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(lines, [f'fork-cleaner: another report is running (it holds {cfg.report_lock_file}): no report, the mark stays'])
+        with open(cfg.report_file) as f:
+            self.assertEqual(f.read(), mark)
+        self.assertIn(' 3.0 GB (1 delete)', self.report(cfg)[1][0])    # the lock is free again: counted once
 
     def test_lines_of_an_older_version_are_skipped_and_counted(self):
         cfg = self.cfg()
@@ -369,7 +473,7 @@ MUTATIONS = {
     'hard links: once': ('report', 'if key in self.seen:', 'if False:', Sizes, 'test_hard_links_count_once_in_a_class_and_across_classes'),
     'could not read: a folder': ('report', "problems.append(f'{folder}: {ex.strerror}')", 'pass',
                                  Sizes, 'test_a_class_that_cannot_be_read_says_so_and_the_rest_still_prints'),
-    'could not read: fails the report': ('report', 'failed = any(s.problems for s in classes) or', 'failed = False and',
+    'could not read: fails the report': ('report', 'failed = (any(s.problems or s.unread for s in classes) or', 'failed = (False and',
                                          Sizes, 'test_a_class_that_cannot_be_read_says_so_and_the_rest_still_prints'),
     'could not read: a pattern folder': ('report', "raise Unreadable(f'{base}: {ex.strerror}') from None", 'continue',
                                          Sizes, 'test_an_unreadable_root_or_pattern_folder_is_could_not_read'),
@@ -378,6 +482,28 @@ MUTATIONS = {
                            Freed, 'test_no_log_means_nothing_freed'),
     'freed: deletes add up': ('report', 'out.bytes += size', 'pass', Freed, 'test_the_deletes_in_the_log_add_up'),
     'freed: after the mark only': ('report', 'start = hits[-1] + 1 if hits else 0', 'start = 0', Freed, 'test_the_next_report_counts_only_what_came_after'),
+    'freed: a trimmed log is said': ('report', 'out.trimmed = not hits', 'out.trimmed = False', Freed,
+                                     'test_the_next_report_counts_only_what_came_after'),
+    'freed: one report at a time': ('report', 'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)', 'pass', Freed,
+                                    'test_two_reports_at_once_the_second_waits_its_turn'),
+    'every rule has a class': ('rules', "RULES = {'worktrees': plan_worktrees,", "RULES = {'dedupe': plan_tmp, 'worktrees': plan_worktrees,",
+                               Classes, 'test_every_rule_and_every_must_keep_path_has_a_class'),
+    'a plan names only listed rules': ('rules', 'planner(cfg, facts, out, measure)\n',
+                                       "planner(cfg, facts, out, measure)\n    out.kept.append(Kept('/x', 'dedupe', 'x', 'x'))\n",
+                                       Classes, 'test_every_rule_a_plan_runs_is_in_the_rule_list'),
+    'worktrees: one unreadable does not hide the rest': ("report", "sized.unread.append(f'{path} ({ex})')",
+                                                         "sized.problems.append(f'{path} ({ex})')",
+                                                         Classes, 'test_one_worktree_that_cannot_be_read_is_named_and_the_rest_still_count'),
+    'worktrees: an unreadable one fails the report': ('report', 'failed = (any(s.problems or s.unread for s in classes)',
+                                                      'failed = (any(s.problems for s in classes)',
+                                                      Classes, 'test_one_worktree_that_cannot_be_read_is_named_and_the_rest_still_count'),
+    'mounts: another filesystem is not entered': ('report', 'est.st_dev != dev or ', '', Sizes, 'test_another_filesystem_is_not_entered'),
+    'mounts: a mount point inside is not entered': ('report', ' or entry.path in self.mount_points', '', Sizes,
+                                                    'test_a_mount_point_inside_is_not_entered'),
+    'mounts: the report reads the mount list': ('report', 'sizer = Sizer(points)', 'sizer = Sizer()', Sizes,
+                                                'test_the_report_uses_the_mount_list_and_says_when_it_cannot_read_it'),
+    'mounts: an unreadable list fails the report': ('report', '\n              or mount_problem)', ')', Sizes,
+                                                    'test_the_report_uses_the_mount_list_and_says_when_it_cannot_read_it'),
     'freed: the mark is moved': ('report', 'write_mark(cfg, got.mark)', 'pass', Freed, 'test_the_next_report_counts_only_what_came_after'),
     'freed: old lines counted': ('report', 'out.skipped += 1            # a line of an older', 'pass            # a line of an older',
                                  Freed, 'test_lines_of_an_older_version_are_skipped_and_counted'),

@@ -26,15 +26,18 @@ AGENT_HOMES = (
 )
 T3_DATA = ('~/.t3*/userdata', '~/.t3*/dev')
 MUST_KEEP = AGENT_HOMES + T3_DATA
-# The classes of the disk report (`fork-cleaner report`, report.py), in its order: the one list it sizes. A rule's
-# class is what that rule looks at ('rule:<name>', the same selection the rule makes); a must-keep class is its
-# group above; None is a class no rule takes yet. What is in none of them is "everything else". A new rule or a
-# new must-keep group gets its class here (report.test.py fails until it does).
+# The classes of the disk report (`fork-cleaner report`, report.py), in its order: the one list it sizes. Each name
+# says what it measures. A rule's class ('rule:<name>') is what that rule looks at: the worktrees and clones of the
+# listed repositories, the temp entries a pattern takes, and every Docker volume, named ones too (Docker measures
+# them all; the rule takes only unused anonymous ones). A must-keep class is its group above, whole: the agent
+# tools' home folders (transcripts, sessions, settings, caches) and T3's data. None is a class no rule takes yet.
+# What is in none of them is "everything else". A new rule (rules.RULES) or must-keep group gets its class here
+# (report.test.py fails until it does).
 CLASSES = (
     ('worktrees', 'rule:worktrees'),
-    ('docker volumes', 'rule:docker'),
+    ('all docker volumes', 'rule:docker'),
     ('temp', 'rule:tmp'),
-    ('agent transcripts', AGENT_HOMES),
+    ('agent tool homes', AGENT_HOMES),
     ('T3 data', T3_DATA),
     ('build caches', None),
 )
@@ -172,7 +175,8 @@ class Config:
         self.lock_file = self.log_file + '.lock'
         self.journal_file = self.log_file + '.deleting'     # deletes started and not ended (engine.py)
         self.report_file = self.log_file + '.reported'      # the last line of the log the last report counted
-        for own in (self.log_file, self.lock_file, self.journal_file, self.report_file):
+        self.report_lock_file = self.report_file + '.lock'  # one report at a time (report.py)
+        for own in (self.log_file, self.lock_file, self.journal_file, self.report_file, self.report_lock_file):
             kept = must_keep_match(self.must_keep, own)
             if kept is not None or any(fnmatch.fnmatchcase(part.lower(), glob) for part in own.split('/') for glob in MUST_KEEP_NAMES):
                 raise machine_file.MachineFileError(f'{where}.logFile: {values["logFile"]} is in a must-keep path, '
