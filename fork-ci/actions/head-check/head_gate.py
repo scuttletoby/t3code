@@ -645,19 +645,15 @@ def finish(repo, sha, run, verdict_path, gh, out, env, sleep=time.sleep):
 
 # --- judge ----------------------------------------------------------------------------------------------------------
 def bare_repository(work, name):
-    """(path, None): a new, empty bare repository in `work` with the queue's own config (pr_queue.CACHE_CONFIG: no
-    remote, no hook path, no helper), never one an earlier run left; or (None, why it could not be made)."""
+    """(path, None): a new, empty bare repository in `work` made as the queue makes its cache (pr_queue.init_bare:
+    CACHE_CONFIG, no remote, no hook path, no helper, SHA-1 objects and files refs), never one an earlier run left; or
+    (None, why it could not be made)."""
     try:
         path = tempfile.mkdtemp(prefix=name + '-', dir=work)
     except OSError as e:
         return None, f'could not make a folder in {work}: {e}'
-    r = subprocess.run(['git', *pr_queue.GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
-                       capture_output=True, env=pr_queue.git_env(os.environ))
-    if r.returncode != 0:
-        return None, f'git init failed: {r.stderr.strip()[:300]}'
-    with open(os.path.join(path, 'config'), 'w', encoding='utf-8') as f:
-        f.write(pr_queue.CACHE_CONFIG)
-    return path, None
+    problem = pr_queue.init_bare(path)
+    return (None, problem) if problem else (path, None)
 
 
 def fetch(checkout, base, head):
@@ -712,6 +708,8 @@ def judge(a, gh, out, env, decide=head_check.decide, sleep=time.sleep):
         state, why, _, base, numbers = preflight(a, gh)
         if state != 'go':
             ok, reason = False, f'not judged: {why}'
+        elif problem := pr_queue.git_problem() or pr_queue.remote_problem(a.remote):   # before git runs at all
+            ok, reason = False, f'not judged: {problem}'
         else:
             path, problem = bare_repository(a.work, f'head-{a.sha[:12]}')
             checkout = head_check.Checkout(path or a.work, bare=(base, a.sha), remote=a.remote)
@@ -722,7 +720,7 @@ def judge(a, gh, out, env, decide=head_check.decide, sleep=time.sleep):
                     and (problem := empty_lenses_problem(checkout, a.config)):
                 ok, reason = False, f'not judged: {problem}'
             else:
-                shared = list(filter(None, [pr_queue.git_problem(), checkout.problem()]))
+                shared = list(filter(None, [checkout.problem()]))
                 required, _ = head_check.required_names(a.required_lenses)
                 for n in numbers:   # every one: the strictest verdict is the head's
                     code, good, why, rows = decide(a.repo, str(n), a.config, checkout, required, False, gh, sleep, out,
