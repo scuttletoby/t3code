@@ -138,6 +138,12 @@ def killing_keep(*args):
         os.kill(os.getpid(), 9)
     return keep(*args)
 coldcopy._keep = killing_keep
+copy_file = coldcopy._copy_file
+def killing_copy_file(*args):
+    if at == 'mid-copy':
+        os.kill(os.getpid(), 9)
+    return copy_file(*args)
+coldcopy._copy_file = killing_copy_file
 rehearse.run_rehearse(config.load(), say=lambda line: None)
 '''
 
@@ -805,6 +811,8 @@ class Guards(Base):
         self.m.write('other/.golive-rehearsal', '{}')
 
         def swapping_walk(top, *a, **kw):
+            if top != root:  # the walk of the live userdata's links comes first
+                return walk(top, *a, **kw)
             os.rename(root, root + '.moved')
             os.rename(self.m.path('other'), root)
             return walk(top, *a, **kw)
@@ -819,6 +827,8 @@ class Guards(Base):
         root, walk = self.root(), os.walk
 
         def moving_walk(top, *a, **kw):
+            if top != root:  # the walk of the live userdata's links comes first
+                return walk(top, *a, **kw)
             os.rename(root, root + '.moved')
             return walk(root + '.moved', *a, **kw)
         with mock.patch.object(rehearse.os, 'walk', moving_walk), self.assertRaises(journal.Refused) as e:
@@ -1081,6 +1091,230 @@ class Guards(Base):
                     raise RuntimeError('boom')
         with self.assertRaises(journal.Unfinished):
             self.rehearse()
+
+
+class Links(Base):
+    """Links inside userdata (#441): the clone never holds a link out of its own tree, and the rehearsal folder never
+    lands where a link of the live userdata leads."""
+
+    def linked_copy(self, links, name=f't3-copy-20990105T000000Z-{fx.LIVE}'):
+        """A finished copy whose userdata also holds these links ({path: target}), recorded as a copy records them
+        (links as links); a file of the same path is replaced by the link."""
+        dest = self.make_copy(name=name)
+        path = os.path.join(dest, coldcopy.MANIFEST)
+        m = read_json(path)
+        for rel, target in links.items():
+            full = os.path.join(dest, 'userdata', rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            if os.path.lexists(full):
+                os.unlink(full)
+            os.symlink(target, full)
+            m['files'] = [e for e in m['files'] if e['path'] != rel] + [{'path': rel, 'kind': 'link', 'target': target}]
+        with open(path, 'w') as f:
+            json.dump(m, f)
+        return dest
+
+    def clone_links(self):
+        ud = os.path.join(self.root(), 'home', 'userdata')
+        found = {}
+        for d, dirs, names in os.walk(ud):
+            for n in dirs + names:
+                if os.path.islink(os.path.join(d, n)):
+                    found[os.path.relpath(os.path.join(d, n), ud)] = os.readlink(os.path.join(d, n))
+        return found
+
+    # (path, target, stays inside the copied tree)
+    CASES = (
+        ('abs-out', None, False),  # absolute, to a folder elsewhere (target set in the test)
+        ('rel-out', '../../outside', False),  # relative, out by '..'
+        ('deep/er/rel-out', '../../../../x', False),  # the same, two levels below userdata
+        ('chain-a', 'chain-b', False),  # a chain: inside, then out
+        ('chain-b', '../outside', False),
+        ('to-live', None, False),  # to the live home's own attachments (target set in the test)
+        ('p/q/up', '../..', True),  # up to userdata itself: stays
+        ('p/q/through', 'up/../x', False),  # through that link, then '..' above the tree: out
+        ('loop-a', 'loop-b', False),  # a loop: cannot tell where it leads
+        ('loop-b', 'loop-a', False),
+        ('stays', 'settings.json', True),
+        ('stays-dir', 'p/q', True),
+        ('dangling-in', 'not-there/yet', True),  # dangling, inside: harmless
+        ('dangling-out', '../gone/x', False),  # dangling, out: the clone server could make it
+    )
+
+    def cases(self):
+        targets = {'abs-out': self.m.path('elsewhere'), 'to-live': self.m.home + '/userdata/attachments'}
+        os.makedirs(self.m.path('elsewhere'), exist_ok=True)
+        return {p: targets.get(p, t) for p, t, _ in self.CASES}
+
+    def test_the_planned_links_out_of_the_copied_tree_are_found_at_any_depth_through_chains(self):
+        entries = [{'path': p, 'kind': 'link', 'target': t} for p, t in self.cases().items()]
+        entries += [{'path': 'p', 'kind': 'dir'}, {'path': 'p/q', 'kind': 'dir'}]
+        out = dict(coldcopy.links_out(entries))
+        self.assertEqual(set(out), {p for p, _, stays in self.CASES if not stays})
+        self.assertEqual(coldcopy.links_out([]), [], 'empty userdata: nothing to leave out')
+
+    def test_links_out_of_the_copy_are_left_out_of_the_clone_and_named(self):
+        live = self.m.snapshot()
+        copy = self.linked_copy(self.cases())
+        result = self.rehearse()
+        kept = {p: t for p, t, stays in self.CASES if stays}
+        self.assertEqual(self.clone_links(), kept, 'the clone holds only the links that stay inside it')
+        for p, _, stays in self.CASES:
+            self.assertEqual(any(x.startswith(p + ' ') for x in result['leftOut']), not stays, p)
+        clone = [s['data'] for s in self.runs()[-1]['steps'] if s['step'] == 'clone' and s['phase'] == 'done'][0]
+        self.assertEqual(clone['leftOut'], result['leftOut'], 'journalled with the clone step')
+        self.assertTrue(any('left out of the clone' in line for line in self.said), self.said)
+        self.assertEqual(self.m.snapshot(), live)
+        self.assertEqual(os.readlink(os.path.join(copy, 'userdata', 'abs-out')), self.m.path('elsewhere'),
+                         'the copy is never changed')
+
+    def test_a_copy_whose_settings_or_database_is_a_link_out_is_refused_before_any_step(self):
+        for name in ('settings.json', 'statev2.sqlite'):
+            with self.subTest(name):
+                self.m.write('dotfiles/' + name, 'x')
+                copy = self.linked_copy({name: self.m.path('dotfiles/' + name)},
+                                        name=f't3-copy-2099010{6 if name == "settings.json" else 7}T000000Z-{fx.LIVE}')
+                self.refused(f'{name} in the copy', copy_dir=copy)
+                self.assertFalse(os.path.lexists(self.root()))
+
+    def test_a_link_added_to_the_copy_after_r0_is_left_out_by_the_copy_itself(self):
+        append, copy = journal.Run._append, self.copy_dir
+
+        def link_at_clone(run, event, **fields):
+            if fields.get('step') == 'clone' and fields.get('phase') == 'started':
+                os.symlink(self.m.home + '/userdata', os.path.join(copy, 'userdata', 'late'))
+            append(run, event, **fields)
+        with mock.patch.object(journal.Run, '_append', link_at_clone):
+            result = self.rehearse()
+        self.assertEqual(self.clone_links(), {})
+        self.assertTrue(any(x.startswith('late ') for x in result['leftOut']), result['leftOut'])
+
+    def test_r0_on_the_clone_finds_a_link_out_the_copy_let_through(self):
+        """With the copy's leaving-out broken, R0 on the clone still finds a link out (any depth) before anything
+        runs on the clone, and says when it leads into the live home."""
+        for rel, target, needle in (('deep/er/to-live', None, 'the live T3 home'), ('rel', '../../x', 'leads out')):
+            with self.subTest(rel):
+                target = target or self.m.home + '/userdata'
+                copy = self.linked_copy({rel: target}, name=f't3-copy-2099010{8 if target[0] == "/" else 9}'
+                                                            f'T000000Z-{fx.LIVE}')
+                with mock.patch.object(coldcopy, 'links_out', return_value=[]):
+                    text = self.failed(needle, copy_dir=copy)
+                self.assertIn(rel, text)
+                self.assertIn('nothing ran on it', text)
+                self.assertFalse([c for c in self.stub_calls() if c['argv'][0] == '__service-preflight'])
+
+    def test_an_old_clone_holding_links_out_is_removed_without_following_them(self):
+        self.rehearse()
+        victim = self.m.write('victim/keep.txt', 'live data')
+        ud = os.path.join(self.root(), 'home', 'userdata')
+        os.symlink(os.path.dirname(victim), os.path.join(ud, 'abs-out'))
+        os.symlink('../../../../victim', os.path.join(ud, 'rel-out'))
+        os.symlink(self.m.home, os.path.join(ud, 'to-live'))
+        live = self.m.snapshot()
+        self.rehearse()
+        self.assertEqual(self.clone_links(), {})
+        self.assertTrue(os.path.isfile(victim))
+        self.assertEqual(self.m.snapshot(), live)
+
+    def test_the_link_walk_of_an_empty_userdata_finds_nothing(self):
+        empty = self.m.path('empty-userdata')
+        os.makedirs(empty)
+        self.assertEqual(rehearse._links_out_of(empty), [])
+        self.assertEqual(rehearse._live_links(self.m.path('empty-home')), [], 'no userdata at all')
+        os.makedirs(self.m.path('empty-home/userdata'))
+        self.assertEqual(rehearse._live_links(self.m.path('empty-home')), [])
+
+    def test_a_clone_killed_half_way_runs_again_and_never_held_a_link_out(self):
+        self.linked_copy(self.cases())
+        code = KILLED.format(paths=[os.path.join(fx.KIT, 'lib'), fx.COMMON], machine=config.MACHINE_FILE,
+                             at='mid-copy')
+        p = subprocess.run([sys.executable, '-I', '-B', '-c', code], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=60)
+        self.assertEqual(p.returncode, -9, p.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.root(), rehearse.MARK)), 'a half clone bears the mark')
+        inside = {p: t for p, t, stays in self.CASES if stays}
+        self.assertLessEqual(set(self.clone_links()), set(inside), 'no link out, even half-way')
+        self.assertFalse(journal.needs_settling(self.runs()[-1]))
+        self.rehearse()
+        self.assertEqual(self.clone_links(), inside)
+
+    def live_link(self, rel, target):
+        full = os.path.join(self.m.home, 'userdata', rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        os.symlink(target, full)
+        return full
+
+    def test_a_rehearsal_folder_where_a_live_userdata_link_leads_is_refused_before_anything_changes(self):
+        """The live T3 reads and writes where its userdata links lead: the rehearsal folder must be apart from each
+        target (the backups folder inside one, or one inside the rehearsal folder), whatever depth the link is at."""
+        root = self.root()
+        os.makedirs(self.m.path('hop'))
+        cases = (
+            ('attachments-out', self.m.backups),  # the backups folder inside the target
+            ('a/b/deep', self.m.backups),  # the same, two levels below userdata
+            ('rel', '../../backups'),  # relative
+            ('chain', self.m.path('hop/next')),  # through a link elsewhere
+            ('into-old', root + '/home/userdata/attachments'),  # the target inside the rehearsal folder
+            ('dangling-into', root + '/later/x'),  # dangling, inside the rehearsal folder: the live T3 may make it
+        )
+        os.symlink(self.m.backups, self.m.path('hop/next'))
+        self.rehearse()  # an old rehearsal folder to keep
+        old = self.m.snapshot(root)
+        for rel, target in cases:
+            with self.subTest(rel):
+                link = self.live_link(rel, target)
+                self.refused('where the live link')
+                self.assertEqual(self.m.snapshot(root), old, 'the old rehearsal folder (the live data) is kept')
+                os.unlink(link)
+        self.rehearse()  # with no such link, the run passes again
+
+    def test_a_backups_folder_bound_from_where_a_live_userdata_link_leads_is_refused(self):
+        os.makedirs(self.m.path('other/sub'))
+        self.live_link('attachments', self.m.path('other'))
+        with open(self.mountinfo, 'a') as f:  # a bind of a folder of the link's target at the backups folder
+            f.write('91 22 8:1 %s %s rw,relatime - ext4 /dev/sda1 rw\n' % (escaped(self.m.path('other/sub')),
+                                                                        escaped(self.m.backups)))
+        self.refused('bind mount')
+        self.assertFalse(os.path.lexists(self.root()))
+
+    def test_a_live_link_apart_from_the_rehearsal_folder_is_allowed(self):
+        os.makedirs(self.m.path('elsewhere'))
+        self.live_link('attachments-out', self.m.path('elsewhere'))
+        self.live_link('dangling', self.m.path('gone/x'))
+        self.live_link('inside', 'settings.json')
+        self.rehearse()
+
+    def test_a_live_link_added_after_r0_is_caught_by_the_clone_step_and_after_the_clone(self):
+        self.rehearse()
+        append, root = journal.Run._append, self.root()
+        preflights = lambda: [c for c in self.stub_calls() if c['argv'][0] == '__service-preflight']  # noqa: E731
+        ran = len(preflights())
+        for at in ('started', 'done'):  # before the removal; after the clone was made
+            with self.subTest(at):
+                def link_at(run, event, **fields):
+                    if fields.get('step') == 'clone' and fields.get('phase') == at:
+                        self.live_link('late', root + '/home/userdata/attachments')
+                    append(run, event, **fields)
+                old = os.path.join(root, rehearse.MARK)
+                with mock.patch.object(journal.Run, '_append', link_at):
+                    text = self.failed('where the live link')
+                if at == 'started':
+                    self.assertIn('the clone step', text)
+                    self.assertTrue(os.path.isfile(old), 'nothing was removed')
+                else:
+                    self.assertIn('nothing ran on it', text)
+                self.assertEqual(len(preflights()), ran, 'nothing ran on the clone')
+                os.unlink(os.path.join(self.m.home, 'userdata', 'late'))
+        self.rehearse()
+
+    def test_an_unreadable_folder_in_the_live_userdata_is_refused(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads any folder')
+        shut = self.m.path('home/userdata/shut')
+        os.makedirs(shut)
+        os.chmod(shut, 0)
+        self.addCleanup(os.chmod, shut, 0o700)
+        self.refused('cannot tell where its links lead')
 
 
 class StoppedHalfWay(Base):
