@@ -238,6 +238,11 @@ class Worktrees(Case):
         self.assertKept(plan, locked, 'locked', 'under review')
         self.assertKept(plan, detached, 'no branch')
 
+    def test_a_worktree_whose_branch_has_no_commit_is_kept(self):
+        tree = self.finished('gone', number=3)
+        self.git(tree, 'update-ref', '-d', 'refs/heads/gone')        # the branch deleted under the worktree
+        self.assertKept(self.planned(), tree, 'no commit', 'gone has no commit')
+
     def test_another_git_folder_inside_keeps_it(self):
         tree = self.finished()
         self.clone('vendored', into=self.mkdir(tree, 'node_modules'))
@@ -300,6 +305,16 @@ class Worktrees(Case):
         tree = self.finished()
         os.rename(tree, self.path('trees', 'moved'))
         self.assertKept(self.planned(), self.path('trees', 'moved'), 'could not read', 'moved')
+
+    def test_a_worktree_whose_main_repository_is_gone_is_kept_as_orphaned(self):
+        """Its .git file names a git folder that is gone: git can never answer for it. It is kept, under its own name
+        (no "could not read", which would mark every daily run failed)."""
+        clone = self.clone('elsewhere-base', into=self.mkdir('elsewhere'))
+        tree = self.finished(clone=clone)
+        shutil.rmtree(clone)
+        plan = self.planned()
+        self.assertKept(plan, tree, 'orphaned worktree', 'is gone (the main repository was removed)')
+        self.assertTrue(os.path.isdir(tree))
 
     def test_the_last_check_wants_the_same_kind(self):
         tree = self.finished()
@@ -405,6 +420,104 @@ class Worktrees(Case):
         modules = os.path.join(self.git_dir(tree), 'modules', 'sub')
         self.git(modules, 'push', '-q', 'origin', f'{lost}:refs/heads/kept')
         self.assertDeletes(self.planned(), tree)
+
+
+class Used(Case):
+    """The refusal "used under N h ago", with the real reader: files, the git files a command writes, and the
+    times in the HEAD reflog. Commits are made with a committer time three days back, so their reflog lines are old."""
+
+    def setUp(self):
+        super().setUp()
+        real = mock.patch.object(self.c.rules, 'last_used', self.real_last_used)
+        real.start()
+        self.addCleanup(real.stop)
+        os.environ['GIT_COMMITTER_DATE'] = f'@{int(self.now - 3 * fx.DAY)} +0000'
+
+    def idle(self, tree, days=3):
+        """Nothing in the tree or its own git files changed for `days` days."""
+        self.age(tree, days)
+        git_dir = self.git_dir(tree)
+        for name in self.c.rules.USE_MARKS + ('logs/HEAD',):
+            if os.path.exists(os.path.join(git_dir, name)):
+                self.age(os.path.join(git_dir, name), days)
+        return tree
+
+    def test_a_worktree_used_in_the_last_day_is_kept(self):
+        tree = self.finished()
+        self.assertKept(self.planned(), tree, 'used under 24 h ago')
+        self.idle(tree)
+        self.assertDeletes(self.planned(), tree)
+        self.idle(tree, days=1.5)
+        plan = self.plan(self.cfg(worktrees={'repos': [{'root': self.trees, 'github': fx.REPO}], 'usedHours': 48}))
+        self.assertKept(plan, tree, 'used under 48 h ago')
+        with self.assertRaises(machine_file.MachineFileError):
+            self.cfg(worktrees={'usedHours': 23})
+
+    def test_each_sign_of_use_keeps_it(self):
+        tree = self.finished()
+        git_dir = self.git_dir(tree)
+        head = self.head(tree)
+        fresh_line = f'{head} {head} test <test@example.invalid> {int(self.now - 3600)} +0000\tcheckout: moving\n'
+        signs = {'a file in it': lambda: os.utime(os.path.join(tree, 'README.md')),
+                 'its HEAD reflog': lambda: self.file(os.path.join(git_dir, 'logs', 'HEAD'), fresh_line) and
+                 self.age(os.path.join(git_dir, 'logs', 'HEAD'), 3)}
+        for name in self.c.rules.USE_MARKS:
+            signs[f'git {name}'] = lambda name=name: (self.file(os.path.join(git_dir, name), head + '\n') if not
+                                                      os.path.exists(os.path.join(git_dir, name)) else None,
+                                                      os.utime(os.path.join(git_dir, name)))
+        for what, use in signs.items():
+            with self.subTest(sign=what):
+                self.idle(tree)
+                self.assertDeletes(self.planned(), tree)
+                use()
+                self.assertKept(self.planned(), tree, 'used under 24 h ago', what)
+                if what == 'its HEAD reflog':     # the line stays; take it away again for the next sign
+                    self.git(tree, 'reflog', 'expire', '--expire=now', '--all')
+
+    def test_a_rewritten_reflog_file_is_not_use(self):
+        tree = self.idle(self.finished())
+        os.utime(os.path.join(self.git_dir(tree), 'logs', 'HEAD'))     # `git gc` rewrote it; its lines are old
+        self.assertDeletes(self.planned(), tree)
+
+    def test_a_reflog_line_it_cannot_read_keeps_it(self):
+        tree = self.finished()
+        with open(os.path.join(self.git_dir(tree), 'logs', 'HEAD'), 'a') as f:
+            f.write('not a reflog line\n')
+        self.idle(tree)
+        self.assertKept(self.planned(), tree, 'could not read', 'reflog')
+
+    def test_a_clone_used_in_the_last_day_is_kept(self):
+        clone = self.clone('solo')
+        self.git(clone, 'checkout', '-q', '-b', 'solo-work')
+        self.commit(clone)
+        self.push(clone)
+        self.pr(clone, 20, 48)
+        self.assertKept(self.planned(), clone, 'used under 24 h ago')
+        self.idle(clone)
+        self.assertDeletes(self.planned(), clone)
+        os.utime(os.path.join(clone, 'README.md'))
+        self.assertKept(self.planned(), clone, 'used under 24 h ago', 'a file in it')
+
+
+class Branches(Case):
+    def test_only_listed_branches_are_removed(self):
+        clone = self.clone('base')
+        trees = {}
+        for name, branch in (('a', 'work/a'), ('b', 'fix-b'), ('c', 'work/nested/c')):
+            tree = trees[branch] = self.worktree(clone, name, branch)
+            self.commit(tree)
+            self.push(tree)
+            self.pr(tree, len(trees), 48)
+        cfg = self.cfg(worktrees={'repos': [{'root': self.trees, 'github': fx.REPO, 'branches': ['work/*']}]})
+        plan = self.plan(cfg)
+        self.assertDeletes(plan, trees['work/a'])
+        self.assertDeletes(plan, trees['work/nested/c'])      # * crosses /, as in a shell glob of a branch name
+        self.assertKept(plan, trees['fix-b'], 'branch not listed', 'work/*')
+        plan = self.planned()                                 # no list: any branch
+        self.assertDeletes(plan, trees['fix-b'])
+        for bad in ([''], ['ok', 3], 'work/*'):
+            with self.subTest(bad=bad), self.assertRaises(machine_file.MachineFileError):
+                self.cfg(worktrees={'repos': [{'root': self.trees, 'github': fx.REPO, 'branches': bad}]})
 
 
 class Clones(Case):
@@ -636,6 +749,8 @@ class GitHub(Case):
 
 MUTATIONS = {
     'open PR': ('rules', 'if opened:', 'if False:', Worktrees, 'test_an_open_pull_request_keeps_it'),
+    'orphaned worktree': ('rules', "gone = orphaned_worktree(path) if kind == 'worktree' else None", 'gone = None',
+                          Worktrees, 'test_a_worktree_whose_main_repository_is_gone_is_kept_as_orphaned'),
     'no merged PR': ('rules', 'if not merged:', 'if False:', Worktrees, 'test_no_merged_pull_request_keeps_it'),
     'merged under 24 h ago': ('rules', 'if age < cfg.merged_hours * 3600:', 'if False:', Worktrees, 'test_merged_less_than_a_day_ago_keeps_it'),
     'the 24 h floor': ('config', "'mergedHours': (int, MIN_MERGED_HOURS, _at_least(MIN_MERGED_HOURS))", "'mergedHours': (int, MIN_MERGED_HOURS, None)",
@@ -661,6 +776,7 @@ MUTATIONS = {
     'commits only in its reflog': ('rules', 'if alone:  # reflog', 'if False:', Worktrees, 'test_a_commit_only_its_reflog_still_has_keeps_it'),
     'locked': ('rules', "if entry.get('locked') is not None:", 'if False:', Worktrees, 'test_a_locked_or_detached_worktree_is_kept'),
     'no branch': ('rules', 'if not branch:', 'if False:', Worktrees, 'test_a_locked_or_detached_worktree_is_kept'),
+    'no commit': ('rules', "if not head.strip('0'):", 'if False:', Worktrees, 'test_a_worktree_whose_branch_has_no_commit_is_kept'),
     'another git folder inside': ('guard', 'if nested:', 'if False:', Worktrees, 'test_another_git_folder_inside_keeps_it'),
     'only the listed repository': ('rules', 'if not same_repo(url, repo.github):', 'if False:', Worktrees, 'test_only_folders_of_the_listed_repository_are_looked_at'),
     'the last check before a delete': ('engine', 'refusal = rules.recheck(cfg, facts, item)', 'refusal = None', Worktrees, 'test_everything_is_read_again_just_before_the_delete'),
@@ -715,6 +831,15 @@ MUTATIONS = {
                                                    'test_only_githubs_own_head_names_the_default_branch'),
     'GitHub: a failed gh': ('facts', 'if done.returncode != 0:  # gh', 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
     'GitHub: a strange row': ('facts', 'if not valid_pr(row, state):', 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
+    'used: kept when used': ('rules', 'if age < cfg.used_hours * 3600:', 'if False:', Used, 'test_a_worktree_used_in_the_last_day_is_kept'),
+    'used: the git files a command writes': ('rules', 'for name in USE_MARKS:', 'for name in ():', Used, 'test_each_sign_of_use_keeps_it'),
+    'used: the reflog lines': ('rules', "when = reflog_newest(os.path.join(git_dir, 'logs', 'HEAD'))", 'when = 0.0', Used,
+                               'test_each_sign_of_use_keeps_it'),
+    'used: a reflog line it cannot read': ('rules', "raise Unreadable(f'line {number} of its HEAD reflog is no reflog line')",
+                                           'pass', Used, 'test_a_reflog_line_it_cannot_read_keeps_it'),
+    'used: a clone too': ('rules', 'used, what = look.newest, ', 'used, what = 0.0, ', Used, 'test_a_clone_used_in_the_last_day_is_kept'),
+    'branches: only listed ones': ('rules', 'if repo.branches and not matches(branch, repo.branches):', 'if False:', Branches,
+                                   'test_only_listed_branches_are_removed'),
     'GitHub: a cut-off list': ('facts', "if state == 'open' and len(rows) >= PR_LIMIT:", 'if False:', GitHub, 'test_a_list_that_may_be_cut_off_means_keep'),
 }
 

@@ -4,7 +4,7 @@ One rule for every reader here: no answer means keep. A reader that cannot give 
 and whoever asked keeps the thing it asked about. Nothing in this file changes anything, except remove_worktree and
 remove_volume at the very end, which the engine calls after every check has passed again.
 """
-import calendar, ipaddress, json, os, re, socket, subprocess, time
+import calendar, ipaddress, json, os, re, socket, stat, subprocess, time
 
 UNIT_DIRS = ('/etc/systemd/system', '/run/systemd/system', '/run/systemd/transient', '/etc/systemd/user',
              '~/.config/systemd/user', '/run/user/{uid}/systemd/user', '/run/user/{uid}/systemd/transient')
@@ -345,6 +345,36 @@ def worktree_list(cwd, bare=False):
     if not entries:
         raise Unreadable('worktree list: no worktree named')
     return entries
+
+
+def orphaned_worktree(folder):
+    """The git folder a worktree's `.git` file names, when that folder is gone (its main repository was removed or
+    moved): git cannot answer anything about the worktree, and never will. None for anything else: no `.git` file,
+    one that cannot be read (that stays "could not read"), or a git folder that is there."""
+    dot = os.path.join(folder, '.git')
+    try:
+        fd = os.open(dot, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        text = os.read(fd, 4096).decode('utf-8', 'surrogateescape')
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    lines = text.splitlines()
+    if len(lines) != 1 or not lines[0].startswith('gitdir: ') or not lines[0][len('gitdir: '):].strip():
+        return None
+    gitdir = os.path.normpath(os.path.join(folder, lines[0][len('gitdir: '):].strip()))
+    try:
+        os.lstat(gitdir)
+    except (FileNotFoundError, NotADirectoryError):
+        return gitdir
+    except OSError:
+        return None             # cannot tell: no answer means keep, as "could not read"
+    return None
 
 
 def origin_url(cwd):
