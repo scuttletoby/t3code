@@ -492,7 +492,11 @@ again" with what its rerun does (or why it cannot run), and every other way read
 run again, unless it may follow a W1 stuck on its verify (below). With `--way` it runs detached (a transient unit;
 stopping or restarting T3 kills a T3 terminal), `--here` in the calling process (refused inside the boot service).
 
-- **W1, restore and downgrade** (loses everything since the copy): by hand it is refused unless
+- **W1, restore and downgrade** (loses everything since the copy): it restores the newest finished copy (by
+  `createdAt`, a whole second; copies of the same second go by the order of their runs in the journal, never by the
+  order the folder lists them in; a run the journal does not hold, or a journal that cannot be read, counts as the
+  oldest, then the folder name decides: a fixed order, though with no usable journal not always the newer copy,
+  which in real use cannot matter as a copy takes far more than a second). By hand it is refused unless
   `--lose-work-since` names the copy's time exactly as `back` prints it (`createdAt` of the manifest), and it first
   prints the project and thread counts at the copy (journalled by `copy`) against the live build's report now
   (threads that only got new messages are not in the counts). Then, each a journalled step: the plan; the old
