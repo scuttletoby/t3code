@@ -242,11 +242,23 @@ class SwitchBase(unittest.TestCase):
         return run
 
     def assert_w2_follows_the_stuck_w1(self, run):
-        """#440: the switch's automatic W1 got past its update and is stuck on its verify; `back --way w2` follows
-        it with no stop and no second restore, runs the post hooks at the end, and the journal settles."""
+        """#440: the switch's automatic W1 got past its update and one verify of it finished and failed (its own,
+        or the guard's). W2 is refused until the rerun of W1 by hand (it only verifies) fails too; then `back --way
+        w2` follows it with no stop and no second restore, runs the post hooks at the end, and the journal
+        settles."""
         self.assertTrue(switch.w1_holds(run['steps']))
         self.assertFalse(self.adapter.service()['active'])
         self.assertNotIn('post', self.calls())
+        calls, downgrades = len(self.calls()), self.downgrades()
+        with self.assertRaisesRegex(journal.Refused, 'if its verify then fails again, `t3-golive back --way w2`'):
+            back.run_back(config.load(), self.adapter, 'w2', say=self.said.append)
+        self.assertIn('if its verify then fails again, `t3-golive back --way w2`',
+                      '\n'.join(back.status(config.load(), self.adapter)[1]))
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.3), self.assertRaisesRegex(RuntimeError, 'did not come'):
+            back.run_back(config.load(), self.adapter, 'w1', say=self.said.append)
+        self.assertEqual(self.names('started', self.last_run()), ['follows', 'resume', 'verify', 'verify-failed'])
+        self.assertEqual(self.downgrades(), downgrades)  # no second restore or downgrade, and no stop
+        self.assertEqual([c for c in self.calls()[calls:] if c in ('stop', 'disable', 'pre', 'post')], [])
         code, lines = back.status(config.load(), self.adapter)
         self.assertEqual(code, 1)
         self.assertIn('its last verify did not pass', '\n'.join(lines))
@@ -797,10 +809,10 @@ class WayBack(SwitchBase):
         text = ' '.join([str(cm.exception), *getattr(cm.exception, '__notes__', ())])
         self.assertIn('putting T3 back failed', text)
         self.assertIn('did not come back', text)
-        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', text)
+        self.assertIn('if its verify then fails again, `t3-golive back --way w2` or `--way w3` may follow it', text)
         run = self.last_run()
         self.assertEqual(run['end']['result'], 'failed')
-        self.assertEqual(self.names('started', run)[-2:], ['update', 'verify'])  # W1's own, after its restore
+        self.assertEqual(self.names('started', run)[-3:], ['update', 'verify', 'verify-failed'])  # W1's own
         with mock.patch.object(coldcopy, 'START_WAIT', 0.3):
             self.assertIn('nothing to do', ' '.join(self.guard(run['id'], wait=True)))
         self.assert_w2_follows_the_stuck_w1(run)
@@ -1374,7 +1386,7 @@ class Round2(SwitchBase):
             did = ' '.join(self.guard(run['id']))
         self.assertIn('putting T3 back failed', did)
         self.assertIn('did not come back', did)
-        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', did)
+        self.assertIn('if its verify then fails again, `t3-golive back --way w2` or `--way w3` may follow it', did)
         self.assertIn('no post hook ran', did)
         self.assertEqual(len(self.downgrades()), 1)
         run = self.last_run()

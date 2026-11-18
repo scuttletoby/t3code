@@ -3,7 +3,7 @@ manager is faked, the T3 home is a temp folder, a stub t3 acts as the fork build
 nightly. Nothing here stops, starts, reads or calls a real T3 or its port.
 python3 -I -B fork-kit/golive/tests/back.test.py
 """
-import hashlib, io, json, os, shutil, subprocess, sys, unittest
+import hashlib, io, json, os, re, shutil, subprocess, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -107,17 +107,36 @@ class BackBase(unittest.TestCase):
         return [s['step'] for s in self.last_run()['steps'] if s['phase'] == 'started']
 
     def stuck_w1(self, version=fx.LIVE, reruns=1):
-        """A W1 whose update ran but whose build never comes up: its verify fails, and so does each rerun's (a
-        rerun only verifies: no second stop or restore). Returns what the last one printed on stderr."""
+        """A W1 whose update ran but whose build never comes up: its verify finishes and fails, and so does each
+        rerun's (a rerun only verifies: no second stop or restore). reruns=1: two failed verifies, what W2 and W3
+        need to follow it; called again, it is one more failing rerun. Returns what the last one printed on stderr."""
         self.m.write('never-starts', version)
         with mock.patch.object(coldcopy, 'START_WAIT', 0.2):
             for n in range(1 + reruns):
                 code, out, err = self.main('back', '--way', 'w1', '--here', '--lose-work-since', self.at)
                 self.assertEqual(code, 1, out + err)
                 self.assertIn('did not come back', err)
-                self.assertEqual(self.started()[-1], 'verify')
-        self.assertEqual(self.started(), ['follows', 'resume', 'verify'] if reruns else self.started())
+                self.assertEqual(self.started()[-2:], ['verify', 'verify-failed'])
+        if reruns:
+            self.assertEqual(self.started(), ['follows', 'resume', 'verify', 'verify-failed'])
         return err
+
+    def killed(self, setup):
+        """A W1 in its own process, SIGKILLed where `setup` says: no end line, as a kill or a power loss leaves."""
+        script = KILLED.format(paths=[os.path.dirname(os.path.abspath(__file__)), os.path.join(fx.KIT, 'lib'),
+                                      fx.COMMON], machine=config.MACHINE_FILE, systemctl=back.osadapter.SYSTEMCTL,
+                               cgroup=back.osadapter.CGROUP_FILE, root=self.m.root, setup=setup, since=self.at,
+                               stub=self.m.path('bin/t3-stub'))
+        p = subprocess.run([sys.executable, '-I', '-B', '-c', script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, -9, p.stderr)
+        self.assertIsNone(self.last_run()['end'])
+
+    def without_failed_marks(self):
+        """The journal as a kit from before the "verify-failed" mark wrote it: the same runs, without those steps."""
+        path = os.path.join(self.m.state, 'journal.jsonl')
+        with open(path, 'rb') as f:
+            rows = [json.loads(line) for line in f]
+        rewrite(path, [row for row in rows if row.get('step') != 'verify-failed'])
 
 
 class Ways(BackBase):
@@ -596,15 +615,6 @@ class W1(BackBase):
         self.assertTrue(self.adapter.service()['enabled'])
         self.assertTrue(self.back('w1', lose_work_since=self.at)['nothing'])  # and then nothing is left
 
-    def killed(self, setup):
-        script = KILLED.format(paths=[os.path.dirname(os.path.abspath(__file__)), os.path.join(fx.KIT, 'lib'),
-                                      fx.COMMON], machine=config.MACHINE_FILE, systemctl=back.osadapter.SYSTEMCTL,
-                               cgroup=back.osadapter.CGROUP_FILE, root=self.m.root, setup=setup, since=self.at,
-                               stub=self.m.path('bin/t3-stub'))
-        p = subprocess.run([sys.executable, '-I', '-B', '-c', script], capture_output=True, text=True, timeout=60)
-        self.assertEqual(p.returncode, -9, p.stderr)
-        self.assertIsNone(self.last_run()['end'])
-
     def assert_rerun_finishes(self):
         self.back('w1', lose_work_since=self.at)
         self.assertEqual(self.db(), self.copied)
@@ -692,7 +702,7 @@ class W1(BackBase):
         self.assertIn('background jobs stay paused', err)
         self.assertEqual(self.m.hook_log(), ['pre-a'])
         self.assertEqual([s['step'] for s in self.last_run()['steps'] if s['phase'] == 'started'],
-                         ['follows', 'resume', 'verify'])
+                         ['follows', 'resume', 'verify', 'verify-failed'])
 
     def test_a_kept_file_changed_after_the_check_is_refused_by_the_put_back(self):
         real, kept_t3 = keptruntime._copy_tree, os.path.join(self.m.state, 'kept-runtimes', fx.LIVE, 'runtime', 't3')
@@ -834,18 +844,199 @@ class FollowStuckW1(FollowBase):
 
     def test_w3_follows_a_stuck_w1(self):
         self.m.stage_release(bx.STABLE)
-        self.stuck_w1(reruns=0)  # one failed verify is enough
+        self.stuck_w1()
         self.assert_followed('w3', bx.STABLE)
 
-    def test_the_list_of_ways_names_w2_after_a_stuck_w1_and_what_was_left_half_way(self):
+    def test_one_failed_verify_is_not_enough_w2_and_w3_follow_once_the_rerun_fails_too(self):
+        # docs/fork/go-live.md: the check after the update "fails, and fails again on the rerun". The W1 rerun only
+        # verifies (no restore), so it is the safer first try: a late start or a service manager that did not
+        # answer once must not send the home to another build.
+        self.m.stage_release(bx.STABLE)
+        err = self.stuck_w1(reruns=0)
+        self.assertIn('if its verify then fails again, `t3-golive back --way w2` or `--way w3` may follow it', err)
+        self.assertIsNone(back._stuck_w1(journal.read(self.m.state)[0]))
+        self.assert_w2_refused('if its verify then fails again, `t3-golive back --way w2` or `--way w3` may follow')
+        code, out = self.status()
+        self.assertIn('its last verify did not pass', out)
+        self.assertIn('if its verify then fails again, `t3-golive back --way w2` or `--way w3` may follow it', out)
+        code, out, err = self.main('back')
+        self.assertIn('W2 not possible: the last back (w1) stopped half-way', out)
+        self.assertIn('W3 not possible: the last back (w1) stopped half-way', out)
+        err = self.stuck_w1(reruns=0)  # the rerun's verify fails too
+        self.assertNotIn('if its verify then fails', err)
+        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', err)
+        self.assert_followed('w3', bx.STABLE)
+
+    def test_a_verify_that_was_cut_off_is_not_a_failed_verify_and_the_newest_verify_decides(self):
+        # Killed in its verify (a kill, a reboot): no verify finished, and the old build may just be coming up.
+        self.killed('coldcopy._wait_started = kill')
+        self.m.write('never-starts', fx.LIVE)  # and the old build does not come up after it either
+        self.assertEqual(self.started()[-1], 'verify')
+        self.assert_w2_refused('its last verify was cut off', 'which does not count as failed',
+                               'if its verify then fails, and again on the rerun after that, `t3-golive back')
+        code, out = self.status()
+        self.assertEqual(code, 1)
+        self.assertIn('its last verify was cut off', out)
+        self.assertNotIn('did not pass', out)
+        self.assertIn('if its verify then fails, and again on the rerun after that, `t3-golive back', out)
+        code, out, err = self.main('back')
+        self.assertIn('W2 not possible: the last back (w1) stopped half-way', out)
+        self.assertIn('its last verify was cut off', out)
+        self.stuck_w1(reruns=0)  # one verify that finished and failed
+        self.assert_w2_refused('if its verify then fails again')
+        # Stopped in its next verify (an interrupt: the run ends "failed" in the journal, but no verify finished).
+        with mock.patch.object(coldcopy, '_wait_started', side_effect=SystemExit('stopped')):
+            with self.assertRaises(SystemExit):
+                self.back('w1', lose_work_since=self.at)
+        self.assertEqual(self.last_run()['end']['result'], 'failed')
+        self.assertEqual(self.started(), ['follows', 'resume', 'verify'])
+        self.assertEqual(back._w1_scan(back._chain(journal.read(self.m.state)[0]), fx.LIVE), ('updated', 'cut', 1))
+        self.assert_w2_refused('its last verify was cut off', 'if its verify then fails again')
+        self.assertIn('its last verify was cut off', self.status()[1])
+        self.stuck_w1(reruns=0)  # the second verify that finished and failed, and the newest one
+        self.assertIn('its last verify did not pass', self.status()[1])
+        self.assertIsNotNone(back._stuck_w1(journal.read(self.m.state)[0]))
+        with mock.patch.object(coldcopy, '_wait_started', side_effect=SystemExit('stopped')):
+            with self.assertRaises(SystemExit):
+                self.back('w1', lose_work_since=self.at)
+        # Two failed verifies, but the newest verify was cut off: the old build may be coming up now.
+        self.assertEqual(back._w1_scan(back._chain(journal.read(self.m.state)[0]), fx.LIVE), ('updated', 'cut', 2))
+        self.assert_w2_refused('its last verify was cut off', 'if its verify then fails again')
+        self.assertIn('its last verify was cut off', self.status()[1])
         self.stuck_w1(reruns=0)
+        self.assert_followed('w2', bx.BASE)
+        self.assertEqual(len([c for c in self.updates() if c[1] == fx.LIVE]), 1)  # W1's downgrade ran once
+
+    def test_a_journal_without_the_failed_marks_reads_as_cut_off_until_two_verifies_fail_under_this_kit(self):
+        # Old state: a kit from before the "verify-failed" mark journalled a failed verify like a cut-off one.
+        self.stuck_w1()
+        self.assertIsNotNone(back._stuck_w1(journal.read(self.m.state)[0]))
+        self.without_failed_marks()
+        self.assertIsNone(back._stuck_w1(journal.read(self.m.state)[0]))
+        self.assert_w2_refused('its last verify was cut off')
+        self.assertIn('its last verify was cut off', self.status()[1])
+        self.stuck_w1(reruns=0)
+        self.assert_w2_refused('if its verify then fails again')
+        self.stuck_w1(reruns=0)
+        self.assert_followed('w2', bx.BASE)
+        self.assertEqual(len([c for c in self.updates() if c[1] == fx.LIVE]), 1)
+
+    def test_a_w1_killed_between_its_update_and_its_verify_refuses_w2_and_says_when_it_may_follow(self):
+        self.killed('back._verify = kill')
+        self.assertEqual([(s['step'], s['phase']) for s in self.last_run()['steps']][-1], ('update', 'done'))
+        self.assert_w2_refused('if its verify then fails, and again on the rerun after that, `t3-golive back --way '
+                               'w2` or `--way w3` may follow it')
+        out = self.status()[1]
+        self.assertIn(f'W1 got past its update to t3 {fx.LIVE}', out)
+        self.assertNotIn('cut off', out)
+        self.assertNotIn('did not pass', out)
+
+    def test_a_follower_to_a_build_older_than_the_one_the_stuck_w1_put_back_is_refused(self):
+        # A path the kit's own flow never takes (the data lens on #472): after the switch, W3 to a stable; a copy
+        # under it; then a newer fork build put in by hand, so no switch in the journal names it. W1 restores that
+        # stable's copy. The only fork build a switch names is the first one, whose base nightly is older than
+        # that stable: W2 would run `--allow-downgrade` to it under data the stable wrote.
+        ran, newer, later = '0.1.11', '0.1.12-nightly.20261201.7.fork.1', '0.1.12'
+        self.m.stage_release(ran)
+        self.assertEqual(self.back('w3')['version'], ran)
+        self.m.stage_release(newer)  # a copy is taken before a switch to a staged, newer target
+        self.m.set_report(fx.report(version=newer))
+        self.m.config(targetVersion=newer, preHooks=[self.m.path('bin/pre-a')], postHooks=[self.m.path('bin/post-a')])
+        self.take_copy()
+        self.m.switched(newer)
+        self.stuck_w1(version=ran)
+        stuck = back._stuck_w1(journal.read(self.m.state)[0])
+        self.assertEqual(stuck, {'version': ran, 'left': fx.TARGET})
+        self.m.stage_release(bx.STABLE)  # a stable newer than the fork's base, older than the restored data's build
+        snap, calls, updates = self.m.snapshot(), self.calls(), self.updates()
+        with self.assertRaisesRegex(journal.Refused, f'w2 is not possible now: t3 {bx.BASE} is older than t3 {ran}, '
+                                                     'the build whose data the stuck W1 put back'):
+            self.back('w2')
+        with self.assertRaises(journal.Refused) as cm:
+            self.back('w3')
+        self.assertIn(f't3 {ran}: the build the stuck W1 could not verify', str(cm.exception))
+        self.assertIn(f't3 {bx.STABLE}: older than t3 {ran}, the build whose data the stuck W1 put back',
+                      str(cm.exception))
+        self.assertEqual((self.m.snapshot(), self.calls(), self.updates()), (snap, calls, updates))
+        code, out, err = self.main('back')
+        self.assertIn(f'W2 not possible: t3 {bx.BASE} is older than t3 {ran}', out)
+        self.assertIn(f'W3 not possible: no upstream stable newer than {bx.BASE} is installed or staged; t3 {ran}: '
+                      'the build the stuck W1 could not verify', out)
+        self.m.stage_release(later)  # a stable not older than the restored data's build still follows
+        self.assert_followed('w3', later)
+
+    def test_a_fork_builds_data_counts_as_its_base_nightlys_for_the_followers_floor(self):
+        # The stuck W1 went back to a fork build while the service state cannot be read: its data is no newer than
+        # its base nightly, so W2 to the base of a later fork build of that same nightly is not a downgrade.
+        self.assertTrue(back._older(bx.BASE, fx.TARGET))
+        stuck = {'version': fx.TARGET, 'left': bx.BASE + '.fork.2'}
+        with mock.patch.object(back.live, 'service_state', side_effect=back.live.NotLive('unreadable')):
+            found = back.ways(config.load(), self.adapter, stuck)
+        self.assertTrue(found['w2']['ok'], found['w2']['why'])
+        self.assertEqual(found['w2']['version'], bx.BASE)
+
+    def test_the_list_of_ways_names_w2_after_a_stuck_w1_and_what_was_left_half_way(self):
+        self.stuck_w1()
         before = self.m.snapshot()
         code, out, err = self.main('back')
         self.assertEqual(code, 0, out + err)
         self.assertRegex(out, f'W2 possible: .*t3 {bx.BASE}.*follows the W1 stuck on its verify')
+        self.assertIn(f'W1 possible: run it again: it only verifies t3 {fx.LIVE}', out)  # as `--way w1` then does
+        self.assertNotIn('W1 not possible', out)
         self.assertIn('Left half-way: the last run (back', out)
         self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', out)
         self.assertEqual(self.m.snapshot(), before)
+
+    def ways_listed(self):
+        code, out, err = self.main('back')
+        self.assertEqual(code, 0, out + err)
+        return {line[:2].lower(): line for line in out.splitlines() if line[:3] in ('W1 ', 'W2 ', 'W3 ')}, out
+
+    def test_the_list_of_ways_after_a_follower_that_is_itself_stuck_is_what_back_then_does(self):
+        self.stuck_w1()
+        self.m.write('never-starts', f'{fx.LIVE} {bx.BASE}')
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.2), self.assertRaisesRegex(RuntimeError, 'did not come'):
+            self.back('w2')  # the follower's own verify fails: the service state names its build now
+        before = self.m.snapshot()
+        listed, out = self.ways_listed()
+        self.assertRegex(listed['w2'], f'^W2 possible: run it again: it runs the update to t3 {bx.BASE} again')
+        for way in ('w1', 'w3'):
+            self.assertIn(f'{way.upper()} not possible: the last back (w2) stopped half-way: run `t3-golive back '
+                          '--way w2` again', listed[way])
+            with self.assertRaisesRegex(journal.Refused, r'the last back \(w2\) stopped half-way'):
+                self.back(way, **({'lose_work_since': self.at} if way == 'w1' else {}))
+        self.assertIn('run `t3-golive back --way w2` again', out.split('Left half-way: ')[1])
+        self.assertEqual(self.m.snapshot(), before)
+        shutil.rmtree(self.m.path(f'stage/{bx.BASE}'))  # its t3 gone since: the list and the rerun say the same
+        shutil.rmtree(self.m.path(f'home/runtime/versions/{bx.BASE}'))
+        listed, out = self.ways_listed()
+        self.assertIn(f'W2 not possible: the stopped back\'s t3 {bx.BASE} is not available any more', listed['w2'])
+        with self.assertRaisesRegex(journal.Refused, f'the stopped back\'s t3 {bx.BASE} is not available any more'):
+            self.back('w2')
+        self.m.stage_release(bx.BASE)
+        os.unlink(self.m.path('never-starts'))
+        self.assert_followed('w2', bx.BASE)
+
+    def test_the_list_of_ways_after_a_w1_stopped_before_its_update_is_what_back_then_does(self):
+        self.m.write('update.code', '3')
+        with self.assertRaisesRegex(RuntimeError, 'exited 3'):
+            self.back('w1', lose_work_since=self.at)
+        os.unlink(self.m.path('update.code'))
+        listed, out = self.ways_listed()
+        self.assertRegex(listed['w1'], '^W1 possible: run it again: it finishes the W1 left half-way: it restores '
+                                       f'{re.escape(self.copy)} .*--lose-work-since {re.escape(self.at)}')
+        self.assertIn('W2 not possible: the last back (w1) stopped half-way: run `t3-golive back --way w1` again',
+                      listed['w2'])
+        self.assertNotIn('may follow', out)
+        self.assert_w2_refused()
+        os.rename(self.copy, self.copy + '.away')  # the copy its plan names is gone: the list and the rerun agree
+        listed, out = self.ways_listed()
+        self.assertIn('W1 not possible: ', listed['w1'])
+        with self.assertRaisesRegex(journal.Refused, 'nothing was changed'):
+            self.back('w1', lose_work_since=self.at)
+        os.rename(self.copy + '.away', self.copy)
+        self.back('w1', lose_work_since=self.at)
+        self.assertEqual((self.db(), self.live_version()), (self.copied, fx.LIVE))
 
     def assert_w2_refused(self, *words):
         snap, calls, updates, runs = self.m.snapshot(), self.calls(), self.updates(), journal.read(self.m.state)[0]
@@ -871,7 +1062,7 @@ class FollowStuckW1(FollowBase):
         self.assertEqual((self.db(), self.live_version()), (self.copied, fx.LIVE))
 
     def test_a_stuck_w1_that_was_then_begun_over_and_stopped_before_its_update_refuses_w2_again(self):
-        self.stuck_w1(reruns=0)
+        self.stuck_w1()
         self.m.write('update.code', '3')  # the service state names another build by now: the rerun is a whole W1
         with mock.patch.object(back, '_names', return_value=False), self.assertRaisesRegex(RuntimeError, 'exited 3'):
             self.back('w1', lose_work_since=self.at)
@@ -882,7 +1073,7 @@ class FollowStuckW1(FollowBase):
     def test_only_a_w1_counts_as_stuck_never_a_w2_behind_it(self):
         # A journal no kit of today writes (a W2 to the stuck W1's own build is refused): the W2 behind the stuck
         # W1 is what was left half-way, so W1 is refused and nothing is restored a second time.
-        self.stuck_w1(reruns=0)
+        self.stuck_w1()
         with self.assertRaisesRegex(RuntimeError, 'stopped'):
             with journal.run(self.m.state, 'back', may_follow=back.FOLLOWS) as r:
                 with r.step('plan', way='w2', version=fx.LIVE, t3=None, copy=None):
@@ -919,16 +1110,16 @@ class FollowStuckW1(FollowBase):
             self.back('w1', lose_work_since=self.at)
         os.unlink(self.m.path('hooks.log.post-a.code'))
         self.adapter.stop()  # the old build went down after its verify and does not come up again
-        self.m.write('never-starts', fx.LIVE)
-        with mock.patch.object(coldcopy, 'START_WAIT', 0.2), self.assertRaisesRegex(RuntimeError, 'did not come'):
-            self.back('w1', lose_work_since=self.at)
-        self.assertEqual(self.started(), ['follows', 'resume', 'verify'])
+        self.stuck_w1(reruns=0)
+        self.assertEqual(self.started(), ['follows', 'resume', 'verify', 'verify-failed'])
+        self.assert_w2_refused('if its verify then fails again')  # the good verify before it does not count
+        self.stuck_w1(reruns=0)
         self.assertIn('its last verify did not pass', self.status()[1])
         self.assert_followed('w2', bx.BASE)
 
     def test_a_w2_stopped_half_way_after_following_is_finished_by_its_rerun_and_w1_is_not_run_again(self):
         self.m.stage_release(bx.BASE)
-        self.stuck_w1(reruns=0)
+        self.stuck_w1()
         self.m.write('update.code', '3')
         code, out, err = self.main('back', '--way', 'w2', '--here')
         self.assertEqual(code, 1)
@@ -947,19 +1138,19 @@ class FollowStuckW1(FollowBase):
         self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])
 
     def test_a_w2_whose_own_verify_fails_after_following_runs_no_post_hook_and_its_rerun_finishes(self):
-        self.stuck_w1(reruns=0)
+        self.stuck_w1()
         self.m.write('never-starts', f'{fx.LIVE} {bx.BASE}')
         with mock.patch.object(coldcopy, 'START_WAIT', 0.2), self.assertRaisesRegex(RuntimeError, 'did not come'):
             self.back('w2')
         self.assertEqual(self.m.hook_log(), ['pre-a'])
-        self.assertEqual(self.started(), ['follows', 'plan', 'update', 'verify'])
+        self.assertEqual(self.started(), ['follows', 'plan', 'update', 'verify', 'verify-failed'])
         os.unlink(self.m.path('never-starts'))
         self.assert_followed('w2', bx.BASE)
         self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])
 
     def test_a_follower_refused_before_its_plan_leaves_the_stuck_w1_to_follow(self):
         shutil.rmtree(self.m.path(f'stage/{bx.BASE}'))
-        self.stuck_w1(reruns=0)
+        self.stuck_w1()
         with self.assertRaisesRegex(journal.Refused, f'w2 is not possible now: t3 {bx.BASE} is not available'):
             self.back('w2')
         self.assertEqual(self.started(), ['follows'])
@@ -967,16 +1158,23 @@ class FollowStuckW1(FollowBase):
         self.m.stage_release(bx.BASE)
         self.assert_followed('w2', bx.BASE)
 
-    def test_a_journal_from_before_the_resume_step_is_followed_too(self):
-        # The kit before #397's last round redid a whole W1 on every rerun (no `resume` step): two whole W1s, each
-        # past its update with a failed verify. W2 follows the newest; nothing is restored a third time.
+    def test_a_journal_from_before_the_resume_step_is_followed_once_this_kits_reruns_fail_too(self):
+        # The kit before #397's last round redid a whole W1 on every rerun (no `resume` step, no "verify-failed"
+        # mark): two whole W1s, each past its update with a verify that began and did not pass. They read as cut
+        # off (the safe side); this kit's reruns only verify, and after two that fail W2 follows the newest W1.
+        # Nothing is restored a third time.
         self.m.write('never-starts', fx.LIVE)
         with mock.patch.object(coldcopy, 'START_WAIT', 0.2), mock.patch.object(back, '_names', return_value=False):
             for n in range(2):
                 with self.assertRaisesRegex(RuntimeError, 'did not come back'):
                     self.back('w1', lose_work_since=self.at)
+        self.without_failed_marks()
         steps = [s['step'] for r in journal.read(self.m.state)[0] for s in r['steps']]
         self.assertEqual((steps.count('restore'), steps.count('resume')), (4, 0))  # started and done, twice
+        self.assert_w2_refused('its last verify was cut off')
+        self.stuck_w1()
+        steps = [s['step'] for r in journal.read(self.m.state)[0] for s in r['steps']]
+        self.assertEqual((steps.count('restore'), steps.count('resume')), (4, 4))
         self.assert_followed('w2', bx.BASE)
 
     def test_no_switch_in_the_journal_naming_the_fork_build_refuses_the_follower_and_says_why(self):
@@ -984,7 +1182,7 @@ class FollowStuckW1(FollowBase):
         with journal.run(self.m.state, 'rehearse', scratch=True) as r:  # a rehearsal of a build is not a switch
             with r.step('result', version=fx.TARGET):
                 pass
-        self.stuck_w1(reruns=0)
+        self.stuck_w1()
         runs = journal.read(self.m.state)[0]
         with open(path, 'rb') as f:
             rows = [json.loads(line) for line in f]
@@ -1002,7 +1200,7 @@ class FollowStuckW1ToTheForksOwnBase(FollowBase):
 
     def test_w2_to_the_very_build_the_w1_could_not_verify_is_refused_and_w3_still_follows(self):
         self.m.stage_release(bx.STABLE)
-        self.stuck_w1(version=bx.BASE, reruns=0)
+        self.stuck_w1(version=bx.BASE)
         updates = self.updates()
         with self.assertRaisesRegex(journal.Refused, f'w2 is not possible now: t3 {bx.BASE} is the build the stuck '
                                                      'W1 could not verify'):
@@ -1014,18 +1212,47 @@ class FollowStuckW1ToTheForksOwnBase(FollowBase):
 class W1Scan(unittest.TestCase):
     """back._w1_scan on journal steps written out by hand (states no run of today's kit leaves)."""
 
+    def step(self, name, phase='started', **data):
+        return {'step': name, 'phase': phase, 'data': data}
+
+    def scan(self, *steps):
+        return back._w1_scan([{'steps': list(steps)}], '1')
+
     def test_a_stop_after_a_failed_verify_starts_over_nothing_is_stuck_any_more(self):
-        def step(name, phase='started', **data):
-            return {'step': name, 'phase': phase, 'data': data}
+        step = self.step
+        failed = [step('verify-failed', version='1'), step('verify-failed', 'done')]
         steps = [step('plan', way='w1', version='1'), step('stop-service'), step('update', version='1'),
-                 step('update', 'done'), step('verify')]
-        self.assertEqual(back._w1_scan([{'steps': steps}], '1'), ('updated', True))
-        self.assertEqual(back._w1_scan([{'steps': steps + [step('stop-service')]}], '1'), ('stopped', False))
-        self.assertEqual(back._w1_scan([{'steps': steps + [step('verify', 'done', version='1')]}], '1'),
-                         ('verified', False))
-        self.assertEqual(back._w1_scan([{'steps': steps + [step('verify', 'done', version='2')]}], '1'),
-                         ('updated', True))  # another build's verify does not verify this W1
-        self.assertEqual(back._w1_scan([{'steps': steps[:2] + [step('verify')]}], '1'), ('stopped', False))
+                 step('update', 'done'), step('verify')] + failed + [step('verify')] + failed
+        self.assertEqual(self.scan(*steps), ('updated', 'failed', 2))
+        self.assertEqual(self.scan(*steps, step('stop-service')), ('stopped', None, 0))
+        self.assertEqual(self.scan(*steps, step('verify'), step('verify', 'done', version='1')),
+                         ('verified', None, 0))  # a good verify: the failed ones before it do not count any more
+        self.assertEqual(self.scan(*steps, step('verify'), step('verify', 'done', version='2')),
+                         ('updated', 'cut', 2))  # another build's verify does not verify this W1
+        self.assertEqual(self.scan(*steps[:2], step('verify'), *failed), ('stopped', None, 0))
+
+    def test_a_version_that_cannot_be_compared_counts_as_older_the_refusing_side(self):
+        self.assertTrue(back._older('0.1.9', '0.1.10'))
+        self.assertFalse(back._older('0.1.10', '0.1.10'))
+        self.assertFalse(back._older('0.1.11', '0.1.10'))
+        self.assertTrue(back._older('not.a.version', '0.1.10'))
+
+    def test_only_a_verify_that_finished_and_failed_counts_and_the_newest_verify_decides(self):
+        step = self.step
+        past = [step('plan', way='w1', version='1'), step('stop-service'), step('update', version='1'),
+                step('update', 'done')]
+        failed = step('verify-failed', version='1')
+        self.assertEqual(self.scan(*past), ('updated', None, 0))
+        self.assertEqual(self.scan(*past, step('verify')), ('updated', 'cut', 0))  # began; no end either way
+        self.assertEqual(self.scan(*past, step('verify'), failed), ('updated', 'failed', 1))
+        self.assertEqual(self.scan(*past, step('verify'), failed, step('verify-failed', 'done')),
+                         ('updated', 'failed', 1))  # the mark is two lines: it counts once
+        self.assertEqual(self.scan(*past, step('verify'), failed, step('verify')), ('updated', 'cut', 1))
+        self.assertEqual(self.scan(*past, step('verify'), failed, step('verify'), failed), ('updated', 'failed', 2))
+        self.assertEqual(self.scan(*past, failed), ('updated', None, 0))  # a mark with no verify begun before it
+        self.assertEqual(self.scan(*past, step('verify'), failed, failed), ('updated', 'failed', 1))
+        self.assertEqual(self.scan(*past, step('verify'), step('verify-failed', version='2')),
+                         ('updated', 'cut', 0))  # another build's failed verify
 
 
 def rewrite(path, rows):

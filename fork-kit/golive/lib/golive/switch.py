@@ -405,7 +405,7 @@ def _put_back(run, cfg, adapter, steps, say, lose_work_since=None):
         try:
             again = back_mod._verify(run, cfg, adapter, rec['version'], 0, say)
         except Exception as e:
-            e.add_note(f't3 {rec["version"]} is still not verified; if it does not come up, {back_mod.MAY_FOLLOW}')
+            e.add_note(f't3 {rec["version"]} is still not verified; {back_mod._follow_note(cfg, rec["version"])}')
             raise
         with run.step('rolled-back', version=again['version'], copy=rec['copy']) as facts:
             facts.update(version=again['version'], pid=again['pid'], result=FINAL['rolled-back'])

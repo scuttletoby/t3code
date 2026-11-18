@@ -17,11 +17,14 @@ W3: an upstream stable newer than that base, once one is installed or staged. W2
 A back may follow a back or switch that stopped half-way (journal.run may_follow): it finishes that back's plan
 (journalled in its "plan" step); the restore, the put-back and the update are safe to run again. A W1 that got past
 its update (or its verify) is not redone: while the service state names its build, the rerun only verifies (or
-finds it verified) and runs the post hooks, so what T3 served since is never restored over. When that verify does not
-pass (the old build does not come up), W2 or W3 may follow that W1: neither restores, so no work is restored over; it
-goes to the base of the fork build the journal's switch names, runs no pre hook again, and runs the post hooks only
-when it ends ok. Only its own rerun follows it: W1 is not run again behind it. A back after a good
-back of the same way, with nothing unfinished since, finds the build that back verified running and does nothing.
+finds it verified) and runs the post hooks, so what T3 served since is never restored over. When that verify
+finished and failed twice, the newest verify among them (the old build does not come up; a verify that was cut off
+by a kill, a stop or the machine going down is not a failed one), W2 or W3 may follow that W1: neither restores, so
+no work is restored over; it goes to the base of the fork build the journal's switch names, never to a build older
+than the one whose data that W1 put back, runs no pre hook again, and runs the post hooks only when it ends ok. Only
+its own rerun follows it: W1, and the other of W2 and W3, are not run behind it. A back after a good back of the
+same way, with nothing unfinished since, finds the build that back verified running and does nothing. `t3-golive
+back` lists the ways by the same rule its `--way` goes by (possible, _follow).
 """
 import functools, http.client, json, os, re, sys, urllib.error, urllib.request
 
@@ -84,9 +87,13 @@ def copies(cfg):
 
 
 def ways(cfg, adapter, stuck=None):
-    """Read only: {'w1'|'w2'|'w3': {'ok', 'why', 'version', 't3', ...}}: which way back is possible now, and why.
-    stuck (_stuck_w1): a W1 left half-way past its update whose verify did not pass; the service state then names
-    its old build, so W2 and W3 start from the fork build the journal's switch names (stuck['left'])."""
+    """Read only: {'w1'|'w2'|'w3': {'ok', 'why', 'version', 't3', ...}}: which way back is possible now, and why,
+    for a back that finishes nothing left half-way (possible() is what `t3-golive back` lists).
+    stuck (_stuck_w1): a W1 left half-way past its update, stuck on its verify; the service state then names
+    its old build, so W2 and W3 start from the fork build the journal's switch names (stuck['left']). That is the
+    newest fork build a switch of this kit went to, not always the build that W1 went back from (a build put in by
+    hand, a copy taken under a later build): W2 and W3 never go to a build older than the one whose data that W1
+    put back (its `--allow-downgrade` would run under data a newer build wrote), nor to that build itself."""
     try:
         active = live.service_state(cfg.home)[0]
     except live.NotLive:
@@ -109,9 +116,10 @@ def ways(cfg, adapter, stuck=None):
             w1.update(ok=True, why=f'restore {folder} (taken {at} under t3 {old}) and go back to t3 {old}'
                                    + (f' (its runtime is put back from {kept})' if kept else '')
                                    + f': everything since {at} is lost; by hand: --lose-work-since {at}')
-    base, follows = base_of(active), ''
+    base, follows, floor = base_of(active), '', None
     if base is None and stuck:
         base, follows = base_of(stuck['left']), '; it follows the W1 stuck on its verify (nothing is restored again)'
+        floor = base_of(stuck['version']) or stuck['version']  # a fork build's data is its base nightly's
     if base is None:
         why = f'the service runs t3 {active}, not a fork build (.fork.N): W2 and W3 go from a fork build to upstream'
         if stuck:
@@ -126,6 +134,10 @@ def ways(cfg, adapter, stuck=None):
     if stuck and base == stuck['version']:  # an update to the build the service state names may start nothing
         out['w2'] = {'ok': False, 'why': f't3 {base} is the build the stuck W1 could not verify: W2 would run that '
                                          'same build again; take W3, or put the home right and settle'}
+    elif floor and _older(base, floor):
+        out['w2'] = {'ok': False, 'why': f't3 {base} is older than t3 {stuck["version"]}, the build whose data the '
+                                         'stuck W1 put back: W2 would run a downgrade under data a newer build '
+                                         'wrote; take W3 if it is possible, or put the home right and settle'}
     names = set()
     for folder in (cfg.stage_dir, os.path.join(cfg.home, 'runtime', 'versions')):
         try:
@@ -137,11 +149,23 @@ def ways(cfg, adapter, stuck=None):
     out['w3'] = {'ok': False, 'why': f'no upstream stable newer than {base} is installed or staged'}
     for v in reversed(stable):
         t3, where = _upstream_t3(cfg, v)
+        if stuck and v == stuck['version']:
+            t3, where = None, 'the build the stuck W1 could not verify (W3 would run that same build again)'
+        elif floor and _older(v, floor):
+            t3, where = None, f'older than t3 {stuck["version"]}, the build whose data the stuck W1 put back'
         if t3:
             out['w3'] = {'ok': True, 'version': v, 't3': t3, 'why': f'the upstream stable t3 {v} ({where})' + follows}
             break
         out['w3']['why'] += f'; t3 {v}: {where}'
     return out
+
+
+def _older(version, than):
+    """`version` is older than `than`; a version that cannot be compared counts as older (the refusing side)."""
+    try:
+        return live.compare_versions(version, than) < 0
+    except ValueError:
+        return True
 
 
 def _server(cfg, adapter):
@@ -256,8 +280,8 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
             pass
         elif stopped and run._broken == 'verify':
             e.add_note(f'its update to t3 {old} ran, but T3 is not verified (`t3-golive status` says whether it '
-                       'runs); the same `t3-golive back --way w1` verifies it again, with no second restore; if '
-                       f't3 {old} does not come up, {MAY_FOLLOW}')
+                       'runs); the same `t3-golive back --way w1` verifies it again, with no second restore; '
+                       + _follow_note(cfg, old))
         elif stopped:
             e.add_note('T3 was stopped for this W1: T3 stays stopped and is not started at boot (on purpose: the '
                        'home may be half-restored) until the same `t3-golive back --way w1` ends ok')
@@ -266,6 +290,31 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
 
 W1_RERUN = '; run the same `t3-golive back --way w1` again: it runs only the post hooks (no second stop or restore)'
 MAY_FOLLOW = '`t3-golive back --way w2` or `--way w3` may follow it (neither restores: no work is restored over)'
+# W2 or W3 may follow a W1 past its update only after this many of its verifies finished and failed: its first, and
+# that of the rerun (docs/fork/go-live.md: "fails, and fails again on the rerun"). The rerun only verifies, so it is
+# the safer first try: a build that starts late, or a service manager that did not answer once, must not send the
+# home on to another build.
+FAILS_TO_FOLLOW = 2
+CUT_OFF = 'was cut off (killed, stopped, or the machine went down before it finished), which does not count as failed'
+
+
+def _not_yet(fails):
+    """When W2 or W3 may follow a W1 past its update that is not stuck yet, after `fails` failed verifies."""
+    return (f'if its verify then fails{" again" if fails else ""}'
+            f'{", and again on the rerun after that" if FAILS_TO_FOLLOW - fails > 1 else ""}, {MAY_FOLLOW}')
+
+
+def _follow_note(cfg, version):
+    """Said in the error of a W1 to `version` whose verify just failed: whether W2 or W3 may follow it now, read
+    from the journal like the next back reads it (this run's own steps included)."""
+    try:
+        runs = journal.read(cfg.state_dir)[0]
+        fails, stuck = _w1_scan(_chain(runs), version)[2], _stuck_w1(runs)
+    except Exception:
+        return '`t3-golive status` says what may follow it'
+    if stuck and stuck['version'] == version:
+        return f'its verify finished and failed {fails} times: {MAY_FOLLOW}'
+    return _not_yet(fails)
 
 
 def _hooked(run, cfg, hooks, body, *, pre=True, post_on_failure=lambda: True, rerun=''):
@@ -321,13 +370,21 @@ def _update(run, cfg, adapter, t3, version, say):
 
 
 def _verify(run, cfg, adapter, version, old_pid, say):
-    """That version runs (a server other than old_pid), the service state names it, the service is enabled."""
-    with run.step('verify') as facts:
-        again = coldcopy._wait_started(cfg, adapter, version, old_pid)
-        if live.service_state(cfg.home)[0] != version or not adapter.service()['enabled']:
-            raise RuntimeError(f't3 {version} runs, but the service state does not name it or {osadapter.UNIT} is '
-                               'not enabled')
-        facts.update(version=version, pid=again['pid'])
+    """That version runs (a server other than old_pid), the service state names it, the service is enabled.
+    A verify that finished and failed is journalled as such (a "verify-failed" step): one that was cut off (a kill,
+    a stop, the machine going down) leaves no such mark, and only finished failed verifies let W2 or W3 follow a W1
+    (_w1_scan). A kill between the failure and its mark reads as cut off: the safe side."""
+    try:
+        with run.step('verify') as facts:
+            again = coldcopy._wait_started(cfg, adapter, version, old_pid)
+            if live.service_state(cfg.home)[0] != version or not adapter.service()['enabled']:
+                raise RuntimeError(f't3 {version} runs, but the service state does not name it or {osadapter.UNIT} '
+                                   'is not enabled')
+            facts.update(version=version, pid=again['pid'])
+    except Exception:  # not a stop or an interrupt (BaseException): those did not finish the verify
+        with run.step('verify-failed', version=version):
+            pass
+        raise
     say(f't3 {version} runs again (pid {again["pid"]}), verified')
     return {'version': version, 'pid': again['pid']}
 
@@ -361,27 +418,33 @@ def _chain(runs):
 
 
 def _w1_scan(chain, version):
-    """(got, unverified) of the stopped W1 to `version` in `chain` since its plan. got: None (it never stopped T3),
-    'stopped', 'updated' (its `t3 update` exited 0) or 'verified'; a later stop (a whole rerun) starts it over.
-    unverified: past its update, its newest verify (its own or a rerun's) began and did not pass."""
+    """(got, verify, fails) of the stopped W1 to `version` in `chain` since its plan. got: None (it never stopped
+    T3), 'stopped', 'updated' (its `t3 update` exited 0) or 'verified'; a later stop (a whole rerun) starts it over.
+    verify: how its newest verify since (its own or a rerun's) ended when it did not pass: 'failed' (it finished
+    and failed: the "verify-failed" mark follows it) or 'cut' (it began and nothing more is journalled: killed,
+    stopped, the machine went down; a journal from a kit before the mark reads like this too, the safe side); None
+    when it passed or none began. fails: the verifies that finished and failed since its update, or since its last
+    verify that passed."""
     steps = [s for r in chain for s in r['steps']]
     plans = [i for i, s in enumerate(steps) if s['step'] == 'plan' and s['phase'] == 'started'
              and _d(s['data']).get('way') == 'w1' and _d(s['data']).get('version') == version]
-    got, to_version, unverified = None, False, False
+    got, to_version, verify, fails = None, False, None, 0
     for s in steps[plans[-1]:] if plans else ():
         step, done, data = s['step'], s['phase'] == 'done', _d(s['data'])
         if step == 'stop-service':
-            got, unverified = 'stopped', False
+            got, verify, fails = 'stopped', None, 0
         elif step == 'update' and not done:
             to_version = data.get('version') == version
         elif step == 'update' and got == 'stopped' and to_version:
             got = 'updated'
         elif step == 'verify' and got in ('updated', 'verified'):
             if not done:
-                unverified = True
+                verify = 'cut'
             elif data.get('version') == version:
-                got, unverified = 'verified', False
-    return got, unverified
+                got, verify, fails = 'verified', None, 0
+        elif step == 'verify-failed' and not done and verify == 'cut' and data.get('version') == version:
+            verify, fails = 'failed', fails + 1  # the mark of the verify that began before it; it counts once
+    return got, verify, fails
 
 
 def _w1_got(chain, version):
@@ -399,17 +462,85 @@ def _plan_of(chain):
 
 def _stuck_w1(runs):
     """{'version', 'left'} when what `runs` ends with, left half-way, is a W1 (a back's, or a switch's automatic
-    one) that got past its update and whose newest verify did not pass, else None. Only then may W2 or W3 follow
-    it: from its update on, nothing but a verify is left of that W1, and neither restores. left: the newest fork
-    build a switch in the journal names (the build that W1 went back from), or None."""
+    one) that got past its update and is stuck on its verify, else None: FAILS_TO_FOLLOW verifies finished and
+    failed (the W1's own and its reruns'), the newest verify among them. A verify that was cut off is not a failed
+    one: the build may be up, or coming up. Only then may W2 or W3 follow it: from its update on, nothing but a
+    verify is left of that W1, and neither restores. left: the newest fork build a switch in the journal names (the
+    build that W1 went back from), or None."""
     chain = _chain(runs)
     plan = _plan_of(chain)
     if not plan or plan['way'] != 'w1':
         return None
-    if not _w1_scan(chain, plan['version'])[1]:
+    got, verify, fails = _w1_scan(chain, plan['version'])
+    if verify != 'failed' or fails < FAILS_TO_FOLLOW:
         return None
     named = [_d(s['data']).get('version') for r in runs if r['command'] == 'switch' for s in r['steps']]
     return {'version': plan['version'], 'left': next((v for v in reversed(named) if base_of(v)), None)}
+
+
+def _follow(runs, way):
+    """(plan, stuck, why not) of a back `way` behind what `runs` ends with: the one rule that `back --way` (run_back)
+    and the list of ways (possible) both go by. plan: the way back left half-way that this back finishes (its own
+    way: only its rerun follows it), or None: it makes a plan of its own, from ways(stuck). stuck: the W1 stuck on
+    its verify that this W2 or W3 follows (_stuck_w1). why not: refused, with nothing changed: another way was left
+    half-way and is not a W1 stuck on its verify (a W1 before its update may have half-restored the home: only W1
+    finishes that)."""
+    chain = _chain(runs)
+    plan = _plan_of(chain)
+    if not plan or plan['way'] == way:
+        return plan, None, None
+    stuck = _stuck_w1(runs)
+    if stuck:
+        return None, stuck, None
+    why = f'the last back ({plan["way"]}) stopped half-way: run `t3-golive back --way {plan["way"]}` again to finish it'
+    if plan['way'] == 'w1':
+        got, verify, fails = _w1_scan(chain, plan['version'])
+        if got in ('updated', 'verified'):
+            why += f'; {f"its last verify {CUT_OFF}: " if verify == "cut" else ""}{_not_yet(fails)}'
+    return plan, None, why
+
+
+def _gone(version, where):
+    return f'the stopped back\'s t3 {version} is not available any more: {where}; stage it again, then run this again'
+
+
+def _rerun(cfg, chain, plan):
+    """Read only: {'ok', 'why', ...} of the same way again behind its own back left half-way (`plan`): what
+    run_back then does."""
+    way, version = plan['way'], plan['version']
+    if way != 'w1':
+        t3, where = _upstream_t3(cfg, version)
+        if t3 is None:
+            return {'ok': False, 'why': _gone(version, where)}
+        return {'ok': True, 'version': version, 't3': t3,
+                'why': f'run it again: it runs the update to t3 {version} again ({where})'}
+    if _w1_got(chain, version) in ('updated', 'verified') and _names(cfg, version):
+        return {'ok': True, 'version': version, 'why': f'run it again: it only verifies t3 {version} and runs the post '
+                                                       'hooks (no second stop or restore)'}
+    try:
+        m = coldcopy.read_manifest(plan['copy'] or '', cfg.home)
+    except (coldcopy.Incomplete, coldcopy.WrongCopy) as e:
+        return {'ok': False, 'why': f'the W1 left half-way cannot be finished: {e}'}
+    old, at = m.get('liveVersion'), m.get('createdAt')
+    t3, kept, why = old_t3(cfg, old)
+    if t3 is None:
+        return {'ok': False, 'why': f'the W1 left half-way cannot be finished: {why}'}
+    return {'ok': True, 'version': old, 't3': t3, 'copy': plan['copy'], 'kept': kept,
+            'why': f'run it again: it finishes the W1 left half-way: it restores {plan["copy"]} (taken {at} under t3 '
+                   f'{old}) and goes back to t3 {old}: everything since {at} is lost; by hand: --lose-work-since {at}'}
+
+
+def possible(cfg, adapter, runs):
+    """Read only: what `t3-golive back` lists: ways(), as `back --way <each>` would find it behind what `runs` ends
+    with (_follow): refused behind another way left half-way, or the rerun of its own."""
+    out, chain = ways(cfg, adapter, _stuck_w1(runs)), _chain(runs)
+    for way in out:
+        plan, stuck, why = _follow(runs, way)
+        if why:
+            out[way] = {'ok': False, 'why': why}
+        elif plan:
+            out[way] = _rerun(cfg, chain, plan)
+    return out
 
 
 def _resume_w1(run, cfg, adapter, plan, got, say):
@@ -432,7 +563,7 @@ def _resume_w1(run, cfg, adapter, plan, got, say):
         return _hooked(run, cfg, True, finish, pre=False, post_on_failure=lambda: False, rerun=W1_RERUN)
     except Exception as e:
         if run._broken == 'verify':
-            e.add_note(f't3 {version} is still not verified; if it does not come up, {MAY_FOLLOW}')
+            e.add_note(f't3 {version} is still not verified; {_follow_note(cfg, version)}')
         raise
 
 
@@ -451,17 +582,12 @@ def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=pr
             say(f'already back: t3 {_facts(last, "version")} runs, verified by the {way} back of {last["began"]}; '
                 'nothing to do')
             return {'version': _facts(last, 'version'), 'nothing': True}
-        chain, stuck = _chain(runs), None
-        plan = _plan_of(chain)  # the back (or its followers) that stopped half-way: finish its plan
-        if plan and plan['way'] != way:
-            refusal = (f'the last back ({plan["way"]}) stopped half-way: run `t3-golive back --way {plan["way"]}` '
-                       'again to finish it')
-            stuck = _stuck_w1(runs)
-            if stuck is None:  # a W1 before its update may have half-restored the home: only W1 finishes that
-                raise journal.Refused(refusal + (
-                    f'; if its verify then fails, {MAY_FOLLOW}'
-                    if plan['way'] == 'w1' and _w1_got(chain, plan['version']) in ('updated', 'verified') else ''))
-            plan = None  # W2 or W3 behind a W1 stuck on its verify: its own plan, from what is possible now
+        # plan: the back (or its followers) that stopped half-way: finish its plan. None behind a W1 stuck on its
+        # verify (stuck) that this W2 or W3 follows: its own plan, from what is possible now.
+        chain = _chain(runs)
+        plan, stuck, why = _follow(runs, way)
+        if why:
+            raise journal.Refused(why)
         if plan and way == 'w1':
             got = _w1_got(chain, plan['version'])
             if got in ('updated', 'verified') and _names(cfg, plan['version']):
@@ -469,8 +595,7 @@ def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=pr
         if plan and way != 'w1':  # its t3 may be gone since (unstaged, pruned): look again
             t3, where = _upstream_t3(cfg, plan['version'])
             if t3 is None:
-                raise journal.Refused(f'the stopped back\'s t3 {plan["version"]} is not available any more: {where}; '
-                                      'stage it again, then run this again')
+                raise journal.Refused(_gone(plan['version'], where))
             plan['t3'] = t3
         if plan is None:
             w = ways(cfg, adapter, stuck)[way]
@@ -571,11 +696,13 @@ def _rerun_hint(runs):
     again = f'`t3-golive back --way {way}`'
     if way != 'w1':
         return f'run {again} again: it runs the update to t3 {version} again'
-    got, unverified = _w1_scan(chain, version)
-    if unverified:
-        return (f'W1 got past its update to t3 {version}, but its last verify did not pass: T3 may be down, and '
-                f'background jobs stay paused. Run {again} again: it only verifies and runs the post hooks (no second '
-                f'restore while the service state names that build). If t3 {version} does not come up, {MAY_FOLLOW}')
+    got, verify, fails = _w1_scan(chain, version)
+    if verify:
+        said = 'did not pass: T3 may be down' if verify == 'failed' else f'{CUT_OFF}: T3 may be up, coming up or down'
+        then = (f'. If t3 {version} does not come up, {MAY_FOLLOW}' if _stuck_w1(runs) else f'; {_not_yet(fails)}')
+        return (f'W1 got past its update to t3 {version}, but its last verify {said}, and background jobs stay '
+                f'paused. Run {again} again: it only verifies and runs the post hooks (no second restore while the '
+                f'service state names that build){then}')
     if got == 'verified':
         return (f'W1 got past its verify (t3 {version} runs and starts at boot); only its post hooks are left: '
                 f'background jobs may stay paused until {again} runs them (no second stop or restore while the '
@@ -695,7 +822,7 @@ def main(args, cfg, adapter, out=sys.stdout, err=sys.stderr):
                 runs = journal.read(cfg.state_dir)[0]
         except (journal.Busy, journal.Damaged) as e:
             unread = e
-        for way, w in ways(cfg, adapter, _stuck_w1(runs)).items():
+        for way, w in possible(cfg, adapter, runs).items():
             print(f'{way.upper()} {"possible" if w["ok"] else "not possible"}: {w["why"]}', file=out)
         if runs and journal.needs_settling(runs[-1]) and runs[-1]['command'] in FOLLOWS:
             print(f'Left half-way: {journal.describe(runs[-1])}; {_rerun_hint(runs)}', file=out)
