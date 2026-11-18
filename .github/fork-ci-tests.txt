@@ -92,6 +92,7 @@ fork-kit/pc-agents/tests/setup.test.py ~110s
 # Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
 .github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml
 .github/scripts/mobile-preview-comment.test.cjs run by .github/workflows/fork-tests.yml
+.github/scripts/mobile-ios-preview-record.test.cjs run by .github/workflows/fork-tests.yml
 .github/scripts/stage-preview-bundle.test.py run by .github/workflows/fork-tests.yml
 .github/scripts/test-delta.test.cjs run by .github/workflows/fork-tests.yml
 .github/scripts/vercel-deployment-output.test.cjs run by .github/workflows/fork-tests.yml
