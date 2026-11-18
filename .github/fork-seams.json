@@ -92,21 +92,13 @@
       ]
     },
     "apps/server/src/cli/connect.ts": {
-      "why": "A server held with `serve --hold-work` shares the live server's environment id, so `t3 connect --disconnect` refuses before the relay delete (cloud/holdWorkConnect.ts). Announced for #398: that call becomes one line, and the CLI's Connect-on check (requireConnectAllowed) refuses on a held copy too.",
+      "why": "`serve --hold-work`: a held copy's home shares the live server's T3 Connect environment id and sign-in. The CLI's unlink path (disconnectCloud) and its turn-Connect-on check (requireConnectAllowed) each call the refusal in cloud/holdWorkConnect.ts once.",
       "added": [
         "import * as HoldWorkConnect from \"../cloud/holdWorkConnect.ts\";",
         "// Fork: a held copy shares the live server's environment id; refuse before the relay delete.",
-        "yield* HoldWorkConnect.refuseCliUnlinkWhileHeld(",
-        "(yield* ServerConfig.ServerConfig).serverRuntimeStatePath,",
-        ");"
-      ],
-      "announced": {
-        "since": "2026-11-18",
-        "added": [
-          "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig);",
-          "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig); // Fork: a held copy"
-        ]
-      }
+        "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig);",
+        "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig); // Fork: a held copy"
+      ]
     },
     "apps/server/src/cloud/CloudLink.ts": {
       "why": "unlink's error type takes the hold-work refusal (cloud/holdWorkConnect.ts); the one upstream line is split so the fork's error sits on its own line.",
@@ -217,6 +209,7 @@
     ".gitleaks.toml",
     ".gitleaksignore",
     "apps/desktop/src/settings/DesktopClientSettings.removedKeys.test.ts",
+    "apps/server/src/cli/connect.holdWork.test.ts",
     "apps/server/src/cli/server.holdWork.test.ts",
     "apps/server/src/cloud/autoUpdate*",
     "apps/server/src/cloud/holdWorkConnect*",
