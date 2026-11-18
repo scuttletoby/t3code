@@ -13,10 +13,12 @@ job), and a second pull request at the same commit may target a base branch whos
 lists on a run the open pull requests whose head SHA or head branch matches it, so a second pull request from
 another branch at the same commit may be listed on this one's runs; its entry names the other branch, so it is not
 counted. GitHub leaves pull_requests empty on runs of a pull request from another repository, so such a run is never
-counted (fail closed). Two pull requests from the same head branch may both be listed on each other's runs; both
-come from someone who can push to this repository. It waits while that job is queued or running; failed,
-cancelled or skipped fails at once, and so does a finished run without the job (a blocked event leaves one). The
-Actions API needs only actions: read, which every caller of fork-tests.yml grants.
+counted (fail closed). Two pull requests from the same head branch may both be listed on each other's runs, and so
+may a pull request closed and a new one opened from the same branch at the same commit (the old pull request's runs
+list the new one, and decide until its own run exists); either needs someone who can push to this repository. It
+waits while that job is queued or running; failed, cancelled or skipped fails at once, and so does a finished run
+without the job (a blocked event leaves one). The Actions API needs only actions: read, which every caller of
+fork-tests.yml grants.
 
 The config is read from the pull request's base commit (BASE_SHA, fetched when the checkout lacks it), not from the
 checkout: pull_request_target runs the base branch's copy of fork-checks.yml, so a pull request that renames its job
@@ -24,11 +26,11 @@ or file is judged by the names the base branch's copy produces, and cannot edit 
 Missing or undecodable there: fail.
 
 It polls every poll_seconds for at most wait_seconds, counted from before the config is read (its git calls count),
-then fails. The job's timeout leaves room for the checkout, the cap and one last poll: fork-contracts.test.py checks
-it with GIT_TIMEOUT, GIT_CALLS, API_TIMEOUT and API_CALLS_PER_POLL below, so the message shows. An API error fails
-closed: a rate limit or a server error is retried within the same cap (and named in the failure if it lasts), any
-other error (403, 404 ...) fails at once. A pull request from another fork fails at once (the job's if: skips those;
-fork-checks' only job for them always fails).
+then fails. The job's timeout leaves room for the checkout, the cap, one last poll and a minute for the job's
+set-up: fork-contracts.test.py checks it with GIT_TIMEOUT, GIT_CALLS, API_TIMEOUT and API_CALLS_PER_POLL below, so
+the message shows. An API error fails closed: a rate limit or a server error is retried within the same cap (and
+named in the failure if it lasts), any other error (403, 404 ...) fails at once. A pull request from another fork
+fails at once (the job's if: skips those; fork-checks' only job for them always fails).
 
 Not a pull_request event: a run that another workflow called (GITHUB_WORKFLOW_REF names the caller) has nothing to
 check, since its check runs are named "<caller job> / ... / fork-ci-result", never the required "fork-ci-result". A
