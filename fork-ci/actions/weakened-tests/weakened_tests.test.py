@@ -120,6 +120,13 @@ class Repo:
         return sorted((i.path, i.name, i.kind) for i in wt.find(base or self.base, head, CONFIG, wt.Git(self.d)).items)
 
 
+def clock(seconds):
+    """git's clock for the commits made inside: a commit's id names its second, so two commits of the same tree a
+    second apart are two heads (and a comment that names the head differs)."""
+    when = f'@{seconds} +0000'
+    return unittest.mock.patch.dict(os.environ, {'GIT_AUTHOR_DATE': when, 'GIT_COMMITTER_DATE': when})
+
+
 class FakeGh:
     """gh api: the PR (its body), the PR's comments (a list it keeps), POST and PATCH of comments."""
 
@@ -475,11 +482,13 @@ class Refused(unittest.TestCase):
     """git-clean refused the checkout (the action passes --refused): no git runs, status is refused, and the report
     comment of an earlier head is replaced, so it is not read as this head's."""
 
-    def run_refused(self, gh):
-        r = Repo(self)
-        c = Cli(self, r)
+    def setUp(self):
+        self.repo = Repo(self)   # one repository, so one head, for all of a test's runs (#452)
+
+    def run_refused(self, gh, head=None):
+        c = Cli(self, self.repo)
         with unittest.mock.patch.object(wt, 'Git', side_effect=AssertionError('git ran')):
-            out = c.run(r.base, gh, extra=('--refused',))
+            out = c.run(head or self.repo.base, gh, extra=('--refused',))
         return c, out
 
     def test_status_refused_and_the_old_report_is_replaced(self):
@@ -496,9 +505,26 @@ class Refused(unittest.TestCase):
         self.run_refused(gh)
         self.assertEqual(gh.writes(), [])   # nothing stale to replace
         gh = FakeGh(comments=[{'id': 3, 'login': BOT, 'body': MARK + '\nold'}])
-        self.run_refused(gh)
-        self.run_refused(gh)   # runs again: the same text, so no second edit
+        with clock(1_700_000_000):
+            self.run_refused(gh)
+        with clock(1_700_000_001):   # the second run starts a second later: the same head, so the same text
+            self.run_refused(gh)   # runs again: no second edit
         self.assertEqual(gh.writes(), [('PATCH', 'repos/o/r/issues/comments/3')])
+
+    def test_a_new_head_edits_the_note_again(self):
+        """The note names its head: a push (a commit a second later, even of the same tree) is a new head, and the
+        note is edited to name it; this second edit is wanted, not the #452 flake."""
+        gh = FakeGh(comments=[{'id': 3, 'login': BOT, 'body': MARK + '\nold'}])
+        with clock(1_700_000_000):
+            first = self.repo.commit()
+        with clock(1_700_000_001):
+            second = self.repo.commit()
+        self.run_refused(gh, first)
+        self.run_refused(gh, first)
+        self.run_refused(gh, second)
+        self.assertEqual(gh.writes(), [('PATCH', 'repos/o/r/issues/comments/3')] * 2)
+        self.assertIn(second[:12], gh.ours()[0]['body'])
+        self.assertNotIn(first[:12], gh.ours()[0]['body'])
 
 
 class Comment(unittest.TestCase):
@@ -648,6 +674,17 @@ class Guards(unittest.TestCase):
         cell = wt.code('y' * 1000)
         self.assertEqual(len(cell), wt.CELL + 2)
         self.assertTrue(cell.endswith('…`'))
+
+    def test_the_report_reads_no_clock_and_no_chance(self):
+        """A re-run of the same head must write the same text, or it edits the live comment each time (#452): the
+        script imports nothing that tells the time or picks at random."""
+        import ast
+        with open(os.path.join(HERE, 'weakened_tests.py')) as f:
+            tree = ast.parse(f.read())
+        names = {a.name.split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        names |= {n.module.split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+        self.assertFalse(names & {'time', 'datetime', 'calendar', 'random', 'secrets', 'uuid'}, names)
+        self.assertNotIn('__import__', {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)})
 
     def test_escape_keeps_a_name_on_one_log_line(self):
         self.assertEqual(wt.escape('tests/test_x\n::error::y\r%.py'), 'tests/test_x%0A::error::y%0D%25.py')
