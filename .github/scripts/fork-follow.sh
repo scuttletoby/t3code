@@ -195,7 +195,8 @@ seam_check() { # seam_check BASE WHAT [--after-rebase]
     return 0
   fi
   if ((status == 1)) && grep -qF "$seam_refusal" "$logs/seam-check.log"; then
-    fail "$2 does not fit the seam list (.github/fork-seams.json):" '```' "$(cat "$logs/seam-check.log")" '```'
+    fail "$2 does not fit the seam list (.github/fork-seams.json):" '```' "$(cat "$logs/seam-check.log")" '```' \
+      "The series was left as it is."
   fi
   fail "The seam check crashed (exit $status), so it did not say whether the series stays within the seams:" \
     '```' "$(tail -n 20 "$logs/seam-check.log")" '```' "The series was left as it is."
