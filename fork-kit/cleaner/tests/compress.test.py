@@ -19,7 +19,7 @@ GB = 1024 ** 3
 REAL_ZSTD = shutil.which('zstd')
 
 # zstd in front of the real one: `state[step]` makes one step ('compress', 'test', 'decompress') fail as a full
-# disk does, or give other bytes.
+# disk does, give other bytes, or stop reading its input early and still exit 0.
 STUB_ZSTD = '''#!{python} -I
 import json, os, sys
 with open({state!r}) as f:
@@ -35,6 +35,12 @@ if how == 'fail':
 if how == 'other bytes':
     sys.stdin.buffer.read()
     sys.stdout.buffer.write(b'other bytes')
+    sys.exit(0)
+if how == 'stop early':
+    import subprocess
+    part = sys.stdin.buffer.read(1000)
+    sys.stdout.buffer.flush()
+    subprocess.run([state['real']] + args, input=part, stdout=sys.stdout.buffer, check=True)
     sys.exit(0)
 os.execv(state['real'], ['zstd'] + args)
 '''
@@ -287,6 +293,16 @@ class Refused(Case):
         self.assertEqual(code, 1, lines)
         self.assertTrue(any(line.startswith(f'FAILED {path} ') and 'No space left' in line for line in lines), lines)
         self.assertEqual(self.files(), ['old.jsonl'])
+
+    def test_a_zstd_that_stops_reading_early_keeps_the_original(self):
+        path = self.big('old.jsonl')
+        self.zstd_stub(compress='stop early')
+        code, lines = self.run_cleaner(self.cold_cfg())
+        self.assertEqual(code, 1, lines)
+        self.assertTrue(any(line.startswith(f'FAILED {path} ') and '1000 read back' in line for line in lines), lines)
+        self.assertEqual(self.files(), ['old.jsonl'])
+        with open(path) as f:
+            self.assertEqual(f.read(), text())
 
     def test_a_copy_that_does_not_read_back_keeps_the_original(self):
         for step, how in (('decompress', 'other bytes'), ('test', 'fail'), ('decompress', 'fail')):
