@@ -417,6 +417,7 @@ seams "fork seam" "inline fork line"
 plan
 check "plan: a fork line beyond the seams stops the plan, naming it" \
   eval 'has "The series does not fit the seam list" "$root/report.md" && has "inline fork line" "$root/report.md" && [[ -z "$(out action)" ]]'
+check "plan: the seam refusal says the series was left as it is" has "The series was left as it is" "$root/report.md"
 
 # Round 5: upstream workflow files the fork deletes (.github/fork-removed-workflows.txt) stay
 # deleted on every follow, and a new upstream workflow that someone outside the fork can start
