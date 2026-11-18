@@ -47,6 +47,19 @@ for line in text.splitlines():
         unpinned.append(m.group(1))
 check("external actions are pinned by commit SHA with a version comment", not unpinned, ", ".join(unpinned))
 
+# Runners are named by OS version: a moving label such as ubuntu-latest can swap the OS under a
+# release, and a newer glibc on the build host breaks the Linux build's glibc ceiling
+# (scripts/linux-glibc.ts). Upstream's release.yml pins its Linux runners to Ubuntu 24.04 too.
+moving = []
+for job_id, job in jobs.items():
+    labels = [job.get("runs-on")] + [(job.get("with") or {}).get(k) for k in ("runner", "verify_runner")]
+    moving += [f"{job_id}: {l}" for l in labels if isinstance(l, str) and re.search(r"-latest\b", l)]
+check("no job runs on a moving -latest runner label", not moving, ", ".join(moving))
+linux = [(job.get("with") or {}).get("runner") for job in jobs.values()
+         if (job.get("with") or {}).get("platform") in ("linux", "win")]
+check("Linux-built desktop jobs run on ubuntu-24.04", linux and all(r == "ubuntu-24.04" for r in linux),
+      ", ".join(map(str, linux)))
+
 # Named secrets only: the signing secrets release-desktop.yml declares, nothing inherited.
 declared = set(desktop[True]["workflow_call"]["secrets"])
 inherit = [j for j, job in jobs.items() if job.get("secrets") == "inherit"]
