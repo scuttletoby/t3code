@@ -273,7 +273,7 @@ new_fork v0.1.9
 ) > /dev/null 2>&1
 partial_fork
 check "plan test: the partial clone lacks the blob the first pick needs" \
-  eval 'git -C "$root/work" rev-list --objects --missing=print HEAD~2..HEAD | grep -q "^?"'
+  eval 'git -C "$root/work" rev-list --objects --missing=print HEAD~2..HEAD | grep -c "^?" > /dev/null'
 plan
 check "plan: a partial clone follows without fetching while it rebases (#475)" \
   eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.10 ]] && [[ ! -e "$root/refused" ]] \
