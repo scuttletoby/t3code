@@ -1853,6 +1853,9 @@ for label, mutate in {
 crash = policy_mutant(lambda p, w, t: 1 / 0)
 check("policies: a mutant that crashes is a named FAIL, not a traceback",
       crash[0] is False and "ZeroDivisionError" in crash[1], repr(crash))
+crash = policy_problems_or_crash(policies, all_wfs, None)   # no fork-tests.yml to read: the check itself crashes
+check("policies: a crash in the check on the real files is a named problem, not a traceback",
+      len(crash) == 1 and crash[0].startswith("the policy check crashed: AttributeError"), repr(crash))
 # The script's limits, as if it changed them: the budget must still fit (#433 fix round 1, nit of both lenses).
 for label, change in {
     "git calls that outlast the job": {"GIT_TIMEOUT": 300},
