@@ -18,6 +18,9 @@ NEVER_IN_CLONE = ('server-runtime.json', coldcopy.OWNER_LOCK, 'secrets', 'device
 LIVE_DEFAULT_PORT = 3773
 POLL, READY_WAIT, STOP_WAIT, T3_TIMEOUT, MIGRATE_TIMEOUT, MB = 0.5, 300, 60, 120, 3600, 1024 * 1024
 MIGRATE = ('auth', 'session', 'list', '--json')  # R2: read-only, offline, migrates (tests/contract.test.py)
+# A link out of the copy is left out of the clone (coldcopy.links_out); these are refused instead: the rehearsal checks
+# them, and the copy holds only the link (upstream allows a linked settings.json and database).
+READ_BY_REHEARSAL = (live.DATABASE, 'settings.json')
 MIN_PYTHON = (3, 11)  # _remove's shutil.rmtree(dir_fd=); older: a TypeError half-way through every removal
 
 
@@ -84,15 +87,44 @@ def _overlap(path, other):
             or (mine is not None and (mine.st_dev, mine.st_ino) in _ids(other)))
 
 
+def _live_links(home, done='nothing was changed'):
+    """[(link, where it leads: its real path)] of every link in the live userdata, at any depth the copy walks (links
+    are not followed into). The live T3 reads and writes where they lead, so that is live data too. Links inside a
+    folder a link leads to are not walked (the copy does not follow them either)."""
+    userdata = os.path.join(home, 'userdata')
+    if not os.path.isdir(userdata):
+        return []
+    found = []
+    try:
+        for d, dirs, names in os.walk(userdata, onerror=coldcopy._raise):
+            found += [(os.path.join(d, n), os.path.realpath(os.path.join(d, n))) for n in sorted(dirs + names)
+                      if os.path.islink(os.path.join(d, n))]
+    except OSError as e:
+        raise journal.Refused(f'the live userdata {userdata} cannot be read ({e}): the kit cannot tell where its links '
+                              f'lead; {done}') from None
+    return found
+
+
 def _not_live(path, home, done='nothing was changed'):
-    """Refused unless `path` and the live home are apart: neither inside the other, by real path, by the file id of
-    the home and of its userdata (a bind of either keeps its id), and by the mount list (_not_bound_live). `done`
-    ends each message: what the caller has changed so far."""
+    """Refused unless `path` and the live data are apart: neither inside the other, by real path, by the file id of
+    the home, of its userdata (a bind of either keeps its id) and of where each link in it leads (_live_links: a
+    dangling one by its path), and by the mount list (_not_bound_live). `done` ends each message: what the caller has
+    changed so far."""
     userdata = os.path.join(home, 'userdata')
     if _overlap(path, home) or (os.path.isdir(userdata) and _overlap(path, userdata)):
         raise journal.Refused(f'{path} is the live T3 home {home}, or inside it or around it; a rehearsal runs only '
                               f'on a clone apart from it; {done}')
-    _not_bound_live(path, home, done)
+    links, real = _live_links(home, done), os.path.realpath(path)
+    for link, target in links:
+        try:
+            near = _overlap(path, target)
+        except FileNotFoundError:  # dangling: the live T3 may make it, so its path counts
+            near = os.path.commonpath([real, target]) in (real, target)
+        if near:
+            raise journal.Refused(f'{path} is where the live link {link} leads ({target}), or inside it or around it: '
+                                  f'the live T3 reads and writes there; a rehearsal runs only on a clone apart from '
+                                  f'it; {done}')
+    _not_bound_live(path, home, done, [target for _, target in links])
 
 
 def _apart(a, b):
@@ -108,11 +140,12 @@ def _no_list(e, what, done):
     return journal.Refused(f'{e}: {why}, as the kit cannot tell whether {what}; {done}')
 
 
-def _not_bound_live(path, home, done):
+def _not_bound_live(path, home, done, targets=()):
     """Refused when the mount list shows `path` as a folder of a filesystem that is, holds or is inside a folder of
-    the live T3 data: the home, where its userdata really is (a link elsewhere, or its own partition), and each
-    mount at or under either. A bind of any folder of these (at the backups folder, say) gives no file id the kit
-    compares, but its mount names the folder it came from (field 4) on its device. Refused too when the list cannot
+    the live T3 data: the home, where its userdata really is (a link elsewhere, or its own partition), where each
+    link in it leads (`targets`), and each mount at or under any of these. A bind of any folder of these (at the
+    backups folder, say) gives no file id the kit compares, but its mount names the folder it came from (field 4) on
+    its device. Refused too when the list cannot
     tell: rehearse then cannot run on this system at all (or, after a passing read error, until it reads); refused
     too when the mount tree cannot tell which mount is on top (osadapter.source). The kit tells filesystems apart only by that device: the
     same files through a second mount of their own (NFS twice, FUSE/bindfs, a Windows drive twice on WSL) pass."""
@@ -120,7 +153,7 @@ def _not_bound_live(path, home, done):
         entries = osadapter.mounts()
     except osadapter.Unsupported as e:
         raise _no_list(e, f'{path} is a bind mount of a folder of the live T3 home', done) from None
-    tops = (os.path.realpath(home), os.path.realpath(os.path.join(home, 'userdata')))
+    tops = (os.path.realpath(home), os.path.realpath(os.path.join(home, 'userdata')), *targets)
     try:
         mine = osadapter.source(os.path.realpath(path), entries)
         live_ones = [(top, osadapter.source(top, entries)) for top in tops]
@@ -188,6 +221,15 @@ def _prechecks(cfg, copy_dir, port):
     except (coldcopy.Incomplete, coldcopy.WrongCopy) as e:
         raise journal.Refused(f'{e}; pass --copy <a finished copy> or run `t3-golive copy`; nothing was '
                               'changed') from None
+    try:
+        out = dict(coldcopy.links_out(coldcopy.plan(os.path.join(copy_dir, 'userdata'), NOT_CLONED)[0]))
+    except OSError as e:
+        raise journal.Refused(f'{copy_dir} cannot be read ({e}); nothing was changed') from None
+    for name in READ_BY_REHEARSAL:
+        if name in out:
+            raise journal.Refused(f'{name} in the copy {copy_dir} is a link out of it ({out[name]}): the clone would '
+                                  'read and write what it leads to, and the copy does not hold it; make it a file in '
+                                  'the live home and take a new copy; nothing was changed')
     old_version = m.get('liveVersion')
     try:
         active, _ = live.service_state(cfg.home)
@@ -318,7 +360,8 @@ def _remove(root, checked):
 
 def _clone(run, cfg, p):
     """The clone step: the old rehearsal folder (it bears MARK) goes, a new one is made; read back vs the manifest.
-    The guard runs again right before the removal: a mount or a swap since R0 is caught."""
+    The guard runs again right before the removal: a mount or a swap since R0 is caught. A link out of the copied
+    tree is left out of the clone (the copy itself decides, on its own plan); returns what was left out, named."""
     try:
         checked = _guard_old(cfg, p['root'])
     except journal.Refused as e:
@@ -328,12 +371,13 @@ def _clone(run, cfg, p):
     os.makedirs(p['root'], mode=0o700)
     with open(os.path.join(p['root'], MARK), 'w', encoding='utf-8') as f:
         json.dump({'run': run.id, 'copy': p['copy']}, f)
-    entries = coldcopy.copy_userdata(run, p['copy'], p['home'], None, NOT_CLONED)[0]
+    entries, _, left_out = coldcopy.copy_userdata(run, p['copy'], p['home'], None, NOT_CLONED, inside=True)
     left = coldcopy.SKIP | NOT_CLONED
     want = {e['path']: e.get('sha256') for e in p['manifest']['files']
             if isinstance(e, dict) and e.get('kind') == 'file' and str(e.get('path')).split('/')[0] not in left}
     if {e['path']: e['sha256'] for e in entries if e['kind'] == 'file'} != want:
         raise Failed(f'the clone in {p["home"]} does not read back as the copy\'s manifest')
+    return left_out
 
 
 def _r0_clone(cfg, p):
@@ -347,6 +391,33 @@ def _r0_clone(cfg, p):
     found = [n for n in NEVER_IN_CLONE if os.path.lexists(os.path.join(p['home'], 'userdata', n))]
     if found:
         raise Failed(f'the clone holds {", ".join(found)}: it could reach the live T3; nothing ran on it')
+    try:
+        out = _links_out_of(os.path.join(p['home'], 'userdata'))
+    except OSError as e:
+        raise Failed(f'R0 on the clone: its links cannot be read ({e}); nothing ran on it') from None
+    if out:
+        live_home = os.path.realpath(cfg.home)
+        said = [f'{rel} -> {target} leads out of the clone ({why})' + (
+            f', into the live T3 home {cfg.home}' if os.path.commonpath([real, live_home]) == live_home else '')
+            for rel, target, why, real in out]
+        raise Failed(f'R0 on the clone: it holds links out of it: {"; ".join(said)}; nothing ran on it')
+
+
+def _links_out_of(userdata):
+    """[(path, target, why, real path)] of each link in a clone's userdata, at any depth, that leads out of it
+    (coldcopy.link_leaves, read from the disk)."""
+    def look(rel):
+        full = os.path.join(userdata, rel)
+        return os.readlink(full) if os.path.islink(full) else None
+    out = []
+    for d, dirs, names in os.walk(userdata, onerror=coldcopy._raise):
+        for n in sorted(dirs + names):
+            rel = os.path.relpath(os.path.join(d, n), userdata)
+            if os.path.islink(os.path.join(d, n)):
+                why = coldcopy.link_leaves(rel, look)
+                if why is not None:
+                    out.append((rel, look(rel), why, os.path.realpath(os.path.join(d, n))))
+    return out
 
 
 def _report(p):
@@ -440,8 +511,10 @@ def run_rehearse(cfg, copy_dir=None, port=None, say=print):
         p = _prechecks(cfg, copy_dir, port)
         result = {'copy': p['copy'], 'copySha256': coldcopy._hash(os.path.join(p['copy'], coldcopy.MANIFEST)),
                   'fromVersion': p['from'], 'targetVersion': cfg.target_version, 'port': p['port']}
-        with run.step('clone', copy=p['copy'], home=p['home']):
-            _clone(run, cfg, p)
+        with run.step('clone', copy=p['copy'], home=p['home']) as facts:
+            result['leftOut'] = facts['leftOut'] = _clone(run, cfg, p)
+        for line in result['leftOut']:
+            say(f'left out of the clone: {line}')
         _r0_clone(cfg, p)
         settings = coldcopy._file_sum(os.path.join(p['home'], 'userdata', 'settings.json'))
         with run.step('preflight') as facts:
