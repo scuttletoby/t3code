@@ -214,6 +214,87 @@ class Ways(BackBase):
                 with listed(order):
                     self.assertEqual([f for f, _ in back.copies(config.load())], [first, second])
 
+    def two_copies(self):
+        """Two copies, `first` taken in an earlier run than `second`; first's folder name sorts above second's."""
+        with mock.patch.object(coldcopy, '_stamp', return_value='20261101T000001Z'):
+            first = self.take_copy()
+        with mock.patch.object(coldcopy, '_stamp', return_value='20261101T000000Z'):
+            second = self.take_copy()
+        return first, second
+
+    def manifest(self, copy, **fields):
+        """Change a copy's manifest fields (None drops one), as an older kit or a hand edit leaves it."""
+        path = os.path.join(copy, coldcopy.MANIFEST)
+        with open(path) as f:
+            manifest = json.load(f)
+        with open(path, 'w') as f:
+            json.dump({k: v for k, v in {**manifest, **fields}.items() if v is not None}, f)
+
+    def order(self):
+        return [f for f, _ in back.copies(config.load())]
+
+    def test_copies_of_different_seconds_go_by_their_time_first_whatever_the_journal_says(self):
+        # createdAt decides first; the journal only orders copies of one second.
+        first, second = self.two_copies()
+        self.manifest(first, createdAt='20261101T000002Z')
+        self.manifest(second, createdAt='20261101T000001Z')
+        self.assertEqual(self.order(), [first, second])  # the later run took the copy with the older time
+        self.assertEqual(back.ways(config.load(), self.adapter)['w1']['copy'], first)
+        self.manifest(first, runId=None)  # a run the journal does not hold: still first, as its time is newer
+        self.assertEqual(self.order(), [first, second])
+
+    def test_an_unknown_run_counts_as_before_the_journals_first_run(self):
+        first, second = self.two_copies()
+        runs = journal.read(self.m.state)[0]
+        self.manifest(first, runId=runs[0]['id'])  # the journal's first run, place 0
+        self.manifest(second, createdAt='20261101T000001Z', runId=None)
+        self.assertEqual(self.order(), [first, second])
+        with mock.patch.object(coldcopy, '_stamp', return_value='20261101T000009Z'):
+            third = self.take_copy()  # a third copy named above both: the unknown run must not tie with place 0
+        self.manifest(third, createdAt='20261101T000001Z', runId=None)
+        self.assertEqual(self.order(), [first, third, second])
+
+    def test_a_run_id_that_is_not_text_is_never_matched_by_its_text(self):
+        first, second = self.two_copies()
+        self.manifest(second, createdAt='20261101T000001Z')
+        with open(os.path.join(first, coldcopy.MANIFEST)) as f:
+            first_run = json.load(f)['runId']
+        # A hand-edited journal whose later runs have the ids "None" and "7".
+        rewrite(os.path.join(self.m.state, 'journal.jsonl'),
+                [{'v': journal.JOURNAL_VERSION, 'run': rid, 'at': '20261101T000000Z', 'event': 'begin'}
+                 for rid in (first_run, 'None', '7')])
+        for rid in (None, 7):  # no run id, or a number: neither is the run "None" or "7"
+            self.manifest(second, runId=rid)
+            self.assertEqual(self.order(), [first, second])
+        self.manifest(second, runId='7')  # the same id as text is that run
+        self.assertEqual(self.order(), [second, first])
+
+    def test_an_unreadable_journal_counts_as_a_damaged_one(self):
+        # The journal says second is newer, the folder names say first: an unreadable journal leaves the names.
+        first, second = self.two_copies()
+        self.manifest(second, createdAt='20261101T000001Z')
+        self.assertEqual(self.order(), [second, first])
+        path = os.path.join(self.m.state, 'journal.jsonl')
+        kept = path + '.kept'
+        os.rename(path, kept)
+        line = '{"v": %d, "prev": "", "event": "begin", "run": %s}\n'
+        damages = {'a directory': lambda: os.mkdir(path),
+                   'a run id that is a list': lambda: self.m.write('kit-state/journal.jsonl',
+                                                                   line % (journal.JOURNAL_VERSION, '[1]')),
+                   'nested too deep': lambda: self.m.write('kit-state/journal.jsonl', '[' * 100000 + '\n{}\n')}
+        if os.getuid() != 0:  # root reads a file of mode 000
+            damages['not readable'] = lambda: (shutil.copy(kept, path), os.chmod(path, 0))
+        for name, damage in damages.items():
+            with self.subTest(name):
+                damage()
+                with self.assertRaises((OSError, TypeError, RecursionError)):
+                    journal.read(self.m.state)  # every other reader of the journal stops on it
+                self.assertEqual(self.order(), [first, second])
+                if os.path.isdir(path):
+                    os.rmdir(path)
+                else:
+                    os.unlink(path)
+
     def test_an_install_complete_naming_another_version_is_not_a_whole_runtime(self):
         self.assertIsNotNone(back.installed_t3(self.m.home, fx.LIVE))
         self.m.write(f'home/runtime/versions/{fx.LIVE}/.install-complete', fx.TARGET)
@@ -1404,6 +1485,16 @@ class Status(BackBase):
         self.assertIn('FAIL  journal: the last run (back', out)
         self.assertIn('run `t3-golive back --way w2` again: it runs the update', out)
         self.assertTrue(out.startswith(f'T3 is up but not right (journal): t3 {fx.TARGET}'), out)
+
+    def test_an_unreadable_journal_keeps_the_copy_notes(self):
+        path = os.path.join(self.m.state, 'journal.jsonl')
+        os.unlink(path)
+        os.mkdir(path)
+        code, out = self.status()
+        self.assertEqual(code, 1, out)
+        self.assertIn(f'note  copy {self.copy}: taken {self.at} under t3 {fx.LIVE}', out)
+        self.assertIn(f'kept runtime of t3 {fx.LIVE}', out)
+        self.assertNotIn('the copies cannot be listed', out)
 
     def test_status_writes_no_lock_file(self):
         os.unlink(os.path.join(self.m.state, 'lock'))
