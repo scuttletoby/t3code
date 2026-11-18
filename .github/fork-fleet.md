@@ -756,17 +756,24 @@ least `every_hours`) the age, from when it was made, at which it is dropped,
 host the project's own timer or job writes a tar of a cache folder's contents
 to `/var/lib/fork-fleet/seed-files/POOL/NAME.tar` (a folder per pool, so two
 pools never share a file), by a temp file and a rename. A file changed in place
-while it is sent (size, mtime or ctime) is refused; one replaced by a rename while
-it is sent is fine (the old one is sent whole). A file dated more than five minutes in the future, older
+while it is sent is refused (exit 4): the host compares its size and mtime, and
+reads the bytes it sent once more and compares their SHA-256. One replaced by a
+rename while it is sent is fine (exit 0, the old one is sent whole), also when
+another hard link to the old file stays (a backup copy). A same-size rewrite in
+place that is finished before the first byte is sent, with its mtime put back,
+is not a change for this check: exit 0, with the new bytes and a trailer that
+matches them. A file left half-written in place cannot be told from a whole one,
+so always make a seed by a temp file and a rename. The second read runs while
+the pool's lock is still held (one stream per pool at a time): for a large seed
+that is not in the host's page cache it adds about the time of one more read of
+the file from disk, and the desktop's limit for one seed (30 minutes) covers the
+stream and this read together. A file dated more than five minutes in the future, older
 than `max_age_hours` or above `max_mb` is refused. Both folders and the files are
 root's (or the project's), readable by the desk-link user and writable by no one
 else (the owner itself is not checked, only that no one else may write); never
 put a secret in a seed: every job of the pool reads it. **Make a seed only from
 trusted code (the default branch), never in a job that runs pull request code:**
 every later job of the pool starts from it, so a poisoned seed reaches them all.
-A file replaced by a rename while another hard link to the old one stays (a
-backup copy, say) is still "in place" for this check and is refused (exit 4):
-keep no second link to a seed file.
 
 The desktop asks for them with the desk link's key, in an ssh session of its
 own: the same forced command sends every command that starts with `seed` to
