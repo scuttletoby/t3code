@@ -368,26 +368,40 @@ class Parsing(unittest.TestCase):
             with self.subTest(ann=ann):
                 self.assertEqual([t.name for t in wt.parse(text.format(ann), java)[0]], ['adds', 'subs'])
 
-    def test_a_hostile_test_file_parses_in_well_under_a_second(self):
-        """Every line shape that made a test pattern backtrack: in a child, so a regression fails instead of hanging
-        (the regex engine cannot be interrupted)."""
-        child = r"""import sys, time
+    def test_a_hostile_test_file_parses_about_as_fast_as_a_plain_one(self):
+        """Every line shape that made a test pattern backtrack, timed against a plain test file of a similar size parsed
+        in the same process: a busy runner slows both alike, while a backtracking pattern costs seconds to forever on
+        these sizes (thousands of times the plain file). Each time is the best of a few runs, so a moment of runner
+        load does not count. In a child, so a regression fails instead of hanging (the regex engine cannot be
+        interrupted)."""
+        child = r"""import json, sys, time
 sys.path.insert(0, sys.argv[1])
 import weakened_tests as wt
 langs = wt.load_config(None)[0]
+plain = ('python', 'def test_a(): pass\n' * 100000)
 texts = [('node', "it('" + '\\' * 64 + '\n'), ('node', ('it("' + '\\' * 64 + '\n') * 2000),
          ('node', 'it(\n' * 100000), ('java', '@Test(\n' * 100000), ('java', '@Test ' * 20000),
          ('java', '@Test @A("x\n' * 100000), ('java', '@Test @A(' + 'x' * 100000),
-         ('node', "it('a', f); " * 100000), ('python', 'def test_a(): pass\n' * 100000)]
-t = time.monotonic()
-for lang, text in texts:
-    wt.parse(text, langs[lang])
-print(time.monotonic() - t)
+         ('node', "it('a', f); " * 100000)]
+def best(lang, text):
+    times = []
+    for _ in range(3):
+        t = time.perf_counter()
+        wt.parse(text, langs[lang])
+        times.append(time.perf_counter() - t)
+    return min(times)
+print(json.dumps({'plain': best(*plain), 'hostile': [[lang, text[:12], best(lang, text)] for lang, text in texts]}))
 """
-        r = subprocess.run([sys.executable, '-I', '-B', '-c', child, HERE], capture_output=True, text=True,
-                           timeout=30)
+        try:
+            r = subprocess.run([sys.executable, '-I', '-B', '-c', child, HERE], capture_output=True, text=True,
+                               timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail('parsing the hostile test file did not finish in 60 s: a test pattern backtracks')
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertLess(float(r.stdout), 1.0)
+        out = json.loads(r.stdout)
+        for lang, start, took in out['hostile']:
+            with self.subTest(lang=lang, start=start):
+                self.assertLess(took, 5 * out['plain'], f'{took:.3f} s against {out["plain"]:.3f} s for the plain file')
 
 
 class Config(unittest.TestCase):
