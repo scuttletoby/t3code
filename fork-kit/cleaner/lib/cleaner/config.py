@@ -5,7 +5,7 @@ repositories, how many days. It can make the cleaner keep more (mustKeep, longer
 no key takes a refusal away, and the floors below cannot be lowered. An empty section means every rule does nothing.
 KEY_KINDS says, for every key, which of these it is; a test fails for a key that is not in it.
 """
-import fnmatch, os, pwd, re
+import fnmatch, glob, os, pwd, re
 
 import machine_file
 
@@ -53,6 +53,9 @@ MIN_KEEP_FREE_GB = 1     # compress-cold: the disk keeps at least this much free
 # Folders compress-cold never takes, whatever the section says, nor a folder inside one or holding one: Claude Code
 # reads its transcripts as plain text (resume, usage scans), so they stay as they are (#468).
 COMPRESS_NEVER = ('~/.claude*',)
+# Folder names compress-cold never takes or enters (#468: the log archive stays as it is). `repair-backups`, the
+# other must-keep name, may be compressed: #468 names it.
+COMPRESS_NEVER_NAMES = ('*log-archive*',)
 # Folders any tool rebuilds, so an ignored one does not keep a worktree. A repository adds its own (regenerable).
 REGENERABLE = ('node_modules', '__pycache__', '.pytest_cache')
 
@@ -324,7 +327,7 @@ class Config:
         values = machine_file.fields(section, COMPRESS_SPEC, where)
         self.keep_free = values['keepFreeGB'] * 1024 ** 3
         folders = []
-        never = [tuple(self._expand(text).split('/')[1:]) for text in COMPRESS_NEVER]
+        never = self._never()
         for i, entry in enumerate(values['folders']):
             at = f'{where}.folders[{i}]'
             folder = machine_file.fields(entry, FOLDER_SPEC, at)
@@ -332,9 +335,14 @@ class Config:
             parts = tuple(path.split('/')[1:])
             if _holds(path, self.home):
                 raise machine_file.MachineFileError(f'{at}.path: {text} is the home folder or holds it')
-            if must_keep_match(never, path) is not None:
+            real = os.path.realpath(path)
+            if must_keep_match(never, path) is not None or must_keep_match(never, real) is not None:
                 raise machine_file.MachineFileError(f'{at}.path: {text} is in, or holds, a folder this rule never '
-                                                    f'takes ({", ".join(COMPRESS_NEVER)}: read as plain text)')
+                                                    f'takes ({", ".join(COMPRESS_NEVER)}, also where a link to one '
+                                                    'leads: read as plain text)')
+            if any(matches(part.lower(), COMPRESS_NEVER_NAMES) for form in (path, real) for part in form.split('/')):
+                raise machine_file.MachineFileError(f'{at}.path: {text} is or is in a log archive '
+                                                    f'({", ".join(COMPRESS_NEVER_NAMES)}): it stays as it is (#468)')
             held = [p for p in self.must_keep if must_keep_match((p,), path) is not None and len(parts) <= len(p)]
             if held:
                 raise machine_file.MachineFileError(f'{at}.path: {text} is or holds the must-keep path /{"/".join(held[0])}: '
@@ -352,6 +360,20 @@ class Config:
                                                         'another of its folders')
             folders.append(ColdFolder(path, folder['days']))
         return tuple(folders)
+
+    def _never(self):
+        """COMPRESS_NEVER as must-keep patterns: each as written, with its literal folder resolved, and where each
+        entry it matches now leads (`~/.claude` may be a link to a folder elsewhere: that folder is never taken
+        either)."""
+        forms = []
+        for text in COMPRESS_NEVER:
+            expanded = self._expand(text)
+            parent, last = os.path.split(expanded)
+            found = sorted(glob.glob(os.path.join(glob.escape(parent), last)))
+            for form in [expanded, os.path.join(os.path.realpath(parent), last)] + [os.path.realpath(f) for f in found]:
+                if tuple(form.split('/')[1:]) not in forms:
+                    forms.append(tuple(form.split('/')[1:]))
+        return forms
 
     def _expand(self, text):
         return os.path.normpath(os.path.join(self.home, text[2:]) if text.startswith('~/') else text)

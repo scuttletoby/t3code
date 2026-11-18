@@ -271,7 +271,7 @@ Never taken, whatever the patterns say: hidden entries, `claude-*`, `tmux-*`, `s
 
 A fourth rule that deletes no content (#487, owner yes in #468). A file in a folder of `compressCold.folders` that
 nobody has changed or read for that folder's `days` (its content, inode **and access** times) is replaced by a zstd
-copy, `<name>.zst`, with the file's mode and times. Without folders the rule does nothing. It may name folders inside
+copy, `<name>.zst`, with the file's mode, times, group, ACL and `user.*` extended attributes. Without folders the rule does nothing. It may name folders inside
 must-keep paths, such as old agent sessions or database copies: they stay whole, only smaller (`zstd -d` gives them
 back).
 
@@ -298,15 +298,33 @@ of its content must equal those of what was read from the file. That checks ever
 covers every file in it, not only their number. Only then does the copy get its name, by a hard link that never
 replaces a file, and only then is the original removed, after one more look at the process list, the locks and the
 file's own identity, size and times. Files are read with `O_NOATIME`, so a plan or a check never makes a cold file
-look read.
+look read. Before the read-back the copy's pages are dropped from the page cache (`posix_fadvise` DONTNEED), so
+the check reads what is on the disk, not what was just written to memory. Each zstd step has a deadline of ten
+minutes plus one second per MiB of the file; a step that runs out is stopped, its copy removed, and the original
+stays. Just before the original is removed, both names are read once more: the original must still be the file
+this run checked and `<name>.zst` the copy it linked (an editor's atomic save onto either name keeps both). A read
+lease (`F_SETLEASE`) would close the last microseconds too, but only while the cleaner holds the file open, and an
+open descriptor is exactly what the process-list check refuses, so the cleaner closes the file before that check
+and takes no lease.
+
+**Reads must be seen.** "Not read for N days" comes from the access time. On a filesystem mounted `noatime` reads
+never change it, so every folder there is kept whole with `noatime` in the plan (mount it `relatime` to use the
+rule). `relatime`, the Linux default, is fine: it updates the access time on the first read after a change and on
+any read when the stored time is more than a day old. `days` is 7 or more, so a read within those days is always
+seen.
 
 **Never taken**, on top of what the config refuses: links (never followed, folders neither), folders with a `KEEP`
 file, git folders, other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
 files, credential and lock names, a database with a `-wal`, `-shm` or `-journal` beside it (and those files),
-hard-linked files, files already compressed (`.zst`, `.gz`, `.xz`, `.zip`, ...), files under 16 KB, and a file whose
-`.zst` name is taken by something else. The config refuses a folder that is `/`, the home folder or above it, a
+hard-linked files, files already compressed (`.zst`, `.gz`, `.xz`, `.zip`, ...), files under 16 KB, a file whose
+`.zst` name is taken by something else, and a folder named like `*log-archive*` (#468 keeps log archives as they
+are). Skipped with a line in the plan instead of failing every run: a file its owner may not read, an immutable or
+append-only file or folder (`chattr`), a file whose group is not one of the user's (the copy could not keep it), and
+a file with extended attributes other than `user.*` and the ACL (`security.*`, `trusted.*`: the copy would lose
+them). The config refuses a folder that is `/`, the home folder or above it, a
 must-keep path itself or a folder above one (`~/.codex` holds logins: name `~/.codex/sessions`), anything in or
-above `~/.claude*` (Claude Code reads its transcripts as plain text), the cleaner's own log or daily folder, a
+above `~/.claude*` or the folder a `~/.claude*` link leads to (Claude Code reads its transcripts as plain text), a
+folder named like `*log-archive*` or inside one, the cleaner's own log or daily folder, a
 folder another rule deletes from, or a folder in or above another of its folders.
 
 **The plan** says `would compress <file> (<size>, compress-cold: not changed or read for N days ...)` for each file,
@@ -322,7 +340,9 @@ too.
   file stays beside the original; the next run removes it and compresses the file again. Killed after the link:
   both are there; the next run checks the copy against the original again and only then removes the original
   (a copy with other bytes keeps both, and the run fails until a person looks). A part file without its original
-  beside it is left alone and named. No entry goes into the journal of half deletes: there is nothing half gone.
+  beside it is left alone and named. A `<name>.zst` that is still the same file as its part file (killed between
+  the link and the part's removal) is kept with `name taken: ... the copy of a run that stopped`; that run removes
+  the part, and the next one checks the copy. A part file of another owner is never removed. No entry goes into the journal of half deletes: there is nothing half gone.
 - **the file is in use:** it is kept and named (a process has it open or names it, it has a lock, a unit names it
   or a folder above it). A file opened or changed while it was compressed keeps its original; the new copy goes.
 - **the disk is nearly full:** a file whose whole copy and `keepFreeGB` do not fit is kept, in the plan and again
@@ -330,6 +350,8 @@ too.
   the original stays.
 - **zstd is missing:** every folder is kept with "could not read" (exit 1); nothing is touched.
 - **the machine file is older and has no `compressCold`:** the rule does nothing.
+- **the cleaner is older than the machine file:** an older cleaner refuses the unknown `compressCold` key and every
+  daily run exits 2. Install this cleaner on a machine first, then add the key.
 
 ## The machine file
 
