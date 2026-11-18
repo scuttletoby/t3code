@@ -336,6 +336,25 @@ interface RetentionRules {
 }
 
 /**
+ * Decoded lines on either side of a segment break (see `HistoryReading`): the last reading before
+ * a backwards stamp and the first one after it. Thinning keeps both, so the break survives
+ * compaction whatever the size of the step.
+ */
+function segmentEdges(lines: ReadonlyArray<HistoryLine>): Set<HistoryLine> {
+  const edges = new Set<HistoryLine>();
+  let previous: HistoryLine | undefined;
+  for (const line of lines) {
+    if (line.reading === undefined) continue;
+    if (previous !== undefined && line.ms < previous.ms) {
+      edges.add(previous);
+      edges.add(line);
+    }
+    previous = line;
+  }
+  return edges;
+}
+
+/**
  * Lines to keep, oldest first. Ages count back from `baseMs`, the newest reading of any instance
  * (or now, if earlier), so a clock that is far ahead at start cannot age the whole history out.
  */
@@ -344,15 +363,18 @@ function retainLines(
   baseMs: number,
   rules: RetentionRules,
 ): Array<HistoryLine> {
+  const edges = segmentEdges(lines);
   const kept: Array<HistoryLine> = [];
   let lastThinned: HistoryLine | undefined;
   for (const line of lines) {
     if (line.ms < baseMs - rules.retentionMs) continue;
     if (line.reading !== undefined && line.ms < baseMs - rules.thinAfterMs) {
       const previous = lastThinned?.reading;
-      // A stamp before the last kept one starts a new segment; thinning starts again there.
+      // Both sides of a segment break stay (`segmentEdges`), and a stamp before the last kept one
+      // (its own neighbour fell to retention) is kept too: thinning starts again after a break.
       const gap = lastThinned === undefined ? Number.NaN : line.ms - lastThinned.ms;
       if (
+        !edges.has(line) &&
         previous !== undefined &&
         !structureChanged(previous, line.reading) &&
         gap >= 0 &&
