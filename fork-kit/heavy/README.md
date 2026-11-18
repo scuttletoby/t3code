@@ -90,8 +90,20 @@ their real use is in the slice's figures).
 The optional `queue` object in the machine file's `heavy` section; without the file or the key the defaults hold:
 
 ```json
-{ "version": 1, "heavy": { "queue": { "headroomMb": 512, "vmReserveMb": 1024, "pressureFull10": 5,
-  "pressureSome60": 10, "passLimitSeconds": 600, "pollSeconds": 2, "budgetMb": 0 } } }
+{
+  "version": 1,
+  "heavy": {
+    "queue": {
+      "headroomMb": 512,
+      "vmReserveMb": 1024,
+      "pressureFull10": 5,
+      "pressureSome60": 10,
+      "passLimitSeconds": 600,
+      "pollSeconds": 2,
+      "budgetMb": 0
+    }
+  }
+}
 ```
 
 `budgetMb` 0 means the slice's limit. An unknown key or a bad value is refused (heavy then runs no queued job; the
