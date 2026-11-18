@@ -12,7 +12,7 @@ from unittest import mock
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
 LIB = os.path.join(KIT, 'lib', 'cleaner')
-MODULES = ('config', 'facts', 'guard', 'rules', 'engine', 'report', 'compare', 'daily')
+MODULES = ('config', 'facts', 'guard', 'compress', 'rules', 'engine', 'report', 'compare', 'daily')
 if COMMON not in sys.path:
     sys.path.insert(0, COMMON)
 
@@ -145,8 +145,10 @@ class Case(unittest.TestCase):
         self.section = {'logFile': self.path('state', 'cleaner.log'), 'daily': {'outDir': self.path('state', 'daily')}}
         self.merged, self.open = [], []
         self.busy, self.unit_names, self.locks, self.texts = set(), set(), set(), []
+        self.words, self.transcript_times = set(), {}     # process environments' words; {session id: time}
         self.mount_points = {'/'}
         self.mount_lines, self.bind_sources = [], set()     # (point, device, root) and (device, root)
+        self.mount_options = {'/': ('rw', 'relatime')}       # {point: its per-mount options}
         # Tests set a file's age with its modification time. The kit also counts the inode change time, which no
         # test can set, so the tests read the modification time alone; one test puts the real reader back.
         self.real_changed = self.c.guard.changed
@@ -216,12 +218,14 @@ class Case(unittest.TestCase):
         return self.cfg(worktrees={'repos': [repo]}, **section)
 
     def processes(self):
-        return self.c.facts.Processes(busy=set(self.busy), locks=set(self.locks), texts=list(self.texts))
+        return self.c.facts.Processes(busy=set(self.busy), locks=set(self.locks), texts=list(self.texts),
+                                      words=set(self.words))
 
     def facts(self, cfg, **over):
         readers = {'processes': self.processes, 'units': lambda: set(self.unit_names),
                    'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
-                   'dangling': lambda: [], 'now': self.now, 'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources)}
+                   'dangling': lambda: [], 'now': self.now, 'transcripts': lambda: dict(self.transcript_times),
+                   'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):
@@ -342,10 +346,18 @@ class Case(unittest.TestCase):
             return [json.loads(line) for line in f]
 
     def fake_proc(self, processes, locks='', sockets=()):
-        """A fake /proc: {pid: {'cwd': path, 'exe': path, 'fd': [paths], 'cmdline': [args], 'maps': [paths]}}."""
+        """A fake /proc: {pid: {'cwd': path, 'exe': path, 'fd': [paths], 'cmdline': [args], 'maps': [paths],
+        'environ': {name: value}, 'comm': short name, 'start': when it started (seconds since the epoch),
+        'hidden': True (its open files cannot be read, as a process that is not dumpable), 'parent': its parent's
+        pid (1 when not given)}}."""
         if os.path.isdir(self.path('proc')):
+            for d in os.listdir(self.path('proc')):
+                if os.path.isdir(self.path('proc', d, 'fd')) and not os.path.islink(self.path('proc', d, 'fd')):
+                    os.chmod(self.path('proc', d, 'fd'), 0o700)
             shutil.rmtree(self.path('proc'))
         root = self.mkdir('proc')
+        boot = int(self.now) - 30 * DAY
+        self.file(os.path.join(root, 'stat'), f'cpu  1 2 3 4\nbtime {boot}\nprocesses 9\n')
         self.file(os.path.join(root, 'locks'), locks)
         self.file(os.path.join(root, 'net', 'unix'), 'Num       RefCount Protocol Flags    Type St Inode Path\n' + ''.join(
             f'0000000000000000: 00000002 00000000 00010000 0001 01 {i + 9} {s}\n' for i, s in enumerate(sockets))
@@ -360,8 +372,19 @@ class Case(unittest.TestCase):
                 os.symlink(target, os.path.join(d, 'fd', str(i)))
             with open(os.path.join(d, 'cmdline'), 'wb') as f:
                 f.write(b'\0'.join(a.encode() for a in p.get('cmdline', ['sleep'])) + b'\0')
+            if 'environ' in p:
+                with open(os.path.join(d, 'environ'), 'wb') as f:
+                    f.write(b''.join(f'{k}={v}'.encode() + b'\0' for k, v in p['environ'].items()))
             with open(os.path.join(d, 'maps'), 'w') as f:
                 f.write(''.join(f'7f00-7f01 r--p 00000000 08:01 {i + 5}    {m}\n' for i, m in enumerate(p.get('maps', []))))
+            if 'comm' in p:
+                self.file(os.path.join(d, 'comm'), p['comm'] + '\n')
+            if 'start' in p or 'parent' in p:
+                ticks = round((p.get('start', boot) - boot) * os.sysconf('SC_CLK_TCK'))
+                self.file(os.path.join(d, 'stat'), f'{pid} ({p.get("comm", "x")}) S {p.get("parent", 1)} {pid} {pid} 0 -1 4194560 '
+                          + ' '.join(['0'] * 12) + f' {ticks} 1000 200\n')
+            if p.get('hidden'):
+                os.chmod(os.path.join(d, 'fd'), 0)
         return root
 
 

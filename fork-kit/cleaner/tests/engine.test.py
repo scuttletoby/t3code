@@ -793,7 +793,9 @@ class Config(Case):
         cf = self.c.config
         keys = set(cf.SPEC) | {f'worktrees.{k}' for k in cf.WORKTREES_SPEC} | {f'repos.{k}' for k in cf.REPO_SPEC} \
             | {f'docker.{k}' for k in cf.DOCKER_SPEC} | {f'tmp.{k}' for k in cf.TMP_SPEC} \
-            | {f'daily.{k}' for k in cf.DAILY_SPEC} | {f'compare.{k}' for k in cf.COMPARE_SPEC}
+            | {f'daily.{k}' for k in cf.DAILY_SPEC} | {f'compare.{k}' for k in cf.COMPARE_SPEC} \
+            | {f'compressCold.{k}' for k in cf.COMPRESS_SPEC} | {f'folders.{k}' for k in cf.FOLDER_SPEC} \
+            | {f'agentScratch.{k}' for k in cf.SCRATCH_SPEC} | {f'keepFirst.{k}' for k in cf.KEEP_FIRST_SPEC}
         self.assertEqual(set(cf.KEY_KINDS), keys)
         self.assertLessEqual(set(cf.KEY_KINDS.values()), {'own file', 'floor', 'keeps more', 'picks', 'loosens', 'compare only'})
         self.assertEqual([k for k, v in cf.KEY_KINDS.items() if v == 'loosens'], ['repos.regenerable'])
@@ -810,7 +812,7 @@ class Config(Case):
 
 MUTATIONS = {
     'tmp: no patterns, nothing': ('rules', 'if not cfg.tmp_patterns:', 'if False:', Tmp, 'test_no_patterns_means_nothing_is_looked_at'),
-    'tmp: the days of the pattern': ('rules', 'if age < days * DAY:', 'if False:', Tmp, 'test_a_pattern_gives_the_days'),
+    'tmp: the days of the pattern': ('rules', 'if age < days * DAY:\n        return None', 'if False:\n        return None', Tmp, 'test_a_pattern_gives_the_days'),
     'tmp: only names a pattern matches': ('rules', 'match = None', "match = ('*', 1)", Tmp, 'test_a_pattern_gives_the_days'),
     'tmp: the first pattern': ('rules', 'for pattern, days in cfg.tmp_patterns:', 'for pattern, days in reversed(cfg.tmp_patterns):',
                                Tmp, 'test_the_first_pattern_that_matches_counts'),
@@ -818,14 +820,15 @@ MUTATIONS = {
     'tmp: the inode time counts': ('guard', 'return max(st.st_mtime, st.st_ctime)', 'return st.st_mtime',
                                    Tmp, 'test_a_folder_copied_today_with_old_dates_is_not_old'),
     'tmp: names it never takes': ('rules', 'if matches(name, TMP_NEVER):', 'if False:', Tmp, 'test_names_it_never_takes'),
-    'tmp: the hard refusals': ('rules', "look = guard.examine(cfg, facts, path, 'path')", 'look = guard.Look(size=1, newest=0.0)',
+    'tmp: the hard refusals': ('rules', "look = guard.examine(cfg, facts, path, 'path')\n    age", 'look = guard.Look(size=1, newest=0.0)\n    age',
                                Tmp, 'test_the_hard_refusals_hold_here_too'),
     'tmp: the last check before a delete': ('engine', 'refusal = rules.recheck(cfg, facts, item)', 'refusal = None',
                                             Tmp, 'test_everything_is_read_again_just_before_the_delete'),
     'tmp: at least one day': ('config', 'if type(days) is not int or days < 1:', 'if False:', Tmp, 'test_bad_patterns_are_refused'),
     'tmp: a root that is safe': ('config', 'if _holds(root, self.home):', 'if False:', Tmp, 'test_bad_patterns_are_refused'),
     'docker: off by default': ('rules', 'if not cfg.docker_enabled:', 'if False:', Docker, 'test_it_is_off_unless_the_config_turns_it_on'),
-    'docker: off by default in the config': ('config', "'enabled': (bool, False, None)", "'enabled': (bool, True, None)",
+    'docker: off by default in the config': ('config', "'enabled': (bool, False, None),\n    'days': (int, MIN_DOCKER_DAYS",
+                                             "'enabled': (bool, True, None),\n    'days': (int, MIN_DOCKER_DAYS",
                                              Docker, 'test_it_is_off_unless_the_config_turns_it_on'),
     'docker: named never': ('rules', 'if not ANONYMOUS.match(volume.name):', 'if False:', Docker, 'test_a_named_volume_is_never_removed'),
     'docker: used by a container': ('facts', "'--filter', 'dangling=true'", "'--filter', 'dangling=false'",
@@ -846,12 +849,12 @@ MUTATIONS = {
     'tmp: the last check in the temp folder only': ('rules', 'if os.path.dirname(item.path) != cfg.tmp_root:', 'if False:',
                                                     Tmp, 'test_the_last_check_takes_only_entries_of_the_temp_folder'),
     'docker: no --force': ('facts', "'volume', 'rm', name)", "'volume', 'rm', '--force', name)", Docker, 'test_docker_is_asked_again_just_before_the_delete'),
-    'plan deletes nothing': ('engine', "if not really:\n            out(f'would delete", "if False:\n            out(f'would delete", Engine, 'test_plan_changes_nothing_and_writes_no_log'),
+    'plan deletes nothing': ('engine', "if not really:\n            out(f'{would} {told}')", "if False:\n            out(f'{would} {told}')", Engine, 'test_plan_changes_nothing_and_writes_no_log'),
     'plan writes no log': ('engine', 'log = Log(cfg) if really else None', 'log = Log(cfg)', Engine, 'test_plan_changes_nothing_and_writes_no_log'),
-    'one log line per delete': ('engine', "out(f'deleted {told}')", 'pass',
+    'one log line per delete': ('engine', "out(f'{done} {getattr(item, \"result\", None) or told}')", 'pass',
                                 Engine, 'test_run_writes_one_log_line_for_each_delete'),
     'the log is trimmed': ('engine', 'if len(lines) > self.cfg.log_lines:', 'if False:', Engine, 'test_the_log_keeps_its_newest_lines'),
-    'a failed delete fails the run': ('engine', 'failed += 1', 'pass', Engine, 'test_a_delete_that_fails_is_reported_and_the_run_goes_on'),
+    'a failed delete fails the run': ('engine', "failed += 1\n            item.done = 'failed'\n            gone", "item.done = 'failed'\n            gone", Engine, 'test_a_delete_that_fails_is_reported_and_the_run_goes_on'),
     'what it could not read fails the run': ('engine', "unread = unread_journal or any(k.code in ('could not read', 'half deleted') for k in plan.kept)", 'unread = False',
                                              Engine, 'test_what_it_could_not_read_makes_the_run_fail'),
     'one run at a time': ('engine', 'fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)', 'pass', Engine, 'test_two_runs_at_once'),
@@ -862,16 +865,16 @@ MUTATIONS = {
     'the log: never in a must-keep path': ('config', 'if kept is not None or any(', 'if False and any(',
                                            Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
     'the log: never in a root': ('config', 'if _holds(root, own) or _holds(own, root):', 'if False:', Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
-    'the log: deleting before the delete': ('engine', "log.write(one_line(f'deleting {told}'))", 'pass',
+    'the log: deleting before the delete': ('engine', "log.write(one_line(f'{doing} {told}'))", 'pass',
                                             Engine, 'test_run_writes_one_log_line_for_each_delete'),
     'the log: a failed write stops the run': ('engine', "raise LogError(f'the log {self.cfg.log_file}: {ex.strerror}') from None", 'pass',
                                               Engine, 'test_a_log_that_cannot_be_written_stops_the_run_before_the_next_delete'),
     'never as root': ('engine', 'return 2  # root', 'pass', Engine, 'test_it_refuses_to_run_as_root'),
-    'the last check: read anew': ('engine', 'facts.forget()', 'pass', Engine, 'test_the_last_check_reads_the_machine_again'),
+    'the last check: read anew': ('engine', 'facts.forget()                  # the last check reads the machine anew, not what the plan saw', 'pass', Engine, 'test_the_last_check_reads_the_machine_again'),
     'the last check: could not read fails the run': ('engine', "unread = unread or any(item.refusal.code == 'could not read' for item in refused)", 'pass',
                                                      Engine, 'test_what_it_could_not_read_at_the_last_check_makes_the_run_fail'),
     'half deleted: noted before the delete': ('engine', 'journal.append(entry)', 'pass', Engine, 'test_a_delete_that_stopped_part_way_is_named_and_kept'),
-    'half deleted: never deleted again': ('engine', "plan.items = [item for item in plan.items if item.kind == 'volume' or item.path not in halves]", 'pass',
+    'half deleted: never deleted again': ('engine', "plan.items = [item for item in plan.items if item.kind == 'volume' or item.path not in halves or item in finish]", 'pass',
                                           Engine, 'test_a_run_that_was_killed_leaves_its_delete_named'),
     'half deleted: fails the run': ("engine", "k.code in ('could not read', 'half deleted')", "k.code in ('could not read',)",
                                     Engine, 'test_a_delete_that_stopped_part_way_is_named_and_kept'),
@@ -879,7 +882,7 @@ MUTATIONS = {
                                                  Engine, 'test_a_delete_that_stopped_part_way_is_named_and_kept'),
     'half deleted: an unreadable journal stops a run': ('engine', "        if really:\n            out(f'stopped:", "        if False:\n            out(f'stopped:",
                                                         Engine, 'test_a_journal_it_cannot_read_stops_the_run'),
-    'the journal: written before the delete': ('engine', 'journal.append(entry)\n        write_journal(cfg, journal)\n        try:',
+    'the journal: written before the delete': ('engine', 'journal.append(entry)\n            write_journal(cfg, journal)\n        try:',
                                                'journal.append(entry)\n        try:', Engine, 'test_the_journal_names_a_delete_before_it_starts'),
     'the journal: a failed write stops the run': ('engine', "raise LogError(f'the journal {cfg.journal_file}: {ex.strerror}') from None", 'return',
                                                   Engine, 'test_a_journal_that_cannot_be_written_stops_the_run'),
