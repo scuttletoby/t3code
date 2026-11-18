@@ -222,7 +222,7 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc'):
     sources = {(device, root) for _, device, root in lines if root != '/'}
     seen = set()
     try:
-        pids = [name for name in os.listdir(proc) if name.isdigit()] if proc else []
+        pids = sorted((name for name in os.listdir(proc) if name.isdigit()), key=int) if proc else []  # the same answer on any file system
     except OSError:
         pids = []
     for pid in pids:
