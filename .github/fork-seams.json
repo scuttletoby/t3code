@@ -167,15 +167,13 @@
     "apps/server/vite.config.ts": 2,
     "apps/web/src/cloud/linkEnvironment.test.ts": 34,
     "apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx": 277,
-    "apps/web/src/components/ChatMarkdown.tsx": 63,
-    "apps/web/src/components/chat/MarkdownFileLink.logic.ts": 74,
-    "apps/web/src/components/chat/MarkdownFileLink.tsx": 148,
+    "apps/web/src/components/ChatMarkdown.tsx": 39,
+    "apps/web/src/components/chat/MarkdownFileLink.tsx": 32,
     "apps/web/src/components/media/mediaContent.ts": 8,
-    "apps/web/src/components/settings/IntervalSecondsField.tsx": 4,
     "apps/web/src/components/settings/SettingsPanels.tsx": 4,
     "apps/web/src/components/settings/scopedSettings.test.ts": 153,
     "apps/web/src/components/settings/scopedSettings.ts": 9,
-    "apps/web/src/components/settings/settingsSearch.ts": 25,
+    "apps/web/src/components/settings/settingsSearch.ts": 2,
     "apps/web/src/components/settings/useScopedSettings.ts": 27,
     "apps/web/src/index.css": 2,
     "apps/web/src/markdown-links.test.ts": 1,
@@ -325,23 +323,11 @@
       "lines": 9,
       "gone": 9
     },
-    "apps/web/src/components/ChatMarkdown.tsx": {
-      "lines": 2,
-      "gone": 1
-    },
-    "apps/web/src/components/chat/MarkdownFileLink.logic.ts": {
-      "lines": 20,
-      "gone": 18
-    },
     "apps/web/src/components/chat/MarkdownFileLink.tsx": {
-      "lines": 32,
-      "gone": 28
-    },
-    "apps/web/src/components/media/mediaContent.ts": {
       "lines": 1,
       "gone": 1
     },
-    "apps/web/src/components/settings/IntervalSecondsField.tsx": {
+    "apps/web/src/components/media/mediaContent.ts": {
       "lines": 1,
       "gone": 1
     },
