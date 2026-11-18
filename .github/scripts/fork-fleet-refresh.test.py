@@ -737,9 +737,10 @@ class Refresh(unittest.TestCase):
         symlinks (link k goes through link k-1 four times: 4**k steps unbounded), a GNU long-name or pax header of
         1 MiB (tarfile would read it whole, however big), a sparse file of any format (its map is read into memory),
         a name over 4096, too many bytes of long names or pax headers in all (empty ones too), too many bytes of names
-        and link targets in all, a global pax header of too many keys or one that names the entries, headers in a row
-        deeper than tarfile can follow. Each is refused quickly, under a 192 MiB address-space limit; at each budget's
-        exact limit the tarball still gets through."""
+        and link targets in all (as kept in memory), a global pax header of too many keys or with a key tarfile sets
+        on each entry, a size the data does not have (each file after it would decompress the tarball again), a file
+        or special file over MAX_BYTES, headers in a row deeper than tarfile can follow. Each is refused quickly,
+        under a 192 MiB address-space limit; at each budget's exact limit the tarball still gets through."""
         sym, xhd, xgl = tarfile.SYMTYPE, tarfile.XHDTYPE, tarfile.XGLTYPE
         budget = 64 << 20   # the launcher's MAX_NAMES (its MAX_GLOBAL is 64)
         fan = []
@@ -750,16 +751,35 @@ class Refresh(unittest.TestCase):
             m.pax_headers = keys
             return m
 
-        def names(over):
+        def names(over, wide=False):
             """`budget` (+ `over`) bytes of names and link targets, 7000 entries of them in pax headers (64512000
-            bytes counted as headers: under the header budget) and the rest in ustar headers, after a device file: at
-            the limit the read loop ends and the device file is what is refused."""
-            out = [(member('./dev', tarfile.CHRTYPE), None)]
-            out += [(member(f'./{i:05d}'.ljust(4096, 'a'), sym, link='b/' * 2048), None) for i in range(7000)]
+            bytes counted as headers: under the header budget) and the rest in ustar headers, then a device file: at
+            the limit the read loop reaches the device file, which is what is refused. `wide`: 3000 such entries
+            instead, each link target with one 4-byte character, so all its 4096 characters take 4 bytes in memory
+            (its header has 4099 bytes of it)."""
+            n, link = (3000, '\U0001F600' + 'b/' * 2047 + 'b') if wide else (7000, 'b/' * 2048)
+            out = [(member(f'./{i:05d}'.ljust(4096, 'a'), sym, link=link), None) for i in range(n)]
             base = sum(len(m.name) + len(m.linkname) for m in tarfile.open(fileobj=io.BytesIO(hostile([]))))
-            k, r = divmod(budget - base - len('./dev') - 7000 * 8192 - len('./z'), 200)
+            k, r = divmod(budget - base - len('./dev') - n * (4096 + len(link) * (4 if wide else 1)) - len('./z'), 200)
             out += [(member(f'./{i:06d}'.ljust(100, 'c'), sym, link='d' * 100), None) for i in range(k)]
-            return hostile(out + [(member('./z', sym, link='d' * (r + over)), None)], fmt=tarfile.PAX_FORMAT)
+            out += [(member('./z', sym, link='d' * (r + over)), None), (member('./dev', tarfile.CHRTYPE), None)]
+            return hostile(out, fmt=tarfile.PAX_FORMAT)
+
+        def past(local=None, glob=None, n=20):
+            """A 64 MiB file of zeros, then `n` empty files, then 256 KiB of zeros (so a file read past its data
+            does not reach the end). `local`: the pax keys of each empty file (the first one's with GNU.sparse.realsize
+            0, so it would count as 0 bytes); `glob`: a global pax header's. A size its data does not have makes every
+            file after it seek back, and gzip seeks back by decompressing from the start again: about 0.1 s each here,
+            days from a 1 GiB download with 100000 entries."""
+            first = with_pax(member('./bin/filler'), {'GNU.sparse.realsize': '0'} if local else {})
+            files = [(with_pax(member(f'./bin/f{i}'), dict(local or {})), b'') for i in range(n)]
+            return hostile([(first, bytes(64 << 20))] + files + [(member('./bin/tail'), bytes(256 << 10))],
+                           fmt=tarfile.PAX_FORMAT, glob=glob)
+
+        def unwritten(m, size):
+            """`m` with a header of `size` bytes and no data after it (the stream ends first)."""
+            m.size = size
+            return m
 
         # 1024 pax headers of 64915 bytes: each 65536 bytes read (its own block and 127 of data), MAX_NAMES in all.
         at_limit = [(with_pax(member(f'./bin/c{i}'), {'comment': 'x' * 64900}), b'') for i in range(1024)]
@@ -847,7 +867,41 @@ class Refresh(unittest.TestCase):
             'a global pax sparse name': (hostile([(member('./bin/s'), b'')], fmt=tarfile.PAX_FORMAT,
                                                  glob={'GNU.sparse.name': 'a'}),
                                          'a global pax header with GNU.sparse.name'),
+            # Any key tarfile sets on each entry: a uid of 4300 digits is a new int of ~1.9 KB in each of 100000
+            # entries (~190 MB), from a 470 KB download.
+            'a global pax uid': (hostile([(member(f'./bin/{i}', tarfile.DIRTYPE), None) for i in range(99990)],
+                                         fmt=tarfile.PAX_FORMAT, glob={'uid': '9' * 4300}),
+                                 'a global pax header with uid'),
+            'a global pax gid': (hostile([(member('./bin/g'), b'')], fmt=tarfile.PAX_FORMAT, glob={'gid': '0'}),
+                                 'a global pax header with gid'),
+            # A size the data does not have (see past): a global size, or GNU.sparse.realsize, global or on an entry.
+            'a global pax size': (past(glob={'size': '200000'}), 'a global pax header with size'),
+            'a global pax GNU.sparse.realsize': (past(glob={'GNU.sparse.realsize': '200000'}),
+                                                 'a global pax header with GNU.sparse.realsize'),
+            'a pax realsize past the data': (past({'GNU.sparse.realsize': '200000'}),
+                                             "'./bin/filler' has a size its data does not have"),
+            'a pax realsize just past the buffer': (past({'GNU.sparse.realsize': '10000'}),
+                                                    "'./bin/filler' has a size its data does not have"),
+            # Even one that matches the data (so the offset check passes): a runner release has none.
+            'a pax realsize': (hostile([(with_pax(member('./bin/r'), {'GNU.sparse.realsize': '1'}), b'x')],
+                                       fmt=tarfile.PAX_FORMAT), 'has a pax GNU.sparse.realsize'),
+            # int() refuses more than 4300 digits with a ValueError: refused, not a traceback.
+            'a realsize of 5000 digits': (hostile([(with_pax(member('./bin/r'), {'GNU.sparse.realsize': '9' * 5000}),
+                                                    b'')], fmt=tarfile.PAX_FORMAT), 'not a gzip tarball'),
+            # Refused at its header, before its data is decompressed (here the stream ends first, so a check after
+            # the read loop would never see it).
+            'a file over MAX_BYTES': (hostile([(unwritten(member('./bin/big'), 5 << 30), None)]),
+                                      'more than 4294967296 bytes of files'),
+            'a special file over MAX_BYTES': (hostile([(unwritten(member('./bin/odd', b'Z'), 5 << 30), None)]),
+                                              "'./bin/odd' is a special file"),
+            # The names total counts what a name takes in memory: one 4-byte character makes the whole str 4 bytes a
+            # character (and costs its header 3 bytes more).
+            'wide names of MAX_NAMES bytes': (names(0, wide=True), 'is a device file'),
+            'wide names of one byte more': (names(1, wide=True), 'bytes of names and link targets'),
         }
+        # Refused at once (a fraction of a second of CPU), not after the work they would cause.
+        quick = {'a global pax size', 'a global pax GNU.sparse.realsize', 'a pax realsize past the data',
+                 'a pax realsize just past the buffer', 'a file over MAX_BYTES', 'a special file over MAX_BYTES'}
         limit = lambda: resource.setrlimit(resource.RLIMIT_AS, (192 << 20, 192 << 20))
         for name, (data, word) in cases.items():
             with self.subTest(name):
@@ -855,12 +909,15 @@ class Refresh(unittest.TestCase):
                 with open(src, 'wb') as f:
                     f.write(data)
                 os.mkdir(dest)
-                t = time.monotonic()
+                t, cpu = time.monotonic(), resource.getrusage(resource.RUSAGE_CHILDREN)
                 got = subprocess.run(['python3', '-I', '-c', unpack_code(), src, dest, NEW, ''], capture_output=True,
                                      text=True, timeout=60, preexec_fn=limit)
                 self.assertNotIn('Traceback', got.stderr)
                 self.assertNotIn('MemoryError', got.stderr)
                 self.assertLess(time.monotonic() - t, 20)
+                if name in quick:   # CPU time, not wall clock: a loaded machine does not make it flaky
+                    now = resource.getrusage(resource.RUSAGE_CHILDREN)
+                    self.assertLess(now.ru_utime + now.ru_stime - cpu.ru_utime - cpu.ru_stime, 0.5, got.stderr)
                 if word is None:
                     self.assertEqual(got.returncode, 0, got.stderr)
                     self.assertIn('run.sh', os.listdir(dest))
