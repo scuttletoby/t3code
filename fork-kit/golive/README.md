@@ -256,8 +256,10 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   bind mount of any folder inside the live home, at the backups folder say, keeps the device and gives no id the
   kit compares, but its mountinfo line names the folder it came from, so the folder the rehearsal folder is on its
   filesystem must be apart from each folder of the live data: the home, where its `userdata` really is (a link
-  elsewhere, or its own partition), and every mount at or under either; the mount that holds a path is the one on
-  top, found by the mount tree (mount id and parent id), not by the list's order, which a moved mount or one placed
+  elsewhere, or its own partition), where each link in `userdata` leads (any depth the copy walks; the live T3
+  reads and writes there, so the rehearsal folder may neither be inside such a target nor hold one, a dangling one
+  too, by real path and file id as well), and every mount at or under any of these; the mount that holds a path is
+  the one on top, found by the mount tree (mount id and parent id), not by the list's order, which a moved mount or one placed
   beneath another does not keep: from the one mount above the path with no parent listed, into the child above the
   path with the shortest mount point, until none; where the tree cannot tell (a parent missing, a cycle, two
   mounts on one point with one parent) the run is refused); an old one is a real folder (no link) that bears the kit's
@@ -265,15 +267,27 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   point at or under it in the system's mount list (`/proc/self/mountinfo`: a bind mount of the same filesystem keeps
   its device id), and no link to another home's ownership lock; no server holds it; the copy is not inside it (nor
   a link into it); the port is free and is neither the live port nor 3773; `backupDir` holds 3 x the copy plus the
-  floor. Where the mount list cannot be read or is empty (any OS but Linux, no `/proc`), every run is refused before
+  floor; the copy's `settings.json` and database are not links out of the copy (below). Where the mount list
+  cannot be read or is empty (any OS but Linux, no `/proc`), every run is refused before
   any step: rehearse cannot run on that system at all (it cannot tell a bind mount), and removing an old rehearsal
   folder by hand does not change that. Where reading it failed this time (too many open files, say), the refusal
   names the error: run again. **R0 on the clone**: the clone leaves out
   `secrets/` and the live machine's process records (`device/`, `relay-clients/`), with what a copy never holds
   (`server-runtime.json`, the ownership lock); it reads back against the manifest and is checked to hold none of
-  those: a runtime record would point the CLI at the LIVE server; and it is apart from the live data as above (if
-  not, the run fails: only the rehearsal folder was redone, any previous one removed and the clone made; nothing ran
-  on it).
+  those: a runtime record would point the CLI at the LIVE server; it holds no link (any depth) that leads out of it
+  (the message says when one leads into the live home); and it is apart from the live data as above (if not, the
+  run fails: only the rehearsal folder was redone, any previous one removed and the clone made; nothing ran on it).
+- **Links in the copy**: a copy keeps links as links, with their targets. The clone leaves out each link that
+  leads out of its own tree: an absolute target (in a clone it still names the live place), a `..` above
+  `userdata`, a link through such a link (`a -> b`, `b -> /x`; a `..` after a link applies to where that link
+  leads), a loop, a dangling link out (the clone's server could make it). Links that stay inside (dangling ones too)
+  are kept. The copy decides this on its own plan, before it makes anything, so a link added to the copy after R0 is
+  left out as well. Each one left out is printed, journalled with the clone step and in the result (`leftOut`). They
+  are left out, not refused, because upstream T3 makes such links itself (its speech models can be absolute links
+  to model files elsewhere, in `userdata/speech/models`); refusing them would block a normal home. `settings.json`
+  and the database are refused in R0 instead when they are links out of the copy (upstream allows a linked
+  `settings.json` and writes through it): the rehearsal reads and checks them, and the copy holds only the link;
+  make it a file in the live home and take a new copy.
 - **The clone step** runs the old-folder guard again right before it removes anything (a mount or a swap since R0
   is caught), then removes the old folder with its mark last: it opens the folder without following a link, checks
   it is the one the guard checked (device and inode), and removes its contents through that handle, so a swap of the
@@ -282,7 +296,9 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   reached through a second mount of their own (NFS mounted twice, a FUSE or bindfs view, a Windows drive mounted
   twice on WSL) are not caught: keep `backupDir` off any such second view of the live home. Only the kit's own mount
   view is read: a live service with its own mount namespace (systemd `BindPaths=`, say) can see the live data at a
-  path the kit does not know. The guard takes the old
+  path the kit does not know, and the mount-list check does not see it. Links in the live `userdata` are walked at
+  every depth the copy walks, but not inside a folder a link leads to (`attachments -> /other`, then a link in
+  `/other`): keep `backupDir` apart from those too. The guard takes the old
   folder's identity first and then checks by path: a swap still there at its end is refused, a swap away and back
   during it (a same-user process racing the kit) is not. A mount made inside the old folder after the guard (root
   only) is not checked by the removal, and the last `rmdir` goes by path (it only ever removes an empty folder).
@@ -331,6 +347,11 @@ reusing one half-migrated. A run that needs settling still blocks it.
 | Live home by a link or bind path, or bound in a clone   | Refused (real path; file ids both ways and inside) before any removal         |
 | `backupDir` a bind of a folder inside the live home     | Refused before any step (mount list: the folder each is on its filesystem)    |
 | `backupDir` a bind from `userdata`'s own partition      | Refused before any step (and from a link's target, any mount under the home)  |
+| A live `userdata` link into or around the folder        | Refused before any step, any depth, dangling too; the old folder is kept      |
+| Such a link added after R0                              | The clone step's guard, or R0 on the clone, fails the run; nothing ran on it  |
+| A link in the copy leads out of it                      | Left out of the clone and named (also one added after R0)                     |
+| The copy's `settings.json` or database a link out       | Refused before any step: make it a file and take a new copy                   |
+| An old clone holding links out                          | Removed as any old clone: the removal never follows a link                    |
 | Copy with no manifest, not matching it, of another home | Refused (`--copy` or `t3-golive copy`)                                        |
 | Copy from another build than the live one               | Refused: take a new copy                                                      |
 | Port taken between the check and the start              | The server exits; R3 fails, the rerun passes once the port is free            |
