@@ -196,6 +196,8 @@ def _checks(cfg, adapter, result, add, info, own_id):
                 add('T3 steady during the report', False, f'{changed}: T3 stopped, restarted or began an update '
                                                           'while the report read its home, so its answer is not '
                                                           'used; run check again once T3 runs steadily')
+                for key in REPORT_ANSWERS:  # not used, so not handed on either (--json, and any caller)
+                    result.pop(key, None)
 
     ok = all_ok()
     result['ok'] = ok
@@ -205,6 +207,7 @@ def _checks(cfg, adapter, result, add, info, own_id):
 
 
 STEADY = ('boot service', 'live server', 'no update in flight', 'no half switch', 'no markers')
+REPORT_ANSWERS = ('counts', 'pendingMigrations', 'providers')  # what _report takes from the report into the result
 
 
 def server_changed(cfg, adapter, server):

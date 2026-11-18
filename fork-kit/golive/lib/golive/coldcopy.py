@@ -378,19 +378,23 @@ def _read_record(home, copy_dir=None):
     need not go back). A kept file gone while the home's file of that name holds the bytes of a copy's file (by the
     copy's manifest; one the record's copies restored, or copy_dir) and the kept file did not ('sums') is not moved
     back: it was deleted, and the home holds the half-way home's file. When a copy the record names cannot be read,
-    a kept file gone is taken as moved back only when the home's file holds the kept file's bytes ('sums'). And the
+    a kept file gone is taken as moved back only when the home's file holds the kept file's bytes ('sums'). The same
+    for a kept -wal gone while the home's -wal begins with the header of a copy's -wal: the copy's frames with a
+    T3's after them, or the old WAL moved back and appended to since (a WAL the copy was taken with keeps its
+    header), which cannot be told apart (fork #300). And the
     home then holds no -wal, -journal or -shm of a database the record names that the old home did not have: such a
     file is the half-way home's (the copy's WAL, or what a T3 started after the stop wrote), and next to the old
     database it would serve, or on the first checkpoint write, another database's pages.
     No kept file gone, and each (but a -shm) holding the same bytes as the home's file of its name: copied back, or
     a restore stopped once its kept files were written. The home is then the old home and the record stays live
-    (a rerun keeps nothing again), but the same check for a file the old home did not have runs.
+    (a rerun names its kept files as the old home again), but the same check for a file the old home did not have
+    runs.
     RuntimeError, before any data changes, when the record cannot be read, or the old home is put back only in part (a
     rerun would keep that mix as the old home and name no more the kept files still out, such as the WAL with the
     commits), or a file of the half-way home is left beside it; the message names the files and whose each is: the
-    copy's by its SHA256 (remove it, keep the record), the copy's with more frames by its WAL header (move it out,
-    keep the record), a stray -shm (always safe to remove), or one that cannot be told (both readings, and how to
-    tell them apart on scratch copies)."""
+    copy's by its SHA256 or the copy's with more frames by its WAL header (move it out of userdata, keep the
+    record), a stray -shm (always safe to remove), or one that cannot be told (both readings, and how to tell them
+    apart on scratch copies)."""
     userdata = os.path.join(home, 'userdata')
     path = os.path.join(userdata, RESTORE_MARK)
     try:
@@ -424,9 +428,9 @@ def _read_record(home, copy_dir=None):
         kept = [n for n in mark['oldHome'] if not base(n).endswith('-shm')]
         if foreign and kept and all(_same_file(os.path.join(userdata, n), os.path.join(userdata, base(n)))
                                     for n in kept):
-            _refuse_foreign(path, userdata, mark, copy_dir, foreign)
+            _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved=False)
         return mark, False
-    sums, unread, _ = _copy_sums(mark, copy_dir)
+    sums, unread, heads = _copy_sums(mark, copy_dir)
     kept_sums = mark.get('sums', {})
     def copys(name, digest):
         return digest is not None and digest in sums.get(name, ())
@@ -435,6 +439,7 @@ def _read_record(home, copy_dir=None):
     lost = [n for n in gone if not base(n).endswith('-shm') and not os.path.lexists(os.path.join(userdata, base(n)))]
     lost_copy = []  # deleted: the home's file of that name is the copy's, and the kept one was not
     unknown = []  # a copy cannot be read, and the home's file is not the kept bytes: moved back or deleted?
+    appended = []  # a -wal, not the kept bytes, that begins with a copy's WAL header: moved back or deleted?
     for n in gone:
         if base(n).endswith('-shm') or n in lost:
             continue
@@ -443,7 +448,12 @@ def _read_record(home, copy_dir=None):
             lost_copy.append(n)
         elif unread and digest is not None and kept_sums.get(n) != digest:
             unknown.append(n)
-    if out or lost or lost_copy or unknown:
+        elif (base(n).endswith('-wal') and digest is not None and kept_sums.get(n) != digest
+              and _wal_head(os.path.join(userdata, base(n))) in heads.get(base(n), ())):
+            # Fork #300: the copy's frames with a T3's after them (the kept -wal was deleted), or the old WAL moved
+            # back and appended to since: a WAL the copy was taken with keeps its header, so the header cannot say.
+            appended.append(n)
+    if out or lost or lost_copy or unknown or appended:
         said = ([f'{", ".join(out)} not back in the home'] if out else []) \
             + ([f'{", ".join(lost)} gone from the home too'] if lost else []) \
             + ([f'{", ".join(lost_copy)} not moved back: the home\'s '
@@ -455,14 +465,25 @@ def _read_record(home, copy_dir=None):
                 f'readable manifest in {", ".join(unread)} it cannot be told whether {_them(unknown, "it", "they")} '
                 f'{_them(unknown, "was", "were")} moved back and written since, or deleted with the half-way home\'s '
                 f'file left in {_them(unknown, "its", "their")} place; to tell a database or its -wal, ' + _SCRATCH]
-               if unknown else [])
+               if unknown else []) \
+            + ([f'{", ".join(appended)}: the home\'s {", ".join(base(n) for n in appended)} '
+                f'{_them(appended, "does", "do")} not hold the kept bytes (the SHA256 in the record) and '
+                f'{_them(appended, "begins", "begin")} with the header (salts included) of a copy\'s -wal, so it '
+                f'cannot be told whether {_them(appended, "it", "they")} {_them(appended, "was", "were")} moved back '
+                f'and a T3 appended to {_them(appended)} since (a WAL the copy was taken with keeps its header; the '
+                f'home is then the old home: keep {_them(appended)} and remove the record), or deleted with the '
+                'half-way home\'s WAL (the copy\'s frames, then what a T3 wrote) left in '
+                f'{_them(appended, "its", "their")} place (what only the kept -wal held is then gone unless that '
+                f'file can be got back, and the home\'s -wal is not the old home\'s: move {_them(appended)} out of '
+                f'userdata (do not delete {_them(appended)}), then remove the record). Whoever put the files back '
+                'knows which; if not, ' + _SCRATCH] if appended else [])
         raise RuntimeError(f'{path} names the kept files of the old home, but they are only partly put back '
                            f'({", ".join(gone)} gone from the kept files; ' + '; '.join(said) + '): '
                            'finish putting the kept files back (a rerun then names any -wal, -journal or -shm left '
                            'in the home that the old home did not have), or remove the record once the home is '
                            'right; nothing was changed')
     if foreign:
-        _refuse_foreign(path, userdata, mark, copy_dir, foreign)
+        _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved=True)
     return mark, True
 
 
@@ -472,10 +493,14 @@ _SCRATCH = ('open scratch copies, never the files in the home: copy the database
             'rows; a WAL of the copy\'s database gives the copy\'s rows, or fewer than the database alone')
 
 
-def _refuse_foreign(path, userdata, mark, copy_dir, foreign):
+def _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved):
     """Raise the RuntimeError that names each -wal, -journal or -shm in the home the old home did not have, and
     whose it is: the copy's (its manifest SHA256), the copy's with more frames after them (a -wal that begins with
-    the header of a copy's -wal: a T3 ran on the half-way home), a stray -shm, or one that cannot be told."""
+    the header of a copy's -wal: a T3 ran on the half-way home), a stray -shm, or one that cannot be told. `moved`:
+    the kept files were moved back (the rerun then finds the record stale), not copied back (the kept files are
+    still there, so the record stays live and the rerun names them as the old home)."""
+    then = ('the record is then stale: the home is kept as the old home' if moved else
+            'the record stays live: the rerun names its kept files as the old home')
     sums, unread, heads = _copy_sums(mark, copy_dir)
     wals = [c for c in foreign if not c.endswith('-shm')]
     theirs = [c for c in wals if sums.get(c, set()) & {_file_sum(os.path.join(userdata, c))} - {None}]
@@ -495,10 +520,9 @@ def _refuse_foreign(path, userdata, mark, copy_dir, foreign):
     if groups['copy']:
         g = groups['copy']
         said.append(f'{", ".join(g)} {_them(g, "is", "are")} the copy\'s (the same SHA256 as in its manifest; '
-                    f'a -shm goes with its -wal), left from the restore stopped half-way: remove {_them(g)}, '
-                    'and do NOT remove the record (beside the old database the copy\'s WAL would serve or '
-                    'checkpoint another database\'s pages); then run the restore again (the record is then '
-                    'stale)')
+                    f'a -shm goes with its -wal), left from the restore stopped half-way: move {_them(g)} out of '
+                    'userdata, and do NOT remove the record (beside the old database the copy\'s WAL would serve '
+                    f'or checkpoint another database\'s pages); then run the restore again ({then})')
     if groups['mixed']:
         g = groups['mixed']
         said.append(f'{", ".join(g)} {_them(g, "is", "are")} the copy\'s WAL with more commits after its frames '
@@ -507,7 +531,7 @@ def _refuse_foreign(path, userdata, mark, copy_dir, foreign):
                     'Beside the old database it would serve or checkpoint the copy\'s pages: move '
                     f'{_them(g)} out of userdata (keep {_them(g)} only if you want what that T3 wrote on the copy\'s '
                     'database; it is not the old home\'s), do NOT remove the record, then run the restore again '
-                    '(the record is then stale)')
+                    f'({then})')
     if groups['unsure']:
         g = groups['unsure']
         why = (f'no readable manifest in {", ".join(unread)}, so the copy\'s files are unknown' if unread else
@@ -952,8 +976,9 @@ def _home_problem(cfg):
         except (RuntimeError, OSError) as e:
             looked = f'. What the home holds now: {e}'
         return (f'a restore stopped half-way ({os.path.join(userdata, RESTORE_MARK)} is there): if the kept files '
-                'it names are back in the home, remove it (first remove any -wal or -journal of the copy left beside '
-                f'the old database: a restore run names them); otherwise run the restore again; then copy{looked}')
+                'it names are back in the home, remove it (first move out of userdata any -wal or -journal of the '
+                'copy left beside the old database: a restore run names them); otherwise run the restore again; '
+                f'then copy{looked}')
     return None
 
 
