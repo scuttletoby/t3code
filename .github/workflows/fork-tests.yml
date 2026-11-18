@@ -77,7 +77,7 @@ concurrency:
 # its own, and its code runs as soon as a maintainer approves the run. The real protection here is
 # the repository's approval setting (approval for every outside contributor): keep it on, and never
 # approve an outside pull request's run; push its branch to this repository after review instead.
-# (fork-checks.yml is different: pull_request_target always runs main's copy.)
+# (fork-checks.yml is different: pull_request_target always runs the base branch's copy.)
 jobs:
   # Fails on purpose: an outside pull request is not tested here, see above.
   outside_pr:
@@ -246,8 +246,13 @@ jobs:
 
   # fork-checks.yml runs on pull_request_target, which GitHub blocks unless the repository's Actions
   # policy allows it (#401, .github/fork-actions-policies.json); its checks are not required, so a
-  # blocked run would pass unseen. This job waits (capped) for its check run on the pull request's
-  # head, and fork_ci_result needs it. Other events: the script logs a skip and passes.
+  # blocked, failed or cancelled run would pass unseen. This job waits (capped) for its check run on
+  # the pull request's head to pass, in a run of this pull request (PR_NUMBER, #433), judged by the
+  # config on the pull request's base commit (#430), and fork_ci_result needs it. Other events: a called run (release) logs a skip; a direct run passes
+  # only on the default branch. Checks out without a token (the shared plain-git step: actions/checkout
+  # with persist-credentials: false fails on upstream's gitlinks); the script fetches the base commit.
+  # fork-contracts.test.py pins this job (if, env, steps, no continue-on-error, cap below the timeout).
+  # The checkout and the base fetch use no token, so this job works only in a public repository.
   fork_checks_ran:
     name: Fork checks ran
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
@@ -259,18 +264,37 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          sparse-checkout: |
-            /.github/fork-actions-policies.json
-            /.github/scripts/fork-checks-ran.py
-          sparse-checkout-cone-mode: false
+        shell: bash
+        env:
+          REF: ${{ github.sha }}
+          HISTORY: tip
+          SPARSE: /.github/scripts/
+        run: |
+          set -euo pipefail
+          [[ -n "$REF" ]] || { echo "::error::No commit or branch to check out." >&2; exit 1; }
+          case "$HISTORY" in
+            full) history=(--filter=blob:none) ;;
+            tip) history=(--depth=1 --filter=blob:none) ;;
+            *) echo "::error::HISTORY is full or tip, not '$HISTORY'." >&2; exit 1 ;;
+          esac
+          read -r -a sparse <<< "$SPARSE"
+          git init -q
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          # A name is a branch, fetched as refs/heads/<name>: a bare name would take a tag of the same
+          # name first.
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then src="$REF"; else src="refs/heads/$REF"; fi
+          git fetch -q --no-tags --no-recurse-submodules "${history[@]}" origin "$src"
+          if (( ${#sparse[@]} )); then git sparse-checkout set --no-cone "${sparse[@]}"; fi
+          git checkout -q --detach FETCH_HEAD
 
-      - name: Require a fork-checks check run on the head commit
+      - name: Require fork-checks to pass on the head commit
         env:
           EVENT_NAME: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           OUTSIDE_PR: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/fork-checks-ran.py
 
