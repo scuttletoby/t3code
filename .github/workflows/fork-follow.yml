@@ -100,7 +100,7 @@ jobs:
       # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
       # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
       # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
-      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout but in fork_checks_ran.
       - name: Checkout
         shell: bash
         env:
@@ -176,7 +176,7 @@ jobs:
       # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
       # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
       # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
-      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout but in fork_checks_ran.
       - name: Checkout
         shell: bash
         env:
@@ -337,7 +337,7 @@ jobs:
       # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
       # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
       # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
-      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout but in fork_checks_ran.
       - name: Checkout
         shell: bash
         env:
@@ -443,7 +443,7 @@ jobs:
       # .gitmodules, and checkout's credential cleanup (persist-credentials: false) runs `git
       # submodule foreach`, which fails on them, sparse checkout or not. The repository is public,
       # so no token is used. Every job of fork-follow.yml and fork-release.yml checks out with this
-      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout.
+      # same step (fork-contracts.test.py); fork-tests.yml keeps actions/checkout but in fork_checks_ran.
       - name: Checkout
         shell: bash
         env:

@@ -298,7 +298,8 @@ Setup (the repository owner's steps; nothing here creates them):
    blocked again, and a blocked run is only a failed run that nothing
    requires; this fork lists its allowed files in
    `.github/fork-actions-policies.json` and fails its required check when
-   `fork-checks.yml` did not run (`fork-checks-ran.py`, issue 401).
+   `fork-checks.yml` did not run and pass (`fork-checks-ran.py`, issues 401
+   and 430).
 5. Dispatch it once without a number (the backfill), so open pull requests get
    the check under its name.
 6. Bind the required check to the App: in a ruleset, the required status
