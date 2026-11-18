@@ -1,0 +1,12 @@
+# cleaner kit: written by fork-cleaner-install. Do not edit: run the installer again.
+[Unit]
+Description=fork-cleaner daily: plan or run, report, compare (fork-kit/cleaner; cleaner.daily of the machine file)
+# runs the release in use; without one (an uninstall half-way) it does nothing
+ConditionPathExists=/usr/local/libexec/fork-cleaner/current/bin/fork-cleaner
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/fork-cleaner/current/bin/fork-cleaner daily
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

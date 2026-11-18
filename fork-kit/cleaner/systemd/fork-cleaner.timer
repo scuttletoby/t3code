@@ -1,0 +1,11 @@
+# cleaner kit: written by fork-cleaner-install. Do not edit: run the installer again.
+[Unit]
+Description=fork-cleaner daily, once a day (fork-kit/cleaner)
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
