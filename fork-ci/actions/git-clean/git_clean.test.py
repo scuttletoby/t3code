@@ -699,7 +699,7 @@ class FixedGitConfig(Base):
         import pr_queue
         import head_gate
         q = object.__new__(pr_queue.Queue)
-        q.cache, q.read_token = os.path.join(self.d, 'cache', 'repo.git'), None
+        q.cache, q.read_token, q.remote = os.path.join(self.d, 'cache', 'repo.git'), None, 'https://github.com/o/r.git'
         with unittest.mock.patch.dict(os.environ, self.hostile), \
                 unittest.mock.patch('sys.stdout', new_callable=io.StringIO) as out:
             self.assertTrue(q.own_cache(), out.getvalue())                      # git init --bare
