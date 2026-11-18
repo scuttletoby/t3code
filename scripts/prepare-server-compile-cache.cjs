@@ -62,7 +62,10 @@ module.exports = async ({ appOutDir, electronPlatformName, arch, packager }) => 
       runner,
       `require(${JSON.stringify(helper)}).generatePreparedServerCache(${JSON.stringify(resources)}).then(()=>process.exit(0),e=>{console.error(e);process.exit(1)})`,
     );
-    result = spawnSync(executable, [runner], { env, encoding: "utf8", timeout: 120000 });
+    // Under Rosetta the x64 engine runs translated; on a small arm64 runner (3 vCPU) that alone
+    // takes close to two minutes, so it gets three times the native limit.
+    const timeout = runsWithRosetta ? 360000 : 120000;
+    result = spawnSync(executable, [runner], { env, encoding: "utf8", timeout });
   } finally {
     fs.rmSync(state, { recursive: true, force: true });
   }
