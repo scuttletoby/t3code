@@ -1,6 +1,8 @@
 """Shared pieces of the cleaner kit's tests. Everything lives in one temporary folder per test: a fake home, a fake
 temp folder, a folder of git clones and worktrees whose "GitHub" is a bare repository reached through a
-url.insteadOf rule (so remote.origin.url is a real GitHub URL), stub `gh` and `docker` commands, and a fake /proc.
+url.insteadOf rule (so remote.origin.url is a real GitHub URL), stub `gh`, `docker` and `ssh` commands, and a fake
+/proc. The rule rewrites GitHub to ssh://github.invalid/<the bare repository>, and the ssh stub runs git's own
+server command on this machine: to the cleaner it is a remote on another machine, as GitHub is.
 Nothing here reads or changes a real worktree, real Docker, the real process list or anything in the real temp
 folder but the test's own folder. Git reads only the test's own config.
 """
@@ -102,6 +104,14 @@ else:
 '''
 
 
+# `ssh [options] host "git-upload-pack '/path'"`: run the last argument here, as git's own subcommand.
+STUB_SSH = r'''#!/bin/sh
+for last; do :; done
+case "$last" in git-upload-pack\ *|git-receive-pack\ *) ;; *) echo "ssh stub: $last" >&2; exit 255 ;; esac
+exec sh -c "git ${last#git-}"
+'''
+
+
 class Case(unittest.TestCase):
     """One temporary folder, a config over it, fake facts. Subclasses set `c` to the loaded kit."""
     c = None
@@ -116,7 +126,11 @@ class Case(unittest.TestCase):
         with open(self.path('gitconfig'), 'w') as f:
             f.write('[user]\n\tname = test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n'
                     '[advice]\n\tdetachedHead = false\n[commit]\n\tgpgsign = false\n'
-                    f'[url "{self.dir}/gh/"]\n\tinsteadOf = https://github.com/\n')
+                    f'[url "ssh://github.invalid{self.dir}/gh/"]\n\tinsteadOf = https://github.com/\n'
+                    f'[core]\n\tsshCommand = {self.path("bin-ssh")}\n[ssh]\n\tvariant = ssh\n')
+        with open(self.path('bin-ssh'), 'w') as f:
+            f.write(STUB_SSH)
+        os.chmod(self.path('bin-ssh'), 0o755)
         env = mock.patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': self.path('gitconfig'), 'GIT_CONFIG_NOSYSTEM': '1',
                                            'HOME': self.home})
         env.start()
@@ -127,6 +141,7 @@ class Case(unittest.TestCase):
         self.merged, self.open = [], []
         self.busy, self.unit_names, self.locks, self.texts = set(), set(), set(), []
         self.mount_points = {'/'}
+        self.mount_lines, self.bind_sources = [], set()     # (point, device, root) and (device, root)
         # Tests set a file's age with its modification time. The kit also counts the inode change time, which no
         # test can set, so the tests read the modification time alone; one test puts the real reader back.
         self.real_changed = self.c.guard.changed
@@ -195,7 +210,7 @@ class Case(unittest.TestCase):
     def facts(self, cfg, **over):
         readers = {'processes': self.processes, 'units': lambda: set(self.unit_names),
                    'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
-                   'dangling': lambda: [], 'now': self.now, 'mounts': lambda: set(self.mount_points)}
+                   'dangling': lambda: [], 'now': self.now, 'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):
@@ -218,7 +233,7 @@ class Case(unittest.TestCase):
 
     def assertDeletes(self, plan, path, rule=None):
         found = [i for i in plan.items if i.path == path]
-        self.assertEqual(len(found), 1, f'{path} is not in the plan; kept: {[k for k in plan.kept if k.path == path]}')
+        self.assertEqual(len(found), 1, f"{path} is not in the plan; kept: {[(k.code, k.detail) for k in plan.kept if k.path == path]}")
         if rule:
             self.assertEqual(found[0].rule, rule)
         return found[0]

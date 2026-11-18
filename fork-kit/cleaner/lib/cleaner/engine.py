@@ -104,6 +104,9 @@ class Log:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        problem = log_problem(path=cfg.log_file)        # before anything is made next to a file that is not the log
+        if problem is not None:
+            raise ForeignLog(problem)
         os.makedirs(os.path.dirname(cfg.log_file), mode=0o700, exist_ok=True)
         self.lock = os.open(cfg.lock_file, os.O_RDWR | NEW, 0o600)
         try:
@@ -284,6 +287,11 @@ def _execute(cfg, facts, really, say, log):
     if really and journal != entries:
         write_journal(cfg, journal)
     plan = rules.plan(cfg, facts, measure=not really)
+    if unread_journal:              # a plan only: anything may be half deleted, so nothing would be deleted
+        plan.kept += [rules.Kept(item.path, item.rule, 'could not read', 'the journal of deletes in progress cannot '
+                                 'be read, and it may name this as half deleted', item.size)
+                      for item in plan.items if item.kind != 'volume']
+        plan.items = [item for item in plan.items if item.kind == 'volume']
     halves = {kept.path for kept in half}
     plan.items = [item for item in plan.items if item.kind == 'volume' or item.path not in halves]
     plan.kept = [kept for kept in plan.kept if kept.rule == 'docker' or kept.path not in halves] + half

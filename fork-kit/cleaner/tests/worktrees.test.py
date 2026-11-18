@@ -14,11 +14,48 @@ import cleaner_fixture as fx  # noqa: E402
 import machine_file  # noqa: E402
 
 
+STUB_GIT = r'''#!{python} -I
+import json, os, sys
+with open({state!r}) as f:
+    state = json.load(f)
+if 'worktree' in sys.argv and 'remove' in sys.argv:
+    if state['remove'] == 'killed':
+        os.kill(os.getpid(), 9)
+    sys.stderr.write("fatal: failed to delete '" + sys.argv[-1] + "': Device or resource busy\n")
+    sys.exit(128)
+os.execv(state['git'], [state['git']] + sys.argv[1:])
+'''
+
+
 class Case(fx.Case):
     c = fx.load()
 
     def planned(self, **over):
         return self.plan(self.repo_cfg(), **over)
+
+    def swap_after_the_last_check(self, path, swap):
+        """rules.recheck as it is, then `swap(path)`: the folder changes between the last check and the delete."""
+        real = self.c.rules.recheck
+
+        def recheck(cfg, facts, item):
+            refusal = real(cfg, facts, item)
+            if refusal is None and item.path == path:
+                swap(path)
+            return refusal
+        return mock.patch.object(self.c.rules, 'recheck', recheck)
+
+    def precious(self):
+        return self.file(self.path('home', '.claude', 'projects', 'p', 'session.jsonl'), 'transcript\n')
+
+    def assertNothingRemoved(self, code, lines, *texts):
+        self.assertEqual(code, 1, lines)
+        failed = [line for line in lines if line.startswith('FAILED ')]
+        self.assertEqual(len(failed), 1, lines)
+        self.assertIn('is not what the last check saw', failed[0])
+        self.assertNotIn('half deleted', failed[0])
+        for path, text in texts:
+            with open(path) as f:
+                self.assertEqual(f.read(), text)
 
     def git_dir(self, tree):
         return self.git(tree, 'rev-parse', '--absolute-git-dir')
@@ -281,6 +318,94 @@ class Worktrees(Case):
         self.assertEqual(code, 1, lines)
         self.assertFalse(os.path.exists(tree))
 
+    def test_a_worktree_swapped_after_the_last_check_is_never_followed(self):
+        """The lens probe for worktrees: after the last check, the folder is replaced by a link to another worktree
+        that must stay (an open pull request), or to a must-keep folder. Git is never asked to remove it."""
+        tree = self.finished()
+        other = self.finished('fix-2', number=8)
+        self.pr(other, 9, state='open')
+        mark = self.file(os.path.join(other, 'kept.txt'), 'other work\n')
+        precious = self.precious()
+        cfg = self.repo_cfg()
+        for target in (other, os.path.dirname(precious)):
+            with self.subTest(target=target):
+                def swap(path):
+                    os.rename(path, self.path('moved'))
+                    os.symlink(target, path)
+                with self.swap_after_the_last_check(tree, swap):
+                    code, lines = self.run_cleaner(cfg)
+                self.assertNothingRemoved(code, lines, (mark, 'other work\n'), (precious, 'transcript\n'))
+                self.assertIn(other, self.git(other, 'worktree', 'list', '--porcelain'))
+                os.unlink(tree)
+                os.rename(self.path('moved'), tree)
+
+    def test_git_that_cannot_find_the_clone_removes_nothing(self):
+        """The last step before git removes a worktree asks git where its clone is: when that fails, nothing was
+        touched, so it is no "half deleted" but a plain "could not read"."""
+        tree = self.finished()
+        cfg = self.repo_cfg()
+        facts = self.facts(cfg)
+        plan = self.c.rules.plan(cfg, facts)
+        real = self.c.rules.git
+
+        def git(where, *args, **kw):
+            if '--git-common-dir' in args:
+                raise self.c.facts.Unreadable('exit 128: fatal: not a git repository')
+            return real(where, *args, **kw)
+        with mock.patch.object(self.c.rules, 'recheck', lambda *a: None), mock.patch.object(self.c.rules, 'git', git):
+            failed, lines = self.delete_all(cfg, facts, plan.items)
+        self.assertEqual([line.split()[0] for line in lines], ['FAILED'], lines)
+        self.assertIn('could not read', lines[0])
+        self.assertNotIn('half deleted', lines[0])
+        self.assertFalse(os.path.exists(cfg.journal_file))
+        self.assertTrue(os.path.isdir(tree))
+
+    def test_a_git_remove_that_was_killed_or_failed_half_way_is_half_deleted(self):
+        """Git stops with exit 128 both when a check refuses (nothing removed) and when deleting a file failed (some
+        removed); a killed git has no exit code of its own. Only the first is "nothing removed"."""
+        cfg = self.repo_cfg()
+        for how in ('killed', 'failed to delete'):
+            with self.subTest(how=how):
+                tree = self.finished(f'fix-{len(how)}', number=len(how))
+                exe, state = self.stub('git', STUB_GIT, {'remove': how, 'git': shutil.which('git')})
+                with mock.patch.object(self.c.facts, 'GIT', exe):
+                    code, lines = self.run_cleaner(cfg)
+                self.assertEqual(code, 1, lines)
+                failed = [line for line in lines if line.startswith('FAILED ')]
+                self.assertEqual(len(failed), 1, lines)
+                self.assertIn('half deleted', failed[0])
+                self.assertEqual([entry['path'] for entry in self.c.engine.read_journal(cfg)], [tree])
+                os.unlink(cfg.journal_file)
+                self.git(tree, 'worktree', 'remove', tree)
+
+    def test_the_pull_request_lists_are_read_for_the_plan_and_again_before_each_delete(self):
+        self.finished()
+        self.finished('fix-2', number=8)
+        cfg = self.repo_cfg()
+        reads = []
+
+        def prs(repo):
+            reads.append(repo)
+            return {'merged': list(self.merged), 'open': list(self.open)}
+        code, lines = self.run_cleaner(cfg, prs=prs)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(reads, [fx.REPO] * 3)                  # the plan, then the last check of each of the two
+
+    def test_a_deinitialised_submodule_in_a_worktree_keeps_it(self):
+        tree = self.finished()
+        self.origin('acme/sub')
+        self.git(tree, 'submodule', 'add', '-q', 'https://github.com/acme/sub.git', 'sub')
+        self.git(tree, 'commit', '-q', '-m', 'add sub')
+        self.push(tree)
+        self.merged[0]['headRefOid'] = self.head(tree)
+        lost = self.commit(os.path.join(tree, 'sub'), 'only-here.txt')
+        self.git(tree, 'submodule', 'deinit', '-q', '-f', 'sub')
+        self.assertEqual(os.listdir(os.path.join(tree, 'sub')), [])
+        self.assertKept(self.planned(), tree, 'git: unpushed commits', lost[:10])
+        modules = os.path.join(self.git_dir(tree), 'modules', 'sub')
+        self.git(modules, 'push', '-q', 'origin', f'{lost}:refs/heads/kept')
+        self.assertDeletes(self.planned(), tree)
+
 
 class Clones(Case):
     def finished_clone(self, name='base', number=20, hours=48):
@@ -347,6 +472,18 @@ class Clones(Case):
         self.merged[0]['isCrossRepository'] = True                   # a fork's main
         self.assertKept(self.planned(), on_main, 'base branch')
 
+    def test_only_githubs_own_head_names_the_default_branch(self):
+        """`git ls-remote --symref origin HEAD` also prints every other symbolic ref whose name ends in /HEAD. When
+        GitHub's own HEAD names no branch, such a ref does not stand in for it: the default branch is not known."""
+        on_main = self.clone('on-main')
+        self.pr(on_main, 40, base='release')
+        bare = self.origin()
+        self.git(bare, 'branch', 'side', 'main')
+        self.git(bare, 'symbolic-ref', 'refs/heads/team/HEAD', 'refs/heads/side')
+        self.assertKept(self.planned(), on_main, 'base branch', 'default branch')
+        self.git(bare, 'update-ref', '--no-deref', 'HEAD', self.head(on_main))
+        self.assertKept(self.planned(), on_main, 'could not read', 'named no default branch')
+
     def test_a_locked_worktree_whose_folder_is_gone_keeps_the_clone(self):
         clone = self.finished_clone()
         tree = self.finished(clone=clone)
@@ -398,6 +535,59 @@ class Clones(Case):
         self.commit(clone, 'thrown-away.txt')
         self.git(clone, 'reset', '-q', '--hard', merged)
         self.assertKept(self.planned(), clone, 'commits GitHub does not have')
+
+    def test_a_clone_swapped_after_the_last_check_is_never_followed(self):
+        """The lens probe: after the last check passed, the clone is replaced by a link to a folder that must be kept,
+        or by another folder. Nothing is removed, the line says why, the run fails."""
+        clone = self.finished_clone()
+        precious = self.precious()
+        other = self.file(self.path('elsewhere', 'other', 'notes.txt'), 'notes\n')
+        cfg = self.repo_cfg()
+        for name, swap, undo in (
+                ('a link', lambda p: (os.rename(p, self.path('moved')), os.symlink(os.path.dirname(precious), p)),
+                 lambda p: os.unlink(p)),
+                ('another folder', lambda p: (os.rename(p, self.path('moved')), os.rename(os.path.dirname(other), p)),
+                 lambda p: os.rename(p, os.path.dirname(other)))):
+            with self.subTest(swap=name):
+                with self.swap_after_the_last_check(clone, swap):
+                    code, lines = self.run_cleaner(cfg)
+                undo(clone)
+                os.rename(self.path('moved'), clone)
+                self.assertNothingRemoved(code, lines, (precious, 'transcript\n'), (other, 'notes\n'))
+                self.assertFalse(os.path.exists(cfg.journal_file))
+                self.assertTrue(os.path.isdir(os.path.join(clone, '.git')))
+
+    def test_a_deinitialised_submodule_keeps_the_clone(self):
+        clone = self.finished_clone()
+        self.origin('acme/sub')
+        self.git(clone, 'submodule', 'add', '-q', 'https://github.com/acme/sub.git', 'sub')
+        self.git(clone, 'commit', '-q', '-m', 'add sub')
+        self.push(clone)
+        self.merged[0]['headRefOid'] = self.head(clone)
+        lost = self.commit(os.path.join(clone, 'sub'), 'only-here.txt')
+        self.git(clone, 'submodule', 'deinit', '-q', '-f', 'sub')
+        self.assertEqual(os.listdir(os.path.join(clone, 'sub')), [])
+        self.assertKept(self.planned(), clone, 'git: unpushed commits', lost[:10])
+        modules = os.path.join(self.git_dir(clone), 'modules', 'sub')
+        self.git(modules, 'push', '-q', 'origin', f'{lost}:refs/heads/kept')
+        self.assertDeletes(self.planned(), clone)
+
+    def test_an_origin_that_git_turns_into_a_folder_here_keeps_the_clone(self):
+        """origin says github.com, but url.<base>.insteadOf makes git use a folder on this machine: what that
+        folder has is not on GitHub."""
+        clone = self.finished_clone()
+        self.assertDeletes(self.planned(), clone)
+        here = self.path('gh', *fx.REPO.split('/')) + '.git'
+        self.git(clone, 'config', f'url.{here}.insteadOf', f'https://github.com/{fx.REPO}.git')
+        self.assertKept(self.planned(), clone, 'origin on this machine', here)
+
+    def test_a_tag_moved_since_it_was_pushed_keeps_the_clone(self):
+        clone = self.finished_clone()
+        self.git(clone, 'tag', 'v1')
+        self.git(clone, 'push', '-q', 'origin', 'v1')
+        self.assertDeletes(self.planned(), clone)
+        self.git(clone, 'tag', '-f', 'v1', 'origin/main')
+        self.assertKept(self.planned(), clone, 'tags GitHub does not have', 'v1')
 
 
 class GitHub(Case):
@@ -457,8 +647,8 @@ MUTATIONS = {
                                      Worktrees, 'test_commits_the_merged_pull_request_does_not_have_keep_it'),
     'a PR head that is not here': ('rules', 'if oid not in here:', 'if False:', Worktrees, 'test_a_pull_request_head_it_cannot_compare_with_keeps_it'),
     'a process inside': ('rules', 'look = guard.examine(cfg, facts, path, kind)', 'look = guard.Look()', Worktrees, 'test_a_process_inside_keeps_it'),
-    'GitHub down': ('rules', "return kind, Refusal('could not read', str(ex)), '', 0  # GitHub", 'prs = EMPTY_PRS', Worktrees, 'test_github_down_keeps_everything'),
-    'git cannot answer': ('rules', "return kind, Refusal('could not read', f'git: {ex}'), '', 0  # whose it is", 'return None',
+    'GitHub down': ('rules', "return kind, Refusal('could not read', str(ex)), '', None  # GitHub", 'prs = EMPTY_PRS', Worktrees, 'test_github_down_keeps_everything'),
+    'git cannot answer': ('rules', "return kind, Refusal('could not read', f'git: {ex}'), '', None  # whose it is", 'return None',
                           Worktrees, 'test_git_that_cannot_answer_keeps_it'),
     'git stops answering half-way': ('rules', "refusal = Refusal('could not read', f'git: {ex}')", 'refusal = None',
                                      Worktrees, 'test_git_that_stops_answering_half_way_keeps_it'),
@@ -500,6 +690,29 @@ MUTATIONS = {
                                                 Clones, 'test_a_commit_only_a_stale_tracking_ref_names_keeps_the_clone'),
     'clone: tags': ('rules', 'if missing:', 'if False:', Clones, 'test_tags_github_does_not_have_keep_the_clone'),
     'clone: reflog commits': ('rules', "lonely(path, ['--all', '--reflog'], has)", "lonely(path, ['--all'], has)", Clones, 'test_a_commit_only_a_reflog_still_has_keeps_the_clone'),
+    'delete: a worktree still the one the last check judged': ('rules', 'if item.look is None or (st.st_dev, st.st_ino) != item.look.ident:',
+                                                                'if False:', Worktrees, 'test_a_worktree_swapped_after_the_last_check_is_never_followed'),
+    'delete: a clone still the one the last check judged': ('rules', 'if (st.st_dev, st.st_ino) != look.ident:  # ident', 'if False:',
+                                                            Clones, 'test_a_clone_swapped_after_the_last_check_is_never_followed'),
+    'delete: git cannot find the clone': ('rules', "raise Untouched(f'could not read: {ex}: nothing removed') from None", 'raise',
+                                          Worktrees, 'test_git_that_cannot_find_the_clone_removes_nothing'),
+    'git remove: killed is not refused': ('facts', "refused = done.returncode == 128 and 'failed to delete' not in done.stderr",
+                                          'refused = True', Worktrees, 'test_a_git_remove_that_was_killed_or_failed_half_way_is_half_deleted'),
+    'git remove: failed to delete is not refused': ('facts', " and 'failed to delete' not in done.stderr", '',
+                                                    Worktrees, 'test_a_git_remove_that_was_killed_or_failed_half_way_is_half_deleted'),
+    'git remove: only a refusal leaves no note': ('engine', 'if isinstance(ex, Untouched) or (', 'if isinstance(ex, Unreadable) or (',
+                                                  Worktrees, 'test_a_git_remove_that_was_killed_or_failed_half_way_is_half_deleted'),
+    'PR lists: read again before each delete': ('facts', 'self._prs = {}', "self._prs = getattr(self, '_prs', {})", Worktrees,
+                                                'test_the_pull_request_lists_are_read_for_the_plan_and_again_before_each_delete'),
+    'submodules: a worktree': ('rules', 'modules = guard.modules_refusal(path, git_dir)', 'modules = None', Worktrees,
+                               'test_a_deinitialised_submodule_in_a_worktree_keeps_it'),
+    'submodules: a clone': ('rules', 'modules = guard.modules_refusal(path, git_dir)', 'modules = None', Clones,
+                            'test_a_deinitialised_submodule_keeps_the_clone'),
+    'clone: an origin on this machine': ('rules', 'if local:  # origin here', 'if False:', Clones,
+                                         'test_an_origin_that_git_turns_into_a_folder_here_keeps_the_clone'),
+    'clone: a moved tag': ('rules', 'if refs.get(ref) != oid)', 'if ref not in refs)', Clones, 'test_a_tag_moved_since_it_was_pushed_keeps_the_clone'),
+    'the default branch: GitHub HEAD only': ('facts', "and line.endswith('\\tHEAD')", '', Clones,
+                                                   'test_only_githubs_own_head_names_the_default_branch'),
     'GitHub: a failed gh': ('facts', 'if done.returncode != 0:  # gh', 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
     'GitHub: a strange row': ('facts', 'if not valid_pr(row, state):', 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
     'GitHub: a cut-off list': ('facts', "if state == 'open' and len(rows) >= PR_LIMIT:", 'if False:', GitHub, 'test_a_list_that_may_be_cut_off_means_keep'),

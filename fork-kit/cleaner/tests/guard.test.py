@@ -4,7 +4,7 @@ refusal in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/guard.test.py
 """
-import fcntl, os, sys, unittest
+import fcntl, os, subprocess, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -97,6 +97,16 @@ class MustKeep(GuardCase):
         for key in ('mustKeepNot', 'allow', 'mayDelete', 'mustKeepNames'):
             with self.assertRaises(machine_file.MachineFileError):
                 self.cfg(**{key: ['~/.codex/sessions']})
+
+    def test_t3_development_data_and_other_agent_tools_are_kept(self):
+        for inside in ('.t3/dev/state.sqlite', '.t3-second/dev/logs/server.log', '.gemini/tmp/chats/session.json',
+                       '.config/opencode/opencode.json', '.local/share/opencode/storage/session/1.json',
+                       '.aider.tags.cache.v4/cache.db', '.cursor/chats/1.json', '.continue/sessions/1.json', '.qwen/settings.json',
+                       '.local/share/goose/sessions/1.jsonl', '.copilot/history.json'):
+            with self.subTest(must_keep=inside):
+                self.refused(self.file(self.path('home', *inside.split('/'))), 'must keep')
+        self.allowed(self.folder('home', '.t3', 'caches'))
+        self.allowed(self.folder('home', '.config', 'other-tool'))
 
 
 class InUse(GuardCase):
@@ -261,7 +271,7 @@ class PathSafety(GuardCase):
         """A bind mount of a folder on the same filesystem has the same device number: the mount list shows it."""
         d = self.folder('tmp', 'job-1')
         neighbour = self.folder('tmp', 'job-10')
-        for point in (os.path.join(d, 'mnt'), d):
+        for point in (os.path.join(d, 'mnt'), os.path.join(d, 'a', 'b'), d):
             with self.subTest(point=point):
                 self.mount_points = {'/', self.tmp, point}
                 self.refused(d, 'another filesystem', 'mount point')
@@ -279,9 +289,9 @@ class PathSafety(GuardCase):
             r'90 22 8:1 /home/u/src /tmp/job\0401/mnt rw,relatime shared:1 - ext4 /dev/sda1 rw',
             r'91 22 0:50 / /tmp/tab\011and\134slash rw - tmpfs tmpfs rw',
             '92 22 0:51 / /run/user/1000 rw,nosuid master:3 propagate_from:2 - tmpfs tmpfs rw')))
-        self.assertEqual(self.c.facts.read_mounts(info),
+        self.assertEqual(self.c.facts.read_mounts(info, proc=None).points,
                          {'/', '/tmp/job 1/mnt', '/tmp/tab\tand\\slash', '/run/user/1000'})
-        self.assertIn('/', self.c.facts.read_mounts())                           # the real list
+        self.assertIn('/', self.c.facts.read_mounts().points)                    # the real list
         for text in ('22 1 8:1 / / rw\n', '90 22 8:1 / /tmp/x rw - ext4 /dev/sda1 rw\n'):
             with self.subTest(text=text), self.assertRaises(self.c.facts.Unreadable):
                 self.c.facts.read_mounts(self.file(self.path('mountinfo'), text))
@@ -317,6 +327,45 @@ class PathSafety(GuardCase):
         d = self.folder('tmp', 'job-1')
         os.chmod(self.folder('tmp', 'job-1', 'closed'), 0)
         self.refused(d, 'could not read')
+
+    def test_the_source_of_a_bind_mount_is_kept(self):
+        """A folder a container or a sandbox shows through a bind mount: the mount is in another mount namespace,
+        and only its source (device and folder of that filesystem) says it is this one."""
+        d = self.folder('tmp', 'job-1')
+        neighbour = self.folder('tmp', 'job-10')
+        st = os.lstat(d)
+        dev = f'{os.major(st.st_dev)}:{os.minor(st.st_dev)}'
+        self.mount_lines = [('/', dev, '/')]
+        for source in (d, os.path.join(d, 'deep', 'er')):
+            with self.subTest(source=source):
+                self.bind_sources = {(dev, source)}
+                self.refused(d, 'in use', 'bind mount')
+                self.allowed(neighbour)
+        self.bind_sources = {('0:999', d)}                            # another filesystem's folder of that name
+        self.allowed(d)
+        # The filesystem is mounted at self.tmp, showing its folder /export: the source names it from there.
+        self.mount_lines = [('/', '0:998', '/'), (self.tmp, dev, '/export')]
+        self.bind_sources = {(dev, '/export/job-1/data')}
+        self.refused(d, 'in use', '/export/job-1/data')
+        self.allowed(neighbour)
+
+    def test_bind_mount_sources_are_read_from_every_mount_namespace_it_can_read(self):
+        own = '22 1 8:1 / / rw shared:1 - ext4 /dev/sda1 rw\n'
+        info = self.file(self.path('mountinfo'), own + '30 22 8:1 /srv/own /mnt/own rw - ext4 /dev/sda1 rw\n')
+        proc = self.mkdir('fakeproc')
+        for pid, space, line in (('10', 'mnt:[1]', '40 22 8:1 /home/u/tmp/job-1 /work rw - ext4 /dev/sda1 rw'),
+                                 ('11', 'mnt:[1]', '41 22 8:1 /same/space /x rw - ext4 /dev/sda1 rw'),
+                                 ('12', 'mnt:[2]', '42 22 0:5 /var/lib/box /data rw - ext4 /dev/sdb1 rw'),
+                                 ('13', None, '43 22 8:1 /hidden /y rw - ext4 /dev/sda1 rw')):
+            os.makedirs(os.path.join(proc, pid, 'ns'))
+            if space:
+                os.symlink(space, os.path.join(proc, pid, 'ns', 'mnt'))
+            self.file(os.path.join(proc, pid, 'mountinfo'), own + line + '\n')
+        self.file(os.path.join(proc, 'self'), '')
+        got = self.c.facts.read_mounts(info, proc)
+        self.assertEqual(got.points, {'/', '/mnt/own'})
+        self.assertEqual(got.sources, {('8:1', '/srv/own'), ('8:1', '/home/u/tmp/job-1'), ('0:5', '/var/lib/box')})
+        self.assertEqual(got.lines, [('/', '8:1', '/'), ('/mnt/own', '8:1', '/srv/own')])
 
 
 class GitFolders(GuardCase):
@@ -457,13 +506,88 @@ class GitFolders(GuardCase):
             with self.subTest(what=what), mock.patch.object(self.c.facts, 'git', answer):
                 self.refused(d, 'could not read', what)
 
+    def test_a_remote_is_judged_by_the_urls_git_really_uses(self):
+        """url.<base>.insteadOf (in the user's global git config) can turn a GitHub URL into a folder on this
+        machine, and a remote can have more URLs and push URLs. Each must be on another machine."""
+        src = self.mkdir('tmp', 'job-1', 'src')
+        self.git(src, 'init', '-q')
+        self.commit(src)
+        copy = os.path.join(self.mkdir('tmp', 'job-2'), 'copy')
+        self.git(self.dir, 'clone', '-q', src, copy)
+        job = self.path('tmp', 'job-2')
+        self.git(copy, 'remote', 'set-url', 'origin', f'ssh://github.invalid{src}')     # through the ssh stub
+        self.allowed(job)
+        with open(self.path('gitconfig'), 'a') as f:
+            f.write(f'[url "{src}"]\n\tinsteadOf = https://example.org/src.git\n')
+        self.git(copy, 'remote', 'set-url', 'origin', 'https://example.org/src.git')
+        self.refused(job, 'git: unpushed commits')
+        self.git(copy, 'remote', 'set-url', 'origin', f'ssh://github.invalid{src}')
+        self.git(copy, 'remote', 'set-url', '--add', 'origin', src)                      # a second URL
+        self.refused(job, 'git: unpushed commits')
+        self.git(copy, 'remote', 'set-url', '--delete', 'origin', '^/')
+        self.allowed(job)
+        self.git(copy, 'remote', 'set-url', '--push', 'origin', 'file://' + src)        # a push URL
+        self.refused(job, 'git: unpushed commits')
+
+    def test_what_counts_as_another_machine(self):
+        host = __import__('socket').gethostname()
+        for url, far in (('https://github.com/acme/widget.git', True), ('git@github.com:acme/widget.git', True),
+                         ('ssh://git@github.com/acme/widget', True), ('ssh://[2001:db8::1]/x.git', True),
+                         ('/srv/git/x.git', False), ('./x', False), ('file:///srv/x.git', False),
+                         ('FILE://host/x', False), ('localhost:/srv/x.git', False), ('ssh://localhost/x', False),
+                         ('git@127.0.0.1:x.git', False), ('ssh://127.0.0.2:22/x', False), ('[::1]:x.git', False),
+                         ('ssh://[::1]/x', False), ('https://0.0.0.0/x', False), ('ssh://box.localhost/x', False),
+                         (f'ssh://{host}/x', False), (f'{host}:x.git', False), ('ext::ssh github.com %S x', False),
+                         ('no_push', False)):
+            with self.subTest(url=url):
+                self.assertEqual(self.c.facts.elsewhere(url), far)
+
+    def test_a_deinitialised_submodule_keeps_its_history(self):
+        """`git submodule deinit` empties the submodule's folder; its history, local commits too, stays in
+        .git/modules/<name>, and goes with the folder that holds it."""
+        d, repo = self.job()
+        self.origin('acme/sub')
+        self.git(repo, 'submodule', 'add', '-q', 'https://github.com/acme/sub.git', 'sub')
+        self.git(repo, 'commit', '-q', '-m', 'add sub')
+        self.push(repo)
+        self.allowed(d)
+        lost = self.commit(os.path.join(repo, 'sub'), 'only-here.txt')
+        self.git(repo, 'submodule', 'deinit', '-q', '-f', 'sub')
+        self.assertEqual(os.listdir(os.path.join(repo, 'sub')), [])
+        self.assertEqual(self.git(repo, 'status', '--porcelain'), '')
+        self.refused(d, 'git: unpushed commits', lost[:10])
+        self.refused(d, 'git: unpushed commits', 'modules')
+        self.git(os.path.join(repo, '.git', 'modules', 'sub'), 'push', '-q', 'origin', f'{lost}:refs/heads/kept')
+        self.allowed(d)
+        self.git(os.path.join(repo, '.git', 'modules', 'sub'), 'tag', 'v-sub')
+        self.refused(d, 'git: tags not pushed', 'v-sub')
+
+    def test_a_partial_clone_is_never_made_to_fetch(self):
+        """In a partial clone, asking about an object it does not have would fetch it ("lazy fetch"). The cleaner
+        only reads: a missing object is a missing object."""
+        bare = self.origin()
+        self.git(bare, 'config', 'uploadpack.allowFilter', 'true')
+        d = self.mkdir('tmp', 'job-1')
+        repo = os.path.join(d, 'repo')
+        self.git(self.dir, 'clone', '-q', '--filter=blob:none', f'https://github.com/{fx.REPO}.git', repo)
+        later = self.clone('later', into=self.mkdir('elsewhere'))
+        newer = self.commit(later, 'newer.txt')
+        self.git(later, 'push', '-q', 'origin', 'HEAD:refs/heads/other')    # GitHub has a commit the clone has not
+        self.assertEqual(self.c.facts.present(repo, [newer]), set())
+        self.allowed(d)
+        missing = subprocess.run(['git', '-c', 'protocol.allow=never', 'cat-file', '-e', newer], cwd=repo,
+                                 capture_output=True)
+        self.assertNotEqual(missing.returncode, 0, 'the cleaner fetched the commit')
+
 
 MUTATIONS = {
     'must keep: the built-in paths': ('guard', 'kept = must_keep_match(cfg.must_keep, path)', 'kept = None',
                                       MustKeep, 'test_transcripts_sessions_and_t3_data_are_never_deleted'),
-    'must keep: the agent homes whole': ('config', "MUST_KEEP = ('~/.claude*', '~/.codex*', '~/.t3*/userdata')",
-                                         "MUST_KEEP = ('~/.claude*/projects', '~/.codex*/sessions', '~/.t3*/userdata')",
+    'must keep: the agent homes whole': ('config', "'~/.claude*', '~/.codex*', '~/.t3*/userdata',",
+                                         "'~/.claude*/projects', '~/.codex*/sessions', '~/.t3*/userdata',",
                                          MustKeep, 'test_the_agent_homes_are_kept_whole'),
+    'must keep: T3 development data': ('config', "'~/.t3*/dev',", '', MustKeep, 'test_t3_development_data_and_other_agent_tools_are_kept'),
+    'must keep: other agent tools': ('config', "'~/.gemini', ", '', MustKeep, 'test_t3_development_data_and_other_agent_tools_are_kept'),
     'must keep: through a link': ('config', 'for form in (self._expand(text), os.path.realpath(self._expand(text))):',
                                   'for form in (self._expand(text),):', MustKeep, 'test_a_must_keep_path_written_through_a_link'),
     'must keep: a name on the path': ('guard', 'if kept_name(cfg, part)', 'if False',
@@ -510,7 +634,17 @@ MUTATIONS = {
                                     PathSafety, 'test_a_bind_mount_inside'),
     'the mount list: escapes': ('facts', "return re.sub(r'\\\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), field)", 'return field',
                                 PathSafety, 'test_the_mount_list_is_read_with_its_escapes'),
-    'the mount list: a strange line': ("facts", "if len(fields) < 10 or '-' not in fields[6:]:", 'if False:',
+    'a bind mount two levels down': ('guard', "m.startswith(path + '/')", 'os.path.dirname(m) == path',
+                                     PathSafety, 'test_a_bind_mount_inside'),
+    'a bind mount source': ('guard', 'if source is not None:  # bind source', 'if False:',
+                            PathSafety, 'test_the_source_of_a_bind_mount_is_kept'),
+    'a bind mount source: where on its filesystem': ('facts', 'return os.path.normpath(os.path.join(best[1], rest))', 'return path',
+                                                     PathSafety, 'test_the_source_of_a_bind_mount_is_kept'),
+    'a bind mount source: other namespaces': ('facts', "sources.update((device, root) for _, device, root in other if root != '/')",
+                                              'pass', PathSafety, 'test_bind_mount_sources_are_read_from_every_mount_namespace_it_can_read'),
+    'a bind mount source: one read per namespace': ('facts', 'if space in seen:', 'if False:',
+                                                    PathSafety, 'test_bind_mount_sources_are_read_from_every_mount_namespace_it_can_read'),
+    'the mount list: a strange line': ("facts", "if len(fields) < 10 or '-' not in fields[6:] or not re.match(r'^\\d+:\\d+$', fields[2]):", 'if False:',
                                        PathSafety, 'test_the_mount_list_is_read_with_its_escapes'),
     'a device inside': ('guard', "return Refusal('not a file or folder', f'{shown} is a device')", 'pass', PathSafety, 'test_a_device_inside'),
     'another owner': ('guard', 'if owner(st) != uid:', 'if False:', PathSafety, 'test_another_owner'),
@@ -530,9 +664,27 @@ MUTATIONS = {
     'git: a live answer, not tracking refs': ('guard', "lonely(where, ['--all', '--reflog'], sorted(present(where, has, bare)), bare)",
                                               "lonely(where, ['--all', '--reflog'], ['--remotes'], bare)",
                                               GitFolders, 'test_a_commit_only_a_stale_tracking_ref_names'),
-    'git: a remote on this machine': ('guard', 'if not elsewhere(url):', 'if False:', GitFolders, 'test_a_remote_on_this_machine_does_not_count'),
-    'git: a file:// remote': ('facts', "return not url.lower().startswith('file://')", 'return True',
+    'git: a remote on this machine': ('guard', 'if not all(elsewhere(url) for url in remote_urls(where, name, bare)):', 'if False:',
+                                      GitFolders, 'test_a_remote_on_this_machine_does_not_count'),
+    'git: the URLs git really uses': ('guard', 'if not all(elsewhere(url) for url in remote_urls(where, name, bare)):',
+                                      "if not elsewhere(git(where, 'config', f'remote.{name}.url', bare=bare).strip()):",
+                                      GitFolders, 'test_a_remote_is_judged_by_the_urls_git_really_uses'),
+    'git: every URL and push URL': ('facts', "for push in ([], ['--push']):", 'for push in ([],):',
+                                    GitFolders, 'test_a_remote_is_judged_by_the_urls_git_really_uses'),
+    'git: a file:// remote': ('facts', "return found.group(1).lower() != 'file' and not this_machine(found.group(2))", 'return True',
                               GitFolders, 'test_a_remote_on_this_machine_does_not_count'),
+    'git: a host that is this machine': ('facts', "return bool(found) and not this_machine(found.group(1))", 'return bool(found)',
+                                         GitFolders, 'test_what_counts_as_another_machine'),
+    'git: loopback addresses': ('facts', 'return address.is_loopback or address.is_unspecified', 'return False',
+                                GitFolders, 'test_what_counts_as_another_machine'),
+    'git: its own host name': ('facts', "return host in (name, name.split('.')[0])", 'return False',
+                               GitFolders, 'test_what_counts_as_another_machine'),
+    'git: a remote helper': ('facts', "if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*::', url):", 'if False:',
+                             GitFolders, 'test_what_counts_as_another_machine'),
+    'git: deinitialised submodules (tmp)': ('guard', 'refusal = modules_refusal(path, where if bare else os.path.join(where, \'.git\'))',
+                                            'refusal = None', GitFolders, 'test_a_deinitialised_submodule_keeps_its_history'),
+    'git: no lazy fetch': ('facts', "offline = args[0] != 'ls-remote'", 'offline = False',
+                           GitFolders, 'test_a_partial_clone_is_never_made_to_fetch'),
     'git: local tags': ('guard', 'if missing:', 'if False:', GitFolders, 'test_local_tags'),
     'git: a moved tag': ('guard', 'if oid not in tags.get(ref, ())', 'if ref not in tags', GitFolders, 'test_local_tags'),
     'git: a .git link': ('guard', "return Refusal('could not read', f'{shown} is a symbolic link or not a folder: its git folder is not judged')",

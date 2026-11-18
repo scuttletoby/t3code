@@ -4,12 +4,12 @@ may go at all is the guard's answer (guard.py), and every rule asks it.
 `plan` reads and decides, and changes nothing. `recheck` reads everything about one item again, just before its
 delete. `delete` is the only code in the kit that removes anything.
 """
-import errno, fnmatch, os, re, shutil, stat
+import errno, fnmatch, os, re, stat
 
 from . import guard
 from .config import matches
-from .facts import (Unreadable, default_branch, git, git_code, local_tags, lonely, merged_seconds, origin_url, present, reflog,
-                    remote_refs, remove_volume, remove_worktree, worktree_list)
+from .facts import (Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_tags, lonely, merged_seconds,
+                    origin_url, present, reflog, remote_refs, remote_urls, remove_volume, remove_worktree, worktree_list)
 from .guard import CREDENTIAL_NAMES, Refusal
 
 DAY = 86400
@@ -26,9 +26,10 @@ MARKS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-
 class Item:
     """One thing a rule wants gone. `kind` is path, worktree, clone or volume; for a volume `path` is its name."""
 
-    def __init__(self, kind, path, rule, why, size):
+    def __init__(self, kind, path, rule, why, size, look=None):
         self.kind, self.path, self.rule, self.why, self.size = kind, path, rule, why, size
         self.done = None        # after a run: deleted, refused or failed
+        self.look = look        # the guard's look at the last check: the delete removes only what it saw
 
     @property
     def label(self):
@@ -104,14 +105,121 @@ def plan_tmp(cfg, facts, plan, measure):
         if look.refusal is not None:
             plan.kept.append(Kept(path, 'tmp', look.refusal.code, look.refusal.detail, guard.measure(path) if measure else None))
         else:
-            plan.items.append(Item('path', path, 'tmp', why, look.size))
+            plan.items.append(Item('path', path, 'tmp', why, look.size, look))
+
+
+# --- deleting -----------------------------------------------------------------------------------------------------
+# Every delete goes through descriptors, one name at a time, and never through a link: a name that is a link now is
+# removed as a link, and a folder is entered only when it is the folder the name showed a moment before.
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open_parent(path):
+    """A descriptor of the folder `path` is in, opened from / one name at a time, never through a link."""
+    fd = os.open('/', DIR_FLAGS)
+    try:
+        for part in os.path.dirname(path).split('/'):
+            if part:
+                new = os.open(part, DIR_FLAGS, dir_fd=fd)
+                os.close(fd)
+                fd = new
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _clear(top, names, look, shown):
+    """Removes `names` from the open folder `top`, each folder with everything in it. Every entry must be one the
+    last check saw (its inode, on its device): a folder moved in since, a new mount or a new file stops the delete
+    there, so nothing the check did not judge is removed."""
+    stack = [(top, sorted(names, reverse=True), None, shown)]
+    try:
+        while stack:
+            here, left, done, where = stack[-1]
+            if not left:
+                stack.pop()
+                if done is not None:
+                    os.close(here)
+                    os.rmdir(done[1], dir_fd=done[0])
+                continue
+            name = left.pop()
+            st = os.stat(name, dir_fd=here, follow_symlinks=False)
+            if st.st_dev != look.ident[0] or st.st_ino not in look.seen:  # seen
+                raise Unreadable(f'{where}/{name}: not there at the last check (moved in, made or mounted since): the delete stopped')
+            if not stat.S_ISDIR(st.st_mode):
+                os.unlink(name, dir_fd=here)
+                continue
+            sub = os.open(name, DIR_FLAGS, dir_fd=here)
+            sst = os.fstat(sub)
+            if (sst.st_dev, sst.st_ino) != (st.st_dev, st.st_ino):
+                os.close(sub)
+                raise Unreadable(f'{where}/{name}: changed while it was deleted: the delete stopped')
+            stack.append((sub, sorted(os.listdir(sub), reverse=True), (here, name), f'{where}/{name}'))
+    finally:
+        for here, _, done, _ in stack:
+            if done is not None:
+                os.close(here)
+
+
+def remove_tree(path, look, last=None):
+    """Removes the file or folder at `path` if it is still what the last check judged (`look.ident`); else raises
+    Untouched and removes nothing. A folder is emptied through its descriptor, `last` (a name in it) after
+    everything else, and then removed."""
+    if look is None or look.ident is None:
+        raise Untouched(f'{path}: no last check to compare with: nothing removed')
+    try:
+        parent = _open_parent(path)
+    except OSError as ex:
+        raise Untouched(f'{path}: its folder: {ex.strerror}: nothing removed') from None
+    try:
+        name = os.path.basename(path)
+        try:
+            st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (st.st_dev, st.st_ino) != look.ident:  # ident
+                raise Untouched(f'{path} is not what the last check saw (it was moved, or a link or another folder '
+                                'is there now): nothing removed')
+            if not stat.S_ISDIR(st.st_mode):
+                os.unlink(name, dir_fd=parent)
+                return
+            top = os.open(name, DIR_FLAGS, dir_fd=parent)
+        except Untouched:
+            raise
+        except OSError as ex:
+            raise Untouched(f'{path}: {ex.strerror}: nothing removed') from None
+        try:
+            tst = os.fstat(top)
+            if (tst.st_dev, tst.st_ino) != look.ident:
+                raise Untouched(f'{path} changed as it was opened: nothing removed')
+            names = os.listdir(top)
+            _clear(top, [n for n in names if n != last], look, path)
+            _clear(top, [n for n in names if n == last], look, path)
+        finally:
+            os.close(top)
+        os.rmdir(name, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def _still(item):
+    """Untouched unless the folder at item.path is still the one the last check judged (never through a link)."""
+    try:
+        parent = _open_parent(item.path)
+    except OSError as ex:
+        raise Untouched(f'{item.path}: its folder: {ex.strerror}: nothing removed') from None
+    try:
+        st = os.stat(os.path.basename(item.path), dir_fd=parent, follow_symlinks=False)
+    except OSError as ex:
+        raise Untouched(f'{item.path}: {ex.strerror}: nothing removed') from None
+    finally:
+        os.close(parent)
+    if item.look is None or (st.st_dev, st.st_ino) != item.look.ident:
+        raise Untouched(f'{item.path} is not what the last check saw (it was moved, or a link or another folder is '
+                        'there now): nothing removed')
 
 
 def delete_path(item):
-    if stat.S_ISDIR(os.lstat(item.path).st_mode):
-        shutil.rmtree(item.path)
-    else:
-        os.unlink(item.path)
+    remove_tree(item.path, item.look)
 
 
 # --- docker -------------------------------------------------------------------------------------------------------
@@ -284,6 +392,11 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
     own = git(path, 'for-each-ref', '--format=%(refname)', 'refs/worktree', 'refs/bisect', 'refs/rewritten').split()
     if own:
         return Refusal('refs of its own', some(own))
+    # A submodule's history is in the git folder (a worktree's own one too), and stays there after `git submodule
+    # deinit`: removing the clone or the worktree removes it.
+    modules = guard.modules_refusal(path, git_dir)
+    if modules is not None:
+        return modules
 
     if kind == 'worktree':
         # Removing a worktree removes its own HEAD log and nothing else of git's: branches, their logs and every
@@ -299,6 +412,9 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
         # Removing a clone removes every branch, tag and log in it. GitHub has a commit when a branch or tag there
         # holds it right now (`git ls-remote`) or a pull request does; the clone's own remote-tracking refs may be
         # stale and do not count.
+        local = [url for url in remote_urls(path, 'origin') if not elsewhere(url)]
+        if local:  # origin here
+            return Refusal('origin on this machine', f'{local[0]}: what it has does not count as on GitHub')
         refs = remote_refs(path, 'origin', '--heads', '--tags')
         has = sorted(here | present(path, refs.values()))
         alone = lonely(path, ['--all', '--reflog'], has)
@@ -315,30 +431,30 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
 
 
 def tree_answer(cfg, facts, repo, path):
-    """(kind, refusal, why, size) for one entry of a repository's folder; None when it is not a worktree or clone
+    """(kind, refusal, why, look) for one entry of a repository's folder; None when it is not a worktree or clone
     of that repository, and so not this rule's."""
     try:
         kind = tree_kind(path)
     except Unreadable as ex:
-        return 'folder', Refusal('could not read', str(ex)), '', 0
+        return 'folder', Refusal('could not read', str(ex)), '', None
     if kind is None:
         return None
     try:
         url = origin_url(path)
     except Unreadable as ex:
-        return kind, Refusal('could not read', f'git: {ex}'), '', 0  # whose it is
+        return kind, Refusal('could not read', f'git: {ex}'), '', None  # whose it is
     if not same_repo(url, repo.github):
         return None
     try:
         prs = facts.prs(repo.github)
     except Unreadable as ex:
-        return kind, Refusal('could not read', str(ex)), '', 0  # GitHub
+        return kind, Refusal('could not read', str(ex)), '', None  # GitHub
     out = {}
     try:
         refusal = tree_refusal(cfg, facts, repo, path, kind, prs, out)
     except Unreadable as ex:
         refusal = Refusal('could not read', f'git: {ex}')
-    return kind, refusal, out.get('why', ''), out['look'].size if 'look' in out else 0
+    return kind, refusal, out.get('why', ''), out.get('look')
 
 
 def plan_worktrees(cfg, facts, plan, measure):
@@ -351,11 +467,11 @@ def plan_worktrees(cfg, facts, plan, measure):
             answer = tree_answer(cfg, facts, repo, path)
             if answer is None:
                 continue
-            kind, refusal, why, size = answer
+            kind, refusal, why, look = answer
             if refusal is not None:
                 plan.kept.append(Kept(path, 'worktrees', refusal.code, refusal.detail, guard.measure(path) if measure else None))
             else:
-                plan.items.append(Item(kind, path, 'worktrees', why, size))
+                plan.items.append(Item(kind, path, 'worktrees', why, look.size, look))
 
 
 def recheck_tree(cfg, facts, item):
@@ -364,29 +480,29 @@ def recheck_tree(cfg, facts, item):
             answer = tree_answer(cfg, facts, repo, item.path)
             if answer is None or answer[0] != item.kind:
                 return Refusal('not a candidate', f'no longer a {item.kind} of {repo.github}')
+            item.look = answer[3]
             return answer[1]
     return Refusal('not a candidate', 'no repository in the machine file has this folder')
 
 
 def delete_worktree(item):
     """Git removes it, without --force: git refuses on its own when a file changed after the last check, and then
-    raises Untouched (nothing removed). The local branch stays in the clone."""
-    common = git(item.path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip()
+    raises Untouched (nothing removed). The local branch stays in the clone. The folder must still be the one the
+    last check judged, and git itself removes a worktree only when its .git file points back at its own entry in
+    the clone, so a link or another folder swapped in is refused."""
+    _still(item)
+    try:
+        common = git(item.path, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip()
+    except Unreadable as ex:
+        raise Untouched(f'could not read: {ex}: nothing removed') from None
+    _still(item)
     remove_worktree(common, item.path)
 
 
 def delete_clone(item):
     """The working files first and .git last, so a clone that is only half gone still has its history. The engine
     notes the delete before it starts; a later run names a half-gone clone "half deleted" (engine.py)."""
-    for name in sorted(os.listdir(item.path)):
-        if name != '.git':
-            target = os.path.join(item.path, name)
-            if stat.S_ISDIR(os.lstat(target).st_mode):
-                shutil.rmtree(target)
-            else:
-                os.unlink(target)
-    shutil.rmtree(os.path.join(item.path, '.git'))
-    os.rmdir(item.path)
+    remove_tree(item.path, item.look, last='.git')
 
 
 # --- all rules ----------------------------------------------------------------------------------------------------
@@ -410,6 +526,7 @@ def recheck(cfg, facts, item):
     answer = tmp_answer(cfg, facts, item.path)
     if answer is None:
         return Refusal('not a candidate', 'it changed, or the rule no longer takes it')
+    item.look = answer[1]
     return answer[1].refusal
 
 

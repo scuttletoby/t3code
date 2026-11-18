@@ -14,9 +14,16 @@ MACHINE_FILE = None  # tests only: read this file instead of the fixed path
 MACHINE_OWNER = 0    # tests only: the uid that must own it (root)
 
 # Never deleted, whatever a rule or the section says: the agent tools' homes whole (transcripts, sessions, their
-# databases, settings and logins) and the T3 data folder (its databases and logs). `~` is the home of the user the
-# cleaner runs as; * and ? match within one path part.
-MUST_KEEP = ('~/.claude*', '~/.codex*', '~/.t3*/userdata')
+# databases, settings and logins) and T3's data folders (its databases and logs; `dev` is a development build's).
+# `~` is the home of the user the cleaner runs as; * and ? match within one path part.
+MUST_KEEP = (
+    '~/.claude*', '~/.codex*', '~/.t3*/userdata', '~/.t3*/dev',
+    # other agent tools, where they keep sessions, history and logins
+    '~/.gemini', '~/.qwen', '~/.cursor', '~/.config/Cursor', '~/.aider*', '~/.continue', '~/.copilot',
+    '~/.config/github-copilot', '~/.codeium', '~/.kiro', '~/.amazon-q', '~/.config/amazon-q', '~/.local/share/amazon-q',
+    '~/.config/opencode', '~/.local/share/opencode', '~/.local/state/opencode', '~/.config/crush',
+    '~/.local/share/crush', '~/.config/goose', '~/.local/share/goose', '~/.config/amp', '~/.local/share/amp',
+)
 # Never deleted wherever they are: a folder or file with one of these names, and anything that holds one.
 MUST_KEEP_NAMES = ('repair-backups', '*log-archive*')
 MIN_MERGED_HOURS = 24    # a worktree goes no sooner than this after its pull request merged

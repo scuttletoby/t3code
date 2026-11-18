@@ -4,7 +4,7 @@ One rule for every reader here: no answer means keep. A reader that cannot give 
 and whoever asked keeps the thing it asked about. Nothing in this file changes anything, except remove_worktree and
 remove_volume at the very end, which the engine calls after every check has passed again.
 """
-import calendar, json, os, re, subprocess, time
+import calendar, ipaddress, json, os, re, socket, subprocess, time
 
 UNIT_DIRS = ('/etc/systemd/system', '/run/systemd/system', '/run/systemd/transient', '/etc/systemd/user',
              '~/.config/systemd/user', '/run/user/{uid}/systemd/user', '/run/user/{uid}/systemd/transient')
@@ -159,23 +159,86 @@ def _unescape(field):
     return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), field)
 
 
-def read_mounts(path='/proc/self/mountinfo'):
-    """Every mount point, bind mounts too: a bind mount of a folder on the same filesystem has the same device
-    number, so only this list shows it. Raises Unreadable when the list cannot be read or does not even hold /."""
+class Mounts:
+    """`points`: every mount point of the cleaner's own mount namespace. `lines`: (mount point, device, root) of each
+    of them, where root is the folder of its filesystem it shows. `sources`: (device, root) of every mount, in any
+    mount namespace the cleaner may read, that shows one folder of a filesystem rather than all of it: the source of
+    a bind mount (a container volume, a sandbox). A device is "major:minor" as mountinfo writes it."""
+
+    def __init__(self, points=('/',), lines=(), sources=()):
+        self.points, self.lines, self.sources = set(points), list(lines), set(sources)
+
+    def on_filesystem(self, path, dev):
+        """Where `path` is on its own filesystem (the root of the deepest mount holding it, plus the rest), or None
+        when no mount line of that device holds it (btrfs and overlay give other device numbers than mountinfo)."""
+        best = None
+        for point, device, root in self.lines:
+            if device == dev and (point == '/' or path == point or path.startswith(point + '/')):
+                if best is None or len(point) > len(best[0]):
+                    best = (point, root)
+        if best is None:
+            return None
+        rest = os.path.relpath(path, best[0])
+        return os.path.normpath(os.path.join(best[1], rest)) if rest != '.' else best[1]
+
+    def bound(self, path, st_dev):
+        """The first bind mount source that is `path` or inside it: it is shown somewhere else too, maybe in a
+        container. None when there is none, or when where `path` lives on its filesystem is not known."""
+        dev = f'{os.major(st_dev)}:{os.minor(st_dev)}'
+        where = self.on_filesystem(path, dev)
+        if where is None:
+            return None
+        inside = sorted(root for device, root in self.sources
+                        if device == dev and (root == where or root.startswith(where.rstrip('/') + '/')))
+        return inside[0] if inside else None
+
+
+def _mount_lines(path):
+    """[(mount point, device, root)] of one mountinfo file. Raises Unreadable when it cannot be read or a line is
+    strange."""
     try:
         with open(path, errors='surrogateescape') as f:
             lines = f.read().splitlines()
     except OSError as ex:
         raise Unreadable(f'{ex.filename or path}: {ex.strerror}') from None
-    points = set()
+    out = []
     for line in lines:
         fields = line.split(' ')
-        if len(fields) < 10 or '-' not in fields[6:]:
+        if len(fields) < 10 or '-' not in fields[6:] or not re.match(r'^\d+:\d+$', fields[2]):
             raise Unreadable(f'{path}: a line it cannot use: {line[:80]!r}')
-        points.add(os.path.normpath(_unescape(fields[4])))
+        out.append((os.path.normpath(_unescape(fields[4])), fields[2], os.path.normpath(_unescape(fields[3]))))
+    return out
+
+
+def read_mounts(path='/proc/self/mountinfo', proc='/proc'):
+    """Every mount point, bind mounts too: a bind mount of a folder on the same filesystem has the same device
+    number, so only this list shows it. Also the bind mount sources of every other mount namespace the cleaner can
+    read (its own user's processes): a folder a container or a sandbox shows. Raises Unreadable when its own list
+    cannot be read or does not even hold /; another process's list that cannot be read is not seen."""
+    lines = _mount_lines(path)
+    points = {point for point, _, _ in lines}
     if '/' not in points:
         raise Unreadable(f'{path} does not name /')
-    return points
+    sources = {(device, root) for _, device, root in lines if root != '/'}
+    seen = set()
+    try:
+        pids = [name for name in os.listdir(proc) if name.isdigit()] if proc else []
+    except OSError:
+        pids = []
+    for pid in pids:
+        try:
+            space = os.readlink(os.path.join(proc, pid, 'ns', 'mnt'))
+        except OSError:
+            continue                    # another user's process, or gone: its mounts are not seen
+        if space in seen:
+            continue
+        seen.add(space)
+        try:
+            other = _mount_lines(os.path.join(proc, pid, 'mountinfo'))
+        except Unreadable:
+            continue
+        sources.update((device, root) for _, device, root in other if root != '/')
+    return Mounts(points, lines, sources)
 
 
 # --- systemd units ------------------------------------------------------------------------------------------------
@@ -239,10 +302,16 @@ def _first_line(text):
 # --- git ----------------------------------------------------------------------------------------------------------
 def _git(cwd, args, bare, stdin):
     """Git never looks for a repository above `cwd`, takes no optional lock (so reading changes nothing), runs no
-    file-system monitor and asks nothing."""
+    file-system monitor and asks nothing. Only `ls-remote` may reach another machine: every other command runs with
+    every transport off, so a partial clone never fetches a missing object (git 2.44 and later also read
+    GIT_NO_LAZY_FETCH); a missing object stays missing, and whoever asked keeps."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_') or k in GIT_ENV_KEPT}
     env.update(GIT_CEILING_DIRECTORIES=os.path.dirname(cwd), GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0', LC_ALL='C')
-    argv = [GIT, '--no-optional-locks', '--no-pager', '-c', 'core.fsmonitor=false', *(['--git-dir=.'] if bare else []), *args]
+    offline = args[0] != 'ls-remote'
+    if offline:
+        env['GIT_NO_LAZY_FETCH'] = '1'
+    argv = [GIT, '--no-optional-locks', '--no-pager', '-c', 'core.fsmonitor=false',
+            *(['-c', 'protocol.allow=never'] if offline else []), *(['--git-dir=.'] if bare else []), *args]
     return _run(argv, 'git', cwd, env, stdin)
 
 
@@ -336,21 +405,56 @@ def local_tags(cwd, bare=False):
 
 
 def remotes(cwd, bare=False):
-    """{name: url} of the remotes in the repository's own config (no insteadOf rewrite)."""
-    out = {}
+    """The names of the remotes in the repository's own config that have a URL."""
+    out = set()
     for entry in git(cwd, 'config', '--local', '--null', '--list', bare=bare).split('\0'):
         key, _, value = entry.partition('\n')
         if key.startswith('remote.') and key.endswith('.url'):
-            out[key[len('remote.'):-len('.url')]] = value
-    return out
+            out.add(key[len('remote.'):-len('.url')])
+    return sorted(out)
+
+
+def remote_urls(cwd, remote, bare=False):
+    """Every URL of `remote` as git uses it: each url and pushurl after the user's url.<x>.insteadOf and
+    pushInsteadOf rules (`git remote get-url`). `ls-remote` asks the first; a push may go to any."""
+    urls = []
+    for push in ([], ['--push']):
+        urls += [u for u in git(cwd, 'remote', 'get-url', *push, '--all', remote, bare=bare).splitlines() if u]
+    if not urls:
+        raise Unreadable(f'remote get-url: {remote} has no URL')
+    return urls
+
+
+# Names and addresses that are this machine. A remote there may be what is being deleted, or next to go.
+LOCAL_HOSTS = ('localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback')
+SCHEME = re.compile(r'^([A-Za-z][A-Za-z0-9+.-]*)://(?:[^@/?#]*@)?(\[[^\]/]*\]|[^:/?#]*)')
+SCP = re.compile(r'^(?:[^@/:]*@)?(\[[^\]/]*\]|[^:/\[]+):')
+
+
+def this_machine(host):
+    host = host.strip('[]').lower().rstrip('.')
+    if not host or host in LOCAL_HOSTS or host.endswith('.localhost'):
+        return True
+    try:
+        address = ipaddress.ip_address(host.split('%')[0])
+        return address.is_loopback or address.is_unspecified
+    except ValueError:
+        pass
+    name = socket.gethostname().lower()
+    return host in (name, name.split('.')[0])
 
 
 def elsewhere(url):
-    """True for a remote on another machine (https://, ssh://, git@host:path). A folder on this machine, or a
-    file:// URL, may be what is being deleted, so what it has does not count as pushed."""
-    if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', url):
-        return not url.lower().startswith('file://')
-    return bool(re.match(r'^[^/:]+:', url)) and not url.startswith('.')
+    """True for a remote on another machine (https://, ssh://, git@host:path). A folder on this machine, a file://
+    URL, a remote helper (transport::address) or a host that is this machine (localhost, 127.0.0.1, ::1, its own
+    name) may be what is being deleted, so what it has does not count as pushed."""
+    if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*::', url):
+        return False
+    found = SCHEME.match(url)
+    if found:
+        return found.group(1).lower() != 'file' and not this_machine(found.group(2))
+    found = SCP.match(url)
+    return bool(found) and not this_machine(found.group(1))
 
 
 def lonely(cwd, positive, negative, bare=False):

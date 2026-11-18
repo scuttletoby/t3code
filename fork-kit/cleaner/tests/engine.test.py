@@ -4,7 +4,7 @@ in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/engine.test.py
 """
-import fcntl, json, os, re, subprocess, sys, time, unittest
+import fcntl, json, os, re, shutil, subprocess, sys, time, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -132,6 +132,112 @@ class Tmp(Case):
         for root in ('/', 'tmp', self.home, os.path.dirname(self.home), self.tmp + '/../tmp'):
             with self.subTest(root=root), self.assertRaises(machine_file.MachineFileError):
                 self.cfg(tmp={'root': root, 'patterns': {'*': 7}})
+
+    def precious(self):
+        return self.file(self.path('home', '.claude', 'projects', 'p', 'session.jsonl'), 'transcript\n')
+
+    def swap_after_the_last_check(self, path, swap):
+        """rules.recheck as it is, then `swap(path)`: the entry changes between the last check and the delete."""
+        real = self.c.rules.recheck
+
+        def recheck(cfg, facts, item):
+            refusal = real(cfg, facts, item)
+            if item.path == path:
+                swap(path)
+            return refusal
+        return mock.patch.object(self.c.rules, 'recheck', recheck)
+
+    def test_an_entry_swapped_after_the_last_check_is_never_followed(self):
+        """The lens probe: after the last check passed, the entry is replaced by a link to a folder that must be
+        kept, or by another folder. The delete removes nothing and says why; the run fails."""
+        cfg = self.tmp_cfg()
+        precious = self.file(self.path('home', '.claude', 'projects', 'p', 'session.jsonl'), 'transcript\n')
+        other = self.file(self.path('elsewhere', 'other', 'notes.txt'), 'notes\n')
+        d = self.path('tmp', 'job-1')
+        for name, swap, undo in (
+                ('a link', lambda p: (os.rename(p, self.path('moved-1')), os.symlink(os.path.dirname(precious), p)),
+                 lambda p: os.unlink(p)),
+                ('another folder', lambda p: (os.rename(p, self.path('moved-2')), os.rename(os.path.dirname(other), p)),
+                 lambda p: os.rename(p, os.path.dirname(other)))):
+            with self.subTest(swap=name):
+                self.old_dir('job-1')
+                with self.swap_after_the_last_check(d, swap):
+                    code, lines = self.run_cleaner(cfg)
+                self.assertEqual(code, 1, lines)
+                failed = [line for line in lines if line.startswith('FAILED ')]
+                self.assertEqual(len(failed), 1, lines)
+                self.assertIn('is not what the last check saw', failed[0])
+                self.assertNotIn('half deleted', failed[0])
+                undo(d)
+                for path, text in ((precious, 'transcript\n'), (other, 'notes\n')):
+                    with open(path) as f:
+                        self.assertEqual(f.read(), text)
+                self.assertFalse(os.path.exists(cfg.journal_file))
+
+    def test_an_entry_swapped_between_its_check_and_its_open_is_not_entered(self):
+        """The narrowest gap: the delete has just compared the name with the last check, and the entry is swapped
+        before it is opened. The folder it opened is compared again, so nothing in the other one is touched."""
+        cfg = self.tmp_cfg()
+        precious = self.precious()
+        other = self.file(self.path('elsewhere', 'other', 'notes.txt'), 'notes\n')
+        d = self.path('tmp', 'job-1')
+
+        class Os:
+            def __getattr__(self, name):
+                return getattr(os, name)
+        for name, target in (('a link', os.path.dirname(precious)), ('another folder', os.path.dirname(other))):
+            with self.subTest(swap=name):
+                self.old_dir('job-1')
+                proxy, swapped = Os(), []
+
+                def stat(path, *args, dir_fd=None, follow_symlinks=True):
+                    st = os.stat(path, *args, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                    if path == 'job-1' and dir_fd is not None and not swapped:
+                        swapped.append(path)
+                        os.rename(d, self.path('moved'))
+                        if name == 'a link':
+                            os.symlink(target, d)
+                        else:
+                            os.rename(target, d)
+                    return st
+                proxy.stat = stat
+                with mock.patch.object(self.c.rules, 'os', proxy):
+                    code, lines = self.run_cleaner(cfg)
+                if name == 'a link':
+                    os.unlink(d)
+                else:
+                    os.rename(d, target)
+                shutil.rmtree(self.path('moved'))
+                self.assertEqual(swapped, ['job-1'])
+                self.assertEqual(code, 1, lines)
+                failed = [line for line in lines if line.startswith('FAILED ')]
+                self.assertEqual(len(failed), 1, lines)
+                self.assertIn('nothing removed', failed[0])
+                self.assertNotIn('half deleted', failed[0])
+                if name == 'another folder':
+                    self.assertIn('changed as it was opened', failed[0])
+                for path, text in ((precious, 'transcript\n'), (other, 'notes\n')):
+                    with open(path) as f:
+                        self.assertEqual(f.read(), text)
+
+    def test_a_folder_moved_into_an_entry_after_the_last_check_is_not_deleted(self):
+        cfg = self.tmp_cfg()
+        d = self.old_dir('job-1')
+        self.file(os.path.join(d, 'sub', 'old.txt'))
+        self.age(d, 30)
+        other = self.file(self.path('elsewhere', 'other', 'notes.txt'), 'notes\n')
+
+        def swap(path):
+            os.rename(os.path.join(path, 'sub'), self.path('moved'))
+            os.rename(os.path.dirname(other), os.path.join(path, 'sub'))
+        with self.swap_after_the_last_check(d, swap):
+            code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 1, lines)
+        failed = [line for line in lines if line.startswith('FAILED ')]
+        self.assertIn('sub: not there at the last check', failed[0])
+        self.assertIn('half deleted', failed[0])                  # data.bin went first: a person looks at the rest
+        with open(os.path.join(d, 'sub', 'notes.txt')) as f:
+            self.assertEqual(f.read(), 'notes\n')
 
 
 class Docker(Case):
@@ -461,12 +567,34 @@ class Engine(Case):
             elsewhere = self.file(self.path('elsewhere.txt'), text)           # even another log of the cleaner's
             os.symlink(elsewhere, cfg.log_file)
             code, lines = self.run_cleaner(cfg)
-            self.assertEqual(code, 1, lines)
+            self.assertEqual(code, 2, lines)         # the same refusal a plan gives: nothing opened
             self.assertIn('log', lines[-1])
             self.assertEqual([p for p in old if not os.path.isdir(p)], [])
             with open(elsewhere) as f:
                 self.assertEqual(f.read(), text)
             os.unlink(cfg.log_file)
+
+    def test_a_log_swapped_for_a_link_after_its_check_is_never_opened(self):
+        """The log is checked by its name before anything is made, then opened without following a link: a link put
+        there between the two is refused by the open itself."""
+        cfg, old, young, held = self.jobs()
+        os.makedirs(os.path.dirname(cfg.log_file))
+        text = '2026-01-01T00:00:00Z total: deleted 0 (0 B), kept 0, failed 0\n'
+        elsewhere = self.file(self.path('elsewhere.txt'), text)
+        real = self.c.engine.log_problem
+
+        def log_problem(fd=None, path=None):
+            problem = real(fd=fd, path=path)
+            if path is not None and not os.path.lexists(path):
+                os.symlink(elsewhere, path)
+            return problem
+        with mock.patch.object(self.c.engine, 'log_problem', log_problem):
+            code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 1, lines)
+        self.assertIn('log', lines[-1])
+        self.assertEqual([p for p in old if not os.path.isdir(p)], [])
+        with open(elsewhere) as f:
+            self.assertEqual(f.read(), text)
 
     def test_a_log_file_that_is_not_the_cleaners_is_never_written(self):
         cfg, old, young, held = self.jobs()
@@ -478,6 +606,7 @@ class Engine(Case):
                 self.assertIn("is not the cleaner's log", lines[-1])
             with open(cfg.log_file) as f:
                 self.assertEqual(f.read(), text)
+            self.assertFalse(os.path.exists(cfg.lock_file))         # nothing made next to it either
             self.assertEqual([p for p in old if not os.path.isdir(p)], [])
         for text in ('', '2026-01-01T00:00:00Z total: deleted 0 (0 B), kept 0, failed 0\n'):     # new, or its own
             self.file(cfg.log_file, text)
@@ -492,6 +621,18 @@ class Engine(Case):
             self.tmp_cfg(logFile=os.path.join(self.tmp, 'cleaner.log'))
         with self.assertRaises(machine_file.MachineFileError):
             self.repo_cfg(logFile=os.path.join(self.trees, 'state', 'cleaner.log'))
+        # The log's folder is judged as its links resolve.
+        os.symlink(self.mkdir('home', '.claude', 'state'), self.path('home', 'into-claude'))
+        os.symlink(self.tmp, self.path('home', 'into-tmp'))
+        with self.assertRaises(machine_file.MachineFileError):
+            self.cfg(logFile='~/into-claude/cleaner.log')
+        with self.assertRaises(machine_file.MachineFileError):
+            self.tmp_cfg(logFile='~/into-tmp/cleaner.log')
+        # The lock and the journal next to the log are the cleaner's own files too: never in a must-keep path.
+        for own in ('cleaner.log.lock', 'cleaner.log.deleting'):
+            with self.subTest(own=own), self.assertRaises(machine_file.MachineFileError):
+                self.cfg(mustKeep=[self.path('state', own)])
+        self.cfg(mustKeep=[self.path('state', 'cleaner.log.other')])
 
     def test_the_totals_name_each_reason(self):
         cfg, old, young, held = self.jobs()
@@ -500,6 +641,67 @@ class Engine(Case):
         self.assertRegex('\n'.join(lines), r'(?m)^  tmp: would delete 2 paths \(.*\)$')
         self.assertRegex('\n'.join(lines), r'(?m)^  tmp: kept 1 \(.*\): KEEP file$')
         self.assertRegex('\n'.join(lines), r'(?m)^  tmp: kept 1 \(.*\): in use$')
+
+    def test_the_journal_names_a_delete_before_it_starts(self):
+        cfg, old, young, held = self.jobs()
+        real, named = self.c.rules.delete, []
+
+        def delete(item):
+            named.append([entry['path'] for entry in self.c.engine.read_journal(cfg)])
+            real(item)
+        with mock.patch.object(self.c.rules, 'delete', delete):
+            self.assertEqual(self.run_cleaner(cfg)[0], 0)
+        self.assertEqual(named, [[path] for path in old])
+        self.assertFalse(os.path.exists(cfg.journal_file))
+
+    @unittest.skipIf(os.getuid() == 0, 'root writes to a read-only folder')
+    def test_a_journal_that_cannot_be_written_stops_the_run(self):
+        cfg, old, young, held = self.jobs()
+        facts = self.facts(cfg)
+        plan = self.c.rules.plan(cfg, facts)
+        log = self.c.engine.Log(cfg)
+        os.chmod(os.path.dirname(cfg.journal_file), 0o500)
+        try:
+            with self.assertRaises(self.c.engine.LogError):
+                self.c.engine.delete_all(cfg, facts, plan.items, True, [].append, log, [])
+        finally:
+            os.chmod(os.path.dirname(cfg.journal_file), 0o700)
+            log.close()
+        self.assertEqual([p for p in old if not os.path.isdir(p)], [])
+
+    def test_a_journal_that_is_not_a_readable_file_stops_the_run_and_the_plan_keeps_everything(self):
+        cfg, old, young, held = self.jobs()
+        for how in ('a pipe', 'unreadable'):
+            if how == 'unreadable' and os.getuid() == 0:
+                continue
+            with self.subTest(how=how):
+                if os.path.lexists(cfg.journal_file):         # left by a failed subtest: never write into a pipe
+                    os.unlink(cfg.journal_file)
+                if how == 'a pipe':
+                    os.makedirs(os.path.dirname(cfg.journal_file), exist_ok=True)
+                    os.mkfifo(cfg.journal_file)
+                else:
+                    self.journal(cfg, {'kind': 'path', 'path': self.path('tmp', 'gone'), 'rule': 'tmp'})
+                    os.chmod(cfg.journal_file, 0)
+                code, lines = self.run_cleaner(cfg)
+                self.assertEqual(code, 1, lines)
+                self.assertIn('nothing deleted', lines[-1])
+                self.assertEqual([p for p in old if not os.path.isdir(p)], [])
+                code, lines = self.run_cleaner(cfg, really=False)
+                self.assertEqual(code, 1, lines)
+                self.assertEqual([line for line in lines if line.startswith('would delete')], [], lines)
+                for path in old:
+                    self.assertIn(f'kept {path} (tmp: could not read: the journal of deletes in progress cannot be read',
+                                  '\n'.join(lines))
+                os.unlink(cfg.journal_file)
+
+    def test_a_log_of_another_owner_is_not_the_cleaners(self):
+        cfg = self.tmp_cfg()
+        self.file(cfg.log_file, '2026-01-01T00:00:00Z total: deleted 0 (0 B), kept 0, failed 0\n')
+        self.assertIsNone(self.c.engine.log_problem(path=cfg.log_file))
+        me = os.getuid()
+        with mock.patch.object(self.c.engine.os, 'getuid', lambda: me + 1):
+            self.assertEqual(self.c.engine.log_problem(path=cfg.log_file), 'another owner')
 
 
 class Config(Case):
@@ -652,7 +854,7 @@ MUTATIONS = {
     'what it could not read fails the run': ('engine', "unread = unread_journal or any(k.code in ('could not read', 'half deleted') for k in plan.kept)", 'unread = False',
                                              Engine, 'test_what_it_could_not_read_makes_the_run_fail'),
     'one run at a time': ('engine', 'fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)', 'pass', Engine, 'test_two_runs_at_once'),
-    'the log is never a link': ('engine', 'NEW = os.O_CREAT | os.O_NOFOLLOW', 'NEW = os.O_CREAT', Engine, 'test_no_log_file_means_no_delete'),
+    'the log is never a link': ('engine', 'NEW = os.O_CREAT | os.O_NOFOLLOW', 'NEW = os.O_CREAT', Engine, 'test_a_log_swapped_for_a_link_after_its_check_is_never_opened'),
     'the log: only its own file': ('engine', "return None if STAMP.match(first) else", 'return None if True else',
                                    Engine, 'test_a_log_file_that_is_not_the_cleaners_is_never_written'),
     'the log: a plan says so too': ('engine', 'return 2  # log', 'pass', Engine, 'test_a_log_file_that_is_not_the_cleaners_is_never_written'),
@@ -676,6 +878,31 @@ MUTATIONS = {
                                                  Engine, 'test_a_delete_that_stopped_part_way_is_named_and_kept'),
     'half deleted: an unreadable journal stops a run': ('engine', "        if really:\n            out(f'stopped:", "        if False:\n            out(f'stopped:",
                                                         Engine, 'test_a_journal_it_cannot_read_stops_the_run'),
+    'the journal: written before the delete': ('engine', 'journal.append(entry)\n        write_journal(cfg, journal)\n        try:',
+                                               'journal.append(entry)\n        try:', Engine, 'test_the_journal_names_a_delete_before_it_starts'),
+    'the journal: a failed write stops the run': ('engine', "raise LogError(f'the journal {cfg.journal_file}: {ex.strerror}') from None", 'return',
+                                                  Engine, 'test_a_journal_that_cannot_be_written_stops_the_run'),
+    'the journal: unreadable stops the run': ('engine', "        raise Unreadable(f'{cfg.journal_file}: {ex.strerror}') from None\n    try:",
+                                              '        return []\n    try:', Engine,
+                                              'test_a_journal_that_is_not_a_readable_file_stops_the_run_and_the_plan_keeps_everything'),
+    'the journal: only a regular file': ('engine', 'if not stat.S_ISREG(os.fstat(fd).st_mode):', 'if False:', Engine,
+                                         'test_a_journal_that_is_not_a_readable_file_stops_the_run_and_the_plan_keeps_everything'),
+    'the journal: a plan keeps everything when it is unreadable': ('engine', '    if unread_journal:              #', '    if False:              #',
+                                                                   Engine, 'test_a_journal_that_is_not_a_readable_file_stops_the_run_and_the_plan_keeps_everything'),
+    'the log: no lock next to a file that is not the log': ('engine', 'problem = log_problem(path=cfg.log_file)        # before',
+                                                            'problem = None        # before', Engine,
+                                                            'test_a_log_file_that_is_not_the_cleaners_is_never_written'),
+    'the log: its owner': ('engine', "if st.st_uid != os.getuid():", 'if False:', Engine, 'test_a_log_of_another_owner_is_not_the_cleaners'),
+    'the log: its folder through links': ('config', 'os.path.join(os.path.realpath(os.path.dirname(log)), os.path.basename(log))', 'log',
+                                          Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
+    'the log: lock and journal never in a must-keep path': ('config', 'for own in (self.log_file, self.lock_file, self.journal_file):',
+                                                            'for own in (self.log_file,):', Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
+    'delete: the entry the last check judged': ('rules', 'if (st.st_dev, st.st_ino) != look.ident:  # ident', 'if False:',
+                                                Tmp, 'test_an_entry_swapped_after_the_last_check_is_never_followed'),
+    'delete: only what the last check saw inside': ('rules', 'if st.st_dev != look.ident[0] or st.st_ino not in look.seen:  # seen', 'if False:',
+                                                    Tmp, 'test_a_folder_moved_into_an_entry_after_the_last_check_is_not_deleted'),
+    'delete: the folder opened is the one compared': ('rules', 'if (tst.st_dev, tst.st_ino) != look.ident:', 'if False:', Tmp,
+                                                      'test_an_entry_swapped_between_its_check_and_its_open_is_not_entered'),
     'config: every key placed': ('config', "'repos.github': 'picks', ", '', Config, 'test_every_key_says_whether_it_can_loosen_a_refusal'),
     'config: unknown keys': ('config', 'values = machine_file.fields(section, SPEC, where)',
                              'values = machine_file.fields({k: v for k, v in section.items() if k in SPEC}, SPEC, where)',

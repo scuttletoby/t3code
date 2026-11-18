@@ -8,8 +8,8 @@ delete itself. A path may go only when every check here passes; a check that can
 import fnmatch, os, stat
 
 from .config import REGENERABLE, must_keep_match
-from .facts import (Processes, Unreadable, elsewhere, git, git_code, local_tags, lonely, present, remote_refs, remotes,
-                    worktree_list)
+from .facts import (Processes, Unreadable, elsewhere, git, git_code, local_tags, lonely, present, remote_refs, remote_urls,
+                    remotes, worktree_list)
 
 LOCK_NAMES = ('*.lock', 'lock', '.lock', '*.lck')
 # Names that look like they hold a key, a token or a password. Compared without regard to upper and lower case.
@@ -31,10 +31,13 @@ class Refusal:
 
 
 class Look:
-    """What `examine` found: the refusal (None: it may go), the size on disk and the newest change in it."""
+    """What `examine` found: the refusal (None: it may go), the size on disk and the newest change in it. `ident`
+    is (device, inode) of the path itself as the check saw it, and `seen` the inodes of everything in it: the delete
+    removes only what has these (rules.remove_tree)."""
 
     def __init__(self, refusal=None, size=0, newest=0.0):
         self.refusal, self.size, self.newest = refusal, size, newest
+        self.ident, self.seen = None, set()
 
 
 def changed(st):
@@ -80,8 +83,9 @@ def _unpushed(where, shown, bare):
     live answer (`git ls-remote`), never by the folder's own remote-tracking refs, which go stale when a branch is
     deleted or force-pushed there; a remote that is a folder on this machine does not count at all."""
     has, tags = set(), {}
-    for name, url in sorted(remotes(where, bare).items()):
-        if not elsewhere(url):
+    for name in remotes(where, bare):
+        # Judged by the URLs git really uses (after the user's insteadOf rules), each of them.
+        if not all(elsewhere(url) for url in remote_urls(where, name, bare)):
             continue
         refs = remote_refs(where, name, bare=bare)
         has.update(refs.values())
@@ -93,6 +97,51 @@ def _unpushed(where, shown, bare):
     missing = sorted(ref[len('refs/tags/'):] for ref, oid in local_tags(where, bare).items() if oid not in tags.get(ref, ()))
     if missing:
         return Refusal('git: tags not pushed', f'{shown}: {", ".join(missing[:5])}')
+    return None
+
+
+def module_repos(git_dir):
+    """The repositories git keeps under <git_dir>/modules: each submodule's own history, which stays there after
+    `git submodule deinit` has emptied the submodule's folder. Never through a link. Raises Unreadable when a folder
+    there cannot be read, or `modules` is not a plain folder."""
+    top = os.path.join(git_dir, 'modules')
+    try:
+        st = os.lstat(top)
+    except FileNotFoundError:
+        return []
+    except OSError as ex:
+        raise Unreadable(f'{top}: {ex.strerror}') from None
+    if not stat.S_ISDIR(st.st_mode):
+        raise Unreadable(f'{top} is a link or not a folder: the submodules in it are not judged')
+    out, stack = [], [top]
+    while stack:
+        here = stack.pop()
+        try:
+            with os.scandir(here) as it:
+                entries = [entry for entry in it if entry.is_dir(follow_symlinks=False) or entry.name == 'HEAD']
+        except FileNotFoundError:
+            continue
+        except OSError as ex:
+            raise Unreadable(f'{ex.filename or here}: {ex.strerror}') from None
+        if {'HEAD', 'objects', 'refs'} <= {entry.name for entry in entries}:
+            out.append(here)
+            stack.append(os.path.join(here, 'modules'))       # its own submodules
+            continue
+        stack.extend(entry.path for entry in entries if entry.name != 'HEAD')
+    return sorted(out)
+
+
+def modules_refusal(path, git_dir):
+    """For every submodule repository under a git folder (rules.py asks for a clone's and a worktree's own): does
+    it hold anything that exists only here?"""
+    try:
+        found = module_repos(git_dir)
+    except Unreadable as ex:
+        return Refusal('could not read', f'git: {ex}')
+    for where in found:
+        refusal = _git_refusal(path, where, True)
+        if refusal is not None:
+            return refusal
     return None
 
 
@@ -155,9 +204,12 @@ def _check(cfg, facts, path, kind, look):
         mounts = facts.mounts()
     except Unreadable as ex:
         return Refusal('could not read', f'the mount list ({ex})')
-    inside = sorted(m for m in mounts if m == path or m.startswith(path + '/'))
+    inside = sorted(m for m in mounts.points if m == path or m.startswith(path + '/'))
     if inside:  # bind mounts have the device number of what they show
         return Refusal('another filesystem', f'{os.path.relpath(inside[0], root)} is a mount point')
+    source = mounts.bound(path, st.st_dev)
+    if source is not None:  # bind source
+        return Refusal('in use', f'a bind mount shows {source} of its filesystem somewhere else (a container or a sandbox)')
 
     kept = must_keep_match(cfg.must_keep, path)
     if kept is not None:
@@ -174,6 +226,7 @@ def _check(cfg, facts, path, kind, look):
         if matches(name, LOCK_NAMES):
             return Refusal('lock file', name)
     look.size, look.newest = st.st_blocks * 512, changed(st)
+    look.ident = (st.st_dev, st.st_ino)
     inodes = [(st.st_ino, name)]
     if not stat.S_ISDIR(st.st_mode):
         return _in_use(facts, path, inodes)
@@ -210,6 +263,7 @@ def _check(cfg, facts, path, kind, look):
             if names and matches(entry.name, CREDENTIAL_NAMES):
                 return Refusal('credential name', shown)
             inodes.append((est.st_ino, shown))
+            look.seen.add(est.st_ino)
             look.newest = max(look.newest, changed(est))
             twice = est.st_nlink > 1 and not stat.S_ISDIR(est.st_mode)          # a hard link counts once
             if not twice or (est.st_dev, est.st_ino) not in counted:
@@ -231,6 +285,8 @@ def _check(cfg, facts, path, kind, look):
     if kind == 'path':
         for where, bare in gits:
             refusal = _git_refusal(path, where, bare)
+            if refusal is None and (bare or os.path.isdir(os.path.join(where, '.git'))):
+                refusal = modules_refusal(path, where if bare else os.path.join(where, '.git'))
             if refusal is not None:
                 return refusal
     else:

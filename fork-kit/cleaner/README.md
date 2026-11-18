@@ -29,6 +29,20 @@ everything about each item **again** just before its delete, dropping every answ
 themselves, git, `git ls-remote`, the process list (with command lines and file locks), the mount list, the
 systemd unit files, the pull request lists and Docker's list.
 
+**When GitHub is asked.** The pull request lists of a repository are read once for the plan, and again before
+every worktree or clone delete of that repository (never for a temp entry or a volume). Each read is two `gh pr
+list` calls (merged and open, `--limit 1000`); gh fetches 100 rows per GraphQL page, so one read costs
+ceil(merged/100) + ceil(open/100) GraphQL requests, at least 2 and at most 20. A run that deletes N worktrees
+and clones of one repository makes N + 1 reads. Each item's last check also runs `git ls-remote` against GitHub
+(git, not the API).
+
+**How a delete is done.** A temp entry or a clone is removed through open folder descriptors, one name at a
+time, never through a link: the entry must still be the folder (same device and inode) the last check judged,
+and every file and folder removed under it must be one the last check walked. A link or another folder swapped
+in after the last check is refused with `FAILED ... is not what the last check saw ... nothing removed` (exit
+1); something moved into it since stops the delete there (`not there at the last check`, half deleted). A
+worktree is checked the same way just before `git worktree remove` runs.
+
 It refuses to run as root (exit 2): `~` would then be root's home, and the must-keep paths would miss the
 user's own agent folders.
 
@@ -50,8 +64,9 @@ The log (`logFile`, private to the user) gets a `deleting X` line before each de
 newest `logLines` lines. If the log cannot be opened nothing is deleted; if a line cannot be written the run
 stops before the next delete (exit 1). `logFile` must be new, empty or a log the cleaner wrote (a regular file
 of the user's own whose first line starts with a UTC time); anything else, a symbolic link included, is never
-opened for writing: `plan` and `run` both exit 2 and name it. It may not lie in a must-keep path or in a folder a
-rule deletes from.
+opened for writing: `plan` and `run` both exit 2 and name it, and nothing (not even the lock) is made next to
+it. Its folder is judged as its links resolve. Neither it, nor the lock and journal beside it, may lie in a
+must-keep path, and it may not lie in a folder a rule deletes from.
 
 ### Half-deleted entries
 
@@ -66,9 +81,13 @@ it away, or (to have it judged again) delete its line from ~/.local/state/fork-c
 ```
 
 and exits 1, every day, until a person does one of those three things. When the path is gone (removed by hand
-or moved away) the next run drops the line by itself. A delete git refused before it removed anything (`git
-worktree remove` found a changed file) leaves no line: nothing was touched. A journal that cannot be read stops
-`run` before any delete; `plan` says so and exits 1.
+or moved away) the next run drops the line by itself. A delete refused before anything was removed leaves no
+line: `git worktree remove` found a changed file, git could not say where the worktree's clone is, or the entry
+was not what the last check saw. A `git worktree remove` that was killed or failed while deleting ("failed to
+delete") does leave its line. The journal line is written (and synced) before the delete starts, and a journal
+that cannot be written stops the run before that delete. A journal that cannot be read, or is not a regular
+file, stops `run` before any delete; `plan` says so, lists every planned path as `kept ... could not read`
+instead of `would delete`, and exits 1.
 
 ## What it never deletes
 
@@ -76,8 +95,12 @@ These hold for every rule. A rule can only pick candidates; the guard decides, a
 off this list.
 
 - **Must-keep paths:** the agent tools' homes whole (`~/.claude*` and `~/.codex*`: transcripts, sessions,
-  archived sessions, thread databases, logs, settings and logins), the T3 data folder with its databases and
-  logs (`~/.t3*/userdata`), anything inside one, and any folder that holds one. `mustKeep` in the machine file
+  archived sessions, thread databases, logs, settings and logins), the T3 data folders with their databases and
+  logs (`~/.t3*/userdata`, and `~/.t3*/dev` of a development build), where other agent tools keep sessions,
+  history and logins (`~/.gemini`, `~/.qwen`, `~/.cursor`, `~/.config/Cursor`, `~/.aider*`, `~/.continue`,
+  `~/.copilot`, `~/.config/github-copilot`, `~/.codeium`, `~/.kiro`, `~/.amazon-q` and its config and share
+  folders, and the config, share (and state) folders of opencode, crush, goose and amp), anything inside one,
+  and any folder that holds one. `mustKeep` in the machine file
   adds paths; nothing removes one. A path is compared both as written and as its symbolic links resolve, so a
   must-keep path written through a link still keeps the folder the link leads to.
 - **Must-keep names:** a file or folder called `repair-backups` or with `log-archive` in its name, wherever it is,
@@ -92,16 +115,21 @@ off this list.
 - **Git work that exists only there** (for a temp folder that is or holds a git folder): uncommitted or untracked
   changes, stash entries, worktrees hanging off it, any commit (on a branch, a tag or in a reflog) that no remote
   on another machine has right now, and any tag such a remote does not have under the same name and object
-  (annotated and lightweight). "Has right now" is asked live with `git ls-remote`; the folder's own
-  remote-tracking refs (`origin/x`) go stale and do not count, and a remote that is a folder or `file://` URL on
-  this machine does not count at all. A remote that cannot be asked means `could not read`. A `.git` that is a
+  (annotated and lightweight). The same holds for every submodule repository in the git folder
+  (`.git/modules/...`), also one `git submodule deinit` emptied. "Has right now" is asked live with `git
+  ls-remote`; the folder's own remote-tracking refs (`origin/x`) go stale and do not count. A remote counts only
+  when every URL git really uses for it (after `url.<base>.insteadOf` and `pushInsteadOf`, every URL and every
+  push URL) is on another machine: a folder, a `file://` URL, `localhost`, `127.*`, `::1` or this machine's own
+  name is not. A remote that cannot be asked means `could not read`. Git never fetches while it is asked: in a
+  partial clone a missing object is a missing object, not a download. A `.git` that is a
   symbolic link or anything but a folder or a `gitdir:` file is never passed over: the entry is kept as `could not
   read`.
 - **Unsafe paths:** a symbolic link (never followed, never removed), a root folder reached through a link,
-  anything on another filesystem than its root folder or holding a mount point (bind mounts on the same
-  filesystem too: the mount list `/proc/self/mountinfo` is read, and a list that cannot be read means `could not
-  read`), anything owned by another user, a socket, pipe or device, and anything not directly in a configured
-  root folder.
+  anything on another filesystem than its root folder or holding a mount point at any depth (bind mounts on the
+  same filesystem too: the mount list `/proc/self/mountinfo` is read, and a list that cannot be read means
+  `could not read`), anything that is or holds the source of a bind mount seen in any mount namespace whose
+  `/proc/<pid>/mountinfo` the user can read (`in use`), anything owned by another user, a socket, pipe or device,
+  and anything not directly in a configured root folder.
 - **Credential-looking names:** `.env`, `*.pem`, `*.key`, `id_rsa*`, names with `token`, `secret`, `password` or
   `credential` and the like, as the entry itself or anywhere inside it.
 - **No answer means keep.** If the process list, the mount list, a systemd unit, git, GitHub, Docker or the entry
@@ -135,6 +163,8 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `stash entries`                | clone: `git stash list` is not empty                                                                              |
 | `commits GitHub does not have` | clone: a commit on any branch, tag or reflog that no ref on GitHub (`git ls-remote`) or listed pull request holds |
 | `tags GitHub does not have`    | clone: a tag GitHub does not have with the same name and object                                                   |
+| `origin on this machine`       | clone: a URL git really uses for `origin` (after `insteadOf`) is a folder or host on this machine                 |
+| `git: unpushed commits`, ...   | a submodule repository in its git folder (also after `git submodule deinit`) holds work that is only here         |
 | `another git folder inside`    | a nested clone or submodule                                                                                       |
 | `in use`, `KEEP file`, ...     | every refusal of the list above                                                                                   |
 | `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                           |
@@ -242,6 +272,13 @@ GitHub is read with the `gh` command of the user the cleaner runs as.
 - The credential-name check is by name only. A temp folder holding a clone with a tracked file called
   `token.py` is kept; inside `.git`, `node_modules` and the like, names are not checked.
 - A worktree with a submodule or any nested git folder is kept.
+- Bind mounts are seen only as far as this user can read them. Not seen: the mount namespaces of processes of
+  other users and of root (a rootful Docker container's volumes, a service's `PrivateTmp`); a bind mount whose
+  source is a folder **above** the entry (it shares the entry with the mount, but the entry is not its
+  source); and filesystems whose device numbers differ per subvolume or layer (btrfs, overlay), where a source
+  is matched by device and path only. Processes in a container also report paths as the container sees them,
+  so the in-use check can miss them. #491 (the timer) must keep the roots away from container volumes for that
+  reason.
 - A list of 1000 or more open pull requests counts as "could not read".
 - Linux only so far (`/proc`, systemd unit folders).
 
