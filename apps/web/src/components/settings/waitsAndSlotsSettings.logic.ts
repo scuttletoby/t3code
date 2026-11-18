@@ -3,6 +3,7 @@
  * `agentSlots`). The UI only edits the person's own server settings through the normal settings
  * patch; nothing here is reachable by an agent.
  */
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
 import type { ProviderInstanceId } from "@t3tools/contracts";
 import {
   type AgentSlotsSettings,
