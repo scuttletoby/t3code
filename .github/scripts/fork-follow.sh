@@ -51,8 +51,16 @@ REPOSITORY="${REPOSITORY:-${GITHUB_REPOSITORY:-this repository}}"
 upstream_url="${UPSTREAM_URL:-https://github.com/$UPSTREAM.git}"
 reported=""
 
+# quoted TEXT...: the lines of TEXT as they are, for a report GitHub renders (an issue comment): a
+# blank line, then every line indented by four spaces, a code block that no line in TEXT can end. A
+# fence could be ended: git prints upstream's file names raw, and a name may hold a newline and ```.
+quoted() { printf '\n'; printf '%s\n' "$@" | sed 's/^/    /'; }
+
+# The report names files and patches that upstream and the series chose. Every @ in it gets a
+# zero-width space after it, so a name like @someone mentions no one when the report is posted.
+zwsp=$'\xe2\x80\x8b'
 fail() {
-  printf '%s\n' "$@" > "$REPORT"
+  printf '%s\n' "$@" | sed "s/@/@$zwsp/g" > "$REPORT"
   cat "$REPORT" >&2
   reported=1
   exit 1
@@ -92,9 +100,9 @@ fork_channel_init || fail "FORK_FOLLOW_CHANNEL is '$FORK_FOLLOW_CHANNEL'; it mus
 # fork's tags (its releases). Pruned, so a tag deleted since an earlier fetch here is gone too.
 git fetch --quiet --prune --no-tags "$upstream_url" "+refs/tags/v*:refs/upstream-tags/v*" "+HEAD:refs/upstream-head" \
   > "$logs/fetch.log" 2>&1 \
-  || fail "Could not fetch the tags and default branch of $UPSTREAM ($upstream_url):" '```' "$(tail -n 20 "$logs/fetch.log")" '```'
+  || fail "Could not fetch the tags and default branch of $UPSTREAM ($upstream_url):" "$(quoted "$(tail -n 20 "$logs/fetch.log")")"
 git fetch --quiet --prune --no-tags "$ORIGIN" "+refs/tags/v*:refs/fork-tags/v*" > "$logs/fetch.log" 2>&1 \
-  || fail "Could not fetch the tags of this fork ($ORIGIN):" '```' "$(tail -n 20 "$logs/fetch.log")" '```'
+  || fail "Could not fetch the tags of this fork ($ORIGIN):" "$(quoted "$(tail -n 20 "$logs/fetch.log")")"
 
 # Newest first by version (fork-channel.sh), not by name or by when a tag was made.
 upstream_tags="$(git for-each-ref --format='%(refname:strip=2)' refs/upstream-tags | { grep -E "$channel_re" || true; } | newest_first)"
@@ -173,10 +181,10 @@ schema_check() { # schema_check BASE WHAT: fails with the check's output, a refu
   node .github/scripts/fork-schema-check.cjs "$1" HEAD > "$logs/schema-check.log" 2>&1 || status=$?
   ((status != 0)) || return 0
   if ((status == 1)) && grep -qF "$schema_refusal" "$logs/schema-check.log"; then
-    fail "$2 changes the database schema:" '```' "$(cat "$logs/schema-check.log")" '```'
+    fail "$2 changes the database schema:" "$(quoted "$(cat "$logs/schema-check.log")")"
   fi
   fail "The schema check crashed (exit $status), so it did not say whether the series touches the database schema:" \
-    '```' "$(tail -n 20 "$logs/schema-check.log")" '```' "The series was left as it is."
+    "$(quoted "$(tail -n 20 "$logs/schema-check.log")")" "" "The series was left as it is."
 }
 schema_check "$base" "The series"
 
@@ -204,11 +212,11 @@ seam_check() { # seam_check BASE WHAT [--after-rebase]
     return 0
   fi
   if ((status == 1)) && grep -qF "$seam_refusal" "$logs/seam-check.log"; then
-    fail "$2 does not fit the seam list (.github/fork-seams.json):" '```' "$(cat "$logs/seam-check.log")" '```' \
+    fail "$2 does not fit the seam list (.github/fork-seams.json):" "$(quoted "$(cat "$logs/seam-check.log")")" "" \
       "The series was left as it is."
   fi
   fail "The seam check crashed (exit $status), so it did not say whether the series stays within the seams:" \
-    '```' "$(tail -n 20 "$logs/seam-check.log")" '```' "The series was left as it is."
+    "$(quoted "$(tail -n 20 "$logs/seam-check.log")")" "" "The series was left as it is."
 }
 # The sweep (fork-workflows.sh) takes every .github/workflows/fork-*.y[a]ml as the fork's own, even
 # one the series does not have yet, and never disables it. A file of that name that the upstream
@@ -221,7 +229,7 @@ refuse_upstream_fork_named() { # refuse_upstream_fork_named UPSTREAM_COMMIT TAG 
   local named
   named="$(comm -12 <(fork_named "$1" | sort) <(fork_named "$3" | sort))"
   [[ -z "$named" ]] || fail "$UPSTREAM $2 has workflow files named like the fork's own (fork-*.yml), and the candidate keeps them:" \
-    "$(sed 's/^/- /' <<< "$named")" "" \
+    "$(quoted "$named")" "" \
     "The workflow sweep never disables a fork-* workflow, so they would run in the fork. The series was left as it is." \
     "Add a fork patch that deletes them (or rename the fork's rule in fork-workflows.sh and fork-follow.sh), then start the follow workflow again."
 }
@@ -281,13 +289,13 @@ refuse_outside_workflows() { # refuse_outside_workflows UPSTREAM_BASE UPSTREAM_T
     status=0
     events="$(node "$here/fork-workflow-triggers.cjs" "$logs/workflow.yml" 2> "$logs/triggers.log")" || status=$?
     if ((status != 0)); then
-      found+=("- \`$path\`: its triggers could not be read ($(tr '\n' ' ' < "$logs/triggers.log"| sed 's/ *$//'))")
+      found+=("$path: its triggers could not be read ($(tr '\n' ' ' < "$logs/triggers.log"| sed 's/ *$//'))")
     elif grep -qE "$outside_events" <<< "$events" || grep -qwE 'pull_request_target|workflow_run' "$logs/workflow.yml"; then
-      found+=("- \`$path\`: on $(paste -sd ',' <<< "$events" | sed 's/,/, /g')")
+      found+=("$path: on $(paste -sd ',' <<< "$events" | sed 's/,/, /g')")
     fi
   done
   ((${#found[@]} == 0)) || fail "$UPSTREAM $3 adds workflow files that someone outside the fork can start, or whose triggers could not be read:" \
-    "${found[@]}" "" \
+    "$(quoted "${found[@]}")" "" \
     "The workflow sweep cannot stop the first run of such a file, so the series was left as it is." \
     "Add each one to $removed_file with a fork patch (the next follow then deletes it) and start the follow workflow again;" \
     "or, to keep one, rebase onto $3 by hand (see the conflict advice in fork-follow.yml)."
@@ -312,8 +320,8 @@ workflow_paths() { # workflow_paths FILTER FROM TO: sets paths, the ','-joined f
     > "$logs/paths" || fail "Could not list the workflow files that differ between ${2:0:12} and ${3:0:12}."
   while IFS= read -r -d '' path; do
     if [[ "$path" == *[,$'\n']* ]]; then
-      fail "The workflow file \`$path\` (between ${2:0:12} and ${3:0:12}) has a ',' or a newline in its name, so it cannot be named to the workflow sweep." \
-        "The series was left as it is. Rename or delete it with a fork patch."
+      fail "A workflow file between ${2:0:12} and ${3:0:12} has a ',' or a newline in its name, so it cannot be named to the workflow sweep:" \
+        "$(quoted "$path")" "" "The series was left as it is. Rename or delete it with a fork patch."
     fi
     paths+="${paths:+,}$path"
   done < "$logs/paths"
@@ -396,7 +404,7 @@ if [[ -z "$untagged" && "$target_tag" == "$base_tag" ]]; then
   # The candidate here is the series head itself, so a listed file in it is refused, not deleted.
   kept="$(present_removed "$head")"
   [[ -z "$kept" ]] || fail "The series still has workflow files that $removed_file lists as deleted:" \
-    "$(sed 's/^/- /' <<< "$kept")" "" \
+    "$(quoted "$kept")" "" \
     "The plan does not release them. Delete them with a fork patch (or take them off the list), then start the follow workflow again."
   read -r released_tag released_commit <<< "$(latest_release "$base_tag")" || true
   if [[ "${released_commit:-}" == "$head" ]]; then
@@ -433,22 +441,24 @@ before="$(git log --format=%s "$base..HEAD")"
 # that remote in one batch for the blob the pick itself had just merged; no server has it, so the
 # fetch failed ("not our ref") and the pick stopped with a git error, not a conflict (#475). Before
 # the rebase, fetch in one batch every blob it reads: each patch's two sides, the series' own, and
-# the old base's side of every file upstream changed. The rebase then has nothing to fetch. Only
-# ids the remote can have are asked for (blobs of the series and the base, never a gitlink), and a
-# blob that is already here is not fetched again. The promisor is extensions.partialclone or, as
-# `git clone --filter` and `git fetch --filter` leave it, the remote marked `promisor = true`.
+# both sides of every file upstream changed. The rebase then has nothing to fetch. A blob already
+# here is not asked for. The upstream fetch above sends every blob of the target except those the
+# base's history already has (a file upstream brought back to an earlier content), so whatever is
+# asked for is in the series or the base's history, which the remote has; a gitlink never is. The promisor is extensions.partialclone or, as
+# `git clone --filter` and `git fetch --filter` leave it, the remote marked `promisor = true` (in
+# any spelling git takes for true: yes, on, 1).
 prefetch_rebase_blobs() { # prefetch_rebase_blobs BASE TARGET
   local promisor
   promisor="$(git config --get extensions.partialclone || true)"
-  [[ -n "$promisor" ]] || promisor="$(git config --get-regexp '^remote\..*\.promisor$' \
-    | awk 'tolower($2) == "true" { sub(/^remote\./, "", $1); sub(/\.promisor$/, "", $1); print $1; exit }' || true)"
+  [[ -n "$promisor" ]] || promisor="$(git config --type=bool --get-regexp '^remote\..*\.promisor$' \
+    | awk '$2 == "true" { sub(/^remote\./, "", $1); sub(/\.promisor$/, "", $1); print $1; exit }' || true)"
   [[ -n "$promisor" ]] || return 0
   # raw_blobs SIDES: the blob ids (not gitlinks) of `--raw` lines, on the old side or both.
   raw_blobs() { awk -v both="$1" '/^:/ { if ($1 ~ /^:(100|120)/) print $3; if (both && $2 ~ /^(100|120)/) print $4 }'; }
   {
     git rev-list --objects --missing=print "$1..HEAD" | sed -n 's/^?//p'
     git log --raw --no-renames --no-abbrev --format= "$1..HEAD" | raw_blobs 1
-    git diff-tree -r --no-renames "$1" "$2" | raw_blobs ""
+    git diff-tree -r --no-renames "$1" "$2" | raw_blobs 1
   } | awk '$0 !~ /^0+$/' | sort -u > "$logs/prefetch.wanted"
   # Objects already here (listing them never fetches); only the rest is asked for.
   git cat-file --batch-all-objects --batch-check='%(objectname)' | sort -u > "$logs/prefetch.here"
@@ -457,7 +467,7 @@ prefetch_rebase_blobs() { # prefetch_rebase_blobs BASE TARGET
   git -c fetch.negotiationAlgorithm=noop fetch --quiet "$promisor" --no-tags --no-write-fetch-head \
     --recurse-submodules=no --filter=blob:none --stdin < "$logs/prefetch.ids" > "$logs/prefetch.log" 2>&1 \
     || fail "Could not fetch the $(wc -l < "$logs/prefetch.ids") files the rebase from $base_tag onto $target_tag reads from $promisor (this checkout has no file contents of its own):" \
-      '```' "$(tail -n 20 "$logs/prefetch.log")" '```' "Nothing was rebased; the series was left as it is."
+      "$(quoted "$(tail -n 20 "$logs/prefetch.log")")" "" "Nothing was rebased; the series was left as it is."
 }
 prefetch_rebase_blobs "$base" "$target"
 
@@ -475,6 +485,7 @@ if as_fork rebase --empty=drop --onto "$target" "$base" > "$last_log" 2>&1; then
   rebase_ok=1
 fi
 steps=0
+resumed="" # the patch whose listed files were deleted last, and the command that went on from it
 while ((!rebase_ok)) && rebasing && ((steps++ <= series_count)); do
   unmerged=()
   while IFS= read -r -d '' path; do unmerged+=("$path"); done \
@@ -482,35 +493,48 @@ while ((!rebase_ok)) && rebasing && ((steps++ <= series_count)); do
   ((${#unmerged[@]})) || break
   for path in "${unmerged[@]}"; do is_removed "$path" || break 2; done
   last_log="$logs/rebase-step-$steps.log"
+  resumed="$(git log -1 --format='%h %s' REBASE_HEAD 2> /dev/null || echo "a patch")"
   git rm -q --ignore-unmatch -- "${unmerged[@]}" > "$last_log" 2>&1
   if git diff --cached --quiet HEAD; then
+    resumed+=$'\n'--skip
     GIT_EDITOR=true as_fork rebase --skip >> "$last_log" 2>&1 && rebase_ok=1
   else
+    resumed+=$'\n'--continue
     GIT_EDITOR=true as_fork rebase --continue >> "$last_log" 2>&1 && rebase_ok=1
   fi
 done
 if ((!rebase_ok)); then
+  # With no rebase left, git either never began it or ended it in a --continue/--skip above.
   # REBASE_HEAD names a patch that stopped on a conflict. A pick that stopped on a git error has
-  # none; the last line of the rebase's done list is then the patch it was applying.
-  if git rev-parse -q --verify REBASE_HEAD > /dev/null; then
-    stopped="$(git log -1 --format='%h %s' REBASE_HEAD)"
+  # none; the last line of the rebase's done list is then the patch it was applying. With no done
+  # list git stopped before its first pick, while it checked out the target.
+  done_list="$(git rev-parse --git-path rebase-merge/done)"
+  if ! rebasing && [[ -n "$resumed" ]]; then
+    stopped="the patch after ${resumed%$'\n'*}: once its listed files were deleted, \`git rebase ${resumed##*$'\n'}\` failed and left no rebase state that names the patch"
   elif ! rebasing; then
     stopped="its start: git did not begin the rebase, so no patch was applied"
+  elif git rev-parse -q --verify REBASE_HEAD > /dev/null; then
+    stopped="$(git log -1 --format='%h %s' REBASE_HEAD)"
+  elif [[ -d "$(git rev-parse --git-path rebase-merge)" && ! -s "$done_list" ]]; then
+    stopped="its start: git stopped while it checked out $target_tag, before it applied any patch"
   else
-    picked="$(awk '$1 ~ /^(pick|p)$/ { c = $2 } END { print c }' "$(git rev-parse --git-path rebase-merge/done)" 2> /dev/null || true)"
+    picked="$(awk '$1 ~ /^(pick|p)$/ { c = $2 } END { print c }' "$done_list" 2> /dev/null || true)"
     stopped="$(git log -1 --format='%h %s' "${picked:-none}" 2> /dev/null)" \
       || stopped="a patch git did not name (its output is below)"
   fi
-  conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- /')"
+  conflicts="$(git diff --name-only --diff-filter=U)"
   said="$(git_said)"
-  git rebase --abort > /dev/null 2>&1 || true
+  aborted=()
+  git rebase --abort > "$logs/rebase-abort.log" 2>&1 \
+    || aborted=("\`git rebase --abort\` failed as well, so this checkout is still rebasing. It said:" \
+      "$(quoted "$(tail -n 20 "$logs/rebase-abort.log")")" "")
   if [[ -n "$conflicts" ]]; then
-    why=("Conflicting files:" "$conflicts")
+    why=("Conflicting files:" "$(quoted "$conflicts")")
   else
     why=("Git stopped with an error, not a conflict: no file is left unmerged.")
   fi
   fail "Rebasing the series from $base_tag onto $target_tag stopped at: $stopped" "" \
-    "${why[@]}" "" "What git said:" '```' "${said:-(git printed nothing)}" '```' "" \
+    "${why[@]}" "" "What git said:" "$(quoted "${said:-(git printed nothing)}")" "" ${aborted[@]+"${aborted[@]}"} \
     "The series was left as it is. To follow by hand: \`git fetch https://github.com/$UPSTREAM.git tag $target_tag\`," \
     "\`git rebase --onto $target_tag $base_tag <series branch>\`, resolve, run the tests, then push the branch with" \
     "\`--force-with-lease\`, and start the follow workflow once (\`gh workflow run fork-follow.yml --repo $REPOSITORY\`):" \

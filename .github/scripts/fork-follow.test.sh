@@ -245,14 +245,14 @@ rm -f "$root/work/u3.txt"
 # origin when it first reads it. On git 2.56 such a fetch made while a pick was applied asked for
 # the blob the pick had just merged, which origin cannot have, and the rebase stopped. The plan
 # fetches every blob the rebase reads before it starts; here origin refuses any fetch made while
-# the work tree is rebasing, and the plan still follows.
+# the work tree is rebasing (or any fetch, while $root/refuse-all exists), and the plan still follows.
 partial_fork() { # partial_fork: the series of new_fork, checked out again as a partial clone
   local bare="$root/gh/me/t3code.git"
   git -C "$bare" config uploadpack.allowFilter true
   git -C "$bare" config uploadpack.allowAnySHA1InWant true
   cat > "$root/bin/upload-pack-not-while-rebasing" << EOF
 #!/usr/bin/env bash
-if [[ -d "$root/work/.git/rebase-merge" || -d "$root/work/.git/rebase-apply" ]]; then
+if [[ -e "$root/refuse-all" || -d "$root/work/.git/rebase-merge" || -d "$root/work/.git/rebase-apply" ]]; then
   echo "fetch while rebasing" >> "$root/refused"
   echo "fatal: upload-pack: not our ref (a fetch while the rebase runs)" >&2
   exit 1
@@ -260,7 +260,7 @@ fi
 exec git upload-pack "\$@"
 EOF
   chmod +x "$root/bin/upload-pack-not-while-rebasing"
-  rm -rf "$root/work" "$root/refused"
+  rm -rf "$root/work" "$root/refused" "$root/refuse-all"
   git clone -q --filter=blob:none --no-checkout "file://$bare" "$root/work" 2> /dev/null
   work git config remote.origin.uploadpack "$root/bin/upload-pack-not-while-rebasing"
   work git checkout -q --detach origin/main
@@ -504,6 +504,130 @@ fork_remove() { # fork_remove FILE...: a fork patch that lists and deletes upstr
   for f in "$@"; do cmd+="echo .github/workflows/$f >> .github/fork-removed-workflows.txt && rm -f .github/workflows/$f && "; done
   fork_commit "fork: delete $*" "${cmd}true"
 }
+# --- plan: every stop of the rebase is named, and the report quotes git safely (#475) ---------
+# A git that does what FORK_TEST_GIT names and is git otherwise: skip the prefetch (no-prefetch),
+# fail `rebase --abort` (abort-fails), or end the rebase in a --continue/--skip and fail that
+# (continue-quits).
+real_git="$(command -v git)"
+mkdir -p "$root/testgit"
+cat > "$root/testgit/git" << G
+#!/usr/bin/env bash
+args=" \$* "
+case "\${FORK_TEST_GIT:-}" in
+  no-prefetch) [[ "\$args" != *" fetch "*" --stdin "* ]] || exit 0 ;;
+  abort-fails) [[ "\$args" != *" rebase --abort "* ]] || { echo "error: the test git refused the abort" >&2; exit 1; } ;;
+  continue-quits)
+    if [[ "\$args" == *" rebase --continue "* || "\$args" == *" rebase --skip "* ]]; then
+      "$real_git" rebase --quit; echo "error: the test git ended the rebase" >&2; exit 1
+    fi ;;
+esac
+exec "$real_git" "\$@"
+G
+chmod +x "$root/testgit/git"
+tplan() { PATH="$root/testgit:$PATH" FORK_TEST_GIT="$1" plan; }
+zwsp=$'\xe2\x80\x8b'
+
+# Git prints upstream's file names raw. A name with a newline and ``` stays inside the quote of
+# git's words, and no name in the report mentions anyone.
+new_upstream
+fenced="$(printf '.github/workflows/x\n```\n**@octocat injected**\n```\ny.yml')"
+up_release v0.1.11 'git mv .github/workflows/ci.yml "$fenced"'
+new_fork v0.1.10
+fork_remove ci.yml
+plan
+check "plan: a file name that holds a fence stays in the quote of git's words and mentions no one" \
+  eval 'has "^    \*\*@${zwsp}octocat injected\*\*$" "$root/report.md" && hasnt "@octocat" "$root/report.md" \
+    && [[ -z "$(grep -E "octocat|^ {0,3}\`\`\`" "$root/report.md" | grep -v "^    ")" ]]'
+
+new_upstream
+new_fork v0.1.10
+fork_commit "fork: add the octo file" 'echo fork > @octo.txt'
+up_release v0.1.11 'echo upstream > @octo.txt'
+plan
+check "plan: a conflicting file named @name is listed in a quote and mentions no one" \
+  eval 'has "^Conflicting files:" "$root/report.md" && has "^    @${zwsp}octo.txt$" "$root/report.md" && hasnt "@octo" "$root/report.md"'
+
+# A failed `git rebase --abort` is quoted, not hidden.
+new_upstream
+new_fork v0.1.9
+fork_commit "fork: edit u3" 'echo fork > u3.txt'
+tplan abort-fails
+check "plan: a failed rebase --abort is quoted in the report" \
+  eval 'has "rebase --abort. failed as well" "$root/report.md" && has "^    error: the test git refused the abort" "$root/report.md"'
+work git rebase --abort
+
+# A --continue that fails and ends the rebase is not reported as a rebase git never began.
+new_upstream
+up_release v0.1.11 'echo "on: [push] # edited" > .github/workflows/ci.yml'
+new_fork v0.1.10
+fork_remove ci.yml
+tplan continue-quits
+check "plan: a --continue that fails and ends the rebase names the patch it went on from" \
+  eval 'has "stopped at: the patch after [0-9a-f]* fork: delete ci.yml: once its listed files were deleted, .git rebase --continue. failed" "$root/report.md" \
+    && hasnt "did not begin" "$root/report.md" && has "the test git ended the rebase" "$root/report.md"'
+
+# Partial clones (see partial_fork). Prefetch refused: the plan stops before the rebase, quoting git.
+# ORIGIN is the fork's path, so only the promisor remote (origin) refuses.
+new_upstream
+new_fork v0.1.9
+fork_commit "fork: feature one" 'echo one > feature.txt'
+fork_commit "fork: feature two" 'echo two > feature.txt'
+partial_fork
+before="$(work_head)"
+touch "$root/refuse-all"
+ORIGIN="$root/gh/me/t3code.git" plan
+rm -f "$root/refuse-all"
+check "plan: a refused prefetch stops before the rebase and quotes git" \
+  eval 'has "^Could not fetch the [0-9]* files the rebase from v0.1.9 onto v0.1.10 reads from origin" "$root/report.md" \
+    && has "^    fatal: upload-pack: not our ref" "$root/report.md" && has "Nothing was rebased" "$root/report.md" \
+    && [[ ! -d "$root/work/.git/rebase-merge" && "$(work_head)" == "$before" ]]'
+
+# The #475 stop itself: git dies on a lazy fetch in a later pick and leaves no REBASE_HEAD; the done
+# list names the patch. Here the prefetch is skipped and origin refuses while the rebase runs.
+new_fork v0.1.9
+fork_commit "fork: add f" 'echo v1 > f.txt'
+fork_commit "fork: change f" 'echo v2 > f.txt'
+partial_fork
+tplan no-prefetch
+check "plan: a pick that dies on a fetch, with no REBASE_HEAD, is named from the done list" \
+  eval 'has "stopped at: [0-9a-f]* fork: add f$" "$root/report.md" && has "not a conflict" "$root/report.md" \
+    && has "could not fetch" "$root/report.md" && [[ -e "$root/refused" && ! -d "$root/work/.git/rebase-merge" ]]'
+
+# Upstream brings a file back to an earlier content (a revert). A server with reachability bitmaps
+# (GitHub) does not send that blob, since the base's history has it, so the checkout of the target
+# reads it: the prefetch asks for it, and the plan follows without fetching while it rebases.
+new_upstream
+up_release v0.1.11 'echo old > z.txt'
+up_release v0.1.12 'echo new > z.txt'
+new_fork v0.1.12
+partial_fork
+up_release v0.1.13 'echo old > z.txt'
+git -C "$root/gh/up/t3code.git" repack -q -a -d -b
+plan
+check "plan: a partial clone follows an upstream revert without fetching while it rebases" \
+  eval 'action_is rebase && [[ "$(out base_tag)" == v0.1.13 && ! -e "$root/refused" ]] \
+    && [[ "$(git -C "$root/work" show "$(out candidate):z.txt")" == old ]]'
+
+# Without the prefetch git dies while it checks out the target, before its first pick: no patch
+# was applied, and the report says so.
+partial_fork
+tplan no-prefetch
+check "plan: git dying before the first pick says no patch was applied" \
+  eval 'has "stopped at: its start: git stopped while it checked out v0.1.13, before it applied any patch" "$root/report.md" \
+    && has "could not fetch" "$root/report.md" && [[ -e "$root/refused" && ! -d "$root/work/.git/rebase-merge" ]]'
+
+# Git takes yes, on and 1 for true: a remote marked so is a promisor, and the prefetch runs.
+for yes in yes on 1; do
+  new_fork v0.1.9
+  fork_commit "fork: feature one" 'echo one > feature.txt'
+  fork_commit "fork: feature two" 'echo two > feature.txt'
+  partial_fork
+  work git config remote.origin.promisor "$yes"
+  plan
+  check "plan: a promisor remote marked '$yes' is prefetched for" \
+    eval 'action_is rebase && [[ ! -e "$root/refused" ]]'
+done
+
 # Upstream adopts a "pending" fork line word for word: the rebase drops it, so the series is below
 # its ceiling. Lowering the ceiling first fails the check on the old base, so after a rebase the
 # ceiling is only a note; the next run, from the new base, refuses it (a pull request lowers it).
@@ -554,7 +678,7 @@ fork_commit "fork: own u4" 'echo mine > u4.txt'
 before="$(work_head)"
 plan
 check "plan: a conflict on a listed file and an unlisted one is refused, naming the unlisted one" \
-  eval '[[ -z "$(out action)" ]] && has "u4.txt" "$root/report.md" && hasnt "^- \.github/workflows/ci.yml" "$root/report.md" && [[ ! -d "$root/work/.git/rebase-merge" && "$(work_head)" == "$before" ]]'
+  eval '[[ -z "$(out action)" ]] && has "u4.txt" "$root/report.md" && hasnt "^    \.github/workflows/ci.yml$" "$root/report.md" && has "^    u4.txt$" "$root/report.md" && [[ ! -d "$root/work/.git/rebase-merge" && "$(work_head)" == "$before" ]]'
 
 # Upstream deleted the file itself (the fork's deleting patch has nothing left to do), then brings
 # it back: the plan deletes it again with one more commit.
