@@ -112,7 +112,11 @@ seam entry together is refused. It takes two pull requests, each green:
    `"added": []`. The seam check allows an announced line like an `added` one. The seam-check tests
    (on the pull request's tree) refuse an announced line that is already in its file: a line
    upstream has (`}`) cannot be announced, as a pull request cannot add it. A line is in `added` or
-   in `announced`, never both.
+   in `announced`, never both, and holds no line break (one line per item). A file has one
+   `announced` block and one `since`: a second announcement in a file that already has one joins
+   its `added` and sets `since` to its own day, which renews the 14 days for the lines already
+   there too (a visible change of `since` for the reviewers); left as it was, the new line gets
+   only the days that are left.
 2. **Add** the lines, and in the same change move them from `announced` to `added` (drop
    `announced` once empty). Judged by main's list, which announces them, it is green. Keeping the
    announcement fails the tests: kept as it is, the lines are now in the file; copied into `added`
@@ -120,13 +124,21 @@ seam entry together is refused. It takes two pull requests, each green:
    may spend an announced line, not only the one meant to.
 
 An announcement lasts 14 days. From upstream, fork-follow refuses one more than 14 days older than
-the head's commit date (or dated ahead of it): add the lines or remove the announcement with a pull
-request to main. The same commits give the same answer; after a rebase the head is new, dated when
-the rebase ran. A pull request's run refuses only a line that an expired announcement alone allows,
-dated by main's commit (never the pull request's), so the pull request that removes the
-announcement adds no line and is green. If upstream itself adds an announced line, fork-follow
-stops before pushing (pushed, main's tree would fail the seam-check tests for every pull request):
-remove the announcement with a list-only pull request to main.
+the head's commit date (or dated more than a day ahead of it): announce the lines again (set `since`
+to today) or remove the announcement, with a list-only pull request to main; only then step 2. Step
+2 alone is refused too: when fork-follow refuses an announcement, main's date is past its days as
+well (before the rebase its head is main). The same commits give the same answer; after a rebase the
+head is new, dated when the rebase ran. A pull request's run refuses only a line that an expired (or
+dated-ahead) announcement alone allows, dated by the commit whose list judges it (main's, never the
+pull request's), so the pull request that re-dates or removes the announcement adds no line and is
+green. In a pull request's run the 14 days are main's commit dates, not the calendar: while nothing
+merges, main's date stands still (fork-follow does not push past an expired announcement), and the
+next merge moves it. If upstream itself adds an announced line, fork-follow stops before pushing
+(pushed, main's tree would fail the seam-check tests for every pull request): remove the
+announcement with a list-only pull request to main.
+
+To go back to a seam check from before announcements (#409), remove every announcement first: an
+older check refuses the `announced` key, and a list it refuses stops every run.
 
 For example, [#398](https://github.com/scuttletoby/t3code/pull/398) takes one list-only pull
 request first. It announces the new cli/connect.ts lines in main's existing entry, keeping the
@@ -163,10 +175,11 @@ gets `"apps/server/src/peer/RemoteDelegation.ts": {"why": "…", "added": [], "a
 from main and moves its lines to `added`.
 
 A new `forkFiles` pattern needs no announcement: a list-only pull request adds it, and the pull
-request that edits those files follows. `pending` takes no new file or higher ceiling: its lines
-predate the rule and only move out. A pending file takes no new fork line (a pull request may
-change its lines but not add more, and a file cannot be in `files` and `pending`), so a new fork
-line goes in a seam file, after its lines are announced.
+request that edits those files follows. No pull request adds a `pending` file or raises a ceiling:
+its lines predate the rule and only move out. Only the operator raises one, after upstream's own
+change made the count rise (fork-follow's refusal says how). A pending file takes no new fork line
+(a pull request may change its lines but not add more, and a file cannot be in `files` and
+`pending`), so a new fork line goes in a seam file, after its lines are announced.
 
 ### Adding a fork setting
 
@@ -216,7 +229,8 @@ change, or a fork line beyond the seams, it stops and opens one issue. Then:
    `node .github/scripts/fork-seam-check.cjs --from-upstream <upstream tag> HEAD`. A refused line moves into the
    fork's own file (a setting into `forkSettings.ts`, a server layer into
    `apps/server/src/fork/forkLayers.ts`); a changed seam line is fixed in
-   `.github/fork-seams.json`.
+   `.github/fork-seams.json`. A `pending` ceiling or `lost` count that rose with upstream's own
+   change (the refusal says "after the rebase") is raised in the rebased series' list.
 3. Run the pin tests before pushing:
    `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
 4. Push with `--force-with-lease` and start fork-follow once, as its report says.
