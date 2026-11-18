@@ -344,6 +344,11 @@ const make = Effect.gen(function* () {
       const key = input.clientRequestId ?? (yield* random.uuidV4());
       const task = taskPrompt(input);
       const title = input.title ?? parent.thread.title;
+      // Fork: from the launch on, the task is recorded and followed even if this call is
+      // interrupted (the parent's turn moved on), else the thread there runs with nothing here
+      // following it or reporting its end. The reads above stay cancellable.
+      // prettier-ignore
+      return yield* Effect.gen(function* () { // Fork: start of launchAndRecord.
       const launched = yield* forwarding.call(
         scope,
         ProjectToolkit.tools.t3_thread_launch,
@@ -432,6 +437,10 @@ const make = Effect.gen(function* () {
               Effect.orElseSucceed(() => undefined),
             );
       if (taskId === undefined) {
+        // Fork: nothing here follows it, so stop it there, as a failed record does.
+        yield* Effect.logWarning("remote-delegation.record-found-no-task", remoteChild);
+        const unfollowed = stopThere(followScope(scope.thread, remoteChild), remoteChild, "stop");
+        yield* unfollowed.pipe(Effect.ignoreCause({ log: true }));
         return yield* new OrchestratorMcpFailure({
           code: "orchestration_error",
           message: "The delegated task was not recorded.",
@@ -439,6 +448,7 @@ const make = Effect.gen(function* () {
       }
       yield* followOne(scope.thread.threadId, taskId).pipe(Effect.forkIn(followers));
       return { taskId };
+      }).pipe(Effect.uninterruptible); // Fork: end of launchAndRecord.
     },
   );
 
