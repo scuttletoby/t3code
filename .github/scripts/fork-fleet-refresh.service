@@ -1,7 +1,7 @@
 # Fork only: the fleet host's runner template refresh (fork-fleet-launch.sh refresh). Install as
 # /etc/systemd/system/t3code-fleet-refresh.service with its timer (.github/fork-fleet.md, host step 7); not as
-# fork-fleet-*, the runner units' prefix. Safe to start by hand: a second refresh waits for the first (refresh.lock),
-# then finds the template new already.
+# fork-fleet-*, the runner units' prefix. Safe to start by hand: a second refresh waits for the first (a lock on the
+# template's own folder), then finds the template new already.
 #
 # Root, sandboxed. Root because the template must be root's (each job hard-links it, and start refuses one anyone
 # else owns or may write). The sandbox lets it write only the template's own folder (/opt/fork-fleet/template, where
