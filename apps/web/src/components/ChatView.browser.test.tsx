@@ -494,6 +494,8 @@ it("a failed image-only first send of a new thread keeps the new draft", async (
     .element()
     .dispatchEvent(new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }));
   await expect.element(page.getByRole("img", { name: "shot.png" })).toBeVisible();
+  // Fork: the tile shows while the image still compresses, and that Enter sends nothing.
+  await expect.element(page.getByRole("button", { name: "Preview shot.png" })).toBeEnabled();
   await userEvent.keyboard("{Enter}");
   await vi.waitFor(() => expect(launch.calls).toHaveLength(1));
   await userEvent.keyboard("next draft");
