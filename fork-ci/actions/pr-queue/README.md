@@ -172,11 +172,15 @@ head, the one that fixes it too, and the queue stops (an owner then has to push
 the fix by hand). The gate therefore refuses a pull request whose merged config
 (GitHub's merge commit, or `git merge-tree` of base and head in the gate's bare
 mode) does not parse, is deleted, is no regular file (a folder, a symlink or a
-submodule entry), gains a twin whose name differs from it or one of its
-folders only in case (Unicode NFC and NFD forms count as one name), or is
-in `enforce` with a rule order `enforce` refuses (the order checks above), and
-caps what it reads of a config a pull request changes
-(32 KiB, 128 characters per glob, 2,048 in all). That one check reads the
+submodule entry), gains a twin whose name differs from it only in case, gains
+a file, symlink or submodule entry whose name differs from one of its folders
+only in case (`.GitHub` next to `.github/`; a folder of that name is read on,
+and passes while it holds no twin of the config), or is in `enforce` with a
+rule order `enforce` refuses (the order checks above), and caps what it reads
+of a config a pull request changes (32 KiB, 128 characters per glob, 2,048 in
+all). Names compare as macOS compares them: fully case folded (`ſ` is `s`), and
+Unicode NFC and NFD forms as one name. NTFS compares with its own upcase table
+and may pair a few exotic names this keeps apart (`ı`, `İ`). That one check reads the
 merged config; everything else, the rules that judge the head too, the base's.
 It judges the merge with the base of its run: two pull requests that each pass
 alone can still merge into a bad config unless the ruleset requires branches to
