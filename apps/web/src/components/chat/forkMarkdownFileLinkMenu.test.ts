@@ -1,31 +1,33 @@
-// Fork: the file link menu and remote editor links (#17); upstream's tests stay in
-// MarkdownFileLink.logic.test.ts.
+// Fork: the fork's file link menu entries and remote editor links (#17); upstream's tests stay
+// in MarkdownFileLink.logic.test.ts.
 import { describe, expect, it } from "vite-plus/test";
 
 import { resolveMarkdownFileLinkMeta } from "../../markdown-links";
-import { markdownFileMenuItems, markdownFileRemoteEditorUrl } from "./MarkdownFileLink.logic";
+import {
+  forkMarkdownFileMenu,
+  forkMarkdownFileMenuItems,
+  markdownFileRemoteEditorUrl,
+} from "./forkMarkdownFileLinkMenu";
 
-const NOTHING = {
-  hasLine: false,
-  workspaceRelativePath: null,
-  canOpenMedia: false,
-  canOpenInPanel: false,
-  openInEditorLabel: null,
-  canOpenInBrowser: false,
-  revealLabel: null,
-  canDownload: false,
-};
+const NOTHING = { hasLine: false, canOpenInPanel: false, canDownload: false };
+// What upstream's MarkdownFileLink.tsx builds: its own entries, then its copies.
+const UPSTREAM_OPENS = [
+  { id: "preview-media", label: "Preview media" },
+  { id: "open", label: "Open in VS Code" },
+  { id: "open-in-browser", label: "Open in integrated browser" },
+  { id: "reveal", label: "Reveal in Files" },
+] as const;
+const UPSTREAM_COPIES = [
+  { id: "copy-relative", label: "Copy relative path" },
+  { id: "copy-full", label: "Copy full path" },
+] as const;
 
-describe("markdownFileMenuItems", () => {
+describe("forkMarkdownFileMenuItems", () => {
   it("offers every way to open a workspace file at a line, then the copies", () => {
     expect(
-      markdownFileMenuItems({
-        ...NOTHING,
+      forkMarkdownFileMenuItems([UPSTREAM_OPENS[1], UPSTREAM_OPENS[3], ...UPSTREAM_COPIES], {
         hasLine: true,
-        workspaceRelativePath: "src/app.ts",
         canOpenInPanel: true,
-        openInEditorLabel: "Open in VS Code",
-        revealLabel: "Reveal in Files",
         canDownload: true,
       }),
     ).toEqual([
@@ -40,10 +42,74 @@ describe("markdownFileMenuItems", () => {
     ]);
   });
 
+  it("puts the files viewer after the media preview and the download last of the opens", () => {
+    expect(
+      forkMarkdownFileMenuItems([...UPSTREAM_OPENS, ...UPSTREAM_COPIES], {
+        hasLine: false,
+        canOpenInPanel: true,
+        canDownload: true,
+      }).map((item) => item.id),
+    ).toEqual([
+      "preview-media",
+      "open-in-panel",
+      "open-full-size",
+      "open",
+      "open-in-browser",
+      "reveal",
+      "download",
+      "copy-relative",
+      "copy-full",
+    ]);
+  });
+
   it("keeps only the full path copy when nothing can open the file", () => {
-    expect(markdownFileMenuItems(NOTHING)).toEqual([
+    expect(forkMarkdownFileMenuItems([UPSTREAM_COPIES[1]], NOTHING)).toEqual([
       { id: "copy-full", label: "Copy full path", separatorBefore: false },
     ]);
+  });
+
+  it("changes nothing in upstream's entries beyond the separator before the copies", () => {
+    expect(forkMarkdownFileMenuItems([...UPSTREAM_OPENS, ...UPSTREAM_COPIES], NOTHING)).toEqual([
+      ...UPSTREAM_OPENS,
+      { ...UPSTREAM_COPIES[0], separatorBefore: true },
+      UPSTREAM_COPIES[1],
+    ]);
+  });
+
+  it("keeps an entry upstream adds later, with everything upstream set on it", () => {
+    const added = { id: "open-in-terminal", label: "Open in terminal", disabled: true } as const;
+    expect(
+      forkMarkdownFileMenuItems([UPSTREAM_OPENS[1], added, ...UPSTREAM_COPIES], {
+        ...NOTHING,
+        canDownload: true,
+      }),
+    ).toEqual([
+      UPSTREAM_OPENS[1],
+      added,
+      { id: "download", label: "Download to this device" },
+      { ...UPSTREAM_COPIES[0], separatorBefore: true },
+      UPSTREAM_COPIES[1],
+    ]);
+  });
+});
+
+describe("forkMarkdownFileMenu", () => {
+  it("shows the joined entries where upstream asked and returns what was picked", async () => {
+    const shown: unknown[][] = [];
+    const menu = forkMarkdownFileMenu(
+      {
+        show: async (items, position, source) => {
+          shown.push([items.map((item) => item.id), position, source]);
+          return items.at(-1)?.id ?? null;
+        },
+      },
+      { hasLine: true, canOpenInPanel: false, canDownload: false },
+    );
+
+    await expect(menu.show([UPSTREAM_COPIES[1]], { x: 4, y: 9 }, "keyboard")).resolves.toBe(
+      "copy-path-only",
+    );
+    expect(shown).toEqual([[["copy-full", "copy-path-only"], { x: 4, y: 9 }, "keyboard"]]);
   });
 });
 

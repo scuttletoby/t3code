@@ -7,14 +7,7 @@ import {
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
 import type { ContextMenuSource, EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
-import {
-  memo,
-  useEffect,
-  useRef,
-  useState,
-  type MouseEvent as ReactMouseEvent,
-  type PointerEvent as ReactPointerEvent,
-} from "react";
+import { memo, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useGT } from "gt-react";
 import { FolderIcon } from "lucide-react";
 
@@ -30,10 +23,15 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { FileTagChipContent } from "./FileTagChip";
 import {
   hasMarkdownFilePrimaryAction,
-  markdownFileMenuItems,
+  markdownFileCopyMenuItems,
   shouldUseMarkdownFileBrowserPrimaryAction,
 } from "./MarkdownFileLink.logic";
 import { reportMarkdownActionFailure } from "./markdownActionFailure";
+import {
+  forkDownloadMarkdownFile,
+  useForkMarkdownFileLongPress,
+} from "./forkMarkdownFileLinkActions"; // Fork
+import { forkMarkdownFileMenu } from "./forkMarkdownFileLinkMenu"; // Fork
 import { WorkspaceEntryTooltip } from "./WorkspaceEntryIcon";
 
 interface MarkdownFileLinkProps {
@@ -63,8 +61,6 @@ interface MarkdownFileLinkProps {
 }
 
 const MARKDOWN_FILE_LINK_CLASS_NAME = "chat-markdown-file-link";
-const LONG_PRESS_MS = 500;
-const LONG_PRESS_SLOP_PX = 10;
 
 export const MarkdownFileLink = memo(function MarkdownFileLink({
   environmentId,
@@ -219,20 +215,6 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
     })();
   };
 
-  const handleDownload = () => {
-    if (!onDownload) return;
-    onDownload().catch((cause: unknown) => {
-      reportMarkdownActionFailure({ operation: "download-file", target: targetPath }, cause);
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: "Unable to download file",
-          description: cause instanceof Error ? cause.message : gt("An error occurred."),
-        }),
-      );
-    });
-  };
-
   const handleCopy = (resolveValue: () => Promise<string>, title: string) => {
     const failureTitle =
       title === "Relative path"
@@ -282,47 +264,60 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
     if (!api) return;
 
     try {
-      const clicked = await api.contextMenu.show(
-        markdownFileMenuItems({
-          hasLine: line !== undefined,
-          workspaceRelativePath,
-          canOpenMedia: onOpenMedia !== undefined,
-          canOpenInPanel,
-          openInEditorLabel: onOpen ? openInEditorMenuLabel : null,
-          canOpenInBrowser: onOpenInBrowser !== undefined,
-          revealLabel: onReveal && revealLabel ? revealLabel : null,
-          canDownload: onDownload !== undefined,
-        }),
+      const copyItems = markdownFileCopyMenuItems({ targetPath, workspaceRelativePath });
+      // Fork: the fork's entries join upstream's below (forkMarkdownFileLinkMenu.ts).
+      const forkMenu = forkMarkdownFileMenu(api.contextMenu, {
+        hasLine: line !== undefined,
+        canOpenInPanel: threadRef !== undefined && Boolean(panelPath),
+        canDownload: onDownload !== undefined,
+      });
+      const clicked = await forkMenu.show(
+        [
+          ...(onOpenMedia ? ([{ id: "preview-media", label: gt("Preview media") }] as const) : []),
+          ...(onOpen ? ([{ id: "open", label: openInEditorMenuLabel }] as const) : []),
+          ...(onOpenInBrowser
+            ? ([{ id: "open-in-browser", label: gt("Open in integrated browser") }] as const)
+            : []),
+          ...(onReveal && revealLabel ? ([{ id: "reveal", label: revealLabel }] as const) : []),
+          ...copyItems.map(({ id, label }) => ({ id, label })),
+        ] as const,
         position,
         source,
       );
 
+      // Fork: the fork's entries.
+      if (clicked === "open-in-panel" && panelPath) return onOpenInPanel(panelPath, line);
+      if (clicked === "open-full-size") return onOpenFullSize?.();
+      if (clicked === "download") {
+        return forkDownloadMarkdownFile(onDownload, targetPath, gt("An error occurred."));
+      }
+      if (clicked === "copy-path-only") {
+        return handleCopy(() => resolveCopyPaths().then((paths) => paths.pathOnly), "Full path");
+      }
       if (clicked === "preview-media") {
         onOpenMedia?.();
-      } else if (clicked === "open-in-panel" && panelPath) {
-        onOpenInPanel(panelPath, line);
-      } else if (clicked === "open-full-size") {
-        onOpenFullSize?.();
-      } else if (clicked === "open") {
+        return;
+      }
+      if (clicked === "open") {
         handleOpenInEditor();
-      } else if (clicked === "open-in-browser") {
+        return;
+      }
+      if (clicked === "open-in-browser") {
         handleOpenInBrowser();
-      } else if (clicked === "reveal") {
+        return;
+      }
+      if (clicked === "reveal") {
         handleRevealInFileManager();
-      } else if (clicked === "download") {
-        handleDownload();
-      } else if (
-        clicked === "copy-relative" ||
-        clicked === "copy-full" ||
-        clicked === "copy-path-only"
-      ) {
-        const copy = {
-          "copy-relative": ["relativePath", "Relative path"],
-          "copy-full": ["fullPath", "Full path"],
-          "copy-path-only": ["pathOnly", "Full path"],
-        } as const;
-        const [key, title] = copy[clicked];
-        handleCopy(() => resolveCopyPaths().then((paths) => paths[key]), title);
+        return;
+      }
+      if (clicked === "copy-relative" || clicked === "copy-full") {
+        handleCopy(
+          () =>
+            resolveCopyPaths().then((paths) =>
+              clicked === "copy-relative" ? paths.relativePath : paths.fullPath,
+            ),
+          clicked === "copy-relative" ? "Relative path" : "Full path",
+        );
       }
     } catch (cause) {
       reportMarkdownActionFailure(
@@ -332,71 +327,12 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
     }
   };
 
-  // iOS Safari never fires contextmenu for a touch, so a long press opens the same menu.
-  const longPress = useRef<{
-    timer: ReturnType<typeof setTimeout> | undefined;
-    x: number;
-    y: number;
-    fired: boolean;
-    releaseContextMenu: (() => void) | undefined;
-  }>({ timer: undefined, x: 0, y: 0, fired: false, releaseContextMenu: undefined });
-  const cancelLongPress = () => {
-    clearTimeout(longPress.current.timer);
-    longPress.current.timer = undefined;
-  };
-  const releaseLateContextMenu = () => {
-    longPress.current.releaseContextMenu?.();
-    longPress.current.releaseContextMenu = undefined;
-  };
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- clears the long-press timer and the window contextmenu listener this chip holds until unmount.
-  useEffect(() => {
-    const pending = longPress.current;
-    return () => {
-      clearTimeout(pending.timer);
-      pending.releaseContextMenu?.();
-    };
-  }, []);
-  const handlePointerDown = (event: ReactPointerEvent<HTMLElement>) => {
-    cancelLongPress();
-    releaseLateContextMenu();
-    longPress.current.fired = false;
-    if (event.pointerType !== "touch") return;
-    const chip = event.currentTarget;
-    const { clientX: x, clientY: y } = event;
-    longPress.current.x = x;
-    longPress.current.y = y;
-    longPress.current.timer = setTimeout(() => {
-      longPress.current.timer = undefined;
-      longPress.current.fired = true;
-      // Android (after its touch & hold delay) and Windows touch (on lift) send their own
-      // contextmenu for this press after the timer. The open menu would take it as an outside
-      // right-click and close, so the first one on the chip is swallowed before anything sees it.
-      longPress.current.releaseContextMenu = swallowLateContextMenu(chip);
-      // A touch press is a pointer gesture: the native menu must not preselect its first item.
-      void showFileContextMenu({ x, y }, "mouse");
-    }, LONG_PRESS_MS);
-  };
-  // Only the click that ends the touch press; keyboard activation has detail 0.
-  const consumeLongPressClick = (event: ReactMouseEvent<HTMLElement>) => {
-    if (!longPress.current.fired || event.detail === 0) return false;
-    longPress.current.fired = false;
-    return true;
-  };
-  const handlePointerMove = (event: ReactPointerEvent<HTMLElement>) => {
-    const { x, y } = longPress.current;
-    if (Math.hypot(event.clientX - x, event.clientY - y) > LONG_PRESS_SLOP_PX) cancelLongPress();
-  };
-  const longPressHandlers = {
-    onPointerDown: handlePointerDown,
-    onPointerMove: handlePointerMove,
-    onPointerUp: cancelLongPress,
-    onPointerCancel: cancelLongPress,
-  };
+  const longPress = useForkMarkdownFileLongPress(showFileContextMenu); // Fork
 
   const handleContextMenu = (event: ReactMouseEvent<HTMLElement>) => {
     event.preventDefault();
     event.stopPropagation();
-    cancelLongPress();
+    if (longPress.opensNoMenu(event)) return; // Fork
     const position =
       event.clientX === 0 && event.clientY === 0
         ? (() => {
@@ -435,11 +371,11 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
               render={<a href={href} />}
               className={MARKDOWN_FILE_LINK_CLASS_NAME}
               data-markdown-copy={copyMarkdown}
-              {...longPressHandlers}
+              {...longPress.handlers}
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                if (consumeLongPressClick(event)) return;
+                if (longPress.consumeClick(event)) return; // Fork
                 if (onOpen && shouldOpenMarkdownFileLinkInEditor(event)) {
                   handleOpenInEditor();
                   return;
@@ -474,15 +410,8 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
               aria-haspopup="menu"
               className={cn(MARKDOWN_FILE_LINK_CLASS_NAME, "select-text")}
               data-markdown-copy={copyMarkdown}
-              {...longPressHandlers}
-              onClick={(event) => {
-                if (!consumeLongPressClick(event)) {
-                  handleContextMenu(event);
-                  return;
-                }
-                event.preventDefault();
-                event.stopPropagation();
-              }}
+              {...longPress.handlers}
+              onClick={handleContextMenu}
               onContextMenu={handleContextMenu}
             >
               <FileTagChipContent
@@ -506,26 +435,6 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
     </Tooltip>
   );
 }, areMarkdownFileLinkPropsEqual);
-
-// Window capture runs before the menu's own document listeners. The next pointer or key press is
-// a new gesture, so it ends the wait (iOS sends no contextmenu at all).
-function swallowLateContextMenu(chip: HTMLElement): () => void {
-  const onContextMenu = (event: MouseEvent) => {
-    if (!(event.target instanceof Node) || !chip.contains(event.target)) return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    release();
-  };
-  const release = () => {
-    window.removeEventListener("contextmenu", onContextMenu, true);
-    window.removeEventListener("pointerdown", release, true);
-    window.removeEventListener("keydown", release, true);
-  };
-  window.addEventListener("contextmenu", onContextMenu, true);
-  window.addEventListener("pointerdown", release, true);
-  window.addEventListener("keydown", release, true);
-  return release;
-}
 
 function areMarkdownFileLinkPropsEqual(
   previous: Readonly<MarkdownFileLinkProps>,

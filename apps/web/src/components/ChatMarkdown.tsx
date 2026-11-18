@@ -164,7 +164,6 @@ import { appAtomRegistry } from "../rpc/atomRegistry";
 import { hostEnvironmentIdAtom } from "../state/primaryEnvironment";
 import { cn } from "../lib/utils";
 import { resolveRemoteOpenState, useRemoteOpenResolution } from "../remoteOpen";
-import { openRemoteEditorUrl, useRemoteCapableEditors } from "../remoteOpen"; // Fork
 import { useRightPanelStore } from "../rightPanelStore";
 import { useOpenIssueLink } from "../lib/openIssueLink";
 import { readThreadShell, useProjects } from "../state/entities";
@@ -224,7 +223,7 @@ import {
 import { MarkdownExternalLinkContent } from "./chat/MarkdownExternalLink";
 import { MarkdownFileLink } from "./chat/MarkdownFileLink";
 import { canUseMarkdownFileShellActions } from "./chat/MarkdownFileLink.logic";
-import { markdownFileRemoteEditorUrl } from "./chat/MarkdownFileLink.logic"; // Fork
+import { useForkMarkdownFileRemoteEditor } from "./chat/forkMarkdownFileLinkActions"; // Fork
 import { rehypeChipPunctuation } from "./chat/markdownChipPunctuation";
 import { handleMarkdownFragmentClick, rehypeHeadingIds } from "./chat/markdownFragments";
 import { rehypeTextDirection } from "./chat/markdownTextDirection";
@@ -680,16 +679,8 @@ function useChatMarkdownState({
         : revealInFileExplorerLabelForOs(revealInFileManager, messages);
   const projects = useProjects();
   const [preferredEditor] = usePreferredEditor(availableEditors);
-  const remoteCapableEditors = useRemoteCapableEditors();
-  const [preferredRemoteEditor] = usePreferredEditor(remoteCapableEditors);
-  const remoteEditorHost =
-    remoteOpen.state.mode === "remote-links" && preferredRemoteEditor !== null
-      ? remoteOpen.state.host
-      : null;
-  const preferredEditorMenuLabel = openInEditorMenuLabel(
-    remoteEditorHost === null ? preferredEditor : preferredRemoteEditor,
-    messages,
-  );
+  const preferredEditorMenuLabel = openInEditorMenuLabel(preferredEditor, messages);
+  const forkRemoteEditor = useForkMarkdownFileRemoteEditor(remoteOpen.state, cwd, messages); // Fork
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors, cwd);
   const openInEditor = useAtomCommand(shellEnvironment.openInEditor, {
     reportFailure: false,
@@ -889,25 +880,6 @@ function useChatMarkdownState({
     }
     return findAgentDirectoryMatch(workspaceRelativePath, agentRoots, searchRoot);
   };
-  const openFileInRemoteEditor = async (fileLinkMeta: MarkdownFileLinkMeta, path: string) => {
-    const url =
-      remoteEditorHost === null || preferredRemoteEditor === null
-        ? undefined
-        : markdownFileRemoteEditorUrl({
-            editor: preferredRemoteEditor,
-            host: remoteEditorHost,
-            path,
-            cwd,
-            line: fileLinkMeta.line,
-            column: fileLinkMeta.column,
-          });
-    if (url !== undefined && (await openRemoteEditorUrl(url))) {
-      return AsyncResult.success<void>(undefined);
-    }
-    return AsyncResult.failure<void, Error>(
-      Cause.fail(new Error("The editor could not open this file over SSH.")),
-    );
-  };
   const downloadMarkdownFile = async (path: string, fileName: string) => {
     if (!threadRef) return;
     const { environmentId: fileEnvironmentId, threadId } = threadRef;
@@ -1006,10 +978,7 @@ function useChatMarkdownState({
                   openInPreferredEditor(
                     markdownFileEditorTarget(fileLinkMeta, await resolveHostPath()),
                   )
-              : remoteEditorHost !== null
-                ? async () =>
-                    openFileInRemoteEditor(fileLinkMeta, (await resolveHostPath()).absolutePath)
-                : undefined
+              : undefined
         }
         resolveDragPath={async () =>
           resolvePathLinkTarget((await resolveHostPath()).absolutePath, cwd ?? "")
@@ -1038,6 +1007,13 @@ function useChatMarkdownState({
             : undefined
         }
         openInEditorMenuLabel={canOpenApp ? gt("Open app") : preferredEditorMenuLabel}
+        // Fork: over SSH the viewing device's editor opens the file, and the menu names it.
+        {...forkRemoteEditor?.linkProps({
+          canOpenApp,
+          canUseShellActions,
+          fileLinkMeta,
+          resolveAbsolutePath: async () => (await resolveHostPath()).absolutePath,
+        })}
         onReveal={
           canUseShellActions && revealInFileManagerLabel !== undefined
             ? async () => revealFileInFileManager((await resolveHostPath()).absolutePath)
