@@ -3,7 +3,7 @@
 offer in-process, the desktop's run end to end through a fake ssh that runs the host's side, and the forced command's
 divert in fork-fleet-desk.py. Temp folders only; no root, no ssh, no network. Run: python3 -I -B <this>. Linux only."""
 import contextlib, fcntl, hashlib, importlib.util, io, json, os, shutil, stat, subprocess, sys, tarfile, tempfile, threading
-import signal, time, unittest
+import errno, signal, time, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -73,8 +73,9 @@ if words[0] == 'seed' and mode in ('cut', 'trailer', 'odd', 'made1'):
         print(err.getvalue().rsplit(' ', 1)[0] + ' \u00b2', file=sys.stderr)
     elif mode == 'made1':   # bytes and sha256 right, MADE not the list's
         print(err.getvalue().rsplit(' ', 1)[0] + ' 1', file=sys.stderr)
-    else:
-        print(err.getvalue().rsplit(' ', 2)[0] + ' ' + '0' * 64 + ' 1', file=sys.stderr)   # a wrong sha256
+    else:   # a wrong sha256 and nothing else: bytes and MADE are the list's, so only the sha256 check refuses it
+        w = err.getvalue().split()
+        print(' '.join(w[:3] + ['0' * 64, w[4]]), file=sys.stderr)
     sys.exit(code)
 sys.exit(seed.offer({pool!r}, ' '.join(words), {t!r} + '/run', **kw))
 '''
@@ -113,16 +114,40 @@ class Base(unittest.TestCase):
         return os.path.join(self.t, 'files', POOL, f'{name}.tar')
 
     def offer(self, command, **kw):
+        """(exit code, what was sent, stderr) of the host's side; the pipe is read while it runs, so a seed of any
+        size fits."""
         r, w = os.pipe()
-        err = io.StringIO()
+        err, got = io.StringIO(), []
         with os.fdopen(r, 'rb') as rf:
+            reader = threading.Thread(target=lambda: got.append(rf.read()))
+            reader.start()
             try:
                 code = seed.offer(POOL, command, os.path.join(self.t, 'run'), out=w, err=err,
                                   config=os.path.join(self.t, 'fork-fleet.json'), files=os.path.join(self.t, 'files'),
                                   **kw)
             finally:
                 os.close(w)
-            return code, rf.read(), err.getvalue()
+                reader.join(60)
+            return code, got[0], err.getvalue()
+
+    def same_tick(self, moving=False):
+        """os.fstat patched to hold ctime at 0, as when a change lands in the tick of the file's last one (timestamps
+        tick coarsely). With the old mtime put back by os.utime, no result depends on how finely the clock ticks."""
+        fstat, calls = os.fstat, []
+
+        def patched(fd):
+            st = fstat(fd)
+            calls.append(fd)
+            sec = len(calls) if moving else 0
+            return os.stat_result(st[:9] + (sec,), {'st_ctime': float(sec), 'st_ctime_ns': sec * 10 ** 9,
+                                                     'st_atime': st.st_atime, 'st_mtime': st.st_mtime,
+                                                     'st_atime_ns': st.st_atime_ns, 'st_mtime_ns': st.st_mtime_ns})
+        return mock.patch.object(seed.os, 'fstat', patched)
+
+    def new_tick(self):
+        """The other way round: ctime a second later at every os.fstat, as when each change lands in a tick of its
+        own. The check must not look at ctime: a rename, or a date put back, moves it and changes no byte."""
+        return self.same_tick(moving=True)
 
 
 class Config(unittest.TestCase):
@@ -215,14 +240,50 @@ class Host(Base):
         path, send = self.tar('m2'), seed.send
 
         def changing(fd, out, size):
+            st = os.stat(path)
             with open(path, 'ab') as f:   # made in place, not by rename
                 f.write(b'\0' * 512)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))   # the old mtime put back: only the size tells
             return send(fd, out, size)
-        with mock.patch.object(seed, 'send', changing):
+        with mock.patch.object(seed, 'send', changing), self.same_tick():
             code, out, err = self.offer('seed m2')
         self.assertEqual(code, 4)
         self.assertIn('changed while it was sent', err)
         self.assertEqual(len(out), os.stat(path).st_size - 512)   # cut at the size that was checked
+
+    def test_a_new_date_alone_is_exit_4(self):
+        """The date compare: size and bytes are as they were sent (a change that was put back), only mtime moved.
+        The trailer's MADE would no longer be the file's, nor the list's."""
+        data = self.make('m2', {'a': b'x' * 3000})
+        path, send = self.tar('m2'), seed.send
+
+        def touching(fd, out, size):
+            st, sent = os.stat(path), send(fd, out, size)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))   # a second later, whatever the clock's tick
+            return sent
+        with mock.patch.object(seed, 'send', touching), self.same_tick():
+            code, out, err = self.offer('seed m2')
+        self.assertEqual((code, out), (4, data), err)
+        self.assertIn('changed while it was sent', err)
+
+    def test_a_file_cut_short_and_grown_back_is_exit_4(self):
+        """The whole size must have been sent: the stream met the file's end early (cut in place), then the file grew
+        back to its size with the old mtime. Size, mtime and the bytes that were sent are all as before."""
+        data = self.make('m2', {'a': b'x' * 3000})
+        path, send = self.tar('m2'), seed.send
+
+        def cutting(fd, out, size):
+            st = os.stat(path)
+            os.truncate(path, 1000)
+            sent = send(fd, out, size)
+            os.truncate(path, size)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return sent
+        with mock.patch.object(seed, 'send', cutting), self.same_tick():
+            code, out, err = self.offer('seed m2')
+        self.assertEqual((code, out), (4, data[:1000]), err)
+        self.assertIn('changed while it was sent', err)
+        self.assertNotIn('seed m2 ', err)   # no trailer for the 1000 bytes
 
     def test_a_rename_while_sent_is_fine(self):
         old, send = self.make('m2', {'a': b'x' * 3000}), seed.send
@@ -235,6 +296,36 @@ class Host(Base):
         self.assertEqual((code, out), (0, old), err)
         self.assertTrue(err.startswith(f'seed m2 {len(old)} {hashlib.sha256(old).hexdigest()} '), err)
 
+    def test_a_rename_while_a_backup_link_to_the_old_file_stays_is_fine(self):
+        old, send = self.make('m2', {'a': b'x' * 3000}), seed.send
+        os.link(self.tar('m2'), os.path.join(self.t, 'src', 'm2.backup'))   # a second hard link to the old file
+
+        def renaming(fd, out, size):
+            self.make('m2', {'a': b'y' * 3000})
+            return send(fd, out, size)
+        with mock.patch.object(seed, 'send', renaming), self.new_tick():   # the rename moves the old file's ctime
+            code, out, err = self.offer('seed m2')
+        self.assertEqual((code, out), (0, old), err)
+        self.assertTrue(err.startswith(f'seed m2 {len(old)} {hashlib.sha256(old).hexdigest()} '), err)
+
+    def test_a_same_size_rewrite_done_before_the_first_byte_sends_the_new_bytes(self):
+        """Whole before the stream began, its mtime put back: not a change while it was sent. What is sent is the
+        file as it is, and the trailer is of those bytes."""
+        old, send = self.make('m2', {'a': b'x' * 3000}), seed.send
+        path = self.tar('m2')
+        new = bytes(b ^ 0xff for b in old[:512]) + old[512:]
+
+        def rewriting(fd, out, size):
+            st = os.stat(path)
+            with open(path, 'r+b') as f:
+                f.write(new[:512])
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return send(fd, out, size)
+        with mock.patch.object(seed, 'send', rewriting), self.new_tick():   # os.utime moves ctime
+            code, out, err = self.offer('seed m2')
+        self.assertEqual((code, out), (0, new), err)
+        self.assertTrue(err.startswith(f'seed m2 {len(new)} {hashlib.sha256(new).hexdigest()} '), err)
+
     def test_a_lock_of_another_user_is_refused(self):
         self.make('m2', {'a': b'x'})
         open(os.path.join(self.t, 'run', f'{POOL}.seed.lock'), 'a').close()
@@ -243,26 +334,60 @@ class Host(Base):
         self.assertEqual((code, out), (1, b''), err)
         self.assertIn(f'belongs to uid {os.geteuid()}', err)
 
-    def test_a_same_size_rewrite_with_its_old_date_put_back_is_exit_4(self):
-        self.make('m2', {'a': b'x' * 3000})
-        path, send, fstat = self.tar('m2'), seed.send, os.fstat
+    def rewritten_after_sent(self, at):
+        """`seed m2` while 512 bytes at offset AT are rewritten in place after they were sent: the same size, the old
+        mtime put back, ctime held (same_tick), so only the bytes differ."""
+        path, send = self.tar('m2'), seed.send
 
         def rewriting(fd, out, size):
             st, sent = os.stat(path), send(fd, out, size)
-            with open(path, 'r+b') as f:   # in place after bytes were sent, same size, the old mtime put back
-                f.write(b'y' * 512)
+            with open(path, 'r+b') as f:
+                f.seek(at)
+                old = f.read(512)
+                f.seek(at)
+                f.write(bytes(b ^ 0xff for b in old))
             os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
             return sent
+        with mock.patch.object(seed, 'send', rewriting), self.same_tick():
+            return self.offer('seed m2')
 
-        def same_tick(fd):   # the rewrite lands in the tick of the last change: no timestamp moves
-            st = fstat(fd)
-            return os.stat_result(st[:9] + (0,), {'st_ctime': 0.0, 'st_ctime_ns': 0, 'st_atime': st.st_atime,
-                                                   'st_mtime': st.st_mtime, 'st_atime_ns': st.st_atime_ns,
-                                                   'st_mtime_ns': st.st_mtime_ns})
-        with mock.patch.object(seed, 'send', rewriting), mock.patch.object(seed.os, 'fstat', same_tick):
-            code, _, err = self.offer('seed m2')
+    def test_a_same_size_rewrite_with_its_old_date_put_back_is_exit_4(self):
+        self.make('m2', {'a': b'x' * 3000})
+        code, _, err = self.rewritten_after_sent(0)
         self.assertEqual(code, 4)
         self.assertIn('changed while it was sent', err)
+
+    def several_pieces(self):
+        """m2 as a seed of 3 MiB and a little (over three PIECEs; a real seed is far larger): its bytes."""
+        self.config([{**SEEDS[0], 'max_mb': 4}, SEEDS[1]])
+        data = self.make('m2', {'a': os.urandom(3 << 20)})
+        self.assertGreater(len(data), 3 * seed.PIECE)
+        return data
+
+    def test_a_seed_of_several_pieces_streams_whole_with_its_trailer(self):
+        data = self.several_pieces()
+        code, out, err = self.offer('seed m2')
+        self.assertEqual(code, 0, err)   # the re-read goes piece by piece, each at its own offset
+        self.assertTrue(out == data, f'{len(out)} bytes came, not the file\'s {len(data)}')
+        st = os.stat(self.tar('m2'))
+        self.assertEqual(err, f'seed m2 {len(data)} {hashlib.sha256(data).hexdigest()} {int(st.st_mtime)}\n')
+
+    def test_a_same_size_rewrite_in_a_later_piece_is_exit_4(self):
+        data = self.several_pieces()
+        code, out, err = self.rewritten_after_sent(3 << 19)   # 1.5 MiB: in the second piece
+        self.assertEqual(code, 4, err)
+        self.assertIn('changed while it was sent', err)
+        self.assertTrue(out == data)   # sent whole before the rewrite: only the re-read can tell
+        self.assertNotIn('seed m2 ', err)
+
+    def test_a_re_read_that_fails_is_one_line_and_exit_1(self):
+        self.make('m2', {'a': b'x' * 3000})
+        with mock.patch.object(seed.os, 'pread', side_effect=OSError(errno.EIO, os.strerror(errno.EIO))):
+            code, _, err = self.offer('seed m2')
+        self.assertEqual(code, 1, err)
+        self.assertEqual(err, f'fork-fleet-desk seed: m2: it could not be read again after it was sent '
+                              f'({os.strerror(errno.EIO)})\n')   # one line, no trailer: the desktop counts it torn
+        self.assertEqual(self.offer('seed m2')[0], 0)   # the file and the pool's lock were let go: it runs again
 
     def test_a_desktop_that_stops_reading_lets_the_lock_go(self):
         self.make('m2', {'a': os.urandom(1 << 20)})
@@ -279,7 +404,6 @@ class Host(Base):
             os.close(w)
         self.assertEqual(code, 1)
         self.assertIn('took less than 64 KiB in 1 seconds', err.getvalue())
-        self.make('m2', {'a': b'x'})   # small enough for the pipe: offer() below has no reader until it returns
         self.assertEqual(self.offer('seed m2')[0], 0)   # the pool's lock was let go
 
     def test_a_desktop_that_stops_reading_a_one_piece_seed_is_exit_1(self):
@@ -523,7 +647,7 @@ class Desktop(Base):
 
     def test_a_trailer_that_does_not_match_leaves_the_old_seed(self):
         self.torn(lambda: (self.make('m2', {'a': b'two'}, mtime=time.time() + 5), self.mode('trailer')),
-                  'trailer does not match')
+                  'the trailer does not match:')   # the sha256 check's own words, not the list check's
 
     def test_more_than_max_mb_leaves_the_old_seed(self):
         def bigger():

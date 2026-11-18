@@ -65,7 +65,7 @@ The forced command sends every command that starts with `seed` here. The host si
 others may write, above max_mb, older than max_age_hours or dated in the future, or changed while it was sent: made
 in place, not by rename; a file replaced by rename while it is sent is fine, the old one is sent whole), 1 when the
 desktop takes less than WRITE bytes in STALL seconds or the whole file not by its deadline (GRACE seconds plus
-MIN_RATE bytes a second): the pool's lock is then let go.
+MIN_RATE bytes a second), or the file cannot be read again after it was sent: the pool's lock is then let go.
 Standard library only.
 """
 import argparse, fcntl, hashlib, importlib.util, json, math, os, re, signal, stat, subprocess, sys
@@ -180,8 +180,11 @@ def offer(pool, command, lock_dir, out=1, err=sys.stderr, config=CONFIG, files=F
                 after = os.fstat(fd)
                 # Timestamps tick coarsely: a same-size rewrite in the tick of the last change (its mtime put back)
                 # moves none of them, so the bytes are read again. A rename over NAME.tar leaves them as they were.
-                same = (sent == st.st_size and (after.st_size, after.st_mtime_ns) == (st.st_size, st.st_mtime_ns)
-                        and summed(fd, sent) == sha)
+                try:
+                    same = (sent == st.st_size and (after.st_size, after.st_mtime_ns) == (st.st_size, st.st_mtime_ns)
+                            and summed(fd, sent) == sha)
+                except OSError as e:   # a disk error, say: no trailer, so the desktop counts the stream as torn
+                    raise Refused(f'{name}: it could not be read again after it was sent ({e.strerror})', 1) from None
             finally:
                 os.close(fd)
         finally:
