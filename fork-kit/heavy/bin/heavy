@@ -9,7 +9,9 @@
                                   (--owner-pid PID: the long-lived test process that uses it; README)
   heavy --kind <name> [--mb N] [--wait S] [--] <command> [args...]
                                   the same, but first wait in the memory queue until the job's memory fits
-                                  (lib/heavy_queue.py; exit 76 after --wait seconds, default 7200)
+                                  (lib/heavy_queue.py; exit 76 after --wait seconds, default 7200, with the
+                                  line "heavy: gave up after waiting" on stderr: a command that exits 76 by itself
+                                  has no such line)
   heavy queue [--json]            what the memory queue runs and holds, and the figures behind it
   heavy waits [--days N] [--json] minutes waited for memory per day
   heavy -- <command> [args...]    run a command that is named sweep, docker-label, queue or waits
@@ -32,8 +34,8 @@ The command's environment is exactly heavy's, plus HEAVY_SCOPE (the scope's unit
 heavy-keep-<name>-<random>.scope, all others heavy-<name>-<random>.scope (never heavy-keep-...).
 
 Settings: /etc/heavy/config.json ({"slice": "heavy.slice", "grace_seconds": 30}), or the file HEAVY_CONFIG names;
-HEAVY_SLICE and HEAVY_GRACE override single values (HEAVY_SYSTEMCTL: another systemctl, for tests). Standard library
-only; Linux with systemd and cgroup v2.
+HEAVY_SLICE and HEAVY_GRACE override single values (HEAVY_SYSTEMCTL: another systemctl, HEAVY_QUEUE_ROOT: another
+folder for the memory queue's state; both for tests). Standard library only; Linux with systemd and cgroup v2.
 """
 import hashlib, json, os, re, secrets, signal, subprocess, sys, time
 
@@ -418,12 +420,19 @@ def cgroup_root():
     return CGROUP_ROOTS[0]
 
 
-def queue_for(cfg, systemctl, slice_cg, limits):
+def queue_root():
+    """HEAVY_QUEUE_ROOT (tests: a private queue, never the user's live one), else the default."""
+    root = os.environ.get('HEAVY_QUEUE_ROOT')
+    if root and not os.path.isabs(root):
+        raise Refused(f'HEAVY_QUEUE_ROOT {root!r} is not an absolute path')
+    return root or None
+
+
+def queue_for(hq, cfg, systemctl, slice_cg, limits):
     """The memory queue of the slice (lib/heavy_queue.py), with its settings from the machine file."""
-    hq = queue_module()
     box = hq.Box(cfg['slice'], slice_cg, limits.get('MemoryHigh') or limits.get('MemoryMax'), cg_root=cgroup_root(),
-                 resolve=lambda: slice_cgroup(systemctl, cfg['slice']))
-    return hq, hq.Queue(box, hq.settings())
+                 queue_root=queue_root(), resolve=lambda: slice_cgroup(systemctl, cfg['slice']))
+    return hq.Queue(box, hq.settings())
 
 
 def run(argv, cfg, job=None):
@@ -448,11 +457,15 @@ def run(argv, cfg, job=None):
     env[b'HEAVY_SCOPE'] = unit.encode()
     queue = ticket = sampler = None
     if job is not None and not nested:
-        hq, queue = queue_for(cfg, systemctl, slice_cg, limits)
-        hq.check_kind(job['kind'])
-        mb, _how = hq.reservation(job['kind'], job['mb'], queue.box.state_dir)
+        hq = queue_module()
         try:
+            queue = queue_for(hq, cfg, systemctl, slice_cg, limits)
+            hq.check_kind(job['kind'])
+            mb, _how = hq.reservation(job['kind'], job['mb'], queue.box.state_dir)
             ticket = queue.enter(job['kind'], mb, unit, os.path.basename(argv[0]), job['wait'])
+        except OSError as e:
+            say(f'memory queue: {e}; not running {argv[0]}')
+            return 1
         except hq.GaveUp as e:
             say(f'{e}; not running {argv[0]}')
             return hq.EXIT_GAVE_UP
@@ -460,6 +473,9 @@ def run(argv, cfg, job=None):
             say(f'{signal.Signals(e.sig).name} while waiting for memory; not running {argv[0]}')
             return finish(e.sig, None)
         sampler = hq.Sampler(queue, ticket)
+        # The command inherits the ticket's flock: a heavy killed with -9 keeps the job's reservation until the
+        # processes it started are gone (a normal end deletes the ticket, so a process that lives on holds nothing).
+        os.set_inheritable(ticket.fd, True)
     try:
         return run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler)
     finally:
@@ -547,6 +563,10 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, s
                 pass
         deadline = time.monotonic() + grace
 
+    if sampler is not None:             # one more look before the leftovers stop; every run teaches the queue,
+        sampler.sample()                # failed and killed ones too (the reservation only ever goes up)
+        sampler.record()
+
     if status is None:                              # a signal to heavy, and the command is still running
         cg, pids = scope_state(systemctl, unit)
         if pids is None and not cg:
@@ -566,8 +586,6 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, s
         return finish(status, got)
 
     why = f'{signal.Signals(got).name}: ' if got is not None else ''   # the command ended after a signal to heavy
-    if sampler is not None and got is None and os.waitstatus_to_exitcode(status) == 0:
-        sampler.record()                # only a clean run teaches the queue how much this kind needs
 
     cg, pids = scope_state(systemctl, unit)
     if pids is None and not cg:                      # systemctl failed or timed out
@@ -696,7 +714,7 @@ def queue_verb(verb, args):
         systemctl = tool('systemctl')
         limits = {}
         slice_cg = check_slice(systemctl, cfg['slice'], limits)
-        return hq.queue_main(queue_for(cfg, systemctl, slice_cg, limits)[1], args)
+        return hq.queue_main(queue_for(hq, cfg, systemctl, slice_cg, limits), args)
     except (Refused, OSError, ImportError, SyntaxError, subprocess.SubprocessError) as e:
         say(f'{verb}: {e}')
         return 1
@@ -733,7 +751,7 @@ def main(argv):
         say(f'cannot load the memory queue ({e}); not running {argv[0]}')
         return 1
     except OSError as e:
-        say(f'memory queue: {e}; not running {argv[0]}')
+        say(f'{argv[0]}: {e}')
         return 1
     except Refused as e:
         say(f'{e}; not running {argv[0]}')

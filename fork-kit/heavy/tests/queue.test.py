@@ -74,9 +74,10 @@ class FakeHost:
     def drop_scope(self, scope):
         shutil.rmtree(self.cg_root + SLICE_CG + '/' + scope, ignore_errors=True)
 
-    def set_avail(self, mb):
+    def set_avail(self, mb, swap_total_mb=None, swap_free_mb=None):
+        swap = '' if swap_total_mb is None else f'SwapTotal: {swap_total_mb * 1024} kB\nSwapFree: {swap_free_mb * 1024} kB\n'
         with open(self.meminfo, 'w') as f:
-            f.write(f'MemTotal: 32000000 kB\nMemFree: 1000 kB\nMemAvailable: {mb * 1024} kB\n')
+            f.write(f'MemTotal: 32000000 kB\nMemFree: 1000 kB\nMemAvailable: {mb * 1024} kB\n{swap}')
 
     def log(self):
         try:
@@ -163,7 +164,7 @@ class QueueTests(unittest.TestCase):
             t = self.q.create(kind, mb, scope or f'heavy-{kind}-0.scope', kind)
             t.data['state'] = state
             if since is not None:
-                t.data['since'] = since
+                t.data['since'] = t.data['sinceMono'] = since
             self.q.write(t)
         self.addCleanup(self.hq().close, t)
         return t
@@ -172,11 +173,14 @@ class QueueTests(unittest.TestCase):
         with self.q:
             return self.q.tickets()
 
-    def decide(self, mb, **cfg):
+    def decide(self, mb, keep=True, **cfg):
         q = self.queue(**cfg) if cfg else self.q
         me = self.other('me', mb)
         with q:
-            return q.decide(me, q.tickets(), self.host.box.facts(q.cfg))
+            answer = q.decide(me, q.tickets(), self.host.box.facts(q.cfg))
+        if not keep:
+            self.hq().close(me)                     # gone before the next look
+        return answer
 
     # ---------- admission ----------
 
@@ -259,6 +263,8 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(fig['roomMb'], 4608 - 3000)
 
     def test_a_small_job_passes_a_big_one_until_the_pass_limit(self):
+        self.other('running', 2000, 'admitted', scope='heavy-run.scope')    # its end makes room for big
+        self.host.set_scope('heavy-run.scope', 2000)
         self.host.set_slice(used_mb=2000)
         self.other('big', 4000, since=self.clock.now() - 599)
         self.assertTrue(self.decide(1000)[0])       # big does not fit now; small passes
@@ -284,6 +290,93 @@ class QueueTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('runs alone', why)
 
+    def test_a_job_that_cannot_fit_even_when_the_queue_empties_does_not_hold_it(self):
+        self.other('small', 512, 'admitted', scope='heavy-small.scope')
+        self.host.set_scope('heavy-small.scope', 512)
+        self.host.set_slice(used_mb=512)
+        self.host.set_avail(4000)                   # once small ends: 4000 + 512 - 1024 = 3488 < 3500
+        self.other('big', 3500, since=self.clock.now() - 601)
+        ok, why, _ = self.decide(512)
+        self.assertTrue(ok, why)                    # holding the queue for big would help nobody
+
+    def test_past_the_pass_limit_nothing_passes_while_a_running_job_would_make_room(self):
+        self.other('running', 1000, 'admitted', scope='heavy-run.scope')
+        self.host.set_scope('heavy-run.scope', 1000)
+        self.host.set_slice(used_mb=1000)
+        self.host.set_avail(4000)                   # once running ends: 4000 + 1000 - 1024 = 3976 >= 3500
+        self.other('big', 3500, since=self.clock.now() - 601)
+        ok, why, _ = self.decide(512)
+        self.assertFalse(ok)
+        self.assertIn('pass limit', why)
+
+    def test_a_job_larger_than_the_budget_still_needs_the_machines_free_memory(self):
+        self.host.set_avail(1200)
+        ok, why, _ = self.decide(6000, keep=False)
+        self.assertFalse(ok)                        # alone, but the machine does not have the budget free
+        self.assertIn('larger than the budget', why)
+        self.host.set_avail(16000)
+        self.host.set_slice(used_mb=1000)           # plain heavy jobs use more than the headroom
+        self.assertFalse(self.decide(6000, keep=False)[0])
+        self.host.set_slice(used_mb=0)
+        self.assertTrue(self.decide(6000, keep=False)[0])
+
+    def test_swap_under_the_floor_admits_nobody(self):
+        self.host.set_avail(16000, swap_total_mb=4096, swap_free_mb=900)
+        ok, why, _ = self.decide(100)
+        self.assertFalse(ok)
+        self.assertIn('swap free 900 MB is under swapFreeMinMb 1024 MB', why)
+        self.assertTrue(self.decide(100, swapFreeMinMb=0)[0])
+        self.host.set_avail(16000, swap_total_mb=4096, swap_free_mb=1100)
+        self.assertTrue(self.decide(100)[0])
+        self.host.set_avail(16000, swap_total_mb=0, swap_free_mb=0)      # no swap at all: no swap check
+        self.assertTrue(self.decide(100)[0])
+
+    def hooked(self, answers, **cfg):
+        """A queue whose admit command is a fake: it answers from the list (the last answer repeats)."""
+        calls = []
+
+        def hook(argv, timeout):
+            calls.append((argv, timeout))
+            return answers[min(len(calls), len(answers)) - 1]
+        settings = dict(self.cfg, admitCommand=['/bin/true', '--mb', '{mb}'], **cfg)
+        q = self.hq().Queue(self.host.box, settings, now=self.clock.now, sleep=self.clock.sleep,
+                            monotonic=self.clock.monotonic, out=self.lines.append, hook=hook)
+        return q, calls
+
+    def test_the_admit_command_is_asked_with_the_reservation(self):
+        q, calls = self.hooked([(0, '')])
+        t = q.enter('gradle', 2048, 's.scope', 'x', 60)
+        self.assertEqual(t.state, 'admitted')
+        self.assertEqual(calls, [(['/bin/true', '--mb', '2048'], 20)])
+        self.hq().release(q, t)
+
+    def test_the_admit_command_saying_no_keeps_the_job_waiting_in_its_place(self):
+        q, calls = self.hooked([(1, 'available 900MB: NOT OK'), (None, 'no answer in 20 s'), (0, '')])
+        self.other('later', 100)                    # joins after: must not get ahead
+        t = q.enter('gradle', 2048, 's.scope', 'x', 600)
+        self.assertEqual(t.state, 'admitted')
+        self.assertEqual(len(calls), 3)
+        self.assertIn('the admit command says not now (exit 1: available 900MB: NOT OK)', self.lines[0])
+        self.hq().release(q, t)
+
+    def test_the_admit_command_is_not_asked_when_the_queue_says_no(self):
+        self.host.set_slice(used_mb=4500)
+        q, calls = self.hooked([(0, '')])
+        with self.assertRaises(self.hq().GaveUp):
+            q.enter('gradle', 2048, 's.scope', 'x', 30)
+        self.assertEqual(calls, [])
+
+    def test_a_real_admit_command_that_hangs_is_cut_off(self):
+        hq = self.hq()
+        start = time.monotonic()
+        code, line = hq.run_hook(['/bin/sh', '-c', 'sleep 60 & sleep 60'], 1)
+        self.assertIsNone(code)
+        self.assertIn('no answer in 1 s', line)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(hq.run_hook(['/bin/sh', '-c', 'echo checking; echo NOT OK; exit 3'], 5), (3, 'NOT OK'))
+        self.assertEqual(hq.run_hook(['/bin/sh', '-c', 'exit 0'], 5)[0], 0)
+        self.assertIsNone(hq.run_hook([os.path.join(self.host.dir, 'missing')], 5)[0])
+
     def test_gives_up_after_the_wait_and_leaves_no_ticket(self):
         self.host.set_slice(used_mb=4500)
         with self.assertRaises(self.hq().GaveUp) as cm:
@@ -303,6 +396,46 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(cm.exception.sig, signal.SIGTERM)
         self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)      # put back
         self.assertEqual(self.host.log()[-1]['outcome'], 'stopped')
+        self.assertEqual(self.host.files(), [])
+
+    def test_a_signal_while_the_lock_is_held_is_taken_after_it_is_given_back(self):
+        hq = self.hq()
+        seen = []
+
+        def handler(sig, frame):                    # a stop must never arrive as an exception inside the lock
+            seen.append(sig)
+            raise RuntimeError('a signal handler ran while heavy held the queue lock')
+        old = signal.signal(signal.SIGTERM, handler)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        decide = self.q.decide
+
+        def decide_then_signal(*a):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return decide(*a)
+        self.q.decide = decide_then_signal
+        with self.assertRaises(hq.Stopped) as cm:
+            self.q.enter('gradle', 2048, 's.scope', 'x', 600)
+        self.assertEqual(cm.exception.sig, signal.SIGTERM)
+        self.assertEqual(seen, [])
+        self.assertEqual(self.host.log()[-1]['outcome'], 'stopped')     # a stop that came while deciding wins
+        self.assertEqual(self.host.files(), [])
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), set())
+        fd = os.open(os.path.join(self.host.box.queue_dir, 'lock'), os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)                  # the lock is free
+
+    def test_a_lock_held_by_a_stuck_process_ends_the_wait_on_time(self):
+        hq = self.hq()
+        with self.q:
+            pass                                    # makes the folder and the lock file
+        fd = os.open(os.path.join(self.host.box.queue_dir, 'lock'), os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)              # another open file: to the queue, another process
+        start = self.clock.t
+        with self.assertRaises(hq.GaveUp) as cm:
+            self.q.enter('gradle', 2048, 's.scope', 'x', 30)
+        self.assertIn('queue lock', str(cm.exception))
+        self.assertLessEqual(self.clock.t - start, 31)
         self.assertEqual(self.host.files(), [])
 
     # ---------- the state question ----------
@@ -483,29 +616,38 @@ class QueueTests(unittest.TestCase):
 
     # ---------- peaks ----------
 
-    def test_the_start_value_until_three_clean_runs(self):
+    def test_the_highest_recent_peak_is_learned_from_the_first_run(self):
         hq = self.hq()
-        for peak in (1300, 1400):
-            hq.record_peak(self.q, 'gradle', peak)
         self.assertEqual(hq.reservation('gradle', 2048, self.host.state)[0], 2048)
-        hq.record_peak(self.q, 'gradle', 1350)
+        hq.record_peak(self.q, 'gradle', 2300)
         mb, how = hq.reservation('gradle', 2048, self.host.state)
-        self.assertEqual(mb, 1664)                  # 1400 x 1.15 = 1610, rounded up to 128 MB
-        self.assertIn('learned from 3 runs', how)
+        self.assertEqual(mb, 2688)                  # 2300 x 1.15 = 2645, rounded up to 128 MB
+        self.assertIn('learned', how)
 
-    def test_learned_values_stay_between_half_and_four_times_the_start(self):
+    def test_one_high_run_among_many_low_ones_sets_the_reservation(self):
         hq = self.hq()
-        for peak in (10, 10, 10):
-            hq.record_peak(self.q, 'tiny', peak)
-            hq.record_peak(self.q, 'huge', 100000)
-        self.assertEqual(hq.reservation('tiny', 768, self.host.state)[0], 384)
+        for peak in [1400] + [450] * 19:            # a median would learn 518 MB and let the 1400 MB run in short
+            hq.record_peak(self.q, 'gradle', peak)
+        self.assertEqual(hq.reservation('gradle', 1024, self.host.state)[0], 1664)
+
+    def test_learning_never_goes_below_the_start_value(self):
+        hq = self.hq()
+        for peak in (450, 500, 480):
+            hq.record_peak(self.q, 'gradle', peak)
+        mb, how = hq.reservation('gradle', 2048, self.host.state)
+        self.assertEqual(mb, 2048)
+        self.assertIn('start value', how)
+
+    def test_learned_values_stay_at_most_four_times_the_start(self):
+        hq = self.hq()
+        hq.record_peak(self.q, 'huge', 100000)
         self.assertEqual(hq.reservation('huge', 768, self.host.state)[0], 3072)
 
     def test_only_the_last_20_runs_count(self):
         hq = self.hq()
-        for peak in [9000] * 5 + [1000] * 20:
+        for peak in [9000] * 5 + [2500] * 20:
             hq.record_peak(self.q, 'gradle', peak)
-        self.assertEqual(hq.reservation('gradle', 2048, self.host.state)[0], 1152)
+        self.assertEqual(hq.reservation('gradle', 2048, self.host.state)[0], 2944)
 
     def test_a_broken_peak_file_starts_a_new_history(self):
         hq = self.hq()
@@ -538,6 +680,20 @@ class QueueTests(unittest.TestCase):
         s.sample()
         s.record()
         self.assertEqual(hq.read_peaks(self.host.state)[0], {'gradle': [1400]})
+
+    def test_temporary_files_of_killed_writers_are_removed(self):
+        hq = self.hq()
+        os.makedirs(self.host.state)
+        p = subprocess.Popen(['true'])
+        p.wait()                                    # a pid that is gone
+        dead = os.path.join(self.host.state, f'peaks.json.{p.pid}.tmp')
+        alive = os.path.join(self.host.state, f'waits.log.{os.getppid()}.tmp')
+        for path in (dead, alive):
+            with open(path, 'w') as f:
+                f.write('half')
+        hq.record_peak(self.q, 'gradle', 1000)
+        self.assertFalse(os.path.exists(dead))
+        self.assertTrue(os.path.exists(alive))
 
     def test_a_run_that_was_never_seen_records_nothing(self):
         hq = self.hq()
@@ -573,6 +729,19 @@ class QueueTests(unittest.TestCase):
         for bad in ({'headroom': 1}, {'headroomMb': -1}, {'pollSeconds': 0}, {'headroomMb': True}):
             with self.subTest(bad=bad), self.assertRaises(hq.Refused):
                 hq.settings(self.machine({'version': 1, 'heavy': {'queue': bad}}), os.getuid())
+
+    def test_the_admit_command_must_be_a_program_with_an_absolute_path(self):
+        hq = self.hq()
+        ok = {'admitCommand': ['/bin/sh', '-c', 'exit 0', '{mb}'], 'admitTimeoutSeconds': 5, 'swapFreeMinMb': 0}
+        cfg = hq.settings(self.machine({'version': 1, 'heavy': {'queue': ok}}), os.getuid())
+        self.assertEqual(cfg['admitCommand'][0], '/bin/sh')
+        plain = os.path.join(self.host.dir, 'not-a-program')
+        with open(plain, 'w') as f:
+            f.write('')
+        for bad in (['sh', '-c', 'true'], [plain], [''], '/bin/true', [1], {'admitTimeoutSeconds': 0}):
+            data = bad if isinstance(bad, dict) else {'admitCommand': bad}
+            with self.subTest(bad=bad), self.assertRaises(hq.Refused):
+                hq.settings(self.machine({'version': 1, 'heavy': {'queue': data}}), os.getuid())
 
     def test_the_sweep_accepts_the_queue_key(self):
         sweep = load_module('heavy_sweep', SWEEP)
@@ -617,20 +786,38 @@ MUTATIONS = {
                                          '                    _unlink(path)\n                    continue\n',
                                          '                else:\n                    pass\n',
                                          'test_a_crashed_job_frees_its_reservation'),
-    'owed counts unused reservations': ("total += max(0, t.mb * MB - used)", 'total += 0',
+    'owed counts unused reservations': ('owed += max(0, t.mb * MB - used)', 'owed += 0',
                                         'test_admitted_jobs_hold_what_they_have_not_used_yet'),
-    'the VM check': ("room = min(room, facts['avail'] - cfg['vmReserveMb'] * MB - owed)", 'pass',
+    'the VM check': ('box_room = None if avail is None else avail - reserve - owed', 'box_room = None',
                      'test_the_machines_free_memory_limits_too'),
     'the pressure brake': ("if facts['full10'] > cfg['pressureFull10'] or facts['some60'] > cfg['pressureSome60']:",
                            'if False:', 'test_memory_pressure_admits_nobody'),
-    'earlier jobs keep their share': ('room -= t.mb * MB           # its share', 'room -= 0  #',
+    'the swap floor': ("if cfg['swapFreeMinMb'] and swap_total", 'if False and swap_total',
+                       'test_swap_under_the_floor_admits_nobody'),
+    'earlier jobs keep their share': ('shares += need(t)       # its share', 'shares += 0  #',
                                       'test_first_come_first_served'),
-    'the pass limit': ("            elif now - t.since >= cfg['passLimitSeconds']:\n"
-                       "                return False, f'{t.kind} ({t.mb} MB) has waited past the pass limit; nothing "
-                       "passes it', fig\n", '',
+    'the pass limit': ("if self.waited(t) >= cfg['passLimitSeconds'] and holding_helps(t, shares):", 'if False:',
                        'test_a_small_job_passes_a_big_one_until_the_pass_limit'),
-    'oversized runs alone': ('            if not ahead and not admitted:\n', '            if True:\n',
+    'holding only while it helps': ('            return need(t) <= room_after\n', '            return True\n',
+                                    'test_a_job_that_cannot_fit_even_when_the_queue_empties_does_not_hold_it'),
+    'oversized runs alone': ('return (not admitted and not shares and used <= headroom',
+                             'return (used <= headroom',
                              'test_a_job_larger_than_the_budget_waits_for_the_others'),
+    'oversized still needs free memory': ('and (box_room is None or need(t) <= box_room))', 'and True)',
+                                          'test_a_job_larger_than_the_budget_still_needs_the_machines_free_memory'),
+    'the admit command': ('ok, why = self.ask_hook(mb)', 'pass',
+                          'test_the_admit_command_saying_no_keeps_the_job_waiting_in_its_place'),
+    'stop signals blocked in the lock': ('old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)',
+                                         'old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])',
+                                         'test_a_signal_while_the_lock_is_held_is_taken_after_it_is_given_back'),
+    'the lock wait has an end': ('if self.monotonic() >= deadline:', 'if False:',
+                                 'test_a_lock_held_by_a_stuck_process_ends_the_wait_on_time'),
+    'learning never lowers the start value': ('if mb <= start_mb:', 'if mb == start_mb:',
+                                              'test_learning_never_goes_below_the_start_value'),
+    'the highest peak, not a middle one': ('top = max(runs)', 'top = sorted(runs)[len(runs) // 2]',
+                                           'test_one_high_run_among_many_low_ones_sets_the_reservation'),
+    'stale temporary files': ('        _unlink(os.path.join(folder, name))\n', '        pass\n',
+                              'test_temporary_files_of_killed_writers_are_removed'),
     'cache is not used memory': ("max(current - max(droppable, 0), st.get('anon', 0)) + swap", 'current + swap',
                                  'test_used_counts_anon_and_swap_but_not_clean_cache'),
     'the wait limit': ('if waited >= wait_s:', 'if False:', 'test_gives_up_after_the_wait_and_leaves_no_ticket'),
