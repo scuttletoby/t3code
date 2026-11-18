@@ -371,3 +371,99 @@ describe("holdWorkConnect CLI refusal on a held copy's home", () => {
       }),
   );
 });
+
+describe("holdWorkConnect one marker read per boot", () => {
+  /** Both held layers built together, as one server builds them, on a FileSystem that counts marker checks. */
+  const bootBoth = (baseDir: string, deleteMarkerWhileCloudLinkBuilds: boolean) =>
+    Effect.gen(function* () {
+      const markerPath = `${baseDir}/${HoldWorkConnect.HELD_COPY_MARKER_FILE}`;
+      const checks: Array<string> = [];
+      const countingFs = Layer.effect(
+        FileSystem.FileSystem,
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          return FileSystem.FileSystem.of({
+            ...fs,
+            exists: (path) => {
+              if (path === markerPath) checks.push("exists");
+              return fs.exists(path);
+            },
+          });
+        }),
+      ).pipe(Layer.provide(NodeServices.layer));
+      const cloud = recordingCloudLink();
+      const relayCalls: Array<string> = [];
+      // A hand edit while the server starts: the marker is deleted as the real CloudLink is built.
+      const fakeCloudLink = Layer.effect(
+        CloudLink.CloudLink,
+        Effect.gen(function* () {
+          if (deleteMarkerWhileCloudLinkBuilds) {
+            yield* (yield* FileSystem.FileSystem).remove(markerPath);
+          }
+          return cloud.service;
+        }),
+      );
+      const fakeRelay = Layer.succeed(
+        AgentAwarenessRelay.AgentAwarenessRelay,
+        AgentAwarenessRelay.AgentAwarenessRelay.of({
+          publishThread: () => Effect.sync(() => void relayCalls.push("publishThread")),
+          drain: Effect.sync(() => void relayCalls.push("drain")),
+          requestCatchUp: () => Effect.sync(() => void relayCalls.push("requestCatchUp")),
+          start: () => Effect.sync(() => void relayCalls.push("start")),
+        }),
+      );
+      const gate = yield* WorkAdmission.makeWorkAdmissionGate({ heldFromBoot: false });
+      const [cloudLink, relay] = yield* Effect.all([
+        Effect.service(CloudLink.CloudLink),
+        Effect.service(AgentAwarenessRelay.AgentAwarenessRelay),
+      ]).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            HoldWorkConnect.layer(fakeCloudLink),
+            HoldWorkConnect.agentActivityLayer(fakeRelay),
+          ).pipe(
+            Layer.provide(Layer.succeed(WorkAdmission.WorkAdmission, gate)),
+            Layer.provide(homeConfig(baseDir)),
+            Layer.provide(countingFs),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      return { checks, cloud, cloudLink, relay, relayCalls };
+    });
+
+  it.effect.each([
+    { label: "a marked home", deleteMarkerWhileCloudLinkBuilds: false },
+    {
+      label: "a marked home whose marker is deleted by hand during the boot",
+      deleteMarkerWhileCloudLinkBuilds: true,
+    },
+  ])(
+    "CloudLink and agent activity share one read on $label, so both hold",
+    ({ deleteMarkerWhileCloudLinkBuilds }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-hold-work-once-" });
+        yield* fs.writeFileString(`${baseDir}/${HoldWorkConnect.HELD_COPY_MARKER_FILE}`, "marked");
+        const boot = yield* bootBoth(baseDir, deleteMarkerWhileCloudLinkBuilds);
+        expect(boot.checks).toEqual(["exists"]);
+        expect(yield* boot.cloudLink.startManagedTunnelIfOriginConfirmed(ORIGIN)).toBe(false);
+        expect(yield* boot.cloudLink.releaseManagedTunnelOnShutdown()).toBe(false);
+        expect(boot.cloud.calls).toEqual([]);
+        yield* useRelay(boot.relay);
+        expect(boot.relayCalls).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("an unmarked home is read once too, and neither part is held", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-hold-work-once-" });
+      const boot = yield* bootBoth(baseDir, false);
+      expect(boot.checks).toEqual(["exists"]);
+      expect(yield* boot.cloudLink.startManagedTunnelIfOriginConfirmed(ORIGIN)).toBe("ran");
+      yield* useRelay(boot.relay);
+      expect(boot.relayCalls).toEqual(["start", "publishThread", "requestCatchUp", "drain"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});

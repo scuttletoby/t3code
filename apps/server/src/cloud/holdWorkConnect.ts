@@ -2,6 +2,7 @@
 // server's Connect environment id, so it starts, registers and releases no tunnel, publishes no
 // agent activity, and refuses to link, change or unlink (an unlink ends in a relay delete of that
 // id). Every method is listed by name, never spread: a new upstream method is a type error here.
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -80,14 +81,27 @@ const holdConnect = (
   });
 };
 
-/** Held from boot, or a normal boot of a home a held boot marked; read once, as the layer builds. */
-const connectHold = Effect.gen(function* () {
-  if ((yield* WorkAdmission.WorkAdmission).heldFromBoot) {
-    return Option.some<ConnectHold>({ markerPath: null });
-  }
-  const marker = yield* heldCopyMarker((yield* ServerConfig.ServerConfig).baseDir);
-  return Option.map(marker, (markerPath): ConnectHold => ({ markerPath }));
-});
+/** Whether this boot holds Connect: held from boot, or a normal boot of a home a held boot marked. */
+class ConnectHoldDecision extends Context.Service<
+  ConnectHoldDecision,
+  Option.Option<ConnectHold>
+>()("t3/cloud/holdWorkConnect/ConnectHoldDecision") {}
+
+/**
+ * The boot's one read of the marker. `layer` and `agentActivityLayer` both provide this one layer
+ * value, and a server builds a layer value once, so CloudLink and agent activity share the result:
+ * a marker deleted or added by hand while the server starts cannot hold one and not the other.
+ */
+const connectHoldDecision = Layer.effect(
+  ConnectHoldDecision,
+  Effect.gen(function* () {
+    if ((yield* WorkAdmission.WorkAdmission).heldFromBoot) {
+      return Option.some<ConnectHold>({ markerPath: null });
+    }
+    const marker = yield* heldCopyMarker((yield* ServerConfig.ServerConfig).baseDir);
+    return Option.map(marker, (markerPath): ConnectHold => ({ markerPath }));
+  }),
+);
 
 /**
  * A held boot marks its home as a copy before the real CloudLink is built, so the CLI refusals
@@ -122,7 +136,7 @@ export const layer = <E, R>(cloudLinkLayer: Layer.Layer<CloudLink.CloudLink, E, 
     CloudLink.CloudLink,
     Effect.gen(function* () {
       const cloudLink = yield* CloudLink.CloudLink;
-      const hold = yield* connectHold;
+      const hold = yield* ConnectHoldDecision;
       if (Option.isNone(hold)) return cloudLink;
       yield* Effect.logInfo(
         holdLog(
@@ -133,7 +147,11 @@ export const layer = <E, R>(cloudLinkLayer: Layer.Layer<CloudLink.CloudLink, E, 
       );
       return holdConnect(cloudLink, hold.value);
     }),
-  ).pipe(Layer.provide(cloudLinkLayer), Layer.provide(markHeldCopy));
+  ).pipe(
+    Layer.provide(cloudLinkLayer),
+    Layer.provide(markHeldCopy),
+    Layer.provide(connectHoldDecision),
+  );
 
 /** The publisher a held server uses: it logs that it is held and sends nothing. */
 const holdAgentActivity = (hold: ConnectHold): AgentAwarenessRelay.AgentAwarenessRelay["Service"] =>
@@ -163,10 +181,10 @@ export const agentActivityLayer = <E, R>(
     AgentAwarenessRelay.AgentAwarenessRelay,
     Effect.gen(function* () {
       const relay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
-      const hold = yield* connectHold;
+      const hold = yield* ConnectHoldDecision;
       return Option.isSome(hold) ? holdAgentActivity(hold.value) : relay;
     }),
-  ).pipe(Layer.provide(relayLayer));
+  ).pipe(Layer.provide(relayLayer), Layer.provide(connectHoldDecision));
 
 /** Written in a home by a held boot. Every boot and the `t3 connect` refusals read it; nothing removes it. */
 export const HELD_COPY_MARKER_FILE = "hold-work-copy.txt";
@@ -190,6 +208,9 @@ const heldCopyMarker = Effect.fn("HoldWorkConnect.heldCopyMarker")(function* (ba
             ),
           ),
     ),
+    // Fails closed on purpose: a check that errors (EIO, EACCES) counts as marked, so a copy is
+    // never let reach Connect because its marker could not be read. On the live home that holds
+    // Connect for that boot only, and the log names the file. Do not turn this into fail-open.
     Effect.orElseSucceed(() => true),
   );
   return marked ? Option.some(markerPath) : Option.none();
