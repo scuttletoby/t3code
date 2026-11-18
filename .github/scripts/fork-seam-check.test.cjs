@@ -1383,12 +1383,18 @@ test("a key from the list is printed escaped, so it cannot forge a workflow comm
     { files: { [forged]: SEAM["a.ts"] } },
     { files: {}, pending: { [forged]: 1 } },
     { files: SEAM, lost: { [forged]: { lines: 1, gone: 0 } } },
+    // C1 controls (NEL is a line break to some readers; CSI starts a terminal escape).
+    { files: SEAM, ["x\u0085::notice title=forged::y\u009b31m"]: {} },
   ]) {
     const problem = ownListProblem(JSON.stringify(config));
     assert.ok(problem, JSON.stringify(config));
-    assert.doesNotMatch(problem, /[\n\r]/, problem);
-    assert.match(problem, /x\\n::notice/, problem);
+    assert.doesNotMatch(problem, /[\n\r\u0080-\u009f]/, problem);
+    assert.match(problem, /x\\u(000a|0085)::notice|x\\n::notice/, problem);
   }
+  assert.match(
+    ownListProblem(JSON.stringify({ files: SEAM, ["x\u0085y\u009b"]: {} })),
+    /x\\u0085y\\u009b/,
+  );
   // Node's JSON error quotes a short bad text as it is.
   const badJson = ownListProblem("\n::notice title=forged::y");
   assert.match(badJson, /is malformed: .*JSON/);
@@ -1403,7 +1409,78 @@ test("a line the change adds is printed escaped in a refusal", () => {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /x\\u000d::warning::forged\\u2028y/);
     assert.doesNotMatch(result.stderr, /[\r\u2028]/);
+    // Bidi and zero-width characters: a refusal shows what the line holds, not what it looks like.
+    const hidden = commit(
+      { "a.ts": `${BASE["a.ts"]}ok(/*\u202e } \u2066*/\ufeff\u061c\u200e\u200f);\u200b\n` },
+      "hidden",
+    );
+    const shown = run(main, hidden);
+    assert.equal(shown.status, 1);
+    assert.match(
+      shown.stderr,
+      /ok\(\/\*\\u202e } \\u2066\*\/\\ufeff\\u061c\\u200e\\u200f\);\\u200b/,
+    );
+    assert.doesNotMatch(shown.stderr, /[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/);
+    // Other characters that print as nothing (or as a blank that is no space): soft hyphen,
+    // Hangul fillers, the Mongolian vowel separator, variation selectors and tag characters.
+    const INVISIBLE = [
+      ["\u00ad", "\\u00ad"],
+      ["\u115f", "\\u115f"],
+      ["\u1160", "\\u1160"],
+      ["\u180e", "\\u180e"],
+      ["\u3164", "\\u3164"],
+      ["\ufe00", "\\ufe00"],
+      ["\ufe0f", "\\ufe0f"],
+      ["\uffa0", "\\uffa0"],
+      ["\u{e0000}", "\\u{e0000}"],
+      ["\u{e0041}", "\\u{e0041}"],
+      ["\u{e007f}", "\\u{e007f}"],
+      ["\u{e0100}", "\\u{e0100}"],
+      ["\u{e01ef}", "\\u{e01ef}"],
+    ];
+    const unseen = commit(
+      { "a.ts": `${BASE["a.ts"]}ok(${INVISIBLE.map(([char]) => `${char}|`).join("")});\n` },
+      "unseen",
+    );
+    const spelled = run(main, unseen);
+    assert.equal(spelled.status, 1);
+    assert.ok(
+      spelled.stderr.includes(`ok(${INVISIBLE.map(([, text]) => `${text}|`).join("")});`),
+      spelled.stderr,
+    );
+    assert.doesNotMatch(
+      spelled.stderr,
+      /[\u00ad\u115f\u1160\u180e\u3164\ufe00-\ufe0f\uffa0\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/u,
+    );
+    // The characters next to each range stay as they are, as does an astral one outside them.
+    const kept =
+      "\u00ac\u00ae\u115e\u1161\u180d\u180f\u3163\u3165\ufdff\ufe10\uff9f\uffa1\u{dffff}\u{e0080}\u{e00ff}\u{e01f0}\u{1f600}";
+    const plain = run(main, commit({ "a.ts": `${BASE["a.ts"]}ok(${kept});\n` }, "kept"));
+    assert.equal(plain.status, 1);
+    assert.ok(plain.stderr.includes(`ok(${kept});`), plain.stderr);
   });
+});
+
+// A listed line with a line break was two allowances: "fork();\nevil();" let a change add
+// `evil();` alone, which nobody listed as a line.
+test("a listed or announced line with a line break is refused", () => {
+  for (const [entry, line] of [
+    [{ why: "t", added: ["fork();\nevil();"] }, "fork();\nevil();"],
+    [{ why: "t", added: ["fork();\r"] }, "fork();\r"],
+    [
+      { why: "t", added: [], announced: { since: "2026-11-18", added: ["a();", "b();\nevil();"] } },
+      "b();\nevil();",
+    ],
+  ]) {
+    const text = JSON.stringify({ files: { "a.ts": entry } });
+    assert.throws(
+      () => parseConfig(text),
+      (error) =>
+        error.message ===
+        `${CONFIG}: a.ts: a listed line holds a line break (one line per item): ${JSON.stringify(line)}`,
+    );
+    assert.match(ownListProblem(text), /a listed line holds a line break/);
+  }
 });
 
 // JSON.parse keeps the last of two equal keys: a conflict resolved by keeping both entries would
@@ -1474,7 +1551,7 @@ test("an announcement is refused from upstream once it is older than its days, o
   };
   assert.deepEqual(findExpiredAnnouncements(files, "2026-11-18"), []);
   assert.deepEqual(findExpiredAnnouncements(files, "2026-11-19"), [
-    'n.ts: 2 lines "announced" on 2026-11-04, more than 14 days before 2026-11-19 (the head\'s commit date): add them (step 2) or remove the announcement.',
+    'n.ts: 2 lines "announced" on 2026-11-04, more than 14 days before 2026-11-19 (the head\'s commit date): announce them again (set "since" to the day that pull request merges) or remove the announcement, with a list-only pull request to main.',
   ]);
   // A date ahead of the head's would never expire (one day is left for time zones).
   const ahead = { "n.ts": { ...files["n.ts"], announced: { since: "2026-11-20", added: ["x"] } } };
@@ -1537,7 +1614,13 @@ test("a new seam line lands green in two steps: announce, then add", () => {
     const expired = fromUpstream(upstream, later);
     assert.equal(expired.status, 1, expired.stdout);
     assert.match(expired.stderr, /- n\.ts: 1 line "announced" on 2026-11-18, more than 14 days/);
-    assert.match(expired.stderr, /Add each announced line \(step 2\) or remove its announcement/);
+    assert.match(
+      expired.stderr,
+      /Announce each line named above again \(set "since" to the day that pull request merges\) or remove its announcement, with a list-only pull request to main; only then step 2\. Step 2 alone is refused once main's commit date is past the announcement's days too/,
+    );
+    // One wording for the day in every message: "today" loses the days a review takes.
+    assert.doesNotMatch(expired.stderr, /to today|refused too/);
+    assert.doesNotMatch(expired.stderr, /add them \(step 2\)|Add each announced line/);
     assert.doesNotMatch(expired.stderr, /a file of the fork's own/);
     // The pull request's run reads no clock and refuses only a line an expired announcement
     // alone allows: a change that adds none is green.
@@ -1547,6 +1630,14 @@ test("a new seam line lands green in two steps: announce, then add", () => {
     assert.equal(fromUpstream(upstream, dropped).status, 0);
     // Runs again on the same commits: the same answer (the head's commit date, not the clock).
     assert.equal(fromUpstream(upstream, later).stderr, expired.stderr);
+    // "Step 2 alone is refused" holds only once main's own date is past the days. A head dated
+    // later than main (a fresh rebase) expires first: step 2 alone, on a main still inside its
+    // days, is green and fixes it.
+    git("checkout", "-q", "-f", "-B", "rebased", step1);
+    const rebased = commit({ "fork/own.ts": UP }, "rebased later", "2026-12-03T12:00:00Z");
+    assert.equal(fromUpstream(upstream, rebased).status, 1);
+    assert.equal(run(step1, step2).status, 0);
+    assert.equal(fromUpstream(upstream, step2).status, 0);
   });
 });
 
@@ -1598,6 +1689,27 @@ test("from upstream, an announced line upstream itself added stops the run befor
   });
 });
 
+// Round 2's surviving mutant (M22): the landed check read upstream's base, not the head. A head
+// that has an announced line upstream lacks (step 2 kept its announcement) is refused too.
+test("from upstream, an announced line the head has and upstream does not stops the run", () => {
+  withRepo(({ commit, fromUpstream }) => {
+    const day = "2026-11-18T12:00:00Z";
+    const upstream = commit({ ...BASE, "n.ts": UP }, "upstream", day);
+    const head = commit({ "n.ts": `${UP}forkNew();\n`, ...seams(ANNOUNCED()) }, "kept", day);
+    for (const args of [
+      [upstream, head],
+      ["--after-rebase", upstream, head],
+    ]) {
+      const result = fromUpstream(...args);
+      assert.equal(result.status, 1, result.stdout);
+      assert.match(
+        result.stderr,
+        /- n\.ts: the announced line `forkNew\(\);` is already in the head's file \(1× there\)/,
+      );
+    }
+  });
+});
+
 // The state lens's surviving mutant: only "added" lines are the fork's in main's file. Should an
 // announced line be in it anyway (upstream's copy), a pull request may not delete it as "dropped".
 test("on a pull request, an announced line in main's file is upstream's and may not go", () => {
@@ -1630,9 +1742,43 @@ test("on a pull request, a line only an expired announcement allows is refused, 
       assert.equal(result.status, 1, result.stdout);
       assert.match(
         result.stderr,
-        /- n\.ts: adds `forkNew\(\);` \(its announcement of 2026-11-18 is more than 14 days before 2026-12-03, main's commit date: announce it again with a list-only pull request\)/,
+        /- n\.ts: adds `forkNew\(\);` \(its announcement of 2026-11-18 is more than 14 days before 2026-12-03, the list's commit date: announce it again with a list-only pull request\)/,
       );
+      // A late step 2 is the announcement's to fix, not a reason to move the line elsewhere.
+      assert.match(
+        result.stderr,
+        /Announce each line named above again .* then update this change/,
+      );
+      assert.doesNotMatch(result.stderr, /A new seam line needs its own entry/);
     }
+    // With another refusal beside it, the author hint is printed too.
+    const both = commit(
+      { "a.ts": BASE["a.ts"].replace("  a: 1,", "  inline: 1,\n  a: 1,") },
+      "step 2 and more",
+      "2026-11-20T12:00:00Z",
+    );
+    const mixed = run(later, both);
+    assert.equal(mixed.status, 1);
+    assert.match(mixed.stderr, /A new seam line needs its own entry/);
+    assert.match(mixed.stderr, /Announce each line named above again/);
+    // The same expired line added twice: announcing again allows one copy, so only that copy is
+    // the announcement's; the second is a line beyond the seam, with the author hint.
+    git("checkout", "-q", "-f", "-B", "twice", later);
+    const twice = commit(
+      { "n.ts": `${UP}forkNew();\nforkNew();\n`, ...seams(ADDED) },
+      "step 2, twice",
+      "2026-11-20T12:00:00Z",
+    );
+    const doubled = run(later, twice);
+    assert.equal(doubled.status, 1);
+    assert.match(
+      doubled.stderr,
+      /- n\.ts: adds `forkNew\(\);` \(its announcement of 2026-11-18 is/,
+    );
+    assert.match(doubled.stderr, /- n\.ts: adds `forkNew\(\);`\n/);
+    assert.doesNotMatch(doubled.stderr, /2×/);
+    assert.match(doubled.stderr, /A new seam line needs its own entry/);
+    assert.match(doubled.stderr, /Announce each line named above again/);
     // Inside the days by main's date, a late pull request date does not refuse it.
     git("checkout", "-q", "-f", "-B", "main2", step1);
     const inside = commit({ "fork/own.ts": UP }, "main moves on", "2026-12-02T12:00:00Z");
@@ -1647,6 +1793,124 @@ test("on a pull request, a line only an expired announcement allows is refused, 
     const seam = commit({ "a.ts": BASE["a.ts"].replace("  a: 1,", "  ...fork,\n  a: 1,") }, "seam");
     assert.equal(run(later, seam).status, 0);
   });
+});
+
+// A future-dated announcement on main never expired in a pull request's run (only fork-follow
+// refused it). Dated by the commit whose list judges the pull request (--config-ref, else base).
+test("on a pull request, a line only a future-dated announcement allows is refused, dated by the list's commit", () => {
+  withRepo(({ git, commit, run }) => {
+    const day = "2026-11-18T12:00:00Z";
+    const upstream = commit({ ...BASE, "n.ts": UP, ...seams({ files: SEAM }) }, "main", day);
+    const step2 = { "n.ts": `${UP}forkNew();\n`, ...seams(ADDED) };
+    const runs = (main, pr) => [run(main, pr), run("--config-ref", main, main, pr)];
+    // Dated ahead (more than the day left for time zones): refused, naming the fix.
+    git("checkout", "-q", "-b", "ahead", upstream);
+    const ahead = commit(seams(ANNOUNCED("2099-01-01")), "step 1, dated ahead", day);
+    const spend = commit(step2, "step 2", day);
+    for (const result of runs(ahead, spend)) {
+      assert.equal(result.status, 1, result.stdout);
+      assert.match(
+        result.stderr,
+        /- n\.ts: adds `forkNew\(\);` \(its announcement of 2099-01-01 is dated after 2026-11-18, the list's commit date: announce it again with a list-only pull request\)/,
+      );
+      assert.doesNotMatch(result.stderr, /A new seam line needs its own entry/);
+    }
+    // One day ahead is time zones: allowed. Two: refused.
+    for (const [since, status] of [
+      ["2026-11-19", 0],
+      ["2026-11-20", 1],
+    ]) {
+      git("checkout", "-q", "-f", "-B", "near", upstream);
+      const near = commit(seams(ANNOUNCED(since)), "step 1", day);
+      const used = commit(step2, "step 2", day);
+      for (const result of runs(near, used)) assert.equal(result.status, status, since);
+    }
+    // The way out: a list-only change that re-dates it is green, and step 2 then is too.
+    git("checkout", "-q", "-f", "-B", "redate", ahead);
+    const redated = commit(seams(ANNOUNCED("2026-11-18")), "announce again", day);
+    assert.equal(run(ahead, redated).status, 0);
+    assert.equal(run(redated, commit(step2, "step 2", day)).status, 0);
+
+    // A pull request's base (fork-checks: pull_request.base.sha) can be older than the list's
+    // commit (main now): the date is the list's. Expired by main's date, not by the old base's:
+    git("checkout", "-q", "-f", "-B", "main", upstream);
+    const step1 = commit(seams(ANNOUNCED("2026-11-18")), "step 1", day);
+    const later = commit({ "fork/own.ts": UP }, "main moves on", "2026-12-03T12:00:00Z");
+    git("checkout", "-q", "-f", "-B", "old", step1);
+    const fromOld = commit(step2, "step 2 from an old base", day);
+    const late = run("--config-ref", later, step1, fromOld);
+    assert.equal(late.status, 1, late.stdout);
+    assert.match(late.stderr, /more than 14 days before 2026-12-03, the list's commit date/);
+    // ...and a base older than the announcement does not make main's announcement "ahead".
+    git("checkout", "-q", "-f", "-B", "early", upstream);
+    const oldBase = commit({ "fork/old.ts": UP }, "old main", "2026-11-01T12:00:00Z");
+    git("checkout", "-q", "-f", "-B", "main2", oldBase);
+    const main2 = commit(seams(ANNOUNCED("2026-11-18")), "step 1", day);
+    git("checkout", "-q", "-f", "-B", "pr2", oldBase);
+    const pr2 = commit(step2, "step 2 from a base before step 1", day);
+    const legit = run("--config-ref", main2, oldBase, pr2);
+    assert.equal(legit.status, 0, legit.stderr);
+  });
+});
+
+// For an annotated tag `git show` printed the tag's header and message before the date, and for a
+// commit with no committer date no day at all. That text is no day, every comparison with it was
+// false, and an expired or future-dated announcement allowed its lines again.
+test("the date is read through an annotated tag, and a commit with no date stops the run", () => {
+  withRepo(({ dir, git, commit, run, fromUpstream }) => {
+    const upstream = commit({ ...BASE, "n.ts": UP }, "upstream", "2026-11-18T12:00:00Z");
+    commit(seams(ANNOUNCED()), "step 1", "2026-11-18T12:00:00Z");
+    const later = commit({ "fork/own.ts": UP }, "main moves on", "2026-12-03T12:00:00Z");
+    git("tag", "-a", "-m", "a release\n\n2026-11-19", "listed", later);
+    git("checkout", "-q", "-b", "pr", later);
+    const step2 = { "n.ts": `${UP}forkNew();\n`, ...seams(ADDED) };
+    const spend = commit(step2, "step 2", "2026-11-20T12:00:00Z");
+    // A pull request's run with the list named by a tag: the tagged commit's date.
+    const tagged = run("--config-ref", "listed", later, spend);
+    assert.equal(tagged.status, 1, tagged.stdout);
+    assert.match(tagged.stderr, /more than 14 days before 2026-12-03, the list's commit date/);
+    // From upstream with the head named by a tag.
+    const expired = fromUpstream(upstream, "listed");
+    assert.equal(expired.status, 1, expired.stdout);
+    assert.match(expired.stderr, /"announced" on 2026-11-18, more than 14 days before 2026-12-03/);
+    // A commit whose committer line has no date: both runs stop, naming the ref.
+    const undated = execFileSync(
+      "git",
+      ["-C", dir, "hash-object", "-t", "commit", "-w", "--literally", "--stdin"],
+      {
+        input: `tree ${git("rev-parse", `${later}^{tree}`).trim()}\nparent ${later}\nauthor t <t@t> 1795000000 +0000\ncommitter t <t@t>\n\nno date\n`,
+        encoding: "utf8",
+      },
+    ).trim();
+    for (const stopped of [
+      run("--config-ref", undated, later, spend),
+      fromUpstream(upstream, undated),
+    ]) {
+      assert.equal(stopped.status, 3, stopped.stdout + stopped.stderr);
+      assert.ok(
+        stopped.stderr.startsWith(`fork-seam-check crashed: ${undated}: no commit date (`),
+        stopped.stderr,
+      );
+      assert.equal(stopped.stdout, "");
+    }
+    // Runs again: the same answer.
+    assert.equal(run("--config-ref", "listed", later, spend).stderr, tagged.stderr);
+  });
+});
+
+// The same guard for a caller of the functions: a date that is no day throws, it does not compare.
+test("a date that is no day stops the check instead of allowing an announcement", () => {
+  const files = { "n.ts": ANNOUNCED("2000-01-01").files["n.ts"] };
+  const spent = (today) =>
+    findSeamBreaches(files, { atBase: () => UP, atHead: () => `${UP}forkNew();\n`, today });
+  assert.equal(spent("2026-11-18").length, 1);
+  assert.equal(findExpiredAnnouncements(files, "2026-11-18").length, 1);
+  for (const today of ["", "tag v1\nTagger: t <t@t>\n\nmsg\n2026-11-18", "%cs", "2026-02-30"]) {
+    const refused = { message: `not a day (YYYY-MM-DD): ${JSON.stringify(today.slice(0, 40))}` };
+    assert.throws(() => spent(today), refused);
+    assert.throws(() => findExpiredAnnouncements(files, today), refused);
+    assert.throws(() => findAnnouncementWarnings(files, {}, today), refused);
+  }
 });
 
 // A step-1 pull request that waited for its reviews could merge (nearly) expired; fork-follow then
