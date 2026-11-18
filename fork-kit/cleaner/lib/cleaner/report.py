@@ -12,7 +12,7 @@ each folder and each hard-linked file counts once in the whole report (in the fi
 that cannot be read in full says "could not read" and the others still print; a worktree that cannot be read is
 named, and the worktrees that can be still count. Docker's volumes are root's, so Docker's own measure is used.
 """
-import fcntl, fnmatch, json, os, re, socket, stat, tempfile, time
+import errno, fcntl, fnmatch, json, os, re, socket, stat, tempfile, time
 
 from . import rules
 from .config import CLASSES
@@ -355,10 +355,25 @@ def take_lock(cfg):
     return fd
 
 
-def report(cfg, say=print, docker=docker_volume_sizes, host=None, disk_of=disk, mounts=mount_points):
+def deliver(out, line):
+    """Appends the line to the file `out` and waits until it is on disk. Raises OSError when it cannot."""
+    os.makedirs(os.path.dirname(out), mode=0o700, exist_ok=True)
+    fd = os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, 'not a regular file')
+        os.write(fd, (line + '\n').encode('utf-8', 'surrogateescape'))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def report(cfg, say=print, docker=docker_volume_sizes, host=None, disk_of=disk, mounts=mount_points, out=None, mark=True):
     """Prints the line and moves the mark, one report at a time. Returns the exit code: 0, or 1 when anything
     could not be read (that part says so; the rest is still there) or another report is running (then it prints
-    no line and the mark stays)."""
+    no line and the mark stays).
+    `out`: a file the line is appended to (and synced) first; the mark moves only once the line is there, so a line
+    that went nowhere is counted again by the next report (#491). `mark=False`: the mark stays where it is."""
     try:
         lock = take_lock(cfg)
     except BlockingIOError:
@@ -368,13 +383,13 @@ def report(cfg, say=print, docker=docker_volume_sizes, host=None, disk_of=disk, 
         say(f'fork-cleaner: cannot take the report\'s lock {cfg.report_lock_file} ({ex.strerror}): no report')
         return 1
     try:
-        return _report(cfg, say, docker, host, disk_of, mounts, lock is not None)
+        return _report(cfg, say, docker, host, disk_of, mounts, lock is not None, out, mark)
     finally:
         if lock is not None:
             os.close(lock)
 
 
-def _report(cfg, say, docker, host, disk_of, mounts, locked):
+def _report(cfg, say, docker, host, disk_of, mounts, locked, out=None, mark=True):
     try:
         points, mount_problem = mounts(), None
     except Unreadable as ex:
@@ -426,11 +441,19 @@ def _report(cfg, say, docker, host, disk_of, mounts, locked):
         tail += f'; {got.skipped} log line' + ('' if got.skipped == 1 else 's') + ' not understood, skipped'
     if mount_problem is not None:
         tail += f'; the mount list could not be read ({mount_problem}): a bind mount may be counted twice'
-    say(f'disk on {host or socket.gethostname()}: ' + ', '.join(parts) + '; ' + tail)
+    line = f'disk on {host or socket.gethostname()}: ' + ', '.join(parts) + '; ' + tail
+    if out is not None:
+        try:
+            deliver(out, line)
+        except OSError as ex:
+            say(line)
+            say(f'fork-cleaner: could not write the line to {out} ({ex.strerror}): the mark stays, the next report counts these deletes again')
+            return 1
+    say(line)
 
     failed = (any(s.problems or s.unread for s in classes) or disk_problem or got.problem or got.mark_problem
               or mount_problem)
-    if got.problem is None and got.mark is not None and locked:
+    if mark and got.problem is None and got.mark is not None and locked:
         try:
             write_mark(cfg, got.mark)
         except OSError as ex:

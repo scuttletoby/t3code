@@ -20,6 +20,9 @@ ANONYMOUS = re.compile(r'^[0-9a-f]{64}$')       # the name Docker gives a volume
 EMPTY_PRS = {'merged': [], 'open': []}
 GITHUB_URL = re.compile(r'^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?$')
 # In a worktree's own git folder: an operation somebody started and did not finish.
+# In a worktree's own git folder: files the commands of somebody working in it write (`fetch` writes FETCH_HEAD).
+USE_MARKS = ('HEAD', 'index', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG')
+REFLOG_LINE = re.compile(rb'(?:[0-9a-f]{40}|[0-9a-f]{64}) (?:[0-9a-f]{40}|[0-9a-f]{64}) [^<>\n]*<[^<>\n]*> (\d+) [+-]\d{4}(?:\t[^\n]*)?')
 MARKS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-merge', 'rebase-apply', 'index.lock')
 
 
@@ -337,6 +340,8 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
     branch = branch[len('refs/heads/'):] if branch.startswith('refs/heads/') else ''
     if not branch:
         return Refusal('no branch', 'HEAD is detached')
+    if repo.branches and not matches(branch, repo.branches):
+        return Refusal('branch not listed', f'{branch} matches none of {some(list(repo.branches))}')
 
     opened = [row for row in prs['open'] if row['headRefName'] == branch]
     if opened:
@@ -433,7 +438,55 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
 
     look = guard.examine(cfg, facts, path, kind)
     out['look'] = look
-    return look.refusal
+    if look.refusal is not None:
+        return look.refusal
+    # Somebody may still use it although its pull request merged: an agent's shell between two commands holds no
+    # file open. Any change to its files (build output too) or to its own git state says it was used.
+    used, what = last_used(path, git_dir, look)
+    age = facts.now - used
+    if age < cfg.used_hours * 3600:
+        return Refusal(f'used under {cfg.used_hours} h ago', f'{what} changed {int(max(age, 0) // 3600)} h ago')
+    return None
+
+
+def last_used(path, git_dir, look):
+    """(time, what) of the newest sign of use: a change to anything in the folder (the guard's look, which walks
+    all of it, a clone's git folder too), to the git files a command in it writes (USE_MARKS), or the newest time
+    written in its own HEAD reflog. The reflog file's own change time does not count: `git gc` rewrites it.
+    Raises Unreadable when a reflog line cannot be read."""
+    used, what = look.newest, 'a file in it'
+    for name in USE_MARKS:
+        try:
+            when = guard.changed(os.lstat(os.path.join(git_dir, name)))
+        except FileNotFoundError:
+            continue                    # most are there only after the command that writes them
+        except OSError as ex:
+            raise Unreadable(f'{name} in its git folder: {ex.strerror}') from None
+        if when > used:
+            used, what = when, f'git {name}'
+    when = reflog_newest(os.path.join(git_dir, 'logs', 'HEAD'))
+    if when > used:
+        used, what = when, 'its HEAD reflog'
+    return used, what
+
+
+def reflog_newest(path):
+    """The newest time a reflog file names; 0 when there is no such file."""
+    try:
+        with open(path, 'rb') as f:
+            lines = f.read().split(b'\n')
+    except FileNotFoundError:
+        return 0.0
+    except OSError as ex:
+        raise Unreadable(f'{path}: {ex.strerror}') from None
+    newest = 0.0
+    for number, line in enumerate(lines, 1):
+        found = REFLOG_LINE.fullmatch(line)
+        if found:
+            newest = max(newest, float(found.group(1)))
+        elif line or number < len(lines):  # the text ends with a newline: only the last piece may be empty
+            raise Unreadable(f'line {number} of its HEAD reflog is no reflog line')
+    return newest
 
 
 def tree_of(repo, path):
