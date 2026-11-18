@@ -488,4 +488,105 @@ describe("work held for an automatic update", () => {
         assert.isTrue(yield* process.gate.heldWorkSettled);
       }),
   );
+
+  it.effect(
+    "does not send a held scheduled run again at startup: it starts once, on the commit",
+    () =>
+      Effect.gen(function* () {
+        const world = yield* heldWorld([{ kind: "scheduled run", live: true }]);
+        const [thread] = world.threads;
+        const process = yield* world.startProcess();
+        // Upstream sends an unattended prompt again right here; a held one waits for the commit.
+        assert.deepEqual(world.starts(), []);
+        assert.deepInclude(yield* world.marker, { runs: [thread!.runId] });
+        yield* process.gate.startHeldWork;
+        assert.deepEqual(world.starts(), [thread!.runId]);
+        yield* process.gate.startHeldWork;
+        assert.deepEqual(world.starts(), [thread!.runId]);
+      }),
+  );
+
+  it.effect(
+    "starts a held agent message once when the server restarts twice before the commit",
+    () =>
+      Effect.gen(function* () {
+        const world = yield* heldWorld([{ kind: "t3_thread_send", live: true }]);
+        yield* world.startProcess();
+        const second = yield* world.startProcess();
+        assert.deepEqual(world.starts(), []);
+        yield* second.gate.startHeldWork;
+        assert.deepEqual(world.starts(), [world.threads[0]!.runId]);
+      }),
+  );
+
+  it.effect("does not hold a rewound scheduled run: upstream sends it again once, reset", () =>
+    Effect.gen(function* () {
+      const world = yield* heldWorld([{ kind: "scheduled run", live: true, rewound: true }]);
+      const [thread] = world.threads;
+      const process = yield* world.startProcess();
+      assert.deepEqual(world.starts(), [thread!.runId]);
+      // Put back to unstarted, as upstream does for a run no provider accepted.
+      assert.isTrue(
+        world
+          .runUpdates()
+          .some(
+            (update) =>
+              update.id === thread!.runId &&
+              update.status === "starting" &&
+              update.startedAt === null,
+          ),
+      );
+      assert.equal(process.summary.terminalizedRuns, 0);
+      // Not held work: the commit starts nothing more, and the marker never listed it.
+      assert.deepInclude(yield* world.marker, { runs: [] });
+      yield* process.gate.startHeldWork;
+      assert.deepEqual(world.starts(), [thread!.runId]);
+    }),
+  );
+
+  it.effect("does not hold a rewound user message: it waits in the visible held queue", () =>
+    Effect.gen(function* () {
+      const world = yield* heldWorld([{ kind: "user message", live: true, rewound: true }]);
+      const process = yield* world.startProcess();
+      yield* process.gate.startHeldWork;
+      assert.deepEqual(world.starts(), []);
+      assert.isTrue(
+        world
+          .runUpdates()
+          .some((update) => update.id === world.threads[0]!.runId && update.queueHeld === true),
+      );
+    }),
+  );
+
+  it.effect("sends a rewound run the marker lists again once, never as held work too", () =>
+    Effect.gen(function* () {
+      // An earlier startup kept it; then a process started it and stopped before its provider did.
+      const world = yield* heldWorld([{ kind: "scheduled run", live: true, rewound: true }], {
+        marker: { runs: ["run_update_hold_scheduled_run_0"] },
+      });
+      const [thread] = world.threads;
+      assert.equal(thread!.runId, "run_update_hold_scheduled_run_0");
+      const process = yield* world.startProcess();
+      assert.deepEqual(world.starts(), [thread!.runId]);
+      yield* process.gate.startHeldWork;
+      assert.deepEqual(world.starts(), [thread!.runId]);
+    }),
+  );
+
+  it.effect.each([
+    { name: "a rewound scheduled run", kind: "scheduled run", rewound: true },
+    { name: "an agent message", kind: "t3_thread_send", rewound: false },
+  ] as const)("leaves upstream's resend of $name alone when no update held work", (input) =>
+    Effect.gen(function* () {
+      const world = yield* heldWorld([{ kind: input.kind, live: true, rewound: input.rewound }], {
+        marker: "none",
+      });
+      const [thread] = world.threads;
+      const process = yield* world.startProcess();
+      assert.deepEqual(world.starts(), [thread!.runId]);
+      assert.equal(process.summary.terminalizedRuns, 0);
+      yield* process.gate.startHeldWork;
+      assert.deepEqual(world.starts(), [thread!.runId]);
+    }),
+  );
 });
