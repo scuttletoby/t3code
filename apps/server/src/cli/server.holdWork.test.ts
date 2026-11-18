@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - CLI integration uses temporary Node paths.
 // Fork (go-live kit): `serve --hold-work` is refused for the background service and on the default
 // home (it would mark the live home as a copy).
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -22,7 +23,11 @@ import {
   SERVICE_LAUNCHER_PROTOCOL,
 } from "../cloud/serviceProtocol.ts";
 import { cli } from "../binCli.ts";
-import { refuseHoldWorkForBootService, refuseHoldWorkOnDefaultHome } from "./forkHoldWork.ts";
+import {
+  AccountHomeDirectory,
+  refuseHoldWorkForBootService,
+  refuseHoldWorkOnDefaultHome,
+} from "./forkHoldWork.ts";
 
 const launcher = (input: { readonly connected: boolean; readonly context?: string }) => ({
   host: {
@@ -144,6 +149,72 @@ describe("serve --hold-work needs a home named with --base-dir, never the defaul
             `--hold-work is refused on the default T3 home (${defaultHome})`,
           );
         }
+      }),
+    ),
+  );
+
+  it.effect("refuses the account's own T3 home when $HOME points somewhere else", () =>
+    onHome(() =>
+      Effect.gen(function* () {
+        // `HOME=/scratch t3 serve --hold-work --base-dir /home/<user>/.t3`: $HOME moved, the live
+        // home did not. The account's home comes from the passwd entry, which ignores $HOME.
+        const accountHome = NodePath.join(NodeOS.userInfo().homedir, ".t3");
+        const message = yield* refusal(Option.some(accountHome));
+        expect(message).toContain(`--hold-work is refused on the default T3 home (${accountHome})`);
+      }),
+    ),
+  );
+
+  it.effect("refuses the account home's .t3, made or not, and nothing beside it", () =>
+    onHome((root) =>
+      Effect.gen(function* () {
+        const accountHome = NodePath.join(root, "account");
+        const live = NodePath.join(accountHome, ".t3");
+        const message = yield* refusal(Option.some(live)).pipe(
+          Effect.provideService(AccountHomeDirectory, accountHome),
+        );
+        expect(message).toContain(`--hold-work is refused on the default T3 home (${live})`);
+        yield* refuseHoldWorkOnDefaultHome(Option.some(`${live}-copy`)).pipe(
+          Effect.provideService(AccountHomeDirectory, accountHome),
+        );
+      }),
+    ),
+  );
+
+  it.effect("refuses the same folder under another spelling the path check cannot see", () =>
+    onHome((root) =>
+      Effect.gen(function* () {
+        // A case-insensitive disk (or a second mount): `<root>/.T3` is `<root>/.t3`, and realPath
+        // keeps the spelling it was given. Only the folder's identity (dev+ino) shows it.
+        const fs = yield* FileSystem.FileSystem;
+        const defaultHome = NodePath.join(root, ".t3");
+        yield* fs.makeDirectory(defaultHome);
+        const upper = NodePath.join(root, ".T3");
+        const fold = (path: string) => (path === upper ? defaultHome : path);
+        const caseInsensitive: FileSystem.FileSystem = {
+          ...fs,
+          exists: (path) => fs.exists(fold(path)),
+          stat: (path) => fs.stat(fold(path)),
+          realPath: (path) =>
+            fs.realPath(fold(path)).pipe(Effect.as(path === upper ? upper : path)),
+        };
+        const message = yield* refusal(Option.some(upper)).pipe(
+          Effect.provideService(FileSystem.FileSystem, caseInsensitive),
+        );
+        expect(message).toContain(`--hold-work is refused on the default T3 home (${defaultHome})`);
+      }),
+    ),
+  );
+
+  it.effect("refuses a default home not made yet, reached through a symlinked parent", () =>
+    onHome((root) =>
+      Effect.gen(function* () {
+        // No `<root>/.t3` yet: the server would create it through the alias and mark it.
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.symlink(root, NodePath.join(root, "alias"));
+        const message = yield* refusal(Option.some(NodePath.join(root, "alias", ".t3")));
+        expect(message).toContain("--hold-work is refused on the default T3 home");
+        assert.isFalse(yield* fs.exists(NodePath.join(root, ".t3")));
       }),
     ),
   );

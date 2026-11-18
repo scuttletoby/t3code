@@ -1,10 +1,15 @@
+// @effect-diagnostics nodeBuiltinImport:off - the account's home comes from the passwd entry.
 /**
  * Fork (go-live kit): the refusals `t3 serve --hold-work` runs before config resolution, which
  * claims a port and creates directories. cli/server.ts calls `refuseHoldWork` once.
  */
+import * as NodeOS from "node:os";
+
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as CliError from "effect/cli/CliError";
 
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
@@ -38,10 +43,57 @@ const defaultHomeRefusal = (detail: string) =>
     ].join("\n"),
   });
 
+/** The account's home from its passwd entry, which ignores `$HOME` (null when there is none). */
+export const AccountHomeDirectory = Context.Reference<string | null>(
+  "t3/cli/forkHoldWork/AccountHomeDirectory",
+  {
+    defaultValue: () => {
+      try {
+        return NodeOS.userInfo().homedir || null;
+      } catch {
+        return null;
+      }
+    },
+  },
+);
+
 /**
- * `--hold-work` marks the home it runs on as a copy (cloud/holdWorkConnect.ts), so it needs a home
- * named with `--base-dir`, and never the default home (`~/.t3`), which is the live one on most
- * machines. `T3CODE_HOME` alone does not count: it is set in a shell, not written on the command.
+ * The real path of `path`, also when it does not exist yet: the deepest folder that exists is
+ * resolved and the rest appended, so a symlinked parent cannot hide a home not made yet.
+ */
+const realPathOrParent = Effect.fn("cli.forkHoldWork.realPathOrParent")(function* (path: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const { basename, dirname, join } = yield* Path.Path;
+  const rest: Array<string> = [];
+  let current = path;
+  for (;;) {
+    const real = yield* fs.realPath(current).pipe(Effect.option);
+    if (Option.isSome(real)) return join(real.value, ...rest.toReversed());
+    const parent = dirname(current);
+    if (parent === current) return path;
+    rest.push(basename(current));
+    current = parent;
+  }
+});
+
+/** The same folder by identity (device and inode), for spellings and mounts a path cannot show. */
+const sameFolder = Effect.fn("cli.forkHoldWork.sameFolder")(function* (a: string, b: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const both = yield* Effect.all([fs.stat(a), fs.stat(b)]).pipe(Effect.option);
+  if (Option.isNone(both)) return false;
+  const [left, right] = both.value;
+  return (
+    left.dev === right.dev &&
+    Option.isSome(left.ino) &&
+    Option.isSome(right.ino) &&
+    left.ino.value === right.ino.value
+  );
+});
+
+/**
+ * `--hold-work` marks its home as a copy (cloud/holdWorkConnect.ts): it needs `--base-dir` (not
+ * just `T3CODE_HOME`) and never a default home, `$HOME/.t3` or the account's own `.t3`, since a
+ * scratch `$HOME` does not move the live one.
  */
 export const refuseHoldWorkOnDefaultHome = Effect.fn("cli.refuseHoldWorkOnDefaultHome")(function* (
   baseDirFlag: Option.Option<string>,
@@ -50,15 +102,25 @@ export const refuseHoldWorkOnDefaultHome = Effect.fn("cli.refuseHoldWorkOnDefaul
   if (Option.isNone(named)) {
     return yield* defaultHomeRefusal("without --base-dir: it would run on this machine's T3 home");
   }
+  const { join } = yield* Path.Path;
   const home = yield* resolveBaseDir(named.value);
-  const defaultHome = yield* resolveBaseDir(undefined);
-  // A symlink to the default home is the default home: compare real paths when both exist.
-  const fs = yield* FileSystem.FileSystem;
-  const real = (path: string) => fs.realPath(path).pipe(Effect.orElseSucceed(() => path));
-  if (home === defaultHome || (yield* real(home)) === (yield* real(defaultHome))) {
-    return yield* defaultHomeRefusal(
-      `on the default T3 home (${defaultHome}): it is the live one on most machines`,
-    );
+  const accountHome = yield* AccountHomeDirectory;
+  const defaultHomes = [
+    yield* resolveBaseDir(undefined),
+    ...(accountHome === null ? [] : [join(accountHome, ".t3")]),
+  ];
+  const realHome = yield* realPathOrParent(home);
+  for (const defaultHome of defaultHomes) {
+    // A symlink to the default home is the default home: compare real paths, then identities.
+    if (
+      home === defaultHome ||
+      realHome === (yield* realPathOrParent(defaultHome)) ||
+      (yield* sameFolder(home, defaultHome))
+    ) {
+      return yield* defaultHomeRefusal(
+        `on the default T3 home (${defaultHome}): it is the live one on most machines`,
+      );
+    }
   }
 });
 
