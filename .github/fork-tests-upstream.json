@@ -62,6 +62,14 @@
           "digest": "dfb39b82dec44c75"
         },
         {
+          "name": "Check generated Linear GraphQL operations",
+          "digest": "87fcd508dc0ab7a6"
+        },
+        {
+          "name": "Check i18n catalogs",
+          "digest": "ef26754e36973d26"
+        },
+        {
           "name": "Check",
           "digest": "b9e0beb00c16198e"
         }
@@ -177,7 +185,7 @@
         },
         {
           "name": "Test release checks",
-          "digest": "fbb6d647ca2913e8"
+          "digest": "f90a484690b87700"
         },
         {
           "name": "Finish installing browser secret helper build libraries",
