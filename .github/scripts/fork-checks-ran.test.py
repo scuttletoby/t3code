@@ -280,6 +280,16 @@ class Check(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn('fork-checks did not run', out)
 
+    def test_a_run_whose_head_repository_has_another_name_does_not_count(self):
+        # The id match alone already ties the entry to the run; the run's head repository must also be this one by
+        # name (GITHUB_REPOSITORY), kept as defence in depth (#449). A foreign name with this repository's id fails.
+        run = {**wr(5, [job(CFG['check'])]), 'head_repository': {'full_name': 'x/r', 'id': REPO_ID}}
+        fake = Fake([[run]])
+        code, out, _ = check(fake)
+        self.assertEqual(code, 1, out)
+        self.assertIn('fork-checks did not run', out)
+        self.assertNotIn('actions/runs/5/jobs', ' '.join(fake.paths))
+
     def test_missing_head_fields_fail_closed(self):
         # Without the head branch and repository on both sides the entry cannot be tied to this run: never counted.
         entry, run = pr(7), wr(5, [job(CFG['check'])])
