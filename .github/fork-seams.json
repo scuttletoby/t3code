@@ -143,7 +143,7 @@
     "apps/server/src/binCli.ts": 2,
     "apps/server/src/binMain.ts": 6,
     "apps/server/src/cli/config.ts": 2,
-    "apps/server/src/cli/server.ts": 37,
+    "apps/server/src/cli/server.ts": 17,
     "apps/server/src/cloud/selfUpdate.ts": 4,
     "apps/server/src/config.ts": 2,
     "apps/server/src/mcp/McpHttpServer.ts": 10,
@@ -271,8 +271,8 @@
       "gone": 1
     },
     "apps/server/src/cli/server.ts": {
-      "lines": 4,
-      "gone": 4
+      "lines": 3,
+      "gone": 3
     },
     "apps/server/src/mcp/McpHttpServer.ts": {
       "lines": 1,

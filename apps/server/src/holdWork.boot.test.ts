@@ -266,20 +266,24 @@ const ready = async (root: string, started: Boot) => {
   return read() ?? {};
 };
 
-/** The names of the spans the server wrote to its trace file, from byte `from` on. */
+/** The names of the spans the server wrote to its trace file, from byte `from` on, and how often each. */
 const spansFrom = (stateDir: string, from: number) => {
   const tracePath = NodePath.join(stateDir, "logs", "server.trace.ndjson");
   const text = NodeFS.existsSync(tracePath) ? NodeFS.readFileSync(tracePath) : Buffer.alloc(0);
   const names = new Set<string>();
+  const counts = new Map<string, number>();
   for (const line of text.subarray(from).toString("utf8").split("\n")) {
     try {
       const name = (JSON.parse(line) as { readonly name?: unknown }).name;
-      if (typeof name === "string") names.add(name);
+      if (typeof name === "string") {
+        names.add(name);
+        counts.set(name, (counts.get(name) ?? 0) + 1);
+      }
     } catch {
       // A blank or partial line.
     }
   }
-  return { names, end: text.length };
+  return { names, counts, end: text.length };
 };
 
 /** What each hold outside the work gate logs instead of starting. */
@@ -846,6 +850,8 @@ describe("serve --hold-work on a seeded home", () => {
       expect(marked.output()).not.toMatch(PUBLISHER_STARTED);
       expect(marked.output()).not.toContain("--hold-work");
       expect(markedSpans.names).toContain("HoldWorkConnect.releaseManagedTunnel");
+      // T3 Connect and agent activity share the boot's one marker read, so they cannot disagree.
+      expect(markedSpans.counts.get("HoldWorkConnect.heldCopyMarker")).toBe(1);
       expect(markedSpans.names).toContain("autoPullProjects");
       expect(markedSpans.names).toContain("RemoteDelegation.followOnce");
       // A normal boot of the copy leaves its marker as it is.
@@ -868,7 +874,9 @@ describe("serve --hold-work on a seeded home", () => {
       await stop(normal.child);
       // Its tunnel registration waits a random part of half a minute, but stopping releases the
       // tunnel at once: the relay has the release itself.
-      const normalSpans = spansFrom(paths.stateDir, markedSpans.end).names;
+      const normalSpanCounts = spansFrom(paths.stateDir, markedSpans.end);
+      const normalSpans = normalSpanCounts.names;
+      expect(normalSpanCounts.counts.get("HoldWorkConnect.heldCopyMarker")).toBe(1);
       expect(normalSpans).toContain("environment.cloud.releaseManagedTunnelOnShutdown");
       expect(tunnelReleases(remote)).toHaveLength(1);
       expect(NodeFS.existsSync(marker)).toBe(false);
