@@ -968,6 +968,19 @@ class Judge(Files, unittest.TestCase):
         self.assertEqual((code, v['conclusion']), (0, 'failure'), out)
         self.assertIn('could not fetch the base and the head', v['title'])
 
+    def test_a_fetch_with_no_login_says_so_by_name(self):   # #450 item 7: a private repository and no GH_TOKEN
+        class NoLogin:
+            remote = f'https://github.com/{REPO}.git'
+
+            def git(self, *a, **kw):
+                return types.SimpleNamespace(returncode=128, stdout='', stderr=(
+                    "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n"))
+        for _ in range(2):
+            why = G.fetch(NoLogin(), 'a' * 40, 'b' * 40)
+            self.assertIn('git fetch failed', why)
+            self.assertIn('git found no login for GitHub', why)
+            self.assertIn('GH_TOKEN', why)
+
     def test_a_crash_in_the_rules_is_a_failed_verdict_that_says_so(self):   # unknown never passes
         def boom(*a, **kw):
             raise RuntimeError('broken')

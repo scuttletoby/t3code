@@ -382,12 +382,14 @@ queue's own bare repository (`--cache`) and gets its login from
 A token is in git's environment and `STATE` decides what is re-armed, so run
 the queue on a runner (or runner group) that runs no `pull_request` job and no
 other repository's job, as a user of its own. The `--state-file` and `--cache`
-folders belong to that user alone. git runs with no hooks, no fsmonitor and no
-replace refs, and a cache that is not that user's alone (mode `0700`), has a
-config the queue did not write, or holds a file that changes what its objects
-say or how a merge reads them (`info/grafts`, `shallow`,
-`objects/info/alternates`, `objects/info/http-alternates` or
-`info/attributes`) is rebuilt, never used. A job of the same user
+folders belong to that user alone. git runs with no hooks, no fsmonitor, no
+replace refs and no attributes (`GIT_ATTR_SOURCE` is the empty tree, so no
+`.gitattributes` of any commit, the cache's `HEAD` or `attr.tree` changes how
+a merge reads a file), and a cache that is not that user's alone (mode
+`0700`), has a config or a `HEAD` the queue did not write, has a branch at
+`HEAD`, or holds a file that changes what its objects say or how a merge reads
+them (`info/grafts`, `shallow`, `objects/info/alternates`,
+`objects/info/http-alternates` or `info/attributes`) is rebuilt, never used. A job of the same user
 can still change the cache between that check and git's next read: only the
 runner rule above stops that.
 
@@ -401,7 +403,8 @@ runner rule above stops that.
 It refuses to start on a GitHub-hosted runner (its disk, and with it the plan,
 goes with the job), with a `--repo` that is not `owner/name`, a relative path,
 a path inside the job's workspace (the next checkout empties it), a config
-error, or a git older than 2.38 (`merge-tree --write-tree`).
+error, or a git older than 2.43 (`merge-tree --write-tree` that honours
+`GIT_ATTR_SOURCE`).
 
 `--state-file` (`STATE`) holds the plan of the run that turned auto-merge off:
 `{"repo", "pr", "old", "base", "read"}` (and `"told"` once the pull request was
@@ -474,7 +477,7 @@ the re-arm still needs exactly the change the lenses read.
 
 The queue needs:
 
-- a self-hosted runner whose disk outlives the job, with git 2.38+, `gh` and
+- a self-hosted runner whose disk outlives the job, with git 2.43+, `gh` and
   `python3`: the plan in `--state-file` and the cache must be there for the
   next run. That runner (or runner group) runs no `pull_request` job and no
   other repository's job, as a user of its own, and the state and cache
