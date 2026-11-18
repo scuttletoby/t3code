@@ -651,11 +651,92 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       const minutes = kept.map(
         (entry) => (Date.parse(entry.checkedAt) - (NOW_MS + start)) / MINUTE,
       );
-      // Thinning alone: minutes 0, 15, 30 and 45 of each pass; the recent reading stays.
-      assert.deepStrictEqual(minutes.slice(0, 8), [0, 15, 30, 45, 0, 15, 30, 45]);
-      assert.deepStrictEqual(percents(kept), [40, 40, 40, 40, 50, 50, 50, 50, 60]);
-      assert.deepStrictEqual(segments(kept), [0, 0, 0, 0, 1, 1, 1, 1, 1]);
-      assert.strictEqual((yield* fileLines(file)).length, 9);
+      // Minutes 0, 15, 30 and 45 of each pass, plus minute 59 just before the break; the recent
+      // reading stays.
+      assert.deepStrictEqual(minutes.slice(0, 9), [0, 15, 30, 45, 59, 0, 15, 30, 45]);
+      assert.deepStrictEqual(percents(kept), [40, 40, 40, 40, 40, 50, 50, 50, 50, 60]);
+      assert.deepStrictEqual(segments(kept), [0, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
+      assert.strictEqual((yield* fileLines(file)).length, 10);
+    }),
+  );
+
+  it.effect(
+    "thinning keeps a clock step back of any size, also one shorter than the interval",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW_MS);
+        const start = -3 * DAY;
+        for (const stepMinutes of [1, 5, 14, 15, 60]) {
+          const directory = yield* historyDirectory;
+          // One reading a minute for an hour, three days ago; then the clock steps back
+          // `stepMinutes` behind the last reading and another hour is read. Both hours are older
+          // than `thinAfterMs`; the recent reading sets the age base.
+          const pass = (fromMinute: number, percent: number) =>
+            Array.from({ length: 60 }, (_, minute) =>
+              reading(at(start + (fromMinute + minute) * MINUTE), percent),
+            );
+          const file = yield* seedHistory(
+            directory,
+            INSTANCE,
+            jsonLines([...pass(0, 40), ...pass(59 - stepMinutes, 50), reading(at(-MINUTE), 60)]),
+          );
+          const history = yield* make({ directory, thinAfterMs: DAY, thinIntervalMs: 15 * MINUTE });
+          assert.deepStrictEqual(
+            new Set(segments(yield* history.readings(INSTANCE))),
+            new Set([0, 1]),
+          );
+          yield* history.compact;
+
+          const kept = yield* history.readings(INSTANCE);
+          const minutes = kept.map(
+            (entry) => (Date.parse(entry.checkedAt) - (NOW_MS + start)) / MINUTE,
+          );
+          // The last reading before the step and the first after it both stay, so the break does.
+          // Thinned: at most 5 of each hour, plus the recent reading.
+          assert.isAtMost(kept.length, 11, `step of ${stepMinutes} min`);
+          const breakAt = segments(kept).indexOf(1);
+          assert.isAbove(breakAt, 0, `step of ${stepMinutes} min`);
+          assert.deepStrictEqual(
+            minutes.slice(breakAt - 1, breakAt + 1),
+            [59, 59 - stepMinutes],
+            `step of ${stepMinutes} min`,
+          );
+          assert.deepStrictEqual(
+            percents(kept).slice(breakAt - 1, breakAt + 1),
+            [40, 50],
+            `step of ${stepMinutes} min`,
+          );
+          // Run again: a second compaction keeps the same lines.
+          const once = yield* fileLines(file);
+          yield* history.compact;
+          assert.deepStrictEqual(yield* fileLines(file), once, `step of ${stepMinutes} min`);
+        }
+      }),
+  );
+
+  it.effect("thinning keeps the first reading after a break that follows a recent stamp", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const directory = yield* historyDirectory;
+      const start = -3 * DAY;
+      const minute = (n: number, percent: number) => reading(at(start + n * MINUTE), percent);
+      // Three days ago: minutes 0-40, then one reading from a clock three days ahead (so it looks
+      // recent and is not thinned), then the clock is put right and minutes 41-44 are read.
+      const old = Array.from({ length: 41 }, (_, n) => minute(n, 40));
+      const after = Array.from({ length: 4 }, (_, n) => minute(41 + n, 50));
+      yield* seedHistory(
+        directory,
+        INSTANCE,
+        jsonLines([...old, reading(at(-MINUTE), 45), ...after]),
+      );
+      const history = yield* make({ directory, thinAfterMs: DAY, thinIntervalMs: 15 * MINUTE });
+      yield* history.compact;
+
+      // Minutes 0, 15 and 30, the ahead reading, then minute 41: within the interval of minute
+      // 30, but it starts a segment, so it stays.
+      const kept = yield* history.readings(INSTANCE);
+      assert.deepStrictEqual(percents(kept), [40, 40, 40, 45, 50]);
+      assert.deepStrictEqual(segments(kept), [0, 0, 0, 0, 1]);
     }),
   );
 
@@ -764,6 +845,51 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
       yield* history.compact;
       assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 41]);
       assert.strictEqual((yield* fileLines(file)).length, 2);
+    }),
+  );
+
+  it.effect(
+    "one reading ahead of the clock does not age out a history the server was off for",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW_MS);
+        const directory = yield* historyDirectory;
+        // The server was off: the newest real reading is 41 days old, older than retention. One
+        // reading is stamped a year ahead (a clock that was wrong when it was taken).
+        const old = Array.from({ length: 10 }, (_, day) => reading(at(-(50 - day) * DAY), day));
+        const file = yield* seedHistory(
+          directory,
+          INSTANCE,
+          jsonLines([...old, reading(at(365 * DAY), 99)]),
+        );
+        // Start compaction: ages count from the newest reading the clock has reached, not from the
+        // one ahead of it.
+        const history = yield* make({ directory });
+        yield* history.compact;
+        assert.strictEqual((yield* fileLines(file)).length, old.length + 1);
+        assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), percents(old));
+      }),
+  );
+
+  it.effect("a clock that was ahead for one append does not age the history out later", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS + 10 * MINUTE);
+      const directory = yield* historyDirectory;
+      const history = yield* make({ directory, appendsBetweenCompactions: 5 });
+      for (let step = 0; step < 3; step++) {
+        yield* history.record([provider(limits(at(step * MINUTE), 40 + step))]);
+      }
+      // The clock jumps a year ahead for one append, then is put right.
+      yield* TestClock.setTime(NOW_MS + 365 * DAY);
+      yield* history.record([provider(limits(at(365 * DAY), 90))]);
+      yield* TestClock.setTime(NOW_MS + 10 * MINUTE);
+      // The fifth append runs the in-run compaction: ages count from now, not from the year-ahead
+      // reading, so nothing ages out.
+      yield* history.record([provider(limits(at(3 * MINUTE), 45))]);
+
+      const path = yield* Path.Path;
+      assert.strictEqual((yield* fileLines(path.join(directory, `${INSTANCE}.jsonl`))).length, 5);
+      assert.deepStrictEqual(percents(yield* history.readings(INSTANCE)), [40, 41, 42, 45]);
     }),
   );
 
