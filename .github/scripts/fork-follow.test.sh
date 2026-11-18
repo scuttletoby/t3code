@@ -91,11 +91,16 @@ git config --global url."$root/gh/".insteadOf https://github.com/
 export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code UPSTREAM=up/t3code
 unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_ACTIONS UPSTREAM_URL ORIGIN RUN_SHA PUSH_URL \
   SERIES_BRANCH FORK_PUSH_TOKEN OWN_WORKFLOWS HEAD_SHA TREE_REF SINCE REPO_SECRET_PRESENT \
-  FORK_PUSH_ENVIRONMENT
+  FORK_PUSH_ENVIRONMENT RUNNER_TEMP
 # The cases below use stable tags; the nightly section sets the channel itself.
 export FORK_FOLLOW_CHANNEL=stable
 
 export FAKE_API="$root/api"
+# The scripts make their temporary files in a folder of this test, and outside a run (no
+# RUNNER_TEMP) the plan makes its log folder there too: a leftover is seen at the end of this
+# file and goes with $root (fork-temp-files.test.sh has the cases, one by one).
+export TMPDIR="$root/tmp"
+mkdir -p "$TMPDIR"
 
 failures=0
 pass() { echo "ok   $1"; }
@@ -1097,6 +1102,10 @@ check "workflow: the report runs on every run (also action none)" \
   eval 'grep -q "^    if: always()$" <<< "$(sed -n "/^  report:/,\$p" "$workflow")"'
 check "workflow: upstream workflows are swept after each push" \
   eval '[[ $(grep -c "fork-workflows.sh" "$workflow") -ge 3 ]]'
+
+# Every script call above, passing or refused: what it made in TMPDIR is gone again.
+ls -A "$TMPDIR" > "$root/out"
+check "temp: no script of this test left anything in TMPDIR" eval '[[ ! -s "$root/out" ]]'
 
 echo
 if (( failures )); then

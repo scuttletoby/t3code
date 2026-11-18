@@ -75,6 +75,10 @@ unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY UPSTREAM UPSTREAM_URL ORIGIN
 export FORK_FOLLOW_CHANNEL=stable
 
 export FAKE_API="$root/api"
+# The script makes its temporary files in a folder of this test: a leftover is seen at the end of
+# this file and goes with $root (fork-temp-files.test.sh has the cases, one by one).
+export TMPDIR="$root/tmp"
+mkdir -p "$TMPDIR"
 
 failures=0
 pass() { echo "ok   $1"; }
@@ -486,6 +490,10 @@ refuses "gh: a test run without the stub first on PATH fails closed and never ca
 refuses "gh: run by hand (no test mode, not in a GitHub Actions run) refuses" FORK_TEST_MODE= PATH="$root/decoy:$PATH"
 refuses "gh: test mode with a GitHub token set refuses, even with the stub" GH_TOKEN=x
 refuses "gh: test mode with GH_HOST github.com refuses" GH_HOST=github.com
+
+# Every call above, passing or refused: what the script made in TMPDIR is gone again.
+ls -A "$TMPDIR" > "$root/out"
+if [[ ! -s "$root/out" ]]; then pass "temp: the script left nothing in TMPDIR"; else fail "temp: the script left nothing in TMPDIR"; fi
 
 if (( failures )); then
   echo "$failures failed"
