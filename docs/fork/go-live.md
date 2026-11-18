@@ -124,13 +124,13 @@ Each feature is its own setting in the home's `userdata/settings.json`, read aga
 Switch on one and run its check; when the check passes, switch on the next. There is no waiting period. After each change, `t3-golive status` lists what is on.
 Each one's **off again** is a single edit of that one setting; nothing else changes back.
 
-| Step      | Setting           | On                                                        | Check                                                                                                                             | Off again                  |
-| --------- | ----------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| 0         | none              | -                                                         | `status`: `fork features: all off`                                                                                                | -                          |
-| 1         | `agentSlots`      | `"agentSlots": { "enabled": true, "maxPerMachine": <n> }` | A `delegate_task` above `<n>` running agents is refused; below it, starts                                                         | `"enabled": false`         |
-| 2         | `waitFor`         | `"waitFor": { "enabled": true }`                          | One test wait (a file that appears) arrives once, and survives a restart of T3 between the wait and the event                     | `"enabled": false`         |
-| 3         | `usagePacingGate` | `"usagePacingGate": "advise"`                             | A `delegate_task` reply carries a pace note; nothing is held or moved                                                             | `"usagePacingGate": "off"` |
-| 4         | old project tools | -                                                         | Retire, one at a time, the tools this machine used before the fork for what the features now do; keep each until it is not missed | put the tool back          |
+| Step | Setting           | On                                                        | Check                                                                                                                             | Off again                  |
+| ---- | ----------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| 0    | none              | -                                                         | `status`: `fork features: all off`                                                                                                | -                          |
+| 1    | `agentSlots`      | `"agentSlots": { "enabled": true, "maxPerMachine": <n> }` | A `delegate_task` above `<n>` running agents is refused; below it, starts                                                         | `"enabled": false`         |
+| 2    | `waitFor`         | `"waitFor": { "enabled": true }`                          | One test wait (a file that appears) arrives once, and survives a restart of T3 between the wait and the event                     | `"enabled": false`         |
+| 3    | `usagePacingGate` | `"usagePacingGate": "advise"`                             | A `delegate_task` reply carries a pace note; nothing is held or moved                                                             | `"usagePacingGate": "off"` |
+| 4    | old project tools | -                                                         | Retire, one at a time, the tools this machine used before the fork for what the features now do; keep each until it is not missed | put the tool back          |
 
 Later, and each a decision of its own: `"usagePacingGate": "enforce"` (tasks are held, moved or run at a
 lower effort; off again: `"advise"`), and `"automaticUpdates": true` (the boot service updates itself to
