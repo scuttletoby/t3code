@@ -43,9 +43,26 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...actual, existsSync };
 });
 
+/** The next `remaining` database opens throw, as an open can in a server's stop race. */
+const openFails = vi.hoisted(() => ({ remaining: 0 }));
+vi.mock("node:sqlite", async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeSqlite>();
+  class DatabaseSync extends actual.DatabaseSync {
+    constructor(...args: ConstructorParameters<typeof actual.DatabaseSync>) {
+      if (openFails.remaining > 0) {
+        openFails.remaining -= 1;
+        throw new Error("unable to open database file");
+      }
+      super(...args);
+    }
+  }
+  return { ...actual, DatabaseSync };
+});
+
 const homes: Array<string> = [];
 const children: Array<NodeChildProcess.ChildProcess> = [];
 afterEach(() => {
+  openFails.remaining = 0;
   for (const child of children.splice(0)) child.kill("SIGKILL");
   for (const home of homes.splice(0)) NodeFS.rmSync(home, { recursive: true, force: true });
 });
@@ -298,6 +315,42 @@ describe("__fork-report writes nothing", () => {
     expect(report.problems.map((problem) => problem.code)).toEqual(["database-needs-recovery"]);
     expect(report.ok).toBe(false);
   });
+
+  it.each([
+    ["a stopped home", "immutable", 2],
+    ["a crashed WAL", "readonly-shm", 4],
+  ] as const)("retries an open of %s that fails once, writing nothing", (name, mode, threads) => {
+    const home = makeHome();
+    if (name === "a crashed WAL") leaveCrashedWal(home);
+    const before = snapshot(home);
+    openFails.remaining = 1;
+
+    const report = readForkReport(home);
+
+    expect(openFails.remaining).toBe(0);
+    expect(snapshot(home)).toEqual(before);
+    expect(report.problems).toEqual([]);
+    expect(report.database.openMode).toBe(mode);
+    expect(report.database.counts?.threads).toBe(threads);
+    expect(report.ok).toBe(true);
+  });
+
+  it("reports an open that fails twice once, as the second attempt's problem", () => {
+    const home = makeHome();
+    openFails.remaining = 2;
+
+    const report = readForkReport(home);
+
+    expect(openFails.remaining).toBe(0);
+    expect(report.database.state).toBe("unreadable");
+    expect(report.problems).toEqual([
+      {
+        code: "database-unreadable",
+        message: "Could not open the database: unable to open database file",
+      },
+    ]);
+    expect(report.ok).toBe(false);
+  });
 });
 
 describe("__fork-report on old, newer and empty state", () => {
@@ -379,6 +432,27 @@ describe("__fork-report on old, newer and empty state", () => {
     expect(report.settings.state).toBe("missing");
     expect(report.problems.map((problem) => problem.code)).toEqual(["home-missing"]);
     expect(report.problems[0]!.message).toContain("userdata");
+    expect(report.ok).toBe(false);
+  });
+
+  it.each([
+    ["nothing", () => {}, (home: string) => `No T3 home folder at ${home}.`],
+    [
+      "a link to nothing",
+      (home: string) => NodeFS.symlinkSync(NodePath.join(NodePath.dirname(home), "gone"), home),
+      (home: string) => `${home} is a link that leads nowhere; a start would fail.`,
+    ],
+  ] as const)("names a home path that holds %s, creating nothing", (_, layOut, message) => {
+    const parent = tempDir();
+    const home = NodePath.join(parent, "home");
+    layOut(home);
+    const before = snapshot(parent);
+
+    const report = readForkReport(home);
+
+    expect(snapshot(parent)).toEqual(before);
+    expect(report.home.exists).toBe(false);
+    expect(report.problems).toEqual([{ code: "home-missing", message: message(home) }]);
     expect(report.ok).toBe(false);
   });
 
@@ -516,7 +590,9 @@ describe("__fork-report through a linked statev2.sqlite", () => {
       expect([snapshot(elsewhere), snapshot(home)]).toEqual(before);
       expect(report.database.state).toBe("unreadable");
       expect(report.problems.map((problem) => problem.code)).toEqual(["database-unreadable"]);
-      expect(report.problems[0]!.message).toContain("link");
+      expect(report.problems[0]!.message).toMatch(
+        /^statev2\.sqlite is a link that does not lead to a file \((ENOENT|ELOOP)\b/,
+      );
       expect(report.problems[0]!.message.includes("would create")).toBe(wouldCreate);
       expect(report.ok).toBe(false);
     }
@@ -554,7 +630,9 @@ describe("__fork-report through a linked statev2.sqlite", () => {
 
         expect(report.database.state).toBe("unreadable");
         expect(report.problems.map((problem) => problem.code)).toEqual(["database-unreadable"]);
-        expect(report.problems[0]!.message).toContain("EACCES");
+        expect(report.problems[0]!.message).toMatch(
+          /^statev2\.sqlite could not be followed \(EACCES/,
+        );
         expect(report.problems[0]!.message).not.toContain("would create");
       } finally {
         NodeFS.chmodSync(locked, 0o755);
@@ -564,19 +642,24 @@ describe("__fork-report through a linked statev2.sqlite", () => {
 
   // Root bypasses directory permissions, so chmod cannot force EACCES.
   it.skipIf(process.getuid?.() === 0)(
-    "reports a userdata it may not look into instead of failing",
+    "names a userdata it may not enter as its own problem instead of failing",
     () => {
       const home = makeHome();
       const userdata = NodePath.join(home, "userdata");
-      NodeFS.chmodSync(userdata, 0o000);
+      NodeFS.chmodSync(userdata, 0o600);
       try {
         const report = readForkReport(home);
 
+        expect(report.home.exists).toBe(true);
         expect(report.database.state).toBe("unreadable");
         expect(report.problems.map((problem) => problem.code)).toEqual([
+          "home-missing",
           "database-unreadable",
           "settings-unreadable",
         ]);
+        const { message } = report.problems[0]!;
+        expect(message.startsWith(`${userdata} cannot be entered (EACCES`)).toBe(true);
+        expect(message.endsWith("); a start would fail.")).toBe(true);
         expect(report.ok).toBe(false);
       } finally {
         NodeFS.chmodSync(userdata, 0o755);
