@@ -259,11 +259,11 @@ def verify_copy(copy_dir):
 
 
 def incomplete_copies(backup_dir):
-    """Read only: [(folder, bytes)] of the copy folders (t3-copy-*) in backup_dir with no finished manifest, left
-    by a copy killed or failed half-way. They are never used, and the kit deletes no data: the owner removes them
-    (a copy names them, and a refusal for free disk counts them)."""
+    """Read only: [(folder, bytes)] of the copy folders (t3-copy-*, and the switch's t3-switch-*) in backup_dir with
+    no finished manifest, left by a copy killed or failed half-way. They are never used, and the kit deletes no
+    data: the owner removes them (a copy names them, and a refusal for free disk counts them)."""
     try:
-        names = sorted(n for n in os.listdir(backup_dir) if n.startswith('t3-copy-'))
+        names = sorted(n for n in os.listdir(backup_dir) if n.startswith(('t3-copy-', 't3-switch-')))
     except FileNotFoundError:
         return []
     found = []
