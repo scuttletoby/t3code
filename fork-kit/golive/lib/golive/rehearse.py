@@ -92,8 +92,8 @@ def _live_links(home, done='nothing was changed'):
     """[(link, where it leads: its real path)] of every link in the live userdata, at any depth, also in the folders
     the copy skips (links are not followed into). The live T3 reads and writes where they lead, so that is live data
     too. Links inside a folder a link leads to are not walked (the copy does not follow them either). The live T3 runs
-    meanwhile: a folder it removes during the walk refuses the run with "run again" (the walk cannot tell whether
-    it was moved, links and all, to a part already walked)."""
+    meanwhile: a folder it removes, or replaces with a file, during the walk refuses the run with "run again" (the
+    walk cannot tell whether it was moved, links and all, to a part already walked)."""
     userdata = os.path.join(home, 'userdata')
     if not os.path.isdir(userdata):
         return []
@@ -102,10 +102,10 @@ def _live_links(home, done='nothing was changed'):
         for d, dirs, names in os.walk(userdata, onerror=coldcopy._raise):
             found += [(os.path.join(d, n), os.path.realpath(os.path.join(d, n))) for n in sorted(dirs + names)
                       if os.path.islink(os.path.join(d, n))]
-    except FileNotFoundError as e:
-        raise journal.Refused(f'a folder of the live userdata {userdata} was removed during the walk ({e}), by the '
-                              f'live T3 most likely: run again, as the kit cannot tell where its links lead; '
-                              f'{done}') from None
+    except (FileNotFoundError, NotADirectoryError) as e:  # the walk lists only folders: one is gone or a file now
+        raise journal.Refused(f'a folder of the live userdata {userdata} was removed or replaced during the walk '
+                              f'({e}), by the live T3 most likely: run again, as the kit cannot tell where its links '
+                              f'lead; {done}') from None
     except OSError as e:
         raise journal.Refused(f'the live userdata {userdata} cannot be read ({e}): the kit cannot tell where its links '
                               f'lead; {done}') from None
@@ -235,8 +235,9 @@ def _prechecks(cfg, copy_dir, port):
         out = dict(coldcopy.links_out(coldcopy.plan(os.path.join(copy_dir, 'userdata'), NOT_CLONED)[0]))
     except OSError as e:
         raise journal.Refused(f'{copy_dir} cannot be read ({e}); nothing was changed') from None
-    for name in READ_BY_REHEARSAL:
-        if name in out:
+    read = {n.casefold() for n in READ_BY_REHEARSAL}  # a copy folder that ignores case reads STATEV2.SQLITE-WAL too
+    for name in sorted(out):
+        if name.casefold() in read:
             raise journal.Refused(f'{name} in the copy {copy_dir} is a link out of it ({out[name]}): the clone would '
                                   'read and write what it leads to, and the copy does not hold it; make it a file in '
                                   'the live home and take a new copy; nothing was changed')

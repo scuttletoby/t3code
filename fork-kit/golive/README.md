@@ -257,9 +257,9 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   kit compares, but its mountinfo line names the folder it came from, so the folder the rehearsal folder is on its
   filesystem must be apart from each folder of the live data: the home, where its `userdata` really is (a link
   elsewhere, or its own partition), where each link in `userdata` leads (any depth, also in the folders the copy
-  skips, such as `logs/` and `secrets/`; a link whose target cannot be looked at, a loop, a link through a file or
-  into a folder the kit may not read, is refused by name; a folder the live T3 removes during the walk refuses the
-  run with "run again"; the live T3 reads and writes there, so the rehearsal folder may neither be inside such a target nor hold one, a dangling one
+  or the clone skips (`logs/`, `secrets/`); a link whose target cannot be looked at, a loop, a link through a file or
+  into a folder the kit may not read, is refused by name; a folder the live T3 removes, or replaces with a file,
+  during any of the three walks refuses the run with "run again"; the live T3 reads and writes there, so the rehearsal folder may neither be inside such a target nor hold one, a dangling one
   too, by real path and file id as well), and every mount at or under any of these; the mount that holds a path is
   the one on top, found by the mount tree (mount id and parent id), not by the list's order, which a moved mount or one placed
   beneath another does not keep: from the one mount above the path with no parent listed, into the child above the
@@ -304,10 +304,11 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   every depth, but not inside a folder a link leads to (`attachments -> /other`, then a link in `/other`): keep
   `backupDir` apart from those too. Each run walks the live `userdata` three times (R0, the clone step's guard, R0 on
   the clone), which takes a while on a large `attachments/`. The copy's plan reads link targets by name, case
-  sensitive: on a folder that ignores case (ext4 casefold, vfat or ntfs on Linux), `x -> SUB/D/../..` with
-  `sub/d -> ..` is kept in the clone though it leads out; R0 on the clone reads each link from the disk, as the
-  kernel resolves it there, and fails the run before anything runs on the clone (tested by simulation only). The
-  guard takes the old folder's identity first and then checks by path: a swap still there at its end is refused, a swap away and back
+  sensitive: on a folder that ignores case (ext4 casefold, or ntfs3 on Linux; vfat holds no links),
+  `x -> SUB/D/../..` with `sub/d -> ..` is kept in the clone though it leads out; R0 on the clone reads each link
+  from the disk, as the kernel resolves it there, and fails the run before anything runs on the clone (tested by
+  simulation only). The guard takes the old folder's identity first and then checks by path: a swap still there at
+  its end is refused, a swap away and back
   during it (a same-user process racing the kit) is not. A mount made inside the old folder after the guard (root
   only) is not checked by the removal, and the last `rmdir` goes by path (it only ever removes an empty folder).
 - **R1**: `__service-preflight` of the old build and of the fork build on the clone: both `ready`. The fork build's
@@ -358,9 +359,9 @@ reusing one half-migrated. A run that needs settling still blocks it.
 | A live `userdata` link into or around the folder        | Refused before any step, any depth, dangling too; the old folder is kept      |
 | Such a link added after R0                              | The clone step's guard, or R0 on the clone, fails the run; nothing ran on it  |
 | A live `userdata` link that loops or cannot be followed | Refused before any step, naming the link; the old folder is kept              |
-| A live folder removed while the kit walks `userdata`    | Refused (after R0: the run fails), saying run again; the run again passes     |
+| A live folder removed or made a file in a walk          | Refused (after R0: the run fails), saying run again; the run again passes     |
 | A link in the copy leads out of it                      | Left out of the clone and named (also one added after R0)                     |
-| The copy's `settings.json` or database a link out       | Refused before any step (`-wal`, `-journal` too): make it a file, a new copy  |
+| The copy's `settings.json` or database a link out       | Refused before any step (`-wal`, `-journal`, any case): a file, a new copy    |
 | An old clone holding links out                          | Removed as any old clone: the removal never follows a link                    |
 | Copy with no manifest, not matching it, of another home | Refused (`--copy` or `t3-golive copy`)                                        |
 | Copy from another build than the live one               | Refused: take a new copy                                                      |

@@ -1201,8 +1201,12 @@ class Links(Base):
                          'the copy is never changed')
 
     def test_a_copy_whose_settings_or_database_is_a_link_out_is_refused_before_any_step(self):
-        for i, name in enumerate(('settings.json', 'statev2.sqlite', 'statev2.sqlite-wal', 'statev2.sqlite-journal')):
-            with self.subTest(name):  # a left-out WAL or journal would quietly rehearse an older database
+        # a left-out WAL or journal would quietly rehearse an older database; a copy folder that ignores case reads
+        # STATEV2.SQLITE-WAL as the WAL, so names match whatever their case (a case-sensitive one merely refuses an
+        # odd name)
+        for i, name in enumerate(('settings.json', 'statev2.sqlite', 'statev2.sqlite-wal', 'statev2.sqlite-journal',
+                                  'STATEV2.SQLITE-WAL', 'Settings.json')):
+            with self.subTest(name):
                 self.m.write('dotfiles/' + name, 'x')
                 copy = self.linked_copy({name: self.m.path('dotfiles/' + name)},
                                         name=f't3-copy-2099012{i}T000000Z-{fx.LIVE}')
@@ -1372,26 +1376,60 @@ class Links(Base):
                 os.unlink(link)
         self.rehearse()  # with the link gone, the run passes again
 
-    def test_a_live_folder_removed_during_the_walk_is_refused_with_run_again(self):
-        """The live T3 runs while the kit walks its userdata: a folder it removes mid-walk is no fault of the home;
-        the refusal says to run again, and the run again passes."""
-        self.rehearse()  # an old rehearsal folder to keep
-        old = self.m.snapshot(self.root())
+    def test_a_live_folder_removed_or_made_a_file_during_any_of_the_three_walks_says_run_again(self):
+        """The kit walks the live userdata three times: R0, the clone step's guard (before the old folder goes) and
+        R0 on the clone. A folder the live T3 removes, or replaces with a file, during any of them refuses the run
+        (after R0: fails it) saying run again, never "cannot be read": before the removal nothing was changed, after
+        the clone only the rehearsal folder was redone and nothing ran on it. The run again passes."""
         userdata = os.path.join(self.m.home, 'userdata')
         goes = os.path.join(userdata, 'goes')
-        os.makedirs(goes)
-        walk = os.walk
+        walk, append = os.walk, journal.Run._append
+        preflights = lambda: [c for c in self.stub_calls() if c['argv'][0] == '__service-preflight']  # noqa: E731
+        armed = []  # the change to make in the next walk of the live userdata
 
-        def walk_and_remove(top, *a, **kw):
+        def walk_and_change(top, *a, **kw):
             for i, step in enumerate(walk(top, *a, **kw)):
                 yield step
-                if i == 0 and os.path.normpath(top) == userdata and os.path.isdir(goes):
-                    os.rmdir(goes)  # listed by the walk, gone before it is read
-        with mock.patch.object(os, 'walk', walk_and_remove):
-            text = self.refused('run again')
-        self.assertIn('removed during the walk', text)
-        self.assertEqual(self.m.snapshot(self.root()), old)
-        self.rehearse()
+                if armed and i == 0 and os.path.normpath(top) == userdata and os.path.isdir(goes):
+                    os.rmdir(goes)  # listed by the walk, gone (or a file) before it is read
+                    if armed[0] == 'made a file':
+                        with open(goes, 'w') as f:
+                            f.write('x')
+                    armed.clear()
+        self.rehearse()  # an old rehearsal folder to keep
+        for walk_no, at, needle, done in ((1, None, 'cannot tell where its links lead', 'nothing was changed'),
+                                          (2, 'started', 'the clone step: ', 'nothing was changed'),
+                                          (3, 'done', 'R0 on the clone: ', 'only the rehearsal folder was redone')):
+            for change in ('removed', 'made a file'):
+                with self.subTest(walk=walk_no, change=change):
+                    armed.clear()
+                    if os.path.isfile(goes):  # left by a subtest that failed
+                        os.unlink(goes)
+                    os.makedirs(goes, exist_ok=True)
+                    old, ran = self.m.snapshot(self.root()), len(preflights())
+
+                    def seen(snap, whole=walk_no == 1):  # past R0 (walk 2), its lock probe in the old clone has moved
+                        return snap if whole else {k: v if v[0] else v[:2] + v[3:] for k, v in snap.items()}  # mtimes
+                    if at is None:
+                        armed.append(change)
+
+                    def arm(run, event, **fields):
+                        if fields.get('step') == 'clone' and fields.get('phase') == at:
+                            armed.append(change)
+                        append(run, event, **fields)
+                    with mock.patch.object(os, 'walk', walk_and_change), \
+                            mock.patch.object(journal.Run, '_append', arm):
+                        text = self.refused(needle) if walk_no == 1 else self.failed(needle)
+                    self.assertFalse(armed, 'the change was made during the walk')
+                    self.assertIn('removed or replaced during the walk', text)
+                    self.assertIn('run again', text)
+                    self.assertIn(done, text)
+                    if walk_no < 3:
+                        self.assertEqual(seen(self.m.snapshot(self.root())), seen(old), 'the old folder is kept')
+                    self.assertEqual(len(preflights()), ran, 'nothing ran on the clone')
+                    if os.path.isfile(goes):
+                        os.unlink(goes)
+                    self.rehearse()  # the run again passes
 
     def test_a_live_link_to_the_backups_folder_under_another_name_is_caught_by_file_id(self):
         """A bind mount gives a folder a second name that real paths cannot see through; the mount list does not
@@ -1401,8 +1439,9 @@ class Links(Base):
         link = self.live_link('attachments-bound', alias)
         real = os.path.realpath
 
-        def bind_name(p, *a, **kw):  # the link leads to `alias`, which no real path shows to be the backups folder
-            return alias if os.path.normpath(p) == link else real(p, *a, **kw)
+        def bind_name(p, *a, **kw):  # the link leads to `alias`, and `alias` resolves to itself, as a bind path does:
+            # no real path shows it to be the backups folder, so a check by real path alone passes it
+            return alias if os.path.normpath(p) in (link, alias) else real(p, *a, **kw)
         with mock.patch.object(os.path, 'realpath', bind_name):
             self.refused(f'where the live link {link} leads ({alias})')
         self.assertFalse(os.path.lexists(self.root()))
@@ -1435,9 +1474,10 @@ class Links(Base):
         self.rehearse()  # the failed run's clone is thrown away and redone
 
     def test_r0_on_the_clone_reads_links_as_a_case_folding_folder_resolves_them(self):
-        """On a folder that ignores case (ext4 casefold, vfat, ntfs), `x -> SUB/D/../..` with `sub/d -> ..` leads
-        above the tree, but the plan's names are case-sensitive, so the copy keeps x. R0 on the clone reads each
-        link from the disk, as the kernel resolves it, and finds it. Simulated: no case-folding filesystem here."""
+        """On a folder that ignores case (ext4 casefold, ntfs3; vfat holds no links), `x -> SUB/D/../..` with
+        `sub/d -> ..` leads above the tree, but the plan's names are case-sensitive, so the copy keeps x. R0 on the
+        clone reads each link from the disk, as the kernel resolves it, and finds it. Simulated: no case-folding
+        filesystem here."""
         ud = self.m.path('fold/userdata')
         os.makedirs(os.path.join(ud, 'sub'))
         os.symlink('..', os.path.join(ud, 'sub', 'd'))
