@@ -17,9 +17,10 @@ import machine_file
 from . import config, rules
 from .facts import Facts, Unreadable, Untouched
 
-USAGE = 'usage: fork-cleaner plan | fork-cleaner run   (fork-cleaner --help says more)'
-HELP = '''fork-cleaner plan   print what a run would delete and what it keeps; changes nothing
-fork-cleaner run    delete it, one log line per delete
+USAGE = 'usage: fork-cleaner plan | fork-cleaner run | fork-cleaner report   (fork-cleaner --help says more)'
+HELP = '''fork-cleaner plan     print what a run would delete and what it keeps; changes nothing
+fork-cleaner run      delete it, one log line per delete
+fork-cleaner report   one line: GB per class on this host, and what runs freed since the last report
 
 What may go is decided by three rules (worktrees, docker, tmp) and the "cleaner" section of the machine file.
 What must stay is decided by the code and cannot be turned off. Exit code: 0 done, 1 something could not be read or
@@ -351,7 +352,7 @@ def main(argv, say=print):
     if argv == ['--help']:
         say(HELP)
         return 0
-    if argv not in (['plan'], ['run']):
+    if argv not in (['plan'], ['run'], ['report']):
         say(USAGE)
         return 2
     if os.geteuid() == 0:
@@ -363,4 +364,7 @@ def main(argv, say=print):
     except machine_file.MachineFileError as ex:
         say(f'fork-cleaner: {ex}')
         return 2  # config
+    if argv == ['report']:
+        from . import report        # report.py builds on this module
+        return report.report(cfg, say)
     return execute(cfg, Facts(cfg), argv == ['run'], say)
