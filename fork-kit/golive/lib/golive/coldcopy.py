@@ -125,12 +125,59 @@ def plan(userdata, skip=frozenset()):
     return entries, total, left_out
 
 
-def copy_userdata(run, home, dest, deadline, skip=frozenset()):
+LINK_HOPS = 40  # Linux's own limit on links followed in one path
+
+
+def link_leaves(rel, look):
+    """Why following the link at `rel` ('/'-joined, inside a tree) leaves that tree, or None when it, and every link
+    it leads through, stays inside. look(path) gives the target of the link at a path of the tree, None for anything
+    else (a folder, a file, nothing: a dangling remainder is taken as it reads). Out: an absolute target (in a copy
+    it still names its old place), a '..' above the tree, more than LINK_HOPS links (a loop). A '..' after a link
+    applies to where that link leads, as in the kernel, so 'up/../x' with up -> '../..' leaves."""
+    parts, hops = rel.split('/'), 0
+    cur, todo = parts[:-1], parts[-1:]
+    while todo:
+        name = todo.pop(0)
+        if name in ('', '.'):
+            continue
+        if name == '..':
+            if not cur:
+                return f'{"/".join(parts)} goes above the tree'
+            cur.pop()
+            continue
+        here = '/'.join(cur + [name])
+        target = look(here)
+        if target is None:
+            cur.append(name)
+            continue
+        hops += 1
+        if hops > LINK_HOPS:
+            return f'more than {LINK_HOPS} links (a loop)'
+        if target.startswith('/'):
+            return f'{here} -> {target} is absolute'
+        todo[:0] = target.split('/')
+    return None
+
+
+def links_out(entries):
+    """[(path, why)] of the planned links (plan()) that lead out of the copied tree, or through a link that does."""
+    links = {e['path']: e['target'] for e in entries if e['kind'] == 'link'}
+    found = [(rel, link_leaves(rel, links.get)) for rel in links]
+    return [(rel, why) for rel, why in found if why is not None]
+
+
+def copy_userdata(run, home, dest, deadline, skip=frozenset(), inside=False):
     """The cold copy (in a step): every planned entry into dest/userdata, hashing what is read. dest is new.
-    skip: more top-level names to leave out (rehearse's clone leaves out secrets/)."""
+    skip: more top-level names to leave out (rehearse's clone leaves out secrets/). inside (rehearse's clone): a link
+    that leads out of the copied tree (links_out) is left out and named in left_out, decided on the plan, before
+    anything is made, so the copy never holds one, whatever was added since an earlier look."""
     run.require_step('cold copy')
     userdata = os.path.join(home, 'userdata')
     entries, total, left_out = plan(userdata, skip)
+    if inside:
+        out = dict(links_out(entries))
+        entries = [e for e in entries if e['path'] not in out]
+        left_out += [f'{rel} (a link out of the copied tree: {why})' for rel, why in out.items()]
     os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
     os.mkdir(dest, 0o700)  # FileExistsError: never over an old copy
     os.mkdir(os.path.join(dest, 'userdata'), 0o700)
