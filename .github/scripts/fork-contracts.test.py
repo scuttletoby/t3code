@@ -45,9 +45,12 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                can merge.
   policies     every workflow with a pull_request_target trigger is listed in
                .github/fork-actions-policies.json (#401): allowed (the fork workflows the repository's
-               Actions policy allows; each there, with the trigger) or upstream_blocked; fork-checks'
-               check names are its jobs' names, and fork-tests.yml's fork_checks_ran runs
-               fork-checks-ran.py with actions: read.
+               Actions policy allows; each there, with that trigger and no other) or upstream_blocked;
+               fork-checks' check names are its jobs' names, and fork-tests.yml's fork_checks_ran is
+               exactly the pinned job (#430): its if:, permissions, the shared checkout and the step
+               running fork-checks-ran.py with the pinned env (PR_NUMBER too, #433), no
+               continue-on-error, and a timeout that holds the worst case: the checkout, the wait cap (or
+               the script's git calls, if longer) and one last poll, from the script's own limits.
 
     python3 .github/scripts/fork-contracts.test.py
 
@@ -55,6 +58,7 @@ Needs PyYAML, git and bash. Each check prints ok/FAIL; any FAIL exits 1.
 """
 
 import copy
+import importlib.util
 import json
 import os
 import pathlib
@@ -168,16 +172,21 @@ def outside_job_problems(name, job):
     return problems
 
 
-def result_job_problems(name, job):
+def result_job_problems(name, job, jobs):
     where = f"{name}: job {RESULT_JOBS[name]}"
     if job is None:
         return [f"{where} is missing"]
     problems = []
     needs = job.get("needs") or []
+    needs = [needs] if isinstance(needs, str) else needs
     if expression(job.get("if")) != "always()":
         problems.append(f"{where}: if is not exactly always() (skipped on an outside pull request = green)")
-    if OUTSIDE_JOB not in ([needs] if isinstance(needs, str) else needs):
+    if OUTSIDE_JOB not in needs:
         problems.append(f"{where}: does not need {OUTSIDE_JOB}")
+    # The ruleset requires only this job: a job it does not need can fail, or be split off, and stay unseen.
+    unneeded = sorted(set(jobs) - set(needs) - {RESULT_JOBS[name]})
+    if unneeded:
+        problems.append(f"{where}: does not need {', '.join(unneeded)} (a failure there would not block a merge)")
     job_steps = job.get("steps") or []
     for step in job_steps:
         uses = str(step.get("uses", ""))
@@ -200,7 +209,7 @@ def pr_guard_problems(name, wf):
         jobs = wf.get("jobs") or {}
         problems += outside_job_problems(name, jobs.get(OUTSIDE_JOB))
         if name in RESULT_JOBS:
-            problems += result_job_problems(name, jobs.get(RESULT_JOBS[name]))
+            problems += result_job_problems(name, jobs.get(RESULT_JOBS[name]), jobs)
         problems += [f"{name}: job {j} does not start with the pull request guard"
                      for j, job in jobs.items()
                      if j not in {OUTSIDE_JOB, RESULT_JOBS.get(name)} and not guarded(job.get("if"))]
@@ -240,6 +249,10 @@ mutants = {
     "fork_ci_result skipped on outside pull requests (guard && (always()))":
         set_if("fork_ci_result", "${{ " + PR_GUARD + " && (always()) }}"),
     "fork_ci_result not needing outside_pr": lambda wf: wf["jobs"]["fork_ci_result"]["needs"].remove("outside_pr"),
+    "fork_ci_result not needing a job (action_tests)":
+        lambda wf: wf["jobs"]["fork_ci_result"]["needs"].remove("action_tests"),
+    "a new guarded job fork_ci_result does not need":
+        lambda wf: wf["jobs"].__setitem__("extra", {"if": "${{ " + PR_GUARD + " }}", "runs-on": "ubuntu-24.04"}),
     "fork_ci_result without its outside refusal": lambda wf: wf["jobs"]["fork_ci_result"]["steps"][0].__setitem__(
         "run", wf["jobs"]["fork_ci_result"]["steps"][0]["run"].replace(RESULT_REFUSAL, "")),
     "fork_ci_result checking out": lambda wf: wf["jobs"]["fork_ci_result"]["steps"].insert(
@@ -1620,9 +1633,65 @@ for label, mutate in {
 # (fork-tests.yml's fork_checks_ran) proves the effect on each pull request.
 policies_path = root / ".github/fork-actions-policies.json"
 POLICY_SCRIPT = "python3 -I .github/scripts/fork-checks-ran.py"
+# fork_checks_ran as it must be (#430): any other env value could turn it into a silent pass (EVENT_NAME
+# from another expression, OUTSIDE_PR hard-coded, the base or head from elsewhere).
+POLICY_ENV = {
+    "EVENT_NAME": "${{ github.event_name }}",
+    "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+    "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+    "PR_NUMBER": "${{ github.event.pull_request.number }}",
+    "OUTSIDE_PR": "${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}",
+    "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+    "GITHUB_TOKEN": "${{ github.token }}",
+}
+POLICY_CHECKOUT_ENV = {"REF": "${{ github.sha }}", "HISTORY": "tip", "SPARSE": "/.github/scripts/"}
+POLICY_JOB_KEYS = {"name", "if", "runs-on", "timeout-minutes", "permissions", "steps"}
+POLICY_CHECKOUT_BUDGET = 180  # seconds for the token-free sparse checkout of one commit (a few seconds in CI)
+_fcr_spec = importlib.util.spec_from_file_location("fork_checks_ran", root / ".github/scripts/fork-checks-ran.py")
+_fcr = importlib.util.module_from_spec(_fcr_spec)
+sys.dont_write_bytecode = True   # no __pycache__ in the tree
+_fcr_spec.loader.exec_module(_fcr)
+# The script's own limits (fork-checks-ran.test.py checks it keeps to them): its cap counts its git calls.
+POLICY_LIMITS = {k: getattr(_fcr, k) for k in ("GIT_TIMEOUT", "GIT_CALLS", "API_TIMEOUT", "API_CALLS_PER_POLL")}
 
 
-def policy_problems(policies, wfs, tests_wf):
+def policy_worst_case(cap, limits):
+    """Seconds fork_checks_ran can take: the checkout, then the cap (the git calls run inside it, or past it if they
+    take longer), then one last poll after the deadline."""
+    return (POLICY_CHECKOUT_BUDGET + max(cap, limits["GIT_TIMEOUT"] * limits["GIT_CALLS"])
+            + limits["API_TIMEOUT"] * limits["API_CALLS_PER_POLL"])
+
+
+def policy_job_problems(job, fc, limits=POLICY_LIMITS):
+    """fork-tests.yml's fork_checks_ran: exactly the pinned shape (the shared checkout step itself is held by the
+    checkout section)."""
+    problems = []
+    where = "fork-tests.yml: job fork_checks_ran"
+    if set(job) != POLICY_JOB_KEYS:
+        problems.append(f"{where} has keys {sorted(set(job))}, not {sorted(POLICY_JOB_KEYS)} (continue-on-error, needs, env ...)")
+    if expression(job.get("if", "")) != PR_GUARD:
+        problems.append(f"{where}: if: is not the pull request guard alone")
+    if job.get("permissions") != {"actions": "read", "contents": "read"}:
+        problems.append(f"{where}: permissions are not exactly actions: read, contents: read")
+    steps_ = job.get("steps") or []
+    if len(steps_) != 2:
+        problems.append(f"{where}: not exactly two steps (checkout, script)")
+    else:
+        checkout, script = steps_
+        if "git init" not in str(checkout.get("run", "")) or checkout.get("env") != POLICY_CHECKOUT_ENV:
+            problems.append(f"{where}: the first step is not the shared checkout of github.sha with only the script")
+        if set(script) != {"name", "env", "run"} or str(script.get("run", "")).strip() != POLICY_SCRIPT \
+                or script.get("env") != POLICY_ENV:
+            problems.append(f"{where}: the second step is not `{POLICY_SCRIPT}` with the pinned env and nothing else")
+    timeout, cap = job.get("timeout-minutes"), fc.get("wait_seconds")
+    if not isinstance(timeout, int) or not isinstance(cap, int) or policy_worst_case(cap, limits) > timeout * 60:
+        problems.append(f"{where}: its worst case (checkout {POLICY_CHECKOUT_BUDGET} s, fork_checks.wait_seconds "
+                        f"{cap!r} or the git calls {limits}, one last poll) does not fit the timeout ({timeout!r} min), "
+                        "so a timeout would cancel the job before its message")
+    return problems
+
+
+def policy_problems(policies, wfs, tests_wf, limits=POLICY_LIMITS):
     """wfs: tree path -> parsed workflow (every workflow file, upstream's too)."""
     prt = policies.get("pull_request_target") or {}
     allowed, blocked = prt.get("allowed") or [], prt.get("upstream_blocked") or []
@@ -1633,8 +1702,9 @@ def policy_problems(policies, wfs, tests_wf):
     for path in allowed:
         if path not in wfs:
             problems.append(f"allowed {path} is not in the tree (renamed? the Actions policy names the old path)")
-        elif "pull_request_target" not in triggers(wfs[path]):
-            problems.append(f"allowed {path} has no pull_request_target trigger")
+        elif triggers(wfs[path]) != {"pull_request_target"}:
+            # Another trigger runs the pull request's own copy of the file: a same-named job of no worth (#430).
+            problems.append(f"allowed {path} has triggers {sorted(triggers(wfs[path]))}, not pull_request_target alone")
         if not path.startswith(".github/workflows/fork-"):
             problems.append(f"allowed {path} is not a fork workflow")
     for path in blocked:
@@ -1647,10 +1717,7 @@ def policy_problems(policies, wfs, tests_wf):
         names = {str(j.get("name")) for j in (wfs.get(fc["workflow"], {}).get("jobs") or {}).values()}
         problems += [f"{fc['workflow']} has no job named {fc.get(k)!r} (fork_checks.{k})"
                      for k in ("check", "outside_check") if fc.get(k) not in names]
-    job = (tests_wf.get("jobs") or {}).get("fork_checks_ran") or {}
-    if not any(str(s.get("run", "")).strip() == POLICY_SCRIPT for s in job.get("steps") or []) \
-            or (job.get("permissions") or {}).get("actions") != "read":
-        problems.append(f"fork-tests.yml: job fork_checks_ran does not run `{POLICY_SCRIPT}` with actions: read")
+    problems += policy_job_problems((tests_wf.get("jobs") or {}).get("fork_checks_ran") or {}, fc, limits)
     return problems
 
 
@@ -1662,10 +1729,10 @@ check("policies: every pull_request_target workflow is allowed or upstream_block
       "names are its jobs'", not problems, "; ".join(problems))
 
 
-def policy_mutant(mutate):
+def policy_mutant(mutate, limits=POLICY_LIMITS):
     p, w, t = copy.deepcopy(policies), copy.deepcopy(all_wfs), copy.deepcopy(fork_tests)
     mutate(p, w, t)
-    return bool(policy_problems(p, w, t))
+    return bool(policy_problems(p, w, t, limits))
 
 
 FC = ".github/workflows/fork-checks.yml"
@@ -1686,8 +1753,56 @@ for label, mutate in {
     "fork_checks_ran without actions: read": lambda p, w, t: t["jobs"]["fork_checks_ran"]["permissions"].pop("actions"),
     "fork_checks_ran not running the script": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1].__setitem__(
         "run", POLICY_SCRIPT + " || true"),
+    "fork-checks.yml also on push": lambda p, w, t: w[FC][True].__setitem__("push", None),
+    "fork-checks.yml also on pull_request": lambda p, w, t: w[FC][True].__setitem__("pull_request", None),
+    "fork_checks_ran job may fail quietly": lambda p, w, t: t["jobs"]["fork_checks_ran"].__setitem__(
+        "continue-on-error", True),
+    "fork_checks_ran step may fail quietly": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1].__setitem__(
+        "continue-on-error", True),
+    "fork_checks_ran with another if": lambda p, w, t: t["jobs"]["fork_checks_ran"].__setitem__(
+        "if", "${{ " + PR_GUARD + " && github.actor != 'x' }}"),
+    "fork_checks_ran with OUTSIDE_PR hard-coded": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
+        .__setitem__("OUTSIDE_PR", "false"),
+    "fork_checks_ran with EVENT_NAME from elsewhere": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
+        .__setitem__("EVENT_NAME", "push"),
+    "fork_checks_ran with the base from the head": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
+        .__setitem__("BASE_SHA", "${{ github.event.pull_request.head.sha }}"),
+    "fork_checks_ran with an extra env": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
+        .__setitem__("BASH_ENV", "x"),
+    "fork_checks_ran with a job env": lambda p, w, t: t["jobs"]["fork_checks_ran"].__setitem__("env", {"X": "1"}),
+    "fork_checks_ran with a step between": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"].insert(
+        1, {"run": "echo 'EVENT_NAME=push' >> $GITHUB_ENV"}),
+    "fork_checks_ran checking out with actions/checkout": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"]
+        .__setitem__(0, {"uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"}),
+    "fork_checks_ran with write permissions": lambda p, w, t: t["jobs"]["fork_checks_ran"]["permissions"].__setitem__(
+        "actions", "write"),
+    "a wait cap equal to the job timeout": lambda p, w, t: p["fork_checks"].__setitem__(
+        "wait_seconds", t["jobs"]["fork_checks_ran"]["timeout-minutes"] * 60),
+    "a job timeout cut below the cap": lambda p, w, t: t["jobs"]["fork_checks_ran"].__setitem__("timeout-minutes", 10),
+    "a cap that leaves no room for the last poll": lambda p, w, t: p["fork_checks"].__setitem__(
+        "wait_seconds", t["jobs"]["fork_checks_ran"]["timeout-minutes"] * 60 - POLICY_CHECKOUT_BUDGET - 1),
+    "fork_checks_ran without PR_NUMBER": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
+        .pop("PR_NUMBER"),
+    "fork_checks_ran with PR_NUMBER from elsewhere": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][-1]["env"]
+        .__setitem__("PR_NUMBER", "${{ github.run_number }}"),
+    # The checkout's env (#433 fix round 1, state finding 5): only github.sha, depth 1, only the scripts.
+    "fork_checks_ran checking out the pull request's head": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]
+        ["env"].__setitem__("REF", "${{ github.event.pull_request.head.sha }}"),
+    "fork_checks_ran checking out the whole tree": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]["env"]
+        .__setitem__("SPARSE", ""),
+    "fork_checks_ran checking out the full history": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]["env"]
+        .__setitem__("HISTORY", "full"),
+    "fork_checks_ran's checkout with an extra env": lambda p, w, t: t["jobs"]["fork_checks_ran"]["steps"][0]["env"]
+        .__setitem__("BASH_ENV", "x"),
 }.items():
     check(f"policies: {label} fails", policy_mutant(mutate))
+# The script's limits, as if it changed them: the budget must still fit (#433 fix round 1, nit of both lenses).
+for label, change in {
+    "git calls that outlast the job": {"GIT_TIMEOUT": 300},
+    "more git calls than the budget holds": {"GIT_CALLS": 20},
+    "a slower last poll than the budget holds": {"API_TIMEOUT": 200},
+}.items():
+    check(f"policies: {label} fails", policy_mutant(lambda p, w, t: None, {**POLICY_LIMITS, **change}))
 
 shutil.rmtree(work, ignore_errors=True)
 if failures:

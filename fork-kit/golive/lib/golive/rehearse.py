@@ -6,7 +6,7 @@ which the next run throws away and redoes, so a stop needs no settling. The old 
 _guard_old (in R0 and again right before the removal), its mark last, so a run killed half-way leaves a folder the
 next run still knows as its own.
 """
-import ctypes, json, os, shutil, signal, socket, stat, subprocess, tempfile, time
+import ctypes, json, os, shutil, signal, socket, stat, subprocess, sys, tempfile, time
 
 from golive import coldcopy, journal, live, osadapter
 
@@ -18,6 +18,7 @@ NEVER_IN_CLONE = ('server-runtime.json', coldcopy.OWNER_LOCK, 'secrets', 'device
 LIVE_DEFAULT_PORT = 3773
 POLL, READY_WAIT, STOP_WAIT, T3_TIMEOUT, MIGRATE_TIMEOUT, MB = 0.5, 300, 60, 120, 3600, 1024 * 1024
 MIGRATE = ('auth', 'session', 'list', '--json')  # R2: read-only, offline, migrates (tests/contract.test.py)
+MIN_PYTHON = (3, 11)  # _remove's shutil.rmtree(dir_fd=); older: a TypeError half-way through every removal
 
 
 def _env(empty):
@@ -83,11 +84,59 @@ def _overlap(path, other):
             or (mine is not None and (mine.st_dev, mine.st_ino) in _ids(other)))
 
 
-def _not_live(path, home):
-    """Refused unless `path` and the live home are apart: neither inside the other, by real path and by file id."""
-    if _overlap(path, home):
+def _not_live(path, home, done='nothing was changed'):
+    """Refused unless `path` and the live home are apart: neither inside the other, by real path, by the file id of
+    the home and of its userdata (a bind of either keeps its id), and by the mount list (_not_bound_live). `done`
+    ends each message: what the caller has changed so far."""
+    userdata = os.path.join(home, 'userdata')
+    if _overlap(path, home) or (os.path.isdir(userdata) and _overlap(path, userdata)):
         raise journal.Refused(f'{path} is the live T3 home {home}, or inside it or around it; a rehearsal runs only '
-                              'on a clone apart from it; nothing was changed')
+                              f'on a clone apart from it; {done}')
+    _not_bound_live(path, home, done)
+
+
+def _apart(a, b):
+    """Two folders of one filesystem (mountinfo field 4 joined with a path) are apart: neither inside the other. A
+    pseudo filesystem's root ('net:[...]') is never taken as apart."""
+    return (a.startswith('/') and b.startswith('/')
+            and os.path.commonpath([a, b]) not in (os.path.normpath(a), os.path.normpath(b)))
+
+
+def _no_list(e, what, done):
+    """The refusal when the mount list cannot be read: a system without one, or a read that failed now (named)."""
+    why = 'run again' if isinstance(e, osadapter.Unreadable) else 'rehearse cannot run on this system'
+    return journal.Refused(f'{e}: {why}, as the kit cannot tell whether {what}; {done}')
+
+
+def _not_bound_live(path, home, done):
+    """Refused when the mount list shows `path` as a folder of a filesystem that is, holds or is inside a folder of
+    the live T3 data: the home, where its userdata really is (a link elsewhere, or its own partition), and each
+    mount at or under either. A bind of any folder of these (at the backups folder, say) gives no file id the kit
+    compares, but its mount names the folder it came from (field 4) on its device. Refused too when the list cannot
+    tell: rehearse then cannot run on this system at all (or, after a passing read error, until it reads); refused
+    too when the mount tree cannot tell which mount is on top (osadapter.source). The kit tells filesystems apart only by that device: the
+    same files through a second mount of their own (NFS twice, FUSE/bindfs, a Windows drive twice on WSL) pass."""
+    try:
+        entries = osadapter.mounts()
+    except osadapter.Unsupported as e:
+        raise _no_list(e, f'{path} is a bind mount of a folder of the live T3 home', done) from None
+    tops = (os.path.realpath(home), os.path.realpath(os.path.join(home, 'userdata')))
+    try:
+        mine = osadapter.source(os.path.realpath(path), entries)
+        live_ones = [(top, osadapter.source(top, entries)) for top in tops]
+    except osadapter.Unsupported as e:
+        raise journal.Refused(f'{e}; so the kit cannot tell whether {path} is a bind mount of a folder of the live T3 '
+                              f'home; {done}') from None
+    if mine is None or any(one is None for _, one in live_ones):
+        raise journal.Refused(f'the mount list {osadapter.MOUNTINFO} holds no mount of {path} or of {home}: the kit '
+                              f'cannot tell whether one is a bind mount of the other; {done}')
+    live_ones += [(m.point, (m.dev, m.root)) for m in entries
+                  if any(os.path.commonpath([os.path.normpath(m.point), top]) == top for top in tops)]
+    for where, (dev, folder) in live_ones:
+        if dev == mine[0] and not _apart(mine[1], folder):
+            raise journal.Refused(f'{path} is, by a bind mount, {mine[1]} of device {mine[0]}: the live T3 data at '
+                                  f'{where} ({folder}), or inside it or around it; a rehearsal runs only on a clone '
+                                  f'apart from it; {done}')
 
 
 def _port_free(port):
@@ -128,6 +177,10 @@ def _newest_copy(cfg):
 
 def _prechecks(cfg, copy_dir, port):
     """R0 before any step (journal.Refused, nothing changed): the copy, the builds, the rehearsal home, the port."""
+    if sys.version_info < MIN_PYTHON:
+        need, have = '.'.join(map(str, MIN_PYTHON)), '.'.join(map(str, sys.version_info[:3]))
+        raise journal.Refused(f'rehearse needs Python {need} or newer (its removal of the old rehearsal folder uses '
+                              f'shutil.rmtree with dir_fd); this is Python {have}; nothing was changed')
     copy_dir, root = os.path.normpath(copy_dir or _newest_copy(cfg)), os.path.join(cfg.backup_dir, REHEARSAL)
     try:
         m = coldcopy.read_manifest(copy_dir, cfg.home)
@@ -175,11 +228,16 @@ def _guard_old(cfg, root):
     (no link) that bears the kit's mark (or is empty: a removal killed after the mark), with no folder in it that is
     the live home or on another device, no mount point at or under it in the system's mount list (a bind mount of
     the same filesystem keeps st_dev; rmtree would go into it), no link to another home's lock, and no server on it.
-    Where the mount list cannot be read (another OS, no /proc) an old folder is never removed."""
+    Where the mount list cannot be read (another OS, no /proc, empty) rehearse cannot run at all (_not_live). The
+    folder's identity is taken first and the checks go by path: a swap that is still there at the end is refused (a
+    swap away and back during the checks is not caught; it needs a same-user process racing the kit). Returns the
+    old folder's (st_dev, st_ino) as checked, for _remove; None when there is none."""
     _not_live(root, cfg.home)
-    if not os.path.lexists(root):
-        return
-    if os.path.islink(root) or not os.path.isdir(root):
+    try:
+        here = os.lstat(root)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(here.st_mode):
         raise journal.Refused(f'{root} is a link or not a folder: move it away; nothing was changed')
     try:
         marked = stat.S_ISREG(os.lstat(os.path.join(root, MARK)).st_mode)
@@ -191,14 +249,13 @@ def _guard_old(cfg, root):
     live_ids = {(st.st_dev, st.st_ino) for st in (os.stat(cfg.home), os.stat(os.path.join(cfg.home, 'userdata')))}
     for d, _, _ in os.walk(root):
         st = os.lstat(d)
-        if (st.st_dev, st.st_ino) in live_ids or st.st_dev != os.lstat(root).st_dev:
+        if (st.st_dev, st.st_ino) in live_ids or st.st_dev != here.st_dev:
             raise journal.Refused(f'{d} in the old rehearsal folder is the live T3 home or a mount point: unmount '
                                   'it; nothing was changed')
     try:
         points = osadapter.mount_points()
     except osadapter.Unsupported as e:
-        raise journal.Refused(f'{e}: the old rehearsal folder {root} is removed only when no mount can be in it; '
-                              'remove it by hand; nothing was changed') from None
+        raise _no_list(e, f'a mount is in the old rehearsal folder {root}', 'nothing was changed') from None
     real = os.path.realpath(root)
     inside = [m for m in points if os.path.commonpath([real, os.path.normpath(m)]) == real]
     if inside:
@@ -215,34 +272,59 @@ def _guard_old(cfg, root):
         except TimeoutError:
             raise journal.Refused(f'a T3 server still holds the old rehearsal home {old_userdata} (see its '
                                   'server-runtime.json): stop it; nothing was changed') from None
+    try:
+        now = os.lstat(root)
+    except OSError:
+        now = None
+    if now is None or (now.st_dev, now.st_ino) != (here.st_dev, here.st_ino):
+        raise journal.Refused(f'{root} changed during the check (moved, or another folder or a link now): nothing '
+                              'was changed; run again')
+    return here.st_dev, here.st_ino
 
 
-def _remove(root):
-    """Remove the old rehearsal folder, its mark last: a run killed half-way leaves a folder that still bears the
-    mark (or an empty one), which the next run removes under the same guard."""
-    if os.path.islink(root):
-        raise Failed(f'{root} became a link: nothing was removed')
-    for name in os.listdir(root):
-        if name != MARK:
-            path = os.path.join(root, name)
-            if os.path.isdir(path) and not os.path.islink(path):
-                shutil.rmtree(path)
-            else:
-                os.unlink(path)
-    if os.path.lexists(os.path.join(root, MARK)):
-        os.unlink(os.path.join(root, MARK))
-    os.rmdir(root)
+def _remove(root, checked):
+    """Remove the old rehearsal folder that _guard_old checked (`checked`: its (st_dev, st_ino)), its mark last: a
+    run killed half-way leaves a folder that still bears the mark (or an empty one), which the next run removes under
+    the same guard. The folder is opened without following a link, must be the one checked, and is emptied through
+    that handle (rmtree's own walk never follows a link either): a swap of the path after the check, to a link or to
+    another folder, removes nothing of what is there now."""
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise Failed(f'{root} changed after the check (a link now, or not a folder: {e.strerror}): nothing was '
+                     'removed') from None
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != checked:
+            raise Failed(f'{root} changed after the check (another folder now): nothing was removed')
+        for name in os.listdir(fd):
+            if name != MARK:
+                if stat.S_ISDIR(os.lstat(name, dir_fd=fd).st_mode):
+                    shutil.rmtree(name, dir_fd=fd)
+                else:
+                    os.unlink(name, dir_fd=fd)
+        try:
+            os.unlink(MARK, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(fd)
+    try:
+        os.rmdir(root)  # only ever an empty folder
+    except OSError as e:
+        raise Failed(f'{root} changed during the removal ({e.strerror}): the old folder was emptied through its '
+                     'own handle and what is at that path now was left as it is; move it away') from None
 
 
 def _clone(run, cfg, p):
     """The clone step: the old rehearsal folder (it bears MARK) goes, a new one is made; read back vs the manifest.
     The guard runs again right before the removal: a mount or a swap since R0 is caught."""
     try:
-        _guard_old(cfg, p['root'])
+        checked = _guard_old(cfg, p['root'])
     except journal.Refused as e:
         raise Failed(f'the clone step: {e}') from None
-    if os.path.lexists(p['root']):
-        _remove(p['root'])
+    if checked is not None:
+        _remove(p['root'], checked)
     os.makedirs(p['root'], mode=0o700)
     with open(os.path.join(p['root'], MARK), 'w', encoding='utf-8') as f:
         json.dump({'run': run.id, 'copy': p['copy']}, f)
@@ -255,8 +337,13 @@ def _clone(run, cfg, p):
 
 
 def _r0_clone(cfg, p):
-    """R0 on the clone itself, apart from how it was made: nothing in it may lead to the live T3."""
-    _not_live(p['home'], cfg.home)
+    """R0 on the clone itself, apart from how it was made: nothing in it may lead to the live T3. The clone exists
+    by now, so a refusal here is a failure of the run (only the rehearsal folder was redone)."""
+    try:
+        _not_live(p['home'], cfg.home, done='only the rehearsal folder was redone (any previous rehearsal folder was '
+                                            'removed, the clone made); nothing ran on it')
+    except journal.Refused as e:
+        raise Failed(f'R0 on the clone: {e}') from None
     found = [n for n in NEVER_IN_CLONE if os.path.lexists(os.path.join(p['home'], 'userdata', n))]
     if found:
         raise Failed(f'the clone holds {", ".join(found)}: it could reach the live T3; nothing ran on it')

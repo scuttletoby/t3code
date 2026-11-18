@@ -2,19 +2,21 @@
 
 `t3-golive` moves a T3 home that runs as a boot service from its current build to a newer one (for example a
 fork build), with a cold copy of the data first and a way back. It is built in steps; this folder has the
-**core**, the **copy** and the **rehearsal** so far:
+**core**, the **copy**, the **rehearsal**, the way **back** and **status** so far:
 
-| Part              | File                      | What it does                                                 |
-| ----------------- | ------------------------- | ------------------------------------------------------------ |
-| config            | `lib/golive/config.py`    | reads the `golive` section of the machine file               |
-| lock and journal  | `lib/golive/journal.py`   | one run at a time; each step journalled "started" and "done" |
-| live T3           | `lib/golive/live.py`      | finds the running server from its own files and process      |
-| `check`, `settle` | `lib/golive/check.py`     | read only: may this home move to the target build now?       |
-| OS adapter        | `lib/golive/osadapter.py` | systemd user units only; other systems refuse until written  |
-| `copy`, restore   | `lib/golive/coldcopy.py`  | the practice stop: a cold copy; the restore primitive        |
-| `rehearse`        | `lib/golive/rehearse.py`  | the target build tried on a clone of a copy (R0-R5)          |
+| Part              | File                        | What it does                                                 |
+| ----------------- | --------------------------- | ------------------------------------------------------------ |
+| config            | `lib/golive/config.py`      | reads the `golive` section of the machine file               |
+| lock and journal  | `lib/golive/journal.py`     | one run at a time; each step journalled "started" and "done" |
+| live T3           | `lib/golive/live.py`        | finds the running server from its own files and process      |
+| `check`, `settle` | `lib/golive/check.py`       | read only: may this home move to the target build now?       |
+| OS adapter        | `lib/golive/osadapter.py`   | systemd user units only; other systems refuse until written  |
+| `copy`, restore   | `lib/golive/coldcopy.py`    | the practice stop: a cold copy; the restore primitive        |
+| `rehearse`        | `lib/golive/rehearse.py`    | the target build tried on a clone of a copy (R0-R5)          |
+| `back`, `status`  | `lib/golive/back.py`        | the way back (W1-W3); read only: is T3 up and right?         |
+| kept runtime      | `lib/golive/keptruntime.py` | the old build's runtime, kept for W1 (upstream prunes it)    |
 
-Later parts (switch, back) come in their own PRs. Install from `ci-release` comes with them.
+The switch comes in its own PR. The owner's runbook is `docs/fork/go-live.md`. Install from `ci-release` comes with it.
 
 ## `t3-golive check`
 
@@ -242,25 +244,48 @@ empty state?
 
 Tries the target build on a **clone** of a finished copy (the newest `t3-copy-*` in `backupDir`, or `--copy`), in
 its own T3 home (`<backupDir>/t3-rehearsal/home`) and port. It never stops, starts or writes the live home and
-needs no boot service; it runs in the calling process. Every `t3` it runs gets an empty `HOME`, `PATH=/usr/bin:/bin`
+needs no boot service; it runs in the calling process, on Linux only, with Python 3.11 or newer (older: refused
+before any step). Every `t3` it runs gets an empty `HOME`, `PATH=/usr/bin:/bin`
 and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`).
 
 - **R0, before any step** (refused, nothing changed): the copy has a finished manifest, reads back against it, is
   of this home, and was taken under the build the live service state names now (else "take a new copy"); the target
   is newer; the old build (`<home>/runtime/versions/<copy's version>/t3`) is there; the staged release checks out
   and its `serve --help` has `--hold-work`; the rehearsal folder is apart from the live home (real paths and file
-  ids, both ways, so a link or a bind path is caught); an old one is a real folder (no link) that bears the kit's
+  ids of the home and of its `userdata`, both ways, so a link or a bind path is caught; and by the mount list: a
+  bind mount of any folder inside the live home, at the backups folder say, keeps the device and gives no id the
+  kit compares, but its mountinfo line names the folder it came from, so the folder the rehearsal folder is on its
+  filesystem must be apart from each folder of the live data: the home, where its `userdata` really is (a link
+  elsewhere, or its own partition), and every mount at or under either; the mount that holds a path is the one on
+  top, found by the mount tree (mount id and parent id), not by the list's order, which a moved mount or one placed
+  beneath another does not keep: from the one mount above the path with no parent listed, into the child above the
+  path with the shortest mount point, until none; where the tree cannot tell (a parent missing, a cycle, two
+  mounts on one point with one parent) the run is refused); an old one is a real folder (no link) that bears the kit's
   mark `.golive-rehearsal` (or is empty), with no folder in it that is the live home or on another device, no mount
   point at or under it in the system's mount list (`/proc/self/mountinfo`: a bind mount of the same filesystem keeps
   its device id), and no link to another home's ownership lock; no server holds it; the copy is not inside it (nor
   a link into it); the port is free and is neither the live port nor 3773; `backupDir` holds 3 x the copy plus the
-  floor. Where the mount list cannot be read (any OS but Linux, no `/proc`), an old rehearsal folder is never
-  removed: the run is refused and the owner removes it by hand. **R0 on the clone**: the clone leaves out
+  floor. Where the mount list cannot be read or is empty (any OS but Linux, no `/proc`), every run is refused before
+  any step: rehearse cannot run on that system at all (it cannot tell a bind mount), and removing an old rehearsal
+  folder by hand does not change that. Where reading it failed this time (too many open files, say), the refusal
+  names the error: run again. **R0 on the clone**: the clone leaves out
   `secrets/` and the live machine's process records (`device/`, `relay-clients/`), with what a copy never holds
   (`server-runtime.json`, the ownership lock); it reads back against the manifest and is checked to hold none of
-  those: a runtime record would point the CLI at the LIVE server.
+  those: a runtime record would point the CLI at the LIVE server; and it is apart from the live data as above (if
+  not, the run fails: only the rehearsal folder was redone, any previous one removed and the clone made; nothing ran
+  on it).
 - **The clone step** runs the old-folder guard again right before it removes anything (a mount or a swap since R0
-  is caught), then removes the old folder with its mark last.
+  is caught), then removes the old folder with its mark last: it opens the folder without following a link, checks
+  it is the one the guard checked (device and inode), and removes its contents through that handle, so a swap of the
+  path after the check removes nothing of what is there now.
+- **Limits of these checks**: filesystems are told apart only by the mount list's device number, so the same files
+  reached through a second mount of their own (NFS mounted twice, a FUSE or bindfs view, a Windows drive mounted
+  twice on WSL) are not caught: keep `backupDir` off any such second view of the live home. Only the kit's own mount
+  view is read: a live service with its own mount namespace (systemd `BindPaths=`, say) can see the live data at a
+  path the kit does not know. The guard takes the old
+  folder's identity first and then checks by path: a swap still there at its end is refused, a swap away and back
+  during it (a same-user process racing the kit) is not. A mount made inside the old folder after the guard (root
+  only) is not checked by the removal, and the last `rmdir` goes by path (it only ever removes an empty folder).
 - **R1**: `__service-preflight` of the old build and of the fork build on the clone: both `ready`. The fork build's
   read-only report of the clone is the "before" report.
 - **R2**: `<fork t3> auth session list --json --base-dir <clone>`, with no server: a read-only command whose
@@ -293,17 +318,121 @@ reusing one half-migrated. A run that needs settling still blocks it.
 | Killed at any step (R0-R5, mid-restore)                 | The server dies with the run; nothing to settle; the next run redoes it       |
 | Killed while it removes the old folder                  | The mark goes last: the folder still bears it (or is empty); next run ends it |
 | A mount (or a swap to a link) after R0, before removal  | The guard runs again in the clone step: the run fails, nothing is removed     |
-| A mount point at or under the folder; no mount list     | Refused; never removed (other OSes: remove an old folder by hand)             |
+| A swap (link, other folder) after that check            | The run fails; what is at the path now is never removed                       |
+| A mount point at or under the folder                    | Refused; never removed                                                        |
+| No mount list (not Linux, no `/proc`, an empty list)    | Refused before any step: rehearse cannot run there at all                     |
+| Reading the mount list failed this time                 | Refused before any step, naming the error; run again                          |
+| Mount tree cannot tell which mount is on top            | Refused before any step (a parent missing, a cycle, two on one point)         |
+| Python older than 3.11                                  | Refused before any step; an old rehearsal folder is kept                      |
 | `--copy` inside the rehearsal folder, or a link into it | Refused before any step: the clone step would remove it                       |
 | R2 left migrations pending                              | The run fails before R3: the server would migrate unmeasured                  |
 | A server still holds an old rehearsal home              | Refused before any step; stop it (its pid is in that home's runtime record)   |
 | `t3-rehearsal` without the mark, or a link              | Refused; never removed                                                        |
 | Live home by a link or bind path, or bound in a clone   | Refused (real path; file ids both ways and inside) before any removal         |
+| `backupDir` a bind of a folder inside the live home     | Refused before any step (mount list: the folder each is on its filesystem)    |
+| `backupDir` a bind from `userdata`'s own partition      | Refused before any step (and from a link's target, any mount under the home)  |
 | Copy with no manifest, not matching it, of another home | Refused (`--copy` or `t3-golive copy`)                                        |
 | Copy from another build than the live one               | Refused: take a new copy                                                      |
 | Port taken between the check and the start              | The server exits; R3 fails, the rerun passes once the port is free            |
 | Server never ready, or not saying work is held          | Stopped; the run fails                                                        |
 | Server dies during R4, or any R4 check fails            | The run fails naming every problem; the server is stopped                     |
+
+## `t3-golive back [--way w1|w2|w3] [--lose-work-since <time>] [--here]`
+
+Without `--way` it is read only and says which way back is possible now, and why: W1 needs a finished copy of this
+home (`manifest.json`; incomplete copies are named, never used) taken under an older build whose t3 is still whole
+in `runtime/versions/<v>/` (`.install-complete`) or kept by the kit (below); W2 needs a fork build live
+(`.fork.N`) and its base nightly (the version without `.fork.N`) installed in the home or staged in `stageDir` like
+the target (checksums checked); W3 needs an upstream stable newer than that base, installed or staged. With `--way`
+it runs detached (a transient unit; stopping or restarting T3 kills a T3 terminal), `--here` in the calling process
+(refused inside the boot service).
+
+- **W1, restore and downgrade** (loses everything since the copy): by hand it is refused unless
+  `--lose-work-since` names the copy's time exactly as `back` prints it (`createdAt` of the manifest), and it first
+  prints the project and thread counts at the copy (journalled by `copy`) against the live build's report now
+  (threads that only got new messages are not in the counts). Then, each a journalled step: the plan; the old
+  runtime put back from the kit's kept copy if upstream pruned it; the **pre hooks**; **disable** and stop the boot
+  service (no start at boot on a half-restored home); the restore primitive (the migrated database and
+  `settings.json` are kept aside, never deleted; the copy stays); `<home>/runtime/versions/<old>/t3 update <old>
+  --allow-downgrade --yes --base-dir <home>` (it enables and starts the service); verify: a new server of the old
+  build, named by the service state, the service enabled; the **post hooks**. `restore_and_downgrade(run, ...,
+  automatic=True)` is the same function for the switch's own way back, inside the switch's run, with no time typed
+  (`hooks=False` when the switch's run runs the hooks itself).
+- **A W1 that is killed or fails after its stop leaves T3 stopped and disabled** (not started at boot), and runs
+  no post hook (background jobs stay paused), on purpose: the home may be half-restored. `status` says DOWN and
+  names the run; nothing starts T3 again until a `t3-golive back --way w1` ends ok (a copy run's guard starts only
+  an enabled service). Run the same back again: stopped before its update ended ok, it restores and downgrades
+  again (the restore is safe to run again; what was moved aside stays kept); past its update, while the service
+  state names the old build, it does not stop T3 or restore again: it verifies (or, verified and running steadily,
+  skips that) and runs the post hooks, so work T3 served in between is never restored over. A post hook that fails
+  after the verify leaves T3 running and enabled: the rerun runs only the post hooks. If the service state names
+  another build by then, the rerun is a whole W1 again.
+- **W2, the same-base upstream nightly** (loses nothing): the fork adds no migrations, so the upstream nightly the
+  fork build is cut from runs the migrated database as it is: between the pre and the post hooks,
+  `<that t3> update <base> --allow-downgrade --yes`, then the same verify. **Read from the code, untried on a live
+  home**: the tests use a stub t3. Upstream's update installs the version from its release feed unless it is
+  already whole in `runtime/versions`, so W2 needs the network; staging it means adding its archive's line to
+  `stageDir/SHA256SUMS` beside the target's, not replacing the file.
+- **W3, an upstream stable newer than the base**: the same, with that stable.
+
+**The pre and post hooks** (`preHooks`, `postHooks` of the machine file) run around stopping and starting T3 as in
+the copy run: a failed pre hook runs the post hooks and refuses before T3 is touched; the post hooks run after the
+verify. After a failure they run for W2 and W3 (T3 was never stopped) and for a W1 that never stopped T3; once a W1
+stopped T3, they do not run until a back ends ok (background jobs stay paused while T3 is down on a half-restored
+home; the error and `status` say so). A killed back runs no post hook (back has no guard): background jobs stay
+paused until a back runs again (each hook must be safe twice).
+
+### The kept runtime (`lib/golive/keptruntime.py`)
+
+Every upstream `t3 update` ends by pruning the whole runtimes in `runtime/versions` that nothing names any more
+(`prunePinnedRuntimes({keep: [currentVersion, targetVersion]})` in `apps/server/src/cli/update.ts`). So the switch's
+own update removes the old build's runtime, and W2 and W3 remove it too: without more, W1 would be gone after the
+switch. The switch therefore keeps a copy first: `keptruntime.keep(run, cfg, <old>)`, inside one of its journalled
+steps before its update (`keptruntime.plan_keep(cfg, <old>, floor_bytes)` is the read-only check before its first
+step), copies `<home>/runtime/versions/<old>/` to `<stateDir>/kept-runtimes/<old>/runtime/` with `kept.json` (every
+entry's kind, size, mode, SHA256, link target) written last and the folder renamed into place whole. W1 checks it
+entry by entry (`keptruntime.check`; a linked kept folder is never followed) and only then copies it back into
+`runtime/versions/<old>/`, hashing each file as it copies it against the entries it checked (a kept file changed
+since the check is refused, nothing put back) (a fresh `.install-complete`, so upstream's 1 h grace covers it, and upstream uses it as installed instead of downloading).
+Upstream never looks in `stateDir`, so no update removes it, and the kit deletes none.
+
+| Situation                                                                            | What happens                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Run twice                                                                            | The second finds the build the first back of the same way verified live (service state names it, no update or marker) and no run left half-way since: "nothing to do", no stop, no update                                                                                                                                                                                                                 |
+| Another way than the last good back (W1 after W2 or W3)                              | Not "nothing to do": W1 runs when it is possible (the kept runtime is put back; the copy is restored over the data W2 ran on, which is kept aside), else it is refused naming why (no kept runtime, the copy, the build)                                                                                                                                                                                  |
+| A back after a switch or back left half-way                                          | Never "nothing to do": it finishes the stopped back's plan, or takes the way afresh; a refusal ends "failed", so the home still needs settling                                                                                                                                                                                                                                                            |
+| Stopped half-way (killed, failed, power loss)                                        | Another `back` may follow it (`journal.run(may_follow=('back', 'switch'))`); it finishes the stopped back's journalled plan: the put-back, the restore and the update are safe to run again (tested after the stop, the move-aside, mid-copy, mid-put-back, mid-update). Any other command still asks for `settle`. A stopped W2 or W3 looks for its t3 again first (refused, naming it, when it is gone) |
+| ... and the follow-up is refused (a wrong time, another way)                         | It ends "failed", not "refused", so the half-way home still needs settling; another way than the stopped one is refused, naming the way to run again                                                                                                                                                                                                                                                      |
+| ... and the machine boots meanwhile                                                  | W1 disabled the service before the stop, so T3 does not start on a half-restored home                                                                                                                                                                                                                                                                                                                     |
+| No copy, an incomplete one, one of another home                                      | W1 not possible (named); a copy of another home is never listed                                                                                                                                                                                                                                                                                                                                           |
+| The newest copy was taken under the build running now, or its t3 is not kept         | W1 not possible, named. Older copies are not used in its place (they lose more)                                                                                                                                                                                                                                                                                                                           |
+| The kept runtime is missing, unfinished (no `kept.json`) or damaged (a file differs) | Never used: W1 not possible, named, refused before any change. `keep` run again sets a damaged one aside (`<version>.bad-<time>`) and keeps anew; a stopped keep leaves only `.partial-<version>`, redone by the next keep                                                                                                                                                                                |
+| W2 with no base nightly installed or staged                                          | Refused before any change, naming what is missing                                                                                                                                                                                                                                                                                                                                                         |
+| The guard timer (switch) fires `back` during a manual back                           | Refused by the kit's lock (`journal.Busy`): one back at a time                                                                                                                                                                                                                                                                                                                                            |
+| W1 after W2 or W3 when the old build is the nightly the fork is cut from             | Refused ("not older than the t3 now"): W2 then runs that very build, and upstream's `t3 update <the version it runs>` may answer "already on" and not start the service W1 stopped (update.ts), which would leave T3 down. Take the copy's data back by hand, or stay on W2's build                                                                                                                       |
+| A journal from before this kit (no `way` in a back's plan)                           | No "nothing to do" from it; the way is taken afresh from what is on disk                                                                                                                                                                                                                                                                                                                                  |
+
+## `t3-golive status`
+
+Read only: it holds the kit's lock shared like `check` but makes no lock file or state folder when there is none
+(no golive run ever took the lock then). It checks: the boot service (active, enabled, serves this home); the
+journal (no run left half-way: a back or switch that stopped or failed is named, with what it left and what the
+next back does: a W1 past its verify has only its post hooks left; one past its stop keeps T3 stopped and the jobs
+paused; a switch with no way back begun says to take one);
+the service state (the version the last golive run verified, no update pending); no marker; the live server
+(`server-runtime.json`, a live pid of that version, started by the service); HTTP answers on `127.0.0.1` at the port
+the server recorded (never another host its `origin` may name); the t3 launcher links upstream recorded
+(`runtime/launchers`) lead to that version; and the live fork build's report: read cleanly, no pending or unknown
+migration, project and thread counts not below the newest `reportCounts` in the journal (the newest run that
+journalled any: a copy after the switch replaces the switch's). It lists the fork features that are on, the provider
+instances, the copies on disk with their sizes (complete, incomplete, kept files) and the kept runtimes (and whether
+each is usable): the kit deletes none. A kept runtime that is there but damaged is a failed check ("way back W1: not
+available"), so T3 reads up but not right. The first line is one of **T3 is up:**, **T3 is up but not right**, **T3 is
+restarting or starting** (a golive run holds the lock, a marker, the service activating or stopping, or no server
+yet), **T3 is DOWN**, or **T3 state unknown** (the service manager did not answer, or status itself failed); exit 0
+only for `T3 is up:` (every check passed). An error inside it is a failed check, never a crash or an OK. No report
+runs unless T3 runs steadily, and none for a build that is not a fork build (an upstream build after W2 or W3: the
+counts are then not checked, said in a note).
 
 ## `t3-golive settle --reason "<what you did>"`
 
@@ -367,6 +496,7 @@ file and how to settle it; a line from a newer kit refuses with "update the kit"
 python3 -I -B fork-kit/golive/tests/check.test.py      # check on a fake machine
 python3 -I -B fork-kit/golive/tests/journal.test.py    # lock, journal, adapter, version order
 python3 -I -B fork-kit/golive/tests/copy.test.py       # copy, guard, restore on a fake machine
+python3 -I -B fork-kit/golive/tests/back.test.py       # back W1-W3 and status, a stub t3 for every build
 python3 -I -B fork-kit/golive/tests/rehearse.test.py   # rehearse R0-R5 with a stub t3 (old and fork build)
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
 python3 -I -B fork-kit/common/tests/machine_file.test.py

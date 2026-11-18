@@ -78,6 +78,16 @@ GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c'
 # ~/.gitconfig or ~/.config/git/attributes. The same
 # two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
 GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
+# Never passed on to git (git_env): variables of the job that point git at another repository, object store, index,
+# config or pathspec rule than the call names. The job's environment is the owner's, but each git call says alone what
+# it reads.
+GIT_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+            'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
+            'GIT_REPLACE_REF_BASE', 'GIT_GRAFT_FILE', 'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH', 'GIT_PREFIX',
+            'GIT_IMPLICIT_WORK_TREE', 'GIT_INTERNAL_SUPER_PREFIX', 'GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS',
+            'GIT_NOGLOB_PATHSPECS', 'GIT_ICASE_PATHSPECS')
+GIT_DROP_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+GIT_READ_SECONDS = 60   # each git call of the config read
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
@@ -297,6 +307,12 @@ def no_token_env():
     return {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
 
 
+def git_env(env):
+    """`env` for a git call: without GIT_DROP, with GIT_ENV and no prompt. Tokens are the caller's to drop."""
+    return {**{k: v for k, v in env.items() if k not in GIT_DROP and not k.startswith(GIT_DROP_PREFIXES)},
+            'GIT_TERMINAL_PROMPT': '0', **GIT_ENV}
+
+
 def git_problem(run=subprocess.run):
     """Why this git cannot run the queue (merge-tree --write-tree needs GIT_MIN), or None."""
     try:
@@ -308,6 +324,68 @@ def git_problem(run=subprocess.run):
     if m and tuple(map(int, m.groups())) >= GIT_MIN:
         return None
     return f'git {".".join(map(str, GIT_MIN))} or newer is needed (merge-tree --write-tree); found: {out[:80] or "none"}'
+
+
+def committed_config(path, run=None):
+    """The config at `path` as the commit checked out there (HEAD) holds it: its blob, read with git, never the file. A
+    checkout writes that file through filters and `.gitattributes` (a `working-tree-encoding` makes it UTF-16, an
+    `ident` rewrites it), which a pull request can change without changing the config's own entry, so the head check
+    would pass it. A path outside a git checkout, a commit without the config, an entry that is no regular file
+    (a symlink, a submodule, a folder), a blob the checkout does not hold or that is not UTF-8 JSON is a ConfigError,
+    never a crash. Nothing is fetched: a partial clone's missing blob would come from origin with the token the
+    checkout stored."""
+    full = os.path.abspath(path)
+    where = os.path.dirname(full)
+    while not os.path.isdir(where):   # the folder is missing when the commit has no config: git still says so
+        where = os.path.dirname(where)
+
+    def git(cwd, *a):
+        try:   # no lazy fetch (git 2.44+), and no transport at all for an older git that ignores the variable
+            r = (run or subprocess.run)(['git', *GIT_SAFE, '-C', cwd, *a], capture_output=True,
+                                        timeout=GIT_READ_SECONDS, env={**git_env(no_token_env()),
+                                                                       'GIT_NO_LAZY_FETCH': '1',
+                                                                       'GIT_ALLOW_PROTOCOL': 'none'})
+        except subprocess.TimeoutExpired:
+            raise config.ConfigError(f'{path}: git {a[0]} took over {GIT_READ_SECONDS} seconds') from None
+        except OSError as e:
+            raise config.ConfigError(f'{path}: cannot run git to read it: {e}') from None
+        return r.returncode, r.stdout, os.fsdecode(r.stderr or b'').strip()[:200]
+    code, out, err = git(where, 'rev-parse', '--show-toplevel')
+    if code != 0:
+        raise config.ConfigError(f'{path}: not in a git checkout ({err}): the queue reads the config as the '
+                                 'checked-out commit holds it, never the file')
+    top, head, rest = os.path.realpath(os.fsdecode(out.rstrip(b'\n'))), full, []
+    while os.path.realpath(head) != top:   # the path's own names below the top, links in them not followed
+        head, name = os.path.split(head)
+        if not name:
+            raise config.ConfigError(f'{path}: not inside the checkout {top}')
+        rest.insert(0, name)
+    rel = '/'.join(rest)
+    code, out, err = git(top, 'rev-parse', '--verify', '-q', 'HEAD^{commit}')
+    sha = os.fsdecode(out).strip()
+    if code != 0 or not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise config.ConfigError(f'{path}: the checkout {top} has no commit checked out')
+    code, out, err = git(top, 'ls-tree', '-z', sha, '--', rel)
+    records = [x for x in out.split(b'\0') if x]
+    if code != 0 or not records:
+        raise config.ConfigError(f'{path}: the commit checked out ({sha[:12]}) has no {rel}'
+                                 + (f': {err}' if err else ''))
+    meta, _, name = records[0].partition(b'\t')
+    fields = meta.decode('ascii', 'replace').split(' ')
+    if len(records) != 1 or name != os.fsencode(rel) or len(fields) != 3:
+        raise config.ConfigError(f'{path}: git ls-tree {sha[:12]} -- {rel} did not list one entry')
+    mode, kind, oid = fields
+    if mode not in ('100644', '100755'):   # git lists a blob in no other mode as a file
+        what = {'120000': 'symlink', '160000': 'submodule', '040000': 'tree'}.get(mode, kind[:20])
+        raise config.ConfigError(f'{path}: at {sha[:12]} {rel} is a {what} (mode {mode}), not a file (mode 100644 or '
+                                 '100755): make it a regular file')
+    code, out, err = git(top, 'cat-file', 'blob', oid)
+    if code != 0:
+        raise config.ConfigError(f'{path}: cannot read {rel} at {sha[:12]}: its blob {oid[:12]} is not in this checkout '
+                                 '(the queue fetches nothing). In a partial clone, check the config out: the '
+                                 'sparse-checkout pattern must match its name, which glob characters ([ ] * ?), a '
+                                 f'leading ! or #, a trailing space or a backslash keep it from doing ({err})')
+    return config.parse(out, f'{path} at {sha[:12]}')
 
 
 class Queue:
@@ -389,9 +467,9 @@ class Queue:
         """git in the cache. It only fetches: with the run's read token, and with no token at all when there is none
         (never gh's own login of the machine)."""
         token = self.read_token
-        env = self.gh_env(token) if token else {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
+        env = self.gh_env(token) if token else no_token_env()
         return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0', **GIT_ENV})
+                              text=True, capture_output=True, env=git_env(env))
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
@@ -447,7 +525,7 @@ class Queue:
             print(f'could not make {new}: {e}')
             return False
         r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True, env={**no_token_env(), **GIT_ENV})
+                           capture_output=True, env=git_env(no_token_env()))
         if r.returncode != 0:
             print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
             return False
@@ -1146,7 +1224,7 @@ def cli(argv=None, env=None):
         elif work and (os.path.realpath(path) + os.sep).startswith(work + os.sep):
             problems.append(f'{flag} {path} is inside the job\'s workspace, which the next checkout empties')
     try:
-        cfg = config.load(a.config)
+        cfg = committed_config(a.config)
     except config.ConfigError as e:
         problems.append(str(e))
     read, write = env.get(READ_TOKEN) or '', env.get(WRITE_TOKEN) or ''

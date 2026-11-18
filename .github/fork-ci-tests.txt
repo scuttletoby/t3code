@@ -1,7 +1,8 @@
 # Every test file under .github/scripts, fork-ci and fork-kit (*.test.*, subdirectories included) and
 # where it runs (.github/scripts/fork-ci-tests.cjs checks this list).
-#   <test>                  run by Fork tests (fork-kit/ in the kit job, the rest in the
-#                           workflows job), by extension (sh, py, cjs, mjs, js)
+#   <test>                  run by Fork tests (fork-kit/ in the kit job, fork-ci/ and the
+#                           fleet walls' in the action job, the rest in the workflows job),
+#                           by extension (sh, py, cjs, mjs, js)
 #   <test> ~<seconds>s      the same, with its usual time on CI: the longest start first.
 #                           Tests without one start before them. A test over 30 s without
 #                           one, or far from its weight, gets a note in the log to fix it.
@@ -17,7 +18,7 @@
 .github/scripts/fork-fleet-desk-seed.test.py ~10s
 .github/scripts/fork-fleet-desk.test.py ~8s
 .github/scripts/fork-fleet.test.py ~47s
-.github/scripts/fork-fleet-refresh.test.py ~13s
+.github/scripts/fork-fleet-refresh.test.py ~46s
 .github/scripts/fork-fleet-walls.test.py ~75s
 .github/scripts/fork-fleet-walls-contract.test.py ~100s
 .github/scripts/fork-fleet-walls-wsl2.test.py ~36s
@@ -65,6 +66,7 @@ fork-kit/common/tests/free_contract.test.py ~5s
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py ~65s
 fork-kit/desk/tests/windows.test.py ~8s
+fork-kit/golive/tests/back.test.py ~35s
 fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
 fork-kit/golive/tests/copy.test.py ~26s
