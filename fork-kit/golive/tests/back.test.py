@@ -57,7 +57,7 @@ class BackBase(unittest.TestCase):
         self.copied = sha(os.path.join(self.copy, 'userdata/statev2.sqlite'))
         return self.copy
 
-    def switch(self, keep=True):
+    def switch(self, keep=True, old=fx.LIVE):
         """A switch to the fork build, journalled as PR 6 will: the counts before it, the old build's runtime kept
         (keptruntime.keep, before the update), the fork build's update (it prunes the old runtime, as upstream's
         does), its verify."""
@@ -65,8 +65,8 @@ class BackBase(unittest.TestCase):
             with r.step('check') as facts:
                 facts['reportCounts'] = {'projects': 3, 'projectsArchived': 0, 'threads': 40, 'threadsArchived': 2}
             if keep:
-                with r.step('keep-runtime', version=fx.LIVE) as facts:
-                    facts.update(keptruntime.keep(r, config.load(), fx.LIVE))
+                with r.step('keep-runtime', version=old) as facts:
+                    facts.update(keptruntime.keep(r, config.load(), old))
             with r.step('update', version=fx.TARGET):
                 self.m.switched()
                 self.m.upstream_update(fx.TARGET)
@@ -102,6 +102,22 @@ class BackBase(unittest.TestCase):
         with mock.patch.object(back.osadapter, 'for_this_os', return_value=self.adapter):
             code = check.main(list(args), out=out, err=err)
         return code, out.getvalue(), err.getvalue()
+
+    def started(self):
+        return [s['step'] for s in self.last_run()['steps'] if s['phase'] == 'started']
+
+    def stuck_w1(self, version=fx.LIVE, reruns=1):
+        """A W1 whose update ran but whose build never comes up: its verify fails, and so does each rerun's (a
+        rerun only verifies: no second stop or restore). Returns what the last one printed on stderr."""
+        self.m.write('never-starts', version)
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.2):
+            for n in range(1 + reruns):
+                code, out, err = self.main('back', '--way', 'w1', '--here', '--lose-work-since', self.at)
+                self.assertEqual(code, 1, out + err)
+                self.assertIn('did not come back', err)
+                self.assertEqual(self.started()[-1], 'verify')
+        self.assertEqual(self.started(), ['follows', 'resume', 'verify'] if reruns else self.started())
+        return err
 
 
 class Ways(BackBase):
@@ -758,6 +774,269 @@ class W2W3(BackBase):
         self.back('w3')
         self.assertEqual(self.live_version(), bx.STABLE)
         self.assertEqual(self.db(), self.migrated)
+
+
+class FollowBase(BackBase):
+    """A switch from OLD to the fork build with a copy to go back to, hooks, and the fork's base nightly staged."""
+    OLD = fx.LIVE
+
+    def setUp(self):
+        super().setUp()
+        if self.OLD != fx.LIVE:
+            self.m.t3_home(self.OLD)
+        self.take_copy()
+        self.switch(old=self.OLD)
+        self.m.hooks('pre-a', 'post-a')
+        self.m.stage_release(bx.BASE)
+
+    def status(self):
+        with mock.patch.object(back, '_http', return_value=(True, 'answers')):
+            code, out, err = self.main('status')
+        return code, out + err
+
+    def assert_followed(self, way, version, steps=('follows', 'plan', 'update', 'verify', 'post-hooks')):
+        """`way` follows the stuck W1: no stop, no second restore, the data W1 restored stays, the journal settles."""
+        db, kept, calls = self.db(), self.kept(), self.calls()
+        self.assertEqual(db, self.copied)
+        self.assertEqual(self.back(way)['version'], version)
+        self.assertEqual(self.live_version(), version)
+        self.assertEqual(self.started(), list(steps))
+        self.assertEqual(self.db(), db)  # W1's restore stays as it is: nothing is restored again
+        self.assertEqual(self.kept(), kept)
+        for call in ('stop', 'disable'):
+            self.assertNotIn(call, self.calls()[len(calls):])
+        self.assertEqual(self.updates()[-1][:4], ['update', version, '--allow-downgrade', '--yes'])
+        self.assertTrue(self.adapter.service()['enabled'])
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+        self.assertIsNone(journal.unfinished(self.m.state))  # settled: any golive run may start again
+        self.assertIn('ok    journal: no golive run was left half-way', self.status()[1])
+        self.assertTrue(self.back(way)['nothing'])  # and the same way again does nothing
+
+
+class FollowStuckW1(FollowBase):
+    """#440: a W1 that got past its update but whose build never verifies may be followed by W2 or W3 (they do not
+    restore), so the owner is not left with only `settle`."""
+
+    def test_w2_follows_a_w1_whose_verify_failed_twice_and_the_journal_settles(self):
+        err = self.stuck_w1()
+        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', err)  # the failure names the way out
+        self.assertFalse(self.adapter.service()['active'])
+        self.assertEqual(self.m.hook_log(), ['pre-a'])  # W1 stopped T3: the jobs stay paused
+        with self.assertRaises(journal.Unfinished):
+            coldcopy.run_copy(config.load(), self.adapter, owner_says_go=True, say=self.said.append)
+        code, out = self.status()
+        self.assertEqual(code, 1)
+        self.assertIn('its last verify did not pass', out)
+        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', out)
+        self.assert_followed('w2', bx.BASE)
+        self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])  # no second pre hook; the post hooks at the end
+        self.assertEqual(len([c for c in self.updates() if c[1] == fx.LIVE]), 1)  # W1's downgrade ran once
+
+    def test_w3_follows_a_stuck_w1(self):
+        self.m.stage_release(bx.STABLE)
+        self.stuck_w1(reruns=0)  # one failed verify is enough
+        self.assert_followed('w3', bx.STABLE)
+
+    def test_the_list_of_ways_names_w2_after_a_stuck_w1_and_what_was_left_half_way(self):
+        self.stuck_w1(reruns=0)
+        before = self.m.snapshot()
+        code, out, err = self.main('back')
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, f'W2 possible: .*t3 {bx.BASE}.*follows the W1 stuck on its verify')
+        self.assertIn('Left half-way: the last run (back', out)
+        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', out)
+        self.assertEqual(self.m.snapshot(), before)
+
+    def assert_w2_refused(self, *words):
+        snap, calls, updates, runs = self.m.snapshot(), self.calls(), self.updates(), journal.read(self.m.state)[0]
+        for way in ('w2', 'w3'):
+            with self.assertRaises(journal.Refused) as cm:
+                self.back(way)
+            for w in ('the last back (w1) stopped half-way: run `t3-golive back --way w1` again', *words):
+                self.assertIn(w, str(cm.exception))
+        self.assertEqual((self.m.snapshot(), self.calls(), self.updates()), (snap, calls, updates))
+        self.assertTrue(journal.needs_settling(self.last_run()))  # a refused follow-up does not hide the W1
+        return str(cm.exception)
+
+    def test_a_w1_stopped_before_its_update_still_refuses_w2_and_w3(self):
+        self.m.stage_release(bx.STABLE)
+        self.m.write('update.code', '3')  # W1 stopped T3 and restored; its downgrade failed
+        with self.assertRaisesRegex(RuntimeError, 'exited 3'):
+            self.back('w1', lose_work_since=self.at)
+        os.unlink(self.m.path('update.code'))
+        said = self.assert_w2_refused()
+        self.assertNotIn('may follow', said)  # the home may be half-restored: only W1 finishes it
+        self.assertNotIn('may follow', self.status()[1])
+        self.back('w1', lose_work_since=self.at)  # and the same W1 again still finishes it
+        self.assertEqual((self.db(), self.live_version()), (self.copied, fx.LIVE))
+
+    def test_a_stuck_w1_that_was_then_begun_over_and_stopped_before_its_update_refuses_w2_again(self):
+        self.stuck_w1(reruns=0)
+        self.m.write('update.code', '3')  # the service state names another build by now: the rerun is a whole W1
+        with mock.patch.object(back, '_names', return_value=False), self.assertRaisesRegex(RuntimeError, 'exited 3'):
+            self.back('w1', lose_work_since=self.at)
+        os.unlink(self.m.path('update.code'))
+        self.assertNotIn('may follow', self.assert_w2_refused())  # stopped again, before its update
+        self.assertNotIn('may follow', self.status()[1])
+
+    def test_only_a_w1_counts_as_stuck_never_a_w2_behind_it(self):
+        # A journal no kit of today writes (a W2 to the stuck W1's own build is refused): the W2 behind the stuck
+        # W1 is what was left half-way, so W1 is refused and nothing is restored a second time.
+        self.stuck_w1(reruns=0)
+        with self.assertRaisesRegex(RuntimeError, 'stopped'):
+            with journal.run(self.m.state, 'back', may_follow=back.FOLLOWS) as r:
+                with r.step('plan', way='w2', version=fx.LIVE, t3=None, copy=None):
+                    pass
+                raise RuntimeError('stopped')
+        self.assertIsNone(back._stuck_w1(journal.read(self.m.state)[0]))
+        db, kept, calls = self.db(), self.kept(), self.calls()
+        with self.assertRaisesRegex(journal.Refused, r'the last back \(w2\) stopped half-way'):
+            self.back('w1', lose_work_since=self.at)
+        self.assertEqual((self.db(), self.kept(), self.calls()), (db, kept, calls))
+
+    def test_a_w1_killed_mid_restore_still_refuses_w2(self):
+        real = coldcopy.restore
+
+        def killed(*a, **kw):
+            raise SystemExit('killed')
+        with mock.patch.object(coldcopy, 'restore', killed), self.assertRaises(SystemExit):
+            self.back('w1', lose_work_since=self.at)
+        self.assertNotIn('may follow', self.assert_w2_refused())
+        self.assertEqual(real, coldcopy.restore)
+
+    def test_a_w1_past_its_update_with_no_failed_verify_refuses_w2_and_says_when_it_may_follow(self):
+        self.m.write('hooks.log.post-a.code', '1')  # W1 verified; only a post hook failed: T3 runs the old build
+        with self.assertRaisesRegex(RuntimeError, 'a post hook failed'):
+            self.back('w1', lose_work_since=self.at)
+        self.assertNotIn('may follow', self.status()[1])  # nothing is stuck: status names only the W1 rerun
+        self.assert_w2_refused('if its verify then fails', '`t3-golive back --way w2` or `--way w3` may follow it')
+        self.assertEqual(self.live_version(), fx.LIVE)
+        self.assertTrue(self.adapter.service()['active'])
+
+    def test_a_verified_w1_whose_build_later_stops_coming_up_may_be_followed(self):
+        self.m.write('hooks.log.post-a.code', '1')
+        with self.assertRaisesRegex(RuntimeError, 'a post hook failed'):
+            self.back('w1', lose_work_since=self.at)
+        os.unlink(self.m.path('hooks.log.post-a.code'))
+        self.adapter.stop()  # the old build went down after its verify and does not come up again
+        self.m.write('never-starts', fx.LIVE)
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.2), self.assertRaisesRegex(RuntimeError, 'did not come'):
+            self.back('w1', lose_work_since=self.at)
+        self.assertEqual(self.started(), ['follows', 'resume', 'verify'])
+        self.assertIn('its last verify did not pass', self.status()[1])
+        self.assert_followed('w2', bx.BASE)
+
+    def test_a_w2_stopped_half_way_after_following_is_finished_by_its_rerun_and_w1_is_not_run_again(self):
+        self.m.stage_release(bx.BASE)
+        self.stuck_w1(reruns=0)
+        self.m.write('update.code', '3')
+        code, out, err = self.main('back', '--way', 'w2', '--here')
+        self.assertEqual(code, 1)
+        self.assertIn('exited 3', err)
+        self.assertIn('no post hook ran: background jobs stay paused', err)  # that W1 stopped T3: none until ok
+        self.assertEqual(self.m.hook_log(), ['pre-a'])
+        os.unlink(self.m.path('update.code'))
+        self.assertIn('run `t3-golive back --way w2` again', self.status()[1])
+        db, kept, calls, updates = self.db(), self.kept(), self.calls(), self.updates()
+        with self.assertRaisesRegex(journal.Refused, r'the last back \(w2\) stopped half-way'):
+            self.back('w1', lose_work_since=self.at)  # W1 never twice: no second restore behind a follower
+        with self.assertRaisesRegex(journal.Refused, r'the last back \(w2\) stopped half-way'):
+            self.back('w3')
+        self.assertEqual((self.db(), self.kept(), self.calls(), self.updates()), (db, kept, calls, updates))
+        self.assert_followed('w2', bx.BASE, steps=('follows', 'plan', 'update', 'verify', 'post-hooks'))
+        self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])
+
+    def test_a_w2_whose_own_verify_fails_after_following_runs_no_post_hook_and_its_rerun_finishes(self):
+        self.stuck_w1(reruns=0)
+        self.m.write('never-starts', f'{fx.LIVE} {bx.BASE}')
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.2), self.assertRaisesRegex(RuntimeError, 'did not come'):
+            self.back('w2')
+        self.assertEqual(self.m.hook_log(), ['pre-a'])
+        self.assertEqual(self.started(), ['follows', 'plan', 'update', 'verify'])
+        os.unlink(self.m.path('never-starts'))
+        self.assert_followed('w2', bx.BASE)
+        self.assertEqual(self.m.hook_log(), ['pre-a', 'post-a'])
+
+    def test_a_follower_refused_before_its_plan_leaves_the_stuck_w1_to_follow(self):
+        shutil.rmtree(self.m.path(f'stage/{bx.BASE}'))
+        self.stuck_w1(reruns=0)
+        with self.assertRaisesRegex(journal.Refused, f'w2 is not possible now: t3 {bx.BASE} is not available'):
+            self.back('w2')
+        self.assertEqual(self.started(), ['follows'])
+        self.assertTrue(journal.needs_settling(self.last_run()))
+        self.m.stage_release(bx.BASE)
+        self.assert_followed('w2', bx.BASE)
+
+    def test_a_journal_from_before_the_resume_step_is_followed_too(self):
+        # The kit before #397's last round redid a whole W1 on every rerun (no `resume` step): two whole W1s, each
+        # past its update with a failed verify. W2 follows the newest; nothing is restored a third time.
+        self.m.write('never-starts', fx.LIVE)
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.2), mock.patch.object(back, '_names', return_value=False):
+            for n in range(2):
+                with self.assertRaisesRegex(RuntimeError, 'did not come back'):
+                    self.back('w1', lose_work_since=self.at)
+        steps = [s['step'] for r in journal.read(self.m.state)[0] for s in r['steps']]
+        self.assertEqual((steps.count('restore'), steps.count('resume')), (4, 0))  # started and done, twice
+        self.assert_followed('w2', bx.BASE)
+
+    def test_no_switch_in_the_journal_naming_the_fork_build_refuses_the_follower_and_says_why(self):
+        path = os.path.join(self.m.state, 'journal.jsonl')
+        with journal.run(self.m.state, 'rehearse', scratch=True) as r:  # a rehearsal of a build is not a switch
+            with r.step('result', version=fx.TARGET):
+                pass
+        self.stuck_w1(reruns=0)
+        runs = journal.read(self.m.state)[0]
+        with open(path, 'rb') as f:
+            rows = [json.loads(line) for line in f]
+        keep = {r['id'] for r in runs if r['command'] != 'switch'}  # as if the fork build was installed by hand
+        rewrite(path, [row for row in rows if row['run'] in keep])
+        with self.assertRaisesRegex(journal.Refused, 'w2 is not possible now: .*no switch in the journal names the '
+                                                     'fork build'):
+            self.back('w2')
+        self.assertEqual(len(self.updates()), 1)
+
+
+class FollowStuckW1ToTheForksOwnBase(FollowBase):
+    """The build before the switch was the very nightly the fork is cut from: W2 would run the stuck build again."""
+    OLD = bx.BASE
+
+    def test_w2_to_the_very_build_the_w1_could_not_verify_is_refused_and_w3_still_follows(self):
+        self.m.stage_release(bx.STABLE)
+        self.stuck_w1(version=bx.BASE, reruns=0)
+        updates = self.updates()
+        with self.assertRaisesRegex(journal.Refused, f'w2 is not possible now: t3 {bx.BASE} is the build the stuck '
+                                                     'W1 could not verify'):
+            self.back('w2')
+        self.assertEqual(self.updates(), updates)
+        self.assert_followed('w3', bx.STABLE)
+
+
+class W1Scan(unittest.TestCase):
+    """back._w1_scan on journal steps written out by hand (states no run of today's kit leaves)."""
+
+    def test_a_stop_after_a_failed_verify_starts_over_nothing_is_stuck_any_more(self):
+        def step(name, phase='started', **data):
+            return {'step': name, 'phase': phase, 'data': data}
+        steps = [step('plan', way='w1', version='1'), step('stop-service'), step('update', version='1'),
+                 step('update', 'done'), step('verify')]
+        self.assertEqual(back._w1_scan([{'steps': steps}], '1'), ('updated', True))
+        self.assertEqual(back._w1_scan([{'steps': steps + [step('stop-service')]}], '1'), ('stopped', False))
+        self.assertEqual(back._w1_scan([{'steps': steps + [step('verify', 'done', version='1')]}], '1'),
+                         ('verified', False))
+        self.assertEqual(back._w1_scan([{'steps': steps + [step('verify', 'done', version='2')]}], '1'),
+                         ('updated', True))  # another build's verify does not verify this W1
+        self.assertEqual(back._w1_scan([{'steps': steps[:2] + [step('verify')]}], '1'), ('stopped', False))
+
+
+def rewrite(path, rows):
+    """Write journal rows again with their hash chain (journal.py's format)."""
+    out, prev = [], ''
+    for row in rows:
+        raw = json.dumps({**row, 'prev': prev}, sort_keys=True).encode()
+        out.append(raw + b'\n')
+        prev = hashlib.sha256(raw).hexdigest()
+    with open(path, 'wb') as f:
+        f.write(b''.join(out))
 
 
 class Status(BackBase):

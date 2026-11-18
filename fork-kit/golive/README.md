@@ -489,6 +489,18 @@ it runs detached (a transient unit; stopping or restarting T3 kills a T3 termina
   skips that) and runs the post hooks, so work T3 served in between is never restored over. A post hook that fails
   after the verify leaves T3 running and enabled: the rerun runs only the post hooks. If the service state names
   another build by then, the rerun is a whole W1 again.
+- **A W1 stuck on its verify may be followed by W2 or W3** (fork #440). When a W1 (by hand, or the switch's
+  automatic one) got past its update and its newest verify did not pass (the old build does not come up on the
+  restored home, in that run, a rerun or the switch's guard), every rerun of W1 only verifies again. Then
+  `t3-golive back --way w2` or `--way w3` may follow it; the failed W1, `status` and `back` without `--way` say
+  so. Neither restores, so nothing is restored a second time and no work is restored over: it runs its update on
+  the data as that W1 left it (the restored copy), to the base of the newest fork build a `switch` in the journal
+  names (the service state names the old build by then), and when it ends ok the journal is settled. It runs no
+  pre hook again (that W1 ran them) and, like that W1, no post hook after a failure: the post hooks run when it
+  ends ok. Until then only that same way follows: W1 and the other way are refused, so W1 is not run again behind
+  it. Refused, with nothing changed: a W1 that stopped before its update ended ok (the home may be half-restored:
+  only W1 finishes that), a W1 past its update with no failed verify yet (run W1 again first), a W2 to the very
+  build that W1 could not verify (take W3), and a journal in which no switch names a fork build.
 - **W2, the same-base upstream nightly** (loses nothing): the fork adds no migrations, so the upstream nightly the
   fork build is cut from runs the migrated database as it is: between the pre and the post hooks,
   `<that t3> update <base> --allow-downgrade --yes`, then the same verify. **Read from the code, untried on a live
@@ -501,8 +513,9 @@ it runs detached (a transient unit; stopping or restarting T3 kills a T3 termina
 the copy run: a failed pre hook runs the post hooks and refuses before T3 is touched; the post hooks run after the
 verify. After a failure they run for W2 and W3 (T3 was never stopped) and for a W1 that never stopped T3; once a W1
 stopped T3, they do not run until a back ends ok (background jobs stay paused while T3 is down on a half-restored
-home; the error and `status` say so). A killed back runs no post hook (back has no guard): background jobs stay
-paused until a back runs again (each hook must be safe twice).
+home; the error and `status` say so), and that holds for a W2 or W3 that follows that W1 too. A killed back runs
+no post hook (back has no guard): background jobs stay paused until a back runs again (each hook must be safe
+twice).
 
 ### The kept runtime (`lib/golive/keptruntime.py`)
 

@@ -402,7 +402,11 @@ def _put_back(run, cfg, adapter, steps, say, lose_work_since=None):
                                f'again from here: {W1_HOLDS}')
         say(f'the way back W1 got past its {"verify" if got == "verified" else "update"}: verifying t3 '
             f'{rec["version"]} again (no second stop or restore)')
-        again = back_mod._verify(run, cfg, adapter, rec['version'], 0, say)
+        try:
+            again = back_mod._verify(run, cfg, adapter, rec['version'], 0, say)
+        except Exception as e:
+            e.add_note(f't3 {rec["version"]} is still not verified; if it does not come up, {back_mod.MAY_FOLLOW}')
+            raise
         with run.step('rolled-back', version=again['version'], copy=rec['copy']) as facts:
             facts.update(version=again['version'], pid=again['pid'], result=FINAL['rolled-back'])
         return f'rolled back to t3 {again["version"]} from {rec["copy"]} (its W1 had got past its {got})'

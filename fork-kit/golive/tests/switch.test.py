@@ -241,6 +241,38 @@ class SwitchBase(unittest.TestCase):
         self.assertIn('nothing to do', ' '.join(self.guard(run['id'])))
         return run
 
+    def assert_w2_follows_the_stuck_w1(self, run):
+        """#440: the switch's automatic W1 got past its update and is stuck on its verify; `back --way w2` follows
+        it with no stop and no second restore, runs the post hooks at the end, and the journal settles."""
+        self.assertTrue(switch.w1_holds(run['steps']))
+        self.assertFalse(self.adapter.service()['active'])
+        self.assertNotIn('post', self.calls())
+        code, lines = back.status(config.load(), self.adapter)
+        self.assertEqual(code, 1)
+        self.assertIn('its last verify did not pass', '\n'.join(lines))
+        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', '\n'.join(lines))
+        with self.assertRaisesRegex(journal.Refused, f'w2 is not possible now: t3 {bx.BASE} is not available'):
+            back.run_back(config.load(), self.adapter, 'w2', say=self.said.append)  # the base is not staged yet
+        self.m.stage_release(bx.BASE)
+        n, db = len(self.calls()), sha(self.m.path('home/userdata/statev2.sqlite'))
+        self.assertEqual(db, self.db_before)  # the automatic W1 restored the copy
+        got = back.run_back(config.load(), self.adapter, 'w2', say=self.said.append)
+        self.assertEqual(got['version'], bx.BASE)
+        self.assertEqual(self.server()['version'], bx.BASE)
+        self.assertTrue(self.adapter.service()['enabled'])
+        self.assertEqual(sha(self.m.path('home/userdata/statev2.sqlite')), db)  # nothing restored again
+        self.assertEqual([c[1] for c in self.downgrades()], [fx.LIVE, bx.BASE])  # W1's downgrade ran once
+        after = self.calls()[n:]
+        self.assertEqual(after[-1], 'post')  # the jobs the switch paused go on only now
+        for call in ('stop', 'disable', 'pre'):
+            self.assertNotIn(call, after)
+        self.assertEqual(self.names('started'), ['follows', 'plan', 'update', 'verify', 'post-hooks'])
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+        self.assertIsNone(journal.unfinished(self.m.state))
+        calls = len(self.calls())
+        self.assertIn('nothing to do', ' '.join(self.guard(run['id'])))  # the guard leaves a followed run alone
+        self.assertEqual(len(self.calls()), calls)
+
 
 class Switch(SwitchBase):
     def test_switch_keeps_copies_installs_the_rehearsed_build_updates_verifies_and_runs_the_post_hooks(self):
@@ -755,6 +787,23 @@ class WayBack(SwitchBase):
         self.assertEqual(self.calls()[-1], 'post')
         self.assertEqual(self.last_run()['end']['result'], 'ok')
         self.assertEqual(self.started_data('plan')['copy'], copy)
+
+    def test_w2_follows_a_switch_whose_automatic_w1_got_past_its_update_and_is_stuck_on_its_verify(self):
+        self.rehearsed()
+        self.mode = 'never'
+        self.m.write('never-starts', fx.LIVE)  # the old build does not come up on the restored home
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.3), self.assertRaises(RuntimeError) as cm:
+            self.switch()
+        text = ' '.join([str(cm.exception), *getattr(cm.exception, '__notes__', ())])
+        self.assertIn('putting T3 back failed', text)
+        self.assertIn('did not come back', text)
+        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', text)
+        run = self.last_run()
+        self.assertEqual(run['end']['result'], 'failed')
+        self.assertEqual(self.names('started', run)[-2:], ['update', 'verify'])  # W1's own, after its restore
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.3):
+            self.assertIn('nothing to do', ' '.join(self.guard(run['id'], wait=True)))
+        self.assert_w2_follows_the_stuck_w1(run)
 
 
 class Guard(SwitchBase):
@@ -1314,6 +1363,23 @@ class Round2(SwitchBase):
         self.assertNotIn('stays stopped', did)
         self.assertEqual(len(self.downgrades()), 1)
         self.assert_rolled_back()
+
+    def test_killed_after_w1s_update_the_guards_verify_fails_and_w2_follows_it(self):
+        self.rehearsed()
+        self.mode = 'never'
+        self.m.write('never-starts', fx.LIVE)
+        run = self.kill_after('update', 'done', nth=2)  # the forward update, then W1's downgrade
+        self.assertIn('restore', self.names('done', run))
+        with mock.patch.object(coldcopy, 'START_WAIT', 0.3):
+            did = ' '.join(self.guard(run['id']))
+        self.assertIn('putting T3 back failed', did)
+        self.assertIn('did not come back', did)
+        self.assertIn('`t3-golive back --way w2` or `--way w3` may follow it', did)
+        self.assertIn('no post hook ran', did)
+        self.assertEqual(len(self.downgrades()), 1)
+        run = self.last_run()
+        self.assertEqual(run['end']['result'], 'failed')
+        self.assert_w2_follows_the_stuck_w1(run)
 
     def test_the_guard_step_journals_the_boot(self):
         self.rehearsed()
