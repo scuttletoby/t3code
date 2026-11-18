@@ -7,11 +7,14 @@ cancelled run would merge unseen. This script makes the required fork-ci-result 
 pull_request_target run of the configured workflow file that belongs to THIS pull request must have a job (= check run)
 of the configured name (`check`) whose latest attempt concluded success. Runs of other events do not count: they run
 the pull request's own copy of the file. A run belongs to this pull request when its head repository is this
-repository and its pull_requests list holds PR_NUMBER (#433): anyone can open a pull request from their own fork at
-the same public commit (its run skips the job), and a second pull request at the same commit may target a base branch
-whose fork-checks.yml is a no-op. GitHub leaves pull_requests empty on runs of a pull request from another
-repository, so such a run is never counted (fail closed). Two pull requests from the same head branch may both be
-listed on each other's runs; both come from someone who can push to this repository. It waits while that job is queued or running; failed,
+repository and its pull_requests list holds PR_NUMBER (#433) with that entry's head branch and head repository the
+run's own (#443): anyone can open a pull request from their own fork at the same public commit (its run skips the
+job), and a second pull request at the same commit may target a base branch whose fork-checks.yml is a no-op. GitHub
+lists on a run the open pull requests whose head SHA or head branch matches it, so a second pull request from
+another branch at the same commit may be listed on this one's runs; its entry names the other branch, so it is not
+counted. GitHub leaves pull_requests empty on runs of a pull request from another repository, so such a run is never
+counted (fail closed). Two pull requests from the same head branch may both be listed on each other's runs; both
+come from someone who can push to this repository. It waits while that job is queued or running; failed,
 cancelled or skipped fails at once, and so does a finished run without the job (a blocked event leaves one). The
 Actions API needs only actions: read, which every caller of fork-tests.yml grants.
 
@@ -140,11 +143,24 @@ def config_problems(cfg):
 
 
 def of_this_pull_request(run, repo, number):
-    """A run from this repository whose pull_requests list holds this pull request. An empty or missing list (what
-    GitHub gives a pull request from another repository) is not this pull request's run: never counted."""
-    head, prs = run.get('head_repository'), run.get('pull_requests')
-    return (isinstance(head, dict) and head.get('full_name') == repo and isinstance(prs, list)
-            and any(isinstance(p, dict) and p.get('number') == number for p in prs))
+    """A run from this repository whose pull_requests list holds this pull request from the run's own head branch
+    and head repository. GitHub lists the open pull requests whose head SHA or head branch matches the run, so a
+    second pull request at the same commit can be listed on this one's runs (#443): its entry is counted only if its
+    head.ref is the run's head_branch and its head.repo.id is the run's head repository's id (each entry's
+    head.repo has an id, a short name and an API url, no full_name). An empty or missing list (what GitHub gives a
+    pull request from another repository), or a missing field on either side, is never counted."""
+    head, prs, branch = run.get('head_repository'), run.get('pull_requests'), run.get('head_branch')
+    if not (isinstance(head, dict) and head.get('full_name') == repo and isinstance(prs, list)):
+        return False
+    repo_id = head.get('id')
+    if not (isinstance(branch, str) and branch and type(repo_id) is int):   # not bool, not None
+        return False
+
+    def from_this_run(p):
+        h = p.get('head') if isinstance(p, dict) else None
+        r = h.get('repo') if isinstance(h, dict) else None
+        return isinstance(r, dict) and h.get('ref') == branch and r.get('id') == repo_id
+    return any(isinstance(p, dict) and p.get('number') == number and from_this_run(p) for p in prs)
 
 
 def look(api, sha, name, workflow, repo, number):

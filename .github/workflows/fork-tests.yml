@@ -251,7 +251,10 @@ jobs:
   # config on the pull request's base commit (#430), and fork_ci_result needs it. Other events: a called run (release) logs a skip; a direct run passes
   # only on the default branch. Checks out without a token (the shared plain-git step: actions/checkout
   # with persist-credentials: false fails on upstream's gitlinks); the script fetches the base commit.
-  # fork-contracts.test.py pins this job (if, env, steps, no continue-on-error, cap below the timeout).
+  # fork-contracts.test.py pins this job (if, env, steps, no continue-on-error) and checks its worst case
+  # fits the job timeout: the checkout step's own timeout + the wait cap (or the script's git calls, if
+  # longer) + one last poll (today 3 + 10 + 1 = 14 min of 15). The checkout's timeout makes a slow fetch fail
+  # as a timed-out Checkout step, not as a job cancelled before the script's message.
   # The checkout and the base fetch use no token, so this job works only in a public repository.
   fork_checks_ran:
     name: Fork checks ran
@@ -265,6 +268,7 @@ jobs:
     steps:
       - name: Checkout
         shell: bash
+        timeout-minutes: 3
         env:
           REF: ${{ github.sha }}
           HISTORY: tip
