@@ -237,7 +237,7 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `another git folder inside`    | a nested clone or submodule                                                                                                                 |
 | `in use`, `KEEP file`, ...     | every refusal of the list above                                                                                                             |
 | `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                                                     |
-| `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0); also in a temp folder |
+| `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0); also in a temp folder               |
 
 A worktree is removed with `git worktree remove`, never with `--force`: git itself refuses when a file changed
 after the last check. The local branch and its reflog stay in the clone, so a commit that was amended or reset
@@ -362,12 +362,12 @@ removed there. `outDir` may not be in a must-keep path, in or above a folder a r
 the home folder. The command prints one summary line (the journal keeps it), which ends with its exit code in
 words:
 
-| exit | meaning                                                                                                     |
-| ---- | ----------------------------------------------------------------------------------------------------------- |
-| 0    | done                                                                                                        |
+| exit | meaning                                                                                                                                      |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | done                                                                                                                                         |
 | 1    | something failed: a step could not read something, a file could not be written or trimmed, a source of the compare failed, the report failed |
-| 2    | refused: run mode with an old timer on or unknown, or the plan refused                                      |
-| 3    | compare mode: every step worked, and the compare found "new only" paths (each a bug until explained)        |
+| 2    | refused: run mode with an old timer on or unknown, or the plan refused                                                                       |
+| 3    | compare mode: every step worked, and the compare found "new only" paths (each a bug until explained)                                         |
 
 A 1 always wins over a 3: exit 3 never hides a real failure. An orphaned worktree (`orphaned worktree` above) is
 kept and is no failure.
