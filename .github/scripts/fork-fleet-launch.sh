@@ -24,10 +24,11 @@
 #                script answers free (free/v1, fork-kit/common/FREE.md: run by FREE_CHECK, its reader).
 #   stop NAME    stops that unit (a job on it fails: its runner is gone).
 #   prune        removes the copies and environment files whose unit is gone.
-#   refresh-net  every dispatcher pass: looks this host's own public address up again and, when what is blocked would
-#                change or the table is gone, re-applies the table (it covers running jobs too) and adds the new
-#                addresses to each running unit's IPAddressDeny. No lookup answers: it fails and changes nothing (the
-#                last block stays), and the dispatcher starts no runner on the pool this pass.
+#   refresh-net  every dispatcher pass: looks this host's own public address up again (once its last answer is
+#                OWN_ADDRESS_SECONDS old, or the table is gone, or a unit still waits for its IPAddressDeny) and, when
+#                what is blocked would change or the table is gone, re-applies the table (it covers running jobs too)
+#                and adds the new addresses to each running unit's IPAddressDeny. No lookup answers: it fails and
+#                changes nothing (the last block stays), and the dispatcher starts no runner on the pool this pass.
 #   check-net URL HOST:PORT...
 #                the proof of the network and the walls (.github/fork-fleet.md, host step 6): runs two probes in a
 #                runner's real sandbox, as a free runner user. Exit 0 only when URL (public) answers, every HOST:PORT
@@ -45,7 +46,7 @@
 # The network: each runner user has a namespace of its own, fork-fleet-USER, so a job has its own loopback and reaches
 # no service on this host's (nor an abstract socket). Its only link, ffh-UID (host side), goes to the public internet:
 # the nft table inet fork_fleet refuses the host itself, RFC 1918, CGNAT (Tailscale), link-local, every IPv6 packet
-# and this host's own public IPv4 addresses (own_address, before every start and every pass), and the unit's
+# and this host's own public IPv4 addresses (own_address, before every start and in refresh-net), and the unit's
 # IPAddressDeny refuses the same again, in the kernel, should the table ever go. Every start (re)makes the namespace
 # and the table under the launch lock and fails closed: no runner starts when either fails. The walls (sandbox): no
 # AF_VSOCK, io_uring or 32-bit system calls, only the pseudo devices, and of this host's files only what job_fs
@@ -58,9 +59,11 @@
 # RESERVE_MB, MAX_SECONDS, MEMINFO, NET_BASE (10.N: the runners' 10.N.0.0/16, one /30 per user from its uid, unused by
 # anything else on the host), RESOLV_CONF (the jobs' resolv.conf: public nameservers, as this host's own resolver is on
 # its loopback), OWN_ADDRESS_URLS (https URLs, comma-separated, that answer with the address they see: every public
-# address they give is blocked, at least one must answer), JOB_PATHS (the system paths every job sees:
-# fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only, comma-separated, say a
-# tool cache: empty by default), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an https
+# address they give is blocked, at least one must answer), OWN_ADDRESS_SECONDS (how long refresh-net keeps using its
+# last answer, at most 3600; 0: it looks up on every pass; start always looks up), JOB_PATHS (the system paths every
+# job sees: fork-fleet-job-paths.txt beside this launcher), ALLOW_PATHS (more paths jobs see read-only, comma-separated, say a
+# tool cache: empty by default), CANARY_DIR (where check-net keeps its two canary files while it runs: /etc, which no
+# job sees whole), IP_FORWARD, SYSTEMD_RUN, SYSTEMCTL, RUNNER_RELEASE (refresh's release record, an https
 # URL), RUNNER_DOWNLOAD (the https base of its tarballs) and RUNNER_MIN (the oldest runner version refresh may install,
 # empty for none), FREE_COMMAND (a free/v1 script's absolute path, empty for none) and FREE_CHECK (its reader,
 # free_contract.py beside this launcher) have defaults below.
@@ -116,10 +119,11 @@ conf_file=/dev/null
 RUNNER_USERS='' TEMPLATE=/opt/fork-fleet/template/runner-template WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
 RESOLV_CONF=/etc/fork-fleet/resolv.conf IP_FORWARD=/proc/sys/net/ipv4/ip_forward SYSTEMD_RUN=systemd-run
-SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com ALLOW_PATHS=''
+SYSTEMCTL=systemctl OWN_ADDRESS_URLS=https://api.ipify.org,https://checkip.amazonaws.com OWN_ADDRESS_SECONDS=120
+ALLOW_PATHS='' CANARY_DIR=/etc
 JOB_PATHS='' RUNNER_RELEASE=https://api.github.com/repos/actions/runner/releases/latest
 RUNNER_DOWNLOAD=https://github.com/actions/runner/releases/download RUNNER_MIN='' FREE_COMMAND='' FREE_CHECK=''
-setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|JOB_PATHS|ALLOW_PATHS|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK)=([^[:space:]]*)$'
+setting='^(RUNNER_USERS|TEMPLATE|WORK_ROOT|RUN_DIR|HOOK|LINGER_DIR|RESERVE_MB|MAX_SECONDS|MEMINFO|NET_BASE|RESOLV_CONF|IP_FORWARD|SYSTEMD_RUN|SYSTEMCTL|OWN_ADDRESS_URLS|OWN_ADDRESS_SECONDS|JOB_PATHS|ALLOW_PATHS|CANARY_DIR|RUNNER_RELEASE|RUNNER_DOWNLOAD|RUNNER_MIN|FREE_COMMAND|FREE_CHECK)=([^[:space:]]*)$'
 while IFS= read -r line || [[ -n $line ]]; do
   [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
   [[ $line =~ $setting ]] || die "$conf: not a setting: ${line%%=*}"
@@ -130,6 +134,8 @@ done <"$conf_file"
 { [[ $NET_BASE =~ ^10\.(0|[1-9][0-9]{0,2})$ ]] && ((BASH_REMATCH[1] <= 255)); } || die "$conf: NET_BASE is 10.N (N up to 255)"
 own_url='https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?'
 [[ $OWN_ADDRESS_URLS =~ ^$own_url(,$own_url)*$ ]] || die "$conf: OWN_ADDRESS_URLS is a comma-separated list of https URLs"
+{ [[ $OWN_ADDRESS_SECONDS =~ ^[0-9]{1,4}$ ]] && ((10#$OWN_ADDRESS_SECONDS <= 3600)); } ||
+  die "$conf: OWN_ADDRESS_SECONDS is a number of seconds, at most 3600"
 PLAIN_PATH='(/[A-Za-z0-9._@+-]+)+'
 [[ $ALLOW_PATHS =~ ^($PLAIN_PATH(,$PLAIN_PATH)*)?$ ]] || die "$conf: ALLOW_PATHS is a comma-separated list of plain paths"
 # An absolute path (a relative one would be read from wherever this runs); on the fake machine, the fake one's.
@@ -137,6 +143,7 @@ PLAIN_PATH='(/[A-Za-z0-9._@+-]+)+'
 if [[ -n $JOB_PATHS ]]; then JOB_PATHS=$ROOT$JOB_PATHS; else
   JOB_PATHS=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fork-fleet-job-paths.txt
 fi
+[[ $CANARY_DIR =~ ^$PLAIN_PATH$ ]] || die "$conf: CANARY_DIR is a plain absolute path"
 [[ $FREE_COMMAND =~ ^($PLAIN_PATH)?$ && $FREE_CHECK =~ ^($PLAIN_PATH)?$ ]] ||
   die "$conf: FREE_COMMAND and FREE_CHECK are plain absolute paths"
 [[ -n $FREE_CHECK ]] || FREE_CHECK=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/free_contract.py
@@ -295,25 +302,45 @@ EOF
 # $4 the floor (the oldest version a later refresh may roll this template back to).
 # The tarball is treated as hostile (a compromised release passes the sha256 check): read once, checked whole, then
 # written by this same reader (no second parser to disagree with). Refused: an absolute name, a "..", a name twice, a
-# name under a symlink or a file, a symlink or hard link that leads outside the folder, a device, FIFO, sparse or other
-# special file, a .fork-fleet-* name of its own, more than MAX_ENTRIES entries or MAX_BYTES of files, a long-name or pax
-# header over MAX_HEADER bytes (refused before it is read into memory), a name or link target over MAX_NAME, symlinks
-# that take more than MAX_STEPS steps to follow (fanned-out links would take hours). Stripped (as tar's
-# --no-same-owner --no-same-permissions would): owner (all root's), setuid, setgid, sticky and group/other write, and
-# every directory is 0755. Files are created with O_EXCL|O_NOFOLLOW and symlinks last, so nothing is ever written
-# through a link; the version and floor files too.
+# name under a symlink or a file, a symlink or hard link that leads outside the folder, a device, FIFO or other special
+# file, a sparse file of any format (GNU or pax: its map is read into memory), a .fork-fleet-* name of its own, more
+# than MAX_ENTRIES entries or MAX_BYTES of files (the type and size refused at each header, before the data is
+# decompressed), a file whose size its data does not have (a pax GNU.sparse.realsize: gzip would decompress again from
+# the start for each file after it), a long-name or pax header over MAX_HEADER bytes or such headers over MAX_NAMES
+# bytes read in all (each refused before it is read into memory), names and link targets over MAX_NAMES bytes in all
+# (as kept in memory), global pax headers of more than MAX_GLOBAL keys (tarfile copies them into every entry after
+# them) or with any key tarfile sets on each entry, more headers in a row than tarfile can follow, a name or link
+# target over MAX_NAME, symlinks that take more than MAX_STEPS steps to follow (fanned-out links would take hours).
+# Stripped (as tar's --no-same-owner --no-same-permissions would): owner (all root's), setuid, setgid, sticky and
+# group/other write, and every directory is 0755. Files are created with O_EXCL|O_NOFOLLOW and symlinks last, so nothing
+# is ever written through a link; the version and floor files too.
 read -r -d '' UNPACK_PY <<'EOF' || true
 # fork-fleet-unpack
 import os, posixpath, sys, tarfile, zlib
 src, dest, version, floor = sys.argv[1:5]
 MAX_ENTRIES, MAX_BYTES = 100000, 4 << 30
 MAX_HEADER, MAX_NAME, MAX_STEPS = 65536, 4096, 1000000
+# MAX_NAMES bounds both the long-name and pax headers read (counted in the 512-byte blocks read, so empty ones cost
+# too) and the names and link targets kept for all MAX_ENTRIES entries. A runner release reads about 1.1 MB of such
+# headers (GNU long names; no pax and no global header) and keeps about 0.9 MB of names.
+MAX_NAMES, MAX_GLOBAL = 64 << 20, 64
+# The global pax keys tarfile sets on every entry after them (a 4300-digit uid is a new int in each).
+PER_ENTRY = {*tarfile.PAX_FIELDS, *(f'GNU.sparse.{k}' for k in ('name', 'size', 'realsize', 'major', 'minor', 'map',
+                                                                'offset', 'numblocks'))}
+headers = names = total = 0
 NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 os.umask(0o022)
 
 
 def no(why):
     sys.exit(f'refused: {why}')
+
+
+def kept(s):
+    """The bytes a name takes in memory: a str is 1, 2 or 4 bytes a character, by its widest one (one emoji makes
+    4096 characters 16 KiB, from 4099 bytes of header)."""
+    w = max(s, default='')
+    return len(s) * (1 if w <= '\xff' else 2 if w <= '\uffff' else 4)
 
 
 def parts(name):
@@ -326,16 +353,34 @@ def parts(name):
 
 
 class Capped(tarfile.TarInfo):
-    """Refuses a GNU long name or pax header over MAX_HEADER bytes before tarfile reads it whole into memory, and a
-    GNU sparse file (its chained headers are read into memory too; a runner release has none)."""
+    """Refuses a GNU long name or pax header over MAX_HEADER bytes, or past MAX_NAMES bytes of them read in all,
+    before tarfile reads it whole into memory; global pax keys past MAX_GLOBAL, or one tarfile sets on each entry,
+    before tarfile copies them into the next entry; and a sparse file of any format before tarfile reads its map (a
+    runner release has none)."""
 
     def _proc_member(self, tar):
+        global headers
+        if len(tar.pax_headers) > MAX_GLOBAL:
+            no(f'more than {MAX_GLOBAL} global pax keys')
+        if bad := sorted(tar.pax_headers.keys() & PER_ENTRY):   # a new copy in each entry, or a size it does not have
+            no(f'a global pax header with {bad[0]}')
         if self.type == tarfile.GNUTYPE_SPARSE:
             no(f'{self.name!r} is a sparse file')
         if self.type in (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.XGLTYPE,
-                         tarfile.SOLARIS_XHDTYPE) and self.size > MAX_HEADER:
-            no(f'a header of {self.size} bytes (more than {MAX_HEADER})')
+                         tarfile.SOLARIS_XHDTYPE):
+            if self.size > MAX_HEADER:
+                no(f'a header of {self.size} bytes (more than {MAX_HEADER})')
+            headers += tarfile.BLOCKSIZE + self._block(self.size)
+            if headers > MAX_NAMES:
+                no(f'more than {MAX_NAMES} bytes of long names and pax headers')
         return super()._proc_member(tar)
+
+    # A pax header's sparse map, in any of its three formats, is read (from the header or the entry's data) into
+    # lists with no bound; called once the next header is read, before the map is.
+    def _proc_gnusparse_00(self, *_):
+        no('a pax sparse file')
+
+    _proc_gnusparse_01 = _proc_gnusparse_10 = _proc_gnusparse_00
 
 
 try:
@@ -345,26 +390,36 @@ try:
         # Each name as it is read: many long names would fill memory before a check after the loop.
         if len(m.name) > MAX_NAME or len(m.linkname) > MAX_NAME:
             no(f'a name or link target longer than {MAX_NAME}: {m.name[:100]!r}')
+        names += kept(m.name) + kept(m.linkname)
+        if names > MAX_NAMES:
+            no(f'more than {MAX_NAMES} bytes of names and link targets')
+        # A size its data does not have (a pax GNU.sparse.realsize sets it, and tarfile skips the data by the old
+        # one): each file after it would seek back, and gzip seeks back by decompressing from the start again.
+        if m.isreg() and tar.offset != m.offset_data + m._block(m.size):
+            no(f'{m.name[:100]!r} has a size its data does not have')
+        if 'GNU.sparse.realsize' in m.pax_headers:
+            no(f'{m.name[:100]!r} has a pax GNU.sparse.realsize')
+        # The type and the size at the header, before tarfile decompresses past the data (a gzip bomb).
+        if not (m.isdir() or m.issym() or m.islnk() or m.isreg()):
+            what = 'device' if m.ischr() or m.isblk() else 'FIFO' if m.isfifo() else 'special'
+            no(f'{m.name!r} is a {what} file')
+        if m.isreg():
+            total += m.size
+            if total > MAX_BYTES:
+                no(f'more than {MAX_BYTES} bytes of files')
+        m.pax_headers = {}   # its copy of the global pax keys (and its own): not used after this
         members.append(m)
         if len(members) > MAX_ENTRIES:
             no(f'more than {MAX_ENTRIES} entries')
-except (tarfile.TarError, OSError, EOFError, zlib.error) as e:
+except RecursionError:   # tarfile recurses on each header in a row (pax, long name) before an entry
+    no('more headers in a row than tarfile can follow')
+except (tarfile.TarError, OSError, EOFError, zlib.error, ValueError) as e:   # ValueError: int() of 4301 digits
     sys.exit(f'not a gzip tarball: {e}')
 
-kinds, links, order, plan, total = {}, {}, {}, [], 0
+kinds, links, order, plan = {}, {}, {}, []
 for i, m in enumerate(members):
     p = parts(m.name)
-    if m.isdir():
-        kind = 'dir'
-    elif m.issym():
-        kind = 'symlink'
-    elif m.islnk():
-        kind = 'hardlink'
-    elif m.isreg():
-        kind = 'file'
-    else:
-        what = 'device' if m.ischr() or m.isblk() else 'FIFO' if m.isfifo() else 'special'
-        no(f'{m.name!r} is a {what} file')
+    kind = 'dir' if m.isdir() else 'symlink' if m.issym() else 'hardlink' if m.islnk() else 'file'   # no other
     if not p:
         if kind != 'dir':
             no(f'{m.name!r}, the top, is not a directory')
@@ -375,11 +430,7 @@ for i, m in enumerate(members):
     if path in kinds and not (kind == 'dir' == kinds[path]):
         no(f'{path!r} twice')
     kinds[path], order[path] = kind, i
-    if kind == 'file':
-        total += m.size
-        if total > MAX_BYTES:
-            no(f'more than {MAX_BYTES} bytes of files')
-    elif kind == 'symlink':
+    if kind == 'symlink':
         links[path] = m.linkname
     plan.append((path, kind, m))
 
@@ -838,14 +889,21 @@ docker_rules() {
 # refresh-net (each dispatcher pass): the address may change while a job runs (a new lease, a VPN that went down).
 # The table covers every runner's link, so re-applying it covers running jobs; their units get the new addresses too.
 # The same addresses in another order change nothing. A unit whose set-property failed is tried again next pass.
+# A pass within OWN_ADDRESS_SECONDS of the last answer (RUN_DIR/own-lookup: when it was asked, written once a pass
+# is done; not when the pass ended, which may wait up to 100 s for the launch lock) changes nothing and asks no lookup
+# service (each may throttle a host that asks every 20 s), unless the table is gone or a unit waits for its retry.
 refresh_net() {
-  local own name blocked old='' retry=$RUN_DIR/deny-retry
+  local own name blocked old='' retry=$RUN_DIR/deny-retry asked=${EPOCHSECONDS-}
+  if lookup_fresh && [[ ! -e $retry ]] && nft list table inet fork_fleet >/dev/null 2>&1; then return 0; fi
   own=$(own_address)
   setup
   [[ ! -f $RUN_DIR/own-address ]] || old=$(<"$RUN_DIR/own-address")
   merge_own "$own"
   if [[ $(addr_set "$blocked") == "$(addr_set "$old")" && ! -e $retry ]] &&
-    nft list table inet fork_fleet >/dev/null 2>&1; then return 0; fi
+    nft list table inet fork_fleet >/dev/null 2>&1; then
+    lookup_done "$asked"
+    return 0
+  fi
   local failed=''
   : >"$retry"
   table_up
@@ -855,6 +913,22 @@ refresh_net() {
   if [[ -n $failed ]]; then
     warn "refresh-net: IPAddressDeny not changed for$failed (the table blocks $blocked); tried again next pass"
   else rm -f -- "$retry"; fi
+  lookup_done "$asked"
+}
+
+# Whether refresh-net's last answer is younger than OWN_ADDRESS_SECONDS: RUN_DIR/own-lookup (root's, as RUN_DIR is)
+# holds when it came. None, a garbled one or one from the future (the clock set back): not fresh.
+lookup_fresh() {
+  local last now=${EPOCHSECONDS-} f=$RUN_DIR/own-lookup
+  [[ $now =~ ^[1-9][0-9]*$ && -O $RUN_DIR && -f $f && -O $f && ! -L $f ]] || return 1
+  last=$(<"$f")
+  [[ $last =~ ^[1-9][0-9]{0,11}$ ]] && ((last <= now && now - last < 10#$OWN_ADDRESS_SECONDS))
+}
+
+# $1: when the lookup was asked (empty without EPOCHSECONDS: never fresh, so every pass looks up).
+lookup_done() {
+  printf '%s\n' "$1" >"$RUN_DIR/own-lookup.new"
+  mv -f -- "$RUN_DIR/own-lookup.new" "$RUN_DIR/own-lookup"
 }
 
 addr_set() { tr ' ' '\n' <<<"$1" | sort -u | tr '\n' ' '; }
@@ -944,12 +1018,15 @@ real_path() {
   printf '%s\n' "$real"
 }
 
-# A path no job ever sees of this host's: its own of these or none (/proc, /sys, /dev, /run, /tmp, /var/tmp), or one
-# that holds data (no_data). The rule of the list's and ALLOW_PATHS' lines.
+# A path no job ever sees of this host's: its own of these or none (/proc, /sys, /dev, /run, /tmp, /var/tmp), all of
+# /etc, or one that holds data (no_data). The rule of the list's and ALLOW_PATHS' lines.
 never() {
   case $1/ in /proc/* | /sys/* | /dev/* | /run/* | /tmp/* | /var/tmp/*)
     die "$2: a job never sees it from this host (its own, none, or data): not a path to allow" ;;
   esac
+  # All of /etc (issue #243): only the entries a build needs (the list's /etc lines), never the logins, units, cron,
+  # /etc/default and backup tools' folders beside them. An older kit's list still names it: refused, no runner starts.
+  [[ $1 != /etc ]] || die "$2: all of /etc is never in a job's view (an older kit's list?): re-run the installer"
   no_data "$1" "$2"
 }
 
@@ -1023,18 +1100,29 @@ job_view() {
 
 # job_view for a unit: its root ($1, root's), its copy ($2, read-write; already a real path, in WORK_ROOT's), and
 # the jobs' resolv.conf at $3. Sets props_fs and resolv_bind; seen, the mount points check-net's probe allows (its
-# own /proc, /sys, /dev and memory file systems are allowed there); and from, each of them with the device and inode
-# its source has here, which the probe compares with what the unit has there (a link swapped in after job_view shows).
+# own /proc, /sys, /dev and memory file systems are allowed there); from, each of them with the device and inode
+# its source has here, which the probe compares with what the unit has there (a link swapped in after job_view shows);
+# and linked, the links its root has (the list's, and /etc/resolv.conf when $3 is elsewhere: the probe allows them).
 job_fs() {
   local root=$1 rw=$2 resolv=$3 i b real
   local -a ro=() view_ro view_links
   job_view
   rm -rf --one-file-system -- "$root"
   mkdir -m 0755 -- "$root"
+  linked=''
   for ((i = 0; i < ${#view_links[@]}; i += 2)); do
     mkdir -p -m 0755 -- "$root${view_links[i]%/*}"
     ln -s -- "${view_links[i + 1]}" "$root${view_links[i]}"
+    linked+=" ${view_links[i]}"
   done
+  # A host whose /etc/resolv.conf is a link (systemd-resolved's, into /run) has the jobs' file bound at its target:
+  # the job's /etc/resolv.conf is then that same link, as no whole /etc brings it any more (issue #243).
+  if [[ $resolv != /etc/resolv.conf && ! -e $root/etc/resolv.conf && ! -L $root/etc/resolv.conf ]]; then
+    mkdir -p -m 0755 -- "$root/etc"
+    ln -s -- "$resolv" "$root/etc/resolv.conf"
+    linked+=' /etc/resolv.conf'
+  fi
+  linked=${linked# }
   seen='/' from=''
   for b in "${view_ro[@]}"; do
     ro+=("$b:norbind") seen+=" ${b#*:}" from+=" ${b#*:}=$(stat -L -c '%d:%i' -- "${b%%:*}")"
@@ -1094,7 +1182,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv bad own blocked seen from f real
+  local name=$1 dir env_file line key value user resolv bad own blocked seen from linked f real
   local -a props
   local -A got=()
   name_ok "$name"
@@ -1167,9 +1255,11 @@ start() {
   ) || die "start: could not make $env_file, a new file: refused"
   # Type=exec: systemd-run returns once run.sh started, so the environment file has been read and can go.
   # ProtectSystem=strict: the job writes its copy and its own memory file systems, nothing else.
+  # Stop timeouts of its own (at most the walls' STOP_MAX): systemd's defaults never decide how long a job that ignores
+  # SIGTERM at RuntimeMaxSec runs on.
   "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" --working-directory "$dir" \
     -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" "${props[@]}" -p "ReadWritePaths=$dir" \
-    -p "RuntimeMaxSec=$MAX_SECONDS" -- "$dir/run.sh"
+    -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh"
 }
 
 # Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public addresses, which the
@@ -1208,7 +1298,8 @@ exit "$bad"
 EOF
 
 # The walls' probe (python3 -I -c, arguments job or host, the mount points job_fs allows, then each bound one's
-# POINT=DEVICE:INODE: its source as job_fs checked it, seen from outside). job: in the sandbox,
+# POINT=DEVICE:INODE: its source as job_fs checked it, seen from outside, the links its root has, and the canaries'
+# paths). job: in the sandbox,
 # as the runner user; a line per wall, exit 1 when one is open or could not be tried. host: as root, outside, the
 # control: whether this host has what the walls close (where it has not, the refusal inside shows nothing; the walls
 # are still set). Each 32-bit call is made in a child that may not dump core: the filter ends it with SIGSYS; another
@@ -1218,7 +1309,10 @@ EOF
 # mounts (mountinfo's master: or shared: tag: a disk mounted after the job started would show up in it); whether each
 # bound point is the very file or folder job_fs checked (a link swapped in before systemd bound it would show);
 # entries in /mnt or /media; and sockets in the places a desktop keeps them (WSLg's X11 and PulseAudio). Other mount
-# points are read from mountinfo, never looked at: a share that hangs cannot stop the probe.
+# points are read from mountinfo, never looked at: a share that hangs cannot stop the probe. Then /etc (issue #243),
+# checked by looking: every entry of the job's /etc is one the list (a mount point), a link of job_fs's (its fourth
+# argument) or the jobs' resolv.conf put there, and check-net's canaries (its fifth: files outside the list, one
+# others may read, one only the runner's group may) are not there nor readable.
 read -r -d '' WALLS <<'EOF' || true
 import ctypes, errno, mmap, os, re, signal, socket, stat, sys
 libc = ctypes.CDLL(None, use_errno=True)
@@ -1316,6 +1410,37 @@ socks = [p for d in ('/tmp', '/var/tmp', '/run', '/dev/shm') for p in walk(d, st
 whole = budget[0] >= 0
 def few(xs):
     return ', '.join(sorted(xs)[:8]) + (' ...' if len(xs) > 8 else '')
+ETC = '/etc'
+links = set(sys.argv[4].split()) if len(sys.argv) > 4 else set()
+listed = {p[5:] for p in allowed | links if p.startswith('/etc/')}
+def etc_extra():
+    """What /etc holds beyond the entries job_fs put there (names under /etc), or None when it cannot be listed."""
+    extra, todo = [], ['']
+    try:
+        while todo:
+            d = todo.pop()
+            for x in os.listdir(os.path.join(ETC, d)):
+                rel = os.path.join(d, x)
+                p = os.path.join(ETC, rel)
+                if rel in listed:
+                    continue
+                if any(a.startswith(rel + '/') for a in listed) and os.path.isdir(p) and not os.path.islink(p):
+                    todo.append(rel)
+                else:
+                    extra.append(rel)
+    except OSError:
+        return None
+    return extra
+etc = etc_extra()
+canaries = sys.argv[5].split() if len(sys.argv) > 5 else []
+def there(p):
+    try:
+        with open(p, 'rb') as f:
+            f.read(1)
+        return True
+    except OSError:
+        return os.path.lexists(p)
+seen_canaries = [c for c in canaries if there(c)]
 if sys.argv[1] == 'host':
     print('host: AF_VSOCK ' + ('opens here: the wall matters' if vsock == 'open' else
                                f'does not open here either ({vsock}): the refusal inside shows nothing on this host'))
@@ -1327,6 +1452,11 @@ if sys.argv[1] == 'host':
                      ('mounts that receive later mounts', receive), ('entries in /mnt and /media', mnt),
                      ('sockets', socks)):
         print(f'host: {what}: ' + (few(xs) if xs else 'none here either: the refusal inside shows nothing'))
+    print('host: /etc: ' + ('cannot be listed' if etc is None else
+                            f'{len(etc)} entries no list line puts in a job\'s: the wall matters' if etc else
+                            'nothing beyond the list here either: the refusal inside shows nothing'))
+    print(f'host: canaries: {len(seen_canaries)} of {len(canaries)} there' + (': the wall matters' if seen_canaries else
+                                                                              ''))
     sys.exit(0)
 bad = 0
 def line(ok, text):
@@ -1350,13 +1480,44 @@ line(bool(sources) and not swapped, 'mount sources: ' + (
 line(not receive, 'later mounts: ' + (f'the host\'s reach {few(receive)}' if receive else
                                       'no mount inside receives the host\'s'))
 line(not mnt, '/mnt and /media: ' + (f'hold {few(mnt)} inside' if mnt else 'nothing inside'))
+line(etc == [], '/etc: ' + ('cannot list it' if etc is None else
+                            f'holds {few(etc)}, which no list line puts there' if etc else 'only the listed entries'))
+line(bool(canaries) and not seen_canaries, 'canaries: ' + (
+    f'{few(seen_canaries)} there inside' if seen_canaries else f'{len(canaries)} not there inside' if canaries else
+    'none given'))
 line(whole and not socks, 'sockets: ' + (f'{few(socks)} inside' if socks else 'none in /tmp, /var/tmp, /run, /dev/shm'
                                          if whole else 'too many files to look through'))
 sys.exit(bad)
 EOF
 
+# check-net's canaries (issue #243): two files in CANARY_DIR (/etc, root's: no list line names them), one others may
+# read and one only the runner user's group ($1's) may, so a job that saw them would read both. Made fresh each time
+# (a file left by a check-net that was cut off is removed first) and removed when check-net ends (its trap). Root
+# writes them, so their folder is checked as a bound path is: CANARY_DIR is its own real path (no link on the way),
+# each folder above it is closed (closed_folder, through real_path), and CANARY_DIR itself is root's and only root may
+# write it (owned_safe); then no one else can put a link where a canary goes. Still, each is a new file (noclobber:
+# O_EXCL, which a link fails too) made with its mode (umask, no chmod that follows a link), and chown -h.
+make_canaries() {
+  local c=$CANARY_DIR/fork-fleet-canary gid real
+  real=$(real_path "$CANARY_DIR")
+  [[ $real == "$CANARY_DIR" ]] ||
+    die "check-net: CANARY_DIR $CANARY_DIR leads to $real: name the folder itself, with no link on the way"
+  owned_safe "$CANARY_DIR"
+  [[ -d $CANARY_DIR ]] || die "check-net: CANARY_DIR $CANARY_DIR is not a folder"
+  gid=$(id -g -- "$1") || die "check-net: no group of $1"
+  rm -f -- "$c" "$c-group"
+  (
+    set -o noclobber
+    umask 022
+    printf 'fork-fleet canary: no job may see this file\n' >"$c"
+    umask 027
+    printf 'fork-fleet canary: no job may see this file\n' >"$c-group"
+  ) 2>/dev/null || die "check-net: could not make the canaries in $CANARY_DIR as new files: refused"
+  chown -h -- ":$gid" "$c-group"
+}
+
 check_net() {
-  local url=$1 target host port user resolv own blocked seen from rc=0
+  local url=$1 target host port user resolv own blocked seen from linked canaries rc=0
   local -a pairs=() props
   shift
   [[ $url =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] || die "check-net: not a plain http(s) URL: $url"
@@ -1380,14 +1541,19 @@ check_net() {
   merge_own "$own"
   net_up "$user"
   sandbox "$user" "$resolv" "$blocked" "$RUN_DIR/check-net.root" ''
+  canaries="$CANARY_DIR/fork-fleet-canary $CANARY_DIR/fork-fleet-canary-group"
+  # Expanded now, as start's env file: removed however check-net ends (one a kill left is replaced next time).
+  # shellcheck disable=SC2064
+  trap "rm -f -- $(printf '%q' "$CANARY_DIR/fork-fleet-canary") $(printf '%q' "$CANARY_DIR/fork-fleet-canary-group")" EXIT
+  make_canaries "$user"
   # Every probe's words (the names of files any local user may make among them) reach the terminal through shown().
-  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from" 2>&1 | shown_lines
+  /usr/bin/python3 -I -c "$WALLS" host "$seen" "$from" "$linked" "$canaries" 2>&1 | shown_lines
   echo "check-net: as $user, in its namespace fork-fleet-$user"
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-net --uid "$user" "${props[@]}" \
     -p RuntimeMaxSec=120 -- /bin/bash --norc --noprofile -c "$PROBE" check-net "$url" "$blocked" "${pairs[@]}" </dev/null 2>&1 |
     shown_lines || rc=$?
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect --unit fork-fleet-check-walls --uid "$user" "${props[@]}" \
-    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" </dev/null 2>&1 |
+    -p RuntimeMaxSec=60 -- /usr/bin/python3 -I -c "$WALLS" job "$seen" "$from" "$linked" "$canaries" </dev/null 2>&1 |
     shown_lines || rc=$((rc | 2))
   ((rc == 0)) || die "check-net: the runners' network or walls are NOT as they must be (see above): do not use this pool"
   echo "check-net: the runners reach $url and none of the $((${#pairs[@]} / 2)) services named nor this host's own" \

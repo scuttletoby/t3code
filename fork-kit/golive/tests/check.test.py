@@ -6,7 +6,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golive_fixture as fx  # noqa: E402
-from golive import check, config, journal  # noqa: E402
+from golive import check, config, journal, live  # noqa: E402
 
 
 class CheckBase(unittest.TestCase):
@@ -36,11 +36,12 @@ class Ready(CheckBase):
         self.assertEqual(code, 0, out + err)
         self.assertIn('Ready. Plan:', out)
         self.assertIn(f'{fx.LIVE} -> {fx.TARGET}', out)
-        self.assertIn('threads now: 40', out)
+        self.assertIn('the report counts 40 threads', out)
         self.assertNotIn('FAIL', out)
         self.assertEqual(self.m.snapshot(), before, 'check changed the T3 home')
-        # The service manager was only asked, never told; nothing was started detached.
-        self.assertEqual([c[:2] for c in self.m.calls('systemctl-calls.jsonl')], [['--user', 'show']])
+        # The service manager was only asked, never told (before the report, and again after it: fork #180);
+        # nothing was started detached.
+        self.assertEqual([c[:2] for c in self.m.calls('systemctl-calls.jsonl')], [['--user', 'show']] * 2)
         self.assertEqual(self.m.calls('systemd-run-calls.jsonl'), [])
         # The staged build ran the report with the home named, an empty HOME and a bare PATH.
         [call] = self.m.calls('stub-t3-calls.jsonl')
@@ -285,6 +286,71 @@ class Refusals(CheckBase):
                     os.remove(self.m.path(marker))
         self.assertEqual(self.check()[0], 0)
 
+    def test_the_report_never_runs_while_t3_is_not_running_steadily(self):
+        # Fork #180: a report reading the home while T3 stops keeps SQLite from tidying its WAL at the stop (a WAL
+        # with frames and its -shm stay; a copy then takes the WAL without the -shm). check ran the report whatever
+        # the service did; now it runs only beside a T3 that every check before it found running steadily.
+        cases = {
+            'stopping': lambda: self.m.unit(ActiveState='deactivating'),
+            'stopped': lambda: self.m.unit(ActiveState='inactive', MainPID=0),
+            'stop marker': lambda: self.m.write('home/runtime/.service-stopping', ''),
+            'restart marker': lambda: self.m.write('home/runtime/.restart-pending', ''),
+            'update pending': lambda: self.m.write('home/runtime/service-state.json', json.dumps({
+                'protocol': 3, 'activeVersion': fx.LIVE, 'update': {'targetVersion': '0.1.10', 'status': 'pending'}})),
+            'no server': lambda: os.remove(os.path.join(self.m.home, 'userdata/server-runtime.json')),
+        }
+        for name, make in cases.items():
+            with self.subTest(name):
+                self.m.standard()
+                for marker in ('.service-stopping', '.restart-pending'):
+                    if os.path.exists(self.m.path(f'home/runtime/{marker}')):
+                        os.remove(self.m.path(f'home/runtime/{marker}'))
+                if os.path.exists(self.m.path('stub-t3-calls.jsonl')):
+                    os.remove(self.m.path('stub-t3-calls.jsonl'))
+                make()
+                code, result, _ = self.check_json()
+                self.assertEqual(code, 1)
+                self.assertEqual(self.m.calls('stub-t3-calls.jsonl'), [], 'the report ran')
+                self.assertIn('report', self.failed(result))
+                self.assertIn('not run', self.failed(result)['report'])
+
+    def test_t3_stopping_during_the_report_refuses_its_answer(self):
+        # Fork #180: T3 can be stopped from outside the kit (the owner, the auto-updater) while the report reads.
+        # The live server is read again after it: if it stopped, restarted or began an update, the answer is not used.
+        real = check.live.fork_report
+        for name, change in {
+            'stopping': lambda: self.m.service(**{**json.load(open(self.m.path('service.json'))),
+                                                   'ActiveState': 'deactivating'}),
+            'stop marker': lambda: self.m.write('home/runtime/.service-stopping', ''),
+            'restarted': lambda: self.m.spawn_server(fx.LIVE),
+            # Fork #300 item 4: the auto-updater names an update while the report reads.
+            'update pending': lambda: self.m.write('home/runtime/service-state.json', json.dumps({
+                'protocol': 3, 'activeVersion': fx.LIVE, 'update': {'targetVersion': '0.1.10', 'status': 'pending'}})),
+        }.items():
+            with self.subTest(name):
+                self.m.standard()
+                if os.path.exists(self.m.path('home/runtime/.service-stopping')):
+                    os.remove(self.m.path('home/runtime/.service-stopping'))
+                ran = []
+
+                def report(*a, **kw):
+                    out = real(*a, **kw)
+                    change()
+                    ran.append(out)
+                    return out
+                with mock.patch.object(check.live, 'fork_report', report):
+                    code, result, _ = self.check_json()
+                self.assertEqual(len(ran), 1, 'the report must have run for this probe')
+                self.assertEqual(code, 1, result)
+                self.assertNotIn('plan', result)
+                self.assertIn('T3 steady during the report', self.failed(result))
+                if name == 'update pending':
+                    self.assertIn('an update to 0.1.10 is pending', self.failed(result)['T3 steady during the report'])
+                # Fork #300 item 5: the answer is not used, so the result does not carry it either: a caller that
+                # reads counts or providers from a refused check finds none.
+                for key in ('counts', 'pendingMigrations', 'providers'):
+                    self.assertNotIn(key, result)
+
     def test_target_older_than_live(self):
         self.m.standard(target='0.1.8')
         self.refused('target is newer', '0.1.9 -> 0.1.8')
@@ -420,6 +486,42 @@ class Refusals(CheckBase):
         self.assertEqual(code, 1)
         self.assertIs(result['ok'], False)
         self.assertIn('surprise', self.failed(result)['check ran'])
+
+
+class CountsReportToReport(unittest.TestCase):
+    """Fork #181: thread and project counts are compared report with report (the same build's way of counting on
+    both sides), never with `t3 thread list` (one project, no sub-agents)."""
+
+    def counts(self, **over):
+        return fx.report(database={'counts': {**fx.report()['database']['counts'], **over}})
+
+    def test_equal_reports_have_no_difference(self):
+        self.assertEqual(live.compare_counts(self.counts(), self.counts()), [])
+
+    def test_every_count_that_differs_is_named(self):
+        said = live.compare_counts(self.counts(), self.counts(threads=39, threadsArchived=3))
+        self.assertEqual(said, ['threads: 40 before, 39 after', 'threadsArchived: 2 before, 3 after'])
+
+    def test_a_count_a_report_could_not_read_is_never_equal(self):
+        # Fail toward refusing: a missing count (an older or newer schema reads as null), a missing database, no
+        # report at all, or a count that is not a whole number cannot be shown equal.
+        for before, after in ((self.counts(threads=None), self.counts(threads=None)),
+                              (self.counts(), fx.report(database={'state': 'missing', 'counts': None})),
+                              (None, self.counts()),
+                              (self.counts(threads=True), self.counts(threads=1)),
+                              (self.counts(projects=3.0), self.counts())):
+            with self.subTest(before=str(before)[:40], after=str(after)[:40]):
+                said = live.compare_counts(before, after)
+                self.assertTrue(said and any('cannot be compared' in d for d in said), said)
+
+    def test_the_plan_says_what_is_counted_and_with_what_it_is_compared(self):
+        m = fx.Machine()
+        self.addCleanup(m.close)
+        m.standard()
+        out = io.StringIO()
+        self.assertEqual(check.main(['check'], out=out, err=io.StringIO()), 0)
+        self.assertIn('40 threads (sub-agent and archived ones included, all projects), 3 projects', out.getvalue())
+        self.assertIn('never with t3 thread list', out.getvalue())
 
 
 class CannotRun(CheckBase):

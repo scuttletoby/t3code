@@ -2,14 +2,16 @@ name: pr-queue
 description: >-
   A merge queue for a repository whose ruleset requires pull requests to be up to date: each run brings one waiting
   pull request up to date and turns auto-merge back on only for the head the review read (README.md). Needs a
-  self-hosted runner whose disk outlives the job, with git 2.38+, gh and python3.
+  self-hosted runner whose disk outlives the job, with git 2.43+, gh and python3.
 inputs:
   repo:
     description: The repository, owner/name.
     required: false
     default: ${{ github.repository }}
   config:
-    description: The queue's JSON config (README.md, "Config").
+    description: >-
+      Path of the queue's JSON config inside a git checkout; the queue reads it as the checked-out commit (HEAD) holds
+      it, never the file on disk (README.md, "Config").
     required: true
   state-file:
     description: Absolute path, outside the job's workspace, of the plan a stopped run leaves for the next one.

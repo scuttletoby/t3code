@@ -4,7 +4,7 @@ check run of the gate's own GitHub App (fork-head-gate.yml; README.md, "The gate
 
 A pull request can change the workflow its own head check runs in, and that job reports as GitHub Actions, which any
 workflow file of the pull request can also report as. The gate runs from the default branch's workflow
-(pull_request_target, issue_comment, workflow_dispatch), with code from the fork's pinned release, reads the pull
+(pull_request_target, issue_comment, workflow_dispatch, and workflow_run of the review trigger), with code from the fork's pinned release, reads the pull
 request only as data, and posts with a key that lives only in an Environment that only the default branch may use. A
 ruleset that binds the required check to the gate App's id then counts this check run and nothing else.
 
@@ -21,8 +21,8 @@ failure. A run posts nothing only when it cannot post at all (README.md, "Stops 
 GitHub does not take the first write (start), no token can be made (no key, no App, no Environment), the guard job
 cannot read the Environment (it may not exist; when REST says 5xx or a rate limit every try, GraphQL, with its own
 rate limit, may still show it exists), the head is unknown (on an event that does not carry it, the pull
-request read fails every try and so does git's refs/pull/N/head), the backfill cannot list the open pull requests, a
-step before start fails, or the run never reaches start.
+request read fails every try and so does git's refs/pull/N/head), the backfill or a review run's lookup cannot list
+the open pull requests, a step before start fails, or the run never reaches start.
   guard   GITHUB_OUTPUT guard=ok when the key can only be the Environment's: no repository or organisation secret of
           its name (REPO_SECRET_PRESENT=true|false: the workflow passes only whether one is set), the Environment
           exists, and its deployment branches are exactly one rule, the default branch. Else exit 1 and guard=fail
@@ -35,16 +35,24 @@ step before start fails, or the run never reaches start.
           failure, so a pass it had cannot survive to a later ready, retarget or reopen), or, for a dispatch without
           one, the head of every open pull request (the backfill, paged, one entry per head). When the read fails
           every try: the head the event carries (--event-sha), else refs/pull/N/head by git (not the REST API, so
-          not its rate limit).
+          not its rate limit). On a workflow_run (the review trigger's run finished, README.md "Run again after a
+          review"): no number is taken; the open pull requests whose head is the run's head sha from the run's
+          head repository and branch (--run-*, GitHub's fields of the run), read from the API. More than one (one
+          branch into two bases): the head is judged once, in the job for the lowest number; target names the ones
+          it judges (ready, into the default branch). None, or a run of another event: nothing to judge (a log
+          line says why).
   target  before any token: post=false only for bad arguments. Else post=true: the head gets a failure (judge writes
           it) when the guard did not pass, on a re-run (run attempt 2 or later), for a caller that is not the default
-          branch's current one or does not pin this gate release, for an empty lens list, for a head no open, ready
-          pull request into the default branch has, or when GitHub did not say. GITHUB_OUTPUT: post, base.
+          branch's current one or does not pin this gate release, for a lens list with a name that names no lens, for
+          a head no open, ready pull request into the default branch has, or when GitHub did not say. GITHUB_OUTPUT:
+          post, base. An empty lens list is judge's to refuse: only the config at the base tip says whether its
+          `review` block is in enforce, where the path rules name the lenses.
   start   an in-progress check run on the head (it never passes), so a run that stops or fails from here on leaves
           "not passed", never an older pass. Up to 3 tries. GITHUB_OUTPUT: id.
   judge   read the base tip and the pull requests with the head from the API, fetch both commits by sha into a new
           bare repository, run head_check's rules in bare mode (head_check.decide, the same code as the action) for
-          each pull request, and write the strictest verdict for finish. Anything target would fail is a failed verdict.
+          each pull request, and write the strictest verdict for finish. Anything target would fail is a failed verdict,
+          and so is an empty lens list unless the config at the base tip has a `review` block in enforce.
   finish  complete start's check run with the verdict, or with a failure when there is none (the run stopped or
           failed before it judged). Up to 3 tries; when all fail, the job is red and the check stays in progress.
   drift   warn (never fail) when the base branch's rules do not bind the required check to the gate App.
@@ -58,7 +66,8 @@ sys.path.insert(0, HERE)
 import head_check  # noqa: E402
 import pr_queue  # noqa: E402  (../pr-queue, put on the path by head_check)
 
-EVENTS = ('pull_request_target', 'issue_comment', 'workflow_dispatch')
+EVENTS = ('pull_request_target', 'issue_comment', 'workflow_dispatch', 'workflow_run')
+REVIEW_EVENTS = ('pull_request_review', 'pull_request_review_comment')   # what starts the review trigger (#88)
 MAX_PRS = 256   # a matrix runs at most 256 jobs
 MAX_SAME_HEAD = 20   # open, ready pull requests one head may have; each is judged
 RETRY_SECONDS = head_check.RETRY_SECONDS   # between two tries of a write
@@ -72,6 +81,8 @@ CALLER_PATH = re.compile(r'\.github/workflows/[A-Za-z0-9._-]+\.ya?ml')
 GATE_WORKFLOW = 'fork-head-gate.yml'
 GATE_FILES = ('.github/workflows/' + GATE_WORKFLOW, 'fork-ci/actions/head-check', 'fork-ci/actions/pr-queue')
 LIST_JQ = '.[] | [.number, .draft, .head.sha, .base.ref] | @json'
+HEAD_JQ = '.[] | [.number, .head.sha, .head.repo.full_name] | @json'   # head.repo is null for a deleted fork
+BRANCH_MAX = 255
 SERVER = 'https://github.com'
 
 
@@ -273,6 +284,7 @@ def open_heads(repo, gh, base=None):
 def pull_head_by_git(repo, number, env):
     """(sha, None) or (None, why): refs/pull/N/head by git ls-remote (the job's token as a header from the
     environment, never on the command line), for when the REST API is down or rate limited. Up to READ_TRIES tries."""
+    # Not pr_queue.git_env: it drops GIT_CONFIG_COUNT/KEY_/VALUE_, which carry this call's own auth header.
     clean = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'TMPDIR')}
     clean.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
     token = env.get('GH_TOKEN', '')
@@ -298,15 +310,81 @@ def pull_head_by_git(repo, number, env):
     return None, why
 
 
-def prs(repo, event, pr_text, gh, out, env, event_sha='', git_head=None):
+def review_run_pr(repo, run, gh, out):
+    """([{pr, sha}] or [], None) or (None, why) for a workflow_run of the review trigger. `run`: {event, sha, repo,
+    branch}, GitHub's fields of the finished run (github.event.workflow_run: event, head_sha,
+    head_repository.full_name, head_branch). The number is read from the API: the open pull requests whose head
+    branch is that branch of that repository, kept when their head is the run's sha. Never from the run's outputs,
+    artifacts or names: whatever the run did (a pull request can change its own copy of the trigger), it only says
+    "look at this head again", as an issue comment can."""
+    event, sha = str(run.get('event') or ''), str(run.get('sha') or '').strip().lower()
+    head_repo, branch = str(run.get('repo') or ''), str(run.get('branch') or '')
+    if event not in REVIEW_EVENTS:
+        out(f'nothing to judge: the run that finished was started by {event or "no event"!r}, not by a review or an '
+            f'inline review comment ({", ".join(REVIEW_EVENTS)})')
+        return [], None
+    if not (pr_queue.SHA.fullmatch(sha) and pr_queue.REPO_RE.fullmatch(head_repo) and 0 < len(branch) <= BRANCH_MAX
+            and branch.isprintable()):
+        out("nothing to judge: the run does not name a head (head sha, head repository, head branch); dispatch the "
+            'gate with the pull request number')
+        return [], None
+    owner = urllib.parse.quote(head_repo.split('/')[0], safe='')
+    query = (f'repos/{repo}/pulls?state=open&per_page=100&head={owner}:'
+             + urllib.parse.quote(branch, safe='/'))
+    r = read(gh, '--paginate', query, '--jq', HEAD_JQ)
+    if r.returncode != 0:
+        return None, f'could not list the open pull requests with the head of the review run: {said(r)}'
+    matches = []
+    for line in r.stdout.splitlines():
+        try:
+            n, head, from_repo = json.loads(line)
+        except (ValueError, TypeError):
+            return None, 'GitHub listed something that is not a pull request'
+        if not (type(n) is int and n > 0 and isinstance(head, str)
+                and pr_queue.SHA.fullmatch(head.lower()) and (from_repo is None or isinstance(from_repo, str))):
+            return None, 'GitHub listed something that is not a pull request'
+        if head.lower() == sha and isinstance(from_repo, str) and from_repo.lower() == head_repo.lower():
+            matches.append(n)
+    where = f'{sha} of {head_repo} branch {branch!r}'
+    if not matches:
+        out(f'nothing to judge: no open pull request has the head {head_check.escape(where)} (closed or merged since, '
+            'or the head moved on: its push ran the gate)')
+        return [], None
+    # One branch into two bases: every match has this head, and the gate judges a head, not a pull request (preflight
+    # lists every open pull request with it again; the number only names the job). So it is judged once. The listing
+    # has no draft or base, so this line cannot say which of them are judged: target's "judging" line does.
+    numbers = sorted(set(matches))   # numbers, so 9 < 10; a number GitHub listed twice is named once
+    if len(numbers) == 1:
+        out(f'review run: #{numbers[0]} has the head {head_check.escape(where)}')
+    else:
+        out(f'review run: open pull requests {", ".join(f"#{n}" for n in numbers)} have the head '
+            f'{head_check.escape(where)}; judged once, in the job for #{numbers[0]} (the lowest number); the target '
+            'step names the ones it judges (ready, into the default branch)')
+    return [{'pr': numbers[0], 'sha': sha}], None
+
+
+def prs(repo, event, pr_text, gh, out, env, event_sha='', git_head=None, run=None):
     """The heads to judge, [{pr, sha}] (see the module's doc). target and judge judge a head as a whole; the pr only
     names the job. When the pull request read fails every try: `event_sha`, the head the event carries
-    (pull_request_target), else `git_head(repo, number, env)` (the CLI's: pull_head_by_git)."""
+    (pull_request_target), else `git_head(repo, number, env)` (the CLI's: pull_head_by_git). On a workflow_run: `run`,
+    see review_run_pr."""
     pr_text, event_sha = (pr_text or '').strip(), (event_sha or '').strip().lower()
     if event not in EVENTS:
         return refuse(out, env, f'refused on a {event or "unnamed"} event: the gate runs only on {", ".join(EVENTS)}')
     if pr_text and not NUMBER.fullmatch(pr_text):
         return refuse(out, env, f'{pr_text!r} is not a pull request number')
+    if event == 'workflow_run':
+        if pr_text:
+            return refuse(out, env, f'a workflow_run that names #{pr_text}: on a workflow_run the pull request comes '
+                          "only from the API, by the run's head")
+        if not pr_queue.REPO_RE.fullmatch(repo):
+            return refuse(out, env, f'--repo {repo!r} is not owner/name')
+        found, why = review_run_pr(repo, run or {}, gh, out)
+        if found is None:
+            return refuse(out, env, why, 'Nothing was posted: an older check run on the head stays until the next '
+                          'event on the pull request, or a dispatch with its number.')
+        set_output(env, prs=json.dumps(found, separators=(',', ':')))
+        return 0
     if not pr_text and event != 'workflow_dispatch':
         return refuse(out, env, f'a {event} event that names no pull request')
     if not pr_queue.REPO_RE.fullmatch(repo):
@@ -447,10 +525,10 @@ def preflight(a, gh):
                         'release of the first attempt, whatever the default branch names now, and a re-run of the '
                         'gate job alone skips the guard job: dispatch the gate with the pull request number '
                         'instead (Actions > the caller > Run workflow)'), None, None, []
-    required, problems = head_check.required_names(a.required_lenses)
-    if problems or not required:
-        return 'fail', ('required-lenses names no lens (' + ('; '.join(problems) or 'it is empty') + '): with none, '
-                        'a head with no lens comment would pass. Give one lens name per line'), None, None, []
+    _, problems = head_check.required_names(a.required_lenses)
+    if problems:   # an empty list is judge's to refuse (empty_lenses_problem): it needs the config at the base tip
+        return 'fail', ('required-lenses names no lens (' + '; '.join(problems) + '): with none, a head with no lens '
+                        'comment would pass. Give one lens name per line'), None, None, []
     branch, why = default_branch(a.repo, gh)
     if branch is None:
         return 'fail', why, None, None, []
@@ -567,26 +645,35 @@ def finish(repo, sha, run, verdict_path, gh, out, env, sleep=time.sleep):
 
 # --- judge ----------------------------------------------------------------------------------------------------------
 def bare_repository(work, name):
-    """(path, None): a new, empty bare repository in `work` with the queue's own config (pr_queue.CACHE_CONFIG: no
-    remote, no hook path, no helper), never one an earlier run left; or (None, why it could not be made)."""
+    """(path, None): a new, empty bare repository in `work` made as the queue makes its cache (pr_queue.init_bare:
+    CACHE_CONFIG, no remote, no hook path, no helper, SHA-1 objects and files refs), never one an earlier run left; or
+    (None, why it could not be made)."""
     try:
         path = tempfile.mkdtemp(prefix=name + '-', dir=work)
     except OSError as e:
         return None, f'could not make a folder in {work}: {e}'
-    r = subprocess.run(['git', *pr_queue.GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
-                       capture_output=True)
-    if r.returncode != 0:
-        return None, f'git init failed: {r.stderr.strip()[:300]}'
-    with open(os.path.join(path, 'config'), 'w', encoding='utf-8') as f:
-        f.write(pr_queue.CACHE_CONFIG)
-    return path, None
+    problem = pr_queue.init_bare(path)
+    return (None, problem) if problem else (path, None)
 
 
 def fetch(checkout, base, head):
     """The base tip and the head, by sha, with their history, into refs only the gate names. None or why not."""
     r = checkout.git('-c', 'gc.auto=0', 'fetch', '-q', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head',
-                     checkout.remote, f'{base}:refs/gate/base', f'{head}:refs/gate/head')
-    return None if r.returncode == 0 else f'git fetch failed: {r.stderr.strip()[:300]}'
+                     checkout.remote, f'{base}:refs/gate/base', f'{head}:refs/gate/head', fetch=True)
+    return None if r.returncode == 0 else pr_queue.fetch_failed(r.stderr, 'GH_TOKEN (the gate\'s read token)')
+
+
+def empty_lenses_problem(checkout, config_path):
+    """None when an empty required-lenses input may stand: the config at the base tip has a `review` block in enforce,
+    so the path rules name the lenses. Else why the head fails (no block, shadow, or a config that cannot be read)."""
+    problems = []
+    cfg = head_check.base_config(checkout, config_path, problems)
+    if cfg is None:
+        return '; '.join(problems)
+    if cfg.review is not None and cfg.review.mode == 'enforce':
+        return None
+    return ('required-lenses names no lens (it is empty): with none, a head with no lens comment would pass. Give one '
+            'lens name per line, or let the review rules of the config decide (a `review` block in mode enforce)')
 
 
 def verdict_text(ok, reason, results, head, base):
@@ -621,14 +708,19 @@ def judge(a, gh, out, env, decide=head_check.decide, sleep=time.sleep):
         state, why, _, base, numbers = preflight(a, gh)
         if state != 'go':
             ok, reason = False, f'not judged: {why}'
+        elif problem := pr_queue.git_problem() or pr_queue.remote_problem(a.remote):   # before git runs at all
+            ok, reason = False, f'not judged: {problem}'
         else:
             path, problem = bare_repository(a.work, f'head-{a.sha[:12]}')
             checkout = head_check.Checkout(path or a.work, bare=(base, a.sha), remote=a.remote)
             problem = problem or fetch(checkout, base, a.sha)
             if problem:
                 ok, reason = False, f'could not fetch the base and the head: {problem}'
+            elif not head_check.required_names(a.required_lenses)[0] \
+                    and (problem := empty_lenses_problem(checkout, a.config)):
+                ok, reason = False, f'not judged: {problem}'
             else:
-                shared = list(filter(None, [pr_queue.git_problem(), checkout.problem()]))
+                shared = list(filter(None, [checkout.problem()]))
                 required, _ = head_check.required_names(a.required_lenses)
                 for n in numbers:   # every one: the strictest verdict is the head's
                     code, good, why, rows = decide(a.repo, str(n), a.config, checkout, required, False, gh, sleep, out,
@@ -685,7 +777,8 @@ def run_arguments(p):
     """What target and judge both read about the head and the run."""
     p.add_argument('--repo', required=True)
     p.add_argument('--sha', required=True, help='the head to judge')
-    p.add_argument('--required-lenses', required=True, help='lens names, one per line; none = refused')
+    p.add_argument('--required-lenses', required=True, help='lens names, one per line; none = refused unless the '
+                   "config's review block is in enforce")
     p.add_argument('--caller-ref', required=True, help='github.workflow_ref: the caller workflow file and its ref')
     p.add_argument('--caller-sha', required=True, help='github.workflow_sha: the caller commit')
     p.add_argument('--gate-repo', required=True, help='job.workflow_repository: where this gate comes from')
@@ -710,6 +803,10 @@ def cli(argv=None, env=None, gh=gh_run, out=print, decide=head_check.decide, sle
     s.add_argument('--event', required=True)
     s.add_argument('--pr', default='')
     s.add_argument('--event-sha', default='', help='the head the event carries, used when the pull request read fails')
+    s.add_argument('--run-event', default='', help='workflow_run: the event that started the finished run')
+    s.add_argument('--run-sha', default='', help="workflow_run: the run's head sha")
+    s.add_argument('--run-repo', default='', help="workflow_run: the run's head repository, owner/name")
+    s.add_argument('--run-branch', default='', help="workflow_run: the run's head branch (give it as --run-branch=X)")
     run_arguments(sub.add_parser('target'))
     j = sub.add_parser('judge')
     run_arguments(j)
@@ -736,7 +833,8 @@ def cli(argv=None, env=None, gh=gh_run, out=print, decide=head_check.decide, sle
         return guard(a.repo, a.environment, a.secret_name, env.get('REPO_SECRET_PRESENT', ''), a.environment_only, gh,
                      out, env)
     if a.cmd == 'prs':
-        return prs(a.repo, a.event, a.pr, gh, out, env, a.event_sha, git_head)
+        return prs(a.repo, a.event, a.pr, gh, out, env, a.event_sha, git_head,
+                   run={'event': a.run_event, 'sha': a.run_sha, 'repo': a.run_repo, 'branch': a.run_branch})
     if a.cmd == 'target':
         return target(a, gh, out, env)
     if a.cmd == 'judge':

@@ -192,6 +192,72 @@ def install_t3(c, version, done):
     return None
 
 
+# What dpkg and apt-get say (under LC_ALL=C) when another one (apt-daily, unattended-upgrades) holds a lock they take
+# without a wait. Not apt's `Unable to lock directory` or dpkg's `unable to lock`: those follow any lock failure (a
+# lock file that cannot be opened too), which waiting does not cure.
+LOCKED = re.compile(r'could not get lock|(is|was) locked by another process', re.I)
+
+
+def dpkg_interrupted():
+    """True when a dpkg run stopped before it saved its status: /var/lib/dpkg/updates holds a file named all digits
+    (apt-get install then refuses: "dpkg was interrupted"). `dpkg --audit` does not name the packages of such a
+    journal when their last state is installed. A folder that cannot be read counts as interrupted."""
+    try:
+        names = os.listdir(k.ROOT + '/var/lib/dpkg/updates')
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return any(re.fullmatch(r'[0-9]+', n) for n in names)
+
+
+def run_locked(argv, env):
+    """k.run(argv), tried again every k.LOCK_STEP s for up to k.LOCK_WAIT s while it fails on a lock another apt-get
+    or dpkg holds. apt-get's DPkg::Lock::Timeout waits only for dpkg's frontend lock: `update` takes the lists lock and
+    `install` the archives lock without a wait, and so does dpkg its own."""
+    end = time.monotonic() + k.LOCK_WAIT
+    while True:
+        r = k.run(argv, timeout=900, env=env)
+        if not r.returncode or not LOCKED.search(r.stderr) or time.monotonic() >= end:
+            return r
+        time.sleep(k.LOCK_STEP)
+
+
+def install_packages():
+    """Install the k.PACKAGES that are not (fully) installed; held counts as installed. A dpkg run stopped half-way
+    (`dpkg --audit` names a package, or dpkg_interrupted()) is finished first (apt-get refuses until it is). Nothing
+    asks a question (stdin is /dev/null): a changed config file is kept, debconf takes its defaults, and a lock
+    apt-daily holds is waited for (run_locked). apt and dpkg run under LC_ALL=C: LOCKED reads their English (sudo
+    keeps the caller's LANG). Returns why not, or None."""
+    r = k.run(['/usr/bin/dpkg-query', '-W', '-f=${Package}\t${Status}\n', *k.PACKAGES])
+    have = {p for p, _, status in (line.partition('\t') for line in r.stdout.splitlines())
+            if status.endswith(' ok installed')}
+    missing = [p for p in k.PACKAGES if p not in have]
+    if not missing:
+        return None
+    say('installing ' + ' '.join(missing))
+    quiet = {'DEBIAN_FRONTEND': 'noninteractive', 'LC_ALL': 'C'}
+    busy = (' Another apt-get or dpkg still runs (apt-daily, on a new distro) after 5 minutes: '
+            'wait for it to end, then run setup again')
+    r = k.run(['/usr/bin/dpkg', '--audit'], env={'LC_ALL': 'C'})   # reads only: no lock; exits 0 when it names one
+    if r.returncode or r.stdout.strip() or dpkg_interrupted():
+        r = run_locked(['/usr/bin/dpkg', '--force-confdef', '--force-confold', '--configure', '-a'], quiet)
+        if r.returncode:
+            return (f'cannot install {" ".join(missing)}: dpkg --configure -a failed ({r.stderr.strip()[-300:]}).'
+                    + (busy if LOCKED.search(r.stderr) else ' Run `dpkg --configure -a` as root, then setup again'))
+    apt = ['/usr/bin/apt-get', '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold',
+           '-o', 'DPkg::Lock::Timeout=300']
+    for argv in (apt + ['update'], apt + ['install', '-y', *missing]):
+        r = run_locked(argv, quiet)
+        if r.returncode:
+            return (f'cannot install {" ".join(missing)}: apt-get {argv[len(apt)]} failed ({r.stderr.strip()[-300:]}).'
+                    + (busy if LOCKED.search(r.stderr) else
+                       ' Fix the distro\'s network (the machine file\'s nameservers are in /etc/resolv.conf now) or '
+                       f'package sources, run `apt-get update && apt-get install -y {" ".join(missing)}` as root, '
+                       'then setup again'))
+    return None
+
+
 def setup(source, sha):
     if not re.fullmatch(r'[0-9a-f]{40}', sha) or not os.path.isdir(source):
         return say('usage: pc-agents setup --source DIR --sha 40-HEX-SHA') or 2
@@ -215,13 +281,6 @@ def setup(source, sha):
         r = k.run(['/usr/sbin/usermod', '--shell', k.NOLOGIN, k.USER])
         if r.returncode:
             return say(f'usermod failed: {r.stderr.strip()[-300:]}') or 1
-    if k.lstat('/usr/sbin/nft') is None:
-        for argv in (['/usr/bin/apt-get', 'update'], ['/usr/bin/apt-get', 'install', '-y', 'nftables']):
-            r = k.run(argv, timeout=900)
-            if r.returncode:
-                return say(f'cannot install nftables: {" ".join(argv)} failed ({r.stderr.strip()[-300:]}). Fix the '
-                           'distro\'s network or package sources, run `apt-get update && apt-get install -y '
-                           'nftables` as root, then setup again') or 1
     version = f'{k.OPT}/{sha}'
     for src, (dst, mode) in k.CODE.items():
         with open(os.path.join(source, src), 'rb') as f:
@@ -239,6 +298,10 @@ def setup(source, sha):
         put(path, text, mode)
         done[path] = {k.sha(text)}
         keep(done)
+    # The packages after the files (apt-get resolves through the kit's own resolv.conf, the machine file's nameservers
+    # as they are now) and before the firewall loads (nftables is one of them)
+    if why := install_packages():
+        return say(why) or 1
     why = k.load_firewall()   # now, not after the install: a tightened firewall must not wait for a download
     if why:
         return say(why) or 1
@@ -319,15 +382,19 @@ def stays_up():
 
 
 def pair(args):
-    """T3's own `t3 pair` for the T3 the unit runs (this t3Version's, not a glob over the versions folder, where an
-    older version stays), as the agent with the unit's T3 home, so it finds that running server."""
+    """T3's own `t3 pair` of the machine file's t3Version, the one the unit starts (not a glob over the versions
+    folder, where an older version stays), as the agent with the unit's T3 home, so it finds that running server.
+    An upgrade stopped half-way (the new t3Version written, its download failed) has no such t3 yet: said so."""
     if not k.ROOT and os.geteuid() != 0:
         return say('run this as root') or 2
     try:
         c = k.config()
     except machine_file.MachineFileError as e:
         return say(str(e)) or 2
-    return as_agent([k.runtime(c) + '/t3', 'pair'] + args)
+    t3 = k.runtime(c) + '/t3'
+    if k.lstat(t3) is None:
+        return say(f'T3 {c["t3Version"]} is not installed yet: run pc-agents setup again (README step 3)') or 1
+    return as_agent([t3, 'pair'] + args)
 
 
 def as_agent(cmd):

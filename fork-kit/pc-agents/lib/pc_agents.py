@@ -19,6 +19,7 @@ PENDING = STATE + '/restart-pending'   # setup changed something T3 runs with: r
 BOOT_ID = '/proc/sys/kernel/random/boot_id'   # the marker holds this boot's id and CLOCK_MONOTONIC, like systemd's
 AS_AGENT = 'pc-agents-as-agent'   # name prefix of `pc-agents as-agent`'s transient units (check --enforce stops them)
 SETTLE, SETTLE_STEP = 15, 1   # after a (re)start, setup watches T3 this many seconds, every SETTLE_STEP, before done
+LOCK_WAIT, LOCK_STEP = 300, 5   # setup retries a dpkg or apt-get step that found a lock held this long, every LOCK_STEP
 LOADED = '/run/pc-agents/firewall.loaded'   # sha256 of the firewall file and `nft list` of it, saved when loaded
 T3 = OPT + '/t3'   # T3's runtime, installed by root (T3CODE_HOME of scripts/install.sh): the agent cannot change it
 UNIT, WALLS = 't3code-agents.service', 'pc-agents-walls'
@@ -44,6 +45,12 @@ MODES = ('approval-required', 'auto-accept-edits', 'auto', 'full-access')
 # off through limits.updates (all versions; the server's self-update refuses), not the newer automaticUpdates.
 KIT_SETTINGS = {'linkedEnvironmentsEnabled': True}
 VERSION = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)?')
+# The oldest T3 that applies a managed policy (0.1.7; `t3 pair` is older): an older one would run with none of the
+# kit's locks, updates on, and quietly. Its pre-releases are older than it (semver), as some nightlies are.
+OLDEST_T3 = (0, 1, 7)
+# Debian packages setup installs when missing: the agent firewall's nft; libatomic1, which Node (and so most agent
+# tools) needs to start, while the agent has no sudo to install it; unzip, which install steps of packages use.
+PACKAGES = ('nftables', 'libatomic1', 'unzip')
 HEAD = '# pc-agents kit: written by `pc-agents setup`; an edit is refused at its next run and fails the walls check\n'
 
 # What the kit runs from a release: source path -> (path in the version folder, mode). The walls are the merged
@@ -72,7 +79,9 @@ def is_ip_list(value, net, glob=False, most=64):
 SPEC = {
     'organization': (str, machine_file.REQUIRED,
                      lambda v: None if v.strip() and len(v) <= 80 else '1 to 80 characters, not blank'),
-    't3Version': (str, machine_file.REQUIRED, lambda v: None if VERSION.fullmatch(v) else 'an exact version, no v'),
+    't3Version': (str, machine_file.REQUIRED, lambda v: 'an exact version, no v' if not VERSION.fullmatch(v) else
+                  None if new_enough(v) else '%d.%d.%d or newer, not a pre-release of it (the first T3 with the '
+                  'managed policy)' % OLDEST_T3),
     't3ReleaseBaseUrl': (str, machine_file.REQUIRED,
                          lambda v: None if re.fullmatch(r'https://[A-Za-z0-9./_-]+', v) else 'an https URL'),
     'port': (int, machine_file.REQUIRED, lambda v: None if 1024 <= v <= 65535 else '1024 to 65535'),
@@ -87,6 +96,14 @@ SPEC = {
     'tailscaleTag': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'tag:[a-z0-9-]{1,50}', v) else 'tag:name'),
     'devPorts': (str, '4100-4199', lambda v: None if port_range(v) else 'LOW-HIGH, 1024 to 65535, like 4100-4199'),
 }
+
+
+def new_enough(version):
+    """Whether VERSION version is OLDEST_T3 or newer, in semver order: a pre-release ranks below its release. The
+    fork's stable build of a release (`-fork.<n>`, fork-release.yml) is that release; its nightlies are pre-releases."""
+    m = VERSION.fullmatch(version)
+    numbers = tuple(map(int, m.groups()[:3]))
+    return numbers > OLDEST_T3 or numbers == OLDEST_T3 and (not m[4] or bool(re.fullmatch(r'-fork\.[1-9]\d*', m[4])))
 
 
 def port_range(text):
@@ -426,12 +443,13 @@ def user_problem(c, need_agent):
     return f'user {USER} is in other groups ({", ".join(extra)}): it must have none' if extra else None
 
 
-def run(argv, timeout=120):
+def run(argv, timeout=120, env=None):
     """Run argv (argv[0] under ROOT) in a process group of its own. Past timeout, or when this process stops (Ctrl-C,
     or SIGTERM and SIGHUP once stop_on_signals() ran), the whole group is killed (a download's curl too); a timeout
-    returns exit 124 and says so in stderr."""
+    returns exit 124 and says so in stderr. env: variables added to this process's own."""
     p = subprocess.Popen([ROOT + argv[0]] + argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+                         stderr=subprocess.PIPE, text=True, start_new_session=True,
+                         env={**os.environ, **env} if env else None)
     try:
         out, err = p.communicate(timeout=timeout)
     except BaseException as e:

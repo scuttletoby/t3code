@@ -52,6 +52,19 @@ UPSTREAM = [
     ('apps/server/src/serviceLauncher.ts', 'NodePath.join(baseDir, "runtime", "versions", version)',
      'runtimes under runtime/versions/<v>/'),
     ('apps/server/src/serviceLauncher.ts', 'process.platform === "win32" ? "t3.exe" : "t3"', 'runtime binary t3'),
+    ('apps/server/src/cli/update.ts', 'export const updateCommand = Command.make("update", {', 'switch: t3 update'),
+    ('apps/server/src/cli/update.ts', '...projectLocationFlags,', 'switch: update takes --base-dir'),
+    ('apps/server/src/cli/update.ts', 'allowDowngrade: Flag.Boolean("allow-downgrade")', 'way back: --allow-downgrade'),
+    ('apps/server/src/cli/update.ts', 'yes: Flag.Boolean("yes")', 'switch: update --yes restarts the service'),
+    ('apps/server/src/cli/servicePreflight.ts', 'Command.make("__service-preflight", {', 'switch: old preflight'),
+    ('apps/server/src/cli/servicePreflight.ts', 'databasePath: Flag.String("database-path"),', 'preflight flag'),
+    ('apps/server/src/cli/servicePreflight.ts', 'launcherProtocol: Flag.Int("launcher-protocol"),', 'preflight flag'),
+    ('apps/server/src/cloud/servicePreflight.ts', 'return { status: "ready", version, launcherProtocol };',
+     'switch: preflight says ready'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'const PINNED_RUNTIME_LAUNCHERS_FILE = "launchers";',
+     'switch.launchers: runtime/launchers'),
+    ('apps/server/src/cloud/pinnedRuntime.ts',
+     'environment["T3CODE_INSTALL_BIN_DIR"] || path.join(home, ".local", "bin"),', 'switch.launchers: default'),
     ('apps/server/src/config.ts', 'join(stateDir, "server-runtime.json")', 'server runtime file'),
     ('apps/server/src/config.ts', f'join(stateDir, "{live.DATABASE}")', 'database file'),
     ('apps/server/src/config.ts', ': "userdata",', 'state folder userdata/'),
@@ -64,18 +77,79 @@ UPSTREAM = [
     ('packages/shared/src/cliRelease.ts',
      'return `t3-${version}-${platformKey}.${platformKey.startsWith("win32") ? "zip" : "tar.gz"}`;',
      'archive name t3-<version>-<platform>.tar.gz'),
+    # back and status (back.py)
+    # switch._install_target: the rehearsed build installed by the kit, so the update downloads nothing
+    ('apps/server/src/cli/update.ts', '      ? Effect.succeed(input.requestedVersion)',
+     'switch: update <exact version> looks no version up'),
+    ('apps/server/src/cloud/pinnedRuntime.ts',
+     'entryExists && Option.isSome(sentinel) && sentinel.value.trim() === input.version;',
+     'switch._install_target: a runtime with t3 and .install-complete naming the version is used, not downloaded'),
+    ('apps/server/src/cli/update.ts', '    requirePublishedRelease: mirror !== undefined,',
+     'switch: only a managed update mirror makes the update ask the network about an installed runtime'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'sentinelPath: path.join(versionDir, ".install-complete"),',
+     'back.installed_t3: a whole runtime has runtime/versions/<v>/.install-complete'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'const PINNED_RUNTIME_LAUNCHERS_FILE = "launchers";',
+     'status: the launcher links upstream recorded in runtime/launchers'),
+    ('apps/server/src/cli/update.ts', 'allowDowngrade: Flag.Boolean("allow-downgrade")',
+     'back: update --allow-downgrade'),
+    ('apps/server/src/cli/update.ts', 'yes: Flag.Boolean("yes")', 'back: update --yes restarts the service'),
+    ('apps/server/src/cli/config.ts', 'export const baseDirFlag = Flag.String("base-dir")', 'back: update --base-dir'),
+    # keptruntime.py: upstream prunes old runtimes at the end of every update, so W1 keeps its own copy
+    ('apps/server/src/cli/update.ts', '      keep: [currentVersion, targetVersion],',
+     'keptruntime: every update prunes the runtimes it does not keep (the old build after the switch, W2, W3)'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', 'const PINNED_RUNTIME_PRUNE_GRACE = Duration.hours(1);',
+     'keptruntime.put_back: a fresh .install-complete is spared by a prune for 1 h'),
+    ('apps/server/src/cloud/pinnedRuntime.ts',
+     'entryExists && Option.isSome(sentinel) && sentinel.value.trim() === input.version;',
+     'keptruntime.put_back: a whole runtime put back is used as it is, not downloaded again'),
+    ('apps/server/src/cloud/pinnedRuntime.ts', '    if (!isExactServiceVersion(version)) continue;',
+     'keptruntime: its .golive-* folders in runtime/versions are no version, never pruned'),
     ('apps/server/src/cloud/serviceProtocol.ts', 'const SEMVER_NUMBER = "(?:0|[1-9]\\\\d*)";',
      'config.EXACT_VERSION'),
     ('apps/server/src/cloud/serviceProtocol.ts',
      'const SEMVER_PRERELEASE = `(?:${SEMVER_NUMBER}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)`;', 'config.EXACT_VERSION'),
+    ('apps/server/src/serverRuntimeState.ts', '  workHeld: Schema.optional(Schema.Boolean),', 'rehearse R3: work held'),
+    ('apps/server/src/config.ts', 'secretsDir: join(stateDir, "secrets"),', 'rehearse.NOT_CLONED: secrets/'),
+]
+
+# The commands and flags `rehearse` runs (R1-R5). Each file is in the kit_tests and workflows jobs' sparse checkouts
+# (.github/workflows/fork-tests.yml); a missing one fails, never skips.
+REHEARSE_UPSTREAM = [
+    ('apps/server/src/cli/servicePreflight.ts', 'Command.make("__service-preflight", {', 'R1/R5 preflight'),
+    ('apps/server/src/cli/servicePreflight.ts', 'databasePath: Flag.String("database-path"),', 'preflight flag'),
+    ('apps/server/src/cli/servicePreflight.ts', 'launcherProtocol: Flag.Int("launcher-protocol"),', 'preflight flag'),
+    ('apps/server/src/cloud/servicePreflight.ts', 'readonly status: "blocked";', 'preflight answers blocked'),
+    ('apps/server/src/cloud/servicePreflight.ts', 'readonly status: "ready";', 'preflight answers ready'),
+    ('apps/server/src/cli/auth.ts', 'const sessionListCommand = Command.make("list", {', 'R2 auth session list'),
+    ('apps/server/src/cli/auth.ts', 'Command.withSubcommands([sessionIssueCommand, sessionListCommand, '
+     'sessionRevokeCommand]),', 'R2 auth session list'),
+    ('apps/server/src/auth/EnvironmentAuth.ts',
+     'const layerStorage = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerCliConfig);',
+     'R2: auth commands open the database through layerCliConfig'),
+    ('apps/server/src/persistence/Sqlite.ts', 'export const layerCliConfig = makeLayerConfig(\n  '
+     'makeLayerFromPath(() => makeLayerSetup(runMigrationsAsOwner())),', 'R2: layerCliConfig migrates as owner'),
+    ('apps/server/src/cli/server.ts', 'const holdWorkFlag = Flag.Boolean("hold-work")', 'R3 serve --hold-work'),
+    ('apps/server/src/cli/config.ts', 'const portFlag = Flag.Int("port")', 'R3 --port'),
+    ('apps/server/src/cli/config.ts', 'const hostFlag = Flag.String("host")', 'R3 --host'),
+    ('apps/server/src/cli/config.ts', 'const noBrowserFlag = Flag.Boolean("no-browser")', 'R3 --no-browser'),
+    ('apps/server/src/cli/config.ts', 'export const baseDirFlag = Flag.String("base-dir")', '--base-dir'),
 ]
 
 REPORT_FILE = 'apps/server/src/golive/forkReport.ts'
 REPORT_CLI = 'apps/server/src/cli/forkReport.ts'
-# Every key path check.py and live.py read from the report, with where it sits.
+# Every key path check.py, live.py and back.py read from the report, with where it sits.
 REPORT_PATHS = ['reportVersion', 'version', 'ok', 'problems', 'problems.code', 'problems.message',
                 'database.pendingMigrations', 'database.counts', 'database.counts.threads',
-                'database.counts.projects', 'fork.featuresOn']
+                'database.counts.projects', 'database.counts.threadsArchived', 'database.counts.projectsArchived',
+                'fork.featuresOn', 'fork.features', 'database.appliedMigrations', 'database.appliedMigrations.id',
+                'database.unknownMigrations', 'settings.parseWarning', 'settings.providerInstances',
+                'settings.providerInstances.id', 'settings.providerInstances.driver',
+                'settings.providerInstances.enabled']
+# What live.compare_counts relies on (fork #181): both reports count the same rows, every project and every thread
+# not deleted (sub-agent and archived threads included), so one report is compared with another, never with
+# `t3 thread list` (one project, no sub-agents).
+REPORT_COUNTS = ['projects: count("projection_projects", "deleted_at IS NULL", ["deleted_at"]),',
+                 'threads: count(threads, "deleted_at IS NULL", ["deleted_at"]),']
 
 
 def interface_paths(text, name):
@@ -105,6 +179,11 @@ class Upstream(unittest.TestCase):
             with self.subTest(why, file=rel):
                 self.assertIn(text, source(rel), f'{rel} changed: update the go-live kit ({why})')
 
+    def test_the_commands_rehearse_runs_are_still_there(self):
+        for rel, text, why in REHEARSE_UPSTREAM:
+            with self.subTest(why, file=rel):
+                self.assertIn(text, source(rel), f'{rel} changed: update rehearse ({why})')
+
     def test_platform_keys(self):
         keys = re.search(r'CLI_ARCHIVE_PLATFORM_KEYS = \[(.*?)\]', source('packages/shared/src/cliRelease.ts'),
                          re.S).group(1)
@@ -123,6 +202,10 @@ class Report(unittest.TestCase):
         for key in REPORT_PATHS:
             with self.subTest(key):
                 self.assertIn(key, paths, f'{REPORT_FILE}: ForkReport.{key} moved or is gone')
+        for line in REPORT_COUNTS:
+            with self.subTest(line):
+                self.assertIn(line, text, f'{REPORT_FILE}: what a count counts changed: update live.compare_counts')
+        self.assertEqual(set(live.COUNTS), {p.split('.')[-1] for p in paths if p.startswith('database.counts.')})
         cli = source(REPORT_CLI)
         self.assertIn('Command.make("__fork-report"', cli)
         self.assertIn('Flag.String("base-dir")', cli)  # live.fork_report passes --base-dir <home>

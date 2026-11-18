@@ -71,7 +71,8 @@ class MachineFile(unittest.TestCase):
         self.refused('JSON object')
 
     def test_version_rules(self):
-        for bad, words in (({}, ['"version"']), ({'version': '1'}, ['whole number']), ({'version': True}, ['whole number']),
+        for bad, words in (({}, ['"version"']), ({'version': '1'}, ['whole number']),
+                           ({'version': True}, ['whole number']),
                            ({'version': 1.0}, ['whole number']), ({'version': 0}, ['bad version']),
                            ({'version': 2}, ['newer', 'update the kit'])):
             with self.subTest(bad=bad):
@@ -127,11 +128,32 @@ class MachineFile(unittest.TestCase):
         real_open = os.open
 
         def swap_then_open(path, *args, **kw):
-            if path == self.path:
+            if path == os.path.basename(self.path) and kw.get('dir_fd') is not None:   # the file, by its folder
                 self.write({'version': 1, 'heavy': {'sweep': {'stop': 'evil'}}}, mode=0o666)
             return real_open(path, *args, **kw)
         with mock.patch.object(self.mf.os, 'open', swap_then_open):
             self.refused('writable by group or others')
+
+    def test_every_folder_above_is_safe(self):
+        deep = os.path.join(self.dir, 'a', 'b')
+        os.makedirs(deep, 0o755)
+        self.path = os.path.join(deep, 'machine.json')
+        self.write(GOOD)
+        self.assertEqual(self.read(), GOOD['heavy'])
+        above = os.path.join(self.dir, 'a')
+        os.chmod(above, 0o777)                               # anyone could rename b and put their own in its place
+        self.assertIn(f'{above} is writable by group or others', self.refused())
+        os.chmod(above, 0o1777)                              # sticky, like /tmp: nobody else can rename b
+        self.assertEqual(self.read(), GOOD['heavy'])
+        os.chmod(above, 0o755)
+        self.assertIn(f'{self.dir} is owned by uid', self.refused(uid=os.getuid() + 1))
+        os.rename(above, above + '-real')
+        os.symlink(above + '-real', above)
+        self.assertIn(f'{above} is a symbolic link', self.refused())
+        os.unlink(above)
+        with open(above, 'w') as f:
+            f.write('')
+        self.assertIn(f'{above} is not a folder', self.refused())
 
     def test_only_a_plain_file_of_at_most_1_mib(self):
         os.mkfifo(self.path, 0o644)                    # would block a plain open
@@ -187,18 +209,36 @@ class MachineFile(unittest.TestCase):
             if kit != 'version':
                 self.assertIsInstance(self.read(kit), dict)
 
+    def test_windows_is_refused_until_its_checks_exist(self):
+        # #193: owner, mode and link checks are POSIX only; no kit reads the file on Windows yet
+        self.write(GOOD)
+        with mock.patch.object(self.mf.os, 'name', 'nt'):
+            self.refused('Windows')
+
     def test_default_paths(self):
         self.assertEqual(mf.default_path('linux'), '/etc/fork-kit/machine.json')
         self.assertEqual(mf.default_path('darwin'), '/Library/Application Support/fork-kit/machine.json')
-        self.assertTrue(mf.default_path('win32').endswith(os.path.join('fork-kit', 'machine.json')))
+        # the fixed folder, never %ProgramData% from the environment, which any caller can point elsewhere
+        from unittest import mock
+        with mock.patch.dict(os.environ, {'ProgramData': self.dir}):
+            self.assertEqual(mf.default_path('win32'), r'C:\ProgramData\fork-kit\machine.json')
         with self.assertRaises(mf.MachineFileError):
             mf.default_path('plan9')
 
 
 # Each file-safety rule broken on purpose in a copy of machine_file.py: (text, broken text, the test that must fail)
 MUTATIONS = {
+    'folders above are safe': ('            _check_folder_on_the_way(path, where, os.fstat(fd), owner_uid)\n', '',
+                               'test_every_folder_above_is_safe'),
+    'sticky folders above are fine': ('and not st.st_mode & stat.S_ISVTX', '', 'test_every_folder_above_is_safe'),
+    'no linked folder followed': ('os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW', 'os.O_RDONLY | os.O_DIRECTORY',
+                                  'test_every_folder_above_is_safe'),
     'no link followed': ('os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK', 'os.O_RDONLY | os.O_NONBLOCK',
                          'test_symbolic_links_are_refused'),
+    'protected text: owner checked': ('        _check_owner(path, where, os.fstat(fd), owner_uid)\n', '',
+                                      'test_writable_by_others_the_file_or_its_folder'),
+    'protected text: no dots': ("any(p in ('.', '..') for p in parts)", 'False',
+                                'test_only_an_absolute_path_without_dots'),
     'opened file checked': ('        _check_owner(path, path, st, owner_uid)\n', '',
                             'test_the_opened_file_is_checked_not_the_path'),
     'plain file only': ('if not stat.S_ISREG(st.st_mode):', 'if False:', 'test_only_a_plain_file_of_at_most_1_mib'),
@@ -207,7 +247,77 @@ MUTATIONS = {
                   'test_deep_json_is_refused_cleanly'),
     'no key twice': ('json.loads(text, object_pairs_hook=_no_duplicates)', 'json.loads(text)',
                      'test_a_key_given_twice_is_refused'),
+    'Windows refused': ("    if os.name == 'nt':\n", "    if False:\n", 'test_windows_is_refused_until_its_checks_exist'),
 }
+
+
+class ProtectedText(unittest.TestCase):
+    """read_protected_text: another root-owned file a kit trusts (a policy file), under the machine file's rules."""
+    mf = mf
+
+    def setUp(self):
+        self.umask = os.umask(0o022)
+        self.dir = os.path.realpath(tempfile.mkdtemp(prefix='protected-text-test-'))
+        os.chmod(self.dir, 0o755)
+        self.path = os.path.join(self.dir, 'policy.json')
+        self.addCleanup(self.close)
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write('{"any": "text"}')
+        os.chmod(self.path, 0o644)
+
+    def close(self):
+        os.umask(self.umask)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def refused(self, *words, path=None, uid=None):
+        path = path or self.path
+        with self.assertRaises(self.mf.MachineFileError) as cm:
+            self.mf.read_protected_text(path, os.getuid() if uid is None else uid)
+        for w in words:
+            self.assertIn(w, str(cm.exception))
+        self.assertIn(path, str(cm.exception))
+        return str(cm.exception)
+
+    def test_the_text_is_returned_as_it_is(self):
+        self.assertEqual(self.mf.read_protected_text(self.path, os.getuid()), '{"any": "text"}')
+
+    def test_not_there(self):
+        self.refused('not there', path=os.path.join(self.dir, 'gone.json'))
+        self.refused('not there', path=os.path.join(self.dir, 'gone', 'policy.json'))
+
+    def test_not_root_owned(self):
+        self.refused('owned by uid', f'not {os.getuid() + 1} (root)', uid=os.getuid() + 1)
+
+    def test_writable_by_others_the_file_or_its_folder(self):
+        os.chmod(self.path, 0o664)
+        self.refused('writable by group or others')
+        os.chmod(self.path, 0o644)
+        os.chmod(self.dir, 0o775)
+        self.refused(f'{self.dir} is writable by group or others')
+
+    def test_a_link_the_file_or_a_folder_above(self):
+        link = os.path.join(self.dir, 'link.json')
+        os.symlink(self.path, link)
+        self.refused('is a symbolic link', path=link)
+        os.symlink(self.dir, self.dir + '-link')
+        self.addCleanup(os.unlink, self.dir + '-link')
+        self.refused('is a symbolic link', path=os.path.join(self.dir + '-link', 'policy.json'))
+
+    def test_only_an_absolute_path_without_dots(self):
+        for path in ('policy.json', os.path.join(self.dir, '..', os.path.basename(self.dir), 'policy.json'),
+                     os.path.join(self.dir, '.', 'policy.json'), self.dir + '/'):
+            with self.subTest(path=path):
+                self.refused('must be an absolute path', path=path)
+
+    def test_not_a_plain_file_or_not_utf8(self):
+        os.unlink(self.path)
+        os.mkdir(self.path, 0o755)
+        self.refused('not a plain file')
+        os.rmdir(self.path)
+        with open(self.path, 'wb') as f:
+            f.write(b'\xff')
+        os.chmod(self.path, 0o644)
+        self.refused('not UTF-8')
 
 
 class RedCheck(unittest.TestCase):
@@ -217,7 +327,8 @@ class RedCheck(unittest.TestCase):
         for rule, (text, broken, test) in MUTATIONS.items():
             with self.subTest(rule=rule):
                 self.assertEqual(source.count(text), 1, f'the red check for {rule!r} no longer matches the code')
-                cls = type('Broken', (MachineFile,), {'mf': load(source.replace(text, broken))})
+                base = ProtectedText if test in vars(ProtectedText) else MachineFile
+                cls = type('Broken', (base,), {'mf': load(source.replace(text, broken))})
                 result = unittest.TestResult()
                 cls(test).run(result)
                 self.assertFalse(result.wasSuccessful(), f'{test} still passes with the rule {rule!r} broken')

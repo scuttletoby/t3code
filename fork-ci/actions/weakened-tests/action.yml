@@ -1,0 +1,85 @@
+name: weakened-tests
+description: >-
+  Reports the existing tests a pull request deletes, skips or weakens (Java, Python and Node patterns by default; a
+  project adds its own in a config read from the base commit), as the job summary and one pull request comment edited
+  in place. Report only: the step never fails. Run it on pull_request after a checkout with fetch-depth 0.
+  Usage: README.md next to this file.
+inputs:
+  config:
+    description: The project's JSON config (optional file; README "Config"), a plain path, read at the base commit.
+    required: false
+    default: .github/weakened-tests.json
+  base:
+    description: The base commit; the change is merge-base(base, head)..head.
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  head:
+    description: The pull request head commit.
+    required: false
+    default: ${{ github.event.pull_request.head.sha }}
+  path:
+    description: Where the repository is checked out (actions/checkout's path), with both commits fetched.
+    required: false
+    default: "."
+  pr:
+    description: The pull request number.
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  repo:
+    description: The repository, owner/name.
+    required: false
+    default: ${{ github.repository }}
+  token:
+    description: A token that can read the pull request and write its comments (pull-requests write).
+    required: false
+    default: ${{ github.token }}
+  comment:
+    description: true posts or edits the report comment; false writes only the job summary and outputs.
+    required: false
+    default: "true"
+  comment-author:
+    description: The login the token comments as; only this login's marked comment is edited.
+    required: false
+    default: github-actions[bot]
+outputs:
+  status:
+    description: >-
+      ok; could-not-read (the change could not be read: README "Could not read"); refused (git-clean refused the
+      checkout's git config: nothing was checked, and an earlier report comment says so); empty when the step did not
+      run.
+    value: ${{ steps.report.outputs.status }}
+  count:
+    description: How many items are listed (empty when the change could not be read).
+    value: ${{ steps.report.outputs.count }}
+  missing_why:
+    description: How many listed items the PR body gives no why for (empty when the body or the change could not be read).
+    value: ${{ steps.report.outputs.missing_why }}
+runs:
+  using: composite
+  steps:
+    # Only code from this action's folder (the caller's pinned SHA) runs; nothing from the checkout. Before any git
+    # call, the checkout's .git config must be one actions/checkout writes (fork-ci git-clean): when it is not (one an
+    # earlier job left), no git runs, status is refused and an earlier report comment is replaced; report only, so the
+    # step still passes.
+    - id: report
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        CONFIG: ${{ inputs.config }}
+        BASE: ${{ inputs.base }}
+        HEAD: ${{ inputs.head }}
+        CHECKOUT_PATH: ${{ inputs.path }}
+        PR: ${{ inputs.pr }}
+        REPO: ${{ inputs.repo }}
+        COMMENT: ${{ inputs.comment }}
+        COMMENT_AUTHOR: ${{ inputs.comment-author }}
+      run: |
+        args=(--config "$CONFIG" --repo "$REPO" --pr "$PR" --base "$BASE" --head "$HEAD" --path "$CHECKOUT_PATH"
+              --comment-author "$COMMENT_AUTHOR")
+        [ "$COMMENT" = true ] || args+=(--no-comment)
+        if ! python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path "$CHECKOUT_PATH" --require; then
+          echo "::warning::weakened-tests: no report, git-clean refused the checkout's git config (above)"
+          args+=(--refused)
+        fi
+        python3 -I "$GITHUB_ACTION_PATH/weakened_tests.py" "${args[@]}" ||
+          echo "::warning::weakened-tests: the report step failed (exit $?); report only, the pull request is not failed"

@@ -41,13 +41,16 @@ def _gh_never_ran():
 
 atexit.register(_gh_never_ran)
 
-import argparse, contextlib, fcntl, io, json, subprocess, unittest, unittest.mock  # noqa: E402
+import argparse, contextlib, fcntl, io, json, re, stat, subprocess, threading, time  # noqa: E402
+import unittest, unittest.mock, zlib  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import config  # noqa: E402
 import lens  # noqa: E402
 import pr_queue as Q  # noqa: E402
+
+REAL_HOLDS = Q.holds   # for a test that patches Q.holds and still needs the real one
 
 REPO = 'owner/proj'
 CFG_RAW = {
@@ -65,6 +68,10 @@ READ_AT = r'(?i)read at\s*:|\blens\s*:'
 
 
 # --- the World: real commits, a local "GitHub" ----------------------------------------------------------------------
+# What git_env sets on every git call of the queue, whatever the job's environment holds.
+FORCED = {'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C', **Q.GIT_ENV,
+          'GIT_ATTR_SOURCE': '4b825dc642cb6eb9a060e54bf8d69288fbee4904',   # the empty tree
+          'GIT_DEFAULT_HASH': 'sha1', 'GIT_DEFAULT_REF_FORMAT': 'files'}   # #457 item 3: what CACHE_CONFIG names
 GIT_ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
            'GIT_EDITOR': 'true'}
 
@@ -250,9 +257,18 @@ def inline_node(body, when='2026-11-07T10:00:00Z', login='owner', association='O
             'authorAssociation': association, 'author': {'__typename': typename, 'login': login}}
 
 
+# GraphQL's PageInfo.endCursor is a nullable String: GitHub can say hasNextPage true and give no cursor. `more=NO_CURSOR`
+# fakes that page (more=None is the last page).
+NO_CURSOR = object()
+
+
+def page_info(more):
+    return {'hasNextPage': more is not None, 'endCursor': None if more is NO_CURSOR else more}
+
+
 def inline_page(nodes=(), more=None):
-    """One page of a review's inline comments; more: the endCursor of a next page."""
-    return {'pageInfo': {'hasNextPage': more is not None, 'endCursor': more}, 'nodes': list(nodes)}
+    """One page of a review's inline comments; more: the endCursor of a next page (NO_CURSOR: there is one, no cursor)."""
+    return {'pageInfo': page_info(more), 'nodes': list(nodes)}
 
 
 def flags_page(*reviews, edited=False, hidden=False, more=None, typename='User', inline=(), inline_more=None):
@@ -264,7 +280,7 @@ def flags_page(*reviews, edited=False, hidden=False, more=None, typename='User',
     if inline or inline_more:
         nodes.append({'id': 'PRR_inline', 'includesCreatedEdit': False, 'isMinimized': False, 'url': 'https://x/PRR_inline',
                       'author': {'__typename': 'User', 'login': 'owner'}, 'comments': inline_page(inline, inline_more)})
-    page = {'hasNextPage': more is not None, 'endCursor': more}
+    page = page_info(more)
     return ok(json.dumps({'data': {'repository': {'pullRequest': {'reviews': {'pageInfo': page, 'nodes': nodes}}}}}))
 
 
@@ -407,10 +423,10 @@ class Update(Base):
     def test_a_network_error_on_the_fetch_by_sha_is_no_gone_commit(self):   # None (nothing known), not False
         real = self.q.git
 
-        def git(*a):
-            if a[:1] == ('fetch',) and not any(x.startswith('+refs/') for x in a):
+        def git(*a, **kw):
+            if 'fetch' in a and not any(x.startswith('+refs/') for x in a):   # after NO_DETACH's -c flags
                 return argparse.Namespace(returncode=128, stdout='', stderr='fatal: unable to access: timed out')
-            return real(*a)
+            return real(*a, **kw)
         self.w.set('refs/pull/7/head', self.c)
         self.q.git = git
         self.assertIsNone(run_quiet(self.q.fetch, 'main', 7, self.c, 'de' * 20)[0])
@@ -589,6 +605,14 @@ class ReviewFlagsQuery(unittest.TestCase):
             self.assertEqual(len(calls), 2, cursor)
         (flags, why), _ = self.read(flags_page(r, more=''))
         self.assertIsNone(flags)
+
+    def test_a_next_page_with_a_null_cursor_fails(self):   # endCursor is nullable: never read as the last page
+        r = gh_review('x', 't')
+        for pages in ([flags_page(r, more=NO_CURSOR)], [flags_page(r, more='c1'), flags_page(r, more=NO_CURSOR)]):
+            (flags, why), calls = self.read(*pages)
+            self.assertIsNone(flags, len(pages))
+            self.assertIn('no next page', why)
+            self.assertEqual(len(calls), len(pages))
 
     def test_more_pages_than_the_limit_fail(self):
         r = gh_review('x', 't')
@@ -1030,6 +1054,132 @@ class Recover(Base):   # a run killed after its disarm
         self.assertFalse(self.plan_exists())
 
 
+class ObjectsCheckInAnUpdate(Recover):   # #457 fix round: the cache check in a real run
+    def plant_corrupt(self, name):
+        """A corrupt loose object under `name` in the cache: what an earlier job could leave there."""
+        os.makedirs(os.path.join(self.q.cache, 'objects', name[:2]), exist_ok=True)
+        with open(os.path.join(self.q.cache, 'objects', name[:2], name[2:]), 'wb') as f:
+            f.write(zlib.compress(b'blob 5\0evil\n'))
+
+    def test_the_check_runs_while_github_updates_the_branch(self):   # state lens cost: overlaps the update and wait
+        f, seen, foreground = self.fake(polls=2), {}, []
+        git = self.q.git
+
+        def counted(*a, **kw):
+            if 'fsck' in a:
+                foreground.append(a)
+            return git(*a, **kw)
+        self.q.git = counted
+
+        def gh(*a):
+            if QueueGh.kind(a) == 'update':
+                seen['check'] = self.q.later
+            return f(*a)
+        code, out = self.update(gh)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+        self.assertIsInstance(seen.get('check'), subprocess.Popen, 'started before the branch update')
+        self.assertEqual(foreground, [], 'checked once, in the background')
+        self.assertIsNone(self.q.later)
+
+    def test_a_run_that_ends_before_the_merge_check_leaves_no_check_running(self):
+        procs, real = [], subprocess.Popen
+
+        def popen(*a, **kw):   # subprocess.run's own Popen too: only the check counts
+            p = real(*a, **kw)
+            if 'fsck' in a[0]:
+                procs.append(p)
+            return p
+        with unittest.mock.patch.object(Q.subprocess, 'Popen', popen):
+            code, out = self.update(self.fake(after=None))   # no new head in time: SILENT before the merge check
+            self.assertEqual(code, Q.SILENT, out)
+            with self.assertRaises(Killed):   # killed while it waits for the new head
+                self.update(self.fake(kill_at='poll'))
+        self.assertEqual(len(procs), 2)
+        self.assertEqual([p.poll() is None for p in procs], [False, False], 'stopped and reaped')
+        self.assertIsNone(self.q.later)
+
+    def test_a_broken_object_found_while_github_updates_is_rebuilt_before_the_merge_check(self):
+        f = self.fake()
+        self.assertTrue(run_quiet(self.q.fetch, 'main', 7, self.c)[0])   # an earlier run's cache
+        self.plant_corrupt(self.up)   # the name update-branch's head will have
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+        self.assertIn('rebuilding it', out)
+
+    def test_the_background_checks_answer_is_read_before_the_merge_check(self):   # no fetch trips over this one
+        f, fscks = self.fake(), []
+        self.assertTrue(run_quiet(self.q.fetch, 'main', 7, self.c)[0])   # an earlier run's cache
+        git = self.q.git
+
+        def counted(*a, **kw):
+            if 'fsck' in a:
+                fscks.append(a)
+            return git(*a, **kw)
+        self.q.git = counted
+        self.plant_corrupt('ab' * 20)   # a name no fetch needs: only git fsck sees it
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+        self.assertIn('rebuilding it', out)
+        self.assertEqual(len(fscks), 1, 'the background answer, then only the rebuilt cache checked in the foreground')
+
+    def test_a_fetch_a_broken_object_fails_in_recover_is_rebuilt(self):   # trust lens 1: never stuck
+        self.fake()
+        self.assertTrue(run_quiet(self.q.fetch, 'main', 7, self.c)[0])   # an earlier run's cache
+        self.plant_corrupt(self.up)
+        f = self.fake(armed=False, h1=self.up)   # killed after update-branch: the new head must be fetched
+        code, out = self.recover(f, self.plan())
+        self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+        self.assertIn('rebuilding it', out)
+
+    def test_an_object_written_while_github_updates_is_never_merged_in(self):   # #465 item 1
+        """The background check has passed. While GitHub updates the branch, another process writes main's tree
+        under the name of the tree of the change read, and the new head drops the change: merge-tree in the cache
+        calls that head the change read merged with main."""
+        w = self.w
+        tree = w.git(w.remote, 'rev-parse', self.m1 + '^{tree}')
+        self.lost = w.keep(w.git(w.work, 'commit-tree', tree, '-p', self.c, '-p', self.m1, '-m', 'lost'))
+        f = self.fake(after='lost')
+
+        def gh(*a):
+            if QueueGh.kind(a) == 'update':
+                self.assertEqual(self.q.later.wait(), 0, 'the background check found the cache healthy')
+                victim = w.git(w.remote, 'rev-parse', self.c + '^{tree}')
+                body = subprocess.run(['git', '--git-dir', self.q.cache, 'cat-file', 'tree', tree],
+                                      capture_output=True, check=True).stdout
+                path = os.path.join(self.q.cache, 'objects', victim[:2], victim[2:])
+                self.assertTrue(os.path.exists(path), 'a small fetch leaves loose objects')
+                os.chmod(path, 0o644)
+                with open(path, 'wb') as o:
+                    o.write(zlib.compress(b'tree %d\0' % len(body) + body))
+                self.assertEqual(Q.merge_tree(self.q.git, self.m1, self.c).stdout.split()[:1], [tree],
+                                 'the planted tree does not make merge-tree drop the change: the test reads nothing')
+            return f(*a)
+        code, out = self.update(gh)
+        self.assertEqual((f.armed, len(f.comments)), (None, 1), out)   # left OFF, said why, in the same run
+        self.assertIn('is not exactly the change read', f.comments[0])
+        self.assertIn('although git fsck passed', out)
+        self.assertIn('rebuilding it', out)
+        self.assertFalse(self.plan_exists(), 'answered: nothing is left for the next run')
+        self.assertFalse(os.path.lexists(self.q.cache + Q.MERGE_COPY))
+
+    def test_a_cache_still_broken_says_so_not_could_not_fetch(self):   # state lens 2, trust nit 2: log and PR comment
+        self.q.objects_problem = lambda *a: 'has objects git fsck finds broken or missing (planted)'
+        f = self.fake()
+        code, out = self.update(f)
+        self.assertEqual((code, f.armed, f.comments), (Q.SILENT, None, []), out)
+        self.assertIn('fails git fsck', out)
+        self.assertNotIn('could not fetch', out)
+        g = self.fake(armed=False, h1=self.up)
+        for _ in range(2):
+            code, out = self.recover(g, self.saved_plan())
+            self.assertEqual((code, g.armed, len(g.comments)), (1, None, 1), out)
+            self.assertIn('fails git fsck', out)
+            self.assertNotIn('could not fetch', out)
+        self.assertIn('fails git fsck', g.comments[0])
+        self.assertNotIn('could not fetch', g.comments[0])
+        self.assertNotIn(self.w.dir, g.comments[0], 'no runner path in a PR comment')
+
+
 class WhoseCommentsCount(Base):
     """Anyone can comment on a public repository: only comments of the configured lens associations, shown and never
     edited, are lens reads (lens.Review.counts). Everyone else's neither vouch for a head nor block one."""
@@ -1161,6 +1311,111 @@ class OwnCache(Base):
                 self.assertTrue(got, out)
                 self.assertIn("is not this user's alone", out)
                 self.assertEqual(os.stat(self.q.cache).st_mode & 0o777, 0o700)
+
+    def init_writes(self, head=None, config=None):
+        """subprocess.run, where `git init` also writes `head` to HEAD and adds `config` to the config, as another git
+        would (git 3.0: HEAD names main; a reftable or SHA-256 default)."""
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            r = real(cmd, **kw)
+            if 'init' in cmd and r.returncode == 0:
+                if head is not None:
+                    with open(os.path.join(cmd[-1], 'HEAD'), 'w') as f:
+                        f.write(head)
+                if config is not None:
+                    with open(os.path.join(cmd[-1], 'config'), 'a') as f:
+                        f.write(config)
+            return r
+        return unittest.mock.patch.object(subprocess, 'run', run)
+
+    def test_a_git_whose_init_names_another_branch_still_makes_the_queues_head(self):   # #457 item 2: git 3.0, main
+        with self.init_writes(head='ref: refs/heads/main\n'):
+            for _ in range(3):   # made once, then kept: never rebuilt for a HEAD git chose
+                got, out = self.fetch(self.c)
+                self.assertTrue(got, out)
+                self.assertNotIn('rebuilding', out)
+                with open(os.path.join(self.q.cache, 'HEAD')) as f:
+                    self.assertEqual(f.read(), Q.CACHE_HEAD)
+                self.assertIsNone(self.q.cache_problem())
+
+    def test_a_head_or_config_that_is_a_link_is_never_followed(self):   # #457 item 4: cache_problem's O_NOFOLLOW
+        for name, text in (('HEAD', Q.CACHE_HEAD), ('config', Q.CACHE_CONFIG)):
+            with self.subTest(name):
+                self.assertTrue(self.fetch(self.c)[0])
+                target = os.path.join(self.w.dir, name + '-elsewhere')   # what the queue would write, but elsewhere
+                with open(target, 'w') as f:
+                    f.write(text)
+                path = os.path.join(self.q.cache, name)
+                os.remove(path)
+                os.symlink(target, path)
+                self.assertIn('cannot be checked', self.q.cache_problem())
+                got, out = self.fetch(self.up)
+                self.assertTrue(got, out)
+                self.assertIn('cannot be checked', out)
+                self.assertIn('rebuilding it', out)
+                self.assertFalse(os.path.islink(path))
+                got, out = self.fetch(self.up)   # runs again: kept
+                self.assertTrue(got, out)
+                self.assertNotIn('rebuilding', out)
+
+    def test_the_jobs_default_formats_never_reach_the_cache(self):   # #457 item 3: git 3.0 defaults, or a job's
+        envs, real = [], subprocess.run
+
+        def run(cmd, **kw):
+            if 'init' in cmd:
+                envs.append(kw.get('env'))
+            return real(cmd, **kw)
+        job = {'GIT_DEFAULT_HASH': 'sha256', 'GIT_DEFAULT_REF_FORMAT': 'reftable'}
+        with unittest.mock.patch.dict(os.environ, job), unittest.mock.patch.object(subprocess, 'run', run):
+            for _ in range(2):
+                got, out = self.fetch(self.c)
+                self.assertTrue(got, out)
+                self.assertNotIn('rebuilding', out)
+                self.assertEqual(self.q.git('rev-parse', '--show-object-format').stdout.strip(), 'sha1')
+        self.assertEqual(len(envs), 1, 'made once')
+        self.assertEqual({k: envs[0].get(k) for k in job}, Q.GIT_FORMATS)
+
+    def test_a_git_that_makes_another_format_is_refused_clearly(self):   # #457 item 3: refused, never written over
+        for extension in ('\n[extensions]\n\trefStorage = reftable\n', '\n[extensions]\n\tobjectFormat = sha256\n'):
+            with self.subTest(extension.split()[1]), self.init_writes(config=extension):
+                shutil.rmtree(self.q.cache, ignore_errors=True)
+                for _ in range(2):   # runs again: the same refusal, nothing fetched, nothing merged
+                    got, out = self.fetch(self.c)
+                    self.assertIsNone(got, out)
+                    self.assertIn('git init made a repository with extensions.' + extension.split()[1], out)
+                    self.assertIn('GIT_DEFAULT_HASH=sha1', out)
+                    self.assertFalse(os.path.lexists(self.q.cache))
+        got, out = self.fetch(self.c)   # a git that keeps the formats again: made as the queue's
+        self.assertTrue(got, out)
+
+    def test_a_git_that_makes_another_format_version_is_refused_clearly(self):   # state lens 4: M6, no [extensions]
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            r = real(cmd, **kw)
+            if 'init' in cmd and r.returncode == 0:
+                path = os.path.join(cmd[-1], 'config')
+                with open(path) as f:
+                    text = f.read()
+                with open(path, 'w') as f:
+                    f.write(text.replace('repositoryformatversion = 0', 'repositoryformatversion = 1'))
+            return r
+        with unittest.mock.patch.object(subprocess, 'run', run):
+            for _ in range(2):
+                got, out = self.fetch(self.c)
+                self.assertIsNone(got, out)
+                self.assertIn('git init made a repository with format version 1', out)
+                self.assertFalse(os.path.lexists(self.q.cache))
+
+    def test_a_git_whose_init_writes_more_config_still_makes_the_queues_config(self):   # state lens 4: M17 (Windows)
+        with self.init_writes(config='\n[core]\n\tignorecase = true\n\tsymlinks = false\n'):
+            for _ in range(3):   # made once, then kept: never rebuilt for config git chose
+                got, out = self.fetch(self.c)
+                self.assertTrue(got, out)
+                self.assertNotIn('rebuilding', out)
+                with open(os.path.join(self.q.cache, 'config')) as f:
+                    self.assertEqual(f.read(), Q.CACHE_CONFIG)
 
 
 def own(comment):
@@ -2085,6 +2340,1118 @@ class ArmWaitsOutTheQueuedCheckRace(Base):
         self.assertEqual((code, len(f.comments)), (0, 1))
 
 
+class HoldsReadsAnyFileName(unittest.TestCase):   # #374 item 5: merge-tree names a conflicted file as git stores it
+    """A conflict lists file names in merge-tree's output, and a name need not be UTF-8: a strict decode raised
+    UnicodeDecodeError out of holds. Not the same change (a conflict never gives the head's tree), said clearly."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix='pr-queue-holds-')
+        self.addCleanup(shutil.rmtree, self.d, True)
+        World.git(self.d, 'init', '-q', '-b', 'main')
+
+    def commit(self, text, parents=()):
+        with open(os.path.join(os.fsencode(self.d), b'bad\xff.txt'), 'w') as f:
+            f.write(text)
+        World.git(self.d, 'add', '-A')
+        tree = World.git(self.d, 'write-tree')
+        return World.git(self.d, 'commit-tree', tree, *sum((['-p', p] for p in parents), []), '-m', 'c')
+
+    def git(self, *a):   # as Queue.git and head_check's Checkout.git decode: strictly
+        return subprocess.run(['git', *a], cwd=self.d, text=True, encoding='utf-8', errors='strict',
+                              capture_output=True, env={**os.environ, **GIT_ENV})
+
+    def test_a_conflict_on_a_file_name_that_is_not_utf8_is_no_same_change(self):
+        m0 = self.commit('a\n')
+        read, m1 = self.commit('read\n', [m0]), self.commit('base\n', [m0])
+        World.git(self.d, 'update-ref', 'refs/queue/base', m1)
+        head = self.commit('resolved\n', [m1, read])   # a conflict resolution: never the read change alone
+        real = subprocess.run(['git', 'merge-tree', '--write-tree', m1, read], cwd=self.d, capture_output=True)
+        self.assertEqual(real.returncode, 1)   # a real conflict, naming the file as git stores it
+        self.assertIn(b'bad\xff.txt', real.stdout)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIs(Q.holds(self.git, head, read), False)
+        said = out.getvalue()
+        self.assertIn('git printed bytes that are not UTF-8', said)
+        self.assertIn('not taken as the change read', said)
+        self.assertIs(Q.holds(self.git, read, read), True)   # the read itself: no git at all
+
+
+class HoldsIgnoresTheJobsAttributeSource(unittest.TestCase):   # #442 item 1: GIT_ATTR_SOURCE is in GIT_DROP
+    """GIT_ATTR_SOURCE makes git read attributes from a tree of its choice. Naming one that holds `* merge=union`
+    makes merge-tree union-merge a conflict, so a conflict resolution nobody read would be the merge's own tree."""
+
+    def test_a_conflict_stays_a_conflict_whatever_tree_the_job_names(self):
+        w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'c.json': '{"a": 1}\n'})
+        read = w.commit({'c.json': '{"a": 2}\n'}, [m0])
+        m1 = w.commit({'c.json': '{"a": 3}\n', 'u/.gitattributes': '* merge=union\n'}, [m0])
+        attrs = w.git(w.work, 'rev-parse', f'{m1}:u')
+        union = subprocess.run(['git', 'merge-tree', '--write-tree', m1, read], cwd=w.work, text=True,
+                               capture_output=True, env={**os.environ, 'GIT_ATTR_SOURCE': attrs})
+        self.assertEqual(union.returncode, 0, 'no union merge with GIT_ATTR_SOURCE on this git: the test reads nothing')
+        head = w.keep(w.git(w.work, 'commit-tree', union.stdout.split()[0], '-p', read, '-p', m1, '-m', 'union'))
+        w.set('refs/heads/main', m1)
+        w.set('refs/pull/7/head', head)
+        q = make_queue(w.dir, remote=w.remote)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIs(q.fetch('main', 7, read), True)
+            for _ in range(2):   # runs again: the same answer
+                with unittest.mock.patch.dict(os.environ, {'GIT_ATTR_SOURCE': attrs}):
+                    self.assertIs(Q.holds(q.git, head, read), False)
+
+
+class HoldsReadsNoAttributesOfTheCache(unittest.TestCase):   # #450 item 1
+    """A bare repository's HEAD is an attribute source (git 2.43 to 2.45 read `HEAD:.gitattributes` there), and so is
+    `attr.tree` (2.43+). The queue's cache is kept between runs: an earlier job on the runner (the same user) could
+    point HEAD at a commit whose `.gitattributes` holds `* merge=union`, and merge-tree would union-merge a conflict.
+    Every git call of the queue reads attributes from the empty tree (GIT_ATTR_SOURCE), and the cache's HEAD must be
+    the one the queue wrote, never resolving to a commit."""
+
+    def setUp(self):
+        w = self.w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'c.json': '{"a": 1}\n'})
+        self.read = w.commit({'c.json': '{"a": 2}\n'}, [m0])
+        self.m1 = w.commit({'c.json': '{"a": 3}\n'}, [m0])
+        self.evil = w.commit({'c.json': '{"a": 3}\n', '.gitattributes': '* merge=union\n'}, [self.m1])
+        union = subprocess.run(['git', '-c', f'attr.tree={self.evil}', 'merge-tree', '--write-tree', self.m1,
+                                self.read], cwd=w.work, text=True, capture_output=True, env={**os.environ, **GIT_ENV})
+        self.assertEqual(union.returncode, 0, 'no union merge through attr.tree on this git: the test reads nothing')
+        self.head = w.keep(w.git(w.work, 'commit-tree', union.stdout.split()[0], '-p', self.read, '-p', self.m1,
+                                 '-m', 'union'))
+        w.set('refs/heads/main', self.m1)
+        w.set('refs/pull/7/head', self.head)
+        self.q = make_queue(w.dir, remote=w.remote)
+        got, out = run_quiet(self.q.fetch, 'main', 7, self.read, self.evil)
+        self.assertIs(got, True, out)
+        self.cache_git('update-ref', 'refs/queue/evil', self.evil)
+
+    def cache_git(self, *a):
+        return World.git(self.w.dir, '--git-dir', self.q.cache, *a)
+
+    def plant_head(self, text):
+        with open(os.path.join(self.q.cache, 'HEAD'), 'w') as f:
+            f.write(text)
+
+    def test_every_git_call_reads_attributes_from_the_empty_tree(self):
+        self.assertEqual(Q.git_env({})['GIT_ATTR_SOURCE'], Q.EMPTY_TREE)
+        self.assertEqual(Q.git_env({'GIT_ATTR_SOURCE': self.evil}, 'https://github.com/o/r.git')['GIT_ATTR_SOURCE'],
+                         Q.EMPTY_TREE)
+        self.assertEqual(Q.EMPTY_TREE, World.git(self.w.dir, 'hash-object', '-t', 'tree', '/dev/null'))
+        for _ in range(2):   # runs again: the same answer; attr.tree stands for any source git may read
+            self.assertIs(Q.holds(lambda *a: self.q.git('-c', f'attr.tree={self.evil}', *a), self.head, self.read),
+                          False)
+
+    def test_a_planted_head_is_no_attribute_source(self):   # the lens's case
+        self.plant_head('ref: refs/queue/evil\n')
+        for _ in range(2):
+            self.assertIs(Q.holds(self.q.git, self.head, self.read), False)
+
+    def test_the_cache_is_made_with_the_queues_head_and_kept_with_it(self):
+        with open(os.path.join(self.q.cache, 'HEAD')) as f:
+            self.assertEqual(f.read(), Q.CACHE_HEAD)
+        self.assertIsNone(self.q.cache_problem())
+        self.assertEqual(self.cache_git('symbolic-ref', 'HEAD'), 'refs/heads/master')   # what git init writes, too
+        for _ in range(2):   # runs again: kept, not rebuilt
+            got, out = run_quiet(self.q.fetch, 'main', 7, self.read)
+            self.assertIs(got, True, out)
+            self.assertNotIn('rebuilding', out)
+
+    def test_a_cache_whose_head_the_queue_did_not_write_is_rebuilt(self):
+        def symlink():
+            os.remove(os.path.join(self.q.cache, 'HEAD'))
+            os.symlink(os.path.join(self.q.cache, 'refs', 'queue', 'evil'), os.path.join(self.q.cache, 'HEAD'))
+
+        def missing():
+            os.remove(os.path.join(self.q.cache, 'HEAD'))
+
+        def born():   # HEAD as written, but its branch made: HEAD names a commit
+            self.cache_git('update-ref', 'refs/heads/master', self.evil)
+
+        for name, plant, says in (('a ref to the commit', lambda: self.plant_head('ref: refs/queue/evil\n'), 'HEAD'),
+                                  ('a detached HEAD', lambda: self.plant_head(self.evil + '\n'), 'HEAD'),
+                                  ('an empty HEAD', lambda: self.plant_head(''), 'HEAD'),
+                                  ('a symlink', symlink, 'HEAD'), ('no HEAD', missing, 'HEAD'),
+                                  ('the queue\'s HEAD, born', born, 'HEAD names a commit')):
+            with self.subTest(name):
+                plant()
+                self.assertIn(says, self.q.cache_problem() or '')
+                got, out = run_quiet(self.q.fetch, 'main', 7, self.read, self.evil)   # the next run
+                self.assertIs(got, True, out)
+                self.assertIn('rebuilding it', out)
+                self.assertIsNone(self.q.cache_problem())
+                self.assertIs(Q.holds(self.q.git, self.head, self.read), False)
+                self.cache_git('update-ref', 'refs/queue/evil', self.evil)
+
+    def test_a_head_planted_between_two_runs_is_found_by_the_next(self):   # stopped after the fetch, before merge-tree
+        self.plant_head('ref: refs/queue/evil\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIs(self.q.same_change('main', 7, self.head, self.read), False)
+        self.assertIn('rebuilding it', out.getvalue())
+
+
+class HoldsChecksTheCachesObjects(unittest.TestCase):   # #457 item 1
+    """git checks an object's hash on only some reads, never of a tree or blob merge-tree reads. The cache is kept
+    between runs: an earlier job on the runner (the same user) could write another tree or blob under the name of one
+    side's, and merge-tree would merge a real conflict clean. Before each merge check the queue runs git fsck on the
+    cache; a cache it finds broken is set aside and fetched again, never merged in."""
+
+    def setUp(self):
+        w = self.w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'c.json': '{"a": 1}\n'})
+        self.read = w.commit({'c.json': '{"a": 2}\n'}, [m0])
+        self.m1 = w.commit({'c.json': '{"a": 3}\n'}, [m0])
+        # what a planted tree makes merge-tree say: the base's side alone, the change read gone without a word
+        self.head = w.keep(w.git(w.work, 'commit-tree', self.m1 + '^{tree}', '-p', self.read, '-p', self.m1,
+                                 '-m', 'lost'))
+        w.set('refs/heads/main', self.m1)
+        w.set('refs/pull/7/head', self.head)
+        self.run_again()
+        got, out = run_quiet(self.q.fetch, 'main', 7, self.read)
+        self.assertIs(got, True, out)
+        self.assertIs(Q.holds(self.q.git, self.head, self.read), False, 'a real conflict')
+
+    def run_again(self):
+        """The next run: a new Queue on the same cache."""
+        self.q = make_queue(self.w.dir, remote=self.w.remote)
+        self.fscks, self.merges = [], []   # merges: the repository of each merge-tree (None: the cache)
+        git = self.plain_git = self.q.git
+
+        def counted(*a, **kw):
+            if 'fsck' in a:
+                self.fscks.append(a)
+            if 'merge-tree' in a:
+                self.merges.append(kw.get('repo'))
+            return git(*a, **kw)
+        self.q.git = counted
+
+    def cache_git(self, *a):
+        return World.git(self.w.dir, '--git-dir', self.q.cache, *a)
+
+    def plant(self, kind='tree'):
+        """The read side's tree object replaced by the base side's tree, at the same name (a loose object, as a small
+        fetch leaves it: git reads a packed object before a loose one, so a packed one is replaced by a pack). `blob`:
+        the read side's c.json replaced by the merge base's (merge-tree reads a blob's content only when the three
+        names differ, and then takes the base side's change: clean)."""
+        if kind == 'tree':
+            victim, donor = self.cache_git('rev-parse', self.read + '^{tree}', self.m1 + '^{tree}').split()
+        else:
+            victim, donor = self.cache_git('rev-parse', self.read + ':c.json', self.read + '^:c.json').split()
+        body = subprocess.run(['git', '--git-dir', self.q.cache, 'cat-file', kind, donor], capture_output=True,
+                              check=True).stdout
+        self.write_object(victim, kind.encode() + b' %d\0' % len(body) + body)
+        self.assertIs(Q.holds(self.plain_git, self.head, self.read), True,
+                      f'the planted {kind} does not merge the conflict clean on this git: the test reads nothing')
+
+    def write_object(self, name, raw):
+        """`raw` (zlib-compressed) as the loose object `name`, over the one a small fetch left there."""
+        path = os.path.join(self.q.cache, 'objects', name[:2], name[2:])
+        self.assertTrue(os.path.exists(path), 'a small fetch leaves loose objects')
+        os.chmod(path, 0o644)
+        with open(path, 'wb') as f:
+            f.write(zlib.compress(raw))
+
+    def same_change(self):
+        return run_quiet(self.q.same_change, 'main', 7, self.head, self.read)
+
+    def test_a_replaced_tree_object_makes_the_run_refuse(self):   # the lens's case
+        for planted in range(2):   # planted again in the rebuilt cache: refused again
+            with self.subTest(planted=planted):
+                self.plant()
+                self.run_again()
+                same, out = self.same_change()
+                self.assertIs(same, False, out)
+                self.assertIn('git fsck', out)
+                self.assertIn('rebuilding it', out)
+                fsck = subprocess.run(['git', '--git-dir', self.q.cache, 'fsck', '--no-dangling'], capture_output=True)
+                self.assertEqual(fsck.returncode, 0, 'the rebuilt cache holds only what was fetched')
+                for _ in range(2):   # runs again: the rebuilt cache is kept and gives the same answer
+                    self.run_again()
+                    same, out = self.same_change()
+                    self.assertIs(same, False, out)
+                    self.assertNotIn('rebuilding', out)
+                    self.assertEqual(len(self.fscks), 1, 'one check before the merge check')
+
+    def test_a_cache_still_broken_after_the_rebuild_is_never_merged(self):   # nothing is known: STATE stays
+        with unittest.mock.patch.object(Q, 'holds', side_effect=AssertionError('merged in a broken cache')):
+            for _ in range(2):   # each a run of its own (a new Queue): one download from scratch per run
+                self.run_again()
+                self.q.objects_problem = lambda: 'has objects git fsck finds broken (planted)'
+                fetches = self.count_fetches()
+                same, out = self.same_change()
+                self.assertIsNone(same, out)
+                self.assertIn('fetched again', out)
+                self.assertEqual(len(fetches), 2)
+                same, out = self.same_change()   # asked once more in the same run: no second download
+                self.assertIsNone(same, out)
+                self.assertNotIn('rebuilding', out)
+                self.assertIn('not downloaded a second time', out)
+                self.assertEqual(len(fetches), 3)
+
+    def test_a_kept_healthy_cache_is_checked_and_kept(self):   # a cache from before the fix: the same files
+        for _ in range(2):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            self.assertNotIn('rebuilding', out)
+            self.assertEqual(len(self.fscks), 1)
+        self.cache_git('repack', '-adq')   # git's own gc packs it: still the queue's
+        self.run_again()
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertNotIn('rebuilding', out)
+
+    def test_a_new_empty_cache_is_made_fetched_and_checked(self):
+        shutil.rmtree(self.q.cache)
+        for _ in range(2):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            self.assertNotIn('rebuilding', out)
+            self.assertEqual(len(self.fscks), 1)
+
+    def test_a_fetch_stopped_half_way_leaves_a_cache_that_still_answers(self):   # killed while writing objects
+        for name in (os.path.join('objects', 'pack', 'tmp_pack_x1Y2z3'), os.path.join('objects', 'ab', 'tmp_obj_x')):
+            path = os.path.join(self.q.cache, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'wb') as f:
+                f.write(b'PACK\0\0\0\2half')
+        for _ in range(2):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+
+
+    def test_a_replaced_blob_object_makes_the_run_refuse(self):   # state lens 4: not only trees (and no
+        self.plant('blob')                                          # --connectivity-only, which misses it)
+        for again in range(2):   # rebuilt once, then kept with the same answer
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            (self.assertNotIn if again else self.assertIn)('rebuilding', out)
+
+    def test_a_replaced_object_no_ref_reaches_makes_the_run_refuse(self):   # M16: git fsck says exit 1 alone
+        """The change read was force-pushed away: the queue fetched it by sha, so no ref in the cache reaches its
+        tree, and git fsck finds the planted tree with exit code 1 only (no missing object: nothing reachable is
+        broken). Any non-zero exit is a broken cache."""
+        lost = self.w.keep(self.w.git(self.w.work, 'commit-tree', self.m1 + '^{tree}', '-p', self.m1, '-m', 'lost'))
+        self.w.set('refs/pull/7/head', lost)
+        self.head = lost
+        self.run_again()
+        got, out = run_quiet(self.q.fetch, 'main', 7, self.read)
+        self.assertIs(got, True, out)
+        self.assertIs(Q.holds(self.q.git, self.head, self.read), False, 'a real conflict')
+        self.plant()
+        fsck = subprocess.run(['git', '--git-dir', self.q.cache, *Q.FSCK_IGNORE, 'fsck', '--no-dangling',
+                               '--no-reflogs'], capture_output=True)
+        self.assertEqual(fsck.returncode, 1, 'the planted tree is reachable: the test reads nothing new')
+        self.run_again()
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertIn('rebuilding it', out)
+
+    def odd_base(self):
+        """main moves to a commit with time zone +99999: old imports have such commits, `git fetch` takes them and
+        plain `git fsck` calls them badTimezone."""
+        raw = (f'tree {self.cache_git("rev-parse", self.m1 + "^{tree}")}\nparent {self.m1}\n'
+               'author t <t@t> 1700000000 +99999\ncommitter t <t@t> 1700000000 +99999\n\nold import\n')
+        odd = self.w.keep(subprocess.run(['git', 'hash-object', '--literally', '-t', 'commit', '-w', '--stdin'],
+                                         cwd=self.w.work, input=raw, text=True, capture_output=True,
+                                         check=True).stdout.strip())
+        self.w.set('refs/heads/main', odd)
+        return odd
+
+    def test_old_format_history_github_serves_is_no_broken_cache(self):   # state lens 1: never a refetch loop
+        self.odd_base()
+        got, out = run_quiet(self.q.fetch, 'main', 7, self.read)
+        self.assertIs(got, True, out)
+        plain = subprocess.run(['git', '--git-dir', self.q.cache, 'fsck', '--no-dangling'], text=True,
+                               capture_output=True)
+        self.assertIn('badTimezone', plain.stdout + plain.stderr,
+                      'plain git fsck takes this commit: the test reads nothing')
+        for _ in range(3):   # runs again: an answer every time, never a rebuild
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            self.assertNotIn('rebuilding', out)
+            self.assertEqual(len(self.fscks), 1)
+        self.plant()   # what the check is for still counts with the old format ignored
+        self.run_again()
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertIn('rebuilding it', out)
+
+    def test_a_missing_object_is_still_broken_with_the_old_format_ignored(self):   # FSCK_FORMAT_IDS names no loss
+        self.odd_base()
+        self.assertIs(run_quiet(self.q.fetch, 'main', 7, self.read)[0], True)
+        blob = self.cache_git('rev-parse', self.read + ':c.json')
+        os.remove(os.path.join(self.q.cache, 'objects', blob[:2], blob[2:]))
+        for again in range(2):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            (self.assertNotIn if again else self.assertIn)('rebuilding', out)
+
+    def test_a_fresh_download_that_fails_the_same_way_is_not_downloaded_again(self):   # state lens 1: cost
+        self.odd_base()   # as a newer git's fsck may refuse what no FSCK_IGNORE id names
+        fetches = []
+        real_fetch = Q.Queue.fetch
+
+        def fetch(q, *a):
+            fetches.append(a)
+            return real_fetch(q, *a)
+        with unittest.mock.patch.object(Q, 'FSCK_IGNORE', (), create=True), \
+                unittest.mock.patch.object(Q.Queue, 'fetch', fetch), \
+                unittest.mock.patch.object(Q, 'holds', side_effect=AssertionError('merged in a broken cache')):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIsNone(same, out)
+            self.assertIn('rebuilding it', out)
+            self.assertEqual(len(fetches), 2, 'one download from scratch')
+            for _ in range(2):   # the next runs: the same lines from a fresh download, so no download again
+                fetches.clear()
+                self.run_again()
+                same, out = self.same_change()
+                self.assertIsNone(same, out)
+                self.assertNotIn('rebuilding', out)
+                self.assertIn('the same way', out)
+                self.assertIn('fails git fsck', self.q.unknown)
+                self.assertEqual(len(fetches), 1, out)
+            with unittest.mock.patch.object(Q, 'holds', REAL_HOLDS):
+                self.plant()   # a new broken object is another answer: rebuilt again
+            fetches.clear()
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIsNone(same, out)
+            self.assertIn('rebuilding it', out)
+            self.assertEqual(len(fetches), 2)
+
+    def test_a_fetch_a_broken_object_fails_is_rebuilt_once(self):   # trust lens 1: never stuck on "could not fetch"
+        head = self.w.keep(self.w.git(self.w.work, 'commit-tree', self.m1 + '^{tree}', '-p', self.read, '-p', self.m1,
+                                      '-m', 'lost again'))
+        self.w.set('refs/pull/7/head', head)
+        os.makedirs(os.path.join(self.q.cache, 'objects', head[:2]), exist_ok=True)
+        path = os.path.join(self.q.cache, 'objects', head[:2], head[2:])
+        with open(path, 'wb') as f:   # a corrupt object under the name the next fetch needs
+            f.write(zlib.compress(b'blob 5\0evil\n'))
+        for _ in range(2):   # the first run rebuilds; the next keeps it and answers the same
+            self.run_again()
+            same, out = run_quiet(self.q.same_change, 'main', 7, head, self.read)
+            self.assertIs(same, False, out)
+        self.assertNotIn('rebuilding', out)
+        self.assertFalse(os.path.exists(path) and open(path, 'rb').read() == zlib.compress(b'blob 5\0evil\n'))
+
+    def test_a_fetch_that_fails_on_the_network_runs_no_check(self):   # only a cause in the cache is checked
+        self.q.remote = 'https://localhost:1/o/r.git'   # nothing listens there: "unable to access"
+        self.run_again()
+        self.q.remote = 'https://localhost:1/o/r.git'
+        same, out = self.same_change()
+        self.assertIsNone(same, out)
+        self.assertEqual(self.fscks, [])
+        self.assertIn('could not fetch', self.q.unknown)
+
+    # --- #465 item 1: an object written after the cache's check and before merge-tree --------------------------------
+    def plant_after_the_check(self, plant, times=1, skip=0):
+        """The next run, in which `plant` runs right after the run's first `times` git fscks returned (after its
+        first `skip`, which are left alone): what another process that can write the cache does while the run goes on
+        (in an update the check ends minutes before merge-tree)."""
+        self.run_again()
+        git, left = self.q.git, [skip, times]
+
+        def then_plant(*a, **kw):
+            r = git(*a, **kw)
+            if 'fsck' in a:
+                if left[0]:
+                    left[0] -= 1
+                elif left[1]:
+                    left[1] -= 1
+                    plant()
+            return r
+        self.q.git = then_plant
+
+    def count_fetches(self):
+        """The list of every Queue.fetch call from now on."""
+        fetches, real_fetch = [], Q.Queue.fetch
+
+        def fetch(q, *a):
+            fetches.append(a)
+            return real_fetch(q, *a)
+        patched = unittest.mock.patch.object(Q.Queue, 'fetch', fetch)
+        patched.start()
+        self.addCleanup(patched.stop)
+        return fetches
+
+    def assert_merged_outside_the_cache(self):
+        self.assertTrue(self.merges, 'a merge check ran')
+        self.assertEqual([r for r in self.merges if r != self.q.cache + Q.MERGE_COPY], [],
+                         'every merge-tree ran in the copy, never in the cache')
+        self.assertFalse(os.path.lexists(self.q.cache + Q.MERGE_COPY), 'and the copy is gone after the check')
+
+    def test_an_object_changed_after_the_check_is_never_merged_in(self):
+        for kind in ('tree', 'blob'):
+            with self.subTest(kind=kind):
+                self.plant_after_the_check(lambda: self.plant(kind))
+                same, out = self.same_change()
+                self.assertIs(same, False, out)   # the real answer, in the same run
+                self.assertIn('although git fsck passed', out)
+                self.assertIn('does not hash to its name', out)
+                self.assertIn('rebuilding it', out)
+                self.assertEqual(len(self.fscks), 2, 'the check that passed, and the rebuilt cache\'s')
+                self.assert_merged_outside_the_cache()
+                self.assertFalse(os.path.lexists(self.q.known), 'a check that passed leaves no record')
+                self.run_again()   # the next run: the rebuilt cache is kept
+                same, out = self.same_change()
+                self.assertIs(same, False, out)
+                self.assertNotIn('rebuilding', out)
+
+    def test_an_object_changed_again_after_the_rebuild_is_not_merged_in(self):
+        """Whoever changes the cache keeps at it: the run knows nothing (STATE stays), and the next run's git fsck
+        finds what was left there."""
+        self.plant_after_the_check(lambda: self.plant('tree'), times=2)
+        same, out = self.same_change()
+        self.assertIsNone(same, out)
+        self.assertIn('rebuilding it', out)
+        self.assertIn('fetched again from GitHub, still', out)
+        self.assertEqual(self.merges, [], 'no merge-tree ran at all')
+        self.assertIn('not what its name says', self.q.unknown)
+        self.assertNotIn(self.w.dir, self.q.unknown, 'no runner path in a PR comment')
+        with open(self.q.known) as f:
+            self.assertRegex(f.read(), r'^merge check: object [0-9a-f]{40} does not hash to its name$')
+        self.run_again()   # the next run: git fsck finds the planted tree, one more download, the real answer
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertIn('rebuilding it', out)
+        self.assertFalse(os.path.lexists(self.q.known), 'a check that passed drops the record')
+
+    # --- #476 fix round: one download from scratch per run, whichever check asked for it ------------------------------
+    def test_a_cache_rebuilt_for_its_git_fsck_is_not_rebuilt_again_for_the_merge_check(self):   # state lens minor 1
+        """The run's git fsck finds a planted tree and downloads the cache from scratch; the tree is planted again
+        right after the new cache's check. That is the second failure of the run: no second download, nothing merged,
+        STATE stays (None), and the next run's git fsck finds what was left."""
+        self.plant()
+        fetches = self.count_fetches()
+        self.plant_after_the_check(lambda: self.plant('tree'), skip=1)
+        same, out = self.same_change()
+        self.assertIsNone(same, out)
+        self.assertEqual(out.count('rebuilding it'), 1, out)
+        self.assertEqual(len(fetches), 2, 'the fetch, and one download from scratch')
+        self.assertEqual(len(self.fscks), 2, 'the check that failed, and the rebuilt cache\'s')
+        self.assertEqual(self.merges, [], 'no merge-tree ran at all')
+        self.assertIn('fetched again from GitHub, still', out)
+        self.assertIn('not what its name says', self.q.unknown)
+        self.assertNotIn(self.w.dir, self.q.unknown, 'no runner path in a PR comment')
+        with open(self.q.known) as f:
+            self.assertRegex(f.read(), r'^merge check: object [0-9a-f]{40} does not hash to its name$')
+        self.assertFalse(os.path.lexists(self.q.cache + Q.MERGE_COPY))
+        for again in range(2):   # the next runs: one more download (git fsck finds the tree), then the kept cache
+            fetches.clear()
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            (self.assertNotIn if again else self.assertIn)('rebuilding it', out)
+            self.assertEqual(len(fetches), 1 if again else 2)
+            self.assertFalse(os.path.lexists(self.q.known), 'a check that passed drops the record')
+
+    def test_a_cache_found_broken_twice_in_one_run_is_downloaded_once(self):
+        """A run checks the cache more than once (an update: before the disarm, and again with the new head). A cache
+        downloaded from scratch for the first check and broken again at the second is not downloaded a second time:
+        nothing is known, and no record is kept (it passed its check right after the download)."""
+        self.plant()
+        self.run_again()
+        fetches = self.count_fetches()
+        got, out = run_quiet(self.q.fetch_checked, 'main', 7, self.read)
+        self.assertIs(got, True, out)
+        self.assertEqual(out.count('rebuilding it'), 1, out)
+        self.plant()
+        same, out = self.same_change()
+        self.assertIsNone(same, out)
+        self.assertNotIn('rebuilding', out)
+        self.assertIn('not downloaded a second time', out)
+        self.assertEqual(len(fetches), 3, 'two fetches and one download from scratch')
+        self.assertEqual(self.merges, [])
+        self.assertIn('fails git fsck again', self.q.unknown)
+        self.assertNotIn(self.w.dir, self.q.unknown)
+        self.assertFalse(os.path.lexists(self.q.known), 'not what a download from scratch failed with')
+        self.run_again()   # the next run downloads it once and answers
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertEqual(out.count('rebuilding it'), 1, out)
+
+    def test_a_merge_check_that_failed_twice_knows_nothing_even_when_the_download_went_uncounted(self):
+        """state lens minor 2: the end of same_change's loop is reached only if the run loses count of its download
+        from scratch (here: a fetch_again that does not count). It must then say None, never "the same change"."""
+        real = Q.Queue.fetch_again
+
+        def uncounted(q, *a):
+            got = real(q, *a)
+            q.rebuilt = False
+            return got
+        self.plant_after_the_check(lambda: self.plant('tree'), times=3)
+        with unittest.mock.patch.object(Q.Queue, 'fetch_again', uncounted):
+            same, out = self.same_change()
+        self.assertIsNone(same, out)
+        self.assertEqual(out.count('rebuilding it'), 2, 'the loop ends after its second pass')
+        self.assertEqual(self.merges, [], 'no merge-tree ran at all')
+        self.assertIn('merge check failed again', self.q.unknown)
+        self.assertNotIn(self.w.dir, self.q.unknown)
+
+    def test_a_download_that_fails_the_merge_check_the_same_way_is_not_downloaded_again(self):
+        """History GitHub serves that git fsck passes and the copy refuses (it should not happen): one download from
+        scratch, then no more, and a person must look. A later check that passes ends it."""
+        fetches, real_fetch = [], Q.Queue.fetch
+
+        def fetch(q, *a):
+            fetches.append(a)
+            return real_fetch(q, *a)
+
+        def refuse(q, head, read):
+            raise Q.Changed('object ' + '12' * 20 + ' does not hash to its name')
+        with unittest.mock.patch.object(Q.Queue, 'fetch', fetch):
+            with unittest.mock.patch.object(Q.Queue, 'holds_checked', refuse):
+                self.run_again()
+                same, out = self.same_change()
+                self.assertIsNone(same, out)
+                self.assertIn('rebuilding it', out)
+                self.assertEqual(len(fetches), 2, 'one download from scratch')
+                for _ in range(2):
+                    fetches.clear()
+                    self.run_again()
+                    same, out = self.same_change()
+                    self.assertIsNone(same, out)
+                    self.assertNotIn('rebuilding', out)
+                    self.assertIn('a person must look', out)
+                    self.assertIn('a person must look', self.q.unknown)
+                    self.assertEqual(len(fetches), 1, out)
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            self.assertFalse(os.path.lexists(self.q.known))
+
+    def test_a_commit_changed_after_the_check_is_never_merged_in(self):
+        """git checks no hash of a commit it walks. main's history with one more parent on an older commit puts a
+        commit on the base that never was there: a head that merges the change read into that commit would count."""
+        w = self.w
+        evil = w.commit({'c.json': '{"a": 1}\n', 'evil.sh': 'x\n'}, [w.git(w.work, 'rev-parse', self.m1 + '^')])
+        m2 = w.commit({'c.json': '{"a": 3}\n', 'more': 'y\n'}, [self.m1])
+        head = w.merge(self.read, evil)   # parents: the change read, and a commit that is not on main
+        w.set('refs/heads/main', m2)
+        w.set('refs/pull/7/head', head)
+        got, out = run_quiet(self.q.fetch, 'main', 7, self.read)
+        self.assertIs(got, True, out)
+        self.assertIs(Q.holds(self.plain_git, head, self.read), False, 'evil is not on main')
+
+        def plant():
+            body = subprocess.run(['git', '--git-dir', self.q.cache, 'cat-file', 'commit', self.m1],
+                                  capture_output=True, check=True).stdout
+            body = body.replace(b'\nauthor ', b'\nparent ' + evil.encode() + b'\nauthor ', 1)
+            self.write_object(self.m1, b'commit %d\0' % len(body) + body)
+            self.assertIs(Q.holds(self.plain_git, head, self.read), True,
+                          'git checked the hash of a commit it walked: the test reads nothing')
+        self.plant_after_the_check(plant)
+        same, out = run_quiet(self.q.same_change, 'main', 7, head, self.read)
+        self.assertIs(same, False, out)
+        self.assertIn(f'object {self.m1} does not hash to its name', out)
+        self.assertIn('rebuilding it', out)
+        self.assertEqual(self.merges, [], 'no parent of the head is on main: nothing to merge')
+
+    def test_a_missing_object_git_fsck_does_not_see_is_fetched_again(self):
+        """The change read is in the cache by its sha only (no ref reaches it), and one of its blobs is gone: git
+        fsck says nothing of an object missing under a commit no ref reaches, and merge-tree stops on it. The run
+        downloads the cache again and answers; it does not call the head another change."""
+        w = self.w
+        m0 = w.commit({'f': lines()})
+        main = w.commit({'f': lines(extra=['main'], at=0)}, [m0])
+        read = w.commit({'f': lines(extra=['new'], at=20)}, [m0])
+        tree = w.git(w.work, 'rev-parse', w.merge(read, main) + '^{tree}')
+        head = w.keep(w.git(w.work, 'commit-tree', tree, '-p', main, '-m', 'the change, on main'))
+        w.set('refs/heads/main', main)
+        w.set('refs/pull/7/head', head)
+        self.assertIs(run_quiet(self.q.fetch, 'main', 7, read)[0], True)
+        self.assertIs(Q.holds(self.plain_git, head, read), True)
+        blob = self.cache_git('rev-parse', read + ':f')
+        os.remove(os.path.join(self.q.cache, 'objects', blob[:2], blob[2:]))
+        self.assertIsNone(self.q.objects_problem(), 'git fsck sees the missing blob: the test reads nothing')
+        self.assertIs(Q.holds(self.plain_git, head, read), False, 'merge-tree does not need the blob')
+        self.run_again()
+        same, out = run_quiet(self.q.same_change, 'main', 7, head, read)
+        self.assertIs(same, True, out)
+        self.assertIn(f'object {blob} is missing', out)
+        self.assertIn('rebuilding it', out)
+        self.run_again()
+        same, out = run_quiet(self.q.same_change, 'main', 7, head, read)
+        self.assertIs(same, True, out)
+        self.assertNotIn('rebuilding', out)
+
+    def criss_cross(self):
+        """A PR whose change read and main have two merge bases (each merged the other's first commit): git merges
+        the two into a tree of its own, in no commit, and writes it before the real merge. head: what update-branch
+        makes; lost: main's tree with the parents of an update, the change read gone."""
+        w = self.w
+        m0 = w.commit({'a': '1\n', 'b': '1\n', 'c': '1\n'})
+        x = w.commit({'a': '2\n', 'b': '1\n', 'c': '1\n'}, [m0])
+        y = w.commit({'a': '1\n', 'b': '2\n', 'c': '1\n'}, [m0])
+        main = w.commit({'a': '2\n', 'b': '2\n', 'c': '1\n', 'm': '1\n'}, [y, x])
+        read = w.commit({'a': '2\n', 'b': '2\n', 'c': '2\n'}, [x, y])
+        self.assertEqual(len(w.git(w.work, 'merge-base', '--all', main, read).split()), 2)
+        head = w.merge(read, main)
+        lost = w.keep(w.git(w.work, 'commit-tree', main + '^{tree}', '-p', read, '-p', main, '-m', 'lost'))
+        w.set('refs/heads/main', main)
+        w.set('refs/pull/7/head', head)
+        return argparse.Namespace(head=head, read=read, lost=lost)
+
+    def test_two_merge_bases_merge_in_the_copy(self):
+        c = self.criss_cross()
+        for _ in range(2):
+            self.run_again()
+            same, out = run_quiet(self.q.same_change, 'main', 7, c.head, c.read)
+            self.assertIs(same, True, out)
+            self.assertEqual(len(self.fscks), 1)
+            self.assert_merged_outside_the_cache()
+        self.w.set('refs/pull/7/head', c.lost)
+        self.run_again()
+        same, out = run_quiet(self.q.same_change, 'main', 7, c.lost, c.read)
+        self.assertIs(same, False, out)
+
+    def test_more_merge_bases_than_the_cap_is_not_the_change_read(self):
+        c = self.criss_cross()
+        self.run_again()
+        with unittest.mock.patch.object(Q, 'MERGE_BASES', 1):
+            same, out = run_quiet(self.q.same_change, 'main', 7, c.head, c.read)
+        self.assertIs(same, False, out)
+        self.assertIn('more than 1 merge bases', out)
+        self.assertEqual(self.merges, [], 'not merged')
+
+    def clean_update(self):
+        """(head, read): a change that merges clean with main, and what update-branch makes of it."""
+        w = self.w
+        read = w.commit({'c.json': '{"a": 1}\n', 'n/new': 'n\n'}, [w.git(w.work, 'rev-parse', self.m1 + '^')])
+        head = w.merge(read, self.m1)
+        w.set('refs/pull/7/head', head)
+        return head, read
+
+    def taken(self):
+        """The next run, with the names of the objects its merge check copies in the list this returns."""
+        self.run_again()
+        names, real = [], Q.Copy.take
+
+        def take(copy, name, kind):
+            if name not in copy.seen:
+                names.append(name)
+            return real(copy, name, kind)
+        patched = unittest.mock.patch.object(Q.Copy, 'take', take)
+        patched.start()
+        self.addCleanup(patched.stop)
+        return names
+
+    def test_what_no_side_changed_is_not_copied(self):   # the cost: a big tree, a small change
+        w = self.w
+        m0 = w.commit({'f': lines(), 'kept/big': 'big\n', 'kept/more/big': 'more\n', 'gone/old': 'old\n'})
+        main = w.commit({'f': lines(extra=['main'], at=0), 'kept/big': 'big\n', 'kept/more/big': 'more\n',
+                         'gone/old': 'old\n'}, [m0])
+        read = w.commit({'f': lines(extra=['new'], at=20), 'kept/big': 'big\n', 'kept/more/big': 'more\n',
+                         'here/old': 'old\n'}, [m0])   # and a folder renamed: all under it is read
+        head = w.merge(read, main)
+        w.set('refs/heads/main', main)
+        w.set('refs/pull/7/head', head)
+        names = self.taken()
+        same, out = run_quiet(self.q.same_change, 'main', 7, head, read)
+        self.assertIs(same, True, out)
+        self.assertEqual(len(self.merges), 1, 'git missed nothing')
+        name = lambda what: w.git(w.work, 'rev-parse', what)   # noqa: E731
+        for kept in ('kept', 'kept/big', 'kept/more', 'kept/more/big'):
+            self.assertNotIn(name(f'{m0}:{kept}'), names, kept)
+        for needed in (f'{m0}:f', f'{main}:f', f'{read}:f', f'{m0}:gone', f'{m0}:gone/old', f'{read}:here',
+                       f'{m0}^{{tree}}', f'{main}^{{tree}}', f'{read}^{{tree}}', f'{head}^{{tree}}', m0, main, head):
+            self.assertIn(name(needed), names, needed)
+        self.assertEqual(len(names), len(set(names)), 'each object once')
+
+    def test_a_tree_that_holds_a_name_twice_is_copied_whole(self):
+        """Old history has trees with one name twice, and the cache's git fsck lets them pass (duplicateEntries):
+        all under each entry is copied, and the copy answers as git does in the cache."""
+        w = self.w
+
+        def twice(files, *parents):   # `d` a file too, next to the folder d
+            listed = w.git(w.work, 'ls-tree', w.commit(files, parents)).splitlines()
+            blob = w.git(w.work, 'rev-parse', self.m1 + ':c.json')
+            body = b''
+            for mode, _, oid, entry in [('100644', 'blob', blob, 'd')] + [re.split(r'[ \t]', e, 3) for e in listed]:
+                body += mode.lstrip('0').encode() + b' ' + entry.encode() + b'\0' + bytes.fromhex(oid)
+            tree = subprocess.run(['git', 'hash-object', '-t', 'tree', '--literally', '-w', '--stdin'], cwd=w.work,
+                                  input=body, capture_output=True, check=True).stdout.decode().strip()
+            return w.keep(w.git(w.work, 'commit-tree', tree, *sum((['-p', p] for p in parents), []), '-m', 'twice'))
+        m0 = twice({'d/x': '1\n', 'f': lines()})
+        main = twice({'d/x': '1\n', 'f': lines(extra=['main'], at=0)}, m0)
+        read = twice({'d/x': '2\n', 'd/in/y': 'y\n', 'f': lines(extra=['new'], at=20)}, m0)
+        head = w.keep(w.git(w.work, 'commit-tree', main + '^{tree}', '-p', read, '-p', main, '-m', 'update'))
+        w.set('refs/heads/main', main)
+        w.set('refs/pull/7/head', head)
+        self.assertIs(run_quiet(self.q.fetch, 'main', 7, read)[0], True)
+        expected = Q.holds(self.plain_git, head, read)
+        names = self.taken()
+        same, out = run_quiet(self.q.same_change, 'main', 7, head, read)
+        self.assertIs(same, expected, out)
+        self.assertNotIn('rebuilding', out)
+        self.assertEqual(len(self.fscks), 1)
+        for needed in ('{"a": 3}\n', '1\n', '2\n', 'y\n'):   # the file d, and all in the folders d
+            blob = subprocess.run(['git', 'hash-object', '--stdin'], input=needed, text=True, capture_output=True,
+                                  check=True).stdout.strip()
+            self.assertIn(blob, names, needed)
+
+    def test_a_merge_that_misses_an_object_in_the_copy_gets_whole_trees(self):
+        """Should the copy ever lack an object a merge reads, git stops (it never guesses): the trees are then
+        copied whole and the merge runs once more."""
+        head, read = self.clean_update()
+        self.run_again()
+        with unittest.mock.patch.object(Q.Copy, 'take_merged', lambda copy, roots: None):
+            same, out = run_quiet(self.q.same_change, 'main', 7, head, read)
+        self.assertIs(same, True, out)
+        self.assertEqual(len(self.merges), 2, 'the merge that stopped, and the one with whole trees')
+        self.run_again()   # and with what the merge reads copied: one merge
+        same, out = run_quiet(self.q.same_change, 'main', 7, head, read)
+        self.assertIs(same, True, out)
+        self.assertEqual(len(self.merges), 1)
+        self.assert_merged_outside_the_cache()
+
+    def test_a_merge_git_calls_clean_with_an_error_is_not_clean(self):
+        """A git that cannot read a commit's tree says so and merges it as an empty tree, exit 0."""
+        head, read = self.clean_update()
+        tree = self.w.git(self.w.work, 'rev-parse', head + '^{tree}')
+
+        def merge_tree(git, p, side):
+            git('merge-tree', '--write-tree', p, side)
+            return subprocess.CompletedProcess([], 0, tree + '\n', 'error: Could not read ' + '12' * 20 + '\n')
+        self.run_again()
+        with unittest.mock.patch.object(Q, 'merge_tree', merge_tree):
+            same, out = run_quiet(self.q.same_change, 'main', 7, head, read)
+        self.assertIs(same, False, out)
+        self.assertIn('not taken as a clean merge', out)
+        self.assertEqual(len(self.merges), 2, 'run once more with whole trees first')
+
+    def test_a_submodule_entry_is_no_missing_object(self):
+        """A tree's submodule entry (mode 160000) names a commit of another repository: the cache never holds it and
+        no merge reads it."""
+        w = self.w
+
+        def with_sub(files, *parents):
+            c = w.commit(files, parents)
+            listed = w.git(w.work, 'ls-tree', c) + f'\n160000 commit {"12" * 20}\tsub\n'
+            tree = subprocess.run(['git', 'mktree'], cwd=w.work, input=listed, text=True, capture_output=True,
+                                  check=True).stdout.strip()
+            return w.keep(w.git(w.work, 'commit-tree', tree, *sum((['-p', p] for p in parents), []), '-m', 'sub'))
+        m0 = with_sub({'a': '1\n', 'b': '1\n'})
+        read = with_sub({'a': '2\n', 'b': '1\n'}, m0)
+        main = with_sub({'a': '1\n', 'b': '2\n'}, m0)
+        moved = w.git(w.work, 'ls-tree', read).replace('12' * 20, '34' * 20) + '\n'   # the change moves the submodule
+        tree = subprocess.run(['git', 'mktree'], cwd=w.work, input=moved, text=True, capture_output=True,
+                              check=True).stdout.strip()
+        read = w.keep(w.git(w.work, 'commit-tree', tree, '-p', m0, '-m', 'sub moved'))
+        head = w.merge(read, main)
+        self.assertIn('160000 commit ' + '34' * 20, w.git(w.work, 'ls-tree', head))
+        w.set('refs/heads/main', main)
+        w.set('refs/pull/7/head', head)
+        self.run_again()
+        same, out = run_quiet(self.q.same_change, 'main', 7, head, read)
+        self.assertIs(same, True, out)
+        self.assertEqual(len(self.merges), 1)
+
+    def test_a_run_killed_in_the_merge_check_leaves_no_git_running(self):
+        procs, real = [], subprocess.Popen
+
+        def popen(*a, **kw):   # subprocess.run's own Popen too: only the object reader counts
+            p = real(*a, **kw)
+            if '--batch' in a[0]:
+                procs.append(p)
+            return p
+        self.run_again()
+        with unittest.mock.patch.object(Q.subprocess, 'Popen', popen), \
+                unittest.mock.patch.object(Q, 'holds', side_effect=Killed('merge-tree')):
+            with self.assertRaises(Killed):
+                self.same_change()
+        self.assertEqual([p.poll() is None for p in procs], [False], 'stopped and reaped')
+
+    def test_what_a_killed_merge_check_left_is_deleted_by_the_next(self):   # kill -9: no finally ran
+        left = self.q.cache + Q.MERGE_COPY
+        elsewhere = os.path.join(self.w.dir, 'elsewhere')
+        os.makedirs(os.path.join(elsewhere, 'objects'))
+
+        def a_copy():   # with a tree of main under the name of the change read's: never read
+            self.assertIsNone(Q.init_bare(left))
+            victim, donor = self.cache_git('rev-parse', self.read + '^{tree}', self.m1 + '^{tree}').split()
+            body = subprocess.run(['git', '--git-dir', self.q.cache, 'cat-file', 'tree', donor], capture_output=True,
+                                  check=True).stdout
+            os.makedirs(os.path.join(left, 'objects', victim[:2]))
+            with open(os.path.join(left, 'objects', victim[:2], victim[2:]), 'wb') as f:
+                f.write(zlib.compress(b'tree %d\0' % len(body) + body))
+
+        def a_file():
+            with open(left, 'w') as f:
+                f.write('x')
+
+        def a_link():
+            os.symlink(elsewhere, left)
+        for leave in (a_copy, a_file, a_link):
+            with self.subTest(left=leave.__name__):
+                leave()
+                self.run_again()
+                same, out = self.same_change()
+                self.assertIs(same, False, out)
+                self.assertNotIn('rebuilding', out)
+                self.assert_merged_outside_the_cache()
+        self.assertEqual(os.listdir(elsewhere), ['objects'], 'nothing written or deleted through the link')
+        self.assertEqual(os.listdir(os.path.join(elsewhere, 'objects')), [])
+        self.assertEqual([f for f in os.listdir(self.w.dir) if '.old-' in f], [], 'and nothing set aside is left')
+
+    def test_a_copy_that_cannot_be_made_is_nothing_known(self):   # a full disk, a folder that cannot be made
+        def no_room(*a, **kw):
+            raise OSError(28, 'No space left on device')
+        self.run_again()
+        with unittest.mock.patch.object(Q.Copy, 'take', no_room):
+            same, out = self.same_change()
+        self.assertIsNone(same, out)
+        self.assertIn('No space left', out)
+        self.assertNotIn('rebuilding', out)   # the cache is not to blame
+        self.assertIn('could not copy', self.q.unknown)
+        self.assertNotIn(self.w.dir, self.q.unknown)
+        self.assertFalse(os.path.lexists(self.q.cache + Q.MERGE_COPY))
+        self.assertFalse(os.path.lexists(self.q.known))
+
+    def test_a_reader_that_stops_inside_an_object_is_not_waited_for(self):
+        """git cat-file ends in the middle of an object (killed, a pack cut short): the copy says so. It does not wait
+        for the rest and does not take the part it got."""
+        to, name = os.path.join(self.w.dir, 'copy'), 'a' * 40
+        os.makedirs(os.path.join(to, 'objects'))
+        half = f"import sys; sys.stdin.readline(); sys.stdout.write('{name} blob 10\\nabc')"
+        copy = Q.Copy([sys.executable, '-I', '-c', half], None, to)
+        self.addCleanup(copy.close)
+        with self.assertRaises(Q.Changed) as e:
+            copy.take(name, 'blob')
+        self.assertIn('git cat-file stopped', str(e.exception))
+        self.assertFalse(os.path.lexists(os.path.join(to, 'objects', name[:2], name[2:])))
+        self.assertNotIn(name, copy.seen)
+
+    # --- #476 fix round (trust lens 2): a reader that hangs ---------------------------------------------------------
+    def test_a_reader_that_stops_answering_is_stopped(self):
+        """git opens a loose object with a plain open(): a FIFO planted under an object's name holds cat-file, and
+        with it the run and the queue's lock. After CAT_SECONDS without an answer the reader is stopped and the copy
+        says so (an OSError: nothing is known about the object)."""
+        name = 'a' * 40
+        for case, reader in (('no line', 'time.sleep(20)'),
+                             ('inside an object', f"sys.stdout.write('{name} blob 10\\nabc'); sys.stdout.flush(); "
+                                                  'time.sleep(20)')):
+            with self.subTest(case=case), unittest.mock.patch.object(Q, 'CAT_SECONDS', 0.3):
+                to = tempfile.mkdtemp(dir=self.w.dir)
+                os.makedirs(os.path.join(to, 'objects'))
+                copy = Q.Copy([sys.executable, '-I', '-c', 'import sys, time; sys.stdin.readline(); ' + reader], None,
+                              to)
+                self.addCleanup(copy.close)
+                start = time.monotonic()
+                with self.assertRaises(TimeoutError) as e:   # without the limit: Changed, when the reader ends
+                    copy.take(name, 'blob')
+                self.assertLess(time.monotonic() - start, 15, 'waited for the reader to end by itself')
+                self.assertIn('gave no answer for 0.3 s', str(e.exception))
+                self.assertFalse(os.path.lexists(os.path.join(to, 'objects', name[:2], name[2:])))
+                self.assertNotIn(name, copy.seen)
+                with self.assertRaises(TimeoutError):   # and nothing more is taken from it
+                    copy.take('b' * 40, 'blob')
+                copy.close()
+                self.assertIsNotNone(copy.cat.poll(), 'stopped and reaped')
+                self.assertFalse(copy.watcher.is_alive())
+
+    def test_only_the_wait_for_an_answer_is_timed(self):   # git merges between two objects: that is not the reader's
+        with unittest.mock.patch.object(Q, 'CAT_SECONDS', 0.3):
+            to = tempfile.mkdtemp(dir=self.w.dir)
+            os.makedirs(os.path.join(to, 'objects'))
+            copy = Q.Copy(*self.q.git_call('cat-file', '--batch'), to)
+            self.addCleanup(copy.close)
+            self.assertTrue(copy.take(self.read, 'commit'))
+            time.sleep(1.5)
+            self.assertTrue(copy.take(self.m1, 'commit'))
+            self.assertFalse(copy.stalled)
+            self.assertIsNone(copy.cat.poll(), 'the reader still runs')
+
+    def test_a_merge_check_whose_reader_hangs_knows_nothing_and_keeps_the_cache(self):
+        self.run_again()
+        fetches, git_call = self.count_fetches(), self.q.git_call
+
+        def hangs(*a, **kw):
+            argv, env = git_call(*a, **kw)
+            if '--batch' in a:
+                argv = [sys.executable, '-I', '-c', 'import sys, time; sys.stdin.readline(); time.sleep(20)']
+            return argv, env
+        self.q.git_call = hangs
+        for _ in range(2):   # runs again: the same, and nothing left behind
+            fetches.clear()
+            start = time.monotonic()
+            with unittest.mock.patch.object(Q, 'CAT_SECONDS', 0.3):
+                same, out = self.same_change()
+            self.assertIsNone(same, out)
+            self.assertLess(time.monotonic() - start, 15)
+            self.assertIn('gave no answer', out)
+            self.assertNotIn('rebuilding', out)   # a reader that hangs says nothing about the objects
+            self.assertEqual(len(fetches), 1)
+            self.assertEqual(self.merges, [])
+            self.assertIn('could not copy', self.q.unknown)
+            self.assertNotIn(self.w.dir, self.q.unknown)
+            self.assertFalse(os.path.lexists(self.q.cache + Q.MERGE_COPY))
+            self.assertFalse(os.path.lexists(self.q.known))
+        self.q.git_call = git_call   # the reader answers again: the kept cache gives the real answer
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertNotIn('rebuilding', out)
+
+    def test_the_objects_are_copied_after_the_last_check_and_before_the_merge(self):
+        """A healthy cache: the answer is as before, and the copy is made after the fetch and its check."""
+        order, modes, real = [], [], subprocess.Popen
+
+        def popen(*a, **kw):
+            for what in ('fetch', 'fsck', '--batch', 'merge-tree'):
+                if what in a[0] and order[-1:] != [what]:
+                    order.append(what)
+            if 'merge-tree' in a[0]:
+                modes.append(os.lstat(self.q.cache + Q.MERGE_COPY).st_mode)
+            return real(*a, **kw)
+        for _ in range(2):
+            self.run_again()
+            with unittest.mock.patch.object(Q.subprocess, 'Popen', popen):
+                same, out = self.same_change()
+            self.assertIs(same, False, out)
+            self.assertEqual(order, ['fetch', 'fsck', '--batch', 'merge-tree'], out)
+            self.assertEqual(modes, [0o40700], 'a folder of its own that no one else can enter')
+            self.assert_merged_outside_the_cache()
+            order.clear()
+            modes.clear()
+
+    # --- #465 item 2: what a download from scratch still failed with is kept next to STATE, not in the cache ----------
+    def test_a_record_inside_the_cache_is_never_read(self):
+        """An older queue kept the record in the cache (queue-fsck-known), where a job that can write the cache
+        could plant one with the right lines: the queue then stopped and asked for a person without a download."""
+        self.plant()
+        self.assertTrue(self.q.objects_problem())
+        with open(os.path.join(self.q.cache, 'queue-fsck-known'), 'w') as f:
+            f.write(self.q.fsck_said)
+        for again in range(2):
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIs(same, False, out)
+            self.assertNotIn('a person must look', out)
+            (self.assertNotIn if again else self.assertIn)('rebuilding it', out)
+        self.assertFalse(os.path.lexists(self.q.known))
+
+    def test_only_the_queues_own_record_stops_a_download(self):
+        self.odd_base()   # as a newer git's fsck may refuse what no FSCK_IGNORE id names
+        fetches = []
+        real_fetch = Q.Queue.fetch
+
+        def fetch(q, *a):
+            fetches.append(a)
+            return real_fetch(q, *a)
+
+        def run():
+            fetches.clear()
+            self.run_again()
+            same, out = self.same_change()
+            self.assertIsNone(same, out)
+            return out
+        with unittest.mock.patch.object(Q, 'FSCK_IGNORE', ()), \
+                unittest.mock.patch.object(Q.Queue, 'fetch', fetch), \
+                unittest.mock.patch.object(Q, 'holds', side_effect=AssertionError('merged in a broken cache')):
+            run()
+            record, inside = self.q.known, os.path.join(self.q.cache, 'queue-fsck-known')
+            self.assertEqual(record, self.q.state + '.fsck-known', 'next to STATE')
+            self.assertFalse(os.path.lexists(inside), 'nothing of the queue in the cache but git\'s files')
+
+            def others_can_write(_):
+                os.chmod(record, 0o666)
+
+            def a_link(_):
+                os.replace(record, record + '.real')
+                os.symlink(record + '.real', record)
+
+            def someone_elses(undo):   # by inode, so only for this subtest: a later record may get the same inode
+                info = os.stat(record)
+                real_fstat = os.fstat
+
+                def fstat(fd):
+                    got = real_fstat(fd)
+                    if (got.st_dev, got.st_ino) != (info.st_dev, info.st_ino):
+                        return got
+                    return os.stat_result((*got[:4], got.st_uid + 1, *got[5:]))
+                undo.enter_context(unittest.mock.patch.object(Q.os, 'fstat', fstat))
+
+            def an_older_queues(_):   # the old place: ignored, so one more download, then kept in the new place
+                os.replace(record, inside)
+
+            def a_fifo_fed_the_same_lines(_):   # this user's, mode 0600, and a writer that says what the queue wrote
+                with open(record, 'rb') as f:
+                    said = f.read()
+                os.remove(record)
+                self.feed_fifo(record, said)
+            for spoil in (others_can_write, a_link, someone_elses, an_older_queues, a_fifo_fed_the_same_lines):
+                with self.subTest(spoil=spoil.__name__), contextlib.ExitStack() as undo:
+                    self.assertIn('the same way', run())
+                    self.assertEqual(len(fetches), 1, 'the record as the queue wrote it: no download')
+                    spoil(undo)
+                    self.assertIn('rebuilding it', run())
+                    self.assertEqual(len(fetches), 2, 'no record of the queue\'s own: one download from scratch')
+                    self.assertEqual(os.lstat(record).st_mode & 0o7777, 0o600, 'written again, a file of its own')
+                    self.assertTrue(stat.S_ISREG(os.lstat(record).st_mode), 'a regular file, never a link or a FIFO')
+                    self.assertFalse(os.path.lexists(inside))
+
+    def feed_fifo(self, path, said):
+        """A FIFO at `path` (this user's, mode 0600) that already holds `said`, with both ends kept open."""
+        os.mkfifo(path, 0o600)
+        ends = [os.open(path, os.O_RDONLY | os.O_NONBLOCK)]
+        ends.append(os.open(path, os.O_WRONLY))
+        for fd in ends:
+            self.addCleanup(os.close, fd)
+        os.write(ends[1], said)
+
+    def known_soon(self, seconds=15):
+        """known_broken()'s answer; fails when it has none after `seconds` (and then lets the reader go)."""
+        got = []
+        reader = threading.Thread(target=lambda: got.append(self.q.known_broken()), daemon=True)
+        reader.start()
+        reader.join(seconds)
+        if reader.is_alive():
+            os.close(os.open(self.q.known, os.O_WRONLY))   # a writer ends the open() it waits in
+            reader.join(seconds)
+            self.fail(f'known_broken still waited after {seconds} s: with STATE.lock held, no run of the queue starts')
+        return got[0]
+
+    def test_a_fifo_as_the_record_is_not_waited_for(self):   # trust lens 1: the open must not block
+        """A plain open() of a FIFO waits until someone opens it for writing: for ever, while the run holds
+        STATE.lock. The record is opened without waiting, and a FIFO is no record."""
+        os.makedirs(os.path.dirname(self.q.known), exist_ok=True)
+        os.mkfifo(self.q.known, 0o600)
+        self.assertIsNone(self.known_soon())
+        self.run_again()   # and in a run: no record, so the answer as without one, and nothing written through it
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertFalse(os.path.lexists(self.q.known), 'a healthy check deletes it')
+
+    def test_only_a_regular_file_is_a_record(self):   # state lens nit 4 / trust lens 1
+        said = 'error: what an earlier download said'
+        Q.write_text(self.q.known, said)
+        self.assertEqual(self.known_soon(), said, 'the record as the queue wrote it: the test reads nothing')
+        os.remove(self.q.known)
+        self.feed_fifo(self.q.known, said.encode())   # a FIFO whose writer gives the right lines
+        self.assertIsNone(self.known_soon())
+        os.remove(self.q.known)
+        os.mkdir(self.q.known, 0o700)
+        self.assertIsNone(self.known_soon())
+
+    def test_a_healthy_check_drops_an_old_record(self):   # old state: the record of a cache that is healthy now
+        Q.write_text(self.q.known, 'error: what an earlier download said')
+        self.run_again()
+        same, out = self.same_change()
+        self.assertIs(same, False, out)
+        self.assertFalse(os.path.lexists(self.q.known))
+        self.run_again()   # and again with none there
+        self.assertIs(self.same_change()[0], False)
+
+
 class Conflict(unittest.TestCase):
     """An armed PR that conflicts with its base (merge state DIRTY) cannot merge, the queue cannot update it, and
     GitHub leaves auto-merge on without a word. It is told once per head and passed over; before, only the run log
@@ -2404,6 +3771,15 @@ class InlineCommentsQuery(ReviewFlagsQuery):
         (flags, why), _ = self.read(flags_page(inline=[inline_node('a')], inline_more=''))
         self.assertIsNone(flags)
 
+    def test_a_next_page_of_inline_comments_with_a_null_cursor_fails(self):   # endCursor is nullable
+        for pages in ([flags_page(inline=[inline_node('a')], inline_more=NO_CURSOR)],
+                      [flags_page(inline=[inline_node('a')], inline_more='i1'),
+                       more_comments_page([inline_node('b')], more=NO_CURSOR)]):
+            (flags, why), calls = self.read(*pages)
+            self.assertIsNone(flags, len(pages))
+            self.assertIn('no next page', why)
+            self.assertEqual(len(calls), len(pages))
+
     def test_more_pages_than_the_limit_fail(self):
         pages = [flags_page(inline=[inline_node('a')], inline_more='i0')] + \
             [more_comments_page([inline_node('b')], more=f'i{i}') for i in range(1, Q.REVIEW_PAGES + 1)]
@@ -2593,27 +3969,106 @@ class StackedPrsAreRetargetedNeverClosed(unittest.TestCase):
 
 
 class GitCalls(unittest.TestCase):
-    def git_call(self, read=None, write=None):
+    def git_call(self, read=None, write=None, remote=None, job=None, args=('fetch', 'x'), fetch=True):
         d = tempfile.mkdtemp(prefix='pr-queue-git-')
         self.addCleanup(shutil.rmtree, d, True)
-        q = make_queue(d)
+        q = make_queue(d, remote=remote)
         q.read_token, q.write_token = read, write
         seen = []
-        env = {'GH_TOKEN': 'machine-token', 'GITHUB_TOKEN': 'other-token', Q.WRITE_TOKEN: 'pat-token'}
+        env = {'GH_TOKEN': 'machine-token', 'GITHUB_TOKEN': 'other-token', Q.WRITE_TOKEN: 'pat-token', **(job or {})}
         with unittest.mock.patch.object(Q.subprocess, 'run', lambda argv, **kw: seen.append((argv, kw)) or ok()), \
                 unittest.mock.patch.dict(os.environ, env):
-            q.git('fetch', 'x')
+            q.git(*args, fetch=fetch)
         (argv, kw), = seen
         return q, argv, kw['env']
 
+    def test_the_caches_local_calls_run_no_program_of_the_job(self):   # #450 item 2: only the fetches keep any
+        job = {k: 'job-' + k for k in Q.GIT_RUN}
+        for args in (('merge-tree', '--write-tree', 'a', 'b'), ('cat-file', '-e', 'a'), ('rev-parse', 'HEAD')):
+            with self.subTest(args[0]):
+                q, argv, env = self.git_call('run-token', remote=f'https://github.com/{REPO}.git', job=job, args=args,
+                                             fetch=False)
+                self.assertEqual({k: env[k] for k in Q.GIT_RUN if k in env}, {})
+
+    def test_a_fetch_with_no_login_says_so_by_name(self):   # #450 item 7: not just git's prompt error
+        d = tempfile.mkdtemp(prefix='pr-queue-git-')
+        self.addCleanup(shutil.rmtree, d, True)
+        q = make_queue(d, remote=f'https://github.com/{REPO}.git')
+        for err in ("fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+                    "remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/o/r.git/'"):
+            with self.subTest(err[:30]), unittest.mock.patch.object(q, 'git', lambda *a, **kw: failed(err)), \
+                    unittest.mock.patch.object(q, 'own_cache', lambda: True):
+                for _ in range(2):   # every run says the same
+                    got, out = run_quiet(q.fetch, 'main', 7, 'a' * 40)
+                    self.assertIsNone(got)
+                    self.assertIn('git fetch failed', out)
+                    self.assertIn('git found no login for GitHub', out)
+                    self.assertIn('PR_QUEUE_READ_TOKEN', out)
+        with unittest.mock.patch.object(q, 'git', lambda *a, **kw: failed('fatal: unable to access: Could not resolve '
+                                                                           'host: github.com')), \
+                unittest.mock.patch.object(q, 'own_cache', lambda: True):
+            got, out = run_quiet(q.fetch, 'main', 7, 'a' * 40)
+        self.assertNotIn('no login', out)   # a network error is not blamed on the login
+
+    def test_only_the_queues_two_fetches_are_fetches(self):   # #450 item 2: Queue.fetch marks them, nothing else
+        w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'x': '0\n'})
+        gone = w.commit({'x': 'gone\n'}, [m0])   # no ref reaches it: the second fetch, by sha
+        w.set('refs/heads/main', m0)
+        w.set('refs/pull/7/head', m0)
+        q = make_queue(w.dir, remote=w.remote)   # a local path: a fetch keeps every GIT_RUN name
+        exec_path = subprocess.run(['git', '--exec-path'], text=True, capture_output=True).stdout.strip()
+        job = {'GIT_EXEC_PATH': exec_path, 'GIT_SSH_COMMAND': 'false', 'GIT_ALLOW_PROTOCOL': 'file'}
+        seen, real = [], subprocess.run
+
+        def run(argv, **kw):
+            seen.append((argv, kw.get('env') or {}))
+            return real(argv, **kw)
+        with unittest.mock.patch.object(Q.subprocess, 'run', run), unittest.mock.patch.dict(os.environ, job), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIs(q.fetch('main', 7, m0, gone), True, out.getvalue())
+        fetches = [e for argv, e in seen if 'fetch' in argv]
+        local = [(argv, e) for argv, e in seen if 'fetch' not in argv and 'init' not in argv]
+        self.assertEqual(len(fetches), 2, seen)
+        self.assertTrue(local, seen)
+        for e in fetches:
+            self.assertEqual({k: e[k] for k in Q.GIT_RUN if k in e}, job)
+        for argv, e in local:
+            self.assertEqual({k: e[k] for k in Q.GIT_RUN if k in e}, {}, argv)
+
+    def test_the_fetches_run_gc_in_the_foreground(self):   # state lens 3: no detached gc races the git fsck
+        w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'x': '0\n'})
+        gone = w.commit({'x': 'gone\n'}, [m0])
+        w.set('refs/heads/main', m0)
+        w.set('refs/pull/7/head', m0)
+        q = make_queue(w.dir, remote=w.remote)
+        seen, real = [], subprocess.run
+
+        def run(argv, **kw):
+            seen.append(argv)
+            return real(argv, **kw)
+        with unittest.mock.patch.object(Q.subprocess, 'run', run), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIs(q.fetch('main', 7, m0, gone), True, out.getvalue())
+        fetches = [a for a in seen if 'fetch' in a]
+        self.assertEqual(len(fetches), 2, seen)
+        for argv in fetches:
+            before = argv[:argv.index('fetch')]
+            for flag in ('gc.autoDetach=false', 'maintenance.autoDetach=false'):
+                self.assertIn(flag, before)
+                self.assertEqual(before[before.index(flag) - 1], '-c')
+
     def test_git_gets_the_login_from_gh_only_and_never_prompts(self):
         q, argv, env = self.git_call('run-token', 'pat-token')
-        self.assertEqual(argv[:13], ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
-                                     '-c', 'core.commitGraph=false', '--no-replace-objects',
-                                     '-c', 'credential.https://github.com.helper=',
+        self.assertEqual(argv[:15], ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                                     '-c', 'core.commitGraph=false', '-c', 'core.attributesFile=/dev/null',
+                                     '--no-replace-objects', '-c', 'credential.https://github.com.helper=',
                                      '-c', 'credential.https://github.com.helper=!gh auth git-credential', '--git-dir'])
-        self.assertEqual(argv[13:], [q.cache, 'fetch', 'x'])
+        self.assertEqual(argv[15:], [q.cache, 'fetch', 'x'])
         self.assertEqual(env['GIT_TERMINAL_PROMPT'], '0')
+        self.assertEqual(env['GIT_ATTR_NOSYSTEM'], '1')
 
     def test_git_fetches_with_the_read_token_only(self):   # gh auth git-credential answers with GH_TOKEN
         q, argv, env = self.git_call('run-token', 'pat-token')
@@ -2623,6 +4078,16 @@ class GitCalls(unittest.TestCase):
         q, argv, env = self.git_call()
         self.assertNotIn('credential.https://github.com.helper=!gh auth git-credential', argv)
         self.assertEqual([k for k in Q.TOKEN_VARS if k in env], [])
+
+    def test_the_cache_fetches_from_github_with_no_program_of_the_job_but_gits_own(self):   # #442 item 2
+        # Queue.remote is always https://github.com/...: ssh, a git:// proxy and a login prompt are never needed (the
+        # login is gh's, or none at all), and git's default protocols allow https.
+        job = {k: 'job-' + k for k in Q.GIT_RUN}
+        self.assertEqual(Q.Queue(REPO, CFG, *('/nowhere',) * 3).remote, f'https://github.com/{REPO}.git')
+        for read in ('run-token', None):
+            with self.subTest(read=read):
+                q, argv, env = self.git_call(read, remote=f'https://github.com/{REPO}.git', job=job)
+                self.assertEqual({k: env[k] for k in Q.GIT_RUN if k in env}, {'GIT_EXEC_PATH': 'job-GIT_EXEC_PATH'})
 
     def test_the_empty_helper_resets_any_helper_the_machine_set(self):   # git's rule, checked on this git
         d = tempfile.mkdtemp(prefix='pr-queue-git-')
@@ -2643,10 +4108,16 @@ class GitVersion(unittest.TestCase):
             return ok(out)
         return Q.git_problem(run)
 
-    def test_merge_tree_write_tree_needs_2_38(self):
-        self.assertIn('git 2.38 or newer is needed', self.problem('git version 2.34.1\n'))
-        self.assertIn('2.34.1', self.problem('git version 2.34.1\n'))
-        for fine in ('git version 2.38.0', 'git version 2.47.1.windows.1', 'git version 3.0.0'):
+    def test_merge_tree_with_an_attribute_source_needs_2_43(self):   # #450 item 1: never silently without it
+        # GIT_ATTR_SOURCE came in 2.41 (an older git ignores it: HEAD's or attr.tree's attributes would merge), and
+        # merge-tree with an attribute source crashed until 2.43.
+        for old in ('git version 2.34.1', 'git version 2.38.0', 'git version 2.40.1', 'git version 2.42.2'):
+            with self.subTest(old):
+                said = self.problem(old + '\n')
+                self.assertIn('git 2.43 or newer is needed', said)
+                self.assertIn('GIT_ATTR_SOURCE', said)
+                self.assertIn(old[len('git version '):], said)
+        for fine in ('git version 2.43.0', 'git version 2.47.1.windows.1', 'git version 3.0.0'):
             self.assertIsNone(self.problem(fine), fine)
 
     def test_no_git_or_odd_output_is_a_problem(self):
@@ -2956,10 +4427,32 @@ class Cli(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp(prefix='pr-queue-cli-')
         self.addCleanup(shutil.rmtree, self.d, True)
-        self.config = os.path.join(self.d, 'queue.json')
-        with open(self.config, 'w') as f:
-            json.dump(CFG_RAW, f)
+        self.repo = os.path.join(self.d, 'caller')   # the caller's checkout, as the reusable workflow makes it
+        self.git('init', '-q', '-b', 'main')
+        self.config = os.path.join(self.repo, '.github', 'pr-queue.json')
+        self.commit({'.github/pr-queue.json': json.dumps(CFG_RAW)})
         self.built, self.tokens, self.steps = [], [], []
+
+    def git(self, *a):
+        os.makedirs(self.repo, exist_ok=True)
+        return subprocess.run(['git', '-C', self.repo, *a], check=True, capture_output=True,
+                              env={**os.environ, **GIT_ENV}).stdout
+
+    def write(self, rel, data):
+        where = os.path.join(self.repo, rel)
+        os.makedirs(os.path.dirname(where), exist_ok=True)
+        with open(where, 'wb') as f:
+            f.write(data if isinstance(data, bytes) else data.encode())
+
+    def commit(self, files):
+        """Commit `files` (path: text or bytes; None deletes it) on the checkout's HEAD; the work tree follows."""
+        for rel, data in files.items():
+            if data is None:
+                self.git('rm', '-q', '--', rel)
+            else:
+                self.write(rel, data)
+                self.git('add', '--', rel)
+        self.git('commit', '-q', '--allow-empty', '-m', 'c')
 
     def cli(self, *extra, repo=REPO, state=None, cache=None, env=None, git=None):
         test = self
@@ -2998,6 +4491,51 @@ class Cli(unittest.TestCase):
         self.assertEqual(args[1], CFG)
         self.cli('--dry-run', '--lock-file', os.path.join(self.d, 'l'), env={'RUNNER_ENVIRONMENT': 'self-hosted'})
         self.assertEqual((self.built[1][0][4], self.built[1][1]), (os.path.join(self.d, 'l'), True))
+
+    def test_a_path_with_a_trailing_slash_is_the_same_path(self):   # trust lens nit 4
+        """The queue names its other files by adding to the path (CACHE.merge, CACHE.new, CACHE.old-*, STATE.lock,
+        STATE.fsck-known): after `--cache /x/c/` they would be inside the cache, where set_aside deletes what is in
+        the way."""
+        state, cache = os.path.join(self.d, 'run', 'plan.json'), os.path.join(self.d, 'cache.git')
+        for tail in ('/', '//', '/.', '/./', '/.//./'):
+            with self.subTest(tail=tail):
+                self.built.clear()
+                self.assertEqual(self.cli(state=state + tail, cache=cache + tail)[0], 0)
+                (args, _), = self.built
+                self.assertEqual((args[2], args[3], args[4]), (state, cache, state + '.lock'))
+                self.built.clear()
+                self.assertEqual(self.cli('--lock-file', os.path.join(self.d, 'l') + tail)[0], 0)
+                self.assertEqual(self.built[0][0][4], os.path.join(self.d, 'l'))
+        self.assertEqual([Q.own_name(p) for p in ('/', '//', '/x', '/x/../y/', 'c/', '')],
+                         ['/', '//', '/x', '/x/../y', 'c', ''], 'nothing but the end is touched')
+
+    def test_the_copy_and_the_set_aside_names_are_beside_the_cache(self):   # the real Queue, from cli's paths
+        cache = os.path.join(self.d, 'cache.git')
+        with unittest.mock.patch.object(Q.Queue, 'main', lambda q, dry: self.built.append(q) or 0), \
+                unittest.mock.patch.object(Q.Queue, 'warn_if_branches_stay', lambda q: None), \
+                unittest.mock.patch.object(Q, 'git_problem', lambda: None):
+            argv = ['--repo', REPO, '--config', self.config, '--state-file', os.path.join(self.d, 'run', 'plan.json/'),
+                    '--cache', cache + '/']
+            self.assertEqual(run_quiet(Q.cli, argv, dict(TOKENS))[0], 0)
+        q, = self.built
+        self.assertEqual((q.cache, q.cache + Q.MERGE_COPY, os.path.dirname(q.known)),
+                         (cache, cache + '.merge', os.path.join(self.d, 'run')))
+        self.assertTrue(run_quiet(q.own_cache)[0])
+        keep = os.path.join(cache, '.merge')   # a file inside the cache that happens to have the copy's old name
+        with open(keep, 'w') as f:
+            f.write('x')
+        self.assertTrue(Q.set_aside(q.cache + Q.MERGE_COPY))
+        self.assertTrue(os.path.exists(keep), 'nothing inside the cache is set aside as the copy')
+        self.assertEqual(sorted(os.listdir(self.d)), ['cache.git', 'caller'])
+
+    def test_a_path_that_ends_in_no_name_is_refused(self):
+        for bad in ('/', os.path.join(self.d, 'x', '..'), os.path.join(self.d, 'x', '..') + '/'):
+            with self.subTest(path=bad):
+                self.built.clear()
+                out = self.refused('does not end in a name of its own', cache=bad)
+                self.assertIn('--cache', out)
+        self.built.clear()
+        self.refused('--state-file', 'does not end in a name of its own', state=os.path.join(self.d, '..'))
 
     def test_the_tokens_reach_the_queue(self):   # reads with the run's token, writes with the caller's
         self.cli()
@@ -3061,19 +4599,300 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 0, 'a sibling folder whose name starts the same is not inside: ' + out)
 
     def test_a_config_error_is_refused(self):
-        with open(self.config, 'w') as f:
-            json.dump({**CFG_RAW, 'required_check': ['build']}, f)
+        self.commit({'.github/pr-queue.json': json.dumps({**CFG_RAW, 'required_check': ['build']})})
         self.refused("unknown key 'required_check'")
+        self.commit({'.github/pr-queue.json': None})
+        self.refused('has no .github/pr-queue.json')
+
+    def test_the_config_is_read_as_committed_never_from_the_checkouts_file(self):   # #424 item 1
+        # A .gitattributes encoding leaves the config's blob as it was (the head check skips it), but a checkout writes
+        # the file as UTF-16: the queue must read what git holds, which no checkout filter or attribute changes.
+        self.commit({'.gitattributes': '.github/pr-queue.json working-tree-encoding=UTF-16\n'})
         os.remove(self.config)
-        self.refused('cannot read it')
+        self.git('checkout', '--', '.github/pr-queue.json')
+        with open(self.config, 'rb') as f:
+            self.assertEqual(f.read(2), b'\xff\xfe', 'the checkout wrote UTF-16')
+        code, out = self.cli()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.built[-1][0][1], CFG)
+        self.write('.github/pr-queue.json', 'not json')   # an edit in the work tree, not committed: never read
+        code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+        os.remove(self.config)   # nor a file missing from the work tree
+        code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+
+    def test_a_config_changed_between_runs_is_read_anew_and_a_rerun_reads_the_same(self):   # state: nothing kept
+        self.cli()
+        self.commit({'.github/pr-queue.json': json.dumps({**CFG_RAW, 'merge_method': 'merge'})})
+        self.cli()
+        self.cli()
+        self.assertEqual([b[0][1].merge_method for b in self.built], ['squash', 'merge', 'merge'])
+
+    def test_the_config_read_ignores_global_and_system_git_config(self):   # an earlier job's ~/.gitconfig, say
+        broken = os.path.join(self.d, 'broken.gitconfig')
+        with open(broken, 'w') as f:
+            f.write('[core\n')
+        with unittest.mock.patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': broken, 'GIT_CONFIG_SYSTEM': broken,
+                                                   'GIT_CONFIG_NOSYSTEM': '0'}):
+            code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+
+    def test_a_config_that_is_not_utf8_is_refused_never_a_crash(self):   # #424 item 1: was a UnicodeDecodeError
+        for name, data in (('UTF-16', json.dumps(CFG_RAW).encode('utf-16')), ('Latin-1', b'{"push_command": "\xe9"}')):
+            with self.subTest(name):
+                self.commit({'.github/pr-queue.json': data})
+                self.refused('.github/pr-queue.json at ', 'not UTF-8 text')
+
+    def test_a_config_that_is_empty_missing_or_no_file_at_head_is_refused(self):   # old, empty or missing state
+        self.commit({'.github/pr-queue.json': ''})
+        self.refused('not JSON')
+        self.commit({'.github/pr-queue.json': None})
+        self.write('.github/pr-queue.json', json.dumps(CFG_RAW))   # on disk, never committed: not read
+        self.refused('has no .github/pr-queue.json')
+        self.commit({'.github/real.json': json.dumps(CFG_RAW)})
+        os.symlink('real.json', self.config + '.tmp')
+        os.replace(self.config + '.tmp', self.config)
+        self.git('add', '--', '.github/pr-queue.json')
+        self.git('commit', '-q', '-m', 'symlink')
+        self.refused('is a symlink (mode 120000), not a file')
+        os.remove(self.config)
+        self.commit({'.github/pr-queue.json/x.json': json.dumps(CFG_RAW)})
+        self.refused('is a tree (mode 040000), not a file')
+
+    def test_a_tree_that_lists_the_config_twice_is_refused(self):   # git mktree makes one; fsck would flag it
+        def hashed(*a, data):
+            return subprocess.run(['git', '-C', self.repo, *a], input=data, check=True, capture_output=True,
+                                  env={**os.environ, **GIT_ENV}).stdout.decode().strip()
+        good = hashed('hash-object', '-w', '--stdin', data=json.dumps(CFG_RAW).encode())
+        bad = hashed('hash-object', '-w', '--stdin', data=b'not json')
+        for first, second in ((good, bad), (bad, good)):
+            with self.subTest(first=first[:7]):
+                inner = hashed('mktree', data=f'100644 blob {first}\tpr-queue.json\n'
+                                              f'100644 blob {second}\tpr-queue.json\n'.encode())
+                root = hashed('mktree', data=f'040000 tree {inner}\t.github\n'.encode())
+                self.git('reset', '-q', '--soft', hashed('commit-tree', root, '-m', 'twice', data=b''))
+                self.refused('did not list one entry')
+
+    def test_a_config_outside_a_git_checkout_or_before_its_first_commit_is_refused(self):
+        outside = os.path.join(self.d, 'outside', 'queue.json')
+        os.makedirs(os.path.dirname(outside))
+        with open(outside, 'w') as f:
+            json.dump(CFG_RAW, f)
+        self.config = outside
+        self.refused('not in a git checkout')
+        os.symlink(os.path.join(self.repo, '.github'), os.path.join(self.d, 'outside', 'link'))
+        self.config = os.path.join(self.d, 'outside', 'link', 'pr-queue.json')   # into the checkout from outside
+        self.refused('not inside the checkout')
+        shutil.rmtree(self.repo)
+        self.git('init', '-q', '-b', 'main')
+        self.write('.github/pr-queue.json', json.dumps(CFG_RAW))
+        self.config = os.path.join(self.repo, '.github', 'pr-queue.json')
+        self.refused('has no commit checked out')
+
+    def test_a_config_blob_missing_from_a_partial_clone_is_refused_never_fetched(self):   # #435 item 1
+        # actions/checkout's sparse checkout is a --filter=blob:none clone: a pattern that does not match the config's
+        # own name ([1] is a glob) leaves its blob on the remote, and cat-file would fetch it with the stored token.
+        rel = '.github/q[1].json'
+        self.commit({rel: json.dumps(CFG_RAW)})
+        remote, pc = os.path.join(self.d, 'remote.git'), os.path.join(self.d, 'pc')
+        self.git('clone', '-q', '--bare', self.repo, remote)
+        subprocess.run(['git', '-C', remote, 'config', 'uploadpack.allowFilter', 'true'], check=True)
+        subprocess.run(['git', 'clone', '-q', '--filter=blob:none', '--no-checkout', 'file://' + remote, pc],
+                       check=True, capture_output=True)
+        subprocess.run(['git', '-C', pc, 'sparse-checkout', 'set', '--no-cone', rel], check=True, capture_output=True)
+        subprocess.run(['git', '-C', pc, 'checkout', '-q', 'main'], check=True, capture_output=True)
+        oid = subprocess.run(['git', '-C', pc, 'rev-parse', f'HEAD:{rel}'], check=True, capture_output=True,
+                             text=True).stdout.strip()
+
+        def local(sha):   # without fetching it
+            return subprocess.run(['git', '-C', pc, 'cat-file', '-e', sha], capture_output=True,
+                                  env={**os.environ, 'GIT_NO_LAZY_FETCH': '1', 'GIT_ALLOW_PROTOCOL': 'none'}).returncode == 0
+        self.assertFalse(local(oid), 'the clone holds the blob: the test reads nothing missing')
+        self.config = os.path.join(pc, rel)
+        for _ in range(2):   # runs again: the same refusal, still nothing fetched
+            self.refused(f'{rel} at ', 'not in this checkout', 'sparse-checkout pattern')
+            self.assertFalse(local(oid), 'the read fetched the blob')
+        subprocess.run(['git', '-C', pc, 'sparse-checkout', 'disable'], check=True, capture_output=True)   # the fix
+        code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+
+    def test_every_git_call_of_the_read_has_a_timeout(self):   # #435 item 1: a stuck git never holds the job
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(kw.get('timeout'))
+            if 'cat-file' in cmd:
+                raise subprocess.TimeoutExpired(cmd, kw.get('timeout'))
+            return subprocess.run(cmd, **kw)
+        with self.assertRaisesRegex(config.ConfigError, r'pr-queue\.json: git cat-file took over \d+ seconds'):
+            Q.committed_config(self.config, run=run)
+        self.assertTrue(calls and all(t == Q.GIT_READ_SECONDS for t in calls), calls)
+
+    def test_a_config_path_with_pathspec_magic_reads_only_that_name(self):   # #435 item 2: the exact-name check
+        self.commit({'x.json': json.dumps(CFG_RAW)})   # ls-tree -- ':(top)x.json' lists x.json
+        self.config = os.path.join(self.repo, ':(top)x.json')
+        self.refused('did not list one entry')
+
+    def test_a_leftover_replace_ref_does_not_change_the_config_read(self):   # #435 item 2: GIT_SAFE on the read
+        oid = self.git('rev-parse', 'HEAD:.github/pr-queue.json').decode().strip()
+        other = subprocess.run(['git', '-C', self.repo, 'hash-object', '-w', '--stdin'], check=True, capture_output=True,
+                               input=json.dumps({**CFG_RAW, 'replaced': 1}).encode()).stdout.decode().strip()
+        self.git('replace', oid, other)   # a self-hosted runner's .git can outlive a job
+        self.assertIn(b'replaced', self.git('cat-file', 'blob', oid), 'the replace ref does nothing')
+        code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+
+    def envs_of_the_read(self, extra):
+        envs = []
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            envs.append(kw.get('env'))
+            return real(cmd, **kw)
+        with unittest.mock.patch.dict(os.environ, extra), unittest.mock.patch.object(subprocess, 'run', run):
+            code, out = self.cli()
+        self.assertEqual((code, self.built[-1][0][1]), (0, CFG), out)
+        self.assertTrue(envs and None not in envs, envs)
+        return envs
+
+    def test_the_config_read_passes_no_token_to_git(self):   # #435 item 2
+        tokens = {k: 'secret-' + k for k in Q.TOKEN_VARS}
+        for env in self.envs_of_the_read(tokens):
+            self.assertEqual(set(env) & set(tokens), set())
+            # never a fetch: git 2.44+ honours the first, an older git still refuses every transport
+            self.assertEqual((env.get('GIT_NO_LAZY_FETCH'), env.get('GIT_ALLOW_PROTOCOL')), ('1', 'none'))
+
+    def test_the_config_read_ignores_git_variables_of_the_job(self):   # #435 item 6
+        other = os.path.join(self.d, 'other')
+        subprocess.run(['git', 'init', '-q', '-b', 'main', other], check=True)
+        os.makedirs(os.path.join(other, '.github'))
+        with open(os.path.join(other, '.github', 'pr-queue.json'), 'w') as f:
+            json.dump({**CFG_RAW, 'merge_method': 'merge'}, f)
+        subprocess.run(['git', '-C', other, 'add', '-A'], check=True)
+        subprocess.run(['git', '-C', other, 'commit', '-qm', 'other'], check=True, env={**os.environ, **GIT_ENV})
+        hostile = {'GIT_DIR': os.path.join(other, '.git'), 'GIT_WORK_TREE': self.repo,
+                   'GIT_OBJECT_DIRECTORY': os.path.join(other, '.git', 'objects'), 'GIT_NAMESPACE': 'x',
+                   'GIT_ALTERNATE_OBJECT_DIRECTORIES': os.path.join(other, '.git', 'objects'),
+                   'GIT_INDEX_FILE': os.path.join(self.d, 'index'), 'GIT_CONFIG_PARAMETERS': "'core.bare'='true'",
+                   'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'true',
+                   'GIT_ICASE_PATHSPECS': '1'}
+        for env in self.envs_of_the_read(hostile):
+            self.assertEqual(set(env) & set(hostile), set())
+
+    def test_the_queue_drops_one_list_of_git_variables(self):   # #435 item 6: every git call of the queue
+        hostile = {k: 'x' for k in Q.GIT_DROP}
+        hostile.update(GIT_CONFIG_KEY_3='core.bare', GIT_CONFIG_VALUE_3='true', GIT_TRACE='0', PATH='/bin')
+        env = Q.git_env(hostile)
+        self.assertEqual(env, {'PATH': '/bin', **FORCED})   # #457 item 4: a local call writes no trace either
+        for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
+                     'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_CONFIG',
+                     'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_REPLACE_REF_BASE', 'GIT_GRAFT_FILE',
+                     'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH', 'GIT_PREFIX', 'GIT_IMPLICIT_WORK_TREE',
+                     'GIT_INTERNAL_SUPER_PREFIX', 'GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS', 'GIT_NOGLOB_PATHSPECS',
+                     'GIT_ICASE_PATHSPECS', 'GIT_ATTR_SOURCE', 'GIT_EXTERNAL_DIFF'):   # #442 items 1, 2, 6: each name
+            with self.subTest(name):
+                self.assertIn(name, Q.GIT_DROP)
+        q = object.__new__(Q.Queue)   # the cache's git and init
+        q.cache, q.read_token, q.remote = os.path.join(self.d, 'cache', 'repo.git'), None, 'https://github.com/o/r.git'
+        envs, real = [], subprocess.run
+
+        def run(cmd, **kw):
+            envs.append(kw.get('env'))
+            return real(cmd, **kw)
+        with unittest.mock.patch.dict(os.environ, {'GIT_DIR': self.repo + '/.git', 'GIT_CONFIG_COUNT': '1',
+                                                   'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'false'}), \
+                unittest.mock.patch.object(subprocess, 'run', run), \
+                unittest.mock.patch('sys.stdout', new_callable=io.StringIO) as out:
+            self.assertTrue(q.own_cache(), out.getvalue())
+            self.assertEqual(q.git('rev-parse', '--is-bare-repository').stdout.strip(), 'true')
+        self.assertTrue(envs)
+        for env in envs:
+            self.assertFalse({'GIT_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0'} & set(env), env)
+
+    def test_programs_and_transports_of_the_job_reach_only_a_fetch_that_may_need_them(self):   # #442 item 2
+        names = {'GIT_EXEC_PATH', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS',
+                 'GIT_ALLOW_PROTOCOL'}
+        self.assertLessEqual(names, set(Q.GIT_RUN))
+        job = {**{k: 'x' for k in Q.GIT_RUN}, 'PATH': '/bin'}
+        plain = {'PATH': '/bin', **FORCED}
+        self.assertEqual(Q.git_env(job), plain)   # a call that reaches no remote runs none of them
+        # https with the queue's own login (or none): no ssh, no git:// proxy, no prompt, git's default protocols;
+        # git's own helpers (remote-https, index-pack) are found through GIT_EXEC_PATH
+        self.assertEqual(Q.git_env(job, 'https://github.com/o/r.git'), {**plain, 'GIT_EXEC_PATH': 'x'})
+        self.assertEqual(Q.git_env(job, 'Https://github.com/o/r.git'), {**plain, 'GIT_EXEC_PATH': 'x'})
+        for remote in ('origin', '/srv/r.git', 'file:///srv/r.git', 'ssh://git@host/r.git', 'git@host:r.git',
+                       'http://host/r.git'):   # #450 item 6: plain http is no GitHub fetch either
+            with self.subTest(remote):   # the caller's remote: it may need them, so they stay
+                self.assertEqual(Q.git_env(job, remote), {**job, **plain})
+
+    def test_a_fetch_from_github_writes_no_trace(self):   # #450 item 5: the gate puts git's stderr into a public summary
+        trace = {k: '1' for k in ('GIT_TRACE', 'GIT_TRACE_CURL', 'GIT_TRACE_PACKET', 'GIT_TRACE_PACK_ACCESS',
+                                  'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_CURL_VERBOSE')}
+        trace['GIT_TRACE_REDACT'] = '0'
+        job = {**trace, 'PATH': '/bin'}
+        for remote in (None, 'https://github.com/o/r.git', 'HTTPS://GitHub.com/o/r.git'):   # #457 item 4: local calls
+            with self.subTest(remote):   # (the gate's merge-tree, the queue's), and https in any case
+                self.assertEqual(Q.git_env(job, remote), {'PATH': '/bin', **FORCED})
+        for remote in ('origin', 'ssh://git@host/r.git'):   # no token of the queue's goes there
+            with self.subTest(remote):
+                self.assertLessEqual(trace.items(), Q.git_env(job, remote).items())
+
+    def test_only_a_url_or_a_path_is_a_remote_a_token_goes_to(self):   # #457 item 4
+        for remote in ('https://github.com/o/r.git', 'HTTPS://github.com/o/r.git', 'origin', '/srv/r.git',
+                       'file:///srv/r.git', 'ssh://git@host/r.git', 'git@host:r.git', 'C:/srv/r.git'):
+            with self.subTest(remote):
+                self.assertIsNone(Q.remote_problem(remote))
+        for remote, said in (('', 'empty'), (None, 'empty'), ('http://github.com/o/r.git', 'plain http'),
+                             ('HTTP://github.com/o/r.git', 'plain http'), ('ext::sh -c id', 'remote helper'),
+                             ('fd::3', 'remote helper'), ('https::github.com/o/r.git', 'remote helper'),
+                             ('--upload-pack=touch /tmp/x', 'starts with -'), ('-oProxy', 'starts with -')):
+            with self.subTest(remote):
+                self.assertIn(said, Q.remote_problem(remote))
+
+    def test_git_speaks_one_language(self):   # #450 item 4: messages are matched and decoded as UTF-8
+        env = Q.git_env({'LC_ALL': 'de_DE.ISO-8859-1', 'LANG': 'de_DE', 'LANGUAGE': 'de', 'LC_MESSAGES': 'de_DE'})
+        self.assertEqual(env['LC_ALL'], 'C')   # LANGUAGE is ignored under LC_ALL=C (gettext)
+        for remote in (None, 'https://github.com/o/r.git', 'origin'):
+            with self.subTest(remote):
+                self.assertEqual(Q.git_env({'LC_ALL': 'de_DE'}, remote)['LC_ALL'], 'C')
+
+    def test_a_partial_clone_names_the_sparse_pattern_only_for_a_missing_blob(self):   # #450 item 6: cat-file -e
+        self.git('config', 'extensions.partialClone', 'origin')
+        self.git('config', 'remote.origin.promisor', 'true')
+        real = subprocess.run
+
+        def run(cmd, **kw):   # the blob is there, and cat-file blob fails anyway
+            if 'cat-file' in cmd and 'blob' in cmd:
+                return subprocess.CompletedProcess(cmd, 128, b'', b'fatal: some other failure')
+            return real(cmd, **kw)
+        for _ in range(2):
+            with self.assertRaises(config.ConfigError) as e:
+                Q.committed_config(self.config, run=run)
+            self.assertIn('some other failure', str(e.exception))
+            self.assertNotIn('sparse-checkout', str(e.exception))
+
+    def test_the_config_read_runs_no_program_of_the_job(self):   # #442 item 2: it reaches no remote
+        job = {k: os.path.join(self.d, 'nowhere') for k in Q.GIT_RUN}
+        for env in self.envs_of_the_read(job):
+            self.assertEqual({k: env[k] for k in Q.GIT_RUN if k in env}, {'GIT_ALLOW_PROTOCOL': 'none'})
+
+    def test_a_blob_missing_from_a_full_clone_is_not_blamed_on_a_sparse_pattern(self):   # #442 item 5
+        oid = self.git('rev-parse', 'HEAD:.github/pr-queue.json').decode().strip()
+        os.remove(os.path.join(self.repo, '.git', 'objects', oid[:2], oid[2:]))   # a lost or broken object
+        for _ in range(2):   # runs again: the same refusal
+            out = self.refused('.github/pr-queue.json: cannot read .github/pr-queue.json at ')
+            self.assertNotIn('sparse-checkout', out)
+            self.assertNotIn('not in this checkout', out)
 
     def test_an_old_git_is_refused(self):
-        self.refused('git 2.38 or newer', git='git 2.38 or newer is needed (merge-tree --write-tree); found: git 2.34')
+        self.refused('git 2.43 or newer', git='git 2.43 or newer is needed (GIT_ATTR_SOURCE); found: git 2.42')
 
     def test_every_problem_is_named_at_once(self):
-        os.remove(self.config)
-        self.refused('GitHub-hosted', 'is not owner/name', 'not an absolute path', 'cannot read it', 'git 2.38',
-                     repo='x', state='p', env={'RUNNER_ENVIRONMENT': 'github-hosted'}, git='git 2.38 or newer')
+        self.commit({'.github/pr-queue.json': None})
+        self.refused('GitHub-hosted', 'is not owner/name', 'not an absolute path', 'has no .github/pr-queue.json',
+                     'git 2.43', repo='x', state='p', env={'RUNNER_ENVIRONMENT': 'github-hosted'},
+                     git='git 2.43 or newer')
 
 
 class GateApp(unittest.TestCase):

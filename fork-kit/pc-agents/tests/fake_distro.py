@@ -1,8 +1,8 @@
 """A fake WSL2 distro in a temporary folder for the pc-agents tests: every fixed path under PC_AGENTS_ROOT, the
-current user as root, fake useradd, usermod, env (T3's installer), apt-get, systemctl, systemd-run and nft (each logs
-to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and policy a started one runs
-with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units). No root, no systemd, no network,
-no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
+current user as root, fake useradd, usermod, env (T3's installer), apt-get, dpkg-query, dpkg, systemctl, systemd-run
+and nft (each logs to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and policy a
+started one runs with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units). No root, no
+systemd, no network, no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest
 from unittest import mock
 
@@ -48,9 +48,11 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          # a start: refused while the start limit is hit ($S/U.limit, until reset-failed); with
                          # /log/t3-crash T3 exits at once, with /log/t3-dies after the first look (show) at it
                          'run() { [ -e "$S/$1.limit" ] && { echo "$1: start request repeated too quickly" >&2; '
-                         'return 1; }\nrm -f "$S/$1.seen" "$S/$1.status"\n'
+                         'return 1; }\nrm -f "$S/$1.seen" "$S/$1.status" "$S/$1.code"\n'
+                         # /log/t3-crash: T3's exit status (empty: 1), or "CODE STATUS" (2 9: killed by signal 9)
                          '[ "$1" = t3code-agents.service ] && [ -e "$R/log/t3-crash" ] && { rm -f "$S/$1.active"; '
-                         'c=$(cat "$R/log/t3-crash"); echo "${c:-1}" >"$S/$1.status"; return; }\n'
+                         'c=$(cat "$R/log/t3-crash"); case "$c" in *" "*) echo "${c%% *}" >"$S/$1.code"; c=${c#* };; '
+                         '*) echo 1 >"$S/$1.code";; esac; echo "${c:-1}" >"$S/$1.status"; return; }\n'
                          '{ grep "^ExecStart=" "$R/etc/systemd/system/$1"; '
                          'cat "$R/etc/t3code/policy.json"; } >"$S/$1.active" 2>/dev/null || :\n'
                          'echo $$ >"$S/$1.pid"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
@@ -74,13 +76,74 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  [ -e "$S/reload" ] && echo NeedDaemonReload=yes || echo NeedDaemonReload=no\n'
                          '  if [ -e "$S/$u.active" ]; then echo ActiveState=active; echo "MainPID=$(cat "$S/$u.pid")"\n'
                          '  else echo ActiveState=inactive; echo MainPID=0; fi; echo NRestarts=0\n'
-                         '  [ -e "$S/$u.status" ] && { echo ExecMainCode=1; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
+                         '  [ -e "$S/$u.status" ] && { echo "ExecMainCode=$(cat "$S/$u.code")"; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
                          '  echo "ExecMainStartTimestampMonotonic=$(cat "$S/$u.start" 2>/dev/null || echo 0)";;\n'
                          'esac\n',
-    # apt-get: update, or install nftables (the fake nft kept in /log/nft-package); /log/apt-fail makes it fail
-    'usr/bin/apt-get': 'R="${0%/usr/bin/apt-get}"; echo "$*" >>"$R/log/apt-get"\n'
+    # apt-get [-o OPTION]... update|install -y PKG...: logs the rest (and the options, in /log/apt-get-options);
+    # installs each package in /log/packages (nftables brings the fake nft kept in /log/nft-package). As real apt-get:
+    # refuses while a package is unpacked, and `install` while /var/lib/dpkg/updates holds a file named all digits
+    # (dpkg was interrupted). /log/apt-locked-update (or -install) holds how many more runs find the lists (or
+    # archives) lock held, as while apt-daily runs: real apt-get does not wait for those. Its lock messages are in
+    # German under a German locale (LC_ALL, else LC_MESSAGES, else LANG), as libapt's translations; /log/apt-denied
+    # makes the lock file one it may not open (not root). /log/apt-fail makes it fail; /log/dns holds the resolv.conf
+    # line `update` needs to reach the mirror; with /log/questions it fails unless noninteractive and keeping changed
+    # config files.
+    'usr/bin/apt-get': 'R="${0%/usr/bin/apt-get}"; o=; while [ "$1" = -o ]; do o="$o $2"; shift 2; done\n'
+                       'echo "$*" >>"$R/log/apt-get"; echo "${o# }" >>"$R/log/apt-get-options"\n'
+                       '[ "$1" = update ] && d=/var/lib/apt/lists || d=/var/cache/apt/archives\n'
+                       '[ -e "$R/log/apt-denied" ] && { echo "E: Could not open lock file $d/lock - open (13: '
+                       'Permission denied)" >&2; echo "E: Unable to lock directory $d/" >&2; exit 100; }\n'
+                       'n=$(cat "$R/log/apt-locked-$1" 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then\n'
+                       '  echo $((n - 1)) >"$R/log/apt-locked-$1"\n'
+                       '  case "${LC_ALL:-${LC_MESSAGES:-$LANG}}" in de*)\n'
+                       '    echo "E: Sperre $d/lock konnte nicht erlangt werden. Sie wird von Prozess 4242 (apt-get) '
+                       'gehalten (test)" >&2\n'
+                       '    echo "E: Das Verzeichnis $d/ kann nicht gesperrt werden." >&2;;\n'
+                       '  *) echo "E: Could not get lock $d/lock. It is held by process 4242 (apt-get) (test)" >&2\n'
+                       '    echo "E: Unable to lock directory $d/" >&2;; esac; exit 100; fi\n'
                        '[ -e "$R/log/apt-fail" ] && { echo "E: no network (test)" >&2; exit 100; }\n'
-                       '[ "$1" = install ] && cp "$R/log/nft-package" "$R/usr/sbin/nft"; exit 0\n',
+                       'grep -qs unpacked "$R"/log/packages/* && { echo "E: dpkg was interrupted, you must manually '
+                       'run \'dpkg --configure -a\' to correct the problem." >&2; exit 100; }\n'
+                       '[ "$1" != install ] || ! ls "$R/var/lib/dpkg/updates" 2>/dev/null | grep -qxE "[0-9]+" || '
+                       '{ echo "E: dpkg was interrupted, you must manually run \'dpkg --configure -a\' to correct the '
+                       'problem." >&2; exit 100; }\n'
+                       '[ ! -e "$R/log/questions" ] || { [ "$DEBIAN_FRONTEND" = noninteractive ] && case "$o" in '
+                       '*Dpkg::Options::=--force-confold*) :;; *) false;; esac; } || '
+                       '{ echo "E: end of file on stdin at conffile prompt (test)" >&2; exit 100; }\n'
+                       '[ "$1" != update ] || [ ! -e "$R/log/dns" ] || grep -qxF "$(cat "$R/log/dns")" "$R/etc/resolv.conf" '
+                       '|| { echo "E: Temporary failure resolving the mirror (test)" >&2; exit 100; }\n'
+                       '[ "$1" = install ] || exit 0; shift 2\n'
+                       'for p; do echo "install ok installed" >"$R/log/packages/$p"\n'
+                       '  [ "$p" != nftables ] || cp "$R/log/nft-package" "$R/usr/sbin/nft"; done\n',
+    # dpkg-query -W -f=FORMAT PKG...: "PKG<TAB>its status" for each package in /log/packages (the status inside)
+    'usr/bin/dpkg-query': 'R="${0%/usr/bin/dpkg-query}"; echo "$*" >>"$R/log/dpkg-query"; shift 2; rc=0\n'
+                          'for p; do if [ -e "$R/log/packages/$p" ]; then printf "%s\\t%s\\n" "$p" "$(cat "$R/log/packages/$p")"\n'
+                          '  else echo "dpkg-query: no packages found matching $p" >&2; rc=1; fi; done; exit $rc\n',
+    # dpkg --audit: names each package an apt-get stopped half-way left unpacked (no lock: it only reads) and, as
+    # real dpkg, exits 0 all the same; /log/dpkg-audit-fail makes it fail (exit 2) and name nothing, as on a status
+    # file it cannot parse. It does not name a package whose last state, in a journal file under
+    # /var/lib/dpkg/updates, is installed. dpkg [--force-...]... --configure -a: finishes them and merges that journal
+    # (removes its files). /log/dpkg-locked holds how many more runs find the lock held (real dpkg does not wait),
+    # with the message in German under a German locale; /log/questions as for apt-get.
+    'usr/bin/dpkg': 'R="${0%/usr/bin/dpkg}"; echo "$*" >>"$R/log/dpkg"\n'
+                    'if [ "$1" = --audit ]; then [ ! -e "$R/log/dpkg-audit-fail" ] || '
+                    '{ echo "dpkg: error: parsing file \'/var/lib/dpkg/status\' (test)" >&2; exit 2; }; h=\n'
+                    '  for f in "$R"/log/packages/*; do grep -qs unpacked "$f" || continue\n'
+                    '  [ -n "$h" ] || echo "The following packages have been unpacked but not yet configured:"\n'
+                    '  echo " ${f##*/}"; h=1; done; exit 0; fi\n'
+                    'n=$(cat "$R/log/dpkg-locked" 2>/dev/null || echo 0); if [ "$n" -gt 0 ]; then\n'
+                    '  echo $((n - 1)) >"$R/log/dpkg-locked"\n'
+                    '  case "${LC_ALL:-${LC_MESSAGES:-$LANG}}" in de*) echo "dpkg: Fehler: dpkg-Frontend-Sperre wurde '
+                    'von einem anderen Prozess mit PID 4242 gesperrt (test)" >&2;;\n'
+                    '  *) echo "dpkg: error: dpkg frontend lock was locked by another process with pid 4242 (test)" >&2;; '
+                    'esac\n'
+                    '  exit 2; fi\n'
+
+                    '[ ! -e "$R/log/questions" ] || { [ "$DEBIAN_FRONTEND" = noninteractive ] && case "$*" in '
+                    '*--force-confold*) :;; *) false;; esac; } || '
+                    '{ echo "dpkg: error: end of file on stdin at conffile prompt (test)" >&2; exit 1; }\n'
+                    'for f in "$R"/log/packages/*; do [ ! -e "$f" ] || sed -i "s/unpacked/installed/" "$f"; done\n'
+                    'for f in "$R"/var/lib/dpkg/updates/[0-9]*; do [ ! -e "$f" ] || rm "$f"; done\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
 }
@@ -111,6 +174,7 @@ class Case(unittest.TestCase):
 
     def setUp(self):
         k.SETTLE, k.SETTLE_STEP = self.settle, 0.05
+        k.LOCK_WAIT, k.LOCK_STEP = 0.3, 0.01   # 300 s and 5 s on a machine
         # No power cut in a fake root, so when a write reaches the disk is not tested here: fsync only costs time.
         fsync = mock.patch.object(os, 'fsync', lambda fd: None)
         fsync.start()
@@ -130,6 +194,7 @@ class Case(unittest.TestCase):
         files['proc/sys/kernel/random/boot_id'] = '0f8e4f9c-1b6a-4d2e-9a57-3c1d2e4f5a6b\n'
         files['proc/net/route'] = 'Iface\tDestination\tGateway\tFlags\nboth\t00000000\t011014AC\t0003\n'
         files['log/'] = files['opt/'] = files['etc/systemd/system/'] = ''   # as in a fresh Ubuntu
+        files['log/packages/nftables'] = 'install ok installed'   # and no libatomic1 or unzip, as in a fresh Ubuntu
         files.update({rel: {'text': '#!/bin/sh\n' + text, 'mode': '755'} for rel, text in TOOLS.items()})
         for rel, value in files.items():
             self.write('/' + rel, value)

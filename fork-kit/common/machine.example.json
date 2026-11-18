@@ -29,11 +29,12 @@
     "preHooks": ["/srv/example/golive/bin/pause-jobs"],
     "postHooks": ["/srv/example/golive/bin/resume-jobs"],
     "quietWaitSeconds": 7200,
-    "stopLimitSeconds": 1800
+    "stopLimitSeconds": 1800,
+    "rehearsalMaxAgeHours": 72
   },
   "pc-agents": {
     "organization": "Example home lab",
-    "t3Version": "0.0.30",
+    "t3Version": "0.1.9",
     "t3ReleaseBaseUrl": "https://github.com/example/t3code/releases/download",
     "port": 3773,
     "maxRuntimeMode": "full-access",
@@ -43,6 +44,9 @@
     "nameservers": ["1.1.1.1", "9.9.9.9"],
     "peers": ["100.101.102.103/32"],
     "tailscaleTag": "tag:pc-agents"
+  },
+  "model-guard": {
+    "policyFile": "/etc/fork-kit/model-policy.json"
   },
   "desk": {
     "pool": "pc",

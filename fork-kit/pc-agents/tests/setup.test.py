@@ -6,9 +6,14 @@ walls, and a distro that is not fresh is refused with nothing changed.
   python3 -I -B fork-kit/pc-agents/tests/setup.test.py
 """
 import json, os, re, shutil, signal, stat, subprocess, sys, time, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_distro import CONFIG, KIT, REPO, SHA1, SHA2, Case, blob, cli, k  # noqa: E402
+
+DPKG = '--force-confdef --force-confold --configure -a'   # how setup runs dpkg: no config-file question
+# apt-get's options: no config-file question, and a wait for dpkg's lock (apt-get's own locks are retried by setup)
+APT = 'Dpkg::Options::=--force-confdef Dpkg::Options::=--force-confold DPkg::Lock::Timeout=300'
 
 
 class Setup(Case):
@@ -309,15 +314,192 @@ class Setup(Case):
 
     def test_nftables_installed_after_a_package_list_update(self):
         os.replace(self.path('/usr/sbin/nft'), self.path('/log/nft-package'))
+        os.unlink(self.path('/log/packages/nftables'))
         self.terminate()
         self.write('/log/apt-fail', '')
         code, out = self.setup_run()
         self.assertEqual(code, 1, out)
-        self.assertIn('apt-get update && apt-get install -y nftables', out)
+        self.assertIn('apt-get update && apt-get install -y nftables libatomic1 unzip', out)
         os.unlink(self.path('/log/apt-fail'))
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.log('apt-get'), ['update', 'update', 'install -y nftables'])
+        self.assertEqual(self.log('apt-get'), ['update', 'update', 'install -y nftables libatomic1 unzip'])
+
+    def test_libatomic1_and_unzip_are_installed_once(self):
+        """Node (the agents' tool) does not start without libatomic.so.1 and the agent has no sudo; unzip is for
+        postinstall steps. A fresh Ubuntu has neither (#269)."""
+        self.ready()
+        self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+        for p in ('libatomic1', 'unzip'):
+            self.assertEqual(self.read('/log/packages/' + p), 'install ok installed\n')
+        for log in ('apt-get', 'dpkg', 'systemctl'):
+            os.unlink(self.path('/log/' + log))
+        self.assertEqual(self.setup_run()[0], 0)   # runs again: nothing to install
+        self.assertEqual(self.log('apt-get'), [])
+        self.assertEqual(self.log('dpkg'), [])
+        self.write('/log/packages/unzip', 'install ok unpacked')   # an apt-get stopped half-way
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.log('dpkg'), ['--audit', DPKG])   # first: apt-get refuses while dpkg was interrupted
+        self.assertEqual(self.log('apt-get'), ['update', 'install -y unzip'])
+        self.assertFalse([line for line in self.log() if line.startswith('restart')])   # no T3 restart for a package
+
+    def test_a_held_package_counts_as_installed(self):
+        """`apt-mark hold` makes the status `hold ok installed`: installed, so no apt-get on every run (#296)."""
+        self.ready()
+        for log in ('apt-get', 'dpkg'):
+            os.unlink(self.path('/log/' + log))
+        self.write('/log/packages/unzip', 'hold ok installed')
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.log('apt-get'), [])
+        self.assertEqual(self.log('dpkg'), [])
+
+    def test_packages_are_installed_after_the_kits_own_resolv_conf(self):
+        """A distro of an older kit (no libatomic1) whose machine file's nameservers broke DNS: the corrected
+        nameservers reach resolv.conf before apt-get needs them, and a run stopped at apt-get goes on (#296)."""
+        self.ready()
+        os.unlink(self.path('/log/packages/libatomic1'))
+        self.write('/log/dns', 'nameserver 8.8.8.8')   # the mirror resolves only through the corrected nameserver
+        self.machine({**CONFIG, 'nameservers': ['8.8.8.8']})
+        self.write('/log/apt-fail', '')   # and the network is down for this run
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('nameserver 8.8.8.8\n', self.read('/etc/resolv.conf'))   # written before apt-get
+        self.assertEqual(self.check()[0], 1)   # between the two runs: the files changed, T3 did not restart (#321)
+        os.unlink(self.path('/log/apt-fail'))
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.read('/log/packages/libatomic1'), 'install ok installed\n')
+        self.assertEqual(self.check()[0], 0)
+
+    def test_dpkg_and_apt_get_ask_nothing(self):
+        """stdin is /dev/null: a config-file question (an upgrade stopped half-way over an edited file) or a debconf
+        one takes its default instead of failing at end of file (#296)."""
+        self.write('/log/questions', '')
+        self.ready()
+        self.assertEqual(self.read('/log/packages/unzip'), 'install ok installed\n')
+        self.write('/log/packages/unzip', 'install ok unpacked')
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.read('/log/packages/unzip'), 'install ok installed\n')
+        self.assertEqual(set(self.log('apt-get-options')), {APT})   # every apt-get run, every option (#321)
+
+    def test_dpkg_configure_runs_only_when_something_is_half_installed(self):
+        """`dpkg --configure -a` takes dpkg's lock without waiting: on a fresh distro with nothing half-installed
+        it is not run, so unattended-upgrades holding that lock is left to apt-get's own wait (#321). A journal file
+        whose name is not all digits (the whole name: not 0003.new) is one apt-get does not look at either, and a
+        distro without that folder, or with it empty, has no journal (#349)."""
+        fresh = self.keep()
+        self.assertFalse(os.path.lexists(self.path('/var/lib/dpkg')))
+        for p in (None, '/var/lib/dpkg/updates/', '/var/lib/dpkg/updates/tmp.i', '/var/lib/dpkg/updates/0003.new'):
+            with self.subTest(p):
+                self.restore(fresh)
+                if p:
+                    self.write(p, '')
+                self.ready()
+                self.assertEqual(self.log('dpkg'), ['--audit'])
+                self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+
+    def test_an_updates_folder_it_cannot_read_counts_as_interrupted(self):
+        """apt skips a /var/lib/dpkg/updates it cannot read; setup runs `dpkg --configure -a` then, which costs one
+        dpkg run that waits for its lock and finds nothing to do (#349)."""
+        fresh = self.keep()
+        full = self.path('/var/lib/dpkg/updates')
+        self.addCleanup(lambda: os.path.isdir(full) and os.chmod(full, 0o755))
+        for how in ('a file', 'mode 000'):   # ENOTDIR, EACCES (the tests never run as root)
+            with self.subTest(how):
+                self.restore(fresh)
+                if how == 'a file':
+                    self.write('/var/lib/dpkg/updates', '')
+                else:
+                    self.write('/var/lib/dpkg/updates/', '')
+                    os.chmod(full, 0)
+                self.ready()
+                self.assertEqual(self.log('dpkg'), ['--audit', DPKG])
+                self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+
+    def test_dpkg_configure_runs_when_its_audit_fails(self):
+        """A `dpkg --audit` that fails and names nothing (a status file it cannot parse) is not taken as all clear:
+        `dpkg --configure -a` runs (#349)."""
+        self.write('/log/dpkg-audit-fail', '')
+        self.ready()
+        self.assertEqual(self.log('dpkg'), ['--audit', DPKG])
+
+    def test_an_interrupted_dpkg_that_names_nothing_is_finished(self):
+        """dpkg stopped after its last status change but before saving it (`wsl --shutdown` during
+        unattended-upgrades): its journal under /var/lib/dpkg/updates says installed, so `dpkg --audit` names
+        nothing, yet apt-get install refuses ("dpkg was interrupted") while that folder holds a file named all
+        digits, on every run. Setup finishes it first, as apt asks; the next run has nothing to finish (#349)."""
+        self.write('/var/lib/dpkg/updates/0003', 'Package: unzip\nStatus: install ok installed\n')
+        self.write('/var/lib/dpkg/updates/tmp.i', '')
+        self.ready()
+        self.assertEqual(self.log('dpkg'), ['--audit', DPKG])
+        self.assertEqual(os.listdir(self.path('/var/lib/dpkg/updates')), ['tmp.i'])
+        self.assertEqual(self.log('apt-get'), ['update', 'install -y libatomic1 unzip'])
+        os.unlink(self.path('/log/packages/unzip'))   # and a later run with a package to install
+        code, out = self.setup_run()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.log('dpkg'), ['--audit', DPKG, '--audit'])
+
+    def test_a_lock_apt_daily_holds_is_waited_for(self):
+        """A new distro where apt-daily runs: apt-get update's lists lock, install's archives lock and dpkg's own
+        lock are taken without a wait (only DPkg::Lock::Timeout's frontend lock waits), so setup tries again (#321)."""
+        self.write('/log/packages/unzip', 'install ok unpacked')   # an upgrade stopped half-way
+        for name in ('dpkg-locked', 'apt-locked-update', 'apt-locked-install'):
+            self.write('/log/' + name, '2')
+        self.ready()
+        self.assertEqual(self.log('dpkg'), ['--audit'] + [DPKG] * 3)
+        self.assertEqual(self.log('apt-get'), ['update'] * 3 + ['install -y libatomic1 unzip'] * 3)
+        self.assertEqual(self.read('/log/packages/libatomic1'), 'install ok installed\n')
+        self.assertEqual(self.check()[0], 0)
+
+    def test_a_lock_is_told_apart_under_any_locale(self):
+        """sudo keeps LANG and LC_*, and apt and dpkg ship translations: setup runs them under LC_ALL=C, so a lock
+        held while the owner's locale is German is still waited for (#349)."""
+        env = {n: v for n, v in os.environ.items() if n not in ('LC_ALL', 'LC_MESSAGES')}
+        with mock.patch.dict(os.environ, {**env, 'LANG': 'de_DE.UTF-8'}, clear=True):
+            self.write('/log/packages/unzip', 'install ok unpacked')
+            for name in ('dpkg-locked', 'apt-locked-update', 'apt-locked-install'):
+                self.write('/log/' + name, '2')
+            self.ready()
+        self.assertEqual(self.log('dpkg'), ['--audit'] + [DPKG] * 3)
+        self.assertEqual(self.log('apt-get'), ['update'] * 3 + ['install -y libatomic1 unzip'] * 3)
+
+    def test_a_lock_file_it_may_not_open_is_not_waited_for(self):
+        """apt-get adds `Unable to lock directory` to any lock failure, also one no other apt-get causes (here the
+        lock file cannot be opened): that one is not tried again for 5 minutes, nor named as a busy apt (#349)."""
+        self.write('/log/apt-denied', '')
+        code, out = self.setup_run()
+        self.assertEqual(code, 1, out)
+        self.assertIn('Permission denied', out)
+        self.assertNotIn('Another apt-get or dpkg still runs', out)
+        self.assertEqual(self.log('apt-get'), ['update'])
+
+    def test_a_lock_held_past_the_wait_is_named_with_its_own_fix(self):
+        """A lock still held after the wait (5 minutes on a machine): the advice is to wait for the other apt-get or
+        dpkg, not to fix the network; nothing is installed, and the next run goes on."""
+        for name, failed in (('dpkg-locked', 'dpkg --configure -a failed'),
+                             ('apt-locked-update', 'apt-get update failed'),
+                             ('apt-locked-install', 'apt-get install failed')):
+            with self.subTest(lock=name):
+                self.ready()
+                os.unlink(self.path('/log/packages/libatomic1'))
+                self.write('/log/packages/unzip', 'install ok unpacked')
+                self.write('/log/' + name, '1000000')
+                code, out = self.setup_run()
+                self.assertEqual(code, 1, out)
+                self.assertIn(failed, out)
+                self.assertIn('Could not get lock' if 'apt' in name else 'locked by another process', out)
+                self.assertIn('Another apt-get or dpkg still runs', out)
+                self.assertNotIn('network', out)
+                self.assertFalse(os.path.exists(self.path('/log/packages/libatomic1')))
+                os.unlink(self.path('/log/' + name))
+                code, out = self.setup_run()
+                self.assertEqual(code, 0, out)
+                self.assertEqual(self.read('/log/packages/libatomic1'), 'install ok installed\n')
+                shutil.rmtree(self.root)
+                self.setUp()
 
     def test_t3_that_does_not_start_is_reported(self):
         self.ready()
@@ -348,6 +530,20 @@ class Setup(Case):
         self.assertEqual(self.setup_run()[0], 0)
         self.assertFalse(os.path.lexists(self.path(k.PENDING)))
 
+
+    def test_how_t3_ended_is_said_only_when_not_cleanly(self):
+        self.ready()
+        self.machine({**CONFIG, 'memoryMax': '4G'})
+        for crash, said in (('2 9', 'killed by signal 9'), ('3 6', 'killed by signal 6'), ('1 0', None)):
+            self.write('/log/t3-crash', crash)   # ExecMainCode ExecMainStatus: CLD_KILLED, CLD_DUMPED, a clean exit
+            code, out = self.setup_run()
+            self.assertEqual(code, 1, out)
+            self.assertIn('T3 did not start or stay up', out)
+            if said:
+                self.assertIn(said, out)
+            else:
+                self.assertNotIn('exit status', out)
+                self.assertNotIn('killed', out)
 
     def test_t3_that_dies_a_moment_after_the_restart_is_reported(self):
         self.ready()
@@ -576,6 +772,29 @@ class AsAgent(Case):
         self.assertIn('not running anything as the agent', out)
         self.assertEqual(self.log('systemd-run'), [])
 
+    def test_pair_before_its_t3_is_installed_says_so(self):
+        """An upgrade stopped half-way (the new t3Version written, its download failed): no env error, the cause."""
+        self.ready()
+        self.machine({**CONFIG, 't3Version': '1.2.4'})
+        self.write('/log/install-fail', '')
+        self.assertEqual(self.setup_run()[0], 1)
+        for stopped in (False, True):   # the old T3 still runs, or the 2-minute check stopped it (a restart is due)
+            if stopped:
+                k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
+            code, out = self.call(cli.main, ['pair'])
+            self.assertEqual(code, 1, out)
+            self.assertIn('T3 1.2.4 is not installed yet: run pc-agents setup again (README step 3)', out)
+            self.assertEqual(self.log('systemd-run'), [])
+
+    def test_pair_and_as_agent_are_for_root_only(self):
+        for argv in (['pair'], ['pair', '--ttl', '1m'], ['as-agent', '--', 'claude']):
+            with mock.patch.object(k, 'ROOT', ''), mock.patch.object(os, 'geteuid', lambda: 1100), \
+                    mock.patch.object(k, 'config', mock.Mock(side_effect=AssertionError('read the machine file'))):
+                code, out = self.call(cli.main, argv)
+            self.assertEqual(code, 2, out)
+            self.assertIn('run this as root', out)
+        self.assertEqual(self.log('systemd-run'), [])
+
     def test_pair_runs_the_installed_t3_pair_as_the_agent(self):
         self.ready()
         self.machine({**CONFIG, 't3Version': '1.2.4'})
@@ -663,12 +882,45 @@ class Refused(Case):
                             ({'lockedSettings': {'agentSlots.maxPerMachine.x': {'y': 2}}}, 'one field per dotted path'),
                             ({'nameservers': ['192.168.1.1']}, 'only public addresses'),
                             ({'t3Version': 'latest'}, 'an exact version'),
+                            ({'t3Version': '0.1.6'}, '0.1.7 or newer'),   # no managed policy: no locks at all
+                            ({'t3Version': '0.0.30-fork.1'}, '0.1.7 or newer'),
+                            # built before 0.1.7 had the managed policy: a pre-release is older than its release
+                            ({'t3Version': '0.1.7-nightly.20261031.3991'}, '0.1.7 or newer'),
+                            ({'t3Version': '0.1.7-nightly.20261031.3991.fork.1'}, '0.1.7 or newer'),   # the fork's
+                            ({'t3Version': '0.1.7-fork.1.rc.1'}, '0.1.7 or newer'),
                             ({'maxRuntimeMode': 'root'}, 'one of')):
             self.machine({**CONFIG, **change})
             code, out = self.setup_run()
             self.assertEqual(code, 2, out)
             self.assertIn(why, out)
         self.assertFalse(os.path.lexists(self.path('/etc/t3code/policy.json')))
+
+
+    def test_versions_from_0_1_7_on_are_accepted(self):
+        """Compared as numbers, the release itself included: a string compare would refuse 0.1.10 (#296). The fork's
+        stable build of a release (`v<upstream>-fork.<n>`, fork-release.yml) is that release (#321)."""
+        for v in ('0.1.7', '0.1.7-fork.1', '0.1.7-fork.12', '0.1.8-rc.1', '0.1.10',
+                  '0.1.10-nightly.20261114.4682.fork.1', '0.2.0', '1.0.0'):
+            self.machine({**CONFIG, 't3Version': v})
+            self.assertEqual(k.config()['t3Version'], v)
+
+
+class Readme(unittest.TestCase):
+    def test_owner_steps_run_as_written_in_powershell(self):
+        """Every kit command of the owner steps is a whole PowerShell line: `pc-agents ...` alone is not found there."""
+        with open(os.path.join(KIT, 'README.md'), encoding='utf-8') as f:
+            readme = f.read()
+        steps = readme[readme.index('## Owner steps'):readme.index('## Tailscale tag')]
+        spans = re.findall(r'`([^`]*pc-agents (?:pair|as-agent)\b[^`]*)`', steps)
+        self.assertGreaterEqual(len(spans), 5, spans)
+        for span in spans:
+            self.assertRegex(span, r'^wsl -d <distro> -u root (--|-e) /opt/pc-agents/current/sbin/pc-agents ')
+        self.assertIn('pc-agents pair --ttl 15m`', steps)
+        for key in ('user.name', 'user.email'):   # the agent's git identity: placeholders the owner fills in
+            line = next(s for s in spans if f'git config --global {key} ' in s)
+            self.assertRegex(line, rf"git config --global {key} '<[^>]+>'$")
+            # -e: wsl runs it without root's shell, so a name with an apostrophe (O'Brien) reaches git as typed
+            self.assertTrue(line.startswith('wsl -d <distro> -u root -e '), line)
 
 
 class ReleaseHolds(unittest.TestCase):

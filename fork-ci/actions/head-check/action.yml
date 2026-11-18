@@ -2,7 +2,7 @@ name: pr-queue head check
 description: >-
   Fails a pull request head that is not the change its review read: the merge queue's head_check (pr-queue), with the
   queue's own lens rules and config. Run it in a job of its own, right after the checkout of GitHub's merge commit
-  with fetch-depth 0, on pull_request events. Reads only and posts nothing. Needs git 2.38+, gh and python3.
+  with fetch-depth 0, on pull_request events. Reads only and posts nothing. Needs git 2.43+, gh and python3.
 inputs:
   config:
     description: The merge queue's JSON config (pr-queue README, "Config"), a path in the repository, read from the base commit.
@@ -38,6 +38,12 @@ outputs:
 runs:
   using: composite
   steps:
+    # Before any git call: a .git config that actions/checkout does not write (one an earlier job left) is refused.
+    - name: Refuse a git config actions/checkout does not write (fork-ci git-clean)
+      shell: bash
+      env:
+        CHECKOUT_PATH: ${{ inputs.path }}
+      run: exec python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path "$CHECKOUT_PATH" --require
     - id: check
       name: The head is the change the review read
       shell: bash

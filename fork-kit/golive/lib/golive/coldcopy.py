@@ -96,7 +96,7 @@ def _raise(error):
     raise error  # os.walk's onerror: an unreadable folder stops the copy instead of being skipped in silence
 
 
-def plan(userdata):
+def plan(userdata, skip=frozenset()):
     """What a copy takes from userdata/: [{'path', 'kind', 'bytes', 'mode'[, 'target']}] top-down, and the total
     bytes. Plain files, folders and links; anything else (a socket, a fifo) is left out and named. A folder that
     cannot be read raises OSError (a copy that says complete must hold everything)."""
@@ -105,7 +105,7 @@ def plan(userdata):
         rel_d = os.path.relpath(d, userdata)
         for n in sorted(dirs + names):
             rel = n if rel_d == '.' else f'{rel_d}/{n}'
-            if rel_d == '.' and (n in SKIP or n.endswith('-shm') or ASIDE in n
+            if rel_d == '.' and (n in SKIP or n in skip or n.endswith('-shm') or ASIDE in n
                                  or (n.startswith('.') and RESTORE_TEMP in n)):
                 if n in dirs:
                     dirs.remove(n)
@@ -125,11 +125,59 @@ def plan(userdata):
     return entries, total, left_out
 
 
-def copy_userdata(run, home, dest, deadline):
-    """The cold copy (in a step): every planned entry into dest/userdata, hashing what is read. dest is new."""
+LINK_HOPS = 40  # Linux's own limit on links followed in one path
+
+
+def link_leaves(rel, look):
+    """Why following the link at `rel` ('/'-joined, inside a tree) leaves that tree, or None when it, and every link
+    it leads through, stays inside. look(path) gives the target of the link at a path of the tree, None for anything
+    else (a folder, a file, nothing: a dangling remainder is taken as it reads). Out: an absolute target (in a copy
+    it still names its old place), a '..' above the tree, more than LINK_HOPS links (a loop). A '..' after a link
+    applies to where that link leads, as in the kernel, so 'up/../x' with up -> '../..' leaves."""
+    parts, hops = rel.split('/'), 0
+    cur, todo = parts[:-1], parts[-1:]
+    while todo:
+        name = todo.pop(0)
+        if name in ('', '.'):
+            continue
+        if name == '..':
+            if not cur:
+                return f'{"/".join(parts)} goes above the tree'
+            cur.pop()
+            continue
+        here = '/'.join(cur + [name])
+        target = look(here)
+        if target is None:
+            cur.append(name)
+            continue
+        hops += 1
+        if hops > LINK_HOPS:
+            return f'more than {LINK_HOPS} links (a loop)'
+        if target.startswith('/'):
+            return f'{here} -> {target} is absolute'
+        todo[:0] = target.split('/')
+    return None
+
+
+def links_out(entries):
+    """[(path, why)] of the planned links (plan()) that lead out of the copied tree, or through a link that does."""
+    links = {e['path']: e['target'] for e in entries if e['kind'] == 'link'}
+    found = [(rel, link_leaves(rel, links.get)) for rel in links]
+    return [(rel, why) for rel, why in found if why is not None]
+
+
+def copy_userdata(run, home, dest, deadline, skip=frozenset(), inside=False):
+    """The cold copy (in a step): every planned entry into dest/userdata, hashing what is read. dest is new.
+    skip: more top-level names to leave out (rehearse's clone leaves out secrets/). inside (rehearse's clone): a link
+    that leads out of the copied tree (links_out) is left out and named in left_out, decided on the plan, before
+    anything is made, so the copy never holds one, whatever was added since an earlier look."""
     run.require_step('cold copy')
     userdata = os.path.join(home, 'userdata')
-    entries, total, left_out = plan(userdata)
+    entries, total, left_out = plan(userdata, skip)
+    if inside:
+        out = dict(links_out(entries))
+        entries = [e for e in entries if e['path'] not in out]
+        left_out += [f'{rel} (a link out of the copied tree: {why})' for rel, why in out.items()]
     os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
     os.mkdir(dest, 0o700)  # FileExistsError: never over an old copy
     os.mkdir(os.path.join(dest, 'userdata'), 0o700)
@@ -211,11 +259,11 @@ def verify_copy(copy_dir):
 
 
 def incomplete_copies(backup_dir):
-    """Read only: [(folder, bytes)] of the copy folders (t3-copy-*) in backup_dir with no finished manifest, left
-    by a copy killed or failed half-way. They are never used, and the kit deletes no data: the owner removes them
-    (a copy names them, and a refusal for free disk counts them)."""
+    """Read only: [(folder, bytes)] of the copy folders (t3-copy-*, and the switch's t3-switch-*) in backup_dir with
+    no finished manifest, left by a copy killed or failed half-way. They are never used, and the kit deletes no
+    data: the owner removes them (a copy names them, and a refusal for free disk counts them)."""
     try:
-        names = sorted(n for n in os.listdir(backup_dir) if n.startswith('t3-copy-'))
+        names = sorted(n for n in os.listdir(backup_dir) if n.startswith(('t3-copy-', 't3-switch-')))
     except FileNotFoundError:
         return []
     found = []
@@ -262,7 +310,7 @@ def stopped_restore(home, copy_dir=None):
     names the kept files that are the home as it was before that restore; its 'alsoKept' (when there) what reruns
     kept from the half-way home; its 'names' the files that restore put back; its 'sums' the SHA256 of each kept
     file; its 'copy' and 'alsoCopies' the copies it and its reruns restored from. None as well when the old home
-    was put back by hand (see _read_record; copy_dir, the copy about to be restored, counts as one of the record's
+    was moved back by hand (see _read_record; copy_dir, the copy about to be restored, counts as one of the record's
     copies). RuntimeError when the record cannot be read (which kept files are the old home is then unknown), or
     when the old home was put back only in part or with a file of the half-way home left: the owner looks."""
     record, stale = _read_record(home, copy_dir)
@@ -281,9 +329,12 @@ def _file_sum(path):
 
 def _copy_sums(mark, copy_dir=None):
     """({name: {SHA256}} of the files the copies a restore record names (and copy_dir) hold, by their manifests;
-    [those copies whose manifest cannot be read, so what they hold is unknown])."""
+    [those copies whose manifest cannot be read, so what they hold is unknown]; {name: {first WAL_HEADER bytes}} of
+    each -wal those copies hold that still matches its manifest SHA256; {name: [path]} of each -wal of those copies
+    that is gone or no longer matches its manifest SHA256 (someone opened the copy's database in place), so its
+    header proves nothing: what begins with it is unknown, as with a copy that cannot be read)."""
     copies = [mark.get('copy')] + list(mark.get('alsoCopies', [])) + ([copy_dir] if copy_dir else [])
-    sums, unread = {}, []
+    sums, unread, heads, changed = {}, [], {}, {}
     for c in dict.fromkeys(os.path.normpath(c) if isinstance(c, str) else c for c in copies):
         try:
             if not isinstance(c, str):
@@ -295,7 +346,64 @@ def _copy_sums(mark, copy_dir=None):
         for e in m['files']:
             if isinstance(e, dict) and e.get('kind') == 'file' and isinstance(e.get('path'), str):
                 sums.setdefault(e['path'], set()).add(e.get('sha256'))
-    return sums, unread
+                if e['path'].endswith('-wal') and '/' not in e['path']:
+                    wal = os.path.join(c, 'userdata', e['path'])
+                    try:
+                        digest = _file_sum(wal)
+                    except OSError:
+                        digest = None
+                    if digest is None or digest != e.get('sha256'):  # gone, unreadable, or other bytes
+                        changed.setdefault(e['path'], []).append(wal)
+                        continue
+                    head = _wal_head(wal)
+                    if head is not None:  # None: shorter than a header (an empty -wal), as its manifest says
+                        heads.setdefault(e['path'], set()).add(head)
+    return sums, unread, heads, changed
+
+
+WAL_HEADER = 32  # SQLite's WAL header: magic, version, page size, checkpoint count, the two salts, its checksum
+
+
+WAL_FRAME_HEADER = 24  # before each page in a WAL; a frame is this and one page
+
+
+def _wal_head(path):
+    """The WAL header of a regular file at path (None when it is shorter or not a regular file). The salts in it
+    are new each time SQLite starts a WAL over: a WAL that begins with a copy's header holds that copy's frames,
+    whatever was appended after them."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        with open(path, 'rb') as f:
+            head = f.read(WAL_HEADER)
+    except OSError:
+        return None
+    return head if len(head) == WAL_HEADER else None
+
+
+def _wal_begins_with(path, sha256):
+    """True when the WAL at path begins with exactly the bytes of that SHA256, up to its header or a whole frame
+    after it (a record holds a kept file's SHA256, not its length; a WAL ends on a whole frame). SQLite only appends
+    to a WAL until it starts it over, so a WAL that was moved back and appended to since begins with the bytes it
+    had when it was kept. False for anything else: no SHA256, not a regular file, no WAL page size in its header,
+    other bytes, or a kept length that is not a whole number of frames."""
+    try:
+        if not sha256 or not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        with open(path, 'rb') as f:
+            head = f.read(WAL_HEADER)
+            page = int.from_bytes(head[8:12], 'big')
+            if len(head) != WAL_HEADER or not 512 <= page <= 65536 or page & (page - 1):
+                return False
+            h = hashlib.sha256(head)
+            while h.hexdigest() != sha256:
+                frame = f.read(WAL_FRAME_HEADER + page)
+                if len(frame) != WAL_FRAME_HEADER + page:
+                    return False
+                h.update(frame)
+            return True
+    except OSError:
+        return False
 
 
 def _them(names, one='it', more='them'):
@@ -304,19 +412,31 @@ def _them(names, one='it', more='them'):
 
 def _read_record(home, copy_dir=None):
     """(record, stale) of RESTORE_MARK: (None, False) when there is none. Stale when the old home was put back by
-    hand in full: every file 'oldHome' names is moved back (gone from its kept name and back in the home) or
-    copied back (still there, and the home's file of that name holds the same bytes); a kept -shm need not go
-    back. A kept file gone while the home's file of that name holds the bytes of a copy's file (by the copy's
-    manifest; one the record's copies restored, or copy_dir) and the kept file did not ('sums') is not moved back:
-    it was deleted, and the home holds the half-way home's file. And the home then holds no -wal, -journal or -shm
-    of a database the record names that the old home did not have: such a file is the half-way home's (the copy's
-    WAL, or what a T3 started after the stop wrote), and next to the old database it would serve, or on the first
-    checkpoint write, another database's pages.
+    hand in full by moving: every file 'oldHome' names is gone from its kept name and back in the home (a kept -shm
+    need not go back). A kept file gone while the home's file of that name holds the bytes of a copy's file (by the
+    copy's manifest; one the record's copies restored, or copy_dir) and the kept file did not ('sums') is not moved
+    back: it was deleted, and the home holds the half-way home's file. When a copy the record names cannot be read,
+    a kept file gone is taken as moved back only when the home's file holds the kept file's bytes ('sums'); the same
+    for a kept -wal when a copy's -wal of that name is gone or no longer matches its manifest (its header then
+    proves nothing). And the same for a kept -wal gone while the home's -wal begins with the header of a copy's
+    -wal: the copy's frames with a T3's after them, or the old WAL moved back and appended to since (a WAL the copy
+    was taken with keeps its header). Those two are told apart by the kept bytes (fork #300): a -wal that begins
+    with exactly the kept -wal's bytes ('sums', see _wal_begins_with), which are not also a copy's -wal's, was
+    moved back and appended to: the home is the old home. Otherwise it cannot be told, and is not moved back. And the
+    home then holds no -wal, -journal or -shm of a database the record names that the old home did not have: such a
+    file is the half-way home's (the copy's WAL, or what a T3 started after the stop wrote), and next to the old
+    database it would serve, or on the first checkpoint write, another database's pages.
+    No kept file gone, and each (but a -shm) holding the same bytes as the home's file of its name: copied back, or
+    a restore stopped once its kept files were written. The home is then the old home and the record stays live
+    (a rerun names its kept files as the old home again), but the same check for a file the old home did not have
+    runs.
     RuntimeError, before any data changes, when the record cannot be read, or the old home is put back only in part (a
     rerun would keep that mix as the old home and name no more the kept files still out, such as the WAL with the
-    commits), or a file of the half-way home is left beside it; the message names the files and, by the copy's
-    SHA256, whose each is: the copy's (remove it, keep the record), a T3's that ran on the put-back home (keep it,
-    remove the record), or a stray -shm (always safe to remove)."""
+    commits), or a file of the half-way home is left beside it; the message names the files and whose each is: the
+    copy's by its SHA256 or the copy's with more frames by its WAL header (move it out of userdata, keep the
+    record), a stray -shm (always safe to remove), or one that cannot be told (both readings, how to tell them
+    apart on scratch copies, and for a -wal what to do when that does not tell either: move it out of userdata,
+    never delete it)."""
     userdata = os.path.join(home, 'userdata')
     path = os.path.join(userdata, RESTORE_MARK)
     try:
@@ -338,12 +458,21 @@ def _read_record(home, copy_dir=None):
         raise RuntimeError(f'{path} cannot be read ({mark if isinstance(mark, Exception) else "not a record"}): a '
                            'restore stopped half-way and which kept files are the old home is unknown; look at the '
                            f'*{ASIDE}* files, put the home right, then remove it')
-    gone = [n for n in mark['oldHome'] if not os.path.lexists(os.path.join(userdata, n))]
-    if not gone:
-        return mark, False
     def base(n):
         return n.split(ASIDE)[0]
-    sums, unread = _copy_sums(mark, copy_dir)
+    had = {base(n) for n in mark['oldHome']}
+    foreign = [c for name in mark.get('names', DEFAULT_RESTORE) for c in _companions(name)
+               if c not in had and os.path.lexists(os.path.join(userdata, c))]
+    gone = [n for n in mark['oldHome'] if not os.path.lexists(os.path.join(userdata, n))]
+    if not gone:
+        # Nothing moved back. Every kept file (a -shm need not) the same bytes as the home's: copied back, or a
+        # restore stopped right after keeping. Then only a file the old home did not have can be wrong (fork #244).
+        kept = [n for n in mark['oldHome'] if not base(n).endswith('-shm')]
+        if foreign and kept and all(_same_file(os.path.join(userdata, n), os.path.join(userdata, base(n)))
+                                    for n in kept):
+            _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved=False)
+        return mark, False
+    sums, unread, heads, changed = _copy_sums(mark, copy_dir)
     kept_sums = mark.get('sums', {})
     def copys(name, digest):
         return digest is not None and digest in sums.get(name, ())
@@ -351,69 +480,146 @@ def _read_record(home, copy_dir=None):
            and not _same_file(os.path.join(userdata, n), os.path.join(userdata, base(n)))]
     lost = [n for n in gone if not base(n).endswith('-shm') and not os.path.lexists(os.path.join(userdata, base(n)))]
     lost_copy = []  # deleted: the home's file of that name is the copy's, and the kept one was not
+    unknown = []  # a copy (or its -wal) cannot be read, the home's file is not the kept bytes: moved back or deleted?
+    appended = []  # a -wal that begins with a copy's WAL header, not proven to begin with the kept bytes: the same
     for n in gone:
         if base(n).endswith('-shm') or n in lost:
             continue
-        digest = _file_sum(os.path.join(userdata, base(n)))
+        in_home = os.path.join(userdata, base(n))
+        digest = _file_sum(in_home)
         if copys(base(n), digest) and kept_sums.get(n) != digest:
             lost_copy.append(n)
-    had = {base(n) for n in mark['oldHome']}
-    foreign = [c for name in mark.get('names', DEFAULT_RESTORE) for c in _companions(name)
-               if c not in had and os.path.lexists(os.path.join(userdata, c))]
-    if out or lost or lost_copy:
+        elif (unread or changed.get(base(n))) and digest is not None and kept_sums.get(n) != digest:
+            unknown.append(n)
+        elif (base(n).endswith('-wal') and digest is not None and kept_sums.get(n) != digest
+              and _wal_head(in_home) in heads.get(base(n), ())):
+            # Fork #300: the copy's frames with a T3's after them (the kept -wal was deleted), or the old WAL moved
+            # back and appended to since: a WAL the copy was taken with keeps its header, so the header cannot say.
+            # The kept bytes can: only a -wal that was moved back begins with them. Unless they are a copy's -wal's
+            # too (the old home wrote nothing after that copy): then the half-way home's WAL begins with them as well.
+            if copys(base(n), kept_sums.get(n)) or not _wal_begins_with(in_home, kept_sums.get(n)):
+                appended.append(n)
+    if out or lost or lost_copy or unknown or appended:
         said = ([f'{", ".join(out)} not back in the home'] if out else []) \
             + ([f'{", ".join(lost)} gone from the home too'] if lost else []) \
             + ([f'{", ".join(lost_copy)} not moved back: the home\'s '
                 f'{", ".join(base(n) for n in lost_copy)} {_them(lost_copy, "holds", "hold")} the bytes of the '
                 f'copy\'s file (its manifest SHA256), not the kept {_them(lost_copy, "one", "ones")}, so '
-                f'{_them(lost_copy)} was deleted'] if lost_copy else [])
+                f'{_them(lost_copy)} was deleted'] if lost_copy else []) \
+            + ([f'{", ".join(unknown)}: the home\'s {", ".join(base(n) for n in unknown)} '
+                f'{_them(unknown, "does", "do")} not hold the kept bytes (the SHA256 in the record), and with '
+                f'{_unread_why(unread, changed, [base(n) for n in unknown])} it cannot be told whether '
+                f'{_them(unknown, "it", "they")} '
+                f'{_them(unknown, "was", "were")} moved back and written since, or deleted with the half-way home\'s '
+                f'file left in {_them(unknown, "its", "their")} place; to tell a database or its -wal, ' + _SCRATCH
+                + ('; for a -wal you still cannot tell: ' + _WAL_OUT + ': ' + _WAL_OUT_WHY
+                   if any(base(n).endswith('-wal') for n in unknown) else '')]
+               if unknown else []) \
+            + ([f'{", ".join(appended)}: the home\'s {", ".join(base(n) for n in appended)} '
+                f'{_them(appended, "does", "do")} not hold the kept bytes (the SHA256 in the record) and '
+                f'{_them(appended, "begins", "begin")} with the header (salts included) of a copy\'s -wal, and '
+                f'nothing proves {_them(appended, "it is", "they are")} the kept -wal with more frames after it (no '
+                'whole frames from its start are the kept bytes, or the kept bytes are a copy\'s -wal\'s too), so it '
+                f'cannot be told whether {_them(appended, "it", "they")} {_them(appended, "was", "were")} moved back '
+                f'and a T3 appended to {_them(appended)} since (a WAL the copy was taken with keeps its header; the '
+                f'home is then the old home: keep {_them(appended)} and remove the record), or deleted with the '
+                'half-way home\'s WAL (the copy\'s frames, then what a T3 wrote) left in '
+                f'{_them(appended, "its", "their")} place (what only the kept -wal held is then gone unless that '
+                f'file can be got back, and the home\'s -wal is not the old home\'s: move {_them(appended)} out of '
+                f'userdata (do not delete {_them(appended)}), then remove the record). Whoever put the files back '
+                'knows which; if not, ' + _SCRATCH + '. If you still cannot tell: ' + _WAL_OUT + ', then remove the '
+                'record: ' + _WAL_OUT_WHY] if appended else [])
         raise RuntimeError(f'{path} names the kept files of the old home, but they are only partly put back '
                            f'({", ".join(gone)} gone from the kept files; ' + '; '.join(said) + '): '
                            'finish putting the kept files back (a rerun then names any -wal, -journal or -shm left '
                            'in the home that the old home did not have), or remove the record once the home is '
                            'right; nothing was changed')
     if foreign:
-        wals = [c for c in foreign if not c.endswith('-shm')]
-        theirs = [c for c in wals if copys(c, _file_sum(os.path.join(userdata, c)))]
-        others = [c for c in wals if c not in theirs]
-        t3s, unsure = ([], others) if unread else (others, [])
-        groups = {'copy': theirs, 't3': t3s, 'unsure': unsure, 'stray': []}
-        for c in foreign:
-            if c.endswith('-shm'):
-                wal = c[:-len('-shm')] + '-wal'
-                for key in ('t3', 'unsure', 'copy'):
-                    if wal in groups[key]:
-                        groups[key].append(c)
-                        break
-                else:
-                    groups['stray'].append(c)
-        said = []
-        if groups['copy']:
-            g = groups['copy']
-            said.append(f'{", ".join(g)} {_them(g, "is", "are")} the copy\'s (the same SHA256 as in its manifest; '
-                        f'a -shm goes with its -wal), left from the restore stopped half-way: remove {_them(g)}, '
-                        'and do NOT remove the record (beside the old database the copy\'s WAL would serve or '
-                        'checkpoint another database\'s pages); then run the restore again (the record is then '
-                        'stale)')
-        if groups['t3']:
-            g = groups['t3']
-            said.append(f'{", ".join(g)} {_them(g, "does", "do")} not match the copy\'s: a T3 that ran on the '
-                        f'put-back home (with the record still there) wrote {_them(g)}, and '
-                        f'{_them(g, "it holds", "they hold")} its newest commits: keep {_them(g)} and remove the '
-                        'record instead (the next restore then keeps the whole home)')
-        if groups['unsure']:
-            g = groups['unsure']
-            said.append(f'whose {", ".join(g)} {_them(g, "is", "are")} cannot be told (no readable manifest in '
-                        f'{", ".join(unread)}, so the copy\'s SHA256 is unknown): remove neither '
-                        f'{_them(g)} nor the record until you have compared {_them(g)} with the copy\'s file')
-        if groups['stray']:
-            g = groups['stray']
-            said.append(f'{", ".join(g)} {_them(g, "is a -shm", "are -shm files")} with no -wal of the half-way '
-                        'home beside it, only SQLite\'s index of a WAL, rebuilt when the database opens: always '
-                        'safe to remove' + ('' if len(said) else ' (then run the restore again)'))
-        raise RuntimeError(f'{path} names the kept files of the old home and they are back, but the home also '
-                           'holds files the old home did not have: ' + '; '.join(said) + '; nothing was changed')
+        _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved=True)
     return mark, True
+
+
+_SCRATCH = ('open scratch copies, never the files in the home: copy the database alone into one empty folder and the '
+            'database with the -wal into another, open each with sqlite3 and compare the row counts (PRAGMA '
+            'integrity_check too): the old home\'s WAL gives a whole database with what it holds alone plus newer '
+            'rows, the old home\'s last among them; a WAL of the copy\'s database gives the copy\'s rows, or fewer '
+            'than the database alone, or, with a T3\'s commits after the copy\'s frames, the copy\'s rows and that '
+            'T3\'s (more rows than the database alone does not make it the old home\'s: what the old home wrote '
+            'after the copy was taken is then missing)')
+# The way out for a -wal when nothing tells whose it is: out of userdata, never deleted (what follows it differs).
+_WAL_OUT = 'move it out of userdata (do not delete it)'
+_WAL_OUT_WHY = ('nothing more is lost, the moved file keeps what it holds (if it was the old home\'s WAL, it goes '
+                'with the database the next restore keeps)')
+
+
+def _unread_why(unread, changed, names):
+    """Why a copy's files or WAL header are unknown: no readable manifest, or a -wal (of `names`) that changed."""
+    wals = [w for n in names for w in changed.get(n, [])]
+    return ' and '.join(
+        ([f'no readable manifest in {", ".join(unread)}'] if unread else [])
+        + ([f'{", ".join(wals)} no longer {_them(wals, "matches its manifest", "match their manifests")}, so '
+            f'{_them(wals, "its", "their")} WAL header proves nothing'] if wals else []))
+
+
+def _refuse_foreign(path, userdata, mark, copy_dir, foreign, moved):
+    """Raise the RuntimeError that names each -wal, -journal or -shm in the home the old home did not have, and
+    whose it is: the copy's (its manifest SHA256), the copy's with more frames after them (a -wal that begins with
+    the header of a copy's -wal: a T3 ran on the half-way home), a stray -shm, or one that cannot be told. `moved`:
+    the kept files were moved back (the rerun then finds the record stale), not copied back (the kept files are
+    still there, so the record stays live and the rerun names them as the old home)."""
+    then = ('the record is then stale: the home is kept as the old home' if moved else
+            'the record stays live: the rerun names its kept files as the old home')
+    sums, unread, heads, changed = _copy_sums(mark, copy_dir)
+    wals = [c for c in foreign if not c.endswith('-shm')]
+    theirs = [c for c in wals if sums.get(c, set()) & {_file_sum(os.path.join(userdata, c))} - {None}]
+    mixed = [c for c in wals if c not in theirs and c.endswith('-wal')
+             and _wal_head(os.path.join(userdata, c)) in heads.get(c, ())]
+    groups = {'copy': theirs, 'mixed': mixed, 'unsure': [c for c in wals if c not in theirs + mixed], 'stray': []}
+    for c in foreign:
+        if c.endswith('-shm'):
+            wal = c[:-len('-shm')] + '-wal'
+            for key in ('unsure', 'mixed', 'copy'):
+                if wal in groups[key]:
+                    groups[key].append(c)
+                    break
+            else:
+                groups['stray'].append(c)
+    said = []
+    if groups['copy']:
+        g = groups['copy']
+        said.append(f'{", ".join(g)} {_them(g, "is", "are")} the copy\'s (the same SHA256 as in its manifest; '
+                    f'a -shm goes with its -wal), left from the restore stopped half-way: move {_them(g)} out of '
+                    'userdata, and do NOT remove the record (beside the old database the copy\'s WAL would serve '
+                    f'or checkpoint another database\'s pages); then run the restore again ({then})')
+    if groups['mixed']:
+        g = groups['mixed']
+        said.append(f'{", ".join(g)} {_them(g, "is", "are")} the copy\'s WAL with more commits after its frames '
+                    '(it begins with the header, salts included, of the copy\'s -wal; a -shm goes with its -wal): '
+                    'a T3 ran on the half-way home, the copy\'s database, before the kept files were put back. '
+                    'Beside the old database it would serve or checkpoint the copy\'s pages: move '
+                    f'{_them(g)} out of userdata (keep {_them(g)} only if you want what that T3 wrote on the copy\'s '
+                    'database; it is not the old home\'s), do NOT remove the record, then run the restore again '
+                    f'({then})')
+    if groups['unsure']:
+        g = groups['unsure']
+        why = _unread_why([], changed, g)
+        why = (f'no readable manifest in {", ".join(unread)}, so the copy\'s files are unknown' if unread else
+               'not its SHA256, not its WAL header' + (f'; {why}' if why else ''))
+        said.append(f'whose {", ".join(g)} {_them(g, "is", "are")} cannot be told ({why}). Either a T3 ran on the '
+                    'put-back home with the record still there and wrote it: then it holds that T3\'s newest '
+                    'commits: keep it and remove the record. Or a T3 ran on the half-way home (the copy\'s database) '
+                    'before the put-back and its WAL started over: then it must not stay beside the old database: '
+                    'move it out of userdata, keep the record and run the restore again. To tell, ' + _SCRATCH
+                    + '. If you still cannot tell, or no copy is left to compare with: move it out of userdata (do '
+                    'not delete it), keep the record and run the restore again: nothing is lost, the moved file '
+                    'keeps what it holds')
+    if groups['stray']:
+        g = groups['stray']
+        said.append(f'{", ".join(g)} {_them(g, "is a -shm", "are -shm files")} with no -wal of the half-way '
+                    'home beside it, only SQLite\'s index of a WAL, rebuilt when the database opens: always '
+                    'safe to remove' + ('' if len(said) else ' (then run the restore again)'))
+    raise RuntimeError(f'{path} names the kept files of the old home and they are back, but the home also '
+                       'holds files the old home did not have: ' + '; '.join(said) + '; nothing was changed')
 
 
 def _record_names(record):
@@ -625,7 +831,7 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     record is rewritten to name them, and a rerun's copy ('alsoCopies'), before anything leaves the home, so a
     later rerun names them too). The record holds each kept file's SHA256 ('sums'). A record put back only in part,
     or with a -wal, -journal or -shm the old home did not have, refuses before any data change (see _read_record);
-    one put back in full is stale: the home is the old home ('staleRecord', and 'staleKept' names the record's kept
+    one moved back in full is stale: the home is the old home ('staleRecord', and 'staleKept' names the record's kept
     files still there). A rerun after a stop between step 6 and
     the end of the caller's step finds no record and the home exactly the copy's: it keeps nothing
     ('alreadyRestored'), so the restored data is never named as the old home.
@@ -833,9 +1039,15 @@ def _home_problem(cfg):
         return (f'{", ".join(links)} in {userdata} is a link: the copy takes files only and would hold the link, '
                 'not the database')
     if os.path.lexists(os.path.join(userdata, RESTORE_MARK)):
+        try:  # fork #244: name what is left of the half-way home here, not only in a restore's refusal
+            stopped_restore(cfg.home)
+            looked = ''
+        except (RuntimeError, OSError) as e:
+            looked = f'. What the home holds now: {e}'
         return (f'a restore stopped half-way ({os.path.join(userdata, RESTORE_MARK)} is there): if the kept files '
-                'it names are back in the home, remove it (first remove any -wal or -journal of the copy left beside '
-                'the old database: a restore run names them); otherwise run the restore again; then copy')
+                'it names are back in the home, remove it (first move out of userdata any -wal or -journal of the '
+                'copy left beside the old database: a restore run names them); otherwise run the restore again; '
+                f'then copy{looked}')
     return None
 
 
@@ -846,26 +1058,7 @@ def _plan_total(cfg):
         raise journal.Refused(f'the T3 home cannot be read in full ({e}); nothing was changed') from None
 
 
-def _server_changed(cfg, adapter, server):
-    """Why the live server is not the one the checks passed (None when it still is). The auto-updater keeps the
-    same quiet contract, so it may restart T3 on a newer build (and migrate its database) while a copy waits."""
-    try:
-        svc = adapter.service()
-        now = live.live_server(cfg.home, svc['mainPid']) if svc['active'] else None
-        active, pending = live.service_state(cfg.home)
-    except (live.NotLive, osadapter.AdapterError) as e:
-        return f'the live server cannot be read again: {e}'
-    if now is None:
-        return f'{osadapter.UNIT} is not active any more'
-    if (now['pid'], now['version']) != (server['pid'], server['version']):
-        return (f'the live server changed (t3 {server["version"]} pid {server["pid"]} -> t3 {now["version"]} pid '
-                f'{now["pid"]})')
-    if active != server['version']:
-        return f'the service state now names t3 {active}, not the live {server["version"]}'
-    if pending:
-        return f'an update to {pending.get("targetVersion")} is pending'
-    found = live.markers(cfg.home)
-    return f'markers appeared: {", ".join(found)}' if found else None
+_server_changed = check_mod.server_changed  # the live server re-read; check runs it after its report
 
 
 class UpdateAtStop(RuntimeError):
@@ -1019,6 +1212,7 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
                     'home': cfg.home, 'liveVersion': server['version'], 'bytes': total, 'files': entries,
                     'leftOut': left_out})
                 facts['manifest'] = os.path.join(dest, MANIFEST)
+                facts['reportCounts'] = result.get('counts')  # read by check before the wait; `back` compares
         except BaseException as e:
             error = e
         finally:
@@ -1052,9 +1246,10 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
 def guard(cfg, adapter, run_id):
     """Started detached by a copy run before T3 stops. Logs that it waits (the run stops T3 only after this line),
     then waits for that run to end however it ends (the lock frees when its holder dies), then starts T3 if the
-    run had stopped it and left it stopped, and runs the post hooks if the run ran the pre hooks but not the post
-    hooks. A journal it cannot read fails open: T3 is started if it is not active and the post hooks run (each is
-    safe twice). It changes nothing else and writes no journal line (the run, ended or killed, stays as it is for
+    run had stopped it and left it stopped and the service is enabled (a copy never disables it; a back W1 that
+    stopped disables it on purpose), and runs the post hooks if the run ran the pre hooks but not the post hooks. A
+    journal it cannot read fails open: T3 is started if it is not active and enabled, and the post hooks run (each
+    is safe twice). It changes nothing else and writes no journal line (the run, ended or killed, stays as it is for
     the owner). Logs to <stateDir>/guard.log. Returns what it did."""
     try:
         _guard_log(cfg.state_dir, {'run': run_id, 'waiting': True})
@@ -1073,7 +1268,10 @@ def guard(cfg, adapter, run_id):
             did.append(f'journal unreadable, so T3 is put back as if the run had stopped it: {e}')
         if stopped:
             try:
-                if not adapter.service()['active']:
+                svc = adapter.service()
+                if not svc['active'] and not svc['enabled']:  # a copy never disables it; a back W1 does, on purpose
+                    did.append(f'{osadapter.UNIT} is not enabled: left stopped (a back W1 that stopped may hold it)')
+                elif not svc['active']:
                     adapter.start()
                     did.append(f'started {osadapter.UNIT}')
             except osadapter.AdapterError as e:

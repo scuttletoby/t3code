@@ -36,6 +36,152 @@ def wslconfig_part():
     return src[src.index('# --- wslconfig ---'):src.index('# --- end wslconfig ---')]
 
 
+def wsl_reads(text):
+    """WSL's own .wslconfig parser, ported statement by statement to be the tests' oracle: ParseConfigFile in parse
+    mode (microsoft/WSL src/shared/configfile/configfile.cpp at db6dc6cb, lines 239-825), with the
+    CFG_SKIP_INVALID_LINES that src/windows/common/WslCoreConfig.cpp:150 passes. It returns the (key, value) pairs it
+    hands SetConfig, in order; ConfigKey::Parse (configfile.cpp:187) keeps the first one of each key. WSL opens the
+    file as text (WslCoreConfig.cpp:136, rt,ccs=UTF-8), so CR LF reads as LF and a lone CR stays."""
+    s = text.replace('\r\n', '\n')
+    st = {'pos': 0, 'eof': False}
+
+    def getc():   # fgetwc; None is WEOF
+        if st['pos'] < len(s):
+            st['pos'] += 1
+            return s[st['pos'] - 1]
+        st['eof'] = True
+        return None
+
+    def hspace(c):
+        return c == ' ' or c == '\t'
+
+    def alpha(c):   # isalpha/isalnum in the C locale: ASCII only
+        return c is not None and c.isascii() and c.isalpha()
+
+    def alnum(c):
+        return c is not None and c.isascii() and c.isalnum()
+
+    def cstr(x):   # SetConfig gets key.c_str(): a NUL ends it
+        return x.split('\0')[0]
+
+    calls, ch, section_length, key, label = [], 0, 0, '', 'NewLine'
+    while True:
+        if label == 'NewLine':
+            while True:
+                if ch == '#':   # skip a pending comment
+                    while True:
+                        ch = getc()
+                        if ch == '\r':
+                            ch = getc()
+                        if ch == '\n' or ch is None:
+                            break
+                if st['eof']:
+                    return calls
+                ch = getc()
+                while hspace(ch):
+                    ch = getc()
+                if ch is None or ch == '\n' or ch == '#':
+                    continue
+                if ch == '\r':
+                    if getc() not in ('\n', None):
+                        st['pos'] -= 1   # ungetwc
+                    continue
+                label = 'ParseSection' if ch == '[' else 'ParseKeyValue' if alpha(ch) else 'InvalidLine'
+                break
+        elif label == 'ParseSection':
+            ch = getc()
+            if not alpha(ch):
+                label = 'InvalidLine'
+                continue
+            key = ''
+            while True:
+                key += ch
+                ch = getc()
+                if not alnum(ch):
+                    break
+            if ch != ']':
+                label = 'InvalidLine'
+                continue
+            ch = getc()
+            while hspace(ch):
+                ch = getc()
+            if not (ch is None or ch in ('\n', '\r', '#')):
+                label = 'InvalidLine'
+                continue
+            section_length = len(key)
+            label = 'NewLine'
+        elif label == 'ParseKeyValue':
+            key = (key + '\0' * section_length)[:section_length] + ('.' if section_length else '')   # key.resize
+            while True:
+                key += ch
+                ch = getc()
+                if not alnum(ch):
+                    break
+            while hspace(ch):
+                ch = getc()
+            if ch != '=':
+                label = 'InvalidLine'
+                continue
+            ch = getc()
+            while hspace(ch):
+                ch = getc()
+            value, trimmed, in_quote, invalid = [], 0, False, False
+            while ch is not None and ch != '\n' and ch != '\r':
+                if ch == '"':
+                    in_quote = not in_quote
+                elif ch == '\\':
+                    ch2 = getc()
+                    if ch2 in ('\\', '"'):
+                        value.append(ch2)
+                    elif ch2 in ('b', 'n', 't'):
+                        value.append({'b': '\b', 'n': '\n', 't': '\t'}[ch2])
+                    elif ch2 != '\n':   # '\n': the line goes on
+                        invalid = True
+                        break
+                elif ch == '#' and not in_quote:
+                    break
+                else:
+                    value.append(ch)
+                if not hspace(ch):
+                    trimmed = len(value)
+                ch = getc()
+            if invalid or in_quote:
+                label = 'InvalidLine'
+                continue
+            calls.append((cstr(key), cstr(''.join(value[:trimmed]))))
+            label = 'NewLine'
+        else:   # InvalidLine
+            while ch is not None and ch != '\n':
+                ch = getc()
+            label = 'NewLine'
+
+
+# The names WSL reads each key the desk manages under (WslCoreConfig.cpp:116-117: the old [experimental] names are
+# the same key, so whichever comes first in the file is the one used).
+WSL_NAMES = {'memory': ('wsl2.memory',), 'swap': ('wsl2.swap',), 'guiapplications': ('wsl2.guiapplications',),
+             'networkingmode': ('wsl2.networkingmode', 'experimental.networkingmode'),
+             'dnstunneling': ('wsl2.dnstunneling', 'experimental.dnstunneling')}
+
+
+def wsl_value(calls, name):
+    """The value WSL uses for one key: the first line of it, even one whose value WSL then rejects. None: not set."""
+    for k, v in calls:
+        if k.lower() in WSL_NAMES[name.lower()]:
+            return v
+    return None
+
+
+def wsl_others(calls):
+    """What WSL reads besides the keys the desk manages: these must be the same before and after a merge."""
+    managed = {n for names in WSL_NAMES.values() for n in names}
+    return [(k.lower(), v) for k, v in calls if k.lower() not in managed]
+
+
+def wsl_same(value, want):
+    """Whether WSL reads value as want: a size exactly (ParseMemorySize: case matters), a word in any ASCII case."""
+    return value == want or (want.isalpha() and value is not None and value.isascii() and value.lower() == want)
+
+
 def walls(root):
     os.environ['FORK_FLEET_WALLS_ROOT'] = root
     try:
@@ -248,7 +394,7 @@ class Script(unittest.TestCase):
         self.assertLess(body.index('Mark $Made'), body.index('wsl.exe --install'))
         self.assertIn('Merge-WslConfig $WslConfig $want { Mark $Owed }', body)
         self.assertIn('& $before', wslconfig_part())
-        self.assertLess(wslconfig_part().index('& $before'), wslconfig_part().index('WriteAllLines'))
+        self.assertLess(wslconfig_part().index('& $before'), wslconfig_part().index('WriteAllText("$path.new"'))
         shutdown = body.index('Run \'wsl --shutdown\'')
         self.assertLess(body.index('if (Test-Path -LiteralPath $Owed)'), shutdown)
         self.assertGreater(body.index('Remove-Item -LiteralPath $Owed -ErrorAction'), shutdown)
@@ -275,9 +421,9 @@ class Script(unittest.TestCase):
         part = wslconfig_part()
         self.assertIn("$Experimental = @('networkingMode', 'dnsTunneling')", part)
         merge = part[part.index('function MergeLines'):part.index('function WslVersion')]
-        self.assertIn("$sec -eq 'experimental'", merge)
-        self.assertIn('$Matches[1] -in $Experimental) {', merge)
-        self.assertIn(': removed (the [wsl2] one is used)"); continue }', merge)
+        self.assertIn("foreach ($k in $Experimental) { $old[$k.ToLowerInvariant()] = 1 }", merge)
+        self.assertIn("elseif ($e.Sec -ceq 'experimental' -and $old.ContainsKey($lk)) {", merge)
+        self.assertIn(': removed (the [wsl2] one is used)"); Drop $e.First $e.Last }', merge)
         src = text().decode('ascii')
         body = src[src.index('try {'):]
         ask = min(body.index("Read-Host 'Type yes"), body.index('Read-Host "Type the distro'))
@@ -285,6 +431,7 @@ class Script(unittest.TestCase):
         check = body[body.index("Head 'check'"):]
         self.assertIn("SectionKeys (Read-WslConfig $WslConfig) 'experimental'", check)
         self.assertIn('FAIL  wslconfig  [experimental] $k=', check)
+        self.assertIn('if (SameValue $cfg[$k] $want[$k]) { "PASS  wslconfig', check)   # as WSL compares (#387)
 
     def test_the_question_and_the_merge_decide_the_same_way(self):
         """lens d8min r3 N2: the question compared trimmed values, the merge whole text, so "no change" could be shown
@@ -303,7 +450,11 @@ class Script(unittest.TestCase):
         path = os.path.join(d, '.wslconfig')
         for old, notes in (('[wsl2]\nmemory = 9GB\nNetworkingMode=NAT\n', []),
                            ('[wsl2]\nmemory=9GB\nnetworkingMode=nat\nmemory=12GB\n',
-                            ['[wsl2] memory=12GB: a repeated line, removed'])):
+                            ['[wsl2] memory=12GB: a repeated line, removed']),
+                           # WSL trims space and tab only: a key after a non-breaking space or a form feed is not
+                           # networkingMode to WSL, so it is not removed (and the check does not FAIL on it either)
+                           ('[wsl2]\nmemory=9GB\nnetworkingMode=nat\n[experimental]\n networkingMode=mirrored\n'
+                            '\fdnsTunneling=true\n', [])):
             with self.subTest(old):
                 with open(path, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(old)
@@ -362,11 +513,326 @@ class Script(unittest.TestCase):
                      '[experimental] dnsTunneling=false: removed', 'changed=True', 'left=sparseVhd', 'after=0'):
             self.assertIn(line, r.stdout)
 
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_section_headers_are_read_as_wsl_reads_them(self):
+        """lens #354: WSL's ParseSection (configfile.cpp) takes space or tab, '[', a letter then letters or digits,
+        ']', space or tab, then the end or a '#' comment, in any case. On a '[' line it rejects, the keys after it go
+        under the old section's length of the letters it had read: none read keeps the section."""
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, '.wslconfig')
+        want = '[wsl2]\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n'
+        # (old file, the [wsl2] memory WSL reads, [experimental] keys WSL reads, the file after the merge)
+        rows = (
+            ('[wsl2]\nmemory=9GB\n[experimental] # from an old guide\ndnsTunneling=false\n', '9GB', 'dnsTunneling',
+             want + '[experimental] # from an old guide\n'),
+            ('[experimental]\nautoProxy=true\n[ wsl2 ]\nmemory=4GB\n', '', 'autoProxy,memory',
+             '[experimental]\nautoProxy=true\n[ wsl2 ]\nmemory=4GB\n' + want),
+            ('[WSL2]\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '', None),
+            ('\t[wsl2]\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '', None),
+            # a vertical tab is not space to WSL: the line is rejected, so this is a repeated [wsl2] key
+            (want + '\v[experimental]\nnetworkingMode=mirrored\n', '9GB', '', want + '\v[experimental]\n'),
+            # rejected after the name: WSL keeps the old section's length (4) of it, 'expe' here, so neither section
+            ('[wsl2]\nmemory=9GB\n[experimental] old\nnetworkingMode=mirrored\n', '9GB', '',
+             want + '[experimental] old\nnetworkingMode=mirrored\n'),
+            # ... and from [boot] (also 4 letters) into wsl2
+            ('[boot]\nsystemd=true\n[wsl2] old\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '',
+             None),
+            # ... and from a longer one into 'wsl2' padded past its length, which is no section (lens re-check: a NUL
+            # pad compared equal to 'wsl2' in PowerShell). WSL takes no comment but '#' on a header.
+            ('[experimental]\nautoMemoryReclaim=gradual\n[wsl2] ; set by hand\nmemory=20GB\n', '', 'autoMemoryReclaim',
+             '[experimental]\nautoMemoryReclaim=gradual\n[wsl2] ; set by hand\nmemory=20GB\n' + want),
+            # only space or tab after ']': a form feed rejects the header after its name
+            ('[experimental]\nautoProxy=true\n[wsl2]\f\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n', '',
+             'autoProxy', '[experimental]\nautoProxy=true\n[wsl2]\f\nmemory=9GB\nnetworkingMode=nat\nguiApplications=false\n'
+             + want),
+            # a name starts with a letter: none read, so the keys stay in [wsl2]
+            ('[wsl2]\nmemory=9GB\n[1x]\nnetworkingMode=nat\nguiApplications=false\n', '9GB', '', None),
+            # names are ASCII any case (strcasecmp): under a Turkish culture .ToLower() makes this 'experımental'
+            (want + '[EXPERIMENTAL]\nnetworkingMode=mirrored\n', '9GB', 'networkingMode', want + '[EXPERIMENTAL]\n'),
+        )
+        script = os.path.join(d, 'merge.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = "9GB"; networkingMode = "nat"; '
+                    'guiApplications = "false" }\n$l = Read-WslConfig $args[0]\n'
+                    '"memory=$((Wsl2Keys $l)[\'memory\'])"\n'
+                    '"experimental=$((SectionKeys $l \'experimental\').Keys | Sort-Object | Join-String -Separator \',\')"\n'
+                    '"changed=$(Merge-WslConfig $args[0] $want)"\n'
+                    '"after=$(@(Changes (Read-WslConfig $args[0]) $want).Count)"\n'
+                    '"now=$((Wsl2Keys (Read-WslConfig $args[0]))[\'memory\'])"\n')
+        for (old, memory, experimental, new), culture in ((row, c) for c in ('C', 'tr_TR.UTF-8') for row in rows):
+            with self.subTest(old, culture=culture):   # .NET takes its culture from LC_ALL (tr: I lowers to dotless ı)
+                with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(old)
+                r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path],
+                                   capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+                                   env={**os.environ, 'LC_ALL': culture})
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                out = r.stdout.splitlines()
+                self.assertIn(f'memory={memory}', out)   # what the check at the end reads
+                self.assertIn(f'experimental={experimental}', out)
+                self.assertIn(f'changed={new is not None}', out)
+                self.assertEqual(slurp(path), old if new is None else new)
+                self.assertIn('after=0', out)
+                self.assertIn('now=9GB', out)
+                for n in os.listdir(d):
+                    if n.startswith('.wslconfig.bak-'):
+                        os.unlink(os.path.join(d, n))
+
+    # The desk's own keys (start-desk.ps1's $want), -MemoryGB not given: 8 GB, a higher cap kept up to 30 GB.
+    VALUES_SCRIPT = ('\nforeach ($path in $args) {\n  try {\n'
+                     '    $want = [ordered]@{ memory = (WantMemory $path 8 30); swap = "4GB"; networkingMode = "nat"; '
+                     'dnsTunneling = "true"; guiApplications = "false" }\n'
+                     '    $k = Wsl2Keys (Read-WslConfig $path); $x = SectionKeys (Read-WslConfig $path) "experimental"\n'
+                     '    $o = [ordered]@{ path = $path; want = $want.memory; memory = $k["memory"]; swap = $k["swap"]; '
+                     'networkingMode = $k["networkingMode"]; dnsTunneling = $k["dnsTunneling"]; '
+                     'guiApplications = $k["guiApplications"]; experimental = @($x.Keys | Sort-Object) }\n'
+                     '    try { $o.changed = Merge-WslConfig $path $want; $o.after = @(Changes (Read-WslConfig $path) $want).Count;'
+                     ' $o.again = Merge-WslConfig $path $want } catch { $o.refused = $_.Exception.Message }\n'
+                     '  } catch { $o = @{ path = $path; error = "$_" } }\n'
+                     '  $o | ConvertTo-Json -Compress\n}\n')
+    WANT = {'swap': '4GB', 'networkingMode': 'nat', 'dnsTunneling': 'true', 'guiApplications': 'false'}
+
+    def run_values(self, files, culture='C'):
+        """Each file (None: no file) merged by the real Read-WslConfig/Wsl2Keys/WantMemory/Merge-WslConfig, in one
+        pwsh; for each: what the script read, its merge, and the file after it."""
+        import json
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        script = os.path.join(d, 'values.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + self.VALUES_SCRIPT)
+        paths = []
+        for i, old in enumerate(files):
+            os.mkdir(os.path.join(d, str(i)))
+            paths.append(os.path.join(d, str(i), '.wslconfig'))
+            if old is not None:
+                with open(paths[-1], 'w', encoding='utf-8', newline='') as f:
+                    f.write(old)
+        r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script] + paths, capture_output=True,
+                           text=True, timeout=600, stdin=subprocess.DEVNULL, env={**os.environ, 'LC_ALL': culture})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = [json.loads(line) for line in r.stdout.splitlines() if line.startswith('{')]
+        self.assertEqual([o['path'] for o in out], paths, r.stdout + r.stderr)
+        for o, path in zip(out, paths):
+            o['dir'] = os.path.dirname(path)
+            if os.path.exists(path):
+                with open(path, encoding='utf-8-sig', newline='') as f:
+                    o['new'] = f.read()
+            else:
+                o['new'] = None
+        return out
+
+    def check_merge(self, old, o):
+        """What WSL itself reads (the oracle) agrees with the script before the merge and after it."""
+        before = wsl_reads(old or '')
+        self.assertNotIn('error', o)
+        for k in ('memory', 'swap', 'networkingMode', 'dnsTunneling', 'guiApplications'):   # the [wsl2] line WSL uses
+            self.assertEqual(o[k], next((v for n, v in before if n.lower() == 'wsl2.' + k.lower()), None), k)
+        self.assertEqual(o['experimental'], sorted({n.split('.', 1)[1] for n, _ in before
+                                                    if n.lower().startswith('experimental.')}, key=str.lower))
+        leftovers = [n for n in os.listdir(o['dir']) if n != '.wslconfig' and not n.startswith('.wslconfig.bak-')]
+        self.assertEqual(leftovers, [])
+        if 'refused' in o:   # refused before anything changed
+            self.assertEqual(o['new'], old)
+            return
+        after = wsl_reads(o['new'])
+        for k, w in {'memory': o['want'], **self.WANT}.items():
+            self.assertTrue(wsl_same(wsl_value(after, k), w), f'{k}: WSL reads {wsl_value(after, k)!r}, not {w}')
+        self.assertEqual(wsl_others(after), wsl_others(before))   # every other key WSL reads, as it was
+        self.assertEqual(o['after'], 0)   # run again: nothing to change, file left alone
+        self.assertIs(o['again'], False)
+        backups = [n for n in os.listdir(o['dir']) if n.startswith('.wslconfig.bak-')]
+        self.assertEqual(len(backups), int(o['changed'] and old is not None))   # a dated copy of a file that was there
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_values_are_read_as_wsl_reads_them(self):
+        """#387: the value of a key=value line as WSL's parser reads it (configfile.cpp): the first line of a key is the
+        one used (ConfigKey::Parse warns of a later one and skips it), a # outside quotes starts a comment, quotes are
+        dropped, and a \\ at the end of a line goes on to the next line, which then is no key of its own."""
+        w = 'swap=4GB\nnetworkingMode=nat\ndnsTunneling=true\nguiApplications=false\n'
+        # (old file (None: no file), the [wsl2] memory WSL reads, the file after the merge: None unchanged, or REFUSED)
+        rows = (
+            # repeated key: WSL uses the first, so a cap raised by hand above an older one is kept
+            ('[wsl2]\nmemory=20GB\n' + w + 'memory=12GB\n', '20GB', '[wsl2]\nmemory=20GB\n' + w),
+            # ... even one WSL rejects: it then runs on its default, and the later line is not read
+            ('[wsl2]\nmemory=26 GB\n' + w + 'memory=20GB\n', '26 GB', '[wsl2]\nmemory=8GB\n' + w),
+            # a comment after the value
+            ('[wsl2]\nmemory=20GB # raised by hand\n' + w, '20GB', None),
+            ('[wsl2]\nmemory=20GB#raised\n' + w, '20GB', None),
+            ('[wsl2]\r\nmemory=20GB # raised\r\n' + w.replace('\n', '\r\n'), '20GB', None),
+            # quotes are dropped; a # inside them is part of the value (WSL then rejects this one)
+            ('[wsl2]\nmemory="20GB"\n' + w, '20GB', None),
+            ('[wsl2]\nmemory="20GB # raised"\n' + w, '20GB # raised', '[wsl2]\nmemory=8GB\n' + w),
+            # a \ at the end goes on: memory= is part of kernelCommandLine, not a key, so the cap is added
+            ('[wsl2]\nkernelCommandLine=quiet \\\nmemory=20GB\n' + w, None,
+             '[wsl2]\nkernelCommandLine=quiet \\\nmemory=20GB\n' + w + 'memory=8GB\n'),
+            # ... and a header too: the keys after it are still [wsl2]'s
+            ('[wsl2]\nmemory=20GB\nkernelCommandLine=quiet \\\n[experimental]\n' + w, '20GB', None),
+            # ... on the last line: an empty line ends it before the [wsl2] added after it
+            ('[experimental]\nautoProxy=true\nignoredPorts=1,2 \\\n', None,
+             '[experimental]\nautoProxy=true\nignoredPorts=1,2 \\\n\n[wsl2]\nmemory=8GB\n' + w),
+            # ... with no LF after it, WSL drops the line; a line added after it would be read: refused
+            ('[wsl2]\nmemory=20GB\nswap=4GB\nnetworkingMode=nat\ndnsTunneling=true\nkernelCommandLine=quiet \\',
+             '20GB', 'REFUSED'),
+            # an escaped \ (\\) at the end does not go on
+            ('[wsl2]\nkernelCommandLine=quiet \\\\\nmemory=20GB\n' + w, '20GB', None),
+            # a line WSL drops (an unknown \ escape, a quote left open) is not read and left as it is
+            ('[wsl2]\nmemory=20\\GB\nmemory=12GB\n' + w, '12GB', None),
+            ('[wsl2]\nmemory="20GB\n' + w, None, '[wsl2]\nmemory="20GB\n' + w + 'memory=8GB\n'),
+            # ... a quote left open drops the line up to its LF, past a lone CR: swap= after it is not read either
+            ('[wsl2]\nmemory="2GB\rswap=1GB\nkernel=y\n', None,
+             '[wsl2]\nmemory="2GB\rswap=1GB\nkernel=y\nmemory=8GB\n' + w),
+            # a key replaced with the lines its value goes on to (\ at the end), so none of them is read as a key
+            ('[wsl2]\nmemory=2\\\nGB\nswap=1\\\nkernel=x\n', '2GB', '[wsl2]\nmemory=8GB\n' + w),
+            # a lone CR does not end a comment (it ends a value or a header)
+            ('[wsl2]\n# raised\rmemory=20GB\n' + w, None, '[wsl2]\n# raised\rmemory=20GB\n' + w + 'memory=8GB\n'),
+            # ... a lone CR between two keys on one line: replacing memory= would delete the kernel= WSL reads: refused
+            ('[wsl2]\nmemory=2GB\rkernel=C:\\\\k\\\\bz\n' + w, '2GB', 'REFUSED'),
+            # sizes are compared exactly (ParseMemorySize: 4gb is rejected), words in any case
+            ('[wsl2]\nmemory=20GB\nswap=4gb\nnetworkingMode=NAT\ndnsTunneling=TRUE\nguiApplications=False\n', '20GB',
+             '[wsl2]\nmemory=20GB\nswap=4GB\nnetworkingMode=NAT\ndnsTunneling=TRUE\nguiApplications=False\n'),
+            # old or empty state: an empty file, no file, no LF at the end
+            ('', None, '[wsl2]\nmemory=8GB\n' + w),
+            (None, None, '[wsl2]\nmemory=8GB\n' + w),
+            ('[wsl2]\nmemory=20GB', '20GB', '[wsl2]\nmemory=20GB\n' + w),
+        )
+        for culture in ('C', 'tr_TR.UTF-8'):
+            for (old, memory, new), o in zip(rows, self.run_values([r[0] for r in rows], culture)):
+                with self.subTest(old, culture=culture):
+                    self.assertEqual(o['memory'], memory)
+                    self.assertEqual(wsl_value(wsl_reads(old or ''), 'memory'), memory)   # the row is WSL's
+                    self.check_merge(old, o)
+                    if new == 'REFUSED':
+                        self.assertIn('nothing was changed', o.get('refused', ''))
+                    else:
+                        self.assertNotIn('refused', o)
+                        self.assertEqual(o['new'], old if new is None else new)
+                        self.assertIs(o['changed'], new is not None)
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_random_files_are_read_and_merged_as_wsl_reads_them(self):
+        """The approach of the #354 re-check: random files from lines that WSL reads in odd ways; the script's view
+        must be WSL's (the oracle above), and after a merge WSL must read the desk's keys and every other key as it
+        did. A refusal must leave the file alone."""
+        import random
+        rnd = random.Random(387)
+        parts = ['[wsl2]', '[WSL2]', '[experimental]', '[boot]', '[wsl2] # c', '[ wsl2 ]', '[wsl2] x', '\t[wsl2]',
+                 '[experimental] ;c', '[1x]', 'memory=20GB', 'memory = 9GB', 'memory=20GB # c', 'memory="20GB"',
+                 'memory="20GB # c"', 'memory=12GB', 'memory=lots', 'memory=20\\GB', 'memory="20GB', 'memory=9GB\\n',
+                 'swap=4GB', 'swap=4gb', 'networkingMode=nat', 'networkingMode=mirrored', 'NetworkingMode=NAT',
+                 'dnsTunneling=true', 'guiApplications=false', 'kernelCommandLine=quiet \\', 'kernel=C:\\\\k\\\\',
+                 'autoProxy=true', 'sparseVhd=true # c', '# comment \\', '# c\rmemory=7GB', 'x', '', '  ',
+                 'memory=10GB\rswap=2GB', 'swap=1GB\rautoProxy=true', 'firewall=true']
+        files = []
+        for _ in range(240):
+            eol = rnd.choice(['\n', '\r\n'])
+            lines = [rnd.choice(parts) for _ in range(rnd.randint(0, 9))]
+            files.append(eol.join(lines) + rnd.choice([eol, eol, '']))
+        refused = 0
+        for old, o in zip(files, self.run_values(files)):
+            with self.subTest(old):
+                self.check_merge(old, o)
+                refused += 'refused' in o
+        # the two known kinds (a lone CR between two keys, a \ at the end with no LF) refuse these: a new kind shows
+        self.assertEqual(refused, 5)
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_a_rewrite_stopped_half_way_is_done_again(self):
+        """A run stopped while rewriting .wslconfig, before its move: the old file is still there, with a half-written
+        .new beside it. The next run merges the old file as a clean run does, and its own .new replaces that one."""
+        old = '[wsl2]\nmemory=20GB # raised\nswap=1GB\n'
+        clean = self.run_values([old])[0]['new']
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, '.wslconfig')
+        put(path, old)
+        put(path + '.new', '[wsl2]\nmemory=2GB\n')
+        script = os.path.join(d, 'merge.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = (WantMemory $args[0] 8 30); swap = "4GB"; '
+                    'networkingMode = "nat"; dnsTunneling = "true"; guiApplications = "false" }\n'
+                    '"changed=$(Merge-WslConfig $args[0] $want)"\n')
+        r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path], capture_output=True,
+                           text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('changed=True', r.stdout)
+        self.assertEqual(slurp(path), clean)
+        self.assertFalse(os.path.exists(path + '.new'))
+        self.assertEqual(wsl_value(wsl_reads(clean), 'memory'), '20GB')   # the raised cap, as WSL reads it
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
+    def test_the_memory_cap_kept_is_one_wsl_reads_within_its_bounds(self):
+        """Without -MemoryGB, a higher cap a person set (more agents or jobs in WSL) is neither lowered nor a FAIL, nor
+        a `wsl --shutdown` on every run (the live check's cap is the one kept), up to the RAM less 2 GB. With
+        -MemoryGB, that is the cap. A value WSL itself cannot read (it then runs on half the RAM) is rewritten: its
+        parser takes a number and B, K, KB, M, MB, G, GB, T or TB exactly, no space, upper case (#296)."""
+        d = tempfile.mkdtemp(prefix='desk-wslconfig-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, '.wslconfig')
+        script = os.path.join(d, 'memory.ps1')
+        with open(script, 'w', encoding='ascii') as f:
+            f.write(wslconfig_part() + '\n$want = [ordered]@{ memory = (WantMemory $args[0] 8 $args[1]); swap = "4GB" }\n'
+                    '"want=$($want.memory) kb=$(CapKb $want.memory)"\n'
+                    '"notes=$(@(Changes (Read-WslConfig $args[0]) $want) -join \'|\')"\n'
+                    '$null = Merge-WslConfig $args[0] $want\n$cfg = Wsl2Keys (Read-WslConfig $args[0])\n'
+                    '"check=$(@($want.Keys | Where-Object { $cfg[$_] -ne $want[$_] }).Count)"\n')
+        for old, most, want, kb, note in (
+                ('memory=26GB', 30, '26GB', 27262976, ''),   # raised: kept, no change, no FAIL
+                ('memory=30GB', 30, '30GB', 31457280, ''),   # the RAM less 2 GB
+                ('memory = 30720MB', 30, '30720MB', 31457280, ''),
+                ('memory=8GB', 30, '8GB', 8388608, ''),
+                ('memory=9G', 30, '9G', 9437184, ''),
+                ('memory=31GB', 30, '8GB', 8388608, '[wsl2] memory: 31GB -> 8GB'),   # Windows would keep under 2 GB
+                ('memory=64GB', 30, '8GB', 8388608, '[wsl2] memory: 64GB -> 8GB'),   # from a bigger PC
+                ('memory=16777216TB', 30, '8GB', 8388608, '[wsl2] memory: 16777216TB -> 8GB'),   # WSL: 0, its default
+                ('memory=26 GB', 30, '8GB', 8388608, '[wsl2] memory: 26 GB -> 8GB'),   # WSL rejects these two
+                ('memory=30720mb', 30, '8GB', 8388608, '[wsl2] memory: 30720mb -> 8GB'),
+                ('memory=26Gb', 30, '8GB', 8388608, '[wsl2] memory: 26Gb -> 8GB'),   # the unit is case-sensitive
+                # WSL trims only space and tab: a non-breaking space (pasted from a web page) or a form feed after
+                # the unit stays in its value, and it rejects that (#321)
+                ('memory=26GB\u00a0', 30, '8GB', 8388608, '[wsl2] memory: 26GB\u00a0 -> 8GB'),
+                ('memory=26GB\f', 30, '8GB', 8388608, '[wsl2] memory: 26GB\f -> 8GB'),
+                ('memory=\u00a026GB', 30, '8GB', 8388608, '[wsl2] memory: \u00a026GB -> 8GB'),
+                ('memory=4GB', 30, '8GB', 8388608, '[wsl2] memory: 4GB -> 8GB'),   # below: raised
+                ('memory=8191MB', 30, '8GB', 8388608, '[wsl2] memory: 8191MB -> 8GB'),
+                ('memory=lots', 30, '8GB', 8388608, '[wsl2] memory: lots -> 8GB'),
+                ('', 30, '8GB', 8388608, '[wsl2] memory: (not set) -> 8GB'),
+                ('memory=26GB', 8, '8GB', 8388608, '[wsl2] memory: 26GB -> 8GB'),   # -MemoryGB 8 lowers it
+                ('memory=8192MB', 8, '8192MB', 8388608, '')):   # -MemoryGB 8, the same size: left as written
+            with self.subTest(old=old, most=most):
+                with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(f'[wsl2]\n{old}\nswap=4GB\n')
+                r = subprocess.run(['pwsh', '-NoProfile', '-NonInteractive', '-File', script, path, str(most)],
+                                   capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f'want={want} kb={kb}\n', r.stdout)
+                self.assertIn(f'notes={note and "  " + note}\n', r.stdout)   # a note is indented
+                self.assertIn('check=0\n', r.stdout)
+                if not note:
+                    self.assertEqual(slurp(path), f'[wsl2]\n{old}\nswap=4GB\n')   # left alone
+
+    def test_the_memory_cap_decides_through_wantmemory(self):
+        src = text().decode('ascii')
+        body = src[src.index('try {'):]
+        # -MemoryGB given: it is the cap; not given: a higher one is kept up to what leaves Windows 2 GB
+        self.assertIn('$most = if ($asked) { $MemoryGB } else { $ram - 2 }', body)
+        self.assertIn('$want = [ordered]@{ memory = (WantMemory $WslConfig $MemoryGB $most);', body)
+        self.assertIn('("WANT_KB=$(CapKb $want.memory)`n" + $Live)', body)   # the cap kept, not -MemoryGB
+        self.assertNotIn('$MemoryGB * 1048576', body)
+
     def test_wslconfig_is_utf8_without_a_bom_never_ascii(self):
         src = text().decode('ascii')
         self.assertNotRegex(src, r'(?i)-Encoding\s+ascii')
         self.assertNotRegex(src, r'(?i)(Get|Set)-Content[^\n]*\$WslConfig')
         self.assertIn('[Text.UTF8Encoding]::new($false)', wslconfig_part())
+
+    def test_the_wslconfig_parser_searches_ordinally(self):
+        """lens #414 nit 6: a string IndexOf compares by culture, and under ICU "\r\n".IndexOf("\n") can be -1, which
+        would skip the rest of the file after a lone CR; a [char] search is ordinal."""
+        part = wslconfig_part()
+        self.assertIn('$t.IndexOf([char]10, $i)', part)
+        self.assertNotRegex(part, r'\.IndexOf\("')
 
     @unittest.skipUnless(shutil.which('pwsh'), 'pwsh is not installed')
     def test_wslconfig_merge_keeps_every_other_letter_and_key(self):

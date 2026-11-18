@@ -7,9 +7,20 @@ only for a head that holds exactly the change the review read.
 
 ## Config
 
-One JSON file in the project's repository. Unknown keys, a key written twice, a
+One JSON file in the project's repository, UTF-8. Unknown keys, a key written twice, a
 missing required key, an empty `required_checks` or a value of the wrong type is
 an error: the queue then exits non-zero and touches no pull request.
+
+The queue reads the config with git, as the commit checked out at its path
+(HEAD) holds it, never the file on disk: a checkout writes that file through
+`.gitattributes` (an encoding, `ident`), which a pull request can change
+without touching the config itself. So the path must be inside a git checkout,
+and the config must be committed there as a regular file: an edit that is not
+committed is not read, and a symlink, a submodule entry or a folder is refused.
+The read fetches nothing: in a partial clone (a sparse checkout) the config's
+blob must be checked out, so the sparse-checkout pattern has to match its name.
+A name with `[ ] * ?`, a leading `!` or `#`, a trailing space or a backslash
+does not match itself as a pattern, and the queue then refuses to start.
 
 ```json
 {
@@ -42,6 +53,155 @@ an error: the queue then exits non-zero and touches no pull request.
 | `list_limit`               | no       | How many open pull requests to read (default 50).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `update_when_base_was_red` | no       | `true` updates a behind pull request whose required checks failed only because the base commit they tested failed them too (section "The base was red"). Set it only when the job of every required check runs the `tested-base` action. Default `false`.                                                                                                                                                                                                                                                                                                                               |
 | `head_check_app`           | no       | The id of the GitHub App that alone posts `head_check` (the head gate, `../head-check/README.md`, "The gate"). The queue then counts only that App's newest check run of that name and ignores a job or commit status of the same name from anyone else; it skips a pull request whose gate check it cannot read. Add it only after every queue that reads this config runs a release that knows it: an older release refuses an unknown key.                                                                                                                                           |
+| `review`                   | no       | Which changed paths need which lens reads, and the round cap (section "Review rules"). Without it the queue and the gate behave as before.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+
+## Review rules
+
+The optional `review` block of the config says which changed paths need which
+lens reads and caps the review rounds. The head gate (`../head-check`) judges
+the required lenses by changed path with it (below, "How the gate judges"); the
+round cap, the approach lens and the `findings` / `state_line` lines are not
+enforced yet. `review.recommended.json` (next to this file) is a complete
+example with made-up paths; a test parses it. Real paths, lens names and prompt
+files belong in the project's own config.
+
+Every key is required and an unknown key is an error, as in the rest of the
+config. A wrong block makes the whole config invalid, naming every problem at
+once.
+
+| Key          | Meaning                                                                                                                                                                                                                       |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`    | `1`. Any other version is refused by name (a newer one: update the pinned release first).                                                                                                                                     |
+| `mode`       | `shadow`: the gate keeps judging by its `required-lenses` input and only reports what the path rules would have said. `enforce`: the path rules decide.                                                                       |
+| `rules`      | An ordered list of `{"name", "weight", "paths", "lenses"}`. A changed file belongs to the first rule with a matching glob. `weight` is `critical`, `normal` or `light`; `lenses` are names from `lenses`.                     |
+| `lenses`     | `{"<lens name>": {"prompt": "<file>"}}`: every lens a rule or `rounds` names, with its prompt file (repo-relative, no `..`, no leading `/`, no glob characters).                                                              |
+| `min_lenses` | `{"critical", "normal", "light"}`: the fewest different lenses a rule of that weight must list, 0-10, never falling with weight.                                                                                              |
+| `rounds`     | `{"approach_at", "max", "approach_lens"}`: from round `approach_at` the approach lens is required too; after round `max` a person must write an override comment or close the pull request. `max` is not below `approach_at`. |
+| `findings`   | `true` or `false`: lens comments carry `blocker:`, `major:` and `minor:` lines, and a blocker or major at the head fails the gate.                                                                                            |
+| `state_line` | `true` or `false`: a required lens comment needs a `state:` line to count.                                                                                                                                                    |
+
+The config is refused when:
+
+- a rule lists fewer different lenses than `min_lenses` of its weight. "Different"
+  is as the gate reads lens names (section "Lens comments"): case, blanks and a
+  trailing round marker do not count, so `data r1` and `data r2` are one lens;
+- two names in `lenses` are one lens to the gate in that way;
+- a lens name names no lens (a `<placeholder>`, a bare round marker such as `r2`,
+  nothing), or the gate would read it as another name in a lens header (Markdown
+  such as `data *2*`, or a `reviewer:` / `read at` field), or a rule or `rounds.approach_lens` names a lens with no entry in
+  `lenses` (names match exactly);
+- a `critical` or `normal` rule has `"lenses": []` (only `light` may);
+- no rule has a catch-all path (`**`, or any glob that matches every path such as
+  `**/*` or `*/**`), the catch-all rule is `light`, or a rule comes after the
+  catch-all rule (it could never match): a new folder must never fall to no rule
+  or to no lens;
+- there is no `critical` rule (the built-in protected paths below take its lenses);
+- in `enforce`, a rule comes before another rule, some path matches a glob of
+  both, and the first rule is lighter (`**/*.md` light above `src/**` critical:
+  `src/notes.md` would belong to the light rule and need no lens) or of the same
+  weight without one of the other rule's lenses (`**/*.py` critical `[a]` above
+  `src/**/*` critical `[a, b]`: `src/x.py` would need no `b`). Put heavier rules
+  first, and of one weight the rule with more lenses. Only the match-every globs
+  of the catch-all rule (`**`) are exempt: a lighter rule above it is the normal
+  case, but an explicit glob it also names (`["src/**", "**"]`) is compared like
+  any other. In `shadow` the same order is a warning in the gate's summary row,
+  not a refusal, and the warning says that enforce refuses it;
+- a glob is not in the dialect below, or a rule name or glob is written twice.
+
+**Globs.** Paths are repo-relative and use `/`. `*` is any characters inside one
+path segment, `**` is any number of whole segments (it must be a segment of its
+own: `src/**/*.py`, not `src/**.py`), `?` is one character inside a segment.
+There are no braces, character classes, `!` negation or backslashes, and no
+empty, `.` or `..` segments. Matching is case-sensitive, and `*`, `**` and `?`
+also match names that start with `.` (`**` matches `.github/x`). The gate and T3 match with this dialect, so a glob
+means the same thing on both sides.
+
+**Built-in protected paths.** The config file itself, every lens prompt file and
+`.github/workflows/**` always count as critical, whatever the rules say, with the
+lenses of the first critical rule. So a pull request that weakens the rules needs
+the critical lenses, and it is judged by the old rules: the gate reads the config
+from the base tip only. The config file is named as git names a changed file
+(one leading `./` aside; no empty, `.` or `..` segment): any other character is
+part of its name, glob characters too (`queue[main].json`), as the protected
+paths are compared exactly, never matched as globs.
+
+**How the gate judges.** The gate fetches the base tip and the head by sha and
+reads the changed paths with `git diff --name-status -z -M <merge base> <head>`:
+three dots, so what the base changed since the pull request branched off is not
+the pull request's, and no API page cap (a pull request of 5000 files is judged
+whole). Then (`review_judge.py`, `review_glob.py`):
+
+- every changed path goes to the first rule with a matching glob. A rename or a
+  copy counts under its old and its new path (moving a file out of a critical
+  folder is a critical change); a delete, a mode change and a type change count
+  under their path;
+- a built-in protected path also counts for the first critical rule;
+- the heaviest weight hit decides; the required lenses are the lenses of every
+  rule of that weight that was hit, in rule order, each once;
+- an empty diff (the head adds nothing to its merge base) counts as the catch-all
+  rule, never as "no lens needed";
+- with more than one merge base (criss-cross merges), the paths changed against
+  each one count together: more paths, never fewer.
+
+`review.vectors.json` holds the shared cases (globs, rule sets, changed paths with
+their status, and the expected weight and lenses); the Python tests read it, and
+T3 tests its own matcher on the same file.
+
+Notes for T3's matcher and its GitHub reader (no change in the gate):
+
+- add a glob vector with a non-ASCII name (an emoji, which is two UTF-16 units):
+  `?` is one character of the path, so a TypeScript matcher must count code
+  points as Python does, never UTF-16 units;
+- GitHub's changed-files API stops at 3,000 files and gives text, not git's
+  bytes (no `-z`, and a name that is not UTF-8 is changed). A reader on that API
+  must map its names to git's, and when the list is cut, judge the change by the
+  heaviest weight of the rules (unknown never judges lighter).
+
+**Shadow and enforce.** In `shadow` the gate judges as before, by its
+`required-lenses` input, and its check summary adds a row "the path rules would
+have said: <weight>, lenses <...>" with the rules and paths behind it. In
+`enforce` the path rules' lenses are required, and every lens in the
+`required-lenses` input is still required as well (the input can add lenses,
+never remove them). Switching `shadow` to `enforce` takes effect on each pull
+request at its next gate run (a push, a base change, or the backfill dispatch);
+a check posted before stays as it was until then.
+
+Fix every config warning before switching to `enforce`: the gate reads the
+config from the base tip, so a base config that does not parse refuses every
+head, the one that fixes it too, and the queue stops (an owner then has to push
+the fix by hand). The gate therefore refuses a pull request whose merged config
+(GitHub's merge commit, or `git merge-tree` of base and head in the gate's bare
+mode) does not parse, is deleted, is no regular file (a folder, a symlink or a
+submodule entry), gains a twin whose name differs from it only in case, gains
+a file, symlink or submodule entry whose name differs from one of its folders
+only in case (`.GitHub` next to `.github/`; a folder of that name is read on,
+and passes while it holds no twin of the config), or is in `enforce` with a
+rule order `enforce` refuses (the order checks above), and caps what it reads
+of a config a pull request changes (32 KiB, 128 characters per glob, 2,048 in
+all). Names compare as macOS compares them: fully case folded (`ſ` is `s`), and
+Unicode NFC and NFD forms as one name. NTFS compares with its own upcase table
+and may pair a few exotic names this keeps apart (`ı`, `İ`). That one check reads the
+merged config; everything else, the rules that judge the head too, the base's.
+It judges the merge with the base of its run: two pull requests that each pass
+alone can still merge into a bad config unless the ruleset requires branches to
+be up to date, which the queue needs anyway.
+
+**The empty input.** The gate refuses an empty `required-lenses` input (a head
+with no lens comment would pass), except when the config at the base tip has a
+`review` block in `enforce`: then the path rules name the lenses. A name that
+names no lens (`<LENS_NAME>`, `r4`) is refused in every mode.
+
+**Fail closed.** No merge base (the base was force-pushed, or the histories are
+unrelated), a failed `git diff`, a diff line the judge cannot read, a base or
+head that cannot be fetched, or a `review` block that does not parse: the gate
+posts a failure that says why, in `shadow` as in `enforce`. Never a pass, never
+"no lenses needed", and never today's rule instead. A config without the
+`review` key gives exactly the gate of before this block.
+
+**Adding the block.** A release that does not know the `review` key refuses the
+whole config (an unknown key), so: release first, then pin that release in every
+caller of the queue and the gate, then add the key. Roll back in the reverse order:
+remove the key, then the pin.
 
 ## Lens comments
 
@@ -103,13 +263,28 @@ queue never takes a reviewed pull request for an unreviewed one. Looking like a
 report means any of: `lens:`, `read at`, `safe to merge`, a `## ... lens`
 heading near the top, or two `covered:`/`checks:` lines. A comment that is no
 report says so on its first line, `not a lens: ...`. That clears it unless one of
-its lines is a lens header or a `lens:` field with a sha.
+its lines is a lens header, a lens field with a sha (`lens:`, `lens=`, `lens —`
+or `lens –`, quoted or not), or a `read at` with a hex sha outside a `>` quote
+(a fenced or indented block is no quote). To name a sha a lens read in such a
+comment, quote that line with `>`.
 
 A comment that looks like a report but is not one valid read is a lens of its
 own, keyed by that comment. Posting the report again the right way adds a new
 read and leaves the old comment blocking, and hiding it is not enough either.
 The ways out: delete it, edit its first line to `not a lens: ...` with no lens
-header line left in it, or post an override for the head.
+header line left in it and any `read at <sha>` quoted with `>`, or post an
+override for the head.
+
+These shapes were measured on this repository's 677 pull request comments by
+people (November 2026): 25 are flagged, before and after the `not a lens:`
+rule above. Of the 25, 7 are real lens reports with a broken header (one of
+them NOT SAFE), caught by the `## ... lens` heading rule (6) or a hex
+`read at` (1); 13 are fix-round comments caught by the same heading rule and 5
+fix-round comments with a `lens:` or `read at` in their text, and
+`not a lens:` is their way out. All 34 comments that say `safe to merge` are
+valid lens reads (`Verdict: not safe to merge ...`), so the rules stay as they
+are: each one that flags an ordinary comment also catches broken reports that
+read the same way ([issue 76](https://github.com/scuttletoby/t3code/issues/76)).
 
 ## The queue
 
@@ -207,14 +382,92 @@ queue's own bare repository (`--cache`) and gets its login from
 A token is in git's environment and `STATE` decides what is re-armed, so run
 the queue on a runner (or runner group) that runs no `pull_request` job and no
 other repository's job, as a user of its own. The `--state-file` and `--cache`
-folders belong to that user alone. git runs with no hooks, no fsmonitor and no
-replace refs, and a cache that is not that user's alone (mode `0700`), has a
-config the queue did not write, or holds a file that changes what its objects
-say or how a merge reads them (`info/grafts`, `shallow`,
-`objects/info/alternates`, `objects/info/http-alternates` or
-`info/attributes`) is rebuilt, never used. A job of the same user
-can still change the cache between that check and git's next read: only the
-runner rule above stops that.
+folders belong to that user alone. git runs with no hooks, no fsmonitor, no
+replace refs and no attributes (`GIT_ATTR_SOURCE` is the empty tree, so no
+`.gitattributes` of any commit, the cache's `HEAD` or `attr.tree` changes how
+a merge reads a file), and a cache that is not that user's alone (mode
+`0700`), has a config or a `HEAD` the queue did not write, has a branch at
+`HEAD`, or holds a file that changes what its objects say or how a merge reads
+them (`info/grafts`, `shallow`, `objects/info/alternates`,
+`objects/info/http-alternates` or `info/attributes`) is rebuilt, never used.
+git checks an object's hash on only some reads (never a tree or a blob
+`merge-tree` reads), so the queue runs `git fsck` on the cache before its merge
+check: an object stored under another object's name (a tree or a blob that
+makes a conflict merge clean) is found there. In an update it runs in the
+background right after the first fetch, while GitHub updates the branch, and
+the queue waits for it before it fetches the new head; in a run that finishes
+a stopped one it runs right after the fetch. Old formats that `git fetch`
+takes (a commit with time zone `+99999`, a tree out of order, an odd
+`.gitmodules`) are no problem (`FSCK_FORMAT_IDS`); an object that does not
+hash to its name, a missing or unreadable one, or a corrupt pack is. A cache
+`git fsck` finds broken, or one a fetch fails on for a reason that is not the
+network or the login, is downloaded from scratch once and checked again; one
+still broken after that is not merged in (STATE stays, and the PR comment says
+the cache fails `git fsck`). One run downloads the cache from scratch at most
+once, whether `git fsck`, a fetch or the merge check below asked for it: a
+cache that fails again in that run is not downloaded a second time and not
+merged in, STATE stays and the next run starts over. If a later run's `git fsck` gives the same lines
+as right after that download, the history GitHub serves is what fails: the
+queue does not download it again, and a person must look. A fetch's automatic
+`git gc` runs in the foreground, so no repack races the check. `git fsck`
+reads every object on one core: about 30 seconds for 270,000 objects, at most
+once per run (the queue makes at most one merge check per run). The cache is
+made with SHA-1 objects and files refs whatever git's defaults
+(`GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT`; git 3.0 plans others); a git
+that makes another format is refused, never written over.
+
+That check ends before the merge check starts (in an update, minutes before),
+and whoever can write the cache could change an object in between. So the
+merge check never reads the cache. Right before it, the queue makes a
+repository of its own (`CACHE.merge`, mode `0700`, new in every run) and
+copies into it the objects the check reads: each one comes out of the cache
+through one `git cat-file --batch`, the queue hashes it itself, and only an
+object that hashes to its name is written. Every git call of the merge check
+(`merge-base`, `rev-parse`, `merge-tree`) then runs in that copy, so what is
+written to the cache after an object was copied cannot reach the merge.
+Copied are every commit the head, the change read and the base reach, and for
+each `merge-tree` the trees and blobs it can read: the root trees of the two
+sides and of their merge bases, and below them everything that is not the
+same entry in all of them (what no side changed is not read by a merge and is
+left out; a submodule entry names a commit of another repository and is never
+copied). On this fork (270,000 objects, 11,500 commits) that is about 2
+seconds for the commits and a fraction of a second for a merge of 300 changed
+files. Should git still say anything on stderr or stop there, the whole trees
+of the merged commits are copied (about 10 seconds a tree here) and the merge
+runs once more; a merge git calls clean while it reports an error is never
+taken as clean, and two sides with more than 8 merge bases are not merged at
+all (the head is then not the change read). An object that is missing or not
+what its name says is handled as a failed `git fsck` is: the cache is
+downloaded from scratch and the merge check runs again in the same run; if it
+fails again, or if this run had already downloaded the cache (one download a
+run, as above), nothing is merged in, STATE stays and the PR comment says so;
+a download that fails the same way as the last one is not repeated. If the
+copy cannot be made (no room on the disk) nothing is known either, and the
+cache is kept. The same holds for a reader that hangs: a `git cat-file` that
+owes one answer (the line that names an object, or the next 1 MiB of it) for
+120 seconds is stopped, and nothing is merged in. The copy is deleted when the check ends; what a killed run left
+at `CACHE.merge` is deleted by the next check.
+
+What the last download from scratch failed on is kept in `STATE.fsck-known`,
+next to the plan and not in the cache, and it is read only as a regular file
+of the queue's user that no one else can write. It can only stop a second
+download of the same broken history, never let a merge through; a healthy
+check deletes it. (Until this version it was `queue-fsck-known` inside the
+cache. That file is no longer read.)
+
+What is left for the runner rule above: a job of the same user can still
+write the queue's ref or config in the cache between the fetch and the moment
+the queue reads them, and can write into `CACHE.merge` during the seconds it
+exists. It can also make a git call wait without end (a FIFO where an object
+file should be): only the merge check's object reader has the 120-second limit
+above; `git fetch`, `git fsck` and the calls in the copy have no limit but the
+job's `timeout-minutes`. Nothing is merged in while one waits, and STATE
+stays.
+
+The queue's own hash is Python's SHA-1, which does not detect a collision
+attack as git's does (sha1dc). That is enough here: one of two colliding
+objects would have to come from GitHub, which refuses them, and the cache's
+`git fsck` hashes with git's own.
 
 | Exit | Meaning                                                                                                     |
 | ---- | ----------------------------------------------------------------------------------------------------------- |
@@ -225,8 +478,13 @@ runner rule above stops that.
 
 It refuses to start on a GitHub-hosted runner (its disk, and with it the plan,
 goes with the job), with a `--repo` that is not `owner/name`, a relative path,
-a path inside the job's workspace (the next checkout empties it), a config
-error, or a git older than 2.38 (`merge-tree --write-tree`).
+a path inside the job's workspace (the next checkout empties it), a path that
+is `/` or ends in `..`, a config error, or a git older than 2.43
+(`merge-tree --write-tree` that honours `GIT_ATTR_SOURCE`). A `/` or `/.` at
+the end of `--state-file`, `--cache` or `--lock-file` is dropped: the queue
+names its other files (`CACHE.merge`, `CACHE.new`, `CACHE.old-*`, `STATE.lock`,
+`STATE.fsck-known`) by adding to those paths, and they belong beside the cache
+and the plan, not inside.
 
 `--state-file` (`STATE`) holds the plan of the run that turned auto-merge off:
 `{"repo", "pr", "old", "base", "read"}` (and `"told"` once the pull request was
@@ -249,6 +507,11 @@ live in a comment of the queue's own login instead (trusted by
 the base from GitHub anyway, and a failed write before the disarm would only
 mean no disarm. That stays open for a queue that moves several pull requests at
 once, and for GitHub-hosted runners.
+
+Next to the plan the queue keeps `STATE.fsck-known` (what the last download
+of the cache from scratch failed on, if it did), and next to the cache
+`CACHE.merge` exists while a merge check runs. Both are the queue's own: give
+each queue its own `--state-file` and `--cache`.
 
 `--lock-file` (default: `STATE.lock`) keeps two runs from overlapping.
 `--dry-run` takes no lock and writes nothing: no `STATE`, no cache, no comment.
@@ -299,7 +562,7 @@ the re-arm still needs exactly the change the lenses read.
 
 The queue needs:
 
-- a self-hosted runner whose disk outlives the job, with git 2.38+, `gh` and
+- a self-hosted runner whose disk outlives the job, with git 2.43+, `gh` and
   `python3`: the plan in `--state-file` and the cache must be there for the
   next run. That runner (or runner group) runs no `pull_request` job and no
   other repository's job, as a user of its own, and the state and cache
@@ -380,7 +643,8 @@ checkout of its config, in a job with the read permissions above:
 
 With `update_when_base_was_red`, the job of every required check runs
 `tested-base` right after its checkout of the merge commit (`path` is the
-checkout's path, default `.`):
+checkout's path relative to the workspace, default `.`; an absolute path or a
+`.git` that fork-ci git-clean refuses writes no note):
 
 ```yaml
 - uses: actions/checkout@<sha>
@@ -397,14 +661,16 @@ replaced, and the replaced corpus was checked against the source copy before it
 was committed. A rule change here must keep the corpus green or say in its pull
 request why a recorded answer changes.
 
-The port differs on purpose in four ways, and the replay checks each recorded
+The port differs on purpose in five ways, and the replay checks each recorded
 answer that changes for its reason. The source's repository is private, so its
 comments carry no author association: the replay gives them `OWNER` and
 unedited. A read shorter than 40 hex, and a lens comment edited after posting,
 read nothing here (54 recorded answers). The source's `full_sha`, which matched
 a short read to the pull request's commits, is gone. A hidden (minimized) lens
 comment reads nothing: the source never read `isMinimized`, and no recorded
-call has it, so no recorded answer changes for it.
+call has it, so no recorded answer changes for it. A comment whose first line
+is `not a lens:` and that holds a hex `read at` outside a `>` quote is a lens
+that read nothing (2 recorded answers; the source cleared it).
 
 `pr_queue.py` is a port of the same project's queue, and `pr_queue.test.py`
 holds that project's queue tests with the port's names. What the port changed:

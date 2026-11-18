@@ -40,7 +40,7 @@ and no comment says so yet (STATE stays, the next run finishes it).
     PR_QUEUE_READ_TOKEN=... PR_QUEUE_WRITE_TOKEN=... \
     pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 """
-import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, time, urllib.parse
+import argparse, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, threading, time, urllib.parse, zlib
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -58,9 +58,10 @@ TESTED_BASE = 'pr_queue tested base'   # the annotation title the tested-base ac
 BASE_RED = ('FAILURE', 'ERROR')   # "the base was red": a real failure. CANCELLED, STALE, STARTUP_FAILURE, TIMED_OUT,
 # SKIPPED, not reported or running say nothing about the base's code (a busy runner times out or cancels base runs)
 UPDATES = 3   # holds() follows at most this many queue updates in a row
-GIT_MIN = (2, 38)   # git merge-tree --write-tree
+GIT_MIN = (2, 43)   # merge-tree --write-tree (2.38) with GIT_ATTR_SOURCE (2.41; merge-tree crashed with it until 2.43)
 REFUSED, SILENT = 2, 3
 READ_TOKEN, WRITE_TOKEN = 'PR_QUEUE_READ_TOKEN', 'PR_QUEUE_WRITE_TOKEN'
+READ_LOGIN = f"{READ_TOKEN} (the run's read token: contents read)"
 # Never passed on: each gh and git gets exactly one token, as GH_TOKEN (gh_env).
 TOKEN_VARS = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', READ_TOKEN, WRITE_TOKEN)
 READ_PERMISSIONS = 'actions, checks, contents, issues, pull-requests and statuses: read'
@@ -73,7 +74,90 @@ GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
 # Every git call, whatever the repository's files say: no hooks, no fsmonitor command, no replace refs, and no
 # commit-graph (a planted objects/info/commit-graph(s) could change the parents git reports; git rebuilds nothing from it).
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
-            '--no-replace-objects')
+            '-c', 'core.attributesFile=/dev/null', '--no-replace-objects')
+# ... and no global or system config or attributes: on a self-hosted runner an earlier job may have written
+# ~/.gitconfig or ~/.config/git/attributes. The same
+# two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
+# The tree git reads `.gitattributes` from, for every call git_env makes: the empty tree, so no attribute file of any
+# commit counts. Without it a bare repository's HEAD (git 2.43 to 2.45 read `HEAD:.gitattributes` there) or an
+# `attr.tree` is one: `* merge=union` there makes merge-tree's conflict clean. Git knows the empty tree in every
+# repository, even one with no objects. GIT_ATTR_SOURCE is read from git 2.41 (an older git ignores it without a word,
+# so git_problem refuses it: GIT_MIN). Kept apart from GIT_ENV, which other actions share (git_clean.test.py).
+EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+GIT_ATTRS = {'GIT_ATTR_SOURCE': EMPTY_TREE}
+# What a new repository is made with, whatever the job's environment or git's own default says (git 3.0 plans SHA-256
+# and reftable): the queue's cache and the gate's repository hold SHA-1 objects and files refs, as GitHub's commits,
+# EMPTY_TREE and CACHE_CONFIG (format 0, no extensions) are. git reads GIT_DEFAULT_REF_FORMAT from 2.45 (an older one
+# makes files refs anyway); init_bare refuses a repository a git made otherwise.
+GIT_FORMATS = {'GIT_DEFAULT_HASH': 'sha1', 'GIT_DEFAULT_REF_FORMAT': 'files'}
+# One language for git's messages: the queue and the gate match them (GONE_RE, NO_LOGIN_RE) and read them as UTF-8.
+GIT_LANG = {'LC_ALL': 'C'}
+# Never passed on to git (git_env): variables of the job that point git at another repository, object store, index,
+# config, attribute tree (GIT_ATTR_SOURCE: git_env sets its own, GIT_ATTRS) or pathspec rule than the call names, or
+# run another diff program. The job's environment is the owner's, but each git call says alone
+# what it reads.
+GIT_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+            'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
+            'GIT_REPLACE_REF_BASE', 'GIT_GRAFT_FILE', 'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH', 'GIT_PREFIX',
+            'GIT_IMPLICIT_WORK_TREE', 'GIT_INTERNAL_SUPER_PREFIX', 'GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS',
+            'GIT_NOGLOB_PATHSPECS', 'GIT_ICASE_PATHSPECS', 'GIT_ATTR_SOURCE', 'GIT_EXTERNAL_DIFF')
+GIT_DROP_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+# The programs git runs and the transports it may use, as the job's environment chooses them. Dropped by git_env from
+# a call that reaches no remote, and (all but GIT_EXEC_PATH, where git finds its own https helper and index-pack) from
+# a fetch from an https URL: its login is GIT_AUTH's or none, and ssh, the git:// proxy and a protocol list are never
+# needed there. A fetch from another remote (a checkout's origin, an owner's ssh URL) keeps them: it may need them.
+# Only a call that fetches names its remote: the cache's and the gate's local calls (merge-tree, cat-file, rev-parse)
+# run none of them, GIT_EXEC_PATH included.
+GIT_RUN = ('GIT_EXEC_PATH', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS',
+           'GIT_ALLOW_PROTOCOL')
+# Traces: they write an https fetch's headers (the login) and its talk with GitHub to stderr or a file, and the gate
+# puts git's stderr into a public summary (a merge-tree's too). Dropped from every call but a fetch from another
+# remote, which carries no token of ours (remote_problem refuses plain http, where GitHub's redirect would ask for it).
+GIT_TRACE_PREFIXES = ('GIT_TRACE', 'GIT_CURL_VERBOSE')
+GIT_READ_SECONDS = 60   # each git call of the config read
+# The cache's HEAD, as the queue writes it (what `git init --template=` writes): a branch that is never made, so HEAD
+# names no commit and no tree. A cache with any other HEAD (a ref or sha an earlier job planted) is rebuilt.
+CACHE_HEAD = 'ref: refs/heads/master\n'
+# git's words for a fetch that needed a login it did not have (none given, or one GitHub refused)
+NO_LOGIN_RE = re.compile(r'could not read (Username|Password)|terminal prompts disabled|Authentication failed', re.I)
+# git's words for a fetch the network failed (curl's errors, a transfer cut off). Any other failed fetch may be the
+# cache's fault (an object git cannot read under a name the fetch needs), so the cache is checked (fetch_checked).
+NETWORK_RE = re.compile(r'unable to access|RPC failed|Could not resolve host', re.I)
+# git fsck's message ids for an object whose hash is right but whose content is in an old or odd format: a commit
+# with time zone +99999, a zero-padded date or a missing space; a tree with entries out of order or twice; a
+# .gitmodules or .gitattributes git would not check out. git fetch takes them (transfer.fsckObjects is off) and old
+# imports hold them, but plain git fsck calls them errors: a cache with such history would fail every check and be
+# downloaded again on every run. objects_problem ignores them. What the check is for stays an error, since none of
+# it is a message id: an object that does not hash to its name, a missing or unreadable object, a broken link, a
+# corrupt pack or index. So do the ids for a commit git cannot parse (bad parent or tree line, no tree), an object it
+# could not read, and the tags the queue never fetches (--no-tags). Each id is one git 2.43 (GIT_MIN) knows: git
+# refuses to run with an unknown one.
+FSCK_FORMAT_IDS = ('badDate', 'badDateOverflow', 'badEmail', 'badName', 'badTimezone', 'missingAuthor',
+                   'missingCommitter', 'missingEmail', 'missingNameBeforeEmail', 'missingSpaceBeforeDate',
+                   'missingSpaceBeforeEmail', 'multipleAuthors', 'zeroPaddedDate', 'duplicateEntries', 'treeNotSorted',
+                   'gitmodulesBlob', 'gitmodulesLarge', 'gitmodulesName', 'gitmodulesPath', 'gitmodulesSymlink',
+                   'gitmodulesUpdate', 'gitmodulesUrl', 'gitattributesBlob', 'gitattributesLarge',
+                   'gitattributesLineLength')
+FSCK_IGNORE = tuple(a for i in FSCK_FORMAT_IDS for a in ('-c', f'fsck.{i}=ignore'))
+# A fetch's automatic gc runs before the fetch returns, never detached: a repack in the background deletes packs and
+# loose objects while the next git fsck reads them (a false "broken", and a download from scratch).
+NO_DETACH = ('-c', 'gc.autoDetach=false', '-c', 'maintenance.autoDetach=false')
+# STATE + this, next to the queue's plan and never in the cache: what the cache's check said right after a download
+# from scratch that it still failed (git fsck's lines, or the merge check's one line). The same words on a later run
+# are GitHub's own history, not an earlier job's object: that run does not download it all again. An older queue kept
+# it in the cache (`queue-fsck-known`), where whoever can write the cache could plant one: that file is never read.
+FSCK_KNOWN = '.fsck-known'
+# CACHE + this: the merge check's own repository (Queue.holds_checked), made new for each check and deleted after it.
+MERGE_COPY = '.merge'
+# How long the merge check's object reader (Copy: one `git cat-file --batch`) may owe one answer, the line that names
+# an object or its next 1 MiB, before it is stopped and the run knows nothing (STATE stays). An answer takes
+# milliseconds; this is for a reader that hangs. The run's other git calls have no limit but the job's.
+CAT_SECONDS = 120
+# A merge check follows at most this many merge bases (bases_of): a history with more is not taken as the change read.
+MERGE_BASES = 8
+# A commit as git reads it: the tree line, then the parent lines right after it.
+COMMIT_RE = re.compile(rb'tree ([0-9a-f]{40})\n((?:parent [0-9a-f]{40}\n)*)')
 # The cache's whole config, as the queue writes it: a cache with any other config (a planted `url.*.insteadOf`, helper
 # or hook path) is rebuilt, never run.
 CACHE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n'
@@ -112,12 +196,35 @@ CHECK_NOT_DONE_RE = re.compile(r'required status checks?\b(?:"[^"\n]*"|[^."\n])*
                                r'(?:queued|in progress|expected|pending)\b', re.I)
 
 
-def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
+def merge_tree(git, p, side):
+    """git's merge of the commits `p` and `side`: exit 0 and the tree's name when clean."""
+    return git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', p, side)
+
+
+def holds(git, head, read, depth=UPDATES, base='refs/queue/base', merge=None):
     """Step 4's rule on commits `git` (a callable running git in one repository) already has: `head` is `read`, or a
     parent P of `head` is on `base` and head's tree is `git merge-tree --write-tree P X` byte for byte, where X is
     `read` or head's other parent when that one holds this itself (an earlier queue update: GitHub merges the new base
     into the head the queue already proved, which can be clean where a direct merge of `read` conflicts). A tree is
-    the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same."""
+    the same or not: a hunk moved to another function, a conflict resolution or a later push is not the same.
+
+    git's output is decoded strictly by the callers. A conflict lists the conflicted files by name, and a name need
+    not be UTF-8: that is no same change (a clean merge prints only the tree id), said once, never a crash.
+
+    `merge`: what runs each merge-tree, as merge_tree(git, p, side) does (the queue's copies the objects that merge
+    reads first: Queue.holds_checked)."""
+    if head == read:
+        return True
+    try:
+        return _holds(git, head, read, depth, base, merge or (lambda p, side: merge_tree(git, p, side)))
+    except UnicodeDecodeError as e:
+        print(f'::warning::pr-queue: git printed bytes that are not UTF-8 while checking {head[:12]} against the read '
+              f'{read[:12]} (a conflict naming a file whose name is not UTF-8: {e.reason}, byte {e.start}): the head '
+              'is not taken as the change read')
+        return False
+
+
+def _holds(git, head, read, depth, base, merge):
     if head == read:
         return True
     tree = git('rev-parse', '--verify', '-q', head + '^{tree}').stdout.strip()
@@ -125,12 +232,230 @@ def holds(git, head, read, depth=UPDATES, base='refs/queue/base'):
     for p in parents:
         if git('merge-base', '--is-ancestor', p, base).returncode != 0:
             continue
-        sides = [read] + [h for h in parents if h != p and depth > 1 and holds(git, h, read, depth - 1, base)]
+        sides = [read] + [h for h in parents if h != p and depth > 1
+                          and _holds(git, h, read, depth - 1, base, merge)]
         for side in dict.fromkeys(sides):
-            m = git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', p, side)
+            m = merge(p, side)
             if m.returncode == 0 and tree and m.stdout.split()[:1] == [tree]:
                 return True
     return False
+
+
+class Changed(Exception):
+    """An object the merge check needs is not in the cache as its name says: missing, unreadable or other content."""
+
+
+class Copy:
+    """The objects of one merge check, copied out of the cache into a repository of their own (`to`, new and empty)
+    with every hash checked on the way. git checks no hash of a tree or blob merge-tree reads nor of a commit a walk
+    reads, and the cache's git fsck ends before the merge check (in an update, minutes before): whoever can write the
+    cache could change an object in between. One `git cat-file --batch` (`argv`, `env`) hands each object out the way
+    any git call finds it; this process hashes what it got (`<type> <size>\\0<content>`, SHA-1) and writes it to `to`
+    as a loose object only when that is its name. The merge check then runs in `to`: it reads only objects hashed
+    here, and nothing written to the cache after an object was copied can reach it. The trees git itself makes there
+    (of two or more merge bases) are written by git into `to`, where nothing was planted under their names.
+
+    Changed: an object is missing, cannot be read or does not hash to its name. OSError: `to` cannot be written, or
+    (TimeoutError) cat-file gave no answer for CAT_SECONDS, which says nothing about the cache's objects."""
+
+    def __init__(self, argv, env, to):
+        self.to, self.seen, self.folders = to, set(), set()
+        self.tree_of, self.trees, self.whole, self.walked = {}, {}, set(), set()   # commit: its tree; tree: entries
+        self.cat = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        self.asked, self.stalled, self.done = None, False, threading.Event()   # asked: since when said() waits
+        self.watcher = threading.Thread(target=self.watch, daemon=True)
+        self.watcher.start()
+
+    def watch(self):
+        """Stops a cat-file that owes one answer (said) for more than CAT_SECONDS: git opens a loose object with a
+        plain open(), so a FIFO planted under an object's name would hold it, and with it the run and the queue's
+        lock, until the job's time limit. The reads themselves are not touched: a stopped cat-file can only give
+        less than was asked for, never other bytes. Between two answers (while git merges) nothing is counted."""
+        while not self.done.wait(min(1.0, CAT_SECONDS / 4)):
+            asked = self.asked
+            if asked is not None and time.monotonic() - asked > CAT_SECONDS:
+                self.stalled = True
+                self.cat.kill()
+                return
+
+    def close(self):
+        """cat-file stopped and reaped (a run that is killed outright closes its stdin, which ends it too)."""
+        self.done.set()
+        self.watcher.join()
+        self.cat.kill()
+        for pipe in (self.cat.stdin, self.cat.stdout):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        self.cat.wait()
+
+    def said(self, name, n=None):
+        """cat-file's next line (after asking for `name`), or its next `n` bytes; Changed when it gives less, and
+        TimeoutError when it gave less because it was stopped after CAT_SECONDS without an answer (watch)."""
+        self.asked = time.monotonic()
+        try:
+            if n is None:
+                self.cat.stdin.write(name.encode() + b'\n')
+                self.cat.stdin.flush()
+                got = self.cat.stdout.readline()
+            else:
+                got = self.cat.stdout.read(n)
+        except (OSError, ValueError) as e:
+            got = e
+        finally:
+            self.asked = None
+        if self.stalled:   # whatever came before it was stopped: never taken, and no word on the object
+            raise TimeoutError(f'git cat-file gave no answer for {CAT_SECONDS:g} s (object {name}) and was stopped')
+        if isinstance(got, Exception):
+            raise Changed(f'object {name} cannot be read (git cat-file: {got})') from None
+        if n is not None and len(got) != n:
+            raise Changed(f'object {name} cannot be read (git cat-file stopped)')
+        return got
+
+    def take(self, name, kind):
+        """Object `name`, which must be a `kind`, copied if it was not yet: its content when it is a commit or a
+        tree copied now, else None."""
+        if name in self.seen:
+            return None
+        # No test pins the name echo, the type or the newline after the content below: a wrong name or type fails
+        # the hash (the type is in the hashed header), a lost newline fails the next header. Kept as a second net.
+        line = self.said(name).split()
+        if len(line) != 3 or line[0] != name.encode() or not line[2].isdigit():
+            raise Changed(f'object {name} is missing or cannot be read')
+        if line[1] != kind.encode():
+            raise Changed(f'object {name} is a {line[1][:20].decode("ascii", "replace")}, not a {kind}')
+        left = int(line[2])
+        header = b'%s %d\0' % (line[1], left)
+        hashed, packed, kept = hashlib.sha1(header), zlib.compressobj(1), []
+        folder = os.path.join(self.to, 'objects', name[:2])
+        if folder not in self.folders:
+            os.makedirs(folder, exist_ok=True)
+            self.folders.add(folder)
+        path = os.path.join(folder, name[2:])
+        with open(path + '.new', 'wb') as out:   # git may have written this name itself (a merge's result)
+            out.write(packed.compress(header))
+            while left:
+                part = self.said(name, min(left, 1 << 20))
+                left -= len(part)
+                hashed.update(part)
+                out.write(packed.compress(part))
+                if kind != 'blob':
+                    kept.append(part)
+            out.write(packed.flush())
+        if self.said(name, 1) != b'\n':
+            raise Changed(f'object {name} cannot be read (git cat-file said something else)')
+        if hashed.hexdigest() != name:
+            raise Changed(f'object {name} does not hash to its name')
+        os.replace(path + '.new', path)
+        self.seen.add(name)
+        return None if kind == 'blob' else b''.join(kept)
+
+    def take_commits(self, *tips):
+        """Every commit these reach. A history in which each commit hashes to its name is the one GitHub sent: every
+        walk in `to` (rev-list, merge-base, merge-tree's merge bases) then reads real parents."""
+        todo = list(tips)
+        while todo:
+            name = todo.pop()
+            body = self.take(name, 'commit')
+            if body is None:
+                if name not in self.tree_of:
+                    raise Changed(f'object {name} is not a commit')
+                continue
+            links = COMMIT_RE.match(body)
+            if not links:
+                raise Changed(f'object {name} is not a commit git can read')
+            self.tree_of[name] = links.group(1).decode()
+            todo += [line.split()[1].decode() for line in links.group(2).splitlines()]
+
+    def tree(self, name):
+        """{entry name: [(mode, object name), ...]} of tree `name` (one entry per name, but for an old tree that
+        holds a name twice), copied on first use."""
+        if name not in self.trees:
+            body = self.take(name, 'tree')
+            if body is None:
+                raise Changed(f'object {name} is not a tree')
+            entries, at = {}, 0
+            try:
+                while at < len(body):
+                    space = body.index(b' ', at)
+                    end = body.index(b'\0', space)
+                    oid = body[end + 1:end + 21]
+                    if len(oid) != 20:
+                        raise ValueError
+                    entries.setdefault(body[space + 1:end], []).append((int(body[at:space], 8), oid.hex()))
+                    at = end + 21
+            except ValueError:
+                raise Changed(f'object {name} is not a tree git can read') from None
+            self.trees[name] = entries
+        return self.trees[name]
+
+    def take_entry(self, mode, name):
+        """One tree entry's object; True for a tree. A submodule's commit (mode 160000) is another repository's:
+        the cache never holds it and no merge reads it."""
+        if stat.S_IFMT(mode) == 0o160000:
+            return False
+        if stat.S_ISDIR(mode):
+            self.tree(name)
+            return True
+        self.take(name, 'blob')
+        return False
+
+    def take_whole(self, root):
+        """Tree `root` and everything in it."""
+        todo = [root]
+        while todo:
+            name = todo.pop()
+            if name not in self.whole:
+                self.whole.add(name)
+                todo += [oid for entry in self.tree(name).values() for mode, oid in entry if self.take_entry(mode, oid)]
+
+    def take_merged(self, roots):
+        """What a merge of the commits with these root trees (the two sides and every merge base) can read: the
+        root trees, and below them every entry that is not the same object with the same mode in all of them, with
+        all that is under such an entry in each. An entry that is the same in all of them git takes as it is, without
+        reading it or anything under it (in a merge of merge bases too: the tree that makes has the same entry
+        there), and a rename is found only among paths that differ."""
+        todo = [tuple(roots)]
+        while todo:
+            at = todo.pop()
+            if at in self.walked:
+                continue
+            self.walked.add(at)
+            listed = [self.tree(t) if t else {} for t in at]
+            for name in set().union(*listed):
+                here = [entries.get(name) for entries in listed]
+                if all(h == here[0] for h in here):
+                    continue
+                below = []
+                for h in here:
+                    trees = [oid for mode, oid in h or () if self.take_entry(mode, oid)]
+                    if len(h or ()) > 1:   # a name held twice: all of each, nothing left out
+                        for oid in trees:
+                            self.take_whole(oid)
+                    below.append(trees[0] if len(trees) == 1 and len(h) == 1 else None)
+                if any(below):
+                    todo.append(tuple(below))
+
+
+def bases_of(git, p, side):
+    """The commits whose trees `git merge-tree p side` reads besides the two: their merge bases. Two or more of them
+    git first merges into one, pair by pair, and each of those merges reads its own merge bases, which are among the
+    merge bases of the pairs: so those are added too, until none is new. None when there are more than MERGE_BASES."""
+    def pair(a, b):
+        return [c for c in git('merge-base', '--all', a, b).stdout.split() if SHA.fullmatch(c)]
+    found, done = list(dict.fromkeys(pair(p, side))), set()
+    while len(found) > 1:
+        pairs = [(a, b) for i, a in enumerate(found) for b in found[i + 1:] if (a, b) not in done]
+        if not pairs:
+            break
+        for a, b in pairs:
+            done.add((a, b))
+            found += [c for c in pair(a, b) if c not in found]
+            if len(found) > MERGE_BASES:
+                return None
+    return found
 
 
 def connection(found, after):
@@ -278,8 +603,80 @@ def no_token_env():
     return {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
 
 
+def git_env(env, remote=None):
+    """`env` for a git call: without GIT_DROP, with GIT_ENV, GIT_ATTRS, GIT_FORMATS, GIT_LANG and no prompt. `remote`:
+    None for a call that reaches no remote, else the URL or remote name it fetches from, which decides what of GIT_RUN
+    it keeps. Only a fetch from a remote that is not https keeps the traces (GIT_TRACE_PREFIXES). Tokens are the
+    caller's to drop."""
+    drop, prefixes = set(GIT_DROP), GIT_DROP_PREFIXES
+    if remote is None:
+        drop.update(GIT_RUN)
+        prefixes += GIT_TRACE_PREFIXES
+    elif remote.lower().startswith('https://'):   # git reads the scheme in any case: HTTPS:// is https too
+        drop.update(set(GIT_RUN) - {'GIT_EXEC_PATH'})
+        prefixes += GIT_TRACE_PREFIXES
+    return {**{k: v for k, v in env.items() if k not in drop and not k.startswith(prefixes)},
+            'GIT_TERMINAL_PROMPT': '0', **GIT_LANG, **GIT_ENV, **GIT_ATTRS, **GIT_FORMATS}
+
+
+def remote_problem(remote):
+    """Why a fetch that carries the run's token (GIT_AUTH: gh's login for https://github.com) must not go to
+    `remote`, or None. Plain http keeps the job's traces (git_env), and GitHub redirects it to https, where git then
+    asks the helper for the token; a `transport::address` remote runs whichever remote helper it names on any address,
+    https included. An ssh URL, a path or a file:// URL gets no token."""
+    if not remote:
+        return 'the remote is empty'
+    if remote.startswith('-'):
+        return f'the remote {remote[:100]} starts with -: git would read it as an option'
+    if remote.lower().startswith('http://'):
+        return (f'the remote {remote[:100]} is plain http: GitHub would redirect it to https and git would hand the '
+                'token over with the traces kept. Use https')
+    if re.match(r'[A-Za-z][A-Za-z0-9+.-]*::', remote):
+        return f'the remote {remote[:100]} names a remote helper (transport::address): give a URL or a path'
+    return None
+
+
+def init_bare(path):
+    """Makes the empty folder `path` a bare repository as the queue's cache and the gate's repository are:
+    `git init --bare --template=` (no hooks, no sample files), then CACHE_CONFIG and CACHE_HEAD written over what git
+    wrote, never left to git's defaults (git 3.0 plans `main`). None, or why it could not be made. A repository git made
+    in another format than SHA-1 objects with files refs (format 0, no extensions: a git that ignored GIT_FORMATS) is
+    refused, never written over: CACHE_CONFIG would then name a format its refs or objects are not in."""
+    r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', path], text=True,
+                       capture_output=True, env=git_env(no_token_env()))
+    if r.returncode != 0:
+        return f'git init failed: {r.stderr.strip()[:300]}'
+    try:
+        with open(os.path.join(path, 'config'), encoding='utf-8', errors='replace') as f:
+            made = f.read()
+        version = re.search(r'^\s*repositoryformatversion\s*=\s*(\S*)', made, re.M | re.I)
+        section = re.search(r'^\s*\[\s*extensions\s*\]([^[]*)', made, re.M | re.I)
+        if section or (version and version.group(1) != '0'):
+            said = ', '.join(f'extensions.{k}={v}' for k, v in
+                             re.findall(r'^\s*([\w.-]+)\s*=\s*(\S*)', section.group(1) if section else '', re.M))
+            said = said or (f'format version {version.group(1)}' if version else 'an [extensions] section')
+            return (f'git init made a repository with {said[:200]}: the '
+                    'queue reads only SHA-1 objects and files refs (format 0, no extensions), and this git ignored '
+                    'GIT_DEFAULT_HASH=sha1 and GIT_DEFAULT_REF_FORMAT=files')
+        write_text(os.path.join(path, 'config'), CACHE_CONFIG)
+        write_text(os.path.join(path, 'HEAD'), CACHE_HEAD)
+    except OSError as e:
+        return f'could not read or write its config: {e}'
+    return None
+
+
+def fetch_failed(stderr, login):
+    """What a failed fetch says: git's own words, and when they are about a login, which one was missing or refused
+    (`login`: where the run's token comes from)."""
+    said = f'git fetch failed: {stderr.strip()[:300]}'
+    if NO_LOGIN_RE.search(stderr):
+        said += f' (git found no login for GitHub, or GitHub refused it: check {login})'
+    return said
+
+
 def git_problem(run=subprocess.run):
-    """Why this git cannot run the queue (merge-tree --write-tree needs GIT_MIN), or None."""
+    """Why this git cannot run the queue (merge-tree --write-tree that reads attributes from GIT_ATTRS needs GIT_MIN),
+    or None."""
     try:
         r = run(['git', 'version'], text=True, capture_output=True, env=no_token_env())
         out = r.stdout.strip()
@@ -288,7 +685,75 @@ def git_problem(run=subprocess.run):
     m = re.match(r'git version (\d+)\.(\d+)', out)
     if m and tuple(map(int, m.groups())) >= GIT_MIN:
         return None
-    return f'git {".".join(map(str, GIT_MIN))} or newer is needed (merge-tree --write-tree); found: {out[:80] or "none"}'
+    return (f'git {".".join(map(str, GIT_MIN))} or newer is needed (merge-tree --write-tree that honours GIT_ATTR_SOURCE); '
+            f'found: {out[:80] or "none"}')
+
+
+def committed_config(path, run=None):
+    """The config at `path` as the commit checked out there (HEAD) holds it: its blob, read with git, never the file. A
+    checkout writes that file through filters and `.gitattributes` (a `working-tree-encoding` makes it UTF-16, an
+    `ident` rewrites it), which a pull request can change without changing the config's own entry, so the head check
+    would pass it. A path outside a git checkout, a commit without the config, an entry that is no regular file
+    (a symlink, a submodule, a folder), a blob the checkout does not hold or that is not UTF-8 JSON is a ConfigError,
+    never a crash. Nothing is fetched: a partial clone's missing blob would come from origin with the token the
+    checkout stored."""
+    full = os.path.abspath(path)
+    where = os.path.dirname(full)
+    while not os.path.isdir(where):   # the folder is missing when the commit has no config: git still says so
+        where = os.path.dirname(where)
+
+    def git(cwd, *a):
+        try:   # no lazy fetch (git 2.44+), and no transport at all for an older git that ignores the variable
+            r = (run or subprocess.run)(['git', *GIT_SAFE, '-C', cwd, *a], capture_output=True,
+                                        timeout=GIT_READ_SECONDS, env={**git_env(no_token_env()),
+                                                                       'GIT_NO_LAZY_FETCH': '1',
+                                                                       'GIT_ALLOW_PROTOCOL': 'none'})
+        except subprocess.TimeoutExpired:
+            raise config.ConfigError(f'{path}: git {a[0]} took over {GIT_READ_SECONDS} seconds') from None
+        except OSError as e:
+            raise config.ConfigError(f'{path}: cannot run git to read it: {e}') from None
+        return r.returncode, r.stdout, os.fsdecode(r.stderr or b'').strip()[:200]
+    code, out, err = git(where, 'rev-parse', '--show-toplevel')
+    if code != 0:
+        raise config.ConfigError(f'{path}: not in a git checkout ({err}): the queue reads the config as the '
+                                 'checked-out commit holds it, never the file')
+    top, head, rest = os.path.realpath(os.fsdecode(out.rstrip(b'\n'))), full, []
+    while os.path.realpath(head) != top:   # the path's own names below the top, links in them not followed
+        head, name = os.path.split(head)
+        if not name:
+            raise config.ConfigError(f'{path}: not inside the checkout {top}')
+        rest.insert(0, name)
+    rel = '/'.join(rest)
+    code, out, err = git(top, 'rev-parse', '--verify', '-q', 'HEAD^{commit}')
+    sha = os.fsdecode(out).strip()
+    if code != 0 or not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise config.ConfigError(f'{path}: the checkout {top} has no commit checked out')
+    code, out, err = git(top, 'ls-tree', '-z', sha, '--', rel)
+    records = [x for x in out.split(b'\0') if x]
+    if code != 0 or not records:
+        raise config.ConfigError(f'{path}: the commit checked out ({sha[:12]}) has no {rel}'
+                                 + (f': {err}' if err else ''))
+    meta, _, name = records[0].partition(b'\t')
+    fields = meta.decode('ascii', 'replace').split(' ')
+    if len(records) != 1 or name != os.fsencode(rel) or len(fields) != 3:
+        raise config.ConfigError(f'{path}: git ls-tree {sha[:12]} -- {rel} did not list one entry')
+    mode, kind, oid = fields
+    if mode not in ('100644', '100755'):   # git lists a blob in no other mode as a file
+        what = {'120000': 'symlink', '160000': 'submodule', '040000': 'tree'}.get(mode, kind[:20])
+        raise config.ConfigError(f'{path}: at {sha[:12]} {rel} is a {what} (mode {mode}), not a file (mode 100644 or '
+                                 '100755): make it a regular file')
+    code, out, err = git(top, 'cat-file', 'blob', oid)
+    if code != 0:
+        # a partial clone (a sparse checkout's) leaves out the blobs its pattern does not check out
+        partial = git(top, 'config', '--get-regexp', r'^(extensions\.partialclone|remote\..*\.promisor)$')[0] == 0
+        if partial and git(top, 'cat-file', '-e', oid)[0] != 0:
+            raise config.ConfigError(f'{path}: cannot read {rel} at {sha[:12]}: its blob {oid[:12]} is not in this '
+                                     'checkout (the queue fetches nothing). In a partial clone, check the config out: '
+                                     'the sparse-checkout pattern must match its name, which glob characters '
+                                     f'([ ] * ?), a leading ! or #, a trailing space or a backslash keep it from doing '
+                                     f'({err})')
+        raise config.ConfigError(f'{path}: cannot read {rel} at {sha[:12]}: {err}')
+    return config.parse(out, f'{path} at {sha[:12]}')
 
 
 class Queue:
@@ -296,8 +761,12 @@ class Queue:
 
     def __init__(self, repo, cfg, state, cache, lock, sleep=time.sleep, read_token=None, write_token=None):
         self.repo, self.cfg, self.state, self.cache, self.lock, self.sleep = repo, cfg, state, cache, lock, sleep
+        self.known = state + FSCK_KNOWN
         self.read_token, self.write_token, self.said = read_token, write_token, set()
         self.remote = f'https://github.com/{repo}.git'
+        self.later, self.fetch_error, self.fsck_said = None, '', ''   # check_later, fetch, objects_problem
+        self.rebuilt = False   # this run downloaded the cache from scratch (fetch_again): never a second time
+        self.unknown = 'the queue could not fetch from GitHub'   # why fetch_checked knows nothing (PR comment words)
         self.review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association,
                                   cfg.lens_author_associations)
 
@@ -366,20 +835,28 @@ class Queue:
             self.said.add(key)
             print(text)
 
-    def git(self, *a):
-        """git in the cache. It only fetches: with the run's read token, and with no token at all when there is none
-        (never gh's own login of the machine)."""
+    def git(self, *a, fetch=False, errors='strict', repo=None):
+        """git in the cache, with the run's read token, and with no token at all when there is none (never gh's own
+        login of the machine). `fetch`: the call fetches from the remote (only Queue.fetch's two), so it keeps what of
+        the job's GIT_RUN the remote may need; every other call runs none of it (git_env). `errors`: how git's output
+        is decoded (UTF-8). `repo`: another repository than the cache (the merge check's own: holds_checked)."""
+        argv, env = self.git_call(*a, fetch=fetch, repo=repo)
+        return subprocess.run(argv, text=True, encoding='utf-8', errors=errors, capture_output=True, env=env)
+
+    def git_call(self, *a, fetch=False, repo=None):
+        """The argv and environment of Queue.git's call."""
         token = self.read_token
-        env = self.gh_env(token) if token else {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
-        return subprocess.run(['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', self.cache, *a],
-                              text=True, capture_output=True, env={**env, 'GIT_TERMINAL_PROMPT': '0'})
+        env = self.gh_env(token) if token else no_token_env()
+        return (['git', *GIT_SAFE, *(GIT_AUTH if token else GIT_AUTH[:2]), '--git-dir', repo or self.cache, *a],
+                git_env(env, self.remote if fetch else None))
 
     # --- step 1 and 4: the queue's own git repository -------------------------------------------------------------
     def cache_problem(self):
         """Why the cache is not the one the queue made, or None. git runs there with the token in its environment, and
         its objects decide what is re-armed: only a directory of this user that no one else can enter, whose config is
-        CACHE_CONFIG, that holds none of the files that make git read other objects or history (UNTRUSTED_FILES) and
-        that is a bare repository, counts."""
+        CACHE_CONFIG and whose HEAD is CACHE_HEAD naming no commit (a HEAD is an attribute source in a bare repository),
+        that holds none of the files that make git read other objects or history (UNTRUSTED_FILES) and that is a bare
+        repository, counts."""
         try:
             st = os.lstat(self.cache)
             if not stat.S_ISDIR(st.st_mode):
@@ -389,6 +866,9 @@ class Queue:
             with open(os.path.join(self.cache, 'config'), opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
                 if f.read() != CACHE_CONFIG:
                     return 'has a config the queue did not write'
+            with open(os.path.join(self.cache, 'HEAD'), opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as f:
+                if f.read() != CACHE_HEAD:
+                    return 'has a HEAD the queue did not write'
             for name in UNTRUSTED_FILES:
                 if os.path.lexists(os.path.join(self.cache, name)):
                     return f'holds {name}, which the queue never writes'
@@ -396,6 +876,8 @@ class Queue:
             return f'cannot be checked ({e})'
         if self.git('rev-parse', '--is-bare-repository').stdout.strip() != 'true':
             return 'is not a bare git repository'
+        if self.git('rev-parse', '-q', '--verify', 'HEAD').returncode != 1:   # 1: no such commit, as the queue made it
+            return 'has a branch at HEAD: HEAD names a commit (the queue never makes its branch)'
         return None
 
     def own_cache(self):
@@ -427,18 +909,88 @@ class Queue:
         except OSError as e:
             print(f'could not make {new}: {e}')
             return False
-        r = subprocess.run(['git', *GIT_SAFE, 'init', '-q', '--bare', '--template=', new], text=True,
-                           capture_output=True, env=no_token_env())
-        if r.returncode != 0:
-            print(f'could not make {self.cache}: {r.stderr.strip()[:300]}')
+        problem = init_bare(new)
+        if problem:
+            print(f'could not make {self.cache}: {problem}')
             return False
         try:
-            write_text(os.path.join(new, 'config'), CACHE_CONFIG)
             os.rename(new, self.cache)
         except OSError as e:   # something made the cache between the two steps: the next run sets it aside
             print(f'could not move the new repository to {self.cache}: {e}')
             return False
         return True
+
+    def objects_problem(self, r=None):
+        """Why the cache's objects are not what GitHub sent, or None. git checks an object's hash on only some reads
+        (rev-parse, merge-base and merge-tree of a commit; never a tree or blob merge-tree reads, nor a commit rev-list
+        walks), and the cache is kept between runs: a tree or blob an earlier job wrote under the name of one side's
+        (a loose object where the real one is loose too, as a small fetch leaves it, or a pack of its own) makes a real
+        conflict merge clean. git fsck checks the hash of every object, loose and packed, and that each ref's history
+        is complete; an old format GitHub serves is no problem (FSCK_FORMAT_IDS). It reads every object, on one core:
+        about 30 s for 270,000 objects. `r`: the answer of a git fsck already run (check_later). Keeps git fsck's
+        lines in self.fsck_said (fetch_checked compares them)."""
+        if r is None:
+            r = self.git(*FSCK_IGNORE, 'fsck', '--no-dangling', '--no-reflogs', '--no-progress', errors='replace')
+        if r.returncode == 0:
+            self.fsck_said = ''
+            return None
+        said = [line for line in (r.stderr + r.stdout).splitlines() if line.strip()]
+        self.fsck_said = '\n'.join(sorted(set(said)))
+        return f'has objects git fsck finds broken or missing ({said[0][:200] if said else f"exit {r.returncode}"})'
+
+    def check_later(self):
+        """objects_problem's git fsck, started in the background (update(), right after its fetch): it reads the cache
+        while the disarm, the branch update and the wait for the new head run, none of which touches the cache. The
+        next fetch_checked waits for its answer before it fetches, and update() stops it if the run ends first."""
+        argv, env = self.git_call(*FSCK_IGNORE, 'fsck', '--no-dangling', '--no-reflogs', '--no-progress')
+        try:
+            self.later = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                          encoding='utf-8', errors='replace')
+        except OSError as e:   # checked in the foreground then
+            print(f'could not start git fsck in the background: {e}')
+
+    def checked_before(self):
+        """The background check's answer: None when none ran, '' for a healthy cache, else the problem."""
+        p, self.later = self.later, None
+        if p is None:
+            return None
+        out, err = p.communicate()
+        return self.objects_problem(subprocess.CompletedProcess(p.args, p.returncode, out, err)) or ''
+
+    def stop_check(self):
+        """The background check, if one still runs, stopped and reaped."""
+        p, self.later = self.later, None
+        if p is not None:
+            p.kill()
+            p.communicate()
+
+    def known_broken(self):
+        """What the cache's check said right after its download from scratch (self.known), or None. Only a record the
+        queue wrote counts: a regular file of this user that no one else can write, never a link (as STATE). Any
+        other is no record, so the cache is downloaded once more and the record written again."""
+        try:
+            with open(self.known, 'rb', opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW | os.O_NONBLOCK)) as f:
+                info = os.fstat(f.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                    return None
+                return f.read().decode('utf-8', 'replace')
+        except OSError:
+            return None
+
+    def keep_known(self, said):
+        try:
+            write_text(self.known, said)
+        except OSError as e:
+            print(f'could not keep what the check of {self.cache} said in {self.known}: {e}')
+
+    def forget_known(self):
+        """A check the cache passed: an older record says nothing about this cache any more."""
+        try:
+            os.remove(self.known)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f'could not delete {self.known}: {e}')
 
     def has(self, sha):
         return bool(SHA.fullmatch(sha or '')) and self.git('cat-file', '-e', sha + '^{commit}').returncode == 0
@@ -447,32 +999,185 @@ class Queue:
         """The base branch (refs/queue/base), PR n's head and `shas` into the cache. True when every sha is there,
         False when the refs came but a sha is not on GitHub, None when nothing could be fetched (no cache, a git or
         network error: nothing is known)."""
+        self.fetch_error = ''   # git fetch's words when it failed (fetch_checked)
         if not re.fullmatch(r'[\w./-]+', base or '') or not all(SHA.fullmatch(s or '') for s in shas):
             return False
         if not self.own_cache():
             return None
-        r = self.git('fetch', '-q', '--no-tags', self.remote, f'+refs/heads/{base}:refs/queue/base',
-                     f'+refs/pull/{n}/head:refs/queue/pr{n}')
+        r = self.git(*NO_DETACH, 'fetch', '-q', '--no-tags', self.remote, f'+refs/heads/{base}:refs/queue/base',
+                     f'+refs/pull/{n}/head:refs/queue/pr{n}', fetch=True)
         if r.returncode != 0:
-            print(f'#{n}: git fetch failed: {r.stderr.strip()[:300]}')
+            print(f'#{n}: {fetch_failed(r.stderr, READ_LOGIN)}')
+            self.fetch_error = r.stderr
             return None
         missing = [s for s in shas if not self.has(s)]
         if missing:   # a read commit no ref reaches any more (GitHub keeps it)
-            r = self.git('fetch', '-q', '--no-tags', self.remote, *missing)
+            r = self.git(*NO_DETACH, 'fetch', '-q', '--no-tags', self.remote, *missing, fetch=True)
             if r.returncode != 0 and not GONE_RE.search(r.stderr):   # a network error is no "not on GitHub"
-                print(f'#{n}: git fetch of {", ".join(s[:12] for s in missing)} failed: {r.stderr.strip()[:300]}')
+                print(f'#{n}: {fetch_failed(r.stderr, READ_LOGIN)} (of {", ".join(s[:12] for s in missing)})')
+                self.fetch_error = r.stderr
                 return None
         return all(self.has(s) for s in shas)
 
+    def fetch_checked(self, base, n, *shas, later=False):
+        """fetch, with the cache's objects checked (objects_problem) before anything reads them: True, False or None
+        as fetch returns them, and None for a cache that is still broken after a download from scratch. A cache found
+        broken (by this run's earlier background check, after the fetch, or after a fetch that failed for a cause
+        that is neither the network nor the login) is set aside and downloaded from scratch once, then checked again.
+        A cache whose check gives the same lines as right after its own download from scratch (self.known) is not
+        downloaded again, and neither is one this run already downloaded from scratch (self.rebuilt: it passed its
+        check then, so it was written since; nothing is kept in self.known, and the next run downloads it). `later`:
+        the check after a good fetch runs in the background (check_later). self.unknown says why None, in words for a
+        PR comment (no runner paths). What the check passes is still not what the merge check reads: that runs on a
+        copy whose hashes are checked as it is made (holds_checked)."""
+        self.unknown = 'the queue could not fetch from GitHub'
+        before = self.checked_before()
+        problem = before
+        if not problem:
+            got = self.fetch(base, n, *shas)
+            if got is None and self.fetch_error and not (NO_LOGIN_RE.search(self.fetch_error)
+                                                         or NETWORK_RE.search(self.fetch_error)):
+                problem = self.objects_problem()
+            elif got and before is None:
+                if later:
+                    self.check_later()
+                    return got
+                problem = self.objects_problem()
+            if not problem:
+                return got
+        if self.fsck_said and self.fsck_said == self.known_broken():
+            print(f'#{n}: {self.cache} {problem}: the same way as right after its download from scratch, so the '
+                  'history GitHub serves fails this git fsck. Not downloaded again and not merged in: a person must '
+                  'look')
+            self.unknown = ("the queue's git cache fails git fsck the same way as right after a download from "
+                            "GitHub (the run's log says why), so a person must look")
+            return None
+        if self.rebuilt:
+            print(f'#{n}: {self.cache} {problem}, after this run already downloaded it from scratch: not downloaded a '
+                  'second time in one run and not merged in')
+            self.unknown = ("the queue's git cache fails git fsck again after this run fetched it again from GitHub "
+                            "(the run's log says why)")
+            return None
+        return self.fetch_again(base, n, shas, problem)
+
+    def fetch_again(self, base, n, shas, problem):
+        """The cache, which `problem`, set aside and downloaded from scratch, then checked (objects_problem): as
+        fetch returns, and None for one that is still broken (its lines kept: self.known). At most once per run:
+        the callers ask self.rebuilt first."""
+        self.rebuilt = True
+        print(f'{self.cache} {problem}: rebuilding it')
+        got = self.fetch(base, n, *shas) if set_aside(self.cache) else None
+        if got and (problem := self.objects_problem()):
+            print(f'#{n}: {self.cache}, fetched again from GitHub, still {problem}: not merged in')
+            self.keep_known(self.fsck_said)
+            self.unknown = ("the queue's git cache fails git fsck even when fetched again from GitHub "
+                            "(the run's log says why)")
+            return None
+        return got
+
     def same_change(self, base, n, head, read):
         """Step 4's check (holds) on GitHub's commits: True, False (any other content or a git error), or None when
-        nothing could be fetched (the caller keeps STATE and tries again). Only full shas count."""
+        nothing is known (nothing could be fetched, or the cache's objects are not GitHub's: the caller keeps STATE
+        and tries again). Only full shas count.
+
+        The check runs on a copy of the objects it reads, each hashed as it is copied (holds_checked). An object that
+        is missing or not what its name says, though git fsck passed, was written while this run went on: the cache is
+        downloaded from scratch and the check made again, as for a cache git fsck finds broken. One that fails in a
+        cache this run downloaded from scratch (for this or, before, for its git fsck: self.rebuilt, so one download
+        per run) says None, and its line is kept (self.known) so the next run does not download it all once more."""
         if not (SHA.fullmatch(head or '') and SHA.fullmatch(read or '')):
             return False
         if head == read:
             return True
-        got = self.fetch(base, n, head, read)
-        return holds(self.git, head, read) if got else got
+        got = self.fetch_checked(base, n, head, read)   # the whole cache: finds and rebuilds a broken one
+        for _ in range(2):   # the check, and once more after the run's one download from scratch
+            if not got:
+                return got
+            try:
+                same = self.holds_checked(head, read)
+            except OSError as e:   # no room, no folder, or a reader that hangs: nothing is known, the cache is kept
+                print(f'#{n}: could not copy the objects of the merge check out of {self.cache}: {e}')
+                self.unknown = "the queue could not copy the objects of its merge check (the run's log says why)"
+                return None
+            except Changed as e:
+                problem = (f'has an object the merge check reads that is missing or not what its name says, although '
+                           f'git fsck passed ({e})')
+                said = f'merge check: {e}'
+                if self.rebuilt or said == self.known_broken():
+                    if self.rebuilt:
+                        print(f'#{n}: {self.cache}, fetched again from GitHub, still {problem}: not merged in')
+                        self.keep_known(said)
+                    else:
+                        print(f'#{n}: {self.cache} {problem}: the same way as right after its download from '
+                              'scratch. Not downloaded again and not merged in: a person must look')
+                    self.unknown = ("the queue's git cache has an object that is missing or not what its name says, "
+                                    "although git fsck passed and even when fetched again from GitHub (the run's log "
+                                    "says why), so a person must look")
+                    return None
+                got = self.fetch_again(base, n, (head, read), problem)
+            else:
+                self.forget_known()
+                return same
+        # Not reached while fetch_again counts its download (self.rebuilt). Should that ever break: nothing is known.
+        print(f'#{n}: the merge check of {self.cache} failed again after a download from scratch: not merged in')
+        self.unknown = "the queue's merge check failed again after its git cache was fetched again from GitHub"
+        return None
+
+    def holds_checked(self, head, read):
+        """holds() in a repository of its own (CACHE + MERGE_COPY, deleted before this returns) that holds only what
+        this call copied out of the cache and hashed (Copy): every commit head, read and the base reach, and for each
+        merge-tree the trees and blobs that merge can read, copied right before it. Should git still miss an object
+        there, all of the merged commits' trees are copied and the merge is run once more; a merge git calls clean
+        with an error on stderr is never taken as clean. Changed: an object is not what its name says. OSError: the
+        copy cannot be made. A folder a killed run left is deleted first."""
+        base = self.git('rev-parse', '--verify', '-q', 'refs/queue/base^{commit}').stdout.strip()
+        if not SHA.fullmatch(base):
+            raise Changed('refs/queue/base names no commit')
+        to = self.cache + MERGE_COPY
+        if not set_aside(to):
+            raise OSError(f'{to} is in the way')
+        try:
+            os.mkdir(to, 0o700)   # new, and no one else can enter it
+            os.chmod(to, 0o700)
+            problem = init_bare(to)
+            if problem:
+                raise OSError(problem)
+            copy = Copy(*self.git_call('cat-file', '--batch'), to)
+            try:
+                copy.take_commits(head, read, base)
+
+                def git(*a, **kw):
+                    for arg in a:   # git names a commit's tree (holds: rev-parse) only when the tree is there
+                        if arg.endswith('^{tree}') and arg[:-len('^{tree}')] in copy.tree_of:
+                            copy.tree(copy.tree_of[arg[:-len('^{tree}')]])
+                    return self.git(*a, repo=to, **kw)
+
+                def merge(p, side):
+                    bases = bases_of(git, p, side)
+                    if bases is None:
+                        print(f'::warning::pr-queue: {p[:12]} and {side[:12]} have more than {MERGE_BASES} merge '
+                              'bases (with those of each pair of them): not merged, so the head is not taken as the '
+                              'change read')
+                        return subprocess.CompletedProcess(['git', 'merge-tree'], 1, '', '')
+                    roots = [copy.tree_of[c] for c in (p, side, *bases)]
+                    copy.take_merged(roots)
+                    m = merge_tree(git, p, side)
+                    # A merge or a conflict says nothing on stderr. Anything else with a merge base: git stopped, or
+                    # went on without an object (a git that cannot read a commit's tree merges it as an empty one).
+                    if bases and (m.returncode not in (0, 1) or m.stderr.strip()):
+                        for root in roots:
+                            copy.take_whole(root)
+                        m = merge_tree(git, p, side)
+                    if m.returncode == 0 and m.stderr.strip():
+                        print(f'::warning::pr-queue: git merge-tree of {p[:12]} and {side[:12]} called the merge clean '
+                              f'and said {m.stderr.strip()[:300]!r}: not taken as a clean merge')
+                        m.returncode = 1
+                    return m
+                return holds(git, head, read, base=base, merge=merge)
+            finally:
+                copy.close()
+        finally:
+            remove_old(to)
 
     # --- which armed PRs wait, and why ------------------------------------------------------------------------------
     def red_checks(self, pr):
@@ -841,12 +1546,15 @@ class Queue:
                   f'and re-arm if the new head stays the change read at {(read or "?")[:12]}'
                   + ('' if read else f' ({why})'))
             return 0
-        fetched = bool(read) and self.fetch(base, n, read)
-        if read and fetched is None:   # nothing changed yet: an armed PR stays as it was, the next run tries again
-            print(f'#{n}: could not fetch from GitHub (see above): nothing changed, the next run tries again')
-            return 1
-        self.write_state({'repo': self.repo, 'pr': n, 'old': old, 'base': base, 'read': read})
-        code = self.update_off(n, old, base, read, fetched, why)
+        try:
+            fetched = bool(read) and self.fetch_checked(base, n, read, later=True)
+            if read and fetched is None:   # nothing changed yet: an armed PR stays as it was, the next run tries again
+                print(f'#{n}: {self.unknown} (see above): nothing changed, the next run tries again')
+                return 1
+            self.write_state({'repo': self.repo, 'pr': n, 'old': old, 'base': base, 'read': read})
+            code = self.update_off(n, old, base, read, fetched, why)
+        finally:
+            self.stop_check()
         if code != SILENT:
             self.drop_state()
         return code
@@ -878,7 +1586,7 @@ class Queue:
             return SILENT
         same = self.same_change(base, n, head, read)
         if same is None:
-            print(f'#{n}: could not fetch {head[:12]} to check it: STATE stays, the next run finishes it')
+            print(f'#{n}: {self.unknown}, so {head[:12]} was not checked: STATE stays, the next run finishes it')
             return SILENT
         if not same:
             return self.leave_off(n, f'the new head {head[:12]} is not exactly the change read at {read[:12]} merged '
@@ -962,8 +1670,8 @@ class Queue:
                                      f'off at {old}; {why or "it stored no read commit"}, so it was not re-armed: which '
                                      'head the review vouches for is unclear.', self.read_advice(why or ''))
         elif same is None:   # never OFF and silent: say it once on the PR, as for a gh error
-            print(f'#{n}: could not fetch from GitHub to check {head[:12]}: trying again next run, no other PR meanwhile')
-            return self.tell_once(st, n, f'the queue could not fetch {head[:12]} from GitHub to check it')
+            print(f'#{n}: {self.unknown}, so {head[:12]} was not checked: trying again next run, no other PR meanwhile')
+            return self.tell_once(st, n, f'{self.unknown}, so it could not check {head[:12]}')
         elif same:
             r = self.arm(n, head)
             if r.returncode == 0:
@@ -1103,6 +1811,18 @@ class Queue:
         return 0
 
 
+def own_name(path):
+    """`path` without what follows its last name (`/`, `/.`): the queue makes its other files by adding to the path
+    (CACHE.merge, CACHE.new, CACHE.old-*, STATE.lock, STATE.tmp, STATE.fsck-known), and after `CACHE/` those would be
+    inside the cache, where set_aside deletes what is in the way. Nothing else is changed: a `..` is the kernel's to
+    follow (it may come after a link)."""
+    while True:
+        head, tail = os.path.split(path)
+        if tail not in ('', '.') or head == path:
+            return path
+        path = head
+
+
 def cli(argv=None, env=None):
     env = os.environ if env is None else env
     p = argparse.ArgumentParser(prog='pr_queue.py', description='Merge queue: one waiting PR per run (README.md).')
@@ -1113,7 +1833,8 @@ def cli(argv=None, env=None):
     p.add_argument('--lock-file', help='absolute; default: the state file + .lock')
     p.add_argument('--dry-run', action='store_true', help='say what a run would do; write nothing')
     a = p.parse_args(argv)
-    lock = a.lock_file or a.state_file + '.lock'
+    a.state_file, a.cache = own_name(a.state_file), own_name(a.cache)
+    lock = own_name(a.lock_file or a.state_file + '.lock')
     problems = []
     if env.get('RUNNER_ENVIRONMENT') == 'github-hosted':
         problems.append('this is a GitHub-hosted runner: its disk goes with the job, and with it the plan of a run that '
@@ -1124,10 +1845,13 @@ def cli(argv=None, env=None):
     for flag, path in (('--state-file', a.state_file), ('--cache', a.cache), ('--lock-file', lock)):
         if not os.path.isabs(path):
             problems.append(f'{flag} {path!r} is not an absolute path')
+        elif os.path.basename(path) in ('', '..'):   # / or a path that ends in ..
+            problems.append(f'{flag} {path!r} does not end in a name of its own: the queue makes its other files '
+                            'beside it, by adding to that name')
         elif work and (os.path.realpath(path) + os.sep).startswith(work + os.sep):
             problems.append(f'{flag} {path} is inside the job\'s workspace, which the next checkout empties')
     try:
-        cfg = config.load(a.config)
+        cfg = committed_config(a.config)
     except config.ConfigError as e:
         problems.append(str(e))
     read, write = env.get(READ_TOKEN) or '', env.get(WRITE_TOKEN) or ''

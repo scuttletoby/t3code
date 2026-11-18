@@ -38,6 +38,7 @@ class Config:
     update_when_base_was_red: bool = False
     head_check_app: int = None
     delete_branch: bool = False   # read and checked, never used: the queue deletes no branch (README.md, "Config")
+    review: object = None         # review_config.ReviewRules, or None without the key (head_check judges by it)
 
     def ready(self, n):
         """The command that re-arms PR n after a lens read, as the project writes it."""
@@ -63,6 +64,12 @@ def _no_duplicates(pairs):
 
 def _int(lo, hi):
     return lambda v: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+
+
+def _review(v):
+    """The `review` block's own parser names its problems (a ConfigError); imported here, as it imports this module."""
+    import review_config
+    return review_config.parse_review(v, 'review') is not None
 
 
 # key: (required, check, what a valid value is)
@@ -92,11 +99,18 @@ KEYS = {
     'head_check_app': (False, _int(1, 2 ** 53),
                        'the id of the GitHub App that alone posts head_check (the head gate): the queue then counts '
                        'only that App\'s check runs of that name'),
+    'review': (False, _review, 'the review rules block (README.md, "Review rules")'),
 }
 
 
 def parse(text, where='config'):
-    """A Config from the JSON text, or ConfigError naming every problem at once."""
+    """A Config from the JSON text (str, or bytes that must be UTF-8), or ConfigError naming every problem at once."""
+    if isinstance(text, bytes):
+        try:
+            text = text.decode('utf-8')
+        except UnicodeDecodeError as e:   # a ValueError, but not JSON's: say what it is, never crash on it
+            raise ConfigError(f'{where}: not UTF-8 text ({e.reason} at byte {e.start}): commit the config as UTF-8 '
+                              'JSON') from None
     try:
         raw = json.loads(text, object_pairs_hook=_no_duplicates)
     except ConfigError as e:
@@ -110,8 +124,14 @@ def parse(text, where='config'):
         if key not in raw:
             if required:
                 problems.append(f'{key} is missing: {what}')
-        elif not ok(raw[key]):
-            problems.append(f'{key} is {json.dumps(raw[key])[:80]}: must be {what}')
+        else:
+            try:
+                good = ok(raw[key])
+            except ConfigError as e:   # a block with its own parser (review) names its own problems
+                problems.append(str(e))
+                continue
+            if not good:
+                problems.append(f'{key} is {json.dumps(raw[key])[:80]}: must be {what}')
     if not problems and raw['head_check'] not in raw['required_checks']:
         problems.append(f'head_check {raw["head_check"]!r} is not one of required_checks')
     if not problems and raw.get('poll_seconds', 5) > raw.get('wait_seconds', 60):
@@ -119,15 +139,10 @@ def parse(text, where='config'):
     if problems:
         raise ConfigError(f'{where}: ' + '; '.join(problems))
     override = raw.pop('override')
+    if 'review' in raw:
+        import review_config
+        raw['review'] = review_config.parse_review(raw['review'], 'review')
     return Config(required_checks=frozenset(raw.pop('required_checks')), bot_logins=tuple(raw.pop('bot_logins')),
                   lens_author_associations=tuple(raw.pop('lens_author_associations')),
                   override_prefix=override['prefix'], override_association=override['author_association'], **raw)
 
-
-def load(path):
-    try:
-        with open(path, encoding='utf-8') as f:
-            text = f.read()
-    except OSError as e:
-        raise ConfigError(f'{path}: cannot read it: {e}') from None
-    return parse(text, path)

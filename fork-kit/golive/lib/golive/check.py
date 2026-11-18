@@ -1,4 +1,5 @@
-"""The command line (`check`, `settle`, `copy`; coldcopy.py has the copy) and `t3-golive check`: may this T3 home move to the target build now?
+"""The command line (`check`, `settle`, `copy`, `rehearse`; coldcopy.py and rehearse.py have the last two) and
+`t3-golive check`: may this T3 home move to the target build now?
 
 check is read only: it never stops, starts or writes to a T3 home, never opens its database (the target build's
 read-only report does that) and never runs a `t3` from PATH. It writes only the kit's own lock file.
@@ -9,7 +10,7 @@ Exit 2: the kit cannot run here (no config, no adapter for this OS).
 settle records that the owner put the home right after a run that stopped half-way or ended with an error (or
 moves a damaged journal aside), so changing runs may start again. It writes only the kit's own journal.
 """
-import argparse, json, os, sys
+import argparse, hashlib, json, os, sys
 
 import machine_file
 from golive import config as config_mod, journal, live, osadapter
@@ -71,7 +72,9 @@ def _journal(cfg, add, info, own_id):
     last = runs[-1] if runs else None
     if last is not None and journal.needs_settling(last):
         return add('journal', False, f'{journal.describe(last)}; {journal.SETTLE_HINT}')
-    if last is not None and last['end'] is not None and last['end']['result'] != 'ok' and not last['settled']:
+    if last is not None and last.get('scratch') and (last['end'] or {}).get('result') != 'ok':
+        info.append(f'last run: {journal.describe(last)}; it changed only its own clone: nothing to settle')
+    elif last is not None and last['end'] is not None and last['end']['result'] != 'ok' and not last['settled']:
         info.append(f'last run: {last["command"]} ended {last["end"]["result"]} before its first step: '
                     f'{last["end"]["detail"]}')
     elif last is not None and last['end'] is None and not last['settled']:
@@ -175,17 +178,60 @@ def _checks(cfg, adapter, result, add, info, own_id):
     _disk(cfg, db_bytes, add)
 
     if binary is not None:
-        try:
-            report = live.fork_report(binary, cfg.home)
-            _report(cfg, report, result, add)
-        except live.NotLive as e:
-            add('report', False, str(e))
+        # Fork #180: the report reads the home only beside a T3 every check above found running steadily. A reader
+        # while T3 stops keeps SQLite from tidying its WAL at the stop (nothing is lost, but the WAL with its
+        # frames and -shm stay, and a copy takes the WAL without its -shm).
+        unsteady = [c['name'] for c in result['checks'] if not c['ok'] and c['name'] in STEADY]
+        if server is None or unsteady:
+            add('report', False, f'not run: T3 is not running steadily here ({", ".join(unsteady)} failed); the '
+                                 'report never reads the home while T3 may be stopping')
+        else:
+            try:
+                report = live.fork_report(binary, cfg.home)
+                _report(cfg, report, result, add)
+            except live.NotLive as e:
+                add('report', False, str(e))
+            changed = server_changed(cfg, adapter, server)
+            if changed is not None:
+                add('T3 steady during the report', False, f'{changed}: T3 stopped, restarted or began an update '
+                                                          'while the report read its home, so its answer is not '
+                                                          'used; run check again once T3 runs steadily')
+                for key in REPORT_ANSWERS:  # not used, so not handed on either (--json, and any caller)
+                    result.pop(key, None)
 
     ok = all_ok()
     result['ok'] = ok
     if ok:
         result['plan'] = _plan(cfg, server['version'], db_bytes, result.get('counts'))
     return (0 if ok else 1), result
+
+
+STEADY = ('boot service', 'live server', 'no update in flight', 'no half switch', 'no markers')
+REPORT_ANSWERS = ('counts', 'pendingMigrations', 'providers')  # what _report takes from the report into the result
+
+
+def server_changed(cfg, adapter, server):
+    """Why the live server is not the one the checks passed (None when it still is): the service is no longer
+    active (stopping included), its server or version changed, an update is pending or a marker appeared. The
+    auto-updater keeps the copy's quiet contract, so it may restart T3 on a newer build (and migrate its database)
+    while a copy waits, and anyone may stop T3 while the report reads."""
+    try:
+        svc = adapter.service()
+        now = live.live_server(cfg.home, svc['mainPid']) if svc['active'] else None
+        active, pending = live.service_state(cfg.home)
+    except (live.NotLive, osadapter.AdapterError) as e:
+        return f'the live server cannot be read again: {e}'
+    if now is None:
+        return f'{osadapter.UNIT} is not active any more'
+    if (now['pid'], now['version']) != (server['pid'], server['version']):
+        return (f'the live server changed (t3 {server["version"]} pid {server["pid"]} -> t3 {now["version"]} pid '
+                f'{now["pid"]})')
+    if active != server['version']:
+        return f'the service state now names t3 {active}, not the live {server["version"]}'
+    if pending:
+        return f'an update to {pending.get("targetVersion")} is pending'
+    found = live.markers(cfg.home)
+    return f'markers appeared: {", ".join(found)}' if found else None
 
 
 def _disk(cfg, db_bytes, add):
@@ -226,6 +272,14 @@ def _report(cfg, report, result, add):
     db = report.get('database') if isinstance(report.get('database'), dict) else {}
     result['counts'] = db.get('counts')
     result['pendingMigrations'] = db.get('pendingMigrations')
+    result['providers'] = providers_sum(report)  # switch's verify: the same after as before
+
+
+def providers_sum(report):
+    """SHA256 of the report's provider instances (only the sum: the journal and --json never hold settings)."""
+    settings = report.get('settings') if isinstance(report.get('settings'), dict) else {}
+    text = json.dumps(settings.get('providerInstances'), sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _plan(cfg, live_version, db_bytes, counts):
@@ -233,8 +287,9 @@ def _plan(cfg, live_version, db_bytes, counts):
         f'stop {osadapter.UNIT} at a quiet point (later command)',
         f'cold copy of the database ({db_bytes // MB} MB) and small files to a new folder in {cfg.backup_dir}',
         f'update {live_version} -> {cfg.target_version} with the staged build, then verify'
-        + (f' (threads now: {counts.get("threads")}, projects: {counts.get("projects")})'
-           if isinstance(counts, dict) else ''),
+        + (f' (the report counts {counts.get("threads")} threads (sub-agent and archived ones included, all '
+           f'projects), {counts.get("projects")} projects; verify compares report with report, never with t3 thread '
+           'list)' if isinstance(counts, dict) else ''),
         'expected downtime: unknown until a rehearsal of this target has run',
     ]
 
@@ -286,9 +341,50 @@ def main(argv, out=sys.stdout, err=sys.stderr):
                                    'Runs detached (a transient unit) unless --here.')
     p.add_argument('--owner-says-go', action='store_true',
                    help='do not wait for a quiet point (the owner says now is fine)')
-    p.add_argument('--here', action='store_true', help='run in this process (refused inside the boot service)')
+    p.add_argument('--here', action='store_true',
+                   help='what the detached unit runs: refused anywhere but inside its own t3-golive-switch unit')
+    p = sub.add_parser('back', help='the way back from a fork build: say which of W1-W3 is possible, or take one',
+                       description='Without --way: read only, says which way back is possible now and why. W1 '
+                                   'restores the newest copy and goes back to the build it was taken under (loses '
+                                   'everything since the copy); W2 goes to the upstream nightly the fork build is cut '
+                                   'from; W3 to a newer upstream stable. Runs detached unless --here.')
+    p.add_argument('--way', choices=('w1', 'w2', 'w3'))
+    p.add_argument('--lose-work-since', metavar='TIME', help="W1 by hand: the copy's time, as `back` prints it")
+    p.add_argument('--here', action='store_true',
+                   help='what the detached unit runs: refused anywhere but inside its own t3-golive-switch unit')
+    sub.add_parser('status', help='read only: is T3 up and right?', description='Read only: the light checks of '
+                   'verify, the fork features that are on, and the copies on disk. Exit 0 only when all pass.')
+    p = sub.add_parser('rehearse', help='try the target build on a clone of a copy, in its own home and port',
+                       description='R0-R5 on a clone of a finished copy (the newest, or --copy): preflights, the '
+                                   'migration, `serve --hold-work`, report-to-report checks, the way back. Never '
+                                   'touches the live T3 home; the result is journalled.')
+    p.add_argument('--copy', help='the copy folder to rehearse on (default: the newest in backupDir)')
+    p.add_argument('--port', type=int, help='the rehearsal server port (default: a free one)')
+    p.add_argument('--json', action='store_true', help='print the result as JSON')
     p = sub.add_parser('guard', help=argparse.SUPPRESS)
     p.add_argument('--run', required=True)
+    p = sub.add_parser('switch', help='move the live T3 to the target build, verify it, go back on its own if not',
+                       description='Needs a passed, fresh rehearsal of this staged build (its archive sha256) from '
+                                   'the live build. Keeps the old runtime outside the home, then at a quiet point: '
+                                   'stop the boot service, cold copy its userdata to a new folder in backupDir, '
+                                   'check the old build can start on the copy, install the staged build it '
+                                   'rehearsed, update to it and verify (the build that runs is checked byte for '
+                                   'byte). A failed or late verify goes back on its own (W1, once); a guard unit '
+                                   'puts T3 back if the run dies. Runs detached unless --here.')
+    p.add_argument('--owner-says-go', action='store_true',
+                   help='do not wait for a quiet point (the owner says now is fine)')
+    p.add_argument('--here', action='store_true',
+                   help='what the detached unit runs: refused anywhere but inside its own t3-golive-switch unit')
+    p = sub.add_parser('switch-guard', help='after a switch run that died: put T3 back as its journal says',
+                       description='What the switch guard runs (its unit and timer). Waits for the kit lock, then '
+                                   'acts only if the given switch run is the last run and has no end line (it was '
+                                   'killed): starts the old build again, or runs W1 once, never after a W1 stopped '
+                                   'T3. After a reboot it runs that W1 only with --lose-work-since (the target may '
+                                   'have served work since). Going back by hand is `t3-golive back`.')
+    p.add_argument('--run', required=True, help='the switch run id (in the journal)')
+    p.add_argument('--lose-work-since', metavar='TIME',
+                   help="after a reboot, to let it run W1: the switch copy's time, as `t3-golive back` prints it")
+    p.add_argument('--wait', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         cfg = config_mod.load()
@@ -298,11 +394,24 @@ def main(argv, out=sys.stdout, err=sys.stderr):
         return 2
     if args.command == 'settle':
         return _settle(cfg, args.reason, out, err)
+    if args.command == 'rehearse':  # it never stops or starts the boot service: no adapter needed
+        from golive import rehearse
+        return rehearse.main(cfg, args.copy, args.port, args.json, out, err)
     try:
         adapter = osadapter.for_this_os()
     except osadapter.Unsupported as e:
         print(f't3-golive: {e}', file=err)
         return 2
+    if args.command in ('back', 'status'):
+        from golive import back  # it uses this module
+        return back.main(args, cfg, adapter, out, err)
+    if args.command in ('switch', 'switch-guard'):
+        from golive import switch
+        if args.command == 'switch-guard':
+            switch.guard(cfg, adapter, args.run, args.wait, say=lambda line: print(line, file=out, flush=True),
+                         lose_work_since=args.lose_work_since)
+            return 0
+        return switch.main_switch(cfg, adapter, args.here, args.owner_says_go, out, err)
     if args.command in ('copy', 'guard'):
         from golive import coldcopy  # it uses run_check from this module
         if args.command == 'guard':
