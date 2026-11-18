@@ -588,6 +588,15 @@ class SameChangeBare(SameChange):
                 self.assertEqual((code, calls), (H.REFUSED, []), out)
                 self.assertIn(says, '\n'.join(out))
 
+    def test_remote_needs_the_bare_mode(self):   # #450 item 3: checkout mode fetches from the checkout's own origin
+        path = self.w.checkout(self.m1, self.read)
+        for _ in range(2):
+            out = []
+            code = H.cli(['--repo', REPO, '--pr', '7', '--config', CONFIG_PATH, '--path', path, '--remote',
+                          'https://github.com/o/r.git'], env={}, gh=fake_gh((0, json.dumps(pr([])))), out=out.append)
+            self.assertEqual(code, H.REFUSED)
+            self.assertIn('--remote needs --bare', out[0])
+
     def test_base_and_head_need_the_bare_mode(self):   # a checkout names its own: never two answers to one question
         path = self.w.checkout(self.m1, self.read)
         out = []
@@ -1204,6 +1213,27 @@ class PathRulesBare(PathRules):
             self.assertEqual(code, H.REFUSED, out)
             self.assertIn(f'the head {head[:12]} does not merge cleanly into the base {b1[:12]}', out)
 
+    def test_no_attribute_source_of_the_repository_merges_a_conflict(self):   # #450 item 1
+        # A bare repository the caller cloned: its HEAD names a branch (git 2.43 to 2.45 read HEAD's .gitattributes in a
+        # bare repository), and its config may name attr.tree (2.43+). Neither may union-merge a conflict.
+        b0 = self.base('shadow')
+        head = self.head(b0, 'shadow', **{'docs/a.md': 'head\n'})
+        b1 = self.base('shadow', parent=b0, **{'docs/a.md': 'base\n'})
+        evil = self.w.commit({'.gitattributes': '* merge=union\n'})
+        gate = self.w.checkout(b1, head)
+        World.git(self.w.dir, '--git-dir', gate, 'fetch', '-q', self.w.remote, f'{evil}:refs/heads/evil')
+        with open(os.path.join(gate, 'HEAD'), 'w') as f:
+            f.write('ref: refs/heads/evil\n')
+        World.git(self.w.dir, '--git-dir', gate, 'config', 'attr.tree', 'refs/heads/evil')
+        union = subprocess.run(['git', '--git-dir', gate, 'merge-tree', '--write-tree', b1, head], capture_output=True,
+                               env={**os.environ, **GIT_ENV})
+        self.assertEqual(union.returncode, 0, 'no union merge through attr.tree on this git: the test reads nothing')
+        comments = [self.p.lens(n, head) for n in EVERY_LENS]
+        for _ in range(2):   # runs again: the same refusal, in this repository (self.check would make a new one)
+            code, out = run_cli(gate, fake_gh((0, json.dumps(pr(comments, head=head)))))
+            self.assertEqual(code, H.REFUSED, out)
+            self.assertIn(f'the head {head[:12]} does not merge cleanly into the base {b1[:12]}', out)
+
     def test_the_merge_follows_a_directory_rename_as_the_queue_does(self):   # #413 item 4: merge.directoryRenames
         # pr_queue.holds merges with merge.directoryRenames=true, so the check does too: the base adds the config into a
         # folder the head renamed, the merge moves it along, and the config's path is gone (git's default, conflict,
@@ -1263,6 +1293,26 @@ class GitEnvironment(unittest.TestCase):   # #442 item 2: pr_queue.GIT_RUN
                 envs = self.envs(call)
                 self.assertEqual(envs[0], want)
                 self.assertTrue(all(e == {} for e in envs[1:]), envs)   # cat-file -e after a fetch: local
+
+    def test_every_call_reads_no_attributes_and_speaks_one_language(self):   # #450 items 1 and 4
+        github = f'https://github.com/{REPO}.git'
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(kw['env'])
+            return types.SimpleNamespace(returncode=0, stdout='', stderr='')
+        work = tempfile.mkdtemp(prefix='head-check-env-')
+        self.addCleanup(shutil.rmtree, work, True)
+        job = {'LC_ALL': 'de_DE.ISO-8859-1', 'LANGUAGE': 'de', 'GIT_ATTR_SOURCE': 'refs/heads/evil'}
+        with unittest.mock.patch.object(subprocess, 'run', run), unittest.mock.patch.dict(os.environ, job):
+            head_gate.bare_repository(work, 'gate')
+            head_gate.fetch(H.Checkout(work, bare=(C, A), remote=github), C, A)
+            H.Checkout(work, bare=(C, A), remote=github).git('merge-tree', C, A)
+            H.Checkout(work).git('merge-tree', C, A)
+            H.Checkout(work).fetch(A)
+        self.assertEqual(len(seen), 6)
+        for env in seen:
+            self.assertEqual((env['LC_ALL'], env['GIT_ATTR_SOURCE']), ('C', '4b825dc642cb6eb9a060e54bf8d69288fbee4904'))
 
     def test_the_checkout_mode_keeps_them_as_before(self):   # old callers: its origin is the caller's
         for name, call in (('merge-base', lambda d: H.Checkout(d).git('merge-base', C, A)),

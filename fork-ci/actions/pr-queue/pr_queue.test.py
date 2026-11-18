@@ -65,6 +65,9 @@ READ_AT = r'(?i)read at\s*:|\blens\s*:'
 
 
 # --- the World: real commits, a local "GitHub" ----------------------------------------------------------------------
+# What git_env sets on every git call of the queue, whatever the job's environment holds.
+FORCED = {'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C', **Q.GIT_ENV,
+          'GIT_ATTR_SOURCE': '4b825dc642cb6eb9a060e54bf8d69288fbee4904'}   # the empty tree
 GIT_ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
            'GIT_EDITOR': 'true'}
 
@@ -416,10 +419,10 @@ class Update(Base):
     def test_a_network_error_on_the_fetch_by_sha_is_no_gone_commit(self):   # None (nothing known), not False
         real = self.q.git
 
-        def git(*a):
+        def git(*a, **kw):
             if a[:1] == ('fetch',) and not any(x.startswith('+refs/') for x in a):
                 return argparse.Namespace(returncode=128, stdout='', stderr='fatal: unable to access: timed out')
-            return real(*a)
+            return real(*a, **kw)
         self.w.set('refs/pull/7/head', self.c)
         self.q.git = git
         self.assertIsNone(run_quiet(self.q.fetch, 'main', 7, self.c, 'de' * 20)[0])
@@ -2163,6 +2166,96 @@ class HoldsIgnoresTheJobsAttributeSource(unittest.TestCase):   # #442 item 1: GI
                     self.assertIs(Q.holds(q.git, head, read), False)
 
 
+class HoldsReadsNoAttributesOfTheCache(unittest.TestCase):   # #450 item 1
+    """A bare repository's HEAD is an attribute source (git 2.43 to 2.45 read `HEAD:.gitattributes` there), and so is
+    `attr.tree` (2.43+). The queue's cache is kept between runs: an earlier job on the runner (the same user) could
+    point HEAD at a commit whose `.gitattributes` holds `* merge=union`, and merge-tree would union-merge a conflict.
+    Every git call of the queue reads attributes from the empty tree (GIT_ATTR_SOURCE), and the cache's HEAD must be
+    the one the queue wrote, never resolving to a commit."""
+
+    def setUp(self):
+        w = self.w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'c.json': '{"a": 1}\n'})
+        self.read = w.commit({'c.json': '{"a": 2}\n'}, [m0])
+        self.m1 = w.commit({'c.json': '{"a": 3}\n'}, [m0])
+        self.evil = w.commit({'c.json': '{"a": 3}\n', '.gitattributes': '* merge=union\n'}, [self.m1])
+        union = subprocess.run(['git', '-c', f'attr.tree={self.evil}', 'merge-tree', '--write-tree', self.m1,
+                                self.read], cwd=w.work, text=True, capture_output=True, env={**os.environ, **GIT_ENV})
+        self.assertEqual(union.returncode, 0, 'no union merge through attr.tree on this git: the test reads nothing')
+        self.head = w.keep(w.git(w.work, 'commit-tree', union.stdout.split()[0], '-p', self.read, '-p', self.m1,
+                                 '-m', 'union'))
+        w.set('refs/heads/main', self.m1)
+        w.set('refs/pull/7/head', self.head)
+        self.q = make_queue(w.dir, remote=w.remote)
+        got, out = run_quiet(self.q.fetch, 'main', 7, self.read, self.evil)
+        self.assertIs(got, True, out)
+        self.cache_git('update-ref', 'refs/queue/evil', self.evil)
+
+    def cache_git(self, *a):
+        return World.git(self.w.dir, '--git-dir', self.q.cache, *a)
+
+    def plant_head(self, text):
+        with open(os.path.join(self.q.cache, 'HEAD'), 'w') as f:
+            f.write(text)
+
+    def test_every_git_call_reads_attributes_from_the_empty_tree(self):
+        self.assertEqual(Q.git_env({})['GIT_ATTR_SOURCE'], Q.EMPTY_TREE)
+        self.assertEqual(Q.git_env({'GIT_ATTR_SOURCE': self.evil}, 'https://github.com/o/r.git')['GIT_ATTR_SOURCE'],
+                         Q.EMPTY_TREE)
+        self.assertEqual(Q.EMPTY_TREE, World.git(self.w.dir, 'hash-object', '-t', 'tree', '/dev/null'))
+        for _ in range(2):   # runs again: the same answer; attr.tree stands for any source git may read
+            self.assertIs(Q.holds(lambda *a: self.q.git('-c', f'attr.tree={self.evil}', *a), self.head, self.read),
+                          False)
+
+    def test_a_planted_head_is_no_attribute_source(self):   # the lens's case
+        self.plant_head('ref: refs/queue/evil\n')
+        for _ in range(2):
+            self.assertIs(Q.holds(self.q.git, self.head, self.read), False)
+
+    def test_the_cache_is_made_with_the_queues_head_and_kept_with_it(self):
+        with open(os.path.join(self.q.cache, 'HEAD')) as f:
+            self.assertEqual(f.read(), Q.CACHE_HEAD)
+        self.assertIsNone(self.q.cache_problem())
+        self.assertEqual(self.cache_git('symbolic-ref', 'HEAD'), 'refs/heads/master')   # what git init writes, too
+        for _ in range(2):   # runs again: kept, not rebuilt
+            got, out = run_quiet(self.q.fetch, 'main', 7, self.read)
+            self.assertIs(got, True, out)
+            self.assertNotIn('rebuilding', out)
+
+    def test_a_cache_whose_head_the_queue_did_not_write_is_rebuilt(self):
+        def symlink():
+            os.remove(os.path.join(self.q.cache, 'HEAD'))
+            os.symlink(os.path.join(self.q.cache, 'refs', 'queue', 'evil'), os.path.join(self.q.cache, 'HEAD'))
+
+        def missing():
+            os.remove(os.path.join(self.q.cache, 'HEAD'))
+
+        def born():   # HEAD as written, but its branch made: HEAD names a commit
+            self.cache_git('update-ref', 'refs/heads/master', self.evil)
+
+        for name, plant, says in (('a ref to the commit', lambda: self.plant_head('ref: refs/queue/evil\n'), 'HEAD'),
+                                  ('a detached HEAD', lambda: self.plant_head(self.evil + '\n'), 'HEAD'),
+                                  ('an empty HEAD', lambda: self.plant_head(''), 'HEAD'),
+                                  ('a symlink', symlink, 'HEAD'), ('no HEAD', missing, 'HEAD'),
+                                  ('the queue\'s HEAD, born', born, 'HEAD names a commit')):
+            with self.subTest(name):
+                plant()
+                self.assertIn(says, self.q.cache_problem() or '')
+                got, out = run_quiet(self.q.fetch, 'main', 7, self.read, self.evil)   # the next run
+                self.assertIs(got, True, out)
+                self.assertIn('rebuilding it', out)
+                self.assertIsNone(self.q.cache_problem())
+                self.assertIs(Q.holds(self.q.git, self.head, self.read), False)
+                self.cache_git('update-ref', 'refs/queue/evil', self.evil)
+
+    def test_a_head_planted_between_two_runs_is_found_by_the_next(self):   # stopped after the fetch, before merge-tree
+        self.plant_head('ref: refs/queue/evil\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIs(self.q.same_change('main', 7, self.head, self.read), False)
+        self.assertIn('rebuilding it', out.getvalue())
+
+
 class Conflict(unittest.TestCase):
     """An armed PR that conflicts with its base (merge state DIRTY) cannot merge, the queue cannot update it, and
     GitHub leaves auto-merge on without a word. It is told once per head and passed over; before, only the run log
@@ -2680,7 +2773,7 @@ class StackedPrsAreRetargetedNeverClosed(unittest.TestCase):
 
 
 class GitCalls(unittest.TestCase):
-    def git_call(self, read=None, write=None, remote=None, job=None):
+    def git_call(self, read=None, write=None, remote=None, job=None, args=('fetch', 'x'), fetch=True):
         d = tempfile.mkdtemp(prefix='pr-queue-git-')
         self.addCleanup(shutil.rmtree, d, True)
         q = make_queue(d, remote=remote)
@@ -2689,9 +2782,64 @@ class GitCalls(unittest.TestCase):
         env = {'GH_TOKEN': 'machine-token', 'GITHUB_TOKEN': 'other-token', Q.WRITE_TOKEN: 'pat-token', **(job or {})}
         with unittest.mock.patch.object(Q.subprocess, 'run', lambda argv, **kw: seen.append((argv, kw)) or ok()), \
                 unittest.mock.patch.dict(os.environ, env):
-            q.git('fetch', 'x')
+            q.git(*args, fetch=fetch)
         (argv, kw), = seen
         return q, argv, kw['env']
+
+    def test_the_caches_local_calls_run_no_program_of_the_job(self):   # #450 item 2: only the fetches keep any
+        job = {k: 'job-' + k for k in Q.GIT_RUN}
+        for args in (('merge-tree', '--write-tree', 'a', 'b'), ('cat-file', '-e', 'a'), ('rev-parse', 'HEAD')):
+            with self.subTest(args[0]):
+                q, argv, env = self.git_call('run-token', remote=f'https://github.com/{REPO}.git', job=job, args=args,
+                                             fetch=False)
+                self.assertEqual({k: env[k] for k in Q.GIT_RUN if k in env}, {})
+
+    def test_a_fetch_with_no_login_says_so_by_name(self):   # #450 item 7: not just git's prompt error
+        d = tempfile.mkdtemp(prefix='pr-queue-git-')
+        self.addCleanup(shutil.rmtree, d, True)
+        q = make_queue(d, remote=f'https://github.com/{REPO}.git')
+        for err in ("fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+                    "remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/o/r.git/'"):
+            with self.subTest(err[:30]), unittest.mock.patch.object(q, 'git', lambda *a, **kw: failed(err)), \
+                    unittest.mock.patch.object(q, 'own_cache', lambda: True):
+                for _ in range(2):   # every run says the same
+                    got, out = run_quiet(q.fetch, 'main', 7, 'a' * 40)
+                    self.assertIsNone(got)
+                    self.assertIn('git fetch failed', out)
+                    self.assertIn('git found no login for GitHub', out)
+                    self.assertIn('PR_QUEUE_READ_TOKEN', out)
+        with unittest.mock.patch.object(q, 'git', lambda *a, **kw: failed('fatal: unable to access: Could not resolve '
+                                                                           'host: github.com')), \
+                unittest.mock.patch.object(q, 'own_cache', lambda: True):
+            got, out = run_quiet(q.fetch, 'main', 7, 'a' * 40)
+        self.assertNotIn('no login', out)   # a network error is not blamed on the login
+
+    def test_only_the_queues_two_fetches_are_fetches(self):   # #450 item 2: Queue.fetch marks them, nothing else
+        w = World()
+        self.addCleanup(w.close)
+        m0 = w.commit({'x': '0\n'})
+        gone = w.commit({'x': 'gone\n'}, [m0])   # no ref reaches it: the second fetch, by sha
+        w.set('refs/heads/main', m0)
+        w.set('refs/pull/7/head', m0)
+        q = make_queue(w.dir, remote=w.remote)   # a local path: a fetch keeps every GIT_RUN name
+        exec_path = subprocess.run(['git', '--exec-path'], text=True, capture_output=True).stdout.strip()
+        job = {'GIT_EXEC_PATH': exec_path, 'GIT_SSH_COMMAND': 'false', 'GIT_ALLOW_PROTOCOL': 'file'}
+        seen, real = [], subprocess.run
+
+        def run(argv, **kw):
+            seen.append((argv, kw.get('env') or {}))
+            return real(argv, **kw)
+        with unittest.mock.patch.object(Q.subprocess, 'run', run), unittest.mock.patch.dict(os.environ, job), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIs(q.fetch('main', 7, m0, gone), True, out.getvalue())
+        fetches = [e for argv, e in seen if 'fetch' in argv]
+        local = [(argv, e) for argv, e in seen if 'fetch' not in argv and 'init' not in argv]
+        self.assertEqual(len(fetches), 2, seen)
+        self.assertTrue(local, seen)
+        for e in fetches:
+            self.assertEqual({k: e[k] for k in Q.GIT_RUN if k in e}, job)
+        for argv, e in local:
+            self.assertEqual({k: e[k] for k in Q.GIT_RUN if k in e}, {}, argv)
 
     def test_git_gets_the_login_from_gh_only_and_never_prompts(self):
         q, argv, env = self.git_call('run-token', 'pat-token')
@@ -2741,10 +2889,16 @@ class GitVersion(unittest.TestCase):
             return ok(out)
         return Q.git_problem(run)
 
-    def test_merge_tree_write_tree_needs_2_38(self):
-        self.assertIn('git 2.38 or newer is needed', self.problem('git version 2.34.1\n'))
-        self.assertIn('2.34.1', self.problem('git version 2.34.1\n'))
-        for fine in ('git version 2.38.0', 'git version 2.47.1.windows.1', 'git version 3.0.0'):
+    def test_merge_tree_with_an_attribute_source_needs_2_43(self):   # #450 item 1: never silently without it
+        # GIT_ATTR_SOURCE came in 2.41 (an older git ignores it: HEAD's or attr.tree's attributes would merge), and
+        # merge-tree with an attribute source crashed until 2.43.
+        for old in ('git version 2.34.1', 'git version 2.38.0', 'git version 2.40.1', 'git version 2.42.2'):
+            with self.subTest(old):
+                said = self.problem(old + '\n')
+                self.assertIn('git 2.43 or newer is needed', said)
+                self.assertIn('GIT_ATTR_SOURCE', said)
+                self.assertIn(old[len('git version '):], said)
+        for fine in ('git version 2.43.0', 'git version 2.47.1.windows.1', 'git version 3.0.0'):
             self.assertIsNone(self.problem(fine), fine)
 
     def test_no_git_or_odd_output_is_a_problem(self):
@@ -3366,7 +3520,7 @@ class Cli(unittest.TestCase):
         hostile = {k: 'x' for k in Q.GIT_DROP}
         hostile.update(GIT_CONFIG_KEY_3='core.bare', GIT_CONFIG_VALUE_3='true', GIT_TRACE='0', PATH='/bin')
         env = Q.git_env(hostile)
-        self.assertEqual(env, {'GIT_TRACE': '0', 'PATH': '/bin', 'GIT_TERMINAL_PROMPT': '0', **Q.GIT_ENV})
+        self.assertEqual(env, {'GIT_TRACE': '0', 'PATH': '/bin', **FORCED})
         for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
                      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_INDEX_FILE', 'GIT_NAMESPACE', 'GIT_CONFIG',
                      'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_REPLACE_REF_BASE', 'GIT_GRAFT_FILE',
@@ -3397,14 +3551,47 @@ class Cli(unittest.TestCase):
                  'GIT_ALLOW_PROTOCOL'}
         self.assertLessEqual(names, set(Q.GIT_RUN))
         job = {**{k: 'x' for k in Q.GIT_RUN}, 'PATH': '/bin'}
-        plain = {'PATH': '/bin', 'GIT_TERMINAL_PROMPT': '0', **Q.GIT_ENV}
+        plain = {'PATH': '/bin', **FORCED}
         self.assertEqual(Q.git_env(job), plain)   # a call that reaches no remote runs none of them
         # https with the queue's own login (or none): no ssh, no git:// proxy, no prompt, git's default protocols;
         # git's own helpers (remote-https, index-pack) are found through GIT_EXEC_PATH
         self.assertEqual(Q.git_env(job, 'https://github.com/o/r.git'), {**plain, 'GIT_EXEC_PATH': 'x'})
-        for remote in ('origin', '/srv/r.git', 'file:///srv/r.git', 'ssh://git@host/r.git', 'git@host:r.git'):
+        for remote in ('origin', '/srv/r.git', 'file:///srv/r.git', 'ssh://git@host/r.git', 'git@host:r.git',
+                       'http://host/r.git'):   # #450 item 6: plain http is no GitHub fetch either
             with self.subTest(remote):   # the caller's remote: it may need them, so they stay
                 self.assertEqual(Q.git_env(job, remote), {**job, **plain})
+
+    def test_a_fetch_from_github_writes_no_trace(self):   # #450 item 5: the gate puts git's stderr into a public summary
+        trace = {k: '1' for k in ('GIT_TRACE', 'GIT_TRACE_CURL', 'GIT_TRACE_PACKET', 'GIT_TRACE_PACK_ACCESS',
+                                  'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_CURL_VERBOSE')}
+        trace['GIT_TRACE_REDACT'] = '0'
+        job = {**trace, 'PATH': '/bin'}
+        self.assertEqual(Q.git_env(job, 'https://github.com/o/r.git'), {'PATH': '/bin', **FORCED})
+        for remote in (None, 'origin', 'ssh://git@host/r.git'):   # no token of the queue's goes there
+            with self.subTest(remote):
+                self.assertLessEqual(trace.items(), Q.git_env(job, remote).items())
+
+    def test_git_speaks_one_language(self):   # #450 item 4: messages are matched and decoded as UTF-8
+        env = Q.git_env({'LC_ALL': 'de_DE.ISO-8859-1', 'LANG': 'de_DE', 'LANGUAGE': 'de', 'LC_MESSAGES': 'de_DE'})
+        self.assertEqual(env['LC_ALL'], 'C')   # LANGUAGE is ignored under LC_ALL=C (gettext)
+        for remote in (None, 'https://github.com/o/r.git', 'origin'):
+            with self.subTest(remote):
+                self.assertEqual(Q.git_env({'LC_ALL': 'de_DE'}, remote)['LC_ALL'], 'C')
+
+    def test_a_partial_clone_names_the_sparse_pattern_only_for_a_missing_blob(self):   # #450 item 6: cat-file -e
+        self.git('config', 'extensions.partialClone', 'origin')
+        self.git('config', 'remote.origin.promisor', 'true')
+        real = subprocess.run
+
+        def run(cmd, **kw):   # the blob is there, and cat-file blob fails anyway
+            if 'cat-file' in cmd and 'blob' in cmd:
+                return subprocess.CompletedProcess(cmd, 128, b'', b'fatal: some other failure')
+            return real(cmd, **kw)
+        for _ in range(2):
+            with self.assertRaises(config.ConfigError) as e:
+                Q.committed_config(self.config, run=run)
+            self.assertIn('some other failure', str(e.exception))
+            self.assertNotIn('sparse-checkout', str(e.exception))
 
     def test_the_config_read_runs_no_program_of_the_job(self):   # #442 item 2: it reaches no remote
         job = {k: os.path.join(self.d, 'nowhere') for k in Q.GIT_RUN}
@@ -3420,13 +3607,13 @@ class Cli(unittest.TestCase):
             self.assertNotIn('not in this checkout', out)
 
     def test_an_old_git_is_refused(self):
-        self.refused('git 2.38 or newer', git='git 2.38 or newer is needed (merge-tree --write-tree); found: git 2.34')
+        self.refused('git 2.43 or newer', git='git 2.43 or newer is needed (GIT_ATTR_SOURCE); found: git 2.42')
 
     def test_every_problem_is_named_at_once(self):
         self.commit({'.github/pr-queue.json': None})
         self.refused('GitHub-hosted', 'is not owner/name', 'not an absolute path', 'has no .github/pr-queue.json',
-                     'git 2.38', repo='x', state='p', env={'RUNNER_ENVIRONMENT': 'github-hosted'},
-                     git='git 2.38 or newer')
+                     'git 2.43', repo='x', state='p', env={'RUNNER_ENVIRONMENT': 'github-hosted'},
+                     git='git 2.43 or newer')
 
 
 class GateApp(unittest.TestCase):
