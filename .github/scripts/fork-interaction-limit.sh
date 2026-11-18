@@ -89,13 +89,11 @@ command -v jq > /dev/null || die "jq is missing"
 read_limit() {
   local body err
   cur_limit="" cur_origin="" cur_expires="" cur_days="" read_error=""
-  err="$(mktemp)"
+  err="$tmp/err"
   if ! body="$(gh api "repos/$repo/interaction-limits" 2> "$err")"; then
     read_error="could not read the interaction limit of $repo: $(tr '\n' ' ' < "$err" | cut -c1-300)"
-    rm -f "$err"
     return 1
   fi
-  rm -f "$err"
   [[ -n "${body//[[:space:]]/}" ]] || body='{}'
   local parsed fields
   # One field per line, read by position with mapfile: an empty field (no origin) stays in place.
@@ -140,6 +138,11 @@ write_out() { # write_out STATUS MESSAGE
   [[ -z "$out" ]] || printf '%s\n%s\n' "$1" "$2" > "$out" || die "could not write $out"
 }
 
+# gh's error text and the issue body are kept in files of one folder, removed however the script
+# ends (a cancelled run ends it while it waits for GitHub).
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/fork-interaction-limit.XXXXXX")" || die "could not make a temporary folder"
+trap 'rm -rf "$tmp"' EXIT
+
 case "$cmd" in
   check)
     if ! read_limit; then
@@ -175,16 +178,14 @@ case "$cmd" in
       fi
       echo "renewing: $repo: $(describe)."
     fi
-    err="$(mktemp)"
+    err="$tmp/err"
     if ! gh api -X PUT "repos/$repo/interaction-limits" -f "limit=$limit" -f expiry=six_months > /dev/null 2> "$err"; then
       msg="could not set the interaction limit of $repo: $(tr '\n' ' ' < "$err" | cut -c1-300)"
       if grep -q "HTTP 409" "$err"; then
         msg+=" GitHub answers 409 when the limit is set for the whole user or organization: change it there, in that account's moderation settings."
       fi
-      rm -f "$err"
       die "$msg"
     fi
-    rm -f "$err"
     # Read back: the answer to the PUT is not proof, the stored limit is.
     read_limit || die "set the limit, but could not read it back: $read_error"
     if [[ "$cur_limit" != "$limit" || "$cur_days" -lt "$FRESH_DAYS" ]]; then
@@ -206,7 +207,7 @@ case "$cmd" in
       attention | error) failed=true ;;
       *) failed=true; status=error; message="The check left no result (${file}): it did not run to the end." ;;
     esac
-    body="$(mktemp)"
+    body="$tmp/body"
     {
       echo "**$message**"
       echo
@@ -253,7 +254,6 @@ case "$cmd" in
       cat "$body"
       [[ -z "$note" ]] || printf '\n%s\n' "$note"
     } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
-    rm -f "$body"
     if [[ "$failed" == true ]]; then
       # An ok check whose issue could not be handled fails on the note, not on the ok message.
       [[ "$status" == ok ]] && echo "::error::$note" >&2 || echo "::error::$message" >&2
