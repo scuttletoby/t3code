@@ -375,7 +375,8 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
     p.add_argument('--bare', action='store_true', help='read a bare repository (head_gate.py) instead of a checkout')
     p.add_argument('--base', default='', help='with --bare: the base tip the config is read from')
     p.add_argument('--head', default='', help='with --bare: the head GitHub named when the base was read')
-    p.add_argument('--remote', help='with --bare: where a missing read commit is fetched from (default origin)')
+    p.add_argument('--remote', help='with --bare: where a missing read commit is fetched from (default origin): a '
+                   'remote name, a path or a URL; not plain http, not empty')
     a = p.parse_args(argv)
     required, problems = argument_problems(a.repo, a.pr, a.required_lenses)
     bare = None
@@ -387,7 +388,9 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
         problems.append('--base and --head need --bare (a checkout names its own through its merge commit)')
     if a.remote is not None and not a.bare:
         problems.append("--remote needs --bare (a checkout fetches from its own origin)")
-    checkout = Checkout(a.path, git, bare=bare, remote=a.remote or 'origin')
+    elif a.remote is not None and (why := pr_queue.remote_problem(a.remote)):   # an empty one is no "origin"
+        problems.append(f'--remote: {why}')
+    checkout = Checkout(a.path, git, bare=bare, remote='origin' if a.remote is None else a.remote)
     if git is None:
         problems += filter(None, [pr_queue.git_problem(), checkout.problem()])
     code, ok, reason, rows = decide(a.repo, a.pr, a.config, checkout, required, a.pass_drafts, gh, sleep, out, problems)

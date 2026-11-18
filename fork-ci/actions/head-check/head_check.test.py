@@ -597,6 +597,19 @@ class SameChangeBare(SameChange):
             self.assertEqual(code, H.REFUSED)
             self.assertIn('--remote needs --bare', out[0])
 
+    def test_a_remote_that_is_no_url_or_path_is_refused(self):   # #457 item 4: never "origin" for an empty one
+        path = self.w.checkout(self.m1, self.read)
+        for remote, says in (('', 'the remote is empty'), ('http://github.com/o/r.git', 'plain http'),
+                             ('ext::sh -c id', 'remote helper'), ('--upload-pack=touch x', 'starts with -')):
+            with self.subTest(remote):
+                for _ in range(2):
+                    calls, out = [], []
+                    code = H.cli(['--repo', REPO, '--pr', '7', '--config', CONFIG_PATH, '--bare', '--path', path,
+                                  '--base', self.m1, '--head', self.read, '--remote', remote], env={},
+                                 gh=fake_gh((0, json.dumps(pr([])))), out=out.append)
+                    self.assertEqual((code, calls), (H.REFUSED, []), out)
+                    self.assertIn(says, '\n'.join(out))
+
     def test_base_and_head_need_the_bare_mode(self):   # a checkout names its own: never two answers to one question
         path = self.w.checkout(self.m1, self.read)
         out = []
@@ -1313,6 +1326,29 @@ class GitEnvironment(unittest.TestCase):   # #442 item 2: pr_queue.GIT_RUN
         self.assertEqual(len(seen), 6)
         for env in seen:
             self.assertEqual((env['LC_ALL'], env['GIT_ATTR_SOURCE']), ('C', '4b825dc642cb6eb9a060e54bf8d69288fbee4904'))
+
+    def test_the_gates_local_calls_and_github_fetch_write_no_trace(self):   # #457 item 4: merge-tree's stderr is
+        github = f'https://github.com/{REPO}.git'                           # put into the public summary
+        trace = {'GIT_TRACE': '1', 'GIT_TRACE_PACKET': '1', 'GIT_TRACE2_EVENT': '1', 'GIT_CURL_VERBOSE': '1',
+                 'GIT_TRACE_REDACT': '0'}
+        for name, call, kept in (
+                ('git init', lambda d: head_gate.bare_repository(d, 'gate'), False),
+                ('merge-tree', lambda d: H.Checkout(d, bare=(C, A), remote=github).git('merge-tree', C, A), False),
+                ('the gate fetch', lambda d: head_gate.fetch(H.Checkout(d, bare=(C, A), remote=github), C, A), False),
+                ('the checkout mode', lambda d: H.Checkout(d).git('merge-base', C, A), True)):   # its own origin
+            with self.subTest(name):
+                seen = []
+
+                def run(argv, **kw):
+                    seen.append(kw['env'])
+                    return types.SimpleNamespace(returncode=0, stdout='', stderr='')
+                work = tempfile.mkdtemp(prefix='head-check-env-')
+                self.addCleanup(shutil.rmtree, work, True)
+                with unittest.mock.patch.object(subprocess, 'run', run), unittest.mock.patch.dict(os.environ, trace):
+                    call(work)
+                self.assertTrue(seen)
+                got = {k: seen[0][k] for k in trace if k in seen[0]}
+                self.assertEqual(got, trace if kept else {})
 
     def test_the_checkout_mode_keeps_them_as_before(self):   # old callers: its origin is the caller's
         for name, call in (('merge-base', lambda d: H.Checkout(d).git('merge-base', C, A)),
