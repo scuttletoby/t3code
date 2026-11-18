@@ -69,12 +69,14 @@ It refuses to start (exit 2, before it reads GitHub, every reason at once) on
 a config error (also a base commit without the config), a missing pull
 request number (not a `pull_request` event), a lens name in `required-lenses`
 that names no lens, a `review` block whose path rules cannot judge the head
-(above), a git older than 2.38, a checkout that is not GitHub's
+(above), a git older than 2.43, a checkout that is not GitHub's
 two-parent merge commit, a checkout that is shallow, or a checkout holding a
 file that changes what git's objects or merges say (`info/grafts`, `shallow`,
 alternates, `info/attributes`). A refusal is a red required check too. git
-runs with no hooks, no fsmonitor, no replace refs and no attributes: the pull
-request's `.gitattributes` cannot turn a conflict into a clean merge.
+runs with no hooks, no fsmonitor, no replace refs and no attributes (they are
+read from the empty tree): neither the pull request's `.gitattributes` nor a
+bare repository's `HEAD` or `attr.tree` can turn a conflict into a clean merge.
+`--remote` (where a missing read commit is fetched from) needs `--bare`.
 
 It reads only and posts nothing. The one write is a fetch, into the job's own
 checkout, of a read commit the head dropped (a rebase or force-push; GitHub
@@ -298,7 +300,8 @@ Setup (the repository owner's steps; nothing here creates them):
    blocked again, and a blocked run is only a failed run that nothing
    requires; this fork lists its allowed files in
    `.github/fork-actions-policies.json` and fails its required check when
-   `fork-checks.yml` did not run (`fork-checks-ran.py`, issue 401).
+   `fork-checks.yml` did not run and pass (`fork-checks-ran.py`, issues 401
+   and 430).
 5. Dispatch it once without a number (the backfill), so open pull requests get
    the check under its name.
 6. Bind the required check to the App: in a ruleset, the required status

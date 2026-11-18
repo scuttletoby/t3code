@@ -13,6 +13,64 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: no attributes from HEAD; local git calls run no job program (#450)
+
+- Every git call of the queue, the gate and the head check reads attributes from the empty tree
+  (`GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904`). In a bare repository git 2.43 to 2.45 read
+  `HEAD:.gitattributes`, and git 2.43+ reads `attr.tree`: a cache whose `HEAD` an earlier job pointed at a commit
+  holding `* merge=union` made the queue's same-change rule union-merge a conflict.
+- The queue's cache must have the `HEAD` the queue writes (`ref: refs/heads/master`, a branch it never makes);
+  a cache with another `HEAD`, a symlink, none, or that branch made is rebuilt.
+- Only the queue's two fetches keep the job's `GIT_EXEC_PATH` (from GitHub) or `pr_queue.GIT_RUN` (another remote);
+  its merge-tree, cat-file and rev-parse calls in the cache run none of them.
+- `head_check.py --remote` without `--bare` is refused (exit 2): checkout mode fetches from the checkout's origin.
+- git runs with `LC_ALL=C`, so its messages are matched in one language.
+- A fetch from GitHub (https) drops `GIT_TRACE*` and `GIT_CURL_VERBOSE`: the trace would write the login header, and
+  the gate puts git's error into its public summary.
+- A fetch that failed for want of a login says so and names the token (`PR_QUEUE_READ_TOKEN` for the queue, `GH_TOKEN`
+  for the gate).
+
+**Upgrade:** the queue, the gate and the head check need git 2.43 or newer (`GIT_ATTR_SOURCE` came in 2.41, and
+`merge-tree` with it crashed before 2.43); an older git is refused (exit 2), never run without it. A kept queue cache
+is rebuilt once if its `HEAD` is not the queue's; nothing else to do.
+
+### pr-queue and head-check: GIT_ATTR_SOURCE and the job's git programs (#442)
+
+- Every git call of the queue and the head check also drops `GIT_ATTR_SOURCE` and `GIT_EXTERNAL_DIFF`. With
+  `GIT_ATTR_SOURCE` naming a tree that holds `* merge=union`, the gate's `git merge-tree` and the queue's same-change
+  rule union-merged a conflict instead of refusing it.
+- The queue's and the gate's git calls drop the job's `GIT_EXEC_PATH`, `GIT_SSH`, `GIT_SSH_COMMAND`,
+  `GIT_PROXY_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS` and `GIT_ALLOW_PROTOCOL` (`pr_queue.GIT_RUN`) where none can be
+  needed: a call that reaches no remote drops all of them, a fetch from GitHub (https) keeps `GIT_EXEC_PATH` only.
+  A fetch from another remote (the gate's `--remote`, the head check's origin in checkout mode) keeps them.
+- The head check decodes git's output as UTF-8 whatever the job's locale, so a base config that is not UTF-8 is
+  "not UTF-8 text" under any locale.
+- The queue's config read names the sparse-checkout pattern only when the blob is missing from a partial clone; any
+  other `cat-file` failure says git's own error.
+
+**Upgrade:** a job that needs `GIT_ASKPASS` or `GIT_SSH_COMMAND` for the queue's or the gate's fetch from GitHub no
+longer gets it: the queue and the gate log in with the run's token (`gh`), as documented.
+
+### pr-queue and head-check: follow-ups of the git config read (#435)
+
+- The queue's config read fetches nothing and is timed. In a partial clone (actions/checkout's sparse checkout) a
+  config whose blob the sparse-checkout pattern did not check out was fetched from origin with the token the checkout
+  stored, with no timeout. It is now a refusal (exit 2) that names the cause; each git call of the read has 60
+  seconds.
+- Every git call of the queue and the head check drops the job's `GIT_*` variables that point git at another
+  repository, object store, index, config or pathspec rule (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`,
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_INDEX_FILE`, `GIT_NAMESPACE`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`
+  with its `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*`, and the like: `pr_queue.GIT_DROP`).
+- A base config that is not UTF-8 is a refusal in the head check (exit 2, "not UTF-8 text", as the queue says), not
+  a crash (exit 1).
+- The case-twin rule also refuses a file, symlink or submodule entry that differs only in case from one of the
+  config's folders (`.GitHub` next to `.github/`), and it counts Unicode NFC and NFD forms of a name as one.
+
+**Upgrade:** a caller whose checkout leaves the config's blob out must check the config out. The reusable workflow's
+sparse pattern is the config's path, which matches itself unless the name holds `[ ] * ?`, a leading `!` or `#`, a
+trailing space or a backslash: rename such a config. A base that already holds a twin of a config folder is not a
+lock: pull requests that leave or delete it pass.
+
 ### pr-queue: reads its config with git, never from the checkout's file (#424)
 
 The queue now reads its config as the commit checked out at `config` holds it (HEAD): the blob, with `git ls-tree` and

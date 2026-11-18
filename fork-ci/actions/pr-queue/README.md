@@ -17,6 +17,10 @@ The queue reads the config with git, as the commit checked out at its path
 without touching the config itself. So the path must be inside a git checkout,
 and the config must be committed there as a regular file: an edit that is not
 committed is not read, and a symlink, a submodule entry or a folder is refused.
+The read fetches nothing: in a partial clone (a sparse checkout) the config's
+blob must be checked out, so the sparse-checkout pattern has to match its name.
+A name with `[ ] * ?`, a leading `!` or `#`, a trailing space or a backslash
+does not match itself as a pattern, and the queue then refuses to start.
 
 ```json
 {
@@ -168,10 +172,15 @@ head, the one that fixes it too, and the queue stops (an owner then has to push
 the fix by hand). The gate therefore refuses a pull request whose merged config
 (GitHub's merge commit, or `git merge-tree` of base and head in the gate's bare
 mode) does not parse, is deleted, is no regular file (a folder, a symlink or a
-submodule entry), gains a twin whose name differs from it only in case, or is
-in `enforce` with a rule order `enforce` refuses (the order checks above), and
-caps what it reads of a config a pull request changes
-(32 KiB, 128 characters per glob, 2,048 in all). That one check reads the
+submodule entry), gains a twin whose name differs from it only in case, gains
+a file, symlink or submodule entry whose name differs from one of its folders
+only in case (`.GitHub` next to `.github/`; a folder of that name is read on,
+and passes while it holds no twin of the config), or is in `enforce` with a
+rule order `enforce` refuses (the order checks above), and caps what it reads
+of a config a pull request changes (32 KiB, 128 characters per glob, 2,048 in
+all). Names compare as macOS compares them: fully case folded (`ſ` is `s`), and
+Unicode NFC and NFD forms as one name. NTFS compares with its own upcase table
+and may pair a few exotic names this keeps apart (`ı`, `İ`). That one check reads the
 merged config; everything else, the rules that judge the head too, the base's.
 It judges the merge with the base of its run: two pull requests that each pass
 alone can still merge into a bad config unless the ruleset requires branches to
@@ -373,12 +382,14 @@ queue's own bare repository (`--cache`) and gets its login from
 A token is in git's environment and `STATE` decides what is re-armed, so run
 the queue on a runner (or runner group) that runs no `pull_request` job and no
 other repository's job, as a user of its own. The `--state-file` and `--cache`
-folders belong to that user alone. git runs with no hooks, no fsmonitor and no
-replace refs, and a cache that is not that user's alone (mode `0700`), has a
-config the queue did not write, or holds a file that changes what its objects
-say or how a merge reads them (`info/grafts`, `shallow`,
-`objects/info/alternates`, `objects/info/http-alternates` or
-`info/attributes`) is rebuilt, never used. A job of the same user
+folders belong to that user alone. git runs with no hooks, no fsmonitor, no
+replace refs and no attributes (`GIT_ATTR_SOURCE` is the empty tree, so no
+`.gitattributes` of any commit, the cache's `HEAD` or `attr.tree` changes how
+a merge reads a file), and a cache that is not that user's alone (mode
+`0700`), has a config or a `HEAD` the queue did not write, has a branch at
+`HEAD`, or holds a file that changes what its objects say or how a merge reads
+them (`info/grafts`, `shallow`, `objects/info/alternates`,
+`objects/info/http-alternates` or `info/attributes`) is rebuilt, never used. A job of the same user
 can still change the cache between that check and git's next read: only the
 runner rule above stops that.
 
@@ -392,7 +403,8 @@ runner rule above stops that.
 It refuses to start on a GitHub-hosted runner (its disk, and with it the plan,
 goes with the job), with a `--repo` that is not `owner/name`, a relative path,
 a path inside the job's workspace (the next checkout empties it), a config
-error, or a git older than 2.38 (`merge-tree --write-tree`).
+error, or a git older than 2.43 (`merge-tree --write-tree` that honours
+`GIT_ATTR_SOURCE`).
 
 `--state-file` (`STATE`) holds the plan of the run that turned auto-merge off:
 `{"repo", "pr", "old", "base", "read"}` (and `"told"` once the pull request was
@@ -465,7 +477,7 @@ the re-arm still needs exactly the change the lenses read.
 
 The queue needs:
 
-- a self-hosted runner whose disk outlives the job, with git 2.38+, `gh` and
+- a self-hosted runner whose disk outlives the job, with git 2.43+, `gh` and
   `python3`: the plan in `--state-file` and the cache must be there for the
   next run. That runner (or runner group) runs no `pull_request` job and no
   other repository's job, as a user of its own, and the state and cache

@@ -1,8 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off - Boots the real CLI in a child process on a temp home.
 /**
- * Fork (`serve --hold-work`): boots the real `t3 serve` held, then normally, on one seeded temp home
- * (work, a Connect link and analytics on a local fake server, a task in a linked environment). The
- * held boot must log each hold and start none of it; the normal boot must then run it all.
+ * Fork (`serve --hold-work`): boots the real `t3 serve` on one seeded temp home (work, a Connect link
+ * and analytics on a local fake server, a task in a linked environment): held, which starts none of
+ * it and marks the home; then normally, which runs the work but still holds Connect on the marked
+ * home; then normally with the marker deleted, which releases the tunnel.
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
@@ -34,6 +35,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
+import * as HoldWorkConnect from "./cloud/holdWorkConnect.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
@@ -176,6 +178,8 @@ const boot = async (
         T3CODE_CLERK_PUBLISHABLE_KEY: "pk_test_hold_work",
         T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: "client-hold-work",
         NO_COLOR: "1",
+        // No managed policy, whatever this machine has: a missing file means none.
+        T3CODE_DEV_MANAGED_POLICY_PATH: NodePath.join(root, "no-policy.json"),
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -299,15 +303,29 @@ const HELD_CONNECT_STEPS = [
   "HoldWorkConnect.reconcileDesiredLink",
 ];
 
-/** The spans that show a hold was not kept: each runs only when its part starts. */
-const HELD_SPANS = [
-  "autoPullProjects",
-  "RemoteDelegation.followOnce",
+/** The real CloudLink's spans: a held boot, or any boot of a marked copy, runs none of them. */
+const CONNECT_SPANS = [
   "environment.cloud.registerManagedCloudTunnelRecovery",
   "environment.cloud.releaseManagedTunnelOnShutdown",
   "environment.cloud.startManagedCloudTunnelIfOriginConfirmed",
   "environment.cloud.reconcileDesiredLinkIfStillDesired",
 ];
+
+/** The spans that show a hold was not kept: each runs only when its part starts. */
+const HELD_SPANS = ["autoPullProjects", "RemoteDelegation.followOnce", ...CONNECT_SPANS];
+
+/** What a normal boot of a marked copy logs instead of starting Connect and agent activity. */
+const markedLines = (marker: string) =>
+  ["T3 Connect held: ", "Agent activity publishing held: "].map(
+    (part) => `${part}${marker} marks this home as a copy`,
+  );
+
+const tunnelReleases = (remote: FakeRemote) =>
+  relayRequests(remote).filter(
+    (request) =>
+      request.method === "DELETE" &&
+      /^\/v1\/client\/environment-links\/[^/]+\/tunnel$/.test(request.path),
+  );
 
 const seedThreads = (dbPath: string, nowMs: number, activityRoot: string) => {
   const at = (offsetMs: number) => DateTime.makeUnsafe(nowMs + offsetMs);
@@ -694,7 +712,7 @@ const snapshot = (paths: { stateDir: string; dbPath: string }): Snapshot => {
 };
 
 describe("serve --hold-work on a seeded home", () => {
-  it("a held boot consumes no seeded work; a normal boot on the same home then runs it", async () => {
+  it("a held boot consumes no seeded work; a normal boot on the same home then runs it, Connect only once unmarked", async () => {
     const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-hold-work-boot-"));
     const remote = await fakeRemote();
     try {
@@ -709,6 +727,9 @@ describe("serve --hold-work on a seeded home", () => {
       expect(Object.keys(seeded.connect)).toHaveLength(8);
       expect(seeded.remoteTask).toBeDefined();
 
+      // A home linked before held copies were marked: no marker until it boots held.
+      const marker = NodePath.join(root, "t3", HoldWorkConnect.HELD_COPY_MARKER_FILE);
+      expect(NodeFS.existsSync(marker)).toBe(false);
       const held = await boot(root, remote, ["--hold-work"]);
       const runtime = await ready(root, held);
       expect(runtime.workHeld).toBe(true);
@@ -742,6 +763,9 @@ describe("serve --hold-work on a seeded home", () => {
         );
       });
       await stop(held.child);
+      // The stopped copy stays marked, so `t3 connect` refuses to unlink or link it.
+      const markerText = NodeFS.readFileSync(marker, "utf8");
+      expect(markerText).toContain("--hold-work");
       const heldSpans = spansFrom(paths.stateDir, 0);
       // The publisher logs its state when it starts, before any held line: a held one never does.
       expect(held.output()).not.toMatch(PUBLISHER_STARTED);
@@ -778,34 +802,76 @@ describe("serve --hold-work on a seeded home", () => {
         if (effect.status === "pending") expect(effect.attempt_count).toBe(0);
       }
 
+      // A normal boot of the marked copy runs the work, but Connect and agent activity stay held:
+      // its stop would release the running server's tunnel under the shared environment id.
+      const marked = await boot(root, remote, []);
+      const markedRuntime = await ready(root, marked);
+      expect(markedRuntime.workHeld).toBeUndefined();
+      await when(
+        "the marked copy's normal boot to pick up the seeded work",
+        marked,
+        paths.stateDir,
+        () => {
+          const now = snapshot(paths);
+          const spans = spansFrom(paths.stateDir, heldSpans.end).names;
+          // A leak ends the wait at once, so the checks below name it instead of a timeout.
+          if (
+            activityPublishes(remote).length > 0 ||
+            CONNECT_SPANS.some((name) => spans.has(name))
+          ) {
+            return true;
+          }
+          return (
+            now.task.last_run_status !== "never" &&
+            now.waits.every((wait) => wait.state !== "waiting") &&
+            now.limitedThread.limit_recovery !== null &&
+            now.effects.some(
+              (row) => row.effect_id === "effect:hold-work:continue" && row.status !== "pending",
+            ) &&
+            heartbeats(remote).length > 0 &&
+            spans.has("RemoteDelegation.followOnce") &&
+            markedLines(marker).every((line) => marked.output().includes(line)) &&
+            // Past the random wait before registration, and past the desired-link reconcile.
+            HELD_CONNECT_STEPS.every((name) => spans.has(name))
+          );
+        },
+      );
+      await stop(marked.child);
+      const markedSpans = spansFrom(paths.stateDir, heldSpans.end);
+      // No tunnel registered, started or released, and no agent activity sent.
+      expect(tunnelReleases(remote)).toEqual([]);
+      expect(activityPublishes(remote)).toEqual([]);
+      expect(CONNECT_SPANS.filter((name) => markedSpans.names.has(name))).toEqual([]);
+      expect(relayRequests(remote)).toEqual([]);
+      expect(marked.output()).not.toMatch(PUBLISHER_STARTED);
+      expect(marked.output()).not.toContain("--hold-work");
+      expect(markedSpans.names).toContain("HoldWorkConnect.releaseManagedTunnel");
+      expect(markedSpans.names).toContain("autoPullProjects");
+      expect(markedSpans.names).toContain("RemoteDelegation.followOnce");
+      // A normal boot of the copy leaves its marker as it is.
+      expect(NodeFS.readFileSync(marker, "utf8")).toBe(markerText);
+
+      // With the marker deleted, the same home is no longer taken to be a copy.
+      NodeFS.rmSync(marker);
       const normal = await boot(root, remote, []);
-      const normalRuntime = await ready(root, normal);
-      expect(normalRuntime.workHeld).toBeUndefined();
-      await when("the normal boot to pick up the seeded work", normal, paths.stateDir, () => {
-        const now = snapshot(paths);
-        return (
-          now.task.last_run_status !== "never" &&
-          now.waits.every((wait) => wait.state !== "waiting") &&
-          now.limitedThread.limit_recovery !== null &&
-          now.effects.some(
-            (row) => row.effect_id === "effect:hold-work:continue" && row.status !== "pending",
-          ) &&
-          heartbeats(remote).length > 0 &&
-          // The finished thread's activity reaches the relay, so the held boot had it to send.
-          activityPublishes(remote).length > 0 &&
-          spansFrom(paths.stateDir, heldSpans.end).names.has("RemoteDelegation.followOnce")
-        );
-      });
+      await ready(root, normal);
+      await when(
+        "the unmarked home's normal boot to publish",
+        normal,
+        paths.stateDir,
+        () =>
+          // The finished thread's activity reaches the relay, so the held boots had it to send.
+          activityPublishes(remote).length > 0,
+      );
       expect(normal.output()).not.toContain("--hold-work");
+      expect(normal.output()).not.toContain(HoldWorkConnect.HELD_COPY_MARKER_FILE);
       await stop(normal.child);
-      // The same home without the flag does each held thing. Its tunnel registration waits a
-      // random part of half a minute, but stopping releases the tunnel at once, so the relay has
-      // been reached by now either way.
-      const normalSpans = spansFrom(paths.stateDir, heldSpans.end).names;
-      expect(normalSpans).toContain("autoPullProjects");
-      expect(normalSpans).toContain("RemoteDelegation.followOnce");
+      // Its tunnel registration waits a random part of half a minute, but stopping releases the
+      // tunnel at once: the relay has the release itself.
+      const normalSpans = spansFrom(paths.stateDir, markedSpans.end).names;
       expect(normalSpans).toContain("environment.cloud.releaseManagedTunnelOnShutdown");
-      expect(relayRequests(remote).length).toBeGreaterThan(0);
+      expect(tunnelReleases(remote)).toHaveLength(1);
+      expect(NodeFS.existsSync(marker)).toBe(false);
     } finally {
       for (const child of children) await stop(child);
       await remote.close();

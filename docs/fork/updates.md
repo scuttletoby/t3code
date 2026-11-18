@@ -52,9 +52,12 @@ watches; it changes nothing on the machine, and `0` turns it off.
   upstream file, listed or not. It runs on every pull request (Fork tests, "Workflow lint and
   upstream drift") and in fork-follow before and after each rebase, against the upstream commit
   the series sits on. A pull request is judged by its base's list, never by its own: a new seam,
-  `pending` or `forkFiles` entry counts once the owner merges it. Its own list is only parsed: a
-  malformed one (bad JSON, an unknown key, a `lost` entry not in the form below, or none) is
-  refused, since once merged it would stop every later run. `pending` maps upstream files
+  `pending` or `forkFiles` entry counts once the owner merges it (a new seam line takes two pull
+  requests, [below](#adding-a-seam-line)). Its own list is only parsed: a malformed one (bad JSON,
+  an unknown or duplicate key, a `files` or `pending` key that is not a plain repository path, a
+  `lost` entry not in the form below, a line in both `added` and `announced`, or none) is refused
+  (a repeated `"//"` comment key is a duplicate too: give each comment its own `//name` key), since once merged it would stop every
+  later run. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it, so a pull request that moves fork lines out
   also lowers the ceiling in the same change). Right after a rebase, below the ceiling is only a
@@ -64,9 +67,14 @@ watches; it changes nothing on the machine, and `0` turns it off.
   it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
   guard, or re-indented) add no line, so they are counted too, two ways: `lines`, the upstream lines
   it does not keep in order and indentation, and `gone`, those whose text it no longer has at all,
-  so a line already counted as moved or re-indented cannot later be deleted unseen. `lost` maps such
+  so deleting a line already counted as moved or re-indented raises `gone`. `lost` maps such
   a file to both (`{"lines": N, "gone": M}`), counted from upstream (none when unlisted) and held
-  exactly like a `pending` ceiling. A pull request may drop a seam file's listed seam lines (no more
+  exactly like a `pending` ceiling. A count is not a set of lines: in a file with a `lost` entry a
+  line it counts may move unseen, and in a pending file with one a pull request can put back one
+  gone upstream line and delete a different one with both counts unchanged (neither run sees it),
+  so keep each count small. Right after a rebase, a count or ceiling that rises came with the
+  rebase, not a fork pull request: the refusal tells the operator to rebase by hand and raise it
+  in the rebased series (fork-follow cannot commit it until #325 item 1). A pull request may drop a seam file's listed seam lines (no more
   copies than listed) but lose no other line, and may not move a seam line: a moved copy of `}`
   looks the same as upstream's (move one with two pull requests). In a pending file it cannot tell
   upstream's lines from the fork's (moving a fork line out loses one), so there fork-follow counts
@@ -77,7 +85,9 @@ watches; it changes nothing on the machine, and `0` turns it off.
   [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
   `fork-*.yml`. A submodule pointer counts as a line. A pull request's run has no upstream commit,
   so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
-  for the fork's own; from upstream, a pattern that matches an upstream file fails. For the same
+  for the fork's own; from upstream, a pattern that matches an upstream file fails. Then remove the
+  entry (or exclude a fork-named path with `!path`): from then on a pull request's run judges the
+  file as upstream's, also before the rebase that brings upstream's copy. For the same
   reason a pull request's run counts upstream's copies of a seam line against its allowance: a
   seam line upstream also has (`}`, `/**`) cannot be added by a pull request, only checked by
   fork-follow, so keep seam lines specific. A branch made before fork-follow last rebased main
@@ -89,6 +99,74 @@ watches; it changes nothing on the machine, and `0` turns it off.
   with no file, `{}`, a file an upstream build wrote, a file cut off half-way and a file with a bad
   value. A file that cannot be read gives no settings at all, and the update loop then does nothing
   (`autoUpdate.test.ts`).
+
+### Adding a seam line
+
+A pull request is judged by main's list, so a change that adds a line to an upstream file and its
+seam entry together is refused. It takes two pull requests, each green:
+
+1. **Announce** (list only, reviewed like any gate change): add the lines under `announced` in the
+   file's entry, with the day: `{"since": "YYYY-MM-DD", "added": [lines]}`. Set `since` to the day
+   this pull request merges (refresh it if the reviews took days): its run warns when the
+   announcement it adds would be refused within 3 days. A file with no entry yet gets one with
+   `"added": []`. The seam check allows an announced line like an `added` one. The seam-check tests
+   (on the pull request's tree) refuse an announced line that is already in its file: a line
+   upstream has (`}`) cannot be announced, as a pull request cannot add it. A line is in `added` or
+   in `announced`, never both.
+2. **Add** the lines, and in the same change move them from `announced` to `added` (drop
+   `announced` once empty). Judged by main's list, which announces them, it is green. Keeping the
+   announcement fails the tests: kept as it is, the lines are now in the file; copied into `added`
+   too, the list is malformed. Review where the line goes, not only the list edit: any pull request
+   may spend an announced line, not only the one meant to.
+
+An announcement lasts 14 days. From upstream, fork-follow refuses one more than 14 days older than
+the head's commit date (or dated ahead of it): add the lines or remove the announcement with a pull
+request to main. The same commits give the same answer; after a rebase the head is new, dated when
+the rebase ran. A pull request's run refuses only a line that an expired announcement alone allows,
+dated by main's commit (never the pull request's), so the pull request that removes the
+announcement adds no line and is green. If upstream itself adds an announced line, fork-follow
+stops before pushing (pushed, main's tree would fail the seam-check tests for every pull request):
+remove the announcement with a list-only pull request to main.
+
+For example, [#398](https://github.com/scuttletoby/t3code/pull/398) takes one list-only pull
+request first. It announces the new cli/connect.ts lines in main's existing entry, keeping the
+three old lines #398 replaces in `added`, and adds `apps/server/src/cloud/holdWorkConnect*` to
+`forkFiles` (#398 changes them, and a pull request's run takes these fork files, not named as the
+fork's, for upstream's until `forkFiles` names them):
+
+```json
+"apps/server/src/cli/connect.ts": {
+  "why": "…, and the CLI's Connect-on check (requireConnectAllowed) refuses on a held copy too.",
+  "added": [
+    "import * as HoldWorkConnect from \"../cloud/holdWorkConnect.ts\";",
+    "// Fork: a held copy shares the live server's environment id; refuse before the relay delete.",
+    "yield* HoldWorkConnect.refuseCliUnlinkWhileHeld(",
+    "(yield* ServerConfig.ServerConfig).serverRuntimeStatePath,",
+    ");"
+  ],
+  "announced": {
+    "since": "2026-11-19",
+    "added": [
+      "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig);",
+      "yield* HoldWorkConnect.refuseCliOnHeldCopy(yield* ServerConfig.ServerConfig); // Fork: a held copy"
+    ]
+  }
+}
+```
+
+The three old lines stay listed until #398 merges: a pull request may delete only lines main's
+list names, so dropping them first makes #398 red on its own deletions. #398 then drops them from
+`added` in its own change, as its tree no longer has them (the seam-check tests refuse a listed line
+its file lacks). [#412](https://github.com/scuttletoby/t3code/pull/412)'s file, which has no entry,
+gets `"apps/server/src/peer/RemoteDelegation.ts": {"why": "…", "added": [], "announced": {"since":
+…, "added": [its 10 lines]}}` in the same list-only pull request. Each pull request then updates
+from main and moves its lines to `added`.
+
+A new `forkFiles` pattern needs no announcement: a list-only pull request adds it, and the pull
+request that edits those files follows. `pending` takes no new file or higher ceiling: its lines
+predate the rule and only move out. A pending file takes no new fork line (a pull request may
+change its lines but not add more, and a file cannot be in `files` and `pending`), so a new fork
+line goes in a seam file, after its lines are announced.
 
 ### Adding a fork setting
 
@@ -178,7 +256,7 @@ settings files may still exist; it moves with the add-ons.
 threads, settings and migrations before it replaces a running T3. It is refused for the background
 service.
 
-Held (nothing of it starts until the server restarts without the flag):
+Held (nothing of it starts until the server restarts without the flag, except T3 Connect: see below):
 
 - agent turns, steers and rollbacks (outbox effects stay pending, unclaimed);
 - thread launches and worktree preparation;
@@ -192,14 +270,34 @@ Held (nothing of it starts until the server restarts without the flag):
   and tunnel). The held server starts no tunnel, registers none with the relay and releases none when
   it stops, so remote access stays with the running server. It publishes no agent activity (thread
   state) to the relay under that id. A client's request to link, change the link, unlink or answer
-  the relay is refused with the reason, and so is every CLI unlink on that home (`t3 connect unlink`,
-  `t3 connect logout`, `t3 up` turning Connect off) while the held server runs: unlinking ends in a
-  relay delete of the shared environment id, which would remove the running server's link too.
-  The stored link files are kept as they are (`apps/server/src/cloud/holdWorkConnect.ts`).
+  the relay is refused with the reason. The stored link files are kept as they are
+  (`apps/server/src/cloud/holdWorkConnect.ts`), with one exception: a managed policy that turns
+  T3 Connect off makes the server unlink while it starts, before the hold applies. That removes the
+  copy's own link files and sends nothing to the relay; the policy has unlinked the running server
+  on that machine already.
 
-  The CLI can only tell a copy is held while its server runs. Never run `t3 connect unlink` or
-  `t3 connect logout` against a stopped copy's home: it removes the running server's link. Delete
-  the copy's home instead.
+  The first held boot writes `hold-work-copy.txt` in the copy's home, and nothing removes it, not
+  a normal boot either. While it is there:
+  - Every boot of that home holds T3 Connect and agent activity publishing as above, with or without
+    `--hold-work`, and logs the marker's path. A copy started normally (`t3 serve` or `t3 up` on its
+    home) runs its work but never registers or releases the tunnel under the shared environment id.
+    The server reads the marker once as it starts: one added while it runs counts from its next
+    start.
+  - `t3 connect login`, `link`, `unlink` and `logout`, `t3 connect publish` turning publishing on,
+    and `t3 up` turning T3 Connect on or off are refused on that home, running or not, before they
+    send anything or change the link or sign-in (the CLI may still create the home's folders and
+    signing key, as any command there does). Unlinking ends in a relay delete of the shared
+    environment id, which would remove the running server's link too, and signing in can refresh
+    the copied sign-in, which the running server shares.
+
+  Anything at that path counts, even an empty file or a dangling symlink, and so does a path that
+  cannot be checked. If the home is not a copy, delete the file and run the command or start the
+  server again.
+
+  A copy with no marker is not protected: one that has never booted held, or one held-booted only by
+  a build from before the marker (its first held boot on a newer build marks it). Neither the CLI
+  nor the server can tell it from the running server's home: never run those commands against it or
+  start it normally. Delete the copy's home instead.
 
 Still runs:
 
@@ -214,6 +312,10 @@ Still runs:
 - reading the copy's Connect status;
 - the periodic Connect reachability check: read-only requests to the stored public address and the
   tunnel network. It restarts only a tunnel this server started, and a held server starts none.
+- the held-hooks waker, which reads the copied relay credential but sends only when a tunnel
+  connects, and a held server connects none;
+- the relay client ledger's clean-up at start, which stops only a recorded tunnel client whose
+  owner process is gone (a running server's own is skipped). Local only.
 
 Startup refuses to serve when the gate is not held or a part that starts work (outbox, thread launch,
 recovery, scheduler) does not use it. The check runs before activation, so nothing parked has run.

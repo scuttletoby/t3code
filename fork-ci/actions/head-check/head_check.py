@@ -26,7 +26,7 @@ request with no lens comments and no required lens (nothing to compare); a draft
 never pass, when anything is unknown: GitHub unreadable after ATTEMPTS (the reviews' flags and inline comments too), a
 malformed answer, a checkout whose merge commit merges another head than the one GitHub reports, a read commit that is
 not in the checkout and cannot be fetched.
-Refuse to start (exit 2, before GitHub is read) on a config or argument error, a git older than 2.38, and a checkout
+Refuse to start (exit 2, before GitHub is read) on a config or argument error, a git older than 2.43, and a checkout
 that is not GitHub's two-parent merge commit, is shallow or is tampered with. Reads only (a fetch of a missing read
 commit into the job's own checkout aside) and posts nothing: a re-run on the same head gives the same answer, and a
 run stopped half-way leaves nothing behind.
@@ -38,7 +38,7 @@ for a check that runs where nothing of the pull request is ever checked out (for
 head come from differs (Checkout).
 `--required-lenses` takes one lens name per line (a name may hold a comma: `data-integrity (DI-1, DI-2)`).
 """
-import argparse, json, os, re, subprocess, sys, tempfile, time
+import argparse, json, os, re, subprocess, sys, tempfile, time, unicodedata
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'pr-queue'))
@@ -73,15 +73,17 @@ class Checkout:
         # Bare, git logs in the way the queue does (gh's login, GH_TOKEN), never with a helper of the machine's config.
         self.auth = pr_queue.GIT_AUTH if self.bare else ()
 
-    def git(self, *a, errors='strict', timeout=None):
-        """errors: how git's output is decoded; 'surrogateescape' for file names, which need not be UTF-8. timeout:
-        seconds, after which git is killed and subprocess.TimeoutExpired raised."""
+    def git(self, *a, errors='strict', timeout=None, fetch=False):
+        """errors: how git's output is decoded (as UTF-8, whatever the locale); 'surrogateescape' for file names, which
+        need not be UTF-8. timeout: seconds, after which git is killed and subprocess.TimeoutExpired raised. fetch: the
+        call fetches from `remote` (pr_queue.git_env: what of the job's GIT_RUN it keeps). In checkout mode every call
+        may fetch from the caller's origin (a partial clone's missing object), so each keeps them, as before."""
         if self.run:
             return self.run(*a)
         with tempfile.TemporaryDirectory(prefix='head-check-') as empty:
             return subprocess.run(['git', *GIT_SAFE, *self.auth, '--git-dir', self.git_dir, *a], cwd=empty, text=True,
-                                  errors=errors, capture_output=True, timeout=timeout,
-                                  env={**os.environ, 'GIT_TERMINAL_PROMPT': '0', **pr_queue.GIT_ENV})
+                                  encoding='utf-8', errors=errors, capture_output=True, timeout=timeout,
+                                  env=pr_queue.git_env(os.environ, self.remote if fetch or not self.bare else None))
 
     def problem(self):
         """Why the repository cannot be read as git made it, or None: not a git folder, shallow (the base's history is
@@ -118,7 +120,8 @@ class Checkout:
     def fetch(self, sha):
         """A read commit no ref of the repository reaches (a force-push dropped it; GitHub keeps it), from origin with the
         credentials the checkout stored or the gate's environment gives (none: a private repository then fails)."""
-        return self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha).returncode == 0 \
+        return self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha,
+                        fetch=True).returncode == 0 \
             and self.has(sha)
 
 
@@ -372,7 +375,7 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
     p.add_argument('--bare', action='store_true', help='read a bare repository (head_gate.py) instead of a checkout')
     p.add_argument('--base', default='', help='with --bare: the base tip the config is read from')
     p.add_argument('--head', default='', help='with --bare: the head GitHub named when the base was read')
-    p.add_argument('--remote', default='origin', help='with --bare: where a missing read commit is fetched from')
+    p.add_argument('--remote', help='with --bare: where a missing read commit is fetched from (default origin)')
     a = p.parse_args(argv)
     required, problems = argument_problems(a.repo, a.pr, a.required_lenses)
     bare = None
@@ -382,7 +385,9 @@ def cli(argv=None, env=None, gh=gh_run, sleep=time.sleep, git=None, out=print):
                      if not SHA.fullmatch(v)]
     elif a.base or a.head:
         problems.append('--base and --head need --bare (a checkout names its own through its merge commit)')
-    checkout = Checkout(a.path, git, bare=bare, remote=a.remote)
+    if a.remote is not None and not a.bare:
+        problems.append("--remote needs --bare (a checkout fetches from its own origin)")
+    checkout = Checkout(a.path, git, bare=bare, remote=a.remote or 'origin')
     if git is None:
         problems += filter(None, [pr_queue.git_problem(), checkout.problem()])
     code, ok, reason, rows = decide(a.repo, a.pr, a.config, checkout, required, a.pass_drafts, gh, sleep, out, problems)
@@ -422,12 +427,12 @@ def base_config(checkout, path, problems):
         return None
     # Bare, the base is the tip the gate read from GitHub's API, fetched by sha: what the pull request's branch says
     # about its own config is never read.
-    r = checkout.git('show', f'{parents[0]}:{repo_path(path)}')
+    r = checkout.git('show', f'{parents[0]}:{repo_path(path)}', errors='surrogateescape')
     if r.returncode != 0:
         problems.append(f'the base commit {parents[0][:12]} has no config {path}')
         return None
-    try:
-        return config.parse(r.stdout, f'{path} at the base {parents[0][:12]}')
+    try:   # as bytes: config.parse refuses one that is not UTF-8, as the queue does
+        return config.parse(r.stdout.encode('utf-8', 'surrogateescape'), f'{path} at the base {parents[0][:12]}')
     except config.ConfigError as e:
         problems.append(str(e))
         return None
@@ -470,12 +475,19 @@ def tree_entry(checkout, tree, rel):
     return tuple(fields)
 
 
+def folded(name):
+    """`name` as a case-insensitive file system compares it: fully case folded (`ſ` is `s`, `ß` is `ss`), NFC and
+    NFD as one (APFS, HFS+). NTFS compares with its own upcase table, which may pair names this keeps apart (`ı`, `İ`
+    and `i`): out of scope, like HFS+'s ignorable code points."""
+    return unicodedata.normalize('NFD', unicodedata.normalize('NFD', name).casefold())
+
+
 def case_matches(checkout, tree, rel):
-    """The paths in `tree` that name `rel` ignoring case, `rel` itself too: at each level the entries whose name
-    casefolds to the same as `rel`'s, the last of any type (a folder there collides too). Raises ValueError when git
-    fails (the caller refuses)."""
-    parts = rel.casefold().split('/')
-    level = [('', tree)]
+    """The paths in `tree` that name `rel` or one of its folders ignoring case (folded), `rel` itself too: at each level
+    the entries of any type whose name folds to the same as `rel`'s there (a file, a symlink or a submodule next to the
+    folder collides with it too); only folders are read on. Raises ValueError when git fails (the caller refuses)."""
+    parts = [folded(p) for p in rel.split('/')]
+    level, matches = [('', tree)], set()
     for i, want in enumerate(parts):
         found = []
         for prefix, oid in level:
@@ -486,10 +498,13 @@ def case_matches(checkout, tree, rel):
             for record in filter(None, (r.stdout or '').split('\0')):
                 meta, _, name = record.partition('\t')
                 fields = meta.split(' ')
-                if name.casefold() == want and (i == len(parts) - 1 or fields[1:2] == ['tree']):
-                    found.append((prefix + name, fields[-1]))
-        level = [(p + '/', oid) for p, oid in found] if i < len(parts) - 1 else found
-    return {p for p, _ in level}
+                if folded(name) == want:
+                    if i < len(parts) - 1 and fields[1:2] == ['tree']:
+                        found.append((prefix + name + '/', fields[-1]))
+                    else:
+                        matches.add(prefix + name)
+        level = found
+    return matches
 
 
 def _merged_config_problem(checkout, path, base, head):
