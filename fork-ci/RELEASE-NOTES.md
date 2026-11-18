@@ -13,6 +13,27 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: no attributes from HEAD; local git calls run no job program (#450)
+
+- Every git call of the queue, the gate and the head check reads attributes from the empty tree
+  (`GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904`). In a bare repository git 2.43 to 2.45 read
+  `HEAD:.gitattributes`, and git 2.43+ reads `attr.tree`: a cache whose `HEAD` an earlier job pointed at a commit
+  holding `* merge=union` made the queue's same-change rule union-merge a conflict.
+- The queue's cache must have the `HEAD` the queue writes (`ref: refs/heads/master`, a branch it never makes);
+  a cache with another `HEAD`, a symlink, none, or that branch made is rebuilt.
+- Only the queue's two fetches keep the job's `GIT_EXEC_PATH` (from GitHub) or `pr_queue.GIT_RUN` (another remote);
+  its merge-tree, cat-file and rev-parse calls in the cache run none of them.
+- `head_check.py --remote` without `--bare` is refused (exit 2): checkout mode fetches from the checkout's origin.
+- git runs with `LC_ALL=C`, so its messages are matched in one language.
+- A fetch from GitHub (https) drops `GIT_TRACE*` and `GIT_CURL_VERBOSE`: the trace would write the login header, and
+  the gate puts git's error into its public summary.
+- A fetch that failed for want of a login says so and names the token (`PR_QUEUE_READ_TOKEN` for the queue, `GH_TOKEN`
+  for the gate).
+
+**Upgrade:** the queue, the gate and the head check need git 2.43 or newer (`GIT_ATTR_SOURCE` came in 2.41, and
+`merge-tree` with it crashed before 2.43); an older git is refused (exit 2), never run without it. A kept queue cache
+is rebuilt once if its `HEAD` is not the queue's; nothing else to do.
+
 ### pr-queue and head-check: GIT_ATTR_SOURCE and the job's git programs (#442)
 
 - Every git call of the queue and the head check also drops `GIT_ATTR_SOURCE` and `GIT_EXTERNAL_DIFF`. With
