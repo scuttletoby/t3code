@@ -321,7 +321,9 @@ hard-linked files, files already compressed (`.zst`, `.gz`, `.xz`, `.zip`, ...),
 are). Skipped with a line in the plan instead of failing every run: a file its owner may not read, an immutable or
 append-only file or folder (`chattr`), a file whose group is not one of the user's (the copy could not keep it), and
 a file with extended attributes other than `user.*` and the ACL (`security.*`, `trusted.*`: the copy would lose
-them). The config refuses a folder that is `/`, the home folder or above it, a
+them). On a machine with SELinux every file has `security.selinux`, so every file is skipped this way and the rule
+frees nothing there; that is safe (nothing changes, the run exits 0). The copy gets nothing the original lacks: an
+ACL it would get from its folder is removed. The config refuses a folder that is `/`, the home folder or above it, a
 must-keep path itself or a folder above one (`~/.codex` holds logins: name `~/.codex/sessions`), anything in or
 above `~/.claude*` or the folder a `~/.claude*` link leads to (Claude Code reads its transcripts as plain text), a
 folder named like `*log-archive*` or inside one, the cleaner's own log or daily folder, a

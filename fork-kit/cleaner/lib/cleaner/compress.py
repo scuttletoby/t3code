@@ -683,15 +683,32 @@ def compress(item):
 
 
 def _keep_metadata(src, dst, st):
-    """Gives the copy the original's group, mode, ACL and extended attributes (COPYABLE_XATTRS; _keepable skipped
-    files with others). The group first: a chown may clear set-id bits, which the mode then sets again."""
+    """Gives the copy the original's group, ACL, extended attributes (COPYABLE_XATTRS; _keepable skipped files with
+    others) and mode, and nothing more. The group first: a chown may clear set-id bits. The mode last: the part is
+    still 0600 while the attributes are set (a `user.*` attribute needs write access, also on a read-only file), and
+    an ACL sets the group bits, which the mode then sets again as the original has them."""
     if st.st_gid != os.fstat(dst).st_gid:
         os.fchown(dst, -1, st.st_gid)
-    os.fchmod(dst, stat.S_IMODE(st.st_mode))
-    for attr in xattrs(src):
+    want = xattrs(src)
+    for attr in want:
         if not matches(attr, COPYABLE_XATTRS):
             raise Untouched(f'it has the extended attribute {attr}, which its copy could not keep: the original stays')
+    # The part was made in the original's folder and got what that folder gives new files (a default ACL becomes its
+    # ACL): what the original does not have goes, so the copy lets no one read what the original did not.
+    for attr in xattrs(dst):
+        if attr not in want:
+            _drop_xattr(dst, attr)
+    for attr in want:
         os.setxattr(dst, attr, os.getxattr(src, attr))
+    os.fchmod(dst, stat.S_IMODE(st.st_mode))
+
+
+def _drop_xattr(fd, attr):
+    try:
+        os.removexattr(fd, attr)
+    except OSError as ex:
+        if ex.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise
 
 
 def _write_copy(parent, name, target, src, st, look):

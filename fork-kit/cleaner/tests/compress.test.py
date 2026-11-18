@@ -459,6 +459,30 @@ class Names(Case):
         with open(path) as f:
             self.assertEqual(f.read(), text())
 
+    def test_an_original_saved_over_before_it_goes_stays(self):
+        path = self.big('old.jsonl')
+        write, in_use, written = self.c.compress._write_copy, self.c.compress._in_use, []
+
+        def copied(*args):
+            written.append(write(*args))
+            return written[-1]
+
+        def then_saved(*args):
+            out = in_use(*args)
+            if written:                         # the last check of the compress: an editor saves onto the original
+                other = self.file(self.path('saved.jsonl'), 'NEW CONTENT the user just saved\n')
+                os.rename(other, path)
+            return out
+        with mock.patch.object(self.c.compress, '_write_copy', copied), \
+                mock.patch.object(self.c.compress, '_in_use', then_saved):
+            code, lines = self.run_cleaner(self.cold_cfg())
+        self.assertEqual(code, 1, lines)
+        self.assertTrue(any(line.startswith(f'FAILED {path} ') and 'changed while it was compressed' in line
+                            for line in lines), lines)
+        self.assertEqual(self.files(), ['old.jsonl'])
+        with open(path) as f:
+            self.assertEqual(f.read(), 'NEW CONTENT the user just saved\n')
+
     def test_a_copy_with_another_name_elsewhere_is_no_copy_of_this_rule(self):
         path = self.big('old.jsonl')
         self.pack(path, path + '.zst')
@@ -485,6 +509,14 @@ class Names(Case):
         self.assertEqual(self.files(), ['old.jsonl.zst'])
         self.assertEqual(os.stat(path + '.zst').st_ino, copy)
         self.assertEqual(self.unpack(path + '.zst'), text())
+
+    def test_a_copy_of_another_owner_beside_it_is_no_copy_of_this_rule(self):
+        path = self.big('old.jsonl')
+        self.pack(path, path + '.zst')
+        self.age(path, 40)
+        ino, owner = os.stat(path + '.zst').st_ino, self.c.guard.owner
+        with mock.patch.object(self.c.guard, 'owner', lambda st: 4242 if st.st_ino == ino else owner(st)):
+            self.assertKept(self.plan(self.cold_cfg()), path, 'name taken', 'no copy this rule made')
 
     def test_a_part_file_of_another_owner_stays(self):
         self.big('old.jsonl')
@@ -562,6 +594,41 @@ class Metadata(Case):
         self.assertEqual({name: os.getxattr(copy, name) for name in os.listxattr(copy)}, want)
         if not others:
             self.skipTest('the user has one group: the group copy is not shown')
+
+    def test_a_read_only_file_keeps_its_attributes(self):
+        path = self.big('old.jsonl')
+        self.xattr_or_skip(path, 'user.origin', b'session of october')
+        os.chmod(path, 0o444)
+        self.age(path, 40)
+        code, lines = self.run_cleaner(self.cold_cfg())
+        self.assertEqual(code, 0, lines)
+        copy = path + '.zst'
+        self.assertEqual(self.files(), ['old.jsonl.zst'])
+        self.assertEqual(os.stat(copy).st_mode & 0o7777, 0o444)
+        self.assertEqual(os.getxattr(copy, 'user.origin'), b'session of october')
+
+    def test_the_copy_gets_no_acl_the_original_lacks(self):
+        path = self.big('old.jsonl')
+        os.chmod(path, 0o640)
+        # set after the file was made, as on a folder a file was moved into: user::rw- user:65534:rw- group::r--
+        # mask::rw- other::---; a new file in the folder gets it as its ACL
+        undefined = 0xFFFFFFFF
+        acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', tag, perm, uid) for tag, perm, uid in (
+            (0x01, 6, undefined), (0x02, 6, 65534), (0x04, 4, undefined), (0x10, 6, undefined), (0x20, 0, undefined)))
+        self.xattr_or_skip(self.cold, 'system.posix_acl_default', acl)
+        probe = self.file(os.path.join(self.cold, 'probe'))
+        inherited = 'system.posix_acl_access' in os.listxattr(probe)
+        os.unlink(probe)
+        if not inherited:
+            self.skipTest('a default ACL is not given to new files here')
+        self.assertEqual(os.listxattr(path), [])
+        self.age(path, 40)
+        code, lines = self.run_cleaner(self.cold_cfg())
+        self.assertEqual(code, 0, lines)
+        copy = path + '.zst'
+        self.assertEqual(self.files(), ['old.jsonl.zst'])
+        self.assertEqual(os.listxattr(copy), [])
+        self.assertEqual(os.stat(copy).st_mode & 0o7777, 0o640)
 
     def test_what_a_copy_could_not_keep_is_skipped(self):
         foreign, tagged = self.big('foreign.log'), self.big('tagged.log')
@@ -740,6 +807,11 @@ MUTATIONS = {
         Names, 'test_a_name_that_appears_while_the_copy_is_written_is_never_replaced'),
     'both names checked just before the original goes': ('compress', ' or named != copy:', ':',
                                                           Names, 'test_a_copy_name_swapped_before_the_original_goes_keeps_the_original'),
+    'the original checked by name just before it goes': ('compress', ' or not _same(now, item.look) or named', ' or named',
+                                                         Names, 'test_an_original_saved_over_before_it_goes_stays'),
+    'a twin of another owner is no copy of this rule': ('compress', 'or st.st_nlink != 1 or guard.owner(st) != os.getuid():',
+                                                        'or st.st_nlink != 1:', Names,
+                                                        'test_a_copy_of_another_owner_beside_it_is_no_copy_of_this_rule'),
     'a twin must have one name': ('compress', 'or st.st_nlink != 1 or guard.owner(st)', 'or guard.owner(st)',
                                   Names, 'test_a_copy_with_another_name_elsewhere_is_no_copy_of_this_rule'),
     'a twin still linked to its part is named so': ('compress', 'and _linked_part(path, st):', 'and False:',
@@ -754,6 +826,12 @@ MUTATIONS = {
                                  Metadata, 'test_the_copy_keeps_the_group_acl_and_extended_attributes'),
     'the copy keeps the ACL and attributes': ('compress', 'os.setxattr(dst, attr, os.getxattr(src, attr))', 'pass',
                                               Metadata, 'test_the_copy_keeps_the_group_acl_and_extended_attributes'),
+    'the copy is given no attribute the original lacks': ('compress', '            _drop_xattr(dst, attr)\n', '            pass\n',
+                                                          Metadata, 'test_the_copy_gets_no_acl_the_original_lacks'),
+    'the mode is set after the attributes': (
+        'compress', "    for attr in want:\n        os.setxattr(dst, attr, os.getxattr(src, attr))\n    os.fchmod(dst, stat.S_IMODE(st.st_mode))\n",
+        "    os.fchmod(dst, stat.S_IMODE(st.st_mode))\n    for attr in want:\n        os.setxattr(dst, attr, os.getxattr(src, attr))\n",
+        Metadata, 'test_a_read_only_file_keeps_its_attributes'),
     'a group the copy could not keep': ("compress", "if st.st_gid != os.getegid() and st.st_gid not in os.getgroups():", 'if False:',
                                         Metadata, 'test_what_a_copy_could_not_keep_is_skipped'),
     'attributes the copy could not keep': ('compress', 'if other:', 'if False:', Metadata, 'test_what_a_copy_could_not_keep_is_skipped'),
