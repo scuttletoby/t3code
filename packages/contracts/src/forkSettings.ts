@@ -60,6 +60,8 @@ const DEFAULT_HEADLESS_USAGE_REFRESH_INTERVAL = Duration.minutes(10);
 export const ForkServerSettingsFields = {
   /** Optional executable asked before an automatic update; a non-zero exit means "not now". */
   automaticUpdatesQuietCommand: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+  /** Answers "is T3 busy?" read-only on loopback (GET /api/fork/activity); off: no such route. */
+  activityProbe: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Usage pacing per provider instance; an instance without an entry has no reserve. */
   usagePacing: Schema.Record(ProviderInstanceId, UsagePacingInstanceSettings).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
@@ -112,6 +114,7 @@ export type ForkServerSettingKey = keyof typeof ForkServerSettingsFields;
 /** The settings patch's fork fields: one per server field, how a client may change it. */
 export const ForkServerSettingsPatchFields = {
   automaticUpdatesQuietCommand: Schema.optionalKey(TrimmedString),
+  activityProbe: Schema.optionalKey(Schema.Boolean),
   usagePacing: Schema.optionalKey(
     Schema.Record(ProviderInstanceId, Schema.NullOr(UsagePacingInstanceSettingsPatch)),
   ),
@@ -157,6 +160,7 @@ export type ForkPatchRule =
 /** One rule per fork patch field. */
 export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatchRule } = {
   automaticUpdatesQuietCommand: "replace",
+  activityProbe: "replace",
   usagePacing: { mergeEntries: DEFAULT_USAGE_PACING_INSTANCE_SETTINGS },
   usagePacingGate: "replace",
   // A level left out of the patch is removed.
