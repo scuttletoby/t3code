@@ -21,7 +21,8 @@
 #                           candidate's exact files: move the series to that release, build nothing
 #                  stage    the release workflows of this run's commit differ from the candidate's
 #                           (upstream changed them, or this is a re-run of an older run): push the
-#                           candidate and stop, so it is released with its own files (see $REPORT)
+#                           candidate and stop; $REPORT says how to move main to it, so that a new
+#                           run releases it from main with its own files
 #   base_tag, base_commit  the upstream tag (and its commit) the candidate sits on
 #   previous_tag, previous_head  where the series was (rebase, advance, stage)
 #   candidate      the commit to release or to move the series to
@@ -401,13 +402,27 @@ changed_release_workflows() { # lists the release workflow files that differ bet
   done <<< "$(sort -u <<< "$(called "$run_sha")"$'\n'"$(called "$1")")"
 }
 stage_report() { # stage_report CANDIDATE TAG CHANGED
-  printf '%s\n' \
-    "The release workflows differ between this run's commit (${run_sha:0:12}) and the candidate ${1:0:12} on $2:" \
-    "${3%$'\n'}" "" \
-    "A run uses the reusable workflows of its own commit, so this run would build the candidate with other release steps than its own; it built nothing." \
-    "The candidate ${1:0:12} is on the branch fork-follow/candidate. Release it with its own workflow files:" \
-    "\`gh workflow run fork-release.yml --repo $REPOSITORY --ref fork-follow/candidate -f ref=$1 -f publish=true\`" \
-    "The next follow run then finds that release (and moves the series to it if it is not there yet)." > "$REPORT"
+  # A release publishes only commits on main (fork-release.sh on-main, and the pc-agents kit checks
+  # the build attestation's ref), so the candidate is released from main, by this workflow: main is
+  # moved to it first, as the advance job does (the old series kept as a tag), then a new run has the
+  # candidate's own release workflows and plans "release".
+  {
+    printf '%s\n' \
+      "The release workflows differ between this run's commit (${run_sha:0:12}) and the candidate ${1:0:12} on $2:" \
+      "${3%$'\n'}" "" \
+      "A run uses the reusable workflows of its own commit, so this run would build the candidate with other release steps than its own; it built nothing." \
+      "A release publishes only commits on main, so the candidate is not released from another branch."
+    if [[ "$1" == "$head" ]]; then
+      printf '%s\n' "The series is at the candidate already: start a new run (not a re-run of this one), which has its release workflows:" \
+        "\`gh workflow run fork-follow.yml --repo $REPOSITORY\`"
+    else
+      printf '%s\n' "The candidate is on the branch fork-follow/candidate. Move main to it as this workflow's advance does (the old series kept as a tag), then start a new run: it has the candidate's release workflows, releases it from main and disables the upstream workflows that the push started." \
+        "\`git fetch origin fork-follow/candidate main\`" \
+        "\`git push origin $head:refs/tags/fork-follow/pre-$2-${head:0:12}\`" \
+        "\`git push --force-with-lease=main:$head origin $1:refs/heads/main\`" \
+        "\`gh workflow run fork-follow.yml --repo $REPOSITORY\`"
+    fi
+  } > "$REPORT"
 }
 
 # Nightly: the newest nightly must contain the series' base. A nightly tag moved or added to an older
