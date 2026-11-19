@@ -740,6 +740,50 @@ it.layer(NodeServices.layer)("UsageReadingsHistory", (it) => {
     }),
   );
 
+  it.effect("thinning keeps a break whose reading before the step fell to retention", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const directory = yield* historyDirectory;
+      const start = -31 * DAY;
+      const minutes = (from: number, percent: number) =>
+        Array.from({ length: 30 }, (_, n) => reading(at(start + (from + n) * MINUTE), percent));
+      // A reading a minute for 30 minutes at day -31; then the clock steps back to day -36 (older
+      // than retention, so that reading goes), then readings resume 20 minutes before the first
+      // pass. The new pass starts before the last reading kept, so thinning starts again there.
+      const file = yield* seedHistory(
+        directory,
+        INSTANCE,
+        jsonLines([
+          ...minutes(0, 40),
+          reading(at(-36 * DAY), 45),
+          ...minutes(-20, 50),
+          reading(at(-MINUTE), 60),
+        ]),
+      );
+      const history = yield* make({
+        directory,
+        retentionMs: 35 * DAY,
+        thinAfterMs: DAY,
+        thinIntervalMs: 15 * MINUTE,
+      });
+      yield* history.compact;
+
+      // Minutes 0 and 15 and the last reading (29) before the step, then minutes -20 and -5 of
+      // the new pass, and the recent reading. The break between 29 and -20 stays.
+      const kept = yield* history.readings(INSTANCE);
+      assert.deepStrictEqual(
+        kept.map((entry) => (Date.parse(entry.checkedAt) - (NOW_MS + start)) / MINUTE).slice(0, 5),
+        [0, 15, 29, -20, -5],
+      );
+      assert.deepStrictEqual(percents(kept), [40, 40, 40, 50, 50, 60]);
+      assert.deepStrictEqual(segments(kept), [0, 0, 0, 1, 1, 1]);
+      // Run again: a second compaction keeps the same lines.
+      const once = yield* fileLines(file);
+      yield* history.compact;
+      assert.deepStrictEqual(yield* fileLines(file), once);
+    }),
+  );
+
   it.effect(
     "keeps readings ahead of a clock that is behind and serves them once it is put right",
     () =>
