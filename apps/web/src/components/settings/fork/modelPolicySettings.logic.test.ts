@@ -4,6 +4,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   modelPolicyAllowText,
+  modelPolicyEditorText,
+  unknownModelPolicyDrivers,
+  unreadableModelPolicyMode,
   unreadableModelPolicyText,
   withModelPolicyAllow,
 } from "./modelPolicySettings.logic";
@@ -43,5 +46,52 @@ describe("unreadableModelPolicyText", () => {
     const bad = fromFile({ modelPolicy: { mode: "on" } }).modelPolicy;
     expect(bad).toMatchObject({ mode: "enforce", allow: [] });
     expect(unreadableModelPolicyText(bad)).toBe('{"mode":"on"}');
+  });
+});
+
+describe("modelPolicyEditorText and unreadableModelPolicyMode", () => {
+  it("start the editor from an unreadable value's own rows and name its own mode", () => {
+    const typo = { ...ROW, effort: "low" };
+    const bad = fromFile({ modelPolicy: { mode: "advise", allow: [typo] } }).modelPolicy;
+    expect(bad).toMatchObject({ mode: "enforce", allow: [] });
+    expect(JSON.parse(modelPolicyEditorText(bad))).toEqual([typo]);
+    expect(unreadableModelPolicyMode(bad)).toBe("advise");
+  });
+
+  it("start from no rows and no mode when the unreadable value has neither", () => {
+    for (const value of [{ mode: "always" }, "enforce", 3, null]) {
+      const bad = fromFile({ modelPolicy: value }).modelPolicy;
+      expect(modelPolicyEditorText(bad)).toBe("[]");
+      expect(unreadableModelPolicyMode(bad)).toBeNull();
+    }
+    const list = fromFile({ modelPolicy: [ROW] }).modelPolicy;
+    expect(JSON.parse(modelPolicyEditorText(list))).toEqual([ROW]);
+    expect(unreadableModelPolicyMode(list)).toBeNull();
+  });
+
+  it("start from the stored rows when the value was read", () => {
+    const stored = fromFile({ modelPolicy: { mode: "off", allow: [ROW] } }).modelPolicy;
+    expect(modelPolicyEditorText(stored)).toBe(modelPolicyAllowText(stored));
+    expect(unreadableModelPolicyMode(stored)).toBeNull();
+  });
+});
+
+describe("unknownModelPolicyDrivers", () => {
+  const rows = fromFile({
+    modelPolicy: {
+      mode: "enforce",
+      allow: [ROW, { driver: "claudAgent", model: "x" }, { driver: "claudAgent", model: "y" }],
+    },
+  }).modelPolicy.allow;
+
+  it("names each driver no provider here has, once", () => {
+    expect(unknownModelPolicyDrivers(rows, new Set(["codex", "claudeAgent"]))).toEqual([
+      "claudAgent",
+    ]);
+    expect(unknownModelPolicyDrivers(rows, new Set(["codex", "claudAgent"]))).toEqual([]);
+  });
+
+  it("flags nothing when no provider is known (a disconnected environment)", () => {
+    expect(unknownModelPolicyDrivers(rows, new Set())).toEqual([]);
   });
 });

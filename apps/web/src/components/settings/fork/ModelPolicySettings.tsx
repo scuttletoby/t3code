@@ -30,16 +30,35 @@ import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
-import { ForkRow } from "./ForkRow";
+import { ForkRow, useSelectedProviders } from "./ForkRow";
 import {
   MODEL_POLICY_MODE_OPTIONS,
-  modelPolicyAllowText,
+  modelPolicyEditorText,
   modelPolicyRowLine,
+  unknownModelPolicyDrivers,
+  unreadableModelPolicyMode,
   unreadableModelPolicyText,
   withModelPolicyAllow,
 } from "./modelPolicySettings.logic";
 
 const MIXED = "The selected environments have different values. Select one environment to edit it.";
+
+/** The warning for a settings-file value that cannot be read, with the file's own text. */
+function UnreadableWarning({
+  text,
+  children,
+}: {
+  readonly text: string;
+  readonly children: string;
+}) {
+  return (
+    <div className="text-xs text-destructive-foreground">
+      The settings file&apos;s model policy cannot be read, so it reads as Enforce with nothing
+      allowed: every pick is refused. It is kept as written until you save here. {children}
+      <code className="mt-1 block break-all text-muted-foreground">{text}</code>
+    </div>
+  );
+}
 
 function AllowDialog({
   value,
@@ -50,12 +69,23 @@ function AllowDialog({
   readonly onOpenChange: (open: boolean) => void;
   readonly onSave: (next: ModelPolicyPatch, onSaved: () => void, onFailed: () => void) => void;
 }) {
-  const [text, setText] = useState(() => modelPolicyAllowText(value));
+  const unreadableText = unreadableModelPolicyText(value);
+  const [text, setText] = useState(() => modelPolicyEditorText(value));
+  // An unreadable value has no mode to keep: its `enforce` is only the fail-closed reading, so the
+  // person picks the mode this save writes, the file's own one offered first when it names one.
+  const [mode, setMode] = useState<ModelPolicyMode | null>(
+    unreadableText === null ? value.mode : null,
+  );
+  const fileMode = unreadableModelPolicyMode(value);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const save = () => {
     if (saving) return;
-    const result = withModelPolicyAllow(value.mode, text);
+    if (mode === null) {
+      setError("Choose the mode this save writes.");
+      return;
+    }
+    const result = withModelPolicyAllow(mode, text);
     if ("error" in result) {
       setError(result.error);
       return;
@@ -83,27 +113,66 @@ function AllowDialog({
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>
-          <Textarea
-            aria-label="Allowed models"
-            className="min-h-72"
-            value={text}
-            onChange={(event) => {
-              setError(null);
-              setText(event.target.value);
-            }}
-          />
-          {error !== null ? (
-            <p role="alert" className="mt-2 text-xs text-destructive-foreground">
-              {error}
-            </p>
-          ) : null}
+          <div className="grid gap-3">
+            {unreadableText !== null ? (
+              <>
+                <UnreadableWarning text={unreadableText}>
+                  Saving here replaces it with the rows below, which start from the file&apos;s own
+                  rows when it has a list of them, and the mode you choose.
+                </UnreadableWarning>
+                <Select
+                  value={mode}
+                  onValueChange={(next) => {
+                    if (next === null) return;
+                    setError(null);
+                    setMode(next as ModelPolicyMode);
+                  }}
+                >
+                  <SelectTrigger size="sm" className="w-full sm:w-64" aria-label="Mode to save">
+                    <SelectValue>
+                      {mode === null
+                        ? "Choose a mode"
+                        : MODEL_POLICY_MODE_OPTIONS.find((candidate) => candidate.value === mode)
+                            ?.label}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectPopup alignItemWithTrigger={false}>
+                    {MODEL_POLICY_MODE_OPTIONS.map((candidate) => (
+                      <SelectItem hideIndicator key={candidate.value} value={candidate.value}>
+                        {candidate.label}
+                        {candidate.value === fileMode ? " (as the file says)" : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectPopup>
+                </Select>
+              </>
+            ) : null}
+            <Textarea
+              aria-label="Allowed models"
+              className="min-h-72"
+              value={text}
+              onChange={(event) => {
+                setError(null);
+                setText(event.target.value);
+              }}
+            />
+            {error !== null ? (
+              <p role="alert" className="text-xs text-destructive-foreground">
+                {error}
+              </p>
+            ) : null}
+          </div>
         </DialogPanel>
         <DialogFooter variant="bare">
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
           <Button disabled={saving} onClick={save}>
-            {saving ? "Saving…" : "Save rows"}
+            {saving
+              ? "Saving…"
+              : unreadableText === null
+                ? "Save rows"
+                : "Replace the unreadable value"}
           </Button>
         </DialogFooter>
       </DialogPopup>
@@ -120,6 +189,7 @@ export function ModelPolicySettings() {
   const [editing, setEditing] = useState(false);
   const unreadableText = mixed ? null : unreadableModelPolicyText(shown);
   const option = MODEL_POLICY_MODE_OPTIONS.find((candidate) => candidate.value === shown.mode);
+  const providers = useSelectedProviders();
 
   const save = (
     next: ModelPolicyPatch,
@@ -143,6 +213,9 @@ export function ModelPolicySettings() {
     );
   }
 
+  const unknownDrivers = new Set(
+    unknownModelPolicyDrivers(shown.allow, new Set(providers.map((provider) => provider.driver))),
+  );
   const byDriver = new Map<string, Array<ModelPolicy["allow"][number]>>();
   for (const row of shown.allow)
     byDriver.set(row.driver, [...(byDriver.get(row.driver) ?? []), row]);
@@ -184,11 +257,10 @@ export function ModelPolicySettings() {
         }
       >
         {unreadableText !== null ? (
-          <div role="alert" className="pb-2 text-xs text-destructive-foreground">
-            The settings file&apos;s model policy cannot be read, so it reads as Enforce with
-            nothing allowed: every pick is refused. It is kept as written until you save here; a
-            save replaces it.
-            <code className="mt-1 block break-all text-muted-foreground">{unreadableText}</code>
+          <div role="alert" className="pb-2">
+            <UnreadableWarning text={unreadableText}>
+              Changing the mode, resetting, or saving the allowed models replaces it.
+            </UnreadableWarning>
           </div>
         ) : null}
       </ForkRow>
@@ -212,6 +284,12 @@ export function ModelPolicySettings() {
               <div key={driver} className="grid gap-0.5 sm:grid-cols-[8rem_1fr]">
                 <dt className="text-muted-foreground">{driver}</dt>
                 <dd className="grid gap-0.5 break-all">
+                  {unknownDrivers.has(driver) ? (
+                    <span role="note" className="text-destructive-foreground">
+                      No provider here uses the driver {driver}; check the name. With Enforce, its
+                      picks are refused.
+                    </span>
+                  ) : null}
                   {rows.map((row) => (
                     <code key={JSON.stringify(row)}>{modelPolicyRowLine(row)}</code>
                   ))}

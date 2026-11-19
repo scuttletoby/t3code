@@ -8,10 +8,26 @@
 import { isManagedSettingPath } from "@t3tools/contracts";
 import { type ComponentProps, useState } from "react";
 
+import { useEnvironmentProviders } from "../../../state/environments";
+import { EMPTY_SERVER_PROVIDERS } from "../../../state/server";
 import { IntervalSecondsField } from "../IntervalSecondsField";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingsRow } from "../settingsLayout";
 import { useScopedSettingsWriteAllowed } from "../useScopedSettings";
+
+/** Every selected environment's accounts, the primary's first, as the agent slots rows list them. */
+export function useSelectedProviders() {
+  const { environment, connectedEnvironments } = useSettingsScope();
+  const providersByEnvironment = useEnvironmentProviders();
+  return [
+    ...(environment ? [environment] : []),
+    ...connectedEnvironments.filter(
+      (candidate) => candidate.environmentId !== environment?.environmentId,
+    ),
+  ].flatMap(
+    (candidate) => providersByEnvironment.get(candidate.environmentId) ?? EMPTY_SERVER_PROVIDERS,
+  );
+}
 
 /** Why the row's setting cannot be changed here: an administrator's lock or no write permission. */
 function useForkRowLock(paths: ReadonlyArray<string>): string | undefined {

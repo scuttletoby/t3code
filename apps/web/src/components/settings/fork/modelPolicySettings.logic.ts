@@ -38,6 +38,47 @@ export function unreadableModelPolicyText(policy: ModelPolicy): string | null {
 /** The allowed rows as the editor shows them: JSON, as in the settings file. */
 export const modelPolicyAllowText = (policy: ModelPolicy) => JSON.stringify(policy.allow, null, 2);
 
+/** The unreadable value's own fields, when it is a JSON object. */
+function unreadableFields(policy: ModelPolicy): Readonly<Record<string, unknown>> | null {
+  if (!("unreadable" in policy)) return null;
+  const raw = policy.unreadable;
+  return typeof raw === "object" && raw !== null && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * The text the rows editor starts from. For an unreadable value, its own rows when it has a list
+ * of them (a bare list counts too), so the person fixes the typo instead of retyping every row;
+ * the fail-closed `[]` would throw the text away without saying so.
+ */
+export function modelPolicyEditorText(policy: ModelPolicy): string {
+  if (!("unreadable" in policy)) return modelPolicyAllowText(policy);
+  const raw = Array.isArray(policy.unreadable)
+    ? policy.unreadable
+    : unreadableFields(policy)?.allow;
+  return JSON.stringify(Array.isArray(raw) ? raw : [], null, 2);
+}
+
+/** The mode an unreadable value names, when it names one of the three; never the fail-closed one. */
+export function unreadableModelPolicyMode(policy: ModelPolicy): ModelPolicyMode | null {
+  const mode = unreadableFields(policy)?.mode;
+  return MODEL_POLICY_MODE_OPTIONS.find((option) => option.value === mode)?.value ?? null;
+}
+
+/**
+ * The drivers the rows name that no provider on the selected environments has, in the rows' order
+ * (a typo such as `claudAgent`: with Enforce, every pick of that provider is refused). Empty when
+ * no provider is known, so a disconnected environment flags nothing.
+ */
+export function unknownModelPolicyDrivers(
+  rows: ReadonlyArray<ModelPolicyRow>,
+  knownDrivers: ReadonlySet<string>,
+): ReadonlyArray<string> {
+  if (knownDrivers.size === 0) return [];
+  return [...new Set(rows.map((row) => row.driver))].filter((driver) => !knownDrivers.has(driver));
+}
+
 /** One allowed row as one line. */
 export function modelPolicyRowLine(row: ModelPolicyRow): string {
   const efforts =

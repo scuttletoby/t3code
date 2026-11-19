@@ -13,7 +13,7 @@ const state = vi.hoisted(() => ({
   settings: {} as Settings,
   environments: [] as Array<{
     environmentId: string;
-    providers: Array<{ instanceId: string; displayName: string }>;
+    providers: Array<{ instanceId: string; driver: string; displayName: string }>;
     managedPolicy?: ManagedPolicySummary;
   }>,
   update: vi.fn((_patch: unknown, _options?: UpdateOptions) => {}),
@@ -90,8 +90,8 @@ function setup(file: object, managedPolicy?: ManagedPolicySummary) {
     {
       environmentId: "env-a",
       providers: [
-        { instanceId: "claude-a", displayName: "Claude A" },
-        { instanceId: "codex-b", displayName: "Codex B" },
+        { instanceId: "claude-a", driver: "claudeAgent", displayName: "Claude A" },
+        { instanceId: "codex-b", driver: "codex", displayName: "Codex B" },
       ],
       ...(managedPolicy ? { managedPolicy } : {}),
     },
@@ -229,12 +229,59 @@ describe("ModelPolicySettings", () => {
     setup({ modelPolicy: { mode: "always" } });
     await using screen = await render(<ModelPolicySettings />);
 
-    await expect.element(screen.getByRole("alert")).toHaveTextContent("cannot be read");
+    await expect.element(screen.getByRole("alert")).toMatchTextContent("cannot be read");
     await expect.element(screen.getByText('{"mode":"always"}')).toBeVisible();
     await expect
       .element(screen.getByRole("combobox", { name: "Model policy mode" }))
-      .toHaveTextContent("Enforce");
+      .toMatchTextContent("Enforce");
     await userEvent.click(screen.getByRole("button", { name: "Reset model policy to default" }));
     expect(state.update.mock.calls[0]![0]).toEqual({ modelPolicy: { mode: "off", allow: [] } });
+  });
+
+  it("edits an unreadable value from its own rows, and saves only with a mode the person chose", async () => {
+    const typo = { driver: "codex", model: "gpt-mini", effort: "low" };
+    setup({ modelPolicy: { mode: "advise", allow: [typo] } });
+    await using screen = await render(<ModelPolicySettings />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit allowed models" }));
+    const dialog = page.getByRole("dialog");
+    await expect.element(dialog.getByText(/cannot be read/)).toBeVisible();
+    await expect
+      .element(dialog.getByText(JSON.stringify({ mode: "advise", allow: [typo] })))
+      .toBeVisible();
+    const rows = dialog.getByRole("textbox", { name: "Allowed models" });
+    await expect.element(rows).toHaveValue(JSON.stringify([typo], null, 2));
+
+    const fixed = { driver: "codex", model: "gpt-mini", efforts: ["low"] };
+    await userEvent.fill(rows, JSON.stringify([fixed]));
+    const replace = dialog.getByRole("button", { name: "Replace the unreadable value" });
+    await userEvent.click(replace);
+    await expect.element(dialog.getByRole("alert")).toMatchTextContent("Choose the mode");
+    expect(state.update).not.toHaveBeenCalled();
+
+    await userEvent.click(dialog.getByRole("combobox", { name: "Mode to save" }));
+    await userEvent.click(page.getByRole("option", { name: "Advise (as the file says)" }));
+    await userEvent.click(replace);
+    expect(state.update.mock.calls[0]![0]).toEqual({
+      modelPolicy: { mode: "advise", allow: [fixed] },
+    });
+  });
+
+  it("flags a row whose driver no provider here has", async () => {
+    setup({
+      modelPolicy: {
+        mode: "enforce",
+        allow: [
+          { driver: "claudAgent", model: "opus" },
+          { driver: "codex", model: "gpt-mini" },
+        ],
+      },
+    });
+    await using screen = await render(<ModelPolicySettings />);
+
+    await expect
+      .element(screen.getByRole("note"))
+      .toMatchTextContent("No provider here uses the driver claudAgent");
+    await expect.element(screen.getByText("gpt-mini")).toBeVisible();
   });
 });

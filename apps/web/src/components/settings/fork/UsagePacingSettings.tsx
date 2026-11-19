@@ -12,8 +12,6 @@ import {
 } from "@t3tools/contracts";
 import { useState } from "react";
 
-import { useEnvironmentProviders } from "../../../state/environments";
-import { EMPTY_SERVER_PROVIDERS } from "../../../state/server";
 import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
@@ -23,7 +21,7 @@ import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
-import { BoundedNumberField, ForkRow } from "./ForkRow";
+import { BoundedNumberField, ForkRow, useSelectedProviders } from "./ForkRow";
 import {
   USAGE_PACING_GATE_OPTIONS,
   formatLowerEffort,
@@ -45,20 +43,6 @@ export function UsagePacingSettings() {
       <LowerEffortRow updateSettings={updateSettings} />
       <AccountRows updateSettings={updateSettings} />
     </SettingsSection>
-  );
-}
-
-/** Every selected environment's accounts, the primary's first, as the agent slots rows list them. */
-function useSelectedProviders() {
-  const { environment, connectedEnvironments } = useSettingsScope();
-  const providersByEnvironment = useEnvironmentProviders();
-  return [
-    ...(environment ? [environment] : []),
-    ...connectedEnvironments.filter(
-      (candidate) => candidate.environmentId !== environment?.environmentId,
-    ),
-  ].flatMap(
-    (candidate) => providersByEnvironment.get(candidate.environmentId) ?? EMPTY_SERVER_PROVIDERS,
   );
 }
 
