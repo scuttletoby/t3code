@@ -134,6 +134,7 @@ function curatedCauseMessages(cause: unknown): {
         case "ClaudeAppendSystemPromptMissingValueError":
         case "ClaudeSettingsLaunchArgError":
         case "ClaudeMcpRegistrationTimeoutError":
+        case "ClaudeMcpProfileError":
         case "ClaudeCodeRootRefusalError":
         case "ClaudeCodeStartupExitError":
         case "ClaudeConversationNotFoundError":
