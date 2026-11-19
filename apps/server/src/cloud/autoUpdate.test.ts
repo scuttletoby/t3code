@@ -40,6 +40,7 @@ import {
   hookReason,
   initialAutoUpdateState,
   type LauncherRecord,
+  makeActivityCounter,
   makeAutoUpdater,
   nextAutoUpdateStep,
   noActivity,
@@ -893,5 +894,91 @@ describe("runningTerminalCommands", () => {
       );
       expect(unsubscribed).toBe(1);
     }),
+  );
+});
+
+describe("makeActivityCounter", () => {
+  const runs: Record<string, ReadonlyArray<string>> = {
+    "thread-a": ["running", "queued"],
+    "thread-b": ["completed"],
+  };
+  const projections = (threadIds: ReadonlyArray<string>, fail = false) => ({
+    getRecoveryThreadIds: () =>
+      fail ? Effect.fail("projection store unreadable") : Effect.succeed(threadIds as never),
+    getRuntimeRecoveryProjection: (threadId: string) =>
+      Effect.succeed({
+        thread: { activeProviderThreadId: null },
+        runs: (runs[threadId] ?? []).map((status, ordinal) => ({
+          id: `${threadId}-${ordinal}`,
+          ordinal,
+          status,
+        })),
+        runtimeRequests: threadId === "thread-b" ? [{ status: "pending" }] : [],
+        providerThreads: [],
+        turnItems: [],
+      } as never),
+  });
+  const terminals = {
+    subscribeMetadata: (listener: (event: TerminalMetadataStreamEvent) => Effect.Effect<void>) =>
+      listener({
+        type: "snapshot",
+        terminals: [
+          {
+            threadId: "thread-a",
+            terminalId: "t1",
+            cwd: "/work",
+            worktreePath: null,
+            status: "running",
+            pid: 10,
+            exitCode: null,
+            exitSignal: null,
+            hasRunningSubprocess: true,
+            label: "t1",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      }).pipe(Effect.as(() => {})),
+  };
+
+  it.effect("adds every thread's work to the running terminal commands", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const count = yield* makeActivityCounter({
+          projections: projections(["thread-a", "thread-b"]) as never,
+          terminals,
+        });
+        expect(yield* count).toEqual({
+          ...noActivity,
+          activeRuns: 1,
+          queuedRuns: 1,
+          pendingRequests: 1,
+          terminalCommands: 1,
+        });
+      }),
+    ),
+  );
+
+  it.effect("counts nothing on a server with no threads and no terminals", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const count = yield* makeActivityCounter({
+          projections: projections([]) as never,
+          terminals: { subscribeMetadata: () => Effect.succeed(() => {}) },
+        });
+        expect(yield* count).toEqual(noActivity);
+      }),
+    ),
+  );
+
+  it.effect("fails, rather than counting zero, when thread state cannot be read", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const count = yield* makeActivityCounter({
+          projections: projections([], true) as never,
+          terminals,
+        });
+        expect(yield* Effect.flip(count)).toBe("projection store unreadable");
+      }),
+    ),
   );
 });

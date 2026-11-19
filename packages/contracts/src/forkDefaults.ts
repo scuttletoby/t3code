@@ -50,6 +50,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
   },
   {
     scope: "server",
+    key: "activityProbe",
+    default: false,
+    off: true,
+    reason: "No activity route: a quiet check falls back to what it can see from outside.",
+    decidedIn: "#509",
+  },
+  {
+    scope: "server",
     key: "usagePacing",
     default: {},
     off: true,
