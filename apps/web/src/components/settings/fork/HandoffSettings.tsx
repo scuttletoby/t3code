@@ -31,6 +31,7 @@ import { CommitTextField } from "./CommitTextField";
 import { BoundedNumberField, ForkRow, useSubRowReset } from "./ForkRow";
 import {
   HANDOFF_MODE_OPTIONS,
+  boundHandoffTokens,
   formatArgvLines,
   handoffModeLabel,
   handoffSourceProblem,
@@ -250,7 +251,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
                 value={shown.sizeTokens}
                 min={HANDOFF_MIN_TOKENS}
                 step={10_000}
-                bound={(value) => Math.max(HANDOFF_MIN_TOKENS, value)}
+                bound={(value) => boundHandoffTokens(value, false)}
                 onCommit={(value, options) => save({ ...shown, sizeTokens: value }, options)}
               />
               <span className="text-xs text-muted-foreground">tokens</span>
@@ -275,7 +276,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
                 value={shown.idleTokens}
                 min={0}
                 step={5_000}
-                bound={(value) => (value === 0 ? 0 : Math.max(HANDOFF_MIN_TOKENS, value))}
+                bound={(value) => boundHandoffTokens(value, true)}
                 onCommit={(value, options) => save({ ...shown, idleTokens: value }, options)}
               />
               <span className="text-xs text-muted-foreground">tokens</span>

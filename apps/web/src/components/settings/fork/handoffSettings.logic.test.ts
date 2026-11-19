@@ -1,8 +1,15 @@
-import { HANDOFF_THREADS_MAX, HandoffSettings, ServerSettings } from "@t3tools/contracts";
+import {
+  HANDOFF_MAX_TOKENS,
+  HANDOFF_MIN_TOKENS,
+  HANDOFF_THREADS_MAX,
+  HandoffSettings,
+  ServerSettings,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  boundHandoffTokens,
   formatArgvLines,
   handoffSourceProblem,
   handoffThreadRows,
@@ -69,5 +76,26 @@ describe("handoff command", () => {
     expect(handoffSourceProblem("command", undefined)).not.toBeNull();
     expect(handoffSourceProblem("command", ["/bin/x"])).toBeNull();
     expect(handoffSourceProblem("agent", undefined)).toBeNull();
+  });
+});
+
+describe("boundHandoffTokens", () => {
+  it("keeps a typed size within what the server's save takes, both ways", () => {
+    const empty = fromFile({}).handoff;
+    for (const typed of [0, 1, 19_999, 150_000, 10_000_001, 200_000_000]) {
+      const sizeTokens = boundHandoffTokens(typed, false);
+      const idleTokens = boundHandoffTokens(typed, true);
+      expect(isSavable({ ...empty, sizeTokens, idleTokens }), String(typed)).toBe(true);
+    }
+    expect(boundHandoffTokens(200_000_000, false)).toBe(HANDOFF_MAX_TOKENS);
+    expect(boundHandoffTokens(150_000, false)).toBe(150_000);
+    expect(boundHandoffTokens(0, false)).toBe(HANDOFF_MIN_TOKENS);
+    expect(boundHandoffTokens(0, true)).toBe(0);
+    expect(boundHandoffTokens(1, true)).toBe(HANDOFF_MIN_TOKENS);
+  });
+
+  it("matches the server's limit: one token more is refused", () => {
+    const empty = fromFile({}).handoff;
+    expect(isSavable({ ...empty, sizeTokens: HANDOFF_MAX_TOKENS + 1 })).toBe(false);
   });
 });

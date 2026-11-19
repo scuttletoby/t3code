@@ -14,7 +14,7 @@ import { IntervalSecondsField } from "../IntervalSecondsField";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingResetButton, SettingsRow } from "../settingsLayout";
 import { useScopedSettingsWriteAllowed } from "../useScopedSettings";
-import { withFieldsFrom } from "./forkRowReset.logic";
+import { subRowResetValue } from "./forkRowReset.logic";
 
 /** Every selected environment's accounts, the primary's first, as the agent slots rows list them. */
 export function useSelectedProviders() {
@@ -91,7 +91,8 @@ export function BoundedNumberField({
 /**
  * A sub-row's reset on a project screen whose value is the project's own: it puts back only that
  * row's fields from the environment's value and keeps the rest of the override (upstream's row
- * reset would clear the whole override). Null where there is nothing to reset.
+ * reset would clear the whole override). Null where there is nothing to reset (see
+ * {@link subRowResetValue}).
  */
 export function useSubRowReset<K extends "handoff" | "playtest">(
   key: K,
@@ -109,7 +110,7 @@ export function useSubRowReset<K extends "handoff" | "playtest">(
         )?.serverConfig?.settings[key];
   return (keys: ReadonlyArray<keyof ServerSettings[K]>, ariaLabel: string) => {
     if (!isOwn || environmentValue === undefined) return null;
-    const next = withFieldsFrom(shown, environmentValue, keys);
+    const next = subRowResetValue(key, shown, environmentValue, keys);
     return next === null ? null : (
       <SettingResetButton
         ariaLabel={ariaLabel}

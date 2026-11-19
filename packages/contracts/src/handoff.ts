@@ -25,7 +25,8 @@ export type HandoffSource = typeof HandoffSource.Type;
 export const HANDOFF_THREADS_MAX = 500;
 /** No handoff of a smaller thread, not even when a person asks. */
 export const HANDOFF_MIN_TOKENS = 20_000;
-const HANDOFF_MAX_TOKENS = 10_000_000;
+/** No handoff size above this; a save of a larger one is refused. */
+export const HANDOFF_MAX_TOKENS = 10_000_000;
 
 const tokens = (minimum: number, value: number) =>
   Schema.Int.check(Schema.isBetween({ minimum, maximum: HANDOFF_MAX_TOKENS })).pipe(

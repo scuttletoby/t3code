@@ -1,6 +1,12 @@
 /** Fork: the pure parts of the handoff panel (`handoff`, server and project). */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
-import { HANDOFF_THREADS_MAX, type HandoffMode, type HandoffSettings } from "@t3tools/contracts";
+import {
+  HANDOFF_MAX_TOKENS,
+  HANDOFF_MIN_TOKENS,
+  HANDOFF_THREADS_MAX,
+  type HandoffMode,
+  type HandoffSettings,
+} from "@t3tools/contracts";
 
 export const HANDOFF_MODE_OPTIONS: ReadonlyArray<{
   readonly value: HandoffMode;
@@ -23,6 +29,15 @@ export const HANDOFF_MODE_OPTIONS: ReadonlyArray<{
 
 export const handoffModeLabel = (mode: HandoffMode) =>
   HANDOFF_MODE_OPTIONS.find((option) => option.value === mode)?.label ?? mode;
+
+/**
+ * A typed handoff size as the server's save takes it: between the minimum and the server's limit,
+ * so the field never offers a value the save refuses. `allowZero` keeps the idle size's 0 (never).
+ */
+export function boundHandoffTokens(value: number, allowZero: boolean): number {
+  if (allowZero && value === 0) return 0;
+  return Math.min(HANDOFF_MAX_TOKENS, Math.max(HANDOFF_MIN_TOKENS, value));
+}
 
 /** The whole new value with one thread's mode set, or removed with `null`. */
 export function withThreadMode(
