@@ -77,6 +77,8 @@ const toolsDefinedElsewhere = (): ReadonlyArray<string> => {
 const NOT_ADVERTISED: Readonly<Record<string, string>> = {
   // Describes the linked environment's `orchestrator_capabilities` to call it there.
   "peer/RemoteDelegation.ts": "a client of another environment's tool",
+  // Decodes the linked environment's `t3_thread_read` without the thread's details.
+  "fork/remoteReplyRead.ts": "a client of another environment's tool",
 };
 
 // A toolkit: an object whose `tools` are all `Tool`s (Toolkit exports no type guard).
