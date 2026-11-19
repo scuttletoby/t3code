@@ -656,6 +656,85 @@ plan
 check "plan: the next run from the new base passes the lowered list" \
   eval 'action_is release && [[ ! -e "$root/report.md" ]] && hasnt "Note: " "$root/out"'
 
+# #510: the same rebase again. An earlier run published the candidate with its lowering commit,
+# then could not move the series: the next run lowers again (a new commit, the same files) and
+# advances to that release instead of building another.
+adopted() { # the fork's pending line in u2.txt, which upstream v0.1.11 adopts word for word
+  new_upstream
+  new_fork v0.1.10
+  amend_fork '{"files":{},"pending":{"u2.txt":1}}' 'echo "fork pending line" >> u2.txt'
+  up_release v0.1.11 'echo "fork pending line" >> u2.txt'
+}
+amend_fork() { # amend_fork LIST CMD: the fork's commit gets LIST as its seam list and the change CMD makes
+  (cd "$root/work" && printf '%s\n' "$1" > .github/fork-seams.json && eval "$2" \
+    && git add -A && git commit -q --amend --no-edit && git push -q --force origin main) > /dev/null 2>&1
+}
+adopted
+plan
+released="$(out candidate)"
+fork_tag v0.1.11-fork.1 "$released"
+work git checkout -q main && work git reset -q --hard "$(series)"
+plan
+check "plan: re-run of a rebase that lowered the list -> the same files, advance to the earlier release" \
+  eval 'action_is advance && [[ "$(out candidate)" == "$released" ]] && grep -q "lowered the seam list" "$root/out"'
+
+# The lowered list is checked again and must lower nothing more. A seam check that always lowers
+# (in the fork's series, which the plan runs) stops the plan: the report says what was lowered, and
+# the run's summary claims no commit, as nothing goes on from here.
+adopted
+fork_commit "fork: a seam check that always lowers" "cat > .github/scripts/fork-seam-check.cjs << 'JS'
+const fs = require('node:fs');
+const at = process.argv.indexOf('--lowered-list');
+if (at !== -1) {
+  fs.writeFileSync(process.argv[at + 1], fs.readFileSync('.github/fork-seams.json', 'utf8') + ' ');
+  console.log('Lowered: u2.txt: always');
+}
+JS"
+summary_before="earlier step line" plan
+check "plan: a lowered list that still lowers again stops the plan, naming what was lowered" \
+  eval '[[ -z "$(out action)" ]] && has "still lowers again" "$root/report.md" && has "^    - u2.txt: always" "$root/report.md" \
+    && has "in this run.s checkout only; the series was left as it is" "$root/report.md"'
+check "plan: a plan stopped after the lowering puts no lowered list in the step summary" \
+  eval 'has "earlier step line" "$root/summary.md" && hasnt "Seam list lowered" "$root/summary.md"'
+
+# One count lowered and another raised in the same run: refused, and nothing is lowered or
+# committed. m.txt is pending (one fork line) with its "c" moved to the end ("lost" 1/0); upstream
+# deletes its own "c", so the moved copy becomes a second fork line and the moved line is gone.
+new_upstream
+up_release v0.1.11 'printf "%s\n" a b c d e f g h i j k l > m.txt'
+new_fork v0.1.11
+amend_fork '{"files":{},"pending":{"m.txt":1},"lost":{"m.txt":{"lines":1,"gone":0}}}' \
+  'printf "%s\n" a b d e f g h i j k l c "fork line" > m.txt'
+up_release v0.1.12 'sed -i "/^c$/d" m.txt'
+before="$(work_head)"
+plan
+check "plan: a count lowered and one raised in one run is refused, committing and lowering nothing" \
+  eval '[[ -z "$(out action)" ]] && has "m.txt: \"pending\" with 2 fork lines, more than its ceiling of 1 after the rebase" "$root/report.md" \
+    && hasnt "^Lowered: " "$root/out" && hasnt "Seam list lowered" "$root/summary.md" \
+    && [[ "$(git -C "$root/work" log -1 --format=%s)" != "fork seams: lower counts"* && "$(series)" == "$before" ]]'
+
+# A "lost" count lowered through fork-follow, and a pending file left with no fork line that "lost"
+# still names: it moves to "files" with no seam line (#510), and the next run passes. The fork
+# deletes "c" and "h" and adds one line; upstream deletes "c" too and adopts the fork's line.
+new_upstream
+up_release v0.1.11 'printf "%s\n" a b c d e f g h i j k l > m.txt'
+new_fork v0.1.11
+amend_fork '{"files":{},"pending":{"m.txt":1},"lost":{"m.txt":{"lines":2,"gone":2}}}' \
+  'printf "%s\n" a b d e f g i j k l "fork line" > m.txt'
+up_release v0.1.12 'sed -i "/^c$/d" m.txt && echo "fork line" >> m.txt'
+plan
+check "plan: a lost count and a pending file with no fork line left are lowered in the lowering commit" \
+  eval 'action_is rebase \
+    && grep -qx -- "- m.txt: \"lost\" 2/2 -> 1/1" <<< "$(git -C "$root/work" log -1 --format=%b "$(out candidate)")" \
+    && grep -q -- "- m.txt: \"pending\" 1 moved to \"files\" with no seam line" <<< "$(git -C "$root/work" log -1 --format=%b "$(out candidate)")" \
+    && [[ "$(node -e "const l = JSON.parse(process.argv[1]); console.log(JSON.stringify([l.pending, l.files[\"m.txt\"].added, l.lost]))" "$(lowered_list)")" == "[{},[],{\"m.txt\":{\"lines\":1,\"gone\":1}}]" ]] \
+    && has "### Seam list lowered" "$root/summary.md"'
+work git reset -q --hard "$(out candidate)"
+work git push -q --force origin HEAD:main
+plan
+check "plan: the next run passes the list with the file moved to files" \
+  eval 'action_is release && [[ ! -e "$root/report.md" ]] && hasnt "Note: " "$root/out"'
+
 in_candidate() { git -C "$root/work" cat-file -e "$(out candidate):.github/workflows/$1" 2> /dev/null; }
 
 new_upstream
