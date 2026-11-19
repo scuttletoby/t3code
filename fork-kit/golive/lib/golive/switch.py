@@ -24,7 +24,7 @@ Every change is made inside a journalled step (journal.py); the refusals all com
 """
 import datetime, hashlib, json, math, os, re, shutil, signal, sys, time, urllib.error, urllib.request
 
-from golive import back as back_mod, check as check_mod, coldcopy, journal, keptruntime, live, osadapter
+from golive import back as back_mod, check as check_mod, coldcopy, handoff, journal, keptruntime, live, osadapter
 
 MIN_LIMIT = 600     # verify's time limit: 3 x the rehearsal's time, at least this (seconds)
 GUARD_MARGIN = 600  # the guard timer fires this long after the latest the run should have ended
@@ -271,15 +271,17 @@ def _look(cfg, adapter, version, before, binary, build=None):
     return said
 
 
-def verify(cfg, adapter, version, before, seconds, build=None, stops=None):
-    """Look until all of design 4.5 holds or `seconds` pass: (True, facts) or (False, {'problems'}). build:
-    install-target's record; the installed runtime is checked against it first and once all else holds, and a
-    mismatch fails at once (it cannot heal). stops: the run's _Stops; a noted signal fails at once."""
+def verify(cfg, adapter, version, before, seconds, build=None, stops=None, old_pid=None):
+    """Look until all of design 4.5 holds or `seconds` pass: (True, facts) or (False, {'problems', 'foreign'?}).
+    build: install-target's record; the installed runtime is checked against it first and once all else holds, and a
+    mismatch fails at once (it cannot heal). stops: the run's _Stops; a noted signal fails at once. old_pid: the
+    server the switch stopped (still exiting, it is no foreign server). A server the boot service did not start that
+    holds the home fails it within handoff.FOREIGN_GRACE ('foreign': that server)."""
     binary = keptruntime.home_t3(cfg.home, version)  # the installed target: build= checks it is that build
     wrong = _installed_changed(cfg, version, build) if build is not None else []
     if wrong:
         return False, {'problems': wrong}
-    end = time.monotonic() + seconds
+    end, watch = time.monotonic() + seconds, handoff.ForeignWatch(cfg.home, old_pid)
     while True:
         if stops is not None and stops.got:
             return False, {'problems': [f'stopped by {stops.names()}']}
@@ -287,6 +289,9 @@ def verify(cfg, adapter, version, before, seconds, build=None, stops=None):
         if not said:
             wrong = _installed_changed(cfg, version, build) if build is not None else []
             return (False, {'problems': wrong}) if wrong else (True, {'version': version})
+        found = watch.check(adapter.service())  # the backstop: no use waiting for a home another server holds
+        if found is not None:
+            return False, {'problems': [handoff.described(found)] + said[:7], 'foreign': found}
         if time.monotonic() >= end:
             return False, {'problems': said[:8]}
         time.sleep(coldcopy.POLL)
@@ -367,11 +372,14 @@ def _install_target(run, cfg, archive, sha):
 
 
 def _update(cfg, adapter, binary, version, timeout):
-    code, out = _t3(binary, ['update', version, '--base-dir', cfg.home, '--yes'], timeout)
-    if code != 0:
-        raise RuntimeError(f'{binary} update {version} exited {code}: {out.strip()[-300:]}')
-    if not adapter.service()['active']:
-        adapter.start()
+    """`t3 update` restarts the service itself; the kit's owner lock goes to its new launcher (handoff.py)."""
+    def update():
+        code, out = _t3(binary, ['update', version, '--base-dir', cfg.home, '--yes'], timeout)
+        if code != 0:
+            raise RuntimeError(f'{binary} update {version} exited {code}: {out.strip()[-300:]}')
+        if not adapter.service()['active']:
+            adapter.start()
+    handoff.starting(cfg.home, update, version)
 
 
 def _started(steps):
@@ -412,18 +420,43 @@ def _put_back(run, cfg, adapter, steps, say, lose_work_since=None):
         return f'rolled back to t3 {again["version"]} from {rec["copy"]} (its W1 had got past its {got})'
     if 'update' in started:  # the forward update (a W1 plan comes only after it)
         say(f'going back to t3 {rec["version"]} (W1: restore {rec["copy"]}, then downgrade)')
-        got = back_mod.restore_and_downgrade(run, cfg, adapter, rec['copy'], automatic=lose_work_since is None,
-                                             lose_work_since=lose_work_since, hooks=False, say=say)
+        try:
+            got = back_mod.restore_and_downgrade(run, cfg, adapter, rec['copy'], automatic=lose_work_since is None,
+                                                 lose_work_since=lose_work_since, hooks=False, say=say)
+        except journal.Refused as e:
+            if getattr(e, 'foreign', None) is None:
+                raise
+            raise HomeHeld(_home_held(cfg, rec, e.foreign)) from None
         with run.step('rolled-back', version=got['version'], copy=rec['copy']) as facts:
             facts.update(version=got['version'], pid=got['pid'], result=FINAL['rolled-back'])
         return f'rolled back to t3 {got["version"]} from {rec["copy"]}'
     with run.step('back-start') as facts:
         stopped = not adapter.service()['active']  # active: the stop never happened, the old server still runs
         if stopped:
-            adapter.start()
+            handoff.starting(cfg.home, adapter.start, rec['version'])
         again = coldcopy._wait_started(cfg, adapter, rec['version'], rec['pid'] if stopped else None)
-        facts.update(version=again['version'], pid=again['pid'], result=FINAL['back-start'])
+        facts.update(version=again['version'], pid=again['pid'], result=FINAL['back-start'],
+                     **handoff.served(cfg.home))
     return f'started t3 {again["version"]} again; nothing it reads was changed'
+
+
+class HomeHeld(RuntimeError):
+    """The switch's way back W1 was refused (nothing changed) because a server the boot service did not start holds
+    the home: the message says where T3 stands and what to do."""
+
+
+def _home_held(cfg, rec, found):
+    """Where T3 stands when the backstop stopped the switch and W1 refused to restore under that server."""
+    try:
+        at = coldcopy.read_manifest(rec['copy'], cfg.home)['createdAt']
+    except Exception:
+        at = '<the copy\'s time, as `t3-golive back` prints it>'
+    then = (f'`t3-golive back --way w1 --lose-work-since {at}` to go back to t3 {rec["version"]} (do not just restart '
+            f'the service: it runs t3 {cfg.target_version}, never verified; once that server is gone the service may '
+            f'start it by itself, and W1 stops it again); `t3-golive status` says where T3 is')
+    return (f'the way back W1 was refused too (it restores nothing under a server it cannot stop), so nothing was put '
+            f'back: t3 {cfg.target_version} is installed and its service waits for the home, never verified, and the '
+            f'copy {rec["copy"]} is kept; {handoff.remedy(found, then)}')
 
 
 def final(run):
@@ -518,6 +551,13 @@ def _before(cfg, binary, migrations):
 
 
 def run_switch(cfg, adapter, owner_says_go=False, say=print):
+    """From just before the stop until a build is verified again, upstream's update marker is kept and the home
+    stays owned (handoff.py); a run that dies leaves the marker to run out by itself (60 s)."""
+    with handoff.run_scope(cfg.home):
+        return _run_switch(cfg, adapter, owner_says_go, say)
+
+
+def _run_switch(cfg, adapter, owner_says_go, say):
     with journal.run(cfg.state_dir, 'switch') as run:
         p = _prechecks(cfg, adapter, owner_says_go, say, run)
         if p is None:
@@ -571,6 +611,7 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
         failed = f'the guard {unit} is not running any more'
     if failed is None and stops.got:
         failed = f'stopped by {stops.names()}'
+    failed = failed or coldcopy.open_gap(cfg.home)
     if failed is not None:
         again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
         if again:
@@ -579,10 +620,12 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
     say(f'stopping {osadapter.UNIT} (t3 {old}) to switch to {cfg.target_version}')
     error, lock, noted = None, None, 0
     try:
-        with run.step('stopping', **rec):
+        with run.step('stopping', **rec, marker=handoff.marker_path(cfg.home)):
             adapter.stop()
             coldcopy._wait_stopped(adapter, server['pid'])
             lock = coldcopy.hold_owner_lock(os.path.join(cfg.home, 'userdata'), coldcopy.STOP_WAIT)
+            if handoff.adopt(cfg.home, lock):  # held until the update's restart hands the home over
+                lock = None
             coldcopy._same_after_stop(cfg, server)
         stops.check()
         deadline = coldcopy._clock() + cfg.stop_limit_seconds
@@ -626,19 +669,18 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
         with run.step('before') as facts:
             facts.update(_before(cfg, keptruntime.home_t3(cfg.home, cfg.target_version), rehearsal['migrations']))
         before = {'counts': facts['reportCounts'], 'providers': facts['providers']}
-        lock.close()
-        lock = None
         stops.check()
         with run.step('update', version=cfg.target_version) as facts:
             _update(cfg, adapter, keptruntime.home_t3(cfg.home, cfg.target_version), cfg.target_version, limit)
             facts['links'] = _repoint(run, cfg.home, cfg.target_version)
         stops.check()
         with run.step('verify', version=cfg.target_version) as facts:  # done only when verified
-            verified, found = verify(cfg, adapter, cfg.target_version, before, limit, installed, stops)
+            verified, found = verify(cfg, adapter, cfg.target_version, before, limit, installed, stops,
+                                     old_pid=server['pid'])
             if not verified:
                 facts.update(found)
                 raise RuntimeError(f'verify failed: {"; ".join(found["problems"])}')
-            facts.update(found, sha256=p['sha'], result=FINAL['verify'])
+            facts.update(found, sha256=p['sha'], result=FINAL['verify'], **handoff.served(cfg.home))
     except Exception as e:
         error, noted = e, len(stops.got)
     finally:
@@ -650,6 +692,8 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
             did = _put_back(run, cfg, adapter, journal.read(cfg.state_dir)[0][-1]['steps'], say)
             if did:
                 errors[0] = RuntimeError(f'{error}; {did}')
+        except HomeHeld as e:
+            errors[0] = RuntimeError(f'{error}; {e}')
         except Exception as e:
             notes = ''.join(f'; {n}' for n in getattr(e, '__notes__', ()))
             errors[0] = RuntimeError(f'{error}; then putting T3 back failed: {type(e).__name__}: {e}{notes}')
@@ -719,7 +763,11 @@ def guard(cfg, adapter, run_id, wait, say=print, lose_work_since=None):
                 runs = None
                 did.append(f'journal unreadable, so T3 is started if it is not active: {e}')
                 if not adapter.service()['active']:
-                    adapter.start()
+                    coldcopy.open_gap(cfg.home)  # left to run out: this guard does not wait for T3
+                    try:
+                        adapter.start()
+                    finally:
+                        handoff.close(cfg.home)
                     did.append(f'started {osadapter.UNIT}')
                 did += [coldcopy._run_command(p, cfg.home, coldcopy.HOOK_TIMEOUT)[1] for p in cfg.post_hooks]
             mine = runs[-1] if runs and runs[-1]['id'] == run_id else None
@@ -732,11 +780,17 @@ def guard(cfg, adapter, run_id, wait, say=print, lose_work_since=None):
                 r.id = run_id
                 try:
                     if not final(mine):
+                        if not adapter.service()['active']:  # the killed run's marker runs out: a fresh one
+                            coldcopy.open_gap(cfg.home)
                         did.append(_put_back(r, cfg, adapter, mine['steps'], say, lose_work_since)
                                    or 'T3 was never stopped')
+                except HomeHeld as e:
+                    did.append(str(e))
                 except Exception as e:
                     notes = ''.join(f'; {n}' for n in getattr(e, '__notes__', ()))
                     did.append(f'putting T3 back failed: {type(e).__name__}: {e}{notes}')
+                finally:
+                    handoff.close(cfg.home)
                 steps = journal.read(cfg.state_dir)[0][-1]['steps']
                 if w1_holds(steps):
                     did.append(f'no post hook ran: {W1_HOLDS}')
