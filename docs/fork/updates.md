@@ -65,13 +65,19 @@ watches; it changes nothing on the machine, and `0` turns it off.
   lines it removes, less the upstream lines it puts back (main's `lost` `gone` less its own), since
   per line text fork lines less gone ones is the copies over upstream's. With none left the entry
   goes, or moves to `files` with `"added": []`. With some left it may move to `files` as a
-  declared seam only when the change adds no fork line and the new entry's `added` lists exactly
-  as many copies as are left, each one the file has; the run from upstream then holds every one
-  of them to that entry, and the owner checks they are the right ones, as for any seam entry (a
-  pull request's run has no upstream, so it cannot tell which lines are the fork's). Left higher, the next run from upstream refuses main for the spare room; set lower or
-  dropped, for the lines still there. It reads its own list only to refuse, never to widen the
-  gate, and does not hold a list-only change (the file's text unchanged), which may correct main. Right after a rebase,
-  below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops
+  declared seam only in a list-only change to that file (its text unchanged), when the new entry's
+  `added` lists exactly as many copies as are left, each one the file has, and its `announced`
+  none the file has; the run from upstream then holds every one of them to that entry. A pull
+  request's run has no upstream, so it cannot tell which lines are the fork's: the owner checks
+  them by running `node .github/scripts/fork-seam-check.cjs --from-upstream "$(git merge-base
+  origin/main upstream/main)" <pull request head>` (upstream's main fetched as `upstream/main`),
+  which refuses any fork line the entry leaves out
+  ([#552](https://github.com/scuttletoby/t3code/issues/552) moves this check into CI). Left
+  higher, the next run from upstream refuses main for the spare room; set lower or dropped, for
+  the lines still there. Neither in `pending` nor moved may a change gain a fork line (an upstream
+  line swapped for one is one more), whatever its list says. It reads its own list only to
+  refuse, never to widen the gate, and does not hold a list-only change (the file's text
+  unchanged), which may correct main. Right after a rebase, below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops
   it, and the ceiling could not have been lowered first. fork-follow then lowers it itself, in a
   commit of its own on the rebased series ("fork seams: lower counts after the rebase onto …", each
   change in its body and in the run's summary), and checks the lowered list again before it goes

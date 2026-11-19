@@ -2081,15 +2081,20 @@ test('from main, a pending file moves to "files" with "added": [] only once no f
   const twoLeft = { "p.ts": `${UP}forkA();\nforkB();\n` };
   const moved = { "p.ts": { why: "w", added: [] } };
   assert.deepEqual(shrink({ "p.ts": 3 }, base, twoLeft, {}, moved).ceilings, [
-    `p.ts: "pending" with a ceiling of 3, and this change removes 1 more line than it adds (keep upstream's lines; if they are fork lines moved out), but moves it to "files" in this change's .github/fork-seams.json while 2 fork lines are left: keep it in "pending" with a ceiling of 2, or list exactly those 2 lines under "added" in its new entry (it lists 0; a move only reclassifies the lines left, and a new one is announced first).`,
+    `p.ts: "pending" with a ceiling of 3, and this change removes 1 more line than it adds (keep upstream's lines; if they are fork lines moved out), and moves it to "files" in this change's .github/fork-seams.json while 2 fork lines are left: with fork lines left, only a list-only change (the file's text unchanged) may move it; change the file in one pull request (keeping it in "pending"), and move it in another.`,
   ]);
-  // A list-only move holds main's ceiling, so it is refused too.
-  assert.match(
-    shrink({ "p.ts": 3 }, base, base, {}, moved).ceilings[0],
-    /changes its lines, but moves it to "files" .* while 3 fork lines are left: keep it in "pending" with a ceiling of 3, .*\(it lists 0; /,
-  );
+  // A list-only move holds main's ceiling, so it is refused too (it moves the file, and changes no line).
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, base, {}, moved).ceilings, [
+    `p.ts: "pending" with a ceiling of 3, and this change moves it to "files" in this change's .github/fork-seams.json while 3 fork lines are left: keep it in "pending" with a ceiling of 3, or list exactly those 3 lines under "added" in its new entry (it lists 0; a move only reclassifies the lines left, and a new one is announced first).`,
+  ]);
   // None left: the move is the fix (kept in "pending" it must go).
   assert.deepEqual(shrink({ "p.ts": 3 }, base, { "p.ts": UP }, {}, moved).ceilings, []);
+  // With none left the entry lists none: an upstream line listed there would be a spare seam
+  // allowance nobody reviewed as a fork line (both runs would pass it).
+  const spare = { "p.ts": { why: "w", added: [UP.trim()] } };
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, { "p.ts": UP }, {}, spare).ceilings, [
+    `p.ts: "pending" with a ceiling of 3, and this change removes 3 more lines than it adds (keep upstream's lines; if they are fork lines moved out), and moves it to "files" in this change's .github/fork-seams.json with no fork line left: list no line under "added" in its new entry (it lists 1; a line upstream has is never a seam line, and a new one is announced first).`,
+  ]);
   // Listed in both (a malformed list is refused elsewhere): judged as "pending".
   assert.deepEqual(shrink({ "p.ts": 3 }, base, twoLeft, { "p.ts": 2 }, moved).ceilings, []);
 });
@@ -2143,7 +2148,7 @@ test("from main, a change that puts an upstream line back counts it in the exact
   assert.deepEqual(fromUpstream(own(1), upstream, head), []);
   assert.deepEqual(fromMain(mainList, own(1), main, head), []);
   assert.deepEqual(fromMain(mainList, own(2), main, head), [
-    `p.ts: "pending" with a ceiling of 3, and this change removes 1 more line than it adds (keep upstream's lines; if they are fork lines moved out), and its own "lost" names 0 upstream lines gone where main's names 1 (an upstream line put back is a fork line fewer): set it to 1 in this change's .github/fork-seams.json (its list has 2; main holds its ceiling exactly).`,
+    `p.ts: "pending" with a ceiling of 3, and this change removes 1 more line than it adds (keep upstream's lines; if they are fork lines moved out), and sets its own "lost" to name 0 upstream lines gone where main's names 1 (an upstream line put back is a fork line fewer): set it to 1 in this change's .github/fork-seams.json (its list has 2; main holds its ceiling exactly).`,
   ]);
   assert.match(fromUpstream(own(2), upstream, head)[0], /fewer than its ceiling of 2/);
   // A pure revert (as many lines as before) is held too.
@@ -2158,25 +2163,60 @@ const promoted = (...added) => ({ "p.ts": { why: "w", added } });
 const NONE = { reasons: [], ceilings: [], rises: [], notes: [] };
 test('from main, a pending file moves to "files" with fork lines left when its entry lists each one', () => {
   const base = { "p.ts": `${UP}forkA();\nforkB();\nforkC();\n` };
-  const twoLeft = { "p.ts": `${UP}forkA();\nforkB();\n` };
-  // List-only (main's ceiling of 3 is left), and with a line moved out (2 left).
+  // List-only: main's ceiling of 3 is left, in any order.
   assert.deepEqual(
-    shrink({ "p.ts": 3 }, base, base, {}, promoted("forkA();", "forkB();", "forkC();")),
-    NONE,
-  );
-  assert.deepEqual(
-    shrink({ "p.ts": 3 }, base, twoLeft, {}, promoted("forkB();", "forkA();")),
-    NONE,
-  );
-  // A swap (one line out, one in) keeps the count, and lists the line it put in.
-  const swap = { "p.ts": `${UP}forkA();\nforkB();\nforkD();\n` };
-  assert.deepEqual(
-    shrink({ "p.ts": 3 }, base, swap, {}, promoted("forkA();", "forkB();", "forkD();")),
+    shrink({ "p.ts": 3 }, base, base, {}, promoted("forkC();", "forkA();", "forkB();")),
     NONE,
   );
   // Copies count: a line the file has twice is listed twice.
   const twice = { "p.ts": `${UP}}\nforkA();\n}\n` };
   assert.deepEqual(shrink({ "p.ts": 3 }, twice, twice, {}, promoted("}", "}", "forkA();")), NONE);
+  // An "announced" line (one a later change adds) is not one of the lines left: it is not counted.
+  const announced = {
+    "p.ts": {
+      why: "w",
+      added: ["forkA();", "forkB();", "forkC();"],
+      announced: { since: "2026-11-19", added: ["forkD();"] },
+    },
+  };
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, base, {}, announced), NONE);
+});
+
+// With fork lines left, a move that also changes the file is refused: main's exact ceiling is then
+// the count, and a "lost" entry left stale cannot hide an upstream line swapped for a fork line.
+test('from main, a move to "files" with fork lines left is a list-only change', () => {
+  const base = { "p.ts": `${UP}forkA();\nforkB();\nforkC();\n` };
+  const refused =
+    /and moves it to "files" in this change's \.github\/fork-seams\.json while (\d) fork lines are left: with fork lines left, only a list-only change \(the file's text unchanged\) may move it; /;
+  // A line moved out (2 left), and a swap (one line out, one in), each listing what is left.
+  const twoLeft = { "p.ts": `${UP}forkA();\nforkB();\n` };
+  assert.match(
+    shrink({ "p.ts": 3 }, base, twoLeft, {}, promoted("forkB();", "forkA();")).ceilings.join("\n"),
+    refused,
+  );
+  const swap = { "p.ts": `${UP}forkA();\nforkB();\nforkD();\n` };
+  assert.match(
+    shrink(
+      { "p.ts": 3 },
+      base,
+      swap,
+      {},
+      promoted("forkA();", "forkB();", "forkD();"),
+    ).ceilings.join("\n"),
+    refused,
+  );
+  // An upstream line swapped for a fork line, "lost" left as main's: the line count is level, so
+  // the count looks the same, but main would hold one fork line more than its ceiling.
+  const upstream = { "p.ts": "a();\nb();\nc();\n" };
+  const main = { "p.ts": "a();\nb();\nc();\nforkA();\n" };
+  const swapped = { "p.ts": "a();\nforkB();\nc();\nforkA();\n" };
+  const mainList = { files: {}, pending: { "p.ts": 1 }, lost: {} };
+  assert.deepEqual(fromUpstream(mainList, upstream, main), []);
+  assert.deepEqual(fromMain(mainList, { files: promoted("forkA();"), lost: {} }, main, swapped), [
+    `p.ts: "pending" with a ceiling of 1, and this change changes its lines, and moves it to "files" in this change's .github/fork-seams.json while 1 fork line is left: with fork lines left, only a list-only change (the file's text unchanged) may move it; change the file in one pull request (keeping it in "pending"), and move it in another.`,
+  ]);
+  // The same file left as it is moves.
+  assert.deepEqual(fromMain(mainList, { files: promoted("forkA();"), lost: {} }, main, main), []);
 });
 
 test('from main, a move to "files" that leaves a fork line out of its entry is refused', () => {
@@ -2184,7 +2224,7 @@ test('from main, a move to "files" that leaves a fork line out of its entry is r
   assert.deepEqual(
     shrink({ "p.ts": 3 }, base, base, {}, promoted("forkA();", "forkB();")).ceilings,
     [
-      `p.ts: "pending" with a ceiling of 3, and this change changes its lines, but moves it to "files" in this change's .github/fork-seams.json while 3 fork lines are left: keep it in "pending" with a ceiling of 3, or list exactly those 3 lines under "added" in its new entry (it lists 2; a move only reclassifies the lines left, and a new one is announced first).`,
+      `p.ts: "pending" with a ceiling of 3, and this change moves it to "files" in this change's .github/fork-seams.json while 3 fork lines are left: keep it in "pending" with a ceiling of 3, or list exactly those 3 lines under "added" in its new entry (it lists 2; a move only reclassifies the lines left, and a new one is announced first).`,
     ],
   );
   // A line the file does not have cannot stand in for one it has.
@@ -2204,18 +2244,31 @@ test('from main, a move to "files" that leaves a fork line out of its entry is r
       .ceilings[0],
     /while 3 fork lines are left: .*\(it lists 4; /,
   );
-  // A line moved out but still listed.
-  const twoLeft = { "p.ts": `${UP}forkA();\nforkB();\n` };
-  assert.match(
-    shrink(
-      { "p.ts": 3 },
-      base,
-      twoLeft,
-      {},
-      promoted("forkA();", "forkB();", "forkC();"),
-    ).ceilings.join("\n"),
-    /it lists 3; [^]*lists `forkC\(\);`, but the file has no copy/,
-  );
+  // A fork line the file has, listed under "announced" instead of "added": it is not counted, and
+  // an announced line is one a later change adds, so not one the file has.
+  const announced = {
+    "p.ts": {
+      why: "w",
+      added: ["forkA();", "forkB();"],
+      announced: { since: "2026-11-19", added: ["forkC();"] },
+    },
+  };
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, base, {}, announced).ceilings, [
+    `p.ts: "pending" with a ceiling of 3, and this change moves it to "files" in this change's .github/fork-seams.json while 3 fork lines are left: keep it in "pending" with a ceiling of 3, or list exactly those 3 lines under "added" in its new entry (it lists 2; a move only reclassifies the lines left, and a new one is announced first).`,
+    'p.ts: moved to "files" in this change\'s .github/fork-seams.json, whose "announced" lists `forkC();`, but the file already has it (1× there): list a fork line the file has under "added", and announce only a line a later change adds (a line upstream has is never a seam line).',
+  ]);
+  // Every fork line listed, and an announced line the file already has (upstream's, here): after
+  // the merge main's tree fails "no announced line is in its file yet" for every pull request.
+  const landed = {
+    "p.ts": {
+      why: "w",
+      added: ["forkA();", "forkB();", "forkC();"],
+      announced: { since: "2026-11-19", added: [UP.trim()] },
+    },
+  };
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, base, {}, landed).ceilings, [
+    `p.ts: moved to "files" in this change's .github/fork-seams.json, whose "announced" lists \`${UP.trim()}\`, but the file already has it (1× there): list a fork line the file has under "added", and announce only a line a later change adds (a line upstream has is never a seam line).`,
+  ]);
 });
 
 test('from main, a move to "files" that also adds fork lines is refused', () => {
@@ -2242,9 +2295,13 @@ test('from main, a move to "files" that also adds fork lines is refused', () => 
     files: promoted("forkA();", "forkB();"),
     lost: { "p.ts": { lines: 1, gone: 1 } },
   };
-  assert.deepEqual(fromMain(mainList, own, main, swapped), [
-    `p.ts: "pending" with a ceiling of 1, and this change its own "lost" names 1 upstream line gone where main's names 0 (an upstream line put back is a fork line fewer), and moves it to "files" in this change's .github/fork-seams.json, but 2 fork lines are left: a move only reclassifies the lines left, so make the change without one more fork line, or keep it in "pending".`,
-  ]);
+  const raised = `p.ts: "pending" with a ceiling of 1, and this change sets its own "lost" to name 1 upstream line gone where main's names 0 (an upstream line put back is a fork line fewer), so 2 fork lines are left, more than its ceiling: a pending file may not gain a fork line (an upstream line swapped for one is one more), whether it stays in "pending" or moves to "files"; make the change without it.`;
+  assert.deepEqual(fromMain(mainList, own, main, swapped), [raised]);
+  // Kept in "pending", its own list may not raise the ceiling either (the run from upstream on the
+  // merged head would pass it: the list and the file agree).
+  const stays = { files: {}, pending: { "p.ts": 2 }, lost: { "p.ts": { lines: 1, gone: 1 } } };
+  assert.deepEqual(fromUpstream({ forkFiles: [], ...stays }, upstream, swapped), []);
+  assert.deepEqual(fromMain(mainList, stays, main, swapped), [raised]);
 });
 
 // Whatever a pull request's run accepts for a pending file, fork-follow's check before the
@@ -2321,8 +2378,7 @@ test("property: a pending ceiling the pull request accepts passes the run from u
     const lists = [
       { files: {}, lost: atHead.lost }, // dropped
       { files: { "p.ts": { why: "w", added: [] } }, lost: atHead.lost }, // moved
-      // Moved as a seam that lists the fork lines left (which ones, only upstream can tell: the
-      // pull request's run holds their number and that the file has them).
+      // Moved as a seam that lists the fork lines left (refused: the change edits the file).
       { files: { "p.ts": { why: "w", added: atHead.forkLines } }, lost: atHead.lost },
       ...Array.from({ length: atMain.added + 3 }, (_, n) => ({
         files: {},
@@ -2345,7 +2401,8 @@ test("property: a pending ceiling the pull request accepts passes the run from u
         JSON.stringify({ main, head, own }),
       );
     }
-    // The right list passes the pull request (unless it grows, which is refused anyway).
+    // The right list passes the pull request (unless it grows or gains a fork line, which is
+    // refused whatever its list says).
     const right =
       atHead.added > 0
         ? { files: {}, pending: { "p.ts": atHead.added }, lost: atHead.lost }
@@ -2354,18 +2411,30 @@ test("property: a pending ceiling the pull request accepts passes the run from u
             lost: atHead.lost,
           };
     const grows = over(main["p.ts"], head["p.ts"]) - over(head["p.ts"], main["p.ts"]);
-    if (grows <= 0)
-      assert.deepEqual(
-        fromMain(mainList, right, main, head),
+    const verdict = fromMain(mainList, right, main, head);
+    if (grows <= 0 && atHead.added <= atMain.added)
+      assert.deepEqual(verdict, [], JSON.stringify({ main, head, right }));
+    else assert.notDeepEqual(verdict, [], JSON.stringify({ main, head, right }));
+    // A list-only move to a seam that lists the lines left passes the pull request and the run
+    // from upstream (which lines, only upstream can tell: the pull request's run holds their
+    // number and that the file has them); with lines left, a move that edits the file never does.
+    const promote = (at) => ({
+      files: { "p.ts": { why: "w", added: at.forkLines } },
+      lost: at.lost,
+    });
+    promotions++;
+    assert.deepEqual(fromMain(mainList, promote(atMain), main, main), [], JSON.stringify({ main }));
+    assert.deepEqual(
+      fromUpstream({ forkFiles: [], pending: {}, ...promote(atMain) }, upstream, main),
+      [],
+      JSON.stringify({ main }),
+    );
+    if (atHead.added > 0)
+      assert.notDeepEqual(
+        fromMain(mainList, promote(atHead), main, head),
         [],
-        JSON.stringify({ main, head, right }),
+        JSON.stringify({ main, head }),
       );
-    // So does the move to a seam that lists them, unless the change adds a fork line.
-    const seam = { files: { "p.ts": { why: "w", added: atHead.forkLines } }, lost: atHead.lost };
-    if (grows <= 0 && atHead.added > 0 && atHead.added <= atMain.added) {
-      promotions++;
-      assert.deepEqual(fromMain(mainList, seam, main, head), [], JSON.stringify({ main, head }));
-    }
   }
   assert.ok(checked > 500, `only ${checked} accepted lists checked`);
   assert.ok(promotions > 100, `only ${promotions} moves to a seam checked`);
