@@ -402,6 +402,13 @@ class Refusals(CheckBase):
         self.m.set_report(fx.report(fork={'featuresOn': ['waitFor']}))
         self.refused('fork features off', 'waitFor')
 
+    def test_fork_feature_switched_on_names_where(self):
+        # Where, so a deleted project's override or a stale thread entry can be cleared.
+        self.m.standard()
+        self.m.set_report(fx.report(fork={'featuresOn': ['handoff', 'waitFor'], 'featuresWhere': {
+            'handoff': ['project:p1', 'project:p1/thread:t1'], 'waitFor': ['server']}}))
+        self.refused('fork features off', 'handoff (project:p1, project:p1/thread:t1), waitFor (server)')
+
     def test_report_not_ok_names_its_problems(self):
         self.m.standard()
         self.m.set_report(fx.report(ok=False, problems=[{'code': 'settings-unreadable', 'message': 'bad json'}]))

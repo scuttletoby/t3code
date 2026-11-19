@@ -692,7 +692,7 @@ def _report(cfg, adapter, add, notes, runs):
         add('counts', not low, '; '.join(low) or f'projects {now["projects"]}, threads {now["threads"]}: not below '
                                                  'the counts before the switch')
     on = fork.get('featuresOn')
-    notes.append(f'fork features on: {", ".join(on)}' if on else 'fork features: all off')
+    notes.append(f'fork features on: {live.features_on(fork)}' if on else 'fork features: all off')
     notes.append(f'fork switches: {json.dumps(_d(fork.get("features")), sort_keys=True)}')
     insts = [_d(i) for i in _d(report.get('settings')).get('providerInstances') or []]
     notes.append('provider instances: ' + (', '.join(f'{i.get("id")} ({i.get("driver")}, '
