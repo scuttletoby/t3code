@@ -1,0 +1,93 @@
+/**
+ * Fork: automatic updates (`automaticUpdates`, `automaticUpdatesQuietCommand`). Server-wide, so a
+ * project screen does not show it. Every write is an ordinary settings patch from the person at the
+ * screen; agents cannot change it.
+ */
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
+import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+
+import { Switch } from "../../ui/switch";
+import { useSettingsScope } from "../SettingsScopeContext";
+import { SettingResetButton, SettingsRow, SettingsSection } from "../settingsLayout";
+import { useSearchableSetting } from "../settingsSearch";
+import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
+import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
+import { CommitTextField } from "./CommitTextField";
+
+const MIXED = "The selected environments have different values. Select one environment to edit it.";
+
+export function UpdatesSettings() {
+  const searchableSetting = useSearchableSetting();
+  const updateSettings = useUpdateScopedSettings();
+  const { targets } = useSettingsScope();
+  const automatic = useScopedSettings((settings) => settings.automaticUpdates);
+  const quietCommand = useScopedSettings((settings) => settings.automaticUpdatesQuietCommand);
+  const automaticMixed = targetsDiffer(targets, (settings) => settings.automaticUpdates);
+  const quietMixed = targetsDiffer(targets, (settings) => settings.automaticUpdatesQuietCommand);
+
+  return (
+    <SettingsSection id="updates-section" title="Updates">
+      <SettingsRow
+        serverScoped
+        {...searchableSetting("automatic-updates")}
+        settingKeys={["automaticUpdates"]}
+        mixed={automaticMixed}
+        description={
+          automaticMixed
+            ? MIXED
+            : "A server installed as a boot service (t3 service install) updates itself to the newest fork release once no thread is working. Off: only t3 update or Update does it."
+        }
+        resetAction={
+          !automaticMixed && automatic !== DEFAULT_SERVER_SETTINGS.automaticUpdates ? (
+            <SettingResetButton
+              ariaLabel="Reset automatic updates to default"
+              onClick={() =>
+                updateSettings({ automaticUpdates: DEFAULT_SERVER_SETTINGS.automaticUpdates })
+              }
+            />
+          ) : null
+        }
+        control={
+          <Switch
+            mixed={automaticMixed}
+            checked={automaticMixed ? false : automatic}
+            onCheckedChange={(checked) => updateSettings({ automaticUpdates: Boolean(checked) })}
+            aria-label="Update automatically"
+          />
+        }
+      />
+      <SettingsRow
+        serverScoped
+        {...searchableSetting("automatic-updates-quiet-command")}
+        settingKeys={["automaticUpdatesQuietCommand"]}
+        mixed={quietMixed}
+        description={
+          quietMixed
+            ? MIXED
+            : "Optional: a program asked before each automatic update, by its full path. A non-zero exit means not now. Empty: none is asked."
+        }
+        resetAction={
+          !quietMixed && quietCommand !== "" ? (
+            <SettingResetButton
+              ariaLabel="Reset quiet check to default"
+              onClick={() => updateSettings({ automaticUpdatesQuietCommand: "" })}
+            />
+          ) : null
+        }
+        control={
+          quietMixed ? null : (
+            <CommitTextField
+              value={quietCommand}
+              ariaLabel="Quiet check before an update"
+              placeholder="/usr/local/bin/quiet-check"
+              onCommit={(text, revert) => {
+                updateSettings({ automaticUpdatesQuietCommand: text.trim() }, { onFailed: revert });
+                return null;
+              }}
+            />
+          )
+        }
+      />
+    </SettingsSection>
+  );
+}

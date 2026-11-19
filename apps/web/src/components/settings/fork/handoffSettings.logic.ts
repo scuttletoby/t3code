@@ -1,0 +1,88 @@
+/** Fork: the pure parts of the handoff panel (`handoff`, server and project). */
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
+import { HANDOFF_THREADS_MAX, type HandoffMode, type HandoffSettings } from "@t3tools/contracts";
+
+export const HANDOFF_MODE_OPTIONS: ReadonlyArray<{
+  readonly value: HandoffMode;
+  readonly label: string;
+  readonly description: string;
+}> = [
+  { value: "off", label: "Off", description: "Long threads compact as upstream's settings say." },
+  {
+    value: "handoff",
+    label: "Handoff",
+    description:
+      "A long thread moves to a fresh session in the same thread with a written handoff, so its children, pull requests and waits keep working.",
+  },
+  {
+    value: "compact",
+    label: "Compact",
+    description: "Same as Off; use it to keep one project or thread out of a Handoff above it.",
+  },
+];
+
+export const handoffModeLabel = (mode: HandoffMode) =>
+  HANDOFF_MODE_OPTIONS.find((option) => option.value === mode)?.label ?? mode;
+
+/** The whole new value with one thread's mode set, or removed with `null`. */
+export function withThreadMode(
+  settings: HandoffSettings,
+  threadId: string,
+  mode: HandoffMode | null,
+): HandoffSettings {
+  const { [threadId]: _old, ...rest } = settings.threads;
+  return { ...settings, threads: mode === null ? rest : { ...rest, [threadId]: mode } };
+}
+
+/** Why a thread cannot be added, or null. */
+export function threadModeProblem(settings: HandoffSettings, threadId: string): string | null {
+  const id = threadId.trim();
+  if (id === "") return "Enter a thread id.";
+  if (Object.hasOwn(settings.threads, id)) return "This thread already has its own mode.";
+  if (Object.keys(settings.threads).length >= HANDOFF_THREADS_MAX) {
+    return `At most ${HANDOFF_THREADS_MAX} threads can have their own mode. Remove one first.`;
+  }
+  return null;
+}
+
+export interface HandoffThreadRow {
+  readonly threadId: string;
+  readonly title: string | null;
+  readonly mode: HandoffMode;
+}
+
+/** The per-thread modes, titled where this client knows the thread, by title then id. */
+export function handoffThreadRows(
+  threads: Readonly<Record<string, HandoffMode>>,
+  titles: ReadonlyMap<string, string>,
+): ReadonlyArray<HandoffThreadRow> {
+  return Object.entries(threads)
+    .map(([threadId, mode]) => ({ threadId, title: titles.get(threadId) ?? null, mode }))
+    .toSorted(
+      (a, b) =>
+        Number(a.title === null) - Number(b.title === null) ||
+        (a.title ?? "").localeCompare(b.title ?? "") ||
+        a.threadId.localeCompare(b.threadId),
+    );
+}
+
+/** One argument per line, the program first; blank lines dropped. Empty: no command. */
+export function parseArgvLines(text: string): ReadonlyArray<string> | undefined {
+  const argv = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  return argv.length === 0 ? undefined : argv;
+}
+
+export const formatArgvLines = (argv: ReadonlyArray<string> | undefined) => (argv ?? []).join("\n");
+
+/** Why the source and command cannot be saved together, or null. */
+export function handoffSourceProblem(
+  source: HandoffSettings["source"],
+  command: ReadonlyArray<string> | undefined,
+): string | null {
+  return source === "command" && command === undefined
+    ? "Written by a command needs a command: its program on the first line, one argument per line."
+    : null;
+}
