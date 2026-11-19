@@ -122,16 +122,11 @@
         "// Fork: nothing here follows it, so stop it there, as a failed record does.",
         "yield* Effect.logWarning(\"remote-delegation.record-found-no-task\", remoteChild);",
         "const unfollowed = stopThere(followScope(scope.thread, remoteChild), remoteChild, \"stop\");",
-        "yield* unfollowed.pipe(Effect.ignoreCause({ log: true }));"
-      ],
-      "announced": {
-        "since": "2026-11-19",
-        "added": [
-          "import * as RemoteReplyRead from \"../fork/remoteReplyRead.ts\"; // Fork: replies across versions",
-          "const replyForwarding = RemoteReplyRead.replyReads(forwarding); // Fork: lastReply reads with it",
-          "const forwarding = replyForwarding; // Fork: a reply there on another version is still read."
-        ]
-      }
+        "yield* unfollowed.pipe(Effect.ignoreCause({ log: true }));",
+        "import * as RemoteReplyRead from \"../fork/remoteReplyRead.ts\"; // Fork: replies across versions",
+        "const replyForwarding = RemoteReplyRead.replyReads(forwarding); // Fork: lastReply reads with it",
+        "const forwarding = replyForwarding; // Fork: a reply there on another version is still read."
+      ]
     },
     "apps/web/src/components/ChatView.browser.test.tsx": {
       "why": "#474: upstream's test \"an interrupted image-only first send of a new thread says it may not have been sent\" presses Enter once the pasted image's tile shows. The tile shows while the image still compresses, and the composer refuses a send then (\"Still compressing a pasted image\"), so on a loaded runner the launch never came and the test went red. The fork line waits until the tile's preview button is enabled, which is when the image is ready. Drop this seam when upstream's test waits for the ready image itself.",
@@ -171,6 +166,21 @@
     "packages/provider-core/src/server/failure.ts": {
       "why": "MCP profiles part 2: the refusal of a Claude turn by its MCP profile says why and how to fix it, so its message is shown.",
       "added": ["case \"ClaudeMcpProfileError\":"]
+    },
+    "apps/web/src/components/settings/settingsSearch.ts": {
+      "why": "The fork's Settings page \"Fork\" (/settings/fork) is one more SettingsPath, so it needs its label, its place in the nav (the Agents group) and its search scope here; its rows are the fork's own search items (forkSettingsSearchItems.ts), spread in at one place. The import and the spread predate the list (they were \"pending\").",
+      "added": [
+        "import { FORK_SETTINGS_LABEL, FORK_SETTINGS_SEARCH_ITEMS } from \"./forkSettingsSearchItems\"; // Fork",
+        "| \"/settings/fork\" // Fork",
+        "\"/settings/fork\": FORK_SETTINGS_LABEL, // Fork",
+        "\"/settings/fork\", // Fork",
+        "\"/settings/fork\": null, // Fork",
+        "...FORK_SETTINGS_SEARCH_ITEMS, // Fork: the rows of the Fork page."
+      ]
+    },
+    "apps/web/src/components/settings/SettingsSidebarNav.tsx": {
+      "why": "The fork's Settings page \"Fork\" (/settings/fork) needs its icon in the nav's icon table, which every SettingsPath must have.",
+      "added": ["GitForkIcon,", "\"/settings/fork\": GitForkIcon, // Fork"]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -217,10 +227,8 @@
     "apps/web/src/components/ChatMarkdown.tsx": 39,
     "apps/web/src/components/chat/MarkdownFileLink.tsx": 32,
     "apps/web/src/components/media/mediaContent.ts": 8,
-    "apps/web/src/components/settings/SettingsPanels.tsx": 4,
     "apps/web/src/components/settings/scopedSettings.test.ts": 153,
     "apps/web/src/components/settings/scopedSettings.ts": 9,
-    "apps/web/src/components/settings/settingsSearch.ts": 2,
     "apps/web/src/components/settings/useScopedSettings.ts": 27,
     "apps/web/src/index.css": 2,
     "apps/web/src/markdown-links.test.ts": 1,
@@ -286,6 +294,9 @@
     "packages/shared/src/waitFor*",
     "scripts/lib/release-repository.ts",
     "scripts/release-repository.test.ts",
+    "apps/web/src/routes/_chat.settings.fork.tsx",
+    "apps/web/src/components/settings/ReviewRulesSettings*",
+    "apps/web/src/components/settings/reviewRulesSettings*",
     "!scripts/scenarios/fork-title-regenerates-from-inherited-history.e2e.ts"
   ],
   "//lost": "Seam and pending files that lost upstream lines, counted from upstream (as fork-follow runs the check): \"lines\", the upstream lines not kept in order and indentation; \"gone\", those whose text is gone. Held exactly, like a ceiling; an unlisted file counts 0. Lower a count when a line comes back, and keep each one small: a count is not a set of lines, so a line counted here may move unseen, and in a pending file a pull request can put back one gone upstream line and delete another with both counts unchanged.",

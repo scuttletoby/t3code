@@ -60,17 +60,32 @@ watches; it changes nothing on the machine, and `0` turns it off.
   later run. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it). So a pull request that moves fork lines out
-  of a pending file lowers its ceiling in its own list, in the same change: its run refuses one
-  that removes more lines than it adds and leaves its own ceiling above main's minus that many (it
-  reads its own list only for that, as a lower ceiling never widens the gate). Right after a rebase,
-  below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops
+  of a pending file lowers its ceiling in its own list, in the same change: its run refuses a
+  change to the file unless its own ceiling is exactly main's, plus the lines it adds, less the
+  lines it removes, less the upstream lines it puts back (main's `lost` `gone` less its own), since
+  per line text fork lines less gone ones is the copies over upstream's. With none left the entry
+  goes, or moves to `files` with `"added": []`. With some left it may move to `files` as a
+  declared seam only in a list-only change to that file (its text unchanged), when the new entry's
+  `added` lists exactly as many copies as are left, each one the file has, and its `announced`
+  none the file has; the run from upstream then holds every one of them to that entry. A pull
+  request's run has no upstream, so it cannot tell which lines are the fork's: the owner checks
+  them by running `node .github/scripts/fork-seam-check.cjs --from-upstream "$(git merge-base
+  origin/main upstream/main)" <pull request head>` (upstream's main fetched as `upstream/main`),
+  which refuses any fork line the entry leaves out
+  ([#552](https://github.com/scuttletoby/t3code/issues/552) moves this check into CI). Left
+  higher, the next run from upstream refuses main for the spare room; set lower or dropped, for
+  the lines still there. Neither in `pending` nor moved may a change gain a fork line (an upstream
+  line swapped for one is one more), whatever its list says. It reads its own list only to
+  refuse, never to widen the gate, and does not hold a list-only change (the file's text
+  unchanged), which may correct main. Right after a rebase, below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops
   it, and the ceiling could not have been lowered first. fork-follow then lowers it itself, in a
   commit of its own on the rebased series ("fork seams: lower counts after the rebase onto …", each
   change in its body and in the run's summary), and checks the lowered list again before it goes
-  on. It never raises one. The one ceiling it cannot lower is a pending file with no fork line left
-  that a `lost` entry still names (a ceiling is 1 or more, and a `lost` entry needs its file in
-  `files` or `pending`): that stays a note, the next run refuses it, and a pull request moves the
-  file to `files` with `"added": []`. A pull request may change a pending file but not grow it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
+  on. It never raises one. A pending file with no fork line left that a `lost` entry still names
+  (a ceiling is 1 or more, and a `lost` entry needs its file in `files` or `pending`) is moved to
+  `files` with `"added": []` in that commit, which holds it tighter: no fork line may come back, and
+  a pull request may lose none of its lines. The run's summary lists the lowered counts once the
+  plan has finished; a run stopped after the lowering pushes nothing. A pull request may change a pending file but not grow it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
   guard, or re-indented) add no line, so they are counted too, two ways: `lines`, the upstream lines
   it does not keep in order and indentation, and `gone`, those whose text it no longer has at all,
   so deleting a line already counted as moved or re-indented raises `gone`. `lost` maps such
@@ -93,7 +108,19 @@ watches; it changes nothing on the machine, and `0` turns it off.
   in no list may gain no line, lose no line and keep its lines in order and indentation (trailing
   blanks and blank lines aside), and no upstream file may be deleted or renamed, except the workflows
   [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
-  `fork-*.yml`. A submodule pointer counts as a line. A pull request's run has no upstream commit,
+  `fork-*.yml`. A submodule pointer counts as a line. `apps/web/src/routeTree.gen.ts` is TanStack's
+  output from `apps/web/src/routes/`: in a change that also changes a route file it is not judged
+  line by line (a fork route's lines repeat upstream's), and
+  [`forkRouteTree.test.ts`](../../apps/web/src/forkRouteTree.test.ts) refuses a committed tree that
+  is not the generator's output for the committed routes, with the options `vite.config.ts` passes to
+  `tanstackRouter(...)`. On a pull request the skip holds only while that test is main's: a pull
+  request that changes it has its tree judged line by line, so change the test in its own pull
+  request (and update a branch from before such a change). On a rebase conflict in the tree, take
+  either side and regenerate it (`vp run dev` or a build writes it), then commit it. A router
+  version bump or a new `tanstackRouter` option can rebase cleanly and still change what the
+  generator writes: fork-follow's release tests then stop on `forkRouteTree.test.ts`. Rebase by hand
+  (the runbook below), regenerate the tree and commit it into the rebased series before pushing; a
+  pull request that changes only the tree is judged line by line and refused. A pull request's run has no upstream commit,
   so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
   for the fork's own; from upstream, a pattern that matches an upstream file fails. Then remove the
   entry (or exclude a fork-named path with `!path`): from then on a pull request's run judges the
@@ -103,9 +130,10 @@ watches; it changes nothing on the machine, and `0` turns it off.
   fork-follow, so keep seam lines specific. A listed copy main's tip already has is spent too, not
   only one the branch's merge-base has: two branches from one main that each add the one listed
   copy are each green, and once one merges the other is refused ("update the branch from its
-  base"). The ruleset does not require a branch to be up to date before it merges, so two changes
-  that are fine apart but not together (a seam line in both, or a pending file each shrinks) still
-  need the later one updated from main to be judged together. A branch made before fork-follow last
+  base"). Neither seam check runs on `merge_group`. Two changes that are fine apart but not together
+  (a seam line in both, or a pending file each shrinks) are judged together because main's ruleset
+  requires a branch to be up to date with main before it merges (#444): the later one is updated
+  from main, and that update runs both checks again. A branch made before fork-follow last
   rebased main is refused with one "update the branch" error. Only `--from-upstream` (which fork-follow passes)
   runs it from an upstream commit and reads the head's list; without it a base with no list is
   refused, and an upstream that is itself a fork with a list is still judged by this fork's list.
@@ -284,7 +312,7 @@ change, or a fork line beyond the seams, it stops and opens one issue. Then:
    change (the refusal says "after the rebase") is raised in the rebased series' list (or, once
    pushed, with a list-only pull request to main).
 3. Run the pin tests before pushing:
-   `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
+   `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts apps/web/src/forkRouteTree.test.ts`.
 4. Push with `--force-with-lease` and start fork-follow once, as its report says.
 
 ### The sync that brings upstream's updater

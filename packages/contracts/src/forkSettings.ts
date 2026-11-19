@@ -22,6 +22,7 @@ import {
   McpThreadProfiles,
   McpThreadProfilesPatch,
 } from "./mcpProfile.ts";
+import { ModelPolicyFromSettingsFile, ModelPolicyPatch } from "./modelPolicy.ts";
 import { PlaytestSettings, PlaytestSettingsFromSettingsFile } from "./playtest.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
@@ -45,8 +46,10 @@ import {
   WaitForSettingsPatch,
 } from "./waitFor.ts";
 
+export * from "./forkFeatures.ts";
 export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
+export * from "./modelPolicy.ts";
 export * from "./playtest.ts";
 export * from "./reviewRules.ts";
 export * from "./usagePacing.ts";
@@ -58,6 +61,8 @@ const DEFAULT_HEADLESS_USAGE_REFRESH_INTERVAL = Duration.minutes(10);
 export const ForkServerSettingsFields = {
   /** Optional executable asked before an automatic update; a non-zero exit means "not now". */
   automaticUpdatesQuietCommand: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+  /** Answers "is T3 busy?" read-only on loopback (GET /api/fork/activity); off: no such route. */
+  activityProbe: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Usage pacing per provider instance; an instance without an entry has no reserve. */
   usagePacing: Schema.Record(ProviderInstanceId, UsagePacingInstanceSettings).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
@@ -100,6 +105,8 @@ export const ForkServerSettingsFields = {
   handoff: HandoffSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   /** How this machine runs a review lens; off by default. A bad value reads as off, kept as written. */
   reviewRules: ReviewRulesFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  /** Which models agents may pick; off by default. A bad value reads as enforce, nothing allowed. */
+  modelPolicy: ModelPolicyFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -108,6 +115,7 @@ export type ForkServerSettingKey = keyof typeof ForkServerSettingsFields;
 /** The settings patch's fork fields: one per server field, how a client may change it. */
 export const ForkServerSettingsPatchFields = {
   automaticUpdatesQuietCommand: Schema.optionalKey(TrimmedString),
+  activityProbe: Schema.optionalKey(Schema.Boolean),
   usagePacing: Schema.optionalKey(
     Schema.Record(ProviderInstanceId, Schema.NullOr(UsagePacingInstanceSettingsPatch)),
   ),
@@ -131,6 +139,11 @@ export const ForkServerSettingsPatchFields = {
   handoff: Schema.optionalKey(HandoffSettingsPatch),
   /** Strict: a save refuses a bad field, an unknown key, or a value without `preset`. */
   reviewRules: Schema.optionalKey(ReviewRulesPatch),
+  /**
+   * Strict: a save refuses a bad row, a `defaultEffort` not in its row's `efforts`, an unknown key,
+   * or a value without both `mode` and `allow` (it replaces the stored value whole).
+   */
+  modelPolicy: Schema.optionalKey(ModelPolicyPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -148,6 +161,7 @@ export type ForkPatchRule =
 /** One rule per fork patch field. */
 export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatchRule } = {
   automaticUpdatesQuietCommand: "replace",
+  activityProbe: "replace",
   usagePacing: { mergeEntries: DEFAULT_USAGE_PACING_INSTANCE_SETTINGS },
   usagePacingGate: "replace",
   // A level left out of the patch is removed.
@@ -170,6 +184,9 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   handoff: "replace",
   // Whole, so the strict check sees the value that is saved; two saves at once, the last one wins.
   reviewRules: "replace",
+  // Whole, as playtest, so the strict check sees the value that is saved; two saves at once, the last
+  // one wins. The patch has no defaults, so a save that leaves out `mode` or `allow` is refused.
+  modelPolicy: "replace",
 };
 
 /** The client settings' fork fields (stored in the browser); none yet. */

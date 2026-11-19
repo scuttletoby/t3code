@@ -11,8 +11,9 @@ fork switch is off by default, except one read-only refresh of usage limits.
 
 Server settings are in `settings.json` in the server's `userdata` folder (by default
 `~/.t3/userdata/settings.json`). The server reads the file again when it changes; no restart is
-needed. Some fork settings also have a row in the app's **Settings** pages (named below). A
-project's overrides are set in **Settings** with that project chosen at the top ("Applying settings
+needed. Fork settings also have rows on the app's own **Settings → Fork** page (named below), with
+one line per feature at the top saying whether it is on, by the same rules as the fork report below
+(on a server, a project's override or one thread's handoff entry counts too). A project's overrides are set in **Settings** with that project chosen at the top ("Applying settings
 for …", see [project settings](../user/project-settings.md)). An agent's tools cannot change any
 fork setting.
 
@@ -42,30 +43,32 @@ The defaults, "off" and "decided in" below come from one table in the code,
 (`packages/shared/src/forkDocs.test.ts`) fails when this table and that one differ, or a setting has
 no section below. "Off" means the default leaves the machine as upstream's would be.
 
-| Setting                                                                      | Default             | Off | Decided in                                               |
-| ---------------------------------------------------------------------------- | ------------------- | --- | -------------------------------------------------------- |
-| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`             | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
-| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
-| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
-| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`             | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}` | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`  | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
-| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
-| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`         | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`    | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
-| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set             | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set             | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
-| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set             | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| Setting                                                                      | Default                     | Off | Decided in                                               |
+| ---------------------------------------------------------------------------- | --------------------------- | --- | -------------------------------------------------------- |
+| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                     | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
+| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                        | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
+| [`server.activityProbe`](#serveractivityprobe)                               | `false`                     | yes | [#509](https://github.com/scuttletoby/t3code/issues/509) |
+| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                        | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
+| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                     | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                        | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`         | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                        | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
+| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
+| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`            | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                     | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 
 For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
 only `mode`; their other fields are tuning that does nothing while the switch is off.
@@ -78,7 +81,8 @@ A server installed as a boot service (`t3 service install`) updates itself to th
 once no thread is working. Off: it updates only when someone runs `t3 update` or presses **Update**.
 Upstream has a setting of this name pending (not on its `main` yet); the fork keeps `false` through every sync.
 
-Switch on in `settings.json`: `"automaticUpdates": true`. There is no Settings row for it yet. An
+Switch on: **Settings → Fork**, section Updates, "Update automatically", or in `settings.json`:
+`"automaticUpdates": true`. An
 admin policy with updates `"off"` still wins. Details: [updates.md](updates.md).
 
 ### `server.automaticUpdatesQuietCommand`
@@ -86,8 +90,48 @@ admin policy with updates `"off"` still wins. Details: [updates.md](updates.md).
 An optional program asked before each automatic update; a non-zero exit means "not now". Used only
 while `automaticUpdates` is on. Empty: no program is asked.
 
-Set in `settings.json`: `"automaticUpdatesQuietCommand": "/path/to/quiet-check"`. Details:
+Set: **Settings → Fork**, section Updates, "Quiet check before an update", or in `settings.json`:
+`"automaticUpdatesQuietCommand": "/path/to/quiet-check"`. Details:
 [updates.md](updates.md).
+
+### `server.activityProbe`
+
+Lets a program on the same machine ask the running server "is T3 busy?" without touching its data:
+`GET /api/fork/activity` answers with the running, queued and waiting turns, pending approvals and
+questions, background tasks and running terminal commands, counted as the automatic updater counts
+them, and `quiet: true` only when all are zero. It writes nothing and needs no sign-in, so it answers
+only a program on this machine: a loopback peer whose request carries no proxy headers (a Tailscale
+Serve or tunnel request) and no browser markers (`Origin`, `sec-fetch-site`, `sec-fetch-dest`, a
+`sec-fetch-mode` other than Node's `cors`, or a `Host` that is not loopback). The caller is checked
+first: every other caller gets a plain `404 Not Found` that names neither the setting nor the fork,
+whether the probe is on or off. Off, a local caller gets a 404 that says so, which the reader reports
+as `off`.
+
+Limits:
+
+- A TCP-level forward to loopback adds no headers and lets its client choose the `Host`, so it looks
+  local: `ssh -L`/`-R`, `tailscale serve --tcp`, socat, editor port forwarding. Whoever can open one
+  can already reach this machine's loopback.
+- The probe is asked on loopback, so the server must listen on loopback or on all addresses. A server
+  bound to one LAN or tailnet address only can never be probed: the reader reports `unreachable`.
+- **Advisory, not a gate an agent cannot pass.** The reader takes the port and the pid from
+  `server-runtime.json`, which anything running as the T3 user can rewrite, agents included, and the
+  `pid` in the answer is the server's own claim. An agent can point the reader at a port of its own
+  that answers `quiet: true` with T3's pid, and the reader exits 0. The pid check only catches a
+  port another program reused by accident. A gate that must hold against agents has to take the port
+  and pid from a source agents cannot write (passed in by a root-owned caller, or a root-owned
+  file), or check that the listening socket on that port belongs to that pid (on Linux: the socket
+  inode for the port in `/proc/net/tcp` and `/proc/net/tcp6` against the links in `/proc/<pid>/fd`).
+
+Switch on in `settings.json`: `"activityProbe": true` (read on every request, no restart). The
+program to call is `t3 __fork-report --base-dir <home> --activity`: it finds the server from the
+home's `server-runtime.json`, asks it, prints one line of JSON (`quiet`, then `reason`, then `state`:
+`quiet`, `busy`, `stopped`, `off`, `unreachable` or `unknown`) and exits 0 only for `quiet`. Every
+other state exits 1, so a quiet check that runs it fails closed: a server still starting (it answers
+nothing until it accepts commands), stopping, gone, too old to know the route, or with the probe off
+counts as busy. Only `quiet` and `busy` come from the server; `stopped` means no live process holds
+the home. A quiet check wraps it in a script with no arguments, for example
+`exec /path/to/t3 __fork-report --base-dir /path/to/home --activity`.
 
 ### `server.usagePacing`
 
@@ -102,7 +146,9 @@ Set in `settings.json`:
 { "usagePacing": { "<instance id>": { "reservePercent": 20 } } }
 ```
 
-The key is the provider instance id, for example `codex` or `codex_work`. There is no Settings row for it yet.
+The key is the provider instance id, for example `codex` or `codex_work`. In the app: **Settings →
+Fork**, section Usage pacing, one row per account by its name (an entry for an account that is gone
+is listed with **Remove**).
 
 ### `server.usagePacingGate`
 
@@ -111,8 +157,8 @@ What happens when an agent starts a task with `delegate_task`. `"off"`: nothing,
 on an account that is ahead of its pace moves to another account of the same provider, runs at a
 lower effort (`usagePacingLowerEffort`), or is refused for now and the agent asks again later.
 
-Switch on in `settings.json`: `"usagePacingGate": "advise"` (try `advise` before `enforce`). There
-is no Settings row for it yet.
+Switch on: **Settings → Fork**, section Usage pacing, "Usage pacing gate", or in `settings.json`:
+`"usagePacingGate": "advise"` (try `advise` before `enforce`).
 
 ### `server.usagePacingLowerEffort`
 
@@ -120,7 +166,8 @@ For `"enforce"`: what each effort level turns into while an account is ahead of 
 account has room, for example `{ "high": "medium", "medium": "medium" }`. A task at a level not
 listed is held instead. Empty: no effort is ever lowered.
 
-Set in `settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
+Set: **Settings → Fork**, "Lower effort when ahead of pace" (pairs like `high=medium`; a level no
+model on the server offers is refused), or in `settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
 
 ### `server.waitFor`
 
@@ -130,7 +177,7 @@ woken with the result. `wait_list` and `wait_cancel` list and end them. While of
 judged nor delivered; listing and cancelling still work. Other fields set deadlines, limits per
 thread and how often each kind is checked.
 
-Switch on: **Settings → Threads**, section Waits (shown while a server is connected), "Let agents wait for events", or in `settings.json`:
+Switch on: **Settings → Fork**, section Waits (shown while a server is connected), "Let agents wait for events", or in `settings.json`:
 `"waitFor": { "enabled": true }`.
 
 ### `server.waitChecks`
@@ -140,7 +187,7 @@ fixed arguments, no shell; exit 0 means the event happened. It runs unsandboxed 
 with the server's environment, so use fixed programs that run no files from the repository (no test
 runners or build scripts). Only the person can add one; agents cannot.
 
-Add one: **Settings → Threads**, section Wait checks, **Add check**, or in `settings.json`:
+Add one: **Settings → Fork**, section Wait checks, **Add check**, or in `settings.json`:
 
 ```json
 { "waitChecks": { "build-done": { "argv": ["test", "-f", "/tmp/build.done"] } } }
@@ -158,6 +205,9 @@ T3 runs the project's adapter, four kinds of step only the person sets: `claim` 
 arguments, run without a shell; T3 passes the session's facts as environment variables. Nothing
 starts a session yet: the session store and the worker (renew, the idle and time limits, ends for
 gone threads) are there, and the tool and the thread controls come in later pull requests. The steps' contract is in [playtest.md](playtest.md).
+
+In the app: **Settings → Fork**, section Playtest: the switch (it stays off until all four steps are
+set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
 
 Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
 push step's name (or names one `claim`, `renew` or `release`), or names a program by anything but
@@ -214,13 +264,52 @@ valid (an unknown preset or key from a newer build, a bad runner) reads as off, 
 a warning in the server log; it is kept as written, and saves of other settings write it back
 unchanged until the person saves this setting.
 
-In the app: Settings, Threads, Review rules shows whether the rules are on and the values a lens
+In the app: Settings, Fork, Review rules shows whether the rules are on and the values a lens
 would run with (each marked as the preset's or set by hand), with "Use recommended review rules"
 and "Turn off" buttons; it asks first before a button drops hand-set fields or an unreadable value.
 
 ```json
 {
   "reviewRules": { "preset": "recommended" }
+}
+```
+
+### `server.modelPolicy`
+
+Which models (and efforts) agents may pick, per provider driver. `mode` is `off` (agents pick any
+model, as upstream's do), `advise` (agents are only told) or `enforce` (a pick off the list is
+refused). Each `allow` row names a `driver` and a `model`; `efforts` (non-empty) limits the efforts
+for that model, and a row without it checks only the model. `defaultEffort` must be one of the
+row's `efforts`; `useFor` is a short note shown to agents when they pick. Nothing reads the setting
+yet: the check comes in a later pull request.
+
+Only the person can change it; agents cannot. A save must give both `mode` and `allow` (it replaces
+the stored value whole) and is refused for a bad row, a `defaultEffort` not in its row's `efforts`,
+or an unknown key such as a misspelt `effort`. A hand-edited value that is not valid, an unknown key
+included, reads as `enforce` with nothing allowed (with a warning in the server log); it is kept as
+written, and saves of other settings write it back unchanged until the person saves this setting.
+
+In the app: **Settings → Fork**, section Model policy (server only; a project cannot override it): the
+mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a save is. An unreadable
+value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
+then starts from the value's own rows and saves only once the person picks the mode, so a save never
+turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged.
+
+```json
+{
+  "modelPolicy": {
+    "mode": "enforce",
+    "allow": [
+      {
+        "driver": "claudeAgent",
+        "model": "claude-sonnet-5-5",
+        "efforts": ["medium", "high"],
+        "defaultEffort": "high",
+        "useFor": "everyday coding"
+      },
+      { "driver": "codex", "model": "gpt-mini" }
+    ]
+  }
 }
 ```
 
@@ -231,7 +320,7 @@ above `maxPerAccount` per provider account, or below `minFreeMemoryMb` of free m
 started in other ways are counted but never refused. With `waitFor` on, an agent can wait for a slot
 instead of retrying.
 
-Switch on: **Settings → Threads**, section Agent slots, "Limit running agents", or in `settings.json`:
+Switch on: **Settings → Fork**, section Agent slots, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is
 refused.
 
@@ -334,6 +423,11 @@ model (not set: the thread's current one). A save with a bad value, a field T3 d
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
 server log), never as `handoff`.
 
+In the app: **Settings → Fork**, section Handoff: the mode, each thread's own mode (added by thread
+id, shown with its title where this client knows the thread), and under Advanced the sizes, who
+writes the handoff (with its command) and the instructions. `modelSelection` has no row yet; a save
+there keeps it as stored.
+
 ```json
 { "handoff": { "mode": "handoff", "threads": { "<thread id>": "compact" } } }
 ```
@@ -343,7 +437,7 @@ server log), never as `handoff`.
 A project's own list of wait checks. It replaces the server's list for that project as a whole (a
 project lists every check it uses). Not set: the project uses the server's checks.
 
-Set: **Settings**, choose the project at the top, then **Wait checks**.
+Set: **Settings → Fork**, choose the project at the top, then **Wait checks**.
 
 ### `projectOverride.playtest`
 

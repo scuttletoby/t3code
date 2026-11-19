@@ -77,6 +77,8 @@ const toolsDefinedElsewhere = (): ReadonlyArray<string> => {
 const NOT_ADVERTISED: Readonly<Record<string, string>> = {
   // Describes the linked environment's `orchestrator_capabilities` to call it there.
   "peer/RemoteDelegation.ts": "a client of another environment's tool",
+  // Decodes the linked environment's `t3_thread_read` without the thread's details.
+  "fork/remoteReplyRead.ts": "a client of another environment's tool",
 };
 
 // A toolkit: an object whose `tools` are all `Tool`s (Toolkit exports no type guard).
@@ -149,6 +151,7 @@ describe("person-only fork settings", () => {
         "mcpSubagentProfile",
         "mcpThreadProfiles",
         "reviewRules",
+        "modelPolicy",
       ]),
     );
     for (const key of FORK_AGENT_WRITABLE_KEYS) expect(FORK_PERSON_ONLY_KEYS).not.toContain(key);
@@ -210,6 +213,7 @@ describe("person-only fork settings", () => {
       ["mcp_profile", "mcpProfile"],
       ["MCP-PROFILE", "mcpProfile"],
       ["review_rules", "reviewRules"],
+      ["model_policy", "modelPolicy"],
     ] as const) {
       const tool = Tool.make("fake_settings_update", {
         parameters: Schema.Struct({

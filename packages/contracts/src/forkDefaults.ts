@@ -50,6 +50,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
   },
   {
     scope: "server",
+    key: "activityProbe",
+    default: false,
+    off: true,
+    reason: "No activity route: a quiet check falls back to what it can see from outside.",
+    decidedIn: "#509",
+  },
+  {
+    scope: "server",
     key: "usagePacing",
     default: {},
     off: true,
@@ -117,6 +125,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     reason:
       "No review lens is listed, changed or checked until a person sets the preset; the repo's CI gate stays the guarantee.",
     decidedIn: "#99",
+  },
+  {
+    scope: "server",
+    key: "modelPolicy",
+    default: { mode: "off", allow: [] },
+    off: true,
+    reason: "Agents pick any model, as upstream's do, until a person sets the policy's mode.",
+    decidedIn: "#268",
   },
   {
     scope: "server",

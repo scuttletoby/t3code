@@ -13,6 +13,15 @@ const CONFIG = ".github/fork-seams.json";
 const REMOVED = ".github/fork-removed-workflows.txt";
 const REMOVED_PATH = /^\.github\/workflows\/[^/,\s]+\.ya?ml$/;
 const FORK_WORKFLOW = /^\.github\/workflows\/fork-[^/]*\.ya?ml$/;
+// Generated upstream files: the folder each is generated from, and the fork test that proves the
+// file is the generator's output (a hand edit fails it). A fork route repeats upstream's lines
+// (`} as any)`), so the file is not judged line by line when its folder changes too.
+const GENERATED = new Map([
+  [
+    "apps/web/src/routeTree.gen.ts",
+    { source: "apps/web/src/routes/", proof: "apps/web/src/forkRouteTree.test.ts" },
+  ],
+]);
 
 function git(args) {
   return execFileSync("git", ["-c", "core.quotePath=false", ...args], {
@@ -188,9 +197,14 @@ function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, toda
       const allowance = counts.get(line) ?? 0;
       return upstream ? allowance : Math.max(0, allowance - spent(line));
     };
-    const adds = (copies, line) =>
+    // The hint only where the base branch's newer copies alone make these too many: judged from
+    // the merge-base (the copies the announcement allows in date), the branch would pass.
+    // `counts` is the allowance the copies are judged by: in date for `late`, else `allowed` (an
+    // expired announcement allows nothing from the merge-base either, so updating would not help).
+    const adds = (copies, line, added, counts) =>
       `${file}: adds ${copies === 1 ? "" : `${copies}× `}\`${line}\`${
-        (tipCounts.get(line) ?? 0) > (baseCounts.get(line) ?? 0)
+        (tipCounts.get(line) ?? 0) > (baseCounts.get(line) ?? 0) &&
+        added <= (counts.get(line) ?? 0) - (baseCounts.get(line) ?? 0)
           ? " (the base branch has more copies than this branch's merge-base: update the branch from its base)"
           : ""
       }`;
@@ -206,10 +220,10 @@ function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, toda
           ? "is dated after"
           : `is more than ${ANNOUNCED_DAYS} days before`;
         lateReasons.push(
-          `${adds(lateCopies, line)} (its announcement of ${since} ${when} ${today}, the list's commit date: announce it again with a list-only pull request)`,
+          `${adds(lateCopies, line, added, inDate)} (its announcement of ${since} ${when} ${today}, the list's commit date: announce it again with a list-only pull request)`,
         );
       }
-      if (extra > lateCopies) reasons.push(adds(extra - lateCopies, line));
+      if (extra > lateCopies) reasons.push(adds(extra - lateCopies, line, added, allowed));
     }
   }
   return reasons;
@@ -256,9 +270,9 @@ const AFTER_REBASE_RISE =
 
 /**
  * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed` names it).
- * A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase `notes`; exceeded:
- * `rises`); on a PR it may not grow, and a shrink lowers its ceiling in `ownPending` to match.
- * `lowered.pending` gets the count each too-high ceiling from upstream lowers to.
+ * A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase `notes`; exceeded: `rises`;
+ * `lowered.pending` gets the lowered count). On a PR it may not grow or gain a fork line; a change sets its `ownPending`
+ * ceiling to exactly what is left (`ownLost`: lines put back), or a list-only change moves it to `ownFiles`, listing them.
  */
 function findUnlistedChanges(
   config,
@@ -266,11 +280,14 @@ function findUnlistedChanges(
     changed,
     atBase,
     atHead,
+    atMain = atBase,
     upstream,
     isForkFile,
     removed = new Set(),
     afterRebase = false,
     ownPending,
+    ownFiles = {},
+    ownLost = {},
     lowered,
   },
 ) {
@@ -290,17 +307,32 @@ function findUnlistedChanges(
       if (!removed.has(file) && !FORK_WORKFLOW.test(file)) reasons.push(deleted(file));
       continue;
     }
+    const generated = GENERATED.get(file);
+    let unproven = "";
+    if (generated !== undefined && changed.some((other) => other.startsWith(generated.source))) {
+      const proof = atHead(generated.proof);
+      if (proof === undefined) {
+        reasons.push(
+          `${file}: generated from ${generated.source}, but this change has no ${generated.proof}, the test that proves it is the generator's output.`,
+        );
+        continue;
+      }
+      // On a pull request the proof must be main's: a change to it (it.skip, an always-green test)
+      // could pass its own hand edit. From upstream the head's own script and tests judge.
+      if (upstream || proof === atMain(generated.proof)) continue;
+      unproven = ` Judged line by line: this change's ${generated.proof} is not main's, so it proves nothing (change that test in its own pull request, or update the branch from main).`;
+    }
     const added = total(addedLines(base, head));
     const entry = upstream
       ? "."
       : ' (if it is a fork file upstream does not have, add it to "forkFiles").';
     if (added > 0) {
       reasons.push(
-        `${file}: upstream file with ${added} fork line${added === 1 ? "" : "s"} but no entry in ${CONFIG}${entry}`,
+        `${file}: upstream file with ${added} fork line${added === 1 ? "" : "s"} but no entry in ${CONFIG}${entry}${unproven}`,
       );
     } else if (!sameLines(base, head)) {
       reasons.push(
-        `${file}: upstream file whose lines this change deletes, moves or re-indents, but no entry in ${CONFIG}${entry}`,
+        `${file}: upstream file whose lines this change deletes, moves or re-indents, but no entry in ${CONFIG}${entry}${unproven}`,
       );
     }
   }
@@ -332,7 +364,7 @@ function findUnlistedChanges(
         lowered?.pending.set(file, added);
         (afterRebase ? notes : ceilings).push(
           added === 0
-            ? `${file}: "pending" with no fork lines left; remove it from the list.`
+            ? `${file}: "pending" with no fork lines left; remove it from the list${Object.hasOwn(config.lost ?? {}, file) ? ' (to "files" with "added": [] while "lost" names it)' : ""}.`
             : `${file}: "pending" with ${added} fork lines, fewer than its ceiling of ${ceiling}; lower it to ${added}.`,
         );
       }
@@ -343,21 +375,93 @@ function findUnlistedChanges(
       reasons.push(
         `${file}: "pending" (fork lines to move out), and this change adds ${grows} more line${grows === 1 ? "" : "s"} than it removes.`,
       );
-    } else if (grows < 0 && ownPending !== undefined) {
-      // Main sits at its ceiling, so a change that moves fork lines out must lower it too, or the next
-      // run from upstream refuses main and the spare room could later admit a fork line. The change's
-      // own list is read only for a lower ceiling (never a wider gate). This run cannot tell fork lines
-      // from upstream's, so the text names both; the run from upstream holds "lost" counts exact.
-      const want = ceiling + grows;
-      const own = Object.hasOwn(ownPending, file) ? ownPending[file] : 0;
-      if (own > Math.max(want, 0)) {
-        const removes = `${-grows} more line${grows === -1 ? "" : "s"} than it adds (keep upstream's lines; if they are fork lines moved out)`;
+      continue;
+    }
+    if (ownPending === undefined) continue;
+    // A change sets the ceiling to exactly what is left (too high admits a fork line later; too low
+    // fails the run from upstream). Fork lines change by lines gained less the change in "gone" (an
+    // upstream line put back is a fork line fewer); that run holds both "gone" counts exact. The own
+    // list only refuses, never widens; a list-only change (text unchanged) is not held: it may fix main.
+    const goneOf = (lost) =>
+      lost !== undefined && Object.hasOwn(lost, file) ? lost[file].gone : 0;
+    const mainGone = goneOf(config.lost);
+    const ownGone = goneOf(ownLost);
+    const moved = Object.hasOwn(ownFiles, file) && !Object.hasOwn(ownPending, file);
+    const edited = base !== head;
+    if (!edited && !moved) continue;
+    const want = Math.max(edited ? ceiling + grows + ownGone - mainGone : ceiling, 0);
+    const parts = [];
+    if (grows < 0) {
+      parts.push(
+        `removes ${-grows} more line${grows === -1 ? "" : "s"} than it adds (keep upstream's lines; if they are fork lines moved out)`,
+      );
+    }
+    if (ownGone !== mainGone) {
+      parts.push(
+        `sets its own "lost" to name ${ownGone} upstream line${ownGone === 1 ? "" : "s"} gone where main's names ${mainGone} (an upstream line put back is a fork line fewer)`,
+      );
+    }
+    const does = parts.length > 0 ? parts.join(", and ") : "changes its lines";
+    const lines = (count) => `${count} fork line${count === 1 ? " is" : "s are"}`;
+    // Above the ceiling only when the change swaps an upstream line for a fork line (it adds no
+    // line, and its own "lost" says one more is gone): a pending file may not gain a fork line,
+    // whether it stays in "pending" or moves to "files" (the own list never raises the ceiling).
+    if (want > ceiling) {
+      ceilings.push(
+        `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}, so ${lines(want)} left, more than its ceiling: a pending file may not gain a fork line (an upstream line swapped for one is one more), whether it stays in "pending" or moves to "files"; make the change without it.`,
+      );
+      continue;
+    }
+    if (moved) {
+      // A move only reclassifies the lines left: with some left, only a list-only change (main's
+      // exact ceiling is the count), its "added" listing exactly those copies and its "announced"
+      // none the file has. Which lines they are, only the run from upstream can tell (it refuses
+      // a wrong one; the owner checks the entry).
+      const entry = ownFiles[file];
+      const what = `${edited ? `${does}, and ` : ""}moves it to "files" in this change's ${CONFIG}`;
+      if (want > 0 && edited) {
         ceilings.push(
-          want > 0
-            ? `${file}: "pending" with a ceiling of ${ceiling}, and this change removes ${removes}: lower it to ${want} in this change's ${CONFIG}.`
-            : `${file}: "pending" with a ceiling of ${ceiling}, and this change removes ${removes}: remove it from "pending" in this change's ${CONFIG}.`,
+          `${file}: "pending" with a ceiling of ${ceiling}, and this change ${what} while ${lines(want)} left: with fork lines left, only a list-only change (the file's text unchanged) may move it; change the file in one pull request (keeping it in "pending"), and move it in another.`,
+        );
+        continue;
+      }
+      const declared = lineCounts(entry.added.join("\n"));
+      const there = lineCounts(head);
+      const listed = [...declared.values()].reduce((sum, count) => sum + count, 0);
+      if (listed !== want) {
+        ceilings.push(
+          want === 0
+            ? `${file}: "pending" with a ceiling of ${ceiling}, and this change ${what} with no fork line left: list no line under "added" in its new entry (it lists ${listed}; a line upstream has is never a seam line, and a new one is announced first).`
+            : `${file}: "pending" with a ceiling of ${ceiling}, and this change ${what} while ${lines(want)} left: keep it in "pending" with a ceiling of ${want}, or list exactly those ${want === 1 ? "line" : `${want} lines`} under "added" in its new entry (it lists ${listed}; a move only reclassifies the lines left, and a new one is announced first).`,
         );
       }
+      for (const [line, count] of declared) {
+        const has = there.get(line) ?? 0;
+        if (has < count) {
+          ceilings.push(
+            `${file}: moved to "files" in this change's ${CONFIG}, whose "added" lists \`${line}\`${count === 1 ? "" : ` ${count}×`}, but the file has ${has === 0 ? "no copy" : `${has}×`}: list only the fork lines the file has.`,
+          );
+        }
+      }
+      for (const line of lineCounts((entry.announced?.added ?? []).join("\n")).keys()) {
+        const has = there.get(line) ?? 0;
+        if (has > 0) {
+          ceilings.push(
+            `${file}: moved to "files" in this change's ${CONFIG}, whose "announced" lists \`${line}\`, but the file already has it (${has}× there): list a fork line the file has under "added", and announce only a line a later change adds (a line upstream has is never a seam line).`,
+          );
+        }
+      }
+      continue;
+    }
+    const listed = Object.hasOwn(ownPending, file);
+    const own = listed ? ownPending[file] : 0;
+    if (own !== want) {
+      const has = listed ? `its list has ${own}` : "its list drops it";
+      ceilings.push(
+        want > 0
+          ? `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}: set it to ${want} in this change's ${CONFIG} (${has}; main holds its ceiling exactly).`
+          : `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}: remove it from "pending" in this change's ${CONFIG} (${has}).`,
+      );
     }
   }
   return { reasons, ceilings, rises, notes };
@@ -768,11 +872,15 @@ function ownListProblem(text) {
   }
 }
 
+// The "why" of a pending file fork-follow moves to "files" (see lowerList).
+const MOVED_WHY =
+  'Was "pending": fork-follow moved it here once it had no fork line left, as its "lost" entry still counts upstream lines it loses. No seam line: a fork line goes in a file of the fork\'s own.';
+
 /**
  * `text` with the counts in `lowered` ({ pending, lost }: Maps of file to count) lowered, as { text, changes },
- * or undefined when nothing changes. Only lowers; a count at 0 removes the entry, except a "pending" one a
- * "lost" entry still names (that would leave the list malformed). Two-space JSON, parsed again before it is
- * returned, so a lowered list is never one the check refuses.
+ * or undefined when nothing changes. Only lowers; a count at 0 removes the entry. A "pending" file with no fork
+ * line left that "lost" still names moves to "files" with no seam line (no fork line may come back, no line may
+ * be lost). Two-space JSON, parsed again before it is returned, so a lowered list is never one the check refuses.
  */
 function lowerList(text, lowered) {
   const raw = JSON.parse(text);
@@ -797,12 +905,18 @@ function lowerList(text, lowered) {
   });
   if (raw.lost !== undefined) raw.lost = Object.fromEntries(lostAfter);
   const stillLost = new Set(lostAfter.map(([file]) => file));
+  const moved = [];
   if (raw.pending !== undefined) {
     raw.pending = Object.fromEntries(
       Object.entries(raw.pending).flatMap(([file, ceiling]) => {
         const to = lowered.pending.get(file);
-        if (to === undefined || to >= ceiling || (to === 0 && stillLost.has(file))) {
-          return [[file, ceiling]];
+        if (to === undefined || to >= ceiling) return [[file, ceiling]];
+        if (to === 0 && stillLost.has(file)) {
+          changes.push(
+            `${file}: "pending" ${ceiling} moved to "files" with no seam line (no fork line left; "lost" still counts its upstream lines)`,
+          );
+          moved.push(file);
+          return [];
         }
         if (to === 0) {
           changes.push(`${file}: "pending" ${ceiling} removed (no fork line left)`);
@@ -812,6 +926,15 @@ function lowerList(text, lowered) {
         return [[file, to]];
       }),
     );
+  }
+  // Appended through defineProperty: a file named `__proto__` stays an own key.
+  for (const file of moved) {
+    Object.defineProperty(raw.files, file, {
+      value: { why: MOVED_WHY, added: [] },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   if (changes.length === 0) return undefined;
   const lowerText = `${JSON.stringify(raw, null, 2)}\n`;
@@ -905,9 +1028,11 @@ function main(argv) {
   // A pull request that moves fork lines out of a "pending" file lowers its ceiling in its own
   // list (read only for that: a lower ceiling never widens the gate).
   let ownPending;
+  let ownFiles;
+  let ownLost;
   if (!upstream && listProblem === undefined && ownList !== undefined) {
     try {
-      ownPending = parseConfig(ownList).pending ?? {};
+      ({ pending: ownPending, files: ownFiles, lost: ownLost } = parseConfig(ownList));
     } catch {
       ownPending = undefined; // The list judged it is main's; a malformed own one is said below.
     }
@@ -918,11 +1043,15 @@ function main(argv) {
     changed,
     atBase,
     atHead,
+    // The list's commit: main on a pull request (fork-checks), the head from upstream.
+    atMain: (file) => textAt(configRef, file),
     upstream,
     isForkFile,
     removed,
     afterRebase: parsed.afterRebase,
     ownPending,
+    ownFiles,
+    ownLost,
     lowered,
   });
   const lost = findLostLines(config, {
@@ -1022,7 +1151,7 @@ function main(argv) {
   }
   if (ceilings.length > 0) {
     console.error(
-      `Lower each "pending" ceiling and "lost" count named above (or remove the entry) in ${CONFIG}: in this change's list where the line says so, otherwise with a pull request to main.`,
+      `Lower each "pending" ceiling and "lost" count named above (or remove the entry, or set the value its line names) in ${CONFIG}: in this change's list where the line says so, otherwise with a pull request to main.`,
     );
   }
   if (late.length > 0) {
@@ -1045,6 +1174,7 @@ function main(argv) {
 
 module.exports = {
   CONFIG,
+  GENERATED,
   compileForkPattern,
   findAnnouncementWarnings,
   findDuplicateKey,
