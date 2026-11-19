@@ -645,3 +645,44 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork review rule
     }).pipe(Effect.provide(layerServerSettings())),
   );
 });
+
+it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork model policy", (it) => {
+  const ROW = { driver: "claudeAgent", model: "m", efforts: ["low", "high"] };
+
+  it.effect.each([
+    { name: "a bad mode", bad: { mode: "Enforce", allow: [ROW] } },
+    { name: "a misspelt row key", bad: { mode: "advise", allow: [{ ...ROW, effort: ["low"] }] } },
+  ])("keeps $name as written when another key is saved, read as nothing allowed", ({ bad }) =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(
+        config.settingsPath,
+        JSON.stringify({ ...FULL_FILE, modelPolicy: bad }),
+      );
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const settings = yield* service.getSettings;
+      assert.strictEqual(settings.modelPolicy.mode, "enforce");
+      assert.deepStrictEqual(settings.modelPolicy.allow, []);
+      // Saved twice: the second save starts from what the first one wrote.
+      for (const enableAgentBrowserAccess of [true, false]) {
+        yield* service.updateSettings(decodePatch({ enableAgentBrowserAccess }));
+        const file = (yield* readFile) as Record<string, unknown>;
+        assert.deepStrictEqual(file.modelPolicy, bad);
+        assert.deepStrictEqual((yield* service.getSettings).modelPolicy.allow, []);
+      }
+      // The person's own save of the key replaces it.
+      const good = { mode: "advise", allow: [ROW] };
+      yield* service.updateSettings(decodePatch({ modelPolicy: good }));
+      assert.deepStrictEqual(((yield* readFile) as Record<string, unknown>).modelPolicy, good);
+      assert.deepStrictEqual((yield* service.getSettings).modelPolicy as unknown, good);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("writes nothing for modelPolicy when the file never had it", () =>
+    Effect.gen(function* () {
+      const file = yield* loadThenPatch({}, { enableAgentBrowserAccess: false });
+      assert.isFalse("modelPolicy" in (file as Record<string, unknown>));
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+});

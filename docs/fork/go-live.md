@@ -126,7 +126,8 @@ After each change, `t3-golive status` lists what is on, each with where: `server
 or a default of the administrator's managed policy), `policy` (on only because the policy locks it),
 `project:<id>` (that project's override in `projectSettingsOverrides`), `thread:<id>` (one thread's entry
 in the server's `handoff.threads`) or `project:<id>/thread:<id>` (one in a project's). The features are `agentSlots`, `waitFor`,
-`usagePacingGate`, `automaticUpdates`, `reviewRules`, `handoff` and `playtest`. Not listed, as none is a
+`usagePacingGate`, `automaticUpdates`, `reviewRules`, `handoff`, `playtest` and `modelPolicy` (by its
+`mode`; a value that does not decode reads as `enforce`). Not listed, as none is a
 switch: `headlessUsageRefreshInterval` (runs by default in every fork build and only reads usage), MCP
 profiles (nothing applies a profile yet), `usagePacing` and `usagePacingLowerEffort` (only the pacing
 gate acts on them), `waitChecks` (only `waitFor` runs them) and `automaticUpdatesQuietCommand`.
@@ -150,5 +151,6 @@ already holds, `status` says `server`, and after the edit it says `policy`.
 
 Later, and each a decision of its own: `"usagePacingGate": "enforce"` (tasks are held, moved or run at a
 lower effort; off again: `"advise"`), and `"automaticUpdates": true` (the boot service updates itself to
-the newest fork release at a quiet point; off again: `false`). What each setting does:
+the newest fork release at a quiet point; off again: `false`), and `"modelPolicy"` with `"mode": "advise"`
+or `"enforce"` and its `allow` rows (nothing reads it yet; off again: `"mode": "off"`). What each setting does:
 [the fork's settings](README.md#each-setting).
