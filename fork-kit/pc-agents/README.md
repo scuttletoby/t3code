@@ -219,11 +219,15 @@ T3 still cannot update itself (`limits.updates` stays off, T3 stays root's): roo
   network trust beyond the bundle: the certificate chains to Sigstore's public-good Fulcio authority (pinned in
   `lib/sigstore-trust.json`), was issued by GitHub Actions' token issuer to a GitHub-hosted runner of `<fork>`, for
   the workflow `.github/workflows/fork-release.yml` on `refs/heads/main` (called from `fork-release.yml` or
-  `fork-follow.yml`), the signature is in Rekor's log (its promise signed by the pinned Rekor key) while the
+  `fork-follow.yml`; names compared exactly, letter case too, but for the GitHub owner and repository name, which
+  GitHub matches in any case), the signature is in Rekor's log (its promise signed by the pinned Rekor key) while the
   certificate was valid, and the signed statement names the archive's file name and SHA-256. `SHA256SUMS` must name
   the same SHA-256. `fork-release.yml` itself refuses to publish a stable-track release from a commit that is not on
-  `main`. A release that fails any of this is refused, nothing of it is kept, and it is not downloaded again (an
-  alert says so). Its attestations not read (a GitHub error) is not a refusal: it tries again next hour.
+  `main`, so the fork's release branch (fork-follow's series branch, `FORK_SERIES_BRANCH`) must be `main`. The chain
+  is checked against the pinned root alone, never the distro's CA certificates, which needs OpenSSL 3 (Debian 12,
+  Ubuntu 22.04 or newer): an older one refuses every release. A release that fails any of this is refused, nothing of
+  it is kept, and it is not downloaded again (an alert says so). Its attestations not read (a GitHub error) is not a
+  refusal: it tries again next hour.
 - **What that leaves an agent:** an agent with a token that can push to a branch of the fork, open pull requests or
   run its own workflows cannot make an archive this check takes: its workflows run from other refs or other files,
   and `main` is protected. It **can** if its token can write to `main` (Contents write, or an admin bypass of the
@@ -254,7 +258,10 @@ T3 still cannot update itself (`limits.updates` stays off, T3 stays root's): roo
   downloaded: kit updates stay yours), and checks that T3 answers on its port as the new version
   (`/.well-known/t3/environment`) within 3 minutes and that every wall holds.
 - **Rollback:** when the new version does not come up, `t3Version` goes back (the `.bak` from before the switch is
-  kept), T3 is stopped, the database copy is put back (files the new version added are removed), setup runs again
+  kept); if T3's unit ran the new version, T3 is stopped, the database as it is then (with its `-wal` and `-shm`) is
+  copied to `/var/lib/pc-agents/db-replaced-<UTC time>-<version>` (root's alone, named in the alert, never removed
+  by the kit: nothing written on the new version is lost) and only then the database copy is put back (files the
+  new version added are removed); a database T3 never opened as the new version stays as it is. Setup runs again
   and the old version is checked the same way. The new version's folder is removed, so a later try downloads it
   again. When T3 itself did not start or answer on it, that release is marked `failed` and not tried again; a
   newer one is. Any other failure (setup failing for another reason, a wall) is tried again the next hours, 3 times
@@ -333,18 +340,20 @@ allowed (connection tracking).
   changed what T3 runs with, the walls check's `restart` wall fails (and the 2-minute check stops T3) until setup runs
   again to the end, as after a failed T3 download. A distro restart in between starts T3 again with the new files and
   firewall, without the packages.
-- **The automatic update:** the same latest release again is a no-op ("up to date"), and so is a release refused
-  or failed before. It saves its journal before each step that changes what T3 runs with. Stopped before the machine
-  file changed (in the download, at the quiet point), the next run starts over, quiet point included; a download cut
+- **The automatic update:** the same latest release again is a no-op ("up to date"), and so is a release refused or
+  failed before. It saves its journal before each step that changes what T3 runs with. Stopped before the machine file
+  changed (in the download, at the quiet point), the next run starts over, quiet point included; a download cut
   half-way (a folder without its `t3`, a `.staging-` or a removal's `.removing-` folder) is removed and downloaded
   again. Stopped after T3 was stopped for the database copy, or after the machine file changed (in setup, before the
   check), the next run finishes the switch, even with `autoUpdate` turned off meanwhile: if T3 runs again by then (a
   distro restart, or setup started it), it first waits for a quiet point again, and a T3 that ran the old version
-  again gets a fresh database copy; cut 3 times, it rolls back instead (counted as a retry, not a `failed` release).
-  Stopped in a rollback, the next run finishes the rollback. Meanwhile the walls check stops a T3 that no longer
-  matches the machine file, as after any setup stopped half-way. A machine file you changed meanwhile ends that
-  switch: the update leaves it to you. No journal yet, an unreadable one (taken as empty), values of the wrong kind in
-  it (left out, named), a bad machine file, no latest release or a GitHub error: it does nothing and says so.
+  again gets a fresh database copy; cut 3 times, it rolls back instead (counted as a retry, not a `failed` release),
+  after that quiet point too. Stopped in a rollback, the next run finishes the rollback: if T3 runs again by then, at
+  a quiet point; the database is put back once (again only when a distro restart started the new version). Meanwhile
+  the walls check stops a T3 that no longer matches the machine file, as after any setup stopped half-way. A machine
+  file you changed meanwhile ends that switch: the update leaves it to you. No journal yet, an unreadable one (taken
+  as empty), values of the wrong kind in it (left out, named), a bad machine file, no latest release or a GitHub
+  error: it does nothing and says so.
 - **A distro that is not fresh:** refused before anything is written, with the reasons: another login user, an
   `agent` with another uid or in another group, a file the kit would write that it did not write (or that was
   edited since, for example a hand-written `wsl.conf` or `policy.json`), a cron, at or ssh unit where the kit masks
@@ -405,7 +414,11 @@ allowed (connection tracking).
   (it cannot make one happen; after 7 days that is an alert). A process started between the quiet check and the
   stop (a few seconds: the window while setup starts) is stopped with T3. After a run stopped mid-switch, T3 may
   stay down until the next run (hourly, and 10 minutes after the distro starts). The database copy is the one from
-  right before the switch: what T3 writes on the new version before a rollback is lost.
+  right before the switch: what T3 writes on the new version before a rollback is not in the database the old
+  version runs on, only in the `db-replaced-` folder (yours to merge back or remove; the kit never prunes them).
+- **Sigstore's keys are pinned** (`lib/sigstore-trust.json`): when Sigstore rotates its Fulcio root or Rekor key, or
+  GitHub's attestations move to another log format, every new release is refused (an alert on every PC). Then
+  install a kit with the new keys (step 3 again) and run `pc-agents auto-update --clear`.
 - **No uninstall** but removing the distro; the distro holds nothing else.
 - **No code hash manifest yet:** the kit's code is checked for root ownership and its written files byte for byte,
   but the code files are not hashed (T3's `t3` is). The bootstrap duplicates the heavy kit's (a shared bootstrap is

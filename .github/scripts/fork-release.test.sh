@@ -435,6 +435,20 @@ if WORKFLOW_REF="me/t3code/.github/workflows/fork-follow.yml@refs/heads/main" ru
 else
   fail "on-main: fork-follow on main publishes its own candidate"
 fi
+# fork-follow's stage report once said to run fork-release.yml from the branch fork-follow/candidate:
+# that cannot publish a candidate main does not have. It now says to move main to the candidate and
+# start fork-follow again; on main, the candidate passes.
+WORKFLOW_REF="me/t3code/.github/workflows/fork-release.yml@refs/heads/fork-follow/candidate" \
+  expect_refused "on-main: a release run from fork-follow/candidate cannot publish the candidate" "is not on main" \
+  "$root" on-main "$side"
+(cd "$root/work" && git push -q --force-with-lease="main:$tip" origin "$side:refs/heads/main")
+if WORKFLOW_REF="me/t3code/.github/workflows/fork-release.yml@refs/heads/main" run "$root" on-main "$side" \
+  && grep -q "is on main" "$root/out"; then
+  pass "on-main: the candidate passes once main was moved to it (the stage report's steps)"
+else
+  fail "on-main: the candidate passes once main was moved to it (the stage report's steps)"
+fi
+(cd "$root/work" && git push -q --force origin "$tip:refs/heads/main")
 if run "$root" on-main "$tip" && grep -q "is on main" "$root/out"; then pass "on-main: main's tip passes"; else fail "on-main: main's tip passes"; fi
 if run "$root" on-main "$old"; then pass "on-main: an older commit of main passes"; else fail "on-main: an older commit of main passes"; fi
 expect_refused "on-main: a branch name is not a commit id" "not a full commit id" "$root" on-main side

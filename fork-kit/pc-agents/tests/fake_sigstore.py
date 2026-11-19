@@ -26,7 +26,19 @@ CLAIMS = {  # a fault in who the certificate was given to
              '1.18': 'https://github.com/other/t3code/.github/workflows/fork-release.yml@refs/heads/main'},
     'runner': {'1.11': 'self-hosted'},
     'issuer': {'1.8': 'https://issuer.example'},
+    # Git refs and workflow paths are case-sensitive: a branch Main is not main (nor is branch protection on main)
+    'branch-case': {'san': WORKFLOWS + 'fork-release.yml@refs/heads/Main', '1.14': 'refs/heads/Main',
+                    '1.18': WORKFLOWS + 'fork-release.yml@refs/heads/Main'},
+    'ref-case': {'1.14': 'refs/heads/Main'},
+    'workflow-case': {'san': WORKFLOWS + 'Fork-Release.yml@refs/heads/main'},
+    'caller-case': {'1.18': WORKFLOWS + 'Fork-Follow.yml@refs/heads/main'},
+    'runner-case': {'1.11': 'GitHub-hosted'},
+    'issuer-case': {'1.8': OIDC.upper()},
 }
+# Good certificates all the same: GitHub's owner and repository names are not case-sensitive
+VARIANTS = {'repo-case': {'san': 'https://github.com/Example/T3Code/.github/workflows/fork-release.yml@refs/heads/main',
+                          '1.12': 'https://github.com/Example/T3Code',
+                          '1.18': 'https://github.com/Example/T3Code/.github/workflows/fork-follow.yml@refs/heads/main'}}
 FAULTS = set(CLAIMS) | {
     'missing',    # no attestation for the digest (a file uploaded by hand)
     'github',     # GitHub's own release attestation: no transparency log entry
@@ -111,7 +123,7 @@ def leaf(d, fault):
     name = f'leaf-{fault}'
     if os.path.exists(f'{d}/{name}.pem'):
         return name
-    claims = {**GOOD, **CLAIMS.get(fault, {})}
+    claims = {**GOOD, **CLAIMS.get(fault, {}), **VARIANTS.get(fault, {})}
     exts = ''.join(f'1.3.6.1.4.1.57264.{oid}=ASN1:UTF8String:{v}\n' for oid, v in claims.items() if oid != 'san')
     exts += (f'subjectAltName=critical,URI:{claims["san"]}\nkeyUsage=critical,digitalSignature\n'
              'extendedKeyUsage=codeSigning\nauthorityKeyIdentifier=keyid\nsubjectKeyIdentifier=hash\n')

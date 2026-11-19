@@ -9,7 +9,7 @@ so; old versions are pruned to the newest three.
 
   python3 -I -B fork-kit/pc-agents/tests/update.test.py
 """
-import fcntl, json, os, shutil, stat, sys, unittest
+import contextlib, fcntl, json, os, shutil, stat, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -265,6 +265,79 @@ class Update(Case):
         self.assertEqual(code, 0, out)
         self.updated()
         self.assertIn('https://attestations.example/', self.read('/log/curl'))
+
+    def test_only_the_pinned_root_is_trusted_not_the_system_ca_store(self):
+        """A leaf from a CA in the distro's own CA store (/etc/ssl/certs: WebPKI roots, a root someone added) is not a
+        Fulcio leaf, whatever claims it carries ('ca': the good claims, from another root)."""
+        self.releases(release('1.2.4'))
+        sig = self.path('/log/sigstore')
+        store = self.path('/srv/ssl-certs')   # a system-like store holding the other root, hashed as c_rehash names it
+        os.makedirs(store)
+        name = fake_sigstore.openssl('x509', '-hash', '-noout', '-in', f'{sig}/other-root.pem').decode().strip()
+        shutil.copy(f'{sig}/other-root.pem', f'{store}/{name}.0')
+        real = shutil.which('openssl')
+        kept = self.keep()
+
+        def openssl(script):   # the distro's openssl, as the kit finds it
+            os.unlink(self.path('/usr/bin/openssl'))
+            self.write('/usr/bin/openssl', {'text': '#!/bin/sh\n' + script, 'mode': '755'})
+
+        def system_store():   # its own CA store holds the other root (what /etc/ssl/certs is to the real one)
+            openssl(f'SSL_CERT_DIR={store} exec {real} "$@"\n')
+
+        def caller_env():   # the update's caller points openssl at the other root
+            return mock.patch.dict(os.environ, {'SSL_CERT_DIR': store, 'SSL_CERT_FILE': f'{store}/{name}.0'})
+
+        for how in ('system store', 'caller env'):
+            with self.subTest(how):
+                self.restore(kept)
+                self.write('/log/sigstore/fault', 'ca')
+                if how == 'system store':
+                    system_store()
+                with caller_env() if how == 'caller env' else contextlib.nullcontext():
+                    code, out = self.update()
+                self.assertEqual(code, 1, out)
+                self.assertIn('does not chain to the pinned Fulcio root', out)
+                self.assertEqual((self.version(), self.serving(), self.state()['refused']), ('1.2.3', '1.2.3', '1.2.4'))
+        with self.subTest('an older openssl is refused'):   # no -no-CAstore: it cannot check against the pin alone
+            self.restore(kept)
+            openssl(f'[ "$1" = version ] && echo "OpenSSL 1.1.1w  11 Sep 2023" && exit 0\nexec {real} "$@"\n')
+            code, out = self.update()
+            self.assertEqual(code, 1, out)
+            self.assertIn("openssl ('OpenSSL 1.1.1w  11 Sep 2023') cannot check a certificate against the pinned "
+                          'Fulcio root alone: OpenSSL 3 or newer is needed', out)
+            self.assertEqual((self.version(), self.state()['refused']), ('1.2.3', '1.2.4'))
+        with self.subTest('a good bundle with the other root in the stores'):
+            self.restore(kept)
+            system_store()
+            with caller_env():
+                code, out = self.update()
+            self.assertEqual(code, 0, out)
+            self.updated()
+        with self.subTest('openssl runs with an environment of its own, none of the caller\'s'):
+            self.restore(kept)
+            openssl(f'env >> {self.path("/log/openssl-env")}\nexec {real} "$@"\n')
+            with caller_env(), mock.patch.dict(os.environ, {'OPENSSL_CONF': f'{store}/openssl.cnf'}):
+                code, out = self.update()
+            self.assertEqual(code, 0, out)
+            seen = {x for x in self.read('/log/openssl-env').splitlines()   # names only: no other values in a log
+                    if x.startswith(('SSL_CERT_', 'OPENSSL_', 'PATH=', 'LC_ALL='))}
+            self.assertEqual({x.split('=')[0] for x in seen if x.startswith('SSL_CERT_')}, set())
+            self.assertEqual(seen, {'OPENSSL_CONF=/dev/null', 'PATH=/usr/bin:/bin', 'LC_ALL=C'})
+
+    def test_names_are_matched_exactly_but_github_owner_and_repository_case(self):
+        """Git refs and workflow paths are case-sensitive ('branch-case' and the other *-case faults are refused in
+        test_a_release_that_fails_a_check_is_refused_and_not_downloaded_again); GitHub's owner/name is not."""
+        self.assertTrue({'branch-case', 'ref-case', 'workflow-case', 'caller-case'} <= fake_sigstore.FAULTS)
+        policy = cli.attestation.github_policy('Example/T3code', 'fork-release.yml', ['fork-follow.yml'])
+        self.assertEqual(policy['san'], [fake_sigstore.WORKFLOWS + 'fork-release.yml@refs/heads/main'])
+        self.assertEqual(cli.attestation.same_case('https://github.com/A/B/.github/workflows/X.yml@refs/heads/Main'),
+                         'https://github.com/a/b/.github/workflows/X.yml@refs/heads/Main')
+        self.releases(release('1.2.4'))
+        self.write('/log/sigstore/fault', 'repo-case')
+        code, out = self.update()
+        self.assertEqual(code, 0, out)
+        self.updated()
 
     def test_attestations_not_read_are_tried_again(self):
         self.releases(release('1.2.4'))
@@ -550,6 +623,111 @@ class Update(Case):
         self.assertEqual((self.version(), self.serving()), ('1.2.3', '1.2.3'))
         self.assertEqual((state['retry'], state['retries']), ('1.2.4', 1))   # not T3's fault: tried again
         self.assertNotIn('failed', state)
+
+    def replaced(self):
+        """The folders a rollback set T3's database aside in (k.DB_REPLACED-*), and what they hold."""
+        parent = self.path(os.path.dirname(k.DB_REPLACED))
+        return {f'{os.path.dirname(k.DB_REPLACED)}/{d}': {n: self.read(f'{os.path.dirname(k.DB_REPLACED)}/{d}/{n}')
+                                                          for n in os.listdir(f'{parent}/{d}')}
+                for d in sorted(os.listdir(parent)) if d.startswith(os.path.basename(k.DB_REPLACED))} \
+            if os.path.isdir(parent) else {}
+
+    def test_a_late_rollback_sets_the_database_aside_before_putting_the_copy_back(self):
+        self.write(DB + '/statev2.sqlite', 'before the update')
+        self.releases(release('1.2.4'))
+        self.cut('serves')   # T3 runs 1.2.4 (setup started it): it takes work
+        self.write(DB + '/statev2.sqlite', 'a week of work')
+        self.write(DB + '/statev2.sqlite-wal', 'its log')
+        real = cli.setup
+
+        def setup(*a):   # the next run finishes the switch, and a wall does not hold: a rollback, late
+            code = real(*a)
+            if self.version() == '1.2.4':
+                os.unlink(self.path('/log/nft-loaded'))
+            return code
+        with mock.patch.object(cli, 'setup', setup):
+            code, out = self.update()
+        self.assertEqual(code, 1, out)
+        self.assertEqual((self.version(), self.serving()), ('1.2.3', '1.2.3'))
+        self.assertEqual(self.read(DB + '/statev2.sqlite'), 'before the update')
+        (folder, files), = self.replaced().items()   # the week of work is not lost
+        self.assertEqual(files, {'statev2.sqlite': 'a week of work', 'statev2.sqlite-wal': 'its log'})
+        self.assertRegex(folder, k.DB_REPLACED + r'-\d{8}T\d{6}Z-1\.2\.4$')
+        self.assertEqual(stat.S_IMODE(os.stat(self.path(folder)).st_mode), 0o700)
+        self.assertIn(f'as T3 1.2.4 left it, it is kept in {folder}', self.state()['alert'])
+        self.assertNotIn('restored', self.state())
+
+    def test_a_cut_rollback_does_not_put_the_database_back_again(self):
+        kept = self.keep()
+        with self.subTest('cut after T3 1.2.3 started: it is at work, and stays'):
+            self.write(DB + '/statev2.sqlite', 'before the update')
+            self.write('/log/t3-crash-version', '1.2.4')
+            self.releases(release('1.2.4'))
+            self.cut('serves', lambda c, v: v == '1.2.3')   # cut after the copy was put back and T3 1.2.3 started
+            state = self.state()
+            self.assertEqual(state['phase'], 'rolling-back')
+            self.assertIn('T3\'s database is back as it was before the update', state['restored'])
+            self.write(DB + '/statev2.sqlite', 'work on 1.2.3 since')   # T3 1.2.3 runs, and is at work
+            self.process(4002, '/home/agent/.local/bin/claude')
+            stops = self.log().count('stop t3code-agents.service')
+            code, out = self.update()
+            self.assertEqual(code, 0, out)
+            self.assertIn('the cut rollback from T3 1.2.4 to 1.2.3 is finished at a quiet point (T3 runs 1 other', out)
+            self.assertEqual(self.state()['phase'], 'rolling-back')
+            self.assertEqual(self.log().count('stop t3code-agents.service'), stops)
+            shutil.rmtree(self.path('/proc/4002'))
+            code, out = self.update()
+            self.assertEqual(code, 1, out)
+            self.assertEqual((self.version(), self.serving(), self.state()['failed']), ('1.2.3', '1.2.3', '1.2.4'))
+            self.assertEqual(self.read(DB + '/statev2.sqlite'), 'work on 1.2.3 since')   # not put back again
+            self.assertEqual(self.log().count('stop t3code-agents.service'), stops)
+            self.assertEqual(len(self.replaced()), 1)   # set aside once, by the first run
+        with self.subTest('cut after the copy was put back, before setup: T3 stopped, its unit still 1.2.4\'s'):
+            self.restore(kept)
+            self.write(DB + '/statev2.sqlite', 'before the update')
+            self.write('/log/t3-crash-version', '1.2.4')
+            self.releases(release('1.2.4'))
+            self.cut('setup', lambda *a: self.version() == '1.2.3')
+            self.assertEqual(self.state()['phase'], 'rolling-back')
+            self.assertEqual(self.serving(), None)
+            stops = self.log().count('stop t3code-agents.service')
+            code, out = self.update()
+            self.assertEqual(code, 1, out)
+            self.assertNotIn('is back as it was before the update; going back', out)   # once, by the cut run
+            self.assertEqual(self.log().count('stop t3code-agents.service'), stops)
+            self.assertEqual((self.version(), self.serving()), ('1.2.3', '1.2.3'))
+            self.assertEqual(self.read(DB + '/statev2.sqlite'), 'before the update')
+            self.assertEqual(len(self.replaced()), 1)
+
+    def test_a_switch_cut_too_often_waits_for_a_quiet_point_and_keeps_the_database(self):
+        kept = self.keep()
+        for cuts, waits in ((k.UPDATE_TRIES, 'the cut update to T3 1.2.4'),   # the next run rolls back
+                            (1 + k.UPDATE_TRIES, 'the cut rollback from T3 1.2.4 to 1.2.3')):   # its rollback cut
+            with self.subTest(cuts=cuts):
+                self.restore(kept)
+                self.write(DB + '/statev2.sqlite', 'before the update')
+                self.releases(release('1.2.4'))
+                for _ in range(cuts):
+                    self.cut('setup')   # the machine file says 1.2.4; T3 stopped, its unit still 1.2.3's
+                k.run(['/usr/bin/systemctl', 'restart', k.UNIT])   # a boot starts it: 1.2.3 runs, takes work
+                self.write(DB + '/statev2.sqlite', 'after the boot')
+                self.process(4002, '/home/agent/.local/bin/claude')
+                stops = self.log().count('stop t3code-agents.service')
+                code, out = self.update()
+                self.assertEqual(code, 0, out)
+                self.assertIn(f'{waits} is finished at a quiet point (T3 runs 1 other', out)
+                self.assertEqual(self.log().count('stop t3code-agents.service'), stops)   # not stopped at work
+                self.assertEqual(self.read(DB + '/statev2.sqlite'), 'after the boot')
+                shutil.rmtree(self.path('/proc/4002'))
+                code, out = self.update()
+                self.assertEqual(code, 1, out)
+                self.assertIn(f'did not come up (its switch was cut {k.UPDATE_TRIES} times)', out)
+                if cuts == k.UPDATE_TRIES:
+                    self.assertIn('T3 never ran 1.2.4, so its database stays as it is', out)
+                self.assertEqual((self.version(), self.serving()), ('1.2.3', '1.2.3'))
+                self.assertEqual(self.read(DB + '/statev2.sqlite'), 'after the boot')   # not the stale copy
+                self.assertEqual(self.replaced(), {})
+                self.assertEqual((self.state()['retry'], self.state()['retries']), ('1.2.4', 1))
 
     def test_a_cut_switch_the_owner_changed_is_left_alone(self):
         self.write(k.UPDATE_STATE, json.dumps({'phase': 'switching', 'from': '1.2.2', 'to': '1.2.4', 'tries': 1}))

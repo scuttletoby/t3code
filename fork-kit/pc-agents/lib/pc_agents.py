@@ -35,6 +35,9 @@ DB_DIR = '/.t3/userdata'   # under HOME: T3's state database (T3CODE_HOME=HOME/.
 DB_FILES = ('statev2.sqlite', 'statev2.sqlite-wal', 'statev2.sqlite-shm', 'state.sqlite', 'state.sqlite-wal',
             'state.sqlite-shm')   # the database and its write-ahead log, and the older one a start imports
 DB_BACKUP = '/var/lib/pc-agents/db-backup'   # root's alone: T3's database as it was before the last switch
+# root's alone: T3's database as a rollback found it, set aside before the copy is put back (a folder per rollback,
+# DB_REPLACED-<UTC time>-<version>; the kit never removes one)
+DB_REPLACED = '/var/lib/pc-agents/db-replaced'
 HTTP_WAIT, HTTP_STEP = 180, 5   # after an update's restart, T3 must answer with its new version within HTTP_WAIT s
 GITHUB_API = 'https://api.github.com'
 # The pinned Sigstore public-good roots (Fulcio's certificate authority, Rekor's log key) the attestation check trusts
@@ -531,13 +534,14 @@ def user_problem(c, need_agent):
     return f'user {USER} is in other groups ({", ".join(extra)}): it must have none' if extra else None
 
 
-def run(argv, timeout=120, env=None):
+def run(argv, timeout=120, env=None, inherit=True):
     """Run argv (argv[0] under ROOT) in a process group of its own. Past timeout, or when this process stops (Ctrl-C,
     or SIGTERM and SIGHUP once stop_on_signals() ran), the whole group is killed (a download's curl too); a timeout
-    returns exit 124 and says so in stderr. env: variables added to this process's own."""
+    returns exit 124 and says so in stderr. env: variables added to this process's own (inherit), or its whole
+    environment (not inherit)."""
     p = subprocess.Popen([ROOT + argv[0]] + argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True,
-                         env={**os.environ, **env} if env else None)
+                         env=({**os.environ, **env} if inherit else dict(env)) if env or not inherit else None)
     try:
         out, err = p.communicate(timeout=timeout)
     except BaseException as e:

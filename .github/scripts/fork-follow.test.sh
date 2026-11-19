@@ -422,20 +422,35 @@ new_upstream
 new_fork v0.1.10
 (cd "$root/work" && RUN_SHA="$(git rev-parse HEAD)" REPORT="$root/report.md" GITHUB_OUTPUT="$root/plan.out" \
   bash "$dir/fork-follow.sh") > "$root/out" 2>&1
-check "plan: changed release workflows -> stage, with the command that releases the candidate" \
-  eval 'action_is stage && has "release-desktop.yml" "$root/report.md" && has "gh workflow run fork-release.yml" "$root/report.md"'
+check "plan: changed release workflows -> stage, with the steps that release the candidate from main" \
+  eval 'action_is stage && has "release-desktop.yml" "$root/report.md" && has "gh workflow run fork-follow.yml --repo me/t3code" "$root/report.md"'
+# A release publishes only commits on main (fork-release.sh on-main; the pc-agents kit checks the
+# attestation's ref), so a release run from the branch fork-follow/candidate can never publish.
+check "plan: stage asks for no release from the candidate branch" \
+  eval 'hasnt "gh workflow run fork-release.yml" "$root/report.md" && hasnt "--ref fork-follow/candidate" "$root/report.md"'
 
 # Round 2: the same comparison on the release path. A re-run (or queued run) of an older run: its
 # commit is the series on v0.1.10, while the series already sits on v0.1.11, whose
 # release-desktop.yml differs. Releasing would build v0.1.11 with v0.1.10's release steps.
 # The stage plan above left the rebased series (on v0.1.11) checked out; the fork's main is still
 # the series on v0.1.10, the older run's commit. Make the rebased series the fork's main.
-old_run="$(series)"
-work git push -q --force origin HEAD:main
+# Follow the stage report's own steps: the push step put the candidate on fork-follow/candidate;
+# the report's git commands keep the old series as a tag and move main to the candidate.
+old_run="$(series)" stage_cand="$(out candidate)"
+work git push -q --force origin "$stage_cand:refs/heads/fork-follow/candidate"
+stage_ok=1
+while IFS= read -r step; do
+  read -ra argv <<< "$step"
+  work "${argv[@]}" || stage_ok=0
+done <<< "$(sed -n 's/^`\(git [^`]*\)`$/\1/p' "$root/report.md")"
+check "plan: the stage report's steps move main to the candidate and keep the old series as a tag" \
+  eval '((stage_ok)) && [[ "$(series)" == "$stage_cand" ]] && git -C "$root/gh/me/t3code.git" rev-parse -q --verify "refs/tags/fork-follow/pre-v0.1.11-${old_run:0:12}" > /dev/null'
 (cd "$root/work" && RUN_SHA="$old_run" REPORT="$root/report.md" GITHUB_OUTPUT="$root/plan.out" \
   bash "$dir/fork-follow.sh") > "$root/out" 2>&1
 check "plan: release path, the run's commit has other release workflows -> stage, not release" \
   eval 'action_is stage && [[ "$(out base_tag)" == v0.1.11 && "$(out candidate)" == "$(work_head)" ]] && has "release-desktop.yml" "$root/report.md"'
+check "plan: release path stage, the series at the candidate -> start a new run, nothing to move" \
+  eval 'has "start a new run" "$root/report.md" && hasnt "git push" "$root/report.md" && hasnt "gh workflow run fork-release.yml" "$root/report.md"'
 (cd "$root/work" && RUN_SHA="$(git rev-parse HEAD)" REPORT="$root/report.md" GITHUB_OUTPUT="$root/plan.out" \
   bash "$dir/fork-follow.sh") > "$root/out" 2>&1
 check "plan: release path, the run's own commit -> release" action_is release

@@ -6,7 +6,7 @@ gave the signing key to a GitHub Actions run of exactly the workflow, repository
 time the public transparency log (Rekor, its key pinned there too) recorded, and that key signed an in-toto statement
 naming the file by name and SHA-256. A release file anyone uploaded by hand, or a build from another workflow, branch
 or repository, has no such attestation."""
-import base64, hashlib, json, os
+import base64, hashlib, json, os, re
 
 # Fulcio's certificate extensions (github.com/sigstore/fulcio docs/oid-info.md): DER UTF8String values.
 ISSUER = '1.3.6.1.4.1.57264.1.8'
@@ -16,6 +16,13 @@ SOURCE_REF = '1.3.6.1.4.1.57264.1.14'
 BUILD_CONFIG = '1.3.6.1.4.1.57264.1.18'
 SAN = '2.5.29.17'
 GITHUB_OIDC = 'https://token.actions.githubusercontent.com'
+OPENSSL = '/usr/bin/openssl'
+# openssl runs with this environment only: no SSL_CERT_DIR, SSL_CERT_FILE or OPENSSL_CONF of the caller's (they add
+# trust anchors, providers or engines), no config file.
+OPENSSL_ENV = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'OPENSSL_CONF': '/dev/null'}
+# OpenSSL 3's verify takes -no-CAstore; without it (and -no-CApath), `verify -CAfile` also trusts the system's CA
+# store (/etc/ssl/certs: about 140 WebPKI roots, and any root a user added). Older or other builds are refused.
+OPENSSL_MAJOR = 3
 
 
 def unsnappy(data):
@@ -135,13 +142,23 @@ def claims(der):
     return out
 
 
+def same_case(value):
+    """value as compared with a policy: GitHub's https://github.com/OWNER/NAME prefix in lower case (GitHub treats
+    owner and repository names case-insensitively, and a certificate names them as GitHub spells them), everything
+    after it exactly. Git refs and workflow file paths are case-sensitive: a branch `Main` is not `main`, and branch
+    protection on main does not cover it."""
+    m = re.fullmatch(r'(https://github\.com/[^/\s]+/[^/\s@]+)((?:[/@].*)?)', value, re.DOTALL)
+    return m[1].lower() + m[2] if m else value
+
+
 def github_policy(repo, workflow, builders, ref='refs/heads/main'):
     """What a certificate must state for a build of repo's workflow file (a name under .github/workflows) on ref,
-    started by one of builders (workflow file names: the workflow itself, or one that calls it)."""
-    base = f'https://github.com/{repo}'.lower()
-    return {'san': [f'{base}/.github/workflows/{workflow}@{ref}'.lower()],
+    started by one of builders (workflow file names: the workflow itself, or one that calls it). Compared exactly,
+    after same_case()."""
+    base = same_case(f'https://github.com/{repo}')
+    return {'san': [f'{base}/.github/workflows/{workflow}@{ref}'],
             ISSUER: [GITHUB_OIDC], RUNNER: ['github-hosted'], SOURCE_REPO: [base], SOURCE_REF: [ref],
-            BUILD_CONFIG: [f'{base}/.github/workflows/{b}@{ref}'.lower() for b in builders]}
+            BUILD_CONFIG: [f'{base}/.github/workflows/{b}@{ref}' for b in builders]}
 
 
 def _pem(der, label='CERTIFICATE'):
@@ -157,7 +174,7 @@ def _b64(text):
 def verify(bundle, name, digest, policy, trust, work, run):
     """Why bundle (a parsed Sigstore bundle) does not attest the file name with SHA-256 digest (hex) under policy
     (github_policy) and trust (sigstore-trust.json), or None. work: an empty folder only root can reach, for openssl's
-    inputs. run(argv) -> CompletedProcess (text): openssl is argv[0]."""
+    inputs. run(argv, env) -> CompletedProcess (text): openssl is argv[0], run with env as its whole environment."""
     try:
         return _verify(bundle, name, digest, policy, trust, work, run)
     except (KeyError, IndexError, TypeError, ValueError, AttributeError, UnicodeError) as e:
@@ -172,10 +189,14 @@ def _write(work, name, data):
     return path
 
 
+def _openssl(run, *args):
+    return run([OPENSSL, *args], OPENSSL_ENV)
+
+
 def _signed(run, key, signature, data, work, what):
     """Why openssl does not find signature (DER) by the public key (PEM) over data, or None."""
-    r = run(['/usr/bin/openssl', 'dgst', '-sha256', '-verify', _write(work, f'{what}.key', key),
-             '-signature', _write(work, f'{what}.sig', signature), _write(work, f'{what}.data', data)])
+    r = _openssl(run, 'dgst', '-sha256', '-verify', _write(work, f'{what}.key', key),
+                 '-signature', _write(work, f'{what}.sig', signature), _write(work, f'{what}.data', data))
     return None if r.returncode == 0 and r.stdout.strip() == 'Verified OK' else \
         f'the {what} signature does not verify ({(r.stderr or r.stdout).strip()[-200:]})'
 
@@ -227,22 +248,29 @@ def _verify(bundle, name, digest, policy, trust, work, run):
     run_at = ['-attime', str(when)]
     if when < _epoch(trust['fulcio']['start']) or when < _epoch(trust['rekor']['start']):
         return 'recorded before the pinned authorities were valid'
-    r = run(['/usr/bin/openssl', 'verify', *run_at, '-purpose', 'any', '-x509_strict',
-             '-CAfile', _write(work, 'root.pem', trust['fulcio']['root']),
-             '-untrusted', _write(work, 'intermediates.pem', ''.join(trust['fulcio']['intermediates'])),
-             _write(work, 'leaf.pem', _pem(leaf))])
+    r = _openssl(run, 'version')
+    got = re.match(r'OpenSSL (\d+)\.', r.stdout) if r.returncode == 0 else None
+    if not got or int(got[1]) < OPENSSL_MAJOR:
+        return (f'this distro\'s openssl ({(r.stdout or r.stderr).strip()[:60]!r}) cannot check a certificate against '
+                f'the pinned Fulcio root alone: OpenSSL {OPENSSL_MAJOR} or newer is needed')
+    # Only the pinned root is trusted: -no-CApath and -no-CAstore keep the system's CA store out.
+    r = _openssl(run, 'verify', '-no-CApath', '-no-CAstore', *run_at, '-purpose', 'any', '-x509_strict',
+                 '-CAfile', _write(work, 'root.pem', trust['fulcio']['root']),
+                 '-untrusted', _write(work, 'intermediates.pem', ''.join(trust['fulcio']['intermediates'])),
+                 _write(work, 'leaf.pem', _pem(leaf)))
     if r.returncode or not r.stdout.strip().endswith(': OK'):
         return f'the certificate does not chain to the pinned Fulcio root ({(r.stderr or r.stdout).strip()[-200:]})'
 
-    # 3. Who it was given to: the policy's repository, workflow, branch and builders, on GitHub's own runners.
+    # 3. Who it was given to: the policy's repository, workflow, branch and builders, on GitHub's own runners. Exact,
+    # but for the case of GitHub's owner/name (same_case()).
     got = claims(leaf)
     for key, allowed in policy.items():
-        values = [v.lower() for v in got['san']] if key == 'san' else [got.get(key, '').lower()]
+        values = [same_case(v) for v in got['san']] if key == 'san' else [same_case(got.get(key, ''))]
         if not values or any(v not in allowed for v in values):
             return f'signed for {got["san"] if key == "san" else got.get(key)!r}, not {allowed} ({key})'
 
     # 4. The certificate's key signed the statement.
-    r = run(['/usr/bin/openssl', 'x509', '-pubkey', '-noout', '-in', os.path.join(work, 'leaf.pem')])
+    r = _openssl(run, 'x509', '-pubkey', '-noout', '-in', os.path.join(work, 'leaf.pem'))
     if r.returncode:
         return f'cannot read the certificate key ({r.stderr.strip()[-200:]})'
     pae = b'DSSEv1 %d %s %d %s' % (len(kind.encode()), kind.encode(), len(payload), payload)

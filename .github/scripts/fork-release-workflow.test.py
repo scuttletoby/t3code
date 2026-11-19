@@ -123,7 +123,7 @@ for job_id in write_jobs:
     attest = index(lambda s: str(s.get("uses", "")).startswith("actions/attest-build-provenance@"))
     subjects = str(((job_steps[attest].get("with") or {}) if attest >= 0 else {}).get("subject-path", "")).split()
     check(f"{job_id}: attests the server archives and SHA256SUMS before the draft is created",
-          -1 < attest < create
+          -1 < on_main < attest < create   # the certificate says refs/heads/main for any dispatched ref
           and subjects == ["release-assets/*.tar.gz", "release-assets/SHA256SUMS"])
     perms = jobs[job_id].get("permissions") or {}
     check(f"{job_id}: may sign (id-token) and store (attestations) the provenance",
