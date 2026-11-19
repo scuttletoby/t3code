@@ -114,6 +114,24 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''^apps/server/src/waits/Wait(?:Delivery|Service)\.test\.ts$''']
 regexes = ['''^0123456789abcdef$''', '''^1123456789abcdef$''', '''^f123456789abcdef$''']
+# Fake values in old pull request heads (#482): branches that later marked the line with a
+# `gitleaks:allow` comment or changed the value, then were squash-merged or force-pushed. GitHub
+# still serves their old tips by id, so the daily sweep reads them. Only the named rule, only the
+# named file, only the exact value; any other value there is still found.
+[[allowlists]]
+description = "fork wait and hold tests: the fixed fake wait keys of old PR heads (#482)"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^apps/server/src/(?:waits/WaitStore|waits/WaitService|holdWork\.boot)\.test\.ts$''']
+regexes = ['''^0123456789abcdef$''', '''^fedcba9876543210$''']
+# The fake password of a process-sweep test command line (an old head of the heavy sweep tests).
+# \x3a is the colon, so this line is no finding of that rule itself.
+[[allowlists]]
+description = "fork-kit heavy sweep tests: a fake user and password of an old PR head (#482)"
+targetRules = ["curl-auth-user"]
+condition = "AND"
+paths = ['''^fork-kit/heavy/tests/sweep\.test\.py$''']
+regexes = ['''^admin\x3ahunter3$''']
 
 [[rules]]
 id = "1password-secret-key"
