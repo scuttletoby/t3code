@@ -2005,7 +2005,7 @@ test("from upstream, a file named like an Object property is held to a lost coun
 
 // A pull request that moved fork lines out of a "pending" file left main's ceiling above its count,
 // and the next run from upstream refused main for it.
-const shrink = (pending, base, head, ownPending) =>
+const shrink = (pending, base, head, ownPending, ownFiles) =>
   findUnlistedChanges(
     { files: {}, pending, forkFiles: [] },
     {
@@ -2015,6 +2015,7 @@ const shrink = (pending, base, head, ownPending) =>
       upstream: false,
       isForkFile: () => false,
       ownPending,
+      ownFiles,
     },
   );
 test("from main, a change that shrinks a pending file lowers its ceiling in its own list", () => {
@@ -2024,7 +2025,7 @@ test("from main, a change that shrinks a pending file lowers its ceiling in its 
   assert.deepEqual(ceilings.length, 1);
   assert.match(
     ceilings[0],
-    /^p\.ts: "pending" with a ceiling of 3, and this change removes 2 more lines than it adds .*: lower it to 1 in this change's \.github\/fork-seams\.json\.$/,
+    /^p\.ts: "pending" with a ceiling of 3, and this change removes 2 more lines than it adds .*: set it to 1 in this change's \.github\/fork-seams\.json \(its list has 3; main holds its ceiling exactly\)\.$/,
   );
   assert.deepEqual(shrink({ "p.ts": 3 }, base, head, { "p.ts": 1 }), {
     reasons: [],
@@ -2033,13 +2034,37 @@ test("from main, a change that shrinks a pending file lowers its ceiling in its 
     notes: [],
   });
   // Still 2 is still too high; with no fork line left, the entry goes.
-  assert.match(shrink({ "p.ts": 3 }, base, head, { "p.ts": 2 }).ceilings[0], /lower it to 1/);
+  assert.match(shrink({ "p.ts": 3 }, base, head, { "p.ts": 2 }).ceilings[0], /set it to 1 .*has 2/);
   const none = { "p.ts": UP };
   assert.match(
     shrink({ "p.ts": 3 }, base, none, { "p.ts": 1 }).ceilings[0],
-    /removes 3 more lines .*: remove it from "pending" in this change's/,
+    /removes 3 more lines .*: remove it from "pending" in this change's .* \(its list has 1\)\.$/,
   );
   assert.deepEqual(shrink({ "p.ts": 3 }, base, none, {}).ceilings, []);
+  // Removing more lines than the ceiling (upstream's too) still only asks for the entry to go.
+  const fewer = { "p.ts": "forkA();\n" };
+  assert.deepEqual(
+    shrink({ "p.ts": 1 }, { "p.ts": `${UP}forkA();\n` }, { "p.ts": "" }, {}).ceilings,
+    [],
+  );
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, fewer, {}).ceilings, []);
+  // #510: exact, not only at most. A ceiling set below the lines left, or an entry dropped while
+  // lines remain, passes here but the next run from upstream refuses main.
+  assert.deepEqual(shrink({ "p.ts": 3 }, base, head, { "p.ts": 1, "q.ts": 1 }).ceilings, []);
+  const twoLeft = { "p.ts": `${UP}forkA();\nforkB();\n` };
+  assert.match(
+    shrink({ "p.ts": 3 }, base, twoLeft, { "p.ts": 1 }).ceilings[0],
+    /removes 1 more line than it adds .*: set it to 2 in this change's .* \(its list has 1; /,
+  );
+  assert.match(
+    shrink({ "p.ts": 3 }, base, twoLeft, {}).ceilings[0],
+    /: set it to 2 in this change's .* \(its list drops it; /,
+  );
+  // Moved to "files" in its own list: the run from upstream judges it there.
+  assert.deepEqual(
+    shrink({ "p.ts": 3 }, base, twoLeft, {}, { "p.ts": { why: "w", added: [] } }).ceilings,
+    [],
+  );
   // A change that swaps one line for another, or grows, or has no own list read: not this rule.
   const swap = { "p.ts": `${UP}forkA();\nforkB();\nforkD();\n` };
   assert.deepEqual(shrink({ "p.ts": 3 }, base, swap, { "p.ts": 3 }).ceilings, []);
@@ -2056,7 +2081,7 @@ test("the command line refuses a pull request that shrinks a pending file but ke
     assert.equal(kept.status, 1, kept.stdout);
     assert.match(
       kept.stderr,
-      /- p\.ts: "pending" with a ceiling of 2, .* lower it to 1 in this change's/,
+      /- p\.ts: "pending" with a ceiling of 2, .* set it to 1 in this change's/,
     );
     assert.match(
       kept.stderr,
@@ -2084,6 +2109,11 @@ test("from main, a listed copy the base branch already has since the merge-base 
   ]);
   // From upstream there is no base branch tip: each listed line is one copy over upstream's.
   assert.deepEqual(findSeamBreaches(SEAM, { ...options(main), upstream: true }), []);
+  // #510: two copies are too many from the merge-base too, so updating would not help: no hint.
+  const twice = { "a.ts": BASE["a.ts"].replace("  a: 1,", "  ...fork,\n  ...fork,\n  a: 1,") };
+  assert.deepEqual(findSeamBreaches(SEAM, { ...options(main), atHead: (file) => twice[file] }), [
+    "a.ts: adds 2× `...fork,`",
+  ]);
 });
 
 test("the command line spends a seam copy another branch merged since the merge-base", () => {
@@ -2132,11 +2162,14 @@ test("lowerList lowers and removes entries, keeps comments and order, and never 
     ]),
   };
   const result = lowerList(text, lowered);
+  const moved = JSON.parse(result.text).files["c.ts"];
+  assert.match(moved.why, /^Was "pending": fork-follow moved it here/);
   assert.deepEqual(JSON.parse(result.text), {
     "//": "comment",
-    files: { "s.ts": { why: "w", added: ["x();"] } },
-    // c.ts keeps its ceiling: "lost" still names it (the run after says so).
-    pending: { "a.ts": 1, "c.ts": 2, "e.ts": 4 },
+    // c.ts has no fork line left, but "lost" still names it (and a ceiling is 1 or more): it
+    // moves to "files" with no seam line, which holds it tighter (#510).
+    files: { "s.ts": { why: "w", added: ["x();"] }, "c.ts": { why: moved.why, added: [] } },
+    pending: { "a.ts": 1, "e.ts": 4 },
     // e.ts: only the count that fell is lowered.
     lost: { "c.ts": { lines: 1, gone: 1 }, "e.ts": { lines: 3, gone: 0 } },
   });
@@ -2147,6 +2180,7 @@ test("lowerList lowers and removes entries, keeps comments and order, and never 
     's.ts: "lost" 1/0 removed (no upstream line lost)',
     'a.ts: "pending" 3 -> 1',
     'b.ts: "pending" 2 removed (no fork line left)',
+    'c.ts: "pending" 2 moved to "files" with no seam line (no fork line left; "lost" still counts its upstream lines)',
   ]);
   assert.equal(lowerList(text, { pending: new Map([["e.ts", 9]]), lost: new Map() }), undefined);
   assert.equal(lowerList(text, { pending: new Map(), lost: new Map() }), undefined);
