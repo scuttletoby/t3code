@@ -5,15 +5,16 @@
  * too. The server refuses such a write anyway; this only keeps a click from ending in an error.
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
-import { isManagedSettingPath } from "@t3tools/contracts";
+import { isManagedSettingPath, type ServerSettings } from "@t3tools/contracts";
 import { type ComponentProps, useState } from "react";
 
 import { useEnvironmentProviders } from "../../../state/environments";
 import { EMPTY_SERVER_PROVIDERS } from "../../../state/server";
 import { IntervalSecondsField } from "../IntervalSecondsField";
 import { useSettingsScope } from "../SettingsScopeContext";
-import { SettingsRow } from "../settingsLayout";
+import { SettingResetButton, SettingsRow } from "../settingsLayout";
 import { useScopedSettingsWriteAllowed } from "../useScopedSettings";
+import { subRowResetValue } from "./forkRowReset.logic";
 
 /** Every selected environment's accounts, the primary's first, as the agent slots rows list them. */
 export function useSelectedProviders() {
@@ -85,4 +86,37 @@ export function BoundedNumberField({
       }}
     />
   );
+}
+
+/**
+ * A sub-row's reset on a project screen whose value is the project's own: it puts back only that
+ * row's fields from the environment's value and keeps the rest of the override (upstream's row
+ * reset would clear the whole override). Null where there is nothing to reset (see
+ * {@link subRowResetValue}).
+ */
+export function useSubRowReset<K extends "handoff" | "playtest">(
+  key: K,
+  shown: ServerSettings[K],
+  isOwn: boolean,
+  save: (next: ServerSettings[K]) => void,
+) {
+  const { targets, connectedEnvironments } = useSettingsScope();
+  const target = targets[0];
+  const environmentValue =
+    target === undefined || target.projectId === null
+      ? undefined
+      : connectedEnvironments.find(
+          (environment) => environment.environmentId === target.environmentId,
+        )?.serverConfig?.settings[key];
+  return (keys: ReadonlyArray<keyof ServerSettings[K]>, ariaLabel: string) => {
+    if (!isOwn || environmentValue === undefined) return null;
+    const next = subRowResetValue(key, shown, environmentValue, keys);
+    return next === null ? null : (
+      <SettingResetButton
+        ariaLabel={ariaLabel}
+        tooltip="Reset to the environment's value"
+        onClick={() => save(next)}
+      />
+    );
+  };
 }
