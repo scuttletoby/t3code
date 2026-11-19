@@ -120,6 +120,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
   },
   {
     scope: "server",
+    key: "modelPolicy",
+    default: { mode: "off", allow: [] },
+    off: true,
+    reason: "Agents pick any model, as upstream's do, until a person sets the policy's mode.",
+    decidedIn: "#268",
+  },
+  {
+    scope: "server",
     key: "agentSlots",
     default: { enabled: false },
     fields: true,

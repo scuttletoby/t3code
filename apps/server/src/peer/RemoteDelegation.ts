@@ -44,6 +44,7 @@ import { followUpOwnerRun } from "../orchestration-v2/CommandPolicy.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as RemoteReplyRead from "../fork/remoteReplyRead.ts"; // Fork: replies across versions
 import * as ProjectService from "../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -614,6 +615,8 @@ const make = Effect.gen(function* () {
       })
       .pipe(Effect.asVoid);
 
+  const replyForwarding = RemoteReplyRead.replyReads(forwarding); // Fork: lastReply reads with it
+
   /**
    * The last reply `runId` gave on the task's thread there, which is its
    * result, read whole however long it is. A failed run prefers its error
@@ -626,6 +629,7 @@ const make = Effect.gen(function* () {
     runId: RunId | null,
     failed = false,
   ) {
+    const forwarding = replyForwarding; // Fork: a reply there on another version is still read.
     let reply: OrchestratorMcpThreadTimelineItem | undefined;
     let error: OrchestratorMcpThreadTimelineItem | undefined;
     let afterPosition: number | undefined;

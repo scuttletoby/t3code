@@ -60,17 +60,23 @@ watches; it changes nothing on the machine, and `0` turns it off.
   later run. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it). So a pull request that moves fork lines out
-  of a pending file lowers its ceiling in its own list, in the same change: its run refuses one
-  that removes more lines than it adds and leaves its own ceiling above main's minus that many (it
-  reads its own list only for that, as a lower ceiling never widens the gate). Right after a rebase,
+  of a pending file lowers its ceiling in its own list, in the same change: its run refuses a
+  change to the file unless its own ceiling is exactly main's, plus the lines it adds, less the
+  lines it removes, less the upstream lines it puts back (main's `lost` `gone` less its own), since
+  per line text fork lines less gone ones is the copies over upstream's. With none left the entry
+  goes, or moves to `files` with `"added": []` (only then: a move while fork lines are left is
+  refused). Left higher, the next run from upstream refuses main for the spare room; set lower or
+  dropped, for the lines still there. It reads its own list only to refuse, never to widen the
+  gate, and does not hold a list-only change (the file's text unchanged), which may correct main. Right after a rebase,
   below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops
   it, and the ceiling could not have been lowered first. fork-follow then lowers it itself, in a
   commit of its own on the rebased series ("fork seams: lower counts after the rebase onto …", each
   change in its body and in the run's summary), and checks the lowered list again before it goes
-  on. It never raises one. The one ceiling it cannot lower is a pending file with no fork line left
-  that a `lost` entry still names (a ceiling is 1 or more, and a `lost` entry needs its file in
-  `files` or `pending`): that stays a note, the next run refuses it, and a pull request moves the
-  file to `files` with `"added": []`. A pull request may change a pending file but not grow it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
+  on. It never raises one. A pending file with no fork line left that a `lost` entry still names
+  (a ceiling is 1 or more, and a `lost` entry needs its file in `files` or `pending`) is moved to
+  `files` with `"added": []` in that commit, which holds it tighter: no fork line may come back, and
+  a pull request may lose none of its lines. The run's summary lists the lowered counts once the
+  plan has finished; a run stopped after the lowering pushes nothing. A pull request may change a pending file but not grow it. Upstream lines a seam or pending file no longer has (deleted, moved below the code they
   guard, or re-indented) add no line, so they are counted too, two ways: `lines`, the upstream lines
   it does not keep in order and indentation, and `gone`, those whose text it no longer has at all,
   so deleting a line already counted as moved or re-indented raises `gone`. `lost` maps such
@@ -103,9 +109,10 @@ watches; it changes nothing on the machine, and `0` turns it off.
   fork-follow, so keep seam lines specific. A listed copy main's tip already has is spent too, not
   only one the branch's merge-base has: two branches from one main that each add the one listed
   copy are each green, and once one merges the other is refused ("update the branch from its
-  base"). The ruleset does not require a branch to be up to date before it merges, so two changes
-  that are fine apart but not together (a seam line in both, or a pending file each shrinks) still
-  need the later one updated from main to be judged together. A branch made before fork-follow last
+  base"). Neither seam check runs on `merge_group`. Two changes that are fine apart but not together
+  (a seam line in both, or a pending file each shrinks) are judged together because main's ruleset
+  requires a branch to be up to date with main before it merges (#444): the later one is updated
+  from main, and that update runs both checks again. A branch made before fork-follow last
   rebased main is refused with one "update the branch" error. Only `--from-upstream` (which fork-follow passes)
   runs it from an upstream commit and reads the head's list; without it a base with no list is
   refused, and an upstream that is itself a fork with a list is still judged by this fork's list.

@@ -43,6 +43,8 @@ import {
 
 /** Runs once, right after the report's last WAL check reads the path it names (the -shm). */
 const afterCheck = vi.hoisted(() => ({ path: "", run: () => {} }));
+/** A stat of this path finds nothing and a look at the path itself (lstat) fails with EACCES. */
+const lstatFails = vi.hoisted(() => ({ path: "" }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeFS>();
   const existsSync: typeof actual.existsSync = (path) => {
@@ -53,7 +55,23 @@ vi.mock("node:fs", async (importOriginal) => {
     }
     return exists;
   };
-  return { ...actual, existsSync };
+  const lstatSync = ((path: NodeFS.PathLike, ...rest: Array<unknown>) => {
+    if (path === lstatFails.path) {
+      throw Object.assign(new Error(`EACCES: permission denied, lstat '${String(path)}'`), {
+        code: "EACCES",
+      });
+    }
+    return (actual.lstatSync as (...args: Array<unknown>) => unknown)(path, ...rest);
+  }) as typeof actual.lstatSync;
+  const statSync = ((path: NodeFS.PathLike, ...rest: Array<unknown>) => {
+    if (path === lstatFails.path) {
+      throw Object.assign(new Error(`ENOENT: no such file or directory, stat '${String(path)}'`), {
+        code: "ENOENT",
+      });
+    }
+    return (actual.statSync as (...args: Array<unknown>) => unknown)(path, ...rest);
+  }) as typeof actual.statSync;
+  return { ...actual, existsSync, lstatSync, statSync };
 });
 
 /** The next `remaining` database opens throw, as an open can in a server's stop race. */
@@ -76,6 +94,7 @@ const homes: Array<string> = [];
 const children: Array<NodeChildProcess.ChildProcess> = [];
 afterEach(() => {
   openFails.remaining = 0;
+  lstatFails.path = "";
   for (const child of children.splice(0)) child.kill("SIGKILL");
   for (const home of homes.splice(0)) NodeFS.rmSync(home, { recursive: true, force: true });
 });
@@ -378,6 +397,30 @@ describe("__fork-report writes nothing", () => {
     ]);
     expect(report.ok).toBe(false);
   });
+
+  // The retry runs at once; a stop still tidying the database can fail it too. The process it names
+  // is this test's own, a live one, as a stopping server's is until it has released the home.
+  it("names the live server of a home whose open fails twice, so the report can be run again", () => {
+    const home = makeHome();
+    const runtimePath = NodePath.join(home, "userdata", "server-runtime.json");
+    NodeFS.writeFileSync(runtimePath, JSON.stringify({ version: 1, pid: process.pid, port: 1 }));
+    openFails.remaining = 2;
+
+    const report = readForkReport(home);
+
+    expect(report.problems).toEqual([
+      {
+        code: "database-unreadable",
+        message: `Could not open the database: unable to open database file. A T3 server (process ${process.pid}) is using this home; if it was stopping, run the report again once it has stopped.`,
+      },
+    ]);
+    // A record whose process has exited is no server: the message stays as it was.
+    NodeFS.writeFileSync(runtimePath, JSON.stringify({ version: 1, pid: 2 ** 31 - 1, port: 1 }));
+    openFails.remaining = 2;
+    expect(readForkReport(home).problems[0]!.message).toBe(
+      "Could not open the database: unable to open database file",
+    );
+  });
 });
 
 describe("__fork-report on old, newer and empty state", () => {
@@ -532,6 +575,33 @@ describe("__fork-report on old, newer and empty state", () => {
     expect(snapshot(parent)).toEqual(before);
   });
 
+  it("names the V1 database a start would import into a home without statev2.sqlite", () => {
+    const home = tempDir();
+    NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+    const v1 = NodePath.join(home, "userdata", "state.sqlite");
+    new NodeSqlite.DatabaseSync(v1).close();
+    const before = snapshot(home);
+
+    const report = readForkReport(home);
+
+    expect(snapshot(home)).toEqual(before);
+    expect(report.database.state).toBe("missing");
+    expect(report.database.v1Import).toBe(v1);
+    expect(report.ok).toBe(true);
+
+    // A V1 path a start cannot copy from stops the start.
+    NodeFS.rmSync(v1);
+    NodeFS.mkdirSync(v1);
+    const folder = readForkReport(home);
+    expect(folder.database.v1Import).toBeNull();
+    expect(folder.problems).toEqual([
+      {
+        code: "database-unreadable",
+        message: `${v1} is not a file; a start would try to import it as the V1 database and fail.`,
+      },
+    ]);
+  });
+
   it("reads an empty home as no database and every fork feature off", () => {
     const home = tempDir();
     NodeFS.mkdirSync(NodePath.join(home, "userdata"));
@@ -552,6 +622,7 @@ describe("__fork-report on old, newer and empty state", () => {
       reviewRules: "off",
       handoff: "off",
       playtest: "off",
+      modelPolicy: "off",
     });
     expect(report.ok).toBe(true);
   });
@@ -671,29 +742,97 @@ describe("__fork-report through a linked statev2.sqlite", () => {
   );
 
   // Root bypasses directory permissions, so chmod cannot force EACCES.
+  it.skipIf(process.getuid?.() === 0).each([
+    ["read or enter", 0o000],
+    ["enter", 0o600],
+  ] as const)("names a userdata it may not %s as its own problem instead of failing", (_, mode) => {
+    const home = makeHome();
+    const userdata = NodePath.join(home, "userdata");
+    NodeFS.chmodSync(userdata, mode);
+    try {
+      const report = readForkReport(home);
+
+      expect(report.home.exists).toBe(true);
+      expect(report.database.state).toBe("unreadable");
+      expect(report.problems.map((problem) => problem.code)).toEqual([
+        "home-missing",
+        "database-unreadable",
+        "settings-unreadable",
+      ]);
+      const { message } = report.problems[0]!;
+      expect(message.startsWith(`${userdata} cannot be entered (EACCES`)).toBe(true);
+      expect(message.endsWith("); a start would fail.")).toBe(true);
+      expect(report.ok).toBe(false);
+    } finally {
+      NodeFS.chmodSync(userdata, 0o755);
+    }
+  });
+});
+
+describe("__fork-report on a home a start could not write", () => {
+  // Root bypasses directory permissions, so chmod cannot force EACCES.
   it.skipIf(process.getuid?.() === 0)(
-    "names a userdata it may not enter as its own problem instead of failing",
+    "names a userdata it may enter but not write, still reading the database",
     () => {
       const home = makeHome();
       const userdata = NodePath.join(home, "userdata");
-      NodeFS.chmodSync(userdata, 0o600);
+      const before = snapshot(home);
+      NodeFS.chmodSync(userdata, 0o500);
       try {
         const report = readForkReport(home);
 
-        expect(report.home.exists).toBe(true);
-        expect(report.database.state).toBe("unreadable");
-        expect(report.problems.map((problem) => problem.code)).toEqual([
-          "home-missing",
-          "database-unreadable",
-          "settings-unreadable",
-        ]);
+        expect(report.database.state).toBe("present");
+        expect(report.problems.map((problem) => problem.code)).toEqual(["home-missing"]);
         const { message } = report.problems[0]!;
-        expect(message.startsWith(`${userdata} cannot be entered (EACCES`)).toBe(true);
+        expect(message.startsWith(`${userdata} cannot be written (EACCES`)).toBe(true);
         expect(message.endsWith("); a start would fail.")).toBe(true);
         expect(report.ok).toBe(false);
       } finally {
         NodeFS.chmodSync(userdata, 0o755);
       }
+      expect(snapshot(home)).toEqual(before);
+    },
+  );
+
+  // Root bypasses directory permissions, so chmod cannot force EACCES.
+  it.skipIf(process.getuid?.() === 0)(
+    "names a home without userdata that a start could not create it in",
+    () => {
+      const home = tempDir();
+      NodeFS.chmodSync(home, 0o500);
+      try {
+        const report = readForkReport(home);
+
+        expect(report.home.exists).toBe(true);
+        expect(report.problems.map((problem) => problem.code)).toEqual(["home-missing"]);
+        const { message } = report.problems[0]!;
+        expect(message.startsWith(`${home} cannot be written (EACCES`)).toBe(true);
+        expect(message.endsWith("); a start could not create userdata in it.")).toBe(true);
+      } finally {
+        NodeFS.chmodSync(home, 0o755);
+      }
+    },
+  );
+
+  it.each([
+    ["the home", (home: string) => home],
+    ["its userdata", (home: string) => NodePath.join(home, "userdata")],
+  ] as const)(
+    "names the error of a lookup of %s that fails another way, not as a link that leads nowhere",
+    (_, pathOf) => {
+      const parent = tempDir();
+      const home = NodePath.join(parent, "home");
+      NodeFS.mkdirSync(home);
+      const path = pathOf(home);
+      // As in a race: the stat finds nothing, then the look at the path itself fails.
+      lstatFails.path = path;
+
+      const report = readForkReport(home);
+
+      expect(report.problems.map((problem) => problem.code)).toEqual(["home-missing"]);
+      expect(report.problems[0]!.message).toBe(
+        `${path} could not be looked at (EACCES: permission denied, lstat '${path}'); a start would fail.`,
+      );
     },
   );
 });
@@ -797,6 +936,29 @@ describe("__fork-report settings", () => {
     // Pinned: playtest with a key this build does not know stays on.
     expect(settingsReport({ playtest: { ...playtest, laterKey: 1 } }).fork.featuresOn).toEqual([
       "playtest",
+    ]);
+  });
+
+  it("names the model policy by its mode, and reads an invalid one as enforce, as the load does", () => {
+    const row = { driver: "claudeAgent", model: "claude-sonnet-5-5" };
+    const modeOf = (modelPolicy: unknown) => {
+      const report = settingsReport({ modelPolicy });
+      expect(report.settings.parseWarning).toBeNull();
+      return [report.fork.features.modelPolicy, report.fork.featuresWhere.modelPolicy] as const;
+    };
+
+    expect(readForkReport(makeHome()).fork.features.modelPolicy).toBe("off");
+    expect(modeOf({ mode: "off", allow: [row] })).toEqual(["off", undefined]);
+    expect(modeOf({ mode: "advise", allow: [row] })).toEqual(["advise", ["server"]]);
+    // Saved sparse: `{mode: "enforce", allow: []}` is stored as `{mode: "enforce"}`.
+    expect(modeOf({ mode: "enforce" })).toEqual(["enforce", ["server"]]);
+    // A typo fails closed: enforce with nothing allowed, and the rest of the file still loads.
+    expect(modeOf({ mode: "advise", allow: [{ ...row, effort: ["high"] }] })).toEqual([
+      "enforce",
+      ["server"],
+    ]);
+    expect(settingsReport({ modelPolicy: { mode: "advise" } }).fork.featuresOn).toEqual([
+      "modelPolicy",
     ]);
   });
 
@@ -1127,6 +1289,7 @@ describe("__fork-report contract", () => {
         "pendingMigrations",
         "unknownMigrations",
         "counts",
+        "v1Import",
       ].toSorted(),
     );
     expect(keys(report.database.counts!)).toEqual(
@@ -1146,6 +1309,7 @@ describe("__fork-report contract", () => {
       "agentSlots",
       "automaticUpdates",
       "handoff",
+      "modelPolicy",
       "playtest",
       "reviewRules",
       "usagePacingGate",

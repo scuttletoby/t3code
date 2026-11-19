@@ -26,8 +26,14 @@ Not covered: a T3 that is stopping. Run the report while T3 is running or stoppe
 the instant the report opens the database leaves an empty `statev2.sqlite-wal` behind
 ([#179](https://github.com/scuttletoby/t3code/issues/179)): harmless, since T3 reuses it, but a file
 the report created. The report does not remove it: a T3 starting at that moment may already be
-using it. When the first open or read fails, the report checks and reads once more, so its answer is
-about the stopped database; only a second failure is reported.
+using it. When the first open or read fails, the report checks and reads once more, at once; only a
+second failure is reported. A stop still tidying the database can fail that second read too: then the
+problem names the T3 server process still using the home, and a run once it has stopped reads the
+stopped database.
+
+A home with only the old V1 database (`state.sqlite`) reports its database `missing` and names the V1
+file in `database.v1Import`: a start would import it. A `userdata` folder the report may enter but not
+write (or a home without one that cannot take a new folder) is a problem, since a start would fail.
 
 ## Settings
 
@@ -36,30 +42,31 @@ The defaults, "off" and "decided in" below come from one table in the code,
 (`packages/shared/src/forkDocs.test.ts`) fails when this table and that one differ, or a setting has
 no section below. "Off" means the default leaves the machine as upstream's would be.
 
-| Setting                                                                      | Default             | Off | Decided in                                               |
-| ---------------------------------------------------------------------------- | ------------------- | --- | -------------------------------------------------------- |
-| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`             | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
-| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
-| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
-| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`             | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}` | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`  | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
-| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
-| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`         | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`    | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
-| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set             | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set             | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
-| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set             | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| Setting                                                                      | Default                     | Off | Decided in                                               |
+| ---------------------------------------------------------------------------- | --------------------------- | --- | -------------------------------------------------------- |
+| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                     | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
+| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                        | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
+| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                        | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
+| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                     | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                        | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`         | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                        | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
+| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
+| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`            | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                     | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 
 For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
 only `mode`; their other fields are tuning that does nothing while the switch is off.
@@ -218,6 +225,39 @@ and "Turn off" buttons; it asks first before a button drops hand-set fields or a
 }
 ```
 
+### `server.modelPolicy`
+
+Which models (and efforts) agents may pick, per provider driver. `mode` is `off` (agents pick any
+model, as upstream's do), `advise` (agents are only told) or `enforce` (a pick off the list is
+refused). Each `allow` row names a `driver` and a `model`; `efforts` (non-empty) limits the efforts
+for that model, and a row without it checks only the model. `defaultEffort` must be one of the
+row's `efforts`; `useFor` is a short note shown to agents when they pick. Nothing reads the setting
+yet: the check comes in a later pull request.
+
+Only the person can change it; agents cannot. A save must give both `mode` and `allow` (it replaces
+the stored value whole) and is refused for a bad row, a `defaultEffort` not in its row's `efforts`,
+or an unknown key such as a misspelt `effort`. A hand-edited value that is not valid, an unknown key
+included, reads as `enforce` with nothing allowed (with a warning in the server log); it is kept as
+written, and saves of other settings write it back unchanged until the person saves this setting.
+
+```json
+{
+  "modelPolicy": {
+    "mode": "enforce",
+    "allow": [
+      {
+        "driver": "claudeAgent",
+        "model": "claude-sonnet-5-5",
+        "efforts": ["medium", "high"],
+        "defaultEffort": "high",
+        "useFor": "everyday coding"
+      },
+      { "driver": "codex", "model": "gpt-mini" }
+    ]
+  }
+}
+```
+
 ### `server.agentSlots`
 
 Limits on running agents: `delegate_task` is refused above `maxPerMachine` agents on this server,
@@ -255,8 +295,35 @@ Named MCP profiles. A profile says which outside MCP servers (`servers`) and whi
 own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Two profiles are built in: `all`
 (everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool); a profile cannot
 take their names, and one written in by hand makes that built-in refuse threads until it is removed
-(a save may send `null` under a built-in name to remove it) or renamed. Nothing applies a profile
-yet: the provider adapters and the T3 tool filter come in later pull requests.
+(a save may send `null` under a built-in name to remove it) or renamed.
+
+A Claude thread applies the profile's `servers`: `[]` (and `t3-only`) starts Claude without any MCP
+server of its own (its config files, plugins and claude.ai connectors), and a list keeps only the
+servers it names, written as Claude lists them (`claude.ai Calendar`). T3's own tools stay. A Claude
+thread whose profile cannot be applied does not start its turn and says why: a missing or broken
+profile, a parent thread that cannot be read, a `settings.json` T3 cannot read (when only a
+provider secret cannot be read, the profile comes from `settings.json` alone and the server log
+says so; with no profile set there, the thread gets `all` as before), a profile whose
+`t3Tools` is not `"all"` (the T3 tool filter comes in a later pull request), or a session that
+still shows a server the profile leaves out, or does not list its servers within 5 minutes. A
+managed Claude policy on the machine or `--mcp-config` in the Claude launch arguments can make
+Claude load a server T3's list leaves out. Other providers do not apply profiles yet.
+
+Each tool call is checked too: a call to an MCP server the profile leaves out (also one an agent
+file declares, or one added while the session runs) is refused at the moment of the call: Claude
+gets the reason as the call's result, and the turn goes on. That covers its tools, its resources
+(a resource listing that names no server is refused, as it would list every server's), and a
+`Skill` call naming `mcp__<server>__…`, the form of a skill an MCP server serves. Where Claude does
+not name the server it calls, the tool name's prefix is matched, so a server named like
+`docs__x`, or `my_docs` under a profile that names `my.docs`, passes. With the `all` profile
+nothing is checked. A
+profile change applies from the thread's next turn: a running turn, and a message sent into it,
+keep the session it started with.
+
+A task delegated to another machine has no parent thread there, so it gets that machine's profile
+for its role (`mcpSubagentProfile`, else `mcpProfile`), not the delegating thread's: server names on
+two machines need not mean the same servers. Carrying the parent's profile along is
+[#532](https://github.com/scuttletoby/t3code/issues/532).
 
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
@@ -273,7 +340,8 @@ one (for example after a hand edit) is refused instead of getting `all`.
 ### `server.mcpSubagentProfile`
 
 The profile a delegated child gets when nobody picked one for it. `inherit` (the default) gives it
-its parent's profile. A child never gets more than its parent.
+its parent's profile. A child on the same machine never gets more than its parent; a task
+delegated from another machine gets this machine's profile (see `server.mcpProfiles`).
 
 ### `server.mcpThreadProfiles`
 
