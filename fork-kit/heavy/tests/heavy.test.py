@@ -8,7 +8,7 @@ HEAVY_TEST_BIN runs the suite against another wrapper: with tests/old-heavy.sh (
 leftover test fails, which is the red check. Every test stops what it started: processes are found by their
 temporary folder in the command line, scopes by those processes.
 """
-import os, re, shutil, signal, subprocess, sys, tempfile, time, unittest
+import json, os, re, shutil, signal, subprocess, sys, tempfile, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEAVY = os.environ.get('HEAVY_TEST_BIN') or os.path.join(KIT, 'bin', 'heavy')
@@ -68,8 +68,10 @@ class Heavy(unittest.TestCase):
         quiet = 'exec </dev/null >/dev/null 2>&1\n'
         self.spin = self.script('spin', quiet + 'while :; do :; done')          # a busy one
         self.stubborn = self.script('stubborn', quiet + f"trap '' TERM INT HUP\nwhile :; do {self.dir}/sleeper 0.1; done")
+        # a private memory queue: never the user's live one (a test job must not wait behind real builds)
+        self.queue_root = os.path.join(self.dir, 'queue')
         self.env = dict(os.environ, HEAVY_SLICE=SLICE, HEAVY_CONFIG=os.path.join(self.dir, 'no-config.json'),
-                        HEAVY_GRACE='1')
+                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root)
         self.env.pop('HEAVY_KEEP', None)
 
     def script(self, name, body):
@@ -440,6 +442,74 @@ class Heavy(unittest.TestCase):
         r = self.heavy()
         self.assertEqual(r.returncode, 2)
         self.assertIn('usage: heavy', r.stderr)
+
+    # --- the memory queue (lib/heavy_queue.py; the rules themselves: tests/queue.test.py) ---------------------------
+
+    def queue_module(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader('heavy_queue', os.path.join(KIT, 'lib', 'heavy_queue.py'))
+        spec = importlib.util.spec_from_loader('heavy_queue', loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+
+    def queue_jobs(self, env):
+        r = self.heavy('queue', '--json', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return [j for j in json.loads(r.stdout)['jobs'] if j['kind'].startswith('heavy-test')]
+
+    def peaks(self):
+        with open(os.path.join(self.dir, '.local', 'state', 'heavy', 'peaks.json')) as f:
+            return json.load(f)['kinds']
+
+    def test_a_queued_job_runs_is_logged_and_leaves_its_peak(self):
+        env = dict(self.env, HOME=self.dir)
+        r = self.heavy('--kind', 'heavy-test', '--mb', '64', '--wait', '60', '--', 'sleep', '4', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        state = os.path.join(self.dir, '.local', 'state', 'heavy')
+        with open(os.path.join(state, 'waits.log')) as f:
+            self.assertIn('"outcome": "admitted"', f.read())
+        self.assertGreater(len(self.peaks()['heavy-test']), 0)
+        self.assertEqual(self.queue_jobs(env), [])
+        self.assertTrue(os.path.isdir(os.path.join(self.queue_root, SLICE)))       # the private queue was used
+
+    def test_a_failed_run_leaves_its_peak_too(self):
+        env = dict(self.env, HOME=self.dir)
+        r = self.heavy('--kind', 'heavy-test', '--mb', '64', '--wait', '60', '--', 'sh', '-c', 'sleep 4; exit 3',
+                       env=env)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertGreater(len(self.peaks()['heavy-test']), 0)      # a failed or OOM-killed run often peaks highest
+
+    def test_a_queued_heavy_killed_with_9_keeps_the_reservation_while_its_command_runs(self):
+        env = dict(self.env, HOME=self.dir)
+        p = self.start('--kind', 'heavy-test', '--mb', '64', '--wait', '60', '--', 'sh', '-c',
+                       f'{self.sleeper} & exec {self.sleeper}', env=env)
+        wait_for(lambda: len(self.ours()) == 2, what='both processes')
+        p.kill()
+        p.communicate(timeout=30)
+        jobs = self.queue_jobs(env)
+        self.assertEqual([(j['kind'], j['state']) for j in jobs], [('heavy-test', 'admitted')])
+        units = self.scopes()
+        subprocess.run(['systemctl', '--user', 'kill', '-s', 'KILL', *units], capture_output=True, timeout=60)
+        wait_for(lambda: not self.ours(), what='the command to end')
+        subprocess.run(['systemctl', '--user', 'stop', *units], capture_output=True, timeout=60)
+        self.assertEqual(self.queue_jobs(env), [])
+
+    def test_a_queued_job_that_never_fits_gives_up_with_76(self):
+        hq = self.queue_module()
+        q = hq.Queue(hq.Box(SLICE, '', None, queue_root=self.queue_root),
+                     hq.machine_file.fields({}, hq.SETTINGS, 'test'), out=lambda m: None)
+        with q:                                     # a job that holds far more than any machine has
+            t = q.create('heavy-test-holder', 1 << 30, 'heavy-test-holder.scope', 'x')
+            t.data['state'] = 'admitted'
+            q.write(t)
+        try:
+            r = self.heavy('--kind', 'heavy-test', '--mb', '64', '--wait', '0', '--', 'true',
+                           env=dict(self.env, HOME=self.dir))
+        finally:
+            hq.release(q, t)
+        self.assertEqual(r.returncode, 76, r.stderr)
+        self.assertIn('gave up after waiting', r.stderr)
 
     # --- red check -----------------------------------------------------------------------------------------------
 
