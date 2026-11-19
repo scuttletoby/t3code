@@ -108,7 +108,19 @@ watches; it changes nothing on the machine, and `0` turns it off.
   in no list may gain no line, lose no line and keep its lines in order and indentation (trailing
   blanks and blank lines aside), and no upstream file may be deleted or renamed, except the workflows
   [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
-  `fork-*.yml`. A submodule pointer counts as a line. A pull request's run has no upstream commit,
+  `fork-*.yml`. A submodule pointer counts as a line. `apps/web/src/routeTree.gen.ts` is TanStack's
+  output from `apps/web/src/routes/`: in a change that also changes a route file it is not judged
+  line by line (a fork route's lines repeat upstream's), and
+  [`forkRouteTree.test.ts`](../../apps/web/src/forkRouteTree.test.ts) refuses a committed tree that
+  is not the generator's output for the committed routes, with the options `vite.config.ts` passes to
+  `tanstackRouter(...)`. On a pull request the skip holds only while that test is main's: a pull
+  request that changes it has its tree judged line by line, so change the test in its own pull
+  request (and update a branch from before such a change). On a rebase conflict in the tree, take
+  either side and regenerate it (`vp run dev` or a build writes it), then commit it. A router
+  version bump or a new `tanstackRouter` option can rebase cleanly and still change what the
+  generator writes: fork-follow's release tests then stop on `forkRouteTree.test.ts`. Rebase by hand
+  (the runbook below), regenerate the tree and commit it into the rebased series before pushing; a
+  pull request that changes only the tree is judged line by line and refused. A pull request's run has no upstream commit,
   so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
   for the fork's own; from upstream, a pattern that matches an upstream file fails. Then remove the
   entry (or exclude a fork-named path with `!path`): from then on a pull request's run judges the
@@ -300,7 +312,7 @@ change, or a fork line beyond the seams, it stops and opens one issue. Then:
    change (the refusal says "after the rebase") is raised in the rebased series' list (or, once
    pushed, with a list-only pull request to main).
 3. Run the pin tests before pushing:
-   `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts`.
+   `vp test run packages/contracts/src/forkDefaults.test.ts packages/contracts/src/forkSettings.test.ts packages/shared/src/forkSettingsPatch.test.ts apps/server/src/serverSettings.forkDefaults.test.ts apps/server/src/serverSettings.forkSettings.test.ts apps/server/src/serverSettings.forkIntervals.test.ts apps/server/src/cloud/autoUpdateSettings.test.ts apps/server/src/cloud/autoUpdate.test.ts apps/web/src/forkRouteTree.test.ts`.
 4. Push with `--force-with-lease` and start fork-follow once, as its report says.
 
 ### The sync that brings upstream's updater

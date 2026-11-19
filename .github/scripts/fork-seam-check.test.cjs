@@ -16,6 +16,7 @@ const {
   findStaleSeamLines,
   findUnlistedChanges,
   forkFileTest,
+  GENERATED,
   lineCounts,
   lostLines,
   lowerList,
@@ -209,6 +210,67 @@ test("from upstream, a fork pattern that matches an upstream file fails until ex
     findHiddenUpstreamFiles(upstreamFiles, forkFileTest([]), () => undefined),
     [],
   );
+});
+
+test("the route tree is judged as generated output: with a route change and its proof test, or line by line", () => {
+  const TREE = "apps/web/src/routeTree.gen.ts";
+  const PROOF = "apps/web/src/forkRouteTree.test.ts";
+  const ROUTE = "apps/web/src/routes/_chat.settings.fork.tsx";
+  const tree = "const A = AImport.update({\n  getParentRoute: () => Root,\n} as any)\n";
+  // A fork route's block repeats upstream's lines, which no seam entry can list.
+  const forkTree = `${tree}const Fork = ForkImport.update({\n  getParentRoute: () => Root,\n} as any)\n`;
+  const base = { [TREE]: tree, [PROOF]: "test\n" };
+  const withRoute = { [TREE]: forkTree, [PROOF]: "test\n", [ROUTE]: "route\n" };
+  for (const upstream of [true, false]) {
+    assert.deepEqual(unlisted({}, base, withRoute, upstream).reasons, [], String(upstream));
+    // Without a route change, a change to the tree is a hand edit, judged like any upstream file.
+    const alone = unlisted({}, base, { ...base, [TREE]: forkTree }, upstream).reasons;
+    assert.equal(alone.length, 1);
+    assert.match(alone[0], /^apps\/web\/src\/routeTree\.gen\.ts: upstream file with 3 fork lines/);
+    const { [PROOF]: _proof, ...noProof } = withRoute;
+    assert.deepEqual(unlisted({}, { [TREE]: tree }, noProof, upstream).reasons, [
+      `${TREE}: generated from apps/web/src/routes/, but this change has no ${PROOF}, the test that proves it is the generator's output.`,
+    ]);
+    // Deleting it is still refused.
+    const { [TREE]: _tree, ...gone } = withRoute;
+    assert.match(
+      unlisted({}, base, gone, upstream).reasons[0],
+      /^apps\/web\/src\/routeTree\.gen\.ts: upstream file this change deletes/,
+    );
+    // A folder that only starts like the routes folder is no route change.
+    const sibling = { ...base, [TREE]: forkTree, "apps/web/src/routes-x/a.ts": "a\n" };
+    const nearRoute = unlisted({}, base, sibling, upstream).reasons;
+    assert.equal(nearRoute.length, 1);
+    assert.match(
+      nearRoute[0],
+      /^apps\/web\/src\/routeTree\.gen\.ts: upstream file with 3 fork lines/,
+    );
+  }
+  // On a pull request the proof must be main's: one that changes it (it.skip, an always-green test)
+  // could pass its own hand edit, so the tree is then judged line by line. From upstream the head's
+  // own script and tests judge it, and upstream has no proof to compare with.
+  const weakened = { ...withRoute, [PROOF]: 'it.skip("…", () => {});\n' };
+  assert.deepEqual(unlisted({}, { [TREE]: tree }, weakened, true).reasons, []);
+  const refused = unlisted({}, base, weakened, false).reasons;
+  assert.equal(refused.length, 1);
+  assert.match(refused[0], /^apps\/web\/src\/routeTree\.gen\.ts: upstream file with 3 fork lines/);
+  assert.match(refused[0], /forkRouteTree\.test\.ts is not main's/);
+  // Main's, not the merge-base's: a branch from before main changed the proof is judged line by line
+  // until it is updated from main.
+  const judge = (main) =>
+    findUnlistedChanges(
+      { files: {}, pending: {}, forkFiles: [] },
+      {
+        changed: [TREE, ROUTE],
+        atBase: (file) => base[file],
+        atHead: (file) => withRoute[file],
+        atMain: (file) => main[file],
+        upstream: false,
+        isForkFile: forkFileTest([]),
+      },
+    ).reasons;
+  assert.deepEqual(judge(base), []);
+  assert.match(judge({ ...base, [PROOF]: "stricter test\n" })[0], /is not main's/);
 });
 
 test("a pending file: held to its ceiling from upstream; on a pull request it may change but not grow", () => {
@@ -448,6 +510,75 @@ const readReal = (file) =>
 // Read in each test, not at load: a parse error then fails the tests that pin it, not the file.
 const realConfig = () => parseConfig(readReal(CONFIG));
 
+// The options apps/web/vite.config.ts passes to tanstackRouter(...), which dev and builds generate
+// the route tree with. Throws when the call is gone, repeated or not a plain literal.
+function viteRouterOptions(source) {
+  const calls = [...source.matchAll(/\btanstackRouter\(/g)];
+  const unreadable = (why) =>
+    new Error(
+      `apps/web/vite.config.ts: ${why}; teach this test to read the router plugin's options again.`,
+    );
+  if (calls.length !== 1) throw unreadable(`${calls.length} tanstackRouter( calls, not 1`);
+  const start = calls[0].index + calls[0][0].length;
+  let depth = 1;
+  let end = start;
+  while (depth > 0 && end < source.length) {
+    const char = source[end++];
+    if (char === "(") depth += 1;
+    if (char === ")") depth -= 1;
+  }
+  const text = source.slice(start, end - 1).trim();
+  if (text === "") return {};
+  try {
+    return new Function(`"use strict"; return (${text});`)();
+  } catch (error) {
+    throw unreadable(`its tanstackRouter(${text}) options are not a plain literal (${error})`);
+  }
+}
+
+// GENERATED must name the tree and folder the router plugin really uses, or the seam check skips the
+// wrong files. Checked here, not in the proof test: app code must not read this fork-owned script
+// (fork-owned-reads.test.py), since a fork-only change to it would skip the app jobs. The proof test
+// pins what the plugin resolves these options to (its defaults: src/routes/, src/routeTree.gen.ts).
+test("the generated-file table names the route tree and routes folder vite.config.ts generates with", () => {
+  const read = (file) => {
+    try {
+      return readReal(file);
+    } catch {
+      return undefined;
+    }
+  };
+  const fileConfig = read("apps/web/tsr.config.json");
+  const options = {
+    ...(fileConfig === undefined ? {} : JSON.parse(fileConfig)),
+    ...viteRouterOptions(readReal("apps/web/vite.config.ts")),
+  };
+  const inWeb = (file) => path.posix.join("apps/web", file);
+  const source = `${inWeb(options.routesDirectory ?? "./src/routes")}/`;
+  const tree = inWeb(options.generatedRouteTree ?? "./src/routeTree.gen.ts");
+  assert.deepEqual(GENERATED.get(tree), { source, proof: "apps/web/src/forkRouteTree.test.ts" });
+  for (const [file, { source: folder, proof }] of GENERATED) {
+    assert.notEqual(read(file), undefined, `${file} is not in the tree`);
+    assert.notEqual(read(proof), undefined, `${proof} is not in the tree`);
+    assert.ok(
+      folder.endsWith("/"),
+      `${folder}: a folder ends with /, or a sibling's name matches it`,
+    );
+    const inFolder = execFileSync(
+      "git",
+      ["-C", REPO_ROOT, "ls-tree", "--name-only", "--full-tree", "HEAD", folder],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(inFolder.trim(), "", `${folder} has no files`);
+  }
+  // The reader itself: a moved or computed option fails it rather than passing on the defaults.
+  assert.deepEqual(viteRouterOptions("x(tanstackRouter({ autoCodeSplitting: true }))"), {
+    autoCodeSplitting: true,
+  });
+  assert.throws(() => viteRouterOptions("plugins: []"), /0 tanstackRouter\( calls/);
+  assert.throws(() => viteRouterOptions("tanstackRouter(options)"), /not a plain literal/);
+});
+
 test("every listed seam line is in its file and no announced one is yet, so the list is not stale", () => {
   const read = (file) => {
     try {
@@ -590,6 +721,37 @@ function withRepo(body) {
   }
 }
 const seams = (config) => ({ [CONFIG]: JSON.stringify(config) });
+
+// Pins main()'s wiring: the proof is compared with the list's commit (main), not the merge-base.
+test("the command line takes the route tree as generated only while the proof is main's", () => {
+  withRepo(({ git, commit, run }) => {
+    const TREE = "apps/web/src/routeTree.gen.ts";
+    const PROOF = "apps/web/src/forkRouteTree.test.ts";
+    const ROUTE = "apps/web/src/routes/_chat.settings.fork.tsx";
+    const tree = "const A = AImport.update({\n  getParentRoute: () => Root,\n} as any)\n";
+    const forkTree = `${tree}const Fork = ForkImport.update({\n  getParentRoute: () => Root,\n} as any)\n`;
+    const main = commit(
+      { ...seams({ files: SEAM }), ...BASE, [TREE]: tree, [PROOF]: "test\n" },
+      "main",
+    );
+    const route = { [TREE]: forkTree, [ROUTE]: "route\n" };
+    git("checkout", "-q", "-b", "pr", main);
+    const pr = commit(route, "a route");
+    assert.equal(run("--config-ref", main, main, pr).status, 0);
+    git("checkout", "-q", "-B", "weak", main);
+    const weak = commit({ ...route, [PROOF]: "it.skip();\n" }, "a route and a weaker proof");
+    const refused = run("--config-ref", main, main, weak);
+    assert.equal(refused.status, 1);
+    assert.match(
+      refused.stderr,
+      /routeTree\.gen\.ts: upstream file with 3 fork lines.*is not main's/,
+    );
+    // Main tightened the proof after the branch: judged line by line until updated from main.
+    git("checkout", "-q", "-B", "main2", main);
+    const main2 = commit({ [PROOF]: "stricter test\n" }, "main: a stricter proof");
+    assert.match(run("--config-ref", main2, main, pr).stderr, /is not main's/);
+  });
+});
 
 test("the command line judges the lines a branch adds since the merge-base", () => {
   withRepo(({ git, commit, run }) => {

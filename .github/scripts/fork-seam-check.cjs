@@ -13,6 +13,15 @@ const CONFIG = ".github/fork-seams.json";
 const REMOVED = ".github/fork-removed-workflows.txt";
 const REMOVED_PATH = /^\.github\/workflows\/[^/,\s]+\.ya?ml$/;
 const FORK_WORKFLOW = /^\.github\/workflows\/fork-[^/]*\.ya?ml$/;
+// Generated upstream files: the folder each is generated from, and the fork test that proves the
+// file is the generator's output (a hand edit fails it). A fork route repeats upstream's lines
+// (`} as any)`), so the file is not judged line by line when its folder changes too.
+const GENERATED = new Map([
+  [
+    "apps/web/src/routeTree.gen.ts",
+    { source: "apps/web/src/routes/", proof: "apps/web/src/forkRouteTree.test.ts" },
+  ],
+]);
 
 function git(args) {
   return execFileSync("git", ["-c", "core.quotePath=false", ...args], {
@@ -271,6 +280,7 @@ function findUnlistedChanges(
     changed,
     atBase,
     atHead,
+    atMain = atBase,
     upstream,
     isForkFile,
     removed = new Set(),
@@ -297,17 +307,32 @@ function findUnlistedChanges(
       if (!removed.has(file) && !FORK_WORKFLOW.test(file)) reasons.push(deleted(file));
       continue;
     }
+    const generated = GENERATED.get(file);
+    let unproven = "";
+    if (generated !== undefined && changed.some((other) => other.startsWith(generated.source))) {
+      const proof = atHead(generated.proof);
+      if (proof === undefined) {
+        reasons.push(
+          `${file}: generated from ${generated.source}, but this change has no ${generated.proof}, the test that proves it is the generator's output.`,
+        );
+        continue;
+      }
+      // On a pull request the proof must be main's: a change to it (it.skip, an always-green test)
+      // could pass its own hand edit. From upstream the head's own script and tests judge.
+      if (upstream || proof === atMain(generated.proof)) continue;
+      unproven = ` Judged line by line: this change's ${generated.proof} is not main's, so it proves nothing (change that test in its own pull request, or update the branch from main).`;
+    }
     const added = total(addedLines(base, head));
     const entry = upstream
       ? "."
       : ' (if it is a fork file upstream does not have, add it to "forkFiles").';
     if (added > 0) {
       reasons.push(
-        `${file}: upstream file with ${added} fork line${added === 1 ? "" : "s"} but no entry in ${CONFIG}${entry}`,
+        `${file}: upstream file with ${added} fork line${added === 1 ? "" : "s"} but no entry in ${CONFIG}${entry}${unproven}`,
       );
     } else if (!sameLines(base, head)) {
       reasons.push(
-        `${file}: upstream file whose lines this change deletes, moves or re-indents, but no entry in ${CONFIG}${entry}`,
+        `${file}: upstream file whose lines this change deletes, moves or re-indents, but no entry in ${CONFIG}${entry}${unproven}`,
       );
     }
   }
@@ -1018,6 +1043,8 @@ function main(argv) {
     changed,
     atBase,
     atHead,
+    // The list's commit: main on a pull request (fork-checks), the head from upstream.
+    atMain: (file) => textAt(configRef, file),
     upstream,
     isForkFile,
     removed,
@@ -1147,6 +1174,7 @@ function main(argv) {
 
 module.exports = {
   CONFIG,
+  GENERATED,
   compileForkPattern,
   findAnnouncementWarnings,
   findDuplicateKey,
