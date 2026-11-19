@@ -23,19 +23,23 @@ waited through the copy found the home free for the second before the new launch
 - Gap.adopt(lock) / Gap.starting(fn): the owner lock the kit took after the stop is not let go before the start.
   starting() starts T3 (fn) and lets go of the lock only once the new launcher holds its serving lock (launchers
   from SERVING_LOCK_SINCE on take it before they start their server), so the home is owned the whole time; after
-  HANDOVER_WAIT it lets go anyway (a launcher that never comes up). A build older than SERVING_LOCK_SINCE takes no
-  serving lock, and its server would meet the kit's lock, idle and leave the home free for a minute: for it the kit
-  lets go just before the start, as before (the marker still holds new launches; the backstop names the rest).
+  HANDOVER_WAIT it lets go anyway (a launcher that never comes up). "Holds" means held on every poll for
+  HANDOVER_HOLD: an SSH launch's own `home-owned` probe takes the same lock for a moment once a second, and one
+  poll that meets that probe must not free the home in the middle of `t3 update`. A build older than
+  SERVING_LOCK_SINCE takes no serving lock, and its server would meet the kit's lock, idle and leave the home free
+  for a minute: for it the kit lets go just before the start, as before (the marker still holds new launches; the
+  backstop names the rest).
 
 foreign() is only a backstop, for what the two cannot cover: an SSH client older than 0.1.10 (it reads no marker and
-probes no lock), or a server started by hand. It names a server that serves the home but was not started by the boot
-service, so a verify that waits for T3 stops at once with what to do instead of waiting minutes. The kit never stops
-a server it did not start.
+probes no lock), or a server started by hand. It names a server that holds the home's owner lock but was not started
+by the boot service, so a verify that waits for T3 stops at once with what to do instead of waiting minutes, and the
+ways back refuse before they change anything. The kit never stops a server it did not start.
 """
 import contextlib, json, os, sqlite3, threading, time
 
 from golive import live
 
+OWNER_LOCK = 'server-owner.sqlite'    # under userdata/ (coldcopy.OWNER_LOCK)
 MARKER = 'desktop-update-in-progress'  # contracts DESKTOP_UPDATE_IN_PROGRESS_MARKER_FILE (tests/contract.test.py)
 TTL_MS = 60_000                        # contracts DESKTOP_UPDATE_IN_PROGRESS_TTL_MS
 SERVING_LOCK = 'service-serving.lock'  # serviceProtocol.ts SERVICE_SERVING_LOCK_FILE, under runtime/
@@ -45,6 +49,11 @@ SERVING_LOCK_SINCE = '0.1.10-nightly.20261114.4695'
 RENEW = 15.0          # seconds between two writes of the marker: four tries inside its 60 s
 HANDOVER_WAIT = 20.0  # seconds the kit keeps the owner lock after a start while no launcher holds the serving lock
 HANDOVER_POLL = 0.02  # a new launcher's server needs far longer than this to start and take the owner lock
+# The serving lock counts as the launcher's once it was held on HANDOVER_HOLD_POLLS polls in a row spanning at least
+# HANDOVER_HOLD seconds. An SSH launch's probe holds it for microseconds; the launcher holds it from #claimServing on,
+# and its server then waits 250 ms for the owner lock (serverOwnership.ts busy_timeout), well after this.
+HANDOVER_HOLD = 0.1
+HANDOVER_HOLD_POLLS = 3
 FOREIGN_GRACE = 10.0  # seconds a server not started by the boot service must stay before verify stops on it
 _now_ms = lambda: int(time.time() * 1000)  # noqa: E731  (Date.now(), as upstream's reader compares)
 
@@ -122,9 +131,12 @@ class Gap:
     def __init__(self, home):
         self.home = home
         self.written = None  # the marker's bytes as the kit wrote them last
-        self.error = None    # the last write that failed (the next one may work)
+        self.error = None    # the last renewal that failed (the next one may work)
+        self.failed = 0      # renewals that failed in all
         self.lock = None     # the owner lock, kept from the stop to the start
-        self.handed_to_launcher = False  # the last starting() let go once a launcher held its serving lock
+        # how the last starting() let go of the owner lock: 'launcher' (it held its serving lock), 'timeout' (none did
+        # within HANDOVER_WAIT), 'start failed', 'before the start' (a build that takes no serving lock); None: none
+        self.handover = None
         self._stop = threading.Event()
         self._thread = None
         self._mutex = threading.Lock()
@@ -144,9 +156,9 @@ class Gap:
                 if self._stop.is_set():
                     return
                 try:
-                    self.written, self.error = publish(self.home), None
-                except OSError as e:
-                    self.error = str(e)
+                    self.written = publish(self.home)
+                except OSError as e:  # the owner lock still covers waiting launches; the journal says it (served)
+                    self.error, self.failed = str(e), self.failed + 1
 
     def adopt(self, lock):
         """Keep the owner lock until starting() hands the home over (one lock at a time)."""
@@ -163,19 +175,33 @@ class Gap:
         """Run fn (it starts T3 `version`: a service start, or `t3 update`), and let go of the owner lock only once
         the new launcher holds its serving lock (or HANDOVER_WAIT after fn returned, or fn failed). Returns fn's
         result. Afterwards the kit holds no lock on the home."""
+        self.handover = None
         if self.lock is not None and not takes_serving_lock(version):
             self.let_go()
+            self.handover = 'before the start (a build that takes no serving lock)'
         if self.lock is None:
             return fn()
         done, outcome, returned = threading.Event(), {}, []
 
         def watch():  # HANDOVER_WAIT counts from fn's return (`t3 update` installs first, then restarts T3)
-            while not done.is_set() and not launcher_serving(self.home):
-                if returned and time.monotonic() >= returned[0] + HANDOVER_WAIT:
-                    break
-                done.wait(HANDOVER_POLL)
-            outcome['serving'] = launcher_serving(self.home)
-            self.let_go()
+            since, polls = None, 0
+            try:
+                while not done.is_set():
+                    if launcher_serving(self.home):  # once is not enough: it may be an SSH launch's probe
+                        now = time.monotonic()
+                        since, polls = since if since is not None else now, polls + 1
+                        if polls >= HANDOVER_HOLD_POLLS and now - since >= HANDOVER_HOLD:
+                            outcome['how'] = 'launcher'
+                            return
+                    else:
+                        since, polls = None, 0
+                    if returned and time.monotonic() >= returned[0] + HANDOVER_WAIT:
+                        outcome['how'] = 'timeout'
+                        return
+                    done.wait(HANDOVER_POLL)
+                outcome['how'] = 'start failed'
+            finally:
+                self.let_go()
         watcher = threading.Thread(target=watch, name='golive-handover', daemon=True)
         watcher.start()
         try:
@@ -187,7 +213,7 @@ class Gap:
             raise
         finally:
             watcher.join()
-            self.handed_to_launcher = outcome.get('serving', False)
+            self.handover = outcome.get('how', 'start failed')
 
     def close(self):
         """Stop renewing, let go of any lock. The marker stays to run out by itself (within 60 s)."""
@@ -200,9 +226,20 @@ class Gap:
         self.let_go()
 
     def served(self):
-        """The new server is verified: stop renewing and remove the marker if it is still the kit's. Returns what
-        was done, for the journal."""
+        """The new server is verified: stop renewing and remove the marker if it is still the kit's. Returns the
+        facts for the verify step: 'marker' (what was done to it), 'handover' (how the owner lock was let go), and
+        'renewFailed' when a renewal failed (the marker may have run out mid-stop; the owner lock still held).
+        A newer marker renamed in between the read and the unlink would still be removed: a window of microseconds,
+        the same as upstream's own DesktopBackendPool.releaseUpdateMarker."""
         self.close()
+        facts = {'marker': self._remove()}
+        if self.handover is not None:
+            facts['handover'] = self.handover
+        if self.failed:
+            facts['renewFailed'] = f'{self.failed} time(s), last: {self.error}'
+        return facts
+
+    def _remove(self):
         path = marker_path(self.home)
         try:
             with open(path, 'rb') as f:
@@ -266,9 +303,10 @@ def starting(home, fn, version):
 
 
 def served(home):
-    """The new server is verified: end the gap; returns what happened to the marker (None: no gap was open)."""
+    """The new server is verified: end the gap; returns the facts for the verify step (Gap.served; marker None: no
+    gap was open)."""
     g = _gaps.pop(_key(home), None)
-    return None if g is None else g.served()
+    return {'marker': None} if g is None else g.served()
 
 
 def close(home):
@@ -301,9 +339,35 @@ def _cmdline(pid):
         return ''
 
 
+def holds_lock(pid, path):
+    """True when process `pid` holds a lock on the file `path` (SQLite's locks are POSIX locks, listed with their
+    process in /proc/locks), False when it does not or the file is missing, None when /proc/locks cannot be read."""
+    try:
+        ino = os.stat(path).st_ino
+    except OSError:
+        return False
+    try:
+        with open('/proc/locks', encoding='ascii', errors='replace') as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:  # "1: POSIX  ADVISORY  WRITE 4242 08:02:131 1073741824 1073741825"; waiters: "1: -> POSIX ..."
+        parts = line.split()[1:]
+        if len(parts) < 5 or parts[0] == '->':
+            continue
+        try:
+            if int(parts[3]) == pid and int(parts[4].rsplit(':', 1)[-1]) == ino:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def foreign(home, svc, old_pid=None):
-    """A live server the home's runtime record names that the boot service did not start (not a child of its main
-    process), as a sentence, or None. old_pid: the server the kit itself stopped (it may still be exiting)."""
+    """{'pid', 'ppid', 'what'} of a live server that holds the home's owner lock and that the boot service did not
+    start (not a child of its main process), named by the home's runtime record; or None. old_pid: the server the
+    kit itself stopped (it may still be exiting). A stale record (its server was killed, its pid reused since) holds
+    no lock, so it is never named: the kit must not tell anyone to kill an unrelated process."""
     try:
         with open(os.path.join(home, 'userdata', 'server-runtime.json'), encoding='utf-8') as f:
             pid = json.load(f).get('pid')
@@ -317,26 +381,57 @@ def foreign(home, svc, old_pid=None):
     exe, ppid = proc
     if svc.get('active') and ppid == svc.get('mainPid'):
         return None
-    cmd = _cmdline(pid)
-    return (f'a T3 server the boot service did not start serves the home: pid {pid} ({cmd or exe}), parent {ppid}; '
-            f'most likely a T3 desktop app connected over SSH started it while T3 was stopped (an SSH client older '
-            f'than 0.1.10 honours neither the update marker nor the home\'s locks), and the service then waits for '
-            f'the home. The kit stops no server it did not start: stop that one (kill {pid}), then at once '
-            f'`systemctl --user restart t3code.service`, then `t3-golive status`')
+    owner = os.path.join(home, 'userdata', OWNER_LOCK)
+    holds = holds_lock(pid, owner)
+    if holds is None:  # no /proc/locks: someone at least holds the home
+        holds = _lock_held(owner)
+    if not holds:
+        return None
+    return {'pid': pid, 'ppid': ppid, 'what': _cmdline(pid) or exe}
+
+
+def described(found):
+    return (f'a T3 server the boot service did not start holds the home: pid {found["pid"]} ({found["what"]}), parent '
+            f'{found["ppid"]}; most likely a T3 desktop app connected over SSH started it while T3 was stopped (an SSH '
+            f'client older than 0.1.10 honours neither the update marker nor the home\'s locks), or someone started '
+            f'it by hand')
+
+
+def remedy(found, then):
+    """What the owner does, in order: the desktop app first, or an old client starts the next server within a
+    second of the kill."""
+    return (f'the kit stops no server it did not start: first quit or disconnect the T3 desktop app connected over '
+            f'SSH (or update it to 0.1.10 or later), then `kill {found["pid"]}`, then {then}')
+
+
+RESTART = '`systemctl --user restart t3code.service`'
+KEEP_STOPPED = ('do not start t3code.service: T3 stays stopped and is not started at boot on purpose (the home may '
+                'be half-restored)')
+
+
+def said(found, svc, again=None, stopped=False):
+    """The sentence for a foreign server: what it is, and the remedy for where T3 stands. stopped: a way back
+    stopped T3 and has not ended ok (the journal says so); a disabled service says the same. again: the command to
+    run once it is gone (default: `t3-golive status`)."""
+    if stopped or not svc.get('enabled', True):
+        then = f'run {again or "the same `t3-golive back`"} again; {KEEP_STOPPED}'
+    else:
+        then = f'{RESTART}, then {f"{again} again" if again else "`t3-golive status`"}'
+    return f'{described(found)}; {remedy(found, then)}'
 
 
 class ForeignWatch:
     """foreign() that has held for FOREIGN_GRACE seconds on the same pid (a server of the boot service's last run,
-    still exiting, is not one)."""
+    still exiting, is not one). check() returns it then, else None."""
 
     def __init__(self, home, old_pid=None):
         self.home, self.old_pid, self.seen = home, old_pid, None
 
     def check(self, svc):
-        why = foreign(self.home, svc, self.old_pid)
-        if why is None:
+        found = foreign(self.home, svc, self.old_pid)
+        if found is None:
             self.seen = None
             return None
-        if self.seen is None or self.seen[0] != why:
-            self.seen = (why, time.monotonic())
-        return why if time.monotonic() - self.seen[1] >= FOREIGN_GRACE else None
+        if self.seen is None or self.seen[0] != found['pid']:
+            self.seen = (found['pid'], time.monotonic())
+        return found if time.monotonic() - self.seen[1] >= FOREIGN_GRACE else None

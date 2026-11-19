@@ -977,9 +977,9 @@ def _wait_started(cfg, adapter, version, old_pid):
                 why = f'{osadapter.UNIT} is not active'
         except live.NotLive as e:
             why = str(e)
-        foreign = watch.check(svc)  # the backstop: no use waiting for a home another server holds
-        if foreign is not None:
-            raise RuntimeError(f'T3 did not come back: {foreign}')
+        found = watch.check(svc)  # the backstop: no use waiting for a home another server holds
+        if found is not None:
+            raise RuntimeError(f'T3 did not come back: {handoff.said(found, svc)}')
         time.sleep(POLL)
     raise RuntimeError(f'T3 did not come back within {START_WAIT} s: {why}')
 
@@ -1148,7 +1148,7 @@ def _restart(run, cfg, adapter, server, say, version):
                 raise start_error
         with run.step('verify') as facts:
             again = _wait_started(cfg, adapter, version, server['pid'])
-            facts.update(pid=again['pid'], version=again['version'], marker=handoff.served(cfg.home))
+            facts.update(pid=again['pid'], version=again['version'], **handoff.served(cfg.home))
         say(f't3 {again["version"]} runs again (pid {again["pid"]})')
     except BaseException as e:
         if start_error is not None and e is not start_error:  # the journal failed too: keep why the start failed
