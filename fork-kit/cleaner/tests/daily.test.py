@@ -264,9 +264,9 @@ class Daily(Case):
         code, lines = self.daily(cfg)
         self.assertEqual(code, 1, lines)
 
-    def test_an_orphaned_worktree_in_the_temp_folder_is_kept_and_is_no_error(self):
-        """A worktree whose main repository was removed: git cannot judge it, so it stays, under its own name, and
-        the daily run is not marked failed for it every day."""
+    def test_an_orphaned_worktree_in_the_temp_folder_goes_by_age_and_is_no_error(self):
+        """A worktree whose main repository was removed holds no commit (#519): the tmp rule deletes it by its
+        pattern's age, and the daily run is not marked failed for it."""
         tree = self.old_dir('agent-tree')
         self.file(os.path.join(tree, '.git'), f'gitdir: {self.path("gone-repo", ".git", "worktrees", "agent-tree")}\n')
         self.age(tree, 30)
@@ -274,10 +274,11 @@ class Daily(Case):
         self.set_units(OFF)
         code, lines = self.daily(self.daily_cfg('run', ['old-retention.timer']))
         self.assertEqual(code, 0, lines)
-        self.assertTrue(os.path.isdir(tree))
+        self.assertFalse(os.path.lexists(tree))
         self.assertFalse(os.path.lexists(job))
         text = self.out(f'run-{self.today()}.txt')
-        self.assertIn(f'kept {tree} (tmp: orphaned worktree: .: its git folder', text)
+        self.assertIn(f'deleted {tree} (', text)
+        self.assertIn('orphaned worktree: its git folder', text)
 
     def test_the_out_folder_is_never_a_must_keep_path_a_root_or_the_home(self):
         for out in ('~/.claude/daily', '~/notes/repair-backups/x', self.tmp + '/daily', self.tmp, '~', '/'):
@@ -429,7 +430,7 @@ MUTATIONS = {
                                         Daily, 'test_new_only_is_exit_3_and_a_failure_hides_it'),
     'daily: an orphaned worktree is its own state': ('guard', 'gone = None if bare else orphaned_worktree(where)',
                                                      'gone = None', Daily,
-                                                     'test_an_orphaned_worktree_in_the_temp_folder_is_kept_and_is_no_error'),
+                                                     'test_an_orphaned_worktree_in_the_temp_folder_goes_by_age_and_is_no_error'),
     'daily: the out folder not in a root': ('config', "('daily.outDir', daily['outDir'], self.daily_dir)", '', Daily,
                                             'test_the_out_folder_is_never_a_must_keep_path_a_root_or_the_home'),
     'daily: the out folder is not the home or above it': ('config', '        if _holds(self.daily_dir, self.home):',
