@@ -18,15 +18,16 @@ import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
 import { Switch } from "../../ui/switch";
-import { IntervalSecondsField } from "../IntervalSecondsField";
 import { useSettingsScope } from "../SettingsScopeContext";
-import { SettingResetButton, SettingsRow, SettingsSection } from "../settingsLayout";
+import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
+import { BoundedNumberField, ForkRow } from "./ForkRow";
 import {
   USAGE_PACING_GATE_OPTIONS,
   formatLowerEffort,
+  knownEffortLevels,
   parseLowerEffort,
   usagePacingAccountRows,
   usagePacingAccountSummary,
@@ -47,6 +48,20 @@ export function UsagePacingSettings() {
   );
 }
 
+/** Every selected environment's accounts, the primary's first, as the agent slots rows list them. */
+function useSelectedProviders() {
+  const { environment, connectedEnvironments } = useSettingsScope();
+  const providersByEnvironment = useEnvironmentProviders();
+  return [
+    ...(environment ? [environment] : []),
+    ...connectedEnvironments.filter(
+      (candidate) => candidate.environmentId !== environment?.environmentId,
+    ),
+  ].flatMap(
+    (candidate) => providersByEnvironment.get(candidate.environmentId) ?? EMPTY_SERVER_PROVIDERS,
+  );
+}
+
 function GateRow({ updateSettings }: { readonly updateSettings: UpdateSettings }) {
   const searchableSetting = useSearchableSetting();
   const gate = useScopedSettings((settings) => settings.usagePacingGate);
@@ -55,10 +70,11 @@ function GateRow({ updateSettings }: { readonly updateSettings: UpdateSettings }
   const option = USAGE_PACING_GATE_OPTIONS.find((candidate) => candidate.value === gate);
   const save = (value: UsagePacingGateMode) => updateSettings({ usagePacingGate: value });
   return (
-    <SettingsRow
+    <ForkRow
       serverScoped
       {...searchableSetting("usage-pacing-gate")}
       settingKeys={["usagePacingGate"]}
+      lockPaths={["usagePacingGate"]}
       mixed={mixed}
       description={
         mixed
@@ -100,6 +116,7 @@ function LowerEffortRow({ updateSettings }: { readonly updateSettings: UpdateSet
   const searchableSetting = useSearchableSetting();
   const stored = useScopedSettings((settings) => settings.usagePacingLowerEffort);
   const { targets } = useSettingsScope();
+  const providers = useSelectedProviders();
   const mixed = targetsDiffer(targets, (settings) => settings.usagePacingLowerEffort);
   const storedText = formatLowerEffort(stored);
   const [draft, setDraft] = useState({ saved: storedText, text: storedText });
@@ -108,7 +125,7 @@ function LowerEffortRow({ updateSettings }: { readonly updateSettings: UpdateSet
 
   const commit = () => {
     if (draft.text === storedText) return;
-    const parsed = parseLowerEffort(draft.text);
+    const parsed = parseLowerEffort(draft.text, knownEffortLevels(providers));
     if ("error" in parsed) {
       setError(parsed.error);
       return;
@@ -121,10 +138,11 @@ function LowerEffortRow({ updateSettings }: { readonly updateSettings: UpdateSet
   };
 
   return (
-    <SettingsRow
+    <ForkRow
       serverScoped
       {...searchableSetting("usage-pacing-lower-effort")}
       settingKeys={["usagePacingLowerEffort"]}
+      lockPaths={["usagePacingLowerEffort"]}
       mixed={mixed}
       description={
         mixed
@@ -164,24 +182,15 @@ function LowerEffortRow({ updateSettings }: { readonly updateSettings: UpdateSet
           {error}
         </p>
       ) : null}
-    </SettingsRow>
+    </ForkRow>
   );
 }
 
 function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettings }) {
   const searchableSetting = useSearchableSetting();
   const usagePacing = useScopedSettings((settings) => settings.usagePacing);
-  const { targets, environment, connectedEnvironments } = useSettingsScope();
-  const providersByEnvironment = useEnvironmentProviders();
-  // Every selected environment's accounts, the primary's first, as the agent slots rows list them.
-  const providers = [
-    ...(environment ? [environment] : []),
-    ...connectedEnvironments.filter(
-      (candidate) => candidate.environmentId !== environment?.environmentId,
-    ),
-  ].flatMap(
-    (candidate) => providersByEnvironment.get(candidate.environmentId) ?? EMPTY_SERVER_PROVIDERS,
-  );
+  const { targets } = useSettingsScope();
+  const providers = useSelectedProviders();
   const mixed = targetsDiffer(targets, (settings) => settings.usagePacing);
   const rows = usagePacingAccountRows(providers, usagePacing);
   const patch = (instanceId: string, value: UsagePacingInstanceSettingsPatch | null) =>
@@ -189,10 +198,11 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
 
   return (
     <>
-      <SettingsRow
+      <ForkRow
         serverScoped
         {...searchableSetting("usage-pacing")}
         settingKeys={["usagePacing"]}
+        lockPaths={["usagePacing"]}
         mixed={mixed}
         description={
           mixed
@@ -205,11 +215,13 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
       {mixed
         ? null
         : rows.map((row) => (
-            <SettingsRow
+            <ForkRow
               key={row.instanceId}
               id={`usage-pacing-account-${row.instanceId}`}
-              // Not serverScoped (the row above carries the scope chip), but a lock still applies.
+              // Not serverScoped (the row above carries the scope chip), but a lock still applies,
+              // to the switches below the title too.
               settingKeys={["usagePacing"]}
+              lockPaths={["usagePacing"]}
               title={`Reserve on ${row.label}`}
               status={usagePacingAccountSummary(row.settings)}
               description={
@@ -228,7 +240,7 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
               control={
                 row.known ? (
                   <div className="flex items-center gap-2">
-                    <IntervalSecondsField
+                    <BoundedNumberField
                       labels={{
                         decrease: `Decrease reserve on ${row.label}`,
                         input: `Reserve on ${row.label} in percent`,
@@ -237,11 +249,9 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
                       value={row.settings.reservePercent}
                       min={0}
                       step={5}
+                      bound={(value) => Math.min(100, value)}
                       onCommit={(value, options) =>
-                        updateSettings(
-                          patch(row.instanceId, { reservePercent: Math.min(100, value) }),
-                          options,
-                        )
+                        updateSettings(patch(row.instanceId, { reservePercent: value }), options)
                       }
                     />
                     <span className="text-xs text-muted-foreground">%</span>
@@ -284,7 +294,7 @@ function AccountRows({ updateSettings }: { readonly updateSettings: UpdateSettin
                   </label>
                 </div>
               ) : null}
-            </SettingsRow>
+            </ForkRow>
           ))}
     </>
   );

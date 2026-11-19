@@ -80,6 +80,22 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "environment-defaults",
   },
   {
+    id: "model-policy",
+    title: "Model policy",
+    to: FORK_PAGE,
+    searchTerms: ["modelPolicy delegate_task allowed models effort advise enforce"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
+    id: "model-policy-allow",
+    title: "Allowed models",
+    to: FORK_PAGE,
+    searchTerms: ["modelPolicy allow driver model efforts defaultEffort useFor"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
     id: "review-rules",
     title: "Review rules",
     to: FORK_PAGE,

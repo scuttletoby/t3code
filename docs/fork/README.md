@@ -12,7 +12,8 @@ fork switch is off by default, except one read-only refresh of usage limits.
 Server settings are in `settings.json` in the server's `userdata` folder (by default
 `~/.t3/userdata/settings.json`). The server reads the file again when it changes; no restart is
 needed. Fork settings also have rows on the app's own **Settings → Fork** page (named below), with
-one line per feature at the top saying whether it is on. A project's overrides are set in **Settings** with that project chosen at the top ("Applying settings
+one line per feature at the top saying whether it is on, by the same rules as the fork report below
+(on a server, a project's override or one thread's handoff entry counts too). A project's overrides are set in **Settings** with that project chosen at the top ("Applying settings
 for …", see [project settings](../user/project-settings.md)). An agent's tools cannot change any
 fork setting.
 
@@ -163,8 +164,8 @@ For `"enforce"`: what each effort level turns into while an account is ahead of 
 account has room, for example `{ "high": "medium", "medium": "medium" }`. A task at a level not
 listed is held instead. Empty: no effort is ever lowered.
 
-Set: **Settings → Fork**, "Lower effort when ahead of pace" (pairs like `high=medium`), or in
-`settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
+Set: **Settings → Fork**, "Lower effort when ahead of pace" (pairs like `high=medium`; a level no
+model on the server offers is refused), or in `settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
 
 ### `server.waitFor`
 
@@ -282,6 +283,10 @@ the stored value whole) and is refused for a bad row, a `defaultEffort` not in i
 or an unknown key such as a misspelt `effort`. A hand-edited value that is not valid, an unknown key
 included, reads as `enforce` with nothing allowed (with a warning in the server log); it is kept as
 written, and saves of other settings write it back unchanged until the person saves this setting.
+
+In the app: **Settings → Fork**, section Model policy (server only; a project cannot override it): the
+mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a save is. An unreadable
+value is shown with a warning and the kept text; a save there replaces it.
 
 ```json
 {

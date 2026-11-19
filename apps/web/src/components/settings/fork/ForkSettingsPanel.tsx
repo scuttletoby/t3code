@@ -3,15 +3,16 @@
  * mounts the fork's own panels; a project screen shows only the settings a project may override.
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: this page is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
+import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
 import type { ReactNode } from "react";
 
 import { ReviewRulesSettings } from "../ReviewRulesSettings";
 import { useSettingsScope } from "../SettingsScopeContext";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
-import { useScopedSettings } from "../useScopedSettings";
 import { WaitsAndSlotsSettings } from "../WaitsAndSlotsSettings";
 import { forkFeatureStatuses } from "./forkStatus.logic";
+import { ModelPolicySettings } from "./ModelPolicySettings";
 import { UsagePacingSettings } from "./UsagePacingSettings";
 
 export function ForkSettingsPanel() {
@@ -35,6 +36,7 @@ export function ForkSettingsPanel() {
       <ForkGroup title="Agents">
         <WaitsAndSlotsSettings isProjectScope={isProjectScope} />
         {isProjectScope ? null : <UsagePacingSettings />}
+        {isProjectScope ? null : <ModelPolicySettings />}
       </ForkGroup>
       <ForkGroup title="Reviews">
         <ReviewRulesSettings isProjectScope={isProjectScope} />
@@ -45,12 +47,15 @@ export function ForkSettingsPanel() {
 
 function ForkStatusSection() {
   const searchableSetting = useSearchableSetting();
-  const statuses = forkFeatureStatuses(useScopedSettings());
+  const { targets } = useSettingsScope();
+  const statuses = forkFeatureStatuses(
+    targets.length > 0 ? targets : [{ projectId: null, settings: DEFAULT_SERVER_SETTINGS }],
+  );
   return (
     <SettingsSection id="fork-status-section" title="Overview">
       <SettingsRow
         {...searchableSetting("fork-status")}
-        description="What the selected server or project has switched on. Every fork feature starts off."
+        description="What the selected server or project has on, by the fork report's rules: on a server, a project's override or one thread's handoff entry counts too. Every feature starts off."
       >
         <ul className="grid gap-x-8 gap-y-1 pb-2 text-xs sm:grid-cols-2">
           {statuses.map((status) => (

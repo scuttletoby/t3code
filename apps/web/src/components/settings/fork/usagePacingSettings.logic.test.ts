@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   formatLowerEffort,
+  knownEffortLevels,
   parseLowerEffort,
   usagePacingAccountRows,
   usagePacingAccountSummary,
@@ -11,6 +12,7 @@ import {
 
 const id = (value: string) => value as ProviderInstanceId;
 const fromFile = Schema.decodeUnknownSync(ServerSettings);
+const KNOWN = knownEffortLevels([]);
 
 describe("usagePacingAccountRows", () => {
   it("lists every account by its name with the defaults when the file names none", () => {
@@ -76,20 +78,57 @@ describe("lower effort field", () => {
     }).usagePacingLowerEffort;
     const text = formatLowerEffort(stored);
     expect(text).toBe("high=medium, medium=low");
-    expect(parseLowerEffort(text)).toEqual({ value: stored });
+    expect(parseLowerEffort(text, KNOWN)).toEqual({ value: stored });
     expect(formatLowerEffort(fromFile({}).usagePacingLowerEffort)).toBe("");
   });
 
   it("reads pairs split by commas or lines, and empty as no lowering", () => {
-    expect(parseLowerEffort(" high = medium,\nxhigh=high ,")).toEqual({
+    expect(parseLowerEffort(" high = medium,\nxhigh=high ,", KNOWN)).toEqual({
       value: { high: "medium", xhigh: "high" },
     });
-    expect(parseLowerEffort("  ")).toEqual({ value: {} });
+    expect(parseLowerEffort("  ", KNOWN)).toEqual({ value: {} });
   });
 
   it("refuses text that is not a list of pairs", () => {
-    expect(parseLowerEffort("high")).toEqual({ error: '"high" is not a pair like high=medium.' });
-    expect(parseLowerEffort("high=medium=low")).toHaveProperty("error");
-    expect(parseLowerEffort("high=low, high=medium")).toEqual({ error: "high is listed twice." });
+    expect(parseLowerEffort("high", KNOWN)).toEqual({
+      error: '"high" is not a pair like high=medium.',
+    });
+    expect(parseLowerEffort("high=medium=low", KNOWN)).toHaveProperty("error");
+    expect(parseLowerEffort("high=low, high=medium", KNOWN)).toEqual({
+      error: "high is listed twice.",
+    });
+  });
+
+  it("refuses a level no model offers, and knows each provider model's own levels", () => {
+    expect(parseLowerEffort("hgih=medium", KNOWN)).toHaveProperty("error");
+    expect(parseLowerEffort("high=meduim", KNOWN)).toHaveProperty("error");
+    const known = knownEffortLevels([
+      {
+        models: [
+          {
+            capabilities: {
+              optionDescriptors: [
+                {
+                  id: "thought_level",
+                  label: "Thought level",
+                  type: "select",
+                  role: "reasoning",
+                  options: [{ id: "deep", label: "Deep" }],
+                },
+                {
+                  id: "mode",
+                  label: "Mode",
+                  type: "select",
+                  options: [{ id: "plan", label: "Plan" }],
+                },
+              ],
+            },
+          },
+          { capabilities: null },
+        ],
+      },
+    ]);
+    expect(parseLowerEffort("deep=high", known)).toEqual({ value: { deep: "high" } });
+    expect(parseLowerEffort("plan=high", known)).toHaveProperty("error");
   });
 });

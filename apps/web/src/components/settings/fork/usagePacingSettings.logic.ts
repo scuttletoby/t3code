@@ -3,6 +3,7 @@
 import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   type ProviderInstanceId,
+  type ProviderOptionDescriptor,
   type UsagePacingGateMode,
   type UsagePacingInstanceSettings,
   type UsagePacingLowerEffort,
@@ -94,9 +95,50 @@ export function formatLowerEffort(map: UsagePacingLowerEffort): string {
     .join(", ");
 }
 
-/** The map typed in the effort field, or why it cannot be read. Empty clears it. */
+/** The option ids the pacing gate reads as a model's effort (apps/server/src/usage/UsagePacingGate.ts). */
+const EFFORT_OPTION_IDS: ReadonlySet<string> = new Set([
+  "effort",
+  "reasoningEffort",
+  "reasoning_effort",
+  "reasoning",
+  "thinking_level",
+]);
+
+/** The usual effort levels, known before any provider has listed its models. */
+const COMMON_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Every effort level a model on the selected servers offers, and the usual ones. */
+export function knownEffortLevels(
+  providers: ReadonlyArray<{
+    readonly models?:
+      | ReadonlyArray<{
+          readonly capabilities: {
+            readonly optionDescriptors?: ReadonlyArray<ProviderOptionDescriptor> | undefined;
+          } | null;
+        }>
+      | undefined;
+  }>,
+): ReadonlySet<string> {
+  const levels = new Set(COMMON_EFFORT_LEVELS);
+  for (const provider of providers) {
+    for (const model of provider.models ?? []) {
+      for (const descriptor of model.capabilities?.optionDescriptors ?? []) {
+        if (descriptor.type !== "select") continue;
+        if (descriptor.role !== "reasoning" && !EFFORT_OPTION_IDS.has(descriptor.id)) continue;
+        for (const choice of descriptor.options) levels.add(choice.id);
+      }
+    }
+  }
+  return levels;
+}
+
+/**
+ * The map typed in the effort field, or why it cannot be read. Empty clears it. A level no model
+ * offers (a typo such as `hgih`) is refused: the gate would never match it, so the task would wait.
+ */
 export function parseLowerEffort(
   text: string,
+  known: ReadonlySet<string>,
 ): { readonly value: UsagePacingLowerEffort } | { readonly error: string } {
   const value: Record<string, string> = {};
   for (const part of text.split(/[,\n]/)) {
@@ -107,6 +149,12 @@ export function parseLowerEffort(
       return { error: `"${pair}" is not a pair like high=medium.` };
     }
     const [, from, to] = match as unknown as [string, string, string];
+    const unknown = [from, to].find((level) => !known.has(level));
+    if (unknown !== undefined) {
+      return {
+        error: `${unknown} is not an effort level any model here offers (${[...known].join(", ")}).`,
+      };
+    }
     if (Object.hasOwn(value, from)) return { error: `${from} is listed twice.` };
     value[from] = to;
   }
