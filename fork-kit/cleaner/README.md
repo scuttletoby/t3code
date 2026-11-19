@@ -269,18 +269,18 @@ a full clone directly in `root` (a clone elsewhere is not looked at, nor the bra
 A branch some worktree has checked out (also one whose folder is gone), rebases or bisects is that worktree's: it
 is not listed, and goes in a later run than its worktree. The others go only when all of this holds:
 
-| Kept as                        | When                                                                                                                     |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `open PR`                      | an open pull request has the branch                                                                                      |
-| `base branch`                  | it is GitHub's default branch, or a pull request merges into it                                                          |
-| `no merged PR`                 | no merged pull request **from this repository** has the branch                                                           |
-| `commits not in the merged PR` | its tip is neither in a merged pull request's head (that this clone has) nor in GitHub's default branch right now        |
-| `merged under 24 h ago`        | as for a worktree (`mergedHours`)                                                                                        |
-| `commits GitHub does not have` | a commit its tip or its reflog names is on no branch or tag of GitHub (`git ls-remote`) and in no listed pull request    |
-| `used under 24 h ago`          | the newest time its reflog names, or its ref file, is within `usedHours`                                                 |
-| `KEEP file`, `must keep`       | the clone has a `KEEP` file at its top or is a must-keep path; or it is reached through a link (`symbolic link`)         |
-| `origin on this machine`       | as for a clone                                                                                                           |
-| `could not read`               | git or GitHub gave no full answer (named `branches in <clone>` when it is about the whole clone)                         |
+| Kept as                        | When                                                                                                                  |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `open PR`                      | an open pull request has the branch                                                                                   |
+| `base branch`                  | it is GitHub's default branch, or a pull request merges into it                                                       |
+| `no merged PR`                 | no merged pull request **from this repository** has the branch                                                        |
+| `commits not in the merged PR` | its tip is neither in a merged pull request's head (that this clone has) nor in GitHub's default branch right now     |
+| `merged under 24 h ago`        | as for a worktree (`mergedHours`)                                                                                     |
+| `commits GitHub does not have` | a commit its tip or its reflog names is on no branch or tag of GitHub (`git ls-remote`) and in no listed pull request |
+| `used under 24 h ago`          | the newest time its reflog names, or its ref file, is within `usedHours`                                              |
+| `KEEP file`, `must keep`       | the clone has a `KEEP` file at its top or is a must-keep path; or it is reached through a link (`symbolic link`)      |
+| `origin on this machine`       | as for a clone                                                                                                        |
+| `could not read`               | git or GitHub gave no full answer (named `branches in <clone>` when it is about the whole clone)                      |
 
 The plan names each one `branch <name> in <clone>` (size `0 B`). The delete is `git update-ref -d` with the commit
 the last check judged: a branch that moved since is left as it is (`FAILED ...: nothing removed`). Then its config
