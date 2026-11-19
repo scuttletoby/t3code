@@ -14,11 +14,18 @@ on neither. For the PR it updates (head H1):
      Only comments of the config's lens_author_associations count, shown and unedited: anyone can comment. Inline
      review comments (on a line of the diff) are comments too, read with the reviews' flags (review_flags).
      The base branch, the PR head and R are fetched into the queue's own bare repository (--cache).
-  2. The plan goes into STATE (--state-file), then auto-merge OFF; if that fails, nothing else happens (if gh's error
-     leaves it unclear whether it is OFF, STATE stays for the next run). R unknown or not on GitHub: the PR stays OFF,
+  2. The PR is read right before the disarm: off by then (someone else's switch) or closed, it is left as it is.
+     The plan goes into STATE (--state-file), unsure until GitHub answers the disarm with success, then auto-merge
+     OFF; if that fails, nothing else happens: still armed, nothing changed; OFF, the queue cannot tell whether a
+     person turned it off, so it stays OFF with a comment and an unsure plan is never re-armed; unclear whether it is
+     OFF, STATE stays for the next run. What GitHub answers for turning off an auto-merge that is already off is not
+     documented: if success, a person's switch-off at the moment of the call counts as the queue's own (README.md,
+     "no compare-and-set for auto-merge"). R unknown or not on GitHub: the PR stays OFF,
      is not updated and gets a comment, so one such PR cannot stall the queue. A git fetch error changes nothing: the
      PR stays as it was and the next run tries again.
-  3. `gh pr update-branch`, then wait until the head moves (at most wait_seconds).
+  3. The PR is read again: armed again (or closed) since the disarm, it is not updated and STATE stays, so the next
+     run decides from what GitHub shows then (a person's arm, or GitHub showing the disarm late). Then
+     `gh pr update-branch`, and wait until the head moves (at most wait_seconds).
   4. Auto-merge back ON with --match-head-commit H2 only if H2 holds exactly R's change on top of the base (holds()).
      GitHub can refuse that only because the new head's required checks have not started yet: then, and only then,
      the same arm is tried again for at most wait_seconds (arm). Anything else (a push after the lenses, a conflict
@@ -1484,6 +1491,21 @@ class Queue:
             return SILENT
         return 0
 
+    def leave_unsure(self, n):
+        """Auto-merge is OFF and the queue cannot tell whether it or a person turned it off (its disarm reported an
+        error, or the run stopped there): it is never turned back on, so a person's switch stands. Not updated. 0, or
+        SILENT when the comment failed (the caller keeps STATE, so the next run says it)."""
+        print(f'#{n}: auto-merge is OFF, maybe by a person: left OFF and not updated')
+        r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
+                          'pr_queue left auto-merge OFF: it is off, and the queue cannot tell whether its own call '
+                          'or a person turned it off (that call reported an error, or the run stopped there), so it '
+                          'did not update this PR and does not turn auto-merge back on. To queue it again: '
+                          f'`{self.cfg.ready(n)}`.')
+        if r.returncode != 0:
+            print(f'#{n}: could not comment either: {r.stderr.strip()[:300]}')
+            return SILENT
+        return 0
+
     def read_advice(self, why):
         """The way out when the review names no head, for the queue's comment."""
         if lens.NO_HEADER in why:
@@ -1551,23 +1573,39 @@ class Queue:
             if read and fetched is None:   # nothing changed yet: an armed PR stays as it was, the next run tries again
                 print(f'#{n}: {self.unknown} (see above): nothing changed, the next run tries again')
                 return 1
-            self.write_state({'repo': self.repo, 'pr': n, 'old': old, 'base': base, 'read': read})
-            code = self.update_off(n, old, base, read, fetched, why)
+            # Read right before the disarm (the fetch above can take long): off by now is someone else's switch, not
+            # the queue's to undo. This, not the disarm's answer, tells a person's switch-off from the queue's own:
+            # what GitHub answers for turning off an auto-merge that is already off is not documented (README.md).
+            pre = self.view(n)
+            if pre is None:
+                print(f'#{n}: gh cannot show it now: nothing changed, the next run tries again')
+                return 1
+            if pre.get('state') != 'OPEN' or not pre.get('autoMergeRequest'):
+                print(f'#{n}: auto-merge was turned off by someone else (or it is not open any more) right before the '
+                      'queue would turn it off: left as it is, not updated')
+                return 0
+            plan = {'repo': self.repo, 'pr': n, 'old': old, 'base': base, 'read': read}
+            self.write_state(dict(plan, unsure=True))   # until the disarm answers OK: maybe a person turned it off
+            code = self.update_off(plan, fetched, why)
         finally:
             self.stop_check()
         if code != SILENT:
             self.drop_state()
         return code
 
-    def update_off(self, n, old, base, read, fetched, why):
+    def update_off(self, plan, fetched, why):
+        n, old, base, read = plan['pr'], plan['old'], plan['base'], plan['read']
         r = self.gh_write('pr', 'merge', str(n), '--repo', self.repo, '--disable-auto')
         if r.returncode != 0:
             print(f'#{n}: could not turn auto-merge off, so not updating: {r.stderr.strip()[:300]}')
             cur = self.view(n)   # gh may report an error for a change GitHub applied
             if cur and cur.get('state') == 'OPEN' and cur.get('autoMergeRequest'):
                 return 1   # still armed: nothing changed
+            if cur and cur.get('state') == 'OPEN':
+                return self.leave_unsure(n)
             print(f'#{n}: auto-merge may be OFF now: STATE stays, the next run finishes it')
             return SILENT
+        self.write_state(plan)   # the queue's own disarm: the plan may re-arm it
         if not read:
             return self.leave_off(n, f'{why}, so it was not updated: which head the review vouched for is unclear.',
                                   self.read_advice(why))
@@ -1575,6 +1613,17 @@ class Queue:
             return self.leave_off(n, f'GitHub does not have the commit read at {read[:12]} (any more), so it was not '
                                      f'updated. Merge {base} into it yourself and push',
                                   f'(`{self.cfg.push_command}`).')
+        now = self.view(n)   # a person may have turned it back on (or closed it) since the disarm
+        if now is None:
+            print(f'#{n}: gh cannot show it now, so not updating: STATE stays, the next run finishes it')
+            return SILENT
+        if now.get('state') != 'OPEN' or now.get('autoMergeRequest'):
+            # a person armed it again (or closed it), or GitHub shows the queue's own disarm late: which one, this read
+            # cannot say. The plan (the queue's own disarm) stays, and the next run decides from what GitHub shows
+            # then: armed or closed, nothing to do; off, its own disarm, re-armed as any plan
+            print(f'#{n}: armed again or not open right after the queue turned auto-merge off (a person, or GitHub '
+                  'showing the disarm late): not updated, STATE stays, the next run decides')
+            return SILENT
         u = self.gh_write('pr', 'update-branch', str(n), '--repo', self.repo)
         print(u.stdout.strip() or u.stderr.strip()[:300])
         if u.returncode != 0:
@@ -1661,10 +1710,14 @@ class Queue:
         # comments: the stored read, the head that run started from.
         reviewed, read, why = self.review.reviewed_head(cur)
         read = read if reviewed else st.get('read')
-        same = self.same_change(base, n, head, read) if open_off and not cur.get('isDraft') and read else False
+        unsure = st.get('unsure') is True   # a plan without it (older queues) is the queue's own disarm
+        same = self.same_change(base, n, head, read) if open_off and not cur.get('isDraft') and read and not unsure \
+            else False
         old = (st.get('old') or '?')[:12]
         if not open_off:
             code = 0
+        elif unsure:
+            code = self.leave_unsure(n)
         elif not read:
             code = self.leave_off(n, f'a pr_queue run that was stopped half-way or could not finish turned auto-merge '
                                      f'off at {old}; {why or "it stored no read commit"}, so it was not re-armed: which '
