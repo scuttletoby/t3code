@@ -170,28 +170,17 @@
     "apps/web/src/components/settings/settingsSearch.ts": {
       "why": "The fork's Settings page \"Fork\" (/settings/fork) is one more SettingsPath, so it needs its label, its place in the nav (the Agents group) and its search scope here; its rows are the fork's own search items (forkSettingsSearchItems.ts), spread in at one place. The import and the spread predate the list (they were \"pending\").",
       "added": [
-        "import { FORK_SETTINGS_SEARCH_ITEMS } from \"./forkSettingsSearchItems\"; // Fork",
-        "...FORK_SETTINGS_SEARCH_ITEMS, // Fork: waits and agent slots."
-      ],
-      "announced": {
-        "since": "2026-11-19",
-        "added": [
-          "import { FORK_SETTINGS_LABEL, FORK_SETTINGS_SEARCH_ITEMS } from \"./forkSettingsSearchItems\"; // Fork",
-          "| \"/settings/fork\" // Fork",
-          "\"/settings/fork\": FORK_SETTINGS_LABEL, // Fork",
-          "\"/settings/fork\", // Fork",
-          "\"/settings/fork\": null, // Fork",
-          "...FORK_SETTINGS_SEARCH_ITEMS, // Fork: the rows of the Fork page."
-        ]
-      }
+        "import { FORK_SETTINGS_LABEL, FORK_SETTINGS_SEARCH_ITEMS } from \"./forkSettingsSearchItems\"; // Fork",
+        "| \"/settings/fork\" // Fork",
+        "\"/settings/fork\": FORK_SETTINGS_LABEL, // Fork",
+        "\"/settings/fork\", // Fork",
+        "\"/settings/fork\": null, // Fork",
+        "...FORK_SETTINGS_SEARCH_ITEMS, // Fork: the rows of the Fork page."
+      ]
     },
     "apps/web/src/components/settings/SettingsSidebarNav.tsx": {
       "why": "The fork's Settings page \"Fork\" (/settings/fork) needs its icon in the nav's icon table, which every SettingsPath must have.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-19",
-        "added": ["GitForkIcon,", "\"/settings/fork\": GitForkIcon, // Fork"]
-      }
+      "added": ["GitForkIcon,", "\"/settings/fork\": GitForkIcon, // Fork"]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -238,7 +227,6 @@
     "apps/web/src/components/ChatMarkdown.tsx": 39,
     "apps/web/src/components/chat/MarkdownFileLink.tsx": 32,
     "apps/web/src/components/media/mediaContent.ts": 8,
-    "apps/web/src/components/settings/SettingsPanels.tsx": 4,
     "apps/web/src/components/settings/scopedSettings.test.ts": 153,
     "apps/web/src/components/settings/scopedSettings.ts": 9,
     "apps/web/src/components/settings/useScopedSettings.ts": 27,
