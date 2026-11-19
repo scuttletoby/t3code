@@ -151,6 +151,7 @@ describe("person-only fork settings", () => {
         "mcpSubagentProfile",
         "mcpThreadProfiles",
         "reviewRules",
+        "modelPolicy",
       ]),
     );
     for (const key of FORK_AGENT_WRITABLE_KEYS) expect(FORK_PERSON_ONLY_KEYS).not.toContain(key);
@@ -212,6 +213,7 @@ describe("person-only fork settings", () => {
       ["mcp_profile", "mcpProfile"],
       ["MCP-PROFILE", "mcpProfile"],
       ["review_rules", "reviewRules"],
+      ["model_policy", "modelPolicy"],
     ] as const) {
       const tool = Tool.make("fake_settings_update", {
         parameters: Schema.Struct({
