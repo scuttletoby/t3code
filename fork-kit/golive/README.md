@@ -631,7 +631,7 @@ the service state (the version the last golive run verified, no update pending);
 the server recorded (never another host its `origin` may name); the t3 launcher links upstream recorded
 (`runtime/launchers`) lead to that version; and the live fork build's report: read cleanly, no pending or unknown
 migration, project and thread counts not below the newest `reportCounts` in the journal (the newest run that
-journalled any: a copy after the switch replaces the switch's). It lists the fork features that are on, the provider
+journalled any: a copy after the switch replaces the switch's). It lists the fork features that are on (each with where: server, policy, project or thread), the provider
 instances, the copies on disk with their sizes (complete, incomplete, kept files) and the kept runtimes (and whether
 each is usable): the kit deletes none. A kept runtime that is there but damaged is a failed check ("way back W1: not
 available"), so T3 reads up but not right. The first line is one of **T3 is up:**, **T3 is up but not right**, **T3 is

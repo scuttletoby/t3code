@@ -55,7 +55,9 @@ def report(**over):
                                                          'threadsArchived': 2}},
         'settings': {'state': 'present', 'parseWarning': None, 'providerInstances': []},
         'fork': {'features': {'agentSlots': 'off', 'waitFor': 'off', 'usagePacingGate': 'off',
-                              'automaticUpdates': 'off'}, 'featuresOn': [], 'keysInFile': [], 'settings': {}},
+                              'automaticUpdates': 'off', 'reviewRules': 'off', 'handoff': 'off',
+                              'playtest': 'off'}, 'featuresOn': [], 'featuresWhere': {}, 'keysInFile': [],
+                 'settings': {}},
         'problems': [], 'ok': True,
     }
     for key, value in over.items():

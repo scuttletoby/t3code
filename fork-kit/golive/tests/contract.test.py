@@ -172,7 +172,7 @@ REPORT_CLI = 'apps/server/src/cli/forkReport.ts'
 REPORT_PATHS = ['reportVersion', 'version', 'ok', 'problems', 'problems.code', 'problems.message',
                 'database.pendingMigrations', 'database.counts', 'database.counts.threads',
                 'database.counts.projects', 'database.counts.threadsArchived', 'database.counts.projectsArchived',
-                'fork.featuresOn', 'fork.features', 'database.appliedMigrations', 'database.appliedMigrations.id',
+                'fork.featuresOn', 'fork.featuresWhere', 'fork.features', 'database.appliedMigrations', 'database.appliedMigrations.id',
                 'database.unknownMigrations', 'settings.parseWarning', 'settings.providerInstances',
                 'settings.providerInstances.id', 'settings.providerInstances.driver',
                 'settings.providerInstances.enabled']
