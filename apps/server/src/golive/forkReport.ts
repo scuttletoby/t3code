@@ -6,12 +6,13 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
 import {
-  DEFAULT_SERVER_SETTINGS,
   effectiveReviewRules,
+  FORK_PROJECT_SCOPED_KEYS,
   FORK_SERVER_SETTING_KEYS,
   type HandoffSettings,
   type PlaytestSettings,
   type ReviewRules,
+  type ServerSettings,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -27,6 +28,7 @@ import {
   settingsFileLegacyKeysUnreadable,
 } from "../serverSettings.ts";
 import { readSettingsFile } from "../fork/settingsFileRead.ts";
+import { type ManagedSettings, unmanagedSettings } from "../policy/managedSettings.ts";
 
 /**
  * Fork (go-live kit): what a T3 home holds, read without writing a byte. It never migrates, never
@@ -39,6 +41,7 @@ export const FORK_REPORT_VERSION = 1;
 export type ForkReportProblemCode =
   | "home-missing"
   | "settings-unreadable"
+  | "policy-unreadable"
   | "database-unreadable"
   | "database-needs-recovery"
   | "database-newer"
@@ -97,6 +100,13 @@ export interface ForkReport {
       readonly playtest: "on" | "off";
     };
     readonly featuresOn: ReadonlyArray<string>;
+    /**
+     * For each feature in `featuresOn`, where it is on: `server` (settings.json's own value, or a
+     * default of the administrator's policy), `policy` (on only because the policy locks it),
+     * `project:<id>` (that project's override), `thread:<id>` (one thread's handoff entry in the
+     * server's value) or `project:<id>/thread:<id>` (one in a project's override).
+     */
+    readonly featuresWhere: Readonly<Record<string, ReadonlyArray<string>>>;
     /** Fork keys written in the file (whatever their value). */
     readonly keysInFile: ReadonlyArray<string>;
     /** Every fork setting, decoded. Commands are reduced to whether they are set. */
@@ -337,6 +347,7 @@ function readOnce(
 function readSettings(
   settingsPath: string,
   problems: Array<Problem>,
+  managed: ManagedSettings,
 ): { settings: ForkReport["settings"]; fork: ForkReport["fork"] } {
   // As the load: a missing file (or a link to nothing) means every default, without a warning; a
   // file that is there, even empty, goes through the load's own decode.
@@ -355,7 +366,7 @@ function readSettings(
       : raw !== undefined && raw.trim() === ""
         ? "empty"
         : "present";
-  const decoded = raw === undefined ? undefined : decodeSettingsFileText(raw);
+  const decoded = raw === undefined ? undefined : decodeSettingsFileText(raw, managed.withDefaults);
   let parseWarning: string | null = null;
   if (readError !== null) {
     parseWarning = `settings.json could not be read: ${readError}`;
@@ -373,11 +384,15 @@ function readSettings(
           : parseWarning,
     });
   }
-  // The load uses every default when the file does not decode; so does the report.
-  const settings =
-    decoded !== undefined && Exit.isSuccess(decoded) && parseWarning === null
-      ? decoded.value
-      : DEFAULT_SERVER_SETTINGS;
+  // As the load: the policy's defaults (with updates off when the file does not decode, as it may
+  // hold an opt-out), then its locks laid over whatever was read.
+  const unlocked =
+    parseWarning !== null
+      ? { ...managed.defaults, automaticUpdates: false }
+      : decoded !== undefined && Exit.isSuccess(decoded)
+        ? decoded.value
+        : managed.defaults;
+  const settings = managed.applyLocks(unlocked);
 
   // The keys come from the load's lenient parse, so comments and trailing commas hide none.
   const parsed = raw === undefined ? undefined : parseSettingsFileText(raw);
@@ -395,18 +410,25 @@ function readSettings(
       ? readSettingsFile(parsed.value).dropped
       : [];
 
-  // A project's override replaces the server's value for that project, so it can switch a feature
-  // on while the server's is off. A bad value already reads as off (the settings decode).
-  const overrides = <K extends "reviewRules" | "handoff" | "playtest">(key: K) =>
-    Object.values(settings.projectSettingsOverrides).map((project) => project[key]);
+  // Where each place is on as loaded; a place on only because of a lock (the server's value or a
+  // project's, which locks also reach) is `policy`: no edit of settings.json switches it off.
+  const loaded = whereEachFeature(settings);
+  const own = whereEachFeature(unlocked);
+  const where = { ...loaded };
+  for (const key of Object.keys(loaded) as Array<ForkReportFeature>) {
+    where[key] = [
+      ...new Set(loaded[key].map((place) => (own[key].includes(place) ? place : "policy"))),
+    ];
+  }
+  const onOff = (key: ForkReportFeature) => (where[key].length > 0 ? "on" : "off");
   const features = {
-    agentSlots: settings.agentSlots.enabled ? "on" : "off",
-    waitFor: settings.waitFor.enabled ? "on" : "off",
+    agentSlots: onOff("agentSlots"),
+    waitFor: onOff("waitFor"),
     usagePacingGate: settings.usagePacingGate,
-    automaticUpdates: settings.automaticUpdates ? "on" : "off",
-    reviewRules: anyOn(settings.reviewRules, overrides("reviewRules"), reviewRulesOn),
-    handoff: anyOn(settings.handoff, overrides("handoff"), handoffOn),
-    playtest: anyOn(settings.playtest, overrides("playtest"), playtestOn),
+    automaticUpdates: onOff("automaticUpdates"),
+    reviewRules: onOff("reviewRules"),
+    handoff: onOff("handoff"),
+    playtest: onOff("playtest"),
   } as const;
   return {
     settings: {
@@ -425,6 +447,9 @@ function readSettings(
       featuresOn: Object.entries(features)
         .filter(([, value]) => value !== "off")
         .map(([key]) => key),
+      featuresWhere: Object.fromEntries(
+        Object.entries(where).filter(([, places]) => places.length > 0),
+      ),
       keysInFile,
       settings: {
         automaticUpdates: settings.automaticUpdates,
@@ -441,18 +466,73 @@ function readSettings(
   };
 }
 
-const reviewRulesOn = (value: ReviewRules) => effectiveReviewRules(value).preset !== "off";
-const handoffOn = (value: HandoffSettings) =>
-  value.mode === "handoff" || Object.values(value.threads).includes("handoff");
-const playtestOn = (value: PlaytestSettings) => value.enabled;
+type ForkReportFeature = keyof ForkReport["fork"]["features"];
+type ForkProjectScopedKey = (typeof FORK_PROJECT_SCOPED_KEYS)[number];
 
-/** "on" when the server's value or any project's (not set: the server's) is on. */
-function anyOn<T>(
+/**
+ * The counted features a project's override can switch on: the report reads each one's override in
+ * every project. A test holds it to every counted feature that is also a project-scoped setting.
+ */
+export const FORK_REPORT_PROJECT_FEATURES = [
+  "reviewRules",
+  "handoff",
+  "playtest",
+] as const satisfies ReadonlyArray<ForkReportFeature & ForkProjectScopedKey>;
+type ForkReportProjectFeature = (typeof FORK_REPORT_PROJECT_FEATURES)[number];
+
+/** Where each counted feature is on in `settings`: `server`, `project:<id>` or a thread's entry. */
+function whereEachFeature(
+  settings: ServerSettings,
+): Record<ForkReportFeature, ReadonlyArray<string>> {
+  // A project's override replaces the server's value for that project, so it can switch a feature
+  // on while the server's is off. A bad value already reads as off (the settings decode).
+  const overrides = <K extends ForkReportProjectFeature>(key: K) =>
+    Object.entries(settings.projectSettingsOverrides).map(
+      ([projectId, project]) => [projectId, project[key]] as const,
+    );
+  const server = (on: boolean) => (on ? ["server"] : []);
+  const perProject = {
+    reviewRules: whereOn(settings.reviewRules, overrides("reviewRules"), reviewRulesOn),
+    handoff: whereOn(settings.handoff, overrides("handoff"), handoffWhere),
+    playtest: whereOn(settings.playtest, overrides("playtest"), playtestOn),
+  } satisfies Record<ForkReportProjectFeature, ReadonlyArray<string>>;
+  return {
+    agentSlots: server(settings.agentSlots.enabled),
+    waitFor: server(settings.waitFor.enabled),
+    usagePacingGate: server(settings.usagePacingGate !== "off"),
+    automaticUpdates: server(settings.automaticUpdates),
+    ...perProject,
+  };
+}
+
+/** Where a value switches its feature on, below `at` (`server` or `project:<id>`). */
+type WhereOn<T> = (value: T, at: string) => ReadonlyArray<string>;
+const when =
+  <T>(isOn: (value: T) => boolean): WhereOn<T> =>
+  (value, at) =>
+    isOn(value) ? [at] : [];
+const reviewRulesOn = when((value: ReviewRules) => effectiveReviewRules(value).preset !== "off");
+const playtestOn = when((value: PlaytestSettings) => value.enabled);
+/** The value's own mode, and each thread whose entry is `handoff` (it wins over the mode). */
+const handoffWhere: WhereOn<HandoffSettings> = (value, at) => [
+  ...(value.mode === "handoff" ? [at] : []),
+  ...Object.entries(value.threads)
+    .filter(([, mode]) => mode === "handoff")
+    .map(([threadId]) => `${at === "server" ? "" : `${at}/`}thread:${threadId}`),
+];
+
+/** Where the server's value and each project's (not set or null: the server's) is on. */
+function whereOn<T>(
   server: T,
-  projects: ReadonlyArray<T | null | undefined>,
-  isOn: (value: T) => boolean,
-): "on" | "off" {
-  return isOn(server) || projects.some((value) => value != null && isOn(value)) ? "on" : "off";
+  projects: ReadonlyArray<readonly [string, T | null | undefined]>,
+  where: WhereOn<T>,
+): ReadonlyArray<string> {
+  return [
+    ...where(server, "server"),
+    ...projects.flatMap(([projectId, value]) =>
+      value == null ? [] : where(value, `project:${projectId}`),
+    ),
+  ];
 }
 
 /** The report as the command prints it: indented JSON. */
@@ -492,8 +572,17 @@ function whyNoHome(
   return null;
 }
 
-/** The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`). */
-export function readForkReport(baseDir: string, version: string = packageJson.version): ForkReport {
+/**
+ * The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`).
+ * `policy` is this machine's managed policy as the server loads it (defaults filled in, locks laid
+ * over; its provider limits change no fork feature and are left out), or why it could not be read:
+ * a start would then stop.
+ */
+export function readForkReport(
+  baseDir: string,
+  policy: ManagedSettings | { readonly unreadable: string } = unmanagedSettings,
+  version: string = packageJson.version,
+): ForkReport {
   const home = NodePath.resolve(baseDir);
   const stateDir = NodePath.join(home, "userdata");
   const problems: Array<Problem> = [];
@@ -512,7 +601,20 @@ export function readForkReport(baseDir: string, version: string = packageJson.ve
     });
     database = { ...unreadDatabase(databasePath), state: "unreadable" };
   }
-  const { settings, fork } = readSettings(NodePath.join(stateDir, "settings.json"), problems);
+  let managed: ManagedSettings = unmanagedSettings;
+  if ("unreadable" in policy) {
+    problems.push({
+      code: "policy-unreadable",
+      message: `The managed policy would stop a start: ${policy.unreadable}`,
+    });
+  } else {
+    managed = policy;
+  }
+  const { settings, fork } = readSettings(
+    NodePath.join(stateDir, "settings.json"),
+    problems,
+    managed,
+  );
   return {
     reportVersion: FORK_REPORT_VERSION,
     version,
