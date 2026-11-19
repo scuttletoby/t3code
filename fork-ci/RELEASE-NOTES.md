@@ -13,6 +13,13 @@ nothing.
 
 ## After ci/v14
 
+### laws: a contract and a small runner for law tests (#464)
+
+- New [`laws/`](laws/README.md): the contract for law tests (a fixed seed in CI, the seed and shortest failing steps
+  printed, capped tries, no sleeps, a failure kept as a fixed test before its fix merges) and `laws.py`, its runner
+  (Python standard library only, test-side). Projects link to the contract at their pinned tag.
+- pr-queue gets its first law test, `pr_queue_laws.test.py`. No action changed.
+
 ### pr-queue: the merge check reads a checked copy, never the cache; FSCK_KNOWN out of the cache (#465)
 
 - `git fsck` on the cache ends before the merge check starts (in an update it runs in the background, minutes
