@@ -72,7 +72,7 @@ UPSTREAM = [
      f'const ownershipLockPath = (stateDir: string) => NodePath.join(stateDir, "{coldcopy.OWNER_LOCK}");',
      'coldcopy.OWNER_LOCK: the ownership lock copy and restore hold'),
     ('apps/server/src/serverOwnership.ts', 'db.exec("PRAGMA busy_timeout = 250; BEGIN EXCLUSIVE;");',
-     'coldcopy.hold_owner_lock: an exclusive transaction; handoff.HANDOVER_HOLD lets go well inside its 250 ms'),
+     'coldcopy.hold_owner_lock: an exclusive transaction; handoff.HANDOVER_POLL lets go well inside its 250 ms'),
     ('packages/shared/src/cliRelease.ts', 'export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";', 'SHA256SUMS'),
     ('packages/shared/src/cliRelease.ts',
      'return `t3-${version}-${platformKey}.${platformKey.startsWith("win32") ? "zip" : "tar.gz"}`;',
