@@ -81,7 +81,8 @@ A server installed as a boot service (`t3 service install`) updates itself to th
 once no thread is working. Off: it updates only when someone runs `t3 update` or presses **Update**.
 Upstream has a setting of this name pending (not on its `main` yet); the fork keeps `false` through every sync.
 
-Switch on in `settings.json`: `"automaticUpdates": true`. There is no Settings row for it yet. An
+Switch on: **Settings → Fork**, section Updates, "Update automatically", or in `settings.json`:
+`"automaticUpdates": true`. An
 admin policy with updates `"off"` still wins. Details: [updates.md](updates.md).
 
 ### `server.automaticUpdatesQuietCommand`
@@ -89,7 +90,8 @@ admin policy with updates `"off"` still wins. Details: [updates.md](updates.md).
 An optional program asked before each automatic update; a non-zero exit means "not now". Used only
 while `automaticUpdates` is on. Empty: no program is asked.
 
-Set in `settings.json`: `"automaticUpdatesQuietCommand": "/path/to/quiet-check"`. Details:
+Set: **Settings → Fork**, section Updates, "Quiet check before an update", or in `settings.json`:
+`"automaticUpdatesQuietCommand": "/path/to/quiet-check"`. Details:
 [updates.md](updates.md).
 
 ### `server.activityProbe`
@@ -203,6 +205,9 @@ T3 runs the project's adapter, four kinds of step only the person sets: `claim` 
 arguments, run without a shell; T3 passes the session's facts as environment variables. Nothing
 starts a session yet: the session store and the worker (renew, the idle and time limits, ends for
 gone threads) are there, and the tool and the thread controls come in later pull requests. The steps' contract is in [playtest.md](playtest.md).
+
+In the app: **Settings → Fork**, section Playtest: the switch (it stays off until all four steps are
+set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
 
 Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
 push step's name (or names one `claim`, `renew` or `release`), or names a program by anything but
@@ -417,6 +422,11 @@ smallest idle thread handed off before its cache expires, and `modelSelection` t
 model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
 server log), never as `handoff`.
+
+In the app: **Settings → Fork**, section Handoff: the mode, each thread's own mode (added by thread
+id, shown with its title where this client knows the thread), and under Advanced the sizes, who
+writes the handoff (with its command) and the instructions. `modelSelection` has no row yet; a save
+there keeps it as stored.
 
 ```json
 { "handoff": { "mode": "handoff", "threads": { "<thread id>": "compact" } } }
