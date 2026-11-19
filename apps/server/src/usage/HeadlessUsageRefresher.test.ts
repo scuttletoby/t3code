@@ -618,6 +618,62 @@ describe("HeadlessUsageRefresher", () => {
     }),
   );
 
+  it.effect("a streak whose retry is overdue by more than two hours is over: a new outage", () =>
+    Effect.gen(function* () {
+      // One refresh fails at T (retry at T+20); the instance is then skipped as signed out until
+      // it comes back, signed in, past its retry by `overdue`, and the refresh fails again.
+      const cases = [
+        [2 * HOUR, false],
+        [2 * HOUR + 1, true],
+        [72 * HOUR, true],
+      ] as const;
+      for (const [overdue, newStreak] of cases) {
+        const label = `overdue ${overdue} ms`;
+        yield* startAt(NOW_MS);
+        let signedOut = false;
+        const fake = fakeTarget(provider(NOW_MS - HOUR), { checksOnInterval: () => !signedOut });
+        fake.setOutcome("noReading");
+        const log = logCollector();
+        const { sweep } = yield* make(deps([fake.target]));
+        const at = (ms: number) =>
+          TestClock.setTime(NOW_MS + ms).pipe(Effect.andThen(sweep), Effect.provide(log.layer));
+        yield* at(0);
+        assert.equal(log.warnings.length, 1, label);
+        signedOut = true;
+        fake.setSnapshot(provider(NOW_MS, { auth: { status: "unauthenticated" } }));
+        const backAt = 2 * INTERVAL + overdue;
+        for (let ms = HOUR; ms < backAt; ms += HOUR) yield* at(ms);
+        assert.equal(fake.calls(), 1, label);
+        signedOut = false;
+        fake.setSnapshot(provider(NOW_MS + backAt - HOUR));
+        yield* at(backAt);
+        assert.equal(fake.calls(), 2, label);
+        // A new streak: logged again, and retried after 2 intervals, not 4.
+        assert.equal(log.warnings.length, newStreak ? 2 : 1, label);
+        yield* at(backAt + 2 * INTERVAL);
+        assert.equal(fake.calls(), newStreak ? 3 : 2, label);
+        yield* at(backAt + 4 * INTERVAL);
+        assert.equal(fake.calls(), 3, label);
+      }
+    }),
+  );
+
+  it.effect("a sweep in the same millisecond as a failed refresh waits out the backoff", () =>
+    Effect.gen(function* () {
+      yield* startAt(NOW_MS);
+      // An error leaves the last check an hour old, so the instance stays due.
+      const fake = fakeTarget(provider(NOW_MS - HOUR));
+      fake.setOutcome("error");
+      const { sweep } = yield* make(deps([fake.target]));
+      yield* sweep;
+      yield* sweep;
+      assert.equal(fake.calls(), 1);
+      yield* TestClock.adjust(2 * INTERVAL);
+      yield* sweep;
+      assert.equal(fake.calls(), 2);
+    }),
+  );
+
   it("backoff doubles and stops at two hours (or the interval, if longer)", () => {
     assert.equal(backoffMs(INTERVAL, 1), 2 * INTERVAL);
     assert.equal(backoffMs(INTERVAL, 3), 8 * INTERVAL);
