@@ -42,30 +42,31 @@ The defaults, "off" and "decided in" below come from one table in the code,
 (`packages/shared/src/forkDocs.test.ts`) fails when this table and that one differ, or a setting has
 no section below. "Off" means the default leaves the machine as upstream's would be.
 
-| Setting                                                                      | Default             | Off | Decided in                                               |
-| ---------------------------------------------------------------------------- | ------------------- | --- | -------------------------------------------------------- |
-| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`             | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
-| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
-| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
-| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`             | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
-| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}` | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}` | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`  | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
-| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}` | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`            | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
-| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`         | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`    | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
-| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set             | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
-| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set             | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set             | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
-| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set             | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
-| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set             | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| Setting                                                                      | Default                     | Off | Decided in                                               |
+| ---------------------------------------------------------------------------- | --------------------------- | --- | -------------------------------------------------------- |
+| [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                     | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
+| [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                        | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
+| [`server.usagePacing`](#serverusagepacing)                                   | `{}`                        | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
+| [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                     | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                        | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
+| [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`         | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                        | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
+| [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
+| [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`            | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
+| [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
+| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                     | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 
 For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
 only `mode`; their other fields are tuning that does nothing while the switch is off.
@@ -221,6 +222,39 @@ and "Turn off" buttons; it asks first before a button drops hand-set fields or a
 ```json
 {
   "reviewRules": { "preset": "recommended" }
+}
+```
+
+### `server.modelPolicy`
+
+Which models (and efforts) agents may pick, per provider driver. `mode` is `off` (agents pick any
+model, as upstream's do), `advise` (agents are only told) or `enforce` (a pick off the list is
+refused). Each `allow` row names a `driver` and a `model`; `efforts` (non-empty) limits the efforts
+for that model, and a row without it checks only the model. `defaultEffort` must be one of the
+row's `efforts`; `useFor` is a short note shown to agents when they pick. Nothing reads the setting
+yet: the check comes in a later pull request.
+
+Only the person can change it; agents cannot. A save must give both `mode` and `allow` (it replaces
+the stored value whole) and is refused for a bad row, a `defaultEffort` not in its row's `efforts`,
+or an unknown key such as a misspelt `effort`. A hand-edited value that is not valid, an unknown key
+included, reads as `enforce` with nothing allowed (with a warning in the server log); it is kept as
+written, and saves of other settings write it back unchanged until the person saves this setting.
+
+```json
+{
+  "modelPolicy": {
+    "mode": "enforce",
+    "allow": [
+      {
+        "driver": "claudeAgent",
+        "model": "claude-sonnet-5-5",
+        "efforts": ["medium", "high"],
+        "defaultEffort": "high",
+        "useFor": "everyday coding"
+      },
+      { "driver": "codex", "model": "gpt-mini" }
+    ]
+  }
 }
 ```
 
