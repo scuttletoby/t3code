@@ -3,7 +3,13 @@
  * only; T3's own tools are filtered in a later PR. A profile that cannot be applied refuses the
  * turn instead of starting it with every tool: the owner chose refusing over warning.
  */
-import type { McpServerStatus, Settings as ClaudeSettings } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  HookCallback,
+  HookCallbackMatcher,
+  HookEvent,
+  McpServerStatus,
+  Settings as ClaudeSettings,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
   MCP_PROFILE_ALL,
   MCP_SUBAGENT_INHERIT,
@@ -12,6 +18,7 @@ import {
   type ThreadId,
   isDelegatedAppThread,
 } from "@t3tools/contracts";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -37,12 +44,16 @@ export class ClaudeMcpProfileError extends Schema.TaggedError<ClaudeMcpProfileEr
 
 const isRefusal = Schema.is(ClaudeMcpProfileError);
 
-/** The SDK options a profile adds, and the outside servers the session may then show. */
+/**
+ * The SDK options a profile adds, and the outside servers the session may then show. `hooks` holds
+ * the call-time guard; ClaudeAdapterV2 merges it into its own hooks.
+ */
 export interface ClaudeMcpProfilePlan {
   readonly name: string;
   readonly options: {
     readonly strictMcpConfig?: true;
     readonly managedSettings?: ClaudeSettings;
+    readonly hooks?: Partial<Record<HookEvent, Array<HookCallbackMatcher>>>;
   };
   readonly servers: McpProfileSet["servers"];
 }
@@ -54,6 +65,9 @@ export type LineageThread = Pick<
 
 const ALL_PLAN: ClaudeMcpProfilePlan = { name: MCP_PROFILE_ALL, options: {}, servers: "all" };
 const FIX = `pick "${MCP_PROFILE_ALL}" for this thread, or fix the profile in Settings`;
+/** What can make Claude load a server T3's options leave out, at start. */
+const START_LEAKS =
+  "A managed Claude policy on this machine or --mcp-config in the Claude launch arguments can add servers T3's list does not drop";
 const blank = (value: string | undefined) => value === undefined || value.trim() === "";
 
 /** `t3-only` and an empty list ignore every server Claude would load itself; a list keeps those named. */
@@ -68,19 +82,91 @@ export function claudeMcpProfilePlan(
     });
   }
   if (profile.servers === "all") return { ...ALL_PLAN, name };
-  if (profile.servers.length === 0) {
-    return { name, options: { strictMcpConfig: true }, servers: [] };
+  const servers = profile.servers;
+  const hooks = { PreToolUse: [{ hooks: [claudeMcpProfileGuard(name, servers, t3ServerNames)] }] };
+  if (servers.length === 0) {
+    return { name, options: { strictMcpConfig: true, hooks }, servers };
   }
   // T3's own servers are listed too, so the allowlist cannot drop them.
-  const allowed = [...new Set([...t3ServerNames, ...profile.servers])];
+  const allowed = [...new Set([...t3ServerNames, ...servers])];
   return {
     name,
     options: {
       managedSettings: { allowedMcpServers: allowed.map((serverName) => ({ serverName })) },
+      hooks,
     },
-    servers: profile.servers,
+    servers,
   };
 }
+
+/** A server name as Claude writes it in a tool name (`mcp__<name>__<tool>`), per its CLI. */
+const toolNameServer = (name: string) => {
+  const normalized = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return name.startsWith("claude.ai ")
+    ? normalized.replace(/_+/g, "_").replace(/^_|_$/g, "")
+    : normalized;
+};
+
+/** Claude's own tools that reach an MCP server named in their input. */
+const MCP_RESOURCE_TOOLS: ReadonlySet<string> = new Set([
+  "ListMcpResourcesTool",
+  "ReadMcpResourceTool",
+]);
+
+/**
+ * The MCP server a tool call reaches that the profile leaves out, or `undefined`. Claude names the
+ * server it calls (`mcp_server`); an older one does not, so the tool name's prefix is matched.
+ */
+export function claudeMcpCallOutsideProfile(
+  servers: ReadonlyArray<string>,
+  t3ServerNames: ReadonlyArray<string>,
+  call: {
+    readonly tool_name: string;
+    readonly tool_input: unknown;
+    readonly mcp_server?: { readonly name: string } | undefined;
+  },
+): string | undefined {
+  const allowed = [...t3ServerNames, ...servers];
+  if (call.mcp_server !== undefined) {
+    return allowed.includes(call.mcp_server.name) ? undefined : call.mcp_server.name;
+  }
+  if (call.tool_name.startsWith("mcp__")) {
+    const kept = allowed.some((name) =>
+      call.tool_name.startsWith(`mcp__${toolNameServer(name)}__`),
+    );
+    return kept ? undefined : call.tool_name.slice("mcp__".length).split("__")[0];
+  }
+  if (MCP_RESOURCE_TOOLS.has(call.tool_name)) {
+    const server = (call.tool_input as { readonly server?: unknown } | null)?.server;
+    return typeof server === "string" && !allowed.includes(server) ? server : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Refuses, at the moment of the call, a tool call to an MCP server the profile leaves out. The
+ * options keep such servers from loading; this covers what loads anyway (a managed policy that
+ * drops T3's allowlist, an agent file's servers, a server added mid-session). Hooks run in every
+ * permission mode and inside sub-agents.
+ */
+const claudeMcpProfileGuard =
+  (
+    name: string,
+    servers: ReadonlyArray<string>,
+    t3ServerNames: ReadonlyArray<string>,
+  ): HookCallback =>
+  async (input) => {
+    if (input.hook_event_name !== "PreToolUse") return {};
+    const server = claudeMcpCallOutsideProfile(servers, t3ServerNames, input);
+    if (server === undefined) return {};
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `MCP profile "${name}" leaves out the MCP server "${server}", so T3 refused this call. Claude loaded it anyway: a managed Claude policy on this machine, --mcp-config in the Claude launch arguments, or an agent file's servers can add one. To use it, ${FIX} so the profile names it.`,
+      },
+    };
+  };
 
 /**
  * Servers the started session shows that the plan leaves out. An IT-managed policy on the machine
@@ -149,7 +235,9 @@ export const claudeMcpProfileForThread = Effect.fn("ClaudeMcpProfile.forThread")
   if (resolved._tag === "CannotApply") {
     return yield* new ClaudeMcpProfileError({ reason: resolved.message });
   }
-  // A parent that is gone (or on another machine) cannot cut the profile down.
+  // A local parent that is gone cannot cut the profile down, so the thread refuses. A task delegated
+  // from another machine has no parent here (`parentThreadId` is null): it never reaches this check
+  // and gets this machine's profile for its role, not its remote parent's (docs/fork/README.md).
   if (parentMissing && resolved.source !== "thread-pick") {
     return yield* new ClaudeMcpProfileError({
       reason: `This thread's parent thread cannot be read, so its MCP profile cannot be worked out: ${FIX}.`,
@@ -159,19 +247,41 @@ export const claudeMcpProfileForThread = Effect.fn("ClaudeMcpProfile.forThread")
   return isRefusal(plan) ? yield* plan : plan;
 });
 
-const PLAN_KEYS = new WeakMap<object, string>();
+const PLAN_KEYS = new WeakMap<object, { readonly key: string | undefined }>();
+let unplanned = 0;
 
 /**
- * The plan's part of the live-query key, by the turn's MCP overrides object, so a profile change
- * opens a new Claude process. `undefined` for `all`, which leaves the key as it was.
+ * The plan's part of the live-query key (`undefined` for `all`), found by the turn's MCP overrides,
+ * the only input of upstream's key line. Overrides with no plan get a key no other turn has, so
+ * such a turn opens a new process instead of reusing one a wider profile started.
  */
-export const planKeyFor = (mcpOverrides: object): string | undefined => PLAN_KEYS.get(mcpOverrides);
+export const planKeyFor = (mcpOverrides: object): string | undefined =>
+  (PLAN_KEYS.get(mcpOverrides) ?? { key: `unplanned\u0000${++unplanned}` }).key;
+
+/** The plan's key part, or `undefined` for `all`. NUL keeps the joined names apart. */
+const planKey = (plan: ClaudeMcpProfilePlan): string | undefined =>
+  plan.servers === "all" ? undefined : ["mcp", ...plan.servers].join("\u0000");
+
+/** Something set that can narrow a thread's profile: a default other than `all`, or any rule. */
+const profileConfigured = (settings: ServerSettings) =>
+  !(blank(settings.mcpProfile) || settings.mcpProfile.trim() === MCP_PROFILE_ALL) ||
+  needsLineage(settings);
 
 type McpOverrides = { readonly mcpServers?: Readonly<Record<string, unknown>> | undefined };
 
-/** The thread's plan, or a refusal. Without the settings service (tests), every thread gets `all`. */
+/**
+ * The thread's plan, or a refusal. Without the settings service (tests), every thread gets `all`.
+ * A settings read that fails (it also reads provider secrets) refuses only when the settings last
+ * read had a profile set; with none set it falls back to `all` with a warning, as upstream's
+ * own reads in the adapter fall back, so an owner who never set a profile sees no change.
+ */
 export const makeClaudeMcpProfiles = Effect.gen(function* () {
   const settingsService = yield* Effect.serviceOption(ServerSettingsService.ServerSettingsService);
+  if (Option.isNone(settingsService)) {
+    yield* Effect.logWarning(
+      "MCP profiles: no settings service here, so every Claude thread gets the all profile",
+    );
+  }
   const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
   const store = Option.isSome(sql)
     ? yield* ProjectionStore.ProjectionStoreV2.pipe(
@@ -182,28 +292,48 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
   // A parent that cannot be read refuses the thread, as a missing one does.
   const findThread =
     store && ((id: ThreadId) => store.findThread(id).pipe(Effect.orElseSucceed(() => null)));
-  return Effect.fn("ClaudeMcpProfile.plan")(function* (
+  // Whether the settings last read could narrow a profile; `false` until one read succeeds.
+  let lastConfigured = false;
+  const planFor = Effect.fn("ClaudeMcpProfile.planFor")(function* (
     thread: LineageThread,
     overrides: McpOverrides,
   ) {
     if (Option.isNone(settingsService)) return ALL_PLAN;
-    const settings = yield* settingsService.value.getSettings.pipe(
-      Effect.mapError(
-        () =>
-          new ClaudeMcpProfileError({
-            reason: `T3 could not read this thread's MCP profile settings, so this thread cannot start: retry, or ${FIX}.`,
-          }),
-      ),
-    );
+    const read = yield* settingsService.value.getSettings.pipe(Effect.result);
+    if (read._tag === "Failure") {
+      if (lastConfigured) {
+        return yield* new ClaudeMcpProfileError({
+          reason: `T3 could not read this thread's MCP profile settings, so this thread cannot start: retry, or ${FIX}.`,
+        });
+      }
+      yield* Effect.logWarning(
+        "MCP profiles: settings could not be read and no profile was set when last read, so this Claude thread gets the all profile",
+        { cause: read.failure },
+      );
+      return ALL_PLAN;
+    }
+    lastConfigured = profileConfigured(read.success);
     const t3ServerNames = Object.keys(overrides.mcpServers ?? {});
-    const plan = yield* claudeMcpProfileForThread(settings, thread, t3ServerNames, findThread);
-    // NUL keeps the joined names apart.
-    if (plan.servers !== "all") PLAN_KEYS.set(overrides, ["mcp", ...plan.servers].join("\u0000"));
+    return yield* claudeMcpProfileForThread(read.success, thread, t3ServerNames, findThread);
+  });
+
+  return Effect.fn("ClaudeMcpProfile.plan")(function* (
+    thread: LineageThread,
+    overrides: McpOverrides,
+  ) {
+    const plan = yield* planFor(thread, overrides);
+    PLAN_KEYS.set(overrides, { key: planKey(plan) });
     return plan;
   });
 });
 
-/** Refuses and closes a started session that shows a server the plan leaves out. */
+/** How long the started session may take to list its servers; Claude's own boot is bounded alike. */
+export const CHECK_SESSION_TIMEOUT = Duration.minutes(5);
+
+/**
+ * Refuses and closes a started session that shows a server the plan leaves out, or that does not
+ * list its servers in time: with a profile set, an unchecked session never starts the turn.
+ */
 export const checkClaudeSession =
   (plan: ClaudeMcpProfilePlan, overrides: McpOverrides) =>
   <E>(session: {
@@ -215,6 +345,7 @@ export const checkClaudeSession =
       const t3ServerNames = Object.keys(overrides.mcpServers ?? {});
       const outside = yield* session.mcpServerStatus.pipe(
         Effect.map((statuses) => claudeMcpServersOutsidePlan(plan, t3ServerNames, statuses)),
+        Effect.timeout(CHECK_SESSION_TIMEOUT),
         Effect.orElseSucceed(() => undefined),
       );
       if (outside?.length === 0) return;
@@ -223,6 +354,6 @@ export const checkClaudeSession =
         reason:
           outside === undefined
             ? `T3 could not check which MCP servers Claude loaded for profile "${plan.name}", so this thread cannot start: retry, or ${FIX}.`
-            : `MCP profile "${plan.name}" could not be applied: Claude still loaded ${outside.join(", ")}, so this thread cannot start. A managed Claude policy on this machine can override T3's server list; check it, or ${FIX}.`,
+            : `MCP profile "${plan.name}" could not be applied: Claude still loaded ${outside.join(", ")}, so this thread cannot start. ${START_LEAKS}; check them, or ${FIX}.`,
       });
     }).pipe(Effect.withSpan("ClaudeMcpProfile.checkSession"));

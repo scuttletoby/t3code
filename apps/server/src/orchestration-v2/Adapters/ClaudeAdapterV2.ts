@@ -2349,6 +2349,7 @@ export function makeClaudeQueryOptions(input: {
     ...(deviceInstructions || input.onStop !== undefined
       ? {
           hooks: {
+            ...input.mcpProfileOptions?.hooks,
             ...(deviceInstructions
               ? { SubagentStart: [{ hooks: [subagentDeviceInstructions] }] }
               : {}),
