@@ -185,6 +185,7 @@ REPO_SPEC = {
     'github': (str, machine_file.REQUIRED, _github),    # owner/name: only folders whose origin is this repository
     'regenerable': (list, (), _names),                  # names of ignored build output, on top of REGENERABLE
     'branches': (list, (), _globs),                     # branch name patterns a worktree must be on; none: any
+    'mergedBranches': (bool, False, None),              # also delete merged local branches `branches` names (#519)
 }
 DOCKER_SPEC = {
     'enabled': (bool, False, None),
@@ -250,6 +251,7 @@ KEY_KINDS = {
     'tmp': 'picks', 'worktrees.repos': 'picks', 'worktrees.mergedHours': 'floor', 'repos.root': 'picks',
     'repos.github': 'picks', 'repos.regenerable': 'loosens', 'docker.enabled': 'picks', 'docker.days': 'floor',
     'tmp.root': 'picks', 'tmp.patterns': 'picks', 'worktrees.usedHours': 'floor', 'repos.branches': 'picks',
+    'repos.mergedBranches': 'picks',
     'daily': 'picks', 'daily.mode': 'picks', 'daily.oldTimers': 'keeps more', 'daily.outDir': 'own file',
     'daily.keepDays': 'floor', 'daily.compare': 'compare only', 'compare.name': 'compare only',
     'compare.command': 'compare only', 'compare.pattern': 'compare only',
@@ -299,8 +301,9 @@ def must_keep_match(patterns, path):
 
 
 class Repo:
-    def __init__(self, root, github, regenerable, branches=()):
+    def __init__(self, root, github, regenerable, branches=(), merged_branches=False):
         self.root, self.github, self.regenerable, self.branches = root, github, regenerable, branches
+        self.merged_branches = merged_branches
 
 
 class ColdFolder:
@@ -400,8 +403,12 @@ class Config:
         for i, entry in enumerate(worktrees['repos']):
             at = f'{where}.worktrees.repos[{i}]'
             repo = machine_file.fields(entry, REPO_SPEC, at)
+            if repo['mergedBranches'] and not repo['branches']:
+                raise machine_file.MachineFileError(f'{at}.mergedBranches: needs branches: only a branch a pattern '
+                                                    'names is ever deleted')
             self.repos.append(Repo(self._root(repo['root'], f'{at}.root'), repo['github'],
-                                   REGENERABLE + tuple(repo['regenerable']), tuple(repo['branches'])))
+                                   REGENERABLE + tuple(repo['regenerable']), tuple(repo['branches']),
+                                   repo['mergedBranches']))
 
         daily = machine_file.fields(values['daily'], DAILY_SPEC, f'{where}.daily')
         self.daily_mode, self.old_timers, self.daily_keep_days = daily['mode'], tuple(daily['oldTimers']), daily['keepDays']

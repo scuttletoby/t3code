@@ -1,8 +1,8 @@
 """What the cleaner reads about the machine: the process list, systemd units, git, GitHub and Docker.
 
 One rule for every reader here: no answer means keep. A reader that cannot give a full answer raises Unreadable,
-and whoever asked keeps the thing it asked about. Nothing in this file changes anything, except remove_worktree and
-remove_volume at the very end, which the engine calls after every check has passed again.
+and whoever asked keeps the thing it asked about. Nothing in this file changes anything, except remove_worktree,
+remove_branch and remove_volume, which the engine calls after every check has passed again.
 """
 import calendar, errno, fnmatch, ipaddress, json, os, re, socket, stat, subprocess, time
 
@@ -245,10 +245,12 @@ class Mounts:
     of them, where root is the folder of its filesystem it shows. `sources`: (device, root) of every mount, in any
     mount namespace the cleaner may read, that shows one folder of a filesystem rather than all of it: the source of
     a bind mount (a container volume, a sandbox). `options`: {mount point: its per-mount options} (`noatime`,
-    `relatime`, ...). A device is "major:minor" as mountinfo writes it."""
+    `relatime`, ...). `fstab`: the mount points /etc/fstab names, mounted now or not; None when it cannot be read.
+    A device is "major:minor" as mountinfo writes it."""
 
-    def __init__(self, points=('/',), lines=(), sources=(), options=None):
+    def __init__(self, points=('/',), lines=(), sources=(), options=None, fstab=()):
         self.points, self.lines, self.sources = set(points), list(lines), set(sources)
+        self.fstab = None if fstab is None else {os.path.normpath(p) for p in fstab}
         self.options = {point: frozenset(opts) for point, opts in (options or {}).items()}
 
     def options_of(self, path):
@@ -306,7 +308,25 @@ def _mount_lines(path, options=None):
     return out
 
 
-def read_mounts(path='/proc/self/mountinfo', proc='/proc'):
+def read_fstab(path='/etc/fstab'):
+    """The mount points /etc/fstab names (swap and `none` left out); none when there is no such file, None when it
+    cannot be read."""
+    try:
+        with open(path, errors='surrogateescape') as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+    points = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) >= 2 and not fields[0].startswith('#') and fields[1].startswith('/'):
+            points.add(os.path.normpath(_unescape(fields[1])))
+    return points
+
+
+def read_mounts(path='/proc/self/mountinfo', proc='/proc', fstab='/etc/fstab'):
     """Every mount point, bind mounts too: a bind mount of a folder on the same filesystem has the same device
     number, so only this list shows it. Also the bind mount sources of every other mount namespace the cleaner can
     read (its own user's processes): a folder a container or a sandbox shows. Raises Unreadable when its own list
@@ -335,7 +355,7 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc'):
         except Unreadable:
             continue
         sources.update((device, root) for _, device, root in other if root != '/')
-    return Mounts(points, lines, sources, options)
+    return Mounts(points, lines, sources, options, read_fstab(fstab))
 
 
 # --- systemd units ------------------------------------------------------------------------------------------------
@@ -444,10 +464,9 @@ def worktree_list(cwd, bare=False):
     return entries
 
 
-def orphaned_worktree(folder):
-    """The git folder a worktree's `.git` file names, when that folder is gone (its main repository was removed or
-    moved): git cannot answer anything about the worktree, and never will. None for anything else: no `.git` file,
-    one that cannot be read (that stays "could not read"), or a git folder that is there."""
+def _gitdir_line(folder):
+    """What the `gitdir: ` line of a worktree's `.git` file names, as written (maybe a relative path); None when there
+    is no such file, it cannot be read, or it is not one `gitdir: ` line."""
     dot = os.path.join(folder, '.git')
     try:
         fd = os.open(dot, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -464,13 +483,119 @@ def orphaned_worktree(folder):
     lines = text.splitlines()
     if len(lines) != 1 or not lines[0].startswith('gitdir: ') or not lines[0][len('gitdir: '):].strip():
         return None
-    gitdir = os.path.normpath(os.path.join(folder, lines[0][len('gitdir: '):].strip()))
+    return lines[0][len('gitdir: '):].strip()
+
+
+def orphaned_worktree(folder):
+    """The git folder a worktree's `.git` file names, when no folder is found there: its main repository was
+    removed, moved or renamed, or is on a drive that is not mounted now (orphan_doubt tells these apart). None for
+    anything else: no `.git` file, one that cannot be read (that stays "could not read"), or a git folder that is
+    there."""
+    named = _gitdir_line(folder)
+    if named is None:
+        return None
+    gitdir = os.path.normpath(os.path.join(folder, named))
     try:
         os.lstat(gitdir)
     except (FileNotFoundError, NotADirectoryError):
         return gitdir
     except OSError:
         return None             # cannot tell: no answer means keep, as "could not read"
+    return None
+
+
+# Where drives that come and go are mounted: WSL's /mnt/c, udisks' /media/<user>/<label> and /run/media/<user>/<label>.
+REMOVABLE = ('/mnt', '/media', '/run/media')
+
+
+def _admin_entry(places, target):
+    """The first worktree admin entry (`<git folder>/worktrees/<name>`) of a repository in `places` (folders that
+    may be a clone, or a bare repository) whose `gitdir` file names `target`, the worktree's own `.git` file. None
+    when there is none. Raises Unreadable when a folder that is there cannot be read."""
+    wanted = {os.path.normpath(target), os.path.realpath(target)}
+    for place in places:
+        for git_dir in (os.path.join(place, '.git'), place):
+            admin = os.path.join(git_dir, 'worktrees')
+            try:
+                names = sorted(os.listdir(admin))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as ex:
+                raise Unreadable(f'{ex.filename or admin}: {ex.strerror}') from None
+            for name in names:
+                try:
+                    with open(os.path.join(admin, name, 'gitdir'), errors='surrogateescape') as f:
+                        named = f.read().strip()
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                except OSError as ex:
+                    raise Unreadable(f'{ex.filename}: {ex.strerror}') from None
+                if os.path.normpath(os.path.join(admin, name, named)) in wanted:
+                    return os.path.join(admin, name)
+    return None
+
+
+def orphan_doubt(folder, gone, mounts, roots=()):
+    """Why the worktree `folder`, whose git folder `gone` is not there (orphaned_worktree), may still have one
+    somewhere: its HEAD, index and reflog, maybe a commit only that folder names. None only when it is provably
+    orphaned (#519):
+    - its `.git` file names the git folder by a full path (a relative one breaks when the worktree is moved);
+    - the deepest part of that path that is there is a real folder (no link, broken or not, on the way), on the
+      worktree's own filesystem, and is no mount point, so the path is not on a drive that is not mounted now (one
+      /etc/fstab names, or one under REMOVABLE with nothing mounted there);
+    - no repository in that folder, in the folders right in it or right in `roots` (the configured repository
+      folders) has a worktree entry that names this worktree: the repository was not renamed or moved there.
+    Raises Unreadable when something it must read cannot be read."""
+    named = _gitdir_line(folder)
+    if named is None:
+        return 'its .git file cannot be read again'
+    if not os.path.isabs(named):
+        return f'its .git file names its git folder by a relative path ({named}): the worktree may have been moved'
+    there = gone
+    while True:
+        there = os.path.dirname(there)
+        try:
+            st = os.lstat(there)
+            break
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as ex:
+            raise Unreadable(f'{ex.filename or there}: {ex.strerror}') from None
+    if stat.S_ISLNK(st.st_mode):
+        return f'{there} is a symbolic link to what is not there now (a broken link)'
+    if not stat.S_ISDIR(st.st_mode):
+        return f'{there} is not a folder'
+    if os.path.realpath(there) != there:
+        return f'{there} is reached through a link'
+    try:
+        own = os.lstat(folder)
+    except OSError as ex:
+        raise Unreadable(f'{ex.filename or folder}: {ex.strerror}') from None
+    if st.st_dev != own.st_dev:
+        return f'{there} is on another filesystem than the worktree'
+    if there in mounts.points:
+        return f'{there} is a mount point: what is mounted there may not be what was'
+    if mounts.fstab is None:
+        return 'could not read /etc/fstab: a drive it names may not be mounted now'
+    inside = lambda path, top: path == top or path.startswith(top.rstrip('/') + '/')
+    for point in sorted(mounts.fstab):
+        if point not in mounts.points and inside(gone, point):
+            return f'{point} is in /etc/fstab and is not mounted now'
+    holder = max((p for p in mounts.points if inside(there, p)), key=len, default='/')
+    for top in REMOVABLE:
+        if inside(gone, top) and not (holder != top and inside(holder, top)):
+            return f'{gone} is under {top}, where drives are mounted, and no drive is mounted there now'
+    places = [there]
+    for parent in [there, *sorted(set(roots))]:
+        try:
+            places += [os.path.join(parent, name) for name in sorted(os.listdir(parent))]
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as ex:
+            raise Unreadable(f'{ex.filename or parent}: {ex.strerror}') from None
+    entry = _admin_entry(places, os.path.join(folder, '.git'))
+    if entry is not None:
+        return f'{entry} still names it: the repository was moved or renamed (git worktree repair there)'
     return None
 
 
@@ -529,6 +654,19 @@ def local_tags(cwd, bare=False):
             raise Unreadable(f'for-each-ref: a line it cannot use: {line[:80]!r}')
         tags[ref] = oid
     return tags
+
+
+def local_branches(cwd):
+    """{name: oid} of the repository's own branches (refs/heads). A branch that is a symbolic ref is left out: it
+    names another branch and is no branch of its own."""
+    branches = {}
+    for line in git(cwd, 'for-each-ref', '--format=%(objectname)%09%(symref)%09%(refname)', 'refs/heads').splitlines():
+        oid, symref, ref = (line.split('\t') + ['', ''])[:3]
+        if not OID.match(oid) or not ref.startswith('refs/heads/'):
+            raise Unreadable(f'for-each-ref: a line it cannot use: {line[:80]!r}')
+        if not symref:
+            branches[ref[len('refs/heads/'):]] = oid
+    return branches
 
 
 def remotes(cwd, bare=False):
@@ -604,6 +742,57 @@ def remove_worktree(common_dir, path):
         # failure while removing says "failed to delete", and a killed git has no exit code of its own.
         refused = done.returncode == 128 and 'failed to delete' not in done.stderr
         raise (Untouched if refused else Unreadable)(f'worktree: exit {done.returncode}: {_first_line(done.stderr)}')
+
+
+def symbolic_refs(cwd):
+    """{ref: the ref it points at} of every symbolic ref of the repository (`git symbolic-ref`), such as a branch
+    that is only another name of a branch."""
+    out = {}
+    for line in git(cwd, 'for-each-ref', '--format=%(refname)%09%(symref)').splitlines():
+        ref, _, target = line.partition('\t')
+        if not ref:
+            raise Unreadable(f'for-each-ref: a line it cannot use: {line[:80]!r}')
+        if target:
+            out[ref] = target
+    return out
+
+
+def branch_config(cwd, branch):
+    """[(key, value)] of the repository's own config section of the branch, `branch.<name>.*` (its upstream)."""
+    head = 'branch.' + branch + '.'
+    out = []
+    for entry in git(cwd, 'config', '--local', '--null', '--list').split('\0'):
+        key, _, value = entry.partition('\n')
+        if key.startswith(head) and '.' not in key[len(head):]:
+            out.append((key, value))
+    return out
+
+
+def remove_branch(cwd, branch, oid):
+    """Deletes the local branch (and its reflog) with `git update-ref -d` only while it still points at `oid`, the
+    commit the last check judged: a branch that moved since is left as it is (Untouched, exit 1). Then its config
+    section (`branch.<name>.*`, its upstream), as `git branch -d` does, but only while it is the section of the
+    branch just deleted: when a branch of that name is there again, or the section changed after it was read before
+    the delete, the section is the new branch's and stays."""
+    try:
+        before = branch_config(cwd, branch)
+    except Unreadable as ex:
+        raise Untouched(f'its config section: {ex}: nothing removed') from None
+    done = _git(cwd, ('update-ref', '--no-deref', '-d', 'refs/heads/' + branch, oid), False, None)
+    if done.returncode != 0:
+        refused = done.returncode == 1  # expected oid
+        raise (Untouched if refused else Unreadable)(f'update-ref: exit {done.returncode}: {_first_line(done.stderr)}'
+                                                     + (': nothing removed' if refused else ''))
+    try:
+        again = git_code(cwd, 'show-ref', '--verify', '--quiet', 'refs/heads/' + branch) == 0
+        if not before or again or branch_config(cwd, branch) != before:   # none, or a new branch's
+            return
+    except Unreadable as ex:
+        raise Unreadable(f'the branch is deleted; its config section branch.{branch} stays: {ex}') from None
+    done = _git(cwd, ('config', '--local', '--remove-section', 'branch.' + branch), False, None)
+    if done.returncode != 0 and 'no such section' not in done.stderr:
+        raise Unreadable(f'the branch is deleted; its config section branch.{branch} stays: config: exit '
+                         f'{done.returncode}: {_first_line(done.stderr)}')
 
 
 # --- GitHub -------------------------------------------------------------------------------------------------------

@@ -4,7 +4,7 @@ refusal in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/guard.test.py
 """
-import fcntl, os, subprocess, sys, unittest
+import fcntl, os, shutil, subprocess, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -471,6 +471,191 @@ class GitFolders(GuardCase):
         self.git(repo, 'tag', '-f', 'moved')                                    # the same name, another commit
         self.refused(d, 'git: tags not pushed', 'moved')
 
+    def orphan(self, name='agent-tree', into=None):
+        """A worktree in the temp folder whose main repository was removed: its .git file names a git folder that is
+        gone, with the history (a commit made in it too) that only that folder had."""
+        clone = self.clone(f'main-of-{name}', into=self.mkdir('elsewhere'))
+        tree = self.worktree(clone, name, into=into or self.tmp)
+        self.commit(tree)
+        shutil.rmtree(clone)
+        return self.age(tree, 30)
+
+    def test_an_orphaned_worktree_in_the_temp_folder_holds_no_commit_and_goes_by_age(self):
+        """#519: its commits, index and HEAD were in the git folder that is gone; the folder holds only files. The tmp
+        rule takes it like a plain folder of the pattern, once nothing in it changed for the pattern's days."""
+        tree = self.orphan()
+        cfg = self.tmp_cfg({'agent-*': 7})
+        item = self.assertDeletes(self.plan(cfg), tree, 'tmp')
+        self.assertIn('orphaned worktree', item.why)
+        self.file(os.path.join(tree, 'new.txt'))                    # changed today: too new
+        self.assertNotCandidate(self.plan(cfg), tree)
+        self.age(tree, 30)
+        self.assertNotCandidate(self.plan(self.tmp_cfg({'job-*': 7})), tree)      # no pattern takes it
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 0, lines)
+        self.assertFalse(os.path.lexists(tree))
+        code, lines = self.run_cleaner(cfg)                         # runs again: nothing left
+        self.assertEqual(code, 0, lines)
+        self.assertEqual([line for line in lines if line.startswith('deleted ')], [])
+
+    def test_an_orphaned_worktree_inside_a_temp_entry_goes_too(self):
+        job = self.mkdir('tmp', 'job-1')
+        self.orphan('tree', into=job)
+        self.age(job, 30)
+        self.assertDeletes(self.plan(self.tmp_cfg({'job-*': 7})), job, 'tmp')
+
+    def test_every_other_refusal_still_keeps_an_orphaned_worktree(self):
+        tree = self.orphan()
+        inner = self.clone('inner', into=tree)                      # a clone of its own inside, with a commit only here
+        self.commit(inner)
+        self.age(tree, 30)
+        cfg = self.tmp_cfg({'agent-*': 7})
+        self.assertKept(self.plan(cfg), tree, 'git: unpushed commits', 'inner')
+        self.push(inner)
+        self.age(tree, 30)
+        self.assertDeletes(self.plan(cfg), tree)
+        for name, code in (('KEEP', 'KEEP file'), ('.env', 'credential name')):
+            with self.subTest(name=name):
+                self.file(os.path.join(tree, name), 'mine\n')
+                self.age(tree, 30)
+                try:
+                    self.assertKept(self.plan(cfg), tree, code)
+                finally:
+                    os.unlink(os.path.join(tree, name))
+                    self.age(tree, 30)
+        self.busy.update(self.c.facts.ancestors(os.path.join(tree, 'README.md')))
+        self.assertKept(self.plan(cfg), tree, 'in use')
+
+    def test_the_guard_alone_keeps_an_orphaned_worktree(self):
+        """Only the tmp rule passes an orphaned worktree; the guard's own answer (agent-scratch asks it so) keeps it."""
+        tree = self.orphan()
+        self.refused(tree, 'orphaned worktree', 'is gone')
+
+    # --- #524: only a provably orphaned worktree goes ----------------------------------------------------------
+    def detached_work(self, name='agent-x', parent=None):
+        """(clone, tree): a worktree in the temp folder, of a clone in `parent` (elsewhere/), with a detached commit
+        made in it and never pushed: only the clone's admin entry for the worktree (its HEAD and reflog) names it."""
+        clone = self.clone(f'main-of-{name}', into=parent or self.mkdir('elsewhere'))
+        tree = self.worktree(clone, name, into=self.tmp)
+        self.git(tree, 'checkout', '-q', '--detach')
+        self.commit(tree, 'only-here.txt')
+        return clone, tree
+
+    def test_a_worktree_whose_repository_was_moved_is_kept(self):
+        """The review's repro: the repository was renamed, not removed; its admin entry for the worktree still holds
+        the detached commit. Deleting the folder would let `git worktree prune` (gc) drop that commit for good."""
+        clone, tree = self.detached_work()
+        lost = self.head(tree)
+        os.rename(clone, clone + '-moved')
+        self.age(tree, 30)
+        cfg = self.tmp_cfg({'agent-*': 7})
+        self.assertKept(self.plan(cfg), tree, 'unknown parent', 'was moved or renamed (git worktree repair there)')
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 0, lines)                            # no error: it is kept, and says why
+        self.assertTrue(os.path.isdir(tree))
+        self.git(clone + '-moved', 'worktree', 'repair', tree)     # the way back: git judges it again
+        self.assertEqual(self.head(tree), lost)
+        self.age(tree, 30)
+        self.assertKept(self.plan(cfg), tree, 'git: worktrees')
+
+    def test_a_repository_moved_into_a_configured_folder_keeps_its_worktree(self):
+        clone, tree = self.detached_work()
+        os.rename(clone, os.path.join(self.trees, 'moved'))
+        self.age(tree, 30)
+        cfg = self.cfg(tmp={'root': self.tmp, 'patterns': {'agent-*': 7}},
+                       worktrees={'repos': [{'root': self.trees, 'github': fx.REPO}]})
+        self.assertKept(self.plan(cfg), tree, 'unknown parent', 'was moved or renamed')
+
+    def test_a_drive_that_is_not_mounted_now_keeps_the_worktree(self):
+        drive = self.mkdir('elsewhere', 'drive')
+        _, tree = self.detached_work(parent=drive)
+        shutil.rmtree(drive)                                        # not mounted: the empty mount point is left
+        os.mkdir(drive)
+        self.age(tree, 30)
+        cfg = self.tmp_cfg({'agent-*': 7})
+        self.fstab_points = {drive}
+        self.assertKept(self.plan(cfg), tree, 'unknown parent', 'is in /etc/fstab and is not mounted now')
+        self.mount_points = {'/', drive}                            # mounted, and what was there is not
+        self.assertKept(self.plan(cfg), tree, 'unknown parent', 'is a mount point')
+        self.mount_points = {'/'}
+        self.fstab_points = None
+        self.assertKept(self.plan(cfg), tree, 'unknown parent', 'could not read /etc/fstab')
+
+    def test_a_drive_place_with_nothing_mounted_keeps_the_worktree(self):
+        """Under /mnt, /media or /run/media (WSL's /mnt/c, a USB drive), a missing folder may be a drive that is not
+        mounted now. Only a drive mounted there now shows the folder is gone."""
+        top = self.mkdir('elsewhere', 'mnt')
+        _, tree = self.detached_work(parent=self.mkdir('elsewhere', 'mnt', 'd', 'repos'))
+        shutil.rmtree(self.path('elsewhere', 'mnt', 'd'))
+        self.age(tree, 30)
+        cfg = self.tmp_cfg({'agent-*': 7})
+        with mock.patch.object(self.c.facts, 'REMOVABLE', (top,)):
+            self.assertKept(self.plan(cfg), tree, 'unknown parent', 'where drives are mounted')
+            os.makedirs(self.path('elsewhere', 'mnt', 'd', 'repos'))
+            self.age(tree, 30)
+            self.mount_points = {'/', self.path('elsewhere', 'mnt', 'd')}      # the drive is there: the repo is gone
+            self.assertDeletes(self.plan(cfg), tree, 'tmp')
+
+    def test_a_link_on_the_way_keeps_the_worktree(self):
+        """A broken link (a drive or folder a link leads to is not there now), or a relative gitdir: line."""
+        real = self.mkdir('elsewhere', 'real')
+        clone, tree = self.detached_work(parent=real)
+        os.symlink(real, self.path('elsewhere', 'link'))
+        dot = os.path.join(tree, '.git')
+        with open(dot) as f:
+            named = f.read().split('gitdir: ', 1)[1].strip()
+        with open(dot, 'w') as f:
+            f.write('gitdir: ' + named.replace(real, self.path('elsewhere', 'link'), 1) + '\n')
+        os.rename(real, real + '-elsewhere')                       # the link now leads nowhere
+        self.age(tree, 30)
+        cfg = self.tmp_cfg({'agent-*': 7})
+        self.assertKept(self.plan(cfg), tree, 'unknown parent', 'a broken link')
+        with open(dot, 'w') as f:
+            f.write('gitdir: ../gone/.git/worktrees/agent-x\n')
+        self.age(tree, 30)
+        self.assertKept(self.plan(cfg), tree, 'unknown parent', 'by a relative path')
+
+    def test_another_filesystem_keeps_the_worktree(self):
+        clone, tree = self.detached_work()
+        shutil.rmtree(clone)
+        self.age(tree, 30)
+        there, real = os.path.dirname(clone), os.lstat
+
+        def lstat(path, *args, **kw):
+            st = real(path, *args, **kw)
+            if path != there:
+                return st
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, st.st_nlink, st.st_uid, st.st_gid,
+                                   st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+        cfg = self.tmp_cfg({'agent-*': 7})
+        with mock.patch.object(self.c.facts.os, 'lstat', lstat):
+            self.assertKept(self.plan(cfg), tree, 'unknown parent', 'on another filesystem')
+        self.assertDeletes(self.plan(cfg), tree, 'tmp')
+
+    def test_a_pruned_entry_of_a_repository_that_is_there_is_an_orphan(self):
+        """The repository is there and has no entry for the worktree (git worktree prune): nothing names its HEAD."""
+        clone, tree = self.detached_work()
+        shutil.rmtree(os.path.join(clone, '.git', 'worktrees', 'agent-x'))
+        self.age(tree, 30)
+        self.assertDeletes(self.plan(self.tmp_cfg({'agent-*': 7})), tree, 'tmp')
+
+    def test_a_folder_it_cannot_search_means_keep(self):
+        clone, tree = self.detached_work()
+        shutil.rmtree(clone)
+        locked = self.mkdir('elsewhere', 'locked', '.git')
+        os.chmod(os.path.dirname(locked), 0)
+        self.addCleanup(os.chmod, os.path.dirname(locked), 0o700)
+        self.age(tree, 30)
+        if os.access(locked, os.R_OK):
+            self.skipTest('runs as root: a folder of mode 0 can still be read')
+        self.assertKept(self.plan(self.tmp_cfg({'agent-*': 7})), tree, 'could not read', 'whether its git folder')
+
+    def test_fstab_is_read_with_its_escapes(self):
+        tab = self.file(self.path('fstab'), '# comment\nUUID=1 / ext4 defaults 0 1\n/dev/sdb1 /mnt/my\\040drive auto noauto 0 0\n'
+                                              '/swap.img none swap sw 0 0\n\n')
+        self.assertEqual(self.c.facts.read_fstab(tab), {'/', '/mnt/my drive'})
+        self.assertEqual(self.c.facts.read_fstab(self.path('no-fstab')), set())
+
     def test_a_git_link_is_never_passed_over(self):
         d, repo = self.job()
         work = self.mkdir('tmp', 'job-2', 'w')
@@ -658,6 +843,40 @@ MUTATIONS = {
     'git: uncommitted or untracked': ('guard', "if not bare and git(where, 'status'", "if False and git(where, 'status'",
                                       GitFolders, 'test_uncommitted_and_untracked_changes'),
     'git: unpushed commits': ('guard', 'if alone:  # tmp', 'if False:', GitFolders, 'test_unpushed_commits'),
+    'orphan: passed over only for the tmp rule': ('guard', 'if not orphans:', 'if False:', GitFolders,
+                                                   'test_the_guard_alone_keeps_an_orphaned_worktree'),
+    'orphan: the tmp rule passes it over': ('rules', "look = guard.examine(cfg, facts, path, 'path', orphans=True)",
+                                            "look = guard.examine(cfg, facts, path, 'path')", GitFolders,
+                                            'test_an_orphaned_worktree_in_the_temp_folder_holds_no_commit_and_goes_by_age'),
+    'orphan: every other git folder is still judged': ('guard', 'look.orphans.append((os.path.relpath(where, path), gone))\n                continue',
+                                                       'look.orphans.append((os.path.relpath(where, path), gone))\n                break',
+                                                       GitFolders, 'test_every_other_refusal_still_keeps_an_orphaned_worktree'),
+    'orphan: only when provable': ('guard', 'if doubt is not None:', 'if False:', GitFolders,
+                                   'test_a_worktree_whose_repository_was_moved_is_kept'),
+    'orphan: a moved repository': ('facts', 'if entry is not None:', 'if False:', GitFolders,
+                                   'test_a_worktree_whose_repository_was_moved_is_kept'),
+    'orphan: the configured folders': ('facts', 'for parent in [there, *sorted(set(roots))]:', 'for parent in [there]:',
+                                       GitFolders, 'test_a_repository_moved_into_a_configured_folder_keeps_its_worktree'),
+    'orphan: a drive in fstab': ('facts', 'if point not in mounts.points and inside(gone, point):', 'if False:', GitFolders,
+                                 'test_a_drive_that_is_not_mounted_now_keeps_the_worktree'),
+    'orphan: a mount point': ('facts', 'if there in mounts.points:', 'if False:', GitFolders,
+                              'test_a_drive_that_is_not_mounted_now_keeps_the_worktree'),
+    'orphan: fstab unreadable': ('facts', 'if mounts.fstab is None:', 'if False:', GitFolders,
+                                 'test_a_drive_that_is_not_mounted_now_keeps_the_worktree'),
+    'orphan: a drive place': ('facts', 'if inside(gone, top) and not (holder != top and inside(holder, top)):', 'if False:',
+                              GitFolders, 'test_a_drive_place_with_nothing_mounted_keeps_the_worktree'),
+    'orphan: a mounted drive place': ('facts', 'if inside(gone, top) and not (holder != top and inside(holder, top)):',
+                                      'if inside(gone, top):', GitFolders, 'test_a_drive_place_with_nothing_mounted_keeps_the_worktree'),
+    'orphan: a link on the way': ('facts', "if stat.S_ISLNK(st.st_mode):\n        return f'{there} is a symbolic link to what is not there now (a broken link)'\n"
+                                  "    if not stat.S_ISDIR(st.st_mode):\n        return f'{there} is not a folder'\n"
+                                  "    if os.path.realpath(there) != there:\n        return f'{there} is reached through a link'\n", 'pass\n',
+                                  GitFolders, 'test_a_link_on_the_way_keeps_the_worktree'),
+    'orphan: a relative gitdir': ('facts', 'if not os.path.isabs(named):', 'if False:', GitFolders,
+                                  'test_a_link_on_the_way_keeps_the_worktree'),
+    'orphan: another filesystem': ('facts', 'if st.st_dev != own.st_dev:', 'if False:', GitFolders,
+                                   'test_another_filesystem_keeps_the_worktree'),
+    'orphan: unreadable means keep': ('guard', "return Refusal('could not read', f'{shown}: whether its git folder {gone} is gone ({ex})')",
+                                      'doubt = None', GitFolders, 'test_a_folder_it_cannot_search_means_keep'),
     'git: reflog commits': ('guard', "lonely(where, ['--all', '--reflog'], sorted(", "lonely(where, ['--all'], sorted(",
                             GitFolders, 'test_a_commit_only_the_reflog_still_has'),
     'git: a live answer, not tracking refs': ('guard', "lonely(where, ['--all', '--reflog'], sorted(present(where, has, bare)), bare)",
