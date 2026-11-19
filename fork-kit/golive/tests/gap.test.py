@@ -378,12 +378,13 @@ class CopyBackstop(copy_t.CopyBase):
         self.adapter.after_stop, self.adapter.before_start = ['old'], []
 
     def test_a_hand_server_in_the_gap_fails_the_copy_soon_and_says_what_to_do(self):
-        began = time.monotonic()
         with self.assertRaises(Exception) as cm:  # its owner lock first: the stop step cannot take it
             self.copy()
-        self.assertLess(time.monotonic() - began, coldcopy.STOP_WAIT + coldcopy.START_WAIT)
         [pid] = self.race.hands
         said = '\n'.join([str(cm.exception), *getattr(cm.exception, '__notes__', ())])
+        # soon: the backstop named it, the start did not wait START_WAIT out (a bound on the wall clock instead failed
+        # under load, #546)
+        self.assertNotIn(f'within {coldcopy.START_WAIT} s', said)
         self.assertIn(f'T3 did not come back: a T3 server the boot service did not start holds the home: pid {pid}',
                       said)
         self.assertRegex(said, f'first quit or disconnect the T3 desktop app .*, then `kill {pid}`, then '
