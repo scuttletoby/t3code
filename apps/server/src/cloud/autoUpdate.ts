@@ -743,6 +743,41 @@ export const runningTerminalCommands = Effect.fn("cloud.auto_update.runningTermi
   },
 );
 
+/**
+ * Counts what is working on this server now: every thread's runs, requests and background work (the
+ * threads startup recovery would look at) and the running terminal commands. One count for the
+ * automatic updater and the activity probe (fork/activityProbe.ts), so both mean the same "busy".
+ * It fails, rather than counting zero, when thread state cannot be read.
+ */
+export const makeActivityCounter = Effect.fn("cloud.auto_update.makeActivityCounter")(
+  function* (input: {
+    readonly projections: Pick<
+      ProjectionStore.ProjectionStoreV2["Service"],
+      "getRecoveryThreadIds" | "getRuntimeRecoveryProjection"
+    >;
+    readonly terminals: Pick<TerminalManager.TerminalManager["Service"], "subscribeMetadata">;
+  }) {
+    const terminalCommands = yield* runningTerminalCommands(input.terminals);
+    const threadWork = input.projections.getRecoveryThreadIds("runtime").pipe(
+      Effect.flatMap((threadIds) =>
+        Effect.forEach(
+          threadIds,
+          (threadId) =>
+            input.projections
+              .getRuntimeRecoveryProjection(threadId)
+              .pipe(Effect.map(threadActivity)),
+          { concurrency: 2 },
+        ),
+      ),
+      Effect.map((each) => each.reduce(addActivity, noActivity)),
+    );
+    return Effect.gen(function* () {
+      const threads = yield* threadWork;
+      return { ...threads, terminalCommands: yield* terminalCommands };
+    });
+  },
+);
+
 const make = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const launcher = yield* ServiceLauncherClient.ServiceLauncherClient;
@@ -760,23 +795,11 @@ const make = Effect.gen(function* () {
   const channel = cliReleaseChannelOf(packageJson.version);
   const statePath = path.join(serverConfig.baseDir, "runtime", SERVICE_STATE_FILE);
 
-  const terminalCommands = yield* runningTerminalCommands(terminals);
-
-  const threadWork = projections.getRecoveryThreadIds("runtime").pipe(
-    Effect.flatMap((threadIds) =>
-      Effect.forEach(
-        threadIds,
-        (threadId) =>
-          projections.getRuntimeRecoveryProjection(threadId).pipe(Effect.map(threadActivity)),
-        { concurrency: 2 },
-      ),
-    ),
-    Effect.map((each) => each.reduce(addActivity, noActivity)),
+  const countActivity = yield* makeActivityCounter({ projections, terminals });
+  const activity = countActivity.pipe(
+    Effect.map(activityReason),
+    Effect.orElseSucceed(() => "thread state could not be read"),
   );
-  const activity = Effect.gen(function* () {
-    const threads = yield* threadWork;
-    return activityReason({ ...threads, terminalCommands: yield* terminalCommands });
-  }).pipe(Effect.orElseSucceed(() => "thread state could not be read"));
 
   const askHook = (command: string, targetVersion: string) => {
     if (command === "") return Effect.succeed(null);

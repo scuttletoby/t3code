@@ -409,7 +409,7 @@ def _update(run, cfg, adapter, t3, version, say):
         # the fixed environment (no release server can be pointed elsewhere), and the child dies with this run;
         # the update restarts T3, and the owner lock W1 holds goes to its new launcher (handoff.py)
         code, out, err = handoff.starting(cfg.home, lambda: live.run_t3(argv, UPDATE_TIMEOUT, cwd=cfg.home),
-                                          version)
+                                          version, adapter.service)
         if code is None:
             raise RuntimeError(f'{t3} update failed: {err.strip()[-300:]}')
         facts['exit'] = code
