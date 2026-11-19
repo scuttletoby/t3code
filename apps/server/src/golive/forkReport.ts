@@ -103,6 +103,8 @@ export interface ForkReport {
       readonly playtest: "on" | "off";
       /** The policy's mode; an invalid value reads as `enforce` (nothing allowed), as the load does. */
       readonly modelPolicy: "off" | "advise" | "enforce";
+      /** The read-only "is T3 busy?" route (`__fork-report --activity` asks it). */
+      readonly activityProbe: "on" | "off";
     };
     readonly featuresOn: ReadonlyArray<string>;
     /**
@@ -492,6 +494,7 @@ function readSettings(
     handoff: onOff("handoff"),
     playtest: onOff("playtest"),
     modelPolicy: settings.modelPolicy.mode,
+    activityProbe: onOff("activityProbe"),
   } as const;
   return {
     settings: {
@@ -515,6 +518,7 @@ function readSettings(
       ),
       keysInFile,
       settings: {
+        activityProbe: settings.activityProbe,
         automaticUpdates: settings.automaticUpdates,
         automaticUpdatesQuietCommandSet: settings.automaticUpdatesQuietCommand !== "",
         usagePacing: settings.usagePacing,
@@ -566,6 +570,7 @@ function whereEachFeature(
     automaticUpdates: server(settings.automaticUpdates),
     ...perProject,
     modelPolicy: server(settings.modelPolicy.mode !== "off"),
+    activityProbe: server(settings.activityProbe),
   };
 }
 

@@ -2,6 +2,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
@@ -26,6 +27,7 @@ import { Command } from "effect/cli";
 import { vi } from "vite-plus/test";
 
 import { cli } from "../binCli.ts";
+import { ACTIVITY_PROBE_PATH, ACTIVITY_PROBE_VERSION } from "../fork/activityProbe.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
@@ -623,6 +625,7 @@ describe("__fork-report on old, newer and empty state", () => {
       handoff: "off",
       playtest: "off",
       modelPolicy: "off",
+      activityProbe: "off",
     });
     expect(report.ok).toBe(true);
   });
@@ -867,6 +870,14 @@ describe("__fork-report settings", () => {
     });
     // A command line is never printed.
     expect(JSON.stringify(report)).not.toContain("/secret/path");
+  });
+
+  it("names the activity probe when on, as a server switch", () => {
+    const report = settingsReport({ activityProbe: true });
+    expect(report.fork.features.activityProbe).toBe("on");
+    expect(report.fork.featuresOn).toEqual(["activityProbe"]);
+    expect(report.fork.featuresWhere).toEqual({ activityProbe: ["server"] });
+    expect(report.fork.settings).toMatchObject({ activityProbe: true });
   });
 
   it("names review rules, handoff and playtest when on, also from one project's override", () => {
@@ -1306,6 +1317,7 @@ describe("__fork-report contract", () => {
       "settings",
     ]);
     expect(keys(report.fork.features)).toEqual([
+      "activityProbe",
       "agentSlots",
       "automaticUpdates",
       "handoff",
@@ -1317,6 +1329,7 @@ describe("__fork-report contract", () => {
     ]);
     expect(keys(report.fork.settings)).toEqual(
       [
+        "activityProbe",
         "agentSlots",
         "automaticUpdates",
         "automaticUpdatesQuietCommandSet",
@@ -1332,4 +1345,123 @@ describe("__fork-report contract", () => {
     // The whole report is plain JSON: it survives a round trip unchanged.
     expect(JSON.parse(formatForkReport(report))).toEqual(report);
   });
+});
+
+describe("__fork-report --activity", () => {
+  const activityThroughCli = (home: string) =>
+    Effect.gen(function* () {
+      const before = process.exitCode;
+      process.exitCode = 0;
+      let exitCode: number | string | null | undefined;
+      const lines = yield* runCli(["__fork-report", "--base-dir", home, "--activity"]).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            exitCode = process.exitCode;
+            process.exitCode = before;
+          }),
+        ),
+      );
+      return { lines, reading: JSON.parse(lines.join("\n")), exitCode };
+    });
+
+  /** A local server answering the probe path as a running T3 would, recorded in the home. */
+  const serveProbe = (
+    home: string,
+    body: unknown,
+    respond: NodeHttp.RequestListener = (request, response) => {
+      response.writeHead(request.url === ACTIVITY_PROBE_PATH ? 200 : 404, {
+        "content-type": "application/json",
+      });
+      response.end(JSON.stringify(body));
+    },
+  ) =>
+    Effect.acquireRelease(
+      Effect.promise(
+        () =>
+          new Promise<NodeHttp.Server>((resolve) => {
+            const server = NodeHttp.createServer(respond);
+            server.listen(0, "127.0.0.1", () => resolve(server));
+          }),
+      ),
+      (server) =>
+        Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve()))),
+    ).pipe(
+      Effect.tap((server) =>
+        Effect.sync(() => {
+          const address = server.address();
+          const port = typeof address === "object" && address !== null ? address.port : 0;
+          NodeFS.writeFileSync(
+            NodePath.join(home, "userdata", "server-runtime.json"),
+            JSON.stringify({
+              version: 1,
+              pid: process.pid,
+              port,
+              origin: `http://127.0.0.1:${port}`,
+              startedAt: "2026-11-19T10:00:00.000Z",
+            }),
+          );
+        }),
+      ),
+    );
+
+  const answer = (quiet: boolean) => ({
+    probeVersion: ACTIVITY_PROBE_VERSION,
+    quiet,
+    reason: quiet ? null : "1 running turn",
+    state: "running",
+    pid: process.pid,
+    serverVersion: "0.0.0",
+    activity: {
+      activeRuns: quiet ? 0 : 1,
+      queuedRuns: 0,
+      pendingRequests: 0,
+      backgroundTasks: 0,
+      terminalCommands: 0,
+    },
+  });
+
+  it.effect("prints one line and exits 1 for a stopped home, writing nothing", () =>
+    Effect.gen(function* () {
+      const home = makeHome();
+      const before = snapshot(home);
+      const { lines, reading, exitCode } = yield* activityThroughCli(home);
+      expect(lines).toHaveLength(1);
+      expect(reading).toMatchObject({ quiet: false, state: "stopped" });
+      expect(exitCode).toBe(1);
+      expect(snapshot(home)).toEqual(before);
+    }),
+  );
+
+  it.effect("exits 0 only when the running server says it is quiet", () =>
+    Effect.gen(function* () {
+      const quietHome = makeHome();
+      yield* serveProbe(quietHome, answer(true));
+      const quiet = yield* activityThroughCli(quietHome);
+      expect(quiet.reading).toMatchObject({ quiet: true, state: "quiet" });
+      expect(quiet.exitCode).toBe(0);
+
+      const busyHome = makeHome();
+      yield* serveProbe(busyHome, answer(false));
+      const busy = yield* activityThroughCli(busyHome);
+      expect(busy.reading).toMatchObject({ quiet: false, state: "busy", reason: "1 running turn" });
+      expect(busy.exitCode).toBe(1);
+      // The reason comes first, so a hook that keeps the first 200 characters keeps it.
+      expect(String(busy.lines[0])).toMatch(/^\{"quiet":false,"reason":"1 running turn"/);
+    }).pipe(Effect.scoped),
+  );
+
+  // T3 sends the headers and then closes mid-body (for example while shutting down).
+  it.effect("prints its one JSON line and exits 1 when the answer is cut off mid-body", () =>
+    Effect.gen(function* () {
+      const home = makeHome();
+      yield* serveProbe(home, null, (_request, response) => {
+        response.writeHead(200, { "content-type": "application/json", "content-length": "500" });
+        response.write('{"probeVersion":1,', () => response.socket?.destroy());
+      });
+      const { lines, reading, exitCode } = yield* activityThroughCli(home);
+      expect(lines).toHaveLength(1);
+      expect(reading).toMatchObject({ quiet: false, state: "unreachable" });
+      expect(exitCode).toBe(1);
+    }).pipe(Effect.scoped),
+  );
 });
