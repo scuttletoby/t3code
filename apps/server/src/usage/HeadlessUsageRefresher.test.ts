@@ -658,6 +658,74 @@ describe("HeadlessUsageRefresher", () => {
     }),
   );
 
+  it.effect("with an interval longer than two hours, a streak lasts that interval overdue", () =>
+    Effect.gen(function* () {
+      // Interval 3 h: the failure at T retries at T+3h. Back past that retry by `overdue`.
+      const interval = 3 * HOUR;
+      const settings = settingsWith({ headlessUsageRefreshInterval: interval });
+      const cases = [
+        [2 * HOUR + 1, false],
+        [3 * HOUR, false],
+        [3 * HOUR + 1, true],
+      ] as const;
+      for (const [overdue, newStreak] of cases) {
+        const label = `overdue ${overdue} ms`;
+        yield* startAt(NOW_MS);
+        let signedOut = false;
+        const fake = fakeTarget(provider(NOW_MS - interval), {
+          checksOnInterval: () => !signedOut,
+        });
+        fake.setOutcome("noReading");
+        const log = logCollector();
+        const { sweep } = yield* make(
+          deps([fake.target], { getSettings: Effect.succeed(settings) }),
+        );
+        const at = (ms: number) =>
+          TestClock.setTime(NOW_MS + ms).pipe(Effect.andThen(sweep), Effect.provide(log.layer));
+        yield* at(0);
+        assert.equal(log.warnings.length, 1, label);
+        signedOut = true;
+        fake.setSnapshot(provider(NOW_MS, { auth: { status: "unauthenticated" } }));
+        const backAt = interval + overdue;
+        for (let ms = HOUR; ms < backAt; ms += HOUR) yield* at(ms);
+        assert.equal(fake.calls(), 1, label);
+        signedOut = false;
+        fake.setSnapshot(provider(NOW_MS + backAt - interval));
+        yield* at(backAt);
+        assert.equal(fake.calls(), 2, label);
+        assert.equal(log.warnings.length, newStreak ? 2 : 1, label);
+      }
+    }),
+  );
+
+  it.effect("a good refresh after an expired streak does not log works again", () =>
+    Effect.gen(function* () {
+      yield* startAt(NOW_MS);
+      let signedOut = false;
+      const fake = fakeTarget(provider(NOW_MS - HOUR), { checksOnInterval: () => !signedOut });
+      fake.setOutcome("noReading");
+      const log = logCollector();
+      const { sweep } = yield* make(deps([fake.target]));
+      const at = (ms: number) =>
+        TestClock.setTime(NOW_MS + ms).pipe(Effect.andThen(sweep), Effect.provide(log.layer));
+      yield* at(0);
+      signedOut = true;
+      fake.setSnapshot(provider(NOW_MS, { auth: { status: "unauthenticated" } }));
+      yield* at(36 * HOUR);
+      signedOut = false;
+      fake.setSnapshot(provider(NOW_MS + 72 * HOUR - HOUR));
+      fake.setOutcome("ok");
+      yield* at(72 * HOUR);
+      assert.equal(fake.calls(), 2);
+      assert.deepEqual(log.infos, []);
+      // The streak is gone: the next failure is a new outage, logged again.
+      fake.setOutcome("noReading");
+      yield* at(73 * HOUR + INTERVAL);
+      assert.equal(fake.calls(), 3);
+      assert.equal(log.warnings.length, 2);
+    }),
+  );
+
   it.effect("a sweep in the same millisecond as a failed refresh waits out the backoff", () =>
     Effect.gen(function* () {
       yield* startAt(NOW_MS);

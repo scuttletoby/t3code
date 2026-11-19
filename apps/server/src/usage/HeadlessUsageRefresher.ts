@@ -156,7 +156,9 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
         ? undefined
         : recorded;
     if (ok) {
-      yield* endStreak(target.instanceId);
+      // An expired streak is already over: drop it without a "works again".
+      if (previous === undefined) failing.delete(target.instanceId);
+      else yield* endStreak(target.instanceId);
       return;
     }
     const failures = (previous?.failures ?? 0) + 1;
