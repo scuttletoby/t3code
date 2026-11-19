@@ -15,12 +15,20 @@ nothing.
 
 ### pr-queue: a person's auto-merge switch during an update stands (#518)
 
+- The queue reads the pull request right before turning auto-merge off: one that is off by then (or closed) is left
+  as it is. It does not rely on GitHub's answer for that: what GitHub answers for turning off an auto-merge that is
+  already off is not documented.
 - The queue writes its plan as `"unsure": true` before turning auto-merge off and drops that once GitHub answered
   with success. When the turning off answers with an error and the pull request reads back off, or a stopped run left
   an unsure plan, the queue cannot tell whether a person turned it off: it leaves it off, does not update it, and
   says so on the pull request. It never re-arms it, as it did before.
-- Right before `gh pr update-branch` the queue reads the pull request again; one a person armed again (or closed)
-  since the queue turned it off is left as they set it.
+- Right before `gh pr update-branch` the queue reads the pull request again; one armed again (or closed) since the
+  queue turned it off is not updated, and the plan stays for the next run, which drops it if GitHub still shows it
+  armed or closed and re-arms it if GitHub only showed the queue's own turning off late.
+- Not guaranteed (GitHub has no compare-and-set for auto-merge; README, "The queue"): a person's switch-off at the
+  very moment of the queue's call, if GitHub answers that call with success; an arm between the last read and
+  `gh pr update-branch`; and an arm and switch-off again while the run waits for the new head or before the next run
+  finishes a plan.
 - A disarm that GitHub applied but gh reported as failed (an HTTP 502) now ends with the pull request off and a
   comment, instead of re-armed by the next run: arm it again with the ready command.
 

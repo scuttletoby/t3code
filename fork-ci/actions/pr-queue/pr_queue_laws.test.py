@@ -7,7 +7,8 @@ fails or runs, main moves, GitHub merges, and queue runs come in between, some k
 write GitHub applied, at a git call), some with a gh call that fails or that GitHub applied but reported as failed
 (aimed at a call number or at the first disarm, arm, update-branch or comment; sometimes the read-back after it fails
 too), with a git fetch that fails as the network does, with a push, a main move, a CI result or a person's arm or disarm
-in the middle of the run, with a head GitHub shows late, and with arm refusals "required check is queued". The start
+in the middle of the run (a disarm also at the queue's own disarm call), with a head GitHub shows late, with the
+queue's disarm shown late (still armed on the next read), and with arm refusals "required check is queued". The start
 state is EMPTY (no plan, no cache) or OLD (a cache an earlier run left, maybe emptied, an older queue's plan without
 `repo` at a head it already updated, a plan cut off half-way, a `.bad` plan, folders a killed run left). Every run is a
 new Queue on the same STATE, cache and lock: what a rerun after a stop sees.
@@ -25,15 +26,18 @@ The laws, checked at every gh call and after every run:
   L5 only allowed moves: the queue turns off only an armed PR and arms only a PR this run turned off or the plan it
      finishes names, and only while it is off by the queue (or armed by a person again: arming agrees). The documented
      exception (README.md, "A plan does not say who turned auto-merge off"): a PR a person armed and disarmed again
-     after the queue's own disarm is re-armed too. A PR a person turned off before the queue's disarm is never armed
-     (#518).
+     after the queue's own disarm is re-armed too. A PR a person turned off before the queue's attempt to turn it off
+     for this update (every attempt is recorded, whatever GitHub answered) is never armed (#518).
   L6 a stopped run is always finished: one run without faults after any history leaves no plan.
   L7 progress: an update with nothing in its way (no faults but a head shown late within the polls, lenses that agree
      on the head, a green head, no conflict) ends armed.
 
-Known limit (README.md, "no compare-and-set for auto-merge"; pinned in FIXED as "mid-run race"): a person who arms
-the PR between the queue's last read of it and its update-branch call is updated over. L3 allows exactly that: an arm
-at the update-branch call itself.
+Known limits (README.md, "no compare-and-set for auto-merge"; pinned in FIXED as "mid-run race"): a person who arms
+the PR between the queue's last read of it and its update-branch call is updated over; L3 allows exactly that: an arm
+at the update-branch call itself. A person who turns it off at the queue's disarm call itself, when GitHub answers that
+call with success, is armed over; L5 allows exactly that. What GitHub answers for turning off an auto-merge that is
+already off is not documented: the model answers with an error in odd runs and with success in even ones (an
+'off_says' fault picks one), so both are played.
 
 The model of GitHub is real git (a local bare repository; fetch by sha as on GitHub) and a fake `gh`, as in
 pr_queue.test.py. The guard below fails the run if anything starts the real gh; nothing reaches the network.
@@ -111,7 +115,8 @@ MUST_SEE = (
     *(f'{f} on {k}' for f in ('kill', 'kill_after', 'fail', 'lie') for k in WRITE_KINDS),
     'disarm failed', 'disarm unclear: STATE stays', 'git fetch failed', 'merge check unknown',
     'merge check unknown in recover', 'recovered a plan at a newer head than its read', 'broken plan kept as .bad',
-    'a person arms mid-run', 'a person disarms mid-run',
+    'a person arms mid-run', 'a person disarms mid-run', 'disarm of an off PR answered with an error',
+    'GitHub shows the disarm late', 'armed again after the disarm: plan kept',
     'update with nothing in its way',
 )
 
@@ -138,10 +143,15 @@ class PR:
         self.armed_heads, self.told = set(), False   # heads it had while armed; queue said OFF since its disarm
         self.comments, self.lenses, self.created, self.unknown = [], [], created, 0
         # plan_run: the run whose plan named it at its disarm; raced: the run in which a person armed or disarmed it
-        # mid-run; armed_at: (run, gh call) of a person's arm mid-run; queue_off, person_off: when the queue's own
-        # disarm and a person's last disarm happened (World.seq); plan_lost: its plan is broken
-        self.plan_run, self.raced, self.armed_at, self.plan_lost = None, None, None, False
-        self.queue_off = self.person_off = None
+        # mid-run; armed_at, off_at: (run, gh call) of a person's arm, disarm mid-run; queue_try: when the queue last
+        # tried to turn it off (World.seq), whatever GitHub answered, so a person's switch-off is compared with the
+        # queue's attempt for THIS update; person_off: when a person last turned it off; gap: the queue_try GitHub
+        # answered with success although a person had turned it off at that very call (the README's limit);
+        # off_late: how many more reads still show it armed after the queue's disarm (GitHub showing it late);
+        # plan_lost: its plan is broken
+        self.plan_run, self.raced, self.armed_at, self.off_at, self.plan_lost = None, None, None, None, False
+        self.queue_try = self.person_off = self.gap = None
+        self.off_late = 0
 
 
 class World:
@@ -288,9 +298,10 @@ class World:
             p.armed_heads.add(p.head)
             p.armed_at = (self.runs, self.calls) if self.in_run else None
         elif what == 'disarm' and p.armed:
-            p.armed, p.mode = False, 'human-off'
+            p.armed, p.mode, p.off_late = False, 'human-off', 0
             self.seq += 1
             p.person_off = self.seq
+            p.off_at = (self.runs, self.calls) if self.in_run else None
         else:
             return
         if self.in_run:   # after the queue may have read it: GitHub has no compare-and-set for auto-merge
@@ -409,11 +420,19 @@ class World:
                   for k, (c, when) in sorted((self.checks.get(head) or {}).items())]
         comments = [dict(c, viewerDidAuthor=bool(c.get('mine')) and poster) for c in p.comments]
         return {'number': p.n, 'title': f'pr {p.n}', 'state': p.state, 'isDraft': False,
-                'autoMergeRequest': {'mergeMethod': 'SQUASH'} if p.armed else None,
+                'autoMergeRequest': {'mergeMethod': 'SQUASH'} if p.armed or self.late_off(p) else None,
                 'mergeStateStatus': self.merge_state(p, head) if p.state == 'OPEN' else 'UNKNOWN',
                 'createdAt': p.created, 'statusCheckRollup': rollup, 'headRefOid': head, 'baseRefName': 'main',
                 'comments': comments, 'reviews': [],
                 'commits': [{'oid': s} for s in p.history if s in self.anc[head] and s not in self.anc[self.tip()]]}
+
+    def late_off(self, p):
+        """GitHub still shows the queue's own disarm as armed for p.off_late more reads (an 'off_late' fault)."""
+        if p.off_late and p.mode == 'queue-off':
+            p.off_late -= 1
+            self.seen.add('GitHub shows the disarm late')
+            return True
+        return False
 
     @staticmethod
     def call_kind(write, a):
@@ -427,10 +446,11 @@ class World:
     def gh_call(self, write, a):
         self.calls += 1
         k = self.calls
-        for ev in self.events.pop(k, ()):
+        kind = self.call_kind(write, a)
+        # an event at this call number, or one aimed at the first call of this kind (a person at the disarm itself)
+        for ev in [*self.events.pop(k, ()), *(self.events.pop(kind, ()) if kind not in self.fired else ())]:
             self.seen.add('event in the middle of a run')
             self.apply(ev)
-        kind = self.call_kind(write, a)
         fault = self.faults.get(k)
         if kind not in self.fired:   # the first call of each kind: the faults aimed at that kind
             self.fired.add(kind)
@@ -515,19 +535,26 @@ class World:
     def disarm(self, p):
         if self.plan_pr() == p.n:
             p.plan_run = self.runs
-        if p.state == 'OPEN' and not p.armed and p.raced == self.runs:
-            # a person turned it off after the queue's view, before this call. GitHub's words for turning off an
-            # auto-merge that is not on are not documented; the model answers with an error (the queue reads any
-            # error back with a view, so another error would go the same way)
-            return failed('GraphQL: auto-merge is not enabled for this pull request (disablePullRequestAutoMerge)')
+        self.seq += 1   # every attempt, whatever GitHub answers: L5 compares a person's switch-off with this one
+        p.queue_try = self.seq
+        if p.state == 'OPEN' and p.mode == 'human-off':
+            # a person turned it off after the queue's last read. GitHub's answer for turning off an auto-merge that is
+            # not on is not documented: the run's off_says (an error, or success as if the call had done it). L5
+            # judges only what the queue does next (arm)
+            if self.off_says == 'error':
+                self.seen.add('disarm of an off PR answered with an error')
+                return failed('GraphQL: auto-merge is not enabled for this pull request (disablePullRequestAutoMerge)')
+            self.seen.add('disarm of an off PR answered with success')
+            if p.off_at == (self.runs, self.calls):   # at this very call: no read can see it (README, the limit)
+                p.gap = p.queue_try
+            self.disarmed_now.add(p.n)
+            return ok()
         if not p.armed or p.state != 'OPEN':
             raise Broken('L5 allowed moves', f'the queue turned off #{p.n}, which is {p.mode}, not armed')
         self.disarmed_now.add(p.n)
         if len(self.disarmed_now) > 1:
             raise Broken('L2 one PR at a time', f'one run turned off #{sorted(self.disarmed_now)}')
-        p.armed, p.mode, p.told, p.plan_lost = False, 'queue-off', False, False
-        self.seq += 1
-        p.queue_off = self.seq
+        p.armed, p.mode, p.told, p.plan_lost, p.off_late = False, 'queue-off', False, False, self.off_late
         if self.no_faults and p.lag == 0 and self.green(p.head) and self.tip() not in self.anc[p.head] \
                 and self.merged(p.head, self.tip()) is not None and (not p.lenses
                                                                      or set(dict(p.lenses).values()) == {p.head}):
@@ -566,10 +593,14 @@ class World:
                                              'names')
         if p.mode in ('queue-off', 'armed'):   # armed: a person armed it again meanwhile, and arming agrees
             pass
-        elif p.mode == 'human-off' and p.queue_off is not None and p.person_off > p.queue_off:
+        elif p.mode == 'human-off' and p.queue_try is not None and p.person_off > p.queue_try:
             # README.md: "A plan does not say who turned auto-merge off after the queue's own disarm": a person armed
-            # and disarmed it again since then. Never one a person turned off before the queue's disarm (#518).
+            # and disarmed it again since this update's disarm. Never one a person turned off before it (#518).
             self.seen.add('re-armed after a person disarmed it (README)')
+        elif p.mode == 'human-off' and p.gap is not None and p.gap == p.queue_try:
+            # README.md, "no compare-and-set for auto-merge": a person turned it off at the very moment of the queue's
+            # disarm, and GitHub answered that disarm with success: the queue cannot see it
+            self.seen.add('re-armed: a person disarmed at the disarm call, answered with success (known limit)')
         else:
             raise Broken('L5 allowed moves', f'the queue armed #{p.n}, which is {p.mode}: only a PR it turned off')
         st = self.plan() or {}
@@ -616,9 +647,13 @@ class World:
         self.runs += 1
         self.calls = self.git_calls = self.fetches = 0
         self.faults, self.events, self.queued, self.update_lag, git_kill, git_fail = {}, {}, 0, 0, None, None
+        # GitHub's undocumented answer for turning off an auto-merge that is off: both, run by run (odd runs an
+        # error), unless an 'off_says' fault names one; off_late: reads that still show the queue's disarm as armed
+        self.off_says, self.off_late = ('error' if self.runs % 2 else 'success'), 0
         self.kind_faults, self.after_faults, self.fired = {}, {}, set()
         # L7's "nothing in its way": no faults but a head GitHub shows late within the queue's polls
-        self.no_faults = all(f[0] == 'lag' and f[1] < CFG.wait_seconds // CFG.poll_seconds for f in faults)
+        self.no_faults = all(f[0] == 'off_says' or f[0] == 'lag' and f[1] < CFG.wait_seconds // CFG.poll_seconds
+                             for f in faults)
         self.progress = None
         for f in faults:
             if f[0] in ('kill', 'kill_after', 'fail', 'lie'):
@@ -628,7 +663,7 @@ class World:
                     self.after_faults.setdefault(f[1][len('after '):], f[0])
                 else:   # the first call of that kind (call_kind)
                     self.kind_faults.setdefault(f[1], f[0])
-            elif f[0] == 'event':
+            elif f[0] == 'event':   # f[1]: a call number, or a kind of write (its first call)
                 self.events.setdefault(f[1], []).append(f[2])
             elif f[0] == 'queued':
                 self.queued = f[1]
@@ -638,6 +673,10 @@ class World:
                 git_kill = f[1]
             elif f[0] == 'git_fail':   # the k-th git fetch fails as the network does (exit 128)
                 git_fail = f[1]
+            elif f[0] == 'off_says':
+                self.off_says = f[1]
+            elif f[0] == 'off_late':
+                self.off_late = f[1]
             else:
                 raise ValueError(f'unknown fault {f!r}')
         self.disarmed_now = set()
@@ -682,8 +721,9 @@ class World:
                            ('was not checked: STATE stays', 'merge check unknown'),
                            ('was not checked: trying again next run', 'merge check unknown in recover'),
                            ('maybe by a person: left OFF', 'unsure who turned it off'),
-                           ('a person changed it after the queue turned auto-merge off',
-                            'left alone: a person changed it after the disarm')):
+                           ('right before the queue would turn it off', 'left alone: off before the disarm'),
+                           ('armed again or not open right after the queue turned auto-merge off',
+                            'armed again after the disarm: plan kept')):
             if line in self.out:
                 self.seen.add(kind)
         if 'a PR may have auto-merge OFF and nothing says so' in self.out and os.path.exists(self.state + '.bad'):
@@ -760,11 +800,14 @@ def a_faults(rng):
             ev = rng.choice((('push', rng.randint(1, 3), rng.choice(('new', 'same')), 0),
                              ('main', 'file', 0), ('ci', rng.randint(1, 3), 'pass'),
                              ('arm', rng.randint(1, 3)), ('disarm', rng.randint(1, 3))))
-            out.append(('event', rng.randint(2, 12), ev))
+            at = rng.randint(2, 12)
+            if ev[0] == 'disarm' and rng.random() < 0.5:   # at the queue's own disarm: no read can see it first
+                at = 'disarm'
+            out.append(('event', at, ev))
         elif r < 0.93:
             out.append(('queued', rng.choice((1, 2, 6))))
         else:
-            out.append(('lag', rng.choice((1, 3, 13))))
+            out.append(rng.choice((('lag', 1), ('lag', 3), ('lag', 13), ('off_late', 1))))
     return tuple(out)
 
 
@@ -842,14 +885,15 @@ FIXED = {
     'killed right after the disarm': [
         ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('kill_after', 'disarm'),)), ('run', ()),
     ],
-    # the disarm took effect but gh reported it failed (call 4 is the disarm): the read-back shows it off, and the
-    # queue cannot tell that from a person's disarm (#518), so it says so and never re-arms it
+    # the disarm took effect but gh reported it failed (call 5 is the disarm, 4 the read right before it): the
+    # read-back shows it off, and the queue cannot tell that from a person's disarm (#518), so it says so and never
+    # re-arms it
     'disarm applied, reported failed': [
-        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('lie', 4),)),
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('lie', 5),)),
     ],
     # ... and the read-back fails too: unclear whether it is off, so the plan stays; the next run says it
     'disarm applied, reported failed, read-back fails': [
-        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('lie', 4), ('fail', 5))),
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('lie', 5), ('fail', 6))),
     ],
     # a git fetch fails after the update: the merge check is unknown, the plan stays; the rerun cannot fetch either
     # and says it once on the PR (tell_once); then a run finishes it
@@ -857,25 +901,58 @@ FIXED = {
         ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('git_fail', 2),)),
         ('run', (('git_fail', 1),)),
     ],
-    # #518 (a test finding of #464): a person turns auto-merge off after the queue's view and before its disarm.
-    # GitHub answers the disarm with an error (the model's stand-in, see World.disarm), the read-back shows it off,
-    # and the queue leaves it off with a comment: never re-armed over the person.
+    # #518 (a test finding of #464): a person turns auto-merge off after the queue's first view, before the read
+    # right before its disarm (call 4): that read shows it off, so the queue never turns it off, under either answer
+    # GitHub may give for turning off an auto-merge that is off (World.disarm). Left as the person set it.
     'a person disarms before the queue does': [
-        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('event', 4, ('disarm', 1)),)),
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0),
+        ('run', (('event', 4, ('disarm', 1)), ('off_says', 'success'))),
+    ],
+    # ... at the disarm call itself (5), after that read, and GitHub answers with an error: the read-back shows it
+    # off, and the queue leaves it off with a comment: never re-armed over the person
+    'a person disarms at the disarm, answered with an error': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0),
+        ('run', (('event', 5, ('disarm', 1)), ('off_says', 'error'))),
+    ],
+    # ... and GitHub answers with success: no read can tell that from the queue's own disarm. The known limit
+    # (README.md, "no compare-and-set for auto-merge"): updated and re-armed
+    'mid-run race: a person disarms at the disarm, answered with success': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0),
+        ('run', (('event', 5, ('disarm', 1)), ('off_says', 'success'))),
+    ],
+    # review of #523: the same on a PR the queue already updated and re-armed once, so an older successful disarm
+    # of the queue's is on record. The second update's run: a person turns it off after the queue's first view (call 4
+    # is the disarm on main's queue, the read right before it here), GitHub answers the disarm with an error. On
+    # main the next run re-armed it over the person (L5 compares with the queue's attempt for this update).
+    'second update: a person disarms just before the queue': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('ci', 1, 'pass'), ('run', ()), ('main', 'file', 0),
+        ('run', (('event', 4, ('disarm', 1)), ('off_says', 'error'))), ('run', ()), ('run', ()),
+    ],
+    # review of #523: GitHub shows the queue's own disarm late, so the read before update-branch (call 6) still
+    # shows it armed: not updated, the plan stays, and the next run finds it off and re-arms it (never OFF and silent)
+    'GitHub shows the disarm late': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('off_late', 1),)), ('run', ()),
     ],
     # L7: GitHub shows the updated head one poll late; the queue waits for it and arms it (not the old head)
     'update shown one poll late': [
         ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('ci', 1, 'pass'), ('run', (('lag', 1),)),
     ],
-    # #518, the other way: a person arms it again after the queue's disarm (call 5 is the queue's re-read before
-    # update-branch): left as they set it, not updated; the next run updates it as any armed PR
+    # #518, the other way: a person arms it again after the queue's disarm (call 6 is the queue's re-read before
+    # update-branch): not updated, the plan stays; the next run finds it armed, drops the plan and updates it as any
+    # armed PR
     'a person re-arms after the queue disarms': [
-        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('event', 5, ('arm', 1)),)),
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('event', 6, ('arm', 1)),)), ('run', ()),
     ],
     # the known limit left (README.md, "no compare-and-set for auto-merge"): the arm lands between that re-read and
-    # update-branch (call 6)
+    # update-branch (call 7)
     'mid-run race: a person re-arms right before update-branch': [
-        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('event', 6, ('arm', 1)),)),
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0), ('run', (('event', 7, ('arm', 1)),)),
+    ],
+    # the README's limit inside one run: a person arms and disarms again while the queue waits for the new head
+    # (calls 8 and 9 are its polls; the head shows late): the queue arms the change read over their disarm
+    'a person arms and disarms while the queue waits': [
+        ('start', 'EMPTY'), ('arm', 1), ('main', 'file', 0),
+        ('run', (('lag', 2), ('event', 8, ('arm', 1)), ('event', 9, ('disarm', 1)))),
     ],
 }
 KNOWN = {   # what each fixed history must reach, and #1's auto-merge at the end
@@ -894,11 +971,23 @@ KNOWN = {   # what each fixed history must reach, and #1's auto-merge at the end
                                                           'left OFF, unsure who turned it off'}, False),
     'merge check unknown, then told once': ({'merge check unknown', 'merge check unknown in recover',
                                              'told once (tell_once)', 'recover armed'}, True),
-    'a person disarms before the queue does': ({'a person disarms mid-run', 'disarm failed',
-                                                'unsure who turned it off'}, False),
+    'a person disarms before the queue does': ({'a person disarms mid-run', 'left alone: off before the disarm'},
+                                               False),
+    'a person disarms at the disarm, answered with an error': ({'a person disarms mid-run',
+                                                                'disarm of an off PR answered with an error',
+                                                                'disarm failed', 'unsure who turned it off'}, False),
+    'mid-run race: a person disarms at the disarm, answered with success': (
+        {'a person disarms mid-run', 'disarm of an off PR answered with success',
+         're-armed: a person disarmed at the disarm call, answered with success (known limit)'}, True),
+    'second update: a person disarms just before the queue': ({'queue armed after update', 'a person disarms mid-run',
+                                                               'left alone: off before the disarm'}, False),
+    'GitHub shows the disarm late': ({'GitHub shows the disarm late', 'armed again after the disarm: plan kept',
+                                      'recover armed'}, True),
+    'a person arms and disarms while the queue waits': ({'a person arms mid-run', 'a person disarms mid-run',
+                                                         're-armed after a person disarmed it (README)'}, True),
     'update shown one poll late': ({'update with nothing in its way', 'queue armed after update'}, True),
-    'a person re-arms after the queue disarms': ({'a person arms mid-run',
-                                                  'left alone: a person changed it after the disarm'}, True),
+    'a person re-arms after the queue disarms': ({'a person arms mid-run', 'armed again after the disarm: plan kept',
+                                                  'queue armed after update'}, True),
     'mid-run race: a person re-arms right before update-branch': ({'a person arms mid-run', 'mid-run race: armed '
                                                                    'between the re-read and update-branch (known '
                                                                    'limit)'}, True),

@@ -161,14 +161,15 @@ class QueueGh:
     where the process dies ('poll': the first view after update-branch). `flags`: the answers to review_flags' pages,
     in turn (none left: the read fails); not given: one page, the reviews as gh shows them (unedited, shown) with the
     `inline` review comments (inline_node) under a review of their own. `arm_says`: what GitHub answers to each arm in
-    turn, an error text or None (armed); none left: armed."""
+    turn, an error text or None (armed); none left: armed. `off_says`: GitHub's answer to turning off an auto-merge that
+    is already off, which GitHub does not document: None success (nothing to do), or an error text."""
     def __init__(self, w, h1, after, comments=(), polls=0, fail=(), armed=True, behind=True, kill_at=None, reviews=(),
-                 flags=None, inline=(), arm_says=()):
+                 flags=None, inline=(), arm_says=(), off_says=None):
         self.w = w
         self.head, self.after, self.armed, self.behind, self.updated = h1, after, (h1 if armed else None), behind, False
         self.on_pr, self.polls, self.fail, self.kill_at = list(comments), polls, set(fail), kill_at
         self.reviews, self.flags, self.inline = list(reviews), flags if flags is None else list(flags), list(inline)
-        self.arm_says = list(arm_says)
+        self.arm_says, self.off_says = list(arm_says), off_says
         self.calls, self.comments = [], []
         w.set('refs/pull/7/head', h1)
 
@@ -211,6 +212,8 @@ class QueueGh:
         if kind == 'list':
             return ok(json.dumps([self.view()]))
         if kind == 'disarm':
+            if self.armed is None and self.off_says:
+                return failed(self.off_says)
             self.armed = None
         elif kind == 'update':
             self.updated = True
@@ -419,6 +422,7 @@ class Update(Base):
         self.assertFalse(self.plan_exists())
 
     def test_a_person_who_re_arms_after_the_disarm_is_left_alone(self):   # issue #518
+        # not updated; the plan (the queue's own disarm) stays, and the next run decides from what GitHub shows then
         for change in ('armed', 'closed'):
             with self.subTest(change):
                 f = self.fake()
@@ -432,9 +436,84 @@ class Update(Base):
                             f.view = lambda v=f.view: dict(v(), state='CLOSED')
                     return r
                 code, out = self.update(gh)
-                self.assertEqual((code, f.order(), f.updated, f.comments), (0, ['disarm'], False, []), out)
+                self.assertEqual((code, f.order(), f.updated, f.comments), (Q.SILENT, ['disarm'], False, []), out)
+                with open(self.q.state) as st:
+                    self.assertNotIn('unsure', json.load(st), 'the disarm answered OK: the queue\'s own')
+                code, out = run_quiet(self.q.recover)   # the next run: armed or closed, nothing to do
+                self.assertEqual((code, f.order(), f.comments), (0, ['disarm'], []), out)
                 self.assertEqual(f.armed, self.c if change == 'armed' else None)
                 self.assertFalse(self.plan_exists())
+
+    def test_a_disarm_github_shows_late_is_finished_by_the_next_run(self):   # review of #523
+        # the read before update-branch still shows it armed (GitHub late), so it is not updated; it is OFF, and the
+        # plan that stays makes the next run re-arm it: never OFF and silent
+        f = self.fake()
+        late = {'views': 0}
+
+        def gh(*a):
+            r = f(*a)
+            if QueueGh.kind(a) == 'disarm':
+                late['views'] = 1
+            elif QueueGh.kind(a) == 'view' and late['views']:
+                late['views'] -= 1
+                return ok(json.dumps(dict(json.loads(r.stdout), autoMergeRequest={'mergeMethod': 'SQUASH'})))
+            return r
+        code, out = self.update(gh)
+        self.assertEqual((code, f.order(), f.armed, f.updated, f.comments), (Q.SILENT, ['disarm'], None, False, []),
+                         out)
+        self.assertTrue(self.plan_exists(), 'OFF and nothing says so: the next run finishes it')
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual((code, f.armed, f.comments), (0, self.c, []), out)
+        self.assertFalse(self.plan_exists())
+
+    def test_a_person_who_turns_it_off_before_the_queue_is_left_alone(self):   # review of #523
+        # after the queue's first read, while it fetches: the read right before the disarm sees it, so the queue never
+        # turns it off, whatever GitHub would answer for turning off an auto-merge that is already off
+        for off_says in (None, 'GraphQL: auto-merge is not enabled'):
+            with self.subTest(off_says=off_says):
+                f = self.fake(off_says=off_says)
+
+                def gh(*a):
+                    if QueueGh.kind(a) == 'api graphql':   # the reviews' flags: read right after the first view
+                        f.armed = None   # a person
+                    return f(*a)
+                code, out = self.update(gh)
+                self.assertEqual((code, f.order(), f.armed, f.updated, f.comments), (0, [], None, False, []), out)
+                self.assertFalse(self.plan_exists())
+                code, out = self.update(gh)   # runs again: not armed, left alone
+                self.assertEqual((code, f.order(), f.armed), (0, [], None), out)
+
+    def test_a_person_who_turns_it_off_at_the_disarm(self):   # review of #523: after the read right before it
+        # GitHub answers an error: the queue cannot tell whose it was, leaves it OFF and says so
+        f = self.fake(off_says='GraphQL: auto-merge is not enabled')
+
+        def gh(*a):
+            if QueueGh.kind(a) == 'disarm':
+                f.armed = None   # a person, a moment before the queue's call
+            return f(*a)
+        code, out = self.update(gh)
+        self.assertEqual((code, f.order(), f.armed, f.updated), (0, ['disarm', 'comment'], None, False), out)
+        self.assertIn('a person', f.comments[0])
+        self.assertFalse(self.plan_exists())
+        # GitHub answers success (not documented either way): no read can tell that from the queue's own disarm, so
+        # it is updated and re-armed. The README's stated limit ("no compare-and-set for auto-merge"), pinned here
+        f = self.fake(off_says=None)
+        code, out = self.update(gh)
+        self.assertEqual((code, f.order(), f.armed), (0, ['disarm', 'update', 'arm'], self.up), out)
+
+    def test_a_pr_gh_cannot_show_right_before_the_disarm_is_not_touched(self):   # the read right before the disarm
+        f = self.fake()
+        views = {'n': 0}
+
+        def gh(*a):
+            if QueueGh.kind(a) == 'view':
+                views['n'] += 1
+                if views['n'] == 2:
+                    return failed('HTTP 502')
+            return f(*a)
+        code, out = self.update(gh)
+        self.assertEqual((code, f.order(), f.armed, f.comments), (1, [], self.c, []), out)
+        self.assertFalse(self.plan_exists(), 'nothing changed: nothing to finish')
 
     def test_a_pr_gh_cannot_show_before_the_update_is_not_updated(self):   # the re-read before update-branch failed
         f = self.fake()
