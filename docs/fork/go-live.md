@@ -121,7 +121,10 @@ with their sizes, to remove by hand once sure.
 ## Then: one feature at a time
 
 Each feature is its own setting in the home's `userdata/settings.json`, read again without a restart.
-Switch on one and run its check; when the check passes, switch on the next. There is no waiting period. After each change, `t3-golive status` lists what is on.
+Switch on one and run its check; when the check passes, switch on the next. There is no waiting period. After each change, `t3-golive status` lists what is on: `agentSlots`,
+`waitFor`, `usagePacingGate`, `automaticUpdates`, `reviewRules`, `handoff` and `playtest`, each also when only
+one project's override turns it on. MCP profiles and `usagePacing` are not listed: nothing applies a profile yet,
+and only the pacing gate acts on `usagePacing`.
 Each one's **off again** is a single edit of that one setting; nothing else changes back.
 
 | Step | Setting           | On                                                        | Check                                                                                                                             | Off again                  |
