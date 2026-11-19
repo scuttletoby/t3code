@@ -17,8 +17,9 @@ for …", see [project settings](../user/project-settings.md)). An agent's tools
 fork setting.
 
 To check what a T3 home has switched on without changing anything, the fork's hidden command
-`t3 __fork-report --base-dir <home>` prints it as JSON. It never migrates, takes no lock and creates
-no file, with the one exception below.
+`t3 __fork-report --base-dir <home>` prints it as JSON, each feature with where it is on (the server,
+a project's override or one thread's handoff entry), reading this machine's managed policy as a start
+does. It never migrates, takes no lock and creates no file, with the one exception below.
 
 Not covered: a T3 that is stopping. Run the report while T3 is running or stopped. A clean stop at
 the instant the report opens the database leaves an empty `statev2.sqlite-wal` behind
