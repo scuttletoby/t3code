@@ -820,7 +820,7 @@ MUTATIONS = {
     'tmp: the inode time counts': ('guard', 'return max(st.st_mtime, st.st_ctime)', 'return st.st_mtime',
                                    Tmp, 'test_a_folder_copied_today_with_old_dates_is_not_old'),
     'tmp: names it never takes': ('rules', 'if matches(name, TMP_NEVER):', 'if False:', Tmp, 'test_names_it_never_takes'),
-    'tmp: the hard refusals': ('rules', "look = guard.examine(cfg, facts, path, 'path')\n    age", 'look = guard.Look(size=1, newest=0.0)\n    age',
+    'tmp: the hard refusals': ('rules', "look = guard.examine(cfg, facts, path, 'path', orphans=True)\n    age", 'look = guard.Look(size=1, newest=0.0)\n    age',
                                Tmp, 'test_the_hard_refusals_hold_here_too'),
     'tmp: the last check before a delete': ('engine', 'refusal = rules.recheck(cfg, facts, item)', 'refusal = None',
                                             Tmp, 'test_everything_is_read_again_just_before_the_delete'),
