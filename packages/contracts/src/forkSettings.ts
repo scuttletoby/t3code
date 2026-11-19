@@ -46,6 +46,7 @@ import {
   WaitForSettingsPatch,
 } from "./waitFor.ts";
 
+export * from "./forkFeatures.ts";
 export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
 export * from "./modelPolicy.ts";
