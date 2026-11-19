@@ -18,8 +18,9 @@ fork setting.
 
 To check what a T3 home has switched on without changing anything, the fork's hidden command
 `t3 __fork-report --base-dir <home>` prints it as JSON, each feature with where it is on (the server,
-a project's override or one thread's handoff entry), reading this machine's managed policy as a start
-does. It never migrates, takes no lock and creates no file, with the one exception below.
+the managed policy's lock, a project's override or one thread's handoff entry). It reads this machine's
+managed policy as a start does for settings (defaults and locks); the policy's provider limits are not
+applied, and no fork feature depends on them. It never migrates, takes no lock and creates no file, with the one exception below.
 
 Not covered: a T3 that is stopping. Run the report while T3 is running or stopped. A clean stop at
 the instant the report opens the database leaves an empty `statev2.sqlite-wal` behind

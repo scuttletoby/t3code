@@ -11,11 +11,13 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { afterEach, describe, expect, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
+  FORK_PROJECT_SCOPED_KEYS,
   FORK_SERVER_SETTING_KEYS,
   ForkProjectOverrideFields,
   type ManagedPolicyDocument,
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -32,7 +34,12 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import { makeManagedSettings } from "../policy/managedSettings.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
-import { FORK_REPORT_VERSION, formatForkReport, readForkReport } from "./forkReport.ts";
+import {
+  FORK_REPORT_PROJECT_FEATURES,
+  FORK_REPORT_VERSION,
+  formatForkReport,
+  readForkReport,
+} from "./forkReport.ts";
 
 /** Runs once, right after the report's last WAL check reads the path it names (the -shm). */
 const afterCheck = vi.hoisted(() => ({ path: "", run: () => {} }));
@@ -186,7 +193,17 @@ function homeWithDatabaseLink(target: string) {
   return home;
 }
 
-const runCli = (args: ReadonlyArray<string>) =>
+/** A policy's settings overlay; a test's policy must be one this build can apply. */
+function managedOf(settings: ManagedPolicyDocument["settings"]) {
+  const managed = makeManagedSettings(settings ?? {});
+  if (managed._tag === "Invalid") throw new Error(managed.reason);
+  return managed.settings;
+}
+
+/** No managed policy, whatever this machine has: a missing file means none. */
+const NO_POLICY = "/nonexistent/t3-fork-report-policy.json";
+
+const runCli = (args: ReadonlyArray<string>, policyPath: string = NO_POLICY) =>
   Command.runWith(cli, { version: "0.0.0" })(args).pipe(
     Effect.andThen(TestConsole.logLines),
     Effect.provide(
@@ -194,18 +211,22 @@ const runCli = (args: ReadonlyArray<string>) =>
         NodeServices.layer,
         NodeCryptoLayer.layer,
         NetService.layer,
-        TestConsole.layer,
+        // Fresh: only this command's lines, not those an earlier step of the test logged.
+        Layer.fresh(TestConsole.layer),
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({ env: { T3CODE_DEV_MANAGED_POLICY_PATH: policyPath } }),
+        ),
       ),
     ),
   );
 
 /** Runs `__fork-report` through the real CLI, keeping the exit code it sets out of the test run. */
-const reportThroughCli = (home: string) =>
+const reportThroughCli = (home: string, policyPath?: string) =>
   Effect.gen(function* () {
     const before = process.exitCode;
     process.exitCode = 0;
     let exitCode: number | string | null | undefined;
-    const lines = yield* runCli(["__fork-report", "--base-dir", home]).pipe(
+    const lines = yield* runCli(["__fork-report", "--base-dir", home], policyPath).pipe(
       Effect.ensuring(
         Effect.sync(() => {
           exitCode = process.exitCode;
@@ -804,6 +825,18 @@ describe("__fork-report settings", () => {
     expect(counted.filter((key) => !keys.has(key))).toEqual([]);
   });
 
+  it("reads each project's override of every counted feature a project can set", () => {
+    const counted = Object.keys(readForkReport(makeHome()).fork.features);
+    const projectKeys = new Set<string>([
+      ...FORK_PROJECT_SCOPED_KEYS,
+      ...Object.keys(ForkProjectOverrideFields),
+    ]);
+
+    expect([...FORK_REPORT_PROJECT_FEATURES].toSorted()).toEqual(
+      counted.filter((key) => projectKeys.has(key)).toSorted(),
+    );
+  });
+
   it("reads a bad review rules, handoff or playtest value as off, as the load does", () => {
     const report = settingsReport({
       reviewRules: { preset: "everything" },
@@ -983,17 +1016,79 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCryptoLayer.layer))(
         const home = tempDir();
         NodeFS.mkdirSync(NodePath.join(home, "userdata"));
         NodeFS.writeFileSync(settingsPathOf(home), '{ "agentSlots": { "enabled": false } }');
-        const managed = makeManagedSettings(document.settings);
-        if (managed._tag === "Invalid") throw new Error(managed.reason);
+        const managed = managedOf(document.settings);
 
-        const report = readForkReport(home, managed.settings);
+        const report = readForkReport(home, managed);
         const loaded = yield* loadedSettings(home, document);
 
         expect([loaded.waitFor.enabled, loaded.agentSlots.enabled]).toEqual([true, true]);
         expect(report.fork.featuresOn).toEqual(["agentSlots", "waitFor"]);
-        expect(report.fork.featuresWhere).toEqual({ agentSlots: ["server"], waitFor: ["server"] });
+        // A default is the file's to change; a lock that changed the value is the policy's alone.
+        expect(report.fork.featuresWhere).toEqual({ agentSlots: ["policy"], waitFor: ["server"] });
         expect(readForkReport(home, { unreadable: "bad" }).problems).toEqual([
           { code: "policy-unreadable", message: "The managed policy would stop a start: bad" },
+        ]);
+
+        // A lock equal to the file's value changes nothing: the file's own value is named.
+        NodeFS.writeFileSync(settingsPathOf(home), '{ "agentSlots": { "enabled": true } }');
+        expect(readForkReport(home, managed).fork.featuresWhere.agentSlots).toEqual(["server"]);
+
+        // Through the real command, which reads the policy a start would.
+        const policyPath = NodePath.join(tempDir(), "policy.json");
+        NodeFS.writeFileSync(policyPath, JSON.stringify(document));
+        NodeFS.writeFileSync(settingsPathOf(home), '{ "agentSlots": { "enabled": false } }');
+        const viaCli = yield* reportThroughCli(home, policyPath);
+        expect(viaCli.exitCode).toBe(0);
+        expect(viaCli.report.fork.featuresWhere).toEqual({
+          agentSlots: ["policy"],
+          waitFor: ["server"],
+        });
+      }),
+    );
+
+    it.effect("with a lock that also reaches each project's override", () =>
+      Effect.gen(function* () {
+        const document = {
+          schemaVersion: 1,
+          organization: "Example",
+          settings: { reviewRules: { value: { preset: "recommended" }, locked: true } },
+        } as const;
+        const home = tempDir();
+        NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+        NodeFS.writeFileSync(
+          settingsPathOf(home),
+          JSON.stringify({
+            projectSettingsOverrides: { "project-1": { reviewRules: { preset: "off" } } },
+          }),
+        );
+        const managed = managedOf(document.settings);
+
+        const loaded = yield* loadedSettings(home, document);
+        const report = readForkReport(home, managed);
+
+        expect(Object.values(loaded.projectSettingsOverrides)[0]?.reviewRules).toEqual({
+          preset: "recommended",
+        });
+        // On at the server and in project-1 only through the lock: one `policy`, nothing to edit.
+        expect(report.fork.featuresWhere).toEqual({ reviewRules: ["policy"] });
+      }),
+    );
+
+    it.effect("with a policy that does not load: exit 1, only JSON on stdout", () =>
+      Effect.gen(function* () {
+        const home = tempDir();
+        NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+        const policyPath = NodePath.join(tempDir(), "policy.json");
+        NodeFS.writeFileSync(policyPath, "{ not json");
+        const before = snapshot(home);
+
+        const { report, exitCode } = yield* reportThroughCli(home, policyPath);
+
+        expect(snapshot(home)).toEqual(before);
+        expect(exitCode).toBe(1);
+        expect(report.ok).toBe(false);
+        expect(report.problems.map((problem: { code: string }) => problem.code)).toEqual([
+          "policy-unreadable",
         ]);
       }),
     );

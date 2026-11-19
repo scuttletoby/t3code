@@ -123,9 +123,9 @@ with their sizes, to remove by hand once sure.
 Each feature is its own setting in the home's `userdata/settings.json`, read again without a restart.
 Switch on one and run its check; when the check passes, switch on the next. There is no waiting period.
 After each change, `t3-golive status` lists what is on, each with where: `server` (the file's own value,
-or the administrator's managed policy), `project:<id>` (that project's override in
-`projectSettingsOverrides`), `thread:<id>` (one thread's entry in the server's `handoff.threads`) or
-`project:<id>/thread:<id>` (one in a project's). The features are `agentSlots`, `waitFor`,
+or a default of the administrator's managed policy), `policy` (on only because the policy locks it),
+`project:<id>` (that project's override in `projectSettingsOverrides`), `thread:<id>` (one thread's entry
+in the server's `handoff.threads`) or `project:<id>/thread:<id>` (one in a project's). The features are `agentSlots`, `waitFor`,
 `usagePacingGate`, `automaticUpdates`, `reviewRules`, `handoff` and `playtest`. Not listed, as none is a
 switch: `headlessUsageRefreshInterval` (runs by default in every fork build and only reads usage), MCP
 profiles (nothing applies a profile yet), `usagePacing` and `usagePacingLowerEffort` (only the pacing
@@ -133,7 +133,9 @@ gate acts on them), `waitChecks` (only `waitFor` runs them) and `automaticUpdate
 
 **Off again** is an edit of that one setting; nothing else changes back. For `reviewRules`, `handoff`
 and `playtest` it may take more than one: also remove each project override and each `handoff` thread
-entry that `status` names, including those of a deleted project or thread.
+entry that `status` names, including those of a deleted project or thread. A `policy` entry is not in
+settings.json: only the administrator's policy file clears it. When the policy locks the value the file
+already holds, `status` says `server`, and after the edit it says `policy`.
 
 | Step | Setting           | On                                                                  | Check                                                                                                                             | Off again                                                                                    |
 | ---- | ----------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |

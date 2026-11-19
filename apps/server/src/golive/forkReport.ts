@@ -7,10 +7,12 @@ import * as NodeURL from "node:url";
 
 import {
   effectiveReviewRules,
+  FORK_PROJECT_SCOPED_KEYS,
   FORK_SERVER_SETTING_KEYS,
   type HandoffSettings,
   type PlaytestSettings,
   type ReviewRules,
+  type ServerSettings,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -99,10 +101,10 @@ export interface ForkReport {
     };
     readonly featuresOn: ReadonlyArray<string>;
     /**
-     * For each feature in `featuresOn`, where it is on: `server` (settings.json's own value, or the
-     * administrator's policy), `project:<id>` (that project's override),
-     * `thread:<id>` (one thread's handoff entry in the server's value) or
-     * `project:<id>/thread:<id>` (one in a project's override).
+     * For each feature in `featuresOn`, where it is on: `server` (settings.json's own value, or a
+     * default of the administrator's policy), `policy` (on only because the policy locks it),
+     * `project:<id>` (that project's override), `thread:<id>` (one thread's handoff entry in the
+     * server's value) or `project:<id>/thread:<id>` (one in a project's override).
      */
     readonly featuresWhere: Readonly<Record<string, ReadonlyArray<string>>>;
     /** Fork keys written in the file (whatever their value). */
@@ -384,13 +386,13 @@ function readSettings(
   }
   // As the load: the policy's defaults (with updates off when the file does not decode, as it may
   // hold an opt-out), then its locks laid over whatever was read.
-  const settings = managed.applyLocks(
+  const unlocked =
     parseWarning !== null
       ? { ...managed.defaults, automaticUpdates: false }
       : decoded !== undefined && Exit.isSuccess(decoded)
         ? decoded.value
-        : managed.defaults,
-  );
+        : managed.defaults;
+  const settings = managed.applyLocks(unlocked);
 
   // The keys come from the load's lenient parse, so comments and trailing commas hide none.
   const parsed = raw === undefined ? undefined : parseSettingsFileText(raw);
@@ -408,23 +410,17 @@ function readSettings(
       ? readSettingsFile(parsed.value).dropped
       : [];
 
-  // A project's override replaces the server's value for that project, so it can switch a feature
-  // on while the server's is off. A bad value already reads as off (the settings decode).
-  const overrides = <K extends "reviewRules" | "handoff" | "playtest">(key: K) =>
-    Object.entries(settings.projectSettingsOverrides).map(
-      ([projectId, project]) => [projectId, project[key]] as const,
-    );
-  const server = (on: boolean) => (on ? ["server"] : []);
-  const where = {
-    agentSlots: server(settings.agentSlots.enabled),
-    waitFor: server(settings.waitFor.enabled),
-    usagePacingGate: server(settings.usagePacingGate !== "off"),
-    automaticUpdates: server(settings.automaticUpdates),
-    reviewRules: whereOn(settings.reviewRules, overrides("reviewRules"), reviewRulesOn),
-    handoff: whereOn(settings.handoff, overrides("handoff"), handoffWhere),
-    playtest: whereOn(settings.playtest, overrides("playtest"), playtestOn),
-  } satisfies Record<keyof ForkReport["fork"]["features"], ReadonlyArray<string>>;
-  const onOff = (key: keyof typeof where) => (where[key].length > 0 ? "on" : "off");
+  // Where each place is on as loaded; a place on only because of a lock (the server's value or a
+  // project's, which locks also reach) is `policy`: no edit of settings.json switches it off.
+  const loaded = whereEachFeature(settings);
+  const own = whereEachFeature(unlocked);
+  const where = { ...loaded };
+  for (const key of Object.keys(loaded) as Array<ForkReportFeature>) {
+    where[key] = [
+      ...new Set(loaded[key].map((place) => (own[key].includes(place) ? place : "policy"))),
+    ];
+  }
+  const onOff = (key: ForkReportFeature) => (where[key].length > 0 ? "on" : "off");
   const features = {
     agentSlots: onOff("agentSlots"),
     waitFor: onOff("waitFor"),
@@ -467,6 +463,45 @@ function readSettings(
         headlessUsageRefreshIntervalMs: Duration.toMillis(settings.headlessUsageRefreshInterval),
       },
     },
+  };
+}
+
+type ForkReportFeature = keyof ForkReport["fork"]["features"];
+type ForkProjectScopedKey = (typeof FORK_PROJECT_SCOPED_KEYS)[number];
+
+/**
+ * The counted features a project's override can switch on: the report reads each one's override in
+ * every project. A test holds it to every counted feature that is also a project-scoped setting.
+ */
+export const FORK_REPORT_PROJECT_FEATURES = [
+  "reviewRules",
+  "handoff",
+  "playtest",
+] as const satisfies ReadonlyArray<ForkReportFeature & ForkProjectScopedKey>;
+type ForkReportProjectFeature = (typeof FORK_REPORT_PROJECT_FEATURES)[number];
+
+/** Where each counted feature is on in `settings`: `server`, `project:<id>` or a thread's entry. */
+function whereEachFeature(
+  settings: ServerSettings,
+): Record<ForkReportFeature, ReadonlyArray<string>> {
+  // A project's override replaces the server's value for that project, so it can switch a feature
+  // on while the server's is off. A bad value already reads as off (the settings decode).
+  const overrides = <K extends ForkReportProjectFeature>(key: K) =>
+    Object.entries(settings.projectSettingsOverrides).map(
+      ([projectId, project]) => [projectId, project[key]] as const,
+    );
+  const server = (on: boolean) => (on ? ["server"] : []);
+  const perProject = {
+    reviewRules: whereOn(settings.reviewRules, overrides("reviewRules"), reviewRulesOn),
+    handoff: whereOn(settings.handoff, overrides("handoff"), handoffWhere),
+    playtest: whereOn(settings.playtest, overrides("playtest"), playtestOn),
+  } satisfies Record<ForkReportProjectFeature, ReadonlyArray<string>>;
+  return {
+    agentSlots: server(settings.agentSlots.enabled),
+    waitFor: server(settings.waitFor.enabled),
+    usagePacingGate: server(settings.usagePacingGate !== "off"),
+    automaticUpdates: server(settings.automaticUpdates),
+    ...perProject,
   };
 }
 
@@ -540,7 +575,8 @@ function whyNoHome(
 /**
  * The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`).
  * `policy` is this machine's managed policy as the server loads it (defaults filled in, locks laid
- * over), or why it could not be read: a start would then stop.
+ * over; its provider limits change no fork feature and are left out), or why it could not be read:
+ * a start would then stop.
  */
 export function readForkReport(
   baseDir: string,

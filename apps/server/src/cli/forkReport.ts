@@ -9,7 +9,8 @@ import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 /**
  * Fork (go-live kit): prints what a T3 home holds as JSON, writing nothing. The home must be named:
  * a report on a guessed home could pass a check against the wrong data. Exit 1 when `ok` is false.
- * The machine's managed policy is read as a start reads it, so a switch it turns on shows as on.
+ * The machine's managed policy is read as a start reads it, so a switch it turns on shows as on
+ * (its defaults and locks; its provider limits change no fork feature and are not applied).
  */
 export const forkReportCommand = Command.make("__fork-report", {
   baseDir: Flag.String("base-dir").pipe(
