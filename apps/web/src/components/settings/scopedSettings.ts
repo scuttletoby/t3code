@@ -343,8 +343,8 @@ export function planScopedSettingsPatch(
                   delete next[key];
                   continue;
                 }
-                // Fork: a project's check map and review rules replace the environment's whole.
-                if (key === "waitChecks" || key === "reviewRules") {
+                // Fork: these project values replace the environment's whole (forkSettings.ts).
+                if (["waitChecks", "reviewRules", "handoff", "playtest"].includes(key)) {
                   next[key] = value;
                   continue;
                 }
