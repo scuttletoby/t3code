@@ -522,6 +522,9 @@ describe("__fork-report on old, newer and empty state", () => {
       waitFor: "off",
       usagePacingGate: "off",
       automaticUpdates: "off",
+      reviewRules: "off",
+      handoff: "off",
+      playtest: "off",
     });
     expect(report.ok).toBe(true);
   });
@@ -693,6 +696,60 @@ describe("__fork-report settings", () => {
     });
     // A command line is never printed.
     expect(JSON.stringify(report)).not.toContain("/secret/path");
+  });
+
+  it("names review rules, handoff and playtest when on, also from one project's override", () => {
+    const step = (name: string) => ({ argv: ["/usr/local/bin/playtest", name] });
+    const playtest = {
+      enabled: true,
+      claim: step("claim"),
+      renew: step("renew"),
+      push: [{ name: "deploy", ...step("deploy") }],
+      release: step("release"),
+    };
+
+    expect(
+      settingsReport({
+        reviewRules: { preset: "recommended" },
+        handoff: { mode: "handoff" },
+        playtest,
+      }).fork.featuresOn,
+    ).toEqual(["reviewRules", "handoff", "playtest"]);
+    // One thread's own mode is enough.
+    expect(
+      settingsReport({ handoff: { mode: "off", threads: { "thread-1": "handoff" } } }).fork
+        .featuresOn,
+    ).toEqual(["handoff"]);
+    // Off on the server, on in one project: the project's value replaces the server's there.
+    expect(
+      settingsReport({
+        projectSettingsOverrides: {
+          "project-1": { reviewRules: { preset: "recommended" }, handoff: { mode: "handoff" } },
+          "project-2": { playtest },
+        },
+      }).fork.featuresOn,
+    ).toEqual(["reviewRules", "handoff", "playtest"]);
+    // A project that turns them off does not hide the server's being on elsewhere.
+    expect(
+      settingsReport({
+        reviewRules: { preset: "recommended" },
+        projectSettingsOverrides: { "project-1": { reviewRules: { preset: "off" } } },
+      }).fork.featuresOn,
+    ).toEqual(["reviewRules"]);
+  });
+
+  it("reads a bad review rules, handoff or playtest value as off, as the load does", () => {
+    const report = settingsReport({
+      reviewRules: { preset: "everything" },
+      handoff: { mode: "handoff", typo: 1 },
+      playtest: { enabled: true },
+      projectSettingsOverrides: {
+        "project-1": { reviewRules: { preset: "recommended", unknownKey: true } },
+      },
+    });
+
+    expect(report.fork.featuresOn).toEqual([]);
+    expect(report.settings.parseWarning).toBeNull();
   });
 
   it("warns when a load would ignore the file, and reports what the load would use", () => {
@@ -892,6 +949,9 @@ describe("__fork-report contract", () => {
     expect(keys(report.fork.features)).toEqual([
       "agentSlots",
       "automaticUpdates",
+      "handoff",
+      "playtest",
+      "reviewRules",
       "usagePacingGate",
       "waitFor",
     ]);

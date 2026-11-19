@@ -5,7 +5,14 @@ import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
-import { DEFAULT_SERVER_SETTINGS, FORK_SERVER_SETTING_KEYS } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  effectiveReviewRules,
+  FORK_SERVER_SETTING_KEYS,
+  type HandoffSettings,
+  type PlaytestSettings,
+  type ReviewRules,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
@@ -82,6 +89,12 @@ export interface ForkReport {
       readonly waitFor: "on" | "off";
       readonly usagePacingGate: "off" | "advise" | "enforce";
       readonly automaticUpdates: "on" | "off";
+      /** On when the server's or any project's rules are on (a project override can switch it on). */
+      readonly reviewRules: "on" | "off";
+      /** On when any mode (server, project or one thread's) is `handoff`. */
+      readonly handoff: "on" | "off";
+      /** On when the server's or any project's adapter is enabled. */
+      readonly playtest: "on" | "off";
     };
     readonly featuresOn: ReadonlyArray<string>;
     /** Fork keys written in the file (whatever their value). */
@@ -382,11 +395,18 @@ function readSettings(
       ? readSettingsFile(parsed.value).dropped
       : [];
 
+  // A project's override replaces the server's value for that project, so it can switch a feature
+  // on while the server's is off. A bad value already reads as off (the settings decode).
+  const overrides = <K extends "reviewRules" | "handoff" | "playtest">(key: K) =>
+    Object.values(settings.projectSettingsOverrides).map((project) => project[key]);
   const features = {
     agentSlots: settings.agentSlots.enabled ? "on" : "off",
     waitFor: settings.waitFor.enabled ? "on" : "off",
     usagePacingGate: settings.usagePacingGate,
     automaticUpdates: settings.automaticUpdates ? "on" : "off",
+    reviewRules: anyOn(settings.reviewRules, overrides("reviewRules"), reviewRulesOn),
+    handoff: anyOn(settings.handoff, overrides("handoff"), handoffOn),
+    playtest: anyOn(settings.playtest, overrides("playtest"), playtestOn),
   } as const;
   return {
     settings: {
@@ -419,6 +439,20 @@ function readSettings(
       },
     },
   };
+}
+
+const reviewRulesOn = (value: ReviewRules) => effectiveReviewRules(value).preset !== "off";
+const handoffOn = (value: HandoffSettings) =>
+  value.mode === "handoff" || Object.values(value.threads).includes("handoff");
+const playtestOn = (value: PlaytestSettings) => value.enabled;
+
+/** "on" when the server's value or any project's (not set: the server's) is on. */
+function anyOn<T>(
+  server: T,
+  projects: ReadonlyArray<T | null | undefined>,
+  isOn: (value: T) => boolean,
+): "on" | "off" {
+  return isOn(server) || projects.some((value) => value != null && isOn(value)) ? "on" : "off";
 }
 
 /** The report as the command prints it: indented JSON. */
