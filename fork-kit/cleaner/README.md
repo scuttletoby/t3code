@@ -204,9 +204,9 @@ off this list.
   name is not. A remote that cannot be asked means `could not read`. Git never fetches while it is asked: in a
   partial clone a missing object is a missing object, not a download. A `.git` that is a
   symbolic link or anything but a folder or a `gitdir:` file is never passed over: the entry is kept as `could not
-  read`. One `.git` is passed over, by the [`tmp`](#tmp) rule only: a `gitdir:` file whose git folder is gone (an
-  orphaned worktree) names no commit that could still be lost here; every other git folder in the entry is judged
-  as above.
+  read`. One `.git` is passed over, by the [`tmp`](#tmp) rule only: a `gitdir:` file whose git folder is
+  provably gone (an orphaned worktree, see there) names no commit that could still be lost here; every other git
+  folder in the entry is judged as above.
 - **Unsafe paths:** a symbolic link (never followed, never removed), a root folder reached through a link,
   anything on another filesystem than its root folder or holding a mount point at any depth (bind mounts on the
   same filesystem too: the mount list `/proc/self/mountinfo` is read, and a list that cannot be read means
@@ -255,6 +255,7 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `in use`, `KEEP file`, ...     | every refusal of the list above                                                                                                             |
 | `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                                                     |
 | `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0)                                      |
+| `unknown parent`               | tmp: its git folder is not there but may be elsewhere (see [`tmp`](#tmp)): kept, but no error (exit 0)                                      |
 
 A worktree is removed with `git worktree remove`, never with `--force`: git itself refuses when a file changed
 after the last check. The local branch and its reflog stay in the clone, so a commit that was amended or reset
@@ -282,15 +283,29 @@ is not listed, and goes in a later run than its worktree. The others go only whe
 | `origin on this machine`       | as for a clone                                                                                                        |
 | `could not read`               | git or GitHub gave no full answer (named `branches in <clone>` when it is about the whole clone)                      |
 
+A branch that a symbolic ref of the clone points at (`git symbolic-ref refs/heads/alias refs/heads/x`) is kept
+as `symbolic ref names it`: deleting it would leave the alias dangling.
+
 The plan names each one `branch <name> in <clone>` (size `0 B`). The delete is `git update-ref -d` with the commit
-the last check judged: a branch that moved since is left as it is (`FAILED ...: nothing removed`). Then its config
-section (`branch.<name>.*`, its upstream) goes, as with `git branch -d`. Deleting a branch deletes its reflog, so a
+the last check judged: a branch that moved since is left as it is (`FAILED ...: nothing removed`). The log line
+names that commit (`... (was <commit>)`), so one line undoes a delete: `git fetch origin <commit> && git branch
+<name> <commit>` (the commit is on GitHub; a clone that still has it needs only the second step). Then its config
+section (`branch.<name>.*`, its upstream) goes, as with `git branch -d`, but only while it is still the deleted
+branch's: it is read before the delete, and left alone when the branch is there again after the delete (made anew
+in between) or the section changed meanwhile. A section left behind this way stays for a later branch of that
+name, as git itself would leave it. Deleting a branch deletes its reflog, so a
 commit amended or reset away that only the reflog holds keeps the branch, until git's own reflog expiry drops it
 (`gc.reflogExpireUnreachable`, 30 days by default). A branch delete is one git step on a ref while its clone stays,
 so it gets no journal line: killed after git removed the branch and before its reflog or config section went, the
 next run finds no branch there and judges nothing (the reflog left behind still counts for the clone, `git log
 --reflog`). A worktree checked out on the branch between the last check and the delete finds it gone; every commit
 of it is on GitHub, so nothing is lost. Branches of a clone that is `half deleted` are not judged.
+
+Two limits. A clone whose refs are in the `reftable` format (`git init --ref-format=reftable`) has no ref or
+reflog files, and the time of last use is read only from those: `used under 24 h ago` cannot protect its branches,
+only `mergedHours` and the other checks do (the commits its reflogs name are still asked of git and checked). Two repositories of the machine file that share one `root` are each judged against their own GitHub
+repository (a clone counts only for the repository its `origin` names); the `worktrees` rule's last check still
+takes the first repository whose root holds the folder.
 
 ### `docker`
 
@@ -313,7 +328,26 @@ entry and of everything in it, so a folder copied today with old dates is new.
 
 An orphaned worktree (its `.git` file names a git folder that is gone, as when another tool removed its main
 repository) is taken like a plain folder (#519): its commits, index and HEAD were in that git folder, so nothing in
-it is a commit that could still be lost. Every other git folder in the entry (a clone inside it, say) is judged as
+it is a commit that could still be lost. That holds only when the git folder is really gone, not just out of
+sight, so it counts as orphaned only when all of this is proven:
+
+- the `gitdir:` line names an absolute path;
+- the deepest part of that path that still exists is a real folder (no link on the way, no broken link), on the
+  same filesystem as the worktree, and not a mount point;
+- no drive could be missing there: the path is under no `/etc/fstab` mount point that is not mounted now (an
+  `/etc/fstab` that cannot be read counts as one), and not in `/mnt`, `/media` or `/run/media` unless a mounted
+  drive below them holds it;
+- no repository still names this worktree: the worktree lists (`.git/worktrees/*/gitdir` and, for a bare
+  repository, `worktrees/*/gitdir`) of that deepest folder, of every folder in it and of every folder in a
+  configured repository root are read, and none names this folder. A repository that was moved or renamed next
+  to its old place is found this way, and so its worktree's HEAD and commits.
+
+Anything else keeps the entry as `unknown parent` (no error, exit 0): the plan says why, for example `.../.git
+still names it: the repository was moved or renamed (git worktree repair there)`. After `git worktree repair` in
+the moved repository the worktree is judged as any worktree, with its commits. A folder that cannot be searched
+for those lists means `could not read`. A repository moved anywhere else (another filesystem, a folder deeper
+down or far away) cannot be seen: its worktree then counts as orphaned, and the files git never committed go
+like those of any folder the pattern takes; its commits stay in the moved repository. Every other git folder in the entry (a clone inside it, say) is judged as
 always, and every other refusal holds (`KEEP`, credential names, in use). What git cannot tell any more is which of
 its files were never committed: like any folder the pattern takes, it goes once nothing in it changed for the
 pattern's days. The plan says so: `...; orphaned worktree: its git folder <path> is gone, so it holds no commit`.
@@ -704,10 +738,15 @@ The installer writes no machine file: the `cleaner` section is the owner's, writ
   [Half-deleted entries](#half-deleted-entries) for what to do. An agent session's folder is judged again and
   finished when every check passes and nothing in it changed since the delete began.
 - **merged branches, the run stops half-way:** a branch is gone or still there (one git step); a reflog or config
-  section left behind is no candidate. Run again: nothing is left to judge. With `mergedBranches` off or missing (an
+  section left behind is no candidate. The log line naming the commit is written before the delete, so it is there
+  even when the run stops right after git removed the branch. A config section left behind is inherited by a new
+  branch of that name that has none of its own (as with git). Run again: nothing is left to judge. With `mergedBranches` off or missing (an
   older machine file), no branch is looked at. An older cleaner refuses the unknown key (exit 2): install this one
   first, then add it.
 - **tmp, an orphaned worktree stopped half-way:** as any temp entry: `half deleted`, judged no more.
+- **tmp, the drive or repository of a worktree comes back:** a worktree whose git folder may be elsewhere is
+  `unknown parent` and kept; once the drive is mounted again or `git worktree repair` ran, the next run judges it
+  as any worktree.
 - **agent-scratch, keep first stopped half-way:** a half-written copy (`.<session>.partial`) is thrown away and
   made again by the next run; a copy that was made but whose delete never ran is found, read back and used again
   (no second copy); an older copy that differs stays, and the new one is `<session>.2`, and so on.
@@ -749,6 +788,9 @@ The installer writes no machine file: the `cleaner` section is the owner's, writ
   so the in-use check can miss them. #491 (the timer) must keep the roots away from container volumes for that
   reason.
 - A list of 1000 or more open pull requests counts as "could not read".
+- Drives are known from `/proc/self/mountinfo` and `/etc/fstab` only: a drive that a systemd `.mount` or
+  automount unit, `autofs` or a desktop mounts elsewhere than `/mnt`, `/media` or `/run/media`, when it is not
+  mounted now, cannot be seen, and a worktree whose repository was on it can count as orphaned in the temp folder.
 - Linux only so far (`/proc`, systemd unit folders).
 
 ## Tests

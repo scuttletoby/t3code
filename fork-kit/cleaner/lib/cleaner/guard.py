@@ -8,7 +8,7 @@ delete itself. A path may go only when every check here passes; a check that can
 import fnmatch, os, stat
 
 from .config import REGENERABLE, must_keep_match
-from .facts import (Processes, Unreadable, elsewhere, git, git_code, local_tags, lonely, orphaned_worktree, present,
+from .facts import (Processes, Unreadable, elsewhere, git, git_code, local_tags, lonely, orphan_doubt, orphaned_worktree, present,
                     remote_refs, remote_urls, remotes, worktree_list)
 
 LOCK_NAMES = ('*.lock', 'lock', '.lock', '*.lck')
@@ -295,13 +295,22 @@ def _check(cfg, facts, path, kind, look, orphans):
         for where, bare in gits:
             gone = None if bare else orphaned_worktree(where)
             if gone is not None:
-                # A worktree whose git folder is gone: its commits, index and HEAD were there, so the folder holds
-                # files and no commit (#519). The tmp rule (`orphans`) judges it as a plain folder; any other asker
-                # keeps it under its own name, no error, as no run will change it.
-                if orphans:
-                    look.orphans.append((os.path.relpath(where, path), gone))
-                    continue
-                return Refusal('orphaned worktree', f'{os.path.relpath(where, path)}: its git folder {gone} is gone')
+                # A worktree whose git folder is not there. Only when that folder is provably gone (not moved, not
+                # on a drive that is not mounted now: orphan_doubt) did its commits, index and HEAD go with it, so
+                # the folder holds files and no commit (#519). The tmp rule (`orphans`) then judges it as a plain
+                # folder; any other asker keeps it under its own name, no error, as no run will change it.
+                shown = os.path.relpath(where, path)
+                if not orphans:
+                    return Refusal('orphaned worktree', f'{shown}: its git folder {gone} is gone')
+                try:
+                    doubt = orphan_doubt(where, gone, mounts, [repo.root for repo in cfg.repos])
+                except Unreadable as ex:
+                    return Refusal('could not read', f'{shown}: whether its git folder {gone} is gone ({ex})')
+                if doubt is not None:
+                    return Refusal('unknown parent', f'{shown}: its git folder {gone} is not there, and may be '
+                                                     f'elsewhere: {doubt}')
+                look.orphans.append((os.path.relpath(where, path), gone))
+                continue
             refusal = _git_refusal(path, where, bare)
             if refusal is None and (bare or os.path.isdir(os.path.join(where, '.git'))):
                 refusal = modules_refusal(path, where if bare else os.path.join(where, '.git'))
@@ -318,7 +327,8 @@ def _check(cfg, facts, path, kind, look, orphans):
 def examine(cfg, facts, path, kind='path', orphans=False):
     """Look at one path a rule wants to delete. `kind` is 'path' (a file or folder of no known kind: every git
     folder in it must be clean and pushed), 'worktree' or 'clone' (the worktrees rule has asked git itself).
-    `orphans` (the tmp rule): a worktree in it whose git folder is gone holds no commit and is passed over."""
+    `orphans` (the tmp rule): a worktree in it whose git folder is provably gone holds no commit and is passed over
+    (see `orphan_doubt`)."""
     look = Look()
     look.refusal = _check(cfg, facts, path, kind, look, orphans)
     return look

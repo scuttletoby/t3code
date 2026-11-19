@@ -252,6 +252,7 @@ def delete_all(cfg, facts, items, really, out, log=None, journal=None):
             item.done, item.refusal = 'refused', refusal
             out(f'REFUSED {item.label} ({item.rule}: {refusal.code}{": " + refusal.detail if refusal.detail else ""})')
             continue
+        told = f'{item.label} ({human(item.size)}, {item.rule}: {item.why})'   # as the last check saw it (a branch's commit)
         if item.kind == 'session':
             # Keep first: what is worth keeping is copied out and read back before anything is deleted. A copy
             # that fails keeps the folder whole.

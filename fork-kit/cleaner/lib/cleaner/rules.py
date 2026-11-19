@@ -10,7 +10,7 @@ from . import compress, guard
 from .config import matches, must_keep_match
 from .facts import (DELETED, Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_branches, local_tags,
                     lonely, merged_seconds, origin_url, orphaned_worktree, present, reflog, remote_refs, remote_urls,
-                    remove_branch, remove_volume, remove_worktree, worktree_list)
+                    remove_branch, remove_volume, remove_worktree, symbolic_refs, worktree_list)
 from .guard import CREDENTIAL_NAMES, Refusal
 
 DAY = 86400
@@ -1287,14 +1287,27 @@ def branch_answers(cfg, facts, repo, clone, only=None):
     refs = remote_refs(clone, 'origin', '--heads', '--tags')
     on_github = present(clone, [row['headRefOid'] for row in prs['merged'] + prs['open']] + list(refs.values()))
     main = refs.get('refs/heads/' + default)
+    aliases = {}
+    for ref, target in symbolic_refs(clone).items():
+        aliases.setdefault(target, []).append(ref)
     answers = []
     for name, oid in sorted(branches.items()):
+        named = sorted(aliases.get('refs/heads/' + name, ()))
+        if named:   # another name of it: deleting the branch would leave that name pointing at nothing
+            answers.append((name, oid, Refusal('symbolic ref names it', f'{named[0]} points at it'), ''))
+            continue
         try:
             refusal, why = branch_refusal(cfg, facts, clone, git_dir, name, oid, prs, default, on_github, main)
         except Unreadable as ex:
             refusal, why = Refusal('could not read', f'git: {ex}'), ''
         answers.append((name, oid, refusal, why))
     return answers
+
+
+def branch_why(why, oid):
+    """The log line of a branch delete names the commit it pointed at, as `git branch -d` does: one line undoes it
+    (`git fetch origin <oid> && git branch <name> <oid>`; every commit is on GitHub)."""
+    return f'{why} (was {oid})'
 
 
 def plan_branches(cfg, facts, repo, clone, plan):
@@ -1307,24 +1320,30 @@ def plan_branches(cfg, facts, repo, clone, plan):
         if refusal is not None:
             plan.kept.append(Kept(branch_label(clone, name), 'worktrees', refusal.code, refusal.detail, 0))
         else:
-            plan.items.append(Item('branch', clone, 'worktrees', why, 0, branch=name, oid=oid))
+            plan.items.append(Item('branch', clone, 'worktrees', branch_why(why, oid), 0, branch=name, oid=oid))
 
 
 def recheck_branch(cfg, facts, item):
-    """The branch read again: the commit it points at now is the one the delete removes it at."""
+    """The branch read again: the commit it points at now is the one the delete removes it at, and the one its log
+    line names. Several repositories may share one folder: the one whose clone it is judges it."""
     for repo in cfg.repos:
         if repo.root == os.path.dirname(item.path) and repo.merged_branches:
             try:
-                if tree_kind(item.path) != 'clone' or not same_repo(origin_url(item.path), repo.github):
-                    return Refusal('not a candidate', f'no longer a clone of {repo.github}')
+                if tree_kind(item.path) != 'clone':
+                    return Refusal('not a candidate', 'no longer a clone')
+                if not same_repo(origin_url(item.path), repo.github):
+                    continue
                 answers = branch_answers(cfg, facts, repo, item.path, only=item.branch)
             except Unreadable as ex:
                 return Refusal('could not read', str(ex))
             if not answers:
                 return Refusal('not a candidate', 'it is gone, checked out, rebased or bisected, or no pattern names it')
-            _, item.oid, refusal, _ = answers[0]
+            _, item.oid, refusal, why = answers[0]
+            if refusal is None:
+                item.why = branch_why(why, item.oid)
             return refusal
-    return Refusal('not a candidate', 'no repository in the machine file deletes merged branches in this folder')
+    return Refusal('not a candidate', 'no repository in the machine file that deletes merged branches in this folder '
+                   'has this clone')
 
 
 def delete_branch(item):

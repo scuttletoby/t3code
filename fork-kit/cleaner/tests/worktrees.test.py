@@ -710,6 +710,68 @@ class MergedBranches(Case):
         self.assertEqual(self.git(clone, 'rev-parse', 'work/a'), main)
         self.assertFalse(os.path.exists(cfg.journal_file))          # one git step: nothing half gone
 
+    def test_the_log_line_names_the_commit_so_one_line_undoes_it(self):
+        """#524: `(was <oid>)`, as `git branch -d` says it, and the commit the last check judged, not the plan's."""
+        clone = self.merged_branch()
+        cfg = self.branch_cfg()
+        facts = self.facts(cfg)
+        plan = self.c.rules.plan(cfg, facts)
+        main = self.git(clone, 'rev-parse', 'main')
+        self.git(clone, 'branch', '-f', 'work/a', main)             # moved, and may still go: main is on GitHub
+        failed, lines = self.delete_all(cfg, facts, plan.items)
+        self.assertEqual(failed, 0, lines)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith(f'deleted {self.label(clone, "work/a")} (0 B, worktrees: '), lines)
+        self.assertTrue(lines[0].endswith(f'(was {main}))'), lines)
+        with open(cfg.log_file) as f:
+            logged = [line for line in f.read().splitlines() if 'deleting branch work/a' in line]
+        self.assertEqual(len(logged), 1, logged)
+        self.assertTrue(logged[0].endswith(f'(was {main}))'), logged)
+        self.git(clone, 'branch', 'work/a', main)                   # the undo the line gives
+        self.assertIn('work/a', self.branches(clone))
+
+    def test_the_config_section_goes_only_while_it_is_the_deleted_branchs(self):
+        """#524: between `update-ref -d` and removing `branch.<b>.*`, a new branch of that name (or a new section)
+        may appear: then the section is the new branch's, and stays."""
+        clone = self.merged_branch('work/a', 7)
+        self.merged_branch('work/b', 8)
+        self.assertIn('branch.work/a.remote=origin', self.git(clone, 'config', '--local', '--list'))
+        real = self.c.facts._git
+
+        def racing(cwd, args, bare, stdin):
+            done = real(cwd, args, bare, stdin)
+            if args[0] == 'update-ref' and args[3] == 'refs/heads/work/a':
+                self.git(clone, 'branch', '--no-track', 'work/a', 'main')             # a branch of that name again
+            if args[0] == 'update-ref' and args[3] == 'refs/heads/work/b':
+                self.git(clone, 'config', 'branch.work/b.description', 'mine')         # the section changed
+            return done
+        with mock.patch.object(self.c.facts, '_git', racing):
+            code, lines = self.run_cleaner(self.branch_cfg())
+        self.assertEqual(code, 0, lines)
+        config = self.git(clone, 'config', '--local', '--list')
+        self.assertIn('branch.work/a.remote=origin', config)
+        self.assertIn('branch.work/b.description=mine', config)
+        self.assertEqual(self.branches(clone), ['main', 'work/a'])
+
+    def test_a_branch_another_name_points_at_is_kept(self):
+        """#524: `refs/heads/work/alias -> refs/heads/work/a` (git symbolic-ref) would point at nothing."""
+        clone = self.merged_branch()
+        self.git(clone, 'symbolic-ref', 'refs/heads/work/alias', 'refs/heads/work/a')
+        cfg = self.branch_cfg()
+        self.assertKept(self.plan(cfg), self.label(clone, 'work/a'), 'symbolic ref names it', 'refs/heads/work/alias')
+        self.assertNotCandidate(self.plan(cfg), self.label(clone, 'work/alias'))     # no branch of its own
+        self.git(clone, 'symbolic-ref', '--delete', 'refs/heads/work/alias')
+        self.assertEqual(self.branch_items(self.plan(cfg)), [(clone, 'work/a')])
+
+    def test_two_repositories_in_one_folder(self):
+        """#524: the last check asks the repository whose clone it is, not the first one listed for the folder."""
+        clone = self.merged_branch()
+        other = {'root': self.trees, 'github': 'someone/other', 'branches': ['work/*'], 'mergedBranches': True}
+        mine = {'root': self.trees, 'github': fx.REPO, 'branches': ['work/*'], 'mergedBranches': True}
+        code, lines = self.run_cleaner(self.cfg(worktrees={'repos': [other, mine]}))
+        self.assertEqual(code, 0, lines)
+        self.assertNotIn('work/a', self.branches(clone))
+
     def test_a_delete_stopped_half_way_leaves_nothing_to_judge(self):
         """Killed after git removed the branch and before its reflog or config section went: the next run sees no
         branch, judges nothing and exits 0. The reflog left behind still counts for the clone (git log --reflog)."""
@@ -1085,9 +1147,26 @@ MUTATIONS = {
                                          'test_the_clone_says_what_keeps_all_its_branches'),
     'branch: an origin on this machine': ('rules', 'if here_urls:', 'if False:', MergedBranches,
                                           'test_the_clone_says_what_keeps_all_its_branches'),
-    'branch: the last check': ('rules', '            _, item.oid, refusal, _ = answers[0]\n            return refusal',
-                               '            _, item.oid, refusal, _ = answers[0]\n            return None', MergedBranches,
+    'branch: the last check': ('rules', '                item.why = branch_why(why, item.oid)\n            return refusal',
+                               '                item.why = branch_why(why, item.oid)\n            return None', MergedBranches,
                                'test_the_last_check_reads_the_branch_again_and_git_deletes_only_what_it_judged'),
+    'branch: the log names the commit': ('rules', "return f'{why} (was {oid})'", 'return why', MergedBranches,
+                                         'test_the_log_line_names_the_commit_so_one_line_undoes_it'),
+    'branch: the log names the last check\'s commit': ('engine', "told = f'{item.label} ({human(item.size)}, {item.rule}: {item.why})'   # as",
+                                                      "pass  # as", MergedBranches, 'test_the_log_line_names_the_commit_so_one_line_undoes_it'),
+    'branch: the commit the last check read': ('rules', "                item.why = branch_why(why, item.oid)\n", '                pass\n', MergedBranches,
+                                               'test_the_log_line_names_the_commit_so_one_line_undoes_it'),
+    'branch: config of a new branch of that name': ('facts', 'if not before or again or branch_config(cwd, branch) != before:',
+                                                    'if not before or branch_config(cwd, branch) != before:', MergedBranches,
+                                                    'test_the_config_section_goes_only_while_it_is_the_deleted_branchs'),
+    'branch: a changed config section': ('facts', 'if not before or again or branch_config(cwd, branch) != before:',
+                                         'if not before or again:', MergedBranches,
+                                         'test_the_config_section_goes_only_while_it_is_the_deleted_branchs'),
+    'branch: another name of it': ('rules', 'if named:   # another name of it', 'if False:  # another name of it', MergedBranches,
+                                   'test_a_branch_another_name_points_at_is_kept'),
+    'branch: two repositories in one folder': ('rules', "if not same_repo(origin_url(item.path), repo.github):\n                    continue",
+                                               "if not same_repo(origin_url(item.path), repo.github):\n                    return Refusal('not a candidate', '')",
+                                               MergedBranches, 'test_two_repositories_in_one_folder'),
     'branch: deleted only at the commit judged': ('facts', "('update-ref', '--no-deref', '-d', 'refs/heads/' + branch, oid)",
                                                   "('update-ref', '--no-deref', '-d', 'refs/heads/' + branch)", MergedBranches,
                                                   'test_the_last_check_reads_the_branch_again_and_git_deletes_only_what_it_judged'),
