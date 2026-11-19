@@ -137,7 +137,7 @@ SPEC = {
     'testPatterns': (list, [], _regexes),
     'ignorePatterns': (list, list(DEFAULT_IGNORE), _regexes),
 }
-SECTION_SPEC = {'sweep': (dict, machine_file.REQUIRED, None)}
+SECTION_SPEC = {'sweep': (dict, machine_file.REQUIRED, None), 'queue': (dict, None, None)}  # queue: heavy_queue.py
 
 
 class Refused(Exception):

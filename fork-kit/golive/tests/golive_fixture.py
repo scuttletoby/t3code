@@ -11,6 +11,10 @@ COMMON = os.path.join(os.path.dirname(KIT), 'common')
 sys.path[:0] = [os.path.join(KIT, 'lib'), COMMON]
 
 from golive import config, live, osadapter  # noqa: E402
+from golive import handoff  # noqa: E402
+
+# No fake launcher takes a serving lock unless a test makes one: the kit lets go of the owner lock at once.
+handoff.HANDOVER_WAIT = 0.05
 
 LIVE, TARGET = '0.1.9', '0.1.10-nightly.20261114.4682.fork.1'
 
@@ -51,7 +55,9 @@ def report(**over):
                                                          'threadsArchived': 2}},
         'settings': {'state': 'present', 'parseWarning': None, 'providerInstances': []},
         'fork': {'features': {'agentSlots': 'off', 'waitFor': 'off', 'usagePacingGate': 'off',
-                              'automaticUpdates': 'off'}, 'featuresOn': [], 'keysInFile': [], 'settings': {}},
+                              'automaticUpdates': 'off', 'reviewRules': 'off', 'handoff': 'off',
+                              'playtest': 'off'}, 'featuresOn': [], 'featuresWhere': {}, 'keysInFile': [],
+                 'settings': {}},
         'problems': [], 'ok': True,
     }
     for key, value in over.items():

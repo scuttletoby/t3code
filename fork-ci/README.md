@@ -89,6 +89,13 @@ for this say which names callers may import in their README's "Python API" secti
 per day (CI hours, runs per workflow, queue wait per runner label, cancelled and failed share), for a before/after
 record of a CI change.
 
+### Law tests
+
+[`laws/`](laws/README.md) is the contract for law tests (generated orders of runs, crashes, reruns and old state
+played against the real code): a fixed seed in CI, the seed and the shortest failing steps printed, capped tries, no
+sleeps, and each failure kept as a fixed test before its fix merges. Projects link to it and do not copy it.
+[`laws/laws.py`](laws/laws.py) is its small runner (Python standard library only, test-side: no action imports it).
+
 ## How a release is made
 
 [`.github/workflows/fork-ci-release.yml`](../.github/workflows/fork-ci-release.yml) runs once a day

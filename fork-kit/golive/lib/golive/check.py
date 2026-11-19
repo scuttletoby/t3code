@@ -263,7 +263,7 @@ def _report(cfg, report, result, add):
     if not isinstance(on, list):
         add('fork features off', False, 'the report has no fork.featuresOn list')
     else:
-        add('fork features off', not on, f'switched on in settings: {", ".join(on)}' if on else 'all off')
+        add('fork features off', not on, f'switched on in settings: {live.features_on(fork)}' if on else 'all off')
     problems = report.get('problems') if isinstance(report.get('problems'), list) else []
     named = '; '.join(f'{p.get("code")}: {p.get("message")}' for p in problems if isinstance(p, dict))
     readable = report.get('ok') is True

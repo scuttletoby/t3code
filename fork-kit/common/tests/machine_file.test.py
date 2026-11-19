@@ -85,6 +85,21 @@ class MachineFile(unittest.TestCase):
         self.write({'version': 1, 'heavy': []})
         self.refused('"heavy" must be a JSON object')
 
+    def test_optional_section_is_none_only_when_missing(self):
+        opt = lambda path=None: self.mf.read_section('heavy', path or self.path, os.getuid(), optional=True)
+        self.assertIsNone(opt())                                        # no file
+        self.assertIsNone(opt(os.path.join(self.dir, 'no-folder', 'machine.json')))
+        self.write({'version': 1, 'homelab': {}})
+        self.assertIsNone(opt())                                        # no section
+        self.write({'version': 1, 'heavy': {'queue': {}}})
+        self.assertEqual(opt(), {'queue': {}})
+        self.write({'version': 1, 'heavy': []})
+        with self.assertRaises(self.mf.MachineFileError):
+            opt()
+        self.write({'version': 1, 'homelab': {}}, mode=0o666)            # every other rule still refuses
+        with self.assertRaises(self.mf.MachineFileError):
+            opt()
+
     def test_other_sections_are_not_read(self):
         self.write({'version': 1, 'heavy': {}, 'homelab': 'not even an object', 'futureKit': {'x': 1}})
         self.assertEqual(self.read(), {})
@@ -228,6 +243,10 @@ class MachineFile(unittest.TestCase):
 
 # Each file-safety rule broken on purpose in a copy of machine_file.py: (text, broken text, the test that must fail)
 MUTATIONS = {
+    'optional: a missing file is None': ('        if optional:        # the file or a folder', '        if False:  #',
+                                         'test_optional_section_is_none_only_when_missing'),
+    'optional: a missing section is None': ('    if kit not in data:\n        if optional:', '    if kit not in data:\n        if False:',
+                                            'test_optional_section_is_none_only_when_missing'),
     'folders above are safe': ('            _check_folder_on_the_way(path, where, os.fstat(fd), owner_uid)\n', '',
                                'test_every_folder_above_is_safe'),
     'sticky folders above are fine': ('and not st.st_mode & stat.S_ISVTX', '', 'test_every_folder_above_is_safe'),
