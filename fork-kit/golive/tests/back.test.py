@@ -1401,14 +1401,14 @@ class Status(BackBase):
         return code, out + err
 
     def test_up_names_version_features_providers_and_copies_and_writes_nothing(self):
-        self.live_report(fork={'featuresOn': ['agentSlots']}, settings={
+        self.live_report(fork={'featuresOn': ['agentSlots'], 'featuresWhere': {'agentSlots': ['server']}}, settings={
             'providerInstances': [{'id': 'codex', 'driver': 'codex', 'enabled': True}]})
         before = self.m.snapshot()
         code, out = self.status()
         self.assertEqual(code, 0, out)
         self.assertIn(f'T3 is up: t3 {fx.TARGET}', out)
         self.assertNotIn('FAIL', out)
-        self.assertIn('fork features on: agentSlots', out)
+        self.assertIn('fork features on: agentSlots (server)', out)
         self.assertIn('codex (codex, on)', out)
         self.assertIn(self.copy, out)
         self.assertEqual(self.m.snapshot(), before)
