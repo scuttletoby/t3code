@@ -4,7 +4,11 @@
  * ordinary settings patch from the person at the screen; agents cannot change it.
  */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
-import { type PlaytestSettings as PlaytestValue } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  type PlaytestSettings as PlaytestValue,
+} from "@t3tools/contracts";
+import * as Equal from "effect/Equal";
 import { useState } from "react";
 
 import { Button } from "../../ui/button";
@@ -20,8 +24,7 @@ import {
 import { Switch } from "../../ui/switch";
 import { Textarea } from "../../ui/textarea";
 import { AdvancedSettings } from "../AdvancedSettings";
-import { IntervalSecondsField } from "../IntervalSecondsField";
-import { SettingResetButton, SettingsRow, SettingsSection } from "../settingsLayout";
+import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import {
   useClearScopedSettings,
@@ -36,6 +39,7 @@ import {
   playtestStepsText,
   withPlaytestSteps,
 } from "./playtestSettings.logic";
+import { BoundedNumberField, ForkRow, useSubRowReset } from "./ForkRow";
 
 const MIXED =
   "The selected environments or projects have different playtest settings. Select one to edit them.";
@@ -149,6 +153,12 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
 
   const save = (next: PlaytestValue, options?: { onSaved?: () => void; onFailed?: () => void }) =>
     updateSettings({ playtest: next }, options);
+  const subRowReset = useSubRowReset(
+    "playtest",
+    shown,
+    isProjectScope && source === "project",
+    save,
+  );
   const missing = playtestMissingSteps(shown);
   const scopeNote = !isProjectScope
     ? ""
@@ -165,10 +175,11 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
   if (mixed) {
     return (
       <SettingsSection id="playtest-section" title="Playtest">
-        <SettingsRow
+        <ForkRow
           serverScoped
           {...searchableSetting("playtest")}
           settingKeys={["playtest"]}
+          lockPaths={["playtest"]}
           mixed
           description={MIXED}
         />
@@ -178,10 +189,11 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
 
   return (
     <SettingsSection id="playtest-section" title="Playtest">
-      <SettingsRow
+      <ForkRow
         serverScoped
         {...searchableSetting("playtest")}
         settingKeys={["playtest"]}
+        lockPaths={["playtest"]}
         onResetOverride={() => clearScopedSettings(["playtest"])}
         description={`${
           !shown.enabled && missing.length > 0
@@ -189,10 +201,10 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
             : "You try an agent's unfinished work on a test target, round after round. Nothing starts a session yet."
         }${scopeNote}`}
         resetAction={
-          !isProjectScope && shown.enabled ? (
+          !isProjectScope && !Equal.equals(shown, DEFAULT_SERVER_SETTINGS.playtest) ? (
             <SettingResetButton
               ariaLabel="Reset playtest to default"
-              onClick={() => save({ ...shown, enabled: false })}
+              onClick={() => save(DEFAULT_SERVER_SETTINGS.playtest)}
             />
           ) : null
         }
@@ -205,9 +217,15 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
           />
         }
       />
-      <SettingsRow
+      <ForkRow
         {...searchableSetting("playtest-steps")}
-        settingKeys={["playtest"]}
+        // Not settingKeys: upstream's reset there would clear the project's whole override.
+        managedPaths={["playtest"]}
+        lockPaths={["playtest"]}
+        resetAction={subRowReset(
+          ["claim", "renew", "push", "release"],
+          "Reset playtest steps to the environment's",
+        )}
         description="claim takes the target, renew keeps the claim, push sends a round (one or more named steps), release puts the target back. See docs/fork/playtest.md."
         control={
           <Button size="xs" variant="outline" onClick={() => setEditing(true)}>
@@ -227,19 +245,24 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
             ))}
           </dl>
         ) : null}
-      </SettingsRow>
+      </ForkRow>
       <AdvancedSettings targetIds={LIMITS.map((limit) => limit.id)}>
         {LIMITS.map((limit) => {
           const title = searchableSetting(limit.id).title;
           return (
-            <SettingsRow
+            <ForkRow
               key={limit.key}
               {...searchableSetting(limit.id)}
-              settingKeys={["playtest"]}
+              managedPaths={["playtest"]}
+              lockPaths={["playtest"]}
+              resetAction={subRowReset(
+                [limit.key],
+                `Reset ${title.toLowerCase()} to the environment's`,
+              )}
               description={limit.description}
               control={
                 <div className="flex items-center gap-2">
-                  <IntervalSecondsField
+                  <BoundedNumberField
                     labels={{
                       decrease: `Decrease ${title.toLowerCase()}`,
                       input: `${title} in ${limit.unit}`,
@@ -248,12 +271,8 @@ export function PlaytestSettings({ isProjectScope }: { readonly isProjectScope: 
                     value={shown[limit.key]}
                     min={limit.min}
                     step={1}
-                    onCommit={(value, options) =>
-                      save(
-                        { ...shown, [limit.key]: Math.min(limit.max, Math.max(limit.min, value)) },
-                        options,
-                      )
-                    }
+                    bound={(value) => Math.min(limit.max, Math.max(limit.min, value))}
+                    onCommit={(value, options) => save({ ...shown, [limit.key]: value }, options)}
                   />
                   <span className="text-xs text-muted-foreground">{limit.unit}</span>
                 </div>

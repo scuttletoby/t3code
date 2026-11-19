@@ -18,8 +18,7 @@ import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
 import { AdvancedSettings } from "../AdvancedSettings";
-import { IntervalSecondsField } from "../IntervalSecondsField";
-import { SettingResetButton, SettingsRow, SettingsSection } from "../settingsLayout";
+import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import {
   useClearScopedSettings,
@@ -29,6 +28,7 @@ import {
   useUpdateScopedSettings,
 } from "../useScopedSettings";
 import { CommitTextField } from "./CommitTextField";
+import { BoundedNumberField, ForkRow, useSubRowReset } from "./ForkRow";
 import {
   HANDOFF_MODE_OPTIONS,
   formatArgvLines,
@@ -93,8 +93,14 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
   const [threadError, setThreadError] = useState<string | null>(null);
   const [sourceError, setSourceError] = useState<string | null>(null);
 
-  const save = (next: HandoffValue, onFailed?: () => void) =>
-    updateSettings({ handoff: next }, onFailed ? { onFailed } : undefined);
+  const save = (next: HandoffValue, options?: { onFailed?: () => void; onSaved?: () => void }) =>
+    updateSettings({ handoff: next }, options);
+  const subRowReset = useSubRowReset(
+    "handoff",
+    shown,
+    isProjectScope && source === "project",
+    save,
+  );
   const option = HANDOFF_MODE_OPTIONS.find((candidate) => candidate.value === shown.mode);
   const scopeNote = !isProjectScope
     ? ""
@@ -109,17 +115,21 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
       return;
     }
     setThreadError(null);
-    save(withThreadMode(shown, threadDraft.id.trim(), threadDraft.mode));
-    setThreadDraft({ ...threadDraft, id: "" });
+    const id = threadDraft.id;
+    // The typed id stays until the save is through, so a refused save keeps it to try again.
+    save(withThreadMode(shown, id.trim(), threadDraft.mode), {
+      onSaved: () => setThreadDraft((draft) => (draft.id === id ? { ...draft, id: "" } : draft)),
+    });
   };
 
   if (mixed) {
     return (
       <SettingsSection id="handoff-section" title="Handoff">
-        <SettingsRow
+        <ForkRow
           serverScoped
           {...searchableSetting("handoff")}
           settingKeys={["handoff"]}
+          lockPaths={["handoff"]}
           mixed
           description={MIXED}
         />
@@ -129,10 +139,11 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
 
   return (
     <SettingsSection id="handoff-section" title="Handoff">
-      <SettingsRow
+      <ForkRow
         serverScoped
         {...searchableSetting("handoff")}
         settingKeys={["handoff"]}
+        lockPaths={["handoff"]}
         onResetOverride={() => clearScopedSettings(["handoff"])}
         description={`${option?.description ?? ""}${scopeNote}`}
         resetAction={
@@ -151,9 +162,12 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
           />
         }
       />
-      <SettingsRow
+      <ForkRow
         {...searchableSetting("handoff-threads")}
-        settingKeys={["handoff"]}
+        // Not settingKeys: upstream's reset there would clear the project's whole override.
+        managedPaths={["handoff"]}
+        lockPaths={["handoff"]}
+        resetAction={subRowReset(["threads"], "Reset thread modes to the environment's")}
         description={
           rows.length === 0
             ? "No thread has its own mode. A thread's own mode wins over the mode above."
@@ -163,9 +177,11 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
         <div className="grid gap-2 pb-2">
           {rows.map((row) => (
             <div key={row.threadId} className="flex flex-wrap items-center gap-2 text-xs">
-              <span className="min-w-0 flex-1 truncate">
-                {row.title ?? <span className="text-muted-foreground">Unknown thread</span>}{" "}
-                <span className="text-muted-foreground">{row.threadId}</span>
+              <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
+                <span className={row.title ? "truncate" : "truncate text-muted-foreground"}>
+                  {row.title ?? "Unknown thread"}
+                </span>
+                <span className="shrink-0 text-muted-foreground">{row.threadId}</span>
               </span>
               <ModeSelect
                 value={row.mode}
@@ -212,17 +228,20 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
             </p>
           ) : null}
         </div>
-      </SettingsRow>
+      </ForkRow>
       <AdvancedSettings
         targetIds={["handoff-size", "handoff-idle", "handoff-source", "handoff-instructions"]}
       >
-        <SettingsRow
+        <ForkRow
           {...searchableSetting("handoff-size")}
-          settingKeys={["handoff"]}
+          // Not settingKeys: upstream's reset there would clear the project's whole override.
+          managedPaths={["handoff"]}
+          lockPaths={["handoff"]}
+          resetAction={subRowReset(["sizeTokens"], "Reset handoff size to the environment's")}
           description="A turn that ends with the thread at this size hands off."
           control={
             <div className="flex items-center gap-2">
-              <IntervalSecondsField
+              <BoundedNumberField
                 labels={{
                   decrease: "Decrease handoff size",
                   input: "Handoff size in tokens",
@@ -231,24 +250,23 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
                 value={shown.sizeTokens}
                 min={HANDOFF_MIN_TOKENS}
                 step={10_000}
-                onCommit={(value, options) =>
-                  save(
-                    { ...shown, sizeTokens: Math.max(HANDOFF_MIN_TOKENS, value) },
-                    options.onFailed,
-                  )
-                }
+                bound={(value) => Math.max(HANDOFF_MIN_TOKENS, value)}
+                onCommit={(value, options) => save({ ...shown, sizeTokens: value }, options)}
               />
               <span className="text-xs text-muted-foreground">tokens</span>
             </div>
           }
         />
-        <SettingsRow
+        <ForkRow
           {...searchableSetting("handoff-idle")}
-          settingKeys={["handoff"]}
+          // Not settingKeys: upstream's reset there would clear the project's whole override.
+          managedPaths={["handoff"]}
+          lockPaths={["handoff"]}
+          resetAction={subRowReset(["idleTokens"], "Reset idle handoff size to the environment's")}
           description={`The smallest idle thread handed off before its prompt cache runs out. 0: never; otherwise at least ${HANDOFF_MIN_TOKENS.toLocaleString("en")}.`}
           control={
             <div className="flex items-center gap-2">
-              <IntervalSecondsField
+              <BoundedNumberField
                 labels={{
                   decrease: "Decrease idle handoff size",
                   input: "Idle handoff size in tokens",
@@ -257,23 +275,22 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
                 value={shown.idleTokens}
                 min={0}
                 step={5_000}
-                onCommit={(value, options) =>
-                  save(
-                    {
-                      ...shown,
-                      idleTokens: value === 0 ? 0 : Math.max(HANDOFF_MIN_TOKENS, value),
-                    },
-                    options.onFailed,
-                  )
-                }
+                bound={(value) => (value === 0 ? 0 : Math.max(HANDOFF_MIN_TOKENS, value))}
+                onCommit={(value, options) => save({ ...shown, idleTokens: value }, options)}
               />
               <span className="text-xs text-muted-foreground">tokens</span>
             </div>
           }
         />
-        <SettingsRow
+        <ForkRow
           {...searchableSetting("handoff-source")}
-          settingKeys={["handoff"]}
+          // Not settingKeys: upstream's reset there would clear the project's whole override.
+          managedPaths={["handoff"]}
+          lockPaths={["handoff"]}
+          resetAction={subRowReset(
+            ["source", "command"],
+            "Reset the handoff writer to the environment's",
+          )}
           description="Who writes the handoff: the old session in one turn, or a read-only program (one argument per line, its full path first). Today it sets how early an idle handoff starts."
           control={
             <Select
@@ -309,7 +326,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
                 const problem = handoffSourceProblem(shown.source, command);
                 if (problem !== null) return problem;
                 const { command: _old, ...rest } = shown;
-                save(command === undefined ? rest : { ...rest, command }, revert);
+                save(command === undefined ? rest : { ...rest, command }, { onFailed: revert });
                 return null;
               }}
             />
@@ -319,10 +336,16 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
               </p>
             ) : null}
           </div>
-        </SettingsRow>
-        <SettingsRow
+        </ForkRow>
+        <ForkRow
           {...searchableSetting("handoff-instructions")}
-          settingKeys={["handoff"]}
+          // Not settingKeys: upstream's reset there would clear the project's whole override.
+          managedPaths={["handoff"]}
+          lockPaths={["handoff"]}
+          resetAction={subRowReset(
+            ["instructions"],
+            "Reset handoff instructions to the environment's",
+          )}
           description="What the old session is asked to write, when it writes the handoff. Empty: T3's built-in text."
         >
           <div className="pb-2">
@@ -332,12 +355,12 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
               ariaLabel="Handoff instructions"
               onCommit={(text, revert) => {
                 if (text.trim().length > 8000) return "At most 8000 characters.";
-                save({ ...shown, instructions: text.trim() }, revert);
+                save({ ...shown, instructions: text.trim() }, { onFailed: revert });
                 return null;
               }}
             />
           </div>
-        </SettingsRow>
+        </ForkRow>
       </AdvancedSettings>
     </SettingsSection>
   );
