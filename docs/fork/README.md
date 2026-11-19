@@ -261,8 +261,9 @@ A Claude thread applies the profile's `servers`: `[]` (and `t3-only`) starts Cla
 server of its own (its config files, plugins and claude.ai connectors), and a list keeps only the
 servers it names, written as Claude lists them (`claude.ai Calendar`). T3's own tools stay. A Claude
 thread whose profile cannot be applied does not start its turn and says why: a missing or broken
-profile, a parent thread that cannot be read, settings T3 cannot read while a profile is set (with
-none set when last read, the thread gets `all` and the server log says so), a profile whose
+profile, a parent thread that cannot be read, a `settings.json` T3 cannot read (when only a
+provider secret cannot be read, the profile comes from `settings.json` alone and the server log
+says so; with no profile set there, the thread gets `all` as before), a profile whose
 `t3Tools` is not `"all"` (the T3 tool filter comes in a later pull request), or a session that
 still shows a server the profile leaves out, or does not list its servers within 5 minutes. A
 managed Claude policy on the machine or `--mcp-config` in the Claude launch arguments can make
@@ -270,7 +271,12 @@ Claude load a server T3's list leaves out. Other providers do not apply profiles
 
 Each tool call is checked too: a call to an MCP server the profile leaves out (also one an agent
 file declares, or one added while the session runs) is refused at the moment of the call: Claude
-gets the reason as the call's result, and the turn goes on. With the `all` profile nothing is checked. A
+gets the reason as the call's result, and the turn goes on. That covers its tools, its resources
+(a resource listing that names no server is refused, as it would list every server's), and a
+`Skill` call naming `mcp__<server>__…`, the form of a skill an MCP server serves. Where Claude does
+not name the server it calls, the tool name's prefix is matched, so a server named like
+`docs__x`, or `my_docs` under a profile that names `my.docs`, passes. With the `all` profile
+nothing is checked. A
 profile change applies from the thread's next turn: a running turn, and a message sent into it,
 keep the session it started with.
 

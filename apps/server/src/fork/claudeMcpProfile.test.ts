@@ -1,14 +1,26 @@
-import { ProjectId, ServerSettings, ServerSettingsError, ThreadId } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import {
+  ManagedPolicyDocument,
+  ProjectId,
+  ServerSettings,
+  ServerSettingsError,
+  ThreadId,
+} from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as ServerConfig from "../config.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
 import {
   CHECK_SESSION_TIMEOUT,
   ClaudeMcpProfileError,
+  EVERY_MCP_SERVER,
   type ClaudeMcpProfilePlan,
   type LineageThread,
   checkClaudeSession,
@@ -21,6 +33,7 @@ import {
 } from "./claudeMcpProfile.ts";
 
 const fromFile = Schema.decodeSync(ServerSettings);
+const policyDocument = Schema.decodeUnknownSync(ManagedPolicyDocument);
 const isRefusal = Schema.is(ClaudeMcpProfileError);
 const T3 = ["t3-code"];
 
@@ -85,6 +98,36 @@ describe("claudeMcpCallOutsideProfile", () => {
       call: { tool_name: "ReadMcpResourceTool", tool_input: { server: "github", uri: "x" } },
       outside: "github",
     },
+    {
+      name: "a resource listing of every server",
+      call: { tool_name: "ListMcpResourcesTool", tool_input: {} },
+      outside: EVERY_MCP_SERVER,
+    },
+    {
+      name: "a resource listing of a named server",
+      call: { tool_name: "ListMcpResourcesTool", tool_input: { server: "docs" } },
+      outside: undefined,
+    },
+    {
+      name: "a skill another server serves, run through Skill",
+      call: { tool_name: "Skill", tool_input: { skill: "/mcp__github__triage" } },
+      outside: "github",
+    },
+    {
+      name: "a skill a named server serves, run through Skill",
+      call: { tool_name: "Skill", tool_input: { skill: "mcp__docs__triage", args: "x" } },
+      outside: undefined,
+    },
+    {
+      name: "a skill no MCP server serves",
+      call: { tool_name: "Skill", tool_input: { skill: "plugin:mcp__github__x" } },
+      outside: undefined,
+    },
+    {
+      name: "another server's prompt, run through the older SlashCommand",
+      call: { tool_name: "SlashCommand", tool_input: { command: "/mcp__github__triage 12" } },
+      outside: "github",
+    },
     { name: "a tool that is not MCP", call: call("Bash"), outside: undefined },
   ])("$name", ({ call: input, outside }) => {
     assert.strictEqual(
@@ -108,9 +151,21 @@ describe("makeClaudeMcpProfiles", () => {
     operation: "read-secret",
     cause: new Error("secret store unreadable"),
   });
-  /** Plans a thread once per entry: a settings file, or a failed read (it reads secrets too). */
-  const plansFor = (reads: ReadonlyArray<Record<string, unknown> | "fails">) =>
+  /**
+   * A fresh start (a server restart or a Claude adapter rebuild) that plans a thread once per
+   * entry: the settings, or a failed read (it reads provider secrets too). `file` is what
+   * settings.json holds: its text, `undefined` for no file, or "unreadable".
+   */
+  const plansFor = (
+    reads: ReadonlyArray<Record<string, unknown> | "fails">,
+    file: string | undefined | "unreadable" = undefined,
+    policy?: unknown,
+  ) =>
     Effect.gen(function* () {
+      const { settingsPath } = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      if (file === "unreadable") yield* fs.makeDirectory(settingsPath);
+      else if (file !== undefined) yield* fs.writeFileString(settingsPath, file);
       const service = yield* ServerSettingsService.ServerSettingsService;
       let next = 0;
       const getSettings = Effect.suspend(() => {
@@ -135,18 +190,50 @@ describe("makeClaudeMcpProfiles", () => {
         );
       }
       return outcomes;
-    }).pipe(Effect.provide(ServerSettingsService.ServerSettingsService.layerTest()));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ServerSettingsService.ServerSettingsService.layerTest(),
+          ManagedPolicy.layerTest(policy === undefined ? undefined : policyDocument(policy)),
+          Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+        ).pipe(Layer.provideMerge(NodeServices.layer)),
+      ),
+    );
 
-  it.effect("with no profile set, a failed settings read gives all instead of refusing", () =>
+  it.effect("with no profile anywhere, a failed settings read gives all instead of refusing", () =>
     Effect.gen(function* () {
       assert.deepStrictEqual(yield* plansFor(["fails", {}, "fails"]), ["all", "all", "all"]);
+      assert.deepStrictEqual(yield* plansFor(["fails"], "{}"), ["all"]);
     }),
   );
 
-  it.effect("with a profile set when last read, a failed settings read refuses", () =>
+  it.effect("after a restart, a failed secret read keeps the profile settings.json sets", () =>
     Effect.gen(function* () {
-      const [first, second] = yield* plansFor([{ mcpProfile: "t3-only" }, "fails"]);
-      assert.strictEqual(first, "t3-only");
+      const file = JSON.stringify({ mcpProfile: "t3-only" });
+      assert.deepStrictEqual(yield* plansFor(["fails", "fails"], file), ["t3-only", "t3-only"]);
+      const named = JSON.stringify({
+        mcpProfile: "docs",
+        mcpProfiles: { docs: { servers: ["docs"], t3Tools: "all" } },
+      });
+      assert.deepStrictEqual(yield* plansFor(["fails"], named), ["docs"]);
+    }),
+  );
+
+  it.effect("a failed secret read follows a profile the managed policy locks", () =>
+    Effect.gen(function* () {
+      const policy = {
+        schemaVersion: 1,
+        organization: "Example Corp",
+        settings: { mcpProfile: { value: "t3-only", locked: true } },
+      };
+      assert.deepStrictEqual(yield* plansFor(["fails"], "{}", policy), ["t3-only"]);
+    }),
+  );
+
+  it.effect("refuses when settings.json cannot be read either, even after a read with none", () =>
+    Effect.gen(function* () {
+      const [first, second] = yield* plansFor([{}, "fails"], "unreadable");
+      assert.strictEqual(first, "all");
       assert.include(second, "could not read this thread's MCP profile settings");
     }),
   );

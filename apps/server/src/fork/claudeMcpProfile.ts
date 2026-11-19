@@ -20,11 +20,15 @@ import {
 } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as ServerConfig from "../config.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
 import {
   MCP_PROFILE_MAX_LINEAGE,
@@ -113,6 +117,22 @@ const MCP_RESOURCE_TOOLS: ReadonlySet<string> = new Set([
   "ReadMcpResourceTool",
 ]);
 
+/** What `claudeMcpCallOutsideProfile` returns for a resource listing of every connected server. */
+export const EVERY_MCP_SERVER = "*";
+
+/**
+ * Claude's tools that run a command by name, and the input holding it. Claude names an MCP
+ * server's prompt `mcp__<server>__<prompt>`; Claude Code 2.1.326 refuses a plain MCP prompt in
+ * `Skill`, but runs a skill an MCP server serves, so a name of that form is checked too.
+ * `SlashCommand` is the older name of `Skill`, whose input holds the whole command line.
+ */
+const COMMAND_TOOLS: Readonly<Record<string, string>> = { Skill: "skill", SlashCommand: "command" };
+
+const mcpToolServer = (allowed: ReadonlyArray<string>, toolName: string): string | undefined => {
+  const kept = allowed.some((name) => toolName.startsWith(`mcp__${toolNameServer(name)}__`));
+  return kept ? undefined : toolName.slice("mcp__".length).split("__")[0];
+};
+
 /**
  * The MCP server a tool call reaches that the profile leaves out, or `undefined`. Claude names the
  * server it calls (`mcp_server`); an older one does not, so the tool name's prefix is matched.
@@ -130,15 +150,23 @@ export function claudeMcpCallOutsideProfile(
   if (call.mcp_server !== undefined) {
     return allowed.includes(call.mcp_server.name) ? undefined : call.mcp_server.name;
   }
-  if (call.tool_name.startsWith("mcp__")) {
-    const kept = allowed.some((name) =>
-      call.tool_name.startsWith(`mcp__${toolNameServer(name)}__`),
-    );
-    return kept ? undefined : call.tool_name.slice("mcp__".length).split("__")[0];
-  }
+  if (call.tool_name.startsWith("mcp__")) return mcpToolServer(allowed, call.tool_name);
+  const input = (call.tool_input ?? {}) as Readonly<Record<string, unknown>>;
   if (MCP_RESOURCE_TOOLS.has(call.tool_name)) {
-    const server = (call.tool_input as { readonly server?: unknown } | null)?.server;
+    const server = input.server;
+    // A listing with no server lists every connected server's, those left out too.
+    if (call.tool_name === "ListMcpResourcesTool" && (server === undefined || server === "")) {
+      return EVERY_MCP_SERVER;
+    }
     return typeof server === "string" && !allowed.includes(server) ? server : undefined;
+  }
+  const commandKey = Object.hasOwn(COMMAND_TOOLS, call.tool_name)
+    ? COMMAND_TOOLS[call.tool_name]
+    : undefined;
+  const command = commandKey === undefined ? undefined : input[commandKey];
+  if (typeof command === "string") {
+    const name = command.trim().replace(/^\//, "").split(/\s/)[0] ?? "";
+    return name.startsWith("mcp__") ? mcpToolServer(allowed, name) : undefined;
   }
   return undefined;
 }
@@ -163,7 +191,10 @@ const claudeMcpProfileGuard =
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "deny",
-        permissionDecisionReason: `MCP profile "${name}" leaves out the MCP server "${server}", so T3 refused this call. Claude loaded it anyway: a managed Claude policy on this machine, --mcp-config in the Claude launch arguments, or an agent file's servers can add one. To use it, ${FIX} so the profile names it.`,
+        permissionDecisionReason:
+          server === EVERY_MCP_SERVER
+            ? `MCP profile "${name}" leaves out some MCP servers, so T3 refused listing every server's resources: name a server in "server", one the profile keeps.`
+            : `MCP profile "${name}" leaves out the MCP server "${server}", so T3 refused this call. Claude loaded it anyway: a managed Claude policy on this machine, --mcp-config in the Claude launch arguments, or an agent file's servers can add one. To use it, ${FIX} so the profile names it.`,
       },
     };
   };
@@ -262,18 +293,38 @@ export const planKeyFor = (mcpOverrides: object): string | undefined =>
 const planKey = (plan: ClaudeMcpProfilePlan): string | undefined =>
   plan.servers === "all" ? undefined : ["mcp", ...plan.servers].join("\u0000");
 
-/** Something set that can narrow a thread's profile: a default other than `all`, or any rule. */
-const profileConfigured = (settings: ServerSettings) =>
-  !(blank(settings.mcpProfile) || settings.mcpProfile.trim() === MCP_PROFILE_ALL) ||
-  needsLineage(settings);
+/**
+ * The settings as a load decodes them from settings.json, without reading provider secrets: the
+ * MCP profile keys hold none. `undefined` when this server has no settings file to read here.
+ * As the load: no file means the policy's defaults, a file that does not decode loads as them too
+ * (upstream's rule), and the policy's locks are laid over either. A file that cannot be read fails.
+ */
+const settingsFileReader = Effect.gen(function* () {
+  const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+  const fileSystem = yield* Effect.serviceOption(FileSystem.FileSystem);
+  const policy = yield* Effect.serviceOption(ManagedPolicy.ManagedPolicy);
+  if (Option.isNone(config) || Option.isNone(fileSystem) || Option.isNone(policy)) {
+    return undefined;
+  }
+  const { settingsPath } = config.value;
+  const fs = fileSystem.value;
+  const managed = policy.value.settings;
+  return Effect.gen(function* () {
+    if (!(yield* fs.exists(settingsPath))) return managed.applyLocks(managed.defaults);
+    const raw = yield* fs.readFileString(settingsPath);
+    const decoded = ServerSettingsService.decodeSettingsFileText(raw, managed.withDefaults);
+    const readable =
+      Exit.isSuccess(decoded) && !ServerSettingsService.settingsFileLegacyKeysUnreadable(raw);
+    return managed.applyLocks(readable ? decoded.value : managed.defaults);
+  });
+});
 
 type McpOverrides = { readonly mcpServers?: Readonly<Record<string, unknown>> | undefined };
 
 /**
- * The thread's plan, or a refusal. Without the settings service (tests), every thread gets `all`.
- * A settings read that fails (it also reads provider secrets) refuses only when the settings last
- * read had a profile set; with none set it falls back to `all` with a warning, as upstream's
- * own reads in the adapter fall back, so an owner who never set a profile sees no change.
+ * The thread's plan, or a refusal; without the settings service (tests), `all`. A settings read
+ * that fails (it reads provider secrets too) falls back to settings.json alone, which holds every
+ * MCP profile key; if that cannot be read either, the turn is refused, never widened to `all`.
  */
 export const makeClaudeMcpProfiles = Effect.gen(function* () {
   const settingsService = yield* Effect.serviceOption(ServerSettingsService.ServerSettingsService);
@@ -292,29 +343,41 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
   // A parent that cannot be read refuses the thread, as a missing one does.
   const findThread =
     store && ((id: ThreadId) => store.findThread(id).pipe(Effect.orElseSucceed(() => null)));
-  // Whether the settings last read could narrow a profile; `false` until one read succeeds.
-  let lastConfigured = false;
+  const readSettingsFile = yield* settingsFileReader;
+  const readSettings = Effect.fn("ClaudeMcpProfile.readSettings")(function* (
+    service: ServerSettingsService.ServerSettingsService["Service"],
+  ) {
+    const read = yield* service.getSettings.pipe(Effect.result);
+    if (read._tag === "Success") return read.success;
+    const file =
+      readSettingsFile === undefined
+        ? undefined
+        : yield* readSettingsFile.pipe(Effect.option, Effect.map(Option.getOrUndefined));
+    if (file === undefined) {
+      yield* Effect.logWarning(
+        "MCP profiles: neither the settings nor settings.json could be read",
+        {
+          cause: read.failure,
+        },
+      );
+      return yield* new ClaudeMcpProfileError({
+        reason: `T3 could not read this thread's MCP profile settings, so this thread cannot start: retry, or check that T3's settings.json can be read.`,
+      });
+    }
+    yield* Effect.logWarning(
+      "MCP profiles: settings could not be read in full, so this Claude thread's profile comes from settings.json alone",
+      { cause: read.failure },
+    );
+    return file;
+  });
   const planFor = Effect.fn("ClaudeMcpProfile.planFor")(function* (
     thread: LineageThread,
     overrides: McpOverrides,
   ) {
     if (Option.isNone(settingsService)) return ALL_PLAN;
-    const read = yield* settingsService.value.getSettings.pipe(Effect.result);
-    if (read._tag === "Failure") {
-      if (lastConfigured) {
-        return yield* new ClaudeMcpProfileError({
-          reason: `T3 could not read this thread's MCP profile settings, so this thread cannot start: retry, or ${FIX}.`,
-        });
-      }
-      yield* Effect.logWarning(
-        "MCP profiles: settings could not be read and no profile was set when last read, so this Claude thread gets the all profile",
-        { cause: read.failure },
-      );
-      return ALL_PLAN;
-    }
-    lastConfigured = profileConfigured(read.success);
+    const settings = yield* readSettings(settingsService.value);
     const t3ServerNames = Object.keys(overrides.mcpServers ?? {});
-    return yield* claudeMcpProfileForThread(read.success, thread, t3ServerNames, findThread);
+    return yield* claudeMcpProfileForThread(settings, thread, t3ServerNames, findThread);
   });
 
   return Effect.fn("ClaudeMcpProfile.plan")(function* (

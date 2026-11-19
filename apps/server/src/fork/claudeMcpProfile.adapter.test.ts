@@ -4,6 +4,8 @@ import type { HookInput, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { assert, describe, it } from "@effect/vitest";
 import {
   ClaudeSettings,
+  EnvironmentId,
+  ProjectId,
   ProviderInstanceId,
   ProviderSessionId,
   type ServerSettings,
@@ -13,6 +15,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import type * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -26,6 +29,7 @@ import * as Stream from "effect/Stream";
 import { makeTurnInput } from "../orchestration-v2/Adapters/AcpAdapterV2.testkit.ts";
 import * as ClaudeAdapterV2 from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
+import { type LineageThread, makeClaudeMcpProfiles } from "./claudeMcpProfile.ts";
 
 const MODEL = {
   instanceId: ProviderInstanceId.make(ClaudeAdapterV2.CLAUDE_PROVIDER),
@@ -282,6 +286,50 @@ describe("ClaudeAdapterV2 MCP profile", () => {
         ]);
         assert.equal(closed, 1);
         assert.include(refusal, "Claude still loaded claude.ai Calendar");
+      }),
+  );
+
+  // Upstream's "invalidates live-query reuse when MCP credentials rotate" keys overrides no profile
+  // planned, which now always differ; this keys planned ones, so it fails if the T3 server's
+  // credentials leave the key.
+  it.effect(
+    "planned turns reuse a process for the same MCP credentials, not after a rotation",
+    () =>
+      Effect.gen(function* () {
+        const threadId = ThreadId.make("thread-mcp-profile-rotation");
+        const overridesFor = (authorizationHeader: string) =>
+          ClaudeAdapterV2.claudeMcpQueryOverrides({
+            mcpSession: {
+              environmentId: EnvironmentId.make("environment-mcp-profile"),
+              threadId,
+              providerSessionId: "mcp-session-mcp-profile",
+              providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+              endpoint: "http://127.0.0.1:43123/mcp",
+              authorizationHeader,
+              browserToolsAvailable: true,
+            } satisfies McpProviderSession.McpProviderSessionConfig,
+            readOnlySandbox: false,
+          });
+        const thread: LineageThread = {
+          id: threadId,
+          projectId: ProjectId.make("project-mcp-profile"),
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        };
+        const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(POLICY);
+        for (const settings of [{}, { mcpProfile: "t3-only" }] satisfies Array<McpSettings>) {
+          const plan = yield* makeClaudeMcpProfiles.pipe(
+            Effect.provide(ServerSettingsService.layerTest(settings)),
+          );
+          const keyFor = (authorizationHeader: string) =>
+            Effect.gen(function* () {
+              const overrides = overridesFor(authorizationHeader);
+              yield* plan(thread, overrides);
+              return ClaudeAdapterV2.claudeEffectiveQueryPolicyKey(queryPolicy, overrides);
+            });
+          const first = yield* keyFor("Bearer first-token");
+          assert.strictEqual(yield* keyFor("Bearer first-token"), first);
+          assert.notStrictEqual(yield* keyFor("Bearer rotated-token"), first);
+        }
       }),
   );
 });
