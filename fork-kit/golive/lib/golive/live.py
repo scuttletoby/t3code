@@ -341,6 +341,20 @@ def compare_counts(before, after):
     return said
 
 
+FORK_BUILD = re.compile(r'\.fork\.\d+$')  # a fork build's version: its upstream nightly's, then `.fork.N`
+
+
+def fork_build(version):
+    """Whether `version` names a fork build (it has a fork report and fork features), not an upstream one."""
+    return isinstance(version, str) and FORK_BUILD.search(version) is not None
+
+
+def features_list(fork):
+    """The report's `featuresOn` when it is a list of names, else None (a report without it says nothing)."""
+    on = fork.get('featuresOn') if isinstance(fork, dict) else None
+    return list(on) if isinstance(on, list) and all(isinstance(n, str) for n in on) else None
+
+
 def features_on(fork):
     """The report's fork features that are on, each with where (`handoff (project:p1, thread:t1)`), so an operator
     knows which project override or thread entry to clear. A report without `featuresWhere` names the features only."""

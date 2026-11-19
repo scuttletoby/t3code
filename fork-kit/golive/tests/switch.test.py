@@ -396,7 +396,8 @@ class Switch(SwitchBase):
         self.rehearsed()
         self.switch()
         cfg, before = config.load(), self.done('before')[0]
-        before = {'counts': before['reportCounts'], 'providers': before['providers']}
+        before = {'counts': before['reportCounts'], 'providers': before['providers'],
+                  'featuresOn': before['featuresOn']}
         binary = keptruntime.home_t3(cfg.home, fx.TARGET)
         build = self.done('install-target')[0]  # its record: the runtime as checked against the rehearsed archive
 
@@ -428,6 +429,8 @@ class Switch(SwitchBase):
                               ({'database': {**self.after['database'], 'pendingMigrations': None}}, 'pending'),
                               ({'database': {**self.after['database'], 'counts': {}}}, 'threads: 40 before'),
                               ({'fork': {**self.after['fork'], 'featuresOn': ['waitFor']}}, 'fork features on'),
+                              ({'fork': {k: v for k, v in self.after['fork'].items() if k != 'featuresOn'}},
+                               'fork features on: None'),
                               ({'settings': {**self.after['settings'], 'providerInstances': PROVIDERS[:1]}},
                                'provider instances'),
                               ({'ok': False}, 'not ok')):
@@ -435,6 +438,17 @@ class Switch(SwitchBase):
                 self.m.set_report({**self.after, **change})
                 self.assertIn(words, look())
         self.m.set_report(self.after)
+        self.assertEqual(look(), '')
+        # Fork #529: verify wants the features that were on before the switch, not all off: the same list passes,
+        # another (fewer, or all off) is a problem.
+        before['featuresOn'] = ['agentSlots', 'waitFor']
+        self.m.set_report({**self.after, 'fork': {**self.after['fork'], 'featuresOn': ['agentSlots', 'waitFor']}})
+        self.assertEqual(look(), '')
+        self.m.set_report({**self.after, 'fork': {**self.after['fork'], 'featuresOn': ['agentSlots']}})
+        self.assertIn("fork features on: ['agentSlots'], before the switch ['agentSlots', 'waitFor']", look())
+        self.m.set_report(self.after)
+        self.assertIn('fork features on: [], before the switch', look())
+        before['featuresOn'] = []
         self.assertEqual(look(), '')
         with open(self.m.path(f'home/runtime/versions/{fx.TARGET}/lib/runtime.txt'), 'a') as f:
             f.write('x')
@@ -1465,6 +1479,95 @@ class Round2(SwitchBase):
         did = ' '.join(self.guard(run['id']))
         self.assertIn('--lose-work-since', did)
         self.assertEqual(self.downgrades(), [])
+
+
+class ForkFeatures(SwitchBase):
+    """Fork #529: from the second switch on the live build is a fork build and features may be on (design 4.7).
+    The switch keeps them as they are: check records the list, the stopped home's `before` and verify require it.
+    The live fixture build is upstream, so these tests say it is a fork build (check.test.py ForkFeatures checks
+    the version rule itself)."""
+    ON = ['agentSlots', 'waitFor']
+
+    def setUp(self):
+        super().setUp()
+        for r in (self.before, self.after):
+            r['fork'] = {**r['fork'], 'featuresOn': list(self.ON), 'featuresWhere': {f: ['server'] for f in self.ON}}
+        self.m.set_report(self.before)
+        patcher = mock.patch.object(live, 'fork_build', return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def with_features(self, report, on):
+        return {**report, 'fork': {**report['fork'], 'featuresOn': on}}
+
+    def changed_after_the_check(self, on):
+        real = check.run_check
+
+        def run_check(*args, **kw):
+            answer = real(*args, **kw)
+            self.m.set_report(self.with_features(self.before, on))  # an owner switched a feature since
+            return answer
+        return mock.patch.object(check, 'run_check', run_check)
+
+    def test_features_on_are_kept_through_the_switch_and_verified(self):
+        self.rehearsed()
+        self.assertEqual(self.switch()['verified'], fx.TARGET)
+        self.assertEqual(self.done('before')[0]['featuresOn'], self.ON)
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+
+    def test_features_changed_since_the_check_refuse_with_t3_running_and_a_rerun_goes(self):
+        # State: the list changed between check and the stop (on to fewer, or off to on). Refused before the
+        # stop, nothing changed; a rerun reads the new list and goes through.
+        for i, on in enumerate((['agentSlots'], self.ON + ['handoff'])):
+            with self.subTest(on), mock.patch.object(coldcopy, '_stamp', return_value=f'2099010{i + 1}T000000Z'):
+                self.m.set_report(self.before)
+                self.rehearsed()
+                with self.changed_after_the_check(on):
+                    words = self.refused('the fork features on changed since the check', str(on))
+                self.assertIn('T3 was not stopped', words)
+                self.assertEqual(self.server()['version'], fx.LIVE)
+                self.assertEqual(sha(self.m.path('home/userdata/statev2.sqlite')), self.db_before)
+                self.assertEqual(self.calls()[-3:], ['pre', 'quiet', 'post'])
+        self.after = self.with_features(self.after, self.ON + ['handoff'])
+        self.assertEqual(self.switch()['verified'], fx.TARGET)
+        self.assertEqual(self.done('before')[0]['featuresOn'], self.ON + ['handoff'])
+
+    def test_features_changed_while_t3_was_stopped_start_the_old_build_again(self):
+        self.rehearsed()
+        self.adapter.on['stop'] = lambda: self.m.set_report(self.with_features(self.before, []))
+        with self.assertRaises(RuntimeError) as cm:
+            self.switch()
+        self.assertIn("other fork features on ([], the check read ['agentSlots', 'waitFor'])", str(cm.exception))
+        self.assertNotIn('update', self.names('started'))
+        self.assertEqual(self.server()['version'], fx.LIVE)
+
+    def test_a_check_result_without_the_list_refuses(self):
+        real = check.run_check
+
+        def run_check(*args, **kw):
+            code, result = real(*args, **kw)
+            result.pop('featuresOn', None)
+            return code, result
+        self.rehearsed()
+        with mock.patch.object(check, 'run_check', run_check):
+            self.refused('no list of the fork features', 'nothing was changed')
+
+
+class FirstSwitchFeatures(SwitchBase):
+    """The first switch (upstream live, all off): a feature switched on between check and the stop refuses with
+    T3 still running (before #529 only the stopped home's `before` saw it, after the stop)."""
+
+    def test_a_feature_switched_on_since_the_check_refuses_before_the_stop(self):
+        self.rehearsed()
+        real = check.run_check
+
+        def run_check(*args, **kw):
+            answer = real(*args, **kw)
+            self.m.set_report({**self.before, 'fork': {**self.before['fork'], 'featuresOn': ['waitFor']}})
+            return answer
+        with mock.patch.object(check, 'run_check', run_check):
+            self.refused("the fork features on changed since the check: [] then, ['waitFor'] now", 'not stopped')
+        self.assertEqual(self.server()['version'], fx.LIVE)
 
 
 class Pieces(unittest.TestCase):

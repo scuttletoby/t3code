@@ -207,7 +207,8 @@ def _checks(cfg, adapter, result, add, info, own_id):
 
 
 STEADY = ('boot service', 'live server', 'no update in flight', 'no half switch', 'no markers')
-REPORT_ANSWERS = ('counts', 'pendingMigrations', 'providers')  # what _report takes from the report into the result
+# What _report takes from the report into the result.
+REPORT_ANSWERS = ('counts', 'pendingMigrations', 'providers', 'featuresOn')
 
 
 def server_changed(cfg, adapter, server):
@@ -259,11 +260,15 @@ def _report(cfg, report, result, add):
     version = report.get('version')
     add('report: target build', version == cfg.target_version, f'the staged build says it is {version}')
     fork = report.get('fork') if isinstance(report.get('fork'), dict) else {}
-    on = fork.get('featuresOn')
-    if not isinstance(on, list):
-        add('fork features off', False, 'the report has no fork.featuresOn list')
-    else:
-        add('fork features off', not on, f'switched on in settings: {live.features_on(fork)}' if on else 'all off')
+    on, live_version = live.features_list(fork), (result.get('live') or {}).get('version')
+    if on is None:
+        add('fork features', False, 'the report has no fork.featuresOn list')
+    elif on and not live.fork_build(live_version):
+        add('fork features', False, f'switched on in settings while the live build {live_version} is not a fork '
+                                    f'build: the first switch starts with all off ({live.features_on(fork)})')
+    else:  # a fork-to-fork switch keeps them as they are: `before` and verify require this same list
+        result['featuresOn'] = on
+        add('fork features', True, f'on, kept as they are: {live.features_on(fork)}' if on else 'all off')
     problems = report.get('problems') if isinstance(report.get('problems'), list) else []
     named = '; '.join(f'{p.get("code")}: {p.get("message")}' for p in problems if isinstance(p, dict))
     readable = report.get('ok') is True

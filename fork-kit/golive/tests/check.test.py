@@ -83,6 +83,36 @@ class Ready(CheckBase):
         self.assertIn('use the normal installer', ' '.join(result['info']))
 
 
+class ForkFeatures(CheckBase):
+    """Fork #529: from the second switch on the live build is a fork build, and features may be on. check records
+    which (the switch keeps them as they are: `before` and verify require the same list) instead of refusing."""
+    LIVE_FORK = '0.1.10-nightly.20261113.4600.fork.1'
+
+    def passes(self, live, fork):
+        self.m.standard(version=live)
+        self.m.set_report(fx.report(fork=fork))
+        before = self.m.snapshot()
+        code, result, err = self.check_json()
+        self.assertEqual((code, result['ok']), (0, True), (err, self.failed(result)))
+        self.assertEqual(self.m.snapshot(), before)
+        return result, {c['name']: c['detail'] for c in result['checks']}
+
+    def test_a_fork_build_live_with_features_on_passes_and_records_them(self):
+        result, detail = self.passes(self.LIVE_FORK, {'featuresOn': ['agentSlots', 'waitFor'], 'featuresWhere': {
+            'agentSlots': ['server'], 'waitFor': ['server']}})
+        self.assertEqual(result['featuresOn'], ['agentSlots', 'waitFor'])
+        self.assertIn('kept as they are: agentSlots (server), waitFor (server)', detail['fork features'])
+
+    def test_all_off_is_recorded_as_an_empty_list(self):
+        # Empty state (an empty or missing settings file decodes to all off): the list is [] and check passes,
+        # on an upstream live build (the first switch) and on a fork build alike.
+        for live in (fx.LIVE, self.LIVE_FORK):
+            with self.subTest(live):
+                result, detail = self.passes(live, {'featuresOn': []})
+                self.assertEqual(result['featuresOn'], [])
+                self.assertEqual(detail['fork features'], 'all off')
+
+
 class NothingToDoNeverHidesARefusal(CheckBase):
     """"Nothing to do" (exit 0) only when no check failed: a half switch, a half restore, a stopped service, a
     dead server or a run to settle always refuse, and the refusal names what was found."""
@@ -348,7 +378,7 @@ class Refusals(CheckBase):
                     self.assertIn('an update to 0.1.10 is pending', self.failed(result)['T3 steady during the report'])
                 # Fork #300 item 5: the answer is not used, so the result does not carry it either: a caller that
                 # reads counts or providers from a refused check finds none.
-                for key in ('counts', 'pendingMigrations', 'providers'):
+                for key in ('counts', 'pendingMigrations', 'providers', 'featuresOn'):
                     self.assertNotIn(key, result)
 
     def test_target_older_than_live(self):
@@ -397,17 +427,26 @@ class Refusals(CheckBase):
         self.m.set_report(fx.report(version='0.1.10-nightly.20261114.4682'))
         self.refused('report: target build')
 
-    def test_fork_feature_switched_on(self):
+    def test_fork_feature_switched_on_before_the_first_switch(self):
+        # The live build is upstream (no fork features): the first switch starts with all off (design 4.7).
         self.m.standard()
         self.m.set_report(fx.report(fork={'featuresOn': ['waitFor']}))
-        self.refused('fork features off', 'waitFor')
+        self.assertIn('not a fork build', self.refused('fork features', 'waitFor')['fork features'])
 
     def test_fork_feature_switched_on_names_where(self):
         # Where, so a deleted project's override or a stale thread entry can be cleared.
         self.m.standard()
         self.m.set_report(fx.report(fork={'featuresOn': ['handoff', 'waitFor'], 'featuresWhere': {
             'handoff': ['project:p1', 'project:p1/thread:t1'], 'waitFor': ['server']}}))
-        self.refused('fork features off', 'handoff (project:p1, project:p1/thread:t1), waitFor (server)')
+        self.refused('fork features', 'handoff (project:p1, project:p1/thread:t1), waitFor (server)')
+
+    def test_a_report_without_the_features_list_refuses(self):
+        # Missing state: a report that does not say which features are on cannot be kept as it is.
+        for fork in ({'featuresOn': None}, {'featuresOn': 'waitFor'}, {'featuresOn': [1]}):
+            with self.subTest(fork):
+                self.m.standard()
+                self.m.set_report(fx.report(fork=fork))
+                self.refused('fork features', 'no fork.featuresOn list')
 
     def test_report_not_ok_names_its_problems(self):
         self.m.standard()

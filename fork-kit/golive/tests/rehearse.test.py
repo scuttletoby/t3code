@@ -63,14 +63,25 @@ elif a[0] == '__fork-report':
     c = sqlite3.connect('file:%s?mode=ro' % db, uri=True)
     counts = {{k: c.execute('SELECT COUNT(*) FROM %s' % k).fetchone()[0] for k in ('projects', 'threads')}}
     c.close()
-    with open(os.path.join(ud, 'settings.json')) as f:
-        s = json.load(f)
+    with open(os.path.join(ud, 'settings.json')) as f:  # lenient as the load: a `//` comment line is dropped
+        s = json.loads(''.join(l for l in f if not l.lstrip().startswith('//')))
+    feats, where = ('agentSlots', 'waitFor', 'reviewRules', 'handoff', 'playtest'), {{}}
+    for k in feats:  # a value that is there and truthy is on; a project's override too; "policyOn" locks one on
+        if s.get(k):
+            where.setdefault(k, []).append('server')
+    for pid, o in sorted((s.get('projectSettingsOverrides') or {{}}).items()):
+        for k in ('reviewRules', 'handoff', 'playtest'):
+            if isinstance(o, dict) and o.get(k):
+                where.setdefault(k, []).append('project:' + pid)
+    for k in M.get('policyOn', []):
+        where.setdefault(k, []).append('policy')
     r = {{'reportVersion': 1, 'version': VERSION,
          'database': {{'state': 'present', 'appliedMigrations': [{{'id': i, 'name': 'm%d' % i}} for i in got],
                       'pendingMigrations': list(range(max(got) + 1, HEAD + 1)), 'unknownMigrations': [],
                       'counts': dict(counts, projectsArchived=0, threadsArchived=0)}},
          'settings': {{'state': 'present', 'parseWarning': None, 'providerInstances': s.get('providerInstances', [])}},
-         'fork': {{'featuresOn': [], 'features': {{}}}}, 'problems': [], 'ok': True}}
+         'fork': {{'featuresOn': [k for k in feats if k in where], 'featuresWhere': where, 'features': {{}}}},
+         'problems': [], 'ok': True}}
     rt = os.path.join(ud, 'server-runtime.json')
     if os.path.exists(rt):
         r.update(M.get('report', {{}}))
@@ -144,6 +155,12 @@ def killing_copy_file(*args):
         os.kill(os.getpid(), 9)
     return copy_file(*args)
 coldcopy._copy_file = killing_copy_file
+replace = os.replace
+def killing_replace(src, dst, *a, **kw):  # the clone's settings.json written with its fork features off
+    if at == 'mid-features-off' and os.fspath(dst).endswith('settings.json'):
+        os.kill(os.getpid(), 9)
+    return replace(src, dst, *a, **kw)
+os.replace = killing_replace
 leaves = coldcopy.link_leaves
 def capped_leaves(rel, look):  # one that never stops (no hop limit) fails at once, not at the parent's timeout
     calls = [0]
@@ -340,8 +357,8 @@ class Rehearse(Base):
         self.assertEqual(self.m.snapshot(), live, 'the live home is never touched')
         self.assertEqual(self.m.snapshot(self.copy_dir), copy, 'the copy is never changed')
         self.assertEqual([s for s, phase in self.steps() if phase == 'done'],
-                         ['clone', 'preflight', 'migrate', 'serve', 'checks', 'stop-server', 'old-build-blocked',
-                          'restore', 'result'])
+                         ['clone', 'preflight', 'features-off', 'migrate', 'serve', 'checks', 'stop-server',
+                          'old-build-blocked', 'restore', 'result'])
         self.assertEqual(self.runs()[-1]['end']['result'], 'ok')
         facts = self.runs()[-1]['steps'][-1]['data']
         self.assertEqual(facts, result)
@@ -1519,10 +1536,125 @@ class Links(Base):
         self.assertEqual([(rel, why) for rel, _, why, _ in out], [('x', 'x goes above the tree')])
 
 
+SETTINGS_ON = {
+    'providerInstances': [{'id': 'codex', 'driver': 'codex', 'enabled': True},
+                          {'id': 'claude', 'driver': 'claude', 'enabled': True}],
+    'agentSlots': {'enabled': True}, 'waitFor': {'enabled': True}, 'waitChecks': {'ci': {}},
+    'projectSettingsOverrides': {'p1': {'handoff': {'mode': 'handoff'}, 'textGenerators': {'x': 1}}, 'p2': {}}}
+SETTINGS_OFF = {k: v for k, v in SETTINGS_ON.items() if k not in ('agentSlots', 'waitFor')}
+SETTINGS_OFF['projectSettingsOverrides'] = {'p1': {'textGenerators': {'x': 1}}, 'p2': {}}
+
+
+class FeaturesOff(Base):
+    """Fork #529 (2): with a fork feature on (waitFor, handoff, ...) the rehearsal's server on the clone could act,
+    deliver waits or send messages. The rehearsal switches every feature on off in the clone's settings.json only
+    (never the home's or the copy's), says so in its facts, and R4 still wants all off."""
+
+    def with_settings(self, text):
+        self.m.write('home/userdata/settings.json', text)
+        self.copy_dir = self.make_copy(name=f't3-copy-20990102T000000Z-{fx.LIVE}')
+
+    def clone_settings(self):
+        return os.path.join(self.root(), 'home', 'userdata', 'settings.json')
+
+    def served_with(self):
+        """Runs the rehearsal; returns it and the clone's settings.json as the R3 server found it."""
+        real, seen = rehearse._serve, []
+
+        def serve(p, empty):
+            with open(self.clone_settings(), 'rb') as f:
+                seen.append(f.read())
+            return real(p, empty)
+        with mock.patch.object(rehearse, '_serve', serve):
+            result = self.rehearse(copy_dir=self.copy_dir)
+        return result, seen[0]
+
+    def test_features_on_in_the_copy_are_off_in_the_clone_only_every_run(self):
+        self.with_settings(json.dumps(SETTINGS_ON))
+        live, copy = self.m.snapshot(), self.m.snapshot(self.copy_dir)
+        for run in (1, 2):  # runs again: the next run clones afresh and switches them off again
+            with self.subTest(run=run):
+                result, served = self.served_with()
+                self.assertEqual(json.loads(served), SETTINGS_OFF)
+                self.assertEqual(result['featuresOff'], {
+                    'featuresOn': ['agentSlots', 'waitFor', 'handoff'],
+                    'where': 'agentSlots (server), waitFor (server), handoff (project:p1)',
+                    'removed': ['agentSlots', 'waitFor', 'project:p1/handoff']})
+                [step] = [s['data'] for s in self.runs()[-1]['steps'] if s['step'] == 'features-off'
+                          and s['phase'] == 'done']
+                self.assertEqual(step['removed'], result['featuresOff']['removed'])
+                self.assertIn('are switched off in the clone only', ' '.join(self.said))
+                self.assertEqual(self.m.snapshot(), live, 'the live home is never touched')
+                self.assertEqual(self.m.snapshot(self.copy_dir), copy, 'the copy is never changed')
+                self.assertEqual(sha(self.clone_settings()), sha(os.path.join(self.copy_dir, 'userdata',
+                                                                                 'settings.json')),
+                                 'the restore puts the copy\'s settings back in the clone')
+
+    def test_all_off_leaves_the_clone_settings_as_they_are(self):
+        # Empty state: nothing on, nothing written (the server reads the copy's settings byte for byte).
+        result, served = self.served_with()
+        with open(os.path.join(self.copy_dir, 'userdata', 'settings.json'), 'rb') as f:
+            self.assertEqual(served, f.read())
+        self.assertEqual(result['featuresOff'], {'featuresOn': [], 'where': '', 'removed': []})
+        self.assertNotIn('switched off', ' '.join(self.said))
+
+    def test_a_feature_the_policy_locks_on_fails_before_any_server(self):
+        self.with_settings(json.dumps(SETTINGS_ON))
+        self.mode(fx.TARGET, policyOn=['waitFor'])
+        live = self.m.snapshot()
+        words = self.failed('stay on in the clone', copy_dir=self.copy_dir)
+        self.assertIn('waitFor (policy)', words)
+        self.assertNotIn(('serve', 'started'), self.steps())
+        self.assertEqual(self.m.snapshot(), live)
+
+    def test_settings_that_are_not_plain_json_fail_before_any_server(self):
+        self.with_settings('// the owner wrote a comment\n' + json.dumps(SETTINGS_ON))
+        live = self.m.snapshot()
+        self.failed('does not read as plain JSON', copy_dir=self.copy_dir)
+        self.assertNotIn(('serve', 'started'), self.steps())
+        self.assertEqual(self.m.snapshot(), live)
+
+    def test_a_report_without_the_list_fails(self):
+        real = rehearse._report
+        with mock.patch.object(rehearse, '_report', lambda p: {**real(p), 'fork': {}}):
+            self.failed('no fork.featuresOn list')
+        self.assertNotIn(('serve', 'started'), self.steps())
+
+    def test_missing_settings_with_a_policy_feature_on_fails(self):
+        # Missing state: no settings.json in the clone, a feature on by the policy alone: nothing to clear, so it
+        # fails, named.
+        p = {'home': self.m.path('nohome')}
+        report = {'fork': {'featuresOn': ['waitFor'], 'featuresWhere': {'waitFor': ['policy']}}}
+        with mock.patch.object(rehearse, '_report', lambda p: report):
+            with self.assertRaises(rehearse.Failed) as cm:
+                rehearse._features_off(p, report)
+        self.assertIn('waitFor (policy)', str(cm.exception))
+        self.assertFalse(os.path.exists(p['home']))
+
+    def test_killed_while_switching_them_off_runs_again(self):
+        self.with_settings(json.dumps(SETTINGS_ON))
+        live, copy = self.m.snapshot(), self.m.snapshot(self.copy_dir)
+        for at in ('features-off', 'mid-features-off'):
+            with self.subTest(at):
+                code = KILLED.format(paths=[os.path.join(fx.KIT, 'lib'), fx.COMMON], machine=config.MACHINE_FILE,
+                                     at=at)
+                p = subprocess.run([sys.executable, '-I', '-B', '-c', code], stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(p.returncode, -9, p.stderr)
+                self.assertIsNone(self.runs()[-1]['end'])
+                self.assertFalse(journal.needs_settling(self.runs()[-1]))
+                self.assertFalse(self.server_left())
+                self.assertEqual(self.m.snapshot(), live)
+                self.assertEqual(self.m.snapshot(self.copy_dir), copy)
+                result, served = self.served_with()
+                self.assertEqual(json.loads(served), SETTINGS_OFF)
+                self.assertEqual(result['featuresOff']['featuresOn'], ['agentSlots', 'waitFor', 'handoff'])
+
+
 class StoppedHalfWay(Base):
     def test_a_rehearsal_stopped_at_each_step_runs_again_with_nothing_to_settle(self):
-        points = ['clone', 'preflight', 'migrate', 'serve', 'checks', 'stop-server', 'old-build-blocked', 'restore',
-                  'mid-restore', 'result']
+        points = ['clone', 'preflight', 'features-off', 'migrate', 'serve', 'checks', 'stop-server',
+                  'old-build-blocked', 'restore', 'mid-restore', 'result']
         for at in points:
             with self.subTest(at):
                 code = KILLED.format(paths=[os.path.join(fx.KIT, 'lib'), fx.COMMON], machine=config.MACHINE_FILE,
