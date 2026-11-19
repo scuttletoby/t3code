@@ -12,7 +12,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import back_fixture as bx  # noqa: E402
 import golive_fixture as fx  # noqa: E402
-from golive import back, check, coldcopy, config, journal, keptruntime, live, switch  # noqa: E402
+from golive import back, check, coldcopy, config, handoff, journal, keptruntime, live, switch  # noqa: E402
 
 HOOK = '''#!{python} -I
 import json, sys
@@ -299,7 +299,9 @@ class Switch(SwitchBase):
         self.assertEqual(self.last_run()['end']['result'], 'ok')
         self.assertEqual(self.server()['version'], fx.TARGET)
         self.assertEqual(os.path.realpath(self.link), self.m.path(f'home/runtime/versions/{fx.TARGET}/t3'))
-        self.assertEqual(self.calls(), ['quiet', 'quiet', 'run_detached', 'pre', 'quiet', 'stop', 'post'])
+        # the guard, then the kit's holder from the stop on (#530), handed to the launcher by the update
+        self.assertEqual(self.calls(), ['quiet', 'quiet', 'run_detached', 'pre', 'quiet', 'stop', 'run_detached',
+                                        'post'])
         # The copy: a new folder with the database, the unit and the service state, read back.
         copy = result['copy']
         self.assertTrue(os.path.basename(copy).startswith('t3-switch-'))
@@ -322,7 +324,10 @@ class Switch(SwitchBase):
             [self.m.path(f'home/runtime/versions/{fx.TARGET}/t3'), 'update', fx.TARGET, '--base-dir', self.m.home,
              '--yes']])
         # The guard: a waiter now and a timer for the deadline, both `switch-guard` for this run.
-        [call] = [c for c in self.m.calls('fake-adapter-calls.jsonl') if c[0] == 'run_detached']
+        call, hold = [c for c in self.m.calls('fake-adapter-calls.jsonl') if c[0] == 'run_detached']
+        self.assertEqual(hold[1:], [handoff.holder_unit(self.m.home),
+                                    [coldcopy.KIT_BIN, *handoff.holder_args(self.m.home)]])  # the holder (#530)
+        self.assertIsNone(handoff.find_holder(self.m.home))  # handed to the launcher: the home is T3's again
         rid = self.last_run()['id']
         self.assertEqual(call[2], [coldcopy.KIT_BIN, 'switch-guard', '--run', rid, '--wait'])
         self.assertEqual(call[4], [coldcopy.KIT_BIN, 'switch-guard', '--run', rid])

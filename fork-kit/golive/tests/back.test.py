@@ -529,7 +529,8 @@ class W1(BackBase):
         self.assertEqual([s for s, _ in steps], ['plan', 'runtime', 'pre-hooks', 'stop-service', 'restore', 'update',
                                                  'verify', 'post-hooks'])
         self.assertEqual(steps[5][1]['t3'], self.m.path(f'home/runtime/versions/{fx.LIVE}/t3'))
-        self.assertEqual(self.calls()[-3:], ['disable', 'stop', 'start'])  # off at boot before the data moves
+        # off at boot before the data moves; the kit's holder keeps the home owned from the stop on (#530)
+        self.assertEqual(self.calls()[-4:], ['disable', 'stop', 'run_detached', 'start'])
         self.assertTrue(self.adapter.service()['enabled'])
         self.assertTrue(any('threads: 40 at the copy, 43 now' in line for line in self.said), self.said)
         self.assertEqual(self.last_run()['end']['result'], 'ok')

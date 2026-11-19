@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import golive_fixture as fx  # noqa: E402
 import back_fixture as bx  # noqa: E402
-from golive import back, coldcopy, config, journal, live, switch  # noqa: E402
+from golive import back, coldcopy, config, handoff, journal, live, switch  # noqa: E402
 
 NODE = shutil.which('node')  # before a test's fake PATH
 
@@ -195,6 +195,16 @@ class Prober:
     def __exit__(self, *exc):
         self.stop.set()
         self.thread.join()
+
+
+def reboot_drops_the_holder(home):
+    """What a reboot (or an OOM kill) does to the kit's holder (#530): it is gone, and the owner lock with it."""
+    pid = handoff.find_holder(home)
+    assert pid is not None, 'no holder'
+    os.kill(pid, signal.SIGKILL)
+    end = time.monotonic() + 10
+    while handoff.lock_holders(os.path.join(home, 'userdata', handoff.OWNER_LOCK)) and time.monotonic() < end:
+        time.sleep(0.01)
 
 
 class Race:
@@ -566,7 +576,10 @@ class W1Gap(back_t.BackBase):
             with self.assertRaisesRegex(RuntimeError, 'disk gone'):
                 self.back('w1', lose_work_since=self.at)
         self.assertFalse(self.adapter.service()['enabled'])
-        race = Race(self, self.m)  # the kit exited: its marker runs out, its lock is gone (#530)
+        race = Race(self, self.m)
+        race.launch('waited')
+        self.assertEqual(race.log[-1], ('waited', 'waits: home owned'))  # the kit's holder keeps it owned (#530)
+        reboot_drops_the_holder(self.m.home)  # ... until the machine reboots: then a hand server may take the home
         race.launch('waited')
         calls = len(self.calls())
         with self.assertRaises(journal.Refused) as cm:
@@ -588,6 +601,187 @@ class W1Gap(back_t.BackBase):
         self.assertNotIn('stop', self.calls()[calls:])
         self.assertFalse(any('stopping T3' in s for s in self.said), self.said)
         self.assertTrue(self.adapter.service()['active'])
+
+
+class Holder(back_t.BackBase):
+    """#530: a W1 that stopped T3 keeps the home owned past its own end (a failure, a kill), by the kit's holder
+    unit, until a run hands it to T3's launcher, settle stops it, or the machine reboots. Each test fails on a kit
+    that held the owner lock only in its own process (gone with the run)."""
+
+    def setUp(self):
+        super().setUp()
+        self.take_copy()
+        self.switch()
+
+    def launches_after_the_run(self):
+        """What SSH launches do once the kit run is gone and its marker ran out (60 s later)."""
+        marker = self.m.path('home/runtime/desktop-update-in-progress')
+        if os.path.exists(marker):
+            os.unlink(marker)
+        race = Race(self, self.m)
+        race.launch('fresh')
+        race.launch('waited')
+        return race
+
+    def assert_owned_after_the_run(self):
+        race = self.launches_after_the_run()
+        self.assertEqual(race.log, [('fresh', 'waits: home owned'), ('waited', 'waits: home owned')])
+
+    def status(self):
+        with mock.patch.object(back, '_http', return_value=(True, 'answers')):
+            code, out, err = self.main('status')
+        return code, out + err
+
+    def failed_w1(self):
+        with mock.patch.object(coldcopy, 'restore', side_effect=RuntimeError('disk gone')):
+            with self.assertRaisesRegex(RuntimeError, 'disk gone'):
+                self.back('w1', lose_work_since=self.at)
+
+    def facts(self, step, run=None):
+        return [s['data'] for s in (run or self.last_run())['steps'] if (s['step'], s['phase']) == (step, 'done')]
+
+    def holders(self):
+        return [c for c in self.m.calls('fake-adapter-calls.jsonl') if c[0] == 'run_detached' and c[2][1:2] == ['hold']]
+
+    def assert_rerun_hands_the_home_to_t3(self, adopted):
+        n = len(self.holders())
+        self.back('w1', lose_work_since=self.at)
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+        self.assertEqual(self.live_version(), fx.LIVE)
+        self.assertEqual(len(self.holders()), n + (not adopted))  # an earlier run's holder is taken over: no second
+        if adopted:
+            self.assertEqual(self.facts('stop-service')[0]['holderFrom'], 'an earlier run that stopped T3')
+        self.assertIsNone(handoff.find_holder(self.m.home))  # handed to the launcher: T3 owns its home again
+
+    def test_a_w1_that_fails_after_its_stop_leaves_the_home_owned(self):
+        self.failed_w1()
+        self.assert_owned_after_the_run()
+        holder = handoff.find_holder(self.m.home)
+        self.assertEqual(self.facts('stop-service')[0],
+                         {'holder': holder, 'holderUnit': handoff.holder_unit(self.m.home)})
+        self.assertEqual(self.holders()[0][1:], [handoff.holder_unit(self.m.home),
+                                                 [coldcopy.KIT_BIN, 'hold', '--home', os.path.realpath(self.m.home)]])
+        self.assert_rerun_hands_the_home_to_t3(adopted=True)
+
+    def test_a_killed_w1_leaves_the_home_owned_and_its_rerun_takes_the_holder_over_with_no_gap(self):
+        self.killed('coldcopy.restore = lambda *a, **kw: kill()')  # SIGKILL: no finally or exit handler runs
+        self.assert_owned_after_the_run()
+        seen = []
+        self.adapter.on['stop'] = lambda *a: seen.append(home_owned(self.m.home))
+        self.assert_rerun_hands_the_home_to_t3(adopted=True)
+        self.assertEqual(seen, [True])  # owned while the rerun stops T3 again, before it takes anything itself
+
+    def test_a_resumed_verify_lets_a_holder_still_there_go_to_the_running_t3(self):
+        """The backstop: the update hands the home over before it is journalled done, so a W1 killed after it leaves
+        no holder; one that is there anyway when a rerun resumes at the verify (the service runs T3) must go, or T3
+        could not open its home."""
+        self.killed('coldcopy._wait_started = kill')
+        self.assertIsNone(handoff.find_holder(self.m.home))
+        self.adapter.run_detached(handoff.holder_unit(self.m.home),
+                                  [coldcopy.KIT_BIN, *handoff.holder_args(self.m.home)])
+        for _ in range(500):
+            holder = handoff.find_holder(self.m.home)
+            if holder is not None:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(holder)
+        self.back('w1', lose_work_since=self.at)
+        self.assertEqual(self.started(), ['follows', 'resume', 'verify', 'post-hooks'])
+        self.assertEqual(self.facts('verify')[0]['holderLetGo'], holder)
+        self.assertIsNone(handoff.find_holder(self.m.home))
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+
+    def test_a_w1_killed_mid_update_to_a_build_with_no_serving_lock_had_let_the_holder_go(self):
+        self.m.write('kill-after-update', '')
+        self.killed('')
+        os.unlink(self.m.path('kill-after-update'))
+        self.assertIsNone(handoff.find_holder(self.m.home))  # such a build's server must take the home itself
+        self.assertEqual(self.facts('stop-service')[0]['holderUnit'], handoff.holder_unit(self.m.home))
+
+    def test_status_and_check_name_the_holder(self):
+        self.failed_w1()
+        unit = handoff.holder_unit(self.m.home)
+        code, out = self.status()
+        self.assertEqual(code, 1)
+        self.assertIn(f"the kit's holder {unit}", out)
+        code, out, err = self.main('check')
+        self.assertEqual(code, 1)
+        self.assertIn(f"the kit's holder {unit}", out + err)
+        self.assertIn('`t3-golive settle` stops it', out + err)
+
+    def test_settle_stops_the_holder_and_a_second_settle_finds_none(self):
+        self.failed_w1()
+        holder = handoff.find_holder(self.m.home)
+        code, out, err = self.main('settle', '--reason', 'put the home right by hand')
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"stopped the kit's holder {handoff.holder_unit(self.m.home)} (pid {holder})", out)
+        self.assertIsNone(handoff.find_holder(self.m.home))
+        self.assertFalse(home_owned(self.m.home))  # the owner said the home is right: T3 may start on it
+        code, out, err = self.main('settle', '--reason', 'again')
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('holder', out)
+        self.assertNotIn('home holder', self.status()[1])
+
+    def test_after_a_reboot_there_is_no_holder_and_a_rerun_takes_a_new_one(self):
+        self.failed_w1()
+        reboot_drops_the_holder(self.m.home)
+        self.assertIsNone(handoff.find_holder(self.m.home))
+        self.assertNotIn('home holder', self.status()[1])
+        self.assert_rerun_hands_the_home_to_t3(adopted=False)
+
+    def test_with_no_transient_unit_the_run_holds_the_home_itself_and_says_so(self):
+        self.adapter.holder_up = False
+        self.failed_w1()
+        facts = self.facts('stop-service')[0]
+        self.assertIsNone(facts['holder'])
+        self.assertIn('this run holds the home itself: it is free once the run ends', facts['holderError'])
+        self.assertFalse(home_owned(self.m.home))  # the old behaviour, named in the journal
+        self.back('w1', lose_work_since=self.at)  # and a W1 still runs and ends ok without one
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+        self.assertIsNone(handoff.find_holder(self.m.home))
+
+
+    def test_the_units_command_line_holds_the_home_until_stopped(self):
+        """`t3-golive hold --home <home>`, as the holder's unit runs it: no machine file needed; SIGTERM ends it."""
+        p = subprocess.Popen([sys.executable, '-I', '-B', coldcopy.KIT_BIN, *handoff.holder_args(self.m.home)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env={})
+        self.addCleanup(lambda: p.poll() is None and (p.kill(), p.wait()))
+        for _ in range(1000):
+            if handoff.find_holder(self.m.home) is not None or p.poll() is not None:
+                break
+            time.sleep(0.01)
+        self.assertEqual(handoff.find_holder(self.m.home), p.pid)
+        p.terminate()
+        out, err = p.communicate(timeout=30)
+        self.assertEqual((p.returncode, err), (0, ''))
+        self.assertIn('until stopped', out)
+        self.assertIsNone(handoff.find_holder(self.m.home))
+
+
+class SwitchHolder(switch_t.SwitchBase):
+    """#530 for the switch: killed after its stop, the home stays owned until its guard puts T3 back."""
+
+    def killed_after_the_stop(self):
+        self.rehearsed()
+        run = self.kill_after('stopping', 'done')  # a BaseException: the run's own cleanup leaves the holder be
+        os.unlink(self.m.path('home/runtime/desktop-update-in-progress'))  # the marker ran out
+        self.assertTrue(home_owned(self.m.home))  # before #530: free once the killed run was gone
+        self.assertIsNotNone(handoff.find_holder(self.m.home))
+        return run
+
+    def test_a_killed_switch_keeps_the_home_owned_until_its_guard_hands_it_to_the_old_build(self):
+        run = self.killed_after_the_stop()
+        self.guard(run['id'], wait=True)
+        self.assertEqual(self.server()['version'], fx.LIVE)
+        self.assertIsNone(handoff.find_holder(self.m.home))
+
+    def test_a_guard_that_cannot_read_the_journal_hands_the_holder_to_the_t3_it_starts(self):
+        run = self.killed_after_the_stop()
+        with open(os.path.join(self.m.state, 'journal.jsonl'), 'ab') as f:
+            f.write(b'not json\n')
+        self.assertIn('unreadable', ' '.join(self.guard(run['id'])))
+        self.assertEqual(self.server()['version'], fx.LIVE)
+        self.assertIsNone(handoff.find_holder(self.m.home))
 
 
 class Marker(unittest.TestCase):
