@@ -5,7 +5,15 @@ import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
-import { DEFAULT_SERVER_SETTINGS, FORK_SERVER_SETTING_KEYS } from "@t3tools/contracts";
+import {
+  effectiveReviewRules,
+  FORK_PROJECT_SCOPED_KEYS,
+  FORK_SERVER_SETTING_KEYS,
+  type HandoffSettings,
+  type PlaytestSettings,
+  type ReviewRules,
+  type ServerSettings,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
@@ -20,6 +28,8 @@ import {
   settingsFileLegacyKeysUnreadable,
 } from "../serverSettings.ts";
 import { readSettingsFile } from "../fork/settingsFileRead.ts";
+import { type ManagedSettings, unmanagedSettings } from "../policy/managedSettings.ts";
+import { isProcessAlive } from "../serverRuntimeState.ts";
 
 /**
  * Fork (go-live kit): what a T3 home holds, read without writing a byte. It never migrates, never
@@ -32,6 +42,7 @@ export const FORK_REPORT_VERSION = 1;
 export type ForkReportProblemCode =
   | "home-missing"
   | "settings-unreadable"
+  | "policy-unreadable"
   | "database-unreadable"
   | "database-needs-recovery"
   | "database-newer"
@@ -52,6 +63,8 @@ export interface ForkReport {
     readonly pendingMigrations: ReadonlyArray<number>;
     /** Recorded migrations this build does not know: a newer build wrote them. */
     readonly unknownMigrations: ReadonlyArray<string>;
+    /** With no statev2.sqlite: the V1 `state.sqlite` a start would import into it; else null. */
+    readonly v1Import: string | null;
     readonly counts: {
       readonly projects: number | null;
       readonly projectsArchived: number | null;
@@ -82,8 +95,21 @@ export interface ForkReport {
       readonly waitFor: "on" | "off";
       readonly usagePacingGate: "off" | "advise" | "enforce";
       readonly automaticUpdates: "on" | "off";
+      /** On when the server's or any project's rules are on (a project override can switch it on). */
+      readonly reviewRules: "on" | "off";
+      /** On when any mode (server, project or one thread's) is `handoff`. */
+      readonly handoff: "on" | "off";
+      /** On when the server's or any project's adapter is enabled. */
+      readonly playtest: "on" | "off";
     };
     readonly featuresOn: ReadonlyArray<string>;
+    /**
+     * For each feature in `featuresOn`, where it is on: `server` (settings.json's own value, or a
+     * default of the administrator's policy), `policy` (on only because the policy locks it),
+     * `project:<id>` (that project's override), `thread:<id>` (one thread's handoff entry in the
+     * server's value) or `project:<id>/thread:<id>` (one in a project's override).
+     */
+    readonly featuresWhere: Readonly<Record<string, ReadonlyArray<string>>>;
     /** Fork keys written in the file (whatever their value). */
     readonly keysInFile: ReadonlyArray<string>;
     /** Every fork setting, decoded. Commands are reduced to whether they are set. */
@@ -176,12 +202,15 @@ const unreadDatabase = (path: string) =>
     appliedMigrations: [],
     pendingMigrations: [],
     unknownMigrations: [],
+    v1Import: null,
     counts: null,
   }) as const;
 
 function readDatabase(databasePath: string, problems: Array<Problem>): ForkReport["database"] {
   const empty = unreadDatabase(databasePath);
-  if (statOf(databasePath, false) === undefined) return { ...empty, state: "missing" };
+  if (statOf(databasePath, false) === undefined) {
+    return { ...empty, state: "missing", v1Import: v1ToImport(databasePath, problems) };
+  }
   // SQLite keeps -wal, -shm and -journal beside the file a link resolves to, so every check and the
   // open use the real path. A link that leads nowhere is not "no database": the data is elsewhere.
   let realPath: string;
@@ -210,14 +239,68 @@ function readDatabase(databasePath: string, problems: Array<Problem>): ForkRepor
   }
   if (real.size === 0) return { ...empty, state: "empty" };
 
-  // A clean server stop between the WAL checks and the read deletes the WAL; SQLite then creates an
-  // empty -wal and the read (or the open itself) fails. It stays: removing it could unlink the WAL
-  // of a server starting at that moment. Any failed first attempt runs the checks and the read once
-  // more, so the stopped home reads `immutable`; a second failure is the one reported.
+  // A stop between the WAL checks and the read deletes the WAL; SQLite creates an empty -wal (left:
+  // removing it could unlink a starting server's WAL) and the read fails. A failed read runs once
+  // more, at once; a stop still tidying can fail that too, so the problem names the live server.
   let read = readOnce(realPath, empty);
   if (read.database.state === "unreadable") read = readOnce(realPath, empty);
-  problems.push(...read.problems);
+  const server = read.database.state === "unreadable" ? liveServerOf(databasePath) : null;
+  problems.push(
+    ...read.problems.map((problem) =>
+      server === null
+        ? problem
+        : {
+            ...problem,
+            message: `${problem.message.replace(/\.$/, "")}. A T3 server (process ${server}) is using this home; if it was stopping, run the report again once it has stopped.`,
+          },
+    ),
+  );
   return read.database;
+}
+
+/**
+ * The process of a server still using the home of `databasePath`, or null: its `server-runtime.json`
+ * names a live one. A server removes that record only after it has closed the database.
+ */
+function liveServerOf(databasePath: string): number | null {
+  try {
+    const record: unknown = JSON.parse(
+      NodeFS.readFileSync(
+        NodePath.join(NodePath.dirname(databasePath), "server-runtime.json"),
+        "utf8",
+      ),
+    );
+    const pid =
+      typeof record === "object" && record !== null && "pid" in record ? record.pid : undefined;
+    return typeof pid === "number" && isProcessAlive(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * As a start: with no statev2.sqlite, a `state.sqlite` beside it (followed through links) is the V1
+ * database it copies in. One it cannot copy from stops the start, so it is a problem.
+ */
+function v1ToImport(databasePath: string, problems: Array<Problem>): string | null {
+  const v1Path = NodePath.join(NodePath.dirname(databasePath), "state.sqlite");
+  const v1 = lookAt(v1Path);
+  if (v1 === undefined) return null;
+  if (typeof v1 === "string") {
+    problems.push({
+      code: "database-unreadable",
+      message: `${v1Path} could not be looked at (${v1}); a start would try to import it as the V1 database.`,
+    });
+    return null;
+  }
+  if (!v1.isFile()) {
+    problems.push({
+      code: "database-unreadable",
+      message: `${v1Path} is not a file; a start would try to import it as the V1 database and fail.`,
+    });
+    return null;
+  }
+  return v1Path;
 }
 
 function readOnce(
@@ -324,6 +407,7 @@ function readOnce(
 function readSettings(
   settingsPath: string,
   problems: Array<Problem>,
+  managed: ManagedSettings,
 ): { settings: ForkReport["settings"]; fork: ForkReport["fork"] } {
   // As the load: a missing file (or a link to nothing) means every default, without a warning; a
   // file that is there, even empty, goes through the load's own decode.
@@ -342,7 +426,7 @@ function readSettings(
       : raw !== undefined && raw.trim() === ""
         ? "empty"
         : "present";
-  const decoded = raw === undefined ? undefined : decodeSettingsFileText(raw);
+  const decoded = raw === undefined ? undefined : decodeSettingsFileText(raw, managed.withDefaults);
   let parseWarning: string | null = null;
   if (readError !== null) {
     parseWarning = `settings.json could not be read: ${readError}`;
@@ -360,11 +444,15 @@ function readSettings(
           : parseWarning,
     });
   }
-  // The load uses every default when the file does not decode; so does the report.
-  const settings =
-    decoded !== undefined && Exit.isSuccess(decoded) && parseWarning === null
-      ? decoded.value
-      : DEFAULT_SERVER_SETTINGS;
+  // As the load: the policy's defaults (with updates off when the file does not decode, as it may
+  // hold an opt-out), then its locks laid over whatever was read.
+  const unlocked =
+    parseWarning !== null
+      ? { ...managed.defaults, automaticUpdates: false }
+      : decoded !== undefined && Exit.isSuccess(decoded)
+        ? decoded.value
+        : managed.defaults;
+  const settings = managed.applyLocks(unlocked);
 
   // The keys come from the load's lenient parse, so comments and trailing commas hide none.
   const parsed = raw === undefined ? undefined : parseSettingsFileText(raw);
@@ -382,11 +470,25 @@ function readSettings(
       ? readSettingsFile(parsed.value).dropped
       : [];
 
+  // Where each place is on as loaded; a place on only because of a lock (the server's value or a
+  // project's, which locks also reach) is `policy`: no edit of settings.json switches it off.
+  const loaded = whereEachFeature(settings);
+  const own = whereEachFeature(unlocked);
+  const where = { ...loaded };
+  for (const key of Object.keys(loaded) as Array<ForkReportFeature>) {
+    where[key] = [
+      ...new Set(loaded[key].map((place) => (own[key].includes(place) ? place : "policy"))),
+    ];
+  }
+  const onOff = (key: ForkReportFeature) => (where[key].length > 0 ? "on" : "off");
   const features = {
-    agentSlots: settings.agentSlots.enabled ? "on" : "off",
-    waitFor: settings.waitFor.enabled ? "on" : "off",
+    agentSlots: onOff("agentSlots"),
+    waitFor: onOff("waitFor"),
     usagePacingGate: settings.usagePacingGate,
-    automaticUpdates: settings.automaticUpdates ? "on" : "off",
+    automaticUpdates: onOff("automaticUpdates"),
+    reviewRules: onOff("reviewRules"),
+    handoff: onOff("handoff"),
+    playtest: onOff("playtest"),
   } as const;
   return {
     settings: {
@@ -405,6 +507,9 @@ function readSettings(
       featuresOn: Object.entries(features)
         .filter(([, value]) => value !== "off")
         .map(([key]) => key),
+      featuresWhere: Object.fromEntries(
+        Object.entries(where).filter(([, places]) => places.length > 0),
+      ),
       keysInFile,
       settings: {
         automaticUpdates: settings.automaticUpdates,
@@ -421,6 +526,75 @@ function readSettings(
   };
 }
 
+type ForkReportFeature = keyof ForkReport["fork"]["features"];
+type ForkProjectScopedKey = (typeof FORK_PROJECT_SCOPED_KEYS)[number];
+
+/**
+ * The counted features a project's override can switch on: the report reads each one's override in
+ * every project. A test holds it to every counted feature that is also a project-scoped setting.
+ */
+export const FORK_REPORT_PROJECT_FEATURES = [
+  "reviewRules",
+  "handoff",
+  "playtest",
+] as const satisfies ReadonlyArray<ForkReportFeature & ForkProjectScopedKey>;
+type ForkReportProjectFeature = (typeof FORK_REPORT_PROJECT_FEATURES)[number];
+
+/** Where each counted feature is on in `settings`: `server`, `project:<id>` or a thread's entry. */
+function whereEachFeature(
+  settings: ServerSettings,
+): Record<ForkReportFeature, ReadonlyArray<string>> {
+  // A project's override replaces the server's value for that project, so it can switch a feature
+  // on while the server's is off. A bad value already reads as off (the settings decode).
+  const overrides = <K extends ForkReportProjectFeature>(key: K) =>
+    Object.entries(settings.projectSettingsOverrides).map(
+      ([projectId, project]) => [projectId, project[key]] as const,
+    );
+  const server = (on: boolean) => (on ? ["server"] : []);
+  const perProject = {
+    reviewRules: whereOn(settings.reviewRules, overrides("reviewRules"), reviewRulesOn),
+    handoff: whereOn(settings.handoff, overrides("handoff"), handoffWhere),
+    playtest: whereOn(settings.playtest, overrides("playtest"), playtestOn),
+  } satisfies Record<ForkReportProjectFeature, ReadonlyArray<string>>;
+  return {
+    agentSlots: server(settings.agentSlots.enabled),
+    waitFor: server(settings.waitFor.enabled),
+    usagePacingGate: server(settings.usagePacingGate !== "off"),
+    automaticUpdates: server(settings.automaticUpdates),
+    ...perProject,
+  };
+}
+
+/** Where a value switches its feature on, below `at` (`server` or `project:<id>`). */
+type WhereOn<T> = (value: T, at: string) => ReadonlyArray<string>;
+const when =
+  <T>(isOn: (value: T) => boolean): WhereOn<T> =>
+  (value, at) =>
+    isOn(value) ? [at] : [];
+const reviewRulesOn = when((value: ReviewRules) => effectiveReviewRules(value).preset !== "off");
+const playtestOn = when((value: PlaytestSettings) => value.enabled);
+/** The value's own mode, and each thread whose entry is `handoff` (it wins over the mode). */
+const handoffWhere: WhereOn<HandoffSettings> = (value, at) => [
+  ...(value.mode === "handoff" ? [at] : []),
+  ...Object.entries(value.threads)
+    .filter(([, mode]) => mode === "handoff")
+    .map(([threadId]) => `${at === "server" ? "" : `${at}/`}thread:${threadId}`),
+];
+
+/** Where the server's value and each project's (not set or null: the server's) is on. */
+function whereOn<T>(
+  server: T,
+  projects: ReadonlyArray<readonly [string, T | null | undefined]>,
+  where: WhereOn<T>,
+): ReadonlyArray<string> {
+  return [
+    ...where(server, "server"),
+    ...projects.flatMap(([projectId, value]) =>
+      value == null ? [] : where(value, `project:${projectId}`),
+    ),
+  ];
+}
+
 /** The report as the command prints it: indented JSON. */
 export const formatForkReport = (report: ForkReport): string => JSON.stringify(report, null, 2);
 
@@ -431,35 +605,63 @@ function whyNoHome(
   stateStat: ReturnType<typeof lookAt> | null,
   stateDir: string,
 ): string | null {
-  if (homeStat === undefined) {
-    return lookAt(home, false) === undefined
-      ? `No T3 home folder at ${home}.`
-      : `${home} is a link that leads nowhere; a start would fail.`;
-  }
+  if (homeStat === undefined) return notThere(home, `No T3 home folder at ${home}.`);
   if (typeof homeStat === "string") return `${home} could not be looked at (${homeStat}).`;
   if (stateStat === null) return `${home} is not a folder.`;
   if (typeof stateStat === "string") {
     return `${stateDir} could not be looked at (${stateStat}); a start would fail.`;
   }
   if (stateStat === undefined) {
-    return lookAt(stateDir, false) === undefined
-      ? null
-      : `${stateDir} is a link that leads nowhere; a start would fail.`;
+    // A start creates userdata, so the home must take a new folder.
+    return (
+      notThere(stateDir, null) ??
+      cannot(home, NodeFS.constants.W_OK, "be written", "a start could not create userdata in it")
+    );
   }
   if (!stateStat.isDirectory()) {
     return `${stateDir} is not a folder, so this home holds no T3 state; a start would fail.`;
   }
   // A folder it may not enter hides the database and settings.json; name the folder, not only them.
-  try {
-    NodeFS.accessSync(stateDir, NodeFS.constants.X_OK);
-  } catch (cause) {
-    return `${stateDir} cannot be entered (${errorText(cause)}); a start would fail.`;
-  }
-  return null;
+  // One it may enter but not write fails a start, which writes its lock, logs and database there.
+  return (
+    cannot(stateDir, NodeFS.constants.X_OK, "be entered", "a start would fail") ??
+    cannot(stateDir, NodeFS.constants.W_OK, "be written", "a start would fail")
+  );
 }
 
-/** The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`). */
-export function readForkReport(baseDir: string, version: string = packageJson.version): ForkReport {
+/** Why `path`, which a stat did not find, is not there: `missing` when nothing is, else why. */
+function notThere(path: string, missing: string | null): string | null {
+  const itself = lookAt(path, false);
+  if (itself === undefined) return missing;
+  if (typeof itself === "string") {
+    return `${path} could not be looked at (${itself}); a start would fail.`;
+  }
+  return itself.isSymbolicLink()
+    ? `${path} is a link that leads nowhere; a start would fail.`
+    : `${path} appeared while the report looked at it; run the report again.`;
+}
+
+/** Why this process may not use `path` in the `mode` way (an access check, which writes nothing). */
+function cannot(path: string, mode: number, what: string, then: string): string | null {
+  try {
+    NodeFS.accessSync(path, mode);
+    return null;
+  } catch (cause) {
+    return `${path} cannot ${what} (${errorText(cause)}); ${then}.`;
+  }
+}
+
+/**
+ * The report for the T3 home `baseDir` (an explicit `--base-dir`: state lives under `userdata`).
+ * `policy` is this machine's managed policy as the server loads it (defaults filled in, locks laid
+ * over; its provider limits change no fork feature and are left out), or why it could not be read:
+ * a start would then stop.
+ */
+export function readForkReport(
+  baseDir: string,
+  policy: ManagedSettings | { readonly unreadable: string } = unmanagedSettings,
+  version: string = packageJson.version,
+): ForkReport {
   const home = NodePath.resolve(baseDir);
   const stateDir = NodePath.join(home, "userdata");
   const problems: Array<Problem> = [];
@@ -478,7 +680,20 @@ export function readForkReport(baseDir: string, version: string = packageJson.ve
     });
     database = { ...unreadDatabase(databasePath), state: "unreadable" };
   }
-  const { settings, fork } = readSettings(NodePath.join(stateDir, "settings.json"), problems);
+  let managed: ManagedSettings = unmanagedSettings;
+  if ("unreadable" in policy) {
+    problems.push({
+      code: "policy-unreadable",
+      message: `The managed policy would stop a start: ${policy.unreadable}`,
+    });
+  } else {
+    managed = policy;
+  }
+  const { settings, fork } = readSettings(
+    NodePath.join(stateDir, "settings.json"),
+    problems,
+    managed,
+  );
   return {
     reportVersion: FORK_REPORT_VERSION,
     version,

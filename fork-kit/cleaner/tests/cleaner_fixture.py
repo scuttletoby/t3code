@@ -149,6 +149,7 @@ class Case(unittest.TestCase):
         self.mount_points = {'/'}
         self.mount_lines, self.bind_sources = [], set()     # (point, device, root) and (device, root)
         self.mount_options = {'/': ('rw', 'relatime')}       # {point: its per-mount options}
+        self.fstab_points = set()                           # the mount points /etc/fstab names; None: unreadable
         # Tests set a file's age with its modification time. The kit also counts the inode change time, which no
         # test can set, so the tests read the modification time alone; one test puts the real reader back.
         self.real_changed = self.c.guard.changed
@@ -159,6 +160,10 @@ class Case(unittest.TestCase):
         # read "never used"; the tests of that refusal (worktrees.test.py, Used) put the real reader back.
         self.real_last_used = self.c.rules.last_used
         unused = mock.patch.object(self.c.rules, 'last_used', lambda path, git_dir, look: (0.0, 'nothing'))
+        unused.start()
+        self.addCleanup(unused.stop)
+        self.real_branch_used = self.c.rules.branch_used          # the same for a branch (#519)
+        unused = mock.patch.object(self.c.rules, 'branch_used', lambda git_dir, branch: (0.0, 'nothing'))
         unused.start()
         self.addCleanup(unused.stop)
 
@@ -225,7 +230,8 @@ class Case(unittest.TestCase):
         readers = {'processes': self.processes, 'units': lambda: set(self.unit_names),
                    'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
                    'dangling': lambda: [], 'now': self.now, 'transcripts': lambda: dict(self.transcript_times),
-                   'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options)}
+                   'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options,
+                                                         self.fstab_points)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):
