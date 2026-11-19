@@ -253,8 +253,16 @@ Named MCP profiles. A profile says which outside MCP servers (`servers`) and whi
 own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Two profiles are built in: `all`
 (everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool); a profile cannot
 take their names, and one written in by hand makes that built-in refuse threads until it is removed
-(a save may send `null` under a built-in name to remove it) or renamed. Nothing applies a profile
-yet: the provider adapters and the T3 tool filter come in later pull requests.
+(a save may send `null` under a built-in name to remove it) or renamed.
+
+A Claude thread applies the profile's `servers`: `[]` (and `t3-only`) starts Claude without any MCP
+server of its own (its config files, plugins and claude.ai connectors), and a list keeps only the
+servers it names, written as Claude lists them (`claude.ai Calendar`). T3's own tools stay. A Claude
+thread whose profile cannot be applied does not start its turn and says why: a missing or broken
+profile, a parent thread that cannot be read, a profile whose `t3Tools` is not `"all"` (the T3 tool
+filter comes in a later pull request), or a session that still shows a server the profile leaves out
+(a managed Claude policy on the machine can override T3's list). Other providers do not apply
+profiles yet.
 
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
