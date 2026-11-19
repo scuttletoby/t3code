@@ -46,6 +46,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | ---------------------------------------------------------------------------- | --------------------------- | --- | -------------------------------------------------------- |
 | [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                     | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
 | [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                        | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
+| [`server.activityProbe`](#serveractivityprobe)                               | `false`                     | yes | [#509](https://github.com/scuttletoby/t3code/issues/509) |
 | [`server.usagePacing`](#serverusagepacing)                                   | `{}`                        | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
 | [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                     | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
 | [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                        | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
@@ -89,6 +90,45 @@ while `automaticUpdates` is on. Empty: no program is asked.
 
 Set in `settings.json`: `"automaticUpdatesQuietCommand": "/path/to/quiet-check"`. Details:
 [updates.md](updates.md).
+
+### `server.activityProbe`
+
+Lets a program on the same machine ask the running server "is T3 busy?" without touching its data:
+`GET /api/fork/activity` answers with the running, queued and waiting turns, pending approvals and
+questions, background tasks and running terminal commands, counted as the automatic updater counts
+them, and `quiet: true` only when all are zero. It writes nothing and needs no sign-in, so it answers
+only a program on this machine: a loopback peer whose request carries no proxy headers (a Tailscale
+Serve or tunnel request) and no browser markers (`Origin`, `sec-fetch-site`, `sec-fetch-dest`, a
+`sec-fetch-mode` other than Node's `cors`, or a `Host` that is not loopback). The caller is checked
+first: every other caller gets a plain `404 Not Found` that names neither the setting nor the fork,
+whether the probe is on or off. Off, a local caller gets a 404 that says so, which the reader reports
+as `off`.
+
+Limits:
+
+- A TCP-level forward to loopback adds no headers and lets its client choose the `Host`, so it looks
+  local: `ssh -L`/`-R`, `tailscale serve --tcp`, socat, editor port forwarding. Whoever can open one
+  can already reach this machine's loopback.
+- The probe is asked on loopback, so the server must listen on loopback or on all addresses. A server
+  bound to one LAN or tailnet address only can never be probed: the reader reports `unreachable`.
+- **Advisory, not a gate an agent cannot pass.** The reader takes the port and the pid from
+  `server-runtime.json`, which anything running as the T3 user can rewrite, agents included, and the
+  `pid` in the answer is the server's own claim. An agent can point the reader at a port of its own
+  that answers `quiet: true` with T3's pid, and the reader exits 0. The pid check only catches a
+  port another program reused by accident. A gate that must hold against agents has to take the port
+  and pid from a source agents cannot write (passed in by a root-owned caller, or a root-owned
+  file), or check that the listening socket on that port belongs to that pid (on Linux: the socket
+  inode for the port in `/proc/net/tcp` and `/proc/net/tcp6` against the links in `/proc/<pid>/fd`).
+
+Switch on in `settings.json`: `"activityProbe": true` (read on every request, no restart). The
+program to call is `t3 __fork-report --base-dir <home> --activity`: it finds the server from the
+home's `server-runtime.json`, asks it, prints one line of JSON (`quiet`, then `reason`, then `state`:
+`quiet`, `busy`, `stopped`, `off`, `unreachable` or `unknown`) and exits 0 only for `quiet`. Every
+other state exits 1, so a quiet check that runs it fails closed: a server still starting (it answers
+nothing until it accepts commands), stopping, gone, too old to know the route, or with the probe off
+counts as busy. Only `quiet` and `busy` come from the server; `stopped` means no live process holds
+the home. A quiet check wraps it in a script with no arguments, for example
+`exec /path/to/t3 __fork-report --base-dir /path/to/home --activity`.
 
 ### `server.usagePacing`
 
