@@ -323,6 +323,33 @@ armed. Any other refusal, or a check still not started after that time, leaves
 auto-merge off with the usual comment. A run stopped during the wait is
 finished by the next run, the same way.
 
+A person's own auto-merge switch during the update stands, within what
+GitHub allows: it has no compare-and-set for auto-merge, so the queue acts on
+its last read. What is guaranteed, and what is not:
+
+- Turned off before the queue turns it off: the queue reads the pull request
+  right before its own turning off, and one that is off by then (or closed)
+  is left as it is, not updated, without a comment.
+- Turned off after that read, at the moment of the queue's own call: GitHub
+  does not document what it answers for turning off an auto-merge that is
+  already off. If it answers with an error, the queue cannot tell whether it
+  or a person turned auto-merge off: it leaves it off, does not update, and
+  says so on the pull request (the same when its own call answers with an
+  error, or the run stops right there). If it answers with success, no read
+  can tell that from the queue's own turning off: the pull request is updated
+  and armed again. Not guaranteed: that window is one API call long.
+- Turned on again after the queue turned it off: right before
+  `gh pr update-branch` the queue reads the pull request again. Armed again
+  (or closed), it is not updated, and the plan stays, so the next run decides
+  from what GitHub shows then: armed or closed, nothing to do; off (GitHub
+  showed the queue's own turning off late), armed again for the change read.
+  Not guaranteed: a person who arms it in the moment between that read and
+  the update is updated over.
+- Turned on and off again after the queue turned it off, while the run waits
+  for the new head or before the next run finishes a plan: the queue cannot
+  see that and arms the change read over the last switch-off (see `STATE`,
+  "A plan does not say who turned auto-merge off").
+
 A pull request in a merge state the queue neither updates nor waits for is
 passed over, and the run says so. `UNKNOWN` (GitHub is
 still computing it, often for a few seconds after a push to the base) is listed
@@ -489,7 +516,12 @@ and the plan, not inside.
 `--state-file` (`STATE`) holds the plan of the run that turned auto-merge off:
 `{"repo", "pr", "old", "base", "read"}` (and `"told"` once the pull request was
 told the run could not finish yet). It is written to disk (mode `0600`) before
-the disarm and removed when the pull request is re-armed or told why not. The
+the disarm with `"unsure": true`, written again without it once GitHub answered
+the disarm with success, and removed when the pull request is re-armed or told
+why not. A plan that is still unsure is never re-armed: the next run leaves the
+pull request off with a comment. A plan also stays when the read right before
+the update shows the pull request armed again or closed: the next run drops it
+if GitHub still shows that, and re-arms the change read if it shows it off. The
 next run finishes a plan first, against the review and the base as GitHub shows
 them then (a lens posted since counts; an edited one reads nothing), and
 touches no other pull request until it has. A plan
@@ -498,8 +530,11 @@ was: give each queue its own `--state-file`. A plan without `repo` (the source
 queue's format) is this repository's. An unreadable plan, or one another user
 could have written (not this user's, or writable by its group or others), is
 kept as `STATE.bad`, the run fails, and every later run warns while that file
-exists. A plan does not say who turned auto-merge off: a pull request a person
-disarmed after the stop is re-armed too, if its head holds the change read.
+exists. A plan does not say who turned auto-merge off after the queue's own
+disarm: a pull request a person armed and disarmed again since then (while
+the run waited for the new head, after a stopped run, or after a run that saw
+it armed again right before the update) is re-armed too, if its head holds the
+change read.
 
 The plan is on disk, and that is why the runner rule above exists. It could
 live in a comment of the queue's own login instead (trusted by
