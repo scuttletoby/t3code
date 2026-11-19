@@ -367,15 +367,87 @@ class Update(Base):
         self.assertEqual((f.armed, f.updated, f.comments), (self.c, False, []))
         self.assertFalse(self.plan_exists(), 'still armed: nothing to finish')
 
-    def test_a_disarm_github_applied_despite_an_error_keeps_the_plan(self):   # gh's error does not say it failed
+    def test_a_disarm_that_reports_an_error_is_never_turned_back_on(self):   # issue #518
+        # gh's error says neither whether GitHub applied it nor whether a person turned it off first (after the
+        # queue's view): OFF either way, and a person's switch is not the queue's to undo. Said on the PR, no plan.
         f = self.fake()
 
         def gh(*a):
             r = f(*a)
             return failed('HTTP 502') if QueueGh.kind(a) == 'disarm' else r
         code, out = self.update(gh)
+        self.assertEqual((code, f.armed, f.updated, f.order()), (0, None, False, ['disarm', 'comment']), out)
+        self.assertIn('a person', f.comments[0])
+        self.assertIn('`tool ready 7`', f.comments[0])
+        self.assertNotRegex(f.comments[0], r'(?i)read at\s*:')
+        self.assertFalse(self.plan_exists(), 'said on the PR: nothing left to finish')
+        code, out = self.update(gh)   # runs again: no longer armed, so left alone and not told twice
+        self.assertEqual((code, f.armed, len(f.comments)), (0, None, 1), out)
+
+    def test_a_disarm_error_gh_cannot_read_back_is_never_turned_back_on(self):   # issue #518
+        f = self.fake()
+
+        def gh(*a):
+            r = f(*a)
+            if QueueGh.kind(a) == 'disarm':
+                f.fail.add('view')
+                return failed('HTTP 502')
+            return r
+        code, out = self.update(gh)
         self.assertEqual((code, f.armed, f.updated, f.comments), (Q.SILENT, None, False, []), out)
-        self.assertTrue(self.plan_exists(), 'OFF and nothing says so yet: the next run finishes it')
+        self.assertTrue(self.plan_exists(), 'maybe OFF and nothing says so yet: the next run finishes it')
+        f.fail.discard('view')
+        code, out = run_quiet(self.q.recover)
+        self.assertEqual((code, f.armed, f.order()[-1]), (0, None, 'comment'), out)
+        self.assertIn('a person', f.comments[0])
+        self.assertFalse(self.plan_exists())
+
+    def test_a_run_stopped_at_its_disarm_never_turns_it_back_on(self):   # issue #518: GitHub applied it, then a kill
+        f = self.fake()
+
+        def gh(*a):
+            r = f(*a)
+            if QueueGh.kind(a) == 'disarm':
+                raise Killed('after the disarm')
+            return r
+        with self.assertRaises(Killed):
+            self.update(gh)
+        self.assertTrue(self.plan_exists())
+        code, out = run_quiet(self.q.recover)   # who turned it off is unknown: said, not re-armed
+        self.assertEqual((code, f.armed, f.updated, len(f.comments)), (0, None, False, 1), out)
+        self.assertIn('a person', f.comments[0])
+        self.assertFalse(self.plan_exists())
+
+    def test_a_person_who_re_arms_after_the_disarm_is_left_alone(self):   # issue #518
+        for change in ('armed', 'closed'):
+            with self.subTest(change):
+                f = self.fake()
+
+                def gh(*a):
+                    r = f(*a)
+                    if QueueGh.kind(a) == 'disarm':   # a person, right after the queue turned it off
+                        if change == 'armed':
+                            f.armed = f.head
+                        else:
+                            f.view = lambda v=f.view: dict(v(), state='CLOSED')
+                    return r
+                code, out = self.update(gh)
+                self.assertEqual((code, f.order(), f.updated, f.comments), (0, ['disarm'], False, []), out)
+                self.assertEqual(f.armed, self.c if change == 'armed' else None)
+                self.assertFalse(self.plan_exists())
+
+    def test_a_pr_gh_cannot_show_before_the_update_is_not_updated(self):   # the re-read before update-branch failed
+        f = self.fake()
+
+        def gh(*a):
+            r = f(*a)
+            if QueueGh.kind(a) == 'disarm':
+                f.fail.add('view')
+            return r
+        code, out = self.update(gh)
+        self.assertEqual((code, f.order(), f.updated, f.comments), (Q.SILENT, ['disarm'], False, []), out)
+        self.assertTrue(self.plan_exists())
+        f.fail.discard('view')   # the next run: the queue's own disarm, so the read change is armed again
         code, out = run_quiet(self.q.recover)
         self.assertEqual((code, f.armed, f.comments), (0, self.c, []), out)
 
@@ -808,6 +880,21 @@ class Recover(Base):   # a run killed after its disarm
         f = self.fake(armed=False, h1=self.up)   # killed after update-branch
         code, out = self.recover(f, self.plan())
         self.assertEqual((code, f.armed, f.comments), (0, self.up, []), out)
+
+    def test_a_plan_unsure_who_turned_it_off_is_never_re_armed(self):   # issue #518
+        f = self.fake(armed=False, h1=self.up)   # the head holds the change read: still not the queue's to arm
+        code, out = self.recover(f, self.plan(unsure=True))
+        self.assertEqual((code, f.armed, len(f.comments)), (0, None, 1), out)
+        self.assertIn('a person', f.comments[0])
+        self.assertFalse(self.plan_exists())
+        f = self.fake()   # armed again by then: nothing to say
+        code, out = self.recover(f, self.plan(unsure=True))
+        self.assertEqual((code, f.armed, f.comments), (0, self.c, []), out)
+        self.assertFalse(self.plan_exists())
+        f = self.fake(armed=False, fail=('comment',))   # nothing said: the plan stays as it was for the next run
+        code, out = self.recover(f, self.plan(unsure=True))
+        self.assertEqual((code, f.armed), (Q.SILENT, None), out)
+        self.assertEqual(self.saved_plan(), self.plan(unsure=True))
 
     def test_a_plan_without_repo_from_the_source_queue_is_finished(self):   # the source project's STATE format
         legacy = {k: v for k, v in self.plan().items() if k != 'repo'}
