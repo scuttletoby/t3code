@@ -28,7 +28,8 @@ class Walls(Case):
                      'record', 'linger', 'user-units', 'drop-ins', 'units', 'agent', 'sudoers', 'restart', 'kit-code',
                      'runtime',
                      'automount', 'firewall', 'gateway', 'file:policy.json', 'file:t3code-agents.service',
-                     'file:firewall.nft', 'file:wsl.conf', 'file:pc-agents-walls.timer'):
+                     'file:firewall.nft', 'file:wsl.conf', 'file:pc-agents-walls.timer',
+                     'file:pc-agents-update.service', 'file:pc-agents-update.timer'):
             self.assertIn(wall, walls)
         for wall in k.UNIT_WALLS:   # the launcher's job units: not T3's unit
             self.assertNotIn('wsl2:' + wall, walls)
@@ -109,8 +110,11 @@ class Walls(Case):
         self.fails('sudoers')
 
     def test_timer_stopped_but_enabled(self):
-        os.unlink(self.path('/log/units/pc-agents-walls.timer.active'))
-        self.fails('units')
+        for timer in k.TIMERS:
+            with self.subTest(timer):
+                os.unlink(self.path(f'/log/units/{timer}.active'))
+                self.fails('units')
+                self.write(f'/log/units/{timer}.active', '')
 
     def test_agent_user_manager_masked(self):
         os.unlink(self.path('/etc/systemd/system/user@1100.service'))

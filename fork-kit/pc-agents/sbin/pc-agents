@@ -11,8 +11,10 @@
   pc-agents pair [ARGS...]                 as root: a pairing code for the running T3 (its `t3 pair ARGS`, as the
                                            agent): the kit's T3 is walled from Windows, so no Windows browser can
                                            open it to make one
+  pc-agents auto-update                    as root (its hourly timer): with autoUpdate on, install the followed
+                                           fork's newest release when T3 is idle, check it, roll back on failure
 Standard library only."""
-import os, re, shutil, stat, sys, time
+import contextlib, fcntl, io, json, os, re, shutil, stat, sys, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 LIB = os.path.join(HERE, 'lib')
@@ -38,13 +40,14 @@ def same(path, data, mode, link=False):
         return f.read() == (data.encode() if isinstance(data, str) else data)
 
 
-def put(path, data, mode, link=False):
+def put(path, data, mode, link=False, restart=True):
     """Write a file (or a link) whole: a new file beside it, then one rename. Returns True when it changed. Every
     change but to the record marks T3 for a restart before and after it, so a run stopped after it still restarts T3
-    next time, and `check` fails on a T3 that started before it."""
+    next time, and `check` fails on a T3 that started before it. restart=False: a file T3 does not run with (the
+    automatic update's journal, the machine file it changes before it runs setup, which writes what T3 runs with)."""
     if same(path, data, mode, link):
         return False
-    marks = path not in (k.RECORD, k.PENDING)
+    marks = restart and path not in (k.RECORD, k.PENDING)
     if marks:
         mark()
     real = k.ROOT + path
@@ -145,12 +148,15 @@ def loose(folder):
     return tree(folder, folder)
 
 
-def install_t3(c, version, done):
+def install_t3(c, version, done, prefetch=False):
     """Install T3 as root under k.T3 with upstream's scripts/install.sh (it checks SHA256SUMS and runs the new t3),
     make it root's alone (root_alone), and record its t3's hash. A version folder that is not (an older setup's
     install, or one stopped before root_alone) is removed and installed again: what others could write is never
     trusted. It is first moved aside in one step (a stop half-way leaves no part folder), with T3 stopped (it runs
-    from that folder; setup restarts it). Returns why not, or None."""
+    from that folder; setup restarts it). Returns why not, or None.
+    prefetch: the automatic update downloads a version T3 does not run yet (c holds that version, not the machine
+    file's): nothing T3 runs with changes, so no restart mark and no stop; a folder of it without a t3 is removed
+    too (only root writes under k.T3, and nothing runs from it)."""
     folder = k.runtime(c)
     versions = os.path.dirname(folder)
     if bad := [why for d in (k.T3, k.T3 + '/runtime', versions) if k.lstat(d) and
@@ -162,12 +168,13 @@ def install_t3(c, version, done):
     st = k.lstat(folder)
     if st and not stat.S_ISDIR(st.st_mode):
         return f'{folder} is not a folder (not made by setup): remove it'
-    if st and k.lstat(folder + '/t3') is None:
+    if st and k.lstat(folder + '/t3') is None and not prefetch:
         return f'{folder} is there but has no t3 (not made by setup): remove that folder'
-    if st and (why := loose(folder)):
+    if st and (why := ('no t3' if k.lstat(folder + '/t3') is None else loose(folder))):
         say(f'{why}: removing it to install T3 {c["t3Version"]} again')
-        mark()
-        k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
+        if not prefetch:
+            mark()
+            k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
         done.pop(folder + '/t3', None)   # first: a stop after this leaves no hash the new t3 would have to match
         keep(done)
         aside = f'{versions}/.removing-{os.getpid()}'
@@ -175,7 +182,8 @@ def install_t3(c, version, done):
         shutil.rmtree(k.ROOT + aside)
     if k.lstat(folder) is None:
         say(f'installing T3 {c["t3Version"]} under {k.T3}')
-        mark()
+        if not prefetch:
+            mark()
         r = k.run(['/usr/bin/env', '-i', 'HOME=/root', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', f'T3CODE_HOME={k.T3}',
                    f'T3CODE_INSTALL_BIN_DIR={k.T3}/bin', f'T3CODE_VERSION={c["t3Version"]}',
                    f'T3CODE_RELEASE_BASE_URL={c["t3ReleaseBaseUrl"]}', '/bin/sh', f'{version}/share/install.sh'],
@@ -185,7 +193,8 @@ def install_t3(c, version, done):
         root_alone(folder)
         if why := loose(folder):
             return f'T3 installed, but not root\'s alone: {why}'
-        mark()
+        if not prefetch:
+            mark()
     if not done.get(folder + '/t3'):   # a mismatch is left to the runtime wall; only a missing hash is added
         done[folder + '/t3'] = {k.file_sha(folder + '/t3')}
         keep(done)
@@ -259,7 +268,10 @@ def install_packages():
 
 
 def setup(source, sha):
-    if not re.fullmatch(r'[0-9a-f]{40}', sha) or not os.path.isdir(source):
+    """Make or repair everything from the release sha. source: its files (a checkout), or None for the release folder
+    setup installed before (the automatic update reruns setup from the installed kit, never from new code)."""
+    installed = f'{k.ROOT}{k.OPT}/{sha}'
+    if not re.fullmatch(r'[0-9a-f]{40}', sha) or not os.path.isdir(installed if source is None else source):
         return say('usage: pc-agents setup --source DIR --sha 40-HEX-SHA') or 2
     if not k.ROOT and os.geteuid() != 0:
         return say('run this as root') or 2
@@ -283,7 +295,7 @@ def setup(source, sha):
             return say(f'usermod failed: {r.stderr.strip()[-300:]}') or 1
     version = f'{k.OPT}/{sha}'
     for src, (dst, mode) in k.CODE.items():
-        with open(os.path.join(source, src), 'rb') as f:
+        with open(os.path.join(installed, dst) if source is None else os.path.join(source, src), 'rb') as f:
             put(f'{version}/{dst}', f.read(), mode)
     put(f'{k.OPT}/current', sha, None, link=True)
     done = k.record()
@@ -311,7 +323,7 @@ def setup(source, sha):
     why = install_t3(c, version, done)
     if why:
         return say(why + ' (run setup again; T3 restarts once it succeeds)') or 1
-    units = [k.UNIT, k.WALLS + '.timer']
+    units = [k.UNIT, *k.TIMERS]
     if check(False, before_enable=True) != 0:
         k.run(['/usr/bin/systemctl', 'disable', '--now'] + units)
         return say('a wall does not hold, so T3 is not enabled. After a first run: wsl --terminate <this distro> '
@@ -465,12 +477,12 @@ def own_walls(c, before_enable=False):
         got = dict(line.split('=', 1) for line in r.stdout.splitlines() if '=' in line)
         want = {'LoadState': 'loaded', 'FragmentPath': f'{k.UNIT_DIRS[0]}/{u}', 'DropInPaths': '',
                 'NeedDaemonReload': 'no'}
-        if u != k.WALLS + '.service' and not before_enable:
+        if u not in (k.WALLS + '.service', k.UPDATE + '.service') and not before_enable:   # those two: static
             want['UnitFileState'] = 'enabled'
-        if u == k.WALLS + '.timer' and not before_enable:   # enabled is not enough: a stopped timer checks nothing
+        if u in k.TIMERS and not before_enable:   # enabled is not enough: a stopped timer runs nothing
             want['ActiveState'] = 'active'
         seen += [f'{u}: {key}={got.get(key)!r}' for key, v in want.items() if r.returncode or got.get(key) != v]
-    out.append(('units', 'systemd runs the kit\'s units as written, enabled, the timer running',
+    out.append(('units', 'systemd runs the kit\'s units as written, enabled, the timers running',
                 seen and '; '.join(seen[:3])))
     shell = k.login_shell(k.USER)
     out.append(('agent', f'one login user, {k.USER}, in no group but its own, with no login shell',
@@ -563,11 +575,312 @@ def check(enforce, before_enable=False):
     return 1 if failed else 0
 
 
+# The automatic update (README "Automatic updates"). Its journal, k.UPDATE_STATE (root's), is saved before every step
+# that changes what T3 runs with, so a run stopped anywhere is finished or rolled back by the next one:
+#   phase    "switching" (from -> to) or "rolling-back" (to -> from); none when no switch is under way
+#   from, to the version before and the new one; tries: runs that began this switch (past k.UPDATE_TRIES: rolled back)
+#   failed   the last version that did not come up: never tried again (a newer release is)
+#   result, at   what the last run did, and when (epoch seconds)
+def update_state():
+    """The journal ({} when there is none, or when it is not one: then no switch is under way that this run knows of,
+    and the run starts from the machine file and a running, walled T3 only)."""
+    try:
+        with open(k.ROOT + k.UPDATE_STATE, encoding='utf-8') as f:
+            got = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        say(f'{k.UPDATE_STATE} cannot be read ({e}): taken as empty')
+        return {}
+    if not isinstance(got, dict):
+        say(f'{k.UPDATE_STATE} is not a JSON object: taken as empty')
+        return {}
+    texts = ('phase', 'from', 'to', 'failed', 'why')
+    return {key: v for key, v in got.items() if key in texts and isinstance(v, str) or key == 'tries' and
+            type(v) is int}
+
+
+def note(state, result, ok=True):
+    """Save the journal with this run's result, and say it (a line in the update unit's journal). Returns the exit
+    code: 0, or 1 when not ok."""
+    state = {key: v for key, v in {**state, 'result': result, 'at': int(time.time())}.items() if v is not None}
+    put(k.UPDATE_STATE, json.dumps(state, indent=2, sort_keys=True) + '\n', 0o644, restart=False)
+    say(result if ok else 'FAILED: ' + result)
+    return 0 if ok else 1
+
+
+def told(fn, *args, echo=True):
+    """(exit code of fn(*args), what it printed); echo: printed here too (the update unit's journal)."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = fn(*args)
+    if echo:
+        sys.stdout.write(out.getvalue())
+        sys.stdout.flush()
+    return code, out.getvalue()
+
+
+def last_said(text):
+    lines = [x.removeprefix('pc-agents: ') for x in text.splitlines() if x.strip()]
+    return lines[-1][:400] if lines else 'it said nothing'
+
+
+def walls_hold():
+    """Why a wall does not hold (the kit's own check, its FAIL lines), or None."""
+    code, out = told(check, False, echo=False)
+    return None if code == 0 else '; '.join(x for x in out.splitlines() if x.startswith('FAIL'))[:600] or 'check failed'
+
+
+def set_version(version):
+    """Set t3Version in the machine file to version: a copy of the file as it was first (machine.json.bak), then the
+    file whole (a new file, one rename), its mode kept. Only that value changes: the owner's layout stays when one
+    plain replacement gives the same data, else the file is written out again as JSON (the same data). Read under the
+    machine file's own rules (root's, not a link)."""
+    path = machine_file.default_path()
+    text = machine_file.read_protected_text(k.ROOT + path, k.OWNER)
+    data = json.loads(text)
+    if data[k.KIT]['t3Version'] == version:
+        return
+    data[k.KIT]['t3Version'] = version
+    pattern = re.compile(r'("t3Version"\s*:\s*)"[^"\\]*"')
+    new = pattern.sub(lambda m: f'{m[1]}"{version}"', text) if len(pattern.findall(text)) == 1 else ''
+    try:
+        new = new if json.loads(new) == data else ''
+    except ValueError:
+        new = ''
+    mode = stat.S_IMODE(os.lstat(k.ROOT + path).st_mode)
+    put(path + '.bak', text, mode, restart=False)
+    put(path, new or json.dumps(data, indent=2) + '\n', mode, restart=False)
+
+
+def busy():
+    """Why now is no quiet point, or None: T3 runs a process that is not T3 itself (an agent's provider session, a
+    terminal, a tool it started). Every process below T3's main process counts, but those whose program is in one of
+    T3's version folders (T3's own helpers). Provider sessions end on their own after 30 idle minutes, so a quiet
+    point comes. What cannot be read counts as busy: an update never cuts work it cannot see."""
+    r = k.run(['/usr/bin/systemctl', 'show', '-p', 'MainPID', k.UNIT])
+    main = k.props(r.stdout).get('MainPID', '')
+    if r.returncode or not main.isdigit():
+        return f'cannot tell what T3 runs ({(r.stderr or r.stdout).strip()[-200:]})'
+    if main == '0':
+        return None
+    kids = {}
+    try:
+        names = os.listdir(k.ROOT + '/proc')
+    except OSError as e:
+        return f'cannot list the processes ({e})'
+    for pid in filter(str.isdigit, names):
+        try:
+            with open(f'{k.ROOT}/proc/{pid}/stat', encoding='utf-8', errors='replace') as f:
+                parent = f.read().rsplit(')', 1)[1].split()[1]
+        except FileNotFoundError:
+            continue   # it ended meanwhile
+        except (OSError, IndexError) as e:
+            return f'cannot read process {pid} ({e})'
+        kids.setdefault(parent, []).append(pid)
+    own = os.path.realpath(k.ROOT + k.T3 + '/runtime/versions') + '/'
+    found, todo = [], list(kids.get(main, []))
+    while todo:
+        pid = todo.pop()
+        todo += kids.get(pid, [])
+        try:
+            exe = os.readlink(f'{k.ROOT}/proc/{pid}/exe').removesuffix(' (deleted)')
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return f'cannot read process {pid} ({e})'
+        if not (k.ROOT + exe).startswith(own):
+            try:
+                with open(f'{k.ROOT}/proc/{pid}/comm', encoding='utf-8', errors='replace') as f:
+                    name = re.sub(r'[^\x20-\x7e]', '?', f.read().strip())[:30]   # the agent names its processes
+            except OSError:
+                name = '?'
+            found.append(f'{name} ({pid})')
+    return found and f'T3 runs {len(found)} other process(es): ' + ', '.join(sorted(found)[:5]) or None
+
+
+def serves(c, version):
+    """Why T3 does not answer as version on its port (its environment descriptor's serverVersion, no sign-in needed)
+    within k.HTTP_WAIT seconds, or None."""
+    url = f'http://127.0.0.1:{c["port"]}/.well-known/t3/environment'
+    end = time.monotonic() + k.HTTP_WAIT
+    while True:
+        r = k.run(['/usr/bin/curl', '-q', '-fsS', '--proto', '=http', '--noproxy', '*', '--max-time', '10', url],
+                  timeout=30)
+        try:
+            got = json.loads(r.stdout).get('serverVersion') if r.returncode == 0 else None
+        except (ValueError, AttributeError):
+            got = None
+        if got == version:
+            return None
+        if time.monotonic() >= end:
+            return (f'T3 answers as {str(got)[:60]!r}, not {version}' if got else
+                    f'no answer from T3 on {url} ({r.stderr.strip()[-200:] or "not its JSON"})')
+        time.sleep(k.HTTP_STEP)
+
+
+def newest(c):
+    """(the version of the followed fork's newest release T3 can take, or None; why the list was not read, or
+    None). Its public release list over HTTPS: nothing the agent can write."""
+    url = f'{k.GITHUB_API}/repos/{c["autoUpdate"]["follow"]}/releases?per_page=30'
+    r = k.run(['/usr/bin/curl', '-q', '-fsSL', '--proto', '=https', '--proto-redir', '=https', '--tlsv1.2',
+               '--max-time', '60', '-H', 'Accept: application/vnd.github+json', '-H', 'User-Agent: pc-agents', url],
+              timeout=120)
+    if r.returncode:
+        return None, f'cannot read the release list ({url}: {r.stderr.strip()[-200:] or f"exit {r.returncode}"})'
+    try:
+        listing = json.loads(r.stdout)
+    except ValueError as e:
+        return None, f'the release list is not JSON ({e})'
+    if not isinstance(listing, list):
+        return None, f'the release list is not a list ({r.stdout.strip()[:120]})'
+    return k.newest_release(listing), None
+
+
+def prune(keep_versions):
+    """Remove the T3 version folders past the newest k.KEEP_VERSIONS, never one of keep_versions (the one T3 runs and
+    the one before it), and their record lines. Only folders named as a version, right in the versions folder (root's
+    alone), each moved aside first (one rename: a stop half-way leaves a .removing- folder, which install_t3 removes).
+    Returns the removed versions."""
+    versions = k.T3 + '/runtime/versions'
+    if [why for d in (k.T3, k.T3 + '/runtime', versions) if (why := k.safe(d, k.lstat(d), stat.S_ISDIR))]:
+        return []
+    names = sorted((n for n in os.listdir(k.ROOT + versions) if k.VERSION.fullmatch(n)
+                    and stat.S_ISDIR(k.lstat(f'{versions}/{n}').st_mode)), key=k.semver_key, reverse=True)
+    kept = [n for n in names if n in keep_versions]
+    kept += [n for n in names if n not in kept][:max(0, k.KEEP_VERSIONS - len(kept))]
+    gone = [n for n in names if n not in kept]
+    done = k.record()
+    for n in gone:
+        folder = f'{versions}/{n}'
+        done.pop(folder + '/t3', None)   # first: a stop after this leaves no hash a new t3 there would have to match
+        keep(done)
+        aside = f'{versions}/.removing-{os.getpid()}'
+        os.rename(k.ROOT + folder, k.ROOT + aside)
+        shutil.rmtree(k.ROOT + aside)
+    return gone
+
+
+def switch(c, state, sha):
+    """Run the release state['to']: the machine file says it, setup as the owner runs it (from the installed kit),
+    then T3 must answer as it with every wall holding. Rolled back when it does not."""
+    old, new = state['from'], state['to']
+    set_version(new)
+    code, out = told(setup, None, sha)
+    why = f'setup failed: {last_said(out)}' if code else serves(c, new) or walls_hold()
+    if why:
+        return rollback(c, {**state, 'why': why}, sha)
+    gone = prune({new, old})
+    return note({'failed': state.get('failed')}, f'T3 {new} runs (was {old})' +
+                (f'; removed T3 {", ".join(gone)} (kept the newest {k.KEEP_VERSIONS})' if gone else ''))
+
+
+def rollback(c, state, sha):
+    """Back to state['from'] (its folder is still there): the machine file, setup, and the same checks. state['to']
+    is not tried again."""
+    old, new, why = state['from'], state['to'], state.get('why') or 'its switch was cut too often'
+    note({**state, 'phase': 'rolling-back', 'why': why}, f'T3 {new} did not come up ({why}): going back to {old}',
+         ok=False)
+    set_version(old)
+    code, out = told(setup, None, sha)
+    back = f'setup failed: {last_said(out)}' if code else serves(c, old) or walls_hold()
+    return note({'failed': new}, f'T3 {new} did not come up ({why}); not trying it again. ' +
+                (f'Back on {old}, but that does not come up either ({back}): see journalctl -u {k.UNIT}, run '
+                 'pc-agents setup' if back else f'Back on {old}, running'), ok=False)
+
+
+def auto_update():
+    """One run of the automatic update (README "Automatic updates"): finish or roll back a switch a stop cut; else,
+    with autoUpdate on, a newer release, a running T3 with every wall holding, and nothing at work in T3: download
+    it, switch to it, check it, roll back on failure. Anything it cannot tell: it does nothing, and says why."""
+    state = update_state()
+    try:
+        c = k.config()
+    except machine_file.MachineFileError as e:
+        return note(state, f'nothing done: {e}', ok=False)
+    if not c['autoUpdate']['enabled']:
+        return say('autoUpdate is off in the machine file: nothing to do') or 0
+    current = k.lstat(k.OPT + '/current')
+    sha = os.readlink(k.ROOT + k.OPT + '/current') if current and stat.S_ISLNK(current.st_mode) else ''
+    if not re.fullmatch(r'[0-9a-f]{40}', sha) or not os.path.isdir(f'{k.ROOT}{k.OPT}/{sha}'):
+        return note(state, f'nothing done: no installed kit ({k.OPT}/current): run pc-agents setup', ok=False)
+    have, phase = c['t3Version'], state.get('phase')
+    if phase in ('switching', 'rolling-back'):
+        old, new = state.get('from'), state.get('to')
+        if not (old and new) or have not in (old, new):
+            return note({'failed': state.get('failed')}, f'a cut update ({old} to {new}) is left alone: the machine '
+                        f'file says t3Version {have} now')
+        if phase == 'rolling-back':
+            return rollback(c, state, sha)
+        if have == old:   # cut before the machine file changed: T3 still runs as it was, so start over (quiet point)
+            state = {'failed': state.get('failed')}
+        else:   # the machine file says the new version: finish (the walls check stops a T3 that does not match it)
+            tries = state.get('tries', 0) + 1
+            if tries > k.UPDATE_TRIES:
+                return rollback(c, {**state, 'why': f'its switch was cut {tries - 1} times'}, sha)
+            state = {**state, 'tries': tries}
+            note(state, f'finishing the cut update from T3 {old} to {new} (try {tries} of {k.UPDATE_TRIES})')
+            return switch(c, state, sha)
+    if k.lstat(k.PENDING):
+        return note(state, f'nothing done: setup has not finished ({k.PENDING}): run pc-agents setup', ok=False)
+    follow = c['autoUpdate']['follow']
+    new, why = newest(c)
+    if why:
+        return note(state, f'nothing done: {why}', ok=False)
+    if new is None:
+        return note(state, f'nothing done: {follow} has no published release T3 can take')
+    if k.semver_key(new) <= k.semver_key(have):
+        return note(state, f'T3 {have} is up to date (the newest release of {follow} is {new})')
+    if new == state.get('failed'):
+        return note(state, f'T3 {new} did not come up before: not trying it again (a newer release will be)')
+    if problem := k.SPEC['t3Version'][2](new):
+        return note(state, f'nothing done: {new} cannot be t3Version ({problem})', ok=False)
+    if k.run(['/usr/bin/systemctl', 'is-active', k.UNIT]).returncode:
+        return note(state, f'nothing done: T3 is not running ({k.UNIT}); an update starts from a running T3 only',
+                    ok=False)
+    if why := walls_hold():
+        return note(state, f'nothing done: a wall does not hold ({why})', ok=False)
+    why = install_t3({**c, 't3Version': new}, f'{k.OPT}/{sha}', k.record(), prefetch=True)
+    if why:
+        return note(state, f'nothing done: T3 {new} did not download ({why}); trying again next hour', ok=False)
+    if why := busy():
+        return note(state, f'T3 {new} is downloaded; waiting for a quiet point ({why}); trying again next hour')
+    state = {'phase': 'switching', 'from': have, 'to': new, 'tries': 1, 'failed': state.get('failed')}
+    note(state, f'updating T3 {have} to {new}')
+    return switch(c, state, sha)
+
+
+@contextlib.contextmanager
+def locked():
+    """Hold k.LOCK (root's, under /run) while setup or the automatic update runs; yields False when another holds
+    it. The kernel drops the lock with the process, so a stopped run leaves none behind."""
+    real = k.ROOT + k.LOCK
+    os.makedirs(os.path.dirname(real), mode=0o755, exist_ok=True)
+    if why := k.safe(os.path.dirname(k.LOCK), k.lstat(os.path.dirname(k.LOCK)), stat.S_ISDIR):
+        raise SystemExit(f'pc-agents: {why}')
+    fd = os.open(real, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
 def main(argv):
     if argv[:1] == ['check'] and argv[1:] in ([], ['--enforce']):
         return check(argv[1:] == ['--enforce'])
-    if argv[:1] == ['setup'] and len(argv) == 5 and argv[1] == '--source' and argv[3] == '--sha':
-        return setup(argv[2], argv[4])
+    if argv[:1] == ['setup'] and len(argv) == 5 and argv[1] == '--source' and argv[3] == '--sha' or \
+            argv == ['auto-update']:
+        if not k.ROOT and os.geteuid() != 0:
+            return say('run this as root') or 2
+        with locked() as mine:
+            if not mine:
+                return say('another pc-agents setup or automatic update runs: try again once it ended') or 1
+            return setup(argv[2], argv[4]) if argv[0] == 'setup' else auto_update()
     if argv == ['load-firewall']:
         why = k.load_firewall()
         return say(why) or 1 if why else 0

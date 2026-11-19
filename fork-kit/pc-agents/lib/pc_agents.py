@@ -22,8 +22,15 @@ SETTLE, SETTLE_STEP = 15, 1   # after a (re)start, setup watches T3 this many se
 LOCK_WAIT, LOCK_STEP = 300, 5   # setup retries a dpkg or apt-get step that found a lock held this long, every LOCK_STEP
 LOADED = '/run/pc-agents/firewall.loaded'   # sha256 of the firewall file and `nft list` of it, saved when loaded
 T3 = OPT + '/t3'   # T3's runtime, installed by root (T3CODE_HOME of scripts/install.sh): the agent cannot change it
-UNIT, WALLS = 't3code-agents.service', 'pc-agents-walls'
-UNITS = (UNIT, WALLS + '.service', WALLS + '.timer')
+UNIT, WALLS, UPDATE = 't3code-agents.service', 'pc-agents-walls', 'pc-agents-update'
+UNITS = (UNIT, WALLS + '.service', WALLS + '.timer', UPDATE + '.service', UPDATE + '.timer')
+TIMERS = (WALLS + '.timer', UPDATE + '.timer')   # enabled and running with T3 (the update one does nothing when off)
+UPDATE_STATE = STATE + '/auto-update.json'   # the automatic update's journal and last result (root's, never the agent's)
+LOCK = '/run/pc-agents/setup.lock'   # setup and the automatic update take it: never two at once
+KEEP_VERSIONS = 3   # T3 version folders kept after an automatic update: the new one, the one before (rollback), one more
+UPDATE_TRIES = 3   # a switch to a new version stopped half-way this often is rolled back, not finished
+HTTP_WAIT, HTTP_STEP = 180, 5   # after an update's restart, T3 must answer with its new version within HTTP_WAIT s
+GITHUB_API = 'https://api.github.com'
 CHECK = OPT + '/current/sbin/pc-agents'
 WALLS_PY = OPT + '/current/walls/fork-fleet-walls.py'
 # Walls of fork-fleet-walls/wsl2 that are about the fleet launcher's job units. Here the job unit is T3's own unit,
@@ -95,7 +102,20 @@ SPEC = {
     'peers': (list, machine_file.REQUIRED, lambda v: is_ip_list(v, True, most=16) if v else '1 to 16 entries'),
     'tailscaleTag': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'tag:[a-z0-9-]{1,50}', v) else 'tag:name'),
     'devPorts': (str, '4100-4199', lambda v: None if port_range(v) else 'LOW-HIGH, 1024 to 65535, like 4100-4199'),
+    'autoUpdate': (dict, {'enabled': False, 'follow': ''}, lambda v: auto_update_problem(v)),
 }
+REPO_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}')
+AUTO_UPDATE = {'enabled': (bool, machine_file.REQUIRED, None),
+               'follow': (str, '', lambda v: None if not v or REPO_NAME.fullmatch(v) else 'the fork as OWNER/NAME')}
+
+
+def auto_update_problem(value):
+    """Why the autoUpdate object is not {"enabled": bool, "follow": "OWNER/NAME"} (follow needed when enabled)."""
+    try:
+        got = machine_file.fields(value, AUTO_UPDATE, 'autoUpdate')
+    except machine_file.MachineFileError as e:
+        return str(e).removeprefix('autoUpdate').lstrip('.: ')
+    return 'needs "follow": the fork as OWNER/NAME' if got['enabled'] and not got['follow'] else None
 
 
 def new_enough(version):
@@ -137,7 +157,52 @@ def locked_problem(path, value):
 
 def config():
     section = machine_file.read_section(KIT, ROOT + machine_file.default_path() if ROOT else None, OWNER)
-    return machine_file.fields(section, SPEC, f'{machine_file.default_path()}: {KIT}')
+    where = f'{machine_file.default_path()}: {KIT}'
+    c = machine_file.fields(section, SPEC, where)
+    c['autoUpdate'] = machine_file.fields(c['autoUpdate'], AUTO_UPDATE, where + '.autoUpdate')
+    if c['autoUpdate']['enabled'] and c['t3ReleaseBaseUrl'].rstrip('/') != fork_downloads(c):
+        raise machine_file.MachineFileError(
+            f'{where}.t3ReleaseBaseUrl: is {c["t3ReleaseBaseUrl"]}, but autoUpdate follows the releases of '
+            f'{c["autoUpdate"]["follow"]}: set it to {fork_downloads(c)} (an update installs from there what it finds '
+            'there), or turn autoUpdate off')
+    return c
+
+
+def fork_downloads(c):
+    """Where the followed fork's release files are (GitHub's release downloads)."""
+    return f'https://github.com/{c["autoUpdate"]["follow"]}/releases/download'
+
+
+def semver_key(version):
+    """A sort key in semver order, as T3's updaters compare (packages/shared/src/semver.ts compareSemverVersions):
+    X.Y.Z as numbers, a pre-release below its release, its parts one by one (numbers as numbers and below words,
+    words as text, a shorter list first when the rest is equal). The fork's nightly X.Y.Z-nightly.D.R.fork.N sorts
+    above its stable X.Y.Z-fork.N ("nightly" > "fork"), as in .github/scripts/fork-channel.sh."""
+    m = VERSION.fullmatch(version)
+    parts = m[4][1:].split('.') if m[4] else []
+    return (tuple(map(int, m.groups()[:3])), not parts,
+            tuple((0, int(p), '') if p.isdigit() else (1, 0, p) for p in parts))
+
+
+def release_track(version):
+    """T3's update track of a version (cliReleaseChannelOf): nightly or preview for X.Y.Z-nightly|preview.D.N,
+    stable for every other one, the fork's builds too."""
+    m = re.fullmatch(r'[^-+]+-(nightly|preview)\.\d{8}\.\d+', version)
+    return m[1] if m else 'stable'
+
+
+def newest_release(releases):
+    """The version of the release T3's own updater would take (newestCliReleaseVersion): the first in GitHub's list
+    (newest made first) that is published (not a draft), a full release (not a pre-release: the fork publishes its
+    builds as full releases once their tests pass), tagged vX.Y.Z[-...] and on the stable track; or None."""
+    for r in releases if isinstance(releases, list) else []:
+        if not isinstance(r, dict) or r.get('draft') is not False or r.get('prerelease') is not False:
+            continue
+        tag = r.get('tag_name')
+        version = tag[1:] if isinstance(tag, str) and tag.startswith('v') else ''
+        if VERSION.fullmatch(version) and release_track(version) == 'stable':
+            return version
+    return None
 
 
 def runtime(c):
@@ -254,6 +319,16 @@ WantedBy=multi-user.target
         sd + WALLS + '.timer': (HEAD + '[Unit]\nDescription=pc-agents walls check every 2 minutes\n\n[Timer]\n'
                                 'OnActiveSec=1min\nOnUnitActiveSec=2min\nAccuracySec=10s\n\n[Install]\n'
                                 'WantedBy=timers.target\n', 0o644),
+        # The automatic update (autoUpdate in the machine file; off: it says so and does nothing). Root's, from the
+        # installed kit: it reads only root's files, the release list and T3's own answer. Not After= T3's unit: it
+        # restarts T3 itself (through setup). Its time limit covers the download's 30 minutes, setup and the check.
+        sd + UPDATE + '.service': (HEAD + '[Unit]\nDescription=pc-agents automatic T3 update (autoUpdate)\n'
+                                   'Wants=network-online.target\nAfter=network-online.target\n\n[Service]\n'
+                                   f'Type=oneshot\nTimeoutStartSec=2h\nExecStart={CHECK} auto-update\n', 0o644),
+        # Hourly, spread over 20 minutes; 10 minutes after a start of the distro (finishes an update a stop cut).
+        sd + UPDATE + '.timer': (HEAD + '[Unit]\nDescription=pc-agents automatic T3 update, hourly\n\n[Timer]\n'
+                                 'OnActiveSec=10min\nOnUnitActiveSec=1h\nRandomizedDelaySec=20min\n\n[Install]\n'
+                                 'WantedBy=timers.target\n', 0o644),
     }
 
 

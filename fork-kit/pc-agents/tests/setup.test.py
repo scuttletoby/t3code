@@ -23,12 +23,12 @@ class Setup(Case):
         self.assertIn('FAIL  automount', out)
         self.assertIn('wsl --terminate', out)
         self.assertFalse([line for line in self.log() if line.startswith('enable')])
-        self.assertIn('disable --now t3code-agents.service pc-agents-walls.timer', self.log())
+        self.assertIn('disable --now t3code-agents.service pc-agents-walls.timer pc-agents-update.timer', self.log())
         self.terminate()
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)
         self.assertNotIn('FAIL', out)
-        self.assertIn('enable --now t3code-agents.service pc-agents-walls.timer', self.log())
+        self.assertIn('enable --now t3code-agents.service pc-agents-walls.timer pc-agents-update.timer', self.log())
         self.assertIn('tailscale up --advertise-tags=tag:pc-agents --accept-dns=false', out)
         self.assertFalse(os.path.lexists(self.path(k.PENDING)))
         self.assertIn('versions/1.2.3/t3 serve', self.read('/log/units/t3code-agents.service.active'))
@@ -148,7 +148,7 @@ class Setup(Case):
             code, out = self.setup_run()
             self.assertEqual(code, 0, f'stopped at write {stop} ({writes[stop - 1]}): {out}')
             self.assertEqual({p: v[4] for p, v in self.snapshot().items()}, whole, f'stopped at write {stop}')
-            self.assertIn('enable --now t3code-agents.service pc-agents-walls.timer', self.log())
+            self.assertIn('enable --now t3code-agents.service pc-agents-walls.timer pc-agents-update.timer', self.log())
 
     def test_t3_install_fails_then_works(self):
         self.terminate()
@@ -816,12 +816,13 @@ class AsAgent(Case):
 
 class Refused(Case):
     def refused(self, why):
-        before = self.snapshot()
+        lock = ('/run', os.path.dirname(k.LOCK), k.LOCK)   # the lock setup holds: a tmpfs file, gone at boot
+        before = {p: v for p, v in self.snapshot().items() if p not in lock}
         code, out = self.setup_run()
         self.assertEqual(code, 1, out)
         self.assertIn('refused, nothing changed', out)
         self.assertIn(why, out)
-        self.assertEqual(self.snapshot(), before)
+        self.assertEqual({p: v for p, v in self.snapshot().items() if p not in lock}, before)
         self.assertEqual(self.log(), [])
 
     def test_a_distro_with_its_own_user(self):

@@ -1,6 +1,6 @@
 """A fake WSL2 distro in a temporary folder for the pc-agents tests: every fixed path under PC_AGENTS_ROOT, the
-current user as root, fake useradd, usermod, env (T3's installer), apt-get, dpkg-query, dpkg, systemctl, systemd-run
-and nft (each logs to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and policy a
+current user as root, fake useradd, usermod, env (T3's installer), apt-get, dpkg-query, dpkg, systemctl, systemd-run,
+nft and curl (each logs to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and policy a
 started one runs with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units). No root, no
 systemd, no network, no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest
@@ -50,6 +50,10 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          'run() { [ -e "$S/$1.limit" ] && { echo "$1: start request repeated too quickly" >&2; '
                          'return 1; }\nrm -f "$S/$1.seen" "$S/$1.status" "$S/$1.code"\n'
                          # /log/t3-crash: T3's exit status (empty: 1), or "CODE STATUS" (2 9: killed by signal 9)
+                         # /log/t3-crash-version: only T3 of that version crashes so (exit status 1)
+                         '[ "$1" = t3code-agents.service ] && [ -e "$R/log/t3-crash-version" ] && grep -qF '
+                         '"/versions/$(cat "$R/log/t3-crash-version")/" "$R/etc/systemd/system/$1" && { '
+                         'rm -f "$S/$1.active"; echo 1 >"$S/$1.code"; echo 1 >"$S/$1.status"; return; }\n'
                          '[ "$1" = t3code-agents.service ] && [ -e "$R/log/t3-crash" ] && { rm -f "$S/$1.active"; '
                          'c=$(cat "$R/log/t3-crash"); case "$c" in *" "*) echo "${c%% *}" >"$S/$1.code"; c=${c#* };; '
                          '*) echo 1 >"$S/$1.code";; esac; echo "${c:-1}" >"$S/$1.status"; return; }\n'
@@ -70,7 +74,7 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  [ -e "$R/log/t3-dies" ] && [ -e "$S/$u.active" ] && { [ -e "$S/$u.seen" ] && '
                          'rm -f "$S/$u.active"; : >"$S/$u.seen"; }\n'
                          '  st=disabled; [ -e "$S/$u.enabled" ] && st=enabled\n'
-                         '  [ "$u" = pc-agents-walls.service ] && st=static\n'
+                         '  case "$u" in pc-agents-walls.service|pc-agents-update.service) st=static;; esac\n'
                          '  echo "LoadState=${f:+loaded}"; echo "FragmentPath=$f"\n'
                          '  echo "DropInPaths=$(cat "$S/$u.dropins" 2>/dev/null)"; echo "UnitFileState=$st"\n'
                          '  [ -e "$S/reload" ] && echo NeedDaemonReload=yes || echo NeedDaemonReload=no\n'
@@ -144,6 +148,21 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                     '{ echo "dpkg: error: end of file on stdin at conffile prompt (test)" >&2; exit 1; }\n'
                     'for f in "$R"/log/packages/*; do [ ! -e "$f" ] || sed -i "s/unpacked/installed/" "$f"; done\n'
                     'for f in "$R"/var/lib/dpkg/updates/[0-9]*; do [ ! -e "$f" ] || rm "$f"; done\n',
+    # curl: the release list of the followed fork (/log/releases.json; none: []; /log/releases-fail: a refusal), and
+    # T3's answer on its port: the version in the ExecStart the running T3 unit started with (none while it is not
+    # active, or /log/http-fail; nor for a version named in /log/http-mute: one that starts but never answers)
+    'usr/bin/curl': 'R="${0%/usr/bin/curl}"; echo "$*" >>"$R/log/curl"; for a; do url=$a; done\n'
+                    'case "$url" in https://api.github.com/*)\n'
+                    '  [ -e "$R/log/releases-fail" ] && { echo "curl: (22) The requested URL returned error: 403 '
+                    '(test)" >&2; exit 22; }; cat "$R/log/releases.json" 2>/dev/null || echo "[]";;\n'
+                    'http://127.0.0.1:*) f="$R/log/units/t3code-agents.service.active"\n'
+                    '  [ -e "$f" ] && [ ! -e "$R/log/http-fail" ] || { echo "curl: (7) Failed to connect (test)" >&2; '
+                    'exit 7; }\n'
+                    '  v=$(sed -n "s#^ExecStart=.*/runtime/versions/\\([^/]*\\)/t3 .*#\\1#p" "$f")\n'
+                    '  grep -qsxF "$v" "$R/log/http-mute" && { echo "curl: (28) Operation timed out (test)" >&2; '
+                    'exit 28; }\n'
+                    '  printf \'{"serverVersion":"%s","httpBaseUrl":"/"}\\n\' "$v";;\n'
+                    '*) echo "curl: not a URL of this test: $url" >&2; exit 2;; esac\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
 }
@@ -302,7 +321,7 @@ class Case(unittest.TestCase):
                 self.write(f'/opt/pc-agents/{sha}/{dst}', {'text': f.read(), 'mode': f'{mode:o}'})
         os.symlink(sha, self.path('/opt/pc-agents/current'))
         self.assertIsNone(k.load_firewall())
-        k.run(['/usr/bin/systemctl', 'enable', '--now', k.UNIT, k.WALLS + '.timer'])
+        k.run(['/usr/bin/systemctl', 'enable', '--now', k.UNIT, *k.TIMERS])
         os.unlink(self.path('/log/systemctl'))
         self.terminate()
 
