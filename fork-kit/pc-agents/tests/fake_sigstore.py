@@ -7,7 +7,7 @@ fake_curl.py serves answer(DIR, HEX) for GitHub's attestations API (sha256:HEX).
 
 DIR holds the keys (ca(DIR) makes them) and trust.json, the kit's sigstore-trust.json for them. DIR/fault names one
 fault of FAULTS (none: a good bundle), to test that the kit refuses each."""
-import base64, hashlib, json, os, shutil, subprocess, tempfile, time
+import atexit, base64, hashlib, json, os, shutil, subprocess, tempfile, time
 
 FORK = 'example/t3code'
 GITHUB = 'https://github.com/' + FORK
@@ -83,6 +83,7 @@ def ca(d):
     global _made
     if _made is None:
         _made = tempfile.mkdtemp(prefix='pc-agents-sigstore-')
+        atexit.register(shutil.rmtree, _made, True)
         for name in ('root', 'intermediate', 'other-root', 'rekor', 'other-rekor'):
             key(f'{_made}/{name}.key')
         cert(_made, 'root', None, CA_EXT)
