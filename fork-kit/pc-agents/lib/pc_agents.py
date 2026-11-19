@@ -21,9 +21,31 @@ AS_AGENT = 'pc-agents-as-agent'   # name prefix of `pc-agents as-agent`'s transi
 SETTLE, SETTLE_STEP = 15, 1   # after a (re)start, setup watches T3 this many seconds, every SETTLE_STEP, before done
 LOCK_WAIT, LOCK_STEP = 300, 5   # setup retries a dpkg or apt-get step that found a lock held this long, every LOCK_STEP
 LOADED = '/run/pc-agents/firewall.loaded'   # sha256 of the firewall file and `nft list` of it, saved when loaded
-T3 = OPT + '/t3'   # T3's runtime, installed by root (T3CODE_HOME of scripts/install.sh): the agent cannot change it
-UNIT, WALLS = 't3code-agents.service', 'pc-agents-walls'
-UNITS = (UNIT, WALLS + '.service', WALLS + '.timer')
+T3 = OPT + '/t3'   # T3's runtime, downloaded, checked and unpacked by root (never run by it): the agent cannot change it
+UNIT, WALLS, UPDATE = 't3code-agents.service', 'pc-agents-walls', 'pc-agents-update'
+UNITS = (UNIT, WALLS + '.service', WALLS + '.timer', UPDATE + '.service', UPDATE + '.timer')
+TIMERS = (WALLS + '.timer', UPDATE + '.timer')   # enabled and running with T3 (the update one does nothing when off)
+UPDATE_STATE = STATE + '/auto-update.json'   # the automatic update's journal and last result (root's, never the agent's)
+LOCK = '/run/pc-agents/setup.lock'   # setup and the automatic update take it: never two at once
+KEEP_VERSIONS = 3   # T3 version folders kept after an automatic update: the new one, the one before (rollback), one more
+UPDATE_TRIES = 3   # a switch to a new version stopped half-way this often is rolled back, not finished
+SETUP_TRIES = 3   # a release whose switch failed for another reason than T3 itself this often is not tried again
+QUIET_WAIT_DAYS = 7   # an update that waited this long (for a quiet point, or for GitHub's rate limit) is an alert
+DB_DIR = '/.t3/userdata'   # under HOME: T3's state database (T3CODE_HOME=HOME/.t3; apps/server/src/config.ts)
+DB_FILES = ('statev2.sqlite', 'statev2.sqlite-wal', 'statev2.sqlite-shm', 'state.sqlite', 'state.sqlite-wal',
+            'state.sqlite-shm')   # the database and its write-ahead log, and the older one a start imports
+DB_BACKUP = '/var/lib/pc-agents/db-backup'   # root's alone: T3's database as it was before the last switch
+# root's alone: T3's database as a rollback found it, set aside before the copy is put back (a folder per rollback,
+# DB_REPLACED-<UTC time>-<version>; the kit never removes one)
+DB_REPLACED = '/var/lib/pc-agents/db-replaced'
+HTTP_WAIT, HTTP_STEP = 180, 5   # after an update's restart, T3 must answer with its new version within HTTP_WAIT s
+GITHUB_API = 'https://api.github.com'
+# The pinned Sigstore public-good roots (Fulcio's certificate authority, Rekor's log key) the attestation check trusts
+TRUST = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sigstore-trust.json')
+RELEASE_WORKFLOW = 'fork-release.yml'   # the only workflow whose builds an automatic update installs, from main
+RELEASE_CALLERS = ('fork-release.yml', 'fork-follow.yml')   # what may run it: itself, or fork-follow's release job
+ARCHIVE_MAX, SUMS_MAX, JSON_MAX = 1 << 30, 1 << 16, 16 << 20   # largest download the kit takes of each (bytes)
+UNPACKED_MAX = 4 << 30   # the most an archive may unpack to (bytes)
 CHECK = OPT + '/current/sbin/pc-agents'
 WALLS_PY = OPT + '/current/walls/fork-fleet-walls.py'
 # Walls of fork-fleet-walls/wsl2 that are about the fleet launcher's job units. Here the job unit is T3's own unit,
@@ -61,7 +83,8 @@ CODE = {'fork-kit/pc-agents/sbin/pc-agents': ('sbin/pc-agents', 0o755),
         '.github/scripts/fork-fleet-walls.py': ('walls/fork-fleet-walls.py', 0o755),
         '.github/scripts/fork-fleet-launch.sh': ('walls/fork-fleet-launch.sh', 0o755),
         '.github/scripts/fork-fleet-job-paths.txt': ('walls/fork-fleet-job-paths.txt', 0o644),
-        'scripts/install.sh': ('share/install.sh', 0o644)}
+        'fork-kit/pc-agents/lib/attestation.py': ('lib/attestation.py', 0o644),
+        'fork-kit/pc-agents/lib/sigstore-trust.json': ('lib/sigstore-trust.json', 0o644)}
 for _w, _m in (('linux', 0o755), ('wsl2', 0o755), ('linux.fixture.json', 0o644), ('wsl2.fixture.json', 0o644)):
     CODE['.github/scripts/fork-fleet-walls/' + _w] = ('walls/fork-fleet-walls/' + _w, _m)
 
@@ -95,7 +118,20 @@ SPEC = {
     'peers': (list, machine_file.REQUIRED, lambda v: is_ip_list(v, True, most=16) if v else '1 to 16 entries'),
     'tailscaleTag': (str, machine_file.REQUIRED, lambda v: None if re.fullmatch(r'tag:[a-z0-9-]{1,50}', v) else 'tag:name'),
     'devPorts': (str, '4100-4199', lambda v: None if port_range(v) else 'LOW-HIGH, 1024 to 65535, like 4100-4199'),
+    'autoUpdate': (dict, {'enabled': False, 'follow': ''}, lambda v: auto_update_problem(v)),
 }
+REPO_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.+$)[A-Za-z0-9._-]{1,100}')   # not `.` or `..`
+AUTO_UPDATE = {'enabled': (bool, machine_file.REQUIRED, None),
+               'follow': (str, '', lambda v: None if not v or REPO_NAME.fullmatch(v) else 'the fork as OWNER/NAME')}
+
+
+def auto_update_problem(value):
+    """Why the autoUpdate object is not {"enabled": bool, "follow": "OWNER/NAME"} (follow needed when enabled)."""
+    try:
+        got = machine_file.fields(value, AUTO_UPDATE, 'autoUpdate')
+    except machine_file.MachineFileError as e:
+        return str(e).removeprefix('autoUpdate').lstrip('.: ')
+    return 'needs "follow": the fork as OWNER/NAME' if got['enabled'] and not got['follow'] else None
 
 
 def new_enough(version):
@@ -137,11 +173,56 @@ def locked_problem(path, value):
 
 def config():
     section = machine_file.read_section(KIT, ROOT + machine_file.default_path() if ROOT else None, OWNER)
-    return machine_file.fields(section, SPEC, f'{machine_file.default_path()}: {KIT}')
+    where = f'{machine_file.default_path()}: {KIT}'
+    c = machine_file.fields(section, SPEC, where)
+    c['autoUpdate'] = machine_file.fields(c['autoUpdate'], AUTO_UPDATE, where + '.autoUpdate')
+    if c['autoUpdate']['enabled'] and c['t3ReleaseBaseUrl'].rstrip('/') != fork_downloads(c):
+        raise machine_file.MachineFileError(
+            f'{where}.t3ReleaseBaseUrl: is {c["t3ReleaseBaseUrl"]}, but autoUpdate follows the releases of '
+            f'{c["autoUpdate"]["follow"]}: set it to {fork_downloads(c)} (an update installs from there what it finds '
+            'there), or turn autoUpdate off')
+    return c
+
+
+def fork_downloads(c):
+    """Where the followed fork's release files are (GitHub's release downloads)."""
+    return f'https://github.com/{c["autoUpdate"]["follow"]}/releases/download'
+
+
+def semver_key(version):
+    """A sort key in semver order, as T3's updaters compare (packages/shared/src/semver.ts compareSemverVersions):
+    X.Y.Z as numbers, a pre-release below its release, its parts one by one (numbers as numbers and below words,
+    words as text, a shorter list first when the rest is equal). The fork's nightly X.Y.Z-nightly.D.R.fork.N sorts
+    above its stable X.Y.Z-fork.N ("nightly" > "fork"), as in .github/scripts/fork-channel.sh."""
+    m = VERSION.fullmatch(version)
+    parts = m[4][1:].split('.') if m[4] else []
+    return (tuple(map(int, m.groups()[:3])), not parts,
+            tuple((0, int(p), '') if p.isdigit() else (1, 0, p) for p in parts))
+
+
+def release_track(version):
+    """T3's update track of a version (cliReleaseChannelOf): nightly or preview for X.Y.Z-nightly|preview.D.N,
+    stable for every other one, the fork's builds too."""
+    m = re.fullmatch(r'[^-+]+-(nightly|preview)\.\d{8}\.\d+', version)
+    return m[1] if m else 'stable'
+
+
+def latest_version(latest):
+    """The version of the followed fork's latest release (github.com/OWNER/NAME/releases/latest as JSON: GitHub's
+    latest is published and not a pre-release; fork-release.yml marks each release it publishes latest) when T3 can
+    take it: tagged vX.Y.Z[-...] and on the stable track; else None."""
+    tag = latest.get('tag_name') if isinstance(latest, dict) else None
+    version = tag[1:] if isinstance(tag, str) and tag.startswith('v') else ''
+    return version if VERSION.fullmatch(version) and release_track(version) == 'stable' else None
+
+
+def arch():
+    """The release archives' name for this machine (scripts/build-cli-archive.ts), or None."""
+    return {'x86_64': 'x64', 'amd64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(os.uname().machine.lower())
 
 
 def runtime(c):
-    """T3's version folder (root's, from scripts/install.sh with T3CODE_HOME=T3); the unit runs its `t3`."""
+    """T3's version folder (root's, install_t3 unpacks it); the unit runs its `t3`."""
     return f'{T3}/runtime/versions/{c["t3Version"]}'
 
 
@@ -254,6 +335,16 @@ WantedBy=multi-user.target
         sd + WALLS + '.timer': (HEAD + '[Unit]\nDescription=pc-agents walls check every 2 minutes\n\n[Timer]\n'
                                 'OnActiveSec=1min\nOnUnitActiveSec=2min\nAccuracySec=10s\n\n[Install]\n'
                                 'WantedBy=timers.target\n', 0o644),
+        # The automatic update (autoUpdate in the machine file; off: it says so and does nothing). Root's, from the
+        # installed kit: it reads only root's files, the release list and T3's own answer. Not After= T3's unit: it
+        # restarts T3 itself (through setup). Its time limit covers the download's 30 minutes, setup and the check.
+        sd + UPDATE + '.service': (HEAD + '[Unit]\nDescription=pc-agents automatic T3 update (autoUpdate)\n'
+                                   'Wants=network-online.target\nAfter=network-online.target\n\n[Service]\n'
+                                   f'Type=oneshot\nTimeoutStartSec=2h\nExecStart={CHECK} auto-update\n', 0o644),
+        # Hourly, spread over 20 minutes; 10 minutes after a start of the distro (finishes an update a stop cut).
+        sd + UPDATE + '.timer': (HEAD + '[Unit]\nDescription=pc-agents automatic T3 update, hourly\n\n[Timer]\n'
+                                 'OnActiveSec=10min\nOnUnitActiveSec=1h\nRandomizedDelaySec=20min\n\n[Install]\n'
+                                 'WantedBy=timers.target\n', 0o644),
     }
 
 
@@ -443,13 +534,14 @@ def user_problem(c, need_agent):
     return f'user {USER} is in other groups ({", ".join(extra)}): it must have none' if extra else None
 
 
-def run(argv, timeout=120, env=None):
+def run(argv, timeout=120, env=None, inherit=True):
     """Run argv (argv[0] under ROOT) in a process group of its own. Past timeout, or when this process stops (Ctrl-C,
     or SIGTERM and SIGHUP once stop_on_signals() ran), the whole group is killed (a download's curl too); a timeout
-    returns exit 124 and says so in stderr. env: variables added to this process's own."""
+    returns exit 124 and says so in stderr. env: variables added to this process's own (inherit), or its whole
+    environment (not inherit)."""
     p = subprocess.Popen([ROOT + argv[0]] + argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True,
-                         env={**os.environ, **env} if env else None)
+                         env=({**os.environ, **env} if inherit else dict(env)) if env or not inherit else None)
     try:
         out, err = p.communicate(timeout=timeout)
     except BaseException as e:
