@@ -6,12 +6,9 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
 import {
-  effectiveReviewRules,
-  FORK_PROJECT_SCOPED_KEYS,
+  FORK_REPORT_PROJECT_FEATURES,
   FORK_SERVER_SETTING_KEYS,
-  type HandoffSettings,
-  type PlaytestSettings,
-  type ReviewRules,
+  forkFeaturesWhere,
   type ServerSettings,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -534,75 +531,14 @@ function readSettings(
 }
 
 type ForkReportFeature = keyof ForkReport["fork"]["features"];
-type ForkProjectScopedKey = (typeof FORK_PROJECT_SCOPED_KEYS)[number];
 
-/**
- * The counted features a project's override can switch on: the report reads each one's override in
- * every project. A test holds it to every counted feature that is also a project-scoped setting.
- */
-export const FORK_REPORT_PROJECT_FEATURES = [
-  "reviewRules",
-  "handoff",
-  "playtest",
-] as const satisfies ReadonlyArray<ForkReportFeature & ForkProjectScopedKey>;
-type ForkReportProjectFeature = (typeof FORK_REPORT_PROJECT_FEATURES)[number];
+/** The counted features a project's override can switch on (the rules live in the contracts). */
+export { FORK_REPORT_PROJECT_FEATURES };
 
-/** Where each counted feature is on in `settings`: `server`, `project:<id>` or a thread's entry. */
-function whereEachFeature(
+/** Where each counted feature is on in `settings`, by the rules the Fork settings page reads too. */
+const whereEachFeature = (
   settings: ServerSettings,
-): Record<ForkReportFeature, ReadonlyArray<string>> {
-  // A project's override replaces the server's value for that project, so it can switch a feature
-  // on while the server's is off. A bad value already reads as off (the settings decode).
-  const overrides = <K extends ForkReportProjectFeature>(key: K) =>
-    Object.entries(settings.projectSettingsOverrides).map(
-      ([projectId, project]) => [projectId, project[key]] as const,
-    );
-  const server = (on: boolean) => (on ? ["server"] : []);
-  const perProject = {
-    reviewRules: whereOn(settings.reviewRules, overrides("reviewRules"), reviewRulesOn),
-    handoff: whereOn(settings.handoff, overrides("handoff"), handoffWhere),
-    playtest: whereOn(settings.playtest, overrides("playtest"), playtestOn),
-  } satisfies Record<ForkReportProjectFeature, ReadonlyArray<string>>;
-  return {
-    agentSlots: server(settings.agentSlots.enabled),
-    waitFor: server(settings.waitFor.enabled),
-    usagePacingGate: server(settings.usagePacingGate !== "off"),
-    automaticUpdates: server(settings.automaticUpdates),
-    ...perProject,
-    modelPolicy: server(settings.modelPolicy.mode !== "off"),
-    activityProbe: server(settings.activityProbe),
-  };
-}
-
-/** Where a value switches its feature on, below `at` (`server` or `project:<id>`). */
-type WhereOn<T> = (value: T, at: string) => ReadonlyArray<string>;
-const when =
-  <T>(isOn: (value: T) => boolean): WhereOn<T> =>
-  (value, at) =>
-    isOn(value) ? [at] : [];
-const reviewRulesOn = when((value: ReviewRules) => effectiveReviewRules(value).preset !== "off");
-const playtestOn = when((value: PlaytestSettings) => value.enabled);
-/** The value's own mode, and each thread whose entry is `handoff` (it wins over the mode). */
-const handoffWhere: WhereOn<HandoffSettings> = (value, at) => [
-  ...(value.mode === "handoff" ? [at] : []),
-  ...Object.entries(value.threads)
-    .filter(([, mode]) => mode === "handoff")
-    .map(([threadId]) => `${at === "server" ? "" : `${at}/`}thread:${threadId}`),
-];
-
-/** Where the server's value and each project's (not set or null: the server's) is on. */
-function whereOn<T>(
-  server: T,
-  projects: ReadonlyArray<readonly [string, T | null | undefined]>,
-  where: WhereOn<T>,
-): ReadonlyArray<string> {
-  return [
-    ...where(server, "server"),
-    ...projects.flatMap(([projectId, value]) =>
-      value == null ? [] : where(value, `project:${projectId}`),
-    ),
-  ];
-}
+): Record<ForkReportFeature, ReadonlyArray<string>> => forkFeaturesWhere(settings);
 
 /** The report as the command prints it: indented JSON. */
 export const formatForkReport = (report: ForkReport): string => JSON.stringify(report, null, 2);
