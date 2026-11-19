@@ -12,7 +12,7 @@ again if the run left it stopped, so a killed copy cannot leave T3 down.
 """
 import datetime, hashlib, json, os, sqlite3, stat, subprocess, sys, time
 
-from golive import check as check_mod, journal, live, osadapter
+from golive import check as check_mod, handoff, journal, live, osadapter
 
 KIT_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), 'bin',
                        't3-golive')
@@ -662,7 +662,8 @@ def hold_owner_lock(userdata, wait_seconds):
         os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC, 0o644))  # as upstream creates it
     end = time.monotonic() + wait_seconds
     while True:
-        conn = sqlite3.connect(path, timeout=0, isolation_level=None)
+        # check_same_thread=False: the handover (handoff.py) closes it from its own thread; nothing else uses it
+        conn = sqlite3.connect(path, timeout=0, isolation_level=None, check_same_thread=False)
         try:
             conn.execute('BEGIN EXCLUSIVE')
             return conn
@@ -843,7 +844,8 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
     run.require_step('restore')
     userdata = os.path.join(home, 'userdata')
     mark_path = os.path.join(userdata, RESTORE_MARK)
-    lock = hold_owner_lock(userdata, 0)
+    held = handoff.held(home)  # W1 holds it since its stop (handoff.py): the home is never free in between
+    lock, done = held or hold_owner_lock(userdata, 0), False
     try:  # the checks (disk included) under the lock, so nothing changes between them and the restore
         files, want = plan_restore(copy_dir, home, from_home=from_home, version=version, names=names,
                                    floor_bytes=floor_bytes)
@@ -891,8 +893,10 @@ def restore(run, copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, f
                     _fsync_dir(userdata)
         os.unlink(mark_path)
         _fsync_dir(userdata)
-    finally:
-        lock.close()
+        done = True
+    finally:  # a way back that stopped T3 keeps the lock until the start hands the home over (handoff.py)
+        if lock is not held and not (done and handoff.adopt(home, lock)):
+            lock.close()
     result = {'copy': copy_dir, 'restored': want, 'movedAside': prior['oldHome'] if prior else kept,
               'alsoKept': prior.get('alsoKept', []) if prior else [], 'removedTemps': cleaned}
     if already:
@@ -960,6 +964,7 @@ def _wait_started(cfg, adapter, version, old_pid):
     """T3 runs again: the service is active and its new server, of `version` (None: whatever build the service
     starts), wrote its runtime record."""
     end, why = time.monotonic() + START_WAIT, ''
+    watch = handoff.ForeignWatch(cfg.home, old_pid)
     while time.monotonic() < end:
         svc = adapter.service()
         try:
@@ -972,6 +977,9 @@ def _wait_started(cfg, adapter, version, old_pid):
                 why = f'{osadapter.UNIT} is not active'
         except live.NotLive as e:
             why = str(e)
+        found = watch.check(svc)  # the backstop: no use waiting for a home another server holds
+        if found is not None:
+            raise RuntimeError(f'T3 did not come back: {handoff.said(found, svc)}')
         time.sleep(POLL)
     raise RuntimeError(f'T3 did not come back within {START_WAIT} s: {why}')
 
@@ -1114,11 +1122,22 @@ def _guard_alive(adapter, unit):
         return False
 
 
+def open_gap(home):
+    """Write upstream's update marker and keep it fresh (handoff.py), just before T3 stops. None, or why it could
+    not be written (T3 must not be stopped then: an SSH launch would start its own server in the gap)."""
+    try:
+        handoff.open_gap(home)
+    except OSError as e:
+        handoff.close(home)
+        return f'the update marker {handoff.marker_path(home)} cannot be written: {e}'
+    return None
+
+
 def _restart(run, cfg, adapter, server, say, version):
     """Start T3 again FIRST and journal it after (a full disk must not keep T3 down), then verify that a new server
     of `version` runs (None: of whatever build the service starts). Returns (error or None, the new server)."""
     try:
-        adapter.start()
+        handoff.starting(cfg.home, adapter.start, version or server['version'])  # the owner lock: to the launcher
         start_error = None
     except BaseException as e:
         start_error = e
@@ -1129,7 +1148,7 @@ def _restart(run, cfg, adapter, server, say, version):
                 raise start_error
         with run.step('verify') as facts:
             again = _wait_started(cfg, adapter, version, server['pid'])
-            facts.update(pid=again['pid'], version=again['version'])
+            facts.update(pid=again['pid'], version=again['version'], **handoff.served(cfg.home))
         say(f't3 {again["version"]} runs again (pid {again["pid"]})')
     except BaseException as e:
         if start_error is not None and e is not start_error:  # the journal failed too: keep why the start failed
@@ -1141,7 +1160,13 @@ def _restart(run, cfg, adapter, server, say, version):
 def run_copy(cfg, adapter, owner_says_go=False, say=print):
     """The practice stop, in this process. Returns the result dict; raises journal.Refused (nothing changed or
     all undone), journal.Busy / Unfinished, or the error that ended a run (it then needs settling). When more
-    than one thing failed, the first error is raised with the others as notes."""
+    than one thing failed, the first error is raised with the others as notes. From just before the stop until T3
+    is verified again, upstream's update marker is kept and the home stays owned (handoff.py)."""
+    with handoff.run_scope(cfg.home):  # a run that did not verify T3 leaves the marker to run out (60 s)
+        return _run_copy(cfg, adapter, owner_says_go, say)
+
+
+def _run_copy(cfg, adapter, owner_says_go, say):
     with journal.run(cfg.state_dir, 'copy') as run:
         code, result = check_mod.run_check(cfg, adapter, own_run=run)
         failed = [f'{c["name"]}: {c["detail"]}' for c in result['checks'] if not c['ok']]
@@ -1185,6 +1210,7 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
             failed_hook = _server_changed(cfg, adapter, server) or _home_problem(cfg)
         if failed_hook is None and not _guard_alive(adapter, unit):
             failed_hook = f'the guard {unit} is not running any more ({look})'
+        failed_hook = failed_hook or open_gap(cfg.home)
         if failed_hook is not None:
             again = _hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
             if again:  # jobs may stay paused: not a clean refusal, the owner must look (settle)
@@ -1193,11 +1219,14 @@ def run_copy(cfg, adapter, owner_says_go=False, say=print):
         say(f'stopping {osadapter.UNIT} (t3 {server["version"]}, pid {server["pid"]}) for the copy')
         error, lock, stopping = None, None, False
         try:
-            with run.step('stop-service', version=server['version'], pid=server['pid'], ownerSaysGo=owner_says_go):
+            with run.step('stop-service', version=server['version'], pid=server['pid'], ownerSaysGo=owner_says_go,
+                          marker=handoff.marker_path(cfg.home)):
                 stopping = True
                 adapter.stop()
                 _wait_stopped(adapter, server['pid'])
                 lock = hold_owner_lock(os.path.join(cfg.home, 'userdata'), STOP_WAIT)
+                if handoff.adopt(cfg.home, lock):  # held until the start hands the home over
+                    lock = None
                 _same_after_stop(cfg, server)
             deadline = _clock() + cfg.stop_limit_seconds
             with run.step('cold-copy', dest=dest) as facts:
@@ -1272,7 +1301,11 @@ def guard(cfg, adapter, run_id):
                 if not svc['active'] and not svc['enabled']:  # a copy never disables it; a back W1 does, on purpose
                     did.append(f'{osadapter.UNIT} is not enabled: left stopped (a back W1 that stopped may hold it)')
                 elif not svc['active']:
-                    adapter.start()
+                    open_gap(cfg.home)  # a marker that runs out by itself: this guard does not wait for T3
+                    try:
+                        adapter.start()
+                    finally:
+                        handoff.close(cfg.home)
                     did.append(f'started {osadapter.UNIT}')
             except osadapter.AdapterError as e:
                 did.append(f'could not start {osadapter.UNIT}: {e}')
