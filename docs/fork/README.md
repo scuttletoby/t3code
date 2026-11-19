@@ -26,8 +26,14 @@ Not covered: a T3 that is stopping. Run the report while T3 is running or stoppe
 the instant the report opens the database leaves an empty `statev2.sqlite-wal` behind
 ([#179](https://github.com/scuttletoby/t3code/issues/179)): harmless, since T3 reuses it, but a file
 the report created. The report does not remove it: a T3 starting at that moment may already be
-using it. When the first open or read fails, the report checks and reads once more, so its answer is
-about the stopped database; only a second failure is reported.
+using it. When the first open or read fails, the report checks and reads once more, at once; only a
+second failure is reported. A stop still tidying the database can fail that second read too: then the
+problem names the T3 server process still using the home, and a run once it has stopped reads the
+stopped database.
+
+A home with only the old V1 database (`state.sqlite`) reports its database `missing` and names the V1
+file in `database.v1Import`: a start would import it. A `userdata` folder the report may enter but not
+write (or a home without one that cannot take a new folder) is a problem, since a start would fail.
 
 ## Settings
 
