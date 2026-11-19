@@ -9,8 +9,15 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeCryptoLayer from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { afterEach, describe, expect, it } from "@effect/vitest";
-import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  FORK_PROJECT_SCOPED_KEYS,
+  FORK_SERVER_SETTING_KEYS,
+  ForkProjectOverrideFields,
+  type ManagedPolicyDocument,
+} from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -25,8 +32,14 @@ import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
 import { migrationManifest } from "../persistence/Migrations.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import { makeManagedSettings } from "../policy/managedSettings.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
-import { FORK_REPORT_VERSION, formatForkReport, readForkReport } from "./forkReport.ts";
+import {
+  FORK_REPORT_PROJECT_FEATURES,
+  FORK_REPORT_VERSION,
+  formatForkReport,
+  readForkReport,
+} from "./forkReport.ts";
 
 /** Runs once, right after the report's last WAL check reads the path it names (the -shm). */
 const afterCheck = vi.hoisted(() => ({ path: "", run: () => {} }));
@@ -180,7 +193,17 @@ function homeWithDatabaseLink(target: string) {
   return home;
 }
 
-const runCli = (args: ReadonlyArray<string>) =>
+/** A policy's settings overlay; a test's policy must be one this build can apply. */
+function managedOf(settings: ManagedPolicyDocument["settings"]) {
+  const managed = makeManagedSettings(settings ?? {});
+  if (managed._tag === "Invalid") throw new Error(managed.reason);
+  return managed.settings;
+}
+
+/** No managed policy, whatever this machine has: a missing file means none. */
+const NO_POLICY = "/nonexistent/t3-fork-report-policy.json";
+
+const runCli = (args: ReadonlyArray<string>, policyPath: string = NO_POLICY) =>
   Command.runWith(cli, { version: "0.0.0" })(args).pipe(
     Effect.andThen(TestConsole.logLines),
     Effect.provide(
@@ -188,18 +211,22 @@ const runCli = (args: ReadonlyArray<string>) =>
         NodeServices.layer,
         NodeCryptoLayer.layer,
         NetService.layer,
-        TestConsole.layer,
+        // Fresh: only this command's lines, not those an earlier step of the test logged.
+        Layer.fresh(TestConsole.layer),
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({ env: { T3CODE_DEV_MANAGED_POLICY_PATH: policyPath } }),
+        ),
       ),
     ),
   );
 
 /** Runs `__fork-report` through the real CLI, keeping the exit code it sets out of the test run. */
-const reportThroughCli = (home: string) =>
+const reportThroughCli = (home: string, policyPath?: string) =>
   Effect.gen(function* () {
     const before = process.exitCode;
     process.exitCode = 0;
     let exitCode: number | string | null | undefined;
-    const lines = yield* runCli(["__fork-report", "--base-dir", home]).pipe(
+    const lines = yield* runCli(["__fork-report", "--base-dir", home], policyPath).pipe(
       Effect.ensuring(
         Effect.sync(() => {
           exitCode = process.exitCode;
@@ -522,6 +549,9 @@ describe("__fork-report on old, newer and empty state", () => {
       waitFor: "off",
       usagePacingGate: "off",
       automaticUpdates: "off",
+      reviewRules: "off",
+      handoff: "off",
+      playtest: "off",
     });
     expect(report.ok).toBe(true);
   });
@@ -681,6 +711,11 @@ describe("__fork-report settings", () => {
     });
 
     expect(report.fork.featuresOn).toEqual(["agentSlots", "usagePacingGate", "automaticUpdates"]);
+    expect(report.fork.featuresWhere).toEqual({
+      agentSlots: ["server"],
+      usagePacingGate: ["server"],
+      automaticUpdates: ["server"],
+    });
     expect(report.fork.keysInFile).toEqual([
       "autoUpdateServer",
       "automaticUpdatesQuietCommand",
@@ -693,6 +728,127 @@ describe("__fork-report settings", () => {
     });
     // A command line is never printed.
     expect(JSON.stringify(report)).not.toContain("/secret/path");
+  });
+
+  it("names review rules, handoff and playtest when on, also from one project's override", () => {
+    const step = (name: string) => ({ argv: ["/usr/local/bin/playtest", name] });
+    const playtest = {
+      enabled: true,
+      claim: step("claim"),
+      renew: step("renew"),
+      push: [{ name: "deploy", ...step("deploy") }],
+      release: step("release"),
+    };
+
+    expect(
+      settingsReport({
+        reviewRules: { preset: "recommended" },
+        handoff: { mode: "handoff" },
+        playtest,
+      }).fork.featuresOn,
+    ).toEqual(["reviewRules", "handoff", "playtest"]);
+    // One thread's own mode is enough, in the server's value or in a project's override.
+    const threadOn = settingsReport({
+      handoff: { mode: "off", threads: { "thread-1": "handoff", "thread-2": "compact" } },
+      projectSettingsOverrides: {
+        "project-1": { handoff: { mode: "off", threads: { "thread-3": "handoff" } } },
+      },
+    }).fork;
+    expect(threadOn.featuresOn).toEqual(["handoff"]);
+    // Each place is named, so a stale thread entry can be found and cleared.
+    expect(threadOn.featuresWhere).toEqual({
+      handoff: ["thread:thread-1", "project:project-1/thread:thread-3"],
+    });
+    // Off on the server, on in one project: the project's value replaces the server's there.
+    const projectOn = settingsReport({
+      projectSettingsOverrides: {
+        "project-1": { reviewRules: { preset: "recommended" }, handoff: { mode: "handoff" } },
+        "project-2": { playtest },
+      },
+    }).fork;
+    expect(projectOn.featuresOn).toEqual(["reviewRules", "handoff", "playtest"]);
+    expect(projectOn.featuresWhere).toEqual({
+      reviewRules: ["project:project-1"],
+      handoff: ["project:project-1"],
+      playtest: ["project:project-2"],
+    });
+    // A project that turns them off does not hide the server's being on elsewhere.
+    const serverOn = settingsReport({
+      reviewRules: { preset: "recommended" },
+      projectSettingsOverrides: { "project-1": { reviewRules: { preset: "off" } } },
+    }).fork;
+    expect(serverOn.featuresOn).toEqual(["reviewRules"]);
+    expect(serverOn.featuresWhere).toEqual({ reviewRules: ["server"] });
+    // A project's null clears its override: the project uses the server's value, on or off.
+    for (const [server, featuresOn] of [
+      [{ preset: "recommended" }, ["reviewRules", "handoff", "playtest"]],
+      [{ preset: "off" }, []],
+    ] as const) {
+      const cleared = settingsReport({
+        reviewRules: server,
+        ...(featuresOn.length > 0 ? { handoff: { mode: "handoff" }, playtest } : {}),
+        projectSettingsOverrides: {
+          "project-1": { reviewRules: null, handoff: null, playtest: null },
+        },
+      }).fork;
+      expect(cleared.featuresOn).toEqual(featuresOn);
+      expect(Object.values(cleared.featuresWhere).flat()).toEqual(featuresOn.map(() => "server"));
+    }
+    // Pinned: playtest with a key this build does not know stays on.
+    expect(settingsReport({ playtest: { ...playtest, laterKey: 1 } }).fork.featuresOn).toEqual([
+      "playtest",
+    ]);
+  });
+
+  // The report lists its features by hand, which once missed three. Each fork setting
+  // is either a counted feature or here, with why it switches nothing on by itself.
+  const NOT_A_SWITCH: Readonly<Record<string, string>> = {
+    automaticUpdatesQuietCommand: "a step of automaticUpdates, which is counted",
+    usagePacing: "numbers per account; only usagePacingGate (counted) acts on them",
+    usagePacingLowerEffort: "how usagePacingGate (counted) holds a task",
+    waitChecks: "named commands; only waitFor (counted) runs them",
+    headlessUsageRefreshInterval: "on by default in every fork build; reads usage, changes no work",
+    mcpProfiles: "MCP profiles: nothing applies a profile yet",
+    mcpProfile: "MCP profiles: nothing applies a profile yet",
+    mcpSubagentProfile: "MCP profiles: nothing applies a profile yet",
+    mcpThreadProfiles: "MCP profiles: nothing applies a profile yet",
+  };
+
+  it("counts every fork setting as a feature or names why it is not a switch", () => {
+    const counted = Object.keys(readForkReport(makeHome()).fork.features);
+    const keys = new Set([...FORK_SERVER_SETTING_KEYS, ...Object.keys(ForkProjectOverrideFields)]);
+
+    expect([...keys].filter((key) => !counted.includes(key) && !(key in NOT_A_SWITCH))).toEqual([]);
+    expect(
+      Object.keys(NOT_A_SWITCH).filter((key) => !keys.has(key) || counted.includes(key)),
+    ).toEqual([]);
+    expect(counted.filter((key) => !keys.has(key))).toEqual([]);
+  });
+
+  it("reads each project's override of every counted feature a project can set", () => {
+    const counted = Object.keys(readForkReport(makeHome()).fork.features);
+    const projectKeys = new Set<string>([
+      ...FORK_PROJECT_SCOPED_KEYS,
+      ...Object.keys(ForkProjectOverrideFields),
+    ]);
+
+    expect([...FORK_REPORT_PROJECT_FEATURES].toSorted()).toEqual(
+      counted.filter((key) => projectKeys.has(key)).toSorted(),
+    );
+  });
+
+  it("reads a bad review rules, handoff or playtest value as off, as the load does", () => {
+    const report = settingsReport({
+      reviewRules: { preset: "everything" },
+      handoff: { mode: "handoff", typo: 1 },
+      playtest: { enabled: true },
+      projectSettingsOverrides: {
+        "project-1": { reviewRules: { preset: "recommended", unknownKey: true } },
+      },
+    });
+
+    expect(report.fork.featuresOn).toEqual([]);
+    expect(report.settings.parseWarning).toBeNull();
   });
 
   it("warns when a load would ignore the file, and reports what the load would use", () => {
@@ -778,7 +934,7 @@ describe("__fork-report settings", () => {
 it.layer(Layer.mergeAll(NodeServices.layer, NodeCryptoLayer.layer))(
   "__fork-report settings warning matches the server's load",
   (it) => {
-    const loadedSettings = (home: string) =>
+    const loadedSettings = (home: string, policy?: ManagedPolicyDocument) =>
       Effect.gen(function* () {
         const service = yield* ServerSettingsModule.ServerSettingsService;
         return yield* service.getSettings;
@@ -786,7 +942,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCryptoLayer.layer))(
         Effect.provide(
           ServerSettingsModule.layer.pipe(
             Layer.provide(ServerSecretStore.layer),
-            Layer.provide(ManagedPolicy.layerTest()),
+            Layer.provide(ManagedPolicy.layerTest(policy)),
             Layer.provideMerge(Layer.fresh(SqlitePersistence.layerMemory)),
             Layer.provideMerge(Layer.fresh(ServerConfig.layerTest(process.cwd(), home))),
           ),
@@ -845,6 +1001,97 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCryptoLayer.layer))(
         expect(report.fork.features.agentSlots).toBe(loaded.agentSlots.enabled ? "on" : "off");
       }),
     );
+
+    it.effect("with a managed policy that switches features on", () =>
+      Effect.gen(function* () {
+        const document = {
+          schemaVersion: 1,
+          organization: "Example",
+          settings: {
+            // A default fills a key the file leaves out; a lock wins over the file's value.
+            "waitFor.enabled": { value: true, locked: false },
+            "agentSlots.enabled": { value: true, locked: true },
+          },
+        } as const;
+        const home = tempDir();
+        NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+        NodeFS.writeFileSync(settingsPathOf(home), '{ "agentSlots": { "enabled": false } }');
+        const managed = managedOf(document.settings);
+
+        const report = readForkReport(home, managed);
+        const loaded = yield* loadedSettings(home, document);
+
+        expect([loaded.waitFor.enabled, loaded.agentSlots.enabled]).toEqual([true, true]);
+        expect(report.fork.featuresOn).toEqual(["agentSlots", "waitFor"]);
+        // A default is the file's to change; a lock that changed the value is the policy's alone.
+        expect(report.fork.featuresWhere).toEqual({ agentSlots: ["policy"], waitFor: ["server"] });
+        expect(readForkReport(home, { unreadable: "bad" }).problems).toEqual([
+          { code: "policy-unreadable", message: "The managed policy would stop a start: bad" },
+        ]);
+
+        // A lock equal to the file's value changes nothing: the file's own value is named.
+        NodeFS.writeFileSync(settingsPathOf(home), '{ "agentSlots": { "enabled": true } }');
+        expect(readForkReport(home, managed).fork.featuresWhere.agentSlots).toEqual(["server"]);
+
+        // Through the real command, which reads the policy a start would.
+        const policyPath = NodePath.join(tempDir(), "policy.json");
+        NodeFS.writeFileSync(policyPath, JSON.stringify(document));
+        NodeFS.writeFileSync(settingsPathOf(home), '{ "agentSlots": { "enabled": false } }');
+        const viaCli = yield* reportThroughCli(home, policyPath);
+        expect(viaCli.exitCode).toBe(0);
+        expect(viaCli.report.fork.featuresWhere).toEqual({
+          agentSlots: ["policy"],
+          waitFor: ["server"],
+        });
+      }),
+    );
+
+    it.effect("with a lock that also reaches each project's override", () =>
+      Effect.gen(function* () {
+        const document = {
+          schemaVersion: 1,
+          organization: "Example",
+          settings: { reviewRules: { value: { preset: "recommended" }, locked: true } },
+        } as const;
+        const home = tempDir();
+        NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+        NodeFS.writeFileSync(
+          settingsPathOf(home),
+          JSON.stringify({
+            projectSettingsOverrides: { "project-1": { reviewRules: { preset: "off" } } },
+          }),
+        );
+        const managed = managedOf(document.settings);
+
+        const loaded = yield* loadedSettings(home, document);
+        const report = readForkReport(home, managed);
+
+        expect(Object.values(loaded.projectSettingsOverrides)[0]?.reviewRules).toEqual({
+          preset: "recommended",
+        });
+        // On at the server and in project-1 only through the lock: one `policy`, nothing to edit.
+        expect(report.fork.featuresWhere).toEqual({ reviewRules: ["policy"] });
+      }),
+    );
+
+    it.effect("with a policy that does not load: exit 1, only JSON on stdout", () =>
+      Effect.gen(function* () {
+        const home = tempDir();
+        NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+        const policyPath = NodePath.join(tempDir(), "policy.json");
+        NodeFS.writeFileSync(policyPath, "{ not json");
+        const before = snapshot(home);
+
+        const { report, exitCode } = yield* reportThroughCli(home, policyPath);
+
+        expect(snapshot(home)).toEqual(before);
+        expect(exitCode).toBe(1);
+        expect(report.ok).toBe(false);
+        expect(report.problems.map((problem: { code: string }) => problem.code)).toEqual([
+          "policy-unreadable",
+        ]);
+      }),
+    );
   },
 );
 
@@ -888,10 +1135,19 @@ describe("__fork-report contract", () => {
     expect(keys(report.settings)).toEqual(
       ["intervalsReadAsDefaults", "parseWarning", "path", "providerInstances", "state"].toSorted(),
     );
-    expect(keys(report.fork)).toEqual(["features", "featuresOn", "keysInFile", "settings"]);
+    expect(keys(report.fork)).toEqual([
+      "features",
+      "featuresOn",
+      "featuresWhere",
+      "keysInFile",
+      "settings",
+    ]);
     expect(keys(report.fork.features)).toEqual([
       "agentSlots",
       "automaticUpdates",
+      "handoff",
+      "playtest",
+      "reviewRules",
       "usagePacingGate",
       "waitFor",
     ]);
