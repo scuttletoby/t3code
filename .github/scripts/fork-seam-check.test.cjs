@@ -16,6 +16,7 @@ const {
   findStaleSeamLines,
   findUnlistedChanges,
   forkFileTest,
+  GENERATED,
   lineCounts,
   lostLines,
   lowerList,
@@ -508,6 +509,75 @@ const readReal = (file) =>
     : execFileSync("git", ["-C", REPO_ROOT, "show", `HEAD:${file}`], { encoding: "utf8" });
 // Read in each test, not at load: a parse error then fails the tests that pin it, not the file.
 const realConfig = () => parseConfig(readReal(CONFIG));
+
+// The options apps/web/vite.config.ts passes to tanstackRouter(...), which dev and builds generate
+// the route tree with. Throws when the call is gone, repeated or not a plain literal.
+function viteRouterOptions(source) {
+  const calls = [...source.matchAll(/\btanstackRouter\(/g)];
+  const unreadable = (why) =>
+    new Error(
+      `apps/web/vite.config.ts: ${why}; teach this test to read the router plugin's options again.`,
+    );
+  if (calls.length !== 1) throw unreadable(`${calls.length} tanstackRouter( calls, not 1`);
+  const start = calls[0].index + calls[0][0].length;
+  let depth = 1;
+  let end = start;
+  while (depth > 0 && end < source.length) {
+    const char = source[end++];
+    if (char === "(") depth += 1;
+    if (char === ")") depth -= 1;
+  }
+  const text = source.slice(start, end - 1).trim();
+  if (text === "") return {};
+  try {
+    return new Function(`"use strict"; return (${text});`)();
+  } catch (error) {
+    throw unreadable(`its tanstackRouter(${text}) options are not a plain literal (${error})`);
+  }
+}
+
+// GENERATED must name the tree and folder the router plugin really uses, or the seam check skips the
+// wrong files. Checked here, not in the proof test: app code must not read this fork-owned script
+// (fork-owned-reads.test.py), since a fork-only change to it would skip the app jobs. The proof test
+// pins what the plugin resolves these options to (its defaults: src/routes/, src/routeTree.gen.ts).
+test("the generated-file table names the route tree and routes folder vite.config.ts generates with", () => {
+  const read = (file) => {
+    try {
+      return readReal(file);
+    } catch {
+      return undefined;
+    }
+  };
+  const fileConfig = read("apps/web/tsr.config.json");
+  const options = {
+    ...(fileConfig === undefined ? {} : JSON.parse(fileConfig)),
+    ...viteRouterOptions(readReal("apps/web/vite.config.ts")),
+  };
+  const inWeb = (file) => path.posix.join("apps/web", file);
+  const source = `${inWeb(options.routesDirectory ?? "./src/routes")}/`;
+  const tree = inWeb(options.generatedRouteTree ?? "./src/routeTree.gen.ts");
+  assert.deepEqual(GENERATED.get(tree), { source, proof: "apps/web/src/forkRouteTree.test.ts" });
+  for (const [file, { source: folder, proof }] of GENERATED) {
+    assert.notEqual(read(file), undefined, `${file} is not in the tree`);
+    assert.notEqual(read(proof), undefined, `${proof} is not in the tree`);
+    assert.ok(
+      folder.endsWith("/"),
+      `${folder}: a folder ends with /, or a sibling's name matches it`,
+    );
+    const inFolder = execFileSync(
+      "git",
+      ["-C", REPO_ROOT, "ls-tree", "--name-only", "--full-tree", "HEAD", folder],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(inFolder.trim(), "", `${folder} has no files`);
+  }
+  // The reader itself: a moved or computed option fails it rather than passing on the defaults.
+  assert.deepEqual(viteRouterOptions("x(tanstackRouter({ autoCodeSplitting: true }))"), {
+    autoCodeSplitting: true,
+  });
+  assert.throws(() => viteRouterOptions("plugins: []"), /0 tanstackRouter\( calls/);
+  assert.throws(() => viteRouterOptions("tanstackRouter(options)"), /not a plain literal/);
+});
 
 test("every listed seam line is in its file and no announced one is yet, so the list is not stale", () => {
   const read = (file) => {

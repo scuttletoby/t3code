@@ -17,9 +17,6 @@ interface RouterPlugin {
     root: string,
   ) => { readonly routesDirectory: string; readonly generatedRouteTree: string };
 }
-interface SeamCheck {
-  readonly GENERATED: ReadonlyMap<string, { readonly source: string; readonly proof: string }>;
-}
 
 const web = NodePath.join(import.meta.dirname, "..");
 const repo = NodePath.join(web, "../..");
@@ -71,9 +68,6 @@ it("the committed routeTree.gen.ts is what TanStack's generator writes for the c
     fromWeb.resolve("@tanstack/router-plugin/package.json"),
   );
   const { Generator } = fromPlugin("@tanstack/router-generator") as RouteGenerator;
-  const { GENERATED } = NodeModule.createRequire(import.meta.filename)(
-    NodePath.join(repo, ".github/scripts/fork-seam-check.cjs"),
-  ) as SeamCheck;
   const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "fork-route-tree-"));
   try {
     // The generator also reads apps/web/tsr.config.json, as it does under vite.
@@ -85,8 +79,13 @@ it("the committed routeTree.gen.ts is what TanStack's generator writes for the c
       NodePath.posix.join("apps/web", NodePath.relative(root, file).split(NodePath.sep).join("/"));
     const source = `${inRepo(config.routesDirectory)}/`;
     const tree = inRepo(config.generatedRouteTree);
-    // The seam check's table must name the same files, or it skips the wrong ones.
-    expect(GENERATED.get(tree)).toEqual({ source, proof: "apps/web/src/forkRouteTree.test.ts" });
+    // The seam check's table names these two paths, and its own tests check that it names what
+    // vite.config.ts's options give; this pins what the plugin resolves those options to. (App code
+    // does not read the fork-owned script: a fork-only change to it would skip this job.)
+    expect({ source, tree }).toEqual({
+      source: "apps/web/src/routes/",
+      tree: "apps/web/src/routeTree.gen.ts",
+    });
     const routes = git("ls-tree", "-r", "-z", "--name-only", "--full-tree", "HEAD", source)
       .split("\0")
       .filter(Boolean);
