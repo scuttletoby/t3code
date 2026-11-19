@@ -13,6 +13,11 @@
 #   OLD_HEADS    pull_request: every tip the PR's branch has had, as far as the workflow could list
 #                them; schedule / workflow_dispatch (the sweep): every tip any ref has had, as
 #                GitHub's activity record lists them (whitespace-separated commit ids; may be empty)
+#   SCANNED_GONE  the sweep: those OLD_HEADS GitHub's API has no commit for at all (the workflow
+#                asks GitHub's GraphQL API, repository.object(oid)) that a run with a successful
+#                secret-scan job had as its head commit (the workflow asks GitHub's Actions API),
+#                with the job's token; whitespace-separated commit ids; may be empty. See "sweep,
+#                gone tips"
 #   AFTER        push: the branch tip after the push
 #   PUSH_REF     push: the ref pushed (refs/heads/<name> or refs/tags/<name>); empty is read as the
 #                default branch
@@ -84,9 +89,16 @@
 #                  activity record: each push, force push and deletion with the tips before and
 #                  after), fetched by id, all at once and then one by one; any fetch failure but
 #                  "not our ref" fails the job.
-#   sweep, gone tips  a listed tip origin says it no longer has ("not our ref") is one no run read
-#                  (that is why the sweep lists it), so it fails the sweep (exit 2), after the rest
-#                  is scanned, naming each id: GitHub may still show it on the web. The way out is
+#   sweep, gone tips  a listed tip origin says it no longer has ("not our ref") may be one no run
+#                  read. When GitHub's API has no commit of that id at all and a successful
+#                  secret-scan job read it while it was served (SCANNED_GONE), it gets a warning
+#                  with the count (#482: the old tips of force-pushed or deleted branches; GitHub
+#                  deletes them within hours, so most are gone before a daily sweep). Any other gone
+#                  tip fails the sweep (exit 2), after the rest is scanned, naming each id: no run
+#                  is known to have scanned it, and it may have been public for hours (a [skip ci]
+#                  push, a push with a workflow's token) or GitHub may still show it on the web.
+#                  A branch's own workflow file runs its push and pull request scans, so this
+#                  trusts the people who can push here, as OLD_HEADS already does. The way out is
 #                  the reviewed list of tips known gone, .github/fork-secret-sweep-gone-tips.txt, read
 #                  from the default branch's tip (CONFIG_BRANCH) only, never from the checkout or
 #                  another branch: one line per tip, `<full commit id> <why it is known gone>`, plus
@@ -499,11 +511,28 @@ case "$EVENT_NAME" in
     fi
     # Gone tips (see "sweep, gone tips"): on the reviewed list, a warning; any other fails the sweep
     # once the rest is scanned. A tip on the list origin serves (it came back) is scanned above.
+    # A gone tip GitHub deleted after a successful scan read it (SCANNED_GONE, the workflow's
+    # lookup): a warning; never an exclusion of a tip origin serves (that one is in listed, and scanned).
+    scanned_gone=" "
+    for old in ${SCANNED_GONE:-}; do
+      if ! [[ "$old" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || zero "$old"; then
+        echo "::error::Secret scan: '$old' in SCANNED_GONE is not a commit id" >&2
+        exit 2
+      fi
+      scanned_gone+="$old "
+    done
     gone_known=()
+    gone_scanned=()
     gone_new=()
     back=()
     for old in "${gone[@]}"; do
-      if [[ "$known_gone" == *" $old "* ]]; then gone_known+=("$old"); else gone_new+=("$old"); fi
+      if [[ "$known_gone" == *" $old "* ]]; then
+        gone_known+=("$old")
+      elif [[ "$scanned_gone" == *" $old "* ]]; then
+        gone_scanned+=("$old")
+      else
+        gone_new+=("$old")
+      fi
     done
     for old in "${listed[@]}"; do
       [[ "$known_gone" != *" $old "* ]] || back+=("$old")
@@ -511,12 +540,17 @@ case "$EVENT_NAME" in
     if [[ ${#gone_known[@]} -gt 0 ]]; then
       warning="${warning:+$warning; }${#gone_known[@]} tip(s) on the list of tips known gone ($gone_list) cannot be fetched, so they are not scanned ($(short "${gone_known[@]:0:5}"))"
     fi
+    if [[ ${#gone_scanned[@]} -gt 0 ]]; then
+      warning="${warning:+$warning; }${#gone_scanned[@]} tip(s) GitHub's activity record lists cannot be fetched: GitHub has deleted them, and a successful secret-scan job read each one while it was served ($(short "${gone_scanned[@]:0:5}"))"
+    fi
     if [[ ${#back[@]} -gt 0 ]]; then
       warning="${warning:+$warning; }${#back[@]} tip(s) on the list of tips known gone are served by origin, so they are scanned ($(short "${back[@]:0:5}")): remove their lines from $gone_list"
     fi
     if [[ ${#gone_new[@]} -gt 0 ]]; then
-      gone_failure="${#gone_new[@]} tip(s) GitHub's activity record lists cannot be fetched: origin no longer has them (${gone_new[*]}), and no run scanned them (a [skip ci] push whose branch is gone?), although GitHub may still show them. Look at each by hand; once one is known gone, add a line '<id> <why>' for it to $gone_list on the default branch (a reviewed pull request)"
+      gone_failure="${#gone_new[@]} tip(s) GitHub's activity record lists cannot be fetched: origin no longer has them (${gone_new[*]}), and no run is known to have scanned them (a [skip ci] push whose branch is gone?): no successful secret-scan job had one as its head commit, GitHub may still show one (its API still has a commit of that id), or the workflow did not ask. Their content was never scanned and may have been public. Look at each by hand; once one is known gone, add a line '<id> <why>' for it to $gone_list on the default branch (a reviewed pull request)"
       echo "::error::Secret scan: $gone_failure" >&2
+      # An annotation is cut at about 4 KB, so the full list once more, one id per line.
+      printf 'not fetchable, no scan known: %s\n' "${gone_new[@]}"
     fi
     range="${tips[*]}"
     without_upstream
