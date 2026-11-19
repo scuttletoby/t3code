@@ -7,7 +7,14 @@
   heavy sweep [--dry-run|--json]  stop or report what commands left behind outside heavy (lib/heavy_sweep.py)
   heavy docker-label [--value]    the owner label for a container a test starts, so the sweep can remove it
                                   (--owner-pid PID: the long-lived test process that uses it; README)
-  heavy -- <command> [args...]    run a command that is named sweep or docker-label
+  heavy --kind <name> [--mb N] [--wait S] [--] <command> [args...]
+                                  the same, but first wait in the memory queue until the job's memory fits
+                                  (lib/heavy_queue.py; exit 76 after --wait seconds, default 7200, with the
+                                  line "heavy: gave up after waiting" on stderr: a command that exits 76 by itself
+                                  has no such line)
+  heavy queue [--json]            what the memory queue runs and holds, and the figures behind it
+  heavy waits [--days N] [--json] minutes waited for memory per day
+  heavy -- <command> [args...]    run a command that is named sweep, docker-label, queue or waits
 
 The command runs with the same folder, environment, stdin, stdout, stderr and open files, and heavy exits with
 its exit code (or dies of the same signal). When the command ends, every process it left in its scope is stopped
@@ -27,8 +34,8 @@ The command's environment is exactly heavy's, plus HEAVY_SCOPE (the scope's unit
 heavy-keep-<name>-<random>.scope, all others heavy-<name>-<random>.scope (never heavy-keep-...).
 
 Settings: /etc/heavy/config.json ({"slice": "heavy.slice", "grace_seconds": 30}), or the file HEAVY_CONFIG names;
-HEAVY_SLICE and HEAVY_GRACE override single values (HEAVY_SYSTEMCTL: another systemctl, for tests). Standard library
-only; Linux with systemd and cgroup v2.
+HEAVY_SLICE and HEAVY_GRACE override single values (HEAVY_SYSTEMCTL: another systemctl, HEAVY_QUEUE_ROOT: another
+folder for the memory queue's state; both for tests). Standard library only; Linux with systemd and cgroup v2.
 """
 import hashlib, json, os, re, secrets, signal, subprocess, sys, time
 
@@ -121,8 +128,9 @@ def show(systemctl, unit, props):
     return out
 
 
-def check_slice(systemctl, name):
-    """The slice's cgroup path ('' while it is not active). Refuses anything that would run the command uncapped."""
+def check_slice(systemctl, name, limits=None):
+    """The slice's cgroup path ('' while it is not active). Refuses anything that would run the command uncapped.
+    `limits` (a dict) gets the slice's MemoryHigh and MemoryMax in bytes (None for infinity)."""
     p = show(systemctl, name, ['LoadState', 'ActiveState', 'ControlGroup', 'MemoryMax', 'MemoryHigh',
                                'FragmentPath', 'DropInPaths'])
     # systemd makes up any missing slice on the fly (loaded, no file, no limits): that is "no unit" too
@@ -131,6 +139,9 @@ def check_slice(systemctl, name):
                       f'Add one with a memory limit (fork-kit/heavy/README.md)')
     if p.get('MemoryMax', 'infinity') == 'infinity' and p.get('MemoryHigh', 'infinity') == 'infinity':
         raise Refused(f'{name} has no MemoryMax or MemoryHigh: the command would run uncapped')
+    if limits is not None:
+        for key in ('MemoryHigh', 'MemoryMax'):
+            limits[key] = int(p[key]) if p.get(key, '').isdigit() else None
     return p.get('ControlGroup', '') if p.get('ActiveState') == 'active' else ''
 
 
@@ -394,13 +405,45 @@ def status_signal_was_ours(sig, got):
     return sig in (signal.SIGTERM, signal.SIGKILL) and got != sig
 
 
-def run(argv, cfg):
+def slice_cgroup(systemctl, name):
+    try:
+        p = show(systemctl, name, ['ActiveState', 'ControlGroup'])
+    except (Refused, subprocess.SubprocessError, OSError):
+        return ''
+    return p.get('ControlGroup', '') if p.get('ActiveState') == 'active' else ''
+
+
+def cgroup_root():
+    for root in CGROUP_ROOTS:
+        if os.path.isfile(os.path.join(root, 'cgroup.controllers')):
+            return root
+    return CGROUP_ROOTS[0]
+
+
+def queue_root():
+    """HEAVY_QUEUE_ROOT (tests: a private queue, never the user's live one), else the default."""
+    root = os.environ.get('HEAVY_QUEUE_ROOT')
+    if root and not os.path.isabs(root):
+        raise Refused(f'HEAVY_QUEUE_ROOT {root!r} is not an absolute path')
+    return root or None
+
+
+def queue_for(hq, cfg, systemctl, slice_cg, limits):
+    """The memory queue of the slice (lib/heavy_queue.py), with its settings from the machine file."""
+    box = hq.Box(cfg['slice'], slice_cg, limits.get('MemoryHigh') or limits.get('MemoryMax'), cg_root=cgroup_root(),
+                 queue_root=queue_root(), resolve=lambda: slice_cgroup(systemctl, cfg['slice']))
+    return hq.Queue(box, hq.settings())
+
+
+def run(argv, cfg, job=None):
     systemctl = tool('systemctl')
     systemd_run = tool('systemd-run')
     keep = os.environ.get('HEAVY_KEEP') == '1'
-    slice_cg = check_slice(systemctl, cfg['slice'])
+    limits = {}
+    slice_cg = check_slice(systemctl, cfg['slice'], limits)
     env = caller_environ()
-    if not keep and in_heavy_scope(slice_cg):
+    nested = in_heavy_scope(slice_cg)
+    if not keep and nested:     # the outer heavy holds the memory (and its queue place) for this command too
         env[b'HEAVY_SCOPE'] = own_cgroup().rpartition('/')[2].encode()
         for sig in PYTHON_IGNORED:
             signal.signal(sig, signal.SIG_DFL)
@@ -412,6 +455,43 @@ def run(argv, cfg):
     grace = cfg['grace_seconds']
     unit = unit_name(argv[0], keep)
     env[b'HEAVY_SCOPE'] = unit.encode()
+    queue = ticket = sampler = child_mask = None
+    if job is not None and not nested:
+        hq = queue_module()
+        child_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])     # the mask now: the command's, as without a queue
+        try:
+            queue = queue_for(hq, cfg, systemctl, slice_cg, limits)
+            hq.check_kind(job['kind'])
+            mb, _how = queue.reservation(job['kind'], job['mb'])
+            # admitted: INT/TERM/HUP stay blocked from here until run_scope takes them, so one that comes just after
+            # the admission is no traceback; one that came already stops heavy here, before the command starts
+            ticket = queue.enter(job['kind'], mb, unit, os.path.basename(argv[0]), job['wait'], keep_blocked=True)
+            hq.stopped_already()
+        except OSError as e:
+            say(f'memory queue: {e}; not running {argv[0]}')
+            return 1
+        except hq.GaveUp as e:
+            say(f'{e}; not running {argv[0]}')
+            return hq.EXIT_GAVE_UP
+        except hq.Stopped as e:
+            if ticket is not None:
+                hq.release(queue, ticket)
+                say(f'{signal.Signals(e.sig).name} just after the memory queue admitted it; not running {argv[0]}')
+            else:
+                say(f'{signal.Signals(e.sig).name} while waiting for memory; not running {argv[0]}')
+            return finish(e.sig, None)
+        sampler = hq.Sampler(queue, ticket)
+        # The command inherits the ticket's flock: a heavy killed with -9 keeps the job's reservation until the
+        # processes it started are gone (a normal end deletes the ticket, so a process that lives on holds nothing).
+        os.set_inheritable(ticket.fd, True)
+    try:
+        return run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask)
+    finally:
+        if ticket is not None:
+            hq.release(queue, ticket)
+
+
+def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler, child_mask=None):
 
     ignored = [s for s in WATCH + FORWARD if signal.getsignal(s) == signal.SIG_IGN]
     watch = [s for s in WATCH if s not in ignored]
@@ -424,13 +504,14 @@ def run(argv, cfg):
            '-p', f'TimeoutStopSec={grace:g}s', '--', *argv]
     probe = GroupProbe(list(WATCH + FORWARD))
     try:
-        child = subprocess.Popen(cmd, close_fds=False, env=env, preexec_fn=child_setup(restore, old_mask))
+        child = subprocess.Popen(cmd, close_fds=False, env=env,
+                                 preexec_fn=child_setup(restore, old_mask if child_mask is None else child_mask))
     except OSError as e:
         probe.close()
         say(f'cannot start systemd-run: {e}')
         return 1
     try:
-        return wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward)
+        return wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler)
     finally:
         probe.close()
 
@@ -440,7 +521,7 @@ def unchecked(why, unit):
         f'look with: systemctl --user status {unit}')
 
 
-def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward):
+def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler=None):
 
     # The first INT/TERM/HUP/QUIT reaches the command (heavy passes it on when it was sent to heavy alone); heavy
     # gives the command the grace time to end, then stops the whole scope. A second one stops the scope at once.
@@ -453,8 +534,14 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward):
         if deadline is not None and time.monotonic() >= deadline:
             break
         wanted = watch + forward + [signal.SIGCHLD]
-        info = (signal.sigwaitinfo(wanted) if deadline is None
-                else signal.sigtimedwait(wanted, max(0.0, deadline - time.monotonic())))
+        if sampler is not None:         # a queued job: look at its memory every few seconds for its peak
+            wait = sampler.interval if deadline is None else min(sampler.interval, deadline - time.monotonic())
+            info = signal.sigtimedwait(wanted, max(0.0, wait))
+            if info is None:
+                sampler.sample()
+        else:
+            info = (signal.sigwaitinfo(wanted) if deadline is None
+                    else signal.sigtimedwait(wanted, max(0.0, deadline - time.monotonic())))
         if info is None or info.si_signo == signal.SIGCHLD:
             continue
         sig = info.si_signo
@@ -485,6 +572,11 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward):
                 pass
         deadline = time.monotonic() + grace
 
+    if sampler is not None:             # one more look before the leftovers stop; every run teaches the queue,
+        sampler.sample()                # failed and killed ones too (the reservation only ever goes up)
+        if status is not None:          # after a signal to heavy only a short try for the lock: it wants out
+            sampler.record() if got is None else sampler.record_soon()
+
     if status is None:                              # a signal to heavy, and the command is still running
         cg, pids = scope_state(systemctl, unit)
         if pids is None and not cg:
@@ -496,6 +588,8 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward):
         except OSError:
             pass
         _, status = os.waitpid(child.pid, 0)
+        if sampler is not None:         # stop now: after the scope stop, and only a short try for the queue lock
+            sampler.record_soon()
         name = signal.Signals(got).name
         if text:
             say(f'{name}: stopped {text}')
@@ -576,16 +670,66 @@ def self_check():
     return 0 if not problems else 1
 
 
-def sweep_module():
-    """lib/heavy_sweep.py of this kit, loaded only for the sweep verbs (plain heavy never needs it)."""
+def kit_module(name):
+    """lib/<name>.py of this kit, loaded only when a verb or option needs it (plain heavy never does)."""
     import importlib.machinery, importlib.util
     kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    path = os.path.join(kit, 'lib', 'heavy_sweep.py')
-    loader = importlib.machinery.SourceFileLoader('heavy_sweep', path)
-    spec = importlib.util.spec_from_loader('heavy_sweep', loader)
+    path = os.path.join(kit, 'lib', name + '.py')
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
+
+
+def job_options(argv):
+    """(--kind/--mb/--wait as a dict, or None without --kind, or 'usage'; the rest of argv)."""
+    opts, rest = {}, list(argv)
+    while rest and rest[0].split('=', 1)[0] in ('--kind', '--mb', '--wait'):
+        key, eq, value = rest.pop(0).partition('=')
+        if not eq:
+            if not rest:
+                return 'usage', argv
+            value = rest.pop(0)
+        if key in opts:
+            return 'usage', argv
+        opts[key] = value
+    if not opts:
+        return None, argv
+    if '--kind' not in opts or not rest:
+        return 'usage', argv
+    try:
+        mb = int(opts.get('--mb', 3072))
+        wait = float(opts.get('--wait', 7200))
+    except ValueError:
+        return 'usage', argv
+    if not 64 <= mb <= 1 << 20 or not 0 <= wait <= 7 * 86400:
+        return 'usage', argv
+    return {'kind': opts['--kind'], 'mb': mb, 'wait': wait}, rest
+
+
+def queue_module():
+    hq = kit_module('heavy_queue')
+    hq.Refused = Refused        # one Refused: the queue's refusals end heavy like its own (message, exit 1)
+    return hq
+
+
+def queue_verb(verb, args):
+    try:
+        hq = queue_module()
+        if args[:1] in (['-h'], ['--help']):
+            print(hq.__doc__.split('\n\n')[0] + '\n\n' + hq.__doc__.split('\n\n')[1])
+            return 0
+        cfg = load_config()
+        if verb == 'waits':
+            return hq.waits_main(hq.Box(cfg['slice'], '', None).state_dir, args)
+        systemctl = tool('systemctl')
+        limits = {}
+        slice_cg = check_slice(systemctl, cfg['slice'], limits)
+        return hq.queue_main(queue_for(hq, cfg, systemctl, slice_cg, limits), args)
+    except (Refused, OSError, ImportError, SyntaxError, subprocess.SubprocessError) as e:
+        say(f'{verb}: {e}')
+        return 1
 
 
 def main(argv):
@@ -593,11 +737,17 @@ def main(argv):
         return self_check()
     if argv[:1] in (['sweep'], ['docker-label']):
         try:
-            mod = sweep_module()
+            mod = kit_module('heavy_sweep')
         except (OSError, ImportError, SyntaxError) as e:
             say(f'{argv[0]}: cannot load the sweep ({e})')
             return 1
         return (mod.sweep_main if argv[0] == 'sweep' else mod.label_main)(argv[1:])
+    if argv[:1] in (['queue'], ['waits']):
+        return queue_verb(argv[0], argv[1:])
+    job, argv = job_options(argv)
+    if job == 'usage':
+        print('usage: heavy --kind <name> [--mb N] [--wait SECONDS] [--] <command> [args...]', file=sys.stderr)
+        return 2
     if argv[:1] == ['--']:
         argv = argv[1:]
         if not argv:
@@ -608,7 +758,13 @@ def main(argv):
               file=sys.stdout if argv else sys.stderr)
         return 0 if argv else 2
     try:
-        return run(argv, load_config())
+        return run(argv, load_config(), job)
+    except (ImportError, SyntaxError) as e:
+        say(f'cannot load the memory queue ({e}); not running {argv[0]}')
+        return 1
+    except OSError as e:
+        say(f'{argv[0]}: {e}')
+        return 1
     except Refused as e:
         say(f'{e}; not running {argv[0]}')
         return 1
