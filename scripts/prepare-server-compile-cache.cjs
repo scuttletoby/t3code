@@ -51,11 +51,11 @@ module.exports = async ({ appOutDir, electronPlatformName, arch, packager }) => 
   for (const name of Object.keys(env)) {
     if (name.startsWith("NODE_") || name.startsWith("T3CODE_")) delete env[name];
   }
+  // Fork: under Rosetta the warm step gets 360 s, not 120 s (fork-cache-timeout.cjs).
+  const forkSpawnSync = require("./fork-cache-timeout.cjs").withRosetta(spawnSync, runsWithRosetta);
   const state = fs.mkdtempSync(path.join(os.tmpdir(), "t3-release-cache-"));
   env.T3CODE_HOME = state;
   let result;
-  // Fork: under Rosetta the warm step gets 360 s, not 120 s (fork-cache-timeout.cjs).
-  const forkSpawnSync = require("./fork-cache-timeout.cjs").withRosetta(spawnSync, runsWithRosetta);
   try {
     // Run a script file, not -e: -e defines a global __filename of "[eval]", which
     // @effect/platform-node passes to createRequire and fails on.
