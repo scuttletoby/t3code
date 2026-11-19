@@ -341,6 +341,15 @@ def compare_counts(before, after):
     return said
 
 
+def features_on(fork):
+    """The report's fork features that are on, each with where (`handoff (project:p1, thread:t1)`), so an operator
+    knows which project override or thread entry to clear. A report without `featuresWhere` names the features only."""
+    where = fork.get('featuresWhere') if isinstance(fork.get('featuresWhere'), dict) else {}
+    on = fork.get('featuresOn') if isinstance(fork.get('featuresOn'), list) else []
+    return ', '.join(f'{name} ({", ".join(map(str, where[name]))})' if isinstance(where.get(name), list) and where[name]
+                     else str(name) for name in on)
+
+
 def fork_report(binary, home):
     """Run `<binary> __fork-report --base-dir <home>` (fork PR "read-only report command": it writes nothing,
     takes no lock and is safe beside a running server) with an empty HOME and a bare PATH. Returns the report."""
