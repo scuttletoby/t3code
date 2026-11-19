@@ -286,7 +286,9 @@ written, and saves of other settings write it back unchanged until the person sa
 
 In the app: **Settings → Fork**, section Model policy (server only; a project cannot override it): the
 mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a save is. An unreadable
-value is shown with a warning and the kept text; a save there replaces it.
+value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
+then starts from the value's own rows and saves only once the person picks the mode, so a save never
+turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged.
 
 ```json
 {
