@@ -261,11 +261,9 @@ const AFTER_REBASE_RISE =
 
 /**
  * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed` names it).
- * A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase `notes`; exceeded:
- * `rises`); on a PR it may not grow, and a change to it sets its ceiling in `ownPending` to exactly what
- * is left, counting the upstream lines it puts back from `ownLost` (or, with none left, moves it to
- * `ownFiles`).
- * `lowered.pending` gets the count each too-high ceiling from upstream lowers to.
+ * A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase `notes`; exceeded: `rises`;
+ * `lowered.pending` gets the lowered count). On a PR it may not grow, and a change sets its `ownPending` ceiling to
+ * exactly what is left, counting upstream lines put back from `ownLost` (none left: it moves to `ownFiles`).
  */
 function findUnlistedChanges(
   config,
@@ -355,15 +353,10 @@ function findUnlistedChanges(
       continue;
     }
     if (ownPending === undefined) continue;
-    // Main sits at its ceiling, so a change to the file sets it to exactly what is left, in its own
-    // list: left too high, the next run from upstream refuses main and the spare room could later
-    // admit a fork line; set lower or dropped, that run refuses main for the lines still there.
-    // This run cannot tell fork lines from upstream's, but per line text fork lines less "gone"
-    // ones is head's copies less upstream's, so the fork lines change by the lines gained less the
-    // change in "gone": an upstream line put back is a fork line fewer that the line count misses.
-    // Main's "gone" is exact (the run from upstream holds it); the change's own is held there too,
-    // so a wrong one stops that run either way. The own list is read only to refuse (never a wider
-    // gate). A list-only change (the file's text unchanged) is not held: it may correct main.
+    // A change sets the ceiling to exactly what is left (too high admits a fork line later; too low
+    // fails the run from upstream). Fork lines change by lines gained less the change in "gone" (an
+    // upstream line put back is a fork line fewer); that run holds both "gone" counts exact. The own
+    // list only refuses, never widens; a list-only change (text unchanged) is not held: it may fix main.
     const goneOf = (lost) =>
       lost !== undefined && Object.hasOwn(lost, file) ? lost[file].gone : 0;
     const mainGone = goneOf(config.lost);
@@ -818,11 +811,9 @@ const MOVED_WHY =
 
 /**
  * `text` with the counts in `lowered` ({ pending, lost }: Maps of file to count) lowered, as { text, changes },
- * or undefined when nothing changes. Only lowers; a count at 0 removes the entry. A "pending" file with no
- * fork line left that a "lost" entry still names (a ceiling is 1 or more, and "lost" needs the file listed)
- * moves to "files" with no seam line, which holds it tighter still: no fork line may come back, and a pull
- * request may lose none of its lines. Two-space JSON, parsed again before it is returned, so a lowered list
- * is never one the check refuses.
+ * or undefined when nothing changes. Only lowers; a count at 0 removes the entry. A "pending" file with no fork
+ * line left that "lost" still names moves to "files" with no seam line (no fork line may come back, no line may
+ * be lost). Two-space JSON, parsed again before it is returned, so a lowered list is never one the check refuses.
  */
 function lowerList(text, lowered) {
   const raw = JSON.parse(text);

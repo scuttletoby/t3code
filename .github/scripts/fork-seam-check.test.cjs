@@ -2049,7 +2049,7 @@ test("from main, a change that shrinks a pending file lowers its ceiling in its 
     [],
   );
   assert.deepEqual(shrink({ "p.ts": 3 }, base, fewer, {}).ceilings, []);
-  // #510: exact, not only at most. A ceiling set below the lines left, or an entry dropped while
+  // Exact, not only at most. A ceiling set below the lines left, or an entry dropped while
   // lines remain, passes here but the next run from upstream refuses main.
   assert.deepEqual(shrink({ "p.ts": 3 }, base, head, { "p.ts": 1, "q.ts": 1 }).ceilings, []);
   const twoLeft = { "p.ts": `${UP}forkA();\nforkB();\n` };
@@ -2074,7 +2074,7 @@ test("from main, a change that shrinks a pending file lowers its ceiling in its 
   assert.deepEqual(shrink({ "p.ts": 3 }, base, base, { "p.ts": 2 }).ceilings, []);
 });
 
-// #510 review: moving a pending file to "files" (where "added": [] allows no fork line) is the
+// Moving a pending file to "files" (where "added": [] allows no fork line) is the
 // same as dropping the entry, so only a file with no fork line left may move.
 test('from main, a pending file moves to "files" only once no fork line is left', () => {
   const base = { "p.ts": `${UP}forkA();\nforkB();\nforkC();\n` };
@@ -2130,7 +2130,7 @@ const fromMain = (list, own, main, head) => {
   return [...unlisted.reasons, ...unlisted.ceilings];
 };
 
-// #510 review: a pending file's fork lines change by the lines gained less the change in "gone",
+// A pending file's fork lines change by the lines gained less the change in "gone",
 // so a change that puts an upstream line back has one fork line fewer than its line count says.
 test("from main, a change that puts an upstream line back counts it in the exact ceiling", () => {
   const upstream = { "p.ts": "a();\nb(x);\nc();\n" };
@@ -2295,12 +2295,12 @@ test("from main, a listed copy the base branch already has since the merge-base 
   ]);
   // From upstream there is no base branch tip: each listed line is one copy over upstream's.
   assert.deepEqual(findSeamBreaches(SEAM, { ...options(main), upstream: true }), []);
-  // #510: two copies are too many from the merge-base too, so updating would not help: no hint.
+  // Two copies are too many from the merge-base too, so updating would not help: no hint.
   const twice = { "a.ts": BASE["a.ts"].replace("  a: 1,", "  ...fork,\n  ...fork,\n  a: 1,") };
   assert.deepEqual(findSeamBreaches(SEAM, { ...options(main), atHead: (file) => twice[file] }), [
     "a.ts: adds 2× `...fork,`",
   ]);
-  // #510 review: an expired announcement allows no copy from the merge-base either: no hint.
+  // An expired announcement allows no copy from the merge-base either: no hint.
   const fresh = {
     "a.ts": { why: "t", added: [], announced: { since: "2026-01-01", added: ["...fork,"] } },
   };
@@ -2364,7 +2364,7 @@ test("lowerList lowers and removes entries, keeps comments and order, and never 
   assert.deepEqual(JSON.parse(result.text), {
     "//": "comment",
     // c.ts has no fork line left, but "lost" still names it (and a ceiling is 1 or more): it
-    // moves to "files" with no seam line, which holds it tighter (#510).
+    // moves to "files" with no seam line, which holds it tighter.
     files: { "s.ts": { why: "w", added: ["x();"] }, "c.ts": { why: moved.why, added: [] } },
     pending: { "a.ts": 1, "e.ts": 4 },
     // e.ts: only the count that fell is lowered.
