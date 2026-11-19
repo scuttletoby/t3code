@@ -622,6 +622,7 @@ describe("__fork-report on old, newer and empty state", () => {
       reviewRules: "off",
       handoff: "off",
       playtest: "off",
+      modelPolicy: "off",
     });
     expect(report.ok).toBe(true);
   });
@@ -935,6 +936,29 @@ describe("__fork-report settings", () => {
     // Pinned: playtest with a key this build does not know stays on.
     expect(settingsReport({ playtest: { ...playtest, laterKey: 1 } }).fork.featuresOn).toEqual([
       "playtest",
+    ]);
+  });
+
+  it("names the model policy by its mode, and reads an invalid one as enforce, as the load does", () => {
+    const row = { driver: "claudeAgent", model: "claude-sonnet-5-5" };
+    const modeOf = (modelPolicy: unknown) => {
+      const report = settingsReport({ modelPolicy });
+      expect(report.settings.parseWarning).toBeNull();
+      return [report.fork.features.modelPolicy, report.fork.featuresWhere.modelPolicy] as const;
+    };
+
+    expect(readForkReport(makeHome()).fork.features.modelPolicy).toBe("off");
+    expect(modeOf({ mode: "off", allow: [row] })).toEqual(["off", undefined]);
+    expect(modeOf({ mode: "advise", allow: [row] })).toEqual(["advise", ["server"]]);
+    // Saved sparse: `{mode: "enforce", allow: []}` is stored as `{mode: "enforce"}`.
+    expect(modeOf({ mode: "enforce" })).toEqual(["enforce", ["server"]]);
+    // A typo fails closed: enforce with nothing allowed, and the rest of the file still loads.
+    expect(modeOf({ mode: "advise", allow: [{ ...row, effort: ["high"] }] })).toEqual([
+      "enforce",
+      ["server"],
+    ]);
+    expect(settingsReport({ modelPolicy: { mode: "advise" } }).fork.featuresOn).toEqual([
+      "modelPolicy",
     ]);
   });
 
@@ -1285,6 +1309,7 @@ describe("__fork-report contract", () => {
       "agentSlots",
       "automaticUpdates",
       "handoff",
+      "modelPolicy",
       "playtest",
       "reviewRules",
       "usagePacingGate",

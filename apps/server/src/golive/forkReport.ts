@@ -101,6 +101,8 @@ export interface ForkReport {
       readonly handoff: "on" | "off";
       /** On when the server's or any project's adapter is enabled. */
       readonly playtest: "on" | "off";
+      /** The policy's mode; an invalid value reads as `enforce` (nothing allowed), as the load does. */
+      readonly modelPolicy: "off" | "advise" | "enforce";
     };
     readonly featuresOn: ReadonlyArray<string>;
     /**
@@ -489,6 +491,7 @@ function readSettings(
     reviewRules: onOff("reviewRules"),
     handoff: onOff("handoff"),
     playtest: onOff("playtest"),
+    modelPolicy: settings.modelPolicy.mode,
   } as const;
   return {
     settings: {
@@ -562,6 +565,7 @@ function whereEachFeature(
     usagePacingGate: server(settings.usagePacingGate !== "off"),
     automaticUpdates: server(settings.automaticUpdates),
     ...perProject,
+    modelPolicy: server(settings.modelPolicy.mode !== "off"),
   };
 }
 
