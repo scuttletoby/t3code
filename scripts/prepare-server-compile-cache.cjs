@@ -54,6 +54,8 @@ module.exports = async ({ appOutDir, electronPlatformName, arch, packager }) => 
   const state = fs.mkdtempSync(path.join(os.tmpdir(), "t3-release-cache-"));
   env.T3CODE_HOME = state;
   let result;
+  // Fork: under Rosetta the warm step gets 360 s, not 120 s (fork-cache-timeout.cjs).
+  const forkSpawnSync = require("./fork-cache-timeout.cjs").withRosetta(spawnSync, runsWithRosetta);
   try {
     // Run a script file, not -e: -e defines a global __filename of "[eval]", which
     // @effect/platform-node passes to createRequire and fails on.
@@ -62,6 +64,7 @@ module.exports = async ({ appOutDir, electronPlatformName, arch, packager }) => 
       runner,
       `require(${JSON.stringify(helper)}).generatePreparedServerCache(${JSON.stringify(resources)}).then(()=>process.exit(0),e=>{console.error(e);process.exit(1)})`,
     );
+    const spawnSync = forkSpawnSync; // Fork: the Rosetta limit above
     result = spawnSync(executable, [runner], { env, encoding: "utf8", timeout: 120000 });
   } finally {
     fs.rmSync(state, { recursive: true, force: true });
