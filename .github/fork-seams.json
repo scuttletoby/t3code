@@ -145,39 +145,27 @@
     },
     "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": {
       "why": "MCP profiles part 2: a Claude thread's MCP profile is applied to its session (strict MCP mode or an allowlist of outside servers, from apps/server/src/fork/claudeMcpProfile.ts), is part of the live-query key, refuses the turn when it cannot be applied, and adds a PreToolUse hook (merged into the adapter's hooks) that refuses a call to a server outside the profile. Additions only; tested in apps/server/src/fork/claudeMcpProfile.adapter.test.ts.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-19",
-        "added": [
-          "import * as ClaudeMcpProfile from \"../../fork/claudeMcpProfile.ts\";",
-          "readonly mcpProfileOptions?: ClaudeMcpProfile.ClaudeMcpProfilePlan[\"options\"];",
-          "...input.mcpProfileOptions,",
-          "mcpProfile: ClaudeMcpProfile.planKeyFor(mcpOverrides),",
-          "const mcpProfiles = yield* ClaudeMcpProfile.makeClaudeMcpProfiles;",
-          "// Fork: a profile that cannot apply refuses here, before the live process is replaced.",
-          "const mcpProfile = yield* mcpProfiles(turnInput.appThread, mcpOverrides);",
-          "const checkMcpProfile = ClaudeMcpProfile.checkClaudeSession(mcpProfile, mcpOverrides);",
-          "mcpProfileOptions: mcpProfile.options,",
-          "Effect.tap(checkMcpProfile),",
-          "...input.mcpProfileOptions?.hooks,"
-        ]
-      }
+      "added": [
+        "import * as ClaudeMcpProfile from \"../../fork/claudeMcpProfile.ts\";",
+        "readonly mcpProfileOptions?: ClaudeMcpProfile.ClaudeMcpProfilePlan[\"options\"];",
+        "...input.mcpProfileOptions,",
+        "mcpProfile: ClaudeMcpProfile.planKeyFor(mcpOverrides),",
+        "const mcpProfiles = yield* ClaudeMcpProfile.makeClaudeMcpProfiles;",
+        "// Fork: a profile that cannot apply refuses here, before the live process is replaced.",
+        "const mcpProfile = yield* mcpProfiles(turnInput.appThread, mcpOverrides);",
+        "const checkMcpProfile = ClaudeMcpProfile.checkClaudeSession(mcpProfile, mcpOverrides);",
+        "mcpProfileOptions: mcpProfile.options,",
+        "Effect.tap(checkMcpProfile),",
+        "...input.mcpProfileOptions?.hooks,"
+      ]
     },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-19",
-        "added": ["\"ClaudeMcpProfileError\","]
-      }
+      "added": ["\"ClaudeMcpProfileError\","]
     },
     "packages/provider-core/src/server/failure.ts": {
       "why": "MCP profiles part 2: the refusal of a Claude turn by its MCP profile says why and how to fix it, so its message is shown.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-19",
-        "added": ["case \"ClaudeMcpProfileError\":"]
-      }
+      "added": ["case \"ClaudeMcpProfileError\":"]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",

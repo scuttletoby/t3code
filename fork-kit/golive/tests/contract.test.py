@@ -10,7 +10,7 @@ import os, re, sys, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golive_fixture  # noqa: E402,F401  (puts the kit on sys.path)
-from golive import coldcopy, live, osadapter  # noqa: E402
+from golive import coldcopy, handoff, live, osadapter  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(golive_fixture.KIT))
 
@@ -72,7 +72,7 @@ UPSTREAM = [
      f'const ownershipLockPath = (stateDir: string) => NodePath.join(stateDir, "{coldcopy.OWNER_LOCK}");',
      'coldcopy.OWNER_LOCK: the ownership lock copy and restore hold'),
     ('apps/server/src/serverOwnership.ts', 'db.exec("PRAGMA busy_timeout = 250; BEGIN EXCLUSIVE;");',
-     'coldcopy.hold_owner_lock: an exclusive transaction'),
+     'coldcopy.hold_owner_lock: an exclusive transaction; handoff.HANDOVER_HOLD lets go well inside its 250 ms'),
     ('packages/shared/src/cliRelease.ts', 'export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";', 'SHA256SUMS'),
     ('packages/shared/src/cliRelease.ts',
      'return `t3-${version}-${platformKey}.${platformKey.startsWith("win32") ? "zip" : "tar.gz"}`;',
@@ -110,6 +110,37 @@ UPSTREAM = [
      'const SEMVER_PRERELEASE = `(?:${SEMVER_NUMBER}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)`;', 'config.EXACT_VERSION'),
     ('apps/server/src/serverRuntimeState.ts', '  workHeld: Schema.optional(Schema.Boolean),', 'rehearse R3: work held'),
     ('apps/server/src/config.ts', 'secretsDir: join(stateDir, "secrets"),', 'rehearse.NOT_CLONED: secrets/'),
+    # handoff.py: the gap while the kit has T3 stopped (root cause: the update marker; then the serving lock)
+    ('packages/contracts/src/desktopBootstrap.ts',
+     f'export const DESKTOP_UPDATE_IN_PROGRESS_MARKER_FILE = "{handoff.MARKER}";',
+     'handoff.MARKER: runtime/desktop-update-in-progress'),
+    ('packages/contracts/src/desktopBootstrap.ts',
+     f'export const DESKTOP_UPDATE_IN_PROGRESS_TTL_MS = {handoff.TTL_MS:_};',
+     'handoff.TTL_MS: the marker runs out 60 s after it is written'),
+    ('apps/server/src/desktopUpdate/DesktopUpdateMarker.ts',
+     'Schema.Struct({ startedAt: Schema.Number, expiresAt: Schema.Number }),',
+     'handoff.publish: {"startedAt": ms, "expiresAt": ms}'),
+    ('apps/server/src/desktopUpdate/DesktopUpdateMarker.ts',
+     'expiresAt: startedAt + DESKTOP_UPDATE_IN_PROGRESS_TTL_MS,', 'handoff.publish: expiresAt = startedAt + TTL'),
+    ('apps/server/src/desktopUpdate/DesktopUpdateMarker.ts', 'const temporary = `${markerFile}.tmp`;',
+     'handoff.publish: written to <marker>.tmp'),
+    ('apps/server/src/desktopUpdate/DesktopUpdateMarker.ts', 'yield* fileSystem.rename(temporary, markerFile);',
+     'handoff.publish: then renamed into place'),
+    ('apps/server/src/cli/sshHelper.ts', 'const homeOwned = Command.make("home-owned", {',
+     'handoff: an SSH launch asks home-owned before it starts a server'),
+    ('apps/server/src/cli/sshHelper.ts',
+     'if (!((await serviceLauncherIsServing(baseDir)) || (await stateDirOwned(baseDir)))) {',
+     'handoff.Gap.starting: the serving lock or the owner lock makes the home owned'),
+    ('packages/ssh/src/tunnel.ts',
+     '"$RUNNER_FILE" __ssh-helper update-remaining "$DEFAULT_SERVER_HOME/runtime/@@T3_UPDATE_MARKER_FILE@@"',
+     'handoff: a launch waits while the marker is valid'),
+    ('packages/ssh/src/tunnel.ts', '"$RUNNER_FILE" __ssh-helper home-owned "$DEFAULT_SERVER_HOME"',
+     'handoff: then while the home is owned'),
+    ('apps/server/src/cloud/serviceProtocol.ts',
+     f'export const SERVICE_SERVING_LOCK_FILE = "{handoff.SERVING_LOCK}";',
+     'handoff.SERVING_LOCK: runtime/service-serving.lock'),
+    ('apps/server/src/serviceLauncher.ts', 'async #claimServing(): Promise<void> {',
+     'handoff.Gap.starting: the launcher takes the serving lock before it starts its server'),
 ]
 
 # The commands and flags `rehearse` runs (R1-R5). Each file is in the kit_tests and workflows jobs' sparse checkouts
