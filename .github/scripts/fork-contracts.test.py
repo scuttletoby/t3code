@@ -1001,7 +1001,7 @@ LOOKUP = re.compile(
     r'OLD_HEADS=""\n(?:.*\n)*?\s*if \[\[ "\$EVENT_NAME" == pull_request \]\]; then\n'
     r'\s*if ! OLD_HEADS="\$\(GH_TOKEN="\$LOOKUP_TOKEN" gh api --paginate -X GET "repos/\$GITHUB_REPOSITORY/activity" \\\n'
     r"""\s*-f "ref=refs/heads/\$HEAD_REF" -f per_page=100 --jq '\.\[\] \| \.before, \.after'\)"; then\n"""
-    r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n(?:.*\n)*?\s*export UPSTREAM OLD_HEADS(?: ABSENT_ON_GITHUB)?\n')
+    r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n(?:.*\n)*?\s*export UPSTREAM OLD_HEADS(?: SCANNED_GONE)?\n')
 
 
 # The sweep's lookup (#239), allowed in this exact form only, right after the earlier-heads lookup:
@@ -1031,27 +1031,65 @@ def with_sweep_lookup(run):
     return run.replace("fi\nunset LOOKUP_TOKEN\n", SWEEP_LOOKUP_TEXT + "fi\nunset LOOKUP_TOKEN\n", 1)
 
 
-# The sweep's lookup of the listed tips GitHub has no commit for at all (#482), allowed in this exact
-# form only (each line as written; indentation aside), between the sweep's lookup and the token's
-# unset: a failed query fails the job, only a null answer counts as absent (an answer naming
-# another commit fails the query), and nothing else sets ABSENT_ON_GITHUB, which the scan script
-# trusts to turn a gone tip's failure into a warning.
-ABSENT_LOOKUP_TEXT = (
-    'ABSENT_ON_GITHUB=""\n'
+# The sweep's lookup of the deleted tips a scan read (#482), allowed in this exact form only (each
+# line as written; indentation aside), between the sweep's lookup and the token's unset: git fetches
+# first (so a tip GitHub drops meanwhile is asked about), a failed query fails the job, only a null
+# GraphQL answer counts as deleted (an answer naming another commit fails the query), only a
+# successful secret-scan job of a run whose head commit is the tip counts as read, and nothing else
+# sets SCANNED_GONE, which the scan script trusts to turn a gone tip's failure into a warning.
+SCANNED_LOOKUP_TEXT = (
+    'SCANNED_GONE=""\n'
     'if [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then\n'
-    "mapfile -t tips < <(printf '%s\\n' $OLD_HEADS | grep -E '^[0-9a-f]{40}$' | grep -vE '^0+$' | sort -u)\n"
-    'for ((i = 0; i < ${#tips[@]}; i += 100)); do\n'
+    'mapfile -t tips < <(tr -s \'[:space:]\' \'\\n\' <<< "$OLD_HEADS" | grep -E \'^[0-9a-f]{40}$\' | grep -vE'
+    " '^0+$' | sort -u)\n"
+    'unserved=()\n'
+    'for tip in "${tips[@]}"; do\n'
+    'git cat-file -e "$tip^{commit}" 2> /dev/null \\\n'
+    '|| timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n'
+    '|| unserved+=("$tip")\n'
+    'done\n'
+    'deleted=()\n'
+    "# shellcheck disable=SC2016 # $owner, $name and $id are GraphQL and jq variables, not the shell's\n"
+    'for ((i = 0; i < ${#unserved[@]}; i += 100)); do\n'
     "query='query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {'\n"
-    'for tip in "${tips[@]:i:100}"; do query+=" c_$tip: object(oid: \\"$tip\\") { oid }"; done\n'
+    'for tip in "${unserved[@]:i:100}"; do query+=" c_$tip: object(oid: \\"$tip\\") { oid }"; done\n'
     'if ! absent="$(GH_TOKEN="$LOOKUP_TOKEN" gh api graphql -f query="$query } }" \\\n'
     '-f owner="${GITHUB_REPOSITORY%%/*}" -f name="${GITHUB_REPOSITORY#*/}" \\\n'
     '--jq \'.data.repository | to_entries[] | (.key | ltrimstr("c_")) as $id |\n'
     'if .value == null then $id elif .value.oid == $id then empty else error("not the asked commit") end\')"; then\n'
-    'echo "::error::Secret scan: cannot ask GitHub\'s API which listed tips it has no commit for, so a tip git no'
-    ' longer serves could not be told from one GitHub still shows. Re-run the job." >&2\n'
+    'echo "::error::Secret scan: cannot ask GitHub\'s API which listed tips it has no commit for, so a'
+    ' tip git no longer serves could not be told from one GitHub still shows. Re-run the job." >&2\n'
     'exit 2\n'
     'fi\n'
-    'ABSENT_ON_GITHUB+="$absent "\n'
+    '[[ -z "$absent" ]] || mapfile -t -O "${#deleted[@]}" deleted <<< "$absent"\n'
+    'done\n'
+    'for tip in "${deleted[@]}"; do\n'
+    'if ! runs="$(GH_TOKEN="$LOOKUP_TOKEN" TIP="$tip" gh api --paginate -X GET'
+    ' "repos/$GITHUB_REPOSITORY/actions/runs" \\\n'
+    '-f head_sha="$tip" -f per_page=100 --jq \'.workflow_runs[] |\n'
+    'if .head_sha != env.TIP then error("not the asked commit") else . end |\n'
+    'select(.path == ".github/workflows/fork-secret-scan.yml" or .path =='
+    ' ".github/workflows/fork-tests.yml") | .id\')"; then\n'
+    'echo "::error::Secret scan: cannot list the runs of deleted tip $tip, so whether a scan read it is'
+    ' unknown. Re-run the job." >&2\n'
+    'exit 2\n'
+    'fi\n'
+    'mapfile -t ids <<< "$runs"\n'
+    'for id in "${ids[@]}"; do\n'
+    '[[ "$id" =~ ^[0-9]+$ ]] || continue\n'
+    'if ! scanned="$(GH_TOKEN="$LOOKUP_TOKEN" TIP="$tip" gh api --paginate -X GET'
+    ' "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \\\n'
+    '-f filter=all -f per_page=100 --jq \'.jobs[] | select(.head_sha == env.TIP and .conclusion == "success" and\n'
+    '(.name == "Secret scan" or .name == "Secret scan / Secret scan")) | .id\')"; then\n'
+    'echo "::error::Secret scan: cannot list the jobs of run $id of deleted tip $tip, so whether a scan'
+    ' read it is unknown. Re-run the job." >&2\n'
+    'exit 2\n'
+    'fi\n'
+    'if [[ -n "$scanned" ]]; then\n'
+    'SCANNED_GONE+="$tip "\n'
+    'break\n'
+    'fi\n'
+    'done\n'
     'done\n'
     'fi\n'
     'unset LOOKUP_TOKEN\n')
@@ -1071,13 +1109,13 @@ def lookup_problems(scan):
             if not LOOKUP.search(run):
                 problems.append(f"{SCAN_FILE}/{j}: the earlier-heads lookup is not in its exact form (fails the job "
                                 "on a failed lookup, reads .before and .after, exports OLD_HEADS)")
-            absent_lookup = ABSENT_LOOKUP_TEXT in stripped_lines(run)
-            if re.search(r"\bABSENT_ON_GITHUB\b", run) and (
-                    not absent_lookup or len(re.findall(r"\bABSENT_ON_GITHUB\b", run)) != 3
-                    or "export UPSTREAM OLD_HEADS ABSENT_ON_GITHUB\n" not in stripped_lines(run)):
-                problems.append(f"{SCAN_FILE}/{j}: ABSENT_ON_GITHUB is not set by the sweep's lookup of tips GitHub "
-                                "has no commit for in its exact form (#482), or is set or used outside it")
-            want = 3 + (1 if SWEEP_LOOKUP.search(run) else 0) + (1 if absent_lookup else 0)
+            scanned_lookup = SCANNED_LOOKUP_TEXT in stripped_lines(run)
+            if re.search(r"\bSCANNED_GONE\b", run) and (
+                    not scanned_lookup or len(re.findall(r"\bSCANNED_GONE\b", run)) != 3
+                    or "export UPSTREAM OLD_HEADS SCANNED_GONE\n" not in stripped_lines(run)):
+                problems.append(f"{SCAN_FILE}/{j}: SCANNED_GONE is not set by the sweep's lookup of deleted tips a "
+                                "scan read in its exact form (#482), or is set or used outside it")
+            want = 3 + (1 if SWEEP_LOOKUP.search(run) else 0) + (1 if scanned_lookup else 0)
             if len(re.findall(r"\bOLD_HEADS\b", run)) != want:
                 problems.append(f"{SCAN_FILE}/{j}: OLD_HEADS is set or used outside the lookups")
             env = step.get("env") or {}
@@ -1353,13 +1391,13 @@ for label, mutate in {
             "-f per_page=100 --jq '.[] | .before, .after')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's",
             "-f time_period=week -f per_page=100 --jq '.[] | .before, .after')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's")),
     "a sweep lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
-        "run", re.sub(r"exit 2\n(\s*fi\n\s*fi\n\s*ABSENT_ON_GITHUB=)", r"true\n\1", with_sweep_lookup(scan_step(w)["run"]),
+        "run", re.sub(r"exit 2\n(\s*fi\n\s*fi\n\s*SCANNED_GONE=)", r"true\n\1", with_sweep_lookup(scan_step(w)["run"]),
                       count=1)),
     "a sweep lookup reading the wrong field": lambda w: scan_step(w).__setitem__(
         "run", with_sweep_lookup(scan_step(w)["run"]).replace(
             "-f per_page=100 --jq '.[] | .before, .after')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's",
             "-f per_page=100 --jq '.[] | .sha')\"; then\n    echo \"::error::Secret scan: cannot list GitHub's")),
-    # #482: the sweep's lookup of tips GitHub has no commit for, in its exact form only.
+    # #482: the sweep's lookup of deleted tips a scan read, in its exact form only.
     "an absent-tips lookup whose failure is ignored (|| true)": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace('error("not the asked commit") end\')"', 'error("not the asked commit") end\' || true)"')),
     "an absent-tips lookup that names every tip": lambda w: scan_step(w).__setitem__(
@@ -1367,12 +1405,27 @@ for label, mutate in {
     "an absent-tips lookup that takes any answer": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace('else error("not the asked commit") end', "else $id end")),
     "an absent-tips lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
-        "run", re.sub(r"(Re-run the job\.\" >&2\n\s*)exit 2(\n\s*fi\n\s*ABSENT_ON_GITHUB\+=)", r"\1true\2",
+        "run", re.sub(r"(Re-run the job\.\" >&2\n\s*)exit 2(\n\s*fi\n\s*\[\[ -z \"\$absent\" \]\])", r"\1true\2",
                       scan_step(w)["run"], count=1)),
-    "ABSENT_ON_GITHUB set outside its lookup": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace("unset LOOKUP_TOKEN\n", 'ABSENT_ON_GITHUB="$OLD_HEADS"\nunset LOOKUP_TOKEN\n')),
-    "ABSENT_ON_GITHUB not exported to the scan": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace("export UPSTREAM OLD_HEADS ABSENT_ON_GITHUB\n", "export UPSTREAM OLD_HEADS\n")),
+    "absent tips asked about without git's fetch first (a tip dropped meanwhile fails)": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace(
+            '|| timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n', "")),
+    "a runs lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r"exit 2(\n\s*fi\n\s*mapfile -t ids)", r"true\1", scan_step(w)["run"], count=1)),
+    "a runs lookup that takes a run of another commit": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace('if .head_sha != env.TIP then error("not the asked commit") else . end |', ".")),
+    "a runs lookup that takes any workflow": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace('select(.path == ".github/workflows/fork-secret-scan.yml" or', "select(true or")),
+    "a jobs lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r"exit 2(\n\s*fi\n\s*if \[\[ -n \"\$scanned\" \]\])", r"true\1", scan_step(w)["run"], count=1)),
+    "a jobs lookup that takes a failed scan": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace(' and .conclusion == "success" and', " and")),
+    "a jobs lookup that takes any job": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace('(.name == "Secret scan" or', '(true or')),
+    "SCANNED_GONE set outside its lookup": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("unset LOOKUP_TOKEN\n", 'SCANNED_GONE="$OLD_HEADS"\nunset LOOKUP_TOKEN\n')),
+    "SCANNED_GONE not exported to the scan": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("export UPSTREAM OLD_HEADS SCANNED_GONE\n", "export UPSTREAM OLD_HEADS\n")),
     # c2: the jobs' if: as GitHub evaluates it.
     "every push skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
         "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace("(github.event.deleted ||", "(true || github.event.deleted ||")),
