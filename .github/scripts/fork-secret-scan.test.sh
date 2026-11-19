@@ -25,7 +25,7 @@ git config --global user.name test
 git config --global user.email test@example.invalid
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
-unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML OLD_HEADS PUSH_REF
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML OLD_HEADS SCANNED_GONE PUSH_REF
 export CONFIG_BRANCH=main
 
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
@@ -678,6 +678,32 @@ OLD_HEADS="$gone3 $gone4" EVENT_NAME=schedule \
   "$gone_error: origin no longer has them \\($gone4\\)" "::error.*$gone3"
 OLD_HEADS="" EVENT_NAME=schedule \
   check "daily sweep: an old entry the record no longer lists changes nothing" 0 "" "::error|tips known gone"
+# #482: a gone tip GitHub deleted after a successful scan read it (SCANNED_GONE, the workflow's
+# lookup) warns. Any other gone tip, deleted or not, still fails: no run is known to have read it.
+set_gone_list "# Tips known gone: none yet."
+gone_scanned_warning="::warning.*1 tip\\(s\\) GitHub's activity record lists cannot be fetched: GitHub has deleted them, and a successful secret-scan job read each one"
+SCANNED_GONE="$gone4" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: a gone tip a successful scan read warns, and passes" 0 \
+  "$gone_scanned_warning.*444444444444" "::error"
+# The state question: the same run again in the same clone passes the same way.
+SCANNED_GONE="$gone4" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: the same run again (a gone tip a scan read) passes the same way" 0 \
+  "$gone_scanned_warning" "::error"
+SCANNED_GONE="$gone4" OLD_HEADS="$gone3 $gone4" EVENT_NAME=schedule \
+  check "daily sweep: a gone tip a scan read and one no scan is known to have read: fails, naming only the unscanned one" 2 \
+  "$gone_error: origin no longer has them \\($gone3\\).*never scanned" "::error.*$gone4" "not fetchable, no scan known: $gone3"
+SCANNED_GONE="" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: a gone tip the lookup does not name (deleted, no scan known) still fails" 2 "$gone_error.*$gone4"
+# SCANNED_GONE never hides a tip origin serves: that one is fetched and scanned.
+SCANNED_GONE="$vanished" OLD_HEADS="$vanished" EVENT_NAME=schedule \
+  check "daily sweep: a served tip SCANNED_GONE names is still scanned (its key found)" 1 \
+  "1 tip\\(s\\) no ref holds" "GitHub has deleted them" "leaks found: [1-9]"
+for bad in "--all" "$zeros" "${gone4:0:12}" ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD; do
+  SCANNED_GONE="$bad $gone4" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+    check "daily sweep: a word in SCANNED_GONE that is not a commit id fails ($bad)" 2 \
+    "::error::Secret scan: '.*' in SCANNED_GONE is not a commit id"
+done
+set_gone_list "$gone3 checked by hand: GitHub serves it nowhere (test)" # the list as the tests below expect it
 
 # #317 item 2: "one batch fetch first, then one by one" from a fresh blob-less clone, which holds
 # none of the listed tips, so the batch (failed by the gone tip) is all that could have fetched
@@ -996,6 +1022,22 @@ repo_pr lock-version pnpm-lock.yaml "$(printf "importers:\n  '@example/desktop-p
 # A token after a version-shaped start (1.0.0-<token>) is still a finding (the entry allows only a
 # version's shape: lowercase words and numbers). Built at run time, as the key is.
 repo_pr lock-token pnpm-lock.yaml "$(printf '  npm_auth_%s: 1.0.0-%s\n' token "Zx8Kq2Lm9Vb4""Nc7Rt5Wy3Hd6Jf1Gs0Pa")"
+# #482: the fixed fake values of old pull request heads are allowed in their own test files only,
+# and only as those exact values. Built at run time, as the key is.
+fake_wait="$(printf '  %s: "%s",\n' key "0123456789""abcdef")"
+fake_curl="$(printf "self.orphan(5102, ['bash', '-c', 'curl -u %s https://x/y; pytest -q'], cpu=90)\n" "admin"":hunter3")"
+repo_pr fake-wait apps/server/src/waits/WaitStore.test.ts "$fake_wait"
+repo_pr fake-wait-elsewhere apps/server/src/waits/WaitStore.ts "$fake_wait"
+repo_pr fake-wait-other apps/server/src/waits/WaitStore.test.ts "${fake_wait/0123/9123}"
+fake_wait2="$(printf '  %s: "%s",\n' key "fedcba9876""543210")"
+repo_pr fake-wait2-service apps/server/src/waits/WaitService.test.ts "$fake_wait2"
+repo_pr fake-wait2-hold apps/server/src/holdWork.boot.test.ts "$fake_wait2"
+repo_pr fake-wait-hold apps/server/src/holdWork.boot.test.ts "$fake_wait"
+repo_pr fake-wait2-other apps/server/src/waits/WaitService.test.ts "${fake_wait2/3210/3211}"
+repo_pr fake-wait2-elsewhere apps/server/src/holdWork.boot.ts "$fake_wait2"
+repo_pr fake-curl fork-kit/heavy/tests/sweep.test.py "$fake_curl"
+repo_pr fake-curl-elsewhere fork-kit/heavy/sweep.py "$fake_curl"
+repo_pr fake-curl-other fork-kit/heavy/tests/sweep.test.py "${fake_curl/hunter3/hunter4}"
 # The file itself (deleted and added again, so the PR's diff holds all of it) passes its own rules.
 git checkout -q -b own-file "$repo_base"
 if [[ -f .gitleaks.toml ]]; then
@@ -1017,6 +1059,14 @@ BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse lock-version)" \
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
   BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse lock-token)" \
     check "repository settings: a token after 1.0.0- in pnpm-lock.yaml is found" 1
+  for branch in fake-wait fake-wait2-service fake-wait2-hold fake-wait-hold fake-curl; do
+    BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse "$branch")" \
+      check "repository settings: the fake value of an old PR head in its own test file is not a finding (#482, $branch)" 0
+  done
+  for branch in fake-wait-elsewhere fake-wait-other fake-wait2-other fake-wait2-elsewhere fake-curl-elsewhere fake-curl-other; do
+    BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse "$branch")" \
+      check "repository settings: that value in another file, or another value there, is found (#482, $branch)" 1
+  done
 fi
 if [[ -n "$repo_toml" && -f "$repo_toml" ]]; then
   BASE_SHA="$repo_base" HEAD_SHA="$(git rev-parse own-file)" \
