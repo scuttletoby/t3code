@@ -121,16 +121,32 @@ with their sizes, to remove by hand once sure.
 ## Then: one feature at a time
 
 Each feature is its own setting in the home's `userdata/settings.json`, read again without a restart.
-Switch on one and run its check; when the check passes, switch on the next. There is no waiting period. After each change, `t3-golive status` lists what is on.
-Each one's **off again** is a single edit of that one setting; nothing else changes back.
+Switch on one and run its check; when the check passes, switch on the next. There is no waiting period.
+After each change, `t3-golive status` lists what is on, each with where: `server` (the file's own value,
+or a default of the administrator's managed policy), `policy` (on only because the policy locks it),
+`project:<id>` (that project's override in `projectSettingsOverrides`), `thread:<id>` (one thread's entry
+in the server's `handoff.threads`) or `project:<id>/thread:<id>` (one in a project's). The features are `agentSlots`, `waitFor`,
+`usagePacingGate`, `automaticUpdates`, `reviewRules`, `handoff` and `playtest`. Not listed, as none is a
+switch: `headlessUsageRefreshInterval` (runs by default in every fork build and only reads usage), MCP
+profiles (nothing applies a profile yet), `usagePacing` and `usagePacingLowerEffort` (only the pacing
+gate acts on them), `waitChecks` (only `waitFor` runs them) and `automaticUpdatesQuietCommand`.
 
-| Step | Setting           | On                                                        | Check                                                                                                                             | Off again                  |
-| ---- | ----------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| 0    | none              | -                                                         | `status`: `fork features: all off`                                                                                                | -                          |
-| 1    | `agentSlots`      | `"agentSlots": { "enabled": true, "maxPerMachine": <n> }` | A `delegate_task` above `<n>` running agents is refused; below it, starts                                                         | `"enabled": false`         |
-| 2    | `waitFor`         | `"waitFor": { "enabled": true }`                          | One test wait (a file that appears) arrives once, and survives a restart of T3 between the wait and the event                     | `"enabled": false`         |
-| 3    | `usagePacingGate` | `"usagePacingGate": "advise"`                             | A `delegate_task` reply carries a pace note; nothing is held or moved                                                             | `"usagePacingGate": "off"` |
-| 4    | old project tools | -                                                         | Retire, one at a time, the tools this machine used before the fork for what the features now do; keep each until it is not missed | put the tool back          |
+**Off again** is an edit of that one setting; nothing else changes back. For `reviewRules`, `handoff`
+and `playtest` it may take more than one: also remove each project override and each `handoff` thread
+entry that `status` names, including those of a deleted project or thread. A `policy` entry is not in
+settings.json: only the administrator's policy file clears it. When the policy locks the value the file
+already holds, `status` says `server`, and after the edit it says `policy`.
+
+| Step | Setting           | On                                                                  | Check                                                                                                                             | Off again                                                                                    |
+| ---- | ----------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 0    | none              | -                                                                   | `status`: `fork features: all off`                                                                                                | -                                                                                            |
+| 1    | `agentSlots`      | `"agentSlots": { "enabled": true, "maxPerMachine": <n> }`           | A `delegate_task` above `<n>` running agents is refused; below it, starts                                                         | `"enabled": false`                                                                           |
+| 2    | `waitFor`         | `"waitFor": { "enabled": true }`                                    | One test wait (a file that appears) arrives once, and survives a restart of T3 between the wait and the event                     | `"enabled": false`                                                                           |
+| 3    | `usagePacingGate` | `"usagePacingGate": "advise"`                                       | A `delegate_task` reply carries a pace note; nothing is held or moved                                                             | `"usagePacingGate": "off"`                                                                   |
+| 4    | `reviewRules`     | `"reviewRules": { "preset": "recommended" }`, or in one project     | `status` names `reviewRules` where it was set; nothing reads it yet, so no work changes                                           | `"preset": "off"`, and remove each project's `reviewRules`                                   |
+| 5    | `playtest`        | One project's `"playtest"`: `"enabled": true` and its four steps    | `status` names `playtest (project:<id>)`; nothing starts a session yet, so no step runs                                           | `"enabled": false`, or remove that project's `playtest`                                      |
+| 6    | `handoff`         | `"handoff": { "mode": "handoff" }`, or in one project or one thread | One test thread hands off ([handoff.md](handoff.md)) and its children, watched pull requests and waits keep working               | `"mode": "off"`, and remove each project's `handoff` and each `"handoff"` entry in `threads` |
+| 7    | old project tools | -                                                                   | Retire, one at a time, the tools this machine used before the fork for what the features now do; keep each until it is not missed | put the tool back                                                                            |
 
 Later, and each a decision of its own: `"usagePacingGate": "enforce"` (tasks are held, moved or run at a
 lower effort; off again: `"advise"`), and `"automaticUpdates": true` (the boot service updates itself to
