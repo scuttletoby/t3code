@@ -16,7 +16,7 @@ import { writeLocalStorageValue } from "../../hooks/useLocalStorage";
 import type { MessageResolver } from "../../i18n/messages";
 import { commandLabel } from "./KeybindingsSettings.logic";
 import type { ResolvedSettingsScope } from "./settingsScope";
-import { FORK_SETTINGS_SEARCH_ITEMS } from "./forkSettingsSearchItems"; // Fork
+import { FORK_SETTINGS_LABEL, FORK_SETTINGS_SEARCH_ITEMS } from "./forkSettingsSearchItems"; // Fork
 
 export type SettingsPath =
   | "/settings/projects"
@@ -40,6 +40,7 @@ export type SettingsPath =
   | "/settings/secrets"
   | "/settings/maintenance"
   | "/settings/labs"
+  | "/settings/fork" // Fork
   | "/settings/about"
   | "/settings/archived";
 
@@ -115,6 +116,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/secrets": msg("Secrets"),
   "/settings/maintenance": msg("Maintenance"),
   "/settings/labs": msg("Labs"),
+  "/settings/fork": FORK_SETTINGS_LABEL, // Fork
   "/settings/about": msg("About"),
   "/settings/voice": msg("Voice"),
   "/settings/archived": msg("Archive"),
@@ -156,6 +158,7 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
       "/settings/browser",
       "/settings/devices",
       "/settings/scheduled-tasks",
+      "/settings/fork", // Fork
     ],
   },
   {
@@ -482,7 +485,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/threads",
     searchTerms: [msg("usage quota rate limit reset recover continue")],
   },
-  ...FORK_SETTINGS_SEARCH_ITEMS, // Fork: waits and agent slots.
+  ...FORK_SETTINGS_SEARCH_ITEMS, // Fork: the rows of the Fork page.
   {
     id: "working-shelf",
     title: msg("Working section"),
@@ -1484,6 +1487,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/scheduled-tasks": null,
   "/settings/maintenance": null,
   "/settings/labs": null,
+  "/settings/fork": null, // Fork
   "/settings/about": null,
   "/settings/archived": "project-defaults",
 };

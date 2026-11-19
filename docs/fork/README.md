@@ -11,8 +11,9 @@ fork switch is off by default, except one read-only refresh of usage limits.
 
 Server settings are in `settings.json` in the server's `userdata` folder (by default
 `~/.t3/userdata/settings.json`). The server reads the file again when it changes; no restart is
-needed. Some fork settings also have a row in the app's **Settings** pages (named below). A
-project's overrides are set in **Settings** with that project chosen at the top ("Applying settings
+needed. Fork settings also have rows on the app's own **Settings → Fork** page (named below), with
+one line per feature at the top saying whether it is on, by the same rules as the fork report below
+(on a server, a project's override or one thread's handoff entry counts too). A project's overrides are set in **Settings** with that project chosen at the top ("Applying settings
 for …", see [project settings](../user/project-settings.md)). An agent's tools cannot change any
 fork setting.
 
@@ -143,7 +144,9 @@ Set in `settings.json`:
 { "usagePacing": { "<instance id>": { "reservePercent": 20 } } }
 ```
 
-The key is the provider instance id, for example `codex` or `codex_work`. There is no Settings row for it yet.
+The key is the provider instance id, for example `codex` or `codex_work`. In the app: **Settings →
+Fork**, section Usage pacing, one row per account by its name (an entry for an account that is gone
+is listed with **Remove**).
 
 ### `server.usagePacingGate`
 
@@ -152,8 +155,8 @@ What happens when an agent starts a task with `delegate_task`. `"off"`: nothing,
 on an account that is ahead of its pace moves to another account of the same provider, runs at a
 lower effort (`usagePacingLowerEffort`), or is refused for now and the agent asks again later.
 
-Switch on in `settings.json`: `"usagePacingGate": "advise"` (try `advise` before `enforce`). There
-is no Settings row for it yet.
+Switch on: **Settings → Fork**, section Usage pacing, "Usage pacing gate", or in `settings.json`:
+`"usagePacingGate": "advise"` (try `advise` before `enforce`).
 
 ### `server.usagePacingLowerEffort`
 
@@ -161,7 +164,8 @@ For `"enforce"`: what each effort level turns into while an account is ahead of 
 account has room, for example `{ "high": "medium", "medium": "medium" }`. A task at a level not
 listed is held instead. Empty: no effort is ever lowered.
 
-Set in `settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
+Set: **Settings → Fork**, "Lower effort when ahead of pace" (pairs like `high=medium`; a level no
+model on the server offers is refused), or in `settings.json`: `"usagePacingLowerEffort": { "high": "medium" }`.
 
 ### `server.waitFor`
 
@@ -171,7 +175,7 @@ woken with the result. `wait_list` and `wait_cancel` list and end them. While of
 judged nor delivered; listing and cancelling still work. Other fields set deadlines, limits per
 thread and how often each kind is checked.
 
-Switch on: **Settings → Threads**, section Waits (shown while a server is connected), "Let agents wait for events", or in `settings.json`:
+Switch on: **Settings → Fork**, section Waits (shown while a server is connected), "Let agents wait for events", or in `settings.json`:
 `"waitFor": { "enabled": true }`.
 
 ### `server.waitChecks`
@@ -181,7 +185,7 @@ fixed arguments, no shell; exit 0 means the event happened. It runs unsandboxed 
 with the server's environment, so use fixed programs that run no files from the repository (no test
 runners or build scripts). Only the person can add one; agents cannot.
 
-Add one: **Settings → Threads**, section Wait checks, **Add check**, or in `settings.json`:
+Add one: **Settings → Fork**, section Wait checks, **Add check**, or in `settings.json`:
 
 ```json
 { "waitChecks": { "build-done": { "argv": ["test", "-f", "/tmp/build.done"] } } }
@@ -255,7 +259,7 @@ valid (an unknown preset or key from a newer build, a bad runner) reads as off, 
 a warning in the server log; it is kept as written, and saves of other settings write it back
 unchanged until the person saves this setting.
 
-In the app: Settings, Threads, Review rules shows whether the rules are on and the values a lens
+In the app: Settings, Fork, Review rules shows whether the rules are on and the values a lens
 would run with (each marked as the preset's or set by hand), with "Use recommended review rules"
 and "Turn off" buttons; it asks first before a button drops hand-set fields or an unreadable value.
 
@@ -279,6 +283,12 @@ the stored value whole) and is refused for a bad row, a `defaultEffort` not in i
 or an unknown key such as a misspelt `effort`. A hand-edited value that is not valid, an unknown key
 included, reads as `enforce` with nothing allowed (with a warning in the server log); it is kept as
 written, and saves of other settings write it back unchanged until the person saves this setting.
+
+In the app: **Settings → Fork**, section Model policy (server only; a project cannot override it): the
+mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a save is. An unreadable
+value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
+then starts from the value's own rows and saves only once the person picks the mode, so a save never
+turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged.
 
 ```json
 {
@@ -305,7 +315,7 @@ above `maxPerAccount` per provider account, or below `minFreeMemoryMb` of free m
 started in other ways are counted but never refused. With `waitFor` on, an agent can wait for a slot
 instead of retrying.
 
-Switch on: **Settings → Threads**, section Agent slots, "Limit running agents", or in `settings.json`:
+Switch on: **Settings → Fork**, section Agent slots, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is
 refused.
 
@@ -417,7 +427,7 @@ server log), never as `handoff`.
 A project's own list of wait checks. It replaces the server's list for that project as a whole (a
 project lists every check it uses). Not set: the project uses the server's checks.
 
-Set: **Settings**, choose the project at the top, then **Wait checks**.
+Set: **Settings → Fork**, choose the project at the top, then **Wait checks**.
 
 ### `projectOverride.playtest`
 
