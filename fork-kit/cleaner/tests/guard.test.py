@@ -4,7 +4,7 @@ refusal in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/guard.test.py
 """
-import fcntl, os, subprocess, sys, unittest
+import fcntl, os, shutil, subprocess, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -471,6 +471,66 @@ class GitFolders(GuardCase):
         self.git(repo, 'tag', '-f', 'moved')                                    # the same name, another commit
         self.refused(d, 'git: tags not pushed', 'moved')
 
+    def orphan(self, name='agent-tree', into=None):
+        """A worktree in the temp folder whose main repository was removed: its .git file names a git folder that is
+        gone, with the history (a commit made in it too) that only that folder had."""
+        clone = self.clone(f'main-of-{name}', into=self.mkdir('elsewhere'))
+        tree = self.worktree(clone, name, into=into or self.tmp)
+        self.commit(tree)
+        shutil.rmtree(clone)
+        return self.age(tree, 30)
+
+    def test_an_orphaned_worktree_in_the_temp_folder_holds_no_commit_and_goes_by_age(self):
+        """#519: its commits, index and HEAD were in the git folder that is gone; the folder holds only files. The tmp
+        rule takes it like a plain folder of the pattern, once nothing in it changed for the pattern's days."""
+        tree = self.orphan()
+        cfg = self.tmp_cfg({'agent-*': 7})
+        item = self.assertDeletes(self.plan(cfg), tree, 'tmp')
+        self.assertIn('orphaned worktree', item.why)
+        self.file(os.path.join(tree, 'new.txt'))                    # changed today: too new
+        self.assertNotCandidate(self.plan(cfg), tree)
+        self.age(tree, 30)
+        self.assertNotCandidate(self.plan(self.tmp_cfg({'job-*': 7})), tree)      # no pattern takes it
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 0, lines)
+        self.assertFalse(os.path.lexists(tree))
+        code, lines = self.run_cleaner(cfg)                         # runs again: nothing left
+        self.assertEqual(code, 0, lines)
+        self.assertEqual([line for line in lines if line.startswith('deleted ')], [])
+
+    def test_an_orphaned_worktree_inside_a_temp_entry_goes_too(self):
+        job = self.mkdir('tmp', 'job-1')
+        self.orphan('tree', into=job)
+        self.age(job, 30)
+        self.assertDeletes(self.plan(self.tmp_cfg({'job-*': 7})), job, 'tmp')
+
+    def test_every_other_refusal_still_keeps_an_orphaned_worktree(self):
+        tree = self.orphan()
+        inner = self.clone('inner', into=tree)                      # a clone of its own inside, with a commit only here
+        self.commit(inner)
+        self.age(tree, 30)
+        cfg = self.tmp_cfg({'agent-*': 7})
+        self.assertKept(self.plan(cfg), tree, 'git: unpushed commits', 'inner')
+        self.push(inner)
+        self.age(tree, 30)
+        self.assertDeletes(self.plan(cfg), tree)
+        for name, code in (('KEEP', 'KEEP file'), ('.env', 'credential name')):
+            with self.subTest(name=name):
+                self.file(os.path.join(tree, name), 'mine\n')
+                self.age(tree, 30)
+                try:
+                    self.assertKept(self.plan(cfg), tree, code)
+                finally:
+                    os.unlink(os.path.join(tree, name))
+                    self.age(tree, 30)
+        self.busy.update(self.c.facts.ancestors(os.path.join(tree, 'README.md')))
+        self.assertKept(self.plan(cfg), tree, 'in use')
+
+    def test_the_guard_alone_keeps_an_orphaned_worktree(self):
+        """Only the tmp rule passes an orphaned worktree; the guard's own answer (agent-scratch asks it so) keeps it."""
+        tree = self.orphan()
+        self.refused(tree, 'orphaned worktree', 'is gone')
+
     def test_a_git_link_is_never_passed_over(self):
         d, repo = self.job()
         work = self.mkdir('tmp', 'job-2', 'w')
@@ -658,6 +718,14 @@ MUTATIONS = {
     'git: uncommitted or untracked': ('guard', "if not bare and git(where, 'status'", "if False and git(where, 'status'",
                                       GitFolders, 'test_uncommitted_and_untracked_changes'),
     'git: unpushed commits': ('guard', 'if alone:  # tmp', 'if False:', GitFolders, 'test_unpushed_commits'),
+    'orphan: passed over only for the tmp rule': ('guard', 'if orphans:', 'if True:', GitFolders,
+                                                   'test_the_guard_alone_keeps_an_orphaned_worktree'),
+    'orphan: the tmp rule passes it over': ('rules', "look = guard.examine(cfg, facts, path, 'path', orphans=True)",
+                                            "look = guard.examine(cfg, facts, path, 'path')", GitFolders,
+                                            'test_an_orphaned_worktree_in_the_temp_folder_holds_no_commit_and_goes_by_age'),
+    'orphan: every other git folder is still judged': ('guard', 'look.orphans.append((os.path.relpath(where, path), gone))\n                    continue',
+                                                       'look.orphans.append((os.path.relpath(where, path), gone))\n                    break',
+                                                       GitFolders, 'test_every_other_refusal_still_keeps_an_orphaned_worktree'),
     'git: reflog commits': ('guard', "lonely(where, ['--all', '--reflog'], sorted(", "lonely(where, ['--all'], sorted(",
                             GitFolders, 'test_a_commit_only_the_reflog_still_has'),
     'git: a live answer, not tracking refs': ('guard', "lonely(where, ['--all', '--reflog'], sorted(present(where, has, bare)), bare)",

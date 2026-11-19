@@ -46,8 +46,9 @@ systemd unit files, the pull request lists and Docker's list.
 every worktree or clone delete of that repository (never for a temp entry or a volume). Each read is two `gh pr
 list` calls (merged and open, `--limit 1000`); gh fetches 100 rows per GraphQL page, so one read costs
 ceil(merged/100) + ceil(open/100) GraphQL requests, at least 2 and at most 20. A run that deletes N worktrees
-and clones of one repository makes N + 1 reads. Each item's last check also runs `git ls-remote` against GitHub
-(git, not the API).
+and clones of one repository makes N + 1 reads. With [`mergedBranches`](#merged-branches) on, each clone's branches
+take one read for the plan and one before each branch delete. Each item's last check also runs `git ls-remote`
+against GitHub (git, not the API).
 
 **How a delete is done.** A temp entry or a clone is removed through open folder descriptors, one name at a
 time, never through a link: the entry must still be the folder (same device and inode) the last check judged,
@@ -203,7 +204,9 @@ off this list.
   name is not. A remote that cannot be asked means `could not read`. Git never fetches while it is asked: in a
   partial clone a missing object is a missing object, not a download. A `.git` that is a
   symbolic link or anything but a folder or a `gitdir:` file is never passed over: the entry is kept as `could not
-  read`.
+  read`. One `.git` is passed over, by the [`tmp`](#tmp) rule only: a `gitdir:` file whose git folder is gone (an
+  orphaned worktree) names no commit that could still be lost here; every other git folder in the entry is judged
+  as above.
 - **Unsafe paths:** a symbolic link (never followed, never removed), a root folder reached through a link,
   anything on another filesystem than its root folder or holding a mount point at any depth (bind mounts on the
   same filesystem too: the mount list `/proc/self/mountinfo` is read, and a list that cannot be read means
@@ -251,12 +254,43 @@ clone **of that GitHub repository** (by the `origin` URL in the folder's own git
 | `another git folder inside`    | a nested clone or submodule                                                                                                                 |
 | `in use`, `KEEP file`, ...     | every refusal of the list above                                                                                                             |
 | `could not read`               | git or GitHub gave no full answer; an unreadable merge time or folder; a moved worktree                                                     |
-| `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0); also in a temp folder               |
+| `orphaned worktree`            | its `.git` file names a git folder that is gone (main repository removed): kept, but no error (exit 0)                                      |
 
 A worktree is removed with `git worktree remove`, never with `--force`: git itself refuses when a file changed
 after the last check. The local branch and its reflog stay in the clone, so a commit that was amended or reset
 away on the branch is still there afterwards. A full clone goes only in a later run than its worktrees, when the
 same checks pass for the clone itself; its working files go first and `.git` last.
+
+#### Merged branches
+
+`git worktree remove` leaves the worktree's branch in its clone. With `"mergedBranches": true` on a repository
+(it needs `branches`: only a branch a pattern names is ever looked at), the rule also deletes such a local branch of
+a full clone directly in `root` (a clone elsewhere is not looked at, nor the branches of a clone that goes itself).
+A branch some worktree has checked out (also one whose folder is gone), rebases or bisects is that worktree's: it
+is not listed, and goes in a later run than its worktree. The others go only when all of this holds:
+
+| Kept as                        | When                                                                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `open PR`                      | an open pull request has the branch                                                                                      |
+| `base branch`                  | it is GitHub's default branch, or a pull request merges into it                                                          |
+| `no merged PR`                 | no merged pull request **from this repository** has the branch                                                           |
+| `commits not in the merged PR` | its tip is neither in a merged pull request's head (that this clone has) nor in GitHub's default branch right now        |
+| `merged under 24 h ago`        | as for a worktree (`mergedHours`)                                                                                        |
+| `commits GitHub does not have` | a commit its tip or its reflog names is on no branch or tag of GitHub (`git ls-remote`) and in no listed pull request    |
+| `used under 24 h ago`          | the newest time its reflog names, or its ref file, is within `usedHours`                                                 |
+| `KEEP file`, `must keep`       | the clone has a `KEEP` file at its top or is a must-keep path; or it is reached through a link (`symbolic link`)         |
+| `origin on this machine`       | as for a clone                                                                                                           |
+| `could not read`               | git or GitHub gave no full answer (named `branches in <clone>` when it is about the whole clone)                         |
+
+The plan names each one `branch <name> in <clone>` (size `0 B`). The delete is `git update-ref -d` with the commit
+the last check judged: a branch that moved since is left as it is (`FAILED ...: nothing removed`). Then its config
+section (`branch.<name>.*`, its upstream) goes, as with `git branch -d`. Deleting a branch deletes its reflog, so a
+commit amended or reset away that only the reflog holds keeps the branch, until git's own reflog expiry drops it
+(`gc.reflogExpireUnreachable`, 30 days by default). A branch delete is one git step on a ref while its clone stays,
+so it gets no journal line: killed after git removed the branch and before its reflog or config section went, the
+next run finds no branch there and judges nothing (the reflog left behind still counts for the clone, `git log
+--reflog`). A worktree checked out on the branch between the last check and the delete finds it gone; every commit
+of it is on GitHub, so nothing is lost. Branches of a clone that is `half deleted` are not judged.
 
 ### `docker`
 
@@ -276,6 +310,14 @@ The entries directly in the temp folder (`root`, default `/tmp`) whose name matc
 file, when nothing in them changed for that pattern's number of days. The first pattern that matches counts. The
 default list is empty: with no pattern the rule does nothing. "Changed" is the newest content or inode time of the
 entry and of everything in it, so a folder copied today with old dates is new.
+
+An orphaned worktree (its `.git` file names a git folder that is gone, as when another tool removed its main
+repository) is taken like a plain folder (#519): its commits, index and HEAD were in that git folder, so nothing in
+it is a commit that could still be lost. Every other git folder in the entry (a clone inside it, say) is judged as
+always, and every other refusal holds (`KEEP`, credential names, in use). What git cannot tell any more is which of
+its files were never committed: like any folder the pattern takes, it goes once nothing in it changed for the
+pattern's days. The plan says so: `...; orphaned worktree: its git folder <path> is gone, so it holds no commit`.
+The `worktrees` and `agent-scratch` rules still keep an orphaned worktree.
 
 Never taken, whatever the patterns say: hidden entries, `claude-*`, `tmux-*`, `ssh-*`, `systemd-private-*`,
 `snap-private-tmp`, `snap.*` and `lost+found`. Agent scratch folders have a rule of their own:
@@ -496,7 +538,8 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
           "root": "~/worktrees",
           "github": "example-owner/example-repo",
           "regenerable": ["dist", "coverage"],
-          "branches": ["work/*"]
+          "branches": ["work/*"],
+          "mergedBranches": true
         }
       ]
     },
@@ -534,6 +577,7 @@ The `cleaner` section of the machine file ([common](../common/README.md)). A who
 | `worktrees.repos[].github`               | required                                  | `owner/name` on GitHub                                                                               |
 | `worktrees.repos[].regenerable`          | none                                      | plain names of ignored build folders, on top of `node_modules`, `__pycache__` and `.pytest_cache`    |
 | `worktrees.repos[].branches`             | all                                       | branch patterns (shell style, case as written; `*` crosses `/`): only these branches are taken       |
+| `worktrees.repos[].mergedBranches`       | false                                     | also deletes merged local branches the patterns name (see Merged branches); needs `branches`         |
 | `worktrees.mergedHours`                  | 24                                        | hours after the merge (24 or more)                                                                   |
 | `worktrees.usedHours`                    | 24                                        | hours since the worktree or clone was last used (24 or more)                                         |
 | `docker.enabled`                         | false                                     | turns the rule on                                                                                    |
@@ -595,8 +639,8 @@ words:
 | 2    | refused: run mode with an old timer on or unknown, or the plan refused                                                                       |
 | 3    | compare mode: every step worked, and the compare found "new only" paths (each a bug until explained)                                         |
 
-A 1 always wins over a 3: exit 3 never hides a real failure. An orphaned worktree (`orphaned worktree` above) is
-kept and is no failure.
+A 1 always wins over a 3: exit 3 never hides a real failure. An orphaned worktree in a repository's folder
+(`orphaned worktree` above) is kept and is no failure; in the temp folder the `tmp` rule takes it by age.
 
 ## The compare
 
@@ -659,6 +703,11 @@ The installer writes no machine file: the `cleaner` section is the owner's, writ
   every later plan and run, never judged or deleted again, and the run exits 1 until a person acts; see
   [Half-deleted entries](#half-deleted-entries) for what to do. An agent session's folder is judged again and
   finished when every check passes and nothing in it changed since the delete began.
+- **merged branches, the run stops half-way:** a branch is gone or still there (one git step); a reflog or config
+  section left behind is no candidate. Run again: nothing is left to judge. With `mergedBranches` off or missing (an
+  older machine file), no branch is looked at. An older cleaner refuses the unknown key (exit 2): install this one
+  first, then add it.
+- **tmp, an orphaned worktree stopped half-way:** as any temp entry: `half deleted`, judged no more.
 - **agent-scratch, keep first stopped half-way:** a half-written copy (`.<session>.partial`) is thrown away and
   made again by the next run; a copy that was made but whose delete never ran is found, read back and used again
   (no second copy); an older copy that differs stays, and the new one is `<session>.2`, and so on.

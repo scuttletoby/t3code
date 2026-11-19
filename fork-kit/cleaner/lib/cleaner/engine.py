@@ -93,7 +93,7 @@ def sized(things):
 
 
 def count(n, word):
-    return f'{n} {word}' if n == 1 else f'{n} {word}s'
+    return f'{n} {word}' if n == 1 else f'{n} {word}es' if word.endswith(('ch', 'sh', 's', 'x')) else f'{n} {word}s'
 
 
 def one_line(text):
@@ -340,7 +340,7 @@ def _execute(cfg, facts, really, say, log):
     plan = rules.plan(cfg, facts, measure=not really)
     plan.items += finish
     if unread_journal:              # a plan only: anything may be half deleted, so nothing would be deleted
-        plan.kept += [rules.Kept(item.path, item.rule, 'could not read', 'the journal of deletes in progress cannot '
+        plan.kept += [rules.Kept(item.label, item.rule, 'could not read', 'the journal of deletes in progress cannot '
                                  'be read, and it may name this as half deleted', item.size)
                       for item in plan.items if item.kind != 'volume']
         plan.items = [item for item in plan.items if item.kind == 'volume']

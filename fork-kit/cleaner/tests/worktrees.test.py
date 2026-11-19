@@ -5,7 +5,7 @@ shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/worktrees.test.py
 """
-import os, shutil, sys, unittest
+import os, re, shutil, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -520,6 +520,222 @@ class Branches(Case):
                 self.cfg(worktrees={'repos': [{'root': self.trees, 'github': fx.REPO, 'branches': bad}]})
 
 
+class MergedBranches(Case):
+    """`mergedBranches` (#519): a local branch of a clone in the root, named by a `branches` pattern, whose pull
+    request merged and whose worktree is gone already. It goes only when its tip is in the merged pull request's head
+    or in GitHub's default branch, and every commit it and its reflog name is on GitHub right now."""
+
+    def branch_cfg(self, branches=('work/*',), on=True):
+        repo = {'root': self.trees, 'github': fx.REPO, 'branches': list(branches)}
+        if on is not None:
+            repo['mergedBranches'] = on
+        return self.cfg(worktrees={'repos': [repo]})
+
+    def base(self):
+        return self.path('trees', 'base') if os.path.isdir(self.path('trees', 'base')) else self.clone('base')
+
+    def merged_branch(self, name='work/a', number=7, hours=48, then=None):
+        """A branch of trees/base, pushed, whose pull request merged `hours` ago; its worktree (outside the root) was
+        removed, as a run removes it. `then(tree)` runs before that."""
+        clone = self.base()
+        tree = self.worktree(clone, name.replace('/', '-'), name, into=self.mkdir('elsewhere'))
+        self.commit(tree)
+        self.push(tree)
+        self.pr(tree, number, hours)
+        if then is not None:
+            then(tree)
+        self.git(clone, 'worktree', 'remove', '--force', tree)
+        return clone
+
+    def branches(self, clone):
+        return sorted(self.git(clone, 'for-each-ref', '--format=%(refname:short)', 'refs/heads').split())
+
+    def label(self, clone, name):
+        return f'branch {name} in {clone}'
+
+    def branch_items(self, plan):
+        return [(i.path, i.branch) for i in plan.items if i.kind == 'branch']
+
+    def test_a_merged_branch_with_no_worktree_is_deleted_and_a_second_run_finds_nothing(self):
+        clone = self.merged_branch()
+        self.git(clone, 'branch', 'other')                          # no pattern names it: never looked at
+        cfg = self.branch_cfg()
+        plan = self.plan(cfg)
+        self.assertEqual(self.branch_items(plan), [(clone, 'work/a')])
+        self.assertEqual([k.code for k in plan.kept if k.path == clone], ['branch not listed'])   # the clone stays (main)
+        self.assertEqual([k.path for k in plan.kept if k.path.startswith('branch ')], [])
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 0, lines)
+        self.assertIn(f'deleted {self.label(clone, "work/a")} (0 B, worktrees: #7 merged 2 days ago', '\n'.join(lines))
+        self.assertIn('  worktrees: deleted 1 branch (0 B)', lines)
+        self.assertEqual(self.branches(clone), ['main', 'other'])
+        self.assertFalse(os.path.lexists(os.path.join(clone, '.git', 'logs', 'refs', 'heads', 'work', 'a')))
+        self.assertNotIn('branch.work/a.', self.git(clone, 'config', '--local', '--list'))     # its upstream too
+        code, lines = self.run_cleaner(cfg)                         # runs again: nothing left to do
+        self.assertEqual(code, 0, lines)
+        self.assertEqual([line for line in lines if line.startswith('deleted ')], [])
+        self.assertEqual(self.branches(clone), ['main', 'other'])
+
+    def test_without_the_key_no_branch_is_looked_at(self):
+        """An older machine file (no mergedBranches) deletes no branch after an update; the key needs patterns."""
+        clone = self.merged_branch()
+        for cfg in (self.branch_cfg(on=None), self.branch_cfg(on=False), self.repo_cfg()):
+            plan = self.plan(cfg)
+            self.assertEqual(self.branch_items(plan), [])
+            self.assertEqual([k.path for k in plan.kept if k.path.startswith('branch ')], [])
+            self.assertEqual(self.run_cleaner(cfg)[0], 0)
+            self.assertIn('work/a', self.branches(clone))
+        for bad in ({'branches': [], 'on': True}, {'on': 'yes'}):
+            with self.subTest(bad=bad), self.assertRaises(machine_file.MachineFileError):
+                self.branch_cfg(bad.get('branches', ('work/*',)), bad['on'])
+        with self.assertRaises(machine_file.MachineFileError):
+            self.cfg(worktrees={'repos': [{'root': self.trees, 'github': fx.REPO, 'mergedBranches': True}]})
+
+    def test_a_branch_checked_out_in_a_worktree_goes_in_a_later_run_than_it(self):
+        tree = self.finished('fix-1')
+        clone = self.path('trees', 'base')
+        cfg = self.branch_cfg(['fix-*'])
+        plan = self.plan(cfg)
+        self.assertDeletes(plan, tree)
+        self.assertEqual(self.branch_items(plan), [])               # the worktree's: not listed as a branch
+        self.assertEqual(self.run_cleaner(cfg)[0], 0)
+        self.assertFalse(os.path.exists(tree))
+        self.assertIn('fix-1', self.branches(clone))                # git worktree remove leaves the branch
+        self.assertEqual(self.branch_items(self.plan(cfg)), [(clone, 'fix-1')])
+        self.assertEqual(self.run_cleaner(cfg)[0], 0)
+        self.assertEqual(self.branches(clone), ['main'])
+
+    def test_a_branch_a_worktree_rebases_or_bisects_is_not_a_candidate(self):
+        clone = self.merged_branch()
+        other = self.worktree(clone, 'other', 'side', into=self.mkdir('elsewhere'))
+        git_dir = self.git_dir(other)
+        for name in ('rebase-merge/head-name', 'rebase-apply/head-name', 'BISECT_START'):
+            with self.subTest(name=name):
+                self.file(os.path.join(git_dir, name), 'refs/heads/work/a\n' if 'rebase' in name else 'work/a\n')
+                self.assertEqual(self.branch_items(self.plan(self.branch_cfg())), [])
+                os.unlink(os.path.join(git_dir, name))
+        self.assertEqual(self.branch_items(self.plan(self.branch_cfg())), [(clone, 'work/a')])
+
+    def test_each_reason_keeps_the_branch(self):
+        clone = self.merged_branch('work/done', number=1)
+        self.merged_branch('work/open', number=2)
+        self.pr(clone, 3, state='open', branch='work/open', oid=self.git(clone, 'rev-parse', 'work/open'))
+        self.merged_branch('work/fresh', number=4, hours=2)
+        self.merged_branch('work/fork', number=5)
+        self.merged[-1]['isCrossRepository'] = True
+        self.merged_branch('work/lower', number=6)
+        self.pr(clone, 8, branch='work/upper', base='work/lower', oid=self.git(clone, 'rev-parse', 'work/lower'))
+        self.merged_branch('work/later', number=9, then=lambda tree: self.commit(tree, 'later.txt'))
+
+        def reset_away(tree):
+            lost = self.commit(tree, 'lost.txt')                    # never pushed, then reset away: only in its reflog
+            self.git(tree, 'reset', '-q', '--hard', 'HEAD~1')
+            self.assertNotIn(lost, self.git(tree, 'ls-remote', 'origin'))
+        self.merged_branch('work/reflog', number=10, then=reset_away)
+        self.git(clone, 'branch', 'work/none')                      # no pull request
+        plan = self.plan(self.branch_cfg())
+        self.assertEqual(self.branch_items(plan), [(clone, 'work/done')])
+        self.assertKept(plan, self.label(clone, 'work/open'), 'open PR', '#3')
+        self.assertKept(plan, self.label(clone, 'work/fresh'), 'merged under 24 h ago', '#4')
+        self.assertKept(plan, self.label(clone, 'work/fork'), 'no merged PR')
+        self.assertKept(plan, self.label(clone, 'work/lower'), 'base branch', '#8')
+        self.assertKept(plan, self.label(clone, 'work/later'), 'commits not in the merged PR', '#9')
+        self.assertKept(plan, self.label(clone, 'work/reflog'), 'commits GitHub does not have', 'reflog')
+        self.assertKept(plan, self.label(clone, 'work/none'), 'no merged PR')
+        self.git(clone, 'checkout', '-q', '-b', 'local')               # main checked out nowhere
+        self.assertKept(self.plan(self.branch_cfg(['*'])), self.label(clone, 'main'), 'base branch', 'default branch')
+
+    def test_a_tip_in_githubs_default_branch_may_go(self):
+        """Squash or rebase merges: the pull request's head is a commit this clone never had, but GitHub's default
+        branch holds the tip right now."""
+        clone = self.merged_branch('work/sq', then=lambda tree: self.git(tree, 'push', '-q', 'origin', 'HEAD:main'))
+        self.merged[-1]['headRefOid'] = fx.HEX[:40]
+        plan = self.plan(self.branch_cfg())
+        item = [i for i in plan.items if i.kind == 'branch'][0]
+        self.assertIn('main on GitHub', item.why)
+        self.git(self.origin(), 'update-ref', 'refs/heads/main', self.git(clone, 'rev-parse', 'work/sq~1'))
+        self.assertKept(self.plan(self.branch_cfg()), self.label(clone, 'work/sq'), 'commits not in the merged PR')
+
+    def test_a_branch_used_in_the_last_day_is_kept(self):
+        clone = self.merged_branch()
+        with mock.patch.object(self.c.rules, 'branch_used', self.real_branch_used):
+            self.assertKept(self.plan(self.branch_cfg()), self.label(clone, 'work/a'), 'used under 24 h ago', 'h ago')
+            log = os.path.join(clone, '.git', 'logs', 'refs', 'heads', 'work', 'a')
+            with open(log) as f:
+                text = re.sub(r'> \d+ ([+-]\d{4})', lambda m: f'> {int(self.now - 2 * fx.DAY)} {m.group(1)}', f.read())
+            self.file(log, text, days=2)
+            self.age(os.path.join(clone, '.git', 'refs', 'heads', 'work', 'a'), 2)
+            self.assertEqual(self.branch_items(self.plan(self.branch_cfg())), [(clone, 'work/a')])
+
+    def test_the_clone_says_what_keeps_all_its_branches(self):
+        clone = self.merged_branch()
+        self.file(os.path.join(clone, 'KEEP'), 'my notes\n')
+        self.assertKept(self.plan(self.branch_cfg()), self.label(clone, 'work/a'), 'KEEP file', 'my notes')
+        os.unlink(os.path.join(clone, 'KEEP'))
+        here = self.path('gh', *fx.REPO.split('/')) + '.git'
+        self.git(clone, 'config', f'url.{here}.insteadOf', f'https://github.com/{fx.REPO}.git')
+        self.assertKept(self.plan(self.branch_cfg()), self.label(clone, 'work/a'), 'origin on this machine', here)
+        self.git(clone, 'config', '--unset', f'url.{here}.insteadOf')
+
+        def down(repo):
+            raise self.c.facts.Unreadable('GitHub (gh pr list: could not connect)')
+        self.assertKept(self.plan(self.branch_cfg(), prs=down), f'branches in {clone}', 'could not read', 'GitHub')
+        code, lines = self.run_cleaner(self.branch_cfg(), prs=down)
+        self.assertEqual(code, 1, lines)
+        self.assertIn('work/a', self.branches(clone))
+
+    def test_the_last_check_reads_the_branch_again_and_git_deletes_only_what_it_judged(self):
+        clone = self.merged_branch()
+        cfg = self.branch_cfg()
+        facts = self.facts(cfg)
+        plan = self.c.rules.plan(cfg, facts)
+        self.assertEqual(self.branch_items(plan), [(clone, 'work/a')])
+        main = self.git(clone, 'rev-parse', 'main')
+        scratch = self.worktree(clone, 'w', 'scratch', into=self.mkdir('w2'))
+        self.commit(scratch, 'new.txt')
+        self.push(scratch)                                          # on GitHub, but in no merged pull request
+        self.git(clone, 'branch', '-f', 'work/a', self.head(scratch))
+        failed, lines = self.delete_all(cfg, facts, plan.items)
+        self.assertEqual([line.split()[0] for line in lines], ['REFUSED'], lines)
+        self.assertIn('commits not in the merged PR', lines[0])
+        self.assertIn('work/a', self.branches(clone))
+        # Moved after the last check: git compares the branch with the commit that check judged, and removes nothing.
+        self.git(clone, 'branch', '-f', 'work/a', self.merged[0]['headRefOid'])
+        plan = self.c.rules.plan(cfg, facts)
+        with self.swap_after_the_last_check(clone, lambda path: self.git(path, 'branch', '-f', 'work/a', main)):
+            failed, lines = self.delete_all(cfg, facts, plan.items)
+        self.assertEqual(failed, 1, lines)
+        self.assertEqual([line.split()[0] for line in lines], ['FAILED'], lines)
+        self.assertIn('nothing removed', lines[0])
+        self.assertEqual(self.git(clone, 'rev-parse', 'work/a'), main)
+        self.assertFalse(os.path.exists(cfg.journal_file))          # one git step: nothing half gone
+
+    def test_a_delete_stopped_half_way_leaves_nothing_to_judge(self):
+        """Killed after git removed the branch and before its reflog or config section went: the next run sees no
+        branch, judges nothing and exits 0. The reflog left behind still counts for the clone (git log --reflog)."""
+        clone = self.merged_branch()
+        log = os.path.join(clone, '.git', 'logs', 'refs', 'heads', 'work', 'a')
+        with open(log) as f:
+            text = f.read()
+        self.git(clone, 'update-ref', '-d', 'refs/heads/work/a')
+        self.file(log, text)
+        self.git(clone, 'config', 'branch.work/a.remote', 'origin')
+        code, lines = self.run_cleaner(self.branch_cfg())
+        self.assertEqual(code, 0, lines)
+        self.assertEqual([line for line in lines if 'work/a' in line], [])
+        self.assertTrue(os.path.isfile(log))
+
+    def test_a_half_deleted_clone_has_no_branch_judged(self):
+        clone = self.merged_branch()
+        cfg = self.branch_cfg()
+        os.makedirs(os.path.dirname(cfg.journal_file), exist_ok=True)
+        self.c.engine.write_journal(cfg, [{'kind': 'clone', 'path': clone, 'rule': 'worktrees', 'at': '2026-01-02T03:04:05Z'}])
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 1, lines)
+        self.assertIn('work/a', self.branches(clone))
+        self.assertEqual([line for line in lines if line.startswith(('deleted ', 'would delete '))], [])
+
+
 class Clones(Case):
     def finished_clone(self, name='base', number=20, hours=48):
         clone = self.clone(name)
@@ -835,12 +1051,46 @@ MUTATIONS = {
     'used: the git files a command writes': ('rules', 'for name in USE_MARKS:', 'for name in ():', Used, 'test_each_sign_of_use_keeps_it'),
     'used: the reflog lines': ('rules', "when = reflog_newest(os.path.join(git_dir, 'logs', 'HEAD'))", 'when = 0.0', Used,
                                'test_each_sign_of_use_keeps_it'),
-    'used: a reflog line it cannot read': ('rules', "raise Unreadable(f'line {number} of its HEAD reflog is no reflog line')",
+    'used: a reflog line it cannot read': ('rules', "raise Unreadable(f'line {number} of the reflog {path} is no reflog line')",
                                            'pass', Used, 'test_a_reflog_line_it_cannot_read_keeps_it'),
     'used: a clone too': ('rules', 'used, what = look.newest, ', 'used, what = 0.0, ', Used, 'test_a_clone_used_in_the_last_day_is_kept'),
     'branches: only listed ones': ('rules', 'if repo.branches and not matches(branch, repo.branches):', 'if False:', Branches,
                                    'test_only_listed_branches_are_removed'),
     'GitHub: a cut-off list': ('facts', "if state == 'open' and len(rows) >= PR_LIMIT:", 'if False:', GitHub, 'test_a_list_that_may_be_cut_off_means_keep'),
+    'branch: off without the key': ('rules', "if kind == 'clone' and repo.merged_branches and refusal is not None:",
+                                    "if kind == 'clone' and refusal is not None:", MergedBranches, 'test_without_the_key_no_branch_is_looked_at'),
+    'branch: the key needs patterns': ('config', "if repo['mergedBranches'] and not repo['branches']:", 'if False:', MergedBranches,
+                                       'test_without_the_key_no_branch_is_looked_at'),
+    'branch: only listed ones': ('rules', 'if matches(name, repo.branches) and (only is None or name == only)}',
+                                 'if (only is None or name == only)}', MergedBranches,
+                                 'test_a_merged_branch_with_no_worktree_is_deleted_and_a_second_run_finds_nothing'),
+    'branch: checked out': ('rules', 'if name not in out and not branch_busy(git_dir, name)}', 'if not branch_busy(git_dir, name)}',
+                            MergedBranches, 'test_a_branch_checked_out_in_a_worktree_goes_in_a_later_run_than_it'),
+    'branch: rebased or bisected': ('rules', "if named in ('refs/heads/' + branch, branch):", 'if False:', MergedBranches,
+                                    'test_a_branch_a_worktree_rebases_or_bisects_is_not_a_candidate'),
+    'branch: open PR': ('rules', 'if open_rows:', 'if False:', MergedBranches, 'test_each_reason_keeps_the_branch'),
+    'branch: the default branch': ('rules', 'if branch == default:  # the default branch: a branch', 'if False:', MergedBranches, 'test_each_reason_keeps_the_branch'),
+    'branch: a base branch': ('rules', 'if bases:', 'if False:', MergedBranches, 'test_each_reason_keeps_the_branch'),
+    'branch: no merged PR': ('rules', 'if not finished:', 'if False:', MergedBranches, 'test_each_reason_keeps_the_branch'),
+    'branch: a fork PR': ('rules', " and row['isCrossRepository'] is False", '', MergedBranches, 'test_each_reason_keeps_the_branch'),
+    'branch: commits not in the merged PR': ('rules', "if not holding:\n        return Refusal('commits not in the merged PR', f'{oid",
+                                             "if False:\n        return Refusal('commits not in the merged PR', f'{oid", MergedBranches, 'test_each_reason_keeps_the_branch'),
+    'branch: in the default branch on GitHub': ('rules', "if not holding and main in on_github and git_code(clone, 'merge-base', '--is-ancestor', oid, main) == 0:",
+                                                'if not holding and main in on_github:', MergedBranches, 'test_a_tip_in_githubs_default_branch_may_go'),
+    'branch: merged under 24 h ago': ('rules', 'if since < cfg.merged_hours * 3600:', 'if False:', MergedBranches, 'test_each_reason_keeps_the_branch'),
+    'branch: commits only in its reflog': ('rules', 'if lost:', 'if False:', MergedBranches, 'test_each_reason_keeps_the_branch'),
+    'branch: used': ('rules', 'if facts.now - used < cfg.used_hours * 3600:', 'if False:', MergedBranches,
+                     'test_a_branch_used_in_the_last_day_is_kept'),
+    'branch: a KEEP file in the clone': ('rules', 'if os.path.lexists(keep):', 'if False:', MergedBranches,
+                                         'test_the_clone_says_what_keeps_all_its_branches'),
+    'branch: an origin on this machine': ('rules', 'if here_urls:', 'if False:', MergedBranches,
+                                          'test_the_clone_says_what_keeps_all_its_branches'),
+    'branch: the last check': ('rules', '            _, item.oid, refusal, _ = answers[0]\n            return refusal',
+                               '            _, item.oid, refusal, _ = answers[0]\n            return None', MergedBranches,
+                               'test_the_last_check_reads_the_branch_again_and_git_deletes_only_what_it_judged'),
+    'branch: deleted only at the commit judged': ('facts', "('update-ref', '--no-deref', '-d', 'refs/heads/' + branch, oid)",
+                                                  "('update-ref', '--no-deref', '-d', 'refs/heads/' + branch)", MergedBranches,
+                                                  'test_the_last_check_reads_the_branch_again_and_git_deletes_only_what_it_judged'),
 }
 
 

@@ -7,10 +7,10 @@ delete. `delete` is the only code in the kit that removes anything.
 import calendar, errno, fnmatch, hashlib, json, os, re, shutil, stat, sys, time
 
 from . import compress, guard
-from .config import matches
-from .facts import (DELETED, Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_tags, lonely, merged_seconds,
-                    origin_url, orphaned_worktree, present, reflog, remote_refs, remote_urls, remove_volume,
-                    remove_worktree, worktree_list)
+from .config import matches, must_keep_match
+from .facts import (DELETED, Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_branches, local_tags,
+                    lonely, merged_seconds, origin_url, orphaned_worktree, present, reflog, remote_refs, remote_urls,
+                    remove_branch, remove_volume, remove_worktree, worktree_list)
 from .guard import CREDENTIAL_NAMES, Refusal
 
 DAY = 86400
@@ -30,13 +30,16 @@ MARKS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-
 class Item:
     """One thing a rule wants gone. `kind` is path, worktree, clone or volume; for a volume `path` is its name."""
 
-    def __init__(self, kind, path, rule, why, size, look=None):
+    def __init__(self, kind, path, rule, why, size, look=None, branch=None, oid=None):
         self.kind, self.path, self.rule, self.why, self.size = kind, path, rule, why, size
         self.done = None        # after a run: deleted, refused or failed
         self.look = look        # the guard's look at the last check: the delete removes only what it saw
+        self.branch, self.oid = branch, oid     # kind 'branch': `path` is its clone, `oid` the commit last judged
 
     @property
     def label(self):
+        if self.kind == 'branch':
+            return branch_label(self.path, self.branch)
         return f'docker volume {self.path}' if self.kind == 'volume' else self.path
 
 
@@ -109,11 +112,14 @@ def tmp_answer(cfg, facts, path):
         return None
     except OSError as ex:  # tmp entry
         return '', guard.Look(Refusal('could not read', f'{path}: {ex.strerror}'))
-    look = guard.examine(cfg, facts, path, 'path')
+    look = guard.examine(cfg, facts, path, 'path', orphans=True)
     age = facts.now - max(top, look.newest)       # a refusal stops the look early: then the entry's own time counts
     if age < days * DAY:
         return None
-    return f'not changed for {days_text(int((age + 1) // DAY))} ({pattern}: {days_text(days)})', look
+    why = f'not changed for {days_text(int((age + 1) // DAY))} ({pattern}: {days_text(days)})'
+    for where, gone in look.orphans[:1]:
+        why += f'; orphaned worktree{"" if where == "." else " " + where}: its git folder {gone} is gone, so it holds no commit'
+    return why, look
 
 
 def plan_tmp(cfg, facts, plan, measure):
@@ -1064,7 +1070,7 @@ def reflog_newest(path):
         if found:
             newest = max(newest, float(found.group(1)))
         elif line or number < len(lines):  # the text ends with a newline: only the last piece may be empty
-            raise Unreadable(f'line {number} of its HEAD reflog is no reflog line')
+            raise Unreadable(f'line {number} of the reflog {path} is no reflog line')
     return newest
 
 
@@ -1123,6 +1129,8 @@ def plan_worktrees(cfg, facts, plan, measure):
                 plan.kept.append(Kept(path, 'worktrees', refusal.code, refusal.detail, guard.measure(path) if measure else None))
             else:
                 plan.items.append(Item(kind, path, 'worktrees', why, look.size, look))
+            if kind == 'clone' and repo.merged_branches and refusal is not None:   # a clone that goes takes its branches
+                plan_branches(cfg, facts, repo, path, plan)
 
 
 def recheck_tree(cfg, facts, item):
@@ -1156,17 +1164,184 @@ def delete_clone(item):
     remove_tree(item.path, item.look, last='.git')
 
 
+# --- merged branches (the worktrees rule, `mergedBranches`) --------------------------------------------------------
+# `git worktree remove` leaves the worktree's branch in its clone. With `mergedBranches` on, a later run deletes such
+# a branch of a clone directly in the root once it is finished the way a worktree is, and once nothing it or its
+# reflog names would be lost: every one of those commits is on GitHub right now.
+def branch_label(clone, branch):
+    return f'branch {branch} in {clone}'
+
+
+def branch_busy(git_dir, branch):
+    """True when a worktree of the clone rebases or bisects the branch: it is then detached, and `git worktree list`
+    does not name the branch (git's own `branch -d` refuses it too). Raises Unreadable when a file cannot be read."""
+    folders = [git_dir]
+    try:
+        folders += sorted(os.path.join(git_dir, 'worktrees', name) for name in os.listdir(os.path.join(git_dir, 'worktrees')))
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError as ex:
+        raise Unreadable(f'{ex.filename}: {ex.strerror}') from None
+    for folder in folders:
+        for name in ('rebase-merge/head-name', 'rebase-apply/head-name', 'BISECT_START'):
+            try:
+                with open(os.path.join(folder, name), errors='surrogateescape') as f:
+                    named = f.read().strip()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as ex:
+                raise Unreadable(f'{ex.filename}: {ex.strerror}') from None
+            if named in ('refs/heads/' + branch, branch):
+                return True
+    return False
+
+
+def branch_used(git_dir, branch):
+    """(time, what) of the newest sign the branch was used: the newest time its reflog names, or a change to its
+    loose ref file (a packed branch has none); 0 when neither is there."""
+    used, what = reflog_newest(os.path.join(git_dir, 'logs', 'refs', 'heads', *branch.split('/'))), 'its reflog'
+    try:
+        when = guard.changed(os.lstat(os.path.join(git_dir, 'refs', 'heads', *branch.split('/'))))
+    except (FileNotFoundError, NotADirectoryError):
+        when = 0.0
+    except OSError as ex:
+        raise Unreadable(f'its ref file: {ex.strerror}') from None
+    return (when, 'its ref') if when > used else (used, what)
+
+
+def clone_keeps(cfg, clone):
+    """Why every branch of a clone stays whatever else holds: the clone is or is in a must-keep path or name, is
+    reached through a link, or has a KEEP file at its top. None when nothing does."""
+    if must_keep_match(cfg.must_keep, clone) is not None or any(guard.kept_name(cfg, p) for p in clone.split('/') if p):
+        return Refusal('must keep', clone)
+    if os.path.realpath(clone) != clone:
+        return Refusal('symbolic link', f'{clone} is reached through a link')
+    keep = os.path.join(clone, guard.KEEP_FILE)
+    if os.path.lexists(keep):
+        return Refusal('KEEP file', guard._keep_reason(keep))
+    return None
+
+
+def branch_refusal(cfg, facts, clone, git_dir, branch, oid, prs, default, on_github, main):
+    """(refusal, why) for one branch: why it stays, or None and the pull request (or default branch) it is finished by.
+    `on_github`: the commits this clone has that GitHub holds right now (its refs, its tags, the listed pull requests'
+    heads); `main`: the commit of GitHub's default branch. Raises Unreadable when git cannot answer."""
+    open_rows = [row for row in prs['open'] if row['headRefName'] == branch]
+    if open_rows:
+        return Refusal('open PR', numbers(open_rows)), ''
+    if branch == default:  # the default branch: a branch
+        return Refusal('base branch', f'{branch} is the default branch on GitHub'), ''
+    bases = [row for row in prs['open'] + prs['merged'] if row['baseRefName'] == branch]
+    if bases:
+        return Refusal('base branch', f'pull requests merge into {branch}: {numbers(bases)}'), ''
+    finished = [row for row in prs['merged'] if row['headRefName'] == branch and row['isCrossRepository'] is False]
+    if not finished:
+        return Refusal('no merged PR', f'no merged pull request of this repository has the branch {branch}'), ''
+    holding = [row for row in finished if row['headRefOid'] == oid or (
+        row['headRefOid'] in on_github and git_code(clone, 'merge-base', '--is-ancestor', oid, row['headRefOid']) == 0)]
+    where = 'its tip is in the merged head'
+    if not holding and main in on_github and git_code(clone, 'merge-base', '--is-ancestor', oid, main) == 0:
+        holding, where = finished, f'its tip is in {default} on GitHub'     # a squash or rebase merge
+    if not holding:
+        return Refusal('commits not in the merged PR', f'{oid[:10]} is in neither {numbers(finished)} nor {default} on GitHub'), ''
+    times = [merged_seconds(row) for row in holding]
+    if None in times:
+        return Refusal('could not read', f'GitHub (no merge time for {numbers(holding)})'), ''
+    since = facts.now - max(times)
+    if since < cfg.merged_hours * 3600:
+        return Refusal(f'merged under {cfg.merged_hours} h ago', f'{numbers(holding)} merged {int(max(since, 0) // 3600)} h ago'), ''
+    # Deleting a branch deletes its reflog: a commit amended or reset away is there and maybe nowhere else.
+    lost = lonely(clone, [oid, *reflog(clone, 'refs/heads/' + branch)], sorted(on_github))
+    if lost:
+        return Refusal('commits GitHub does not have', f'{lost[:10]} (in it or its reflog: git log -g {branch})'), ''
+    used, what = branch_used(git_dir, branch)
+    if facts.now - used < cfg.used_hours * 3600:
+        return Refusal(f'used under {cfg.used_hours} h ago', f'{what} changed {int(max(facts.now - used, 0) // 3600)} h ago'), ''
+    return None, (f'{numbers(holding)} merged {days_text(int(since // DAY))} ago, {where}, every commit it and its '
+                  'reflog name is on GitHub')
+
+
+def branch_answers(cfg, facts, repo, clone, only=None):
+    """[(branch, oid, refusal, why)] for each local branch of a clone of the repository that a `branches` pattern
+    names and no worktree has checked out, rebases or bisects (such a branch is its worktree's: the worktree goes
+    first, the branch in a later run). `only`: that branch alone. Raises Unreadable when git or GitHub cannot answer
+    for the clone."""
+    git_dir = os.path.join(clone, '.git')
+    branches = {name: oid for name, oid in local_branches(clone).items()
+                if matches(name, repo.branches) and (only is None or name == only)}
+    if not branches:
+        return []
+    out = {entry['branch'][len('refs/heads/'):] for entry in worktree_list(clone)
+           if entry.get('branch', '').startswith('refs/heads/')}
+    branches = {name: oid for name, oid in branches.items() if name not in out and not branch_busy(git_dir, name)}
+    if not branches:
+        return []
+    refusal = clone_keeps(cfg, clone)
+    here_urls = [url for url in remote_urls(clone, 'origin') if not elsewhere(url)] if refusal is None else []
+    if here_urls:
+        refusal = Refusal('origin on this machine', f'{here_urls[0]}: what it has does not count as on GitHub')
+    if refusal is not None:
+        return [(name, oid, refusal, '') for name, oid in sorted(branches.items())]
+    prs = facts.prs(repo.github)
+    default = default_branch(clone)
+    refs = remote_refs(clone, 'origin', '--heads', '--tags')
+    on_github = present(clone, [row['headRefOid'] for row in prs['merged'] + prs['open']] + list(refs.values()))
+    main = refs.get('refs/heads/' + default)
+    answers = []
+    for name, oid in sorted(branches.items()):
+        try:
+            refusal, why = branch_refusal(cfg, facts, clone, git_dir, name, oid, prs, default, on_github, main)
+        except Unreadable as ex:
+            refusal, why = Refusal('could not read', f'git: {ex}'), ''
+        answers.append((name, oid, refusal, why))
+    return answers
+
+
+def plan_branches(cfg, facts, repo, clone, plan):
+    try:
+        answers = branch_answers(cfg, facts, repo, clone)
+    except Unreadable as ex:
+        plan.kept.append(Kept(f'branches in {clone}', 'worktrees', 'could not read', str(ex), 0))
+        return
+    for name, oid, refusal, why in answers:
+        if refusal is not None:
+            plan.kept.append(Kept(branch_label(clone, name), 'worktrees', refusal.code, refusal.detail, 0))
+        else:
+            plan.items.append(Item('branch', clone, 'worktrees', why, 0, branch=name, oid=oid))
+
+
+def recheck_branch(cfg, facts, item):
+    """The branch read again: the commit it points at now is the one the delete removes it at."""
+    for repo in cfg.repos:
+        if repo.root == os.path.dirname(item.path) and repo.merged_branches:
+            try:
+                if tree_kind(item.path) != 'clone' or not same_repo(origin_url(item.path), repo.github):
+                    return Refusal('not a candidate', f'no longer a clone of {repo.github}')
+                answers = branch_answers(cfg, facts, repo, item.path, only=item.branch)
+            except Unreadable as ex:
+                return Refusal('could not read', str(ex))
+            if not answers:
+                return Refusal('not a candidate', 'it is gone, checked out, rebased or bisected, or no pattern names it')
+            _, item.oid, refusal, _ = answers[0]
+            return refusal
+    return Refusal('not a candidate', 'no repository in the machine file deletes merged branches in this folder')
+
+
+def delete_branch(item):
+    remove_branch(item.path, item.branch, item.oid)
+
+
 # --- all rules ----------------------------------------------------------------------------------------------------
 # The rules, by the name each one writes on what it plans: the one list of them. The disk report (report.py) needs
 # a class for each (config.CLASSES), and report.test.py fails for a rule here that has none.
 RULES = {'worktrees': plan_worktrees, 'docker': plan_docker, 'tmp': plan_tmp, SCRATCH: plan_scratch,
          compress.RULE: compress.plan_compress}
-# Kinds whose step never leaves a path half gone (compress.py: the original or its checked copy is always there),
-# so the journal of deletes in progress does not name them. WORDS: what the engine says of them (plan, run, done)
-# and NOUNS what it counts them as.
-UNJOURNALED = ('compress', 'part')
+# Kinds whose step never leaves a path half gone (compress.py: the original or its checked copy is always there; a
+# branch: one git step on a ref, and its clone stays), so the journal of deletes in progress does not name them.
+# WORDS: what the engine says of them (plan, run, done) and NOUNS what it counts them as.
+UNJOURNALED = ('compress', 'part', 'branch')
 WORDS = {'compress': ('would compress', 'compressing', 'compressed')}
-NOUNS = {'compress': 'file', 'part': 'part file'}
+NOUNS = {'compress': 'file', 'part': 'part file', 'branch': 'branch'}
 
 
 def plan(cfg, facts, measure=False):
@@ -1183,6 +1358,8 @@ def recheck(cfg, facts, item):
         return recheck_volume(cfg, facts, item)
     if item.kind in ('worktree', 'clone'):
         return recheck_tree(cfg, facts, item)
+    if item.kind == 'branch':
+        return recheck_branch(cfg, facts, item)
     if item.kind in ('compress', 'part'):
         return compress.recheck(cfg, facts, item)
     if item.kind == 'session':
@@ -1203,5 +1380,5 @@ def recheck(cfg, facts, item):
 
 
 def delete(item):
-    {'path': delete_path, 'session': delete_path, 'worktree': delete_worktree, 'clone': delete_clone,
+    {'path': delete_path, 'session': delete_path, 'worktree': delete_worktree, 'clone': delete_clone, 'branch': delete_branch,
      'volume': lambda i: remove_volume(i.path), 'compress': compress.compress, 'part': compress.remove_part}[item.kind](item)

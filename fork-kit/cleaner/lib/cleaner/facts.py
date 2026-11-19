@@ -1,8 +1,8 @@
 """What the cleaner reads about the machine: the process list, systemd units, git, GitHub and Docker.
 
 One rule for every reader here: no answer means keep. A reader that cannot give a full answer raises Unreadable,
-and whoever asked keeps the thing it asked about. Nothing in this file changes anything, except remove_worktree and
-remove_volume at the very end, which the engine calls after every check has passed again.
+and whoever asked keeps the thing it asked about. Nothing in this file changes anything, except remove_worktree,
+remove_branch and remove_volume, which the engine calls after every check has passed again.
 """
 import calendar, errno, fnmatch, ipaddress, json, os, re, socket, stat, subprocess, time
 
@@ -531,6 +531,19 @@ def local_tags(cwd, bare=False):
     return tags
 
 
+def local_branches(cwd):
+    """{name: oid} of the repository's own branches (refs/heads). A branch that is a symbolic ref is left out: it
+    names another branch and is no branch of its own."""
+    branches = {}
+    for line in git(cwd, 'for-each-ref', '--format=%(objectname)%09%(symref)%09%(refname)', 'refs/heads').splitlines():
+        oid, symref, ref = (line.split('\t') + ['', ''])[:3]
+        if not OID.match(oid) or not ref.startswith('refs/heads/'):
+            raise Unreadable(f'for-each-ref: a line it cannot use: {line[:80]!r}')
+        if not symref:
+            branches[ref[len('refs/heads/'):]] = oid
+    return branches
+
+
 def remotes(cwd, bare=False):
     """The names of the remotes in the repository's own config that have a URL."""
     out = set()
@@ -604,6 +617,21 @@ def remove_worktree(common_dir, path):
         # failure while removing says "failed to delete", and a killed git has no exit code of its own.
         refused = done.returncode == 128 and 'failed to delete' not in done.stderr
         raise (Untouched if refused else Unreadable)(f'worktree: exit {done.returncode}: {_first_line(done.stderr)}')
+
+
+def remove_branch(cwd, branch, oid):
+    """Deletes the local branch (and its reflog) with `git update-ref -d` only while it still points at `oid`, the
+    commit the last check judged: a branch that moved since is left as it is (Untouched, exit 1). Then its config
+    section (`branch.<name>.*`, its upstream), as `git branch -d` does; none is fine."""
+    done = _git(cwd, ('update-ref', '--no-deref', '-d', 'refs/heads/' + branch, oid), False, None)
+    if done.returncode != 0:
+        refused = done.returncode == 1  # expected oid
+        raise (Untouched if refused else Unreadable)(f'update-ref: exit {done.returncode}: {_first_line(done.stderr)}'
+                                                     + (': nothing removed' if refused else ''))
+    done = _git(cwd, ('config', '--local', '--remove-section', 'branch.' + branch), False, None)
+    if done.returncode != 0 and 'no such section' not in done.stderr:
+        raise Unreadable(f'the branch is deleted; its config section branch.{branch} stays: config: exit '
+                         f'{done.returncode}: {_first_line(done.stderr)}')
 
 
 # --- GitHub -------------------------------------------------------------------------------------------------------

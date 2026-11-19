@@ -43,6 +43,7 @@ class Look:
         self.ident, self.seen = None, set()
         self.linked = set()         # the inodes in `seen` of files with several hard links
         self.checked = None         # agent-scratch: when the last liveness check began (rules.clock); see _clear
+        self.orphans = []           # tmp: (where, its gone git folder) of each orphaned worktree passed over in it
 
 
 def changed(st):
@@ -186,7 +187,7 @@ def _in_use(facts, path, inodes):
     return None
 
 
-def _check(cfg, facts, path, kind, look):
+def _check(cfg, facts, path, kind, look, orphans):
     root = os.path.dirname(path)
     if not (root in cfg.roots() or cfg.session_parent(root)) or os.path.normpath(path) != path:
         return Refusal('not in a configured root', 'only what is directly in a configured folder may go')
@@ -294,8 +295,12 @@ def _check(cfg, facts, path, kind, look):
         for where, bare in gits:
             gone = None if bare else orphaned_worktree(where)
             if gone is not None:
-                # A worktree whose main repository is gone: git cannot judge it, now or later. It is kept, as
-                # "could not read" would keep it, but under its own name: it is no error, and no run will change it.
+                # A worktree whose git folder is gone: its commits, index and HEAD were there, so the folder holds
+                # files and no commit (#519). The tmp rule (`orphans`) judges it as a plain folder; any other asker
+                # keeps it under its own name, no error, as no run will change it.
+                if orphans:
+                    look.orphans.append((os.path.relpath(where, path), gone))
+                    continue
                 return Refusal('orphaned worktree', f'{os.path.relpath(where, path)}: its git folder {gone} is gone')
             refusal = _git_refusal(path, where, bare)
             if refusal is None and (bare or os.path.isdir(os.path.join(where, '.git'))):
@@ -310,11 +315,12 @@ def _check(cfg, facts, path, kind, look):
     return _in_use(facts, path, inodes)
 
 
-def examine(cfg, facts, path, kind='path'):
+def examine(cfg, facts, path, kind='path', orphans=False):
     """Look at one path a rule wants to delete. `kind` is 'path' (a file or folder of no known kind: every git
-    folder in it must be clean and pushed), 'worktree' or 'clone' (the worktrees rule has asked git itself)."""
+    folder in it must be clean and pushed), 'worktree' or 'clone' (the worktrees rule has asked git itself).
+    `orphans` (the tmp rule): a worktree in it whose git folder is gone holds no commit and is passed over."""
     look = Look()
-    look.refusal = _check(cfg, facts, path, kind, look)
+    look.refusal = _check(cfg, facts, path, kind, look, orphans)
     return look
 
 

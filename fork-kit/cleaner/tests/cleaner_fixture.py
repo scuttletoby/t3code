@@ -161,6 +161,10 @@ class Case(unittest.TestCase):
         unused = mock.patch.object(self.c.rules, 'last_used', lambda path, git_dir, look: (0.0, 'nothing'))
         unused.start()
         self.addCleanup(unused.stop)
+        self.real_branch_used = self.c.rules.branch_used          # the same for a branch (#519)
+        unused = mock.patch.object(self.c.rules, 'branch_used', lambda git_dir, branch: (0.0, 'nothing'))
+        unused.start()
+        self.addCleanup(unused.stop)
 
     def close(self):
         for root, dirs, _ in os.walk(self.dir):
