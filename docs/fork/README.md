@@ -261,8 +261,35 @@ Named MCP profiles. A profile says which outside MCP servers (`servers`) and whi
 own tools (`t3Tools`) a thread gets; each is `"all"` or a list. Two profiles are built in: `all`
 (everything, today's behaviour) and `t3-only` (no outside servers, every T3 tool); a profile cannot
 take their names, and one written in by hand makes that built-in refuse threads until it is removed
-(a save may send `null` under a built-in name to remove it) or renamed. Nothing applies a profile
-yet: the provider adapters and the T3 tool filter come in later pull requests.
+(a save may send `null` under a built-in name to remove it) or renamed.
+
+A Claude thread applies the profile's `servers`: `[]` (and `t3-only`) starts Claude without any MCP
+server of its own (its config files, plugins and claude.ai connectors), and a list keeps only the
+servers it names, written as Claude lists them (`claude.ai Calendar`). T3's own tools stay. A Claude
+thread whose profile cannot be applied does not start its turn and says why: a missing or broken
+profile, a parent thread that cannot be read, a `settings.json` T3 cannot read (when only a
+provider secret cannot be read, the profile comes from `settings.json` alone and the server log
+says so; with no profile set there, the thread gets `all` as before), a profile whose
+`t3Tools` is not `"all"` (the T3 tool filter comes in a later pull request), or a session that
+still shows a server the profile leaves out, or does not list its servers within 5 minutes. A
+managed Claude policy on the machine or `--mcp-config` in the Claude launch arguments can make
+Claude load a server T3's list leaves out. Other providers do not apply profiles yet.
+
+Each tool call is checked too: a call to an MCP server the profile leaves out (also one an agent
+file declares, or one added while the session runs) is refused at the moment of the call: Claude
+gets the reason as the call's result, and the turn goes on. That covers its tools, its resources
+(a resource listing that names no server is refused, as it would list every server's), and a
+`Skill` call naming `mcp__<server>__…`, the form of a skill an MCP server serves. Where Claude does
+not name the server it calls, the tool name's prefix is matched, so a server named like
+`docs__x`, or `my_docs` under a profile that names `my.docs`, passes. With the `all` profile
+nothing is checked. A
+profile change applies from the thread's next turn: a running turn, and a message sent into it,
+keep the session it started with.
+
+A task delegated to another machine has no parent thread there, so it gets that machine's profile
+for its role (`mcpSubagentProfile`, else `mcpProfile`), not the delegating thread's: server names on
+two machines need not mean the same servers. Carrying the parent's profile along is
+[#532](https://github.com/scuttletoby/t3code/issues/532).
 
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
@@ -279,7 +306,8 @@ one (for example after a hand edit) is refused instead of getting `all`.
 ### `server.mcpSubagentProfile`
 
 The profile a delegated child gets when nobody picked one for it. `inherit` (the default) gives it
-its parent's profile. A child never gets more than its parent.
+its parent's profile. A child on the same machine never gets more than its parent; a task
+delegated from another machine gets this machine's profile (see `server.mcpProfiles`).
 
 ### `server.mcpThreadProfiles`
 
