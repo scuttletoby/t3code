@@ -12,6 +12,9 @@ import { SettingsPageContainer, SettingsRow, SettingsSection } from "../settings
 import { useSearchableSetting } from "../settingsSearch";
 import { WaitsAndSlotsSettings } from "../WaitsAndSlotsSettings";
 import { forkFeatureStatuses } from "./forkStatus.logic";
+import { HandoffSettings } from "./HandoffSettings";
+import { PlaytestSettings } from "./PlaytestSettings";
+import { UpdatesSettings } from "./UpdatesSettings";
 import { ModelPolicySettings } from "./ModelPolicySettings";
 import { UsagePacingSettings } from "./UsagePacingSettings";
 
@@ -41,6 +44,10 @@ export function ForkSettingsPanel() {
       <ForkGroup title="Reviews">
         <ReviewRulesSettings isProjectScope={isProjectScope} />
       </ForkGroup>
+      {isProjectScope ? null : <UpdatesSettings />}
+      <HandoffSettings isProjectScope={isProjectScope} />
+      <PlaytestSettings isProjectScope={isProjectScope} />
+      {/* MCP profiles (server.mcpProfiles and the profile picks) get their section here. */}
     </SettingsPageContainer>
   );
 }
