@@ -337,20 +337,24 @@ jobs:
             /apps/server/src/cli/forkReport.ts
             /apps/server/src/cli/server.ts
             /apps/server/src/cli/servicePreflight.ts
+            /apps/server/src/cli/sshHelper.ts
             /apps/server/src/cli/update.ts
             /apps/server/src/cloud/bootService.ts
             /apps/server/src/cloud/pinnedRuntime.ts
             /apps/server/src/cloud/servicePreflight.ts
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
+            /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/persistence/Sqlite.ts
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
             /apps/server/src/usage/UsagePacingGate.ts
+            /packages/contracts/src/desktopBootstrap.ts
             /packages/shared/src/cliRelease.ts
             /packages/shared/src/model.ts
+            /packages/ssh/src/tunnel.ts
           sparse-checkout-cone-mode: false
 
       # Pinned release, verified by checksum. Upstream's own workflows use runner
@@ -430,18 +434,22 @@ jobs:
             /apps/server/src/cli/forkReport.ts
             /apps/server/src/cli/server.ts
             /apps/server/src/cli/servicePreflight.ts
+            /apps/server/src/cli/sshHelper.ts
             /apps/server/src/cloud/bootService.ts
             /apps/server/src/cloud/servicePreflight.ts
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
+            /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/persistence/Sqlite.ts
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
             /apps/server/src/usage/UsagePacingGate.ts
+            /packages/contracts/src/desktopBootstrap.ts
             /packages/shared/src/cliRelease.ts
             /packages/shared/src/model.ts
+            /packages/ssh/src/tunnel.ts
           sparse-checkout-cone-mode: false
 
       # These tests, checked against .github/fork-ci-tests.txt as in `workflows`.
@@ -478,20 +486,24 @@ jobs:
             /apps/server/src/cli/forkReport.ts
             /apps/server/src/cli/server.ts
             /apps/server/src/cli/servicePreflight.ts
+            /apps/server/src/cli/sshHelper.ts
             /apps/server/src/cli/update.ts
             /apps/server/src/cloud/bootService.ts
             /apps/server/src/cloud/pinnedRuntime.ts
             /apps/server/src/cloud/servicePreflight.ts
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
+            /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/persistence/Sqlite.ts
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
             /apps/server/src/usage/UsagePacingGate.ts
+            /packages/contracts/src/desktopBootstrap.ts
             /packages/shared/src/cliRelease.ts
             /packages/shared/src/model.ts
+            /packages/ssh/src/tunnel.ts
           sparse-checkout-cone-mode: false
 
       # The tests under fork-kit, checked against .github/fork-ci-tests.txt as in `workflows`.
