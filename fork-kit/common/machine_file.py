@@ -15,7 +15,8 @@ Shape: {"version": 1, "<kit folder name>": {...}, ...}, camelCase keys. Rules, a
 - a JSON object with no key given twice whose "version" is a whole number this loader knows (1);
 - no secrets: a key whose name says secret, token, password or private key holds only "file:<path>";
 - a kit reads "version" and its own section only; a missing section, an unknown key in it or a value of the
-  wrong type is refused, with the reason named.
+  wrong type is refused, with the reason named. A kit that works without settings (heavy's memory queue) asks with
+  optional=True: then a missing file or section is None, and every other rule still refuses.
 
 Tools never write it. Kits call read_section() and then fields() for each object in their section.
 Plain Python 3 standard library; each kit's installer copies this file into its version folder.
@@ -151,13 +152,16 @@ def read_protected_text(path, owner_uid=0):
         raise MachineFileError(f'{path}: cannot be read ({e.strerror or e})') from None
 
 
-def read_section(kit, path=None, owner_uid=0):
+def read_section(kit, path=None, owner_uid=0, optional=False):
     """The kit's section (a dict). Raises MachineFileError for every rule above. `path` and `owner_uid` are for
-    tests; shipped commands use the default path and root."""
+    tests; shipped commands use the default path and root. optional=True: None when the file or the section is not
+    there (a link, a bad owner or a bad mode on the way is still refused)."""
     path = path or default_path()
     try:
         text = _read(path, owner_uid)
     except FileNotFoundError:
+        if optional:        # the file or a folder on its way is not there; the folders that are were checked
+            return None
         raise MachineFileError(f'{path}: not there (the owner writes it; see fork-kit/common/README.md)') from None
     except OSError as e:
         raise MachineFileError(f'{path}: cannot be read ({e.strerror or e})') from None
@@ -178,6 +182,8 @@ def read_section(kit, path=None, owner_uid=0):
     if version < 1:
         raise MachineFileError(f'{path}: bad version {version}')
     if kit not in data:
+        if optional:
+            return None
         raise MachineFileError(f'{path}: no "{kit}" section')
     section = data[kit]
     if not isinstance(section, dict):

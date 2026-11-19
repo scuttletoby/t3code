@@ -34,8 +34,8 @@ INSTALLER = '/usr/local/sbin/heavy-install'
 UNIT_DIR = '/etc/systemd/user'
 LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install'}
 
-SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'common/machine_file.py',
-                'systemd/heavy-sweep.service', 'systemd/heavy-sweep.timer')
+SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'lib/heavy_queue.py',
+                'common/machine_file.py', 'systemd/heavy-sweep.service', 'systemd/heavy-sweep.timer')
 SWEEP_UNITS = ('heavy-sweep.service', 'heavy-sweep.timer')
 UNIT_HEADER = '# heavy kit: written by heavy-install.'
 EXECUTABLE = {'bin/heavy', 'sbin/heavy-install'}
@@ -335,7 +335,7 @@ def install(a, stop_after=None):
     dest = copy_tool(os.path.realpath(a.source), a.sha)
     done('copy')
     problems = tree_problems(dest)
-    for args in (['--help'], ['sweep', '--help']):
+    for args in (['--help'], ['sweep', '--help'], ['queue', '--help']):
         r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', 'heavy'), *args],
                            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
         if r.returncode != 0 or 'heavy' not in r.stdout:
