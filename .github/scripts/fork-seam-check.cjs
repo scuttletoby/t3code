@@ -190,10 +190,12 @@ function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, toda
     };
     // The hint only where the base branch's newer copies alone make these too many: judged from
     // the merge-base (the copies the announcement allows in date), the branch would pass.
-    const adds = (copies, line, added) =>
+    // `counts` is the allowance the copies are judged by: in date for `late`, else `allowed` (an
+    // expired announcement allows nothing from the merge-base either, so updating would not help).
+    const adds = (copies, line, added, counts) =>
       `${file}: adds ${copies === 1 ? "" : `${copies}× `}\`${line}\`${
         (tipCounts.get(line) ?? 0) > (baseCounts.get(line) ?? 0) &&
-        added <= (inDate.get(line) ?? 0) - (baseCounts.get(line) ?? 0)
+        added <= (counts.get(line) ?? 0) - (baseCounts.get(line) ?? 0)
           ? " (the base branch has more copies than this branch's merge-base: update the branch from its base)"
           : ""
       }`;
@@ -209,10 +211,10 @@ function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, toda
           ? "is dated after"
           : `is more than ${ANNOUNCED_DAYS} days before`;
         lateReasons.push(
-          `${adds(lateCopies, line, added)} (its announcement of ${since} ${when} ${today}, the list's commit date: announce it again with a list-only pull request)`,
+          `${adds(lateCopies, line, added, inDate)} (its announcement of ${since} ${when} ${today}, the list's commit date: announce it again with a list-only pull request)`,
         );
       }
-      if (extra > lateCopies) reasons.push(adds(extra - lateCopies, line, added));
+      if (extra > lateCopies) reasons.push(adds(extra - lateCopies, line, added, allowed));
     }
   }
   return reasons;
@@ -260,8 +262,9 @@ const AFTER_REBASE_RISE =
 /**
  * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed` names it).
  * A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase `notes`; exceeded:
- * `rises`); on a PR it may not grow, and a shrink sets its ceiling in `ownPending` to exactly what is left
- * (or moves the file to `ownFiles`).
+ * `rises`); on a PR it may not grow, and a change to it sets its ceiling in `ownPending` to exactly what
+ * is left, counting the upstream lines it puts back from `ownLost` (or, with none left, moves it to
+ * `ownFiles`).
  * `lowered.pending` gets the count each too-high ceiling from upstream lowers to.
  */
 function findUnlistedChanges(
@@ -276,6 +279,7 @@ function findUnlistedChanges(
     afterRebase = false,
     ownPending,
     ownFiles = {},
+    ownLost = {},
     lowered,
   },
 ) {
@@ -348,26 +352,56 @@ function findUnlistedChanges(
       reasons.push(
         `${file}: "pending" (fork lines to move out), and this change adds ${grows} more line${grows === 1 ? "" : "s"} than it removes.`,
       );
-    } else if (grows < 0 && ownPending !== undefined && !Object.hasOwn(ownFiles, file)) {
-      // Main sits at its ceiling, so a change that moves fork lines out must set it to what is
-      // left, in its own list: left too high, the next run from upstream refuses main and the spare
-      // room could later admit a fork line; set lower or dropped, that run refuses main for the
-      // lines still there. The change's own list is read only to refuse (never a wider gate). This
-      // run cannot tell fork lines from upstream's, so the text names both; the run from upstream
-      // holds "lost" counts exact. A change that moves the file to "files" is judged there, by
-      // the run from upstream.
-      const want = Math.max(ceiling + grows, 0);
-      const listed = Object.hasOwn(ownPending, file);
-      const own = listed ? ownPending[file] : 0;
-      if (own !== want) {
-        const removes = `${-grows} more line${grows === -1 ? "" : "s"} than it adds (keep upstream's lines; if they are fork lines moved out)`;
-        const has = listed ? `its list has ${own}` : "its list drops it";
+      continue;
+    }
+    if (ownPending === undefined) continue;
+    // Main sits at its ceiling, so a change to the file sets it to exactly what is left, in its own
+    // list: left too high, the next run from upstream refuses main and the spare room could later
+    // admit a fork line; set lower or dropped, that run refuses main for the lines still there.
+    // This run cannot tell fork lines from upstream's, but per line text fork lines less "gone"
+    // ones is head's copies less upstream's, so the fork lines change by the lines gained less the
+    // change in "gone": an upstream line put back is a fork line fewer that the line count misses.
+    // Main's "gone" is exact (the run from upstream holds it); the change's own is held there too,
+    // so a wrong one stops that run either way. The own list is read only to refuse (never a wider
+    // gate). A list-only change (the file's text unchanged) is not held: it may correct main.
+    const goneOf = (lost) =>
+      lost !== undefined && Object.hasOwn(lost, file) ? lost[file].gone : 0;
+    const mainGone = goneOf(config.lost);
+    const ownGone = goneOf(ownLost);
+    const moved = Object.hasOwn(ownFiles, file) && !Object.hasOwn(ownPending, file);
+    const edited = base !== head;
+    if (!edited && !moved) continue;
+    const want = Math.max(edited ? ceiling + grows + ownGone - mainGone : ceiling, 0);
+    const parts = [];
+    if (grows < 0) {
+      parts.push(
+        `removes ${-grows} more line${grows === -1 ? "" : "s"} than it adds (keep upstream's lines; if they are fork lines moved out)`,
+      );
+    }
+    if (ownGone !== mainGone) {
+      parts.push(
+        `its own "lost" names ${ownGone} upstream line${ownGone === 1 ? "" : "s"} gone where main's names ${mainGone} (an upstream line put back is a fork line fewer)`,
+      );
+    }
+    const does = parts.length > 0 ? parts.join(", and ") : "changes its lines";
+    if (moved) {
+      // In "files" with "added": [] it may hold no fork line: only an empty file may move there.
+      if (want > 0) {
         ceilings.push(
-          want > 0
-            ? `${file}: "pending" with a ceiling of ${ceiling}, and this change removes ${removes}: set it to ${want} in this change's ${CONFIG} (${has}; main holds its ceiling exactly).`
-            : `${file}: "pending" with a ceiling of ${ceiling}, and this change removes ${removes}: remove it from "pending" in this change's ${CONFIG} (${has}).`,
+          `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}, but moves it to "files" in this change's ${CONFIG} while ${want} fork line${want === 1 ? " is" : "s are"} left: keep it in "pending" with a ceiling of ${want} (only a file with no fork line left moves to "files").`,
         );
       }
+      continue;
+    }
+    const listed = Object.hasOwn(ownPending, file);
+    const own = listed ? ownPending[file] : 0;
+    if (own !== want) {
+      const has = listed ? `its list has ${own}` : "its list drops it";
+      ceilings.push(
+        want > 0
+          ? `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}: set it to ${want} in this change's ${CONFIG} (${has}; main holds its ceiling exactly).`
+          : `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}: remove it from "pending" in this change's ${CONFIG} (${has}).`,
+      );
     }
   }
   return { reasons, ceilings, rises, notes };
@@ -937,9 +971,10 @@ function main(argv) {
   // list (read only for that: a lower ceiling never widens the gate).
   let ownPending;
   let ownFiles;
+  let ownLost;
   if (!upstream && listProblem === undefined && ownList !== undefined) {
     try {
-      ({ pending: ownPending, files: ownFiles } = parseConfig(ownList));
+      ({ pending: ownPending, files: ownFiles, lost: ownLost } = parseConfig(ownList));
     } catch {
       ownPending = undefined; // The list judged it is main's; a malformed own one is said below.
     }
@@ -956,6 +991,7 @@ function main(argv) {
     afterRebase: parsed.afterRebase,
     ownPending,
     ownFiles,
+    ownLost,
     lowered,
   });
   const lost = findLostLines(config, {

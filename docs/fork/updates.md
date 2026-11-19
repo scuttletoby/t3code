@@ -60,11 +60,14 @@ watches; it changes nothing on the machine, and `0` turns it off.
   later run. `pending` maps upstream files
   whose fork lines predate the rule to a ceiling: the most fork lines each may hold, counted from
   upstream (fork-follow fails above it and below it). So a pull request that moves fork lines out
-  of a pending file lowers its ceiling in its own list, in the same change: its run refuses one
-  that removes more lines than it adds unless its own ceiling is exactly main's minus that many (or
-  the entry is gone when none are left, or the file moved to `files`): left higher, the next run
-  from upstream refuses main for the spare room; set lower or dropped, for the lines still there. It
-  reads its own list only to refuse, never to widen the gate. Right after a rebase,
+  of a pending file lowers its ceiling in its own list, in the same change: its run refuses a
+  change to the file unless its own ceiling is exactly main's, plus the lines it adds, less the
+  lines it removes, less the upstream lines it puts back (main's `lost` `gone` less its own), since
+  per line text fork lines less gone ones is the copies over upstream's. With none left the entry
+  goes, or moves to `files` with `"added": []` (only then: a move while fork lines are left is
+  refused). Left higher, the next run from upstream refuses main for the spare room; set lower or
+  dropped, for the lines still there. It reads its own list only to refuse, never to widen the
+  gate, and does not hold a list-only change (the file's text unchanged), which may correct main. Right after a rebase,
   below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops
   it, and the ceiling could not have been lowered first. fork-follow then lowers it itself, in a
   commit of its own on the rebased series ("fork seams: lower counts after the rebase onto …", each
