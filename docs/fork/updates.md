@@ -99,7 +99,12 @@ watches; it changes nothing on the machine, and `0` turns it off.
   in no list may gain no line, lose no line and keep its lines in order and indentation (trailing
   blanks and blank lines aside), and no upstream file may be deleted or renamed, except the workflows
   [`fork-removed-workflows.txt`](../../.github/fork-removed-workflows.txt) lists and upstream
-  `fork-*.yml`. A submodule pointer counts as a line. A pull request's run has no upstream commit,
+  `fork-*.yml`. A submodule pointer counts as a line. `apps/web/src/routeTree.gen.ts` is TanStack's
+  output from `apps/web/src/routes/`: in a change that also changes a route file it is not judged
+  line by line (a fork route's lines repeat upstream's), and
+  [`forkRouteTree.test.ts`](../../apps/web/src/forkRouteTree.test.ts) refuses a committed tree that
+  is not the generator's output for the committed routes. On a rebase conflict there, take either
+  side and regenerate it (`vp run dev` or a build writes it), then commit it. A pull request's run has no upstream commit,
   so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
   for the fork's own; from upstream, a pattern that matches an upstream file fails. Then remove the
   entry (or exclude a fork-named path with `!path`): from then on a pull request's run judges the

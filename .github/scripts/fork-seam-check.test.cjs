@@ -211,6 +211,34 @@ test("from upstream, a fork pattern that matches an upstream file fails until ex
   );
 });
 
+test("the route tree is judged as generated output: with a route change and its proof test, or line by line", () => {
+  const TREE = "apps/web/src/routeTree.gen.ts";
+  const PROOF = "apps/web/src/forkRouteTree.test.ts";
+  const ROUTE = "apps/web/src/routes/_chat.settings.fork.tsx";
+  const tree = "const A = AImport.update({\n  getParentRoute: () => Root,\n} as any)\n";
+  // A fork route's block repeats upstream's lines, which no seam entry can list.
+  const forkTree = `${tree}const Fork = ForkImport.update({\n  getParentRoute: () => Root,\n} as any)\n`;
+  const base = { [TREE]: tree, [PROOF]: "test\n" };
+  const withRoute = { [TREE]: forkTree, [PROOF]: "test\n", [ROUTE]: "route\n" };
+  for (const upstream of [true, false]) {
+    assert.deepEqual(unlisted({}, base, withRoute, upstream).reasons, [], String(upstream));
+    // Without a route change, a change to the tree is a hand edit, judged like any upstream file.
+    const alone = unlisted({}, base, { ...base, [TREE]: forkTree }, upstream).reasons;
+    assert.equal(alone.length, 1);
+    assert.match(alone[0], /^apps\/web\/src\/routeTree\.gen\.ts: upstream file with 3 fork lines/);
+    const { [PROOF]: _proof, ...noProof } = withRoute;
+    assert.deepEqual(unlisted({}, { [TREE]: tree }, noProof, upstream).reasons, [
+      `${TREE}: generated from apps/web/src/routes/, but this change has no ${PROOF}, the test that proves it is the generator's output.`,
+    ]);
+    // Deleting it is still refused.
+    const { [TREE]: _tree, ...gone } = withRoute;
+    assert.match(
+      unlisted({}, base, gone, upstream).reasons[0],
+      /^apps\/web\/src\/routeTree\.gen\.ts: upstream file this change deletes/,
+    );
+  }
+});
+
 test("a pending file: held to its ceiling from upstream; on a pull request it may change but not grow", () => {
   const config = { pending: { "p.ts": 2 } };
   const main = { "p.ts": `${UP}forkA();\nforkB();\n` };

@@ -13,6 +13,15 @@ const CONFIG = ".github/fork-seams.json";
 const REMOVED = ".github/fork-removed-workflows.txt";
 const REMOVED_PATH = /^\.github\/workflows\/[^/,\s]+\.ya?ml$/;
 const FORK_WORKFLOW = /^\.github\/workflows\/fork-[^/]*\.ya?ml$/;
+// Generated upstream files: the folder each is generated from, and the fork test that proves the
+// file is the generator's output (a hand edit fails it). A fork route repeats upstream's lines
+// (`} as any)`), so the file is not judged line by line when its folder changes too.
+const GENERATED = new Map([
+  [
+    "apps/web/src/routeTree.gen.ts",
+    { source: "apps/web/src/routes/", proof: "apps/web/src/forkRouteTree.test.ts" },
+  ],
+]);
 
 function git(args) {
   return execFileSync("git", ["-c", "core.quotePath=false", ...args], {
@@ -295,6 +304,15 @@ function findUnlistedChanges(
     const head = atHead(file);
     if (head === undefined) {
       if (!removed.has(file) && !FORK_WORKFLOW.test(file)) reasons.push(deleted(file));
+      continue;
+    }
+    const generated = GENERATED.get(file);
+    if (generated !== undefined && changed.some((other) => other.startsWith(generated.source))) {
+      if (atHead(generated.proof) === undefined) {
+        reasons.push(
+          `${file}: generated from ${generated.source}, but this change has no ${generated.proof}, the test that proves it is the generator's output.`,
+        );
+      }
       continue;
     }
     const added = total(addedLines(base, head));
