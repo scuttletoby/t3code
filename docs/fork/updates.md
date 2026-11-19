@@ -64,8 +64,11 @@ watches; it changes nothing on the machine, and `0` turns it off.
   change to the file unless its own ceiling is exactly main's, plus the lines it adds, less the
   lines it removes, less the upstream lines it puts back (main's `lost` `gone` less its own), since
   per line text fork lines less gone ones is the copies over upstream's. With none left the entry
-  goes, or moves to `files` with `"added": []` (only then: a move while fork lines are left is
-  refused). Left higher, the next run from upstream refuses main for the spare room; set lower or
+  goes, or moves to `files` with `"added": []`. With some left it may move to `files` as a
+  declared seam only when the change adds no fork line and the new entry's `added` lists exactly
+  as many copies as are left, each one the file has; the run from upstream then holds every one
+  of them to that entry, and the owner checks they are the right ones, as for any seam entry (a
+  pull request's run has no upstream, so it cannot tell which lines are the fork's). Left higher, the next run from upstream refuses main for the spare room; set lower or
   dropped, for the lines still there. It reads its own list only to refuse, never to widen the
   gate, and does not hold a list-only change (the file's text unchanged), which may correct main. Right after a rebase,
   below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops

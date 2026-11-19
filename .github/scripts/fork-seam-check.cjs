@@ -263,7 +263,7 @@ const AFTER_REBASE_RISE =
  * Changed files outside the seams. An unlisted upstream file may not change or go (unless `removed` names it).
  * A "pending" one holds its ceiling from upstream (too high: `ceilings`, after a rebase `notes`; exceeded: `rises`;
  * `lowered.pending` gets the lowered count). On a PR it may not grow, and a change sets its `ownPending` ceiling to
- * exactly what is left, counting upstream lines put back from `ownLost` (none left: it moves to `ownFiles`).
+ * exactly what is left, counting upstream lines put back from `ownLost`, or moves it to `ownFiles` (listing those lines).
  */
 function findUnlistedChanges(
   config,
@@ -378,11 +378,33 @@ function findUnlistedChanges(
     }
     const does = parts.length > 0 ? parts.join(", and ") : "changes its lines";
     if (moved) {
-      // In "files" with "added": [] it may hold no fork line: only an empty file may move there.
-      if (want > 0) {
+      // With fork lines left, a move only reclassifies them: the change adds no fork line, and its
+      // new entry's "added" lists exactly the copies left, each one the file has (a further line is
+      // announced first). The run from upstream holds each fork line to that entry; which lines
+      // they are, this run cannot tell (it has no upstream), so a wrong one is refused there.
+      if (want === 0) continue;
+      const lines = (count) => `${count} fork line${count === 1 ? " is" : "s are"}`;
+      if (want > ceiling) {
         ceilings.push(
-          `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}, but moves it to "files" in this change's ${CONFIG} while ${want} fork line${want === 1 ? " is" : "s are"} left: keep it in "pending" with a ceiling of ${want} (only a file with no fork line left moves to "files").`,
+          `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}, and moves it to "files" in this change's ${CONFIG}, but ${lines(want)} left: a move only reclassifies the lines left, so make the change without one more fork line, or keep it in "pending".`,
         );
+        continue;
+      }
+      const declared = lineCounts(ownFiles[file].added.join("\n"));
+      const there = lineCounts(head);
+      const listed = [...declared.values()].reduce((sum, count) => sum + count, 0);
+      if (listed !== want) {
+        ceilings.push(
+          `${file}: "pending" with a ceiling of ${ceiling}, and this change ${does}, but moves it to "files" in this change's ${CONFIG} while ${lines(want)} left: keep it in "pending" with a ceiling of ${want}, or list exactly those ${want === 1 ? "line" : `${want} lines`} under "added" in its new entry (it lists ${listed}; a move only reclassifies the lines left, and a new one is announced first).`,
+        );
+      }
+      for (const [line, count] of declared) {
+        const has = there.get(line) ?? 0;
+        if (has < count) {
+          ceilings.push(
+            `${file}: moved to "files" in this change's ${CONFIG}, whose "added" lists \`${line}\`${count === 1 ? "" : ` ${count}×`}, but the file has ${has === 0 ? "no copy" : `${has}×`}: list only the fork lines the file has.`,
+          );
+        }
       }
       continue;
     }
