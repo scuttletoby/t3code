@@ -93,6 +93,15 @@ export function backoffMs(intervalMs: number, failures: number): number {
   return Math.min(intervalMs * 2 ** failures, Math.max(MAX_BACKOFF_MS, intervalMs));
 }
 
+/**
+ * A failure streak whose retry is overdue by more than this is over: the instance went that long
+ * without a refresh of ours (skipped while signed out, refreshed by a client, a locked host), so
+ * a failure now is a new outage. The longest backoff is far beyond a sweep that merely runs late.
+ */
+function streakExpiryMs(intervalMs: number): number {
+  return Math.max(MAX_BACKOFF_MS, intervalMs);
+}
+
 /** Room for a sweep that runs late: scheduler ticks, and another instance refreshed first. */
 const SWEEP_SLACK_MS = REFRESH_TIMEOUT_MS + 60 * 1000;
 
@@ -141,9 +150,15 @@ export const make = Effect.fn("HeadlessUsageRefresher.make")(function* (deps: Re
     const after = yield* target.snapshot.getSnapshot;
     const timedOut = Exit.isSuccess(exit) && Option.isNone(exit.value);
     const ok = Exit.isSuccess(exit) && !timedOut && gotNewReading(before, after);
-    const previous = failing.get(target.instanceId);
+    const recorded = failing.get(target.instanceId);
+    const previous =
+      recorded !== undefined && nowMs - recorded.retryAtMs > streakExpiryMs(intervalMs)
+        ? undefined
+        : recorded;
     if (ok) {
-      yield* endStreak(target.instanceId);
+      // An expired streak is already over: drop it without a "works again".
+      if (previous === undefined) failing.delete(target.instanceId);
+      else yield* endStreak(target.instanceId);
       return;
     }
     const failures = (previous?.failures ?? 0) + 1;
