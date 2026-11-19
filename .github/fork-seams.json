@@ -141,7 +141,7 @@
       ]
     },
     "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": {
-      "why": "MCP profiles part 2: a Claude thread's MCP profile is applied to its session (strict MCP mode or an allowlist of outside servers, from apps/server/src/fork/claudeMcpProfile.ts), is part of the live-query key, and refuses the turn when it cannot be applied. Additions only; tested in apps/server/src/fork/claudeMcpProfile.adapter.test.ts.",
+      "why": "MCP profiles part 2: a Claude thread's MCP profile is applied to its session (strict MCP mode or an allowlist of outside servers, from apps/server/src/fork/claudeMcpProfile.ts), is part of the live-query key, refuses the turn when it cannot be applied, and adds a PreToolUse hook (merged into the adapter's hooks) that refuses a call to a server outside the profile. Additions only; tested in apps/server/src/fork/claudeMcpProfile.adapter.test.ts.",
       "added": [],
       "announced": {
         "since": "2026-11-19",
@@ -155,7 +155,8 @@
           "const mcpProfile = yield* mcpProfiles(turnInput.appThread, mcpOverrides);",
           "const checkMcpProfile = ClaudeMcpProfile.checkClaudeSession(mcpProfile, mcpOverrides);",
           "mcpProfileOptions: mcpProfile.options,",
-          "Effect.tap(checkMcpProfile),"
+          "Effect.tap(checkMcpProfile),",
+          "...input.mcpProfileOptions?.hooks,"
         ]
       }
     },
