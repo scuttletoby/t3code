@@ -625,7 +625,8 @@ class WayBack(SwitchBase):
             self.switch()
         self.assertIn('rolled back', str(cm.exception))
         run = self.assert_rolled_back()
-        self.assertEqual(self.done('verify', run)[0], {'version': fx.LIVE, 'pid': self.server()['pid']})  # W1's
+        self.assertEqual(self.done('verify', run)[0], {'version': fx.LIVE, 'pid': self.server()['pid'],
+                                                       'marker': 'removed'})  # W1's: verified, its marker gone
         self.assertEqual(self.done('runtime', run)[0]['putBack'], True)  # the update pruned it: put back from kept
         self.assertEqual(run['end']['result'], 'failed')  # the owner looks, then settles
         self.assertEqual(self.names(run=run)[-6:], ['runtime', 'stop-service', 'restore', 'update', 'verify',

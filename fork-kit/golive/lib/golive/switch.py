@@ -24,7 +24,7 @@ Every change is made inside a journalled step (journal.py); the refusals all com
 """
 import datetime, hashlib, json, math, os, re, shutil, signal, sys, time, urllib.error, urllib.request
 
-from golive import back as back_mod, check as check_mod, coldcopy, journal, keptruntime, live, osadapter
+from golive import back as back_mod, check as check_mod, coldcopy, handoff, journal, keptruntime, live, osadapter
 
 MIN_LIMIT = 600     # verify's time limit: 3 x the rehearsal's time, at least this (seconds)
 GUARD_MARGIN = 600  # the guard timer fires this long after the latest the run should have ended
@@ -279,7 +279,7 @@ def verify(cfg, adapter, version, before, seconds, build=None, stops=None):
     wrong = _installed_changed(cfg, version, build) if build is not None else []
     if wrong:
         return False, {'problems': wrong}
-    end = time.monotonic() + seconds
+    end, watch = time.monotonic() + seconds, handoff.ForeignWatch(cfg.home)
     while True:
         if stops is not None and stops.got:
             return False, {'problems': [f'stopped by {stops.names()}']}
@@ -287,6 +287,9 @@ def verify(cfg, adapter, version, before, seconds, build=None, stops=None):
         if not said:
             wrong = _installed_changed(cfg, version, build) if build is not None else []
             return (False, {'problems': wrong}) if wrong else (True, {'version': version})
+        foreign = watch.check(adapter.service())  # the backstop: no use waiting for a home another server holds
+        if foreign is not None:
+            return False, {'problems': [foreign] + said[:7]}
         if time.monotonic() >= end:
             return False, {'problems': said[:8]}
         time.sleep(coldcopy.POLL)
@@ -367,11 +370,14 @@ def _install_target(run, cfg, archive, sha):
 
 
 def _update(cfg, adapter, binary, version, timeout):
-    code, out = _t3(binary, ['update', version, '--base-dir', cfg.home, '--yes'], timeout)
-    if code != 0:
-        raise RuntimeError(f'{binary} update {version} exited {code}: {out.strip()[-300:]}')
-    if not adapter.service()['active']:
-        adapter.start()
+    """`t3 update` restarts the service itself; the kit's owner lock goes to its new launcher (handoff.py)."""
+    def update():
+        code, out = _t3(binary, ['update', version, '--base-dir', cfg.home, '--yes'], timeout)
+        if code != 0:
+            raise RuntimeError(f'{binary} update {version} exited {code}: {out.strip()[-300:]}')
+        if not adapter.service()['active']:
+            adapter.start()
+    handoff.starting(cfg.home, update, version)
 
 
 def _started(steps):
@@ -420,9 +426,10 @@ def _put_back(run, cfg, adapter, steps, say, lose_work_since=None):
     with run.step('back-start') as facts:
         stopped = not adapter.service()['active']  # active: the stop never happened, the old server still runs
         if stopped:
-            adapter.start()
+            handoff.starting(cfg.home, adapter.start, rec['version'])
         again = coldcopy._wait_started(cfg, adapter, rec['version'], rec['pid'] if stopped else None)
-        facts.update(version=again['version'], pid=again['pid'], result=FINAL['back-start'])
+        facts.update(version=again['version'], pid=again['pid'], result=FINAL['back-start'],
+                     marker=handoff.served(cfg.home))
     return f'started t3 {again["version"]} again; nothing it reads was changed'
 
 
@@ -518,6 +525,13 @@ def _before(cfg, binary, migrations):
 
 
 def run_switch(cfg, adapter, owner_says_go=False, say=print):
+    """From just before the stop until a build is verified again, upstream's update marker is kept and the home
+    stays owned (handoff.py); a run that dies leaves the marker to run out by itself (60 s)."""
+    with handoff.run_scope(cfg.home):
+        return _run_switch(cfg, adapter, owner_says_go, say)
+
+
+def _run_switch(cfg, adapter, owner_says_go, say):
     with journal.run(cfg.state_dir, 'switch') as run:
         p = _prechecks(cfg, adapter, owner_says_go, say, run)
         if p is None:
@@ -571,6 +585,7 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
         failed = f'the guard {unit} is not running any more'
     if failed is None and stops.got:
         failed = f'stopped by {stops.names()}'
+    failed = failed or coldcopy.open_gap(cfg.home)
     if failed is not None:
         again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
         if again:
@@ -579,10 +594,12 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
     say(f'stopping {osadapter.UNIT} (t3 {old}) to switch to {cfg.target_version}')
     error, lock, noted = None, None, 0
     try:
-        with run.step('stopping', **rec):
+        with run.step('stopping', **rec, marker=handoff.marker_path(cfg.home)):
             adapter.stop()
             coldcopy._wait_stopped(adapter, server['pid'])
             lock = coldcopy.hold_owner_lock(os.path.join(cfg.home, 'userdata'), coldcopy.STOP_WAIT)
+            if handoff.adopt(cfg.home, lock):  # held until the update's restart hands the home over
+                lock = None
             coldcopy._same_after_stop(cfg, server)
         stops.check()
         deadline = coldcopy._clock() + cfg.stop_limit_seconds
@@ -626,8 +643,6 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
         with run.step('before') as facts:
             facts.update(_before(cfg, keptruntime.home_t3(cfg.home, cfg.target_version), rehearsal['migrations']))
         before = {'counts': facts['reportCounts'], 'providers': facts['providers']}
-        lock.close()
-        lock = None
         stops.check()
         with run.step('update', version=cfg.target_version) as facts:
             _update(cfg, adapter, keptruntime.home_t3(cfg.home, cfg.target_version), cfg.target_version, limit)
@@ -638,7 +653,7 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
             if not verified:
                 facts.update(found)
                 raise RuntimeError(f'verify failed: {"; ".join(found["problems"])}')
-            facts.update(found, sha256=p['sha'], result=FINAL['verify'])
+            facts.update(found, sha256=p['sha'], result=FINAL['verify'], marker=handoff.served(cfg.home))
     except Exception as e:
         error, noted = e, len(stops.got)
     finally:
@@ -719,7 +734,11 @@ def guard(cfg, adapter, run_id, wait, say=print, lose_work_since=None):
                 runs = None
                 did.append(f'journal unreadable, so T3 is started if it is not active: {e}')
                 if not adapter.service()['active']:
-                    adapter.start()
+                    coldcopy.open_gap(cfg.home)  # left to run out: this guard does not wait for T3
+                    try:
+                        adapter.start()
+                    finally:
+                        handoff.close(cfg.home)
                     did.append(f'started {osadapter.UNIT}')
                 did += [coldcopy._run_command(p, cfg.home, coldcopy.HOOK_TIMEOUT)[1] for p in cfg.post_hooks]
             mine = runs[-1] if runs and runs[-1]['id'] == run_id else None
@@ -732,11 +751,15 @@ def guard(cfg, adapter, run_id, wait, say=print, lose_work_since=None):
                 r.id = run_id
                 try:
                     if not final(mine):
+                        if not adapter.service()['active']:  # the killed run's marker runs out: a fresh one
+                            coldcopy.open_gap(cfg.home)
                         did.append(_put_back(r, cfg, adapter, mine['steps'], say, lose_work_since)
                                    or 'T3 was never stopped')
                 except Exception as e:
                     notes = ''.join(f'; {n}' for n in getattr(e, '__notes__', ()))
                     did.append(f'putting T3 back failed: {type(e).__name__}: {e}{notes}')
+                finally:
+                    handoff.close(cfg.home)
                 steps = journal.read(cfg.state_dir)[0][-1]['steps']
                 if w1_holds(steps):
                     did.append(f'no post hook ran: {W1_HOLDS}')
