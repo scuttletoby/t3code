@@ -1137,7 +1137,8 @@ def _restart(run, cfg, adapter, server, say, version):
     """Start T3 again FIRST and journal it after (a full disk must not keep T3 down), then verify that a new server
     of `version` runs (None: of whatever build the service starts). Returns (error or None, the new server)."""
     try:
-        handoff.starting(cfg.home, adapter.start, version or server['version'])  # the owner lock: to the launcher
+        # the owner lock: to the launcher
+        handoff.starting(cfg.home, adapter.start, version or server['version'], adapter.service)
         start_error = None
     except BaseException as e:
         start_error = e
