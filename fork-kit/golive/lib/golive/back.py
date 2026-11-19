@@ -28,7 +28,7 @@ back` lists the ways by the same rule its `--way` goes by (possible, _follow).
 """
 import functools, http.client, json, os, re, sys, urllib.error, urllib.request
 
-from golive import check as check_mod, coldcopy, journal, keptruntime, live, osadapter
+from golive import check as check_mod, coldcopy, handoff, journal, keptruntime, live, osadapter
 from golive.config import EXACT_VERSION
 from golive.keptruntime import installed_t3
 
@@ -266,6 +266,8 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
         coldcopy.plan_restore(copy_dir, cfg.home, from_home=cfg.home, version=old, floor_bytes=cfg.free_floor_mb * MB)
     except (coldcopy.Incomplete, coldcopy.WrongCopy, RuntimeError, OSError, ValueError) as e:
         raise journal.Refused(f'the copy cannot be restored: {e}; nothing was changed') from None
+    # the backstop: W1 would restore under a server it cannot stop
+    refuse_foreign(cfg, adapter, f'`t3-golive back --way w1 --lose-work-since {at}`')
     with run.step('plan', way='w1', version=old, t3=t3, copy=copy_dir, at=at, automatic=automatic, kept=kept):
         pass
     with run.step('runtime', version=old) as facts:
@@ -275,14 +277,19 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
 
     def stop_restore_update():
         server = _server(cfg, adapter)
+        why = coldcopy.open_gap(cfg.home)  # before the stop and before saying so: T3 must not stop without the marker
+        if why is not None:
+            raise journal.Refused(f'{why}; T3 was not stopped')
         say('stopping T3 for W1: until this back ends ok, T3 stays stopped and is not started at boot, and background '
             'jobs stay paused (on purpose: the home may be half-restored); if it stops or fails, run the same back '
             'again')
         stopped.append(True)
-        with run.step('stop-service', pid=server and server['pid']):
+        with run.step('stop-service', pid=server and server['pid'], marker=handoff.marker_path(cfg.home)):
             adapter.disable()  # first: from here T3 must not start at boot until the update enables it again
             adapter.stop()
             coldcopy._wait_stopped(adapter, server['pid'] if server else 0)
+            handoff.adopt(cfg.home, coldcopy.hold_owner_lock(os.path.join(cfg.home, 'userdata'),
+                                                             coldcopy.STOP_WAIT))  # kept until the update starts T3
         with run.step('restore', copy=copy_dir) as facts:
             facts.update(coldcopy.restore(run, copy_dir, cfg.home, from_home=cfg.home, version=old,
                                           floor_bytes=cfg.free_floor_mb * MB))
@@ -301,6 +308,27 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
             e.add_note('T3 was stopped for this W1: T3 stays stopped and is not started at boot (on purpose: the '
                        'home may be half-restored) until the same `t3-golive back --way w1` ends ok')
         raise
+
+
+def refuse_foreign(cfg, adapter, again, stopped=None):
+    """The backstop before a way back changes anything: Refused (nothing changed) while a server the boot service
+    did not start holds the home, with the remedy for where T3 stands. again: the command to run once that server is
+    gone. stopped: a way back stopped T3 and has not ended ok (None: read from the journal; when the journal cannot
+    be read, the safe side: T3 must not be started on a home that may be half-restored). The error carries the
+    server as .foreign (the switch says it in its own words)."""
+    svc = adapter.service()
+    found = handoff.foreign(cfg.home, svc)
+    if found is None:
+        return
+    if stopped is None:
+        try:
+            stopped = any(s['step'] == 'stop-service' for r in _chain(journal.read(cfg.state_dir)[0])
+                          for s in r['steps'])
+        except Exception:
+            stopped = True
+    e = journal.Refused(f'{handoff.said(found, svc, again, stopped)}; nothing was changed')
+    e.foreign = found
+    raise e
 
 
 W1_RERUN = '; run the same `t3-golive back --way w1` again: it runs only the post hooks (no second stop or restore)'
@@ -372,10 +400,16 @@ def _update(run, cfg, adapter, t3, version, say):
     enables and starts it), then verify: that version runs, the service state names it, the service is enabled."""
     before = _server(cfg, adapter)
     old_pid = before['pid'] if before and before['version'] != version else 0
-    with run.step('update', t3=t3, version=version) as facts:
+    if handoff.held(cfg.home) is None:  # W2, W3 (W1 opened it before its stop): a marker before the restart
+        why = coldcopy.open_gap(cfg.home)
+        if why is not None:
+            raise journal.Refused(f'{why}; T3 was not restarted')
+    with run.step('update', t3=t3, version=version, marker=handoff.marker_path(cfg.home)) as facts:
         argv = [T3_STUB or t3, 'update', version, '--allow-downgrade', '--yes', '--base-dir', cfg.home]
-        # the fixed environment (no release server can be pointed elsewhere), and the child dies with this run
-        code, out, err = live.run_t3(argv, UPDATE_TIMEOUT, cwd=cfg.home)
+        # the fixed environment (no release server can be pointed elsewhere), and the child dies with this run;
+        # the update restarts T3, and the owner lock W1 holds goes to its new launcher (handoff.py)
+        code, out, err = handoff.starting(cfg.home, lambda: live.run_t3(argv, UPDATE_TIMEOUT, cwd=cfg.home),
+                                          version)
         if code is None:
             raise RuntimeError(f'{t3} update failed: {err.strip()[-300:]}')
         facts['exit'] = code
@@ -395,7 +429,7 @@ def _verify(run, cfg, adapter, version, old_pid, say):
             if live.service_state(cfg.home)[0] != version or not adapter.service()['enabled']:
                 raise RuntimeError(f't3 {version} runs, but the service state does not name it or {osadapter.UNIT} '
                                    'is not enabled')
-            facts.update(version=version, pid=again['pid'])
+            facts.update(version=version, pid=again['pid'], **handoff.served(cfg.home))
     except Exception:  # not a stop or an interrupt (BaseException): those did not finish the verify
         with run.step('verify-failed', version=version):
             pass
@@ -585,7 +619,13 @@ def _resume_w1(run, cfg, adapter, plan, got, say):
 def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=print):
     """Take the way back `way` ('w1', 'w2', 'w3') in this process. Returns {'version', 'nothing'?}; raises
     journal.Refused (nothing changed), Busy (another run holds the lock: a guard timer firing during a manual back
-    included), Unfinished, or the error that ended the run (running back again finishes it)."""
+    included), Unfinished, or the error that ended the run (running back again finishes it). From just before T3
+    stops or restarts until a build is verified, upstream's update marker is kept (handoff.py)."""
+    with handoff.run_scope(cfg.home):
+        return _run_back(cfg, adapter, way, lose_work_since, automatic, say)
+
+
+def _run_back(cfg, adapter, way, lose_work_since, automatic, say):
     with journal.run(cfg.state_dir, 'back', may_follow=FOLLOWS) as run:
         runs = journal.read(cfg.state_dir)[0][:-1]
         following = bool(runs) and journal.needs_settling(runs[-1])  # a switch or back left half-way
@@ -624,6 +664,8 @@ def run_back(cfg, adapter, way, *, lose_work_since=None, automatic=False, say=pr
         # hooks and left the background jobs paused; they stay paused until a back ends ok, so no post hook runs
         # after a failure here.
         held = any(s['step'] == 'stop-service' for r in chain for s in r['steps'])
+        # the backstop: its update would restart T3 into a home another server holds
+        refuse_foreign(cfg, adapter, f'`t3-golive back --way {way}`', stopped=held)
         with run.step('plan', **plan):
             pass
         if stuck:
