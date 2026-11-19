@@ -1,8 +1,9 @@
 """A fake WSL2 distro in a temporary folder for the pc-agents tests: every fixed path under PC_AGENTS_ROOT, the
-current user as root, fake useradd, usermod, env (T3's installer), apt-get, dpkg-query, dpkg, systemctl, systemd-run,
-nft and curl (each logs to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and policy a
-started one runs with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units). No root, no
-systemd, no network, no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
+current user as root, fake useradd, usermod, apt-get, dpkg-query, dpkg, systemctl, systemd-run, nft and curl
+(fake_curl.py) (each logs to /log in the fake root; systemctl keeps which units are enabled, and the ExecStart and
+policy a started one runs with, its main PID and its start time (CLOCK_MONOTONIC, as systemd's) in /log/units, and a
+running unit's processes in its control group, /sys/fs/cgroup/system.slice/UNIT/cgroup.procs: its main PID, and
+those a test adds); the real openssl. No root, no systemd, no network, no real /etc. Fresh as `wsl --install` leaves one, from the fleet's wsl2 walls fixture."""
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest
 from unittest import mock
 
@@ -21,20 +22,6 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                         'echo "$a:x:$uid:" >>"$R/etc/group"\nmkdir -p "$R/home/$a"\n',
     'usr/sbin/usermod': 'R="${0%/usr/sbin/usermod}"; echo "$*" >>"$R/log/usermod"\n'
                         '[ "$1" = --shell ] && sed -i "s#^$3:\\(\\([^:]*:\\)\\{5\\}\\)[^:]*\\$#$3:\\1$2#" "$R/etc/passwd"\n',
-    # T3's installer, run by root through env -i (scripts/install.sh with T3CODE_HOME=/opt/pc-agents/t3)
-    'usr/bin/env': 'R="${0%/usr/bin/env}"; echo "$*" >>"$R/log/install"\n[ -e "$R/log/install-fail" ] && exit 1\n'
-                   # install-hang: a download that never ends, its pid noted (the group kill must end it)
-                   '[ -e "$R/log/install-hang" ] && { sleep 60 & echo $! >"$R/log/hang.pid"; wait; }\n'
-                   'for a; do case "$a" in T3CODE_VERSION=*) v=${a#*=};; esac; done\n'
-                   'd="$R/opt/pc-agents/t3/runtime/versions/$v"; mkdir -p "$d"; printf "#!/bin/sh\\n# t3 $v\\n" >"$d/t3"\n'
-                   'chmod 755 "$d/t3"\n'
-                   # install-loose: as upstream's tar leaves it (a mktemp -d top, the archive's group-writable modes)
-                   '[ -e "$R/log/install-loose" ] && { mkdir -p "$d/lib/x"; echo x >"$d/lib/x/m.js"; chmod 775 "$d/lib" '
-                   '"$d/lib/x"; chmod 664 "$d/lib/x/m.js"; ln -s x "$d/lib/y"; echo s >"$d/lib/s"; chmod 4775 "$d/lib/s"; '
-                   'chmod 700 "$d"; }\n'
-                   # install-link-out: a link from the runtime to a file outside it
-                   '[ -e "$R/log/install-link-out" ] && { echo o >"$R/log/outside"; chmod 664 "$R/log/outside"; '
-                   'ln -s "$R/log/outside" "$d/out"; }; exit 0\n',
     # systemd-run: like the real one, a bare command name is looked up in the CALLER's PATH, before anything runs
     'usr/bin/systemd-run': 'R="${0%/usr/bin/systemd-run}"; printf "%s\\n" "$@" >"$R/log/systemd-run"\n'
                            'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; cmd=$2\n'
@@ -59,16 +46,18 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '*) echo 1 >"$S/$1.code";; esac; echo "${c:-1}" >"$S/$1.status"; return; }\n'
                          '{ grep "^ExecStart=" "$R/etc/systemd/system/$1"; '
                          'cat "$R/etc/t3code/policy.json"; } >"$S/$1.active" 2>/dev/null || :\n'
-                         'echo $$ >"$S/$1.pid"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
+                         'echo $$ >"$S/$1.pid"; g="$R/sys/fs/cgroup/system.slice/$1"; rm -rf "$g"; mkdir -p "$g"; '
+                         'echo $$ >"$g/cgroup.procs"; python3 -I -c "import time; print(time.monotonic_ns() // 1000)" '
                          '>"$S/$1.start"; }\n'
                          'case "$1" in\n'
                          'enable|disable) v=$1; shift; now=; [ "$1" = --now ] && { now=1; shift; }\n'
                          '  for u; do if [ $v = enable ]; then : >"$S/$u.enabled"; [ -n "$now" ] && '
                          '{ [ -e "$S/$u.active" ] || run "$u" || exit 1; }\n'
-                         '  else rm -f "$S/$u.enabled"; [ -z "$now" ] || rm -f "$S/$u.active"; fi; done;;\n'
+                         '  else rm -f "$S/$u.enabled"; [ -z "$now" ] || { rm -f "$S/$u.active"; '
+                         'rm -rf "$R/sys/fs/cgroup/system.slice/$u"; }; fi; done;;\n'
                          'restart) shift; for u; do run "$u" || exit 1; done;;\n'
                          'reset-failed) shift; for u; do rm -f "$S/$u.limit"; done;;\n'
-                         'stop) shift; for u; do rm -f "$S/$u.active"; done;;\n'
+                         'stop) shift; for u; do rm -f "$S/$u.active"; rm -rf "$R/sys/fs/cgroup/system.slice/$u"; done;;\n'
                          'is-active) [ -e "$S/$2.active" ] && echo active || { echo inactive; exit 3; };;\n'
                          'show) u=$4; f=; [ -e "$R/etc/systemd/system/$u" ] && f=/etc/systemd/system/$u\n'
                          '  [ -e "$R/log/t3-dies" ] && [ -e "$S/$u.active" ] && { [ -e "$S/$u.seen" ] && '
@@ -79,7 +68,8 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                          '  echo "DropInPaths=$(cat "$S/$u.dropins" 2>/dev/null)"; echo "UnitFileState=$st"\n'
                          '  [ -e "$S/reload" ] && echo NeedDaemonReload=yes || echo NeedDaemonReload=no\n'
                          '  if [ -e "$S/$u.active" ]; then echo ActiveState=active; echo "MainPID=$(cat "$S/$u.pid")"\n'
-                         '  else echo ActiveState=inactive; echo MainPID=0; fi; echo NRestarts=0\n'
+                         '  echo "ControlGroup=/system.slice/$u"\n'
+                         '  else echo ActiveState=inactive; echo MainPID=0; echo ControlGroup=; fi; echo NRestarts=0\n'
                          '  [ -e "$S/$u.status" ] && { echo "ExecMainCode=$(cat "$S/$u.code")"; echo "ExecMainStatus=$(cat "$S/$u.status")"; }\n'
                          '  echo "ExecMainStartTimestampMonotonic=$(cat "$S/$u.start" 2>/dev/null || echo 0)";;\n'
                          'esac\n',
@@ -148,21 +138,9 @@ TOOLS = {  # fake programs, under the fake root; each finds the root from its ow
                     '{ echo "dpkg: error: end of file on stdin at conffile prompt (test)" >&2; exit 1; }\n'
                     'for f in "$R"/log/packages/*; do [ ! -e "$f" ] || sed -i "s/unpacked/installed/" "$f"; done\n'
                     'for f in "$R"/var/lib/dpkg/updates/[0-9]*; do [ ! -e "$f" ] || rm "$f"; done\n',
-    # curl: the release list of the followed fork (/log/releases.json; none: []; /log/releases-fail: a refusal), and
-    # T3's answer on its port: the version in the ExecStart the running T3 unit started with (none while it is not
-    # active, or /log/http-fail; nor for a version named in /log/http-mute: one that starts but never answers)
-    'usr/bin/curl': 'R="${0%/usr/bin/curl}"; echo "$*" >>"$R/log/curl"; for a; do url=$a; done\n'
-                    'case "$url" in https://api.github.com/*)\n'
-                    '  [ -e "$R/log/releases-fail" ] && { echo "curl: (22) The requested URL returned error: 403 '
-                    '(test)" >&2; exit 22; }; cat "$R/log/releases.json" 2>/dev/null || echo "[]";;\n'
-                    'http://127.0.0.1:*) f="$R/log/units/t3code-agents.service.active"\n'
-                    '  [ -e "$f" ] && [ ! -e "$R/log/http-fail" ] || { echo "curl: (7) Failed to connect (test)" >&2; '
-                    'exit 7; }\n'
-                    '  v=$(sed -n "s#^ExecStart=.*/runtime/versions/\\([^/]*\\)/t3 .*#\\1#p" "$f")\n'
-                    '  grep -qsxF "$v" "$R/log/http-mute" && { echo "curl: (28) Operation timed out (test)" >&2; '
-                    'exit 28; }\n'
-                    '  printf \'{"serverVersion":"%s","httpBaseUrl":"/"}\\n\' "$v";;\n'
-                    '*) echo "curl: not a URL of this test: $url" >&2; exit 2;; esac\n',
+    # curl: fake_curl.py (GitHub's latest release, T3's release files and their attestations, T3's answer)
+    'usr/bin/curl': f'exec python3 -I {os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_curl.py")} '
+                    '"${0%/usr/bin/curl}" "$@"\n',
     'usr/sbin/nft': 'R="${0%/usr/sbin/nft}"\ncase "$1" in -f) cp "$R$2" "$R/log/nft-loaded";;\n'
                     'list) cat "$R/log/nft-loaded" 2>/dev/null || exit 1;; esac\n',
 }
@@ -218,6 +196,7 @@ class Case(unittest.TestCase):
         for rel, value in files.items():
             self.write('/' + rel, value)
         os.symlink('/mnt/wsl/resolv.conf', self.path('/etc/resolv.conf'))
+        os.symlink(shutil.which('openssl'), self.path('/usr/bin/openssl'))   # the attestation check's
         self.machine(CONFIG)
 
     def close(self):
@@ -326,13 +305,14 @@ class Case(unittest.TestCase):
         self.terminate()
 
     def snapshot(self):
-        """Every path under the fake root but the fake tools' logs: kind, mode, owner, mtime, inode, link, content."""
+        """Every path under the fake root but the fake tools' logs and the running system (/proc, /sys: processes):
+        kind, mode, owner, mtime, inode, link, content."""
         out = {}
         for top, dirs, names in os.walk(self.root):
             for n in dirs + names:
                 full = os.path.join(top, n)
                 rel = full[len(self.root):]
-                if rel.startswith('/log'):
+                if rel.startswith(('/log', '/proc', '/sys')):
                     continue
                 st = os.lstat(full)
                 body = os.readlink(full) if stat.S_ISLNK(st.st_mode) else \

@@ -44,6 +44,17 @@ case "$method $path" in
     elif git -C "$up_git" merge-base --is-ancestor "$b" "$a"; then status=behind
     else status=diverged; fi
     body="{\"status\":\"$status\"}" ;;
+  "GET repos/me/t3code/compare/"*) # SHA...main: how this fork's main relates to SHA
+    range="${path#*/compare/}" me_git="$api/../gh/me/t3code.git"
+    [[ ! -e "$api/fail_compare" ]] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
+    a="$(git -C "$me_git" rev-parse -q --verify "${range%%...*}^{commit}")" \
+      && b="$(git -C "$me_git" rev-parse -q --verify "refs/heads/${range#*...}^{commit}")" \
+      || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    if [[ "$a" == "$b" ]]; then status=identical
+    elif git -C "$me_git" merge-base --is-ancestor "$a" "$b"; then status=ahead
+    elif git -C "$me_git" merge-base --is-ancestor "$b" "$a"; then status=behind
+    else status=diverged; fi
+    body="{\"status\":\"$status\"}" ;;
   "GET repos/me/t3code/releases")
     [[ ! -e "$api/fail_list" ]] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
     body="$(cat "$api/releases.json")" ;;
@@ -70,7 +81,7 @@ git config --global init.defaultBranch main
 git config --global advice.detachedHead false
 git config --global url."$root/gh/".insteadOf https://github.com/
 export REPOSITORY=me/t3code GITHUB_REPOSITORY=me/t3code
-unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY UPSTREAM UPSTREAM_URL ORIGIN
+unset GITHUB_OUTPUT GITHUB_STEP_SUMMARY UPSTREAM UPSTREAM_URL ORIGIN WORKFLOW_REF
 # The cases below use stable tags; the nightly section sets the channel itself.
 export FORK_FOLLOW_CHANNEL=stable
 
@@ -402,6 +413,34 @@ reset_api
 touch "$root/api/fail_list"
 expect_refused "publish: a failed release listing fails the step" "Could not list the releases" "$root/work" publish 9 v0.1.9-fork.2 0.1.9-fork.2
 [[ ! -e "$root/api/writes" ]] || fail "publish: nothing written after a failed listing"
+
+# --- on-main -----------------------------------------------------------------------------------
+# The fork's main (pushed by new_fork) and a side commit main does not have, also pushed (as the
+# branch side) so GitHub's compare would know it.
+reset_api
+(cd "$root/work" && git checkout -q -B side main && git commit -q --allow-empty -m "side change" \
+  && git push -q origin side && git checkout -q main)
+side="$(git -C "$root/work" rev-parse side)" tip="$(git -C "$root/work" rev-parse main)"
+old="$(git -C "$root/work" rev-parse main~1)"
+expect_refused "on-main: a commit not on main is not published" "is not on main (behind)" "$root" on-main "$side"
+WORKFLOW_REF="me/t3code/.github/workflows/fork-follow.yml@refs/heads/side" \
+  expect_refused "on-main: fork-follow run from another branch does not lift it" "is not on main" "$root" on-main "$side"
+WORKFLOW_REF="me/t3code/.github/workflows/fork-release.yml@refs/heads/main" \
+  expect_refused "on-main: fork-release run from main does not lift it either" "is not on main" "$root" on-main "$side"
+WORKFLOW_REF="other/t3code/.github/workflows/fork-follow.yml@refs/heads/main" \
+  expect_refused "on-main: another repository's fork-follow does not lift it" "is not on main" "$root" on-main "$side"
+if WORKFLOW_REF="me/t3code/.github/workflows/fork-follow.yml@refs/heads/main" run "$root" on-main "$side" \
+  && grep -q "fork-follow's candidate" "$root/out"; then
+  pass "on-main: fork-follow on main publishes its own candidate"
+else
+  fail "on-main: fork-follow on main publishes its own candidate"
+fi
+if run "$root" on-main "$tip" && grep -q "is on main" "$root/out"; then pass "on-main: main's tip passes"; else fail "on-main: main's tip passes"; fi
+if run "$root" on-main "$old"; then pass "on-main: an older commit of main passes"; else fail "on-main: an older commit of main passes"; fi
+expect_refused "on-main: a branch name is not a commit id" "not a full commit id" "$root" on-main side
+touch "$root/api/fail_compare"
+expect_refused "on-main: a failed compare refuses" "Could not compare" "$root" on-main "$tip"
+reset_api
 
 # --- check-archives ----------------------------------------------------------------------------
 # Layout of scripts/build-cli-archive.ts: <stem>/t3 (t3.exe in the Windows zip) plus <stem>/client/.

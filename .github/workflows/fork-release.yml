@@ -536,8 +536,12 @@ jobs:
     if: ${{ inputs.publish }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # id-token and attestations: the build provenance below (a Sigstore certificate for this
+    # workflow's identity, stored with GitHub). fork-follow.yml's release job grants the same.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     outputs:
       published: ${{ steps.publish.outputs.published }}
     steps:
@@ -579,6 +583,27 @@ jobs:
       - name: Move the release notes aside
         shell: bash
         run: mv release-assets/release-notes.md release-notes.md
+
+      # Every release reaches the app's stable track and the auto-updating PC agents: only a commit
+      # on main, or the candidate fork-follow.yml on main built itself. The script comes from this
+      # workflow's own commit (above), so a branch cannot change the rule for a run from main.
+      - name: Publish only commits on main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REF: ${{ needs.preflight.outputs.ref }}
+        run: bash .github/scripts/fork-release.sh on-main "$REF"
+
+      # Build provenance for the server archives and their checksums: signed for this workflow file
+      # and ref by GitHub's OIDC token through Sigstore, and readable without a token. The PC agents
+      # kit installs an archive only with an attestation from fork-release.yml on main.
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/SHA256SUMS
 
       # "Re-run failed jobs" reuses the preflight's version: refuse it once a tag or published
       # release has it. Drafts have no tag; one left by a stopped run of this version is removed.

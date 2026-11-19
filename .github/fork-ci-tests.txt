@@ -101,7 +101,7 @@ fork-kit/model-guard/tests/guard.test.py
 fork-kit/model-guard/tests/install.test.py
 fork-kit/pc-agents/tests/check.test.py ~22s
 fork-kit/pc-agents/tests/setup.test.py ~110s
-fork-kit/pc-agents/tests/update.test.py ~40s
+fork-kit/pc-agents/tests/update.test.py ~110s
 
 # Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
 .github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml

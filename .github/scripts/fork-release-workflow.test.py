@@ -102,9 +102,9 @@ for job_id in write_jobs:
     token_steps = [s for s in job_steps if "github.token" in yaml.safe_dump(s) or "secrets." in yaml.safe_dump(s)
                    or str(s.get("uses", "")).startswith("softprops/")]
     allowed = [s for s in token_steps if str(s.get("uses", "")).startswith("softprops/")
-               or re.fullmatch(r"bash \.github/scripts/fork-release\.sh (remove-drafts|publish) .*", str(s.get("run", "")).strip())]
-    check(f"{job_id}: the token reaches only the remove-drafts, create and publish steps",
-          len(token_steps) == len(allowed) == 3, ", ".join(str(s.get("name")) for s in token_steps))
+               or re.fullmatch(r"bash \.github/scripts/fork-release\.sh (on-main|remove-drafts|publish) .*", str(s.get("run", "")).strip())]
+    check(f"{job_id}: the token reaches only the on-main, remove-drafts, create and publish steps",
+          len(token_steps) == len(allowed) == 4, ", ".join(str(s.get("name")) for s in token_steps))
 
     def index(pred):
         return next((i for i, s in enumerate(job_steps) if pred(s)), -1)
@@ -114,6 +114,20 @@ for job_id in write_jobs:
     publish = index(lambda s: "fork-release.sh publish" in str(s.get("run", "")))
     check(f"{job_id}: refuse/remove drafts, then create the draft, then publish it",
           -1 < remove < create < publish)
+    on_main = index(lambda s: str(s.get("run", "")).strip()
+                    == 'bash .github/scripts/fork-release.sh on-main "$REF"')
+    check(f"{job_id}: checks the commit is on main before anything is written",
+          -1 < on_main < remove
+          and (job_steps[on_main].get("env") or {}).get("WORKFLOW_REF") == "${{ github.workflow_ref }}"
+          and (job_steps[on_main].get("env") or {}).get("REF") == "${{ needs.preflight.outputs.ref }}")
+    attest = index(lambda s: str(s.get("uses", "")).startswith("actions/attest-build-provenance@"))
+    subjects = str(((job_steps[attest].get("with") or {}) if attest >= 0 else {}).get("subject-path", "")).split()
+    check(f"{job_id}: attests the server archives and SHA256SUMS before the draft is created",
+          -1 < attest < create
+          and subjects == ["release-assets/*.tar.gz", "release-assets/SHA256SUMS"])
+    perms = jobs[job_id].get("permissions") or {}
+    check(f"{job_id}: may sign (id-token) and store (attestations) the provenance",
+          perms.get("id-token") == "write" and perms.get("attestations") == "write")
     if create >= 0 and publish >= 0:
         check(f"{job_id}: publishes the draft it created, by id",
               job_steps[create].get("id") == "draft"

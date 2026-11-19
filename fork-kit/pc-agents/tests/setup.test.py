@@ -56,11 +56,16 @@ class Setup(Case):
         self.assertEqual(os.stat(t3).st_uid, os.geteuid())
         self.assertEqual(record['/opt/pc-agents/t3/runtime/versions/1.2.3/t3'], {k.file_sha(t3[len(self.root):])})
         self.assertFalse(os.path.lexists(self.path('/home/agent/.t3')))
-        install = self.log('install')[0].split()   # root runs upstream's install.sh, in a clean environment
-        for arg in ('-i', 'HOME=/root', 'T3CODE_HOME=/opt/pc-agents/t3', 'T3CODE_INSTALL_BIN_DIR=/opt/pc-agents/t3/bin',
-                    'T3CODE_VERSION=1.2.3', 'T3CODE_RELEASE_BASE_URL=https://example.com/releases',
-                    f'/opt/pc-agents/{SHA1}/share/install.sh'):
-            self.assertIn(arg, install)
+        # root downloads the release archive and its SHA256SUMS over HTTPS only, checks and unpacks it, and runs
+        # nothing it downloaded (the fake t3 notes a run in /log/t3-ran)
+        self.assertEqual(self.log('install'), [f'1.2.3 {k.arch()}'])
+        fetched = [line.split()[-1] for line in self.log('curl') if 'https://example.com/' in line]
+        self.assertEqual(fetched, ['https://example.com/releases/v1.2.3/SHA256SUMS',
+                                   f'https://example.com/releases/v1.2.3/t3-1.2.3-linux-{k.arch()}.tar.gz'])
+        self.assertTrue(all('--proto =https --proto-redir =https' in line for line in self.log('curl')
+                            if 'https://' in line))
+        self.assertFalse(os.path.exists(self.path('/log/t3-ran')))
+        self.assertEqual(self.read('/opt/pc-agents/t3/runtime/versions/1.2.3/.install-complete'), '1.2.3\n')
 
     def test_what_the_files_say(self):
         self.ready()
@@ -177,11 +182,33 @@ class Setup(Case):
     def test_t3_with_a_link_out_is_refused_and_the_target_untouched(self):
         self.terminate()
         self.write('/log/install-link-out', '')
+        self.write('/log/outside', 'o\n')
+        os.chmod(self.path('/log/outside'), 0o664)
         code, out = self.setup_run()
         self.assertEqual(code, 1, out)
-        self.assertIn('T3 installed, but not root\'s alone', out)
+        self.assertIn(f'T3 1.2.3 refused: t3-1.2.3-linux-{k.arch()}/out links to {self.root}/log/outside, out of '
+                      'the folder', out)
         self.assertEqual(stat.S_IMODE(os.stat(self.path('/log/outside')).st_mode), 0o664)
+        self.assertEqual(os.listdir(self.path('/opt/pc-agents/t3/runtime/versions')), [])   # nothing left
         self.assertFalse([line for line in self.log() if line.startswith('enable')])
+
+    def test_a_release_archive_that_is_not_the_one_named_or_unpacks_out_is_refused(self):
+        for marker, said in (
+                ('sums-bad', f't3-1.2.3-linux-{k.arch()}.tar.gz has SHA-256 '),
+                ('tar-outside', f't3-1.2.3-linux-{k.arch()}/../evil is not under t3-1.2.3-linux-{k.arch()}/'),
+                ('tar-through-link', f't3-1.2.3-linux-{k.arch()}/l/f is unpacked through or over a link'),
+                ('tar-hardlink-out', f't3-1.2.3-linux-{k.arch()}/h links to /etc/passwd, not a file before it')):
+            with self.subTest(marker):
+                kept = self.keep()
+                self.terminate()
+                self.write('/log/' + marker, '')
+                code, out = self.setup_run()
+                self.assertEqual(code, 1, out)
+                self.assertIn('T3 1.2.3 refused: ' + said, out)
+                self.assertEqual(os.listdir(self.path('/opt/pc-agents/t3/runtime/versions')), [])
+                self.assertFalse([p for p in self.snapshot() if p.endswith(('/evil', '/f', '/h'))])
+                self.assertFalse([line for line in self.log() if line.startswith('enable')])
+                self.restore(kept)
 
     def test_setuid_in_the_runtime_fails_the_runtime_wall(self):
         self.ready()
@@ -209,11 +236,10 @@ class Setup(Case):
     def test_loose_t3_from_an_older_setup_is_installed_again(self):
         self.terminate()
         self.write('/log/install-loose', '')
-        cli.root_alone, real = (lambda folder: None), cli.root_alone   # an older kit: no root_alone
-        try:
-            self.assertEqual(self.setup_run()[0], 1)   # the runtime wall fails, as on the PC
-        finally:
-            cli.root_alone = real
+        self.assertEqual(self.setup_run()[0], 0)
+        d = self.path('/opt/pc-agents/t3/runtime/versions/' + CONFIG['t3Version'])
+        os.chmod(d + '/lib', 0o775)   # as an older kit's install left it (upstream's tar kept the archive's modes)
+        self.assertEqual(self.check()[0], 1)   # the runtime wall fails, as on the PC
         os.unlink(self.path('/log/install-loose'))
         code, out = self.setup_run()
         self.assertEqual(code, 0, out)

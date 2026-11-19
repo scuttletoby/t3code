@@ -21,7 +21,7 @@ AS_AGENT = 'pc-agents-as-agent'   # name prefix of `pc-agents as-agent`'s transi
 SETTLE, SETTLE_STEP = 15, 1   # after a (re)start, setup watches T3 this many seconds, every SETTLE_STEP, before done
 LOCK_WAIT, LOCK_STEP = 300, 5   # setup retries a dpkg or apt-get step that found a lock held this long, every LOCK_STEP
 LOADED = '/run/pc-agents/firewall.loaded'   # sha256 of the firewall file and `nft list` of it, saved when loaded
-T3 = OPT + '/t3'   # T3's runtime, installed by root (T3CODE_HOME of scripts/install.sh): the agent cannot change it
+T3 = OPT + '/t3'   # T3's runtime, downloaded, checked and unpacked by root (never run by it): the agent cannot change it
 UNIT, WALLS, UPDATE = 't3code-agents.service', 'pc-agents-walls', 'pc-agents-update'
 UNITS = (UNIT, WALLS + '.service', WALLS + '.timer', UPDATE + '.service', UPDATE + '.timer')
 TIMERS = (WALLS + '.timer', UPDATE + '.timer')   # enabled and running with T3 (the update one does nothing when off)
@@ -29,8 +29,20 @@ UPDATE_STATE = STATE + '/auto-update.json'   # the automatic update's journal an
 LOCK = '/run/pc-agents/setup.lock'   # setup and the automatic update take it: never two at once
 KEEP_VERSIONS = 3   # T3 version folders kept after an automatic update: the new one, the one before (rollback), one more
 UPDATE_TRIES = 3   # a switch to a new version stopped half-way this often is rolled back, not finished
+SETUP_TRIES = 3   # a release whose switch failed for another reason than T3 itself this often is not tried again
+QUIET_WAIT_DAYS = 7   # an update that waited this long (for a quiet point, or for GitHub's rate limit) is an alert
+DB_DIR = '/.t3/userdata'   # under HOME: T3's state database (T3CODE_HOME=HOME/.t3; apps/server/src/config.ts)
+DB_FILES = ('statev2.sqlite', 'statev2.sqlite-wal', 'statev2.sqlite-shm', 'state.sqlite', 'state.sqlite-wal',
+            'state.sqlite-shm')   # the database and its write-ahead log, and the older one a start imports
+DB_BACKUP = '/var/lib/pc-agents/db-backup'   # root's alone: T3's database as it was before the last switch
 HTTP_WAIT, HTTP_STEP = 180, 5   # after an update's restart, T3 must answer with its new version within HTTP_WAIT s
 GITHUB_API = 'https://api.github.com'
+# The pinned Sigstore public-good roots (Fulcio's certificate authority, Rekor's log key) the attestation check trusts
+TRUST = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sigstore-trust.json')
+RELEASE_WORKFLOW = 'fork-release.yml'   # the only workflow whose builds an automatic update installs, from main
+RELEASE_CALLERS = ('fork-release.yml', 'fork-follow.yml')   # what may run it: itself, or fork-follow's release job
+ARCHIVE_MAX, SUMS_MAX, JSON_MAX = 1 << 30, 1 << 16, 16 << 20   # largest download the kit takes of each (bytes)
+UNPACKED_MAX = 4 << 30   # the most an archive may unpack to (bytes)
 CHECK = OPT + '/current/sbin/pc-agents'
 WALLS_PY = OPT + '/current/walls/fork-fleet-walls.py'
 # Walls of fork-fleet-walls/wsl2 that are about the fleet launcher's job units. Here the job unit is T3's own unit,
@@ -68,7 +80,8 @@ CODE = {'fork-kit/pc-agents/sbin/pc-agents': ('sbin/pc-agents', 0o755),
         '.github/scripts/fork-fleet-walls.py': ('walls/fork-fleet-walls.py', 0o755),
         '.github/scripts/fork-fleet-launch.sh': ('walls/fork-fleet-launch.sh', 0o755),
         '.github/scripts/fork-fleet-job-paths.txt': ('walls/fork-fleet-job-paths.txt', 0o644),
-        'scripts/install.sh': ('share/install.sh', 0o644)}
+        'fork-kit/pc-agents/lib/attestation.py': ('lib/attestation.py', 0o644),
+        'fork-kit/pc-agents/lib/sigstore-trust.json': ('lib/sigstore-trust.json', 0o644)}
 for _w, _m in (('linux', 0o755), ('wsl2', 0o755), ('linux.fixture.json', 0o644), ('wsl2.fixture.json', 0o644)):
     CODE['.github/scripts/fork-fleet-walls/' + _w] = ('walls/fork-fleet-walls/' + _w, _m)
 
@@ -104,7 +117,7 @@ SPEC = {
     'devPorts': (str, '4100-4199', lambda v: None if port_range(v) else 'LOW-HIGH, 1024 to 65535, like 4100-4199'),
     'autoUpdate': (dict, {'enabled': False, 'follow': ''}, lambda v: auto_update_problem(v)),
 }
-REPO_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}')
+REPO_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.+$)[A-Za-z0-9._-]{1,100}')   # not `.` or `..`
 AUTO_UPDATE = {'enabled': (bool, machine_file.REQUIRED, None),
                'follow': (str, '', lambda v: None if not v or REPO_NAME.fullmatch(v) else 'the fork as OWNER/NAME')}
 
@@ -191,22 +204,22 @@ def release_track(version):
     return m[1] if m else 'stable'
 
 
-def newest_release(releases):
-    """The version of the release T3's own updater would take (newestCliReleaseVersion): the first in GitHub's list
-    (newest made first) that is published (not a draft), a full release (not a pre-release: the fork publishes its
-    builds as full releases once their tests pass), tagged vX.Y.Z[-...] and on the stable track; or None."""
-    for r in releases if isinstance(releases, list) else []:
-        if not isinstance(r, dict) or r.get('draft') is not False or r.get('prerelease') is not False:
-            continue
-        tag = r.get('tag_name')
-        version = tag[1:] if isinstance(tag, str) and tag.startswith('v') else ''
-        if VERSION.fullmatch(version) and release_track(version) == 'stable':
-            return version
-    return None
+def latest_version(latest):
+    """The version of the followed fork's latest release (github.com/OWNER/NAME/releases/latest as JSON: GitHub's
+    latest is published and not a pre-release; fork-release.yml marks each release it publishes latest) when T3 can
+    take it: tagged vX.Y.Z[-...] and on the stable track; else None."""
+    tag = latest.get('tag_name') if isinstance(latest, dict) else None
+    version = tag[1:] if isinstance(tag, str) and tag.startswith('v') else ''
+    return version if VERSION.fullmatch(version) and release_track(version) == 'stable' else None
+
+
+def arch():
+    """The release archives' name for this machine (scripts/build-cli-archive.ts), or None."""
+    return {'x86_64': 'x64', 'amd64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(os.uname().machine.lower())
 
 
 def runtime(c):
-    """T3's version folder (root's, from scripts/install.sh with T3CODE_HOME=T3); the unit runs its `t3`."""
+    """T3's version folder (root's, install_t3 unpacks it); the unit runs its `t3`."""
     return f'{T3}/runtime/versions/{c["t3Version"]}'
 
 

@@ -11,6 +11,9 @@
 #   check-bundle DIR        The server bundle DIR (apps/server/dist) outside DIR/client must name
 #                           REPOSITORY as its release repository.
 #   check-archives DIR      The `t3` program of every CLI archive in DIR must name REPOSITORY.
+#   on-main SHA             Before a publish: SHA must be on this fork's main, unless WORKFLOW_REF
+#                           (github.workflow_ref) is fork-follow.yml on main, which publishes the
+#                           rebased candidate it built itself before it moves main there.
 #
 # Environment: FORK_FOLLOW_CHANNEL (nightly or stable, default nightly: which upstream tags a base
 # may be; fork-channel.sh), REPOSITORY (owner/name of this fork; GITHUB_REPOSITORY in a run), UPSTREAM
@@ -227,6 +230,26 @@ cmd_publish() {
   } >> "$OUTPUT"
 }
 
+# Every release reaches the app's stable track and the auto-updating PC agents, so only reviewed code
+# is published: a commit on main, or fork-follow's own candidate (upstream's release plus main's
+# commits, rebased by fork-follow.yml on main). The pc-agents kit checks the same through the build
+# attestation; this stops it at the source.
+cmd_on_main() {
+  local sha="${1:?commit}" follow="$REPOSITORY/.github/workflows/fork-follow.yml@refs/heads/main" status
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "'$sha' is not a full commit id."
+  if [[ "${WORKFLOW_REF:-}" == "$follow" ]]; then
+    echo "Publishing fork-follow's candidate $sha (called by $follow)."
+    return
+  fi
+  # compare/A...B is "ahead" or "identical" exactly when A is part of B's history.
+  status="$(gh api "repos/$REPOSITORY/compare/$sha...main" --jq .status)" \
+    || die "Could not compare $sha with main; nothing was published."
+  case "$status" in
+    ahead | identical) echo "$sha is on main." ;;
+    *) die "$sha is not on main ($status), so it is not published (workflow ${WORKFLOW_REF:-unknown}). Merge it first, or run without publish." ;;
+  esac
+}
+
 # The web client (DIR/client) names this repository on every Actions build anyway: upstream's
 # apps/web/vite.config.ts bakes GITHUB_REPOSITORY into it. Only the server code counts here.
 cmd_check_bundle() {
@@ -286,6 +309,7 @@ case "$command" in
   publish) cmd_publish "$@" ;;
   check-bundle) cmd_check_bundle "$@" ;;
   check-archives) cmd_check_archives "$@" ;;
+  on-main) cmd_on_main "$@" ;;
   version-gt) version_gt "$@" ;;
-  *) die "usage: $0 resolve | remove-drafts TAG | publish ID TAG VERSION | check-bundle DIR | check-archives DIR" ;;
+  *) die "usage: $0 resolve | remove-drafts TAG | publish ID TAG VERSION | check-bundle DIR | check-archives DIR | on-main SHA" ;;
 esac

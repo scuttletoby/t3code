@@ -11,16 +11,19 @@
   pc-agents pair [ARGS...]                 as root: a pairing code for the running T3 (its `t3 pair ARGS`, as the
                                            agent): the kit's T3 is walled from Windows, so no Windows browser can
                                            open it to make one
-  pc-agents auto-update                    as root (its hourly timer): with autoUpdate on, install the followed
-                                           fork's newest release when T3 is idle, check it, roll back on failure
+  pc-agents auto-update [--clear]          as root (its hourly timer): with autoUpdate on, install the followed
+                                           fork's latest release (checked: built by its fork-release.yml on main)
+                                           when T3 is idle, check it, roll back on failure. --clear: forget the
+                                           alert and the releases it does not try again
 Standard library only."""
-import contextlib, fcntl, io, json, os, re, shutil, stat, sys, time
+import contextlib, fcntl, io, json, os, re, shutil, stat, sys, tarfile, time, zlib
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 LIB = os.path.join(HERE, 'lib')
 COMMON = os.path.join(os.path.dirname(HERE), 'common')   # the repository's; an installed kit has its own copy in LIB
 sys.path[:0] = [LIB] + ([] if os.path.exists(os.path.join(LIB, 'machine_file.py')) else [COMMON])
 sys.dont_write_bytecode = True
+import attestation  # noqa: E402
 import machine_file  # noqa: E402
 import pc_agents as k  # noqa: E402
 
@@ -124,9 +127,9 @@ def preflight(c, files):
 
 def root_alone(folder):
     """Make folder and all in it the kit's owner's, writable by it alone, without setuid or setgid, the folder itself
-    0755 (the agent runs its t3). Upstream's install.sh unpacks as root with tar, which keeps the archive's owners and
-    modes, and moves in a mktemp -d folder (0700). The folder is closed (0700) while its insides are fixed and opened
-    last, so nothing else can reach in meanwhile. Links are owned, never followed."""
+    0755 (the agent runs its t3). An older kit's install (upstream's install.sh) kept the archive's owners and modes.
+    The folder is closed (0700) while its insides are fixed and opened last, so nothing else can reach in meanwhile.
+    Links are owned, never followed."""
     top = k.ROOT + folder
     os.chmod(top, 0o700)
     for here, dirs, names in os.walk(top):
@@ -148,12 +151,173 @@ def loose(folder):
     return tree(folder, folder)
 
 
-def install_t3(c, version, done, prefetch=False):
-    """Install T3 as root under k.T3 with upstream's scripts/install.sh (it checks SHA256SUMS and runs the new t3),
-    make it root's alone (root_alone), and record its t3's hash. A version folder that is not (an older setup's
-    install, or one stopped before root_alone) is removed and installed again: what others could write is never
-    trusted. It is first moved aside in one step (a stop half-way leaves no part folder), with T3 stopped (it runs
-    from that folder; setup restarts it). Returns why not, or None.
+TRANSIENT = re.compile(r'returned error: (403|429|5\d\d)\b|\(28\) |\(6\) |\(7\) |\(35\) |\(56\) ')
+
+
+def curl(url, dest=None, most=k.JSON_MAX, accept=None, timeout=300):
+    """GET url over HTTPS only (redirects too), as root, to the file dest (root's) or stdout: (text or None, why not
+    or None, whether why is transient: GitHub's rate limit (403, 429), a server error or the network)."""
+    argv = ['/usr/bin/curl', '-q', '-fsSL', '--proto', '=https', '--proto-redir', '=https', '--tlsv1.2',
+            '--max-filesize', str(most), '--max-time', str(timeout), '-H', 'User-Agent: pc-agents']
+    argv += ['-H', f'Accept: {accept}'] if accept else []
+    argv += ['-o', k.ROOT + dest] if dest else []
+    r = k.run(argv + [url], timeout=timeout + 60)
+    if r.returncode == 0:
+        return r.stdout, None, False
+    said = (r.stderr.strip() or f'exit {r.returncode}')[-200:]
+    return None, f'{url}: {said}', bool(TRANSIENT.search(r.stderr) or r.returncode == 124)
+
+
+class Refused(Exception):
+    """A release file the kit does not take: not the one SHA256SUMS names, not attested, not an archive it unpacks."""
+
+
+def summed(sums, name):
+    """The SHA-256 SHA256SUMS (its text) gives for name: exactly one line names it."""
+    found = [m[1] for m in re.finditer(r'(?m)^([0-9a-fA-F]{64}) [ *]?(\S+)$', sums) if m[2] == name]
+    if len(found) != 1:
+        raise Refused(f'SHA256SUMS names {name} {len(found)} times, not once')
+    return found[0].lower()
+
+
+def attested(c, name, digest, work):
+    """Refused unless GitHub's attestations API holds a Sigstore bundle that attests name with digest as built by the
+    followed fork's fork-release.yml on main (attestation.verify, the trust k.TRUST pins). Returns None; raises
+    Refused, or OSError for what may pass next time (the API, the network)."""
+    follow = c['autoUpdate']['follow']
+    url = f'{k.GITHUB_API}/repos/{follow}/attestations/sha256:{digest}'
+    text, why, transient = curl(url, accept='application/vnd.github+json')
+    if why:
+        if transient or not re.search(r'returned error: 404\b', why):
+            raise OSError(f'cannot read its attestations ({why})')
+        raise Refused(f'{name} has no build attestation on {follow}: not built by its {k.RELEASE_WORKFLOW}')
+    with open(k.TRUST, encoding='utf-8') as f:
+        trust = json.load(f)
+    policy = attestation.github_policy(follow, k.RELEASE_WORKFLOW, list(k.RELEASE_CALLERS))
+    try:
+        items = json.loads(text)['attestations']
+    except (ValueError, KeyError, TypeError):
+        items = None
+    if not isinstance(items, list):
+        raise Refused(f'the attestations API answered no list ({text.strip()[:120]})')
+    whys = []
+    for i, item in enumerate(items[:10]):
+        bundle = item.get('bundle') if isinstance(item, dict) else None
+        if bundle is None and isinstance(item, dict) and isinstance(item.get('bundle_url'), str):
+            got = f'{work}/bundle-{i}'
+            _, why, transient = curl(item['bundle_url'], got, k.JSON_MAX)
+            if why:
+                whys.append(f'its bundle did not download ({why})')
+                continue
+            with open(k.ROOT + got, 'rb') as f:
+                raw = f.read()
+            try:
+                bundle = json.loads(raw if raw.lstrip()[:1] == b'{' else attestation.unsnappy(raw))
+            except ValueError as e:
+                whys.append(f'its bundle is not one ({e})')
+                continue
+        if not isinstance(bundle, dict):
+            whys.append('no bundle')
+            continue
+        os.makedirs(f'{k.ROOT}{work}/check-{i}', mode=0o700)
+        why = attestation.verify(bundle, name, digest, policy, trust, f'{k.ROOT}{work}/check-{i}', k.run)
+        if why is None:
+            return None
+        whys.append(why)
+    raise Refused(f'{name} is not attested as built by {follow}\'s {k.RELEASE_WORKFLOW} on main: '
+                  + ('; '.join(dict.fromkeys(whys))[:400] or 'no attestation'))
+
+
+def unpack(archive, stem, dest):
+    """Unpack the release archive (its files under the folder stem) into dest as plain files and folders: tarfile's
+    data filter (no device, no link out of dest or absolute, no setuid, setgid or write for others, no owner kept),
+    every member under stem (stripped, as install.sh's --strip-components=1), k.UNPACKED_MAX in all. Older Pythons'
+    data filters could be led out of dest through a link the archive made first (CVE-2025-4138, -4517): refused here
+    before the filter, so a link never leads up (`..`) or out, and nothing is unpacked through or over a link."""
+    if not hasattr(tarfile, 'data_filter'):
+        raise Refused('this Python has no tarfile.data_filter (3.12, or 3.8.17 and later): not unpacking')
+    total, links, seen = 0, set(), set()
+
+    def under_stem(member, path):
+        nonlocal total
+        name = os.path.normpath(member.name)
+        if name == stem:
+            return None
+        if not name.startswith(stem + '/') or member.name.startswith('/') or '..' in member.name.split('/'):
+            raise Refused(f'{member.name[:120]} is not under {stem}/')
+        name = name[len(stem) + 1:]
+        parts = name.split('/')
+        if any('/'.join(parts[:i]) in links for i in range(1, len(parts) + 1)):
+            raise Refused(f'{member.name[:120]} is unpacked through or over a link')
+        linkname = member.linkname
+        if member.issym():
+            target = os.path.normpath(os.path.join(os.path.dirname(name), linkname))
+            if linkname.startswith('/') or target == '..' or target.startswith('../'):
+                raise Refused(f'{member.name[:120]} links to {linkname[:120]}, out of the folder')
+            links.add(name)
+        elif member.islnk():
+            linkname = os.path.normpath(linkname)
+            if not linkname.startswith(stem + '/') or linkname[len(stem) + 1:] not in seen:
+                raise Refused(f'{member.name[:120]} links to {member.linkname[:120]}, not a file before it')
+            linkname = linkname[len(stem) + 1:]
+        elif not (member.isfile() or member.isdir()):
+            raise Refused(f'{member.name[:120]} is not a file, a folder or a link')
+        if member.isfile():
+            seen.add(name)
+        total += max(member.size, 0)
+        if total > k.UNPACKED_MAX:
+            raise Refused(f'it unpacks to more than {k.UNPACKED_MAX} bytes')
+        return tarfile.data_filter(member.replace(name=name, linkname=linkname, deep=False), path)
+    try:
+        with tarfile.open(k.ROOT + archive, 'r:gz') as tar:
+            tar.extractall(k.ROOT + dest, filter=under_stem)
+    except tarfile.FilterError as e:
+        raise Refused(f'the archive holds what the kit does not unpack ({e})') from None
+    except (tarfile.TarError, EOFError, zlib.error) as e:
+        raise Refused(f'not a gzip tar archive ({e})') from None
+
+
+def download(c, folder, stage):
+    """T3 c['t3Version'] from c['t3ReleaseBaseUrl'], checked and unpacked into folder by way of stage (an empty
+    folder only root can reach, in folder's parent): SHA256SUMS of the release names the archive, the archive is
+    that file, and (with autoUpdate on) its build attestation passes (attested()). Nothing downloaded is run.
+    Raises Refused (a release the kit does not take) or OSError (may pass next time)."""
+    version, machine = c['t3Version'], k.arch()
+    if machine is None:
+        raise Refused(f'no T3 release archive for this machine ({os.uname().machine})')
+    stem = f't3-{version}-linux-{machine}'
+    base = f'{c["t3ReleaseBaseUrl"].rstrip("/")}/v{version}'
+    for name, most in (('SHA256SUMS', k.SUMS_MAX), (stem + '.tar.gz', k.ARCHIVE_MAX)):
+        _, why, _ = curl(f'{base}/{name}', f'{stage}/{name}', most, timeout=1800)
+        if why:
+            raise OSError(f'download failed ({why})')
+    with open(f'{k.ROOT}{stage}/SHA256SUMS', encoding='utf-8', errors='replace') as f:
+        want = summed(f.read(), stem + '.tar.gz')
+    got = k.file_sha(f'{stage}/{stem}.tar.gz')
+    if got != want:
+        raise Refused(f'{stem}.tar.gz has SHA-256 {got}, but SHA256SUMS says {want}')
+    if c['autoUpdate']['enabled']:
+        attested(c, stem + '.tar.gz', got, stage)
+    os.makedirs(f'{k.ROOT}{stage}/t3', mode=0o700)
+    unpack(f'{stage}/{stem}.tar.gz', stem, f'{stage}/t3')
+    t3 = k.lstat(f'{stage}/t3/t3')
+    if not (t3 and stat.S_ISREG(t3.st_mode)):
+        raise Refused(f'{stem}.tar.gz has no file t3')
+    with open(f'{k.ROOT}{stage}/t3/.install-complete', 'w', encoding='utf-8') as f:
+        f.write(version + '\n')   # as install.sh writes it
+    root_alone(f'{stage}/t3')
+    if why := loose(f'{stage}/t3'):
+        raise Refused(f'T3 unpacked, but not root\'s alone: {why}')
+    os.rename(f'{k.ROOT}{stage}/t3', k.ROOT + folder)
+
+
+def install_t3(c, done, prefetch=False):
+    """Install T3 c['t3Version'] as root under k.T3 (download(): checked, never run), and record its t3's hash. A
+    version folder that is not root's alone (an older kit's install) is removed and installed again: what others
+    could write is never trusted. It is first moved aside in one step (a stop half-way leaves no part folder), with T3
+    stopped (it runs from that folder; setup restarts it). A stop half-way leaves a .staging- or .removing- folder,
+    removed by the next run. Returns (why not, or None; whether the release itself was refused, not a download that
+    may pass next time).
     prefetch: the automatic update downloads a version T3 does not run yet (c holds that version, not the machine
     file's): nothing T3 runs with changes, so no restart mark and no stop; a folder of it without a t3 is removed
     too (only root writes under k.T3, and nothing runs from it)."""
@@ -161,44 +325,54 @@ def install_t3(c, version, done, prefetch=False):
     versions = os.path.dirname(folder)
     if bad := [why for d in (k.T3, k.T3 + '/runtime', versions) if k.lstat(d) and
                (why := k.safe(d, k.lstat(d), stat.S_ISDIR))]:
-        return '; '.join(bad)
-    for n in os.listdir(k.ROOT + versions) if k.lstat(versions) else []:
-        if n.startswith('.removing-'):   # a removal stopped half-way
+        return '; '.join(bad), False
+    for d in (k.T3, k.T3 + '/runtime', versions):
+        if k.lstat(d) is None:
+            os.mkdir(k.ROOT + d, 0o755)
+    for n in os.listdir(k.ROOT + versions):
+        if n.startswith(('.removing-', '.staging-')):   # a removal or download stopped half-way
             shutil.rmtree(k.ROOT + versions + '/' + n)
     st = k.lstat(folder)
     if st and not stat.S_ISDIR(st.st_mode):
-        return f'{folder} is not a folder (not made by setup): remove it'
+        return f'{folder} is not a folder (not made by setup): remove it', False
     if st and k.lstat(folder + '/t3') is None and not prefetch:
-        return f'{folder} is there but has no t3 (not made by setup): remove that folder'
+        return f'{folder} is there but has no t3 (not made by setup): remove that folder', False
     if st and (why := ('no t3' if k.lstat(folder + '/t3') is None else loose(folder))):
         say(f'{why}: removing it to install T3 {c["t3Version"]} again')
         if not prefetch:
             mark()
             k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
-        done.pop(folder + '/t3', None)   # first: a stop after this leaves no hash the new t3 would have to match
-        keep(done)
-        aside = f'{versions}/.removing-{os.getpid()}'
-        os.rename(k.ROOT + folder, k.ROOT + aside)
-        shutil.rmtree(k.ROOT + aside)
+        drop(folder, done)
     if k.lstat(folder) is None:
         say(f'installing T3 {c["t3Version"]} under {k.T3}')
         if not prefetch:
             mark()
-        r = k.run(['/usr/bin/env', '-i', 'HOME=/root', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', f'T3CODE_HOME={k.T3}',
-                   f'T3CODE_INSTALL_BIN_DIR={k.T3}/bin', f'T3CODE_VERSION={c["t3Version"]}',
-                   f'T3CODE_RELEASE_BASE_URL={c["t3ReleaseBaseUrl"]}', '/bin/sh', f'{version}/share/install.sh'],
-                  timeout=1800)
-        if r.returncode or k.lstat(folder + '/t3') is None:
-            return f'T3 install failed: {(r.stderr or r.stdout).strip()[-400:]}'
-        root_alone(folder)
-        if why := loose(folder):
-            return f'T3 installed, but not root\'s alone: {why}'
+        stage = f'{versions}/.staging-kit-{os.getpid()}'
+        os.mkdir(k.ROOT + stage, 0o700)
+        try:
+            download(c, folder, stage)
+        except Refused as e:
+            return f'T3 {c["t3Version"]} refused: {e}', True
+        except OSError as e:
+            return f'T3 install failed: {e}', False
+        finally:
+            shutil.rmtree(k.ROOT + stage, ignore_errors=True)
         if not prefetch:
             mark()
     if not done.get(folder + '/t3'):   # a mismatch is left to the runtime wall; only a missing hash is added
         done[folder + '/t3'] = {k.file_sha(folder + '/t3')}
         keep(done)
-    return None
+    return None, False
+
+
+def drop(folder, done):
+    """Remove a T3 version folder and its record line: the line first (a stop after it leaves no hash a new t3 there
+    would have to match), then the folder moved aside in one rename (a stop half-way leaves a .removing- folder)."""
+    done.pop(folder + '/t3', None)
+    keep(done)
+    aside = f'{os.path.dirname(folder)}/.removing-{os.getpid()}'
+    os.rename(k.ROOT + folder, k.ROOT + aside)
+    shutil.rmtree(k.ROOT + aside)
 
 
 # What dpkg and apt-get say (under LC_ALL=C) when another one (apt-daily, unattended-upgrades) holds a lock they take
@@ -320,7 +494,7 @@ def setup(source, sha):
     k.run(['/usr/bin/systemctl', 'daemon-reload'])   # systemd reads the units as written, even if the install fails
     for path in k.masks(c):
         put(path, '/dev/null', None, link=True)
-    why = install_t3(c, version, done)
+    why, _ = install_t3(c, done)
     if why:
         return say(why + ' (run setup again; T3 restarts once it succeeds)') or 1
     units = [k.UNIT, *k.TIMERS]
@@ -341,7 +515,7 @@ def setup(source, sha):
         stays_up() if k.lstat(k.PENDING) or not ran else None
     if why:
         said, ended = t3_said(since), t3_ended(c)
-        return say(f'T3 did not start or stay up ({why}{"; " + ended if ended else ""})'
+        return say(f'{DID_NOT_START} ({why}{"; " + ended if ended else ""})'
                    f'{"; its log: " + said if said else ""}: see journalctl -u '
                    f'{k.UNIT}; run setup again once fixed') or 1
     if k.lstat(k.PENDING):
@@ -579,11 +753,26 @@ def check(enforce, before_enable=False):
 # that changes what T3 runs with, so a run stopped anywhere is finished or rolled back by the next one:
 #   phase    "switching" (from -> to) or "rolling-back" (to -> from); none when no switch is under way
 #   from, to the version before and the new one; tries: runs that began this switch (past k.UPDATE_TRIES: rolled back)
-#   failed   the last version that did not come up: never tried again (a newer release is)
+#   why, blame   (rolling back) why, and whether T3 itself failed ("t3": it did not start, stay up or answer) or
+#            something else ("other": a package lock, a wall, a cut run)
+#   failed   the last version T3 did not come up on, or whose switch failed k.SETUP_TRIES times in a row for other
+#            reasons: never tried again (a newer release is)
+#   retry, retries   the version whose switch failed for another reason, and how often in a row
+#   refused  the last version whose release files the kit refused (no attestation, not the file SHA256SUMS names, an
+#            archive it does not unpack): not downloaded again (a newer release is)
+#   waiting  since when (epoch seconds) an update waits (for a quiet point, or GitHub's rate limit); past
+#            k.QUIET_WAIT_DAYS it is an alert
+#   alert    what the owner must see (a rollback, a refused release, T3 not running, a long wait): kept, and every
+#            run exits 1, until an update succeeds or `pc-agents auto-update --clear`
 #   result, at   what the last run did, and when (epoch seconds)
+KEPT = ('failed', 'retry', 'retries', 'refused', 'waiting', 'alert')   # kept from run to run (the rest: one switch)
+DID_NOT_START = 'T3 did not start or stay up'   # setup's words when T3 itself failed
+
+
 def update_state():
     """The journal ({} when there is none, or when it is not one: then no switch is under way that this run knows of,
-    and the run starts from the machine file and a running, walled T3 only)."""
+    and the run starts from the machine file and a running, walled T3 only). A value of the wrong kind, or a version
+    that is not one (a hand edit, a newer kit's), is left out."""
     try:
         with open(k.ROOT + k.UPDATE_STATE, encoding='utf-8') as f:
             got = json.load(f)
@@ -595,18 +784,45 @@ def update_state():
     if not isinstance(got, dict):
         say(f'{k.UPDATE_STATE} is not a JSON object: taken as empty')
         return {}
-    texts = ('phase', 'from', 'to', 'failed', 'why')
-    return {key: v for key, v in got.items() if key in texts and isinstance(v, str) or key == 'tries' and
-            type(v) is int}
+    versions, texts, ints = ('from', 'to', 'failed', 'retry', 'refused'), ('phase', 'why', 'blame', 'alert'), \
+        ('tries', 'retries', 'waiting')
+    out = {}
+    for key, v in got.items():
+        if key in versions and not (isinstance(v, str) and k.VERSION.fullmatch(v)):
+            say(f'{k.UPDATE_STATE}: {key} is not a version ({str(v)[:40]!r}): left out')
+        elif key in versions + texts and isinstance(v, str) or key in ints and type(v) is int:
+            out[key] = v
+    return out
 
 
-def note(state, result, ok=True):
-    """Save the journal with this run's result, and say it (a line in the update unit's journal). Returns the exit
-    code: 0, or 1 when not ok."""
+def kept(state, *drop):
+    """The journal entries kept from run to run, but drop."""
+    return {key: state[key] for key in KEPT if key in state and key not in drop}
+
+
+def note(state, result, ok=True, alert=None):
+    """Save the journal with this run's result, and say it (a line in the update unit's journal). alert: what the
+    owner must see, kept as the journal's alert. Returns the exit code: 1 when not ok or an alert stands, else 0."""
+    if alert:
+        state = {**state, 'alert': f'{time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}: {alert}'[:700]}
     state = {key: v for key, v in {**state, 'result': result, 'at': int(time.time())}.items() if v is not None}
     put(k.UPDATE_STATE, json.dumps(state, indent=2, sort_keys=True) + '\n', 0o644, restart=False)
     say(result if ok else 'FAILED: ' + result)
-    return 0 if ok else 1
+    if state.get('alert'):
+        say(f'ALERT (kept until an update succeeds, or pc-agents auto-update --clear): {state["alert"]}')
+    return 0 if ok and not state.get('alert') else 1
+
+
+def waits(state, result):
+    """Note that the update waits (exit 0), since the journal's `waiting`; after k.QUIET_WAIT_DAYS an alert (exit 1):
+    one open terminal in T3 would block every update for good, unseen."""
+    since = state.get('waiting') or int(time.time())
+    days = (time.time() - since) / 86400
+    state = {**state, 'waiting': since}
+    if days >= k.QUIET_WAIT_DAYS:
+        return note(state, result, ok=False, alert=f'an update has waited {int(days)} days (more than '
+                    f'{k.QUIET_WAIT_DAYS}): {result}')
+    return note(state, result)
 
 
 def told(fn, *args, echo=True):
@@ -631,11 +847,11 @@ def walls_hold():
     return None if code == 0 else '; '.join(x for x in out.splitlines() if x.startswith('FAIL'))[:600] or 'check failed'
 
 
-def set_version(version):
-    """Set t3Version in the machine file to version: a copy of the file as it was first (machine.json.bak), then the
-    file whole (a new file, one rename), its mode kept. Only that value changes: the owner's layout stays when one
-    plain replacement gives the same data, else the file is written out again as JSON (the same data). Read under the
-    machine file's own rules (root's, not a link)."""
+def set_version(version, copy=True):
+    """Set t3Version in the machine file to version: with copy, a copy of the file as it was first (machine.json.bak;
+    a rollback keeps the copy from before the update), then the file whole (a new file, one rename), its mode kept.
+    Only that value changes: the owner's layout stays when one plain replacement gives the same data, else the file
+    is written out again as JSON (the same data). Read under the machine file's own rules (root's, not a link)."""
     path = machine_file.default_path()
     text = machine_file.read_protected_text(k.ROOT + path, k.OWNER)
     data = json.loads(text)
@@ -649,44 +865,53 @@ def set_version(version):
     except ValueError:
         new = ''
     mode = stat.S_IMODE(os.lstat(k.ROOT + path).st_mode)
-    put(path + '.bak', text, mode, restart=False)
+    if copy:
+        put(path + '.bak', text, mode, restart=False)
     put(path, new or json.dumps(data, indent=2) + '\n', mode, restart=False)
 
 
+def is_active():
+    return k.run(['/usr/bin/systemctl', 'is-active', k.UNIT]).returncode == 0
+
+
 def busy():
-    """Why now is no quiet point, or None: T3 runs a process that is not T3 itself (an agent's provider session, a
-    terminal, a tool it started). Every process below T3's main process counts, but those whose program is in one of
-    T3's version folders (T3's own helpers). Provider sessions end on their own after 30 idle minutes, so a quiet
-    point comes. What cannot be read counts as busy: an update never cuts work it cannot see."""
-    r = k.run(['/usr/bin/systemctl', 'show', '-p', 'MainPID', k.UNIT])
-    main = k.props(r.stdout).get('MainPID', '')
+    """Why now is no quiet point, or None: a process runs in T3's unit (its control group, where systemd keeps every
+    process T3 started, also one that left T3's process tree: `setsid`, `nohup ... &`) that is not T3 itself (an
+    agent's provider session, a terminal, a test run or dev server an agent's shell left). Those whose program is in
+    one of T3's version folders (T3's own helpers) do not count. Provider sessions end on their own after 30 idle
+    minutes, so a quiet point comes (or, after k.QUIET_WAIT_DAYS, an alert). What cannot be read counts as busy: an
+    update never cuts work it cannot see."""
+    r = k.run(['/usr/bin/systemctl', 'show', '-p', 'MainPID,ControlGroup', k.UNIT])
+    got = k.props(r.stdout)
+    main, group = got.get('MainPID', ''), got.get('ControlGroup', '')
     if r.returncode or not main.isdigit():
         return f'cannot tell what T3 runs ({(r.stderr or r.stdout).strip()[-200:]})'
-    if main == '0':
-        return None
-    kids = {}
+    if not group:
+        return None if main == '0' else 'cannot tell what T3 runs (it has no control group)'
+    if not re.fullmatch(r'(/[^/\0]+)+', group) or '..' in group.split('/'):
+        return f'cannot tell what T3 runs (control group {group[:80]!r})'
+    top = next((t for t in (f'{k.ROOT}{base}{group}' for base in ('/sys/fs/cgroup', '/sys/fs/cgroup/unified',
+                                                                    '/sys/fs/cgroup/systemd')) if os.path.isdir(t)),
+               None)
+    if top is None:
+        return f'cannot find T3\'s control group {group}'
+    pids = []
     try:
-        names = os.listdir(k.ROOT + '/proc')
-    except OSError as e:
-        return f'cannot list the processes ({e})'
-    for pid in filter(str.isdigit, names):
-        try:
-            with open(f'{k.ROOT}/proc/{pid}/stat', encoding='utf-8', errors='replace') as f:
-                parent = f.read().rsplit(')', 1)[1].split()[1]
-        except FileNotFoundError:
-            continue   # it ended meanwhile
-        except (OSError, IndexError) as e:
-            return f'cannot read process {pid} ({e})'
-        kids.setdefault(parent, []).append(pid)
+        for here, _, names in os.walk(top, onerror=lambda e: (_ for _ in ()).throw(e)):
+            if 'cgroup.procs' in names:
+                with open(f'{here}/cgroup.procs', encoding='ascii') as f:
+                    pids += f.read().split()
+    except (OSError, UnicodeError) as e:
+        return f'cannot read T3\'s control group ({e})'
     own = os.path.realpath(k.ROOT + k.T3 + '/runtime/versions') + '/'
-    found, todo = [], list(kids.get(main, []))
-    while todo:
-        pid = todo.pop()
-        todo += kids.get(pid, [])
+    found = []
+    for pid in pids:
+        if pid == main:
+            continue
         try:
             exe = os.readlink(f'{k.ROOT}/proc/{pid}/exe').removesuffix(' (deleted)')
         except FileNotFoundError:
-            continue
+            continue   # it ended meanwhile
         except OSError as e:
             return f'cannot read process {pid} ({e})'
         if not (k.ROOT + exe).startswith(own):
@@ -720,132 +945,321 @@ def serves(c, version):
 
 
 def newest(c):
-    """(the version of the followed fork's newest release T3 can take, or None; why the list was not read, or
-    None). Its public release list over HTTPS: nothing the agent can write."""
-    url = f'{k.GITHUB_API}/repos/{c["autoUpdate"]["follow"]}/releases?per_page=30'
-    r = k.run(['/usr/bin/curl', '-q', '-fsSL', '--proto', '=https', '--proto-redir', '=https', '--tlsv1.2',
-               '--max-time', '60', '-H', 'Accept: application/vnd.github+json', '-H', 'User-Agent: pc-agents', url],
-              timeout=120)
-    if r.returncode:
-        return None, f'cannot read the release list ({url}: {r.stderr.strip()[-200:] or f"exit {r.returncode}"})'
+    """(the version of the followed fork's latest release T3 can take, or None; why it was not read, or None; whether
+    that may pass next time). github.com's releases/latest as JSON (what install.sh reads), not the API: no API rate
+    limit (60 an hour for all of a home's machines). Nothing the agent can write."""
+    url = f'https://github.com/{c["autoUpdate"]["follow"]}/releases/latest'
+    text, why, transient = curl(url, accept='application/json', timeout=60)
+    if why and re.search(r'returned error: 404\b', why):
+        return None, None, False   # no release marked latest
+    if why:
+        return None, f'cannot read the latest release ({why})', transient
     try:
-        listing = json.loads(r.stdout)
+        latest = json.loads(text)
     except ValueError as e:
-        return None, f'the release list is not JSON ({e})'
-    if not isinstance(listing, list):
-        return None, f'the release list is not a list ({r.stdout.strip()[:120]})'
-    return k.newest_release(listing), None
+        return None, f'the latest release is not JSON ({e})', False
+    if not isinstance(latest, dict):
+        return None, f'the latest release is not a JSON object ({text.strip()[:120]})', False
+    return k.latest_version(latest), None, False
 
 
-def prune(keep_versions):
+def prune(keep_versions, bad):
     """Remove the T3 version folders past the newest k.KEEP_VERSIONS, never one of keep_versions (the one T3 runs and
-    the one before it), and their record lines. Only folders named as a version, right in the versions folder (root's
-    alone), each moved aside first (one rename: a stop half-way leaves a .removing- folder, which install_t3 removes).
-    Returns the removed versions."""
+    the one before it), and their record lines; a version in bad (did not come up) takes no kept place. Only folders
+    named as a version, right in the versions folder (root's alone), each moved aside first (drop()). Returns the
+    removed versions."""
     versions = k.T3 + '/runtime/versions'
     if [why for d in (k.T3, k.T3 + '/runtime', versions) if (why := k.safe(d, k.lstat(d), stat.S_ISDIR))]:
         return []
     names = sorted((n for n in os.listdir(k.ROOT + versions) if k.VERSION.fullmatch(n)
                     and stat.S_ISDIR(k.lstat(f'{versions}/{n}').st_mode)), key=k.semver_key, reverse=True)
-    kept = [n for n in names if n in keep_versions]
-    kept += [n for n in names if n not in kept][:max(0, k.KEEP_VERSIONS - len(kept))]
-    gone = [n for n in names if n not in kept]
+    kept_names = [n for n in names if n in keep_versions]
+    kept_names += [n for n in names if n not in kept_names and n not in bad][:max(0, k.KEEP_VERSIONS - len(kept_names))]
+    gone = [n for n in names if n not in kept_names]
     done = k.record()
     for n in gone:
-        folder = f'{versions}/{n}'
-        done.pop(folder + '/t3', None)   # first: a stop after this leaves no hash a new t3 there would have to match
-        keep(done)
-        aside = f'{versions}/.removing-{os.getpid()}'
-        os.rename(k.ROOT + folder, k.ROOT + aside)
-        shutil.rmtree(k.ROOT + aside)
+        drop(f'{versions}/{n}', done)
     return gone
 
 
+def userdata():
+    """An open folder of T3's database (HOME + k.DB_DIR), reached one folder at a time without following a link (the
+    agent owns them), or None when there is none."""
+    fd = os.open(k.ROOT + '/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in (k.HOME + k.DB_DIR).strip('/').split('/'):
+            new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = new
+    except FileNotFoundError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def agent_ids():
+    """The agent's (uid, gid), or None when there is no such user."""
+    return (k.OWNER, os.getegid()) if k.ROOT else k.users()[0].get(k.USER)
+
+
+def unit_runs(version):
+    """Whether T3's unit file names version's folder (None: it cannot be read)."""
+    try:
+        with open(f'{k.ROOT}/etc/systemd/system/{k.UNIT}', encoding='utf-8') as f:
+            return f'/versions/{version}/' in f.read()
+    except OSError:
+        return None
+
+
+def backup_matches(old, new):
+    """Whether k.DB_BACKUP holds T3's database as it was before this switch (old to new)."""
+    try:
+        with open(f'{k.ROOT}{k.DB_BACKUP}/manifest.json', encoding='utf-8') as f:
+            got = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(got, dict) and got.get('from') == old and got.get('to') == new
+
+
+def forget_backup():
+    """Remove k.DB_BACKUP (a copy from an earlier switch is never restored into this one)."""
+    for d in (k.DB_BACKUP, k.DB_BACKUP + '.new'):
+        if os.path.lexists(k.ROOT + d):
+            shutil.rmtree(k.ROOT + d)
+
+
+def back_up_db(old, new):
+    """Copy T3's database (k.DB_FILES that are there) to k.DB_BACKUP, root's alone, with T3 stopped (a whole, still
+    copy of the database and its write-ahead log), and note which were there (manifest.json, written last). Only the
+    agent's plain files, opened without following a link. Returns why not, or None."""
+    parent = os.path.dirname(k.DB_BACKUP)
+    os.makedirs(k.ROOT + parent, mode=0o755, exist_ok=True)
+    if why := k.safe(parent, k.lstat(parent), stat.S_ISDIR):
+        return why
+    if agent_ids() is None:
+        return f'there is no user {k.USER}'
+    forget_backup()
+    work = k.ROOT + k.DB_BACKUP + '.new'
+    os.mkdir(work, 0o700)
+    uid, _ = agent_ids()
+    files = {}
+    fd = userdata()
+    try:
+        for name in k.DB_FILES if fd is not None else ():
+            try:
+                src = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                return f'cannot open {k.HOME}{k.DB_DIR}/{name} ({e}: a link?)'
+            with os.fdopen(src, 'rb') as f:
+                st = os.fstat(f.fileno())
+                if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+                    return f'{k.HOME}{k.DB_DIR}/{name} is not a plain file of {k.USER}\'s'
+                with open(f'{work}/{name}', 'xb') as out:
+                    shutil.copyfileobj(f, out, 1 << 20)
+                    os.fsync(out.fileno())
+                files[name] = stat.S_IMODE(st.st_mode) & 0o666
+    finally:
+        if fd is not None:
+            os.close(fd)
+    with open(f'{work}/manifest.json', 'x', encoding='utf-8') as f:
+        json.dump({'from': old, 'to': new, 'files': files}, f)
+    os.rename(work, k.ROOT + k.DB_BACKUP)
+    return None
+
+
+def restore_db(old, new):
+    """Put T3's database back as back_up_db() copied it before this switch, with T3 stopped: each file copied was is
+    written anew (a new file, one rename, the agent's), each that was not is removed (a newer write-ahead log must not
+    be applied to the older database). Returns why not, or None."""
+    if not backup_matches(old, new):
+        return 'no copy of T3\'s database from before this switch, so it stays as T3 ' + new + ' left it'
+    with open(f'{k.ROOT}{k.DB_BACKUP}/manifest.json', encoding='utf-8') as f:
+        files = json.load(f).get('files', {})
+    if agent_ids() is None:
+        return f'there is no user {k.USER}, so T3\'s database was not put back'
+    uid, gid = agent_ids()
+    fd = userdata()
+    if fd is None:
+        return f'{k.HOME}{k.DB_DIR} is gone, so T3\'s database was not put back' if files else None
+    try:
+        for name in k.DB_FILES:
+            tmp = f'.pc-agents-restore-{name}'
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp, dir_fd=fd)
+            if name not in files:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=fd)
+                continue
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            with os.fdopen(out, 'wb') as f, open(f'{k.ROOT}{k.DB_BACKUP}/{name}', 'rb') as src:
+                shutil.copyfileobj(src, f, 1 << 20)
+                if not k.ROOT:
+                    os.fchown(f.fileno(), uid, gid)
+                os.fchmod(f.fileno(), files[name] if isinstance(files[name], int) else 0o600)
+                os.fsync(f.fileno())
+            os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+    except OSError as e:
+        return f'T3\'s database was not put back ({e})'
+    finally:
+        os.close(fd)
+    return None
+
+
 def switch(c, state, sha):
-    """Run the release state['to']: the machine file says it, setup as the owner runs it (from the installed kit),
-    then T3 must answer as it with every wall holding. Rolled back when it does not."""
+    """Run the release state['to']: T3 stopped and its database copied (once per switch), the machine file says it,
+    setup as the owner runs it (from the installed kit), then T3 must answer as it with every wall holding. Rolled
+    back when it does not. Success is saved before the old versions are pruned (best effort)."""
     old, new = state['from'], state['to']
+    if not backup_matches(old, new):
+        k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
+        try:
+            why = back_up_db(old, new)
+        except OSError as e:
+            why = str(e)
+        if why:
+            told(setup, None, sha)   # T3 back on old as it was: nothing it runs with changed
+            return note(kept(state), f'nothing done: T3\'s database cannot be copied before the update ({why})',
+                        ok=False, alert=f'T3\'s database cannot be copied before an update ({why})')
     set_version(new)
     code, out = told(setup, None, sha)
-    why = f'setup failed: {last_said(out)}' if code else serves(c, new) or walls_hold()
+    blame = 't3' if code and DID_NOT_START in out else 'other'
+    why = f'setup failed: {last_said(out)}' if code else None
+    if why is None and (why := serves(c, new)):
+        blame = 't3'
+    why = why or walls_hold()
     if why:
-        return rollback(c, {**state, 'why': why}, sha)
-    gone = prune({new, old})
-    return note({'failed': state.get('failed')}, f'T3 {new} runs (was {old})' +
-                (f'; removed T3 {", ".join(gone)} (kept the newest {k.KEEP_VERSIONS})' if gone else ''))
+        return rollback(c, {**state, 'why': why}, sha, blame)
+    after = kept(state, 'alert', 'waiting', 'retry', 'retries', 'refused')
+    result = f'T3 {new} runs (was {old})'
+    code = note(after, result)
+    try:
+        gone = prune({new, old}, {state.get('failed')})
+    except OSError as e:
+        say(f'removing old T3 versions failed ({e}); the next update tries again')
+        return code
+    return note(after, result + f'; removed T3 {", ".join(gone)} (kept the newest {k.KEEP_VERSIONS})') if gone \
+        else code
 
 
-def rollback(c, state, sha):
-    """Back to state['from'] (its folder is still there): the machine file, setup, and the same checks. state['to']
-    is not tried again."""
+def rollback(c, state, sha, blame=None):
+    """Back to state['from'] (its folder is still there): the machine file (its .bak kept), T3 stopped, its database
+    put back, setup, and the same checks; then state['to']'s folder is removed (a version that failed is downloaded
+    and checked anew if it is tried again). state['to'] is not tried again when T3 itself did not come up on it, or
+    after k.SETUP_TRIES failed switches in a row; else the next run tries it again. Always an alert."""
     old, new, why = state['from'], state['to'], state.get('why') or 'its switch was cut too often'
-    note({**state, 'phase': 'rolling-back', 'why': why}, f'T3 {new} did not come up ({why}): going back to {old}',
-         ok=False)
-    set_version(old)
+    blame = blame or state.get('blame') or 'other'
+    state = {**state, 'phase': 'rolling-back', 'why': why, 'blame': blame}
+    note(state, f'T3 {new} did not come up ({why}): going back to {old}', ok=False)
+    set_version(old, copy=False)
+    k.run(['/usr/bin/systemctl', 'stop', k.UNIT])
+    try:
+        restored = restore_db(old, new)
+    except OSError as e:
+        restored = f'T3\'s database was not put back ({e})'
     code, out = told(setup, None, sha)
     back = f'setup failed: {last_said(out)}' if code else serves(c, old) or walls_hold()
-    return note({'failed': new}, f'T3 {new} did not come up ({why}); not trying it again. ' +
-                (f'Back on {old}, but that does not come up either ({back}): see journalctl -u {k.UNIT}, run '
-                 'pc-agents setup' if back else f'Back on {old}, running'), ok=False)
+    folder = f'{k.T3}/runtime/versions/{new}'
+    if unit_runs(new) is False and k.lstat(folder) and stat.S_ISDIR(k.lstat(folder).st_mode):
+        drop(folder, k.record())
+    after = kept(state, 'retry', 'retries')
+    tries = (state.get('retries', 0) if state.get('retry') == new else 0) + 1
+    if blame == 't3' or tries >= k.SETUP_TRIES:
+        after['failed'] = new
+        then = 'not trying it again' + ('' if blame == 't3' else f' ({tries} failed switches)')
+    else:
+        after.update(retry=new, retries=tries)
+        then = f'trying it again next hour (failed switch {tries} of {k.SETUP_TRIES})'
+    text = f'T3 {new} did not come up ({why}); {then}. ' + \
+        (f'Back on {old}, but that does not come up either ({back}): see journalctl -u {k.UNIT}, run '
+         'pc-agents setup' if back else f'Back on {old}, running') + (f'; {restored}' if restored else '')
+    return note(after, text, ok=False, alert=text)
 
 
-def auto_update():
-    """One run of the automatic update (README "Automatic updates"): finish or roll back a switch a stop cut; else,
-    with autoUpdate on, a newer release, a running T3 with every wall holding, and nothing at work in T3: download
-    it, switch to it, check it, roll back on failure. Anything it cannot tell: it does nothing, and says why."""
+def auto_update(clear=False):
+    """One run of the automatic update (README "Automatic updates"): finish or roll back a switch a stop cut (with
+    autoUpdate on or off); else, with autoUpdate on, a newer release, a running T3 with every wall holding, and
+    nothing at work in T3: download and check it, switch to it at a quiet point, check it, roll back on failure.
+    Anything it cannot tell: it does nothing, and says why. clear: forget the alert and every release not to try
+    again (the owner's `pc-agents auto-update --clear`)."""
+    os.umask(0o022)
     state = update_state()
+    if clear:
+        return note({key: v for key, v in state.items() if key in ('phase', 'from', 'to', 'tries', 'why', 'blame')},
+                    'cleared the alert, the wait and every release not to try again (failed, refused, retry)')
     try:
         c = k.config()
     except machine_file.MachineFileError as e:
-        return note(state, f'nothing done: {e}', ok=False)
-    if not c['autoUpdate']['enabled']:
-        return say('autoUpdate is off in the machine file: nothing to do') or 0
+        return note(kept(state), f'nothing done: {e}', ok=False)
     current = k.lstat(k.OPT + '/current')
     sha = os.readlink(k.ROOT + k.OPT + '/current') if current and stat.S_ISLNK(current.st_mode) else ''
     if not re.fullmatch(r'[0-9a-f]{40}', sha) or not os.path.isdir(f'{k.ROOT}{k.OPT}/{sha}'):
-        return note(state, f'nothing done: no installed kit ({k.OPT}/current): run pc-agents setup', ok=False)
+        return note(kept(state), f'nothing done: no installed kit ({k.OPT}/current): run pc-agents setup', ok=False)
     have, phase = c['t3Version'], state.get('phase')
     if phase in ('switching', 'rolling-back'):
         old, new = state.get('from'), state.get('to')
         if not (old and new) or have not in (old, new):
-            return note({'failed': state.get('failed')}, f'a cut update ({old} to {new}) is left alone: the machine '
-                        f'file says t3Version {have} now')
+            return note(kept(state), f'a cut update ({old} to {new}) is left alone: the machine file says t3Version '
+                        f'{have} now')
         if phase == 'rolling-back':
             return rollback(c, state, sha)
-        if have == old:   # cut before the machine file changed: T3 still runs as it was, so start over (quiet point)
-            state = {'failed': state.get('failed')}
-        else:   # the machine file says the new version: finish (the walls check stops a T3 that does not match it)
+        active = is_active()
+        if have == old and active:   # cut before T3 was stopped: T3 runs as it was, so start over (quiet point)
+            state = kept(state)
+        else:   # T3 stopped for the copy of its database, or the machine file says the new version: finish
             tries = state.get('tries', 0) + 1
             if tries > k.UPDATE_TRIES:
-                return rollback(c, {**state, 'why': f'its switch was cut {tries - 1} times'}, sha)
+                return rollback(c, {**state, 'why': f'its switch was cut {tries - 1} times'}, sha, 'other')
+            if have == new and active:   # T3 runs again (it started as new in setup, or a boot started it)
+                if why := busy():   # it may have taken work since, and setup restarts it
+                    return waits(state, f'the cut update to T3 {new} is finished at a quiet point ({why}); trying '
+                                 'again next hour')
+                if unit_runs(new) is not True:   # it runs old (setup did not get that far): the copy is stale
+                    forget_backup()
             state = {**state, 'tries': tries}
             note(state, f'finishing the cut update from T3 {old} to {new} (try {tries} of {k.UPDATE_TRIES})')
             return switch(c, state, sha)
+    state = kept(state)
+    if not c['autoUpdate']['enabled']:
+        return say('autoUpdate is off in the machine file: nothing to do') or 0
     if k.lstat(k.PENDING):
         return note(state, f'nothing done: setup has not finished ({k.PENDING}): run pc-agents setup', ok=False)
+    if not is_active():
+        return note(state, f'nothing done: T3 is not running ({k.UNIT}); an update starts from a running T3 only',
+                    ok=False, alert=f'T3 was not running ({k.UNIT}; see journalctl -u {k.UNIT})')
     follow = c['autoUpdate']['follow']
-    new, why = newest(c)
+    new, why, transient = newest(c)
+    if why and transient:
+        return waits(state, f'nothing done: {why}; trying again next hour')
     if why:
         return note(state, f'nothing done: {why}', ok=False)
     if new is None:
-        return note(state, f'nothing done: {follow} has no published release T3 can take')
+        return note(kept(state, 'waiting'), f'nothing done: {follow} has no latest release T3 can take')
     if k.semver_key(new) <= k.semver_key(have):
-        return note(state, f'T3 {have} is up to date (the newest release of {follow} is {new})')
+        return note(kept(state, 'waiting'), f'T3 {have} is up to date (the latest release of {follow} is {new})')
     if new == state.get('failed'):
-        return note(state, f'T3 {new} did not come up before: not trying it again (a newer release will be)')
+        return note(kept(state, 'waiting'), f'T3 {new} did not come up before: not trying it again (a newer '
+                    'release will be; pc-agents auto-update --clear tries it again)')
+    if new == state.get('refused'):
+        return note(state, f'the release files of T3 {new} were refused before: not downloading them again (a newer '
+                    'release will be; pc-agents auto-update --clear tries it again)')
     if problem := k.SPEC['t3Version'][2](new):
         return note(state, f'nothing done: {new} cannot be t3Version ({problem})', ok=False)
-    if k.run(['/usr/bin/systemctl', 'is-active', k.UNIT]).returncode:
-        return note(state, f'nothing done: T3 is not running ({k.UNIT}); an update starts from a running T3 only',
-                    ok=False)
     if why := walls_hold():
         return note(state, f'nothing done: a wall does not hold ({why})', ok=False)
-    why = install_t3({**c, 't3Version': new}, f'{k.OPT}/{sha}', k.record(), prefetch=True)
+    why, refused = install_t3({**c, 't3Version': new}, k.record(), prefetch=True)
+    if why and refused:
+        return note({**state, 'refused': new}, f'not updating: {why}', ok=False, alert=f'not updating: {why}')
     if why:
         return note(state, f'nothing done: T3 {new} did not download ({why}); trying again next hour', ok=False)
     if why := busy():
-        return note(state, f'T3 {new} is downloaded; waiting for a quiet point ({why}); trying again next hour')
-    state = {'phase': 'switching', 'from': have, 'to': new, 'tries': 1, 'failed': state.get('failed')}
+        return waits(state, f'T3 {new} is downloaded; waiting for a quiet point ({why}); trying again next hour')
+    forget_backup()
+    state = {**state, 'phase': 'switching', 'from': have, 'to': new, 'tries': 1}
     note(state, f'updating T3 {have} to {new}')
     return switch(c, state, sha)
 
@@ -874,13 +1288,13 @@ def main(argv):
     if argv[:1] == ['check'] and argv[1:] in ([], ['--enforce']):
         return check(argv[1:] == ['--enforce'])
     if argv[:1] == ['setup'] and len(argv) == 5 and argv[1] == '--source' and argv[3] == '--sha' or \
-            argv == ['auto-update']:
+            argv in (['auto-update'], ['auto-update', '--clear']):
         if not k.ROOT and os.geteuid() != 0:
             return say('run this as root') or 2
         with locked() as mine:
             if not mine:
                 return say('another pc-agents setup or automatic update runs: try again once it ended') or 1
-            return setup(argv[2], argv[4]) if argv[0] == 'setup' else auto_update()
+            return setup(argv[2], argv[4]) if argv[0] == 'setup' else auto_update(argv[1:] == ['--clear'])
     if argv == ['load-firewall']:
         why = k.load_firewall()
         return say(why) or 1 if why else 0
