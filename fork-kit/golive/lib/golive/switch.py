@@ -379,7 +379,7 @@ def _update(cfg, adapter, binary, version, timeout):
             raise RuntimeError(f'{binary} update {version} exited {code}: {out.strip()[-300:]}')
         if not adapter.service()['active']:
             adapter.start()
-    handoff.starting(cfg.home, update, version)
+    handoff.starting(cfg.home, update, version, adapter.service)
 
 
 def _started(steps):
@@ -433,7 +433,7 @@ def _put_back(run, cfg, adapter, steps, say, lose_work_since=None):
     with run.step('back-start') as facts:
         stopped = not adapter.service()['active']  # active: the stop never happened, the old server still runs
         if stopped:
-            handoff.starting(cfg.home, adapter.start, rec['version'])
+            handoff.starting(cfg.home, adapter.start, rec['version'], adapter.service)
         again = coldcopy._wait_started(cfg, adapter, rec['version'], rec['pid'] if stopped else None)
         facts.update(version=again['version'], pid=again['pid'], result=FINAL['back-start'],
                      **handoff.served(cfg.home))

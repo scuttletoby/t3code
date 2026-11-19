@@ -84,15 +84,11 @@ def held(path):
         c.close()
 
 
-def home_owned(home, hold=0.0):
-    """`__ssh-helper home-owned`: a launcher serves, or a server (or the kit) holds the owner lock. hold: how long
-    the probe keeps the serving lock (upstream's: microseconds; longer here, so the kit's poll surely meets it)."""
-    return probe(os.path.join(home, 'runtime', 'service-serving.lock'), hold) or \
-        held(os.path.join(home, 'userdata', 'server-owner.sqlite'))
-
-
-def probe(path, hold):
-    """held(path), keeping the lock `hold` seconds when it got it (BEGIN EXCLUSIVE, then close: tunnel.ts held())."""
+# An SSH launch's probe: a process of its own each time, as upstream's (`__ssh-helper home-owned`, or the launch
+# script's node). argv: hold, then paths; the first is kept `hold` seconds when the probe got it (BEGIN EXCLUSIVE,
+# then close: tunnel.ts held()). Exit 0 when one of them is held by another process.
+PROBE = '''import os, sqlite3, sys, time
+def held(path, hold):
     if not os.path.exists(path):
         return False
     c = sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=0, isolation_level=None)
@@ -104,18 +100,56 @@ def probe(path, hold):
         return True
     finally:
         c.close()
+hold, paths = float(sys.argv[1]), sys.argv[2:]
+sys.exit(0 if any(held(p, hold if i == 0 else 0.0) for i, p in enumerate(paths)) else 1)
+'''
+
+
+def probe(hold, *paths):
+    """An SSH launch's probe of these locks, in a process of its own: True when one is held."""
+    code = subprocess.run([sys.executable, '-I', '-c', PROBE, str(hold), *paths], timeout=60).returncode
+    if code not in (0, 1):
+        raise RuntimeError(f'the probe exited {code}')
+    return code == 0
+
+
+def home_owned(home, hold=0.0):
+    """`__ssh-helper home-owned`: a launcher serves, or a server (or the kit) holds the owner lock. hold: how long
+    the probe keeps the serving lock (upstream's: microseconds; longer here, so the kit's poll meets it often)."""
+    return probe(hold, os.path.join(home, 'runtime', 'service-serving.lock'),
+                 os.path.join(home, 'userdata', 'server-owner.sqlite'))
 
 
 PROBE_HOLD = 0.004  # an SSH probe's hold, made long enough that the kit's 20 ms poll meets one every few polls
+PROBES = 40  # how many probes a probing phase lasts: a count, not a time (under load each probe takes longer)
+PROBING_LIMIT = 300  # seconds: a probing phase that has not ended by then fails its test instead of hanging it
+
+
+def kit_meets_probes(test):
+    """An Event set once the kit's handover poll has found the serving lock held by another process than this
+    one (an SSH probe: this process is the fake launcher), so a probing phase surely tested what it is about."""
+    from golive import handoff
+    met, real = threading.Event(), handoff.lock_holders
+
+    def spy(path):
+        pids = real(path)
+        if pids and path.endswith(handoff.SERVING_LOCK) and pids - {os.getpid()}:
+            met.set()
+        return pids
+    patcher = mock.patch.object(handoff, 'lock_holders', spy)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return met
 
 
 class Prober:
     """SSH launches waiting in the launch script's `home_owned` loop (tunnel.ts), probing the serving lock, many
     times faster than upstream's once a second, at random intervals. A launch that finds the home free starts a
-    hand server (race.launch)."""
+    hand server (race.launch). wait() returns after PROBES probes once the kit met one (met: kit_meets_probes)."""
 
-    def __init__(self, race):
-        self.race, self.stop, self.probes = race, threading.Event(), 0
+    def __init__(self, race, met):
+        self.race, self.met, self.stop, self.probes = race, met, threading.Event(), 0
+        self.done = threading.Event()  # enough probes, or a launch found the home free
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self):
@@ -123,11 +157,19 @@ class Prober:
         serving = os.path.join(home, 'runtime', 'service-serving.lock')
         if not os.path.exists(serving):  # a launcher of this home ran before (upstream creates it then)
             sqlite3.connect(serving).close()
-        while not self.stop.wait(random.uniform(0.006, 0.03)):
-            self.probes += 1
-            if not home_owned(home, PROBE_HOLD):
-                self.race.launch('old')  # it looked already: it starts its own server now
-                return
+        try:
+            while not self.stop.wait(random.uniform(0.006, 0.03)):
+                self.probes += 1
+                if not home_owned(home, PROBE_HOLD):
+                    self.race.launch('old')  # it looked already: it starts its own server now
+                    return
+                if self.probes >= PROBES and self.met.is_set():
+                    return
+        finally:
+            self.done.set()
+
+    def wait(self):
+        self.done.wait(PROBING_LIMIT)
 
     def __enter__(self):
         self.thread.start()
@@ -201,7 +243,7 @@ class RaceAdapter(fx.FakeAdapter):
         super().__init__(root, machine, on)
         self.race, self.claims_serving, self.markers = race, claims_serving, []
         self.after_stop, self.before_start = ['fresh'], ['waited', 'fresh']
-        self.probing = 0  # seconds the start takes before its launcher claims the serving lock, while launches probe
+        self.probing = None  # kit_meets_probes(): the start probes (Prober) before its launcher claims the lock
 
     def stop(self):
         super().stop()
@@ -211,12 +253,13 @@ class RaceAdapter(fx.FakeAdapter):
             self.race.launch(kind)
 
     def start(self):
+        self._svc(ActiveState='active', MainPID=os.getpid())  # systemd runs the launcher: the unit's main process
         self.markers.append(('before start', upstream_wait_ms(self.machine.home)))
         for kind in self.before_start:
             self.race.launch(kind)
-        if self.probing:
-            with Prober(self.race) as p:
-                time.sleep(self.probing)
+        if self.probing is not None:
+            with Prober(self.race, self.probing) as p:
+                p.wait()
             self.probes = p.probes
         if not self.race.launcher(super().start, self.claims_serving):
             self._svc(ActiveState='active', MainPID=os.getpid())  # the launcher runs, its server idles
@@ -259,10 +302,12 @@ class CopyRace(copy_t.CopyBase):
     def test_ssh_launches_probing_the_serving_lock_during_the_start_never_free_the_home(self):
         """Review finding (handover phantom): the kit's poll meeting an SSH launch's own probe of the serving lock
         is not the launcher; before the fix the kit let go at the first one, and the next probe started a server."""
-        self.adapter.after_stop, self.adapter.before_start, self.adapter.probing = [], [], 1.5
+        self.adapter.after_stop, self.adapter.before_start = [], []
+        self.adapter.probing = met = kit_meets_probes(self)
         old = self.m.server.pid
         self.copy()
-        self.assertGreater(self.adapter.probes, 40)
+        self.assertGreaterEqual(self.adapter.probes, PROBES)
+        self.assertTrue(met.is_set(), 'the kit never met an SSH probe of the serving lock')
         self.assert_no_hand_server()
         self.assert_t3_runs_again(old)
         [verify] = [s['data'] for s in self.last_run()['steps'] if s['step'] == 'verify' and s['phase'] == 'done']
@@ -363,7 +408,7 @@ class SwitchRace(switch_t.SwitchBase):
             self.race.launch('fresh')
         self.adapter.stop = stop_and_look
 
-    probing = 0  # seconds `t3 update` installs before it restarts T3, while waiting launches probe
+    probing = None  # kit_meets_probes(): `t3 update` installs while waiting launches probe, then restarts T3
 
     def fake_t3(self, binary, args, timeout):
         if args[0] != 'update':
@@ -371,9 +416,10 @@ class SwitchRace(switch_t.SwitchBase):
         self.markers.append(('before update', upstream_wait_ms(self.m.home)))
         self.race.launch('waited')  # `t3 update` restarts the service: the incidents' second
         self.race.launch('fresh')
-        if self.probing:
-            with Prober(self.race):
-                time.sleep(self.probing)
+        if self.probing is not None:
+            with Prober(self.race, self.probing) as p:
+                p.wait()
+            self.probes = p.probes
         mode, self.mode = self.mode, 'never'
         try:
             code, out = super().fake_t3(binary, args, timeout)
@@ -396,10 +442,12 @@ class SwitchRace(switch_t.SwitchBase):
 
     def test_ssh_launches_probing_through_the_update_never_free_the_home(self):
         marker_since(self, fx.TARGET)
-        self.probing = 1.5
+        self.probing = kit_meets_probes(self)
         self.rehearsed()
         self.switch()
         self.assertEqual(self.race.hands, [], self.race.log)
+        self.assertGreaterEqual(self.probes, PROBES)
+        self.assertTrue(self.probing.is_set(), 'the kit never met an SSH probe of the serving lock')
         [verify] = [s['data'] for s in self.last_run()['steps'] if s['step'] == 'verify' and s['phase'] == 'done']
         self.assertEqual(verify['handover'], 'launcher')
 
@@ -544,6 +592,15 @@ class Marker(unittest.TestCase):
         self.assertAlmostEqual(upstream_wait_ms(self.m.home), TTL, delta=2000)
         self.assertAlmostEqual(self.h.remaining_ms(self.m.home), TTL, delta=2000)
 
+    def test_a_wall_clock_that_steps_back_after_the_write_keeps_the_marker_valid(self):
+        """Issue #546: on a WSL2 guest the wall clock stepped back 150 ms; upstream's reader drops a marker that
+        started after its now, and an SSH launch right after the stop then started its own server."""
+        self.h.publish(self.m.home)
+        now = time.time()
+        with mock.patch('time.time', return_value=now - 0.5):
+            self.assertIsNotNone(upstream_wait_ms(self.m.home))
+            self.assertIsNotNone(self.h.remaining_ms(self.m.home))
+
     def test_upstream_s_launch_script_reads_it(self):
         """The launch script's own node reader (tunnel.ts, between its NODE markers), run on the kit's marker."""
         node = NODE
@@ -596,20 +653,25 @@ class Marker(unittest.TestCase):
                 time.sleep(0.01)
             seen.append(held(owner))
             serving.close()
-        g.starting(launcher, NEW)
+        g.starting(launcher, NEW, self.service)
         self.assertEqual(seen, [True, False])  # held up to the serving lock, then handed over
         self.assertEqual(g.handover, 'launcher')
         g.adopt(coldcopy.hold_owner_lock(userdata, 0))
         with mock.patch.object(self.h, 'HANDOVER_WAIT', 0.1):
             began = time.monotonic()
-            g.starting(lambda: None, NEW)  # no launcher comes up
+            g.starting(lambda: None, NEW, self.service)  # no launcher comes up
         self.assertEqual(g.handover, 'timeout')
         self.assertFalse(held(owner))
         self.assertLess(time.monotonic() - began, 5)
 
+    def service(self):
+        """The boot service as adapter.service() reads it: this process stands in for its launcher."""
+        return {'active': True, 'mainPid': os.getpid()}
+
     def test_a_probe_loop_on_the_serving_lock_is_not_the_launcher(self):
         """Review finding (handover phantom), at the unit: SSH probes flicker the serving lock all through a long
-        start; the owner lock stays held until a real launcher takes the serving lock and keeps it."""
+        start; the owner lock stays held until the launcher (the service's main process) takes the serving lock.
+        Issue #546: a rule of "held on every poll for 100 ms" took the probes for the launcher under load."""
         userdata, runtime = self.m.path('home/userdata'), self.m.path('home/runtime')
         os.makedirs(userdata)
         serving = os.path.join(runtime, 'service-serving.lock')
@@ -617,19 +679,23 @@ class Marker(unittest.TestCase):
         owner = os.path.join(userdata, 'server-owner.sqlite')
         g = self.h.Gap(self.m.home)
         g.adopt(coldcopy.hold_owner_lock(userdata, 0))
-        stop, probes, free = threading.Event(), [], []
+        met = kit_meets_probes(self)
+        stop, probing, probes, free = threading.Event(), threading.Event(), [], []
 
         def ssh_probes():
-            while not stop.wait(random.uniform(0.006, 0.03)):
-                probes.append(probe(serving, PROBE_HOLD))
+            try:
+                while not stop.wait(random.uniform(0.006, 0.03)):
+                    probes.append(probe(PROBE_HOLD, serving))
+                    if len(probes) >= PROBES and met.is_set():
+                        return
+            finally:
+                probing.set()
 
-        def start():  # `t3 update`: it installs for a while, then its launcher claims the serving lock
-            end = time.monotonic() + 1.5
-            while time.monotonic() < end:
+        def start():  # `t3 update`: it installs while launches probe, then its launcher claims the serving lock
+            while not probing.wait(0.005):
                 if not held(owner):
                     free.append(time.monotonic())
                     break
-                time.sleep(0.005)
             stop.set()
             t.join()
             launcher = sqlite3.connect(serving, isolation_level=None, timeout=1)
@@ -643,14 +709,40 @@ class Marker(unittest.TestCase):
             launcher.close()
         t = threading.Thread(target=ssh_probes, daemon=True)
         t.start()
-        g.starting(start, NEW)
+        g.starting(start, NEW, self.service)
         self.assertEqual(len(free), 1, 'the kit let go of the owner lock while only SSH probes held the serving lock')
-        self.assertGreater(len(probes), 40)
-        # handed over only after the launcher kept it over several polls (a probe the kit met in the poll just
-        # before the claim may count towards HANDOVER_HOLD: the launcher holds it at the end all the same)
-        self.assertGreaterEqual(free[0], self.h.HANDOVER_POLL * (self.h.HANDOVER_HOLD_POLLS - 1))
+        self.assertGreaterEqual(len(probes), PROBES)
+        self.assertTrue(met.is_set(), 'the kit never met an SSH probe of the serving lock')
         self.assertLess(free[0], 0.25)  # within its server's 250 ms wait for the owner lock
         self.assertEqual(g.handover, 'launcher')
+
+    def test_only_the_service_s_main_process_holding_the_serving_lock_is_the_launcher(self):
+        """However long another process holds the serving lock, the kit keeps the owner lock; it lets go at once
+        when the holder is the boot service's main process."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        serving = self.m.path('home/runtime/service-serving.lock')
+        sqlite3.connect(serving).close()
+        holder = subprocess.Popen(
+            [sys.executable, '-I', '-c', 'import sqlite3, sys\nc = sqlite3.connect(sys.argv[1], isolation_level=None)\n'
+             'c.execute("BEGIN EXCLUSIVE")\nprint("held", flush=True)\nsys.stdin.read()', serving],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.stdin.close)
+        self.assertEqual(holder.stdout.readline(), 'held\n')
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        with mock.patch.object(self.h, 'HANDOVER_WAIT', 0.3):
+            g.starting(lambda: None, NEW, self.service)  # held all along, by a process that is not the service's
+        self.assertEqual(g.handover, 'timeout')
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        g.starting(lambda: None, NEW, lambda: {'active': True, 'mainPid': holder.pid})
+        self.assertEqual(g.handover, 'launcher')
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        with mock.patch.object(self.h, 'HANDOVER_WAIT', 0.3):
+            g.starting(lambda: None, NEW, lambda: {'active': False, 'mainPid': holder.pid})  # a stopped service
+        self.assertEqual(g.handover, 'timeout')
+        holder.stdout.close()
 
     def test_a_failed_renewal_is_journalled(self):
         with mock.patch.object(self.h, 'RENEW', 0.05):
@@ -668,7 +760,7 @@ class Marker(unittest.TestCase):
         g = self.h.Gap(self.m.home)
         g.adopt(coldcopy.hold_owner_lock(userdata, 0))
         seen = []
-        g.starting(lambda: seen.append(held(os.path.join(userdata, 'server-owner.sqlite'))), fx.LIVE)
+        g.starting(lambda: seen.append(held(os.path.join(userdata, 'server-owner.sqlite'))), fx.LIVE, self.service)
         self.assertEqual(seen, [False])
         self.assertTrue(g.handover.startswith('before the start'))
         self.assertTrue(self.h.takes_serving_lock(NEW))
