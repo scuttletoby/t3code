@@ -23,13 +23,14 @@ so the agent cannot undo it:
   `/etc/pc-agents/installed.tsv`);
 - nothing overrides the kit's units: no drop-in or other copy in any folder systemd reads (`system.control`,
   `system.attached`, the generators, `/run`, `/usr/lib`, prefix drop-ins like `t3code-.service.d`), and
-  `systemctl show` agrees (the kit's file, no drop-in, no pending reload, T3 and the timer enabled);
-- the masks are in place, no user lingers, the agent has no systemd user units, the timer is running;
+  `systemctl show` agrees (the kit's file, no drop-in, no pending reload, T3 and both timers enabled);
+- the masks are in place, no user lingers, the agent has no systemd user units, the walls and update timers run;
 - `agent` is the only login user, its login shell is `/usr/sbin/nologin`, and no sudo rule (`/etc/sudoers`,
   `/etc/sudoers.d`) names it, its group or uid, or every user;
 - the kit's code (`/opt/pc-agents`, the release folder it runs) and T3's runtime are root's, and T3's `t3` is the one
-  setup installed (its hash is in the record). Setup makes the runtime root's alone after `scripts/install.sh` (its
-  `tar` keeps the archive's owners and modes), and installs again a runtime an older setup left otherwise;
+  setup installed (its hash is in the record). Setup downloads the release itself (the files `scripts/install.sh`
+  takes, checked against `SHA256SUMS`), unpacks it with no links out of its folder and makes it root's alone, never
+  running any of it; it installs again a runtime an older setup left otherwise;
 - no Windows drive is mounted;
 - the loaded firewall table is the one from the kit's `firewall.nft`: `pc-agents load-firewall` saves the file's hash
   and what the kernel then lists, and any later change, or an older file left loaded, differs;
@@ -69,21 +70,22 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 }
 ```
 
-| Key                     | What                                                                                                              |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `organization`          | the name the managed policy shows in T3's settings                                                                |
-| `t3Version`             | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); installed with `scripts/install.sh`          |
-| `t3ReleaseBaseUrl`      | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                        |
-| `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                      |
-| `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                 |
-| `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                |
-| `lockedSettings`        | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below  |
-| `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                             |
-| `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                   |
-| `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host        |
-| `devPorts`              | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`) |
-| `peers`                 | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to         |
-| `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                |
+| Key                     | What                                                                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `organization`          | the name the managed policy shows in T3's settings                                                                                          |
+| `t3Version`             | the exact T3 version (the linking T3's), 0.1.7 or newer (see below); its release files, as `scripts/install.sh`'s                           |
+| `t3ReleaseBaseUrl`      | where that version's release files are (`T3CODE_RELEASE_BASE_URL` of `scripts/install.sh`)                                                  |
+| `port`                  | T3's port (`T3CODE_PORT`); the Tailscale ACL opens it to the linking T3 only                                                                |
+| `agentUid`              | the `agent` user's uid (default 1100; not 1000, the first user of every other distro, see Limits)                                           |
+| `maxRuntimeMode`        | the highest runtime mode T3 allows (`full-access` for a linked PC)                                                                          |
+| `lockedSettings`        | more T3 settings to lock, `{path: value}`, only ones `t3Version` knows (`agentSlots.…`: a fork build), see below                            |
+| `memoryMax`, `cpuQuota` | the unit's `MemoryMax` and `CPUQuota`                                                                                                       |
+| `nameservers`           | 1 to 3 public DNS servers for `/etc/resolv.conf` (WSL's own one is on the blocked Windows host)                                             |
+| `allow`                 | optional: private networks the agent may still reach (CIDR list); empty by default; never the Windows host                                  |
+| `devPorts`              | optional: the TCP ports the agent's dev servers may listen on and be reached on, `LOW-HIGH` (default `4100-4199`)                           |
+| `peers`                 | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to                                   |
+| `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                                          |
+| `autoUpdate`            | optional: `{"enabled": true, "follow": "OWNER/NAME"}` installs that fork's new releases by itself (see "Automatic updates"); off by default |
 
 `t3Version` must be 0.1.7 or newer: older releases have no managed policy, so they would run with none of the kit's
 locks and with updates on. A 0.1.7 pre-release counts as older (some 0.1.7 nightlies were built before the policy),
@@ -154,7 +156,10 @@ Commands are for Windows PowerShell unless a step says otherwise. `<distro>` is 
    Setup installs the system libraries they need (`libatomic1`, without which Node does not start, and `unzip`).
 8. **Log in to GitHub as the agent:** install `gh` (as root, from GitHub CLI's docs), then
    `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents as-agent -- gh auth login --with-token` and paste
-   a fine-grained token for the agents' repos into that window only. It waits without a prompt: paste the token,
+   a fine-grained token for the agents' repos into that window only. With automatic updates on, the token must not
+   have Contents, Actions or Workflows write on the followed fork, nor belong to an account that can bypass its
+   `main` branch protection: with them, an agent could publish a release this PC installs (see "Automatic
+   updates"). It waits without a prompt: paste the token,
    press Enter, then Ctrl+D. Then give the agent a git identity (its commits fail without one):
    `wsl -d <distro> -u root -e /opt/pc-agents/current/sbin/pc-agents as-agent -- git config --global user.name '<name>'`
    and
@@ -192,6 +197,94 @@ Commands are for Windows PowerShell unless a step says otherwise. `<distro>` is 
 
 Run step 3 again for a new release or a changed machine file (and steps 4 and 5 if it asks); T3 restarts only when
 something changed. To remove everything: `wsl --unregister <distro>`.
+
+## Automatic updates (opt-in)
+
+Off by default: T3 stays on `t3Version` until you change it. To have the kit follow the fork's releases by itself, add
+to the `pc-agents` section of the machine file (as root)
+
+```json
+"autoUpdate": { "enabled": true, "follow": "<fork>" }
+```
+
+with `t3ReleaseBaseUrl` set to `https://github.com/<fork>/releases/download`, and run step 3 once more (it writes and
+starts the update timer; a kit older than this one needs that run anyway). To turn it off, set `"enabled": false`:
+the timer still runs, says it is off and does nothing; no setup run is needed.
+
+T3 still cannot update itself (`limits.updates` stays off, T3 stays root's): root does what you would do.
+
+- **Who approves a release:** nobody by hand, so the kit takes only what the fork's own release workflow built from
+  its protected `main`. Each release archive must have a GitHub build attestation (Sigstore, made by
+  `actions/attest-build-provenance` in `fork-release.yml`) that the kit checks itself, with no other program and no
+  network trust beyond the bundle: the certificate chains to Sigstore's public-good Fulcio authority (pinned in
+  `lib/sigstore-trust.json`), was issued by GitHub Actions' token issuer to a GitHub-hosted runner of `<fork>`, for
+  the workflow `.github/workflows/fork-release.yml` on `refs/heads/main` (called from `fork-release.yml` or
+  `fork-follow.yml`; names compared exactly, letter case too, but for the GitHub owner and repository name, which
+  GitHub matches in any case), the signature is in Rekor's log (its promise signed by the pinned Rekor key) while the
+  certificate was valid, and the signed statement names the archive's file name and SHA-256. `SHA256SUMS` must name
+  the same SHA-256. `fork-release.yml` itself refuses to publish a stable-track release from a commit that is not on
+  `main`, so the fork's release branch (fork-follow's series branch, `FORK_SERIES_BRANCH`) must be `main`. The chain
+  is checked against the pinned root alone, never the distro's CA certificates, which needs OpenSSL 3 (Debian 12,
+  Ubuntu 22.04 or newer): an older one refuses every release. A release that fails any of this is refused, nothing of
+  it is kept, and it is not downloaded again (an alert says so). Its attestations not read (a GitHub error) is not a
+  refusal: it tries again next hour.
+- **What that leaves an agent:** an agent with a token that can push to a branch of the fork, open pull requests or
+  run its own workflows cannot make an archive this check takes: its workflows run from other refs or other files,
+  and `main` is protected. It **can** if its token can write to `main` (Contents write, or an admin bypass of the
+  branch protection) or start and change workflows on `main` (Actions write, Workflows write): so the agent's token
+  must have none of those on the followed fork (step 8). Whoever can merge to `main` decides what every PC that
+  follows the fork runs.
+- **Never run as root:** root downloads, checks and unpacks the release (no links out of its folder, no hard links,
+  nothing outside it), and makes it root's alone; it never runs any of it. T3 runs it, as `agent`, in its unit.
+- **When:** `pc-agents-update.timer` runs `pc-agents auto-update` (root, the installed kit) every hour at a random
+  point in a 20-minute window, and 10 minutes after the distro starts. `systemctl start pc-agents-update` runs it now.
+- **What:** the fork's latest release (`https://github.com/<fork>/releases/latest`, read as JSON, as `install.sh`
+  does, outside the API's rate limit): GitHub's latest is a published full release, never a draft or a pre-release.
+  It must be on the stable track (`vX.Y.Z`, `vX.Y.Z-fork.N`, or a nightly the fork rebuilt as
+  `vX.Y.Z-nightly.D.N.fork.N`), and newer than `t3Version` (semver order).
+- **From where:** only from a finished setup (no restart marker), a running T3 and every wall holding. It downloads
+  the new version first, into its own folder, checks it as above, then makes it root's alone; the running T3 is
+  untouched.
+- **Quiet point:** then it waits until T3's unit runs no process but T3 and its own programs: every process in the
+  unit's control group counts (an agent's provider session, a terminal, a tool it started, also one that left T3's
+  process group or session; provider sessions end after 30 idle minutes). Busy, it tries again next hour; it never
+  stops work. A process that cannot be read counts as busy. An update that waits 7 days (`QUIET_WAIT_DAYS`) is an
+  alert, and the run exits 1 until it switches.
+- **Database:** with T3 stopped, it copies T3's state database (`/home/agent/.t3/userdata/state*.sqlite*`, regular
+  files of `agent` only, no links followed) to `/var/lib/pc-agents/db-backup` (root's alone), so a rollback can put
+  back the database as the old version left it.
+- **Switch:** it writes `t3Version` in the machine file (a copy of the file first, `machine.json.bak`; the new file in
+  one rename; only that value changes), runs the same setup as step 3 from the installed kit (no new kit code is
+  downloaded: kit updates stay yours), and checks that T3 answers on its port as the new version
+  (`/.well-known/t3/environment`) within 3 minutes and that every wall holds.
+- **Rollback:** when the new version does not come up, `t3Version` goes back (the `.bak` from before the switch is
+  kept); if T3's unit ran the new version, T3 is stopped, the database as it is then (with its `-wal` and `-shm`) is
+  copied to `/var/lib/pc-agents/db-replaced-<UTC time>-<version>` (root's alone, named in the alert, never removed
+  by the kit: nothing written on the new version is lost) and only then the database copy is put back (files the
+  new version added are removed); a database T3 never opened as the new version stays as it is. Setup runs again
+  and the old version is checked the same way. The new version's folder is removed, so a later try downloads it
+  again. When T3 itself did not start or answer on it, that release is marked `failed` and not tried again; a
+  newer one is. Any other failure (setup failing for another reason, a wall) is tried again the next hours, 3 times
+  (`SETUP_TRIES`), then marked `failed` too.
+- **Old versions:** after a good update (saved first), T3 version folders past the newest three are removed, never
+  the running one or the one before it; a `failed` version takes no place among the three. Each is moved aside in
+  one rename, then removed, and its line leaves the record.
+- **Alerts:** a refused release, a rollback, T3 found not running, or a 7-day wait leaves an alert in the journal.
+  Every later run prints it (`ALERT ...`) and exits 1, so `systemctl --failed` lists `pc-agents-update`, until an
+  update succeeds or you clear it. Also a run that could do nothing because of an error (a bad machine file, a failed
+  download, an unreadable release) exits 1; GitHub's rate limit (403, 429) and server errors only wait.
+- **Clearing:** `wsl -d <distro> -u root -- /opt/pc-agents/current/sbin/pc-agents auto-update --clear` removes the
+  alert, the wait and every release not to try again (`failed`, `refused`, retries): the next run tries the latest
+  release again. Do it after you fixed the cause (or the fork published a fixed release).
+- **Where to look:** `/etc/pc-agents/auto-update.json` (root's) holds the switch under way, the alert, the releases
+  not to try again (`failed`, `refused`, `retry`) and the last result; every run says what it did in
+  `journalctl -u pc-agents-update`.
+- **Its inputs are root's:** the machine file, the journal, the release over HTTPS and its attestation, T3's own
+  answer, and the control group's process list. Setup and the update take one lock (`/run/pc-agents/setup.lock`):
+  never two at once.
+- **Only from the fork it installs from:** with `autoUpdate` on, setup, `check` and the update refuse a
+  `t3ReleaseBaseUrl` other than the followed fork's downloads, naming both. With it off, the attestation is not
+  checked (the version is yours to pick, step 3), only `SHA256SUMS`.
 
 ## Tailscale tag and ACL
 
@@ -247,6 +340,20 @@ allowed (connection tracking).
   changed what T3 runs with, the walls check's `restart` wall fails (and the 2-minute check stops T3) until setup runs
   again to the end, as after a failed T3 download. A distro restart in between starts T3 again with the new files and
   firewall, without the packages.
+- **The automatic update:** the same latest release again is a no-op ("up to date"), and so is a release refused or
+  failed before. It saves its journal before each step that changes what T3 runs with. Stopped before the machine file
+  changed (in the download, at the quiet point), the next run starts over, quiet point included; a download cut
+  half-way (a folder without its `t3`, a `.staging-` or a removal's `.removing-` folder) is removed and downloaded
+  again. Stopped after T3 was stopped for the database copy, or after the machine file changed (in setup, before the
+  check), the next run finishes the switch, even with `autoUpdate` turned off meanwhile: if T3 runs again by then (a
+  distro restart, or setup started it), it first waits for a quiet point again, and a T3 that ran the old version
+  again gets a fresh database copy; cut 3 times, it rolls back instead (counted as a retry, not a `failed` release),
+  after that quiet point too. Stopped in a rollback, the next run finishes the rollback: if T3 runs again by then, at
+  a quiet point; the database is put back once (again only when a distro restart started the new version). Meanwhile
+  the walls check stops a T3 that no longer matches the machine file, as after any setup stopped half-way. A machine
+  file you changed meanwhile ends that switch: the update leaves it to you. No journal yet, an unreadable one (taken
+  as empty), values of the wrong kind in it (left out, named), a bad machine file, no latest release or a GitHub
+  error: it does nothing and says so.
 - **A distro that is not fresh:** refused before anything is written, with the reasons: another login user, an
   `agent` with another uid or in another group, a file the kit would write that it did not write (or that was
   edited since, for example a hand-written `wsl.conf` or `policy.json`), a cron, at or ssh unit where the kit masks
@@ -300,6 +407,18 @@ allowed (connection tracking).
   run; the distro is the sandbox, so use full access.
 - **Tailscale, Claude Code and `gh` are yours to install** (steps 6 to 8): their installers and logins need you.
   Claude Code and logins go through `pc-agents as-agent`, never a shell as `agent`.
+- **Automatic updates trust the fork's `main`:** whoever can merge to it, or change its release workflow, decides
+  what the PC runs; the agent's token must have no Contents, Actions or Workflows write on the followed fork, and no
+  admin bypass of its branch protection (step 8). A release that starts and answers but has a bad change stays (only
+  one that does not come up is rolled back). An agent can keep an update waiting by keeping processes alive under T3
+  (it cannot make one happen; after 7 days that is an alert). A process started between the quiet check and the
+  stop (a few seconds: the window while setup starts) is stopped with T3. After a run stopped mid-switch, T3 may
+  stay down until the next run (hourly, and 10 minutes after the distro starts). The database copy is the one from
+  right before the switch: what T3 writes on the new version before a rollback is not in the database the old
+  version runs on, only in the `db-replaced-` folder (yours to merge back or remove; the kit never prunes them).
+- **Sigstore's keys are pinned** (`lib/sigstore-trust.json`): when Sigstore rotates its Fulcio root or Rekor key, or
+  GitHub's attestations move to another log format, every new release is refused (an alert on every PC). Then
+  install a kit with the new keys (step 3 again) and run `pc-agents auto-update --clear`.
 - **No uninstall** but removing the distro; the distro holds nothing else.
 - **No code hash manifest yet:** the kit's code is checked for root ownership and its written files byte for byte,
   but the code files are not hashed (T3's `t3` is). The bootstrap duplicates the heavy kit's (a shared bootstrap is
@@ -310,13 +429,19 @@ allowed (connection tracking).
 ```
 python3 -I -B fork-kit/pc-agents/tests/setup.test.py
 python3 -I -B fork-kit/pc-agents/tests/check.test.py
+python3 -I -B fork-kit/pc-agents/tests/update.test.py
 ```
 
 A fake distro in a temporary folder (`PC_AGENTS_ROOT`, refused for root; `tests/fake_distro.py`), with fake
 `useradd`, `usermod`, T3's installer, `systemctl` (it keeps which units are enabled and running, their main process
 and start time, a start limit, and a T3 that dies a moment after it starts), `systemd-run` (a bare command is looked
-up in the caller's `PATH`, as the real one does) and `nft`: every file and mode, a second run changes nothing, a run
+up in the caller's `PATH`, as the real one does), `nft` and `curl` (a release list, and T3's answer as the version its
+unit started): every file and mode, a second run changes nothing, a run
 stopped at every write finishes on the next and restarts T3, an upgrade stopped at every write fails `check` until
 setup runs again, `SIGTERM` and `SIGHUP` end the download too, each kind of foreign distro is refused, and each wall
-fails on its own when its part is taken away.
+fails on its own when its part is taken away. The automatic update: off does nothing; only a newer published full
+release on the stable track is taken; it waits while T3 runs an agent's process; a version that does not come up is
+rolled back and not tried again; a run again changes nothing; a run stopped before or after the machine file, in
+setup, before the check or in a rollback is finished or rolled back; no journal, a bad one, a bad machine file, an
+empty release list or an API error do nothing and say so; old versions are pruned to three; one run at a time.
 `apps/server/src/policy/managedSettings.forkKeys.test.ts` proves the managed policy locks the fork's settings.
