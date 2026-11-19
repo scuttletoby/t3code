@@ -33,9 +33,9 @@ found in `PATH`. It writes only the kit's own lock file. It refuses, with every 
 - free disk is at least 2 x database + floor (database + floor on each disk when backups are on another one);
 - the staged build's read-only report (`t3 __fork-report --base-dir <home>`, run with an empty HOME and a bare
   PATH) is ok, is of the target version, and lists the fork features switched on (`featuresOn`; a report without
-  that list refuses). That list goes into the result: the switch keeps the features as they are (fork #529). While the live
-  build is upstream (no `.fork.N`: the first switch) every one must be off. It runs only beside a T3 that the
-  checks above found running steadily (service active, its own server live, no update pending, no marker): a
+  that list refuses). That list goes into the result: the switch keeps the features as they are (fork #529).
+  While the live build is upstream (no `.fork.N`: the first switch) every one must be off. It runs only beside a
+  T3 that the checks above found running steadily (service active, its own server live, no update pending, no marker): a
   report reading the home while T3 stops keeps SQLite from tidying its WAL at the stop (nothing is lost, but the WAL
   with its frames and `-shm` stay, and a copy takes that WAL without its `-shm`). Otherwise it is not run, and says
   so. The live server is read again after it: if T3 stopped, restarted or began an update meanwhile (the owner or
@@ -506,8 +506,8 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
 
 Apart from its fork features, the clone keeps `settings.json` as it is (R5 checks it is unchanged from then on),
 so the R3 server reads the live provider settings: the provider program paths and homes (`binaryPath`, `homePath`)
-and any trace address. Its provider status checks may start those provider programs against the live provider homes (a login refresh, for example) and send
-traces to the same collector. No T3 data of the live home is reached.
+and any trace address. Its provider status checks may start those provider programs against the live provider
+homes (a login refresh, for example) and send traces to the same collector. No T3 data of the live home is reached.
 
 The result (from and target version, copy, SHA256 of its manifest, migrations, seconds, growth, port) is the
 journal's last step, `result`, of a run that ended `ok`. A rehearsal is a **scratch run**
