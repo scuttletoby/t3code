@@ -236,7 +236,40 @@ test("the route tree is judged as generated output: with a route change and its 
       unlisted({}, base, gone, upstream).reasons[0],
       /^apps\/web\/src\/routeTree\.gen\.ts: upstream file this change deletes/,
     );
+    // A folder that only starts like the routes folder is no route change.
+    const sibling = { ...base, [TREE]: forkTree, "apps/web/src/routes-x/a.ts": "a\n" };
+    const nearRoute = unlisted({}, base, sibling, upstream).reasons;
+    assert.equal(nearRoute.length, 1);
+    assert.match(
+      nearRoute[0],
+      /^apps\/web\/src\/routeTree\.gen\.ts: upstream file with 3 fork lines/,
+    );
   }
+  // On a pull request the proof must be main's: one that changes it (it.skip, an always-green test)
+  // could pass its own hand edit, so the tree is then judged line by line. From upstream the head's
+  // own script and tests judge it, and upstream has no proof to compare with.
+  const weakened = { ...withRoute, [PROOF]: 'it.skip("…", () => {});\n' };
+  assert.deepEqual(unlisted({}, { [TREE]: tree }, weakened, true).reasons, []);
+  const refused = unlisted({}, base, weakened, false).reasons;
+  assert.equal(refused.length, 1);
+  assert.match(refused[0], /^apps\/web\/src\/routeTree\.gen\.ts: upstream file with 3 fork lines/);
+  assert.match(refused[0], /forkRouteTree\.test\.ts is not main's/);
+  // Main's, not the merge-base's: a branch from before main changed the proof is judged line by line
+  // until it is updated from main.
+  const judge = (main) =>
+    findUnlistedChanges(
+      { files: {}, pending: {}, forkFiles: [] },
+      {
+        changed: [TREE, ROUTE],
+        atBase: (file) => base[file],
+        atHead: (file) => withRoute[file],
+        atMain: (file) => main[file],
+        upstream: false,
+        isForkFile: forkFileTest([]),
+      },
+    ).reasons;
+  assert.deepEqual(judge(base), []);
+  assert.match(judge({ ...base, [PROOF]: "stricter test\n" })[0], /is not main's/);
 });
 
 test("a pending file: held to its ceiling from upstream; on a pull request it may change but not grow", () => {
@@ -618,6 +651,37 @@ function withRepo(body) {
   }
 }
 const seams = (config) => ({ [CONFIG]: JSON.stringify(config) });
+
+// Pins main()'s wiring: the proof is compared with the list's commit (main), not the merge-base.
+test("the command line takes the route tree as generated only while the proof is main's", () => {
+  withRepo(({ git, commit, run }) => {
+    const TREE = "apps/web/src/routeTree.gen.ts";
+    const PROOF = "apps/web/src/forkRouteTree.test.ts";
+    const ROUTE = "apps/web/src/routes/_chat.settings.fork.tsx";
+    const tree = "const A = AImport.update({\n  getParentRoute: () => Root,\n} as any)\n";
+    const forkTree = `${tree}const Fork = ForkImport.update({\n  getParentRoute: () => Root,\n} as any)\n`;
+    const main = commit(
+      { ...seams({ files: SEAM }), ...BASE, [TREE]: tree, [PROOF]: "test\n" },
+      "main",
+    );
+    const route = { [TREE]: forkTree, [ROUTE]: "route\n" };
+    git("checkout", "-q", "-b", "pr", main);
+    const pr = commit(route, "a route");
+    assert.equal(run("--config-ref", main, main, pr).status, 0);
+    git("checkout", "-q", "-B", "weak", main);
+    const weak = commit({ ...route, [PROOF]: "it.skip();\n" }, "a route and a weaker proof");
+    const refused = run("--config-ref", main, main, weak);
+    assert.equal(refused.status, 1);
+    assert.match(
+      refused.stderr,
+      /routeTree\.gen\.ts: upstream file with 3 fork lines.*is not main's/,
+    );
+    // Main tightened the proof after the branch: judged line by line until updated from main.
+    git("checkout", "-q", "-B", "main2", main);
+    const main2 = commit({ [PROOF]: "stricter test\n" }, "main: a stricter proof");
+    assert.match(run("--config-ref", main2, main, pr).stderr, /is not main's/);
+  });
+});
 
 test("the command line judges the lines a branch adds since the merge-base", () => {
   withRepo(({ git, commit, run }) => {
