@@ -196,6 +196,9 @@ schema_check "$base" "The series"
 # and the next run (from the new base) would refuse it. So the series gets a commit that lowers each
 # one (#325); a count that rose is still refused, as raising one is the owner's review.
 seam_refusal="Fork changes to upstream files must stay within the seam lines"
+# What a lowering commit changed, for the run's summary: written only once the plan has finished,
+# as a later check can still stop it and then nothing is pushed.
+lowered_summary=()
 seam_run() { # seam_run BASE [--after-rebase]: the check's exit status; its output in seam-check.log
   local status=0 lower=()
   rm -f "$logs/seam-lowered.json"
@@ -213,17 +216,15 @@ seam_check() { # seam_check BASE WHAT [--after-rebase]
     git add -- .github/fork-seams.json
     as_fork commit -q -m "fork seams: lower counts after the rebase onto $target_tag" -m "$lowered"
     printf '%s\n' "$2 lowered the seam list (.github/fork-seams.json) in a commit of its own:" "$lowered" >&2
-    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-      printf '%s\n' "### Seam list lowered: $2" "" "$lowered" "" \
-        "Committed into the series; the fork lines or upstream lines these counted are gone." \
-        "" >> "$GITHUB_STEP_SUMMARY"
-    fi
+    lowered_summary=("### Seam list lowered: $2" "" "$lowered" "" \
+      "Committed on top of the rebased series (the candidate); the fork lines or upstream lines these counted are gone." "")
     # The lowered list is judged again: it must pass and lower nothing more.
     status=0
     seam_run "$1" ${3:+"$3"} || status=$?
     if ((status == 0)) && [[ -f "$logs/seam-lowered.json" ]]; then
-      fail "The seam list fork-follow lowered still lowers again, so it was not committed as checked:" \
-        "$(quoted "$(cat "$logs/seam-check.log")")" "" "The series was left as it is."
+      fail "$2 needed a lower seam list, and the list fork-follow lowered still lowers again, so the run stopped:" \
+        "$(quoted "$lowered")" "" "The check of the lowered list said:" \
+        "$(quoted "$(cat "$logs/seam-check.log")")" "" "The lowering commit was made in this run's checkout only; the series was left as it is."
     fi
   fi
   if ((status == 0)); then
@@ -617,3 +618,7 @@ new_workflows "$base" "$target"
   echo "own_workflows=$own_list"
   echo "new_workflows=$new_list"
 } >> "$OUTPUT"
+# The plan has finished: the lowering commit is in the candidate it hands on.
+if ((${#lowered_summary[@]})) && [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  printf '%s\n' "${lowered_summary[@]}" >> "$GITHUB_STEP_SUMMARY"
+fi
