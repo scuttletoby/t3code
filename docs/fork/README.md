@@ -46,6 +46,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | ---------------------------------------------------------------------------- | --------------------------- | --- | -------------------------------------------------------- |
 | [`server.automaticUpdates`](#serverautomaticupdates)                         | `false`                     | yes | [#41](https://github.com/scuttletoby/t3code/issues/41)   |
 | [`server.automaticUpdatesQuietCommand`](#serverautomaticupdatesquietcommand) | `""`                        | yes | [#5](https://github.com/scuttletoby/t3code/issues/5)     |
+| [`server.activityProbe`](#serveractivityprobe)                               | `false`                     | yes | [#509](https://github.com/scuttletoby/t3code/issues/509) |
 | [`server.usagePacing`](#serverusagepacing)                                   | `{}`                        | yes | [#52](https://github.com/scuttletoby/t3code/issues/52)   |
 | [`server.usagePacingGate`](#serverusagepacinggate)                           | `"off"`                     | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
 | [`server.usagePacingLowerEffort`](#serverusagepacinglowereffort)             | `{}`                        | yes | [#73](https://github.com/scuttletoby/t3code/issues/73)   |
@@ -89,6 +90,25 @@ while `automaticUpdates` is on. Empty: no program is asked.
 
 Set in `settings.json`: `"automaticUpdatesQuietCommand": "/path/to/quiet-check"`. Details:
 [updates.md](updates.md).
+
+### `server.activityProbe`
+
+Lets a program on the same machine ask the running server "is T3 busy?" without touching its data:
+`GET /api/fork/activity` answers with the running, queued and waiting turns, pending approvals and
+questions, background tasks and running terminal commands, counted as the automatic updater counts
+them, and `quiet: true` only when all are zero. It answers only a caller on loopback that came through
+no proxy (a Tailscale Serve or tunnel request is refused), writes nothing and needs no sign-in. Off:
+the route does not exist (404), as on upstream's T3 Code.
+
+Switch on in `settings.json`: `"activityProbe": true` (read on every request, no restart). The
+program to call is `t3 __fork-report --base-dir <home> --activity`: it finds the server from the
+home's `server-runtime.json`, asks it, prints one line of JSON (`quiet`, then `reason`, then `state`:
+`quiet`, `busy`, `stopped`, `off`, `unreachable` or `unknown`) and exits 0 only for `quiet`. Every
+other state exits 1, so a quiet check that runs it fails closed: a server still starting (it answers
+nothing until it accepts commands), stopping, gone, too old to know the route, or with the probe off
+counts as busy. Only `quiet` and `busy` come from the server; `stopped` means no live process holds
+the home. A quiet check wraps it in a script with no arguments, for example
+`exec /path/to/t3 __fork-report --base-dir /path/to/home --activity`.
 
 ### `server.usagePacing`
 

@@ -15,6 +15,7 @@ import * as HeadlessUsageRefresher from "../usage/HeadlessUsageRefresher.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
+import * as ActivityProbe from "./activityProbe.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 
 /** Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. */
@@ -51,6 +52,8 @@ export const layerRoutes = Layer.mergeAll(
   Layer.effectDiscard(SlotGate.SlotGate.pipe(Effect.asVoid)),
   // Off unless automaticUpdates is on; shares the Update button's ServerSelfUpdate in server.ts.
   ServerAutoUpdate.layer,
+  // GET /api/fork/activity: 404 unless activityProbe is on; loopback programs only.
+  ActivityProbe.layer,
 );
 
 /**
