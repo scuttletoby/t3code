@@ -106,8 +106,9 @@ describe("UsagePacingSettings", () => {
     await expect.element(screen.getByText("Reserve on Codex B")).toBeVisible();
     const reserve = screen.getByRole("textbox", { name: "Reserve on Codex B in percent" });
     await expect.element(reserve).toHaveValue("0");
-    await userEvent.clear(reserve);
-    await userEvent.type(reserve, "20{Enter}");
+    // The number field saves when it loses focus.
+    await userEvent.type(reserve, "{Backspace}20");
+    await userEvent.tab();
     expect(state.update.mock.calls[0]![0]).toEqual({
       usagePacing: { "codex-b": { reservePercent: 20 } },
     });
