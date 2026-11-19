@@ -57,6 +57,14 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const isCount = (value: unknown) => Number.isInteger(value) && (value as number) >= 0;
 
+const ACTIVITY_COUNTS = [
+  "activeRuns",
+  "queuedRuns",
+  "pendingRequests",
+  "backgroundTasks",
+  "terminalCommands",
+] as const;
+
 /** The answer, if it is one this reader knows and it agrees with itself; else null. */
 function decodeAnswer(body: unknown): ActivityProbeAnswer | null {
   if (!isRecord(body) || body.probeVersion !== ACTIVITY_PROBE_VERSION) return null;
@@ -66,17 +74,15 @@ function decodeAnswer(body: unknown): ActivityProbeAnswer | null {
   if (!Number.isInteger(pid) || typeof serverVersion !== "string") return null;
   if (
     activity !== null &&
-    !(
-      isRecord(activity) &&
-      ["activeRuns", "queuedRuns", "pendingRequests", "backgroundTasks", "terminalCommands"].every(
-        (key) => isCount(activity[key]),
-      )
-    )
+    !(isRecord(activity) && ACTIVITY_COUNTS.every((key) => isCount(activity[key])))
   ) {
     return null;
   }
-  // Quiet exactly when there is no reason, and only while running.
+  // Quiet exactly when there is no reason, only while running, and only with counts that are all 0.
   if (quiet !== (reason === null) || (quiet && state !== "running")) return null;
+  if (quiet && (!isRecord(activity) || ACTIVITY_COUNTS.some((key) => activity[key] !== 0))) {
+    return null;
+  }
   return body as unknown as ActivityProbeAnswer;
 }
 
@@ -141,12 +147,13 @@ async function fetchWithin(
   });
   try {
     return await Promise.race([
-      deps.fetch(url, { signal: controller.signal }).then(
-        async (response) => ({ status: response.status, text: await response.text() }),
-        (error: unknown) => ({
+      // The catch also covers a body that fails after the headers came (the server closed mid-answer).
+      deps
+        .fetch(url, { signal: controller.signal })
+        .then(async (response) => ({ status: response.status, text: await response.text() }))
+        .catch((error: unknown) => ({
           failed: `the request failed (${error instanceof Error ? error.message : String(error)})`,
-        }),
-      ),
+        })),
       deadline,
     ]);
   } finally {

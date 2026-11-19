@@ -159,6 +159,21 @@ describe("readActivityProbe", () => {
     expect(refused).toMatchObject({ quiet: false, state: "unreachable" });
   });
 
+  it("is unreachable, not a crash, when the answer's body fails after the headers came", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"probeVersion":1,'));
+        controller.error(new TypeError("terminated"));
+      },
+    });
+    const reading = await readActivityProbe(
+      makeHome(record()),
+      deps(() => Promise.resolve(new Response(body, { status: 200 }))),
+    );
+    expect(reading).toMatchObject({ quiet: false, state: "unreachable" });
+    expect(reading.reason).toContain("terminated");
+  });
+
   it("says off when the server has the probe turned off", async () => {
     const reading = await readActivityProbe(
       makeHome(record()),
@@ -182,6 +197,9 @@ describe("readActivityProbe", () => {
       () => json(answer({ probeVersion: 2 })),
       () => json(answer({ quiet: "yes" })),
       () => json(answer({ state: "running", reason: null, quiet: false })),
+      // Quiet needs counts, all of them 0.
+      () => json(answer({ activity: null })),
+      () => json(answer({ activity: { ...answer().activity, backgroundTasks: 1 } })),
     ];
     for (const reply of replies) {
       const reading = await readActivityProbe(makeHome(record()), deps(reply));

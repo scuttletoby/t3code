@@ -1,7 +1,8 @@
 /**
  * Fork: a read-only "is T3 busy?" answer for programs on this machine (a go-live quiet check), counted
  * as the automatic updater counts. No sign-in, so only a loopback caller with no proxy or browser
- * headers is answered. Off (`server.activityProbe`, the default): 404, as upstream's would.
+ * headers is answered; every other caller gets a plain 404 that does not say the route exists.
+ * Off (`server.activityProbe`, the default): a local caller gets 404 with a reason, others the plain one.
  */
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -97,15 +98,36 @@ const PROXY_HEADERS = [
   "via",
 ] as const;
 
-/** Only a program on this machine: a loopback peer, no proxy's headers, no browser page's. */
+/**
+ * A browser page's request: an Origin, or fetch metadata. Browsers send `sec-fetch-site` and
+ * `sec-fetch-dest` on every request to loopback, including no-cors ones such as `<img src>` that
+ * carry no Origin. Node's own `fetch` (undici, which the reader uses) sends `sec-fetch-mode: cors`
+ * and neither of the others, so that one value alone is a program.
+ */
+const isBrowserRequest = (headers: Readonly<Record<string, string | undefined>>): boolean =>
+  headers.origin !== undefined ||
+  headers["sec-fetch-site"] !== undefined ||
+  headers["sec-fetch-dest"] !== undefined ||
+  (headers["sec-fetch-mode"] !== undefined && headers["sec-fetch-mode"] !== "cors");
+
+/**
+ * Only a program on this machine: a loopback peer, no proxy's headers, no browser page's.
+ * A TCP-level forward to loopback (`ssh -L`/`-R`, `tailscale serve --tcp`, socat, editor port
+ * forwarding) adds no headers and lets its client choose the Host, so it looks local; whoever can
+ * open such a forward can already reach this machine's loopback.
+ */
 export function isLocalProbeRequest(
   peerAddress: Option.Option<string>,
   headers: Readonly<Record<string, string | undefined>>,
 ): boolean {
   if (peerAddress._tag === "None" || !isLoopbackAddress(peerAddress.value)) return false;
   if (PROXY_HEADERS.some((header) => headers[header] !== undefined)) return false;
-  return headers.origin === undefined && isLoopbackHost(headers.host);
+  if (isBrowserRequest(headers)) return false;
+  return isLoopbackHost(headers.host);
 }
+
+/** What any caller that is not local gets, on or off: upstream's plain "no such route". */
+const notFound = () => HttpServerResponse.text("Not Found", { status: 404 });
 
 /** "running" while the routes are up, "stopping" once their scope closes (the server shuts down). */
 export const trackServerState: Effect.Effect<
@@ -121,7 +143,11 @@ export const trackServerState: Effect.Effect<
 const json = (body: unknown, status: number) =>
   HttpServerResponse.jsonUnsafe(body, { status, headers: { "cache-control": "no-store" } });
 
-/** The route's work, with the setting, state and counter passed in. Reads nothing it refuses. */
+/**
+ * The route's work, with the setting, state and counter passed in. Reads nothing it refuses.
+ * The caller is checked first, so a remote caller cannot learn that this is the fork or how the
+ * setting is set: it always gets the plain 404.
+ */
 export const handleActivityProbe = Effect.fn("fork.activityProbe.handle")(function* <E>(deps: {
   readonly pid: number;
   readonly serverVersion: string;
@@ -129,12 +155,10 @@ export const handleActivityProbe = Effect.fn("fork.activityProbe.handle")(functi
   readonly state: Effect.Effect<ActivityProbeServerState>;
   readonly activity: Effect.Effect<AutoUpdateActivity, E>;
 }) {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  if (!isLocalProbeRequest(request.peerAddress, request.headers)) return notFound();
   if (!(yield* deps.enabled)) {
     return json({ error: "activity probe is off (server.activityProbe)" }, 404);
-  }
-  const request = yield* HttpServerRequest.HttpServerRequest;
-  if (!isLocalProbeRequest(request.peerAddress, request.headers)) {
-    return json({ error: "the activity probe answers only programs on this machine" }, 403);
   }
   const state = yield* deps.state;
   const activity =
@@ -153,8 +177,11 @@ export const handleActivityProbe = Effect.fn("fork.activityProbe.handle")(functi
   );
 });
 
-/** `GET /api/fork/activity`; the setting is read on each request, so switching it needs no restart. */
-export const layer = Layer.unwrap(
+/**
+ * `GET /api/fork/activity`; the setting is read on each request, so switching it needs no restart.
+ * Takes the projection store from outside; `layer` below gives it the server's.
+ */
+export const layerRoute = Layer.unwrap(
   Effect.gen(function* () {
     const settings = yield* ServerSettings.ServerSettingsService;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -177,4 +204,6 @@ export const layer = Layer.unwrap(
       }),
     );
   }),
-).pipe(Layer.provide(ProjectionStore.layer));
+);
+
+export const layer = layerRoute.pipe(Layer.provide(ProjectionStore.layer));

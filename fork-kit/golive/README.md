@@ -76,7 +76,9 @@ terminal included; `--here` runs it in the calling process and is refused inside
    absolute path, no arguments, run in the home with both versions in its environment, exit 0 = quiet) must say
    quiet twice, 60 s apart, within `quietWaitSeconds`; else it refuses. A wrapper around
    `t3 __fork-report --base-dir <home> --activity` (with `server.activityProbe` on) answers from T3's own
-   turns, approvals and terminal commands; it says busy for anything it cannot read. `--owner-says-go` skips the wait. Then
+   turns, approvals and terminal commands; it says busy for anything it cannot read. It is advisory: an agent
+   that can rewrite the home's `server-runtime.json` can make it say quiet (see `server.activityProbe` in
+   `docs/fork/README.md`). `--owner-says-go` skips the wait. Then
    free space is checked again, and the live server is read again: if its pid, its version, the service
    state's `activeVersion` or a pending update changed during the wait (the auto-updater keeps the same quiet
    contract and may have moved T3 to a newer build), it refuses.

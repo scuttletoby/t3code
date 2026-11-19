@@ -1365,17 +1365,21 @@ describe("__fork-report --activity", () => {
     });
 
   /** A local server answering the probe path as a running T3 would, recorded in the home. */
-  const serveProbe = (home: string, body: unknown) =>
+  const serveProbe = (
+    home: string,
+    body: unknown,
+    respond: NodeHttp.RequestListener = (request, response) => {
+      response.writeHead(request.url === ACTIVITY_PROBE_PATH ? 200 : 404, {
+        "content-type": "application/json",
+      });
+      response.end(JSON.stringify(body));
+    },
+  ) =>
     Effect.acquireRelease(
       Effect.promise(
         () =>
           new Promise<NodeHttp.Server>((resolve) => {
-            const server = NodeHttp.createServer((request, response) => {
-              response.writeHead(request.url === ACTIVITY_PROBE_PATH ? 200 : 404, {
-                "content-type": "application/json",
-              });
-              response.end(JSON.stringify(body));
-            });
+            const server = NodeHttp.createServer(respond);
             server.listen(0, "127.0.0.1", () => resolve(server));
           }),
       ),
@@ -1407,7 +1411,13 @@ describe("__fork-report --activity", () => {
     state: "running",
     pid: process.pid,
     serverVersion: "0.0.0",
-    activity: null,
+    activity: {
+      activeRuns: quiet ? 0 : 1,
+      queuedRuns: 0,
+      pendingRequests: 0,
+      backgroundTasks: 0,
+      terminalCommands: 0,
+    },
   });
 
   it.effect("prints one line and exits 1 for a stopped home, writing nothing", () =>
@@ -1437,6 +1447,21 @@ describe("__fork-report --activity", () => {
       expect(busy.exitCode).toBe(1);
       // The reason comes first, so a hook that keeps the first 200 characters keeps it.
       expect(String(busy.lines[0])).toMatch(/^\{"quiet":false,"reason":"1 running turn"/);
+    }).pipe(Effect.scoped),
+  );
+
+  // T3 sends the headers and then closes mid-body (for example while shutting down).
+  it.effect("prints its one JSON line and exits 1 when the answer is cut off mid-body", () =>
+    Effect.gen(function* () {
+      const home = makeHome();
+      yield* serveProbe(home, null, (_request, response) => {
+        response.writeHead(200, { "content-type": "application/json", "content-length": "500" });
+        response.write('{"probeVersion":1,', () => response.socket?.destroy());
+      });
+      const { lines, reading, exitCode } = yield* activityThroughCli(home);
+      expect(lines).toHaveLength(1);
+      expect(reading).toMatchObject({ quiet: false, state: "unreachable" });
+      expect(exitCode).toBe(1);
     }).pipe(Effect.scoped),
   );
 });

@@ -102,6 +102,30 @@ describe("isLocalProbeRequest", () => {
     ).toBe(false);
   });
 
+  // A no-cors request (`<img src>`, `fetch(url, {mode: "no-cors"})`) carries no Origin, but every
+  // browser request carries fetch metadata.
+  it.each([
+    { "sec-fetch-site": "cross-site" },
+    { "sec-fetch-dest": "image" },
+    { "sec-fetch-mode": "no-cors" },
+    { "sec-fetch-mode": "navigate" },
+    { "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors", "sec-fetch-dest": "empty" },
+  ])("refuses a request with browser fetch metadata (%o)", (metadata) => {
+    expect(
+      isLocalProbeRequest(Option.some("127.0.0.1"), { host: "127.0.0.1:3773", ...metadata }),
+    ).toBe(false);
+  });
+
+  // Node's fetch sends this one header on every request; the reader uses it.
+  it("answers Node's fetch, which sends sec-fetch-mode: cors alone", () => {
+    expect(
+      isLocalProbeRequest(Option.some("::ffff:127.0.0.1"), {
+        host: "127.0.0.1:3773",
+        "sec-fetch-mode": "cors",
+      }),
+    ).toBe(true);
+  });
+
   it.each(["127.0.0.1:3773", "[::1]:3773", "localhost:3773", "localhost"])(
     "answers a local Host (%s)",
     (host) => {
@@ -127,6 +151,15 @@ describe("trackServerState", () => {
     }),
   );
 });
+
+/** JSON, or the text itself for a plain-text answer (the 404 for callers that are not local). */
+const parseBody = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+};
 
 describe("handleActivityProbe", () => {
   const request = (peer: string | null, headers: Record<string, string> = {}) =>
@@ -158,11 +191,8 @@ describe("handleActivityProbe", () => {
       ),
     );
     const web = HttpServerResponse.toWeb(response);
-    return {
-      status: web.status,
-      body: yield* Effect.promise(() => web.json()),
-      reads: yield* Ref.get(reads),
-    };
+    const body = yield* Effect.promise(() => web.text()).pipe(Effect.map(parseBody));
+    return { status: web.status, body, reads: yield* Ref.get(reads) };
   });
 
   it.effect("answers a local caller with the server's state and counts", () =>
@@ -190,16 +220,23 @@ describe("handleActivityProbe", () => {
     }),
   );
 
-  it.effect("refuses a caller from another machine or through a proxy, reading nothing", () =>
+  // On or off, a caller that is not local learns nothing: not that this is the fork, not the setting.
+  it.effect("gives every caller that is not local a plain 404, on or off, reading nothing", () =>
     Effect.gen(function* () {
-      for (const input of [
-        { peer: "192.168.1.5" },
-        { peer: null },
-        { peer: "127.0.0.1", headers: { "x-forwarded-for": "203.0.113.9" } },
-      ]) {
-        const { status, reads } = yield* run(input);
-        expect(status).toBe(403);
-        expect(reads).toBe(0);
+      for (const enabled of [true, false]) {
+        for (const input of [
+          { peer: "192.168.1.5" },
+          { peer: null },
+          { peer: "127.0.0.1", headers: { "x-forwarded-for": "203.0.113.9" } },
+          { peer: "127.0.0.1", headers: { "tailscale-user-login": "someone" } },
+          { peer: "127.0.0.1", headers: { origin: "https://example.test" } },
+          { peer: "127.0.0.1", headers: { "sec-fetch-mode": "no-cors" } },
+        ]) {
+          const { status, body, reads } = yield* run({ ...input, enabled });
+          expect(status).toBe(404);
+          expect(body).toBe("Not Found");
+          expect(reads).toBe(0);
+        }
       }
     }),
   );
