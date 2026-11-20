@@ -275,10 +275,11 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
     const first = `"enforce" would first scan this folder for ${wouldScan.join(", ")}`;
     if (input.pinned && then === HOLD) return `${first}, then ${HOLD} either way.`;
     const one = wouldScan.length === 1;
+    // A listed model is not enough: the task must still fit there (options, runtime mode).
     const listed = input.pinned
       ? HOLD
-      : `run this task on ${one ? wouldScan[0] : "the first that lists it"}`;
-    return `${first}: if ${one ? "it lists" : "one lists"} the model, it would ${listed}; if not, it would ${then}.`;
+      : `run this task on ${one ? wouldScan[0] : "the first of them where it can"}`;
+    return `${first}: if ${one ? "it lists" : "one lists"} the model and the task can run there, it would ${listed}; if not, it would ${then}.`;
   };
   if (current !== undefined) {
     const others = input.providers.filter(
