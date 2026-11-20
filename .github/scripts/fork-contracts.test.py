@@ -75,6 +75,7 @@ Needs PyYAML, git and bash. Each check prints ok/FAIL; any FAIL exits 1.
 """
 
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -1017,7 +1018,7 @@ LOOKUP = re.compile(
     r'OLD_HEADS=""\n(?:.*\n)*?\s*if \[\[ "\$EVENT_NAME" == pull_request \]\]; then\n'
     r'\s*if ! OLD_HEADS="\$\(GH_TOKEN="\$LOOKUP_TOKEN" gh api --paginate -X GET "repos/\$GITHUB_REPOSITORY/activity" \\\n'
     r"""\s*-f "ref=refs/heads/\$HEAD_REF" -f per_page=100 --jq '\.\[\] \| \.before, \.after'\)"; then\n"""
-    r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n(?:.*\n)*?\s*export UPSTREAM OLD_HEADS(?: SCANNED_GONE)?\n')
+    r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n(?:.*\n)*?\s*unset LOOKUP_TOKEN\n')
 
 
 # The sweep's lookup (#239), allowed in this exact form only, right after the earlier-heads lookup:
@@ -1058,12 +1059,23 @@ SCANNED_LOOKUP_TEXT = (
     'if [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then\n'
     'mapfile -t tips < <(tr -s \'[:space:]\' \'\\n\' <<< "$OLD_HEADS" | grep -E \'^[0-9a-f]{40}$\' | grep -vE'
     " '^0+$' | sort -u)\n"
+    '# Which of them this blob-less clone lacks: one git process for all, lazy fetching off\n'
+    '# (#637). A lazy fetch asks for the whole history again (no negotiation) and every lookup\n'
+    '# of a missing commit reads every pack, so one by one that outran the job\'s 30 minutes.\n'
+    'if ! lacked="$(printf \'%s^{commit}\\n\' "${tips[@]}" | GIT_NO_LAZY_FETCH=1 git cat-file'
+    ' --batch-check=\'%(objectname)\' 2> /dev/null)"; then\n'
+    'echo "::error::Secret scan: cannot check which listed tips this clone lacks. Re-run the job." >&2\n'
+    'exit 2\n'
+    'fi\n'
+    "mapfile -t missing < <(sed -n 's/^\\([0-9a-f]\\{40\\}\\)^{commit} missing$/\\1/p' <<< \"$lacked\")\n"
     'unserved=()\n'
-    'for tip in "${tips[@]}"; do\n'
-    'git cat-file -e "$tip^{commit}" 2> /dev/null \\\n'
-    '|| timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n'
+    'if [[ ${#missing[@]} -gt 0 ]] \\\n'
+    '&& ! timeout 600 git fetch --quiet --no-tags --filter=blob:none origin "${missing[@]}" 2> /dev/null; then\n'
+    'for tip in "${missing[@]}"; do\n'
+    'timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n'
     '|| unserved+=("$tip")\n'
     'done\n'
+    'fi\n'
     'deleted=()\n'
     "# shellcheck disable=SC2016 # $owner, $name and $id are GraphQL and jq variables, not the shell's\n"
     'for ((i = 0; i < ${#unserved[@]}; i += 100)); do\n'
@@ -1111,6 +1123,20 @@ SCANNED_LOOKUP_TEXT = (
     'unset LOOKUP_TOKEN\n')
 
 
+# The lists' hand-over to the scan (#637), in this exact form only, right before the scan script is
+# fetched: each id once, both lists in files under RUNNER_TEMP (written afresh each run), the files
+# exported, and the variables too only while they fit in one environment string (the kernel caps one
+# at 128 KiB; past that every program the step starts fails, "Argument list too long").
+HANDOFF_TEXT = (
+    'OLD_HEADS="$(tr -s \'[:space:]\' \'\\n\' <<< "$OLD_HEADS" | sort -u)"\n'
+    'printf \'%s\\n\' "$OLD_HEADS" > "$RUNNER_TEMP/old-heads"\n'
+    'printf \'%s\\n\' "$SCANNED_GONE" > "$RUNNER_TEMP/scanned-gone"\n'
+    'export UPSTREAM OLD_HEADS_FILE="$RUNNER_TEMP/old-heads" SCANNED_GONE_FILE="$RUNNER_TEMP/scanned-gone"\n'
+    'if [[ ${#OLD_HEADS} -le 100000 ]]; then export OLD_HEADS; fi\n'
+    'if [[ ${#SCANNED_GONE} -le 100000 ]]; then export SCANNED_GONE; fi\n'
+    'git fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"\n')
+
+
 def stripped_lines(run):
     return "".join(line.strip() + "\n" for line in run.splitlines())
 
@@ -1124,14 +1150,19 @@ def lookup_problems(scan):
                 continue
             if not LOOKUP.search(run):
                 problems.append(f"{SCAN_FILE}/{j}: the earlier-heads lookup is not in its exact form (fails the job "
-                                "on a failed lookup, reads .before and .after, exports OLD_HEADS)")
+                                "on a failed lookup, reads .before and .after)")
+            handoff = HANDOFF_TEXT in stripped_lines(run)
+            if not handoff:
+                problems.append(f"{SCAN_FILE}/{j}: the lists are not handed to the scan in files in their exact "
+                                "form (#637)")
             scanned_lookup = SCANNED_LOOKUP_TEXT in stripped_lines(run)
             if re.search(r"\bSCANNED_GONE\b", run) and (
-                    not scanned_lookup or len(re.findall(r"\bSCANNED_GONE\b", run)) != 3
-                    or "export UPSTREAM OLD_HEADS SCANNED_GONE\n" not in stripped_lines(run)):
+                    not scanned_lookup or not handoff
+                    or len(re.findall(r"\bSCANNED_GONE\b", run)) != 2 + len(re.findall(r"\bSCANNED_GONE\b", HANDOFF_TEXT))):
                 problems.append(f"{SCAN_FILE}/{j}: SCANNED_GONE is not set by the sweep's lookup of deleted tips a "
                                 "scan read in its exact form (#482), or is set or used outside it")
-            want = 3 + (1 if SWEEP_LOOKUP.search(run) else 0) + (1 if scanned_lookup else 0)
+            want = (2 + len(re.findall(r"\bOLD_HEADS\b", HANDOFF_TEXT)) + (1 if SWEEP_LOOKUP.search(run) else 0)
+                    + (1 if scanned_lookup else 0))
             if len(re.findall(r"\bOLD_HEADS\b", run)) != want:
                 problems.append(f"{SCAN_FILE}/{j}: OLD_HEADS is set or used outside the lookups")
             env = step.get("env") or {}
@@ -1391,7 +1422,7 @@ for label, mutate in {
         "run", scan_step(w)["run"].replace("--jq '.[] | .before, .after')\"; then",
                                            "--jq '.[] | .before, .after' || true)\"; then")),
     "the earlier heads emptied before the export": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace("export UPSTREAM OLD_HEADS", 'OLD_HEADS=""\nexport UPSTREAM OLD_HEADS')),
+        "run", scan_step(w)["run"].replace("unset LOOKUP_TOKEN\n", 'unset LOOKUP_TOKEN\nOLD_HEADS=""\n')),
     "the lookup reading the wrong field": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace(".[] | .before, .after", ".[] | .sha")),
     "the lookup's failure not failing the job": lambda w: scan_step(w).__setitem__(
@@ -1425,7 +1456,11 @@ for label, mutate in {
                       scan_step(w)["run"], count=1)),
     "absent tips asked about without git's fetch first (a tip dropped meanwhile fails)": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace(
-            '|| timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n', "")),
+            'timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n', "")),
+    "the lacked tips checked with lazy fetching on (#637)": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("| GIT_NO_LAZY_FETCH=1 git cat-file --batch-check", "| git cat-file --batch-check")),
+    "a failed check of the lacked tips that does not fail the job": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r"exit 2(\n\s*fi\n\s*mapfile -t missing)", r"true\1", scan_step(w)["run"], count=1)),
     "a runs lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
         "run", re.sub(r"exit 2(\n\s*fi\n\s*mapfile -t ids)", r"true\1", scan_step(w)["run"], count=1)),
     "a runs lookup that takes a run of another commit": lambda w: scan_step(w).__setitem__(
@@ -1441,7 +1476,17 @@ for label, mutate in {
     "SCANNED_GONE set outside its lookup": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace("unset LOOKUP_TOKEN\n", 'SCANNED_GONE="$OLD_HEADS"\nunset LOOKUP_TOKEN\n')),
     "SCANNED_GONE not exported to the scan": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace("export UPSTREAM OLD_HEADS SCANNED_GONE\n", "export UPSTREAM OLD_HEADS\n")),
+        "run", scan_step(w)["run"].replace(' SCANNED_GONE_FILE="$RUNNER_TEMP/scanned-gone"\n', "\n")),
+    # #637: the lists handed over in files, the variables only while they fit.
+    "the earlier heads not handed over in a file": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace(' OLD_HEADS_FILE="$RUNNER_TEMP/old-heads"', "")),
+    "the earlier heads exported whatever their size (Argument list too long)": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("if [[ ${#OLD_HEADS} -le 100000 ]]; then export OLD_HEADS; fi", "export OLD_HEADS")),
+    "SCANNED_GONE exported whatever its size": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("if [[ ${#SCANNED_GONE} -le 100000 ]]; then export SCANNED_GONE; fi",
+                                           "export SCANNED_GONE")),
+    "the earlier heads' file appended to, not written afresh": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace('"$OLD_HEADS" > "$RUNNER_TEMP/old-heads"', '"$OLD_HEADS" >> "$RUNNER_TEMP/old-heads"')),
     # c2: the jobs' if: as GitHub evaluates it.
     "every push skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
         "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace("(github.event.deleted ||", "(true || github.event.deleted ||")),
@@ -1500,6 +1545,220 @@ for label, mutate in {
 check("secret-scan: the sweep's activity lookup (#239) in its exact form passes",
       not scan_mutant(lambda w: scan_step(w).__setitem__("run", with_sweep_lookup(scan_step(w)["run"])))
       and SWEEP_LOOKUP.search(with_sweep_lookup(scan_step(real)["run"])) is not None)
+
+# #637, end to end: the sweep's lookup of the tips it lacks, as the workflow has it (bash -e -o
+# pipefail), in a blob-less clone of a local origin that still serves three tips no ref holds and
+# lacks one (gone), with a gh stub that answers as GitHub would. The sweep of 11-20 ran out of the
+# job's 30 minutes here: `git cat-file -e` per tip, with lazy fetching on, fetched each lacked tip
+# with the whole history again (no negotiation), and each lookup of a missing commit read every pack
+# that left. Now: one cat-file for all tips, no lazy fetch, one batch fetch, one by one only when a
+# gone tip fails the batch. Also: run again in the same clone, stopped half-way (one tip fetched
+# before), no tips at all, and no clone.
+def sweep_lookup_code(run):
+    start, end = run.find('SCANNED_GONE=""\n'), run.find("unset LOOKUP_TOKEN\n")
+    return run[start:end] if 0 <= start < end else "exit 99\n"
+
+
+sweep_work = pathlib.Path(tempfile.mkdtemp(prefix="fork-contracts-sweep-"))
+sweep_origin = sweep_work / "origin"
+sweep_origin.mkdir()
+git(sweep_origin, "init", "-q", "-b", "main")
+git(sweep_origin, "config", "uploadpack.allowFilter", "true")
+git(sweep_origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+(sweep_origin / "a.txt").write_text("a\n")
+git(sweep_origin, "add", "-A")
+git(sweep_origin, "commit", "-q", "-m", "main")
+sweep_main = git(sweep_origin, "rev-parse", "HEAD")
+sweep_vanished = []
+for n in range(3):  # a branch pushed, then deleted: no ref holds its tip, origin still serves it
+    git(sweep_origin, "checkout", "-q", "-b", f"side{n}", sweep_main)
+    (sweep_origin / "a.txt").write_text(f"side {n}\n")
+    git(sweep_origin, "commit", "-q", "-am", f"side {n}")
+    sweep_vanished.append(git(sweep_origin, "rev-parse", "HEAD"))
+    git(sweep_origin, "checkout", "-q", "main")
+    git(sweep_origin, "branch", "-q", "-D", f"side{n}")
+sweep_gone = "ab" * 20  # listed by the activity record, garbage-collected by GitHub
+sweep_stub = sweep_work / "bin"
+sweep_stub.mkdir()
+(sweep_stub / "gh").write_text(r"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  *graphql*)
+    for a in "$@"; do [[ "$a" != query=* ]] || q="$a"; done
+    for id in $(grep -oE 'c_[0-9a-f]{40}' <<< "$q" | cut -c3-); do
+      [[ " $FAKE_GONE " != *" $id "* ]] || echo "$id"
+    done ;;
+  *actions/runs/*/jobs*) [[ -z "${FAKE_SCANNED:-}" ]] || echo 9001 ;;
+  *actions/runs*) echo 101 ;;
+  *) echo "gh stub: unexpected call: $*" >&2; exit 97 ;;
+esac
+""")
+(sweep_stub / "gh").chmod(0o755)
+lookup_code = sweep_lookup_code(scan_step(real)["run"])
+
+
+def sweep_clone(label):
+    dest = sweep_work / label
+    git(sweep_work, "clone", "-q", "--filter=blob:none", "--no-checkout", f"file://{sweep_origin}", str(dest))
+    return dest
+
+
+def sweep_lookup(dest, old_heads, label, code=None):
+    """Runs the lookup in dest; returns (exit, SCANNED_GONE, git trace, gh calls)."""
+    trace, gh_log = sweep_work / f"{label}.trace", sweep_work / f"{label}.gh"
+    trace.write_text("")
+    gh_log.write_text("")
+    script = (code or lookup_code) + 'printf "SCANNED_GONE=[%s]\\n" "$SCANNED_GONE"\n'
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=dest,
+                       env={**base_env, "PATH": f"{sweep_stub}:{base_env['PATH']}", "GITHUB_REPOSITORY": "me/t3code",
+                            "EVENT_NAME": "schedule", "OLD_HEADS": old_heads, "LOOKUP_TOKEN": "x",
+                            "GH_LOG": str(gh_log), "FAKE_GONE": sweep_gone, "FAKE_SCANNED": "1",
+                            "GIT_TRACE": str(trace), "GIT_CEILING_DIRECTORIES": str(sweep_work)},
+                       capture_output=True, text=True)
+    found = re.search(r"SCANNED_GONE=\[(.*)\]", r.stdout)
+    return r, (found.group(1).strip() if found else None), trace.read_text(), gh_log.read_text()
+
+
+def commands(trace, name):
+    return len(re.findall(rf"trace: built-in: git {name}\b", trace))
+
+
+def lazy_fetches(trace):
+    return len(re.findall(r"run_command: git -c fetch\.negotiationAlgorithm=noop fetch", trace))
+
+
+def has_commit(dest, sha):
+    """Whether the clone holds sha, from its own objects only (a lookup of a missing one would fetch it)."""
+    return sha in git(dest, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)").split()
+
+
+# Whether this git honours GIT_NO_LAZY_FETCH (git 2.44, or 2.39.4 to 2.43.4 with the May 2024 fixes):
+# the probe tries it rather than reading the version, as fork-secret-scan.test.sh does. On CI a git
+# that ignores it fails; elsewhere the no-lazy-fetch half of the check is skipped.
+probe = sweep_clone("probe")
+lazy_honoured = subprocess.run(["git", "cat-file", "-e", f"{sweep_vanished[0]}^{{commit}}"], cwd=probe,
+                               env={**base_env, "GIT_NO_LAZY_FETCH": "1"}, capture_output=True).returncode != 0
+if not lazy_honoured and os.environ.get("CI") == "true":
+    check("secret-scan e2e: git on CI honours GIT_NO_LAZY_FETCH (else the no-lazy-fetch checks prove nothing)", False)
+
+all_heads = " ".join([sweep_main, *sweep_vanished, sweep_gone, "0" * 40, "not-a-sha"])
+fresh = sweep_clone("fresh")
+r, gone, trace, calls = sweep_lookup(fresh, all_heads, "fresh")
+check("secret-scan e2e (#637): a fresh blob-less clone: the deleted tip a scan read is SCANNED_GONE, the served "
+      "ones are fetched (GitHub is asked only about the deleted one), with one cat-file for all tips"
+      + ("" if lazy_honoured else " (lazy-fetch half skipped: this git ignores GIT_NO_LAZY_FETCH)"),
+      r.returncode == 0 and gone == sweep_gone and all(has_commit(fresh, v) for v in sweep_vanished)
+      and calls.count("graphql") == 1 and not any(v in calls for v in sweep_vanished)
+      and commands(trace, "cat-file") == 1 and (not lazy_honoured or lazy_fetches(trace) == 0),
+      f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone} cat-files={commands(trace, 'cat-file')} "
+      f"lazy={lazy_fetches(trace)} gh={calls.strip()!r}")
+r, gone, trace, calls = sweep_lookup(fresh, all_heads, "again")
+check("secret-scan e2e: run again in the same clone: the same answer, only the deleted tip fetched (batch + alone)",
+      r.returncode == 0 and gone == sweep_gone and commands(trace, "fetch") == 2 and lazy_fetches(trace) == 0
+      and calls.count("graphql") == 1, f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone} "
+      f"fetches={commands(trace, 'fetch')}")
+half = sweep_clone("half")
+git(half, "fetch", "-q", "--no-tags", "--filter=blob:none", "origin", sweep_vanished[1])
+r, gone, trace, calls = sweep_lookup(half, all_heads, "half")
+check("secret-scan e2e: stopped half-way (one served tip fetched before): the same answer, all served tips here",
+      r.returncode == 0 and gone == sweep_gone and all(has_commit(half, v) for v in sweep_vanished)
+      and (not lazy_honoured or lazy_fetches(trace) == 0), f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone}")
+served = sweep_clone("served")
+r, gone, trace, calls = sweep_lookup(served, " ".join(sweep_vanished), "served")
+check("secret-scan e2e: no tip gone: one batch fetch, nothing one by one, GitHub not asked",
+      r.returncode == 0 and gone == "" and commands(trace, "fetch") == 1 and calls == ""
+      and all(has_commit(served, v) for v in sweep_vanished),
+      f"exit {r.returncode}: {r.stderr.strip()[-400:]} fetches={commands(trace, 'fetch')} gh={calls.strip()!r}")
+r, gone, trace, calls = sweep_lookup(sweep_clone("empty"), "", "empty")
+check("secret-scan e2e: no tips listed: passes with nothing fetched or asked",
+      r.returncode == 0 and gone == "" and commands(trace, "fetch") == 0 and calls == "",
+      f"exit {r.returncode}: {r.stderr.strip()[-400:]}")
+not_a_clone = sweep_work / "not-a-clone"
+not_a_clone.mkdir()
+r, gone, _, calls = sweep_lookup(not_a_clone, all_heads, "no-clone")
+check("secret-scan e2e: no clone (cat-file fails): the job fails before asking GitHub anything",
+      r.returncode == 2 and gone is None and calls == "" and "cannot check which listed tips" in r.stderr,
+      f"exit {r.returncode}: {r.stderr.strip()[-400:]}")
+
+# #637, end to end: the lists' hand-over, as the workflow has it (from the token's unset to the end),
+# in a clone whose origin's default branch holds a stub scan script that reports what it was given.
+# The sweep of 11-20's dispatch got past the lookup and then failed here: OLD_HEADS (every activity
+# entry's before and after, 131 KB) went out as one environment string, over the kernel's 128 KiB,
+# and the next program (git) could not start ("Argument list too long", exit 126). Also: a list
+# too long even with each id once (only the file carries it), small and empty lists, and the files
+# of an earlier or stopped run left in RUNNER_TEMP (written afresh, nothing of theirs read).
+def handoff_code(run):
+    start = run.find("unset LOOKUP_TOKEN\n")
+    return run[start:] if start >= 0 else "exit 99\n"
+
+
+handoff_origin = sweep_work / "handoff-origin"
+(handoff_origin / ".github" / "scripts").mkdir(parents=True)
+git(handoff_origin, "init", "-q", "-b", "main")
+(handoff_origin / ".github" / "scripts" / "fork-secret-scan.sh").write_text(r"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'env_old=%s\nenv_gone=%s\n' "${OLD_HEADS+set}" "${SCANNED_GONE+set}"
+printf 'env_old_words=%s\n' "$(wc -w <<< "${OLD_HEADS:-}")"
+printf 'file_old=%s\nfile_gone=%s\nupstream=%s\n' "${OLD_HEADS_FILE:-}" "${SCANNED_GONE_FILE:-}" "${UPSTREAM-unset}"
+""")
+git(handoff_origin, "add", "-A")
+git(handoff_origin, "commit", "-q", "-m", "stub scan script")
+handoff_clone = sweep_work / "handoff-clone"
+git(sweep_work, "clone", "-q", f"file://{handoff_origin}", str(handoff_clone))
+handoff_temp = sweep_work / "handoff-temp"
+handoff_temp.mkdir()
+
+
+def handoff(old_heads, scanned_gone, label, code=None):
+    """Runs the hand-over with these lists (shell variables, as the lookups leave them); returns
+    (exit, stub report, the words of the old-heads file, the words of the scanned-gone file)."""
+    (sweep_work / f"{label}.old").write_text(old_heads)
+    (sweep_work / f"{label}.gone").write_text(scanned_gone)
+    script = ('set -euo pipefail\nUPSTREAM=up/stream\nLOOKUP_TOKEN=x\n'
+              f'OLD_HEADS="$(cat {sweep_work / (label + ".old")})"\n'
+              f'SCANNED_GONE="$(cat {sweep_work / (label + ".gone")})"\n'
+              + (code or handoff_code(scan_step(real)["run"])))
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=handoff_clone,
+                       env={**base_env, "RUNNER_TEMP": str(handoff_temp), "CONFIG_BRANCH": "main",
+                            "GIT_CEILING_DIRECTORIES": str(sweep_work)}, capture_output=True, text=True)
+    report = dict(re.findall(r"^(\w+)=(.*)$", r.stdout, re.M))
+
+    def words(key):
+        path = report.get(key) or ""
+        return pathlib.Path(path).read_text().split() if path and pathlib.Path(path).is_file() else None
+    return r, report, words("file_old"), words("file_gone")
+
+
+def ids(n, salt):
+    return [hashlib.sha1(f"{salt}{i}".encode()).hexdigest() for i in range(n)]
+
+
+day_ids = ids(1700, "tip")  # the 11-20 shape: each id twice (a push's after is the next one's before)
+day_gone = ids(130, "gone")
+day_list = "\n".join(x for i in day_ids for x in (i, i)) + "\n"
+r, rep_, old_words, gone_words = handoff(day_list, " ".join(day_gone) + " ", "day")
+check("secret-scan e2e (#637): a list over 128 KiB: the scan script starts, the lists reach it in files (each id once), "
+      "the variables are still exported for an older script while they fit",
+      len(day_list) > 131072 and r.returncode == 0 and old_words == sorted(day_ids) and gone_words == day_gone
+      and rep_.get("env_old") == "set" and rep_.get("env_old_words") == str(len(day_ids))
+      and rep_.get("env_gone") == "set" and rep_.get("upstream") == "up/stream",
+      f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_} old={len(old_words or [])}")
+huge_ids = ids(3000, "huge")
+r, rep_, old_words, _ = handoff("\n".join(huge_ids), "", "huge")
+check("secret-scan e2e: a list over 128 KiB with each id once: only the file carries it, and the scan starts",
+      r.returncode == 0 and old_words == sorted(huge_ids) and rep_.get("env_old") == "",
+      f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_}")
+r, rep_, old_words, gone_words = handoff("", "", "nothing")
+check("secret-scan e2e: no tips listed, none gone: empty files, empty variables, the scan starts",
+      r.returncode == 0 and old_words == [] and gone_words == [] and rep_.get("env_old") == "set"
+      and rep_.get("env_old_words") == "0", f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_}")
+(handoff_temp / "old-heads").write_text("\n".join(huge_ids[:5]) + "\n")  # a run stopped half-way left these
+(handoff_temp / "scanned-gone").write_text(day_gone[0] + "\n")
+small = [sweep_main, *sweep_vanished]
+r, rep_, old_words, gone_words = handoff(" ".join(small + small), "", "again")
+check("secret-scan e2e: run again over an earlier or stopped run's files: only this run's lists are read",
+      r.returncode == 0 and old_words == sorted(small) and gone_words == [],
+      f"exit {r.returncode}: {r.stderr.strip()[-300:]} old={old_words} gone={gone_words}")
 
 check("secret-scan: the expression evaluator reads GitHub's rules (&& and || give an operand, == ignores case)",
       gh_eval("'a' && 'B' == 'b'", {}) and not gh_eval("'' || null", {}) and gh_eval("!x.y", {})
