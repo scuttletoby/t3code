@@ -468,13 +468,15 @@ describe("UsagePacingGate decide", () => {
       readonly paces?: Readonly<Record<string, InstancePace | undefined>>;
       readonly pacing?: Partial<UsagePacingInstanceSettings>;
       readonly cannotRunOn?: ReadonlyArray<ProviderInstanceId>;
+      /** Refused only for lack of a folder scan, which `enforce` would run first. */
+      readonly scanFirstOn?: ReadonlyArray<ProviderInstanceId>;
     },
   ) => {
     const calls = {
       paceOf: [] as Array<ProviderInstanceId>,
       targetOn: [] as Array<ProviderInstanceId>,
     };
-    const { paces, pacing, cannotRunOn, ...input } = extra ?? {};
+    const { paces, pacing, cannotRunOn, scanFirstOn, ...input } = extra ?? {};
     return decide<Target, never>({
       mode: "enforce",
       lowerEffort: {},
@@ -497,6 +499,9 @@ describe("UsagePacingGate decide", () => {
       targetOn: (instanceId) =>
         Effect.sync(() => {
           calls.targetOn.push(instanceId);
+          if (scanFirstOn?.includes(instanceId) === true) {
+            return { cannot: "it has no current scan of this folder", wouldScan: true };
+          }
           return cannotRunOn?.includes(instanceId) === true
             ? { cannot: "it does not list this model" }
             : { target: { on: instanceId } };
@@ -745,6 +750,125 @@ describe("UsagePacingGate decide", () => {
         assert.include(noteOf(outcome), text);
         assert.include(noteOf(outcome), "Usage pacing (advice only, the task runs as asked)");
       }
+    }),
+  );
+});
+
+describe("UsagePacingGate decide, advice before a folder scan (#616)", () => {
+  const main = (windows: ReadonlyArray<ServerProviderUsageWindow>) =>
+    provider(MAIN, windows, { email: "main@example.com" });
+  const second = (windows: ReadonlyArray<ServerProviderUsageWindow>) =>
+    provider(SECOND, windows, { email: "second@example.com" });
+  const third = (windows: ReadonlyArray<ServerProviderUsageWindow>) =>
+    provider(THIRD, windows, { email: "third@example.com" });
+  const advise = (
+    providers: ReadonlyArray<ServerProvider>,
+    {
+      scanFirstOn,
+      ...extra
+    }: Partial<GateInput<Target, never>> & {
+      readonly scanFirstOn?: ReadonlyArray<ProviderInstanceId>;
+    },
+  ) =>
+    decide<Target, never>({
+      mode: "advise",
+      lowerEffort: {},
+      nowMs: NOW_MS,
+      instanceId: MAIN,
+      pinned: false,
+      providers,
+      descriptors: [effort()],
+      options: undefined,
+      paceOf: (instanceId) =>
+        Effect.sync(() =>
+          paceOfProvider(
+            providers.find((entry) => entry.instanceId === instanceId),
+            { instanceId },
+          ),
+        ),
+      targetOn: (instanceId) =>
+        Effect.succeed(
+          scanFirstOn?.includes(instanceId) === true
+            ? { cannot: "it has no current scan of this folder", wouldScan: true }
+            : { target: { on: instanceId } },
+        ),
+      ...extra,
+    });
+  const noteOf = (outcome: GateOutcome<Target>) =>
+    outcome.action === "hold" ? outcome.message : (outcome.note ?? "");
+
+  it.effect("says that enforce would scan first, and what it would do either way", () =>
+    Effect.gen(function* () {
+      const ahead = main([weekly(60)]);
+      const cases: ReadonlyArray<readonly [Effect.Effect<GateOutcome<Target>>, string]> = [
+        // Would hold: the scan may switch it.
+        [
+          advise([ahead, second([weekly(10)])], { scanFirstOn: [SECOND] }),
+          '"enforce" would first scan this folder for claude_second: if it lists the model, it would run this task on claude_second; if not, it would hold this task.',
+        ],
+        // Would lower the effort: the scan may switch it.
+        [
+          advise([ahead, second([weekly(10)])], {
+            scanFirstOn: [SECOND],
+            lowerEffort: { high: "medium" },
+          }),
+          "if not, it would run this task at effort medium instead of high (usagePacingLowerEffort setting).",
+        ],
+        // The owner lets this effort run: the scan may still switch it.
+        [
+          advise([ahead, second([weekly(10)])], {
+            scanFirstOn: [SECOND],
+            lowerEffort: { high: "high" },
+          }),
+          'lets effort high run. "enforce" would first scan this folder for claude_second: if it lists the model, it would run this task on claude_second; if not, it would run it as asked.',
+        ],
+        // Another account can run it: the one with more room is scanned first.
+        [
+          advise([ahead, second([weekly(10)]), third([weekly(30)])], { scanFirstOn: [SECOND] }),
+          'claude_third has room; "enforce" would first scan this folder for claude_second: if it lists the model, it would run this task on claude_second; if not, it would run this task on claude_third.',
+        ],
+        // Two to scan.
+        [
+          advise([ahead, second([weekly(10)]), third([weekly(30)])], {
+            scanFirstOn: [SECOND, THIRD],
+          }),
+          "for claude_second, claude_third: if one lists the model, it would run this task on the first that lists it; if not, it would hold this task.",
+        ],
+        // A named instance: a scan only picks the reason for the hold.
+        [
+          advise([ahead, second([weekly(10)])], { scanFirstOn: [SECOND], pinned: true }),
+          '"enforce" would first scan this folder for claude_second, then hold this task either way.',
+        ],
+        // A named instance with a lower effort allowed: the scan picks hold or effort.
+        [
+          advise([ahead, second([weekly(10)])], {
+            scanFirstOn: [SECOND],
+            pinned: true,
+            lowerEffort: { high: "medium" },
+          }),
+          "if it lists the model, it would hold this task; if not, it would run this task at effort medium",
+        ],
+      ];
+      for (const [decided, text] of cases) {
+        const outcome = yield* decided;
+        assert.strictEqual(outcome.action, "pass", text);
+        assert.include(noteOf(outcome), text);
+      }
+      // Without a scan to run, the advice is as before.
+      const plain = yield* advise([ahead, second([weekly(10)])], {});
+      assert.include(noteOf(plain), 'claude_second has room; "enforce" would run this task there.');
+      assert.notInclude(noteOf(plain), "scan");
+    }),
+  );
+
+  it.effect("enforce ignores the mark: it scanned already", () =>
+    Effect.gen(function* () {
+      const outcome = yield* advise([main([weekly(60)]), second([weekly(10)])], {
+        mode: "enforce",
+        scanFirstOn: [SECOND],
+      });
+      assert.strictEqual(outcome.action, "hold");
+      assert.notInclude(noteOf(outcome), "would first scan");
     }),
   );
 });

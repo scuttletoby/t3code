@@ -99,6 +99,12 @@ watches; it changes nothing on the machine, and `0` turns it off.
   (fork-follow lowers a count after a rebase, but never raises one). A pull request may drop a seam
   file's listed seam lines (no more copies than listed) but lose no other line, and may not move a
   seam line: a moved copy of `}` looks the same as upstream's (move one with two pull requests).
+  A seam's `added` lists only the copies the fork adds: the run from upstream refuses a listed copy
+  the fork does not add over upstream (a spare one would let a later change add that line
+  unannounced), and right after a rebase that took the line word for word fork-follow drops it in
+  its lowering commit instead. So a pull request that drops listed seam lines drops them from its
+  own list in the same change, exactly: its run refuses it unless its own `added` lists, for each
+  such line, main's copies less the ones it drops.
   Dropped lines are counted by text, so where upstream has a listed line too (`}`), a pull request
   may drop upstream's copy instead of the fork's and its run passes it; fork-follow, which counts
   from upstream, refuses it unless the lines left read the same as with the fork's copy dropped. In a pending file it cannot tell
