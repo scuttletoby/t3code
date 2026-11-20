@@ -150,9 +150,9 @@ class Install(fx.FakeHost):
 
     def test_an_update_through_the_installer_from_before_kit_install(self):
         """A cleaner installed before the shared installer, updated with its installed fork-cleaner-install (not the
-        bootstrap): that old code copies no common/kit_install.py, and its self-test runs only fork-cleaner, so it
-        installs a copy whose installer cannot load. That installer then refuses cleanly and names the way out (the
-        bootstrap), and the bootstrap's way (the release's own installer) makes the copy whole again."""
+        bootstrap): that old code copies its own module list, which lacks the release's `dedupe`, and no
+        common/kit_install.py, so the new copy fails its self-test and is not switched to (no version, no link); the
+        bootstrap's way (the release's own installer) then installs it whole."""
         src = self.copy_kit()                                       # the release (with RedCheck's break, if any)
         with open(os.path.join(src, 'sbin', 'fork-cleaner-install'), 'w') as f:
             f.write(fx.source_of(self.INSTALLER, self.broken[1:] if self.broken else None))
@@ -161,9 +161,20 @@ class Install(fx.FakeHost):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = old.main(['install', '--source', src, '--sha', SHA1])
-        self.assertEqual(code, 0, err.getvalue())                   # old code: it cannot be changed now
-        self.assertFalse(os.path.exists(self.version(rel='common/kit_install.py')))
+        self.assertEqual(code, 1, err.getvalue())                   # old code: it cannot be changed now
+        self.assertIn('failed its self-test (the version in use is unchanged)', err.getvalue())
+        self.assertFalse(os.path.exists(self.version(rel='sbin/fork-cleaner-install')))
+        for link in ('/usr/local/bin/fork-cleaner', '/usr/local/sbin/fork-cleaner-install',
+                     '/usr/local/libexec/fork-cleaner/current'):
+            self.assertFalse(os.path.lexists(self.path(link)), link)
         installer = self.version(rel='sbin/fork-cleaner-install')
+        code, out, err = self.install(source=src)                   # what the bootstrap runs
+        self.assertEqual(code, 0, err)
+        r = subprocess.run([sys.executable, '-I', '-B', installer, '--help'], capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        os.unlink(self.version(rel='common/kit_install.py'))       # a copy without it (an old installer's)
         for argv in (['--help'], ['self-check'], ['uninstall']):
             with self.subTest(argv=argv):
                 r = subprocess.run([sys.executable, '-I', '-B', installer, *argv], capture_output=True, text=True,
@@ -172,13 +183,12 @@ class Install(fx.FakeHost):
                 self.assertIn('fork-cleaner-install: cannot load its installer code', r.stderr)
                 self.assertIn('install again with the bootstrap', r.stderr)
                 self.assertNotIn('Traceback', r.stderr)
-        code, out, err = self.install(source=src)                   # what the bootstrap runs
+        code, out, err = self.install(source=src)                   # the bootstrap's way makes it whole again
         self.assertEqual(code, 0, err)
         self.assertIn(f'versions/{SHA1} is incomplete or changed: made again', out)
         r = subprocess.run([sys.executable, '-I', '-B', installer, '--help'], capture_output=True, text=True,
                            timeout=60, stdin=subprocess.DEVNULL)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.run_main('self-check')[0], 0)
         before = self.snapshot()                                    # and again: nothing changes
         self.assertEqual(self.install(source=src)[0], 0)
         self.assertEqual(self.snapshot(), before)
