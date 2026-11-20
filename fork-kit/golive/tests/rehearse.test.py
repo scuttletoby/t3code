@@ -2,7 +2,7 @@
 build (the live home's runtime) and the fork build (the staged release) are one stub `t3` that keeps its migrations
 in a real SQLite file. Nothing here starts, stops or reads a real T3 or ~/.t3; every stub run is checked to stay in
 the rehearsal home.  python3 -I -B fork-kit/golive/tests/rehearse.test.py"""
-import errno, hashlib, itertools, json, os, shutil, socket, sqlite3, subprocess, sys, time, types, unittest
+import contextlib, errno, hashlib, itertools, json, os, shutil, socket, sqlite3, subprocess, sys, time, types, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -218,8 +218,8 @@ def read_json(path):
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
+    """A free port outside the kernel's own range (as the rehearsal picks one), so nothing takes it by chance."""
+    with rehearse._pick({rehearse.LIVE_DEFAULT_PORT}) as s:
         return s.getsockname()[1]
 
 
@@ -466,12 +466,88 @@ class Rehearse(Base):
             s.listen()
             self.refused('in use', port=s.getsockname()[1])
 
-    def test_a_port_taken_between_the_check_and_the_start_fails_and_the_rerun_passes(self):
-        port = free_port()
-        with socket.socket() as s, mock.patch.object(rehearse, '_port_free', return_value=True):
+    def neighbour_during_the_clone(self):
+        """Forced interleaving (fork #555): right after the clone step, another socket tries to bind the rehearsal's
+        port, as another program, or the kernel's own pick for one, can while the slow steps run. Returns the list
+        it fills (the port, and True or the bind's errno) and the patch to run under; a socket that got the port
+        listens there until the test ends."""
+        seen, clone = [], rehearse._clone
+
+        def clone_then_bind(run, cfg, p):
+            out = clone(run, cfg, p)
+            s = socket.socket()
+            self.addCleanup(s.close)
+            try:
+                s.bind(('127.0.0.1', p['port']))
+                s.listen()
+                seen.append((p['port'], True))
+            except OSError as e:
+                seen.append((p['port'], e.errno))
+            return out
+        return seen, mock.patch.object(rehearse, '_clone', clone_then_bind)
+
+    def test_the_port_is_held_from_the_check_to_the_start(self):
+        for given in (False, True):
+            seen, patch = self.neighbour_during_the_clone()
+            with self.subTest(port='given' if given else 'picked'), patch:
+                result = self.rehearse(port=free_port() if given else None)
+                self.assertEqual(seen, [(result['port'], errno.EADDRINUSE)])  # old code: the neighbour got it
+                with socket.socket() as s:
+                    s.bind(('127.0.0.1', result['port']))  # and the run let go of it at its end
+
+    def test_a_picked_port_lies_outside_the_kernels_own_range(self):
+        lo, hi = rehearse._ephemeral()
+        for _ in range(20):
+            with rehearse._choose_port(config.load(), None) as held:
+                port = held.getsockname()[1]
+            self.assertTrue(port < lo or port > hi, (port, lo, hi))
+            self.assertNotEqual(port, rehearse.LIVE_DEFAULT_PORT)
+
+    def test_the_kernels_range_old_missing_or_garbled_falls_back_or_is_worked_around(self):
+        for text, want in ((None, rehearse.EPHEMERAL_FALLBACK), ('nonsense', rehearse.EPHEMERAL_FALLBACK),
+                           ('', rehearse.EPHEMERAL_FALLBACK), ('40000\t50000\n', (40000, 50000))):
+            with self.subTest(text=text):
+                path = self.m.path('port-range')
+                if text is None:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(path)
+                else:
+                    self.m.write('port-range', text)
+                with mock.patch.object(rehearse, 'PORT_RANGE', path):
+                    self.assertEqual(rehearse._ephemeral(), want)
+        self.m.write('port-range', '1024 65535')  # no port outside the range: the kernel's pick, still held
+        with mock.patch.object(rehearse, 'PORT_RANGE', self.m.path('port-range')):
+            with rehearse._choose_port(config.load(), None) as held:
+                self.assertNotEqual(held.getsockname()[1], 0)
+
+    def test_a_run_that_fails_before_the_start_lets_go_of_the_port(self):
+        seen, patch = self.neighbour_during_the_clone()
+        c = sqlite3.connect(self.m.path('home/userdata/statev2.sqlite'))
+        c.execute('INSERT INTO migrations VALUES (82)')
+        c.commit()
+        c.close()
+        self.make_copy(name=f't3-copy-20990105T000000Z-{fx.LIVE}')
+        with patch:
+            self.failed('R1: the preflight of t3 ' + fx.LIVE)
+        self.assertEqual(seen[0][1], errno.EADDRINUSE)  # still held after the clone
+        port = seen[0][0]
+        with socket.socket() as s:
             s.bind(('127.0.0.1', port))
-            s.listen()
+
+    def test_a_port_taken_in_the_instant_before_the_start_fails_and_the_rerun_passes(self):
+        """Only a program that binds that very port can take it once it is let go: R3 fails, the rerun passes."""
+        port, popen, taken = free_port(), subprocess.Popen, []
+
+        def bind_first(argv, *a, **kw):
+            if argv[1:2] == ['serve'] and '--help' not in argv and not taken:
+                s = socket.socket()
+                s.bind(('127.0.0.1', port))
+                s.listen()
+                taken.append(s)
+            return popen(argv, *a, **kw)
+        with mock.patch.object(rehearse.subprocess, 'Popen', bind_first):
             self.failed('exited before it was ready', port=port)
+        taken[0].close()
         self.assertEqual(self.rehearse(port=port)['port'], port)
 
     def test_a_server_never_ready_is_stopped_and_fails(self):

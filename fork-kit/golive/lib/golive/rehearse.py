@@ -6,7 +6,7 @@ which the next run throws away and redoes, so a stop needs no settling. The old 
 _guard_old (in R0 and again right before the removal), its mark last, so a run killed half-way leaves a folder the
 next run still knows as its own.
 """
-import ctypes, json, os, shutil, signal, socket, stat, subprocess, sys, tempfile, time
+import contextlib, ctypes, json, os, random, shutil, signal, socket, stat, subprocess, sys, tempfile, time
 
 from golive import coldcopy, journal, live, osadapter
 
@@ -16,6 +16,10 @@ REHEARSAL, MARK = 't3-rehearsal', '.golive-rehearsal'
 NOT_CLONED = frozenset({'secrets', 'device', 'relay-clients'})
 NEVER_IN_CLONE = ('server-runtime.json', coldcopy.OWNER_LOCK, 'secrets', 'device', 'relay-clients')  # R0 checks
 LIVE_DEFAULT_PORT = 3773
+# A port the rehearsal picks itself lies just outside the kernel's ephemeral range (the ports it picks on its own),
+# so between its release and the server's bind no other socket gets it by chance (fork #555).
+PORT_RANGE, EPHEMERAL_FALLBACK = '/proc/sys/net/ipv4/ip_local_port_range', (32768, 60999)  # Linux's default
+PORT_MIN, PORT_SPAN, PICK_TRIES = 1024, 8192, 64
 POLL, READY_WAIT, STOP_WAIT, T3_TIMEOUT, MIGRATE_TIMEOUT, MB = 0.5, 300, 60, 120, 3600, 1024 * 1024
 MIGRATE = ('auth', 'session', 'list', '--json')  # R2: read-only, offline, migrates (tests/contract.test.py)
 # A link out of the copy is left out of the clone (coldcopy.links_out); these are refused instead: the rehearsal checks
@@ -182,16 +186,50 @@ def _not_bound_live(path, home, done, targets=()):
                                   f'apart from it; {done}')
 
 
-def _port_free(port):
-    with socket.socket() as s:
-        try:
-            s.bind(('127.0.0.1', port))
-            return True
-        except OSError:
-            return False
+def _hold(port):
+    """A socket bound to 127.0.0.1:port, or None when the port is in use. Held from R0 until the moment before the
+    server starts (_serve), so no other socket gets the port in between: neither another program's bind nor the
+    kernel's pick of a free port (bind to port 0, or the local port of an outgoing connection), which skips a port
+    that a socket is bound to."""
+    s = socket.socket()
+    try:
+        s.bind(('127.0.0.1', port))
+    except OSError:
+        s.close()
+        return None
+    return s
+
+
+def _ephemeral():
+    """The kernel's range for ports it picks itself, (low, high)."""
+    try:
+        with open(PORT_RANGE, encoding='ascii') as f:
+            lo, hi = map(int, f.read().split())
+    except (OSError, ValueError):
+        return EPHEMERAL_FALLBACK
+    return lo, hi
+
+
+def _pick(taken):
+    """A held free port that the kernel never hands out on its own (outside its ephemeral range): released for the
+    server's start, it can then be taken only by a program that binds that very port. Within the range only when
+    no port outside it is free."""
+    lo, hi = _ephemeral()
+    pool = [n for n in (*range(max(PORT_MIN, lo - PORT_SPAN), lo), *range(hi + 1, min(65536, hi + 1 + PORT_SPAN)))
+            if n not in taken]
+    for n in random.sample(pool, min(len(pool), PICK_TRIES)):
+        held = _hold(n)
+        if held:
+            return held
+    while True:
+        held = _hold(0)
+        if held.getsockname()[1] not in taken:
+            return held
+        held.close()
 
 
 def _choose_port(cfg, port):
+    """The rehearsal's port as a held socket (see _hold); the caller closes it."""
     taken = {LIVE_DEFAULT_PORT}
     try:
         with open(os.path.join(cfg.home, 'userdata', 'server-runtime.json'), encoding='utf-8') as f:
@@ -199,15 +237,13 @@ def _choose_port(cfg, port):
     except (OSError, ValueError, AttributeError):
         pass
     if port is None:
-        while port is None or port in taken:
-            with socket.socket() as s:
-                s.bind(('127.0.0.1', 0))
-                port = s.getsockname()[1]
+        return _pick(taken)
     if port in taken:
         raise journal.Refused(f'port {port} is the live port (or T3\'s default); nothing was changed')
-    if not _port_free(port):
+    held = _hold(port)
+    if held is None:
         raise journal.Refused(f'port {port} is in use on 127.0.0.1; nothing was changed')
-    return port
+    return held
 
 
 def _newest_copy(cfg):
@@ -218,8 +254,9 @@ def _newest_copy(cfg):
     return os.path.join(cfg.backup_dir, names[-1])
 
 
-def _prechecks(cfg, copy_dir, port):
-    """R0 before any step (journal.Refused, nothing changed): the copy, the builds, the rehearsal home, the port."""
+def _prechecks(cfg, copy_dir, port, held):
+    """R0 before any step (journal.Refused, nothing changed): the copy, the builds, the rehearsal home, the port. The
+    port's held socket goes into `held` (an ExitStack), which closes it at the end of the run at the latest."""
     if sys.version_info < MIN_PYTHON:
         need, have = '.'.join(map(str, MIN_PYTHON)), '.'.join(map(str, sys.version_info[:3]))
         raise journal.Refused(f'rehearse needs Python {need} or newer (its removal of the old rehearsal folder uses '
@@ -272,9 +309,10 @@ def _prechecks(cfg, copy_dir, port):
     need = 3 * sum(e.get('bytes', 0) for e in files) + cfg.free_floor_mb * MB  # clone, growth, restore's kept files
     if coldcopy._free_bytes(coldcopy._existing(cfg.backup_dir)) < need:
         raise journal.Refused(f'{cfg.backup_dir} needs {need // MB} MB free for the rehearsal; nothing was changed')
+    hold = held.enter_context(_choose_port(cfg, port))
     return {'copy': copy_dir, 'manifest': m, 'from': old_version, 'protocol': protocol, 'old': old, 'fork': fork,
             'targetSha256': target_sha, 'root': root, 'home': os.path.join(root, 'home'),
-            'port': _choose_port(cfg, port)}
+            'port': hold.getsockname()[1], 'hold': hold}
 
 
 def _guard_old(cfg, root):
@@ -544,6 +582,7 @@ def _features_off(p, before):
 def _serve(p, empty):
     log = open(os.path.join(p['root'], 'server.log'), 'wb')
     try:
+        p['hold'].close()  # the port, held since R0, is let go only now, for the server to bind
         return subprocess.Popen([p['fork'], 'serve', '--hold-work', '--host', '127.0.0.1', '--port', str(p['port']),
                                  '--no-browser', '--base-dir', p['home']], stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, cwd=empty, preexec_fn=_die_with_parent, env=_env(empty))
@@ -556,8 +595,8 @@ def _wait_ready(p, server):
     end, path = time.monotonic() + READY_WAIT, os.path.join(p['home'], 'userdata', 'server-runtime.json')
     while time.monotonic() < end:
         if server.poll() is not None:
-            raise Failed(f'the rehearsal server exited before it was ready (exit {server.returncode}; a port taken '
-                         f'since the check?): see {os.path.join(p["root"], "server.log")}')
+            raise Failed(f'the rehearsal server exited before it was ready (exit {server.returncode}; its port taken '
+                         f'right before the start?): see {os.path.join(p["root"], "server.log")}')
         try:
             with open(path, encoding='utf-8') as f:
                 rt = json.load(f)
@@ -586,8 +625,8 @@ def run_rehearse(cfg, copy_dir=None, port=None, say=print):
     """The rehearsal, in this process. Returns the result (also the journal's "result" step); raises
     journal.Refused (nothing changed), journal.Busy / Unfinished, or Failed (only the clone changed)."""
     began = time.monotonic()
-    with journal.run(cfg.state_dir, 'rehearse', scratch=True) as run:
-        p = _prechecks(cfg, copy_dir, port)
+    with journal.run(cfg.state_dir, 'rehearse', scratch=True) as run, contextlib.ExitStack() as held:
+        p = _prechecks(cfg, copy_dir, port, held)
         result = {'copy': p['copy'], 'copySha256': coldcopy._hash(os.path.join(p['copy'], coldcopy.MANIFEST)),
                   'fromVersion': p['from'], 'targetVersion': cfg.target_version, 'targetSha256': p['targetSha256'],
                   'port': p['port']}

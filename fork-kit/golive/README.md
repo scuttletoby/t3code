@@ -579,7 +579,8 @@ reusing one half-migrated. A run that needs settling still blocks it.
 | An old clone holding links out                            | Removed as any old clone: the removal never follows a link                    |
 | Copy with no manifest, not matching it, of another home   | Refused (`--copy` or `t3-golive copy`)                                        |
 | Copy from another build than the live one                 | Refused: take a new copy                                                      |
-| Port taken between the check and the start                | The server exits; R3 fails, the rerun passes once the port is free            |
+| Another program or socket wants the port during the run   | It cannot have it: the port stays bound from R0 until the moment before the server starts. A port the rehearsal picks lies outside the kernel's ephemeral range (`ip_local_port_range`), so the kernel never hands it out on its own after that release |
+| A program binds that very port in the instant before the start | The server exits; R3 fails, the rerun passes once the port is free     |
 | Server never ready, or not saying work is held            | Stopped; the run fails                                                        |
 | Server dies during R4, or any R4 check fails              | The run fails naming every problem; the server is stopped                     |
 
