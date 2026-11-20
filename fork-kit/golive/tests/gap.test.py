@@ -125,6 +125,23 @@ PROBES = 40  # how many probes a probing phase lasts: a count, not a time (under
 PROBING_LIMIT = 300  # seconds: a probing phase that has not ended by then fails its test instead of hanging it
 
 
+def kit_looks_for_the_launcher(test):
+    """[(monotonic time a look began, whether it found the launcher)]: each of the kit's handover looks that found
+    the serving lock held (handoff.launcher_serving), recorded as it ran."""
+    from golive import handoff
+    looks, real = [], handoff.launcher_serving
+
+    def spy(home, svc):
+        began = time.monotonic()
+        found = real(home, svc)
+        looks.append((began, found))
+        return found
+    patcher = mock.patch.object(handoff, 'launcher_serving', spy)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return looks
+
+
 def kit_meets_probes(test):
     """An Event set once the kit's handover poll has found the serving lock held by another process than this
     one (an SSH probe: this process is the fake launcher), so a probing phase surely tested what it is about."""
@@ -681,7 +698,8 @@ class Marker(unittest.TestCase):
         g = self.h.Gap(self.m.home)
         g.adopt(coldcopy.hold_owner_lock(userdata, 0))
         met = kit_meets_probes(self)
-        stop, probing, probes, free = threading.Event(), threading.Event(), [], []
+        looks = kit_looks_for_the_launcher(self)
+        stop, probing, probes, free, claimed = threading.Event(), threading.Event(), [], [], []
 
         def ssh_probes():
             try:
@@ -701,21 +719,84 @@ class Marker(unittest.TestCase):
             t.join()
             launcher = sqlite3.connect(serving, isolation_level=None, timeout=1)
             launcher.execute('BEGIN EXCLUSIVE')
-            claimed = time.monotonic()
-            for _ in range(300):
-                if not held(owner):
-                    break
+            claimed.append(time.monotonic())
+            end = claimed[0] + PROBING_LIMIT
+            while held(owner) and time.monotonic() < end:
                 time.sleep(0.005)
-            free.append(time.monotonic() - claimed)
+            free.append(not held(owner))
             launcher.close()
         t = threading.Thread(target=ssh_probes, daemon=True)
         t.start()
         g.starting(start, NEW, self.service)
         self.assertEqual(len(free), 1, 'the kit let go of the owner lock while only SSH probes held the serving lock')
+        self.assertTrue(free[0], 'the kit kept the owner lock after the launcher claimed the serving lock')
         self.assertGreaterEqual(len(probes), PROBES)
         self.assertTrue(met.is_set(), 'the kit never met an SSH probe of the serving lock')
-        self.assertLess(free[0], 0.25)  # within its server's 250 ms wait for the owner lock
+        # #534: let go at the kit's first look after the claim, counted in looks, not in wall-clock time (a slow
+        # runner stretches both alike): every look that began after the claim found the launcher, and there was one
+        self.assertEqual([found for at, found in looks if at >= claimed[0]], [True])
         self.assertEqual(g.handover, 'launcher')
+        self.assertIsInstance(g.handover_ms, int)
+
+    def test_the_handover_delay_is_measured_and_journalled(self):
+        """#534: the verify step journals how long the kit kept the owner lock after the launcher's claim (an upper
+        bound), and names a handover that reached the 250 ms its server waits for the owner lock."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        serving = self.m.path('home/runtime/service-serving.lock')
+        owner = os.path.join(userdata, 'server-owner.sqlite')
+        claims = []
+
+        def launcher():  # claims the serving lock and keeps it until the kit let go of the owner lock
+            c = sqlite3.connect(serving, isolation_level=None, check_same_thread=False)
+            c.execute('BEGIN EXCLUSIVE')
+            claims.append(c)
+        # (seconds a look that found the launcher takes, the server's wait in ms): the lateness is fixed by the wait,
+        # never by how fast this runner is: 0.3 s is surely past 250 ms, and no runner reaches a wait of 10**9 ms
+        for slow, wait, late in ((0.0, 10**9, False), (0.3, self.h.SERVER_LOCK_WAIT_MS, True)):
+            real = self.h.launcher_serving
+
+            def seen(home, svc, slow=slow, real=real):  # a look stretched by load, after the claim
+                found = real(home, svc)
+                if found:
+                    time.sleep(slow)
+                return found
+            g = self.h.open_gap(self.m.home)
+            g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+            with mock.patch.object(self.h, 'launcher_serving', seen), \
+                    mock.patch.object(self.h, 'SERVER_LOCK_WAIT_MS', wait):
+                g.starting(launcher, NEW, self.service)
+                self.assertFalse(held(owner))
+                facts = self.h.served(self.m.home)
+            self.assertEqual(facts['handover'], 'launcher')
+            self.assertIsInstance(facts['handoverMs'], int)
+            self.assertGreaterEqual(facts['handoverMs'], slow * 1000)  # an upper bound: it covers the slow look
+            self.assertEqual('handoverLate' in facts, late, facts)
+            if late:
+                self.assertIn(f'up to {facts["handoverMs"]} ms after the launcher took its serving lock',
+                              facts['handoverLate'])
+            claims.pop().close()
+        g = self.h.open_gap(self.m.home)  # no launcher: nothing to measure
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        with mock.patch.object(self.h, 'HANDOVER_WAIT', 0.05):
+            g.starting(lambda: None, NEW, self.service)
+        self.assertIsNone(g.handover_ms)  # a run again: the last handover's delay is not carried over
+        facts = self.h.served(self.m.home)
+        self.assertEqual(facts['handover'], 'timeout')
+        self.assertNotIn('handoverMs', facts)
+        g = self.h.open_gap(self.m.home)  # a start that failed half-way: nothing to measure
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        g.handover_ms = 7  # left by an earlier start of this gap
+
+        def fails():
+            raise OSError('the start failed')
+        with self.assertRaises(OSError):
+            g.starting(fails, NEW, self.service)
+        self.assertFalse(held(owner))
+        facts = self.h.served(self.m.home)
+        self.assertEqual(facts['handover'], 'start failed')
+        self.assertNotIn('handoverMs', facts)
+        self.assertEqual(self.h.served(self.m.home), {'marker': None})  # no gap open: nothing measured
 
     def test_only_the_service_s_main_process_holding_the_serving_lock_is_the_launcher(self):
         """However long another process holds the serving lock, the kit keeps the owner lock; it lets go at once
