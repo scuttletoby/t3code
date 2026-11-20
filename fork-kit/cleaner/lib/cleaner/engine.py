@@ -351,7 +351,14 @@ def _execute(cfg, facts, really, say, log):
     for kept in sorted(plan.kept, key=lambda k: (k.rule, k.path)):
         shown = f'docker volume {kept.path}' if kept.rule == 'docker' and kept.path != 'docker' else kept.path
         say(one_line(f'kept {shown} ({kept.rule}: {kept.code}{": " + kept.detail if kept.detail else ""})'))
+    for note in plan.notes:
+        say(one_line(note))
     failed = delete_all(cfg, facts, plan.items, really, out, log, journal)
+    if really:
+        for after in plan.after:
+            problem = after()
+            if problem is not None:
+                out(problem)
 
     refused = [item for item in plan.items if item.done == 'refused']
     done = [item for item in plan.items if item.done == ('deleted' if really else None)]

@@ -1,13 +1,17 @@
 """The `dedupe` rule (lib/cleaner/dedupe.py, #486) and its keys (config.py). Every file lives in the test's own
-temporary folder (one test also uses a folder of its own in /dev/shm, another filesystem). The state cases: a second
-run (nothing to do), a run killed between the link and the rename (the duplicate stays; the next run finishes), a
-part left whose other names are gone (kept), a file that changes while it is read or compared (kept), a file opened
-or changed between the plan and the link, a machine file without the keys and a folder that is not there.
-RedCheck breaks each rule in a copy of the code and shows its test then fails.
+temporary folder (one test also uses a folder of its own in /dev/shm, another filesystem). The inode time (ctime) is
+modelled as on a real host: what a test made before the first plan counts by its modification time, every inode
+change after that (a link, a rename, a write) counts at its real time; RealTime runs on the real reader. The state
+cases: a second run (nothing to do), a run killed at each step (before the link, after it, after the rename, while
+the cache is written: the duplicate stays whole, the next run finishes), a part left whose other names are gone
+(kept), a name like a part a person made (kept), a file that changes while it is read or compared (kept), a file
+opened, changed or given a name between the plan and the link, a missing, broken, old or unwritable cache, a machine
+file without the keys and a folder that is not there. RedCheck breaks each rule in a copy of the code and shows its
+test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/dedupe.test.py
 """
-import errno, os, shutil, sys, tempfile, unittest
+import errno, fcntl, json, os, shutil, struct, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +34,36 @@ class Case(fx.Case):
     def setUp(self):
         super().setUp()
         self.dd = self.mkdir('dd')
+        self.settled = None
+        clock = mock.patch.object(self.c.guard, 'changed', self.changed)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def changed(self, st):
+        """guard.changed as a real host reads it, with the files the test made before the first plan as old as their
+        modification time says: any change of an inode after that (a link, a rename, a write) counts at its time."""
+        if self.settled is not None and (st.st_dev, st.st_ino, st.st_ctime_ns) in self.settled:
+            return st.st_mtime
+        return max(st.st_mtime, st.st_ctime)
+
+    def settle(self, *more):
+        """What is there now counts by its modification time; later inode changes are new."""
+        self.settled = set()
+        for top in (self.dir,) + more:
+            for root, dirs, names in os.walk(top):
+                self.old(*(os.path.join(root, n) for n in dirs + names))
+
+    def old(self, *paths):
+        """These files, made after the first plan, count by their modification time too (as if made long ago)."""
+        for path in paths:
+            st = os.lstat(path)
+            self.settled.add((st.st_dev, st.st_ino, st.st_ctime_ns))
+        time.sleep(0.02)            # the kernel's inode clock is coarse: a change after this has a later time
+
+    def facts(self, cfg, **over):
+        if self.settled is None:
+            self.settle()
+        return super().facts(cfg, **over)
 
     def dd_cfg(self, days=30, folders=None, **section):
         return self.cfg(dedupe={'folders': folders or [{'path': self.dd, 'days': days}]}, **section)
@@ -140,7 +174,7 @@ class Compared(Case):
     def test_files_a_hash_calls_the_same_are_compared_byte_for_byte(self):
         a, b = self.put('a.bin', days=50), self.put('b.bin', data=body('b'))
         real = self.c.dedupe._digest
-        with mock.patch.object(self.c.dedupe, '_digest', lambda path, st: ('0' * 64, real(path, st)[1])):
+        with mock.patch.object(self.c.dedupe, '_digest', lambda path, st, run: ('0' * 64, real(path, st, run)[1])):
             plan = self.plan(self.dd_cfg())
             self.assertEqual(self.items(plan), [b])     # what a hash collision would look like
             code, lines = self.run_cleaner(self.dd_cfg())
@@ -383,6 +417,7 @@ class Refused(Case):
         self.assertEqual(plan.items, [])
         self.assertKept(plan, b, 'other metadata', a)
         c = self.put('c.bin', mode=0o600, days=45)      # a set of its own: the two 0600 files become one
+        self.old(c)
         plan = self.plan(self.dd_cfg())
         self.assertEqual(self.items(plan), [b])
         self.assertEqual(plan.items[0].keeper, c)
@@ -417,6 +452,7 @@ class Refused(Case):
         b = os.path.join(shm, 'b.bin')
         shutil.copy(a, b)
         self.age(b, 40)
+        self.settle(shm)
         cfg = self.dd_cfg(folders=[{'path': self.dd, 'days': 30}, {'path': shm, 'days': 30}])
         plan = self.plan(cfg)
         self.assertEqual((plan.items, plan.kept), ([], []))
@@ -475,18 +511,430 @@ class Report(Case):
         self.assertIn(('dedupe folders', 'rule:dedupe'), self.c.config.CLASSES)
 
 
+FS_IOC_GETFLAGS = (2 << 30) | (struct.calcsize('l') << 16) | (ord('f') << 8) | 1
+FS_IOC_SETFLAGS = (1 << 30) | (struct.calcsize('l') << 16) | (ord('f') << 8) | 2
+NODUMP = 0x40
+
+
+def set_flag(path, flag):
+    """Sets a chattr flag on the file; False where the filesystem has none."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        old = struct.unpack('i', fcntl.ioctl(fd, FS_IOC_GETFLAGS, struct.pack('i', 0))[:4])[0]
+        fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack('i', old | flag))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def leases_work(folder):
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return fx.load().dedupe._leases_work(fd)
+    finally:
+        os.close(fd)
+
+
+class Names(Case):
+    """The kept file is judged by every one of its names (both reviews of #563): a file with one name the rule
+    refuses, or in use through one name, is neither kept nor joined, and its names are counted again at the link."""
+
+    def keeper_with(self, second):
+        a = self.put('a.bin', days=50)
+        two = os.path.join(self.dd, second)
+        os.link(a, two)
+        b = self.put('b.bin')
+        return a, two, b
+
+    def test_keeper_with_an_in_place_name_is_not_joined(self):
+        a, db, b = self.keeper_with('a.sqlite')
+        code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.ino(b), self.ino(db), 'b.bin now shares every in-place write made through a.sqlite')
+        self.assertTrue(any(line.startswith(f'kept {a} (dedupe: hard-linked: 2 names, and the rule keeps {db} (written in place)')
+                            for line in lines), lines)
+
+    def test_kept_file_with_an_in_place_name_is_never_joined(self):
+        for second in ('a.log', 'id_rsa'):
+            with self.subTest(second=second):
+                shutil.rmtree(self.dd)
+                os.mkdir(self.dd)
+                a, two, b = self.keeper_with(second)
+                self.settle()
+                self.run_cleaner(self.dd_cfg())
+                self.assertNotEqual(self.ino(a), self.ino(b))
+                self.assertEqual(os.stat(a).st_nlink, 2)
+
+    def test_keeper_with_a_credential_name_is_not_joined(self):
+        a, secret, b = self.keeper_with('api-token.bin')
+        self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.ino(b), self.ino(secret), 'b.bin is now a name of a credential-named file')
+
+    def test_keeper_open_through_its_other_name_is_not_joined(self):
+        a, two, b = self.keeper_with('a2.bin')
+        self.busy.add(two)                  # a process has the keeper open (for writing) through a2.bin
+        self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.ino(b), self.ino(a), 'b.bin joined a file a process has open through another name')
+
+    def test_keeper_gaining_a_name_outside_after_the_plan(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        outside = self.path('elsewhere.bin')
+        real = self.c.dedupe._compare
+
+        def then_linked(*args):
+            out = real(*args)
+            if not os.path.exists(outside):
+                os.link(a, outside)
+            return out
+        with mock.patch.object(self.c.dedupe, '_compare', then_linked):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.ino(b), self.ino(outside), 'b.bin joined a file with a name outside the folders')
+        self.assertTrue(any(line.startswith(f'FAILED {b} ') and 'its name' in line for line in lines), lines)
+
+    def test_a_name_made_between_the_link_and_the_rename_stops_it(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        outside = self.path('elsewhere.bin')
+        real = os.link
+
+        def link_and_another(src, dst, **kw):
+            real(src, dst, **kw)
+            if dst.endswith('.cleaner-link'):
+                real(a, outside)
+        with mock.patch.object(self.c.dedupe.os, 'link', link_and_another):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertEqual(code, 1, lines)
+        self.assertTrue(any(line.startswith(f'FAILED {b} ') and 'got or lost a name while it was linked' in line
+                            for line in lines), lines)
+        self.assertNotEqual(self.ino(b), self.ino(a))
+        self.assertEqual(self.files(), ['a.bin', 'b.bin'])        # the part is gone again
+
+    def test_a_name_made_and_removed_after_the_plan_stops_it(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        cfg = self.dd_cfg()
+        facts = self.facts(cfg)
+        plan = self.c.rules.plan(cfg, facts)
+        os.link(a, self.path('elsewhere.bin'))
+        os.unlink(self.path('elsewhere.bin'))       # as many names as before; only its inode time tells
+        failed, lines = self.delete_all(cfg, facts, plan.items)
+        self.assertTrue(lines[0].startswith(f'REFUSED {b} (dedupe: not a candidate: the kept file {a} changed'), lines)
+        self.assertNotEqual(self.ino(a), self.ino(b))
+
+    def test_a_new_copy_joins_files_linked_before(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        self.run_cleaner(self.dd_cfg())
+        self.assertEqual(self.ino(a), self.ino(b))
+        c = self.put('c.bin', days=40)              # arrives later; the two linked files' inode time is the link's
+        self.old(c)
+        code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertEqual(code, 0, lines)
+        self.assertEqual({self.ino(p) for p in (a, b, c)}, {self.ino(a)}, lines)
+        self.assertEqual(os.stat(a).st_nlink, 3)
+
+    def test_a_name_like_a_part_a_person_made_stays(self):
+        mine = self.put('.notes.0123abcd.cleaner-link', days=50)
+        os.link(mine, os.path.join(self.dd, 'notes.bin'))
+        self.put('b.bin')
+        plan = self.plan(self.dd_cfg())
+        self.assertKept(plan, mine, 'not a part')
+        self.assertEqual(plan.items, [])
+        self.run_cleaner(self.dd_cfg())
+        self.assertEqual(os.stat(mine).st_nlink, 2)
+
+
+class RealTime(Case):
+    """The inode time as the host keeps it: each link changes the kept file's, and the cleaner's own do not count."""
+
+    def test_real_inode_time_three_copies_one_run(self):
+        a, b, c = self.put('a.bin', days=50), self.put('b.bin'), self.put('c.bin')
+        t0 = time.time_ns()
+        time.sleep(0.02)
+        # Files made before t0 look old by their content time; any inode change after t0 counts, as the real reader does.
+        clock = lambda st: st.st_mtime if st.st_ctime_ns <= t0 else max(st.st_mtime, st.st_ctime)  # noqa: E731
+        with mock.patch.object(self.c.guard, 'changed', clock):
+            plan = self.plan(self.dd_cfg())
+            self.assertEqual(self.items(plan), [b, c])
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertEqual({self.ino(p) for p in (a, b, c)}, {self.ino(a)}, lines)
+
+    def test_real_inode_time_three_copies_all_linked_in_one_run(self):
+        a, b, c = self.put('a.bin', days=50), self.put('b.bin'), self.put('c.bin')
+        time.sleep(0.05)
+        t0 = time.time()
+        changed = lambda st: max(st.st_mtime, st.st_ctime if st.st_ctime > t0 else st.st_ctime - 40 * DAY)  # noqa: E731
+        with mock.patch.object(self.c.guard, 'changed', changed):
+            self.run_cleaner(self.dd_cfg())
+        self.assertEqual(len({self.ino(p) for p in (a, b, c)}), 1)
+
+    def test_on_the_real_reader_forty_days_on(self):
+        later = self.now + 40 * DAY
+        with mock.patch.object(self.c.guard, 'changed', self.real_changed):
+            a, b, c = (self.put(n, days=None) for n in ('a.bin', 'b.bin', 'c.bin'))
+            self.assertEqual(self.plan(self.dd_cfg()).items, [])       # today they are new
+            code, lines = self.run_cleaner(self.dd_cfg(), now=later)
+            self.assertEqual(code, 0, lines)
+            self.assertEqual({self.ino(p) for p in (a, b, c)}, {self.ino(a)}, lines)
+            plan = self.plan(self.dd_cfg(), now=later)
+            self.assertEqual((plan.items, plan.kept), ([], []))
+            d = self.put('d.bin', days=None)
+            code, lines = self.run_cleaner(self.dd_cfg(), now=later)
+            self.assertEqual(code, 0, lines)
+            self.assertEqual(os.stat(d).st_ino, self.ino(a), lines)
+            self.assertEqual(os.stat(a).st_nlink, 4)
+
+
+class Writes(Case):
+    """Names of one file share every later write into any of them (both reviews): the README and the plan say so."""
+
+    def test_cp_onto_one_name_changes_the_other(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        self.run_cleaner(self.dd_cfg())
+        self.assertEqual(self.ino(a), self.ino(b))
+        new = self.path('new.bin')
+        with open(new, 'wb') as f:
+            f.write(body('z'))
+        subprocess.run(['cp', new, b], check=True)
+        self.assertEqual(self.read(a), body('z'), 'cp writes into the file every name shares')
+
+    def test_the_readme_and_the_plan_say_so(self):
+        with open(os.path.join(fx.KIT, 'README.md')) as f:
+            readme = f.read()
+        self.assertNotIn('editors, `cp`', readme)
+        for words in ('`cp` onto an existing file', 'shell `>`', '`curl -o`', 'changes every name',
+                      'only folders of copies written once'):
+            self.assertIn(words, readme)
+        self.put('a.bin', days=50), self.put('b.bin')
+        code, lines = self.run_cleaner(self.dd_cfg(), really=False)
+        self.assertIn(self.c.dedupe.WARNING, lines)
+        self.assertIn('cp onto an existing file', self.c.dedupe.WARNING)
+
+    def test_more_kinds_written_in_place(self):
+        names = ('r.0.0.mca', 'disk.qcow2', 'disk.img', 'disk.vmdk', 'disk.vdi', 'disk.raw', 'x.wal', 'x.ldb')
+        for name in names:
+            self.put(name)
+        plan = self.plan(self.dd_cfg())
+        for name in names:
+            self.assertKept(plan, os.path.join(self.dd, name), 'written in place')
+
+    def test_files_with_other_chattr_flags_are_not_linked(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        if not set_flag(b, NODUMP):
+            self.skipTest('no chattr flags on this filesystem')
+        self.age(b, 40)
+        plan = self.plan(self.dd_cfg())
+        self.assertEqual(plan.items, [])
+        self.assertKept(plan, b, 'other metadata')
+
+    def test_an_open_while_it_is_linked_stops_it(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        if not leases_work(self.dd):
+            self.skipTest('no leases on this filesystem')
+        real = os.link
+        for opened in (b, a):
+            waited = []
+
+            def link_then_open(src, dst, **kw):
+                real(src, dst, **kw)
+                try:            # a writer opening it now: told to wait until the cleaner lets go of its lease
+                    os.close(os.open(opened, os.O_RDONLY | os.O_NONBLOCK))
+                except BlockingIOError:
+                    waited.append(opened)
+            with self.subTest(opened=opened), mock.patch.object(self.c.dedupe.os, 'link', link_then_open):
+                code, lines = self.run_cleaner(self.dd_cfg())
+                self.assertEqual(waited, [opened])
+                self.assertEqual(code, 1, lines)
+                self.assertTrue(any(line.startswith(f'FAILED {b} ') and f'{opened} was opened while it was linked' in line
+                                    for line in lines), lines)
+                self.assertNotEqual(self.ino(a), self.ino(b))
+                self.assertEqual(self.files(), ['a.bin', 'b.bin'])
+        code, lines = self.run_cleaner(self.dd_cfg())       # the failed tries were its own: the next run links
+        self.assertEqual((code, self.ino(b)), (0, self.ino(a)), lines)
+
+    def test_a_file_open_at_the_link_stays(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        if not leases_work(self.dd):
+            self.skipTest('no leases on this filesystem')
+        with open(b, 'rb'):     # open in a process the process list did not show (the fake one is empty)
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertTrue(any(line.startswith(f'FAILED {b} ') and 'another descriptor of it is open' in line
+                            for line in lines), lines)
+        self.assertNotEqual(self.ino(a), self.ino(b))
+
+
+class Killed(Case):
+    """A run killed at each step leaves every name whole; the next run finishes, or the file waits its `days`."""
+
+    def kill_mark(self, at):
+        real, calls = self.c.dedupe.Run.mark, []
+
+        def mark(run, ident, ctime):
+            calls.append(ident)
+            if len(calls) == at:
+                raise KeyboardInterrupt('killed')
+            return real(run, ident, ctime)
+        return mock.patch.object(self.c.dedupe.Run, 'mark', mark)
+
+    def test_killed_before_the_link(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        real = os.link
+
+        def killed(src, dst, **kw):
+            if dst.endswith('.cleaner-link'):
+                raise KeyboardInterrupt('killed')
+            return real(src, dst, **kw)
+        with mock.patch.object(self.c.dedupe.os, 'link', killed), self.assertRaises(KeyboardInterrupt):
+            self.run_cleaner(self.dd_cfg())
+        self.assertEqual(self.files(), ['a.bin', 'b.bin'])
+        code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertEqual((code, self.ino(b)), (0, self.ino(a)), lines)
+
+    def test_killed_after_the_link_before_its_time_is_kept(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        with self.kill_mark(1), self.assertRaises(KeyboardInterrupt):
+            self.run_cleaner(self.dd_cfg())
+        part = os.path.join(self.dd, next(n for n in self.files() if n.endswith('.cleaner-link')))
+        self.assertEqual((self.read(b), self.ino(part)), (body(), self.ino(a)))
+        # Its inode time is not known as the cleaner's own: the kept file waits its days; the part is the cleaner's
+        # (written down before the link) and goes.
+        code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(self.files(), ['a.bin', 'b.bin'])
+        self.assertNotEqual(self.ino(a), self.ino(b))
+        code, lines = self.run_cleaner(self.dd_cfg(), now=self.now + 40 * DAY)
+        self.assertEqual((code, self.ino(b)), (0, self.ino(a)), lines)
+
+    def test_killed_after_the_rename(self):
+        a, b, c = self.put('a.bin', days=50), self.put('b.bin'), self.put('c.bin')
+        with self.kill_mark(2), self.assertRaises(KeyboardInterrupt):
+            self.run_cleaner(self.dd_cfg())
+        self.assertEqual(self.files(), ['a.bin', 'b.bin', 'c.bin'])
+        self.assertEqual(self.ino(a), self.ino(b))
+        for p in (a, b, c):
+            self.assertEqual(self.read(p), body())
+        code, lines = self.run_cleaner(self.dd_cfg(), now=self.now + 40 * DAY)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual({self.ino(p) for p in (a, b, c)}, {self.ino(a)}, lines)
+
+
+class Cached(Case):
+    """The plan's sha256 comes from the cache while a file's identity, size and both times are unchanged."""
+
+    def reads(self):
+        """A patch of os.read that counts reads of the dedupe folder's files."""
+        real, got = os.read, []
+
+        def read(fd, n):
+            try:
+                where = os.readlink(f'/proc/self/fd/{fd}')
+            except OSError:
+                where = ''
+            if where.startswith(self.dd + '/'):
+                got.append(where)
+            return real(fd, n)
+        return got, mock.patch.object(self.c.dedupe.os, 'read', read)
+
+    def test_unchanged_files_are_not_read_again(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin', data=body()[:-1] + b'!')    # the same size, never linked
+        cfg = self.dd_cfg()
+        got, patch = self.reads()
+        with patch:
+            self.run_cleaner(cfg)
+            self.assertTrue(got)
+            del got[:]
+            code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, got), (0, []), lines)
+        with open(cfg.dedupe_cache) as f:
+            self.assertEqual(json.load(f)['version'], 1)
+
+    def test_a_changed_file_is_read_again(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin', data=body()[:-1] + b'!')
+        cfg = self.dd_cfg()
+        self.run_cleaner(cfg)
+        with open(b, 'r+b') as f:          # now the same bytes as a.bin: the same size, a new stamp
+            f.seek(len(body()) - 1)
+            f.write(body()[-1:])
+        self.age(b, 40)
+        self.old(b)
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, self.ino(b)), (0, self.ino(a)), lines)
+
+    def test_a_missing_broken_old_or_foreign_cache_is_an_empty_one(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin', data=body()[:-1] + b'!')
+        cfg = self.dd_cfg()
+        os.makedirs(os.path.dirname(cfg.dedupe_cache), exist_ok=True)
+        other = self.path('other.json')
+        with open(other, 'w') as f:
+            f.write('{"version": 1, "digests": {}, "own": {}}')
+        for text in (None, '{not json', '{"version": 0, "digests": {"1:2": [1, 2, 3, "x"]}}', '[]', 'link'):
+            with self.subTest(text=text):
+                if os.path.lexists(cfg.dedupe_cache):
+                    os.unlink(cfg.dedupe_cache)
+                if text == 'link':
+                    os.symlink(other, cfg.dedupe_cache)
+                elif text is not None:
+                    with open(cfg.dedupe_cache, 'w') as f:
+                        f.write(text)
+                got, patch = self.reads()
+                with patch:
+                    code, lines = self.run_cleaner(cfg)
+                self.assertEqual(code, 0, lines)
+                self.assertTrue(got)                    # read again
+                self.assertFalse(os.path.islink(cfg.dedupe_cache))
+                with open(cfg.dedupe_cache) as f:
+                    self.assertEqual(json.load(f)['version'], 1)
+        with open(other) as f:
+            self.assertEqual(f.read(), '{"version": 1, "digests": {}, "own": {}}')
+
+    def test_killed_while_the_cache_is_written(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        cfg = self.dd_cfg()
+        real = os.replace
+
+        def killed(src, dst, **kw):
+            if dst == cfg.dedupe_cache:
+                raise KeyboardInterrupt('killed')
+            return real(src, dst, **kw)
+        with mock.patch.object(self.c.dedupe.os, 'replace', killed), self.assertRaises(KeyboardInterrupt):
+            self.run_cleaner(cfg)
+        self.assertEqual(self.ino(a), self.ino(b))
+        state = os.path.dirname(cfg.dedupe_cache)
+        self.assertEqual([n for n in os.listdir(state) if '.dedupe.' in n], [])    # no half-written cache left
+        self.assertTrue(os.path.exists(cfg.dedupe_own))                             # what it did is still known
+        c = self.put('c.bin', days=40)
+        self.old(c)
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, self.ino(c)), (0, self.ino(a)), lines)
+        self.assertFalse(os.path.exists(cfg.dedupe_own))
+
+    def test_an_unwritable_cache_is_named_and_the_run_goes_on(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        cfg = self.dd_cfg()
+        os.makedirs(cfg.dedupe_cache)
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, self.ino(b)), (0, self.ino(a)), lines)
+        self.assertTrue(any(line.startswith(f'dedupe: could not save {cfg.dedupe_cache}') for line in lines), lines)
+        self.assertTrue(os.path.isdir(cfg.dedupe_cache))
+
+    def test_a_plan_writes_no_cache(self):
+        self.put('a.bin', days=50), self.put('b.bin')
+        cfg = self.dd_cfg()
+        self.run_cleaner(cfg, really=False)
+        self.assertFalse(os.path.exists(cfg.dedupe_cache))
+        self.assertFalse(os.path.exists(cfg.dedupe_own))
+
+
 MUTATIONS = {
     'days': ('dedupe', 'if age < folder.days * DAY:', 'if False:', Dedupe, 'test_files_changed_lately_small_or_with_other_bytes_are_not_taken'),
     'small files': ('dedupe', "if name.endswith(PART) or st.st_size < MIN_BYTES:", "if name.endswith(PART):",
                     Dedupe, 'test_files_changed_lately_small_or_with_other_bytes_are_not_taken'),
     'byte for byte': ('dedupe', 'if not equal:', 'if False:', Compared, 'test_files_a_hash_calls_the_same_are_compared_byte_for_byte'),
-    'changed while read': ('dedupe', "        if not _same(os.fstat(fd), _look(st)):\n            return Refusal('changed', 'it changed while it was read: it stays as it is')\n        return",
-                           "        if False:\n            return Refusal('changed', 'it changed while it was read: it stays as it is')\n        return",
+    'changed while read': ('dedupe', "        if not _same(os.fstat(fd), _look(st)):\n            return Refusal('changed', 'it changed while it was read: it stays as it is')\n        run.cache",
+                           "        if False:\n            return Refusal('changed', 'it changed while it was read: it stays as it is')\n        run.cache",
                            Compared, 'test_a_file_that_changes_while_it_is_read_is_kept'),
-    'changed while compared': ('dedupe', 'if not _same(os.fstat(a), item.look) or not _keeper_same(os.fstat(b), item.keeper_look):', 'if False:',
+    'changed while compared': ('dedupe', 'if not _same(os.fstat(a), item.look) or not _keeper_same(os.fstat(b), item):', 'if False:',
                                Compared, 'test_a_file_that_changes_while_it_is_compared_stays'),
     'the last check': ('rules', 'return dedupe.recheck(cfg, facts, item)', 'return None', Compared, 'test_a_file_changed_after_the_plan_is_refused'),
-    'the kept file checked again': ('dedupe', 'if not _keeper_same(kst, item.keeper_look):', 'if False:',
+    'the kept file checked again': ('dedupe', 'if not _keeper_same(kst, item):\n            return Refusal', 'if False:\n            return Refusal',
                                     Compared, 'test_a_kept_file_replaced_after_the_plan_is_refused'),
     'a part goes on the next run': ('dedupe', "            item = Item('link-part'", "            continue\n            item = Item('link-part'",
                                     Stopped, 'test_killed_between_the_link_and_the_rename_the_next_run_finishes'),
@@ -496,9 +944,11 @@ MUTATIONS = {
                                         Stopped, 'test_a_part_that_lost_its_other_name_after_the_plan_stays'),
     'a failed rename removes the part': ('dedupe', "        except OSError as ex:\n            _unlink_part(parent, part, kident)\n",
                                          "        except OSError as ex:\n", Stopped, 'test_a_failed_rename_removes_the_part_and_keeps_the_duplicate'),
-    'in use': ('dedupe', "    refusal = _in_use(facts, folder, path, st)\n    if refusal is not None:\n        return refusal\n    return f'not changed",
-               "    return f'not changed", InUse, 'test_files_in_use_stay'),
-    'in use at the link': ('dedupe', 'refusal = _in_use(facts, folder, which, st)', 'refusal = None', InUse, 'test_a_file_opened_while_it_is_compared_stays'),
+    'in use': ('dedupe', "        return refusal\n    return _in_use(facts, folder, path, st)\n", "        return refusal\n    return None\n",
+               InUse, 'test_files_in_use_stay'),
+    'in use at the link': ('dedupe', 'refusal = _in_use(facts, item.folder, path, st)', 'refusal = None', InUse, 'test_a_file_opened_while_it_is_compared_stays'),
+    'in use at the link through each name of the kept file': ('dedupe', 'refusal = _in_use(facts, kfolder, kpath, kst)', 'refusal = None',
+                                                              InUse, 'test_a_file_opened_while_it_is_compared_stays'),
     'credential names': ('dedupe', "if matches(name, CREDENTIAL_NAMES):\n        return Refusal('credential name', name)", "if False:\n        return Refusal('credential name', name)",
                          Refused, 'test_what_it_never_takes'),
     'written in place': ('dedupe', 'if matches(name, IN_PLACE) or any(name + s in names for s in SIDECARS):', 'if False:',
@@ -506,7 +956,27 @@ MUTATIONS = {
     'must-keep names': ('dedupe', "if guard.kept_name(cfg, name):\n            return Refusal('must keep', name)", "if False:\n            return Refusal('must keep', name)",
                         Refused, 'test_what_it_never_takes'),
     'hard-linked': ('dedupe', 'if st.st_nlink > 1:', 'if False:', Refused, 'test_what_it_never_takes'),
-    'kept only with every name inside': ('dedupe', 'if es[0][2].st_nlink <= seen[ident]]', 'if True]', Refused, 'test_what_it_never_takes'),
+    'kept only with every name inside': ('dedupe', 'if _names_refusal(answers[ident], es[0][2].st_nlink) is None]', 'if True]',
+                                         Refused, 'test_what_it_never_takes'),
+    'kept only when the rule takes every name': ('dedupe', "refused = next(((path, a) for _, path, a in names if isinstance(a, Refusal)), None)",
+                                                 'refused = None', Names, 'test_keeper_with_an_in_place_name_is_not_joined'),
+    'names counted just before the rename': ('dedupe', 'or pst.st_nlink != len(knames) + 1:', ':',
+                                             Names, 'test_a_name_made_between_the_link_and_the_rename_stops_it'),
+    'the inode time of the kept file': ('dedupe', 'and st.st_ctime_ns == run.ctime.get(look.ident)', '',
+                                        Names, 'test_a_name_made_and_removed_after_the_plan_stops_it'),
+    "the cleaner's own links do not count as changes": ('dedupe', 'if run is not None and run.cache.own.get((st.st_dev, st.st_ino)) == st.st_ctime_ns:',
+                                                        'if False:', Names, 'test_a_new_copy_joins_files_linked_before'),
+    'a part is one the cleaner wrote down': ('dedupe', 'if path not in run.cache.parts:', 'if False:',
+                                             Names, 'test_a_name_like_a_part_a_person_made_stays'),
+    'a lease broken by an open': ('dedupe', 'opened = leases.broken()', 'opened = None', Writes, 'test_an_open_while_it_is_linked_stops_it'),
+    'a lease refused for an open file': ('dedupe', "if ex.errno in (errno.EAGAIN, errno.EBUSY) and _leases_work(parent):", 'if False:',
+                                         Writes, 'test_a_file_open_at_the_link_stays'),
+    'chattr flags count': ('dedupe', 'return (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, attrs, _flags(fd))',
+                           'return (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, attrs, 0)', Writes, 'test_files_with_other_chattr_flags_are_not_linked'),
+    'more kinds written in place': ('dedupe', "'*.pid', '*.mca',", "'*.pid',", Writes, 'test_more_kinds_written_in_place'),
+    'the plan warns': ('dedupe', '        plan.notes.append(WARNING)', '        pass', Writes, 'test_the_readme_and_the_plan_say_so'),
+    'the cache needs an unchanged stamp': ('dedupe', 'if cached is not None and tuple(cached[:3]) == stamp:', 'if cached is not None:',
+                                           Cached, 'test_a_changed_file_is_read_again'),
     'git folders': ('dedupe', "if '.git' in names or", "if False or", Refused, 'test_what_it_never_takes'),
     'another owner': ('dedupe', "    if guard.owner(st) != os.getuid():\n        return Refusal('another owner', f'uid {guard.owner(st)}')\n    if not st.st_mode",
                       "    if not st.st_mode", Refused, 'test_another_owners_file_stays'),

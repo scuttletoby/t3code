@@ -368,7 +368,10 @@ class Config:
         self.journal_file = self.log_file + '.deleting'     # deletes started and not ended (engine.py)
         self.report_file = self.log_file + '.reported'      # the last line of the log the last report counted
         self.report_lock_file = self.report_file + '.lock'  # one report at a time (report.py)
-        for own in (self.log_file, self.lock_file, self.journal_file, self.report_file, self.report_lock_file):
+        self.dedupe_cache = self.log_file + '.dedupe'           # what dedupe read and linked (dedupe.Cache)
+        self.dedupe_own = self.log_file + '.dedupe-own'         # its own links since that was written
+        for own in (self.log_file, self.lock_file, self.journal_file, self.report_file, self.report_lock_file,
+                    self.dedupe_cache, self.dedupe_own):
             kept = must_keep_match(self.must_keep, own)
             if kept is not None or any(fnmatch.fnmatchcase(part.lower(), glob) for part in own.split('/') for glob in MUST_KEEP_NAMES):
                 raise machine_file.MachineFileError(f'{where}.logFile: {values["logFile"]} is in a must-keep path, '

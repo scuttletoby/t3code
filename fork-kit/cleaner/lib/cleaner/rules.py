@@ -53,6 +53,8 @@ class Kept:
 class Plan:
     def __init__(self):
         self.items, self.kept = [], []
+        self.notes = []         # lines the plan and the run print before the items
+        self.after = []         # called after a real run; each returns a problem line or None
 
 
 def human(n):

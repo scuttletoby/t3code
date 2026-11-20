@@ -558,8 +558,8 @@ too.
 ## `dedupe`: one copy of the same bytes
 
 Another rule that deletes no content (#486). Files in the folders of `dedupe.folders` that hold the same bytes,
-with the same mode, owner, group and extended attributes, become hard links of one of them: every name stays, each
-reads the same bytes as before, and the disk holds them once. Without folders the rule does nothing.
+with the same mode, owner, group, extended attributes and chattr flags, become hard links of one of them: every name
+stays, each reads the same bytes as before, and the disk holds them once. Without folders the rule does nothing.
 
 ```jsonc
 // in the "cleaner" section
@@ -576,31 +576,62 @@ reads the same bytes as before, and the disk holds them once. Without folders th
 | `dedupe.folders[].path` | required | a folder; files at any depth in it are looked at                 |
 | `dedupe.folders[].days` | required | days without a change (7 or more): newer files are not looked at |
 
-**The risk it takes, and why it is small.** Names of one hard-linked file share later writes: a program that
-opens one name and writes **into** it changes every name. A program that writes a new file and renames it over the
-name (editors, `cp`, `rsync`, `git`, package managers) gives that name its own file again and leaves the others
-alone. So the rule takes only files nobody changed for `days`, never files that are written in place by their kind
-(databases `*.db`, `*.sqlite*`, `*.db3`, and every file with a `-wal`, `-shm` or `-journal` beside it, logs
-`*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`), and only in the folders named. Name folders of
-copies that are written once and then only read: mirrors, release outputs, downloaded archives. Never name a folder
-where programs edit files in place.
+**The risk it takes: read this before you name a folder.** Names of one hard-linked file are one file, so any
+write **into** one name changes every name, and the other names' old bytes are gone. Most ways of writing a file do
+that: `cp` onto an existing file, shell `>` and `>>`, `curl -o`, `wget -O`, `unzip -o`, `rsync --inplace`, `dd`,
+and most programs (`open(path, 'w')`, a Java `FileOutputStream`). Only a tool that writes a new file and renames it
+over the name gives that name its own file again: `rsync` (by default), `git`, package managers, and editors that
+save that way. The `days` rule does not help here: a file nobody touched for a month can get a `cp` the next day.
+So name **only folders of copies written once and then only read** (mirrors, release outputs, downloaded archives),
+never a folder where anything writes into files: no build caches, no game or server worlds, no virtual machine
+images, no working copies. The rule refuses the kinds it knows are written in place (databases `*.db`, `*.db3`,
+`*.sqlite*`, `*.mdb`, `*.ldb`, `*.ibd`, `*.wal`, and every file with a `-wal`, `-shm` or `-journal` beside it; logs
+`*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`; Minecraft region files `*.mca`, `*.mcr`, `*.mcc`;
+disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`, `*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`), but such a
+list can never be complete. Every plan and run that links says it again in one line (`dedupe: names of one file
+share every later write ...`). On btrfs or XFS a tool that shares blocks with a reflink (`FIDEDUPERANGE`) is the
+safer choice: later writes do not reach the other copies. This rule makes hard links because the hosts it was made
+for are ext4, which has no reflinks.
+
+**The kept file is judged by every one of its names.** The file kept is the one with the most names, then the
+oldest, of those whose names are **all** in the folders and **all** taken by the rule. A file with one name outside
+the folders, one name the rule refuses (a database, a log, a credential or lock name, a must-keep name) or one name
+in use is never kept, and nothing is joined to it; its names stay as they are (`hard-linked`, with the reason).
 
 **The order, for each set of the same bytes.** The plan groups files by filesystem and size (only those are read),
-then by sha256 and metadata. The file kept is the one with the most names, then the oldest; it must have all its
-names in the folders (a file with a name elsewhere is never joined to). Before each link the run looks at both
-files again from their configured folder down (the same checks as the plan), compares them **byte for byte** (the
-sha256 only finds the candidates), and reads the stamps of both before and after the compare. Then the process list
-and the locks are read again, a new name of the kept file is made beside the duplicate
-(`.<name>.<8 hex>.cleaner-link`), its identity is checked, the duplicate is read once more (same file, same size
-and times, one name), and the new name is renamed over the duplicate. The duplicate's name then shows the kept
-file's times; mode, owner, group and extended attributes were the same already.
+then by sha256 and metadata. Before each link the run looks at the duplicate and at **every** name of the kept file
+again from their configured folder down (the same checks as the plan), compares the two files **byte for byte**
+(the sha256 only finds the candidates), and reads the stamps of both before and after the compare. Then the process
+list and the locks are read again for the duplicate and every name of the kept file, and the cleaner takes a write
+lease on both files (`fcntl F_SETLEASE`): the kernel grants one only while no other descriptor of the file is open,
+and any later open breaks it. A new name of the kept file is made beside the duplicate (`.<name>.<8 hex>
+.cleaner-link`, written into the cleaner's own list first), its identity is checked, and just before the rename the
+duplicate is read once more (same file, size and times, one name), the kept file's names are counted (a name made or
+removed by anyone else since the plan stops it) and both leases must still be whole (an open of either file since
+stops it). Then the new name is renamed over the duplicate. What is left is the time of the two system calls between
+that last check and the rename. Where the filesystem gives no leases, the run goes on with the process list read just
+before. The duplicate's name then shows the kept file's times; mode, owner, group, extended attributes and chattr
+flags were the same already.
+
+**The inode time.** Each link and rename changes the kept file's inode time (ctime), which the cleaner counts as a
+change. So it writes the inode time its own last step gave each file into a list beside its log
+(`<logFile>.dedupe-own`, at each step, and `<logFile>.dedupe` after the run); a file whose inode time is still that
+one is judged by its content time. All copies of a set are linked in one run, and a copy that arrives later joins
+them. Any other change of the inode time counts as usual.
+
+**The cache.** `<logFile>.dedupe` also keeps the sha256 of each file read, with its identity, size and both times:
+a file that has not changed since is not read again to find candidates (the link still compares byte for byte). A
+plan writes nothing; a run writes it in one step (a new file renamed over the old one). Missing, unreadable, of
+another version, a link or someone else's: an empty cache (files are read again, and files the cleaner linked look
+as new as their inode time until their `days` pass).
 
 **Never taken**, on top of what the config refuses: links (never followed, folders neither), folders with a `KEEP`
 file, git folders, other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
 files, credential and lock names, must-keep names, the in-place kinds above, files under 64 KB, files with more
-than one name (unless all of them are in the folders, as after an earlier run: then it is the file kept), files in
-use (a process has it open or names it, it has a lock, a unit names it or a folder above it), and a file whose
-metadata differs from the others' (kept with `other metadata`: a link would give it theirs). The config refuses a
+than one name (unless all of them are in the folders and taken by the rule, as after an earlier run: then it is the
+file kept), files in use (a process has it open or names it, it has a lock, a unit names it or a folder above it),
+and a file whose metadata differs from the others' (kept with `other metadata`: a link would give it theirs). A
+name like a part that the cleaner did not write down is a person's and stays (`not a part`). The config refuses a
 folder that is `/`, the home folder or above it, in or above a must-keep path or in a must-keep name (also where a link to one
 leads), the cleaner's own log or daily folder (and the keep-first archive while `agent-scratch` is on), a folder
 another rule deletes from, a folder of `compressCold`, or a folder in or above another of its folders.
@@ -612,15 +643,21 @@ and, for the rule, `dedupe: would link N files (<size>)`; the total line adds `w
 
 **What happens when ...**
 
-- **it runs again:** the names are one file already; nothing new is done.
-- **it stops half-way:** the duplicate is either as it was or a name of the kept file, never gone. Killed between
-  the new name and the rename: the duplicate is as it was and the part `.<name>.<8 hex>.cleaner-link` stays; the
-  next run removes that part (only while it is still a name of a file with other names) and links again. A part
-  that is the last name of its bytes is kept and named (`part without its file`). A failed rename removes the part
-  and keeps the duplicate. No entry goes into the journal of half deletes: there is nothing half gone.
+- **it runs again:** the names are one file already; nothing new is done, and unchanged files are not read again.
+- **it stops half-way:** the duplicate is either as it was or a name of the kept file, never gone. Killed before
+  the new name: nothing changed. Killed between the new name and the rename: the duplicate is as it was and the
+  part `.<name>.<8 hex>.cleaner-link` stays; the next run removes that part (only while it is one the cleaner wrote
+  down and still a name of a file with other names) and links again. Killed right after a link or rename, before its
+  inode time was written down: the kept file looks changed and waits its `days`, then the run goes on. Killed while
+  the cache is written: the old cache stays, and the list of its own steps still holds what it did. A part that is
+  the last name of its bytes is kept and named (`part without its file`). A failed rename removes the part and keeps
+  the duplicate. No entry goes into the journal of half deletes: there is nothing half gone.
 - **a file changes or is opened:** while the plan reads it: kept as `changed`. Between the plan and the run, or
-  while it is compared: refused or failed, both files stay as they are. A kept file replaced after the plan: refused.
+  while it is compared or linked: refused or failed, both files stay as they are. A kept file replaced, or given or
+  losing a name, after the plan: refused.
 - **the folder is missing or empty:** nothing to do.
+- **the cache is missing, broken or cannot be written:** files are read again; a cache that cannot be written is
+  named in one line and the run goes on.
 - **the machine file is older and has no `dedupe`:** the rule does nothing.
 - **the cleaner is older than the machine file:** an older cleaner refuses the unknown `dedupe` key and every daily
   run exits 2. Install this cleaner on a machine first, then add the key.
