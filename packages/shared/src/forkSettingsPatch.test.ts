@@ -506,6 +506,50 @@ describe("a project's null for playtest, handoff and reviewRules resolves to the
     expectServers(settings, key);
   });
 
+  it.each(KEYS)("the save step clears %s from the unsplit patch's null, on its own", (key) => {
+    const own = {
+      playtest: playtestAdapter("/opt/project/game"),
+      handoff: { mode: "compact" },
+      reviewRules: { preset: "off" },
+    }[key];
+    const stored = decodeServerSettings({
+      ...SERVER_FILE,
+      projectSettingsOverrides: { [project]: { [key]: own, defaultAutoPull: false } },
+    });
+    const clear = decodePatch({
+      projectSettingsOverrides: { [project]: { [key]: null, defaultAutoPull: false } },
+    });
+    // A `next` that holds the `null` (upstream's merge of an unsplit patch) comes out without it.
+    const holdsNull = {
+      ...stored,
+      projectSettingsOverrides: { [project]: { [key]: null, defaultAutoPull: false } },
+    } as unknown as ServerSettings;
+    const cleaned = keepLeftOutForkProjectKeys(stored, clear, holdsNull);
+    expectServers(cleaned, key);
+    expect(cleaned.projectSettingsOverrides[project], key).toEqual({ defaultAutoPull: false });
+    // An entry the `null` leaves empty is dropped.
+    const onlyNull = decodePatch({ projectSettingsOverrides: { [project]: { [key]: null } } });
+    const holdsOnlyNull = {
+      ...stored,
+      projectSettingsOverrides: { [project]: { [key]: null } },
+    } as unknown as ServerSettings;
+    expect(
+      Object.hasOwn(
+        keepLeftOutForkProjectKeys(stored, onlyNull, holdsOnlyNull).projectSettingsOverrides,
+        project,
+      ),
+      key,
+    ).toBe(false);
+    // Why the step must see the unsplit patch: handed the split one, it keeps the stored value.
+    const [, split] = splitForkSettingsPatch(clear);
+    const wrong = keepLeftOutForkProjectKeys(
+      stored,
+      split,
+      applyServerSettingsPatch(stored, clear),
+    );
+    expect(resolved(wrong, key).source, key).toBe("project");
+  });
+
   it.each(KEYS)("a client's clear of %s (null) resolves to the server's on both sides", (key) => {
     const own = {
       playtest: playtestAdapter("/opt/project/game"),
