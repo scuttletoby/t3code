@@ -40,6 +40,10 @@ FILES = {'fork-fleet-launch.sh': '.github/scripts/fork-fleet-launch.sh',
          'machine_file.py': 'fork-kit/common/machine_file.py', 'README.md': 'fork-kit/desk/README.md',
          'free_contract.py': 'fork-kit/common/free_contract.py', 'free-memory': 'fork-kit/common/free/memory'}
 WALLS = '.github/scripts/fork-fleet-walls'   # copied whole: every OS's walls file and fixture
+# The one file that pins the launcher (its LAUNCHER_SHA256; the other walls files read that pin). swap() renames it in
+# last, so a run stopped half-way never pairs a new pin with walls or a launcher of the old release: any launcher
+# change then fails on the old pin until the next run ends the swap (issue #408 item 1).
+PIN_HOLDER = 'fork-fleet-walls/linux'
 SUBDIRS = ('units', 'fork-fleet-walls')   # the folders the manifest makes inside /opt/fork-fleet
 UNITS = {'fork-fleet-desk-agent.service': '.github/scripts/fork-fleet-desk-agent.service',
          't3code-fleet-refresh.service': '.github/scripts/fork-fleet-refresh.service',
@@ -368,13 +372,14 @@ def swap(tmp, manifest, sha, before_change):
     """Each changed file renamed into /opt/fork-fleet (the agent stopped meanwhile, so no verb runs from half-old,
     half-new files, and the refresh and seed timers and services stopped too: they run its files); files of the old
     release that are gone, removed. Unchanged files (same text, mode and owner root) are left as they are; one whose
-    mode or owner was changed is replaced by the staged copy. True when anything changed."""
+    mode or owner was changed is replaced by the staged copy; the launcher's pin holder (PIN_HOLDER) last. True when
+    anything changed."""
     def same(rel):
         with contextlib.suppress(OSError):
             st = os.lstat(p(f'{OPT}/{rel}'))
             return (stat.S_ISREG(st.st_mode) and st.st_uid == ROOT_UID and stat.S_IMODE(st.st_mode) == file_mode(rel)
                     and sha256(p(f'{OPT}/{rel}')) == manifest[rel])
-    changed = [rel for rel in sorted(manifest) if not same(rel)]
+    changed = sorted((rel for rel in manifest if not same(rel)), key=lambda rel: (rel == PIN_HOLDER, rel))
     gone = sorted(set(read_manifest()) - set(manifest))
     if changed or gone:
         before_change()

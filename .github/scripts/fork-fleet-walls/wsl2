@@ -7,10 +7,11 @@ launcher beside this folder says with `fork-fleet-launch.sh paths`: Windows' dri
 /mnt/wsl and /usr/lib/wsl are outside it, so no job sees them), job-units and etc-secrets. A wall the linux file
 gains is a wall here too. The launcher is one file: the one the linux walls ask (`paths`) is the one whose job units'
 properties are read here (unit_props: sandbox(), job_fs() and start()'s systemd-run, every form of -p), and it must be
-as safe as they want it. It must also be the launcher this file was checked against (the linux file's
-LAUNCHER_SHA256, the one pin: this file has no copy of its own): no reading of bash can follow every way a changed
-launcher could hand systemd-run more (eval, a helper, printf -v, source, a quote), so any other launcher cannot be
-told. On top, what only WSL2 has:
+as safe as they want it. It must also be the launcher the linux file next to this one was checked against (its
+LAUNCHER_SHA256, the one pin: this file has no copy of its own, so it is tied to the launcher only through that
+file, and the installer puts the linux file in last: no partial install leaves an older wsl2 file under a newer pin):
+no reading of bash can follow every way a changed launcher could hand systemd-run more (eval, a helper, printf -v,
+source, a quote), so any other launcher cannot be told. On top, what only WSL2 has:
 - interop: WSL runs Windows programs from the distro (a binfmt_misc handler run by /init), as the Windows user,
   outside every Linux wall. It must be off now, and stay off: in /etc/wsl.conf, and masked for systemd-binfmt, which
   registers WSL's handler again at boot. Any handler that runs Windows programs counts, whatever its name;
@@ -442,9 +443,9 @@ def merged(values):
 def launcher_props():
     """The job units' properties (unit_props) of the launcher the linux walls ask what jobs see (LINUX.LAUNCHER,
     beside this folder: the one the pool runs, also under FORK_FLEET_LAUNCH_CONF), checked as they check it, on the
-    open file itself, if it is the launcher this file was checked against: the linux file's LAUNCHER_SHA256, the one
-    pin of the kit (issue #365 item 2). A linux file without it (one from before the pin) or with another: cannot
-    tell."""
+    open file itself, if it is the launcher the linux file was checked against: its LAUNCHER_SHA256, the one pin of
+    the kit (issue #365 item 2), which the installer puts in after this file (issue #408 item 1). A linux file
+    without it (one from before the pin) or with another: cannot tell."""
     path = LINUX.LAUNCHER
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))   # a FIFO: no wait
     try:
