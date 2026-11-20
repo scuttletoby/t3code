@@ -339,13 +339,23 @@ start: the new launcher then idled and verify waited for minutes.
   and the next SSH launch would start a server on that home. So right after the stop the kit starts a holder, a
   transient unit of its own (`t3-golive-hold-<hash of the home>`, running `t3-golive hold --home <home>`), that
   takes the owner lock and keeps it until it is stopped; the run adopts it as its own lock. Every start the kit makes
-  goes through the same handover, so the launcher gets the home from the holder; a failed start, a failure before
-  the start, or a kill leaves the holder holding. The next run of the same `back` takes the holder over (no free
-  moment, never a second one: there is one unit name per home); a resumed verify stops one that is still there once
-  the service runs T3. `status` and `check` name the holder; `settle` stops it (the owner says the home is right);
-  a reboot ends it. It is found by its live process in `/proc/locks`, never by a file, so nothing stale outlives
-  it. Where no transient unit can be started, the run holds the lock itself, as before, and the stop step says so
-  (`holder: null`, `holderError`). A copy needs none: its guard starts T3 again as soon as the copy run dies.
+  goes through the same handover, so the launcher gets the home from the holder. It goes only to a launcher that
+  holds its serving lock, or once the service runs: a failed start, a start that returns without T3 running (`t3
+  update` exits non-zero or times out, a build that never comes up), a failure before the start, or a kill leaves
+  the holder holding. The next run of the same `back` takes the holder over (no free moment, never a second one:
+  there is one unit name per home); a resumed verify stops one that is still there once the service runs T3.
+  `status` and `check` name the holder (do not start T3 by hand while it holds: its server would idle); `settle`
+  stops it (the owner says the home is right). It is found by its live process in `/proc/locks`, never by a file,
+  so nothing stale outlives it. Where `/proc/locks` cannot be read (the kit could never find the holder again) or
+  no transient unit can be started, the run holds the lock itself, as before, and the stop step says so (`holder:
+  null`, `holderError`); `status` and `check` name an active holder unit they cannot see there. A copy needs none:
+  its guard starts T3 again as soon as the copy run dies.
+- **Known gap: a reboot ends the holder.** The service stays disabled, so nothing starts T3 at boot, but a T3
+  desktop app connected over SSH that reconnects after the reboot finds the home free and may start its own server
+  on it while it may be half-restored. A holder that outlives a reboot would be an enabled unit on disk, state that
+  can outlive its reason (what finding the holder by its live process avoids), so the kit keeps the gap and says
+  it: `status` then fails `home holder` (none, but a run that stopped and disabled T3 has not ended ok) and says to
+  quit or disconnect that app until the same `back` ends ok.
 - **Backstop, a foreign server.** An SSH client older than 0.1.10 reads neither, and a server started by hand
   ignores both. When the runtime record names a live process that the boot service did not start and that itself
   holds `userdata/server-owner.sqlite` (a stale record whose pid was reused holds nothing and is never named), for

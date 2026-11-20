@@ -764,7 +764,10 @@ def guard(cfg, adapter, run_id, wait, say=print, lose_work_since=None):
             except (journal.Damaged, OSError) as e:
                 runs = None
                 did.append(f'journal unreadable, so T3 is started if it is not active: {e}')
-                if not adapter.service()['active']:
+                svc = adapter.service()
+                if not svc['active'] and not svc['enabled']:  # the switch never disables it; its W1 does, on purpose
+                    did.append(f'{osadapter.UNIT} is not enabled: left stopped (a W1 that stopped may hold it)')
+                elif not svc['active']:
                     coldcopy.open_gap(cfg.home)  # left to run out: this guard does not wait for T3
                     try:  # the killed run's holder (#530) lets go to the launcher
                         handoff.starting(cfg.home, adapter.start, None, adapter.service)

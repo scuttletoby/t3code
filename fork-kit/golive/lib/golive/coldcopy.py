@@ -685,6 +685,11 @@ def hold_home(adapter, home, wait):
     if pid is not None:
         return handoff.Holder(home, pid), {'holder': pid, 'holderFrom': 'an earlier run that stopped T3'}
     unit, why = handoff.holder_unit(home), None
+    if handoff.lock_holders(os.path.join(home, 'userdata', OWNER_LOCK)) is None:  # none it could find again
+        return hold_owner_lock(os.path.join(home, 'userdata'), wait), {
+            'holder': None, 'holderError': f'/proc/locks cannot be read, so {unit} was not started (the kit could '
+                                           'not find it again); this run holds the home itself: it is free once the '
+                                           'run ends'}
     began = time.monotonic()
     try:
         adapter.run_detached(unit, [KIT_BIN, *handoff.holder_args(home)])

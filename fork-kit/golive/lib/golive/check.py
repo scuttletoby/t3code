@@ -125,9 +125,9 @@ def _checks(cfg, adapter, result, add, info, own_id):
     else:
         add('boot service', True, f'{osadapter.UNIT} serves this home')
 
-    holder = handoff.find_holder(cfg.home)
+    holder = handoff.holder_seen(cfg.home, adapter.unit_active)
     if holder is not None:  # #530: a W1 or switch left the home held on purpose
-        add('home holder', False, handoff.holder_said(cfg.home, holder))
+        add('home holder', False, holder)
 
     server = None
     try:

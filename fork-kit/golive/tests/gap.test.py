@@ -726,8 +726,60 @@ class Holder(back_t.BackBase):
         self.failed_w1()
         reboot_drops_the_holder(self.m.home)
         self.assertIsNone(handoff.find_holder(self.m.home))
-        self.assertNotIn('home holder', self.status()[1])
+        out = self.status()[1]
+        self.assertNotIn(handoff.holder_unit(self.m.home), out)
+        # a known gap, said where the owner looks: the home is free, an SSH launch may take it (lens A)
+        self.assertIn(f'home holder: {back.NO_HOLDER}', out)
         self.assert_rerun_hands_the_home_to_t3(adopted=False)
+        self.assertNotIn('home holder', self.status()[1])
+
+    def test_a_w1_whose_update_returns_without_t3_up_leaves_the_home_owned(self):
+        """Lens review (blocking): to a build that takes the serving lock, `t3 update` exits non-zero (or times out),
+        or the build never comes up: the handover's timeout must not let the holder go while T3 is not running."""
+        marker_since(self, fx.LIVE)
+        self.m.write('update.code', '3')
+        with self.assertRaisesRegex(RuntimeError, 'exited 3'):
+            self.back('w1', lose_work_since=self.at)
+        os.unlink(self.m.path('update.code'))
+        self.assertFalse(self.adapter.service()['active'])
+        self.assertIsNotNone(handoff.find_holder(self.m.home))
+        self.assert_owned_after_the_run()
+        self.assert_rerun_hands_the_home_to_t3(adopted=True)  # run again: the same holder, then T3's
+
+    def test_a_w1_whose_build_never_comes_up_keeps_the_home_owned_through_its_reruns(self):
+        """The same, when `t3 update` exits 0 but the build never runs (a crash loop): the verify fails, and a rerun
+        (it only verifies again) keeps the home owned too."""
+        marker_since(self, fx.LIVE)
+        self.m.write('never-starts', fx.LIVE)
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, 'did not come back'):
+                self.back('w1', lose_work_since=self.at)
+            self.assertFalse(self.adapter.service()['active'])
+            self.assertIsNotNone(handoff.find_holder(self.m.home))
+            self.assert_owned_after_the_run()
+
+    def test_with_proc_locks_unreadable_no_holder_starts_and_a_rerun_still_ends_ok(self):
+        """Lens review (major): a holder the kit cannot see in /proc/locks could never be adopted or stopped (status,
+        settle and a rerun would all miss it), so none is started; the journal says why."""
+        with mock.patch.object(handoff, 'lock_holders', return_value=None):
+            self.failed_w1()
+            facts = self.facts('stop-service')[0]
+            self.assertEqual(self.holders(), [])
+            self.assertIsNone(facts['holder'])
+            self.assertIn('/proc/locks cannot be read', facts['holderError'])
+            self.back('w1', lose_work_since=self.at)  # run again, still blind: no unit of that name is in the way
+            self.assertEqual(self.last_run()['end']['result'], 'ok')
+            self.assertEqual(self.holders(), [])
+
+    def test_a_holder_unit_status_cannot_see_in_proc_locks_is_named_by_its_unit(self):
+        """Old state: a holder left by a run that could read /proc/locks, then a status that cannot."""
+        self.failed_w1()
+        unit = handoff.holder_unit(self.m.home)
+        with mock.patch.object(handoff, 'lock_holders', return_value=None):
+            code, out = self.status()
+        self.assertEqual(code, 1)
+        self.assertIn(f'holder unit {unit} is active, and /proc/locks cannot be read', out)
+        self.assertIn(f'`systemctl --user stop {unit}`', out)
 
     def test_with_no_transient_unit_the_run_holds_the_home_itself_and_says_so(self):
         self.adapter.holder_up = False
@@ -774,6 +826,34 @@ class SwitchHolder(switch_t.SwitchBase):
         self.guard(run['id'], wait=True)
         self.assertEqual(self.server()['version'], fx.LIVE)
         self.assertIsNone(handoff.find_holder(self.m.home))
+
+    def test_a_switch_whose_target_never_comes_up_keeps_the_home_owned_until_its_guard_puts_t3_back(self):
+        """Lens review (blocking): `t3 update` exits 0, but the target build never runs (a crash loop): the
+        handover's timeout must leave the holder, so the home is owned through the verify and a kill there."""
+        marker_since(self, fx.TARGET)  # a target whose launcher takes the serving lock
+        self.mode = 'down'
+        self.m.write('never-starts', fx.TARGET)
+        self.rehearsed()
+        run = self.kill_after('update', 'done')
+        os.unlink(self.m.path('home/runtime/desktop-update-in-progress'))  # the marker ran out
+        self.assertFalse(self.adapter.service()['active'])
+        self.assertIsNotNone(handoff.find_holder(self.m.home))
+        self.assertTrue(home_owned(self.m.home))
+        self.guard(run['id'], wait=True)  # its W1 adopts the holder and hands it to the old build
+        self.assertEqual(self.server()['version'], fx.LIVE)
+        self.assertIsNone(handoff.find_holder(self.m.home))
+
+    def test_a_guard_that_cannot_read_the_journal_leaves_a_disabled_t3_stopped_and_held(self):
+        """Lens review (minor): the switch never disables T3, its W1 does on purpose (the home may be
+        half-restored): the fail-open start must not start it there, nor free the home."""
+        run = self.killed_after_the_stop()
+        self.adapter.disable()
+        with open(os.path.join(self.m.state, 'journal.jsonl'), 'ab') as f:
+            f.write(b'not json\n')
+        self.assertIn('is not enabled: left stopped', ' '.join(self.guard(run['id'])))
+        self.assertFalse(self.adapter.service()['active'])
+        self.assertIsNotNone(handoff.find_holder(self.m.home))
+        self.assertNotIn('start', self.calls())
 
     def test_a_guard_that_cannot_read_the_journal_hands_the_holder_to_the_t3_it_starts(self):
         run = self.killed_after_the_stop()
@@ -912,8 +992,10 @@ class Marker(unittest.TestCase):
             stop.set()
             t.join()
             launcher = sqlite3.connect(serving, isolation_level=None, timeout=1)
-            launcher.execute('BEGIN EXCLUSIVE')
+            # stamped before the claim (lens A on #554): a look the watcher makes right after the claim, before this
+            # thread runs again, then counts as after it. No look comes before the claim: the probes have stopped
             claimed.append(time.monotonic())
+            launcher.execute('BEGIN EXCLUSIVE')
             end = claimed[0] + PROBING_LIMIT
             while held(owner) and time.monotonic() < end:
                 time.sleep(0.005)

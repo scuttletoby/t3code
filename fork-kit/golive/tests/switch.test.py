@@ -67,7 +67,7 @@ def counts(threads):
 
 
 class SwitchBase(unittest.TestCase):
-    mode = 'ok'  # what the fork build does after `update`: ok, or never (its server never gets ready)
+    mode = 'ok'  # what the fork build does after `update`: ok, never (its server never gets ready), down (not started)
 
     def setUp(self):
         self.m = bx.Machine()
@@ -146,6 +146,8 @@ class SwitchBase(unittest.TestCase):
             d = os.path.join(versions, v)
             if not v.startswith('.') and v != fx.TARGET and keptruntime.installed_t3(self.m.home, v):
                 shutil.rmtree(d)
+        if self.mode == 'down':  # the update does not start it (with a never-starts file, no start does)
+            return 0, ''
         if self.mode != 'never':
             self.m.spawn_server(fx.TARGET)
         self.adapter._svc(ActiveState='active', MainPID=os.getpid())

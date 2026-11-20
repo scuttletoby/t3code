@@ -779,6 +779,11 @@ def _rerun_hint(runs):
     return f'W1 did not stop T3; run {again} again to finish it'
 
 
+NO_HOLDER = ('none, but a run that stopped and disabled T3 has not ended ok (a reboot ends the kit\'s holder): the '
+             'home is free, and a T3 desktop app connected over SSH may start its own server on it while it may be '
+             'half-restored; quit or disconnect that app until the same `t3-golive back` ends ok')
+
+
 def _status(cfg, adapter, add, notes, seen):
     """The checks; returns 'up', 'restarting', 'down' or 'unknown' (the live server goes in seen['server'])."""
     try:
@@ -788,9 +793,9 @@ def _status(cfg, adapter, add, notes, seen):
         return 'unknown'
     add('service', svc['loaded'] and svc['active'] and svc['enabled'] and check_mod._same_dir(svc['home'], cfg.home),
         f'{osadapter.UNIT} {svc.get("state")}, enabled: {svc["enabled"]}, serves {svc["home"]}')
-    holder = handoff.find_holder(cfg.home)
+    holder = handoff.holder_seen(cfg.home, adapter.unit_active)
     if holder is not None:  # #530
-        add('home holder', False, handoff.holder_said(cfg.home, holder))
+        add('home holder', False, holder)
     try:
         runs = journal.read(cfg.state_dir)[0]
     except journal.Damaged as e:  # a journal from a newer kit included
@@ -798,6 +803,8 @@ def _status(cfg, adapter, add, notes, seen):
         add('journal', False, str(e))
     else:
         open_run = runs[-1] if runs and journal.needs_settling(runs[-1]) else None
+        if holder is None and open_run is not None and not svc['active'] and not svc['enabled']:
+            add('home holder', False, NO_HOLDER)  # a reboot ended the holder a W1 or switch left (#530)
         if open_run is None:
             add('journal', True, 'no golive run was left half-way')
         elif open_run['command'] in FOLLOWS:

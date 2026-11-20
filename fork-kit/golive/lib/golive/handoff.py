@@ -40,9 +40,13 @@ runs out within 60 s, but the holder keeps the home owned, so a waiting SSH laun
 has no time limit there) instead of starting its own server on that home. Whoever starts T3 next takes it over
 without a gap: the module's starting() hands the holder's lock to the new launcher exactly like the kit's own, and
 the next W1 adopts it at its stop step (one holder at most: a second failure starts none). `status` and `check`
-name it, `settle` stops it, and a reboot drops it (W1 left the unit disabled: nothing starts at boot). A holder is
+name it, `settle` stops it. A reboot drops it: a known gap, kept on purpose. W1 left the unit disabled, so nothing
+starts T3 at boot, but an SSH launch of the desktop app after the reboot finds the home free; `status` says so then
+(no holder, T3 stopped and disabled, a run unfinished) and names the remedy. A unit that outlives a reboot would be
+state on disk that can outlive its reason (the bug #530 avoids by finding the holder by what it is). A holder is
 found by what it is, never by a file: a process with the holder's command line for this home among the owner lock's
-holders in /proc/locks (find_holder), so a stale pid can never be taken for one.
+holders in /proc/locks (find_holder), so a stale pid can never be taken for one. With /proc/locks unreadable the kit
+starts no holder (it could not find it again); a holder unit that is active then is named by its unit.
 
 foreign() is only a backstop, for what the two cannot cover: an SSH client older than 0.1.10 (it reads no marker and
 probes no lock), or a server started by hand. It names a server that holds the home's owner lock but was not started
@@ -202,7 +206,8 @@ class Gap:
     def starting(self, fn, version, service):
         """Run fn (it starts T3 `version`: a service start, or `t3 update`), and let go of the owner lock only once
         the new launcher holds its serving lock (or HANDOVER_WAIT after fn returned, or fn failed). service: reads
-        the boot service (adapter.service). Returns fn's result. Afterwards the kit holds no lock on the home.
+        the boot service (adapter.service). Returns fn's result. Afterwards the kit holds no lock on the home; a
+        holder (#530) is left holding unless the launcher took the home or the service is active.
         A handover to the launcher measures its delay (handover_ms, an upper bound: the claim came after the start of
         the last look that did not find the launcher serving, and the lock was let go before the clock is read)."""
         self.handover, self.handover_ms = None, None
@@ -215,8 +220,9 @@ class Gap:
 
         serving = os.path.join(self.home, 'runtime', SERVING_LOCK)
 
+        looked = [time.monotonic()]  # the start of the last look that did not find the launcher serving
+
         def watch():  # HANDOVER_WAIT counts from fn's return (`t3 update` installs first, then restarts T3)
-            looked = time.monotonic()  # the start of the last look that did not find the launcher serving
             try:
                 while not done.is_set():
                     began = time.monotonic()
@@ -228,17 +234,20 @@ class Gap:
                         if launcher_serving(self.home, svc):
                             outcome['how'] = 'launcher'
                             self.let_go()
-                            outcome['ms'] = (time.monotonic() - looked) * 1000
+                            outcome['ms'] = (time.monotonic() - looked[0]) * 1000
                             return
-                    looked = began
+                    looked[0] = began
                     if returned and time.monotonic() >= returned[0] + HANDOVER_WAIT:
                         outcome['how'] = 'timeout'
                         return
                     done.wait(HANDOVER_POLL)
                 outcome['how'] = 'start failed'
             finally:
-                if outcome.get('how', 'start failed') == 'start failed' and _stays(self.lock) and not _active(service):
-                    self.lock = None  # T3 did not come up: the holder keeps the home owned past this run (#530)
+                # T3 did not come up (fn raised, or returned without starting it: `t3 update` exited non-zero or timed
+                # out, a target that never runs): the holder keeps the home owned past this run (#530). It goes only
+                # to a launcher, or when the service runs (an old launcher that took no serving lock).
+                if outcome.get('how') != 'launcher' and _stays(self.lock) and not _active(service):
+                    self.lock = None
                 else:
                     self.let_go()
         watcher = threading.Thread(target=watch, name='golive-handover', daemon=True)
@@ -514,7 +523,26 @@ def holder_to_service(home, svc):
 def holder_said(home, pid):
     return (f'the kit\'s holder {holder_unit(home)} (pid {pid}) keeps the home owned, so no SSH launch starts a server '
             'on it: a W1 or switch that stopped T3 and did not end ok left it (the home may be half-restored); the '
-            'same `t3-golive back` takes it over, or put the home right and `t3-golive settle` stops it')
+            'same `t3-golive back` takes it over, or put the home right and `t3-golive settle` stops it; do not start '
+            't3code.service by hand while it holds (its server would idle)')
+
+
+def holder_seen(home, unit_active):
+    """What `status` and `check` say about the holder, or None when there is none: found in /proc/locks, or, when
+    that cannot be read, its unit is active (unit_active: adapter.unit_active; it may raise)."""
+    pid = find_holder(home)
+    if pid is not None:
+        return holder_said(home, pid)
+    if lock_holders(os.path.join(home, 'userdata', OWNER_LOCK)) is not None:
+        return None
+    unit = holder_unit(home)
+    try:
+        if not unit_active(unit):
+            return None
+    except Exception:  # noqa: BLE001  (cannot tell: say nothing more than the failed read)
+        return None
+    return (f'the kit\'s holder unit {unit} is active, and /proc/locks cannot be read, so the kit cannot tell what it '
+            f'holds: it may keep the home owned; once the home is right, `systemctl --user stop {unit}`')
 
 
 def serve_holder(home, wait=None):
