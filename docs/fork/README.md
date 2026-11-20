@@ -421,6 +421,17 @@ are refused for such a thread too, as that machine gives the thread its own prof
 launcher's profile instead. A launcher whose profile cannot be worked out is refused, never taken
 as `all`. A thread on `all`, and the owner's own client, launch as before.
 
+The same rule holds for the other ways such a thread starts a thread on this machine
+([#693](https://github.com/scuttletoby/t3code/issues/693)). `schedule_task` is refused when the
+task's runs would start a new thread (not bound to the caller) whose profile in the task's project
+is not within the caller's; a task bound to the caller runs in it and keeps its profile. A change
+to a task whose runs start new threads (also one made before this check), and unbinding a task from
+the caller, are refused the same way: delete the task, bind it to the caller
+(`bindToCurrentThread: true`), or ask the owner. A run itself is not checked, as a task does not
+record which thread made it. `t3_thread_transfer`'s fork is refused when the fork would get more
+than the caller's profile: a fork gets its source's profile cut to the source's, so forking the
+caller itself always goes through, and a fork of a thread whose parent cannot be read is refused.
+
 Only Claude threads apply profiles. A Codex thread, or one on any other provider, would get every
 MCP server and every T3 tool whatever its profile says. So its turn is not started when its profile
 is narrower than `all` ([#672](https://github.com/scuttletoby/t3code/issues/672)): the machine that
