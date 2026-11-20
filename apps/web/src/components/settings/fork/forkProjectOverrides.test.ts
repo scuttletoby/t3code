@@ -11,7 +11,14 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as Schema from "effect/Schema";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { createScopedSettingsWriter, planScopedSettingsPatch } from "../scopedSettings";
+import { reviewRulesSummary } from "../reviewRulesSettings.logic";
+import {
+  applyPendingScopedWrites,
+  createScopedSettingsWriter,
+  planScopedSettingsPatch,
+  resolveScopedSettingsTargets,
+} from "../scopedSettings";
+import { playtestMissingSteps } from "./playtestSettings.logic";
 
 const environmentId = EnvironmentId.make("laptop");
 const projectId = ProjectId.make("game");
@@ -90,4 +97,62 @@ describe("a project's handoff and playtest overrides", () => {
 
     expect(machine.project()?.playtest).toEqual({ ...shown, enabled: true });
   });
+});
+
+describe("a project's null for playtest, handoff or reviewRules on the project screen", () => {
+  // The environment's values, each away from its default, so "the environment's" differs from off.
+  const SERVER = {
+    playtest: { enabled: true, ...STEPS },
+    handoff: { mode: "handoff" },
+    reviewRules: { preset: "recommended" },
+  };
+  const OWN = {
+    playtest: { enabled: false, ...STEPS },
+    handoff: { mode: "compact" },
+    reviewRules: { preset: "off" },
+  };
+  const KEYS = ["playtest", "handoff", "reviewRules"] as const;
+  const environment = (settings: ServerSettings) => ({
+    environmentId,
+    label: "Laptop",
+    connection: { phase: "connected" as const },
+    serverConfig: { settings },
+  });
+  /** What the project's panels read, and that each renders it (the calls they make on it). */
+  const shown = (settings: ServerSettings, key: (typeof KEYS)[number]) => {
+    const [target] = resolveScopedSettingsTargets(scope as never, [environment(settings)]);
+    expect(target, key).toBeDefined();
+    expect(target!.settings[key], key).toEqual(settings[key]);
+    expect(target!.sources[key], key).toBe("environment");
+    expect(playtestMissingSteps(target!.settings.playtest)).toEqual([]);
+    expect(target!.settings.handoff.mode).toBe("handoff");
+    expect(reviewRulesSummary(target!.settings.reviewRules)).toBe("On: recommended preset");
+  };
+
+  it.each(KEYS)("an old file's hand-written %s: null shows the environment's", (key) => {
+    shown(fromFile({ ...SERVER, projectSettingsOverrides: { [projectId]: { [key]: null } } }), key);
+  });
+
+  it.each(KEYS)(
+    "a pending clear of %s shows the environment's before the server answers",
+    (key) => {
+      const stored = fromFile({
+        ...SERVER,
+        projectSettingsOverrides: { [projectId]: { [key]: OWN[key], defaultAutoPull: false } },
+      });
+      const [pending] = applyPendingScopedWrites(
+        [environment(stored)],
+        [
+          {
+            save: {},
+            environmentId,
+            patch: {
+              projectSettingsOverrides: { [projectId]: { [key]: null, defaultAutoPull: false } },
+            } as ServerSettingsPatch,
+          },
+        ],
+      );
+      shown(pending!.serverConfig.settings, key);
+    },
+  );
 });
