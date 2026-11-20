@@ -321,8 +321,8 @@ jobs:
       # (fork-kit/golive/tests/contract.test.py; UsagePacingGate.ts: the effort option ids and
       # model.ts: the ultracode mapping, ModelManifest.ts and model-manifest.json: T3's model list and its
       # cache, builtInDrivers.ts, the drivers' kind files and the files where each reads its effort
-      # (claudeModelOptions.ts, the adapters): the effort id of each built-in driver, in
-      # fork-kit/model-guard/tests/guard.test.py); keep the lists in step.
+      # (claudeModelOptions.ts, the adapters) and Kiro's agent id (acpSupport.ts): the effort id of each
+      # built-in driver, in fork-kit/model-guard/tests/guard.test.py); keep the lists in step.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -371,6 +371,7 @@ jobs:
             /packages/provider-grok/src/client.ts
             /packages/provider-grok/src/server/adapter.ts
             /packages/provider-kiro/src/client.ts
+            /packages/provider-kiro/src/server/acpSupport.ts
             /packages/provider-kiro/src/server/adapter.ts
             /packages/provider-muse/src/client.ts
             /packages/provider-muse/src/server/adapter.ts
@@ -489,6 +490,7 @@ jobs:
             /packages/provider-grok/src/client.ts
             /packages/provider-grok/src/server/adapter.ts
             /packages/provider-kiro/src/client.ts
+            /packages/provider-kiro/src/server/acpSupport.ts
             /packages/provider-kiro/src/server/adapter.ts
             /packages/provider-muse/src/client.ts
             /packages/provider-muse/src/server/adapter.ts
@@ -574,6 +576,7 @@ jobs:
             /packages/provider-grok/src/client.ts
             /packages/provider-grok/src/server/adapter.ts
             /packages/provider-kiro/src/client.ts
+            /packages/provider-kiro/src/server/acpSupport.ts
             /packages/provider-kiro/src/server/adapter.ts
             /packages/provider-muse/src/client.ts
             /packages/provider-muse/src/server/adapter.ts

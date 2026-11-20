@@ -1051,6 +1051,74 @@ const c = log("agent(") || items.map(i => i.agent)
         self.policy({'mode': 'enforce', 'allow': [dict(AGENT, otherOptionIds=['mode', 'agent'])]})
         self.passed(t, self.delegate({'model': 'example-agent', 'options': {'thought_level': 'low', 'agent': 'x'}}))
 
+    def test_a_built_in_driver_in_another_case_is_refused(self):
+        """#638 review (lens B minor 1): a row of driver "Codex" with effortOptionIds ["thought_level"] passed
+        {"thought_level": "low"} on a pick with no driver, which T3 may run on a codex instance; Codex ignores that id
+        and runs its default. A row naming a built-in driver kind in another case or with spaces around it now makes
+        the policy invalid (every checked call refused, in every mode, the same every time); a driver that only
+        resembles one is a custom driver, as before."""
+        typo = {'driver': 'Codex', 'model': 'example-oc', 'efforts': ['low'], 'effortOptionIds': ['thought_level']}
+        t = 'mcp__t3-code__t3_thread_launch'
+        pick = {'modelSelection': {'model': 'example-oc', 'options': {'thought_level': 'low'}}}
+        for kind in model_guard.BUILT_IN_DRIVER_KINDS:
+            for spelling in {kind.upper(), kind.capitalize(), kind.lower(), f' {kind}', f'{kind}\u00a0'} - {kind}:
+                row = dict(typo, driver=spelling)
+                for mode in model_guard.MODES:
+                    with self.subTest(driver=spelling, mode=mode):
+                        self.policy({'mode': mode, 'allow': [LARGE, row]})
+                        why = (f"driver: {spelling!r} is not T3's driver kind {kind!r}", self.policy_path)
+                        first = self.refused(t, pick, *why)
+                        self.assertEqual(first, self.refused(t, pick, *why))
+                        self.refused('Agent', {'model': 'large', 'effort': 'high'}, *why)
+        # the exact kind is fine, and its pick is checked with the kind's own ids
+        self.policy({'mode': 'enforce', 'allow': [dict(typo, driver='codex')]})
+        self.refused(t, pick, "under 'reasoningEffort'")
+        self.passed(t, {'modelSelection': {'model': 'example-oc', 'options': {'thought_level': 'low',
+                                                                              'reasoningEffort': 'low'}}})
+        # a custom driver whose name only contains a built-in kind is not a typo of one
+        for custom in ('codex2', 'myCodex', 'open-code'):
+            self.policy({'mode': 'enforce', 'allow': [dict(typo, driver=custom)]})
+            self.passed(t, pick)
+
+    def test_an_agent_option_is_never_an_effort_id(self):
+        """#638 review (lens A minor 1, lens B minor 3): an opencode row listing "agent" in effortOptionIds let a pick
+        name an OpenCode agent ({"variant": "low", "agent": "build"} passed), and a Kiro "mode" switches Kiro's agent.
+        Both are refused in effortOptionIds and in otherOptionIds of their driver's row; the policy is then invalid,
+        every checked call refused, in advise too. Another driver may use the same ids."""
+        t = 'mcp__t3-code__delegate_task'
+        pick = self.delegate({'model': 'example-oc', 'options': {'variant': 'low', 'agent': 'build'}})
+        for row, why in (({'driver': 'opencode', 'model': 'example-oc', 'efforts': ['low', 'build'],
+                           'effortOptionIds': ['agent']}, "effortOptionIds: 'agent' picks an agent of opencode"),
+                         ({'driver': 'opencode', 'model': 'example-oc', 'efforts': ['low'],
+                           'effortOptionIds': ['depth', 'agent']}, "effortOptionIds: 'agent' picks"),
+                         ({'driver': 'kiro', 'model': 'example-oc', 'efforts': ['low'],
+                           'effortOptionIds': ['mode']}, "effortOptionIds: 'mode' picks an agent of kiro"),
+                         ({'driver': 'kiro', 'model': 'example-oc', 'efforts': ['low'],
+                           'otherOptionIds': ['mode']}, "otherOptionIds: 'mode' names a model or reasoning")):
+            for mode in ('advise', 'enforce'):
+                with self.subTest(row=row, mode=mode):
+                    self.policy({'mode': mode, 'allow': [row]})
+                    first = self.refused(t, pick, why, self.policy_path)
+                    self.assertEqual(first, self.refused(t, pick, why, self.policy_path))
+        # without the key the agent is an id the guard cannot read: refused
+        self.policy({'mode': 'enforce', 'allow': [{'driver': 'kiro', 'model': 'example-oc', 'efforts': ['low']}]})
+        self.on_every_path((('example-oc', 'kiro', {'reasoningEffort': 'low', 'mode': 'x'}, "option 'mode' is not one"),
+                            ('example-oc', 'kiro', {'reasoningEffort': 'low'}, None)))
+        # an ACP agent's own "agent" or "mode" may be an effort id of its row
+        self.policy({'mode': 'enforce', 'allow': [dict(AGENT, effortOptionIds=['agent'], otherOptionIds=['mode'])]})
+        self.passed(t, self.delegate({'model': 'example-agent', 'options': {'agent': 'low', 'mode': 'x'}}))
+
+    def test_the_true_false_rule_is_for_claude_rows_only(self):
+        """#638 review (lens B minor 6): thinking and fastMode must be true/false on a Claude row only. On a row of
+        another driver they are that driver's own ids: Pi's effort, or an option its row lists."""
+        self.policy({'mode': 'enforce', 'allow': [
+            dict(AGENT, otherOptionIds=['fastMode']),
+            {'driver': 'fx', 'model': 'example-fx', 'efforts': ['low'], 'otherOptionIds': ['fastMode']}]})
+        self.on_every_path((
+            ('example-agent', 'acpDriver', {'thought_level': 'low', 'fastMode': 'on'}, None),
+            ('example-fx', 'fx', {'effort': 'low', 'fastMode': 'on'}, None),
+            ('example-fx', 'fx', {'effort': 'low', 'fastMode': True}, None)))
+
     def test_claude_booleans_take_only_true_or_false(self):
         """#629 (minor): T3's Claude driver reads thinking and fastMode only as true or false. Another driver may read
         the same id as its reasoning level (Pi's "thinking", Mistral Vibe's ACP "thinking"), and a model selection runs
@@ -1726,11 +1794,20 @@ class Contract(unittest.TestCase):
 
     def test_each_built_in_driver_reads_its_effort_where_the_guard_looks(self):
         """#629 (major): the guard pins the effort id of each of T3's built-in drivers. Read from T3's code: the list
-        of drivers, each one's kind, and where each with a fixed id reads its effort."""
+        of drivers, each one's kind, and where each with a fixed id reads its effort. It checks that the read is
+        there, not that it wins: a T3 change that reads a new id first (X ?? reasoningEffort) still passes. That is
+        safe today, because a pick naming the new id is refused as unread unless the row lists it, and NOT_OTHER keeps
+        names with effort, reason or think out of otherOptionIds."""
         block = re.search(r'BUILT_IN_DRIVERS[^=]*= \[(.*?)\];',
                           self.read_repo('apps/server/src/provider/builtInDrivers.ts'), re.S)
         self.assertIsNotNone(block, 'BUILT_IN_DRIVERS not found: keep the guard in step')
         names = re.findall(r'\b(\w+Driver)\b', block.group(1))
+        # #638 review (lens A minor 2): an entry not written as a plain name (a spread, a call, a condition) would
+        # hide drivers from the list above: anything but names, commas, spaces and comments fails the test
+        rest = re.sub(r'//[^\n]*|/\*.*?\*/', '', block.group(1), flags=re.S)
+        rest = re.sub(r'\b\w+Driver\b|[,\s]', '', rest)
+        self.assertEqual(rest, '', "BUILT_IN_DRIVERS holds an entry the test cannot read: read it, and put each "
+                         'driver it adds in DRIVER_EFFORT_IDS or AGENT_NAMED_EFFORT_DRIVERS, and here')
         self.assertEqual(sorted(names), sorted(self.BUILT_IN), "T3's built-in drivers changed: put each one in "
                          'DRIVER_EFFORT_IDS or AGENT_NAMED_EFFORT_DRIVERS, and here')
         kinds = {}
@@ -1755,7 +1832,13 @@ class Contract(unittest.TestCase):
         # an OpenCode agent may set its own model: the guard never takes it as an option that changes neither
         self.assertRegex(self.read_repo('packages/provider-opencode/src/server/adapter.ts'),
                          r'getModelSelectionStringOptionValue\(turn\.modelSelection, "agent"\)')
-        self.assertEqual(model_guard.DRIVER_MODEL_OPTION_IDS, {'opencode': ('agent',)})
+        # a Kiro mode switches Kiro's agent (#638 review, lens B minor 3)
+        self.assertRegex(self.read_repo('packages/provider-kiro/src/server/acpSupport.ts'),
+                         r'export const KIRO_AGENT_CONFIG_ID = "mode";')
+        self.assertRegex(self.read_repo('packages/provider-kiro/src/server/adapter.ts'),
+                         r'getModelSelectionStringOptionValue\(modelSelection, KIRO_AGENT_CONFIG_ID\)')
+        self.assertEqual(model_guard.DRIVER_MODEL_OPTION_IDS, {'kiro': ('mode',), 'opencode': ('agent',)})
+        self.assertEqual(sorted(model_guard.BUILT_IN_DRIVER_KINDS), sorted(kinds.values()))
 
     def test_the_example_policy_is_valid(self):
         with open(os.path.join(KIT, 'model-policy.example.json'), encoding='utf-8') as f:
@@ -2056,6 +2139,20 @@ MUTATIONS = {
                             'test_a_drivers_effort_or_model_id_is_never_an_other_option'),
     'Claude booleans': ("            if text and row['driver'] == CLAUDE_DRIVER:", '            if False:',
                         'test_claude_booleans_take_only_true_or_false'),
+    'the true/false rule is for Claude rows only': ("            if text and row['driver'] == CLAUDE_DRIVER:",
+                                                    "            if text and row['driver'] != 'pi':",
+                                                    'test_the_true_false_rule_is_for_claude_rows_only'),
+    # #638 review
+    'a built-in kind in another case is refused': ('        if twin:\n', '        if False:\n',
+                                                   'test_a_built_in_driver_in_another_case_is_refused'),
+    'the kind is compared trimmed': ("k.casefold() == js_trim(row['driver']).casefold()]",
+                                     "k.casefold() == row['driver'].casefold()]",
+                                     'test_a_built_in_driver_in_another_case_is_refused'),
+    'an agent option is no effort id': ('        if agents:\n', '        if False:\n',
+                                        'test_an_agent_option_is_never_an_effort_id'),
+    'a Kiro mode picks its agent': ("DRIVER_MODEL_OPTION_IDS = {'kiro': ('mode',), 'opencode': ('agent',)}",
+                                    "DRIVER_MODEL_OPTION_IDS = {'opencode': ('agent',)}",
+                                    'test_an_agent_option_is_never_an_effort_id'),
     'Claude booleans are only true or false': ("and not isinstance(value, bool)]", 'and isinstance(value, int)]',
                                                'test_claude_booleans_take_only_true_or_false'),
 }

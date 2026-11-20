@@ -74,10 +74,15 @@ DRIVER_EFFORT_IDS = {
 # a Cursor model's parameter). Their rows, like those of any driver not known here, list it in effortOptionIds; a
 # row with efforts and no such id refuses every T3 pick (fail closed).
 AGENT_NAMED_EFFORT_DRIVERS = ('acpRegistry', 'antigravity', 'cursor')
-# Option ids of a built-in driver that pick what runs other than as a model or reasoning id would say: an OpenCode
-# "agent" (packages/provider-opencode/src/server/adapter.ts turnPromptOptions) may set its own model and variant, so
-# it is never an option that changes neither (#629)
-DRIVER_MODEL_OPTION_IDS = {'opencode': ('agent',)}
+# Every built-in driver kind of T3 (a contract test reads the list from T3's code). A row naming one of them in
+# another case or with spaces around it is refused: a pick of it could run on that driver's instance, which the
+# guard would then check with the wrong row's ids (#638 review).
+BUILT_IN_DRIVER_KINDS = tuple(DRIVER_EFFORT_IDS) + AGENT_NAMED_EFFORT_DRIVERS
+# Option ids of a built-in driver that pick an agent, which brings settings the guard cannot see: an OpenCode "agent"
+# (packages/provider-opencode/src/server/adapter.ts turnPromptOptions; its own prompt, tools and settings) and a
+# Kiro "mode" (packages/provider-kiro/src/server/acpSupport.ts KIRO_AGENT_CONFIG_ID, which switches Kiro's agent and
+# with it the agent's own model). Never an option that changes neither, and never read as an effort (#629, #638).
+DRIVER_MODEL_OPTION_IDS = {'kiro': ('mode',), 'opencode': ('agent',)}
 CLAUDE_EFFORT_ID = DRIVER_EFFORT_IDS[CLAUDE_DRIVER]
 # T3's option id for an ACP agent's session mode (packages/provider-acp/src/server/sessionConfig.ts
 # ACP_SESSION_MODE_OPTION_ID). Some agents repeat their reasoning levels as modes; T3 then hides the control but still
@@ -212,6 +217,12 @@ def parse_policy(text, path):
     for i, raw in enumerate(policy['allow']):
         where = f'{path}.allow[{i}]'
         row = machine_file.fields(raw, ROW, where)
+        twin = [k for k in BUILT_IN_DRIVER_KINDS
+                if k != row['driver'] and k.casefold() == js_trim(row['driver']).casefold()]
+        if twin:
+            raise PolicyError(f'{where}.driver: {row["driver"]!r} is not T3\'s driver kind {twin[0]!r}: write it '
+                              f'exactly so (a pick of it may run on a {twin[0]} instance, which reads other option '
+                              f'ids)')
         if row['defaultEffort'] is not None and row['defaultEffort'] not in (row['efforts'] or ()):
             raise PolicyError(f'{where}.defaultEffort: {row["defaultEffort"]!r} is not one of its efforts')
         if not row['ultracodeOption'] and row['driver'] != CLAUDE_DRIVER:
@@ -227,6 +238,10 @@ def parse_policy(text, path):
                                   f'T3\'s own)')
             if ULTRACODE_OPTION_ID in ids:
                 raise PolicyError(f'{where}.{key}: ultracode is always read as the effort ultracode')
+        agents = [i for i in effort_ids if i in DRIVER_MODEL_OPTION_IDS.get(row['driver'], ())]
+        if agents:
+            raise PolicyError(f'{where}.effortOptionIds: {agents[0]!r} picks an agent of {row["driver"]}, which '
+                              f'brings settings the guard cannot see, so it is never read as an effort')
         both = [i for i in other_ids if i in effort_ids or i in EFFORT_OPTION_IDS
                 or i == DRIVER_EFFORT_IDS.get(row['driver'])]
         if both:
