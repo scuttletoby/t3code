@@ -227,14 +227,15 @@
       ]
     },
     "apps/server/src/mcp/McpToolAccess.ts": {
-      "why": "A thread whose MCP profile is narrower than \"all\" cannot start a thread on another machine, which would get that machine's profile (#681). Upstream's caller check stays as it is: startsThreads' own path marks its caller (startsHere), and working out the modes refuses a narrowed caller nothing marked (refuseUnlessHere), so its remote check refuses; the logic is in fork/launchMcpProfile.ts.",
+      "why": "A thread whose MCP profile is narrower than \"all\" cannot start a thread on another machine, which would get that machine's profile (#681). Upstream's caller check stays as it is: startsThreads' own path marks its caller (startsHere), and working out the modes refuses a narrowed caller nothing marked (refuseUnlessHere), so its remote check refuses; a forwarded fork, scheduled task change or run now from a narrowed caller is refused too (checkForwarded, #693); the logic is in fork/launchMcpProfile.ts.",
       "added": [],
       "announced": {
         "since": "2026-11-20",
         "added": [
           "import * as LaunchMcpProfile from \"../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
           "yield* LaunchMcpProfile.refuseUnlessHere(caller); // Fork: MCP profile launch",
-          "LaunchMcpProfile.startsHere(caller); // Fork: MCP profile launch"
+          "LaunchMcpProfile.startsHere(caller); // Fork: MCP profile launch",
+          "yield* LaunchMcpProfile.checkForwarded(name, params); // Fork: MCP profile launch"
         ]
       }
     },
@@ -262,13 +263,14 @@
       }
     },
     "apps/server/src/mcp/toolkits/thread/handlers.ts": {
-      "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile (fork/launchMcpProfile.ts, #693).",
+      "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693).",
       "added": [],
       "announced": {
         "since": "2026-11-20",
         "added": [
           "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
-          "yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch"
+          "yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch",
+          "yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch"
         ]
       }
     }
