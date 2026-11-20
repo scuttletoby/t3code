@@ -29,7 +29,7 @@ export type HandoffRecords = Pick<
  * relay may not have shown the person's finish, `handoffRelayView.ts`), and `:retry1` for its one
  * retry.
  */
-const HANDOFF_MESSAGE_PREFIX = "handoff:";
+export const HANDOFF_MESSAGE_PREFIX = "handoff:";
 export const HANDOFF_LOUD_SUFFIX = ":loud";
 export const HANDOFF_RETRY_SUFFIX = ":retry1";
 
