@@ -465,20 +465,25 @@ class Contract:
 
     def test_uninstall_stopped_anywhere_then_run_again_finishes(self):
         """Stopped right after any one change it makes (a kill), uninstall run again finishes and leaves nothing.
-        The installer's own link goes last: while the version it runs is still there, the link is too, so the run
-        again can be made with it."""
+        The installer's own link goes after <libexec>: stopped before <libexec> is touched, the link still runs the
+        whole version, so the run again can be made with it. (Stopped while <libexec> goes, in whatever order the
+        filesystem lists it, needs the bootstrap: the README says so.)"""
         own = [p for p, rel in self.m.LINKS.items() if rel == f'sbin/{self.m.PROG}'][0]
+
+        def libexec_untouched(snapshot):
+            return self.files_under(self.path(self.m.LIBEXEC)) == snapshot
         for n in range(1, 500):             # no subTest: a failure must end the loop, not go on to n + 1
             with self.stop_context(n):
                 shutil.rmtree(self.root)
                 os.makedirs(self.root)
                 self.assertEqual(self.install()[0], 0)
+                installed = self.files_under(self.path(self.m.LIBEXEC))
                 code, _, err, stopped = self.uninstall_stopped_after(n)
                 if not stopped:
                     self.assertEqual(code, 0, err)
                     break
                 self.assertEqual(code, 'stopped (test)')
-                if os.path.isfile(self.version(rel=f'sbin/{self.m.PROG}')):
+                if libexec_untouched(installed):
                     self.assertTrue(self.is_file(own), 'the installer link went before its code')
                 code, _, err = self.run_main('uninstall')
                 self.assertEqual(code, 0, err)

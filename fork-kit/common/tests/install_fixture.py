@@ -183,6 +183,17 @@ class FakeHost(unittest.TestCase):
         shutil.copytree(COMMON, os.path.join(self.root, 'common'), ignore=shutil.ignore_patterns('__pycache__'))
         return src
 
+    @staticmethod
+    def files_under(top):
+        """Every path below top (links not followed) with what it is: a link's target, or 'dir' / 'file'."""
+        seen = {}
+        for folder, dirs, files in os.walk(top):
+            for name in dirs + files:
+                p = os.path.join(folder, name)
+                seen[os.path.relpath(p, top)] = (os.readlink(p) if os.path.islink(p)
+                                                 else 'dir' if os.path.isdir(p) else 'file')
+        return seen
+
     def version(self, sha=SHA1, rel=''):
         return self.path(f'{self.m.LIBEXEC}/versions/{sha}' + (f'/{rel}' if rel else ''))
 
