@@ -15,6 +15,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { ServerConfig } from "../../config.ts";
@@ -30,6 +31,18 @@ export const RUNS_FILE = "runs.jsonl";
 export const CURSOR_FILE = "cursor.json";
 /** Runs recorded last, kept in the cursor so a repeated end of the same run writes no second line. */
 const RECENT_LIMIT = 1000;
+/** Reads of one run's records that may fail (a busy database) before the run is skipped. */
+export const READ_ATTEMPTS = 3;
+
+/** A run's records could not be read: the follower stops and retries from its cursor. */
+export class RunRecordReadError extends Schema.TaggedError<RunRecordReadError>()(
+  "RunRecordReadError",
+  { runId: Schema.String, attempt: Schema.Number, cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return `Could not read the records of run ${this.runId} (attempt ${this.attempt}).`;
+  }
+}
 
 interface Cursor {
   readonly v: 1;
@@ -87,11 +100,23 @@ export const make = Effect.fn("RunRecorder.make")(function* (options: {
       Effect.map(decodeCursor),
       Effect.orElseSucceed(() => null),
     );
-    if (saved !== null) {
+    const latest = yield* events.latestAgentSequence();
+    if (saved !== null && saved.sequence <= latest) {
       state = saved;
       return saved;
     }
-    const cursor: Cursor = { v: 1, sequence: yield* events.latestAgentSequence(), recent: [] };
+    // Ahead of the database (it was restored or replaced beside old records): every new event
+    // would be skipped until the sequence caught up, so start again at the latest event.
+    if (saved !== null) {
+      yield* Effect.logWarning(
+        "run records cursor is ahead of the event store; starting at latest",
+        {
+          cursorSequence: saved.sequence,
+          latestSequence: latest,
+        },
+      );
+    }
+    const cursor: Cursor = { v: 1, sequence: latest, recent: saved?.recent ?? [] };
     yield* fs.makeDirectory(options.directory, { recursive: true });
     yield* saveCursor(cursor);
     return cursor;
@@ -161,6 +186,36 @@ export const make = Effect.fn("RunRecorder.make")(function* (options: {
     cleanEnd = true;
   });
 
+  /** Failed reads per run in this process; a run is skipped after `READ_ATTEMPTS`. */
+  const readFailures = new Map<string, number>();
+
+  /**
+   * The run's record. A thread that is gone skips the run. Any other failed read (a busy or locked
+   * database) fails, so the follower retries from its cursor, until the run has failed
+   * `READ_ATTEMPTS` times; then it is skipped with a warning and the next run is recorded.
+   */
+  const readOrSkip = (run: OrchestrationV2Run) =>
+    readRecord(run).pipe(
+      Effect.tap(() => Effect.sync(() => readFailures.delete(run.id))),
+      Effect.catchTags({
+        ProjectionStoreThreadNotFoundError: () =>
+          Effect.logWarning("run record skipped: its thread is gone", { runId: run.id }).pipe(
+            Effect.as(null),
+          ),
+      }),
+      Effect.catchCause((cause) => {
+        const attempt = (readFailures.get(run.id) ?? 0) + 1;
+        if (attempt < READ_ATTEMPTS) {
+          readFailures.set(run.id, attempt);
+          return Effect.fail(new RunRecordReadError({ runId: run.id, attempt, cause }));
+        }
+        readFailures.delete(run.id);
+        return Effect.logWarning("run record skipped", { runId: run.id, attempt, cause }).pipe(
+          Effect.as(null),
+        );
+      }),
+    );
+
   /** One stored `run.updated` event: records the run if it just ended, then moves the cursor. */
   const handle = Effect.fn("RunRecorder.handle")(function* (stored: OrchestrationV2StoredEvent) {
     const cursor = yield* resume();
@@ -169,17 +224,23 @@ export const make = Effect.fn("RunRecorder.make")(function* (options: {
     if (event.type !== "run.updated") return;
     const run = event.payload;
     if (!TERMINAL_RUN_STATUSES.has(run.status) || cursor.recent.includes(run.id)) return;
-    const record = yield* readRecord(run).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("run record skipped", { runId: run.id, cause }).pipe(Effect.as(null)),
-      ),
-    );
-    if (record !== null) yield* append(record);
-    yield* saveCursor({
-      v: 1,
-      sequence: stored.sequence,
-      recent: [...cursor.recent, run.id].slice(-RECENT_LIMIT),
-    });
+    const record = yield* readOrSkip(run);
+    const recent = [...cursor.recent, run.id].slice(-RECENT_LIMIT);
+    // The line first, then the cursor: a crash between them leaves a duplicate line (readers keep
+    // the first), never a lost record.
+    if (record !== null) {
+      if (record.estimateRefused != null) {
+        yield* Effect.logWarning("run estimate tag refused: not a time or a token count", {
+          runId: run.id,
+          tag: record.estimateRefused,
+        });
+      }
+      yield* append(record);
+      // Known in this process at once: if the cursor save fails (a full disk), a retry from the
+      // old cursor writes no second line.
+      state = { ...cursor, recent };
+    }
+    yield* saveCursor({ v: 1, sequence: stored.sequence, recent });
   });
 
   /** Follows stored `run.updated` events from the cursor until the stream ends (never, live). */

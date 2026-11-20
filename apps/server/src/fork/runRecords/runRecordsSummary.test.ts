@@ -1,16 +1,21 @@
 /** Fork: the weekly run records summary and its command (issue 315). */
-import { assert, describe, it } from "@effect/vitest";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
+import { afterEach, assert, describe, it } from "@effect/vitest";
 
 import { parseRateTable } from "../../usage/usagePricing.ts";
 import type { RunRecord } from "./runRecord.ts";
 import {
   formatRunRecordsSummary,
   median,
+  pricedModel,
   summarizeRunRecords,
   WEEK_MS,
 } from "./runRecordsSummary.ts";
 import { iso, MINUTE_MS, NOW_MS } from "./runRecords.testkit.ts";
-import { runSummaryCli } from "./summaryCli.ts";
+import { nodeSummaryIo, readFileLines, runSummaryCli } from "./summaryCli.ts";
 
 const DAY_MS = 24 * 60 * MINUTE_MS;
 
@@ -101,11 +106,55 @@ describe("summarizeRunRecords", () => {
       summary.byModel.map((group) => group.key),
       ["claude-opus-5-5 (high)", "gpt-5"],
     );
-    // A model without a rate costs nothing in the sum rather than failing it.
-    assert.strictEqual(summary.byModel[1]!.listCostUsd, 0);
+    // A model without a rate has no price, and is counted as unpriced rather than as $0.
+    assert.strictEqual(summary.byModel[1]!.listCostUsd, null);
+    assert.strictEqual(summary.byModel[1]!.unpricedRuns, 1);
+    assert.strictEqual(summary.byModel[0]!.unpricedRuns, 0);
     assert.strictEqual(
       summarizeRunRecords([record("a")], { toMs: NOW_MS }).byKind[0]!.listCostUsd,
       null,
+    );
+  });
+
+  it("says how many runs of a group had no rate, and prices a run at the model that ran", () => {
+    const summary = summarizeRunRecords(
+      [record("priced"), record("unpriced", { model: "gpt-5", effort: null })],
+      { toMs: NOW_MS, rates },
+    );
+    const fix = summary.byKind[0]!;
+    assert.closeTo(fix.listCostUsd!, 0.002, 1e-9);
+    assert.strictEqual(fix.unpricedRuns, 1);
+    assert.include(formatRunRecordsSummary(summary), "| $0.00 (+1 unpriced) |");
+    // With a fallback model too, the requested model is priced, not the first name alphabetically.
+    const withFallback = record("fallback", {
+      executedModels: ["a-fallback-model", "claude-opus-5-5"],
+    });
+    assert.strictEqual(pricedModel(withFallback), "claude-opus-5-5");
+    assert.strictEqual(
+      summarizeRunRecords([withFallback], { toMs: NOW_MS, rates }).byKind[0]!.unpricedRuns,
+      0,
+    );
+    // The one model the provider reported running is priced, even when it was not the one asked for.
+    assert.strictEqual(
+      pricedModel(record("swapped", { model: "gpt-5", executedModels: ["claude-opus-5-5"] })),
+      "claude-opus-5-5",
+    );
+  });
+
+  it("counts runs whose estimate tag was refused, and gives them no estimate row", () => {
+    const summary = summarizeRunRecords(
+      [record("refused", { estimateRefused: "1-2h" }), record("plain")],
+      { toMs: NOW_MS },
+    );
+    assert.strictEqual(summary.refusedEstimates, 1);
+    assert.strictEqual(summary.estimates.length, 0);
+    assert.include(
+      formatRunRecordsSummary(summary),
+      "1 runs had an estimate tag that could not be read",
+    );
+    assert.notInclude(
+      formatRunRecordsSummary(summarizeRunRecords([record("plain")], { toMs: NOW_MS })),
+      "could not be read",
     );
   });
 
@@ -165,6 +214,7 @@ describe("summarizeRunRecords", () => {
       }),
     );
     assert.include(text, "| a/b | 1 | 0 | 0 | 10.0m | 1.1k | 1.1k | $0.00 | 0 |");
+    assert.include(text, "List price = public per-token price, not what a plan bills.");
     assert.include(text, "time 2.00x, tokens -");
     assert.include(text, "| a/b | 1 | 5.0m | 10.0m | - | 1.1k |");
   });
@@ -173,6 +223,7 @@ describe("summarizeRunRecords", () => {
 describe("runSummaryCli", () => {
   const files = (entries: Record<string, string>) => (path: string) => entries[path] ?? null;
   const io = (entries: Record<string, string>) => ({
+    readLines: (path: string) => entries[path]?.split("\n") ?? null,
     readFile: files(entries),
     env: {},
     homeDir: "/home/someone",
@@ -219,10 +270,74 @@ describe("runSummaryCli", () => {
     assert.include(runSummaryCli([], io({})), "0 recorded runs");
   });
 
+  it("fails, rather than print 0 runs, when a records file cannot be read or is missing", () => {
+    const failing = {
+      ...io({}),
+      readLines: (): Iterable<string> => {
+        throw new Error("EIO: i/o error, read");
+      },
+    };
+    assert.throws(() => runSummaryCli([], failing), /EIO/);
+    // A file named on the command line must exist; only the state folder's may be missing.
+    assert.throws(() => runSummaryCli(["/far/runs.jsonl"], io({})), /no such file/);
+  });
+
   it("refuses unknown options and bad values", () => {
     assert.throws(() => runSummaryCli(["--weeks", "2"], io({})), /unknown option/);
     assert.throws(() => runSummaryCli(["--days", "0"], io({})), /positive/);
     assert.throws(() => runSummaryCli(["--to", "soon"], io({})), /date/);
     assert.throws(() => runSummaryCli(["--days"], io({})), /needs a value/);
+  });
+});
+
+describe("reading real files", () => {
+  const made: Array<string> = [];
+  const tempDir = () => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "run-records-cli-"));
+    made.push(dir);
+    return dir;
+  };
+  afterEach(() => {
+    for (const dir of made.splice(0)) NodeFS.rmSync(dir, { recursive: true, force: true });
+  });
+  const lines = (...records: ReadonlyArray<RunRecord>) =>
+    records.map((entry) => `${JSON.stringify(entry)}\n`).join("");
+
+  it("streams lines across chunks, multi-byte text and a torn last line included", () => {
+    const dir = tempDir();
+    const file = NodePath.join(dir, "runs.jsonl");
+    const many = Array.from({ length: 200 }, (_, index) =>
+      record(`run-${index}`, { threadTitle: `Prüfung ✓ ${index}` }),
+    );
+    NodeFS.writeFileSync(file, `${lines(...many)}{"v":1,"runId":"torn","endedAt":"2026`);
+    // Chunks far smaller than a line: every line and every multi-byte letter is split somewhere.
+    const read = [...readFileLines(file, 7)!];
+    assert.strictEqual(read.length, 201);
+    assert.strictEqual(read[0], JSON.stringify(many[0]));
+    assert.strictEqual(read[199], JSON.stringify(many[199]));
+    assert.strictEqual(read[200], '{"v":1,"runId":"torn","endedAt":"2026');
+    assert.strictEqual(readFileLines(NodePath.join(dir, "missing.jsonl")), null);
+  });
+
+  it("skips a line too long to be a record and reads on", () => {
+    const dir = tempDir();
+    const file = NodePath.join(dir, "runs.jsonl");
+    NodeFS.writeFileSync(file, `${"x".repeat(1.5 * 2 ** 20)}\n${lines(record("after"))}`);
+    assert.deepStrictEqual([...readFileLines(file, 4096)!], [JSON.stringify(record("after"))]);
+  });
+
+  it("summarizes the state folder's file and fails on one it cannot read", () => {
+    const dir = tempDir();
+    NodeFS.mkdirSync(NodePath.join(dir, "run-records"));
+    const own = NodePath.join(dir, "run-records", "runs.jsonl");
+    NodeFS.writeFileSync(own, lines(record("here")));
+    const real = { ...nodeSummaryIo(), nowMs: NOW_MS };
+    assert.include(runSummaryCli(["--state-dir", dir], real), "1 recorded runs");
+    // No records yet: a fresh state folder.
+    assert.include(runSummaryCli(["--state-dir", tempDir()], real), "0 recorded runs");
+    // Unreadable (here a folder in its place): an error and a failing exit, never "0 recorded runs".
+    NodeFS.rmSync(own);
+    NodeFS.mkdirSync(own);
+    assert.throws(() => runSummaryCli(["--state-dir", dir], real), /EISDIR/);
   });
 });

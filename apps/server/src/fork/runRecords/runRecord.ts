@@ -63,6 +63,11 @@ export interface RunRecord {
   readonly kind: string | null;
   /** `[run-estimate: ...]` in the task: the parent's guess before it ran. */
   readonly estimate: RunEstimate | null;
+  /**
+   * The estimate tag's text when it could not be read (then `estimate` is null): a refused tag is
+   * kept, never guessed at. Absent in records written before this field.
+   */
+  readonly estimateRefused?: string | null;
   /** The run this one continues after a restart, a Continue, or a usage-limit reset. */
   readonly continuationOf: string | null;
   readonly providerInstanceId: string;
@@ -94,29 +99,105 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<OrchestrationV2Run["status"]> = 
 const ROLE_PREFIX = /^Act as the ([^\n]{1,60}?) sub-agent for this task\./u;
 const KIND_TAG = /\[run-kind:\s*([^\]\n]{1,80}?)\s*\]/iu;
 const ESTIMATE_TAG = /\[run-estimate:\s*([^\]\n]{1,80}?)\s*\]/iu;
-const DURATION = /(\d+(?:\.\d+)?)\s*(h|m|min|s)\b/giu;
-const TOKENS = /(\d+(?:\.\d+)?)\s*([kKmM])?\s*tok(?:en)?s?\b/u;
+const DURATION_UNITS: Readonly<Record<string, number>> = {
+  h: 3_600_000,
+  hr: 3_600_000,
+  hrs: 3_600_000,
+  hour: 3_600_000,
+  hours: 3_600_000,
+  m: 60_000,
+  min: 60_000,
+  mins: 60_000,
+  minute: 60_000,
+  minutes: 60_000,
+  s: 1000,
+  sec: 1000,
+  secs: 1000,
+  second: 1000,
+  seconds: 1000,
+};
+/** Scales a token count takes; only before the word "tokens", so `2m` alone stays two minutes. */
+const TOKEN_SCALES: Readonly<Record<string, number>> = {
+  "": 1,
+  k: 1e3,
+  thousand: 1e3,
+  m: 1e6,
+  mil: 1e6,
+  million: 1e6,
+  b: 1e9,
+  billion: 1e9,
+};
+const TOKEN_WORDS = new Set(["tok", "toks", "token", "tokens"]);
+/** Joins parts: spaces, commas, `;`, `+`, `~` (about) and the word "and". */
+const ESTIMATE_GAP = /(?:[\s,;+~]|and(?![a-z]))*/iuy;
+/** A number (`2`, `2.5`, `1e6`, `1,500,000`), its unit, and the word "tokens" if one follows. */
+const ESTIMATE_PART =
+  /(\d{1,3}(?:,\d{3})+(?![\d.])|\d+(?:\.\d+)?(?:e\+?\d+)?)\s*([a-z]*)(?:\s*(tokens?|toks?)(?![a-z]))?(?![a-z])/iuy;
 
-const UNIT_MS: Readonly<Record<string, number>> = { h: 3_600_000, m: 60_000, min: 60_000, s: 1000 };
-const TOKEN_SCALE: Readonly<Record<string, number>> = { k: 1e3, m: 1e6 };
+/** What a `[run-estimate: ...]` tag says: the estimate, or the tag text when it could not be read. */
+export interface EstimateTag {
+  readonly estimate: RunEstimate | null;
+  /** The tag's text when any part of it was not a time or a token count. Never a guess. */
+  readonly refused: string | null;
+}
 
-/** `[run-estimate: 1h 30m 2.5M tokens]`: a wall time, a token count, or both. Null when neither. */
-export function parseEstimate(text: string): RunEstimate | null {
+/**
+ * Reads a tag's text: times (`1h30m`, `1h 30m`, `90 min`, `1.5h`, `45s`) and one token count
+ * (`2M tokens`, `2.5m tokens`, `300k tokens`, `1e6 tokens`, `1,500,000 tokens`). Anything else in the
+ * text (a range, a lone `2M`, an unknown unit, two token counts, a time unit twice) refuses the whole
+ * tag rather than guessing.
+ */
+function readEstimateText(text: string): RunEstimate | null {
+  let at = 0;
+  let wallMs = 0;
+  let tokens: number | null = null;
+  const timeUnits = new Set<number>();
+  const skipGap = () => {
+    ESTIMATE_GAP.lastIndex = at;
+    ESTIMATE_GAP.exec(text);
+    at = ESTIMATE_GAP.lastIndex;
+  };
+  skipGap();
+  while (at < text.length) {
+    ESTIMATE_PART.lastIndex = at;
+    const part = ESTIMATE_PART.exec(text);
+    if (part === null) return null;
+    at = ESTIMATE_PART.lastIndex;
+    const value = Number(part[1]!.replaceAll(",", ""));
+    const unit = part[2]!;
+    const lower = unit.toLowerCase();
+    if (!Number.isFinite(value)) return null;
+    if (part[3] !== undefined || TOKEN_WORDS.has(lower)) {
+      const scale = TOKEN_WORDS.has(lower) ? 1 : TOKEN_SCALES[lower];
+      if (scale === undefined || tokens !== null) return null;
+      tokens = value * scale;
+    } else {
+      const unitMs = DURATION_UNITS[lower];
+      // A capital `M` alone reads as "million" as easily as "minutes": refused.
+      if (unitMs === undefined || unit === "M" || timeUnits.has(unitMs)) return null;
+      timeUnits.add(unitMs);
+      wallMs += value * unitMs;
+    }
+    skipGap();
+  }
+  const estimate: { wallMs?: number; tokens?: number } = {};
+  if (timeUnits.size > 0) estimate.wallMs = Math.round(wallMs);
+  if (tokens !== null) estimate.tokens = Math.round(tokens);
+  const safe = Object.values(estimate).every((n) => Number.isSafeInteger(n) && n > 0);
+  return safe && Object.keys(estimate).length > 0 ? estimate : null;
+}
+
+/** `[run-estimate: 1h 30m 2.5M tokens]` in a text: null when there is no tag. */
+export function readEstimateTag(text: string): EstimateTag | null {
   const tag = ESTIMATE_TAG.exec(text)?.[1];
   if (tag === undefined) return null;
-  const tokens = TOKENS.exec(tag);
-  const withoutTokens = tokens === null ? tag : tag.replace(tokens[0], " ");
-  let wallMs = 0;
-  for (const match of withoutTokens.matchAll(DURATION)) {
-    wallMs += Number(match[1]) * (UNIT_MS[match[2]!.toLowerCase()] ?? 0);
-  }
-  const tokenCount =
-    tokens === null ? 0 : Number(tokens[1]) * (TOKEN_SCALE[(tokens[2] ?? "").toLowerCase()] ?? 1);
-  const estimate = {
-    ...(wallMs > 0 ? { wallMs: Math.round(wallMs) } : {}),
-    ...(tokenCount > 0 ? { tokens: Math.round(tokenCount) } : {}),
-  };
-  return Object.keys(estimate).length === 0 ? null : estimate;
+  const estimate = readEstimateText(tag);
+  return estimate === null ? { estimate: null, refused: tag } : { estimate, refused: null };
+}
+
+/** The estimate in a text, or null when there is none or it was refused. */
+export function parseEstimate(text: string): RunEstimate | null {
+  return readEstimateTag(text)?.estimate ?? null;
 }
 
 /** The labels a parent puts in a delegated task's text. */
@@ -124,12 +205,16 @@ export function parseTaskLabels(text: string | null): {
   readonly role: string | null;
   readonly kind: string | null;
   readonly estimate: RunEstimate | null;
+  /** The estimate tag's text when it could not be read; see `readEstimateTag`. */
+  readonly estimateRefused: string | null;
 } {
-  if (text === null) return { role: null, kind: null, estimate: null };
+  if (text === null) return { role: null, kind: null, estimate: null, estimateRefused: null };
+  const estimate = readEstimateTag(text);
   return {
     role: ROLE_PREFIX.exec(text.trimStart())?.[1]?.trim() ?? null,
     kind: KIND_TAG.exec(text)?.[1] ?? null,
-    estimate: parseEstimate(text),
+    estimate: estimate?.estimate ?? null,
+    estimateRefused: estimate?.refused ?? null,
   };
 }
 
@@ -263,7 +348,10 @@ export function buildRunRecord(input: RunRecordInput): RunRecord | null {
       fromTask.kind ??
       fromRun.kind ??
       (delegated ? (task?.title ?? (task === null ? thread.title : null)) : null),
-    estimate: fromTask.estimate ?? fromRun.estimate,
+    // The first text that has a tag decides; a refused tag is never replaced by a guess.
+    ...(fromTask.estimate !== null || fromTask.estimateRefused !== null
+      ? { estimate: fromTask.estimate, estimateRefused: fromTask.estimateRefused }
+      : { estimate: fromRun.estimate, estimateRefused: fromRun.estimateRefused }),
     continuationOf:
       run.restartContinuationOfRunId ??
       run.manualContinuationOfRunId ??
@@ -287,13 +375,17 @@ export function buildRunRecord(input: RunRecordInput): RunRecord | null {
 }
 
 /**
- * The records in a `runs.jsonl` text: each run once (the first line wins), lines of an unknown
- * version and torn or foreign lines skipped.
+ * The records in a `runs.jsonl` text, or in its lines as a reader streams them: each run once (the
+ * first line wins), lines of an unknown version and torn or foreign lines skipped. `keep` drops
+ * records as they are read (a summary's window), so a large file never sits in memory whole.
  */
-export function parseRunRecordLines(text: string): ReadonlyArray<RunRecord> {
+export function parseRunRecordLines(
+  text: string | Iterable<string>,
+  keep: (record: RunRecord) => boolean = () => true,
+): ReadonlyArray<RunRecord> {
   const seen = new Set<string>();
   const records: Array<RunRecord> = [];
-  for (const line of text.split("\n")) {
+  for (const line of typeof text === "string" ? text.split("\n") : text) {
     if (line.trim() === "") continue;
     let value: unknown;
     try {
@@ -301,7 +393,7 @@ export function parseRunRecordLines(text: string): ReadonlyArray<RunRecord> {
     } catch {
       continue;
     }
-    if (!isRunRecord(value) || seen.has(value.runId)) continue;
+    if (!isRunRecord(value) || !keep(value) || seen.has(value.runId)) continue;
     seen.add(value.runId);
     records.push(value);
   }

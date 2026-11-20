@@ -22,7 +22,7 @@ Each record holds:
 | `parent`                                                        | The thread that delegated this one (`threadId`, the task's `taskId`), or for a task from a linked machine that machine's `environmentId` and thread. Null for a top-level thread. |
 | `role`                                                          | The delegate call's role, read from "Act as the _role_ sub-agent".                                                                                                                |
 | `kind`                                                          | `[run-kind: ...]` from the task text, else the delegated task's title.                                                                                                            |
-| `estimate`                                                      | `[run-estimate: ...]` from the task text: `wallMs`, `tokens`, or both.                                                                                                            |
+| `estimate`, `estimateRefused`                                   | `[run-estimate: ...]` from the task text: `wallMs`, `tokens`, or both. When the tag could not be read, `estimate` is null and `estimateRefused` holds the tag's text.             |
 | `continuationOf`                                                | The run this one continues after a restart, a Continue or a usage-limit reset.                                                                                                    |
 | `model`, `effort`, `modelOptions`, `executedModels`             | What was asked for, and what the provider reported running.                                                                                                                       |
 | `requestedAt`, `startedAt`, `endedAt`, `wallMs`, `queuedMs`     | Times. `wallMs` is start to end.                                                                                                                                                  |
@@ -39,8 +39,16 @@ or ended without a final answer. Its usage is whatever its provider reported unt
 Put these anywhere in the `delegate_task` task text:
 
 - `[run-kind: lens: data]`: a free-text kind, grouped by in the summary.
-- `[run-estimate: 40m 2M tokens]`: the parent's guess. Times take `h`, `m`, `min` and `s`; tokens
-  take `k` and `M`.
+- `[run-estimate: 40m 2M tokens]`: the parent's guess, a time, a token count, or both.
+  - Times: `1h30m`, `1h 30m`, `1.5h`, `90 min`, `45s` (`h`, `hr`, `hour(s)`, `m`, `min`, `minute(s)`,
+    `s`, `sec`, `second(s)`; any case).
+  - Tokens need the word "tokens" (or `tok`): `2M tokens`, `2.5m tokens`, `300k tokens`,
+    `2 million tokens`, `1e6 tokens`, `1,500,000 tokens`. Without it, `m` means minutes.
+  - Parts may be joined by spaces, `,`, `;`, `+`, `~` or "and".
+  - Anything else refuses the whole tag, and nothing is guessed: a range (`30-40m`), a lone `2M`
+    (minutes or a million?), `300k` without "tokens", words like "about", a time unit twice, or two
+    token counts. A refused tag is kept in `estimateRefused`, logged as a warning, and counted in the
+    summary.
 
 ## The weekly summary
 
@@ -52,7 +60,14 @@ node apps/server/src/fork/runRecords/summaryCli.ts [--days 7] [--to 2026-11-20] 
 It reads files only, so it is safe beside a running server. It prints runs, cut-off and failed runs,
 median and total time and tokens per kind, role and model, and estimate against actual per
 delegated task (all of a task's runs summed). With the model rates the Usage page saved, it adds a
-list price; that is the public per-token price, not what a subscription bills.
+list price; that is the public per-token price, not what a subscription bills. A run is priced at
+the model the provider reported running when it reported one, else at the model asked for. Runs
+whose model has no rate are left out of the price and counted (`+2 unpriced`); `-` means none had
+a rate.
+
+It reads the files line by line and keeps only the window's records, so a file of any size works
+(a whole string would stop past about 512 MB). A records file it cannot read (other than the state
+folder's own file not existing yet) is an error with a non-zero exit, never "0 recorded runs".
 
 Runs that ended before a machine first ran this version have no record, and are absent from the
 summary.
@@ -62,4 +77,11 @@ summary.
 The records follow the server's stored events from the cursor, so a run that ends while the server
 is down or restarting is recorded at the next start. A run already recorded is not written again,
 and readers keep the first line of a run, so a crash between writing a line and moving the cursor
-costs nothing. A cursor that cannot be read starts again at the newest event.
+costs nothing. If the cursor cannot be saved after the line was written (a full disk), the run is
+remembered in memory, so retries write no second line. A cursor that cannot be read starts again at
+the newest event, and so does a cursor ahead of the newest event (the database was restored or
+replaced beside an old records folder), with a warning.
+
+If a run's records cannot be read (a busy database), the follower stops and retries from its
+cursor; after 3 failed tries in one server process the run is skipped with a warning. A run whose
+thread is gone is skipped at once.

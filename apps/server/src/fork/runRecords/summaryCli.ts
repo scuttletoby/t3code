@@ -16,7 +16,9 @@ import { formatRunRecordsSummary, summarizeRunRecords } from "./runRecordsSummar
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export interface SummaryCliIo {
-  /** The file's text, or null when it is missing or unreadable. */
+  /** The file's lines as they are read, or null when it does not exist. Other errors throw. */
+  readonly readLines: (path: string) => Iterable<string> | null;
+  /** A small file's text, or null when it does not exist. Other errors throw. */
   readonly readFile: (path: string) => string | null;
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly homeDir: string;
@@ -45,13 +47,28 @@ export function runSummaryCli(argv: ReadonlyArray<string>, io: SummaryCliIo): st
   }
   if (!Number.isFinite(days) || days <= 0) throw new Error("--days needs a positive number");
   if (!Number.isFinite(toMs)) throw new Error("--to needs a date like 2026-11-20");
-  const files = [NodePath.join(stateDir, "run-records", "runs.jsonl"), ...extraFiles];
-  const records: Array<RunRecord> = files.flatMap((file) =>
-    parseRunRecordLines(io.readFile(file) ?? ""),
+  const fromMs = toMs - days * DAY_MS;
+  const inWindow = (record: RunRecord) => {
+    const ended = Date.parse(record.endedAt);
+    return ended >= fromMs && ended < toMs;
+  };
+  // The state folder's file is missing before the first recorded run; a file named here is not.
+  const ownFile = NodePath.join(stateDir, "run-records", "runs.jsonl");
+  const sources = [
+    { file: ownFile, lines: io.readLines(ownFile) },
+    ...extraFiles.map((file) => {
+      const lines = io.readLines(file);
+      if (lines === null) throw new Error(`${file}: no such file`);
+      return { file, lines };
+    }),
+  ];
+  // Line by line, keeping only the window's records: the file can grow past what one string holds.
+  const records: Array<RunRecord> = sources.flatMap(({ lines }) =>
+    lines === null ? [] : parseRunRecordLines(lines, inWindow),
   );
   const summary = summarizeRunRecords(records, {
     toMs,
-    fromMs: toMs - days * DAY_MS,
+    fromMs,
     rates: readRates(io.readFile(NodePath.join(stateDir, "usage-model-rates.json"))),
   });
   return json ? `${JSON.stringify(summary, null, 2)}\n` : formatRunRecordsSummary(summary);
@@ -68,26 +85,84 @@ function readRates(text: string | null): RateTable | null {
   }
 }
 
+const isMissing = (error: unknown) => (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
+
+const CHUNK_BYTES = 1 << 20;
+/** A longer line is no record (one is about 1 KB): it is skipped up to the next new line. */
+const MAX_LINE_CHARS = 1 << 20;
+
+/**
+ * A file's lines, read a chunk at a time, so no string ever holds more than one chunk and one line.
+ * Null when the file does not exist; any other error (unreadable, a folder) throws as it is read.
+ */
+export function readFileLines(file: string, chunkBytes = CHUNK_BYTES): Iterable<string> | null {
+  let fd: number;
+  try {
+    fd = NodeFS.openSync(file, "r");
+  } catch (error) {
+    if (isMissing(error)) return null;
+    throw error;
+  }
+  const openFd = fd;
+  return (function* () {
+    const decoder = new TextDecoder("utf-8");
+    const buffer = new Uint8Array(chunkBytes);
+    let pending = "";
+    let skipping = false;
+    try {
+      for (;;) {
+        const read = NodeFS.readSync(openFd, buffer, 0, chunkBytes, null);
+        const text =
+          read === 0
+            ? decoder.decode()
+            : decoder.decode(buffer.subarray(0, read), { stream: true });
+        let start = 0;
+        for (let end = text.indexOf("\n"); end !== -1; end = text.indexOf("\n", start)) {
+          const line = pending + text.slice(start, end);
+          start = end + 1;
+          pending = "";
+          if (skipping) skipping = false;
+          else yield line;
+        }
+        if (!skipping) {
+          pending += text.slice(start);
+          if (pending.length > MAX_LINE_CHARS) {
+            pending = "";
+            skipping = true;
+          }
+        }
+        if (read === 0) break;
+      }
+      if (!skipping && pending !== "") yield pending;
+    } finally {
+      NodeFS.closeSync(openFd);
+    }
+  })();
+}
+
+/** Reads the real files; used when the command runs. */
+export const nodeSummaryIo = (): SummaryCliIo => ({
+  readLines: (file) => readFileLines(file),
+  readFile: (file) => {
+    try {
+      return NodeFS.readFileSync(file, "utf8");
+    } catch (error) {
+      if (isMissing(error)) return null;
+      throw error;
+    }
+  },
+  env: process.env,
+  homeDir: NodeOS.homedir(),
+  nowMs: Date.now(),
+});
+
 const invokedDirectly =
   process.argv[1] !== undefined &&
   import.meta.url === NodeURL.pathToFileURL(NodePath.resolve(process.argv[1])).href;
 
 if (invokedDirectly) {
   try {
-    process.stdout.write(
-      runSummaryCli(process.argv.slice(2), {
-        readFile: (file) => {
-          try {
-            return NodeFS.readFileSync(file, "utf8");
-          } catch {
-            return null;
-          }
-        },
-        env: process.env,
-        homeDir: NodeOS.homedir(),
-        nowMs: Date.now(),
-      }),
-    );
+    process.stdout.write(runSummaryCli(process.argv.slice(2), nodeSummaryIo()));
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 2;

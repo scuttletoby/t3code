@@ -22,8 +22,13 @@ export interface GroupSummary {
   readonly totalTokens: number;
   /** Runs whose usage the provider reported only in part, or not at all. */
   readonly usageIncomplete: number;
-  /** At list price from the saved model rates; null without rates. Not what a plan bills. */
+  /**
+   * At list price from the saved model rates, over the runs that have a rate; null without rates
+   * or when no run had one. Not what a plan bills.
+   */
   readonly listCostUsd: number | null;
+  /** Runs left out of `listCostUsd`: their model has no saved rate. */
+  readonly unpricedRuns: number;
 }
 
 export interface EstimateRow {
@@ -47,6 +52,8 @@ export interface RunRecordsSummary {
   /** Median of actual / estimate over the tasks that gave one; null when none did. */
   readonly medianWallRatio: number | null;
   readonly medianTokenRatio: number | null;
+  /** Runs whose `[run-estimate: ...]` tag could not be read; they count as giving none. */
+  readonly refusedEstimates: number;
 }
 
 const runTokens = (record: RunRecord) => record.usage.inputTokens + record.usage.outputTokens;
@@ -58,11 +65,19 @@ export function median(values: ReadonlyArray<number>): number {
   return sorted.length % 2 === 1 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 }
 
+/**
+ * The model a run is priced at: the one the provider reported running when it reported exactly one,
+ * else the requested model (with a fallback model too, the requested one did most of the work).
+ */
+export function pricedModel(record: RunRecord): string {
+  return record.executedModels.length === 1 ? record.executedModels[0]! : record.model;
+}
+
 /** List price of one run's tokens, or null when the model has no rate. */
 function listCostUsd(record: RunRecord, rates: RateTable): number | null {
   const { usage } = record;
   const priced = priceUsage(rates, {
-    model: record.executedModels[0] ?? record.model,
+    model: pricedModel(record),
     totals: {
       uncachedInputTokens: Math.max(
         0,
@@ -87,11 +102,14 @@ function group(
   const groups = new Map<string, Array<RunRecord>>();
   for (const record of records) {
     const key = keyOf(record);
-    groups.set(key, [...(groups.get(key) ?? []), record]);
+    const members = groups.get(key);
+    if (members === undefined) groups.set(key, [record]);
+    else members.push(record);
   }
   return [...groups.entries()]
     .map(([key, members]) => {
       const costs = rates === null ? [] : members.map((record) => listCostUsd(record, rates));
+      const priced = costs.filter((cost): cost is number => cost !== null);
       return {
         key,
         runs: members.length,
@@ -102,8 +120,8 @@ function group(
         medianTokens: median(members.map(runTokens)),
         totalTokens: members.reduce((sum, record) => sum + runTokens(record), 0),
         usageIncomplete: members.filter((record) => record.usage.status !== "complete").length,
-        listCostUsd:
-          rates === null ? null : costs.reduce<number>((sum, cost) => sum + (cost ?? 0), 0),
+        listCostUsd: priced.length === 0 ? null : priced.reduce((sum, cost) => sum + cost, 0),
+        unpricedRuns: rates === null ? members.length : costs.length - priced.length,
       };
     })
     .toSorted((left, right) => right.runs - left.runs || left.key.localeCompare(right.key));
@@ -127,7 +145,9 @@ export function summarizeRunRecords(
   const tasks = new Map<string, Array<RunRecord>>();
   for (const record of inWindow) {
     if (record.parent === null) continue;
-    tasks.set(record.threadId, [...(tasks.get(record.threadId) ?? []), record]);
+    const runs = tasks.get(record.threadId);
+    if (runs === undefined) tasks.set(record.threadId, [record]);
+    else runs.push(record);
   }
   const estimates: Array<EstimateRow> = [];
   for (const [threadId, runs] of tasks) {
@@ -163,6 +183,7 @@ export function summarizeRunRecords(
     estimates,
     medianWallRatio: ratios((row) => [row.actualWallMs, row.estimate.wallMs]),
     medianTokenRatio: ratios((row) => [row.actualTokens, row.estimate.tokens]),
+    refusedEstimates: inWindow.filter((record) => (record.estimateRefused ?? null) !== null).length,
   };
 }
 
@@ -174,10 +195,16 @@ const tokens = (count: number) =>
       ? `${(count / 1e3).toFixed(1)}k`
       : `${count}`;
 
+/** `-` when no run had a rate; `+N unpriced` when some had none, so a low sum says so. */
+const listPrice = (row: GroupSummary) =>
+  row.listCostUsd === null
+    ? "-"
+    : `$${row.listCostUsd.toFixed(2)}${row.unpricedRuns > 0 ? ` (+${row.unpricedRuns} unpriced)` : ""}`;
+
 function table(title: string, groups: ReadonlyArray<GroupSummary>): string {
   const rows = groups.map(
     (row) =>
-      `| ${row.key.replaceAll("|", "/")} | ${row.runs} | ${row.cutOff} | ${row.failed} | ${minutes(row.medianWallMs)} | ${tokens(row.medianTokens)} | ${tokens(row.totalTokens)} | ${row.listCostUsd === null ? "-" : `$${row.listCostUsd.toFixed(2)}`} | ${row.usageIncomplete} |`,
+      `| ${row.key.replaceAll("|", "/")} | ${row.runs} | ${row.cutOff} | ${row.failed} | ${minutes(row.medianWallMs)} | ${tokens(row.medianTokens)} | ${tokens(row.totalTokens)} | ${listPrice(row)} | ${row.usageIncomplete} |`,
   );
   return [
     `### ${title}`,
@@ -199,6 +226,7 @@ export function formatRunRecordsSummary(summary: RunRecordsSummary): string {
     `## Agent runs ${new Date(summary.fromMs).toISOString().slice(0, 10)} to ${new Date(summary.toMs).toISOString().slice(0, 10)}`,
     "",
     `${summary.runs} recorded runs. Tokens are input (cache included) plus output, as providers report them.`,
+    "List price = public per-token price, not what a plan bills.",
     "",
     table("By kind", summary.byKind),
     "",
@@ -209,6 +237,11 @@ export function formatRunRecordsSummary(summary: RunRecordsSummary): string {
     "### Estimate vs actual (delegated tasks that gave one)",
     "",
     `Median actual/estimate: time ${ratio(summary.medianWallRatio)}, tokens ${ratio(summary.medianTokenRatio)}.`,
+    ...(summary.refusedEstimates === 0
+      ? []
+      : [
+          `${summary.refusedEstimates} runs had an estimate tag that could not be read (not a time or a token count); they count as giving none.`,
+        ]),
     ...(estimateRows.length === 0
       ? []
       : [

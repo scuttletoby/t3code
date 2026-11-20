@@ -15,6 +15,7 @@ import {
   type OrchestrationV2Subagent,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -22,6 +23,7 @@ import * as Stream from "effect/Stream";
 
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import { ProjectionStoreThreadNotFoundError } from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import { parseRunRecordLines } from "./runRecord.ts";
@@ -49,7 +51,10 @@ interface World {
   providerTurns: Array<OrchestrationV2ProviderTurn>;
   messages: Array<OrchestrationV2ConversationMessage>;
   subagents: Array<OrchestrationV2Subagent>;
-  failReadsOf: Set<string>;
+  /** Thread reads that fail (a busy database), by thread: how many more times. */
+  failReads: Map<string, number>;
+  /** Threads that are gone from the projection. */
+  missing: Set<string>;
 }
 
 const newWorld = (): World => ({
@@ -70,7 +75,8 @@ const newWorld = (): World => ({
       "Fix the cursor",
     ),
   ],
-  failReadsOf: new Set(),
+  failReads: new Map(),
+  missing: new Set(),
 });
 
 /** A run that ended: its attempt, usage, answer and stored `run.updated` event. */
@@ -121,9 +127,15 @@ const dependencies = (world: World) =>
     }),
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
       getThread: (threadId) =>
-        world.failReadsOf.has(threadId)
-          ? Effect.die(new Error("projection read failed"))
-          : Effect.succeed(world.threads.get(threadId)!),
+        Effect.suspend(() => {
+          if (world.missing.has(threadId)) {
+            return Effect.fail(new ProjectionStoreThreadNotFoundError({ threadId }));
+          }
+          const failures = world.failReads.get(threadId) ?? 0;
+          if (failures <= 0) return Effect.succeed(world.threads.get(threadId)!);
+          world.failReads.set(threadId, failures - 1);
+          return Effect.die(new Error("database is locked"));
+        }),
       getThreadRecords: (threadId, _fields, filter) =>
         Effect.sync(
           () =>
@@ -166,11 +178,11 @@ const harness = Effect.gen(function* () {
   const path = yield* Path.Path;
   const directory = path.join(yield* fs.makeTempDirectoryScoped({ prefix: "run-records-" }), "rr");
   const world = newWorld();
+  /** One server process's recorder over the folder; its `follow` again is the follower's retry. */
+  const make = RunRecorder.make({ directory }).pipe(Effect.provide(dependencies(world)));
   /** One server start: a new recorder over the same folder, run until the stored events end. */
   const start = Effect.gen(function* () {
-    const recorder = yield* RunRecorder.make({ directory }).pipe(
-      Effect.provide(dependencies(world)),
-    );
+    const recorder = yield* make;
     yield* recorder.follow;
     return recorder;
   });
@@ -186,7 +198,7 @@ const harness = Effect.gen(function* () {
   );
   /** Records begin when the folder is first seen: an empty start before any test's runs. */
   yield* start;
-  return { fs, world, start, records, lines, cursor, runsFile, cursorFile };
+  return { fs, path, world, make, start, records, lines, cursor, runsFile, cursorFile };
 });
 
 it.layer(NodeServices.layer)("RunRecorder", (it) => {
@@ -375,21 +387,152 @@ it.layer(NodeServices.layer)("RunRecorder", (it) => {
   );
 
   it.effect(
-    "a run whose records cannot be read is skipped, and the next run is still recorded",
+    "a run whose records cannot be read is retried, skipped after 3 tries, and the next one recorded",
     () =>
       Effect.gen(function* () {
-        const { world, start, records, cursor } = yield* harness;
+        const { world, make, records, cursor } = yield* harness;
         world.threads.set("broken", childThread("broken", "parent", "Broken"));
-        world.failReadsOf.add("broken");
+        world.failReads.set("broken", Number.POSITIVE_INFINITY);
         endRun(world, run("broken", "unreadable"), { answer: "?" });
         endRun(world, run("child", "fine"), { answer: "Done." });
-        yield* start;
+        const recorder = yield* make;
+        // The follower stops and retries from its cursor; the third failure skips the run.
+        for (let attempt = 1; attempt < RunRecorder.READ_ATTEMPTS; attempt++) {
+          assert.isTrue(Exit.isFailure(yield* Effect.exit(recorder.follow)), `try ${attempt}`);
+          assert.deepStrictEqual(yield* records, []);
+        }
+        yield* recorder.follow;
         assert.deepStrictEqual(
           (yield* records).map((record) => record.runId),
           ["fine"],
         );
         assert.strictEqual((yield* cursor).sequence, 2);
       }),
+  );
+
+  it.effect("a passing read failure (a busy database) loses no record", () =>
+    Effect.gen(function* () {
+      const { world, make, records } = yield* harness;
+      world.failReads.set("child", 1);
+      endRun(world, run("child", "busy"), { answer: "Done." });
+      const recorder = yield* make;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(recorder.follow)));
+      yield* recorder.follow;
+      assert.deepStrictEqual(
+        (yield* records).map((record) => record.runId),
+        ["busy"],
+      );
+    }),
+  );
+
+  it.effect("a run whose thread is gone is skipped at once", () =>
+    Effect.gen(function* () {
+      const { world, start, records, cursor } = yield* harness;
+      world.threads.set("deleted", childThread("deleted", "parent", "Deleted"));
+      world.missing.add("deleted");
+      endRun(world, run("deleted", "gone"), { answer: "?" });
+      endRun(world, run("child", "fine"), { answer: "Done." });
+      yield* start;
+      assert.deepStrictEqual(
+        (yield* records).map((record) => record.runId),
+        ["fine"],
+      );
+      assert.strictEqual((yield* cursor).sequence, 2);
+    }),
+  );
+
+  it.effect("a failed append moves no cursor: the record lands on the retry", () =>
+    Effect.gen(function* () {
+      const { fs, world, start, records, runsFile } = yield* harness;
+      // The line cannot be written (here a folder stands in the file's place).
+      yield* fs.makeDirectory(runsFile);
+      endRun(world, run("child", "run-1"), { answer: "Done." });
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(start)));
+      yield* fs.remove(runsFile, { recursive: true });
+      yield* start;
+      assert.deepStrictEqual(
+        (yield* records).map((record) => record.runId),
+        ["run-1"],
+      );
+    }),
+  );
+
+  it.effect("a failed cursor save after the line writes no second line on retries", () =>
+    Effect.gen(function* () {
+      const { fs, path, world, make, lines, cursorFile } = yield* harness;
+      const recorder = yield* make;
+      yield* recorder.follow;
+      // The cursor cannot be saved (a full disk; here a folder in its place), the line can.
+      yield* fs.remove(cursorFile);
+      yield* fs.makeDirectory(path.join(cursorFile, "blocked"), { recursive: true });
+      endRun(world, run("child", "run-1"), { answer: "Done." });
+      // The first try fails at the cursor; the follower's retries find the run already written.
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(recorder.follow)));
+      yield* Effect.exit(recorder.follow);
+      yield* Effect.exit(recorder.follow);
+      assert.strictEqual((yield* lines).length, 1);
+      // Space again: the next run moves the cursor past both.
+      yield* fs.remove(cursorFile, { recursive: true });
+      endRun(world, run("child", "run-2"), { answer: "Done." });
+      yield* recorder.follow;
+      assert.strictEqual((yield* lines).length, 2);
+    }),
+  );
+
+  it.effect("a run that ends again after other runs ended is still not written twice", () =>
+    Effect.gen(function* () {
+      const { world, start, lines } = yield* harness;
+      endRun(world, run("child", "a"), { answer: "A." });
+      endRun(world, run("child", "b"), { answer: "B." });
+      endRun(world, run("child", "c"), { answer: "C." });
+      // A repeat end of run a, after b and c: only the recent ids can tell.
+      storeUpdate(world, run("child", "a"));
+      yield* start;
+      storeUpdate(world, run("child", "b"));
+      yield* start;
+      assert.strictEqual((yield* lines).length, 3);
+    }),
+  );
+
+  it.effect("a cursor ahead of the event store (a restored database) starts again at latest", () =>
+    Effect.gen(function* () {
+      const { fs, world, start, records, cursor, cursorFile } = yield* harness;
+      endRun(world, run("child", "before"), { answer: "Done." });
+      yield* start;
+      // The database goes back to an older copy; the records folder stays.
+      world.events = [];
+      world.latestSequence = 0;
+      yield* fs.writeFileString(
+        cursorFile,
+        JSON.stringify({ v: 1, sequence: 50, recent: ["before"] }),
+      );
+      yield* start;
+      assert.strictEqual((yield* cursor).sequence, 0);
+      endRun(world, run("child", "after"), { answer: "Done." });
+      yield* start;
+      assert.deepStrictEqual(
+        (yield* records).map((record) => record.runId),
+        ["before", "after"],
+      );
+      assert.deepStrictEqual((yield* cursor).recent, ["before", "after"]);
+    }),
+  );
+
+  it.effect("a refused estimate tag is recorded as refused, with no estimate", () =>
+    Effect.gen(function* () {
+      const { world, start, records } = yield* harness;
+      world.subagents[0] = task(
+        "parent",
+        "child",
+        "Act as the writer sub-agent for this task.\n\n[run-estimate: 2M]\nFix it.",
+        "Fix the cursor",
+      );
+      endRun(world, run("child", "run-1"), { answer: "Done." });
+      yield* start;
+      const [record] = yield* records;
+      assert.strictEqual(record?.estimate, null);
+      assert.strictEqual(record?.estimateRefused, "2M");
+    }),
   );
 
   it.effect("records a top-level run (an orchestrator) without a parent or labels", () =>

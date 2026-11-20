@@ -7,6 +7,7 @@ import {
   parseEstimate,
   parseRunRecordLines,
   parseTaskLabels,
+  readEstimateTag,
   type RunRecordInput,
   sumRunUsage,
 } from "./runRecord.ts";
@@ -53,6 +54,7 @@ describe("parseTaskLabels", () => {
         role: "review lens",
         kind: "lens: data",
         estimate: { wallMs: 90 * MINUTE_MS, tokens: 2_500_000 },
+        estimateRefused: null,
       },
     );
   });
@@ -62,8 +64,14 @@ describe("parseTaskLabels", () => {
       role: null,
       kind: null,
       estimate: null,
+      estimateRefused: null,
     });
-    assert.deepStrictEqual(parseTaskLabels(null), { role: null, kind: null, estimate: null });
+    assert.deepStrictEqual(parseTaskLabels(null), {
+      role: null,
+      kind: null,
+      estimate: null,
+      estimateRefused: null,
+    });
   });
 
   it("reads an estimate of only time or only tokens, and none from garbage", () => {
@@ -71,6 +79,72 @@ describe("parseTaskLabels", () => {
     assert.deepStrictEqual(parseEstimate("[run-estimate: 300k tokens]"), { tokens: 300_000 });
     assert.strictEqual(parseEstimate("[run-estimate: soon]"), null);
     assert.strictEqual(parseEstimate("no tag"), null);
+  });
+
+  it("reads joined units, capitals, exponents and grouped numbers right", () => {
+    const cases: ReadonlyArray<readonly [string, { wallMs?: number; tokens?: number }]> = [
+      ["1h30m", { wallMs: 90 * MINUTE_MS }],
+      ["1h 30m", { wallMs: 90 * MINUTE_MS }],
+      ["1H30min", { wallMs: 90 * MINUTE_MS }],
+      ["1.5h", { wallMs: 90 * MINUTE_MS }],
+      ["90 min", { wallMs: 90 * MINUTE_MS }],
+      ["2 hours and 5 minutes", { wallMs: 125 * MINUTE_MS }],
+      ["1h 0m", { wallMs: 60 * MINUTE_MS }],
+      ["~40m", { wallMs: 40 * MINUTE_MS }],
+      ["2m", { wallMs: 2 * MINUTE_MS }],
+      ["2M Tokens", { tokens: 2_000_000 }],
+      ["2.5m tokens", { tokens: 2_500_000 }],
+      ["2 million tokens", { tokens: 2_000_000 }],
+      ["300K TOKENS", { tokens: 300_000 }],
+      ["1e6 tokens", { tokens: 1_000_000 }],
+      ["1E6 tokens", { tokens: 1_000_000 }],
+      ["1,500,000 tokens", { tokens: 1_500_000 }],
+      ["5000 tok", { tokens: 5000 }],
+      ["40m, 2M tokens", { wallMs: 40 * MINUTE_MS, tokens: 2_000_000 }],
+      ["2M tokens + 1h30m", { wallMs: 90 * MINUTE_MS, tokens: 2_000_000 }],
+    ];
+    for (const [tag, expected] of cases) {
+      assert.deepStrictEqual(
+        readEstimateTag(`[run-estimate: ${tag}]`),
+        { estimate: expected, refused: null },
+        tag,
+      );
+    }
+  });
+
+  it("refuses, never guesses, a tag it cannot read in full", () => {
+    for (const tag of [
+      "soon",
+      "40",
+      "2M",
+      "300k",
+      "30-40m",
+      "about 40m",
+      "40m or so",
+      "1h 1h",
+      "90min 30m",
+      "2M tokens 3M tokens",
+      "2,5M tokens",
+      "2x tokens",
+      "1e400 tokens",
+      "0m",
+      "0 tokens",
+      "40 m tokens extra",
+    ]) {
+      assert.deepStrictEqual(
+        readEstimateTag(`Act as the writer sub-agent for this task. [run-estimate: ${tag}]`),
+        { estimate: null, refused: tag },
+        tag,
+      );
+      assert.strictEqual(parseEstimate(`[run-estimate: ${tag}]`), null, tag);
+    }
+    assert.strictEqual(readEstimateTag("no tag here"), null);
+    assert.deepStrictEqual(parseTaskLabels("[run-estimate: 2M]"), {
+      role: null,
+      kind: null,
+      estimate: null,
+      estimateRefused: "2M",
+    });
   });
 });
 
@@ -144,6 +218,7 @@ describe("buildRunRecord", () => {
       role: "writer",
       kind: "fix",
       estimate: { wallMs: 40 * MINUTE_MS, tokens: 2_000_000 },
+      estimateRefused: null,
       continuationOf: null,
       providerInstanceId: "claudeAgent",
       model: "claude-opus-5-5",
@@ -171,6 +246,23 @@ describe("buildRunRecord", () => {
         hasSubagents: false,
       },
     });
+  });
+
+  it("keeps a refused estimate tag's text, and takes no guess from the run's own message", () => {
+    const record = buildRunRecord(
+      input({
+        task: task("parent", "child", "[run-estimate: 1-2h]\nDo it.", "Fix the cursor"),
+        runMessage: "[run-estimate: 40m]",
+      }),
+    );
+    assert.strictEqual(record?.estimate, null);
+    assert.strictEqual(record?.estimateRefused, "1-2h");
+    // Without a tag in the task, the run's message gives it.
+    const fromRun = buildRunRecord(
+      input({ task: task("parent", "child", "Do it.", "Fix"), runMessage: "[run-estimate: 40m]" }),
+    );
+    assert.deepStrictEqual(fromRun?.estimate, { wallMs: 40 * MINUTE_MS });
+    assert.strictEqual(fromRun?.estimateRefused, null);
   });
 
   it("records a run stopped half-way as cut off, with the usage seen until then", () => {
@@ -303,5 +395,16 @@ describe("parseRunRecordLines", () => {
       ],
     );
     assert.deepStrictEqual(parseRunRecordLines(""), []);
+    // Streamed lines read the same; `keep` drops records as they are read.
+    assert.deepStrictEqual(
+      parseRunRecordLines(text.split("\n").values()).map((record) => record.runId),
+      ["run-1", "run-2"],
+    );
+    assert.deepStrictEqual(
+      parseRunRecordLines(text.split("\n"), (record) => record.runId === "run-2").map(
+        (record) => record.runId,
+      ),
+      ["run-2"],
+    );
   });
 });
