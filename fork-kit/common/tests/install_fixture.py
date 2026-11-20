@@ -1,7 +1,9 @@
 """Shared by the installer tests of every kit that uses fork-kit/common/kit_install.py: load a kit's installer (or a
 copy with one text broken, in it or in kit_install.py) on a fake host in a temporary folder, every fixed path under
-PREFIX and the current user as root. No root, no systemd, no network."""
-import contextlib, importlib.util, io, os, shutil, subprocess, sys, tempfile, unittest
+PREFIX and the current user as root, with a fake process list and runtime folder of its own (PROC, RUN). No root,
+no systemd, no network. A link the installer writes names a host path: resolve() follows it inside the fake host
+only, never onto the real machine."""
+import contextlib, importlib.util, io, os, shutil, signal, subprocess, sys, tempfile, unittest
 
 FORK_KIT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 COMMON = os.path.join(FORK_KIT, 'common')
@@ -60,6 +62,10 @@ class FakeHost(unittest.TestCase):
                    self.broken[1:] if where == 'installer' else None)
         self.mod, self.m = mod, mod.INSTALLER
         self.m.PREFIX, self.m.ROOT_UID = self.root, os.geteuid()
+        self.host = os.path.realpath(tempfile.mkdtemp(prefix='kit-install-host-'))     # outside root: kept by resets
+        self.m.PROC, self.m.RUN = os.path.join(self.host, 'proc'), os.path.join(self.host, 'run')
+        os.makedirs(self.m.PROC)
+        os.makedirs(self.m.RUN)
         self.bootstrap = os.path.join(self.root, 'bootstrap.sh')
         with open(self.bootstrap, 'w', encoding='utf-8') as f:
             f.write(source_of(BOOTSTRAP, self.broken[1:] if where == 'bootstrap' else None))
@@ -67,9 +73,61 @@ class FakeHost(unittest.TestCase):
     def close(self):
         os.umask(self.umask)
         shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.host, ignore_errors=True)
 
     def path(self, p):
         return self.root + p
+
+    def resolve(self, p):
+        """Host path p with every link on it followed inside the fake host (an absolute target is read under the
+        root, as on the host it would be): the real file under root, or None when the chain ends nowhere. Never
+        follows a link out of the fake host, so a test cannot pass because the real machine has the kit."""
+        parts, done, hops = [x for x in p.split('/') if x], '', 0
+        while parts:
+            part = parts.pop(0)
+            if part == '.':
+                continue
+            if part == '..':
+                done = os.path.dirname(done)
+                continue
+            here = f'{done}/{part}'
+            if os.path.islink(self.path(here)):
+                hops += 1
+                if hops > 40:
+                    return None
+                target = os.readlink(self.path(here))
+                parts = [x for x in target.split('/') if x] + parts
+                done = '' if target.startswith('/') else done
+                continue
+            if not os.path.lexists(self.path(here)):
+                return None
+            done = here
+        return self.path(done or '/')
+
+    def is_file(self, p):
+        """p, links followed inside the fake host only, is a file."""
+        real = self.resolve(p)
+        return real is not None and os.path.isfile(real) and not os.path.islink(real)
+
+    @contextlib.contextmanager
+    def no_hang(self, seconds=20):
+        """Fails the test (instead of hanging it) when the body waits longer than that, on a FIFO say."""
+        def alarm(*_):
+            raise AssertionError(f'still waiting after {seconds} s (it blocked)')
+        old = signal.signal(signal.SIGALRM, alarm)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def process(self, pid, *argv):
+        """A fake process with that command line in the fake process list."""
+        os.makedirs(os.path.join(self.m.PROC, str(pid)), exist_ok=True)
+        with open(os.path.join(self.m.PROC, str(pid), 'cmdline'), 'wb') as f:
+            f.write(b'\0'.join(os.fsencode(a) for a in argv) + b'\0')
+        self.addCleanup(shutil.rmtree, os.path.join(self.m.PROC, str(pid)), True)
 
     def run_main(self, *argv, stop_after=None):
         out, err = io.StringIO(), io.StringIO()

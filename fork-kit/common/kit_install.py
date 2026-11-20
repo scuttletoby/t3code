@@ -7,12 +7,14 @@ self-test, and adds what only that kit does (an option, a unit file, a check). E
   and unchanged is used as it is, any other is made again beside it, self-tested, and swapped in whole;
 - switch the link <libexec>/current to it in one step, then the command links;
 - keep a plain old command found where a link goes (a hand copy from before the kit) in <libexec>/replaced/, and
-  put it back on uninstall;
+  put the last one kept back on uninstall (replaced/order lists them in the order they were kept);
 - write <etc>/installed.tsv, which `self-check` reads to report drift;
 - one installer (or uninstall) at a time; safe to run again and to stop at any step. Old version folders stay:
-  a timer or a detached run may name one.
+  a timer or a detached run may name one. uninstall refuses while a process or a transient systemd unit (a timer
+  still pending) runs code from <libexec>.
 
-Plain Python 3 standard library. Paths are read under PREFIX and owners compared with ROOT_UID (tests only).
+Plain Python 3 standard library. Paths are read under PREFIX and owners compared with ROOT_UID; PROC and RUN name
+the process list and the runtime folder (tests only, all four).
 """
 import argparse, contextlib, ctypes, errno, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
@@ -71,6 +73,8 @@ class Installer:
 
     PREFIX = ''             # tests only: every fixed path is read under this folder
     ROOT_UID = 0            # tests only: who must run the installer and own the installed files
+    PROC = '/proc'          # tests only: the process list uninstall reads (not under PREFIX)
+    RUN = '/run'            # tests only: where systemd keeps transient units (systemd/transient, user/<uid>/...)
 
     Refused = Refused
 
@@ -81,6 +85,7 @@ class Installer:
         self.VERSIONS = self.LIBEXEC + '/versions'
         self.CURRENT = self.LIBEXEC + '/current'
         self.REPLACED = self.LIBEXEC + '/replaced'
+        self.ORDER = self.REPLACED + '/order'
         self.STEPS = ('check', 'folders', 'copy', 'self-test', 'config', 'switch', 'links') + tuple(self.KIT_STEPS) \
             + ('record',)
         self._renameat2 = _renameat2
@@ -282,7 +287,9 @@ class Installer:
         os.rename(aside, new)
 
     def self_test(self, dest):
-        """The copy matches its manifest, every module of the kit imports from it alone, and --help works."""
+        """The copy matches its manifest, every module of the kit imports from it alone, and the --help of its
+        command and of its own installer work (an installer that cannot load from the copy could not update,
+        check or uninstall it later)."""
         problems = self.tree_problems(dest)
         run = dict(capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, cwd=dest)
         if self.PACKAGE:
@@ -291,10 +298,10 @@ class Installer:
             r = subprocess.run([sys.executable, '-I', '-B', '-c', code, dest, *self.MODULES], **run)
             if r.returncode != 0:
                 problems.append(f'lib/{self.PACKAGE} does not import: {(r.stderr or r.stdout).strip()[-300:]}')
-        rel, text = self.HELP
-        r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, rel), '--help'], **run)
-        if r.returncode != 0 or text not in r.stdout:
-            problems.append(f'{rel} --help failed: {(r.stderr or r.stdout).strip()[:200]}')
+        for rel, text in (self.HELP, (f'sbin/{self.PROG}', 'self-check')):
+            r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, rel), '--help'], **run)
+            if r.returncode != 0 or text not in r.stdout:
+                problems.append(f'{rel} --help failed: {(r.stderr or r.stdout).strip()[:200]}')
         return problems
 
     def copy_tool(self, source, sha):
@@ -385,35 +392,53 @@ class Installer:
         self.check_kit(a)
 
     def keep_old(self, path):
-        """A plain old file at a link path goes to REPLACED (named by its hash, so a second run copies nothing);
-        the link then replaces it in one step, so the path is never missing."""
+        """A plain old file at a link path goes to REPLACED (named by its hash, so a second run copies nothing) and
+        its name to the end of REPLACED/order (the last one kept is the one uninstall puts back); the link then
+        replaces it in one step, so the path is never missing."""
         real = self.p(path)
         if not self.plain_file(real):
             return
         self.ensure_dir(self.REPLACED)
+        folder = self.p(self.REPLACED)
+        for name in os.listdir(folder):     # a copy a stopped run left half made
+            if name.endswith('.tmp'):
+                os.unlink(os.path.join(folder, name))
         digest = sha256_file(real)
         name = f'{os.path.basename(path)}.{digest[:16]}'
-        dest = self.p(f'{self.REPLACED}/{name}')
+        dest = os.path.join(folder, name)
         if not os.path.exists(dest):
             tmp = dest + '.tmp'
-            shutil.copy2(real, tmp)
+            shutil.copyfile(real, tmp)
             os.chmod(tmp, 0o755 if os.stat(real).st_mode & 0o111 else 0o644)
             os.replace(tmp, dest)
+        order = [n for n in self.kept_order() if n != name] + [name]
+        self.write_file(self.ORDER, ''.join(n + '\n' for n in order))
         self.say(f'the old {path} (sha256 {digest[:16]}) is kept as {self.REPLACED}/{name}; '
                  'uninstall puts it back')
 
+    def kept_order(self):
+        """The names in REPLACED/order, first kept first (none when there is no such file)."""
+        try:
+            with open(self.p(self.ORDER), encoding='utf-8') as f:
+                return [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
     def replaced(self):
-        """The kept old files: [(link path, kept path)], newest last."""
+        """The kept old files: [(link path, kept path)], in the order they were kept (REPLACED/order), the last
+        kept last. One not in the order yet (a run stopped between keeping it and writing the order) was the last
+        kept, so it goes last too."""
         folder = self.p(self.REPLACED)
         if not os.path.isdir(folder) or os.path.islink(folder):
             return []
-        out = []
+        found = {}
         for name in os.listdir(folder):
             base, _, digest = name.rpartition('.')
             for path in self.KEEP_OLD:
                 if base == os.path.basename(path) and re.fullmatch(r'[0-9a-f]{16}', digest):
-                    out.append((path, os.path.join(folder, name)))
-        return sorted(out, key=lambda pk: os.path.getmtime(pk[1]))
+                    found[name] = (path, os.path.join(folder, name))
+        order = [n for n in self.kept_order() if n in found]
+        return [found[n] for n in order] + [found[n] for n in sorted(set(found) - set(order))]
 
     def record_rows(self, sha, plan):
         rows = [(path, 'link', target) for path, target in sorted(self.links().items())]
@@ -424,6 +449,8 @@ class Installer:
             rows.append((self.CONFIG, 'file', sha256_file(self.p(self.CONFIG))))
         for _, kept in self.replaced():
             rows.append((kept[len(self.PREFIX):], 'file', sha256_file(kept)))
+        if os.path.isfile(self.p(self.ORDER)):
+            rows.append((self.ORDER, 'file', sha256_file(self.p(self.ORDER))))
         return rows + list(self.kit_rows(plan))
 
     def install(self, a, stop_after=None):
@@ -478,7 +505,84 @@ class Installer:
 
     def _uninstall(self):
         with self.uninstall_guard():
+            in_use = self.in_use()
+            if in_use:
+                raise Refused('uninstall refused: code of this kit is in use, and removing it would leave that '
+                              'with nothing to run:\n  ' + '\n  '.join(in_use) + '\nLet it end (or stop it) and '
+                              'run uninstall again')
             return self._remove()
+
+    def code_paths(self):
+        """The paths a command line or a unit names when it runs this kit's code: <libexec>/ (and its real path),
+        and the kit's links."""
+        roots = {self.LIBEXEC}
+        real = os.path.realpath(self.p(self.LIBEXEC))
+        if real.startswith(self.PREFIX + '/'):
+            roots.add(real[len(self.PREFIX):])
+        return tuple(os.fsencode(r + '/') for r in sorted(roots)), {os.fsencode(p) for p in self.LINKS}
+
+    def _names_code(self, args, roots, links):
+        return any(arg.startswith(roots) or arg in links for arg in args)
+
+    @staticmethod
+    def _read_small(path, limit=1 << 20):
+        """A regular file's first bytes, or None for anything else (a FIFO, a link, a device: never waited on)."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            return os.read(fd, limit)
+        finally:
+            os.close(fd)
+
+    def in_use(self):
+        """What runs this kit's code now, one line each: a process whose command line names it (but this one and
+        the ones that started it), and a transient systemd unit (systemd-run's: a detached run, or the service of a
+        timer still pending) whose unit file names it. Refused when the process list cannot be read."""
+        roots, links = self.code_paths()
+        found, mine, pid = [], set(), os.getpid()
+        while pid > 1 and pid not in mine:  # this uninstall and what started it (sudo, a shell) name the links
+            mine.add(pid)
+            try:
+                with open(f'{self.PROC}/{pid}/stat', 'rb') as f:
+                    pid = int(f.read().rpartition(b')')[2].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+        try:
+            pids = [n for n in os.listdir(self.PROC) if n.isdigit()]
+        except OSError as e:
+            raise Refused(f'{self.PROC} cannot be read ({e.strerror}): uninstall cannot see whether code of this '
+                          'kit is running') from None
+        for name in sorted(pids, key=int):
+            if int(name) in mine:
+                continue
+            try:
+                with open(f'{self.PROC}/{name}/cmdline', 'rb') as f:
+                    args = f.read().split(b'\0')
+            except OSError:
+                continue                    # it ended
+            if self._names_code(args, roots, links):
+                shown = b' '.join(a for a in args if a).decode('utf-8', 'replace')
+                found.append(f'process {name}: {shown[:200]}')
+        folders = [f'{self.RUN}/systemd/transient']
+        with contextlib.suppress(OSError):
+            folders += [f'{self.RUN}/user/{u}/systemd/transient' for u in sorted(os.listdir(f'{self.RUN}/user'))]
+        for folder in folders:
+            try:
+                names = sorted(os.listdir(folder))
+            except OSError:
+                continue                    # no such folder: no transient unit there
+            for name in names:
+                text = self._read_small(os.path.join(folder, name))
+                if text is None:
+                    continue
+                if any(r in text for r in roots) or any(re.search(rb'(?:^|[\s="\'@!+:-])' + re.escape(link)
+                                                                    + rb'(?:[\s"\']|$)', text) for link in links):
+                    found.append(f'transient unit {name} ({folder}): a detached run, or a timer still pending')
+        return found
 
     def _remove(self):
         kept = self.replaced()

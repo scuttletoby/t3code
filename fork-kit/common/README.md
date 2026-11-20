@@ -80,7 +80,9 @@ SHA`, as root:
    file there instead: `KEEP_OLD`), a folder that is a file or a link, a bad `--sha`, a source file that is
    missing or reached through a link;
 2. **copy**: the files into `.tmp-*` beside `versions/<sha>/`, read with no link followed, root-owned, with
-   `MANIFEST.sha256`; **self-test**: every module imported and the help run from the copy; then the copy is
+   `MANIFEST.sha256`; **self-test**: every module imported, and the help of the command and of the kit's own
+   installer run from the copy (a copy whose installer cannot load could never be updated or removed by it); then
+   the copy is
    swapped in, in one step (`renameat2` exchange; two renames where the filesystem has none). A version folder
    that is whole and matches is kept as it is; one that differs (a stop half-way, an older installer) is made
    again beside it;
@@ -88,8 +90,12 @@ SHA`, as root:
 4. **record**: `installed.tsv`, what `self-check` compares.
 
 Safe to run again (nothing changes), and to stop at any step (the next run finishes it); one installer at a time
-(`<etc>/install.lock`, `uninstall` too). Old version folders stay: a run of the kit may still be using one.
-`uninstall` removes the links, the libexec and etc folders and puts back what `KEEP_OLD` kept.
+(`<etc>/install.lock`, `uninstall` too). Old version folders stay: a run of the kit may still be using one
+(installing the same release over a changed copy swaps in the same code). `uninstall` removes the links, the
+libexec and etc folders and puts back what `KEEP_OLD` kept last (`replaced/order`). It refuses while a process
+(its command line) or a transient systemd unit (systemd-run's unit file: a detached run, a timer still pending)
+names `<libexec>/` or one of the kit's links; this uninstall and the processes that started it do not count, and a
+process list it cannot read refuses. Updates go through the bootstrap.
 
 `bootstrap.sh --kit cleaner|golive --repo OWNER/REPO --sha SHA [kit options]` checks the commit is on the protected
 release branch, downloads exactly that commit and runs the kit's installer; it passes on only the kit's own options.

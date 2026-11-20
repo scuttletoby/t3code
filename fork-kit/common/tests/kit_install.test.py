@@ -5,7 +5,7 @@ and shows its test then fails.
 
   python3 -I -B fork-kit/common/tests/kit_install.test.py
 """
-import fcntl, os, shutil, subprocess, sys, unittest
+import contextlib, fcntl, os, shutil, subprocess, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -244,6 +244,108 @@ class Contract:
         self.assertIn('broken (test)', err)
         self.assertFalse(os.path.lexists(self.path(self.m.CURRENT)))
 
+    def test_the_self_test_runs_the_installer_help_too(self):
+        """A copy whose own installer cannot load (an installer from before kit_install.py copied no
+        common/kit_install.py) could not be updated, checked or uninstalled later: it is refused."""
+        src = self.copy_kit()
+        installer = os.path.join(src, 'sbin', self.m.PROG)
+        text = fx.source_of(installer, ('    import kit_install', '    import kit_install_gone'))
+        with open(installer, 'w') as f:
+            f.write(text)
+        code, _, err = self.install(source=src)
+        self.assertEqual(code, 1)
+        self.assertIn(f'sbin/{self.m.PROG} --help failed', err)
+        self.assertIn('cannot load its installer code', err)            # its own refusal, not a traceback
+        self.assertFalse(os.path.lexists(self.path(self.m.CURRENT)))
+
+    def transient(self, folder, name, text):
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, name), 'w') as f:
+            f.write(text)
+        return os.path.join(folder, name)
+
+    def test_uninstall_is_refused_while_code_of_the_kit_runs(self):
+        """A process or a transient unit (systemd-run's: a detached run, a timer still pending) that runs code from
+        <libexec> or through the kit's links: removing it would leave that with nothing to run."""
+        code_file = f'{self.m.LIBEXEC}/versions/{SHA1}/{self.m.HELP[0]}'
+        user_units = os.path.join(self.m.RUN, 'user', '1000', 'systemd', 'transient')
+        cases = {
+            'a process of a version': lambda: self.process(4242, '/usr/bin/python3', '-I', '-B', code_file, 'hold'),
+            'a process through a link': lambda: self.process(4243, '/usr/bin/python3', '-IB', self.first_link()),
+            'a user unit (a pending timer)': lambda: self.transient(
+                user_units, 'kit-x-guard.service', '[Service]\nExecStart=\nExecStart="/usr/bin/python3" "-I" '
+                f'"-B" "{code_file}" "switch-guard" "--run" "r1"\n'),
+            'a system unit through a link': lambda: self.transient(
+                os.path.join(self.m.RUN, 'systemd', 'transient'), 'run-u7.service',
+                f'[Service]\nExecStart="{self.first_link()}" "daily"\n'),
+        }
+        for what, make in cases.items():
+            with self.subTest(what=what):
+                self.assertEqual(self.install()[0], 0)
+                made = make()
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1, err)
+                self.assertIn('code of this kit is in use', err)
+                self.assertIn('run uninstall again', err)
+                self.assertTrue(os.path.isdir(self.version()))
+                self.assertTrue(os.path.islink(self.path(self.first_link())))
+                if made:
+                    os.unlink(made)
+                else:
+                    shutil.rmtree(self.m.PROC)
+                    os.makedirs(self.m.PROC)
+                self.assertEqual(self.run_main('uninstall')[0], 0)          # once it ended
+                self.assertFalse(os.path.lexists(self.path(self.m.LIBEXEC)))
+
+    def test_what_is_not_the_kit_never_holds_uninstall(self):
+        """Other code, a name that only starts like the kit's folder, this uninstall and what started it, and a
+        FIFO among the transient units (never waited on) all let it go ahead; an unreadable process list refuses."""
+        self.assertEqual(self.install()[0], 0)
+        self.process(4250, '/usr/bin/python3', f'{self.m.LIBEXEC}-host/bin/x')        # another folder
+        self.process(4251, '/bin/sh', '-c', 'true')
+        self.process(os.getpid(), '/usr/bin/python3', '-IB', self.first_link(), 'uninstall')   # this one
+        with open(os.path.join(self.m.PROC, str(os.getpid()), 'stat'), 'w') as f:
+            f.write(f'{os.getpid()} (python3) S 4260 1 1 0\n')
+        self.process(4260, 'sudo', self.first_link(), 'uninstall')                    # what started it
+        units = os.path.join(self.m.RUN, 'user', '1000', 'systemd', 'transient')
+        self.transient(units, 'other.service', f'[Service]\nExecStart="{self.m.LIBEXEC}-host/bin/x"\n')
+        os.mkfifo(os.path.join(units, 'planted.service'))
+        with self.no_hang():
+            code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.install()[0], 0)
+        shutil.rmtree(self.m.PROC)
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1)
+        self.assertIn('cannot be read', err)
+        self.assertTrue(os.path.isdir(self.version()))
+
+    def test_a_replaced_folder_that_is_not_a_folder_is_refused_before_anything_is_written(self):
+        os.makedirs(self.path(self.m.LIBEXEC))
+        os.symlink('/somewhere/else', self.path(self.m.REPLACED))
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn(f'{self.m.REPLACED} exists and is not a folder', err)
+        self.assertFalse(os.path.exists(self.path(self.m.VERSIONS)))
+        self.assertFalse(os.path.exists(self.path(self.m.ETC)))
+
+    def test_old_state_is_checked_again_under_the_lock(self):
+        """What another process wrote between the first check and the lock is refused before anything is
+        written (a folder at a link path, here)."""
+        take = self.m.install_lock
+
+        @contextlib.contextmanager
+        def lock_then_someone_writes():
+            with take():
+                os.makedirs(self.path(self.first_link()))
+                yield
+
+        self.m.install_lock = lock_then_someone_writes
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn("is not the kit's link", err)
+        self.assertFalse(os.path.exists(self.path(self.m.VERSIONS)))
+
     def test_broken_new_copy_leaves_the_version_in_use(self):
         self.assertEqual(self.install()[0], 0)
         src = self.copy_kit()
@@ -392,6 +494,34 @@ MUTATIONS = {
         'engine', '        with self.install_lock():           # never from under a running install\n'
         '            return self._uninstall()', '        return self._uninstall()',
         'test_uninstall_waits_for_no_installer'),
+    'self-test: the installer of the copy runs too': (
+        'engine', "        for rel, text in (self.HELP, (f'sbin/{self.PROG}', 'self-check')):",
+        '        for rel, text in (self.HELP,):', 'test_the_self_test_runs_the_installer_help_too'),
+    'uninstall: refused while code of the kit runs': (
+        'engine', '            if in_use:\n', '            if False:\n',
+        'test_uninstall_is_refused_while_code_of_the_kit_runs'),
+    'uninstall: a transient unit (a pending timer) counts': (
+        'engine', "                    found.append(f'transient unit", "                    str(f'transient unit",
+        'test_uninstall_is_refused_while_code_of_the_kit_runs'),
+    'uninstall: a process through the kit\'s links counts': (
+        'engine', 'arg.startswith(roots) or arg in links', 'arg.startswith(roots)',
+        'test_uninstall_is_refused_while_code_of_the_kit_runs'),
+    'uninstall: this uninstall and what started it do not count': (
+        'engine', '            if int(name) in mine:', '            if int(name) == os.getpid():',
+        'test_what_is_not_the_kit_never_holds_uninstall'),
+    'uninstall: a FIFO among the units is never waited on': (
+        'engine', 'fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)',
+        'fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)', 'test_what_is_not_the_kit_never_holds_uninstall'),
+    'uninstall: no process list refuses': (
+        'engine', "            raise Refused(f'{self.PROC} cannot be read", "            return []\n"
+        "            raise Refused(f'{self.PROC} cannot be read", 'test_what_is_not_the_kit_never_holds_uninstall'),
+    'check: the replaced folder is checked': (
+        'engine', 'for path in (self.ETC, self.LIBEXEC, self.VERSIONS, self.REPLACED):',
+        'for path in (self.ETC, self.LIBEXEC, self.VERSIONS):',
+        'test_a_replaced_folder_that_is_not_a_folder_is_refused_before_anything_is_written'),
+    'check: again under the lock': (
+        'engine', '        self.check_old_state()      # again, now that no other installer runs\n', '',
+        'test_old_state_is_checked_again_under_the_lock'),
     'bootstrap: --timer is kept, nothing after it passed on': (
         'bootstrap', '    --timer|--no-timer) opt="$1"; shift ;;', '    --timer|--no-timer) break ;;',
         'test_only_the_kit_options_are_passed_on'),

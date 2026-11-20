@@ -1,12 +1,13 @@
 """fork-cleaner-install's own part on a fake host in a temporary folder (every fixed path under PREFIX, the current user
-as root): the config and the daily timer units. What every kit's installer does (copy, switch, links, record,
+as root): the config, the daily timer units, and an update through an installed installer from before
+fork-kit/common/kit_install.py (tests/fixtures/, a copy of that installer as released). What every kit's installer does (copy, switch, links, record,
 self-check, stops half-way, uninstall) and the shared bootstrap are tested once for every kit in
 fork-kit/common/tests/kit_install.test.py. No root, no systemd, no network. RedCheck breaks each guard in a copy of
 the installer and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/install.test.py
 """
-import json, os, shutil, sys, unittest
+import contextlib, io, json, os, shutil, subprocess, sys, unittest
 from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +17,7 @@ import install_fixture as fx  # noqa: E402
 SHA1, SHA2 = fx.SHA1, fx.SHA2
 UNITS = ('/etc/systemd/user/fork-cleaner.service', '/etc/systemd/user/fork-cleaner.timer')
 FOREIGN = '[Timer]\nOnCalendar=daily\n'
+OLD_INSTALLER = os.path.join(KIT, 'tests', 'fixtures', 'fork-cleaner-install-before-kit-install')
 
 
 class Install(fx.FakeHost):
@@ -146,6 +148,41 @@ class Install(fx.FakeHost):
         with open(self.path(UNITS[1])) as f:
             self.assertEqual(f.read(), FOREIGN)
 
+    def test_an_update_through_the_installer_from_before_kit_install(self):
+        """A cleaner installed before the shared installer, updated with its installed fork-cleaner-install (not the
+        bootstrap): that old code copies no common/kit_install.py, and its self-test runs only fork-cleaner, so it
+        installs a copy whose installer cannot load. That installer then refuses cleanly and names the way out (the
+        bootstrap), and the bootstrap's way (the release's own installer) makes the copy whole again."""
+        src = self.copy_kit()                                       # the release (with RedCheck's break, if any)
+        with open(os.path.join(src, 'sbin', 'fork-cleaner-install'), 'w') as f:
+            f.write(fx.source_of(self.INSTALLER, self.broken[1:] if self.broken else None))
+        old = fx._module('old_cleaner_installer', OLD_INSTALLER, fx.source_of(OLD_INSTALLER))
+        old.PREFIX, old.ROOT_UID = self.root, os.geteuid()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = old.main(['install', '--source', src, '--sha', SHA1])
+        self.assertEqual(code, 0, err.getvalue())                   # old code: it cannot be changed now
+        self.assertFalse(os.path.exists(self.version(rel='common/kit_install.py')))
+        installer = self.version(rel='sbin/fork-cleaner-install')
+        for argv in (['--help'], ['self-check'], ['uninstall']):
+            with self.subTest(argv=argv):
+                r = subprocess.run([sys.executable, '-I', '-B', installer, *argv], capture_output=True, text=True,
+                                   timeout=60, stdin=subprocess.DEVNULL)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn('fork-cleaner-install: cannot load its installer code', r.stderr)
+                self.assertIn('install again with the bootstrap', r.stderr)
+                self.assertNotIn('Traceback', r.stderr)
+        code, out, err = self.install(source=src)                   # what the bootstrap runs
+        self.assertEqual(code, 0, err)
+        self.assertIn(f'versions/{SHA1} is incomplete or changed: made again', out)
+        r = subprocess.run([sys.executable, '-I', '-B', installer, '--help'], capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.run_main('self-check')[0], 0)
+        before = self.snapshot()                                    # and again: nothing changes
+        self.assertEqual(self.install(source=src)[0], 0)
+        self.assertEqual(self.snapshot(), before)
+
 
 MUTATIONS = {
     'units: checked again before they are written': (
@@ -158,6 +195,9 @@ MUTATIONS = {
     'units: a link is never ours': (
         'installer', '        if os.path.islink(real):\n            return False\n', '',
         'test_units_someone_else_wrote_are_refused_and_kept'),
+    'installer: a copy without kit_install.py refuses cleanly': (
+        'installer', 'except ImportError as e:', 'except ArithmeticError as e:',
+        'test_an_update_through_the_installer_from_before_kit_install'),
     'timer: kept by a run without the option': (
         'installer', "bool(self.read_config().get('timer'))", 'False',
         'test_timer_kept_by_an_upgrade_and_removed_by_no_timer_and_uninstall'),

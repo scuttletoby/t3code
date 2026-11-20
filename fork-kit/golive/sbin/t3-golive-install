@@ -12,14 +12,23 @@ links /usr/local/bin/t3-golive and /usr/local/sbin/t3-golive-install to it. An o
 a plain file (a hand copy from before this installer) is kept in /usr/local/libexec/t3-golive/replaced/ and put back
 by uninstall. Old version folders stay: the detached units of a run (its guard, the switch guard's timer) run the
 version that started them. uninstall is refused while a golive run holds the kit's lock (golive.stateDir of the
-machine file). Safe to run again, and to stop at any step; one installer at a time. The steps every kit shares are
+machine file), while the journal there has a run that needs settling (a killed switch, a failed W1: T3 may be
+stopped and its home held), and while a process or a transient unit (the holder, a switch guard's pending timer)
+runs code from /usr/local/libexec/t3-golive. Safe to run again, and to stop at any step; one installer at a time. The steps every kit shares are
 in fork-kit/common/kit_install.py.
 """
-import contextlib, fcntl, os, sys
+import contextlib, fcntl, os, stat, sys, tempfile
 _kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 _common = os.path.join(_kit, 'common')
-sys.path[:0] = [_common if os.path.isdir(_common) else os.path.join(os.path.dirname(_kit), 'common')]
-import kit_install, machine_file  # noqa: E402
+sys.path[:0] = [_common if os.path.isdir(_common) else os.path.join(os.path.dirname(_kit), 'common'),
+                os.path.join(_kit, 'lib')]
+try:
+    import kit_install, machine_file  # noqa: E402
+except ImportError as e:     # a copy an installer from before kit_install.py made: it copied no common/kit_install.py
+    sys.exit(f't3-golive-install: cannot load its installer code ({e}): install again with the bootstrap, as root '
+             '(fork-kit/golive/README.md, Install). An installer from before fork-kit/common/kit_install.py made '
+             'this copy without it')
+from golive import journal  # noqa: E402
 
 COMMAND = '/usr/local/bin/t3-golive'
 
@@ -51,29 +60,70 @@ class GoliveInstaller(kit_install.Installer):
 
     @contextlib.contextmanager
     def uninstall_guard(self):
-        """A run (or the holder that keeps T3 stopped) holds <stateDir>/lock: removing the code under it would
-        leave its guard nothing to run. Held for the whole uninstall, so no run starts in between."""
+        """A run holds <stateDir>/lock: removing the code under it would leave its guard nothing to run. Held for
+        the whole uninstall, so no run starts in between. Under it, a run the journal says needs settling refuses
+        too: such a run has ended, but what it left (T3 stopped, the holder, a pending guard) still needs this
+        kit's code (`t3-golive status`, `settle`, `back`). The lock and the journal are opened without following a
+        link and without waiting: anything but a plain file there refuses (the state folder is the T3 user's)."""
         state = self.state_dir()
         if state is None:
             yield
             return
-        try:
-            fd = os.open(self.p(os.path.join(state, 'lock')), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        except FileNotFoundError:
-            yield                   # no golive run has ever taken the lock here
+        fd = self.open_state_file(state, 'lock')
+        if fd is None:              # no golive run has ever taken the lock here; its journal is read all the same
+            self.refuse_unsettled(state)
+            yield
             return
-        except OSError as e:
-            raise self.Refused(f'{state}/lock cannot be read ({e.strerror}): uninstall cannot see whether a golive '
-                               'run is going') from None
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise self.Refused(f'a golive run holds {state}/lock: let it end (`t3-golive status`) and run '
                                    'uninstall again') from None
+            self.refuse_unsettled(state)
             yield
         finally:
             os.close(fd)
+
+    def open_state_file(self, state, name):
+        """A plain file of the state folder, opened read-only with no link followed and no wait; None when there
+        is none. Refused when it is anything else (a FIFO would block root's uninstall forever)."""
+        path = os.path.join(state, name)
+        try:
+            fd = os.open(self.p(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise self.Refused(f'{path} cannot be read ({e.strerror}): uninstall cannot see whether a golive '
+                               'run is going or needs settling') from None
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise self.Refused(f'{path} is not a plain file: uninstall cannot see whether a golive run is going or '
+                               'needs settling; look at it and run again')
+        return fd
+
+    def refuse_unsettled(self, state):
+        """Refused when the journal's last run needs settling (golive's own rule: journal.unfinished). The journal
+        is read through a plain-file descriptor into a private folder, so nothing the state folder holds can make
+        the reader wait or follow a link."""
+        fd = self.open_state_file(state, 'journal.jsonl')
+        if fd is None:
+            return                  # no journal: no run ever here
+        with os.fdopen(fd, 'rb') as f:
+            data = f.read()
+        with tempfile.TemporaryDirectory(prefix='t3-golive-install-') as tmp:
+            with open(os.path.join(tmp, 'journal.jsonl'), 'wb') as f:
+                f.write(data)
+            try:
+                run = journal.unfinished(tmp)
+            except journal.Damaged as e:        # Newer too
+                raise self.Refused(f'the golive journal {state}/journal.jsonl cannot be read ({e}): uninstall '
+                                   'cannot see whether a run needs settling') from None
+        if run is not None:
+            raise self.Refused(f'a golive run needs settling: {journal.describe(run)}. T3 may be stopped and its '
+                               'home held by the kit; this kit\'s code is what puts it right: run `t3-golive status`,'
+                               ' then `t3-golive back` or `t3-golive settle`, and run uninstall again')
+
 
 INSTALLER = GoliveInstaller()
 
