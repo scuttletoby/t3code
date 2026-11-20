@@ -1,7 +1,8 @@
 /**
  * Fork: a task delegated to a linked machine carries its parent's MCP profile (cut to there by
- * fork/mcpProfile.ts). An older machine drops it, so a profile narrower than `all` goes only to one
- * whose fork/forkFeatures.ts route says it applies one; any other refuses, never runs with more.
+ * fork/mcpProfile.ts). An older machine drops it, and one whose owner set `mcpCarriedProfiles` to
+ * `refuse` refuses it, so a profile narrower than `all` goes only to one whose fork/forkFeatures.ts
+ * route says it applies one; any other refuses, never runs with more.
  */
 import { type EnvironmentId, OrchestratorMcpFailure } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -60,6 +61,12 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
           }),
       ),
     );
+    if (features.mcpProfileCarry === false) {
+      return yield* new OrchestratorMcpFailure({
+        code: "capability_denied",
+        message: `${peer.link.label} is set not to take a task that carries a narrower MCP profile (its mcpCarriedProfiles is "refuse"), so the task was not sent: this thread's profile is "${resolved.name}". Delegate the task on this machine, or have the owner set mcpCarriedProfiles to "apply" on ${peer.link.label}.`,
+      });
+    }
     if (features.mcpProfileCarry !== true) {
       return yield* new OrchestratorMcpFailure({
         code: "capability_denied",

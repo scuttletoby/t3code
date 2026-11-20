@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaAST from "effect/SchemaAST";
 
 import { mapSettingsSecrets } from "../settingsSecrets.ts";
+import { FORK_WHOLE_MANAGED_SETTINGS } from "./forkManagedSettings.ts"; // Fork: lenient settings
 
 const encodeSettings = Schema.encodeSync(ServerSettings);
 const decodeSettings = Schema.decodeUnknownSync(ServerSettings);
@@ -254,6 +255,7 @@ export function listManageableSettings() {
     value: unknown,
     ast: SchemaAST.AST | undefined,
   ): ReadonlyArray<readonly [string, unknown]> => {
+    if (FORK_WHOLE_MANAGED_SETTINGS.has(path)) return [[path, value]]; // Fork: lenient settings
     const fields = new Map(
       ast !== undefined && SchemaAST.isObjects(ast)
         ? ast.propertySignatures.map(({ name, type }) => [String(name), type])
