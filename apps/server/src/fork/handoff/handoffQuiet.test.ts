@@ -1,7 +1,7 @@
 /**
  * Fork: a completed handoff run does not alert through the relay; every other run alerts as before.
- * The relay stand-in decides with upstream's `projectThreadAwarenessV2`, wired as server.ts wires
- * the real one, over a real projection store (SQLite in memory) that outlives each "server".
+ * The relay stand-in uses upstream's `projectThreadAwarenessV2` over upstream's own awareness read
+ * (the shell carries the mark), wired as server.ts wires it, over a store that outlives each "server".
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
@@ -12,7 +12,6 @@ import {
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2Run,
   RunId,
-  type ThreadId,
 } from "@t3tools/contracts";
 import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
 import * as Effect from "effect/Effect";
@@ -20,7 +19,6 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../../config.ts";
-import type { AgentAwarenessThread } from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
@@ -37,12 +35,8 @@ import {
   threadId,
 } from "./handoff.testkit.ts";
 import { HANDOFF_LOUD_SUFFIX, HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
-import {
-  HANDOFF_SETTLE_MS,
-  isQuietHandoffRun,
-  quietHandoffAwareness,
-  RELAY_COMPLETION_HOLD_MS,
-} from "./handoffQuiet.ts";
+import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
+import { isQuietHandoffRun, RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
 
 const environmentId = EnvironmentId.make("environment");
 const base = projection({ usedTokens: 0 });
@@ -109,44 +103,10 @@ const seed = (input: {
     }
   });
 
-/** The awareness row upstream reads for the thread: its latest run completed. */
-const awarenessThread = (
-  latestRunId: RunId | null,
-  patch: Partial<AgentAwarenessThread> = {},
-): AgentAwarenessThread => ({
-  id: threadId,
-  projectId: base.thread.projectId,
-  title: "Long thread",
-  lineage: base.thread.lineage,
-  modelSelection: base.thread.modelSelection,
-  creationSource: "web",
-  status: "completed",
-  activityRunStatus: null,
-  latestRunId,
-  latestRunCompletedAt: at(),
-  latestRunStopRequested: false,
-  latestRunBackgroundWake: false,
-  activeRunId: null,
-  pendingRuntimeRequest: null,
-  pendingBackgroundTasks: [],
-  pendingGuestMessageCount: 0,
-  hasActionableProposedPlan: false,
-  settledOverride: null,
-  archivedAt: null,
-  snoozedUntil: null,
-  snoozedAt: null,
-  updatedAt: at(),
-  ...patch,
-});
-
-/** Upstream's thread reads, stubbed to the one awareness row. */
-const threadsOf = (row: AgentAwarenessThread) =>
+/** Upstream's thread reads for the relay: the store's own awareness read, nothing of the fork's. */
+const upstreamThreads = (store: ProjectionStore.ProjectionStoreV2["Service"]) =>
   ({
-    getAgentAwarenessSnapshot: (requested?: ThreadId) =>
-      Effect.succeed({
-        snapshotSequence: 1,
-        threads: requested === undefined || requested === threadId ? [row] : [],
-      }),
+    getAgentAwarenessSnapshot: store.getAgentAwarenessSnapshot,
   }) as unknown as ThreadManagement.ThreadManagementService["Service"];
 
 /** A relay stand-in: on publish it reads the thread and keeps the phase upstream would publish. */
@@ -159,11 +119,15 @@ const relayStandIn = (published: Array<string | null>) =>
         publishThread: (id) =>
           threads.getAgentAwarenessSnapshot(id).pipe(
             Effect.map((snapshot) => {
-              const state = projectThreadAwarenessV2({
-                environmentId,
-                project: { title: "Project" },
-                thread: snapshot.threads[0]!,
-              });
+              const thread = snapshot.threads[0];
+              const state =
+                thread === undefined
+                  ? null
+                  : projectThreadAwarenessV2({
+                      environmentId,
+                      project: { title: "Project" },
+                      thread,
+                    });
               published.push(state?.phase ?? null);
             }),
             Effect.orDie,
@@ -177,20 +141,23 @@ const relayStandIn = (published: Array<string | null>) =>
 
 /**
  * Starts a "server" (a fresh layer graph over the same database) and publishes the thread once
- * through the relay as server.ts wires it; `wired: false` is upstream's relay alone.
+ * through the relay as server.ts wires it.
  */
-const publishOnce = (row: AgentAwarenessThread, wired = true) =>
+const publishOnce = () =>
   Effect.gen(function* () {
     const published: Array<string | null> = [];
     const sql = yield* SqlClient.SqlClient;
+    const store = yield* ProjectionStore.ProjectionStoreV2;
     const gate = yield* WorkAdmission.makeWorkAdmissionGate({ heldFromBoot: false });
     const relayLayer = relayStandIn(published);
     yield* AgentAwarenessRelay.AgentAwarenessRelay.use((relay) =>
       relay.publishThread(threadId),
     ).pipe(
       Effect.provide(
-        (wired ? ForkLayers.holdWorkAgentActivity(relayLayer) : relayLayer).pipe(
-          Layer.provide(Layer.succeed(ThreadManagement.ThreadManagementService, threadsOf(row))),
+        ForkLayers.holdWorkAgentActivity(relayLayer).pipe(
+          Layer.provide(
+            Layer.succeed(ThreadManagement.ThreadManagementService, upstreamThreads(store)),
+          ),
           Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
           Layer.provide(Layer.succeed(WorkAdmission.WorkAdmission, gate)),
           Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-handoff-quiet-" })),
@@ -202,12 +169,12 @@ const publishOnce = (row: AgentAwarenessThread, wired = true) =>
   });
 
 describe("handoff run: no relay alert", () => {
-  it.effect("a completed handoff run does not alert; upstream's relay alone would", () =>
+  it.effect("the person's run alerts; the completed handoff run after it does not", () =>
     Effect.gen(function* () {
-      yield* seed({ runs: [run(), handoffRun], messages: [userMessage, handoffMessage] });
-      const row = awarenessThread(handoffRunId);
-      expect(yield* publishOnce(row)).toBeNull();
-      expect(yield* publishOnce(row, false)).toBe("completed");
+      yield* seed({ runs: [run()], messages: [userMessage] });
+      expect(yield* publishOnce()).toBe("completed");
+      yield* seed({ runs: [handoffRun], messages: [handoffMessage] });
+      expect(yield* publishOnce()).toBeNull();
     }).pipe(Effect.provide(testDatabase)),
   );
 
@@ -215,8 +182,8 @@ describe("handoff run: no relay alert", () => {
     Effect.gen(function* () {
       yield* seed({ runs: [run(), handoffRun], messages: [userMessage, handoffMessage] });
       // Two servers in turn over the same database: nothing is kept in memory between them.
-      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBeNull();
-      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBeNull();
+      expect(yield* publishOnce()).toBeNull();
+      expect(yield* publishOnce()).toBeNull();
     }).pipe(Effect.provide(testDatabase)),
   );
 
@@ -228,21 +195,21 @@ describe("handoff run: no relay alert", () => {
         messages: [userMessage, { ...handoffMessage, id: loudId }],
       });
       // The mark is in the stored message id: each server reads it fresh.
-      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBe("completed");
-      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBe("completed");
+      expect(yield* publishOnce()).toBe("completed");
+      expect(yield* publishOnce()).toBe("completed");
     }).pipe(Effect.provide(testDatabase)),
   );
 
   it.effect("the next real turn alerts as before, after a restart too", () =>
     Effect.gen(function* () {
       yield* seed({ runs: [run(), handoffRun], messages: [userMessage, handoffMessage] });
-      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBeNull();
+      expect(yield* publishOnce()).toBeNull();
       const userMessageId = MessageId.make("message-3");
       yield* seed({
         runs: [run({ id: userRunId, ordinal: 3, userMessageId })],
         messages: [message({ id: userMessageId, runId: userRunId })],
       });
-      expect(yield* publishOnce(awarenessThread(userRunId))).toBe("completed");
+      expect(yield* publishOnce()).toBe("completed");
     }).pipe(Effect.provide(testDatabase)),
   );
 
@@ -254,9 +221,7 @@ describe("handoff run: no relay alert", () => {
         runs: [run(), { ...handoffRun, status: "failed" }],
         messages: [userMessage, handoffMessage],
       });
-      expect(yield* publishOnce(awarenessThread(handoffRunId, { status: "failed" }))).toBe(
-        "failed",
-      );
+      expect(yield* publishOnce()).toBe("failed");
       yield* seed({
         runs: [
           run({
@@ -270,7 +235,7 @@ describe("handoff run: no relay alert", () => {
         messages: [{ ...handoffMessage, id: retryId, runId: retryRunId }],
       });
       // The last alert said "failed": the work went on, so the retry's finish says so.
-      expect(yield* publishOnce(awarenessThread(retryRunId))).toBe("completed");
+      expect(yield* publishOnce()).toBe("completed");
     }).pipe(Effect.provide(testDatabase)),
   );
 
@@ -284,79 +249,24 @@ describe("handoff run: no relay alert", () => {
           message({ id: MessageId.make("steer"), runId: handoffRunId, updatedAt: at(MINUTE_MS) }),
         ],
       });
-      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBe("completed");
+      expect(yield* publishOnce()).toBe("completed");
     }).pipe(Effect.provide(testDatabase)),
   );
 
   it.effect("old, empty or half-written state alerts as before", () =>
     Effect.gen(function* () {
-      // Empty: no thread stored at all (deleted, or never projected).
-      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBe("completed");
-      // Half-written: the run is stored but its handoff message is not.
-      yield* seed({ runs: [run(), handoffRun], messages: [userMessage] });
-      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBe("completed");
-      // Old: a run from before handoffs, with an ordinary message.
-      expect(yield* publishOnce(awarenessThread(runId))).toBe("completed");
+      // Empty: no thread stored at all (deleted, or never projected): nothing to publish.
+      expect(yield* publishOnce()).toBeNull();
       // No run yet: upstream publishes nothing, and nothing changes that.
-      expect(yield* publishOnce(awarenessThread(null, { status: "idle" }))).toBeNull();
+      yield* seed({ runs: [], messages: [] });
+      expect(yield* publishOnce()).toBeNull();
+      // Old: a run from before handoffs, with an ordinary message.
+      yield* seed({ runs: [run()], messages: [userMessage] });
+      expect(yield* publishOnce()).toBe("completed");
+      // Half-written: the handoff run is stored but its handoff message is not.
+      yield* seed({ runs: [handoffRun], messages: [] });
+      expect(yield* publishOnce()).toBe("completed");
     }).pipe(Effect.provide(testDatabase)),
-  );
-});
-
-describe("quietHandoffAwareness", () => {
-  /** A store that fails every read, or counts them. */
-  const storeOf = (reads: { count: number }, fails: boolean) =>
-    ({
-      getThreadRecords: () =>
-        Effect.suspend(() => {
-          reads.count += 1;
-          return fails
-            ? Effect.fail(new ProjectionStore.ProjectionStoreReadError({ threadId }))
-            : Effect.succeed({ runs: [run()], messages: [] });
-        }),
-    }) as unknown as ProjectionStore.ProjectionStoreV2["Service"];
-
-  it.effect("a failed read leaves the row as upstream read it", () =>
-    Effect.gen(function* () {
-      const reads = { count: 0 };
-      const threads = quietHandoffAwareness(
-        threadsOf(awarenessThread(handoffRunId)),
-        storeOf(reads, true),
-      );
-      const snapshot = yield* threads.getAgentAwarenessSnapshot(threadId);
-      expect(snapshot.threads[0]?.latestRunStopRequested).toBe(false);
-      expect(reads.count).toBe(1);
-    }),
-  );
-
-  it.effect("a thread that is not completed costs no read", () =>
-    Effect.gen(function* () {
-      const reads = { count: 0 };
-      for (const status of ["running", "failed", "idle"] as const) {
-        const row = awarenessThread(handoffRunId, { status });
-        const threads = quietHandoffAwareness(threadsOf(row), storeOf(reads, false));
-        expect((yield* threads.getAgentAwarenessSnapshot(threadId)).threads[0]).toEqual(row);
-      }
-      expect(reads.count).toBe(0);
-    }),
-  );
-
-  it.effect("an ordinary run costs one read; the catch-up list none", () =>
-    Effect.gen(function* () {
-      const reads = { count: 0 };
-      const threads = quietHandoffAwareness(
-        threadsOf(awarenessThread(runId)),
-        storeOf(reads, false),
-      );
-      expect((yield* threads.getAgentAwarenessSnapshot(threadId)).threads[0]).toEqual(
-        awarenessThread(runId),
-      );
-      expect(reads.count).toBe(1);
-      expect((yield* threads.getAgentAwarenessSnapshot()).threads[0]).toEqual(
-        awarenessThread(runId),
-      );
-      expect(reads.count).toBe(1);
-    }),
   );
 });
 

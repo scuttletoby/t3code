@@ -23,9 +23,9 @@ import * as Logger from "effect/Logger";
 import { TestClock } from "effect/testing";
 
 import * as OrchestratorV2 from "../orchestration-v2/Orchestrator.ts";
-import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ActiveRunShells from "./ActiveRunShells.ts";
 import * as SlotGate from "./SlotGate.ts";
 
 const MAIN = ProviderInstanceId.make("codex");
@@ -74,7 +74,7 @@ const snapshotOf = (world: World): OrchestrationV2ThreadShellSnapshot => {
 };
 
 const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue> | "unreadable") =>
-  SlotGate.layer.pipe(
+  SlotGate.layerOver.pipe(
     // Merged out too, so a test can change the settings while the gate runs.
     Layer.provideMerge(
       Layer.mergeAll(
@@ -85,21 +85,19 @@ const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue> | "un
               ),
             })
           : ServerSettings.layerTest(settings),
-        Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getShellSnapshot: (options) =>
-            Effect.gen(function* () {
-              // Settled threads too: settling a thread does not stop its run.
-              assert.deepStrictEqual(options, { activeRunOnly: true });
-              world.snapshotReads += 1;
-              if (world.snapshotHangs) return yield* Effect.never;
-              if (world.snapshotDies) return yield* Effect.die(new Error("corrupt row"));
-              // Lets concurrent callers interleave here, the slow part of a real acquire.
-              yield* Effect.yieldNow;
-              if (world.snapshotFails) {
-                return yield* new OrchestratorV2.OrchestratorProjectionError({ threadId: caller });
-              }
-              return snapshotOf(world);
-            }),
+        // Settled threads too, as ActiveRunShells.test.ts shows: settling does not stop a run.
+        Layer.mock(ActiveRunShells.ActiveRunShells)({
+          read: Effect.gen(function* () {
+            world.snapshotReads += 1;
+            if (world.snapshotHangs) return yield* Effect.never;
+            if (world.snapshotDies) return yield* Effect.die(new Error("corrupt row"));
+            // Lets concurrent callers interleave here, the slow part of a real acquire.
+            yield* Effect.yieldNow;
+            if (world.snapshotFails) {
+              return yield* new OrchestratorV2.OrchestratorProjectionError({ threadId: caller });
+            }
+            return snapshotOf(world);
+          }),
         }),
         Layer.mock(HostResources.HostResources)({
           read: Effect.gen(function* () {

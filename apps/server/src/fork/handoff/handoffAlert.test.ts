@@ -60,7 +60,7 @@ import {
   threadId,
 } from "./handoff.testkit.ts";
 import { HANDOFF_LOUD_SUFFIX, HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
-import { HANDOFF_SETTLE_MS, quietHandoffAwareness } from "./handoffQuiet.ts";
+import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 
 const PublishPayload = Schema.Struct({ state: Schema.NullOr(RelayAgentActivityState) });
 const decodePublishPayload = Schema.decodeUnknownSync(Schema.fromJsonString(PublishPayload));
@@ -173,7 +173,7 @@ const world = Effect.fnUntraced(function* (usage: {
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.fromQueue(events),
           dispatch,
-          // Upstream's own reads, as the relay gets them (without the quiet wrapper).
+          // Upstream's own reads, as the relay gets them.
           getAgentAwarenessSnapshot: (requested?: ThreadId) =>
             Effect.gen(function* () {
               const snapshot = yield* threads.getAgentAwarenessSnapshot(requested);
@@ -199,7 +199,7 @@ const world = Effect.fnUntraced(function* (usage: {
     ),
   );
 
-  // Upstream's relay, as its own tests build it, reading the thread through the quiet wrapper.
+  // Upstream's relay, as its own tests build it, reading the thread's shell as upstream's.
   const secretValues = new Map<string, Uint8Array>([
     [PUBLISH_AGENT_ACTIVITY_SECRET, new TextEncoder().encode("true")],
     [RELAY_URL_SECRET, new TextEncoder().encode("https://relay.example.test")],
@@ -286,10 +286,7 @@ const world = Effect.fnUntraced(function* (usage: {
         getOrCreateRandom: unused,
       }),
     ),
-    Effect.provideService(
-      ThreadManagement.ThreadManagementService,
-      quietHandoffAwareness(threads, projections),
-    ),
+    Effect.provideService(ThreadManagement.ThreadManagementService, threads),
     Effect.provideService(ServerEnvironment.ServerEnvironment, {
       getEnvironmentId: Effect.succeed(EnvironmentId.make("relay-environment")),
       getDescriptor: unused(),

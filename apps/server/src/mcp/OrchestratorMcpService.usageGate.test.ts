@@ -130,15 +130,19 @@ const scope: McpInvocationScope = {
   issuedAt: 1,
 };
 
-const parentProjection = (subagents: ReadonlyArray<unknown>): OrchestrationV2ThreadProjection =>
-  ({
+const parentProjection = (
+  subagents: ReadonlyArray<unknown>,
+  options?: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>,
+): OrchestrationV2ThreadProjection => {
+  const modelSelection = { instanceId: MAIN, model: MODEL, ...(options ? { options } : {}) };
+  return {
     thread: {
       id: parentThreadId,
       projectId,
       title: "Parent",
       createdBy: "user",
       creationSource: "web",
-      modelSelection: { instanceId: MAIN, model: MODEL },
+      modelSelection,
       runtimeMode: "full-access",
       interactionMode: "default",
     },
@@ -149,12 +153,13 @@ const parentProjection = (subagents: ReadonlyArray<unknown>): OrchestrationV2Thr
         status: "running",
         rootNodeId: NodeId.make("node:usage-gate-root"),
         providerInstanceId: MAIN,
-        modelSelection: { instanceId: MAIN, model: MODEL },
+        modelSelection,
       },
     ],
     contextTransfers: [],
     subagents,
-  }) as unknown as OrchestrationV2ThreadProjection;
+  } as unknown as OrchestrationV2ThreadProjection;
+};
 
 const childProjection = {
   thread: { id: childThreadId, title: "Child" },
@@ -182,13 +187,15 @@ interface Dispatched {
  */
 const delegate = (input: {
   readonly settings?: Partial<
-    Pick<ServerSettingsValue, "usagePacingGate" | "usagePacingLowerEffort">
+    Pick<ServerSettingsValue, "usagePacingGate" | "usagePacingLowerEffort" | "modelPolicy">
   >;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly pacer?: "real" | "untouched" | "absent" | "failing";
   readonly target?: OrchestratorMcpTarget;
   readonly disabledForProject?: ReadonlyArray<ProviderInstanceId>;
   readonly retryOfAccepted?: boolean;
+  /** The options the parent thread runs with (none by default). */
+  readonly parentOptions?: ReadonlyArray<{ readonly id: string; readonly value: string }>;
   readonly runtimeMode?: RuntimeMode;
   readonly settingsUnreadable?: boolean;
   /** The parent project's folder; without it the project is not found. */
@@ -213,6 +220,18 @@ const delegate = (input: {
   >;
 }) =>
   Effect.gen(function* () {
+    // The unreadable settings mock has no `updateSettings`: a settings change there would die on
+    // the mock with no hint why. Refuse the combination at once, with the reason.
+    if (
+      input.settingsUnreadable === true &&
+      input.calls?.some((call) => typeof call !== "number" && call.settings !== undefined)
+    ) {
+      return yield* Effect.die(
+        new Error(
+          "delegate(): settingsUnreadable cannot be combined with a settings change in calls (unreadable settings cannot be changed)",
+        ),
+      );
+    }
     yield* TestClock.setTime(NOW_MS);
     const dispatched: Array<Dispatched> = [];
     const scans: Array<{ readonly instanceId: ProviderInstanceId; readonly cwd: string }> = [];
@@ -268,7 +287,7 @@ const delegate = (input: {
         getThreadRecords: (threadId) =>
           Effect.succeed(
             threadId === parentThreadId
-              ? parentProjection(dispatched.length > 0 ? [task] : [])
+              ? parentProjection(dispatched.length > 0 ? [task] : [], input.parentOptions)
               : childProjection,
           ),
         isProviderInstanceEnabledForProject: ({ instanceId }) =>
@@ -500,6 +519,64 @@ describe("OrchestratorMcpService usage pacing gate", () => {
         options: [{ id: "reasoningEffort", value: "low" }],
       });
     }),
+  );
+
+  it.effect(
+    "enforce, ahead: under a model policy, a moved pick that names its model takes none of the parent's options",
+    () =>
+      Effect.gen(function* () {
+        // An OpenCode parent that runs an agent and a level; the call names the model and no option,
+        // so with a model policy on neither reaches the child, on the account the pacer moves the
+        // task to as well. With the policy off the move keeps what upstream's lookup gives it.
+        const opencode = (base: ServerProvider): ServerProvider => ({
+          ...base,
+          driver: ProviderDriverKind.make("opencode"),
+          models: base.models.map((model) => ({
+            ...model,
+            capabilities: {
+              optionDescriptors: [
+                ...(model.capabilities?.optionDescriptors ?? []),
+                {
+                  id: "agent",
+                  label: "Agent",
+                  type: "select",
+                  options: [
+                    { id: "build", label: "Build" },
+                    { id: "plan", label: "Plan" },
+                  ],
+                },
+              ],
+            },
+          })),
+        });
+        const pick = (mode: "off" | "advise") =>
+          delegate({
+            settings: { ...enforce, modelPolicy: { mode, allow: [] } },
+            providers: [opencode(main(60)), opencode(second(10))],
+            parentOptions: [
+              { id: "reasoningEffort", value: "low" },
+              { id: "agent", value: "plan" },
+            ],
+            target: { model: MODEL },
+          });
+        const { result, dispatched } = yield* pick("advise");
+        assert.include(textOf(result), "runs on codex-second");
+        assert.deepStrictEqual(dispatched[0]?.modelSelection, {
+          instanceId: SECOND,
+          model: MODEL,
+          options: [],
+        });
+        const off = yield* pick("off");
+        assert.include(textOf(off.result), "runs on codex-second");
+        assert.deepStrictEqual(off.dispatched[0]?.modelSelection, {
+          instanceId: SECOND,
+          model: MODEL,
+          options: [
+            { id: "reasoningEffort", value: "low" },
+            { id: "agent", value: "plan" },
+          ],
+        });
+      }),
   );
 
   it.effect("enforce, ahead: an instance the caller named is kept; the task is held", () =>
@@ -1119,6 +1196,104 @@ describe("OrchestratorMcpService usage pacing gate", () => {
         );
         assert.deepStrictEqual(scans, [{ instanceId: SECOND, cwd: ROOT }]);
       }),
+  );
+
+  it.effect(
+    "advise: a list whose slash commands are still loading is scanned again by enforce, and the advice says so (#644)",
+    () =>
+      Effect.gen(function* () {
+        const advise = { usagePacingGate: "advise" } as const;
+        // Another path published a current scan of the folder that lacks the model, with its slash
+        // commands still loading, and no back-off runs.
+        const loading = inFolders(second(10), [
+          { cwd: ROOT, models: second(10).models, slashCommandsPending: true },
+        ]);
+        const state = {
+          providers: [inFolder(main(60)), loading],
+          scanned: [inFolder(main(60)), loading],
+          workspaceRoot: ROOT,
+          target: { model: LOCAL },
+        } as const;
+        // enforce scans that folder first: the registry probes a snapshot that is not settled.
+        const enforced = yield* delegate({ ...state, settings: enforce });
+        assert.deepStrictEqual(enforced.scans, [{ instanceId: SECOND, cwd: ROOT }]);
+        // advise, twice (runs again): it says enforce would scan first, and never scans itself.
+        const advised = yield* delegate({ ...state, settings: advise, calls: [0, MINUTE] });
+        for (const result of advised.results) {
+          const note = textOf(result);
+          assert.include(
+            note,
+            `codex-second has room, but it does not list ${LOCAL} for this folder in a scan that is still loading its slash commands (advice only, so it was not scanned again)`,
+          );
+          assert.include(
+            note,
+            `"enforce" would first scan this folder for codex-second: if it lists the model and the task can run there, it would run this task on codex-second; if not, it would hold this task.`,
+          );
+          assert.notInclude(note, '"enforce" would hold this task.');
+        }
+        assert.deepStrictEqual(advised.scans, []);
+        assert.deepStrictEqual(
+          advised.dispatched.map((entry) => entry.modelSelection),
+          [MAIN, MAIN].map((instanceId) => ({ instanceId, model: LOCAL })),
+        );
+        // Right after enforce: its scan is still loading, so it backed off. Within the back-off
+        // enforce answers from the list without a scan, and so does the advice.
+        const afterEnforce = yield* delegate({
+          ...state,
+          settings: enforce,
+          calls: [0, { atMs: MINUTE, settings: advise }],
+        });
+        assert.include(
+          textOf(afterEnforce.results[0]!),
+          `it does not list ${LOCAL} for this folder`,
+        );
+        const note = textOf(afterEnforce.results[1]!);
+        assert.include(note, `it does not list ${LOCAL} for this folder`);
+        assert.include(note, '"enforce" would hold this task.');
+        assert.notInclude(note, "still loading");
+        assert.notInclude(note, "would first scan");
+        assert.deepStrictEqual(afterEnforce.scans, [{ instanceId: SECOND, cwd: ROOT }]);
+      }),
+  );
+
+  it.effect("advise: a clock that goes back ends the back-off enforce recorded (#644)", () =>
+    Effect.gen(function* () {
+      const advise = { usagePacingGate: "advise" } as const;
+      // enforce gets no answer and backs off; the owner switches to advise within it; then the
+      // clock goes an hour back, which would stretch the back-off to 65 minutes.
+      const { results, scans } = yield* delegate({
+        settings: enforce,
+        providers: [inFolder(main(60)), second(10)],
+        scanFails: () => true,
+        workspaceRoot: ROOT,
+        target: { model: LOCAL },
+        calls: [0, { atMs: MINUTE, settings: advise }, -60 * MINUTE, -59 * MINUTE],
+      });
+      const noResult = "gave no result (scanned again after 2026-11-13T12:05:00.000Z)";
+      assert.include(textOf(results[0]!), noResult);
+      assert.include(textOf(results[1]!), noResult);
+      assert.include(textOf(results[1]!), '"enforce" would hold this task.');
+      // The back-off ends, as it does in enforce: the advice says enforce would scan again.
+      for (const result of results.slice(2)) {
+        assert.include(textOf(result), "no current scan of this folder (advice only");
+        assert.include(textOf(result), '"enforce" would first scan this folder for codex-second');
+        assert.notInclude(textOf(result), "gave no result");
+      }
+      // advise wrote nothing: the only scan is enforce's.
+      assert.deepStrictEqual(scans, [{ instanceId: SECOND, cwd: ROOT }]);
+    }),
+  );
+
+  it.effect("the test helper refuses a settings change with unreadable settings (#644)", () =>
+    Effect.gen(function* () {
+      const exit = yield* delegate({
+        settingsUnreadable: true,
+        providers: [main(60)],
+        calls: [0, { atMs: MINUTE, settings: enforce }],
+      }).pipe(Effect.exit);
+      assert.isTrue(exit._tag === "Failure");
+      assert.include(String(exit), "settingsUnreadable cannot be combined with a settings change");
+    }),
   );
 
   it.effect("enforce, over the even pace: lowers the effort of a project config model (#559)", () =>

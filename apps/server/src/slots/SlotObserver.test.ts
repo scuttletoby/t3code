@@ -22,9 +22,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { TestClock } from "effect/testing";
 
-import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ActiveRunShells from "./ActiveRunShells.ts";
 import * as SlotGate from "./SlotGate.ts";
 import {
   makeSlotObserver,
@@ -113,29 +113,28 @@ const scopesOf = (world: World): AgentScopeShape => ({
 });
 
 const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue>) =>
-  SlotGate.layer.pipe(
+  SlotGate.layerOver.pipe(
     Layer.provideMerge(
       Layer.mergeAll(
         ServerSettings.layerTest(settings),
-        Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getShellSnapshot: () =>
-            Effect.sync(() => {
-              world.snapshotReads += 1;
-              const shells = world.threads.map(
-                (thread) =>
-                  ({
-                    id: ThreadId.make(thread.id),
-                    providerInstanceId: MAIN,
-                    activeRunId: `run:${thread.id}`,
-                  }) as unknown as OrchestrationV2ThreadShell,
-              );
-              return {
-                schemaVersion: 1,
-                snapshotSequence: 1,
-                threads: shells,
-                archivedThreads: [],
-              } satisfies OrchestrationV2ThreadShellSnapshot;
-            }),
+        Layer.mock(ActiveRunShells.ActiveRunShells)({
+          read: Effect.sync(() => {
+            world.snapshotReads += 1;
+            const shells = world.threads.map(
+              (thread) =>
+                ({
+                  id: ThreadId.make(thread.id),
+                  providerInstanceId: MAIN,
+                  activeRunId: `run:${thread.id}`,
+                }) as unknown as OrchestrationV2ThreadShell,
+            );
+            return {
+              schemaVersion: 1,
+              snapshotSequence: 1,
+              threads: shells,
+              archivedThreads: [],
+            } satisfies OrchestrationV2ThreadShellSnapshot;
+          }),
         }),
         Layer.mock(HostResources.HostResources)({
           read: Effect.succeed({

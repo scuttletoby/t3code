@@ -20,6 +20,107 @@ const RUNNER = {
 };
 const UPSTREAM_WORKFLOW = /^\.github\/workflows\/(?!fork-)[^/]+\.ya?ml$/;
 
+// Words after which a `/` starts a regular expression, not a division.
+const BEFORE_REGEX = new Set(
+  "return typeof instanceof in of new delete void throw case do else yield await".split(" "),
+);
+
+// A JS/TS file's text with its comments blanked (newlines kept): strings, template literals (`${}` nested) and
+// regular expressions stay whole, so a `//` or `/*` in one (upstream's `'**/*'`) is no comment. A `/` is a regular
+// expression where no value ends before it. Same comments as TypeScript's parser on the tree's JS/TS files, but JSX
+// text: there a `//` blanks the rest of its line (removed code: the test counts as not run, the safe side).
+function jsCode(text) {
+  let out = "";
+  let i = 0;
+  let valueEnds = false; // the last token can end a value: a `/` after it divides
+  const nest = []; // for each open `{`: "code", or "template" for a `${` inside a template literal
+  const blank = (part) => part.replace(/[^\n]/g, " ");
+  const template = () => {
+    // From just after a backtick or a `}` that closes a `${`: to the closing backtick, or into the next `${`.
+    const start = i;
+    while (i < text.length && text[i] !== "`" && !(text[i] === "$" && text[i + 1] === "{"))
+      i += text[i] === "\\" ? 2 : 1;
+    if (text[i] === "`") {
+      i += 1;
+      valueEnds = true;
+    } else if (i < text.length) {
+      i += 2;
+      nest.push("template");
+      valueEnds = false;
+    }
+    out += text.slice(start, i);
+  };
+  while (i < text.length) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (c === "/" && next === "/") {
+      const end = text.indexOf("\n", i);
+      const stop = end === -1 ? text.length : end;
+      out += blank(text.slice(i, stop));
+      i = stop;
+    } else if (c === "/" && next === "*") {
+      const end = text.indexOf("*/", i + 2);
+      const stop = end === -1 ? text.length : end + 2;
+      out += blank(text.slice(i, stop));
+      i = stop;
+    } else if (c === "'" || c === '"') {
+      const start = i;
+      i += 1;
+      while (i < text.length && text[i] !== c && text[i] !== "\n") i += text[i] === "\\" ? 2 : 1;
+      i += 1;
+      out += text.slice(start, i);
+      valueEnds = true;
+    } else if (c === "`") {
+      out += c;
+      i += 1;
+      template();
+    } else if (c === "/" && !valueEnds) {
+      const start = i;
+      let inClass = false;
+      i += 1;
+      while (i < text.length && text[i] !== "\n" && (inClass || text[i] !== "/")) {
+        if (text[i] === "\\") i += 1;
+        else if (text[i] === "[") inClass = true;
+        else if (text[i] === "]") inClass = false;
+        i += 1;
+      }
+      i += 1;
+      while (i < text.length && /\w/.test(text[i])) i += 1;
+      out += text.slice(start, i);
+      valueEnds = true;
+    } else if (c === "{") {
+      nest.push("code");
+      out += c;
+      i += 1;
+      valueEnds = false;
+    } else if (c === "}") {
+      i += 1;
+      out += c;
+      if (nest.pop() === "template") template();
+      else valueEnds = true;
+    } else if (/[\w$]/.test(c)) {
+      const word = text.slice(i).match(/^[\w$]+/)[0];
+      out += word;
+      i += word.length;
+      valueEnds = !BEFORE_REGEX.has(word);
+    } else {
+      out += c;
+      i += 1;
+      if (!/\s/.test(c)) valueEnds = c === ")" || c === "]";
+    }
+  }
+  return out;
+}
+
+// A runner file's lines with its comments removed, so a path kept only in a comment names nothing. A JavaScript or
+// TypeScript file goes through jsCode(), so a comment marker inside a string is not a comment. Any other file (YAML,
+// shell, Python) loses `#` to the line's end where `#` starts the line or follows a space; where that errs (a ` #`
+// inside a string) it removes code, so the test counts as not run: the safe side.
+function codeLines(text, file = "") {
+  if (/\.[cm]?[jt]sx?$/.test(file)) return jsCode(text).split("\n");
+  return text.split("\n").map((line) => line.replace(/(^|\s)#.*/, "$1"));
+}
+
 // `entries`: [{ file, runBy, weight }]; `present`: test files in the tree;
 // `ever(file)` says whether the file is in the tested commit's history;
 // `read(file)` returns a runner file's text, or null when it does not exist.
@@ -43,7 +144,8 @@ function plan(entries, present, ever, read = () => null) {
     else {
       const text = read(runBy);
       if (text === null) why = `${runBy} does not exist`;
-      else if (!text.includes(file)) why = `${runBy} does not name ${file}`;
+      else if (!codeLines(text, runBy).some((line) => line.includes(file)))
+        why = `${runBy} does not name ${file} (a comment does not count)`;
     }
     if (why) notRun.push({ file, why });
     else elsewhere.push({ file, runBy });
@@ -72,7 +174,8 @@ function readList(text) {
         );
       return {
         file: match[1],
-        runBy: match[3] ?? null,
+        // `./a/b` and `a//b` name the same file as `a/b`, so every reader compares one spelling.
+        runBy: match[3] ? path.posix.normalize(match[3]) : null,
         weight: match[2] ? Number(match[2]) : null,
       };
     });
@@ -290,7 +393,11 @@ function runTest(file) {
   });
 }
 
-async function main(parts = process.argv.slice(2)) {
+// `runTest` and `now` are the real ones unless a test hands in fakes (a shard's time, its slow warning).
+async function main(
+  parts = process.argv.slice(2),
+  { runTest: run = runTest, now = Date.now } = {},
+) {
   const { index, count } = readShard();
   const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8")).filter((entry) =>
     inPart(entry.file, parts),
@@ -303,9 +410,9 @@ async function main(parts = process.argv.slice(2)) {
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
   const mine = shard(result.run, entries, index, count);
   const jobs = jobCount();
-  const started = Date.now();
-  const runs = await runAll(order(mine, entries), jobs, runTest);
-  const seconds = (Date.now() - started) / 1000;
+  const started = now();
+  const runs = await runAll(order(mine, entries), jobs, run);
+  const seconds = (now() - started) / 1000;
   const judged = judge(runs, weight);
   const { speed } = judged;
   const stale = judged.stale.map(({ note }) => note);
@@ -378,6 +485,7 @@ async function main(parts = process.argv.slice(2)) {
 
 module.exports = {
   plan,
+  jsCode,
   readList,
   order,
   shard,
@@ -392,6 +500,7 @@ module.exports = {
   presentTests,
   runAll,
   jobCount,
+  main,
 };
 
 if (require.main === module)

@@ -150,34 +150,37 @@ written out in full. The message says when no effort is set.
 - **One retry.** A handoff run that fails is sent once more with the same text. If that also fails,
   the text stays in the thread and the server log says so; the next turn end decides again. A
   handoff the person stopped stays stopped: an interrupted handoff run is never sent again.
-- **No second relay alert.** The person's turn alerts once through the relay (phone and other
-  devices). A completed handoff run then does not alert again: the relay sees it as upstream shows
-  a stopped run, so the phone's card for the thread is cleared, not shown as finished. It is quiet
+- **No second alert.** The person's turn alerts once, in the browser and through the relay (phone
+  and other devices). A completed handoff run then does not alert again: the thread shell shows it
+  as upstream shows a stopped run (`latestRunStopRequested`), so the browser gives no notice and the
+  phone's card for the thread is cleared, not shown as finished. It is quiet
   only when the settle saw the relay show the person's finish at every check, and the run was
   requested at least 5 s after the person's run finished, so their alert went out first. Otherwise
   the service sends it as one that alerts: its message id ends in `:loud`, and the run alerts when
   it finishes, as the turn's finish. The mark is the run's own message (its `handoff:` id, sent by
   the server as an agent, with or without `:loud`) and the two runs' times, all stored, so a restart
   keeps it. A failed handoff run, its retry (the last alert said "failed"), a run the person
-  steered a message into, and the next real turn alert as before (`fork/handoff/handoffQuiet.ts`).
+  steered a message into, and the next real turn alert as before. The rule is
+  `fork/handoff/handoffShell.ts`, read in both of the shell's reads (JavaScript and SQL, one line
+  each in `ProjectionStore.ts`), and every shell reader, the relay included, gets it from there.
 
 ## Limits
 
 - Timers, waits and the settle live in memory. After a server restart, the next turn end, or a late update of
   an older run, decides again, with a fresh settle. A crash between the send and the cancel leaves a queued handoff
   queued; it runs after the newer run.
-- The browser notice still fires for a completed handoff run. The browser reads only the thread
-  shell, which upstream's `ProjectionStore.ts` builds, and the fork may not add lines there yet
-  (`.github/fork-seams.json`, `pending`).
 - The same run never hands off twice: the check before the send drops a second trigger, and every
   trigger for one run uses the same ids, so one that got past would replay the first. A cancelled
   handoff spends that run's ids; the next run's turn end decides.
+- A browser that is offline from before the person's turn ends until after the quiet handoff run
+  completes (asleep, network drop) gets no notice for that turn when it reconnects: it sees only the
+  quiet run. The relay's alert for the turn (phone and other devices) still goes out.
 
 ## For developers
 
 - Fork code: `apps/server/src/fork/handoff/` (`HandoffService.ts`, `handoffDispatch.ts`,
   `handoffFacts.ts`, `handoffMessage.ts`, `handoffDecision.ts`, `handoffQuiet.ts`,
-  `handoffRelayView.ts`). Settings:
+  `handoffShell.ts`, `handoffRelayView.ts`). Settings:
   `packages/contracts/src/handoff.ts`.
 - `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes
   through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. The service starts from
