@@ -347,7 +347,7 @@ const make = Effect.gen(function* () {
       const key = input.clientRequestId ?? (yield* random.uuidV4());
       const task = taskPrompt(input);
       const title = input.title ?? parent.thread.title;
-      const carried = yield* carryMcpProfile(parent.thread, target.environmentId); // Fork: before the launch
+      const carried = yield* carryMcpProfile(parent.thread, scope, target, instanceId); // Fork: before the launch
       // Fork: from the launch on, the task is recorded and followed even if this call is
       // interrupted (the parent's turn moved on), else the thread there runs with nothing here
       // following it or reporting its end. The reads above stay cancellable.

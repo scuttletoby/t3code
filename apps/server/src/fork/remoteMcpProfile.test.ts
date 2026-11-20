@@ -9,8 +9,11 @@ import {
   NodeId,
   OrchestrationV2DelegatedFrom,
   type OrchestratorMcpDelegateTaskInput,
+  OrchestratorMcpFailure,
+  type OrchestratorMcpProviderCapability,
   PeerLinkError,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   RunId,
   ServerSettings,
@@ -135,13 +138,46 @@ const answer = (peer: Box, request: HttpClientRequest.HttpClientRequest) => {
   }
 };
 
+/** A provider instance the box lists in its `orchestrator_capabilities`. */
+const providerThere = (id: string, driverKind: string): OrchestratorMcpProviderCapability => ({
+  providerInstanceId: ProviderInstanceId.make(id),
+  driverKind: ProviderDriverKind.make(driverKind),
+  displayName: null,
+  models: [],
+  canRunChildTask: true,
+  canRunCrossProviderChildTask: true,
+  constraints: [],
+});
+
+const CLAUDE_THERE = [providerThere("claude", "claudeAgent"), providerThere("codex", "codex")];
+
+/**
+ * What the box answers to `orchestrator_capabilities`: its providers, a failure ("fails"), or its
+ * providers once `hold` is done.
+ */
+type Capabilities =
+  | ReadonlyArray<OrchestratorMcpProviderCapability>
+  | "fails"
+  | {
+      readonly hold: Deferred.Deferred<void>;
+      readonly providers: ReadonlyArray<OrchestratorMcpProviderCapability>;
+    };
+
 /**
  * The delegation service with the box faked. `settings` is this machine's settings file; the
- * delegating thread has no parent here.
+ * delegating thread has no parent here. The task goes to provider instance `instance` there.
  */
-const makeHarness = (settings: Record<string, unknown>, peer: Box) =>
+const makeHarness = (
+  settings: Record<string, unknown>,
+  peer: Box,
+  capabilities: Capabilities = CLAUDE_THERE,
+  instance = "claude",
+) =>
   Effect.gen(function* () {
     const launched: Array<Record<string, unknown>> = [];
+    /** Each `orchestrator_capabilities` call to the box. */
+    let capabilityAsks = 0;
+    const capabilitiesAsked = yield* Deferred.make<void>();
     /** Each ask of the box: where it went and with which token. */
     const asks: Array<string> = [];
     const resolve = () =>
@@ -165,7 +201,25 @@ const makeHarness = (settings: Record<string, unknown>, peer: Box) =>
               launched.push(params);
               return { threadId: ThreadId.make("thread:box-child"), runId: null, modelSelection };
             })
-          : Effect.die(`unexpected call ${tool.name}`)) as never,
+          : tool.name === "orchestrator_capabilities"
+            ? Effect.sync(() => capabilityAsks++).pipe(
+                Effect.andThen(Deferred.succeed(capabilitiesAsked, undefined)),
+                Effect.andThen(
+                  capabilities === "fails"
+                    ? Effect.fail(
+                        new OrchestratorMcpFailure({
+                          code: "orchestration_error",
+                          message: "box did not answer orchestrator_capabilities.",
+                        }),
+                      )
+                    : "hold" in capabilities
+                      ? Deferred.await(capabilities.hold).pipe(
+                          Effect.as({ providers: capabilities.providers }),
+                        )
+                      : Effect.succeed({ providers: capabilities }),
+                ),
+              )
+            : Effect.die(`unexpected call ${tool.name}`)) as never,
     });
     const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
       getThreadEventSequence: () => Effect.succeed(0) as never,
@@ -233,10 +287,14 @@ const makeHarness = (settings: Record<string, unknown>, peer: Box) =>
       ),
     ).pipe(Effect.map(Context.get(RemoteDelegation.RemoteDelegation)));
 
+    const target = { ...input.target, providerInstanceId: ProviderInstanceId.make(instance) };
     return {
-      delegate: remote.delegate(scope, input),
+      delegate: remote.delegate(scope, { ...input, target }),
       launched,
       asks,
+      capabilityAsks: () => capabilityAsks,
+      /** Done once the box's providers have been asked for. */
+      capabilitiesAsked: Deferred.await(capabilitiesAsked),
       /** Done once the box has been asked. */
       asked: Deferred.await(asked),
       /** What the launch there carried as the parent's profile. */
@@ -259,8 +317,97 @@ it.effect("carries a t3-only parent's profile to a machine that applies it", () 
       assert.deepStrictEqual(harness.carried(), [{ name: "t3-only", servers: [], t3Tools: "all" }]);
       // Asked once, at the address that answered as the box, with its link token.
       assert.deepStrictEqual(harness.asks, ASKED);
+      // And once which driver the instance there runs.
+      assert.strictEqual(harness.capabilityAsks(), 1);
     }),
   ),
+);
+
+it.effect.each<readonly [string, string, string]>([
+  [
+    "a Codex instance",
+    "codex",
+    "Provider instance codex on box uses driver codex, which does not apply",
+  ],
+  [
+    "an instance it does not list",
+    "gone",
+    "box lists no provider instance gone, so it cannot be told",
+  ],
+])(
+  "refuses, before any launch, a narrower profile to %s on a machine that applies it (#661)",
+  ([, instance, says]) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(T3_ONLY, "carries", CLAUDE_THERE, instance);
+        const exit = yield* Effect.exit(harness.delegate);
+        assert.isTrue(Exit.isFailure(exit));
+        assert.include(JSON.stringify(exit), "capability_denied");
+        assert.include(JSON.stringify(exit), says);
+        assert.include(JSON.stringify(exit), 'this thread\'s MCP profile (\\"t3-only\\")');
+        assert.deepStrictEqual(harness.launched, []);
+        // Run again: asked again (an instance there can change), refused again.
+        const again = yield* Effect.exit(harness.delegate);
+        assert.include(JSON.stringify(again), says);
+        assert.strictEqual(harness.capabilityAsks(), 2);
+        assert.deepStrictEqual(harness.launched, []);
+      }),
+    ),
+);
+
+it.effect("refuses a narrower profile to a Codex instance on a machine set to refuse (#661)", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(T3_ONLY, "set to refuse", CLAUDE_THERE, "codex");
+      const exit = yield* Effect.exit(harness.delegate);
+      assert.include(JSON.stringify(exit), "capability_denied");
+      assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
+);
+
+it.effect("sends all, which cuts nothing, to a Codex instance without asking for drivers", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({}, "carries", CLAUDE_THERE, "codex");
+      yield* harness.delegate;
+      assert.deepStrictEqual(harness.carried(), [{ name: "all", servers: "all", t3Tools: "all" }]);
+      assert.strictEqual(harness.capabilityAsks(), 0);
+    }),
+  ),
+);
+
+it.effect("refuses a narrower profile when the machine does not list its providers (#661)", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(T3_ONLY, "carries", "fails");
+      const exit = yield* Effect.exit(harness.delegate);
+      assert.isTrue(Exit.isFailure(exit));
+      assert.include(JSON.stringify(exit), "box did not answer orchestrator_capabilities.");
+      assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
+);
+
+it.effect(
+  "stopped while asking for the machine's providers, it launches nothing; run again, it carries",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const hold = yield* Deferred.make<void>();
+        const harness = yield* makeHarness(T3_ONLY, "carries", { hold, providers: CLAUDE_THERE });
+        const call = yield* harness.delegate.pipe(Effect.forkChild);
+        yield* harness.capabilitiesAsked;
+        yield* Fiber.interrupt(call);
+        assert.deepStrictEqual(harness.launched, []);
+        yield* Deferred.succeed(hold, undefined);
+        yield* harness.delegate;
+        assert.deepStrictEqual(harness.carried(), [
+          { name: "t3-only", servers: [], t3Tools: "all" },
+        ]);
+        assert.strictEqual(harness.capabilityAsks(), 2);
+      }),
+    ),
 );
 
 it.effect.each<readonly [string, Box]>([
@@ -294,7 +441,10 @@ it.effect(
         const harness = yield* makeHarness(T3_ONLY, "set to refuse");
         const exit = yield* Effect.exit(harness.delegate);
         assert.include(JSON.stringify(exit), "capability_denied");
-        assert.include(JSON.stringify(exit), "box is set not to take a task");
+        assert.include(
+          JSON.stringify(exit),
+          "box does not take a task that carries a narrower MCP profile now",
+        );
         assert.include(
           JSON.stringify(exit),
           'have the owner set mcpCarriedProfiles to \\"apply\\" on box',
