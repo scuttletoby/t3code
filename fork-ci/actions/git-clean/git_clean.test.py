@@ -730,6 +730,36 @@ class Wipe(Base):
                 self.assertEqual(os.listdir(self.ws), [])
                 self.rm(os.path.join(self.d, 'swapped'))
 
+    def test_old_glibc_a_folder_swapped_after_the_o_path_open_keeps_the_targets_mode(self):
+        """The fallback changes the mode through the O_PATH fd it opened, never by name: a symlink swapped in between
+        that open and the chmod is not followed (the folder the fd holds, moved aside, gets the mode)."""
+        victim = os.path.join(self.outside, 'keep')
+        os.chmod(victim, 0o600)
+        self.tree('sub/locked/f')
+        locked = os.path.join(self.ws, 'sub', 'locked')
+        os.chmod(locked, 0o500)
+        inode, real, aside = os.stat(locked).st_ino, os.fstat, os.path.join(self.d, 'swapped')
+
+        def fstat(fd):
+            st = real(fd)
+            if st.st_ino == inode and not os.path.lexists(aside):   # make_writable checks the O_PATH fd: swap now
+                os.chmod(locked, 0o700)   # a read-only folder cannot be moved; its owner can make it writable first
+                os.rename(locked, aside)
+                os.chmod(aside, 0o500)
+                os.symlink(victim, locked)
+            return st
+
+        with self.old_glibc(), unittest.mock.patch.object(G.os, 'fstat', fstat):
+            why = G.wipe(self.env())
+        self.assertIn('could not remove', why or '')
+        self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(aside).st_mode), 0o700)   # the fd's folder got it
+        self.assert_outside_kept()
+        with self.old_glibc():
+            self.assertIsNone(G.wipe(self.env()))   # runs again: the symlink goes as a link
+        self.assertEqual(os.listdir(self.ws), [])
+        self.rm(aside)
+
     def swap_after_the_check(self, swapped):
         """Another process swaps the folder `swapped` (the work folder, RUNNER_WORKSPACE or the workspace) for a symlink
         right after workspace() checked the paths: the wipe opens the workspace one name at a time from the work
@@ -833,6 +863,56 @@ class Wipe(Base):
             self.assertEqual(G.wipe(self.env()), why)   # runs again: refused the same way while the mount is there
         self.assertIsNone(G.wipe(self.env()))   # unmounted: the next run empties it
         self.assertEqual(os.listdir(self.ws), [])
+
+    def test_a_read_only_folder_on_another_device_keeps_its_mode(self):
+        """The device is checked from the folder's lstat before its mode is changed: a read-only mount keeps its mode."""
+        self.tree('mnt/f')
+        mnt = os.path.join(self.ws, 'mnt')
+        os.chmod(mnt, 0o555)
+        self.addCleanup(os.chmod, mnt, 0o700)
+        real = os.lstat
+
+        def lstat(name, *a, **kw):
+            st = real(name, *a, **kw)
+            if kw.get('dir_fd') is not None and name == 'mnt':
+                return types.SimpleNamespace(st_dev=st.st_dev + 1, st_ino=st.st_ino, st_mode=st.st_mode)
+            return st
+
+        with unittest.mock.patch.object(G.os, 'lstat', lstat):
+            why = G.wipe(self.env())
+        self.assertIn('another device (a mount or btrfs subvolume)', why or '')
+        self.assertIn(mnt, why)
+        self.assertEqual(stat.S_IMODE(os.stat(mnt).st_mode), 0o555)
+        self.assertEqual(os.listdir(mnt), ['f'])
+
+    @unittest.skipIf(os.geteuid() == 0, 'root reads every folder')
+    def test_work_folders_with_search_permission_only_are_passed_through(self):
+        """The folders above the workspace need only search (x) permission, as a path walk does: they are opened with
+        O_PATH, only the workspace itself is listed."""
+        self.tree('f')
+        work = os.path.join(self.d, '_work')
+        for p in (work, self.runner):
+            os.chmod(p, 0o311)
+            self.addCleanup(os.chmod, p, 0o700)
+        self.assertIsNone(G.wipe(self.env()))
+        os.chmod(self.runner, 0o700)
+        self.assertEqual(os.listdir(self.ws), [])
+
+    def test_a_workspace_that_cannot_be_opened_says_why(self):
+        """Only a symlink or a non-folder met on the way is called a symlink swap; another error is named as it is."""
+        self.tree('f')
+        aside, real = os.path.join(self.d, 'aside'), G.workspace
+
+        def workspace(env):
+            out = real(env)
+            os.rename(self.ws, aside)   # gone after the check, nothing in its place
+            return out
+
+        with unittest.mock.patch.object(G, 'workspace', workspace):
+            why = G.wipe(self.env())
+        self.assertIn(f'{self.ws} cannot be opened (', why or '')
+        self.assertNotIn('symlink', why)
+        self.assertEqual(os.listdir(aside), ['f'])
 
     def test_path_outside_the_workspace_is_refused(self):
         for p in ('/etc', '../x', 'a/../../x', self.ws, os.path.join(self.ws, 'sub')):   # absolute, even inside

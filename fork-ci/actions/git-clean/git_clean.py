@@ -245,6 +245,8 @@ def mounts_inside(real):
 
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+# the folders above the workspace are only passed through: O_PATH needs search permission there, not read permission
+TRAVERSE = (os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW) if hasattr(os, 'O_PATH') else DIR_FLAGS
 
 
 def open_workspace(env):
@@ -259,15 +261,15 @@ def open_workspace(env):
     if any(p in ('', '.', '..') for p in parts):
         raise OSError(errno.EINVAL, 'not a plain path below the runner work folder', ws)
     try:
-        fd = os.open(path, DIR_FLAGS)   # the work folder itself: a symlink there is refused (workspace() said so)
+        fd = os.open(path, TRAVERSE)   # the work folder itself: a symlink there is refused (workspace() said so)
     except OSError as e:
         e.filename = path
         raise
     try:
-        for part in parts:
+        for i, part in enumerate(parts):
             path = os.path.join(path, part)
-            try:
-                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            try:   # only the workspace itself is listed: it needs a full (readable) fd
+                child = os.open(part, DIR_FLAGS if i == len(parts) - 1 else TRAVERSE, dir_fd=fd)
             except OSError as e:
                 e.filename = path
                 raise
@@ -339,6 +341,8 @@ def empty(fd, top):
             if left:
                 name, st = left.pop()
                 try:
+                    if st.st_dev != device:   # checked before its mode is touched; again from the open fd below
+                        raise OSError(errno.EXDEV, 'another device (a mount or btrfs subvolume): it is not entered')
                     if st.st_mode & 0o700 != 0o700:   # a folder swapped for a symlink is refused, not followed
                         make_writable(name, stat.S_IMODE(st.st_mode) | 0o700, fd)
                     child = os.open(name, DIR_FLAGS, dir_fd=fd)
@@ -384,8 +388,11 @@ def wipe(env):
     try:
         fd = open_workspace(env)
     except OSError as e:
-        return (f'refused to empty the workspace: {getattr(e, "filename", None) or real} cannot be opened without '
-                f'following a symlink ({e.strerror or e}): it changed after it was checked')
+        where = getattr(e, 'filename', None) or real
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):   # O_NOFOLLOW / O_DIRECTORY met a symlink or a non-folder
+            return (f'refused to empty the workspace: {where} cannot be opened without following a symlink '
+                    f'({e.strerror or e}): it changed after it was checked')
+        return f'refused to empty the workspace: {where} cannot be opened ({e.strerror or e})'
     try:
         count = empty(fd, real)
     except OSError as e:
