@@ -18,6 +18,7 @@ import type * as Scope from "effect/Scope";
 import { McpSchema } from "effect/ai";
 import type { Tool, Toolkit } from "effect/ai";
 
+import * as LaunchMcpProfile from "../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
 import {
   DispatchModeLimit,
   type DispatchModeRefusal,
@@ -282,7 +283,7 @@ export const startsThreads = <P, A, E, R>(
         if (linked !== "stamped") yield* assertNotLinked(caller, linked.refused);
         return yield* handle(params, yield* started(caller, params));
       }),
-    (params: P) => Effect.flatMap(writingCaller, (caller) => started(caller, params)),
+    (params: P) => LaunchMcpProfile.checkedElsewhere(writingCaller, (c) => started(c, params)), // Fork: MCP profile launch
   );
 };
 

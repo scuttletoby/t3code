@@ -313,8 +313,10 @@ describe("makeClaudeMcpProfiles", () => {
       const file = JSON.stringify({ providers: 5, mcpProfile: "t3-only" });
       const [run] = yield* plansFor(["fails"], file, undefined, carriedTask);
       assert.include(run, "set to refuse such tasks");
-      // So it is not read for this machine's own threads either: they get the defaults.
-      assert.deepStrictEqual(yield* plansFor(["fails"], file), ["all"]);
+      // Its MCP profile keys still count for this machine's own threads: never the defaults' all
+      //, with the read failing or giving the defaults as upstream's load does.
+      assert.deepStrictEqual(yield* plansFor(["fails"], file), ["t3-only"]);
+      assert.deepStrictEqual(yield* plansFor([{}, {}], file), ["t3-only", "t3-only"]);
     }),
   );
 
@@ -352,12 +354,114 @@ describe("makeClaudeMcpProfiles", () => {
     }),
   );
 
-  it.effect("refuses when settings.json cannot be read either, even after a read with none", () =>
+  it.effect("refuses while settings.json cannot be read, whatever the settings read gave", () =>
     Effect.gen(function* () {
-      const [first, second] = yield* plansFor([{}, "fails"], "unreadable");
-      assert.strictEqual(first, "all");
-      assert.include(second, "could not read this thread's MCP profile settings");
+      // The read may hold a broken file's defaults from an earlier load, so it does not count
+      // while the file cannot be read: never all on a guess.
+      const runs = yield* plansFor([{}, "fails"], "unreadable");
+      assert.strictEqual(runs.length, 2);
+      for (const run of runs)
+        assert.include(run, "could not read this thread's MCP profile settings");
     }),
+  );
+
+  it.effect(
+    "a settings.json that does not decode keeps the MCP profile its text sets, never all (#681)",
+    () =>
+      Effect.gen(function* () {
+        // Upstream's load refuses each of these whole and gives every setting its default.
+        const files = [
+          // A setting the decode refuses.
+          { mcpProfile: "t3-only", defaultRuntimeMode: 5 },
+          // Legacy keys the load refuses.
+          { mcpProfile: "t3-only", providers: 5 },
+        ];
+        for (const settings of files) {
+          const file = JSON.stringify(settings);
+          assert.deepStrictEqual(yield* plansFor([{}, "fails", {}], file), [
+            "t3-only",
+            "t3-only",
+            "t3-only",
+          ]);
+        }
+        const decoded = ServerSettingsService.decodeSettingsFileText(
+          JSON.stringify(files[0]),
+          (persisted) => persisted,
+        );
+        assert.strictEqual(decoded._tag, "Failure");
+        // A project's own profile and a thread's pick are read as well.
+        const project = JSON.stringify({
+          defaultRuntimeMode: 5,
+          mcpProfiles: { docs: { servers: ["docs"], t3Tools: "all" } },
+          projectSettingsOverrides: { project: { mcpProfile: "docs" } },
+        });
+        assert.deepStrictEqual(yield* plansFor([{}], project), ["docs"]);
+        const picked = JSON.stringify({ providers: 5, mcpThreadProfiles: { t: "t3-only" } });
+        assert.deepStrictEqual(yield* plansFor([{}], picked), ["t3-only"]);
+        // A project entry it cannot read refuses the thread, never all.
+        const [entry] = yield* plansFor(
+          [{}],
+          JSON.stringify({
+            providers: 5,
+            projectSettingsOverrides: { project: 5 },
+            mcpProfile: "all",
+          }),
+        );
+        assert.include(entry, "unreadable");
+      }),
+  );
+
+  it.effect(
+    "a settings.json that names a profile key but cannot be read refuses until it is fixed (#681)",
+    () =>
+      Effect.gen(function* () {
+        const { settingsPath } = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const service = yield* ServerSettingsService.ServerSettingsService;
+        // As upstream's load reads the file: its settings, the defaults for one it cannot parse.
+        const getSettings = fs.readFileString(settingsPath).pipe(
+          Effect.map((raw) => {
+            try {
+              return fromFile(JSON.parse(raw));
+            } catch {
+              return fromFile({});
+            }
+          }),
+          Effect.orElseSucceed(() => fromFile({})),
+        );
+        const plan = yield* makeClaudeMcpProfiles.pipe(
+          Effect.provideService(ServerSettingsService.ServerSettingsService, {
+            ...service,
+            getSettings,
+          }),
+        );
+        const run = () =>
+          plan(thread("t"), {}).pipe(
+            Effect.match({ onFailure: (refusal) => refusal.message, onSuccess: (r) => r.name }),
+          );
+        // Stopped half-way through a write, or a list: refused on each turn, never all.
+        for (const broken of ['{ "mcpProfile": "t3-only", "theme": ', '["mcpProfile"]']) {
+          yield* fs.writeFileString(settingsPath, broken);
+          for (const _ of [1, 2]) {
+            const refused = yield* run();
+            assert.include(refused, "settings.json sets MCP profiles but cannot be read");
+            assert.include(refused, "fix settings.json");
+          }
+        }
+        // Fixed, the next turn reads it again; removed, the defaults apply as before.
+        yield* fs.writeFileString(settingsPath, JSON.stringify({ mcpProfile: "t3-only" }));
+        assert.strictEqual(yield* run(), "t3-only");
+        yield* fs.remove(settingsPath);
+        assert.strictEqual(yield* run(), "all");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettingsService.ServerSettingsService.layerTest(),
+            ManagedPolicy.layerTest(),
+            Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+          ).pipe(Layer.provideMerge(NodeServices.layer)),
+        ),
+      ),
   );
 });
 
