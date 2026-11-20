@@ -152,11 +152,13 @@ merge() {
 
 failures=0
 check() { # check NAME EXPECTED_STATUS [GREP_PATTERN [ABSENT_PATTERN [ALSO_PATTERN]]] -- runs the scan in $clone
-  # with the env given; exact=TEXT (in that env) wants the whole output to be TEXT, nothing more
-  local name="$1" expected="$2" pattern="${3:-}" absent="${4:-}" also="${5:-}" out status
+  # with the env given; exact=TEXT (in that env) wants the whole output to be TEXT, nothing more;
+  # summary_first=REGEX wants the job summary's first line after its heading to match REGEX
+  local name="$1" expected="$2" pattern="${3:-}" absent="${4:-}" also="${5:-}" out status first
   set +e
   out="$(cd "$clone" && GITLEAKS="$gitleaks" GITHUB_STEP_SUMMARY="$root/summary" "$script" 2>&1)"
   status=$?
+  first="$(sed -n '/^### Secret scan$/,$ { /^### /d; /^$/d; p; }' "$root/summary" 2> /dev/null | head -n 1)"
   set -e
   if [[ "$status" -ne "$expected" ]]; then
     echo "FAIL $name: exit $status, expected $expected"
@@ -177,6 +179,10 @@ check() { # check NAME EXPECTED_STATUS [GREP_PATTERN [ABSENT_PATTERN [ALSO_PATTE
   elif [[ -n "$absent" ]] && grep -qE "$absent" <<< "$out"; then
     echo "FAIL $name: output has /$absent/"
     printf '%s\n' "$out" | sed 's/^/    /'
+    failures=$((failures + 1))
+  elif [[ -n "${summary_first:-}" ]] && ! grep -qE "$summary_first" <<< "$first"; then
+    echo "FAIL $name: the job summary's first line is not /$summary_first/"
+    sed 's/^/    /' "$root/summary" 2> /dev/null || echo "    (no summary)"
     failures=$((failures + 1))
   else
     echo "ok   $name"
@@ -659,7 +665,8 @@ fresh_sweep() { # a new blob-less clone of the sweep origin, holding nothing a r
   git clone -q --filter=blob:none --no-checkout "file://$root/sweep.git" "$clone"
 }
 fresh_sweep
-OLD_HEADS="$gone3 $vanished" EVENT_NAME=schedule \
+# #405: the job summary says why the sweep failed first, before the scan's own result.
+summary_first="^Failed: 1 tip\\(s\\) GitHub's activity record lists cannot be fetched" OLD_HEADS="$gone3 $vanished" EVENT_NAME=schedule \
   check "daily sweep, no list of tips known gone: a listed tip origin no longer serves fails, after the rest is scanned" 2 \
   "$gone_error: origin no longer has them \\($gone3\\).*$gone_list" "" "leaks found: [1-9]"
 # The state question: a run again (the same clone, the tip still gone) fails the same way; nothing a
@@ -667,8 +674,9 @@ OLD_HEADS="$gone3 $vanished" EVENT_NAME=schedule \
 OLD_HEADS="$gone3 $vanished" EVENT_NAME=schedule \
   check "daily sweep: the same run again fails the same way" 2 "$gone_error.*$gone3"
 set_gone_list "# Tips known gone: none yet."
-OLD_HEADS="$gone3" EVENT_NAME=schedule \
-  check "daily sweep: an empty list of tips known gone: a gone tip fails" 2 "$gone_error.*$gone3"
+summary_first="^Failed: 1 tip\\(s\\) GitHub's activity record lists cannot be fetched.*$gone3" OLD_HEADS="$gone3" EVENT_NAME=schedule \
+  check "daily sweep: an empty list of tips known gone: a gone tip fails; with no finding, the summary says why first" 2 \
+  "$gone_error.*$gone3"
 set_gone_list "$gone3 checked by hand: GitHub serves it nowhere (test)"
 OLD_HEADS="$gone3" EVENT_NAME=schedule \
   check "daily sweep: a gone tip on the list of tips known gone warns, and passes" 0 \
@@ -748,6 +756,30 @@ fresh_sweep
 OLD_HEADS="$vanished" EVENT_NAME=schedule \
   check "daily sweep: a tip on the list of tips known gone that origin serves is scanned, with a warning" 1 \
   "::warning.*1 tip\\(s\\) on the list of tips known gone are served.*${vanished:0:12}" "" "1 tip\\(s\\) no ref holds"
+# #405: a listed tip whose fetch fails for any reason but "not our ref" (a 502 every time) fails the
+# sweep and asks for a re-run. It never counts as gone, so neither the reviewed list nor
+# SCANNED_GONE turns it into a warning. In a fresh clone, origin's calls 1 to 3 are the default
+# branch, the list's contents and every ref; from call 4 on (the batch of listed tips, then each one
+# by one) every call fails.
+sweep_502() { # sweep_502 NAME [SCANNED_GONE]: the sweep with OLD_HEADS=$vanished, every fetch of it a 502
+  local name="$1" scanned="${2:-}"
+  fresh_sweep
+  git -C "$clone" config remote.origin.uploadpack "$root/flaky-upload-pack"
+  seq 4 40 > "$root/flaky-fail"
+  rm -f "$root/flaky-count"
+  SCANNED_GONE="$scanned" FETCH_RETRY_DELAY=0 OLD_HEADS="$vanished" EVENT_NAME=schedule \
+    check "$name" 2 "::error::Secret scan: cannot fetch the listed tip $vanished.*Re-run the job" \
+    "tips known gone|GitHub has deleted them"
+}
+sweep_502 "daily sweep: a tip on the list of tips known gone whose fetch fails every time (502): fails, asks for a re-run"
+# The state question: the same clone, origin healthy again: the tip is fetched and scanned (its key
+# found); the failed run left nothing that skips it.
+: > "$root/flaky-fail"
+OLD_HEADS="$vanished" EVENT_NAME=schedule \
+  check "daily sweep: the same clone after the 502 run, origin healthy: the listed tip is scanned" 1 \
+  "::warning.*1 tip\\(s\\) on the list of tips known gone are served" "" "leaks found: [1-9]"
+set_gone_list "# Tips known gone: none yet."
+sweep_502 "daily sweep: a tip SCANNED_GONE names whose fetch fails every time (502): fails, asks for a re-run" "$vanished"
 # The list counts only on the default branch: an entry a branch (or the checkout) adds is not read.
 git checkout -q -b list-pr main
 commit_bytes "$gone_list" "a branch puts a tip on the list" <<< "$gone4 not reviewed"
@@ -759,12 +791,21 @@ OLD_HEADS="$gone4" EVENT_NAME=schedule \
 git push -q origin :list-pr
 # A list the scan cannot trust fails the sweep, gone tips or not.
 upper=ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD
-for bad in "$gone4" "$gone4"$'\r' "$upper reason" "${gone4:0:12} reason" "$zeros reason" "--all reason" "$gone4# reason"; do
+for bad in "$gone4" "$upper reason" "${gone4:0:12} reason" "$zeros reason" "--all reason" "$gone4# reason"; do
   set_gone_list "$gone3 checked by hand (test)
 $bad"
   OLD_HEADS="" EVENT_NAME=schedule \
     check "daily sweep: a list of tips known gone with a bad entry fails ($(printf '%q' "$bad"))" 2 \
     "::error::Secret scan: line 2 of $gone_list on the default branch .* is not"
+done
+# #405: a carriage return fails on any line, with or without a reason, a comment or blank line too,
+# so a CRLF file is refused as a whole rather than line by line.
+for bad in "$gone4"$'\r' "$gone4 reason"$'\r' "$gone4 reason"$'\r'" more" "# a comment"$'\r' $'\r'; do
+  set_gone_list "$gone3 checked by hand (test)
+$bad"
+  OLD_HEADS="" EVENT_NAME=schedule \
+    check "daily sweep: a list of tips known gone with a carriage return fails ($(printf '%q' "$bad"))" 2 \
+    "::error::Secret scan: line 2 of $gone_list on the default branch .* has a carriage return"
 done
 git rm -q "$gone_list"
 mkdir -p .github
@@ -791,6 +832,26 @@ printf '%s\n' 2 > "$root/flaky-fail"
 rm -f "$root/flaky-count"
 OLD_HEADS="$gone3" EVENT_NAME=schedule \
   check "daily sweep: a list of tips known gone that cannot be read fails" 2 "::error::Secret scan: cannot read $gone_list"
+# #405: the tree that would hold the list cannot be read (a clone without trees, origin failing
+# that one call, a 502): fails, never read as no list. An empty list would still fail every gone
+# tip, but a run with none would pass without its list ever read. No tip is listed here, so only
+# this failure can make the run red.
+clone="$root/sweep-treeless"
+rm -rf "${clone:?}"
+git clone -q --filter=tree:0 --no-checkout "file://$root/sweep.git" "$clone"
+# git fetch reads .gitmodules (a lazy fetch of the trees) unless submodules are off, so with them off
+# origin's call 1 is the scan's settings fetch and call 2 the list's tree.
+git -C "$clone" config fetch.recurseSubmodules false
+git -C "$clone" config remote.origin.uploadpack "$root/flaky-upload-pack"
+printf '%s\n' 2 > "$root/flaky-fail"
+rm -f "$root/flaky-count"
+OLD_HEADS="" EVENT_NAME=schedule \
+  check "daily sweep: the tree holding the list of tips known gone cannot be read: fails" 2 \
+  "::error::Secret scan: cannot read $gone_list on the default branch [^ ]+ \\([0-9a-f]{12}\\) \\(the reviewed list of tips known gone\\)$"
+# The state question: the same clone, origin healthy: the list is read and the sweep passes.
+: > "$root/flaky-fail"
+OLD_HEADS="" EVENT_NAME=schedule \
+  check "daily sweep: the same clone after the failed tree read, origin healthy: passes" 0 "" "::error"
 git rm -q "$gone_list"
 GIT_AUTHOR_DATE="@$date" GIT_COMMITTER_DATE="@$date" git commit -qm "no list"
 git push -q origin main

@@ -104,9 +104,10 @@
 #                  another branch: one line per tip, `<full commit id> <why it is known gone>`, plus
 #                  # comments and blank lines. A listed tip origin no longer serves gets a warning; one
 #                  it serves (it came back) is scanned, with a warning to drop its line. No file is an
-#                  empty list; a file that is not a plain file, cannot be read, or has any other line
-#                  fails the job (exit 2), whether or not a tip is gone. Entries the record no longer
-#                  lists change nothing.
+#                  empty list; a file that is not a plain file, cannot be read, has any other line, or
+#                  has a carriage return anywhere (CRLF line ends: one rule for every line, comments
+#                  included) fails the job (exit 2), whether or not a tip is gone. Entries the record
+#                  no longer lists change nothing.
 #
 # Commit objects: each commit of the range as git stores it (`git cat-file`: its message, author
 # and committer names and emails, signature and other headers), and on a tag push the pushed tag's
@@ -320,7 +321,9 @@ fetch_config_branch() {
 }
 # The reviewed list of tips known gone (see "sweep, gone tips") on commit $1, the default branch's
 # tip: sets known_gone to " <id> <id> ... ". No file is an empty list; a list the scan cannot trust
-# (not a plain file, unreadable, a line that is not `<full commit id> <why>`) fails the job (exit 2).
+# (not a plain file, unreadable, a line that is not `<full commit id> <why>`, a carriage return on
+# any line) fails the job (exit 2). A tree that cannot be read fails too: read as no file, the list
+# would be empty, which is strictest for gone tips but would hide that the list was never read.
 gone_list=.github/fork-secret-sweep-gone-tips.txt
 read_gone_list() {
   local entry mode type oid text line id n=0 where="on the default branch ${CONFIG_BRANCH:-} (${1:0:12})"
@@ -341,6 +344,12 @@ read_gone_list() {
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
+    # A carriage return anywhere fails, so `<id>\r` and `<id> why\r` (and a CRLF comment) are judged
+    # alike: the file is saved with LF line ends.
+    if [[ "$line" == *$'\r'* ]]; then
+      echo "::error::Secret scan: line $n of $gone_list $where has a carriage return (CRLF line ends?), so the list of tips known gone cannot be trusted. Save it with LF line ends on the default branch (a reviewed pull request)." >&2
+      exit 2
+    fi
     [[ ! "$line" =~ ^[[:space:]]*(#|$) ]] || continue
     id=""
     if [[ "$line" =~ ^([0-9a-f]{40}([0-9a-f]{24})?)[[:space:]]+[^[:space:]] ]]; then id="${BASH_REMATCH[1]}"; fi
@@ -756,6 +765,8 @@ plain="$(tr -d '\000' < "$log" | sed -E 's/\x1b\[[0-9;]*m//g')"
 scanned="$(sed -nE 's/.* ([0-9]+) commits scanned.*/\1/p' <<< "$plain" | tail -n 1)"
 echo "gitleaks scanned ${scanned:-no} commit(s); $expected commit(s) in range have changes it reads"
 summary "### Secret scan" ""
+# Why the sweep fails comes first: the scan's own result below may read "No secrets found".
+if [[ -n "$gone_failure" ]]; then summary "Failed: $gone_failure." ""; fi
 if [[ -n "$warning" ]]; then summary "Warning: $warning." ""; fi
 # gitleaks 8.30.1 logs git's stderr as ERR (and `ERR error="stderr is not empty"`), stops reading
 # diffs once git exits, and still exits 0; the count above misses that when the dropped files all
@@ -836,10 +847,7 @@ fi
 summary "" "Not covered: ref names; pull request titles, bodies and comments; commits only an outside pull request's head (refs/pull/*) holds; refs that name a tree or blob; a vanished tip GitHub's activity record does not list or that is on the reviewed list of tips known gone; a \`gitleaks:allow\` line; text in other encodings; packed or compressed contents; a key split across lines (see the header of fork-secret-scan.sh)."
 
 # A tip no run read and origin no longer serves fails the sweep (see "sweep, gone tips"), after the
-# scan above, so its findings are still reported.
-if [[ -n "$gone_failure" ]]; then
-  summary "" "Failed: $gone_failure."
-  exit 2
-fi
+# scan above, so its findings are still reported. The summary says so first (above).
+if [[ -n "$gone_failure" ]]; then exit 2; fi
 if [[ $status -ne 0 ]]; then exit "$status"; fi
 exit "$mstatus"
