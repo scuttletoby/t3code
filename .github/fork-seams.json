@@ -216,6 +216,18 @@
       "added": [
         "mcpProfile: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)), // Fork: the parent's MCP profile"
       ]
+    },
+    "apps/server/src/orchestration-v2/ProjectionStore.ts": {
+      "why": "#350: a completed quiet handoff run (the fork's relay of a finished run to the agent that handed off) reads as upstream's stopped run (latestRunStopRequested) in both thread shell reads, the JavaScript one and the SQL one, so the browser's turn notice and the relay stay quiet through upstream's own gates. The rule is in apps/server/src/fork/handoff/handoffShell.ts; tested in apps/server/src/fork/handoff/handoffShell.test.ts. Drop it if upstream gets its own quiet mark for a run.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-20",
+        "added": [
+          "import * as ForkHandoffShell from \"../fork/handoff/handoffShell.ts\"; // Fork: quiet handoff runs",
+          "...ForkHandoffShell.quietHandoffShellMark(projection, latestRun), // Fork: reads as stopped",
+          "${ForkHandoffShell.quietHandoffRunOrSql(sql, \"presented\")}"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
