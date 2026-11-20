@@ -172,6 +172,7 @@ const makeHarness = (
   peer: Box,
   capabilities: Capabilities = CLAUDE_THERE,
   instance = "claude",
+  driverKind?: string,
 ) =>
   Effect.gen(function* () {
     const launched: Array<Record<string, unknown>> = [];
@@ -287,7 +288,11 @@ const makeHarness = (
       ),
     ).pipe(Effect.map(Context.get(RemoteDelegation.RemoteDelegation)));
 
-    const target = { ...input.target, providerInstanceId: ProviderInstanceId.make(instance) };
+    const target = {
+      ...input.target,
+      providerInstanceId: ProviderInstanceId.make(instance),
+      ...(driverKind === undefined ? {} : { driverKind: ProviderDriverKind.make(driverKind) }),
+    };
     return {
       delegate: remote.delegate(scope, { ...input, target }),
       launched,
@@ -353,6 +358,65 @@ it.effect.each<readonly [string, string, string]>([
         assert.deepStrictEqual(harness.launched, []);
       }),
     ),
+);
+
+it.effect(
+  "a call naming a Claude driver asks the machine's providers once, and carries (#672)",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(
+          T3_ONLY,
+          "carries",
+          CLAUDE_THERE,
+          "claude",
+          "claudeAgent",
+        );
+        yield* harness.delegate;
+        assert.deepStrictEqual(harness.carried(), [
+          { name: "t3-only", servers: [], t3Tools: "all" },
+        ]);
+        // Upstream's instance pick asked; the carry reads the driver the call named and was checked.
+        assert.strictEqual(harness.capabilityAsks(), 1);
+        // Run again: one more ask, not two.
+        yield* harness.delegate;
+        assert.strictEqual(harness.capabilityAsks(), 2);
+      }),
+    ),
+);
+
+it.effect(
+  "a call naming the Codex driver is refused, before any launch, after one ask (#672)",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(T3_ONLY, "carries", CLAUDE_THERE, "codex", "codex");
+        const exit = yield* Effect.exit(harness.delegate);
+        assert.include(JSON.stringify(exit), "capability_denied");
+        assert.include(
+          JSON.stringify(exit),
+          "Provider instance codex on box uses driver codex, which does not apply",
+        );
+        assert.strictEqual(harness.capabilityAsks(), 1);
+        assert.deepStrictEqual(harness.launched, []);
+      }),
+    ),
+);
+
+it.effect("a call naming a Claude driver for a Codex instance there is refused upstream", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(T3_ONLY, "carries", CLAUDE_THERE, "codex", "claudeAgent");
+      const exit = yield* Effect.exit(harness.delegate);
+      // The carry trusts the named driver only because this check comes first.
+      assert.include(
+        JSON.stringify(exit),
+        "Provider instance codex there uses driver codex, not claudeAgent.",
+      );
+      assert.strictEqual(harness.capabilityAsks(), 1);
+      assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
 );
 
 it.effect("refuses a narrower profile to a Codex instance on a machine set to refuse (#661)", () =>

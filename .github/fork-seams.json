@@ -31,7 +31,7 @@
       ]
     },
     "apps/server/src/server.ts": {
-      "why": "The fork's service layers are wired here in one place each, from fork/forkLayers.ts (#384), so this file keeps as few fork lines as it can. The ten lines in \"added\" were its pending lines (ceiling 10) when it moved here (#361). The last line in \"added\" gives the runtime's workers upstream's orchestrator with one change: an idle compaction send to a thread whose handoff mode is \"handoff\" is skipped, so the handoff service alone owns that thread (fork/handoff, #361).",
+      "why": "The fork's service layers are wired here in one place each, from fork/forkLayers.ts (#384), so this file keeps as few fork lines as it can. The ten lines in \"added\" were its pending lines (ceiling 10) when it moved here (#361). The last line in \"added\" gives the runtime's workers upstream's orchestrator with one change: an idle compaction send to a thread whose handoff mode is \"handoff\" is skipped, so the handoff service alone owns that thread (fork/handoff, #361). The line naming ForkLayers.mcpProfileTurnCheck gives the runtime upstream's provider instance registry with one change: a provider that cannot apply MCP profiles (all but Claude) refuses a turn whose thread's profile is narrower than \"all\", at turn start (fork/mcpProfileTurnCheck.ts, #672).",
       "added": [
         "import * as ForkLayers from \"./fork/forkLayers.ts\";",
         "// Fork (waits): the `pr` judge reads through the same pull request service and its caches.",
@@ -43,6 +43,7 @@
         "const layerWorkAdmission = yield* ForkLayers.makeWorkAdmissionLayer(config);",
         "Layer.provide(ForkLayers.holdWorkCloudLink(CloudLink.layer, ConnectReachability.layer)),",
         "Layer.provide(Layer.merge(layerActivation, layerWorkAdmission)),",
+        "Layer.provideMerge(ForkLayers.mcpProfileTurnCheck), // Fork: a narrowed MCP profile refuses off Claude",
         "Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction), // Fork: one owner (fork/handoff)"
       ]
     },

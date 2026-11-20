@@ -405,11 +405,22 @@ still shows a server the profile leaves out, or does not list its servers within
 managed Claude policy on the machine or `--mcp-config` in the Claude launch arguments can make
 Claude load a server T3's list leaves out.
 
-Only Claude threads apply profiles. A Codex thread, or one on any other provider, gets every MCP
-server and every T3 tool whatever its profile says. So a thread whose profile is narrower than
-`all` does not delegate a task to a Codex (or other non-Claude) instance on another machine: the
-call is refused before anything is sent (see below). A task such an instance got anyway, from a
-machine on a T3 from before this, runs with every tool.
+Only Claude threads apply profiles. A Codex thread, or one on any other provider, would get every
+MCP server and every T3 tool whatever its profile says. So its turn is not started when its
+profile is narrower than `all` ([#672](https://github.com/scuttletoby/t3code/issues/672)): the
+machine that runs the turn checks the thread's profile as the turn starts (also a resumed turn)
+and refuses it, saying why and how to go on (switch the thread to a Claude instance, or pick `all`
+for it). That covers every way a thread gets there: a thread switched to another provider
+(`t3_thread_configure`, or in the app), a thread made by `t3_thread_launch` in a project whose
+profile is narrower, a task delegated on this machine (a child gets its parent's profile, or
+`mcpSubagentProfile`), and a task another machine sent, also one from a T3 from before carrying,
+which carries nothing and gets this machine's profile for its role. A profile that cannot be
+worked out (a parent thread that cannot be read, settings that cannot be read for a carried task)
+refuses the turn there too, as on Claude. The check is read again for each turn, so a profile
+change, or a switch back to Claude, counts from the next turn. Compacting a thread is not checked:
+it calls no tools. A thread whose profile is `all` runs on any provider as before. A delegation
+also refuses, before anything is sent, a narrower profile to a Codex (or other non-Claude)
+instance on another machine (see below), so the task is not made only to be refused there.
 
 Each tool call is checked too: a call to an MCP server the profile leaves out (also one an agent
 file declares, or one added while the session runs) is refused at the moment of the call: Claude
@@ -448,8 +459,10 @@ says that machine does not take such a task now. When the machine says it applie
 delegating machine then asks its `orchestrator_capabilities` (through the link, as any call there)
 which driver the task's provider instance runs, and refuses the call unless it is Claude: an
 instance it does not list, or no answer, refuses it too
-([#661](https://github.com/scuttletoby/t3code/issues/661)). A thread with `all` delegates to any
-machine and any instance there, without asking. A task that arrives from a machine
+([#661](https://github.com/scuttletoby/t3code/issues/661)). A call that names a driver
+(`target.driverKind`) has that list asked once: upstream's pick of the instance there reads it, and
+the check uses the driver it named. A thread with `all` delegates to any machine and any instance
+there, without asking. A task that arrives from a machine
 on an older T3 carries nothing, so it gets this machine's profile for its role as before, and the
 server log says so.
 
@@ -484,15 +497,15 @@ Whether this machine takes tasks that another machine delegated with a profile n
 down to the carried profile, as `server.mcpProfiles` says. `refuse` takes no part in carrying: the
 features route answers `mcpProfileCarry: false`, so a narrower-profile thread on another machine is
 refused before it sends. A task that arrives with one anyway (sent before the setting changed), or
-with a profile this machine cannot read, does not start its turn on Claude, nor do its sub-agents,
-and says why (a sub-agent's refusal gives the reason at the top of the chain). A sender of this
-version does not send a narrower profile to a Codex or other non-Claude instance here, whichever
-value is set, as only Claude threads apply profiles (see `server.mcpProfiles`). Neither value is an
+with a profile this machine cannot read, does not start its turn, nor do its sub-agents, and says
+why (a sub-agent's refusal gives the reason at the top of the chain). Whichever value is set, a
+narrower task on a Codex or other non-Claude instance here does not start its turn, as only Claude
+threads apply profiles (see `server.mcpProfiles`), and a sender of this version does not send one. Neither value is an
 "ignore the carried profile" value, as a thread could then get more tools by delegating to this
 machine. A task that carries `all`, or nothing (from an older T3), runs as before, and the owner's
 pick for a task here (`mcpThreadProfiles`) still stands. It is read again for each turn and each
-ask, so a change counts from the next one. Only `apply` (in any case, with spaces around it) reads
-as `apply`; any other value, such as a typo of `refuse` or an empty one, reads as `refuse`, and the
+ask, so a change counts from the next one. Only `apply` (in any case, with spaces around it), or
+`null`, reads as `apply`; any other value, such as a typo of `refuse` or an empty one, reads as `refuse`, and the
 file's other settings keep their values.
 
 `settings.json` is checked on each read too, the same way for a Claude turn, for a delegation's

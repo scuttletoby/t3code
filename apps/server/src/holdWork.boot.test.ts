@@ -358,15 +358,15 @@ const CONNECT_SPANS = [
 const HELD_SPANS = ["autoPullProjects", "RemoteDelegation.followOnce", ...CONNECT_SPANS];
 
 /**
- * Spans only the fork's own server layers make while they are built (fork/forkLayers.ts): the read
- * of the usage pacer and slot gate beside /mcp, the usage refresher, automatic updates. A server
- * whose server.ts lost both `ForkLayers.layerRuntimeServices` and `ForkLayers.layerRoutes` (a sync
- * that dropped them) still boots and keeps every hold, so only these show the gates are gone.
+ * Spans only the fork's own server layers make while built (fork/forkLayers.ts). A server.ts that
+ * lost `ForkLayers.layerRuntimeServices` and `layerRoutes`, or `ForkLayers.mcpProfileTurnCheck`,
+ * still boots and keeps every hold, so only these show the gates are gone.
  */
 const FORK_LAYER_SPANS = [
   "ForkLayers.mcpGatesPresent",
   "HeadlessUsageRefresher.make",
   "cloud.auto_update.make",
+  "McpProfileTurnCheck.make",
 ];
 
 const missingForkLayers = (spans: ReadonlySet<string>) =>

@@ -8,6 +8,7 @@ import {
   OrchestratorMcpCapabilitiesInput,
   OrchestratorMcpCapabilitiesResult,
   OrchestratorMcpFailure,
+  type ProviderDriverKind,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -44,7 +45,11 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
   return Effect.fn("RemoteMcpProfile.carry")(function* (
     parent: LineageThread,
     scope: McpInvocationContext.McpThreadInvocationScope,
-    target: { readonly environmentId: EnvironmentId },
+    /** With `driverKind`, peer/RemoteDelegation.ts has picked or checked the instance by it there. */
+    target: {
+      readonly environmentId: EnvironmentId;
+      readonly driverKind?: ProviderDriverKind | undefined;
+    },
     /** The provider instance there the launch names: where the task would run. */
     instanceId: ProviderInstanceId,
   ) {
@@ -95,12 +100,15 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
         message: `${peer.link.label} runs a T3 Code version that does not apply this thread's MCP profile ("${resolved.name}") to a task, so the task was not sent: there it would get every MCP server that machine's own profile allows. Update T3 Code on ${peer.link.label}, or delegate the task on this machine.`,
       });
     }
-    // Only a Claude thread applies a profile there; any other provider runs the task with every
-    // MCP server and T3 tool, whatever it carries. Asked for each task, like the route.
-    const { providers } = yield* forwarding.call(scope, RemoteCapabilitiesTool, environmentId, {});
-    const driverKind = providers.find(
-      (provider) => provider.providerInstanceId === instanceId,
-    )?.driverKind;
+    // Only a Claude thread applies a profile there. A named driver was checked against that
+    // machine's list by upstream's resolveRemoteInstance in this call, so it is not asked twice;
+    // without one, the list is asked here for each task. The turn there is checked again as it
+    // starts (fork/mcpProfileTurnCheck.ts).
+    const driverKind =
+      target.driverKind ??
+      (yield* forwarding.call(scope, RemoteCapabilitiesTool, environmentId, {})).providers.find(
+        (provider) => provider.providerInstanceId === instanceId,
+      )?.driverKind;
     if (driverKind === undefined || !MCP_PROFILE_DRIVERS.has(driverKind)) {
       return yield* new OrchestratorMcpFailure({
         code: "capability_denied",
