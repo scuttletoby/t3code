@@ -875,7 +875,9 @@ way or fails its self-test leaves the copy in use as it was. The bootstrap passe
 on to the installer; any other option is refused. The steps every kit shares are in
 `fork-kit/common/kit_install.py` ([common](../common/README.md#the-installer)).
 
-Update only through the bootstrap, with the newer release commit. An installed `fork-cleaner-install` from
+Update only through the bootstrap, with the newer release commit. The installed `fork-cleaner-install` refuses a
+`--source` whose `sbin/fork-cleaner-install` or `common/kit_install.py` differs from its own (it would copy its own
+file list, not the newer release's) and names the bootstrap, which runs the release's own installer. One from
 before the shared installer (`fork-kit/common/kit_install.py`) copies no `common/kit_install.py`, so the installer
 it leaves cannot load: it then refuses and says to run the bootstrap, which makes the copy whole again. The
 self-test now runs the copied installer's `--help` too, so a copy like that is refused from here on. `uninstall`

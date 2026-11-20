@@ -1200,6 +1200,12 @@ def _restart(run, cfg, adapter, server, say, version):
     return None, again
 
 
+def _blind(cfg, adapter, server):
+    """handoff.handover_blind for a copy: after the stop it starts the live build again, or, after an update caught
+    at the stop (UpdateAtStop), whatever build the service state names then (#580)."""
+    return handoff.handover_blind(cfg.home, [server['version'], handoff.ANY_BUILD], server['version'], adapter.service)
+
+
 def run_copy(cfg, adapter, owner_says_go=False, say=print):
     """The practice stop, in this process. Returns the result dict; raises journal.Refused (nothing changed or
     all undone), journal.Busy / Unfinished, or the error that ended a run (it then needs settling). When more
@@ -1216,7 +1222,9 @@ def _run_copy(cfg, adapter, owner_says_go, say):
         if code != 0 or result.get('nothing'):
             raise journal.Refused('; '.join(failed + result['info']) or 'check refused')
         server = result['live']
-        why = _home_problem(cfg)
+        # and whether the kit can tell the new launcher after the stop: before the wait, the guard and the pre hooks,
+        # so a refusal touches nothing and waits for nothing (#580)
+        why = _home_problem(cfg) or _blind(cfg, adapter, server)
         if why is not None:
             raise journal.Refused(f'{why}; nothing was changed')
         incomplete, kept = incomplete_copies(cfg.backup_dir), kept_files(cfg.home)
@@ -1228,7 +1236,8 @@ def _run_copy(cfg, adapter, owner_says_go, say):
         if not owner_says_go:
             wait_quiet(cfg, server['version'], say)
             _free_check(cfg, _plan_total(cfg), incomplete, kept)  # and again after it: the wait may have taken hours
-        why = _server_changed(cfg, adapter, server) or _home_problem(cfg)
+        # the wait may have taken hours: all of it again
+        why = _server_changed(cfg, adapter, server) or _home_problem(cfg) or _blind(cfg, adapter, server)
         if why is not None:
             raise journal.Refused(f'{why}; nothing was changed')
         dest = os.path.join(cfg.backup_dir, f't3-copy-{_stamp()}-{server["version"]}')
@@ -1254,7 +1263,7 @@ def _run_copy(cfg, adapter, owner_says_go, say):
         if failed_hook is None and not _guard_alive(adapter, unit):
             failed_hook = f'the guard {unit} is not running any more ({look})'
         # before the marker: a run refused here leaves none behind for SSH launches to wait on
-        failed_hook = failed_hook or handoff.handover_blind(cfg.home, [server['version']]) or open_gap(cfg.home)
+        failed_hook = failed_hook or _blind(cfg, adapter, server) or open_gap(cfg.home)
         if failed_hook is not None:
             again = _hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
             if again:  # jobs may stay paused: not a clean refusal, the owner must look (settle)
