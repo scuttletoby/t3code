@@ -46,7 +46,8 @@
     "tailscaleTag": "tag:pc-agents"
   },
   "model-guard": {
-    "policyFile": "/etc/fork-kit/model-policy.json"
+    "policyFile": "/etc/fork-kit/model-policy.json",
+    "t3ModelManifests": ["/srv/example/t3-home/userdata/model-manifest.json"]
   },
   "cleaner": {
     "logFile": "~/.local/state/fork-cleaner/cleaner.log",

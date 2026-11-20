@@ -9,6 +9,8 @@ The policy is a JSON file {"mode": "off" | "advise" | "enforce", "allow": [rows]
 
 - every checked call names its model and its effort, and both are in one row; else enforce refuses and lists
   the rows (the hook cannot see the parent's model or the provider's catalog, so nothing may be inherited);
+- a T3 pick of a row of another driver than Claude names only option ids the guard can read: the shared effort
+  ids, ultracode, and the row's effortOptionIds (read as efforts) and otherOptionIds (#601);
 - a call that would run a model the hook cannot see (a thread fork, a Workflow script it cannot read, a model
   field on a tool that has none) is refused in enforce;
 - the policy file or the machine file missing, unreadable or invalid: refused, naming the file (fail closed);
@@ -19,7 +21,7 @@ The policy is a JSON file {"mode": "off" | "advise" | "enforce", "allow": [rows]
 
 Plain Python 3 standard library. No state: the files are read again on every call.
 """
-import hashlib, json, os, re, sys
+import hashlib, json, os, re, stat, sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 for _common in (os.path.join(HERE, 'common'), os.path.join(os.path.dirname(HERE), 'common')):
@@ -126,11 +128,23 @@ def _text(value):
     return None if value.strip() else 'must not be empty'
 
 
+def _option_ids(value):
+    problem = _words(value)
+    if problem is None and any(v != js_trim(v) for v in value):
+        problem = 'must be option ids without spaces around them (T3 trims them)'
+    return problem
+
+
 # "ultracodeOption": false says T3 offers this Claude model no ultracode option (its effort list has no ultracode,
-# ClaudeModelCatalog.ts withUltracodeToggle), so a T3 pick of it need not name ultracode, and T3 refuses one that does
+# ClaudeModelCatalog.ts withUltracodeToggle), so a T3 pick of it need not name ultracode, and T3 refuses one that does.
+# "effortOptionIds" and "otherOptionIds" (rows of other drivers only): the option ids of the driver's own the guard
+# may read, as an effort (an ACP agent names its reasoning control by its own id, packages/provider-acp
+# sessionConfig.ts role "reasoning") or as an option that changes neither the model nor its reasoning. A pick of
+# such a row that names any other id is refused (#601).
 ROW = {'driver': (str, machine_file.REQUIRED, _text), 'model': (str, machine_file.REQUIRED, _text),
        'efforts': (list, None, _words), 'defaultEffort': (str, None, _text), 'aliases': (list, None, _words),
-       'useFor': (str, None, None), 'ultracodeOption': (bool, True, None)}
+       'useFor': (str, None, None), 'ultracodeOption': (bool, True, None),
+       'effortOptionIds': (list, None, _option_ids), 'otherOptionIds': (list, None, _option_ids)}
 # the guard's own /etc folder: an uninstall removes everything in it, so the policy may not live there
 ETC_DIR = os.path.dirname(INSTALLED)
 
@@ -162,6 +176,17 @@ def parse_policy(text, path):
             raise PolicyError(f'{where}.ultracodeOption: only {CLAUDE_DRIVER} rows have an ultracode option')
         if not row['ultracodeOption'] and ULTRACODE_EFFORT in (row['efforts'] or ()):
             raise PolicyError(f'{where}.ultracodeOption: false, so the model cannot run the effort ultracode')
+        effort_ids, other_ids = row['effortOptionIds'] or [], row['otherOptionIds'] or []
+        for key, ids in (('effortOptionIds', effort_ids), ('otherOptionIds', other_ids)):
+            if ids and row['driver'] == CLAUDE_DRIVER:
+                raise PolicyError(f'{where}.{key}: only rows of other drivers take it ({CLAUDE_DRIVER} options are '
+                                  f'T3\'s own)')
+            if ULTRACODE_OPTION_ID in ids:
+                raise PolicyError(f'{where}.{key}: ultracode is always read as the effort ultracode')
+        both = [i for i in other_ids if i in effort_ids or i in EFFORT_OPTION_IDS]
+        if both:
+            raise PolicyError(f'{where}.otherOptionIds: {both[0]!r} is an effort option id, so it cannot be an option '
+                              f'that changes no reasoning')
         for name in [row['model']] + (row['aliases'] or []):
             # a name (model or alias) means one row of a driver, never two
             if (row['driver'], name) in names:
@@ -207,9 +232,14 @@ def load_policy(machine_path=None, owner_uid=0):
         if in_folder(v, ETC_DIR):
             return f'must not be in {ETC_DIR}, which an uninstall removes'
         return None
+    def paths(v):
+        if not v or any(not isinstance(p, str) or not os.path.isabs(p) for p in v):
+            return 'must be a list of one or more absolute paths'
+        return 'names a path twice' if len(set(v)) != len(v) else None
     cfg = machine_file.fields(section, {
         'policyFile': (str, machine_file.REQUIRED, absolute),
         'allowOtherHooks': (bool, False, None),
+        't3ModelManifests': (list, None, paths),   # read by the self-check only (#600)
     }, f'{machine_path}: {KIT}')
     text = machine_file.read_protected_text(cfg['policyFile'], owner_uid)
     return cfg, parse_policy(text, cfg['policyFile'])
@@ -222,6 +252,10 @@ def describe(row):
         extra.append('Agent tool: ' + ' or '.join(repr(a) for a in row['aliases']))
     if not row['ultracodeOption']:
         extra.append('no ultracode option')
+    if row['effortOptionIds']:
+        extra.append('effort option ids ' + '|'.join(row['effortOptionIds']))
+    if row['otherOptionIds']:
+        extra.append('other option ids ' + '|'.join(row['otherOptionIds']))
     text = f'{row["driver"]} {row["model"]} ({efforts}' + ''.join(f'; {e}' for e in extra) + ')'
     return text + (f': use for {row["useFor"]}' if row['useFor'] else '')
 
@@ -276,10 +310,10 @@ def _option_pairs(options, where, problems):
     return pairs
 
 
-def _efforts_in(pairs):
+def _efforts_in(pairs, effort_ids=EFFORT_OPTION_IDS):
     """The efforts option pairs run, as T3 runs them: ultracode on means the effort "ultracode" (it runs at xhigh,
     so that xhigh is not named again)."""
-    efforts = [value for key, value in pairs if key in EFFORT_OPTION_IDS]
+    efforts = [value for key, value in pairs if key in effort_ids]
     ultracode = [value for key, value in pairs if key == ULTRACODE_OPTION_ID]
     if ULTRACODE_EFFORT in efforts:       # the old effort value: xhigh, with the option on unless it is given
         efforts = [ULTRACODE_RUNS_AT if e == ULTRACODE_EFFORT else e for e in efforts]
@@ -289,9 +323,11 @@ def _efforts_in(pairs):
     return efforts
 
 
-def check_pick(where, model, efforts, driver, rows, agent, problems, matched):
+def check_pick(where, model, efforts, driver, rows, agent, problems, matched, pairs=None):
     """One model pick against the rows; adds problems, or the rows it matched. Without a driver every row naming
-    the model must accept the pick. A row without "efforts" accepts only a pick that names no effort."""
+    the model must accept the pick. A row without "efforts" accepts only a pick that names no effort. A T3 pick
+    gives its option pairs instead of efforts: each row reads them with its own effort option ids, and a row of
+    another driver than Claude refuses an option id it cannot read (#601)."""
     if not isinstance(model, str) or not js_trim(model) or js_trim(model) == 'inherit':
         problems.append(f'{where} names no model (every call must name one; the guard cannot see the parent\'s)')
         return
@@ -305,6 +341,18 @@ def check_pick(where, model, efforts, driver, rows, agent, problems, matched):
         problems.append(f'{where}: model {model!r}' + (f' of driver {driver}' if driver else '') + ' is not allowed')
         return
     for row in found:
+        if pairs is not None:
+            effort_ids = EFFORT_OPTION_IDS + tuple(row['effortOptionIds'] or ())
+            if row['driver'] != CLAUDE_DRIVER:
+                read = set(effort_ids) | {ULTRACODE_OPTION_ID} | set(row['otherOptionIds'] or ())
+                unread = [key for key, _ in pairs if key not in read]
+                if unread:
+                    problems.append(f'{where}: option {unread[0]!r} is not one the guard can read for {row["driver"]} '
+                                    f'{model!r} (a driver may name its reasoning control by its own id): the '
+                                    f'policy row must list it in effortOptionIds (a reasoning control, checked as '
+                                    f'an effort) or otherOptionIds (it changes neither the model nor its reasoning)')
+                    return
+            efforts = _efforts_in(pairs, effort_ids)
         if row['efforts'] is None:
             if efforts:
                 problems.append(f'{where}: effort {efforts[0]!r} is not allowed for {model!r} (its row lists no '
@@ -655,7 +703,7 @@ def check_call(kind, args, rows):
         # only a delegate_task or create_threads target has a real driverKind: T3 refuses an instance of another
         # driver there (OrchestratorMcpService.ts resolveTarget). On a model selection it is refused above.
         model, driver = value.get('model'), value.get('driverKind')
-        check_pick(where, model, _efforts_in(pairs), driver, rows, False, problems, matched)
+        check_pick(where, model, None, driver, rows, False, problems, matched, pairs)
         # A Claude pick that leaves ultracode out can still run it: delegate_task with the parent's model and instance
         # starts from the parent's options and lays the given ones over them (OrchestratorMcpService.ts resolveTarget,
         # "Given values override inherited"), so under a parent running ultracode the child runs it too; and T3 takes
@@ -899,6 +947,119 @@ def model_settings_problems(files, policy):
     return problems
 
 
+# ---------- drift: does T3 still offer no ultracode option to an "ultracodeOption": false row's model? (#600)
+# T3 reloads its model list (the model manifest) from upstream about every hour and keeps it in its state folder
+# (apps/server/src/provider/ModelManifest.ts: <stateDir>/model-manifest.json, {fetchedAtMs, manifest}). The machine
+# file names those files ("t3ModelManifests"); the self-check reads each. They are the T3 user's files, so this is
+# a report, not a control: a refusal never depends on them.
+T3_MANIFEST_MAX = 16 * 1024 * 1024
+ROW_FIX = 'take "ultracodeOption": false out of its policy row, and name "ultracode": false in its picks'
+
+
+def read_t3_manifest(path):
+    """(T3's claudeAgent model list in one manifest file, None) or (None, why it cannot be used). The file is T3's
+    cache ({fetchedAtMs, manifest}) or a manifest itself; a plain file, not a link, read without waiting."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError as e:
+        return None, f'cannot be read ({e.strerror})'
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, 'is not a plain file'
+        with os.fdopen(os.dup(fd), 'rb') as f:
+            raw = f.read(T3_MANIFEST_MAX + 1)
+    except OSError as e:
+        return None, f'cannot be read ({e.strerror})'
+    finally:
+        os.close(fd)
+    if len(raw) > T3_MANIFEST_MAX:
+        return None, f'is larger than {T3_MANIFEST_MAX} bytes'
+    try:
+        data = json.loads(raw.decode('utf-8'))
+    except (ValueError, RecursionError) as e:
+        return None, f'is not valid JSON ({e})'
+    if isinstance(data, dict) and 'manifest' in data and 'version' not in data:
+        data = data['manifest']     # T3's cache
+    if not isinstance(data, dict) or data.get('version') != 1 or isinstance(data.get('version'), bool):
+        return None, 'is not a T3 model manifest of version 1'
+    providers = data.get('providers')
+    catalog = providers.get(CLAUDE_DRIVER) if isinstance(providers, dict) else None
+    if not isinstance(catalog, dict) or not isinstance(catalog.get('models'), list) \
+            or not isinstance(catalog.get('profiles'), dict):
+        return None, f'has no {CLAUDE_DRIVER} model list'
+    return catalog, None
+
+
+def _offers_ultracode(descriptor):
+    """True when an option descriptor gives the model ultracode: the option itself, or a select with the choice
+    ultracode (T3 turns the effort choice into the option, ClaudeModelCatalog.ts withUltracodeToggle)."""
+    if not isinstance(descriptor, dict):
+        return False
+    choices = descriptor.get('options')
+    return descriptor.get('id') == ULTRACODE_OPTION_ID or descriptor.get('type') == 'select' \
+        and isinstance(choices, list) and any(isinstance(c, dict) and c.get('id') == ULTRACODE_EFFORT for c in choices)
+
+
+def ultracode_option_in(catalog, model):
+    """What one T3 model list says of model: 'option' (T3 offers it ultracode), 'no list' (it has no option list, so
+    T3 checks no options), 'missing' (not in the list) or 'none' (an option list without ultracode). Every entry
+    whose slug or alias names the model counts; the worst one wins."""
+    def names(entry):
+        aliases = entry.get('aliases') if isinstance(entry.get('aliases'), list) else []
+        return (isinstance(entry.get('slug'), str) and js_trim(entry['slug']) == model) or any(
+            isinstance(a, str) and js_trim(a).lower() == model.lower() for a in aliases)
+    entries = [e for e in catalog['models'] if isinstance(e, dict) and names(e)]
+    if not entries:
+        return 'missing'
+    found = 'none'
+    for entry in entries:
+        name = entry.get('profile')
+        profile = catalog['profiles'].get(js_trim(name)) if isinstance(name, str) else None
+        capabilities = profile.get('capabilities') if isinstance(profile, dict) else None
+        descriptors = capabilities.get('optionDescriptors') if isinstance(capabilities, dict) else None
+        if not isinstance(descriptors, list):
+            found = 'no list'
+        elif any(_offers_ultracode(d) for d in descriptors):
+            return 'option'
+    return found
+
+
+def ultracode_option_problems(policy, manifest_paths):
+    """Problems with the policy's "ultracodeOption": false rows against T3's model lists (manifest_paths, from the
+    machine file): a model T3 now offers ultracode, one with no option list or not in the list, and a list that
+    cannot be read or is not named. Mode off checks nothing, so it needs none."""
+    rows = [r for r in policy['allow'] if r['driver'] == CLAUDE_DRIVER and not r['ultracodeOption']]
+    if not rows or policy['mode'] == 'off':
+        return []
+    models = ', '.join(repr(r['model']) for r in rows)
+    if not manifest_paths:
+        return [f'policy rows with "ultracodeOption": false ({models}), but the machine file\'s "{KIT}" section '
+                f'names no T3 model list ("t3ModelManifests"), so the self-check cannot tell whether T3 now offers '
+                f'them the ultracode option']
+    problems = []
+    for path in manifest_paths:
+        catalog, why = read_t3_manifest(path)
+        if why:
+            problems.append(f'T3 model list {path} {why}: the self-check cannot tell whether T3 now offers {models} '
+                            f'the ultracode option')
+            continue
+        for row in rows:
+            model, state = row['model'], ultracode_option_in(catalog, row['model'])
+            if state == 'option':
+                problems.append(f'{model!r} has "ultracodeOption": false, but T3\'s model list {path} offers it the '
+                                f'ultracode option, so a pick that leaves the option out can run ultracode '
+                                f'(inherited from the parent, or the model\'s default): {ROW_FIX}')
+            elif state == 'no list':
+                problems.append(f'{model!r} has "ultracodeOption": false, but T3\'s model list {path} gives it no '
+                                f'option list, so T3 checks no options for it and keeps an inherited ultracode: '
+                                f'{ROW_FIX}')
+            elif state == 'missing':
+                problems.append(f'{model!r} has "ultracodeOption": false, but it is not in T3\'s model list {path} '
+                                f'(a custom model, or one T3 no longer lists), so the self-check cannot see its '
+                                f'options, and T3 checks none for a model without an option list: {ROW_FIX}')
+    return problems
+
+
 def managed_files(folder, owner_uid=0):
     """[(path, data, error)] of Claude Code's managed settings files in its order (managed-settings.json, then
     managed-settings.d/*.json by name); each must be root-owned and not writable by others, like the machine file.
@@ -957,6 +1118,7 @@ def self_check(machine_path=None, owner_uid=0, prefix=''):
     else:
         allow_other_hooks = cfg['allowOtherHooks']
         print(f'policy {cfg["policyFile"]}: mode {policy["mode"]}, {len(policy["allow"])} rows')
+        problems += ultracode_option_problems(policy, cfg['t3ModelManifests'])
     try:
         files = managed_files(prefix + managed_dir(), owner_uid)
     except PolicyError as e:

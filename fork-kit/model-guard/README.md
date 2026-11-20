@@ -31,6 +31,7 @@ Linux, Python 3 standard library only. No state: the hook reads the machine file
 | ultracode is on (see below) and the row does not list the effort `ultracode`                       | pass   | pass + note                  | refuse, listing the rows  |
 | a T3 pick of a Claude model whose row lacks `ultracode` does not name the option `ultracode`       | pass   | pass + note                  | refuse, listing the rows  |
 | a T3 option id given twice once trimmed, an empty id, or a value T3 drops (see below)              | pass   | pass + note                  | refuse, listing the rows  |
+| a T3 pick of a row of another driver than Claude names an option id the row cannot read (below)    | pass   | pass + note                  | refuse, listing the rows  |
 | `create_threads`: any thread breaks a rule above, or `threads` is empty                            | pass   | pass + note                  | refuse, listing the rows  |
 | `t3_thread_launch` without `modelSelection`                                                        | pass   | pass + note                  | refuse                    |
 | `t3_thread_configure` without `modelSelection` (it only reads)                                     | pass   | pass                         | pass                      |
@@ -59,13 +60,22 @@ Where the effort is read:
 - the T3 tools: `options` of the target or `modelSelection`, either `{"effort": "high"}` or
   `[{"id": "effort", "value": "high"}]`, under any of the option ids `effort`, `reasoningEffort`,
   `reasoning_effort`, `reasoning`, `thinking_level` (the same list T3's usage pacing gate uses; a test keeps them in
-  step). Every effort named must be allowed.
+  step), and on a row of another driver than Claude also the row's own `effortOptionIds` (see **Options of other
+  drivers**). Every effort named must be allowed.
 - **Options are read the way T3 reads them** (`packages/contracts/src/model.ts`, `ProviderOptionSelections`): T3
   trims option ids and text values (JavaScript's `trim`, which the hook copies) and takes the first entry of an id.
   So `{" effort": "max", "effort": "high"}` runs `max`. The hook trims the same way and refuses an id given twice
   once trimmed, an empty id, and a value that is neither a non-empty text nor `true`/`false` (T3 drops it and uses
   the default). This holds on every path that takes options: `delegate_task`, `create_threads`,
   `t3_thread_launch`, `t3_thread_configure` and a project's `defaultModelSelection`.
+- **Options of other drivers** (#601). An ACP driver names its reasoning control by its own option id (the agent
+  marks it `role: "reasoning"`, `packages/provider-acp/src/server/sessionConfig.ts`), which T3's usage pacing gate
+  counts but the hook cannot see; and `t3_thread_launch` keeps option ids T3 does not know. So a T3 pick of a row
+  whose driver is not `claudeAgent` may name only the five effort ids above, `ultracode`, and the ids its row lists:
+  `effortOptionIds` (the driver's own reasoning controls, read as efforts, so their values must be in `efforts`) and
+  `otherOptionIds` (options that change neither the model nor its reasoning, such as a mode; passed unchecked, so
+  list only ones you have read). Any other id is refused, and the refusal names the two keys. Claude rows are not
+  touched: T3 checks their options against its own option list.
 - **Ultracode** is checked as what the server runs. The option `ultracode` (only `true` or `false`; any other value
   is refused, since T3 would use the default) runs the model in
   ultracode at effort xhigh, and the old effort value `"ultracode"` means xhigh with the option on (unless the option
@@ -100,20 +110,22 @@ Where the effort is read:
   `ultracode` (and cannot). The row may not list the effort `ultracode`, and only `claudeAgent` rows take the key.
   Set it only for a model T3 really offers no ultracode option: on a model that has one, a pick that leaves the
   option out can inherit ultracode from its parent.
-  - **Check such rows again after every T3 update.** The guard checks the key once, against what you know today.
-    T3 also reloads its model list (the model manifest) from upstream about every hour, so a model can gain the
-    ultracode option with no change on the machine. A `false` row then lets a pick that leaves the option out run
-    ultracode (inherited from the parent, or the model's default), and nothing says so. When in doubt, leave the
-    key out: the default is the safe side.
+  - **The self-check watches such rows** (#600). T3 reloads its model list (the model manifest) from upstream
+    about every hour, so a model can gain the ultracode option with no change on the machine. A `false` row then
+    lets a pick that leaves the option out run ultracode (inherited from the parent, or the model's default). Name
+    T3's model list in the machine file (`t3ModelManifests`, "Turn it on" step 2): `--self-check` reads it and
+    reports each `false` row whose model now has the option (the effort choice `ultracode` or the option itself),
+    has no option list, or is not in the list, and says so when a list cannot be read or none is named. It is a
+    report, not a control: the hook keeps passing such picks until the row is fixed, so run the self-check after
+    every T3 update. When in doubt, leave the key out: the default is the safe side.
   - **Custom models with no options:** T3 checks no options for a model it has no option list for, so it neither
     drops an inherited `ultracode` nor refuses `ultracode: false`. Do not set `"ultracodeOption": false` for one;
     name `"ultracode": false` in its picks instead.
   - A pick that names `"ultracode": false` passes on a `false` row too, so briefs may keep naming it everywhere.
 
 What v0 does not check: which provider instance or account a T3 call names (`providerInstanceId`, `environmentId`),
-and the model of the session that makes the call. Nor a reasoning option that an ACP driver names by its own id
-(its agent marks it `role: "reasoning"`, which the hook cannot see) instead of one of the five effort ids above; this
-does not touch Claude rows (#601). A self-check for a stale `"ultracodeOption": false` row is #600.
+and the model of the session that makes the call. What an `otherOptionIds` option does: the owner vouches for it by
+listing it. Between two self-checks, a T3 model list that changed under an `"ultracodeOption": false` row.
 
 ### Decisions
 
@@ -204,9 +216,12 @@ does not touch Claude rows (#601). A self-check for a stale `"ultracodeOption": 
 | `aliases`         | no       | the short names the `Agent` tool may use for this row                        |
 | `useFor`          | no       | what the model is for; shown to the agent with every pick of it (no refusal) |
 | `ultracodeOption` | no       | `false`: T3 offers this Claude model no ultracode option (default `true`)    |
+| `effortOptionIds` | no       | other drivers only: their own reasoning option ids, checked as efforts       |
+| `otherOptionIds`  | no       | other drivers only: option ids that change neither model nor reasoning       |
 
 Rules of the file: JSON with no key given twice and no unknown key; lists not empty and without repeats; texts not
-empty. The file must be owned by root, not writable by group or others, and not a link (the same rules as the
+empty. Option ids have no spaces around them (T3 trims them) and are never `ultracode`, and an effort id (one of
+the five or the row's own) is never an `otherOptionIds` id. The file must be owned by root, not writable by group or others, and not a link (the same rules as the
 machine file), so an agent cannot widen its own policy.
 
 ## Turn it on (owner, as root)
@@ -220,14 +235,26 @@ machine file), so an agent cannot widen its own policy.
 
    ```json
    "model-guard": {
-     "policyFile": "/etc/fork-kit/model-policy.json"
+     "policyFile": "/etc/fork-kit/model-policy.json",
+     "t3ModelManifests": ["/srv/example/t3-home/userdata/model-manifest.json"]
    }
    ```
 
-   | Key               | Required | What                                                                    |
-   | ----------------- | -------- | ----------------------------------------------------------------------- |
-   | `policyFile`      | yes      | the policy; an absolute path                                            |
-   | `allowOtherHooks` | no       | `true` accepts user and project hooks next to the guard (default false) |
+   | Key                | Required | What                                                                    |
+   | ------------------ | -------- | ----------------------------------------------------------------------- |
+   | `policyFile`       | yes      | the policy; an absolute path                                            |
+   | `allowOtherHooks`  | no       | `true` accepts user and project hooks next to the guard (default false) |
+   | `t3ModelManifests` | no       | T3's model lists the self-check reads (#600); absolute paths            |
+
+   `t3ModelManifests` is needed when the policy has an `"ultracodeOption": false` row (the self-check reports it
+   missing otherwise; mode `off` needs none). Name T3's cached list, `<T3 home>/userdata/model-manifest.json`
+   (T3 keeps it in its state folder and reloads it about every hour; `apps/server/src/provider/ModelManifest.ts`),
+   for each T3 on the machine, and a copy of the list that T3 version ships
+   (`apps/server/src/provider/model-manifest.json`): T3 uses the list it ships while its cache is missing or older,
+   and the self-check reports a row that any named list finds stale. Each must be a plain file, not a link. Only the
+   self-check reads them; a call's answer never depends on them.
+   **Upgrade the kit before adding the key**: an older kit refuses an unknown key, and so every checked call
+   (fail closed).
 
 3. Only now install the kit (below). Write the policy and the machine file first: from the installer's settings
    step on, every session runs the hook, and with no usable policy the hook refuses every checked call in every
@@ -384,6 +411,9 @@ exits 1:
 - a managed settings file sets `disableAllHooks`;
 - `allowManagedHooksOnly` is not `true` in the managed settings (the later file wins, as in Claude Code), unless
   the machine file sets `"allowOtherHooks": true`;
+- a policy row with `"ultracodeOption": false` whose model T3's model list (`t3ModelManifests`) now offers the
+  ultracode option, gives no option list, or does not list; a named list that cannot be read (missing, a link, not a
+  plain file, over 16 MiB, not JSON or not a version 1 model list); or no list named (not in mode `off`);
 - in `enforce`: Claude Code's model keys are missing or differ from the policy (see
   [Claude Code's model keys](#claude-codes-model-keys)); the line holds the JSON to put in `managed-settings.json`.
 
@@ -430,6 +460,13 @@ once the kit is gone: take that entry out too.
 - **Empty, old or invalid files:** a missing machine file, a missing `model-guard` section or `policyFile`, a
   missing, empty or invalid policy, a policy that others can write, or a machine file of a newer version: every
   checked call is refused, naming the file and the reason. An empty `allow` refuses every pick in `enforce`.
+- **T3's model list changes, vanishes or is half-written** (#600): the self-check reads each named list again on
+  every run and keeps nothing. A missing list, one being rewritten at that moment (invalid JSON), or one of another
+  shape is reported, never taken as clean. An old machine file without `t3ModelManifests` is reported when the
+  policy has a `false` row; an older kit given a machine file with the key refuses every checked call.
+- **Old policy files** stay valid. Since #601, a T3 pick of a row of another driver than Claude that names an option
+  id other than the five effort ids and `ultracode` is refused in `enforce` (noted in `advise`); the refusal names
+  `effortOptionIds` and `otherOptionIds`.
 - **The installer runs again:** every step checks what is there and only fixes what differs; a second run changes
   nothing. Two installers at once: the second is refused (a lock on `/etc/model-guard/install.lock`). An installer
   that opened the lock file just before an uninstall removed it is refused too ("run again").
@@ -458,12 +495,14 @@ once the kit is gone: take that entry out too.
 
 `python3 -I -B fork-kit/model-guard/tests/guard.test.py`: every rule above with temporary files (the current user
 stands in for root). Its red check breaks each refuse rule and each self-check rule in a copy of
-`lib/model_guard.py` and shows the test for that rule then fails. Two tests read the server's code: the effort
-option ids from `apps/server/src/usage/UsagePacingGate.ts` and the ultracode mapping from
-`packages/shared/src/model.ts`.
+`lib/model_guard.py` and shows the test for that rule then fails. Three tests read the server's code: the effort
+option ids from `apps/server/src/usage/UsagePacingGate.ts`, the ultracode mapping from
+`packages/shared/src/model.ts`, and T3's bundled model list (`apps/server/src/provider/model-manifest.json`, one model
+with the effort `ultracode` and one without) with its cache path and shape in `ModelManifest.ts`.
 
 `python3 -I -B fork-kit/model-guard/tests/install.test.py`: the installer and the self-check on a fake host in a
 temporary folder, no root: a fresh install and an upgrade stopped after each step, a first install without a
 policy, run again, leftovers, a second installer and a removed lock file, old state (a link, a folder or file root
-does not own), pruning, an uninstall stopped after each step, and Claude Code's model keys in the self-check. Its
+does not own), pruning, an uninstall stopped after each step, Claude Code's model keys and a stale
+`"ultracodeOption": false` row (#600) in the self-check. Its
 red check breaks the installer's and the self-check's rules.
