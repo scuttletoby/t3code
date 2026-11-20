@@ -28,6 +28,15 @@ settings first: with a mode other than `handoff` it reads nothing more and sends
 Token counts are the provider's own last reading for the active session. A provider that reports
 none never hands off.
 
+## One owner per thread
+
+With handoff on for a thread (mode `handoff`, from the server, its project or the thread's own
+entry), upstream's idle compaction skips that thread, so a compaction and a handoff never both act
+on it. The handoff settings alone decide what happens when it sits idle: `idleTokens` `0` means no
+idle action at all. The check happens at the moment compaction would send, so a setting changed
+while compaction waited counts. With any other mode, upstream's idle compaction works as before.
+If the thread or the settings cannot be read at that moment, compaction goes ahead.
+
 ## Only at a quiet thread
 
 A thread is quiet when none of these is true: a run is queued or running, a request (an approval or
@@ -95,8 +104,14 @@ written out in full. The message says when no effort is set.
   `handoffFacts.ts`, `handoffMessage.ts`, `handoffDecision.ts`). Settings:
   `packages/contracts/src/handoff.ts`.
 - `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes
-  through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. No upstream file is
-  edited: the service starts from `ForkLayers.layerRuntimeServices` (`apps/server/src/fork/forkLayers.ts`),
-  the fork file `server.ts` already wires.
+  through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. The service starts from
+  `ForkLayers.layerRuntimeServices` (`apps/server/src/fork/forkLayers.ts`), which `server.ts`
+  already wires.
+- One owner per thread: `handoffOwner.ts` wraps upstream's orchestrator for the runtime's workers
+  and skips only an idle compaction send to a thread with handoff on. `IdleCompactionService.ts`
+  stays upstream's; `server.ts` gets one fork line,
+  `Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction)`, first in the pipe of
+  `layerRuntimeCoreDependenciesBase`, and a test checks it is there. `threadHandoffSettings` (same
+  file) is the one place that picks a thread's settings for both the wrapper and the service.
 - The message reuses upstream's handoff budget (`handoffBudget`) and transcript reading
   (`ContextHandoffService.ts`); nothing is copied.

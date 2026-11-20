@@ -412,7 +412,8 @@ thread's children, watched pull requests and waits keep working. How and when:
 [handoff.md](handoff.md).
 
 Only the person can change it; agents cannot. `mode` is `off` (the default: upstream's compaction
-settings apply as they are), `handoff`, or `compact` (the same as `off`, so one thread can opt out
+settings apply as they are), `handoff` (upstream's idle compaction then skips the thread, so
+only the handoff acts on it), or `compact` (the same as `off`, so one thread can opt out
 of its project's `handoff`). `threads` maps a thread id to a mode and wins over `mode` (at most
 500). `source` says who writes the handoff: `agent` (the old session, in one turn; `instructions`
 replaces the built-in text) or `command` (a program given as `command`, run without a shell; it
@@ -538,6 +539,8 @@ switch.
 - [host-tools.md](host-tools.md): design for agents on a person's own computer (no code yet).
 - [playtest.md](playtest.md): the playtest adapter contract (steps, environment, exit codes).
 - [handoff.md](handoff.md): handoff instead of compaction (when, the quiet rule, the message).
+- [run-records.md](run-records.md): one record per agent run (usage, time, labels) and the weekly
+  summary.
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.
 - [`fork-ci/README.md`](../../fork-ci/README.md) and [`fork-kit/README.md`](../../fork-kit/README.md):
   CI actions and host kits.

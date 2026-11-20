@@ -377,6 +377,17 @@ class Command(Case):
         self.assertEqual(cfg.daily_mode, 'compare')
         self.assertEqual([s.name for s in cfg.sources], ['example-retention'])
         self.assertEqual(cfg.sources[0].pattern.search('would remove /x/y (a, b)').group(1), '/x/y')
+        # The example turns every rule on (#491), so each rule's keys are shown working together.
+        on = {'worktrees': bool(cfg.repos) and all(r.merged_branches for r in cfg.repos), 'docker': cfg.docker_enabled,
+              'tmp': bool(cfg.tmp_patterns), 'agent-scratch': cfg.scratch_enabled,
+              'compress-cold': bool(cfg.cold_folders), 'dedupe': bool(cfg.dedupe_folders)}
+        self.assertEqual(set(on), set(self.c.rules.RULES), 'a new rule: add it to the example machine file and here')
+        self.assertEqual([rule for rule, yes in on.items() if not yes], [])
+
+    def test_the_kit_list_names_every_rule(self):
+        with open(os.path.join(os.path.dirname(fx.COMMON), 'README.md')) as f:
+            row = next(line for line in f if line.startswith('| [cleaner]'))
+        self.assertEqual([rule for rule in self.c.rules.RULES if f'`{rule}`' not in row], [])
 
     def test_the_commands_read_the_machine_file(self):
         path = self.path('machine.json')

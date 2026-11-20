@@ -1027,6 +1027,11 @@ never() {
   # All of /etc (issue #243): only the entries a build needs (the list's /etc lines), never the logins, units, cron,
   # /etc/default and backup tools' folders beside them. An older kit's list still names it: refused, no runner starts.
   [[ $1 != /etc ]] || die "$2: all of /etc is never in a job's view (an older kit's list?): re-run the installer"
+  # The host's passwd, group and hosts (issue #370): job_fs writes a job's own; bound over them, the host's would be
+  # seen. An older kit's list still names them: refused, no runner starts.
+  case $1 in /etc/passwd | /etc/group | /etc/hosts)
+    die "$2: a job has the launcher's own, never this host's (an older kit's list?): re-run the installer" ;;
+  esac
   no_data "$1" "$2"
 }
 
@@ -1098,18 +1103,51 @@ job_view() {
   done
 }
 
-# job_view for a unit: its root ($1, root's), its copy ($2, read-write; already a real path, in WORK_ROOT's), and
-# the jobs' resolv.conf at $3. Sets props_fs and resolv_bind; seen, the mount points check-net's probe allows (its
-# own /proc, /sys, /dev and memory file systems are allowed there); from, each of them with the device and inode
-# its source has here, which the probe compares with what the unit has there (a link swapped in after job_view shows);
-# and linked, the links its root has (the list's, and /etc/resolv.conf when $3 is elsewhere: the probe allows them).
+# A job's own /etc/passwd, group and hosts in its root $1 (issue #370), for its user $2 with HOME $3: root, nobody and
+# that user, their groups, and localhost and this host's name on loopback. Never the host's: they name every account,
+# its GECOS (often a person's name) and home folder, and the LAN's host names. New files (noclobber) in a folder job_fs
+# just made, root's: nothing to lead a write astray. A job cannot change them (ProtectSystem=strict, and root's).
+job_etc() {
+  local root=$1 user=$2 home=${3:-/nonexistent} uid gid group name
+  uid=$(id -u -- "$user") gid=$(id -g -- "$user") group=$(id -gn -- "$user")
+  [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $group =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "$user: no plain uid, gid or group name"
+  name=$(uname -n)
+  mkdir -p -m 0755 -- "$root/etc"
+  (
+    set -o noclobber
+    umask 022
+    {
+      printf 'root:x:0:0:root:/root:/usr/sbin/nologin\n'
+      ((uid == 65534)) || printf 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n'
+      printf '%s:x:%s:%s::%s:/bin/sh\n' "$user" "$uid" "$gid" "$home"
+    } >"$root/etc/passwd"
+    {
+      printf 'root:x:0:\n'
+      ((gid == 65534)) || printf 'nogroup:x:65534:\n'
+      printf '%s:x:%s:\n' "$group" "$gid"
+    } >"$root/etc/group"
+    {
+      printf '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n'
+      # Its own name, as uname shows it to the job anyway (Java's getLocalHost and the like look it up).
+      [[ ! $name =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$ || $name == localhost ]] || printf '127.0.1.1 %s\n' "$name"
+    } >"$root/etc/hosts"
+  ) || die "could not write $root/etc's passwd, group and hosts as new files: refused"
+}
+
+# job_view for a unit: its root ($1, root's), its copy ($2, read-write; already a real path, in WORK_ROOT's), the
+# jobs' resolv.conf at $3 and its user $4. Sets props_fs and resolv_bind; seen, the mount points check-net's probe
+# allows (its own /proc, /sys, /dev and memory file systems are allowed there); from, each of them with the device
+# and inode its source has here, which the probe compares with what the unit has there (a link swapped in after
+# job_view shows); and linked, the entries its root has of job_fs's own (the list's links, /etc/resolv.conf when $3 is
+# elsewhere, and its own passwd, group and hosts: job_etc; the probe allows them).
 job_fs() {
-  local root=$1 rw=$2 resolv=$3 i b real
+  local root=$1 rw=$2 resolv=$3 user=$4 i b real
   local -a ro=() view_ro view_links
   job_view
   rm -rf --one-file-system -- "$root"
   mkdir -m 0755 -- "$root"
-  linked=''
+  job_etc "$root" "$user" "${rw:+$rw/home}"
+  linked=' /etc/passwd /etc/group /etc/hosts'
   for ((i = 0; i < ${#view_links[@]}; i += 2)); do
     mkdir -p -m 0755 -- "$root${view_links[i]%/*}"
     ln -s -- "${view_links[i + 1]}" "$root${view_links[i]}"
@@ -1166,7 +1204,7 @@ paths() {
 sandbox() {
   local user=$1 resolv=$2 own=$3 resolv_bind
   local -a props_fs
-  job_fs "$4" "$5" "$resolv"
+  job_fs "$4" "$5" "$resolv" "$user"
   props=(
     -p "NetworkNamespacePath=/run/netns/fork-fleet-$user"
     -p "IPAddressDeny=${PRIVATE4[*]} $own ::/0" -p IPAddressAllow=localhost
@@ -1310,9 +1348,10 @@ EOF
 # bound point is the very file or folder job_fs checked (a link swapped in before systemd bound it would show);
 # entries in /mnt or /media; and sockets in the places a desktop keeps them (WSLg's X11 and PulseAudio). Other mount
 # points are read from mountinfo, never looked at: a share that hangs cannot stop the probe. Then /etc (issue #243),
-# checked by looking: every entry of the job's /etc is one the list (a mount point), a link of job_fs's (its fourth
+# checked by looking: every entry of the job's /etc is one the list (a mount point), an entry job_fs made (its fourth
 # argument) or the jobs' resolv.conf put there, and check-net's canaries (its fifth: files outside the list, one
-# others may read, one only the runner's group may) are not there nor readable.
+# others may read, one only the runner's group may) are not there nor readable. And the job's passwd, group and hosts
+# are job_etc's own (issue #370): root, nobody, its user and loopback only, never the host's accounts or LAN names.
 read -r -d '' WALLS <<'EOF' || true
 import ctypes, errno, mmap, os, re, signal, socket, stat, sys
 libc = ctypes.CDLL(None, use_errno=True)
@@ -1432,6 +1471,30 @@ def etc_extra():
         return None
     return extra
 etc = etc_extra()
+def not_own():
+    """Issue #370: what the job's passwd, group and hosts hold beyond job_fs's own (job_etc): an account or group but
+    root's, nobody's and this process's own, or a name on an address but loopback. The host's would name every account
+    (GECOS, home) and the LAN's hosts."""
+    out = []
+    for name, ids in (('passwd', {0, 65534, os.getuid()}), ('group', {0, 65534, os.getgid()})):
+        try:
+            with open(os.path.join(ETC, name)) as f:
+                for x in f:
+                    w = x.rstrip('\n').split(':')
+                    if x.strip() and not (len(w) >= 4 and w[2].isdigit() and int(w[2]) in ids):
+                        out.append(f'{name} {w[0]}')
+        except OSError:
+            out.append(f'{name} (cannot read it)')
+    try:
+        with open(os.path.join(ETC, 'hosts')) as f:
+            for x in f:
+                w = x.split('#')[0].split()
+                if w and not (w[0] == '::1' or w[0].startswith('127.')):
+                    out.append(f'hosts {w[0]}')
+    except OSError:
+        out.append('hosts (cannot read it)')
+    return out
+own = not_own()
 canaries = sys.argv[5].split() if len(sys.argv) > 5 else []
 def there(p):
     try:
@@ -1457,6 +1520,7 @@ if sys.argv[1] == 'host':
                             'nothing beyond the list here either: the refusal inside shows nothing'))
     print(f'host: canaries: {len(seen_canaries)} of {len(canaries)} there' + (': the wall matters' if seen_canaries else
                                                                               ''))
+    print(f'host: passwd, group, hosts: {len(own)} entries a job\'s own leave out' + (': the wall matters' if own else ''))
     sys.exit(0)
 bad = 0
 def line(ok, text):
@@ -1482,6 +1546,8 @@ line(not receive, 'later mounts: ' + (f'the host\'s reach {few(receive)}' if rec
 line(not mnt, '/mnt and /media: ' + (f'hold {few(mnt)} inside' if mnt else 'nothing inside'))
 line(etc == [], '/etc: ' + ('cannot list it' if etc is None else
                             f'holds {few(etc)}, which no list line puts there' if etc else 'only the listed entries'))
+line(not own, 'passwd, group, hosts: ' + (f'hold {few(own)}, which are not the job\'s own' if own else
+                                         'only root, nobody, the job\'s own user and loopback'))
 line(bool(canaries) and not seen_canaries, 'canaries: ' + (
     f'{few(seen_canaries)} there inside' if seen_canaries else f'{len(canaries)} not there inside' if canaries else
     'none given'))
