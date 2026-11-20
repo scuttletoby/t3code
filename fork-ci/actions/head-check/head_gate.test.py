@@ -556,6 +556,13 @@ class ReviewRun(Files, unittest.TestCase):
                 code, out, gh = self.review(run=run)
                 self.assertEqual((code, self.found(), gh.calls), (0, [], []), out)
                 self.assertIn('nothing to judge', out)
+                # #379: a review run always has its head fields, so odd ones mean GitHub's fields are not what the
+                # lookup expects (no review would ever re-run the gate): a warning the live check can see, one line.
+                # Another event is normal (an older caller without the event clause): a plain log line.
+                odd = 'event' not in run
+                self.assertEqual(out.startswith('::warning::head gate: nothing to judge: '), odd, out)
+                self.assertEqual(out.count('::'), 2 if odd else 0, out)
+                self.assertNotIn('::error::', out)
 
     def test_the_listing_reads_only_the_fields_it_uses(self):   # #379: no draft (preflight fails a draft's head)
         self.assertEqual(G.HEAD_JQ, '.[] | [.number, .head.sha, .head.repo.full_name] | @json')

@@ -5,14 +5,19 @@
  */
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import { TrimmedString } from "./baseSchemas.ts";
 import { HandoffSettingsFromSettingsFile, HandoffSettingsPatch } from "./handoff.ts";
 import {
+  MCP_CARRIED_PROFILES_APPLY,
   MCP_PROFILE_ALL,
   MCP_SUBAGENT_INHERIT,
   MCP_THREAD_PROFILES_MAX,
+  McpCarriedProfiles,
+  McpCarriedProfilesFromSettingsFile,
   McpProfileName,
   McpProfilePatch,
   McpProfileRef,
@@ -99,6 +104,10 @@ export const ForkServerSettingsFields = {
   ),
   /** The owner's MCP profile pick per thread; it wins over the defaults above. */
   mcpThreadProfiles: McpThreadProfiles,
+  /** What a task a linked machine delegates here gets of the profile it carries; `apply` cuts it. */
+  mcpCarriedProfiles: McpCarriedProfilesFromSettingsFile.pipe(
+    Schema.withDecodingDefault(Effect.succeed(MCP_CARRIED_PROFILES_APPLY)),
+  ),
   /** Playtest sessions and their adapter's steps; off by default. A bad value reads as off. */
   playtest: PlaytestSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   /** Handoff instead of compaction for long threads; off by default. A bad value reads as off. */
@@ -133,6 +142,8 @@ export const ForkServerSettingsPatchFields = {
   /** `inherit` or a profile name; the server also refuses a name no profile has. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileName),
   mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
+  /** Strict: `apply` or `refuse`. */
+  mcpCarriedProfiles: Schema.optionalKey(McpCarriedProfiles),
   /** Strict: a save refuses a bad step, or `enabled` without all four steps. */
   playtest: Schema.optionalKey(PlaytestSettings),
   /** Strict: a save refuses a bad value, an unknown field, or `source: command` without a command. */
@@ -178,6 +189,7 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   mcpSubagentProfile: "replace",
   // One pick per thread, so two picks at once keep both; a save past the cap is refused.
   mcpThreadProfiles: { replaceEntries: { maxEntries: MCP_THREAD_PROFILES_MAX } },
+  mcpCarriedProfiles: "replace",
   // Whole, so a step left out is removed and the strict check sees the value that is saved.
   playtest: "replace",
   // Whole, so the strict check (thread cap included) sees the value that is saved.
@@ -206,6 +218,22 @@ export const FORK_PROJECT_SCOPED_KEYS = [
   "reviewRules",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
+/**
+ * A clear-by-`null` project key read from the file: a hand-written `null` reads as the key left out
+ * (the server's value) and the next save drops it. `Schema.Null` comes first, as the lenient file
+ * schemas take any value; the type keeps `null` for the patch, whose `null` the split drops.
+ */
+const nullReadsAsUnset = <S extends Schema.Top>(value: S) =>
+  Schema.optionalKey(Schema.Union([Schema.Null, value])).pipe(
+    Schema.decodeTo(
+      Schema.optionalKey(Schema.Union([Schema.Null, Schema.toType(value)])),
+      SchemaTransformation.transformOptional({
+        decode: (raw) => Option.filter(raw, (entry): boolean => entry !== null),
+        encode: (raw) => raw,
+      }),
+    ),
+  );
+
 /** A project's overrides of fork settings, as the settings file holds them. */
 export const ForkProjectOverrideFields = {
   /** Bad entries are dropped on read; the settings patch refuses them. */
@@ -215,13 +243,15 @@ export const ForkProjectOverrideFields = {
   /** Absent or empty: the server's `mcpSubagentProfile`. Read leniently, as the server's. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileRef),
   /**
-   * A bad value reads as off for that project, never as the server's adapter (`null` too). `null`
-   * is only a save's "clear", which the save removes, so it is never stored or read.
+   * A bad value reads as off for that project, never as the server's adapter. `null` is a save's
+   * "clear", which the save removes; a hand-written one means the same: it reads as left out, so
+   * the project uses the server's (`nullReadsAsUnset`).
    */
-  playtest: Schema.optionalKey(Schema.Union([PlaytestSettingsFromSettingsFile, Schema.Null])),
+  playtest: nullReadsAsUnset(PlaytestSettingsFromSettingsFile),
   /** As `playtest`: a bad value reads as off for that project, never as the server's. */
-  handoff: Schema.optionalKey(Schema.Union([HandoffSettingsFromSettingsFile, Schema.Null])),
-  reviewRules: Schema.optionalKey(Schema.Union([ReviewRulesFromSettingsFile, Schema.Null])),
+  handoff: nullReadsAsUnset(HandoffSettingsFromSettingsFile),
+  /** As `playtest`; a bad value is also kept as written (reviewRules.ts). */
+  reviewRules: nullReadsAsUnset(ReviewRulesFromSettingsFile),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
 /**
