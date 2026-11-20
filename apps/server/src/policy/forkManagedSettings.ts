@@ -1,0 +1,20 @@
+/**
+ * Fork: the fork settings that read any bad value, null included, as off or a default. Upstream
+ * refuses a policy path inside such a setting, so a policy manages each only as a whole. A test
+ * (managedSettings.forkKeys.test.ts) pins this list to exactly the fork settings that read null.
+ */
+import type { ForkServerSettingKey } from "@t3tools/contracts";
+
+const WHOLE_ONLY = [
+  "handoff",
+  "mcpCarriedProfiles",
+  "mcpProfile",
+  "mcpProfiles",
+  "mcpSubagentProfile",
+  "mcpThreadProfiles",
+  "modelPolicy",
+  "playtest",
+  "reviewRules",
+] as const satisfies ReadonlyArray<ForkServerSettingKey>;
+
+export const FORK_WHOLE_MANAGED_SETTINGS: ReadonlySet<string> = new Set(WHOLE_ONLY);
