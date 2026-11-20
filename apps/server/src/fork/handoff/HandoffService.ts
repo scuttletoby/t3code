@@ -7,7 +7,6 @@ import {
   CommandId,
   MessageId,
   type OrchestrationV2Run,
-  resolveHandoffSettings,
   type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -28,6 +27,7 @@ import { type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
 import { dispatchHandoff, readHandoffRecords } from "./handoffDispatch.ts";
 import { HANDOFF_RETRY_SUFFIX, handoffThreadFacts, parseHandoffMessageId } from "./handoffFacts.ts";
 import { handoffMessageText } from "./handoffMessage.ts";
+import { threadHandoffSettings } from "./handoffOwner.ts";
 
 /** Part 3 reads the turn items of this many latest runs; the budget keeps the newest of them. */
 const TRANSCRIPT_RUNS = 20;
@@ -47,11 +47,7 @@ export const make = Effect.gen(function* () {
   const readThread = Effect.fn("HandoffService.readThread")(function* (threadId: ThreadId) {
     const current = yield* serverSettings.getSettings;
     const thread = yield* projections.getThread(threadId);
-    const resolved = resolveHandoffSettings(
-      current.handoff,
-      current.projectSettingsOverrides[thread.projectId]?.handoff,
-      threadId,
-    );
+    const resolved = threadHandoffSettings(current, thread.projectId, threadId);
     // Off (the default) and `compact` read nothing more.
     if (resolved.mode !== "handoff") return null;
     return { ...resolved, records: yield* withStores(readHandoffRecords(threadId)) };

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
-import copy, datetime, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat, subprocess, sys
-import ast, glob, tempfile, textwrap, time
+import ast, copy, datetime, glob, grp, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat
+import subprocess, sys, tempfile, textwrap, time
 import unittest, urllib.error, urllib.parse
 from contextlib import redirect_stdout
 from functools import partial
@@ -1668,10 +1668,11 @@ class Launcher(unittest.TestCase):
         return ' '.join(['/', *self.allowed(), *([rw] if rw else []), os.path.realpath('/etc/resolv.conf')])
 
     def links(self):
-        """The links check-net's probe is told the unit's root has (job_fs): the list's links, and /etc/resolv.conf
-        when the jobs' resolv.conf is bound elsewhere (systemd-resolved's link: issue #243, no longer in a whole /etc)."""
+        """The entries check-net's probe is told the unit's root has of job_fs's own: its passwd, group and hosts
+        (job_etc, issue #370), the list's links, and /etc/resolv.conf when the jobs' resolv.conf is bound elsewhere
+        (systemd-resolved's link: issue #243, no longer in a whole /etc)."""
         resolv = os.path.realpath('/etc/resolv.conf')
-        return ' '.join([p for p in job_paths() if os.path.islink(p)] +
+        return ' '.join(['/etc/passwd', '/etc/group', '/etc/hosts'] + [p for p in job_paths() if os.path.islink(p)] +
                         (['/etc/resolv.conf'] if resolv != '/etc/resolv.conf' else []))
 
     def sources(self):
@@ -1791,7 +1792,8 @@ class Launcher(unittest.TestCase):
                          ({'/etc/resolv.conf': resolv} if resolv != '/etc/resolv.conf' else {}))
         for d, dirs, files in os.walk(root):
             for x in files:
-                self.assertTrue(os.path.islink(os.path.join(d, x)), os.path.join(d, x))
+                p = os.path.join(d, x)
+                self.assertTrue(os.path.islink(p) or p in [f'{root}/etc/{n}' for n in ('passwd', 'group', 'hosts')], p)
         self.write('rec/units', '', 0o644)
         self.assertEqual(self.launch('prune').returncode, 0)
         self.assertFalse(os.path.lexists(root))   # it goes with its unit
@@ -2128,9 +2130,8 @@ class Launcher(unittest.TestCase):
         got = self.paths(root)
         self.assertEqual(got.returncode, 0, got.stderr)
         etc = sorted(x for x in got.stdout.splitlines() if x.startswith('/etc/') and 'resolv.conf' not in x)
-        self.assertEqual(etc, ['/etc/group /etc/group', '/etc/hosts /etc/hosts', '/etc/nsswitch.conf /etc/nsswitch.conf',
-                               '/etc/passwd /etc/passwd', '/etc/ssl/certs /etc/ssl/certs'])
-        for hidden in ('/etc ', 'shadow', 'secret', 'private', 'restic', 'default'):
+        self.assertEqual(etc, ['/etc/nsswitch.conf /etc/nsswitch.conf', '/etc/ssl/certs /etc/ssl/certs'])
+        for hidden in ('/etc ', 'shadow', 'secret', 'private', 'restic', 'default', 'passwd', 'group', 'hosts'):
             self.assertNotIn(hidden, got.stdout)
 
     def test_paths_refuses_all_of_etc_as_an_older_kit_lists_it(self):
@@ -3003,6 +3004,114 @@ class Launcher(unittest.TestCase):
         self.assertEqual(self.etc_probe(etc2, '/ /etc/pki/tls/certs', '', gone)[0],
                          'FAIL  /etc: holds pki, which no list line puts there')
 
+    def test_a_job_has_its_own_passwd_group_and_hosts(self):
+        """Issue #370 item 3: a job never reads the host's passwd, group or hosts (every account's name, its GECOS,
+        often a person's name, its home folder; the LAN's host names). job_fs writes its own in the unit's root:
+        root, nobody and the job's user (HOME its copy's), their groups, and localhost and this host's name (which
+        uname shows the job anyway) on loopback; root's, 0644, plain files, not mounts. State: a second start writes
+        them anew for its own user; a root a killed start left (a host's passwd planted in it) is replaced whole; a
+        start of the same user again gets the same files; check-net's probe (no copy) gets HOME /nonexistent."""
+        name = os.uname().nodename
+        hosts = '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n' + (
+            f'127.0.1.1 {name}\n' if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]{0,252}', name) and name != 'localhost'
+            else '')
+
+        def want(user, home):
+            pw, gr = pwd.getpwnam(user), grp.getgrgid(pwd.getpwnam(user).pw_gid)
+            return ('root:x:0:0:root:/root:/usr/sbin/nologin\n' +
+                    ('' if pw.pw_uid == 65534 else 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n') +
+                    f'{user}:x:{pw.pw_uid}:{pw.pw_gid}::{home}:/bin/sh\n',
+                    'root:x:0:\n' + ('' if pw.pw_gid == 65534 else 'nogroup:x:65534:\n') +
+                    f'{gr.gr_name}:x:{pw.pw_gid}:\n', hosts)
+
+        def files(root):
+            out = []
+            for n in ('passwd', 'group', 'hosts'):
+                p = os.path.join(root, 'etc', n)
+                st = os.lstat(p)
+                self.assertTrue(stat.S_ISREG(st.st_mode), p)
+                self.assertEqual(stat.S_IMODE(st.st_mode), 0o644, p)
+                with open(p) as f:
+                    out.append(f.read())
+            return tuple(out)
+        leftover = self.path(f'run/{self.NAME}.root')
+        os.makedirs(leftover + '/etc')
+        with open(leftover + '/etc/passwd', 'w') as f:
+            f.write('alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n')
+        for name_, user in ((self.NAME, self.USERS[0]), ('fleet-vm-t3code-12', self.USERS[1])):
+            with self.subTest(user):
+                self.assertEqual(self.start(name_), user)
+                dest = self.path(f'var/runners/{name_}')
+                self.assertEqual(files(self.path(f'run/{name_}.root')), want(user, f'{dest}/home'))
+                args = self.rec_text('systemd-run').splitlines()
+                binds = ' '.join(a for a in args if a.startswith(('BindReadOnlyPaths=', 'BindPaths=')))
+                for n in ('passwd', 'group', 'hosts'):
+                    self.assertNotIn(f':/etc/{n}', binds)   # no mount of the host's over them
+        self.write('rec/units', '', 0o644)
+        self.assertEqual(self.launch('prune').returncode, 0)
+        self.assertEqual(self.start(self.NAME), self.USERS[0])   # again, after prune: the same, made anew
+        self.assertEqual(files(self.path(f'run/{self.NAME}.root')),
+                         want(self.USERS[0], self.path(f'var/runners/{self.NAME}') + '/home'))
+        port = self.server()
+        self.write('rec/probe-exit', '0', 0o644)
+        self.write('rec/units', '', 0o644)
+        got = self.check_net(f'127.0.0.1:{port}')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(files(self.path('run/check-net.root')), want(self.USERS[0], '/nonexistent'))
+
+    def test_a_list_that_still_names_passwd_group_or_hosts_is_refused(self):
+        """Issue #370 item 3, old state: an older kit's list (or ALLOW_PATHS) that names the host's passwd, group or
+        hosts would bind them over the job's own. Refused, by `paths` (the walls) and by start: re-run the
+        installer. Nothing is started, nothing is left."""
+        for p in ('/etc/passwd', '/etc/group', '/etc/hosts'):
+            with self.subTest(p):
+                self.conf(ALLOW_PATHS=p)
+                got = self.refused(f'{p}: a job has the launcher\'s own, never this host\'s (an older kit\'s list?): '
+                                   're-run the installer')
+                self.assertFalse(os.path.lexists(self.path(f'run/{self.NAME}.root')))
+                self.assertFalse(os.path.lexists(self.path(f'var/runners/{self.NAME}')))
+        root = self.walls_root('JOB_PATHS=/etc/fork-fleet/job-paths\n',
+                               files=(('/etc/fork-fleet/job-paths', '/usr\n/etc/passwd\n'),
+                                      ('/etc/passwd', 'alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n')))
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('/etc/passwd: a job has the launcher\'s own', got.stderr)
+        self.assertEqual(got.stdout, '')
+
+    def test_check_nets_probe_reads_the_jobs_passwd_group_and_hosts(self):
+        """Issue #370 item 3, check by looking: the probe fails when the job's passwd or group names any account or
+        group but root's, nobody's and its own (the host's, bound in by an older list), when hosts names an address
+        but loopback (the LAN's), or when one cannot be read. job_etc's own pass."""
+        etc = os.path.join(self.d, 'job-etc-own')
+        os.mkdir(etc)
+        me, gid = os.getuid(), os.getgid()
+
+        def probe(passwd, group, hosts):
+            for n, text in (('passwd', passwd), ('group', group), ('hosts', hosts)):
+                p = os.path.join(etc, n)
+                if os.path.lexists(p):
+                    os.remove(p)
+                if text is not None:
+                    with open(p, 'w') as f:
+                        f.write(text)
+            code = walls_probe().replace("ETC = '/etc'\n", f'ETC = {etc!r}\n')
+            out = subprocess.run(['python3', '-I', '-c', code, 'job', '/', '', '', ''], capture_output=True, text=True,
+                                 timeout=60).stdout
+            return [x for x in out.splitlines() if x[6:].startswith('passwd, group, hosts:')]
+        own = (f'root:x:0:0:root:/root:/usr/sbin/nologin\nnobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n'
+               f'me:x:{me}:{gid}::/w/home:/bin/sh\n', f'root:x:0:\nnogroup:x:65534:\nme:x:{gid}:\n',
+               '127.0.0.1 localhost\n::1 localhost ip6-localhost\n127.0.1.1 build-host\n')
+        self.assertEqual(probe(*own), ['ok    passwd, group, hosts: only root, nobody, the job\'s own user and loopback'])
+        host = own[0] + f'alice:x:{me + 1}:{me + 1}:Alice Example:/home/alice:/bin/bash\n'
+        self.assertEqual(probe(host, own[1], own[2]),
+                         ['FAIL  passwd, group, hosts: hold passwd alice, which are not the job\'s own'])
+        self.assertEqual(probe(own[0], own[1] + f'sudo:x:{gid + 1}:alice\n', own[2] + '192.0.2.7 nas.lan # x\n'),
+                         ['FAIL  passwd, group, hosts: hold group sudo, hosts 192.0.2.7, which are not the job\'s own'])
+        self.assertEqual(probe(None, own[1], own[2]),
+                         ['FAIL  passwd, group, hosts: hold passwd (cannot read it), which are not the job\'s own'])
+        self.assertEqual(probe(own[0] + 'broken line\n', own[1], own[2]),
+                         ['FAIL  passwd, group, hosts: hold passwd broken line, which are not the job\'s own'])
+
     def test_check_net_keeps_two_canaries_outside_the_list_while_it_runs(self):
         """Issue #243 item 2: check-net writes its two canaries in CANARY_DIR (/etc: no list line has them), one others
         may read and one only the runner user's group may, hands their paths to the walls' probe, and removes them
@@ -3137,7 +3246,8 @@ def real_walls(test, args, systemd_run, *more, full=False):
                      "ok    later mounts: no mount inside receives the host's", 'ok    /mnt and /media: nothing inside',
                      'ok    sockets: none in /tmp, /var/tmp, /run, /dev/shm',
                      'ok    mount sources: each the host path job_fs checked',
-                     'ok    /etc: only the listed entries', 'ok    canaries: 2 not there inside'):
+                     'ok    /etc: only the listed entries', 'ok    canaries: 2 not there inside',
+                     "ok    passwd, group, hosts: only root, nobody, the job's own user and loopback"):
             test.assertIn(want, got.stdout)
         tools = [t for t in (['git', '--version'], ['node', '--version'], ['java', '-version'], ['docker', '--version'])
                  if shutil.which(t[0]) and os.path.realpath(shutil.which(t[0])).startswith(('/usr/', '/etc/'))]
