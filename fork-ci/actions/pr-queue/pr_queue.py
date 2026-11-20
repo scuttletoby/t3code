@@ -83,8 +83,8 @@ GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
             '-c', 'core.attributesFile=/dev/null', '--no-replace-objects')
 # ... and no global or system config or attributes: on a self-hosted runner an earlier job may have written
-# ~/.gitconfig or ~/.config/git/attributes. The same
-# two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
+# ~/.gitconfig or ~/.config/git/attributes. GIT_SAFE and GIT_ENV are the same as ../git-clean/git_clean.py's
+# (git_clean.test.py pins them to its).
 GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
 # The tree git reads `.gitattributes` from, for every call git_env makes: the empty tree, so no attribute file of any
 # commit counts. Without it a bare repository's HEAD (git 2.43 to 2.45 read `HEAD:.gitattributes` there) or an
