@@ -13,6 +13,19 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue: `notify_command` runs once for each notice on an armed pull request it passes over (#129)
+
+- New optional config keys `notify_command` (an argv list) and `notify_timeout_seconds` (default 30). When set, the
+  queue runs the command right after it posted a notice on an armed pull request it passes over (a conflict, a red,
+  cancelled or missing required check), with repo, PR number, head, kind, reason and a link as arguments (README,
+  "Notify"). The posted comment is the record: a later run, a restart or another runner does not run it again for
+  the same head and reason.
+- A command that is missing, fails or runs too long is a warning in the run log and never changes what the run does
+  or its exit code. It gets no token.
+
+**Upgrade:** move the pin first, then add `notify_command` to the config: a queue of an older release refuses the
+unknown key and touches no pull request.
+
 ### git-clean: the wipe stays in the workspace while another process changes it (#428)
 
 - Going back up by `..` must land in the folder the wipe came from (device and inode): a folder moved out of the
