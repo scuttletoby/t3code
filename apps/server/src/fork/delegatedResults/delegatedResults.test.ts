@@ -6,8 +6,12 @@ import {
   isRemindable,
   type LinkedThread,
   localActivity,
-  orphanReminderIds,
+  legacyOrphanSetId,
+  orphanBatches,
+  orphanBatchIds,
+  orphanKey,
   orphanReminderText,
+  ORPHANS_PER_MESSAGE,
   orphansOf,
   parentBusy,
   REMINDER_MAX_AGE_MS,
@@ -15,6 +19,7 @@ import {
   reminderText,
   remoteActivity,
   resultDelivery,
+  toldOrphanKeys,
 } from "./delegatedResults.ts";
 import { at, delegatedTask, NOW, PARENT } from "./delegatedResults.testkit.ts";
 
@@ -206,14 +211,67 @@ describe("orphansOf", () => {
 
 describe("orphan reminder", () => {
   it("has the same ids for the same orphans in any order, other ids than a task reminder", () => {
-    const a = orphanReminderIds(PARENT, [linked("r-1"), linked("r-2")]);
-    const b = orphanReminderIds(PARENT, [linked("r-2"), linked("r-1")]);
+    const a = orphanBatchIds(PARENT, [linked("r-1"), linked("r-2")]);
+    const b = orphanBatchIds(PARENT, [linked("r-2"), linked("r-1")]);
     expect(a).toEqual(b);
-    expect(orphanReminderIds(PARENT, [linked("r-1")])).not.toEqual(a);
+    expect(orphanBatchIds(PARENT, [linked("r-1")])).not.toEqual(a);
+    // The same thread id in another environment is another orphan.
+    expect(orphanKey(linked("r-1", {}, EnvironmentId.make("env-c")))).not.toBe(
+      orphanKey(linked("r-1")),
+    );
     expect(a.messageId).not.toEqual(
       reminderIds(PARENT, [NodeId.make("r-1"), NodeId.make("r-2")]).messageId,
     );
   });
+
+  it("reads back each orphan a message or command id named, for this parent only", () => {
+    const ids = orphanBatchIds(PARENT, [linked("r-1"), linked("r-2")]);
+    const other = orphanBatchIds(ThreadId.make("other"), [linked("r-3")]);
+    expect(toldOrphanKeys(PARENT, [ids.messageId])).toEqual(
+      new Set([orphanKey(linked("r-1")), orphanKey(linked("r-2"))]),
+    );
+    // A receipt's command id says the same; another parent's ids and other kinds say nothing.
+    expect(toldOrphanKeys(PARENT, [ids.commandId])).toEqual(
+      toldOrphanKeys(PARENT, [ids.messageId]),
+    );
+    expect(toldOrphanKeys(PARENT, [other.messageId, "delegated-reminder:x:0123456789ab"])).toEqual(
+      new Set(),
+    );
+  });
+
+  it("names only the orphans not told yet: a grown set sends just the new ones", () => {
+    const first = orphanBatchIds(PARENT, [linked("r-1")]);
+    const grown = [linked("r-1"), linked("r-2"), linked("r-3")];
+    const batches = orphanBatches(PARENT, grown, [first.messageId]);
+    expect(batches.map((batch) => batch.map((orphan) => orphan.threadId))).toEqual([
+      ["r-2", "r-3"],
+    ]);
+    // Told in two messages, it names none; an empty record names all.
+    const second = orphanBatchIds(PARENT, batches[0]!);
+    expect(orphanBatches(PARENT, grown, [first.commandId, second.messageId])).toEqual([]);
+    expect(orphanBatches(PARENT, grown, []).flat()).toHaveLength(3);
+  });
+
+  it("splits many orphans into messages that each name every one of theirs", () => {
+    const many = Array.from({ length: ORPHANS_PER_MESSAGE + 2 }, (_, index) =>
+      linked(`r-${String(index).padStart(2, "0")}`),
+    );
+    const batches = orphanBatches(PARENT, many, []);
+    expect(batches.map((batch) => batch.length)).toEqual([ORPHANS_PER_MESSAGE, 2]);
+    expect(orphanReminderText(batches[0]!)).not.toContain("more");
+  });
+
+  it("takes the first scan's one message for exactly this set as told", () => {
+    const set = [linked("r-1"), linked("r-2")];
+    // That format's id, as the first scan made it (sha256 of the sorted keys, 16 hex digits).
+    expect(legacyOrphanSetId(PARENT, set)).toBe("delegated-orphans:thread-parent:9f652a107b5cc2f3");
+    expect(orphanBatches(PARENT, set, [legacyOrphanSetId(PARENT, set)])).toEqual([]);
+    // A grown set has another digest: each orphan is named once more, then by its own key.
+    expect(
+      orphanBatches(PARENT, [...set, linked("r-3")], [legacyOrphanSetId(PARENT, set)]).flat(),
+    ).toHaveLength(3);
+  });
+
   it("names each orphan with its environment and the tools that read and stop it", () => {
     const text = orphanReminderText([linked("r-2"), linked("r-1")]);
     expect(text).toContain("2 threads");
@@ -221,5 +279,12 @@ describe("orphan reminder", () => {
     expect(text).toContain(`in ${THERE}`);
     expect(text).toContain("t3_thread_read");
     expect(text).toContain("t3_thread_interrupt");
+  });
+
+  it("does not say why the record is missing: a stop and a failed record read the same", () => {
+    const one = orphanReminderText([linked("r-1")]);
+    expect(one).toContain("1 thread in linked environments was launched");
+    expect(one).toContain("delegate_task did not record it here");
+    expect(one).not.toContain("server stopped");
   });
 });

@@ -125,14 +125,14 @@ export const parentGone = (
 ): boolean => shell === null || shell.archivedAt !== null || shell.deletedAt !== null;
 
 const REMINDER_PREFIX = "delegated-reminder:";
-const ORPHAN_PREFIX = "delegated-orphans:";
+
+const digestOf = (keys: ReadonlyArray<string>) =>
+  NodeCrypto.createHash("sha256")
+    .update([...new Set(keys)].toSorted().join("\n"))
+    .digest("hex");
 
 const idsFor = (prefix: string, parentThreadId: ThreadId, keys: ReadonlyArray<string>) => {
-  const digest = NodeCrypto.createHash("sha256")
-    .update([...new Set(keys)].toSorted().join("\n"))
-    .digest("hex")
-    .slice(0, 16);
-  const messageId = `${prefix}${parentThreadId}:${digest}`;
+  const messageId = `${prefix}${parentThreadId}:${digestOf(keys).slice(0, 16)}`;
   return { messageId, commandId: `${messageId}:0` };
 };
 
@@ -195,27 +195,97 @@ export const orphansOf = (
   );
 };
 
-/** The same orphans always give the same id, as `reminderIds` does for tasks. */
-export const orphanReminderIds = (parentThreadId: ThreadId, orphans: ReadonlyArray<LinkedThread>) =>
+/** The start of every orphan reminder id, of both formats (see `legacyOrphanSetId`). */
+export const ORPHAN_ID_PREFIX = "delegated-orphan";
+const orphanPrefix = (parentThreadId: ThreadId) => `${ORPHAN_ID_PREFIX}:${parentThreadId}:`;
+const ORPHAN_KEY = /^[0-9a-f]{12}$/;
+
+/** One orphan's own key: the same thread there always gives the same key. */
+export const orphanKey = (orphan: Pick<LinkedThread, "environmentId" | "threadId">): string =>
+  digestOf([linkedKey(orphan.environmentId, orphan.threadId)]).slice(0, 12);
+
+/** At most this many orphans in one message, each listed by name. */
+export const ORPHANS_PER_MESSAGE = 10;
+
+/**
+ * A message's ids name the key of each orphan it tells about, so the parent's message and receipt
+ * ids are the record of who was told: an orphan is never told twice, also when the set grows
+ * (a machine that answers late) or the one-day window moves (a restart).
+ */
+export const orphanBatchIds = (
+  parentThreadId: ThreadId,
+  batch: ReadonlyArray<Pick<LinkedThread, "environmentId" | "threadId">>,
+) => {
+  const keys = [...new Set(batch.map(orphanKey))].toSorted();
+  const messageId = `${orphanPrefix(parentThreadId)}${keys.join(".")}`;
+  return { messageId, commandId: `${messageId}:0` };
+};
+
+/** The orphan keys that earlier message or command ids of this parent named. */
+export const toldOrphanKeys = (
+  parentThreadId: ThreadId,
+  ids: ReadonlyArray<string>,
+): ReadonlySet<string> => {
+  const prefix = orphanPrefix(parentThreadId);
+  const told = new Set<string>();
+  for (const id of ids) {
+    if (!id.startsWith(prefix)) continue;
+    for (const key of id.slice(prefix.length).replace(/:0$/, "").split(".")) {
+      if (ORPHAN_KEY.test(key)) told.add(key);
+    }
+  }
+  return told;
+};
+
+/**
+ * The id of the first orphan scan's one message for a whole orphan set (before each orphan had
+ * its own key). A message of that id for exactly this set means all of it was told.
+ */
+export const legacyOrphanSetId = (
+  parentThreadId: ThreadId,
+  orphans: ReadonlyArray<Pick<LinkedThread, "environmentId" | "threadId">>,
+): string =>
   idsFor(
-    ORPHAN_PREFIX,
+    `${ORPHAN_ID_PREFIX}s:`,
     parentThreadId,
     orphans.map((orphan) => linkedKey(orphan.environmentId, orphan.threadId)),
-  );
+  ).messageId;
 
+/** The orphans not told yet, sorted, in messages of at most `ORPHANS_PER_MESSAGE`. */
+export const orphanBatches = (
+  parentThreadId: ThreadId,
+  orphans: ReadonlyArray<LinkedThread>,
+  sentIds: ReadonlyArray<string>,
+): ReadonlyArray<ReadonlyArray<LinkedThread>> => {
+  if (orphans.length > 0 && sentIds.includes(legacyOrphanSetId(parentThreadId, orphans))) {
+    return [];
+  }
+  const told = toldOrphanKeys(parentThreadId, sentIds);
+  const fresh = orphans
+    .filter((orphan) => !told.has(orphanKey(orphan)))
+    .toSorted((a, b) =>
+      linkedKey(a.environmentId, a.threadId) < linkedKey(b.environmentId, b.threadId) ? -1 : 1,
+    );
+  const batches: Array<ReadonlyArray<LinkedThread>> = [];
+  for (let start = 0; start < fresh.length; start += ORPHANS_PER_MESSAGE) {
+    batches.push(fresh.slice(start, start + ORPHANS_PER_MESSAGE));
+  }
+  return batches;
+};
+
+/** One message's text; a batch is at most `ORPHANS_PER_MESSAGE` long, so every orphan is named. */
 export const orphanReminderText = (orphans: ReadonlyArray<LinkedThread>): string => {
-  const sorted = orphans.toSorted((a, b) =>
-    linkedKey(a.environmentId, a.threadId) < linkedKey(b.environmentId, b.threadId) ? -1 : 1,
-  );
-  const lines = sorted
-    .slice(0, MAX_LISTED)
+  const lines = orphans
+    .toSorted((a, b) =>
+      linkedKey(a.environmentId, a.threadId) < linkedKey(b.environmentId, b.threadId) ? -1 : 1,
+    )
     .map((orphan) => `- ${orphan.threadId} "${orphan.title}" in ${orphan.environmentId}`);
-  const more = sorted.length > MAX_LISTED ? [`- and ${sorted.length - MAX_LISTED} more`] : [];
-  const count = sorted.length === 1 ? "1 thread" : `${sorted.length} threads`;
+  const one = orphans.length === 1;
   return [
-    `[delegated results] ${count} in linked environments were launched from this thread, but no task here follows them (the server stopped during delegate_task), so their results will not arrive:`,
+    // Neutral on why: the server stopped during delegate_task, or the record failed (that stops
+    // the thread there, and the agent saw an error then).
+    `[delegated results] ${one ? "1 thread" : `${orphans.length} threads`} in linked environments ${one ? "was" : "were"} launched from this thread, but no task here follows ${one ? "it" : "them"} (delegate_task did not record ${one ? "it" : "them"} here), so ${one ? "its result" : "their results"} will not arrive:`,
     ...lines,
-    ...more,
     "Read each with t3_thread_read and its environmentId; stop one you no longer need with t3_thread_interrupt.",
   ].join("\n");
 };

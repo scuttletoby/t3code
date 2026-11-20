@@ -1,7 +1,7 @@
 /**
- * Fork (issues 386, 625): the two reads of the delegated result reminder that upstream's stores do
- * not offer. Both read only the subagent table's own columns and the payload of the few rows they
- * match, never a parent's whole task list.
+ * Fork (issues 386, 625): the reads of the delegated result reminder that upstream's stores do not
+ * offer. They read only indexed columns and the payload of the few rows they match, never a
+ * parent's whole task list or history.
  */
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -26,6 +26,14 @@ export class DelegatedResultsStore extends Context.Service<
     readonly remoteChildrenOf: (
       parentThreadId: ThreadId,
     ) => Effect.Effect<ReadonlyArray<RemoteChildKey> | null>;
+    /**
+     * The ids of this thread's messages, and of its accepted command receipts, that start with
+     * `prefix`: what was sent to it under ids of that kind. Null: unreadable now.
+     */
+    readonly sentIds: (
+      threadId: ThreadId,
+      prefix: string,
+    ) => Effect.Effect<ReadonlyArray<string> | null>;
   }
 >()("t3/fork/delegatedResults/DelegatedResultsStore") {}
 
@@ -81,7 +89,29 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  return DelegatedResultsStore.of({ parentsWithUnreadResults, remoteChildrenOf });
+  const sentIds: DelegatedResultsStore["Service"]["sentIds"] = (threadId, prefix) =>
+    sql<{ readonly id: string }>`
+      SELECT message_id AS id FROM orchestration_v2_projection_messages
+      WHERE thread_id = ${threadId} AND substr(message_id, 1, ${prefix.length}) = ${prefix}
+      UNION
+      SELECT command_id AS id FROM orchestration_v2_command_receipts
+      WHERE thread_id = ${threadId}
+        AND status = 'accepted'
+        AND substr(command_id, 1, ${prefix.length}) = ${prefix}
+    `.pipe(
+      Effect.map((rows) => rows.map((row) => row.id)),
+      Effect.catchCause((cause) =>
+        Effect.logWarning(
+          "delegated result reminder: a thread's earlier reminders cannot be read",
+          {
+            threadId,
+            cause,
+          },
+        ).pipe(Effect.as(null)),
+      ),
+    );
+
+  return DelegatedResultsStore.of({ parentsWithUnreadResults, remoteChildrenOf, sentIds });
 });
 
 export const layer = Layer.effect(DelegatedResultsStore, make);

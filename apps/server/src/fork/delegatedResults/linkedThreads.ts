@@ -18,10 +18,11 @@ export const LINKED_PAGE_SIZE = 100;
 export interface LinkedThreadsRead {
   readonly threads: ReadonlyArray<LinkedThread>;
   /**
-   * complete: every thread that may match was read. partial: the page limit was reached, or a
-   * later page did not answer. unreachable: the first page did not answer.
+   * complete: every thread that may match was read. limit: the page limit was reached (a rerun
+   * reads the same pages). cut-short: a later page did not answer (a rerun may read the rest).
+   * unreachable: the first page did not answer.
    */
-  readonly state: "complete" | "partial" | "unreachable";
+  readonly state: "complete" | "limit" | "cut-short" | "unreachable";
 }
 
 export const listLinkedThreads = Effect.fn("delegatedResults.listLinkedThreads")(function* <R>(
@@ -47,7 +48,10 @@ export const listLinkedThreads = Effect.fn("delegatedResults.listLinkedThreads")
       Effect.orElseSucceed(() => ({ _tag: "None" }) as const),
     );
     if (listed._tag === "None") {
-      return { threads, state: read === 0 ? "unreachable" : "partial" } satisfies LinkedThreadsRead;
+      return {
+        threads,
+        state: read === 0 ? "unreachable" : "cut-short",
+      } satisfies LinkedThreadsRead;
     }
     for (const thread of listed.value.threads) {
       if (thread.delegatedFrom === undefined) continue;
@@ -76,5 +80,5 @@ export const listLinkedThreads = Effect.fn("delegatedResults.listLinkedThreads")
     }
     cursor = listed.value.nextCursor;
   }
-  return { threads, state: "partial" } satisfies LinkedThreadsRead;
+  return { threads, state: "limit" } satisfies LinkedThreadsRead;
 });

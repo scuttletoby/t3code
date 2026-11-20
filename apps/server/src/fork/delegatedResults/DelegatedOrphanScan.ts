@@ -1,7 +1,7 @@
 /**
- * Fork (issue 625, part of 386): a stop between the linked thread's creation and the task's record
- * leaves a thread there no task here follows. At start, each such thread made before the start gets
- * its parent one queued message; ids come from the orphans, so a rerun or restart never repeats it.
+ * Fork (issue 625, part of 386): names each thread there that no task here follows, made before the
+ * start, to its parent once (ids carry one key per orphan, so reruns and restarts never repeat one).
+ * Upstream's fix (record before launch) is not merged; slim or drop this scan once a sync brings it.
  */
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -21,10 +21,11 @@ import * as WaitDelivery from "../../waits/WaitDelivery.ts";
 import * as WorkAdmission from "../../workAdmission.ts";
 import {
   type LinkedThread,
-  orphanReminderIds,
+  ORPHAN_ID_PREFIX,
+  orphanBatches,
+  orphanBatchIds,
   orphanReminderText,
   orphansOf,
-  parentBusy,
   parentGone,
   REMINDER_MAX_AGE_MS,
 } from "./delegatedResults.ts";
@@ -34,7 +35,7 @@ import { LINKED_PAGE_SIZE, listLinkedThreads } from "./linkedThreads.ts";
 export interface OrphanScanOptions {
   /** From the start to the first scan: links come back and followers settle first. */
   readonly delay: Duration.Input;
-  /** Between scans while an environment did not answer or a parent was busy. */
+  /** Between scans while an environment did not answer (fully) or a parent could not be read. */
   readonly retryDelay: Duration.Input;
   /** Scans in all, the first one included. */
   readonly attempts: number;
@@ -43,6 +44,14 @@ export interface OrphanScanOptions {
   /** The longest one page may take before the environment counts as not answering. */
   readonly pageTimeout: Duration.Input;
 }
+
+/**
+ * A thread there counts as made before this start up to this long after it: the other machine's
+ * clock may run ahead of this one. A launch in that minute was recorded long before the first
+ * scan (`delay`), so it is never raced; only a launch whose record failed (the agent saw an error
+ * then) may be named too, and the message's wording covers that.
+ */
+export const CLOCK_SKEW_MS = 60_000;
 
 const DEFAULT_OPTIONS: OrphanScanOptions = {
   delay: Duration.minutes(3),
@@ -54,10 +63,11 @@ const DEFAULT_OPTIONS: OrphanScanOptions = {
 
 /** What one parent's check did; tests read it. */
 export type ParentOutcome =
+  /** No orphan, or every one was named before. */
   | { readonly type: "none" }
-  | { readonly type: "busy" }
   | { readonly type: "gone" }
   | { readonly type: "unreadable" }
+  /** Named now; a busy parent reads it after its current run (an open question included). */
   | { readonly type: "sent"; readonly threadIds: ReadonlyArray<ThreadId> }
   | { readonly type: "held"; readonly detail: string };
 
@@ -66,12 +76,20 @@ export interface ScanOutcome {
   readonly type: "off" | "scanned";
   /** Environments whose first page did not answer: scanned again. */
   readonly unreachable: ReadonlyArray<EnvironmentId>;
-  /** Environments with more matching threads than the page limit reads. */
+  /** Environments whose later page did not answer: scanned again. */
+  readonly cutShort: ReadonlyArray<EnvironmentId>;
+  /** Environments with more matching threads than the page limit reads (a rerun reads the same). */
   readonly partial: ReadonlyArray<EnvironmentId>;
   readonly parents: ReadonlyMap<ThreadId, ParentOutcome>;
 }
 
-const OFF: ScanOutcome = { type: "off", unreachable: [], partial: [], parents: new Map() };
+const OFF: ScanOutcome = {
+  type: "off",
+  unreachable: [],
+  cutShort: [],
+  partial: [],
+  parents: new Map(),
+};
 
 export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
   options: OrphanScanOptions = DEFAULT_OPTIONS,
@@ -101,43 +119,57 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
     parentThreadId: ThreadId,
     linked: ReadonlyArray<LinkedThread>,
   ) {
+    // The orphans first: a parent with none never needs its shell, nor another scan.
+    const followed = yield* store.remoteChildrenOf(parentThreadId);
+    if (followed === null) return { type: "unreadable" } satisfies ParentOutcome;
+    const orphans = orphansOf(linked, hereId, parentThreadId, followed);
+    if (orphans.length === 0) return { type: "none" } satisfies ParentOutcome;
+    const sentIds = yield* store.sentIds(parentThreadId, ORPHAN_ID_PREFIX);
+    if (sentIds === null) return { type: "unreadable" } satisfies ParentOutcome;
+    const batches = orphanBatches(parentThreadId, orphans, sentIds);
+    if (batches.length === 0) return { type: "none" } satisfies ParentOutcome;
     const shell = yield* threads
       .getThreadShell(parentThreadId)
       .pipe(Effect.orElseSucceed(() => undefined));
     if (shell === undefined) return { type: "unreadable" } satisfies ParentOutcome;
     if (parentGone(shell)) return { type: "gone" } satisfies ParentOutcome;
-    if (parentBusy(shell!)) return { type: "busy" } satisfies ParentOutcome;
-    const followed = yield* store.remoteChildrenOf(parentThreadId);
-    if (followed === null) return { type: "unreadable" } satisfies ParentOutcome;
-    const orphans = orphansOf(linked, hereId, parentThreadId, followed);
-    if (orphans.length === 0) return { type: "none" } satisfies ParentOutcome;
-    const ids = orphanReminderIds(parentThreadId, orphans);
-    const result = yield* delivery.deliver({
-      threadId: parentThreadId,
-      messageId: ids.messageId,
-      commandId: ids.commandId,
-      text: orphanReminderText(orphans),
-    });
-    switch (result.type) {
-      case "delivered":
-        return {
-          type: "sent",
-          threadIds: orphans.map((orphan) => orphan.threadId),
-        } satisfies ParentOutcome;
-      case "gone":
-        return { type: "gone" } satisfies ParentOutcome;
-      case "stopped":
-        // A person stopped it: never restart it from here.
-        return { type: "held", detail: "stopped" } satisfies ParentOutcome;
-      case "rejected":
-        yield* Effect.logWarning("delegated orphan reminder refused", {
-          threadId: parentThreadId,
-          detail: result.detail,
-        });
-        return { type: "held", detail: result.detail } satisfies ParentOutcome;
-      case "retry":
-        return { type: "unreadable" } satisfies ParentOutcome;
+    // A busy parent is not held: its run's end changes nothing about an orphan, and the message
+    // waits in its queue until that run (a question to a person included) is over.
+    const sent: Array<ThreadId> = [];
+    let retry = false;
+    let refused: string | undefined;
+    for (const batch of batches) {
+      const ids = orphanBatchIds(parentThreadId, batch);
+      const result = yield* delivery.deliver({
+        threadId: parentThreadId,
+        messageId: ids.messageId,
+        commandId: ids.commandId,
+        text: orphanReminderText(batch),
+      });
+      switch (result.type) {
+        case "delivered":
+          sent.push(...batch.map((orphan) => orphan.threadId));
+          break;
+        case "gone":
+          return { type: "gone" } satisfies ParentOutcome;
+        case "stopped":
+          // A person stopped it: never restart it from here.
+          return { type: "held", detail: "stopped" } satisfies ParentOutcome;
+        case "rejected":
+          yield* Effect.logWarning("delegated orphan reminder refused", {
+            threadId: parentThreadId,
+            detail: result.detail,
+          });
+          refused = result.detail;
+          break;
+        case "retry":
+          retry = true;
+          break;
+      }
     }
+    if (retry) return { type: "unreadable" } satisfies ParentOutcome;
+    if (refused !== undefined) return { type: "held", detail: refused } satisfies ParentOutcome;
+    return { type: "sent", threadIds: sent } satisfies ParentOutcome;
   });
 
   /** One pass over every linked environment; a parent is checked once, over all of them. */
@@ -152,6 +184,7 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
     if (links === null) return OFF;
     const sinceMs = startedAtMs - REMINDER_MAX_AGE_MS;
     const unreachable: Array<EnvironmentId> = [];
+    const cutShort: Array<EnvironmentId> = [];
     const partial: Array<EnvironmentId> = [];
     const byParent = new Map<ThreadId, Array<LinkedThread>>();
     yield* Effect.forEach(
@@ -169,12 +202,13 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
             maxPages: options.maxPages,
             timeout: options.pageTimeout,
             sinceMs,
-            createdBeforeMs: startedAtMs,
+            createdBeforeMs: startedAtMs + CLOCK_SKEW_MS,
           },
         ).pipe(
           Effect.map((read) => {
             if (read.state === "unreachable") unreachable.push(link.environmentId);
-            if (read.state === "partial") partial.push(link.environmentId);
+            if (read.state === "cut-short") cutShort.push(link.environmentId);
+            if (read.state === "limit") partial.push(link.environmentId);
             for (const thread of read.threads) {
               if (thread.delegatedFrom.environmentId !== hereId) continue;
               const parent = thread.delegatedFrom.threadId;
@@ -189,30 +223,49 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
       parents.set(parentThreadId, yield* checkParent(parentThreadId, linked));
     }
     if (partial.length > 0) {
-      yield* Effect.logWarning("delegated orphan scan read only the newest threads", {
-        environmentIds: partial,
-        threads: options.maxPages * LINKED_PAGE_SIZE,
-      });
+      yield* Effect.logWarning(
+        "delegated orphan scan read only the newest threads: the page limit was reached",
+        { environmentIds: partial, threads: options.maxPages * LINKED_PAGE_SIZE },
+      );
     }
-    return { type: "scanned", unreachable, partial, parents } satisfies ScanOutcome;
+    return { type: "scanned", unreachable, cutShort, partial, parents } satisfies ScanOutcome;
   });
 
-  /** A scan needs another pass while an environment did not answer or a parent could not take it. */
+  const unreadableParents = (outcome: ScanOutcome) =>
+    [...outcome.parents.entries()]
+      .filter(([, parent]) => parent.type === "unreadable")
+      .map(([threadId]) => threadId);
+
+  /** Another pass while an environment did not answer (fully) or a parent could not be read. */
   const needsAnother = (outcome: ScanOutcome): boolean =>
     outcome.type === "scanned" &&
     (outcome.unreachable.length > 0 ||
-      [...outcome.parents.values()].some(
-        (parent) => parent.type === "busy" || parent.type === "unreadable",
-      ));
+      outcome.cutShort.length > 0 ||
+      unreadableParents(outcome).length > 0);
 
-  /** Scans after the delay, and again while `needsAnother`, at most `attempts` times. */
+  /**
+   * Scans after the delay, and again while `needsAnother`, at most `attempts` times. What is still
+   * unchecked then is logged by name; the next start scans it again (within its one-day window).
+   */
   const run = Effect.fn("DelegatedOrphanScan.run")(
     function* () {
       yield* Effect.sleep(options.delay);
       for (let attempt = 1; attempt <= options.attempts; attempt += 1) {
         const outcome = yield* scan();
         if (!needsAnother(outcome)) return;
-        if (attempt < options.attempts) yield* Effect.sleep(options.retryDelay);
+        if (attempt < options.attempts) {
+          yield* Effect.sleep(options.retryDelay);
+          continue;
+        }
+        yield* Effect.logWarning(
+          "delegated orphan scan stopped with work unchecked until the next start",
+          {
+            scans: options.attempts,
+            unansweredEnvironmentIds: outcome.unreachable,
+            cutShortEnvironmentIds: outcome.cutShort,
+            unreadableParentThreadIds: unreadableParents(outcome),
+          },
+        );
       }
     },
     (effect) =>
@@ -224,17 +277,21 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
   return { scan, run, checkParent };
 });
 
+/** A held server (`serve --hold-work`) neither follows nor reminds; its next start does. */
+export const layerWith = (options: OrphanScanOptions = DEFAULT_OPTIONS) =>
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      if ((yield* WorkAdmission.WorkAdmission).heldFromBoot) return;
+      const service = yield* make(options);
+      yield* forkParked(service.run());
+    }),
+  );
+
 /**
  * In the routes beside upstream's follower of linked tasks (fork/forkLayers.ts), which has the
- * links. A held server (`serve --hold-work`) neither follows nor reminds; its next start does.
+ * links.
  */
-export const layer = Layer.effectDiscard(
-  Effect.gen(function* () {
-    if ((yield* WorkAdmission.WorkAdmission).heldFromBoot) return;
-    const service = yield* make();
-    yield* forkParked(service.run());
-  }),
-).pipe(
+export const layer = layerWith().pipe(
   Layer.provide(
     Layer.merge(CommandReceiptStore.layerFromApplicationReceipts, DelegatedResultsStore.layer),
   ),

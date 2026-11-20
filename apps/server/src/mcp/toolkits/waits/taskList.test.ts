@@ -35,6 +35,8 @@ const ENV_UP = EnvironmentId.make("env-up");
 const ENV_GONE = EnvironmentId.make("env-gone");
 /** Answers every page with more to come: more threads than `task_list` reads. */
 const ENV_BIG = EnvironmentId.make("env-big");
+/** Answers its first page, never its second. */
+const ENV_CUT = EnvironmentId.make("env-cut");
 
 const remoteTask = (id: string, environmentId: EnvironmentId, status = "running") =>
   delegatedTask({
@@ -147,7 +149,7 @@ const toolsLayer = (world: World) => {
       links: () =>
         Effect.succeed({
           environmentId: HERE,
-          links: [ENV_UP, ENV_GONE, ENV_BIG].map((environmentId) => ({
+          links: [ENV_UP, ENV_GONE, ENV_BIG, ENV_CUT].map((environmentId) => ({
             environmentId,
             label: environmentId,
             status: "reachable" as const,
@@ -163,72 +165,80 @@ const toolsLayer = (world: World) => {
         environmentId: EnvironmentId,
         params: { readonly cursor: number },
       ) =>
-        environmentId === ENV_GONE
+        environmentId === ENV_GONE || (environmentId === ENV_CUT && params.cursor > 0)
           ? Effect.never
-          : environmentId === ENV_BIG
+          : environmentId === ENV_CUT
             ? Effect.succeed({
                 projectId: null,
                 currentThreadId: null,
-                nextCursor: params.cursor + 100,
-                total: 10_000,
-                threads: [{ threadId: ThreadId.make(`big-${params.cursor}`), title: "busy" }],
+                nextCursor: 100,
+                total: 200,
+                threads: [],
               })
-            : params.cursor > 0
-              ? // The second page: an older thread this one launched, also lost.
-                Effect.succeed({
+            : environmentId === ENV_BIG
+              ? Effect.succeed({
                   projectId: null,
                   currentThreadId: null,
-                  nextCursor: null,
-                  total: 101,
-                  threads: [
-                    {
-                      threadId: ThreadId.make("remote-lost-older"),
-                      title: "older lost one",
-                      delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
-                    },
-                  ],
+                  nextCursor: params.cursor + 100,
+                  total: 10_000,
+                  threads: [{ threadId: ThreadId.make(`big-${params.cursor}`), title: "busy" }],
                 })
-              : Effect.succeed({
-                  projectId: null,
-                  currentThreadId: null,
-                  nextCursor: 100,
-                  total: 101,
-                  threads: [
-                    // Followed by a task here.
-                    {
-                      threadId: ThreadId.make("remote-r-up"),
-                      title: "known",
-                      delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
-                    },
-                    // Launched by this thread, but its record never ran.
-                    {
-                      threadId: ThreadId.make("remote-lost"),
-                      title: "lost one",
-                      delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
-                    },
-                    // Another thread's child.
-                    {
-                      threadId: ThreadId.make("remote-other"),
-                      title: "other",
-                      delegatedFrom: {
-                        environmentId: HERE,
-                        threadId: ThreadId.make("thread-other"),
-                        title: "o",
+              : params.cursor > 0
+                ? // The second page: an older thread this one launched, also lost.
+                  Effect.succeed({
+                    projectId: null,
+                    currentThreadId: null,
+                    nextCursor: null,
+                    total: 101,
+                    threads: [
+                      {
+                        threadId: ThreadId.make("remote-lost-older"),
+                        title: "older lost one",
+                        delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
                       },
-                    },
-                    // Launched by a thread of the same id in another environment.
-                    {
-                      threadId: ThreadId.make("remote-foreign"),
-                      title: "foreign",
-                      delegatedFrom: {
-                        environmentId: EnvironmentId.make("env-other"),
-                        threadId: PARENT,
-                        title: "p",
+                    ],
+                  })
+                : Effect.succeed({
+                    projectId: null,
+                    currentThreadId: null,
+                    nextCursor: 100,
+                    total: 101,
+                    threads: [
+                      // Followed by a task here.
+                      {
+                        threadId: ThreadId.make("remote-r-up"),
+                        title: "known",
+                        delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
                       },
-                    },
-                    { threadId: ThreadId.make("remote-own"), title: "its own thread" },
-                  ],
-                })) as never,
+                      // Launched by this thread, but its record never ran.
+                      {
+                        threadId: ThreadId.make("remote-lost"),
+                        title: "lost one",
+                        delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
+                      },
+                      // Another thread's child.
+                      {
+                        threadId: ThreadId.make("remote-other"),
+                        title: "other",
+                        delegatedFrom: {
+                          environmentId: HERE,
+                          threadId: ThreadId.make("thread-other"),
+                          title: "o",
+                        },
+                      },
+                      // Launched by a thread of the same id in another environment.
+                      {
+                        threadId: ThreadId.make("remote-foreign"),
+                        title: "foreign",
+                        delegatedFrom: {
+                          environmentId: EnvironmentId.make("env-other"),
+                          threadId: PARENT,
+                          title: "p",
+                        },
+                      },
+                      { threadId: ThreadId.make("remote-own"), title: "its own thread" },
+                    ],
+                  })) as never,
     }),
   ).pipe(Layer.provideMerge(NodeServices.layer));
   return McpHttpServer.layerForkTools.pipe(
@@ -376,7 +386,9 @@ describe("task_list", () => {
       expect(listed.unreachable).toEqual([ENV_GONE]);
       expect(listed.next).toContain("t3_thread_read");
       // The environment with more threads than it reads is named.
-      expect(listed.next).toContain(`newest ${ORPHAN_PAGES * 100} threads of ${ENV_BIG}`);
+      expect(listed.next).toContain(`newest ${ORPHAN_PAGES * 100} threads of ${ENV_BIG}.`);
+      // One whose later page did not answer is named for that, not for the page limit.
+      expect(listed.next).toContain(`A later page of ${ENV_CUT} did not answer`);
       // Settled tasks are read to know what is followed, but listed only when asked.
       expect(listed.tasks.map((task) => task.taskId)).not.toContain("l-read");
     }).pipe(Effect.provide(toolsLayer(mixedWorld))),

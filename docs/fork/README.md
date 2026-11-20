@@ -191,17 +191,23 @@ result _may_ not have arrived.
 
 The server makes a thread in a linked environment before it records the task here, so a server that
 stops in between leaves a thread there that no task here follows. At start (a few minutes after,
-and again every ten minutes while an environment does not answer or the parent is busy, six scans
-at most), each linked environment's threads made before the start and changed in the last day are
-read, and a parent that one names as its `delegatedFrom` but no task of it follows gets one queued
-message naming them, with the tools to read and stop them. Off on a held start (`--hold-work`) and
-while Linked environments is off.
+and again every ten minutes while an environment does not answer fully or a parent cannot be read,
+six scans at most), each linked environment's threads made before the start (with a minute's
+tolerance for a clock that runs ahead) and changed in the last day are read. A parent that one
+names as its `delegatedFrom` but no task of it follows gets a queued message naming them, with the
+tools to read and stop them. Each such thread is named once: a machine that answers late, or a
+later start, names only the ones not named yet. A busy parent (a question to a person included)
+reads it after its current run. What is still unchecked after the last scan is logged by name and
+scanned again at the next start. Off on a held start (`--hold-work`) and while Linked environments
+is off. This scan stands in for an upstream gap: upstream's `delegate_task` also launches there
+before it records here, and its fix (record before the launch) is not merged yet. When an upstream
+sync brings that fix, slim the scan to threads lost before it, or drop it.
 
 `task_list` (always there, read only) lists a thread's tasks with an unread result and how many of
 its children run now per place, from their live status; a remote task whose stop there is still
 owed is read there too. An environment that does not answer once is not asked again in the same
 call. With `checkLinked`, it also lists such orphans, from each environment's newest 500 threads
-(an environment with more is named in `next`). Which slot view to trust: `task_list` for this
+(`next` names an environment with more, and one whose later page did not answer). Which slot view to trust: `task_list` for this
 thread's own children (it reads each one's live status), `wait_list` for whether `delegate_task`
 will be let through (it shows what the slot gate counts against `server.agentSlots`, every agent on
 the machine or account).

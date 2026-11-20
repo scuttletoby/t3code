@@ -1,7 +1,7 @@
 /**
- * Fork (issue 625): the startup orphan scan. State question: a rerun and a restart (one message),
- * an environment that does not answer (scanned again), a busy, stopped or gone parent, a thread
- * made after the start (its record may still come), waits off, and no links.
+ * Fork (issue 625): the startup orphan scan. State: reruns, restarts, late machines and a moved
+ * window name each orphan once; a stop half-way; the first scan's format; environments that do
+ * not answer (fully); busy, stopped or gone parents; threads made after start; a held start.
  */
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -16,6 +16,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import { TestClock } from "effect/testing";
 
@@ -25,6 +26,8 @@ import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../../peer/PeerForwarding.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import * as WorkAdmission from "../../workAdmission.ts";
+import { legacyOrphanSetId, orphanBatchIds } from "./delegatedResults.ts";
 import { at, NOW, PARENT } from "./delegatedResults.testkit.ts";
 import * as DelegatedOrphanScan from "./DelegatedOrphanScan.ts";
 import type { RemoteChildKey } from "./DelegatedResultsStore.ts";
@@ -56,6 +59,8 @@ interface ThreadThere {
   readonly from?: { readonly environmentId: EnvironmentId; readonly threadId: ThreadId };
   /** Before the start by default. */
   readonly createdAt?: number;
+  /** A minute ago by default. */
+  readonly updatedAt?: number;
 }
 
 const iso = (ms: number) => DateTime.formatIso(at(ms));
@@ -72,6 +77,8 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   ]);
   followed.set(PARENT, [{ environmentId: ENV_B, threadId: ThreadId.make("known-1") }]);
   const silent = new Set<EnvironmentId>();
+  /** Answers its first page only. */
+  const cutShort = new Set<EnvironmentId>();
   const linksOff = { value: false };
   const pageReads: Array<{ environmentId: EnvironmentId; cursor: number }> = [];
   const sent: Array<{ threadId: ThreadId; messageId: string; text: string }> = [];
@@ -84,7 +91,7 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
       title: `title ${thread.threadId}`,
       delegatedFrom: { ...(thread.from ?? { environmentId: HERE, threadId: PARENT }), title: "p" },
       createdAt: iso(thread.createdAt ?? NOW - 60 * 60_000),
-      updatedAt: iso(NOW - (cursor + index) * 60_000),
+      updatedAt: iso(thread.updatedAt ?? NOW - (cursor + index) * 60_000),
     }));
     return {
       projectId: null,
@@ -99,9 +106,11 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
     followed,
     there,
     silent,
+    cutShort,
     linksOff,
     pageReads,
     sent,
+    receipts,
     layer: Layer.mergeAll(
       ServerSettingsService.layerTest({ waitFor }),
       Layer.mock(ServerEnvironment.ServerEnvironment)({
@@ -136,6 +145,18 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
       Layer.mock(DelegatedResultsStore.DelegatedResultsStore)({
         remoteChildrenOf: (parent) =>
           Effect.succeed(followed.has(parent) ? followed.get(parent)! : []),
+        // As the real read: the thread's message ids and its accepted receipts' command ids.
+        sentIds: (threadId, prefix) =>
+          Effect.succeed(
+            [
+              ...sent
+                .filter((message) => message.threadId === threadId)
+                .map((message) => message.messageId),
+              ...[...receipts.entries()]
+                .filter(([, thread]) => thread === threadId)
+                .map(([commandId]) => commandId),
+            ].filter((id) => id.startsWith(prefix)),
+          ),
       }),
       Layer.mock(PeerForwarding.PeerForwarding)({
         links: () =>
@@ -172,7 +193,7 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
         ) =>
           Effect.suspend(() => {
             pageReads.push({ environmentId, cursor: params.cursor });
-            return silent.has(environmentId)
+            return silent.has(environmentId) || (cutShort.has(environmentId) && params.cursor > 0)
               ? Effect.never
               : Effect.succeed(page(environmentId, params.cursor));
           })) as never,
@@ -181,8 +202,8 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   };
 };
 
-const service = (world: ReturnType<typeof makeWorld>) =>
-  DelegatedOrphanScan.make(OPTIONS).pipe(Effect.provide(world.layer));
+const service = (world: ReturnType<typeof makeWorld>, options: Partial<typeof OPTIONS> = {}) =>
+  DelegatedOrphanScan.make({ ...OPTIONS, ...options }).pipe(Effect.provide(world.layer));
 
 const setClock = TestClock.setTime(NOW);
 
@@ -281,9 +302,9 @@ describe("DelegatedOrphanScan.scan", () => {
       yield* setClock;
       const world = makeWorld();
       world.there.set(ENV_B, [
-        // Launched after this start: its record here may still be written.
-        { threadId: "new-1", createdAt: NOW + 1 },
-        { threadId: "new-2", createdAt: NOW },
+        // Launched after this start (beyond the clock tolerance): its record may still be written.
+        { threadId: "new-1", createdAt: NOW + DelegatedOrphanScan.CLOCK_SKEW_MS + 1 },
+        { threadId: "new-2", createdAt: NOW + DelegatedOrphanScan.CLOCK_SKEW_MS },
         // Launched by a thread of the same id in another environment.
         { threadId: "foreign", from: { environmentId: ENV_C, threadId: PARENT } },
         { threadId: "known-1" },
@@ -297,16 +318,39 @@ describe("DelegatedOrphanScan.scan", () => {
     }),
   );
 
-  it.effect("never writes to a busy, stopped, archived or deleted parent", () =>
+  it.effect("names a thread there whose clock runs a little ahead of this one", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      // Made just before this start, stamped 30 s after it by a clock ahead of this one.
+      world.there.set(ENV_B, [{ threadId: "skewed", createdAt: NOW + 30_000 }]);
+      const outcome = yield* scanned((yield* service(world)).scan());
+      expect(outcome.parents.get(PARENT)).toEqual({ type: "sent", threadIds: ["skewed"] });
+    }),
+  );
+
+  it.effect("queues the message for a busy parent, one waiting on a question too", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      for (const busy of [
+        { status: "running", activityRunStatus: "running" },
+        { pendingRuntimeRequest: {} as never },
+      ] as const) {
+        const world = makeWorld();
+        world.shells.set(PARENT, idleShell(PARENT, busy));
+        const outcome = yield* scanned((yield* service(world)).scan());
+        // Sent now: it waits in the queue until the parent's run is over.
+        expect(outcome.parents.get(PARENT)).toEqual({ type: "sent", threadIds: ["lost-1"] });
+        expect(world.sent).toHaveLength(1);
+      }
+    }),
+  );
+
+  it.effect("never writes to a stopped, archived or deleted parent", () =>
     Effect.gen(function* () {
       yield* setClock;
       const world = makeWorld();
       const scan = yield* service(world);
-      world.shells.set(
-        PARENT,
-        idleShell(PARENT, { status: "running", activityRunStatus: "running" }),
-      );
-      expect((yield* scanned(scan.scan())).parents.get(PARENT)).toEqual({ type: "busy" });
       world.shells.set(PARENT, idleShell(PARENT, { status: "interrupted" }));
       expect((yield* scanned(scan.scan())).parents.get(PARENT)).toEqual({
         type: "held",
@@ -328,6 +372,90 @@ describe("DelegatedOrphanScan.scan", () => {
       const outcome = yield* scanned((yield* service(world)).scan());
       expect(outcome.parents.get(PARENT)).toEqual({ type: "unreadable" });
       expect(world.sent).toHaveLength(0);
+    }),
+  );
+
+  it.effect("names only the new orphans after a restart, when the day window has moved", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.there.set(ENV_B, [{ threadId: "lost-1" }, { threadId: "lost-2" }]);
+      yield* scanned((yield* service(world)).scan());
+      expect(world.sent).toHaveLength(1);
+      // A day later: lost-2 changed since (still in the window), lost-1 fell out of it (paging
+      // stops before it), and a new one appeared. The next start names only the new one.
+      const later = NOW + 24 * 60 * 60_000 + 60 * 60_000;
+      yield* TestClock.setTime(later);
+      world.followed.set(PARENT, [
+        { environmentId: ENV_B, threadId: ThreadId.make("known-1") },
+        { environmentId: ENV_B, threadId: ThreadId.make("known-2") },
+      ]);
+      world.there.set(ENV_B, [
+        { threadId: "lost-3", updatedAt: later - 60_000 },
+        { threadId: "lost-2", updatedAt: later - 2 * 60_000 },
+        { threadId: "known-1", updatedAt: NOW - 60_000 },
+        { threadId: "known-2", updatedAt: NOW - 2 * 60_000 },
+        { threadId: "lost-1", updatedAt: NOW - 3 * 60_000 },
+      ]);
+      const reads = world.pageReads.length;
+      const outcome = yield* scanned((yield* service(world)).scan());
+      expect(outcome.parents.get(PARENT)).toEqual({ type: "sent", threadIds: ["lost-3"] });
+      expect(world.sent).toHaveLength(2);
+      expect(world.sent[1]!.text).toContain("lost-3");
+      expect(world.sent[1]!.text).not.toContain("lost-2");
+      // lost-1's page was never read.
+      expect(world.pageReads.slice(reads).map((read) => read.cursor)).toEqual([0, 2]);
+    }),
+  );
+
+  it.effect("after a stop half-way through its messages, sends only the ones not sent", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const orphans = Array.from({ length: 12 }, (_, index) => ({
+        threadId: `lost-${String(index).padStart(2, "0")}`,
+      }));
+      world.there.set(ENV_B, orphans);
+      world.followed.set(PARENT, []);
+      // The last start sent the first message (ten orphans) and stopped before the second.
+      const first = orphanBatchIds(
+        PARENT,
+        orphans.slice(0, 10).map((orphan) => ({
+          environmentId: ENV_B,
+          threadId: ThreadId.make(orphan.threadId),
+        })),
+      );
+      world.sent.push({ threadId: PARENT, messageId: first.messageId, text: "" });
+      world.receipts.set(first.commandId, PARENT);
+      // Two threads a page: every page read.
+      const allPages = { maxPages: 10 };
+      const outcome = yield* scanned((yield* service(world, allPages)).scan());
+      expect(outcome.parents.get(PARENT)).toEqual({
+        type: "sent",
+        threadIds: ["lost-10", "lost-11"],
+      });
+      expect(world.sent).toHaveLength(2);
+      // Only the receipt survived (no message row): it still counts as sent.
+      world.sent.splice(0, 1);
+      expect(
+        (yield* scanned((yield* service(world, allPages)).scan())).parents.get(PARENT),
+      ).toEqual({ type: "none" });
+      expect(world.sent).toHaveLength(1);
+    }),
+  );
+
+  it.effect("takes the first scan's message for the same orphans as sent", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const old = legacyOrphanSetId(PARENT, [
+        { environmentId: ENV_B, threadId: ThreadId.make("lost-1") },
+      ]);
+      world.sent.push({ threadId: PARENT, messageId: old, text: "" });
+      world.receipts.set(`${old}:0`, PARENT);
+      const outcome = yield* scanned((yield* service(world)).scan());
+      expect(outcome.parents.get(PARENT)).toEqual({ type: "none" });
+      expect(world.sent).toHaveLength(1);
     }),
   );
 
@@ -366,10 +494,10 @@ describe("DelegatedOrphanScan.run", () => {
       world.silent.delete(ENV_C);
       yield* TestClock.adjust(OPTIONS.retryDelay);
       yield* settle;
-      // The next scan read env-c: one new message names both.
+      // The next scan read env-c: one new message names only what was not named yet.
       expect(world.sent).toHaveLength(2);
       expect(world.sent[1]!.text).toContain("lost-c");
-      expect(world.sent[1]!.text).toContain("lost-1");
+      expect(world.sent[1]!.text).not.toContain("lost-1");
       // Nothing left to wait for: no third scan.
       yield* Fiber.join(fiber);
       const reads = world.pageReads.length;
@@ -379,26 +507,132 @@ describe("DelegatedOrphanScan.run", () => {
     }),
   );
 
-  it.effect("scans again while the parent is busy, and stops after its attempts", () =>
+  it.effect("needs no second scan for a busy parent with no orphan", () =>
     Effect.gen(function* () {
       yield* setClock;
       const world = makeWorld();
+      world.followed.set(PARENT, [
+        { environmentId: ENV_B, threadId: ThreadId.make("known-1") },
+        { environmentId: ENV_B, threadId: ThreadId.make("lost-1") },
+      ]);
       world.shells.set(
         PARENT,
         idleShell(PARENT, { status: "running", activityRunStatus: "running" }),
       );
-      const scan = yield* service(world);
-      const fiber = yield* scan.run().pipe(Effect.forkChild);
+      const fiber = yield* (yield* service(world)).run().pipe(Effect.forkChild);
       yield* settle;
       yield* TestClock.adjust(OPTIONS.delay);
       yield* settle;
-      for (let attempt = 1; attempt < OPTIONS.attempts; attempt += 1) {
-        yield* TestClock.adjust(OPTIONS.retryDelay);
+      yield* Fiber.join(fiber);
+      expect(world.pageReads).toHaveLength(1);
+    }),
+  );
+
+  it.effect("scans again while a page or a parent is unread, then logs what is left", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      // env-c answers its first page, never its second. Another parent's tasks cannot be read.
+      world.there.set(ENV_C, [{ threadId: "c-1" }, { threadId: "c-2" }, { threadId: "c-3" }]);
+      world.cutShort.add(ENV_C);
+      const other = ThreadId.make("thread-other");
+      world.there.get(ENV_B)!.push({
+        threadId: "other-1",
+        from: { environmentId: HERE, threadId: other },
+      });
+      world.followed.set(other, null);
+      const warnings: Array<string> = [];
+      const logger = Logger.make(({ message, logLevel }) => {
+        if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+      });
+      const scan = yield* service(world);
+      const fiber = yield* scan
+        .run()
+        .pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          Effect.forkChild,
+        );
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      for (let attempt = 1; attempt <= OPTIONS.attempts; attempt += 1) {
         yield* settle;
+        yield* TestClock.adjust(OPTIONS.pageTimeout);
+        yield* settle;
+        if (attempt < OPTIONS.attempts) yield* TestClock.adjust(OPTIONS.retryDelay);
       }
       yield* Fiber.join(fiber);
-      expect(world.pageReads).toHaveLength(OPTIONS.attempts);
-      expect(world.sent).toHaveLength(0);
+      // Each scan read env-c's first page again, and its second did not answer.
+      expect(
+        world.pageReads.filter((read) => read.environmentId === ENV_C && read.cursor === 0),
+      ).toHaveLength(OPTIONS.attempts);
+      const left = warnings.filter((warning) => warning.includes("work unchecked"));
+      expect(left).toHaveLength(1);
+      expect(left[0]).toContain(ENV_C);
+      expect(left[0]).toContain(other);
+      // A page that did not answer is not called the page limit.
+      expect(warnings.some((warning) => warning.includes("page limit"))).toBe(false);
+      // What env-c's first page showed was named once, over all the scans.
+      expect(world.sent).toHaveLength(1);
+      expect(world.sent[0]!.text).toContain("c-1");
+    }),
+  );
+
+  it.effect("scans again while an environment answers only its first page", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.there.set(ENV_C, [{ threadId: "c-1" }, { threadId: "c-2" }, { threadId: "c-3" }]);
+      world.cutShort.add(ENV_C);
+      const fiber = yield* (yield* service(world)).run().pipe(Effect.forkChild);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.pageTimeout);
+      yield* settle;
+      // env-c answers in full now: the next scan reads its second page and names c-3 alone.
+      world.cutShort.delete(ENV_C);
+      yield* TestClock.adjust(OPTIONS.retryDelay);
+      yield* settle;
+      yield* Fiber.join(fiber);
+      expect(world.pageReads.filter((read) => read.environmentId === ENV_C)).toHaveLength(4);
+      expect(world.sent).toHaveLength(2);
+      expect(world.sent[1]!.text).toContain("c-3");
+      expect(world.sent[1]!.text).not.toContain("c-1");
+    }),
+  );
+});
+
+describe("DelegatedOrphanScan.layerWith", () => {
+  const started = (heldFromBoot: boolean) =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Layer.build(
+            DelegatedOrphanScan.layerWith(OPTIONS).pipe(
+              Layer.provide(
+                Layer.merge(
+                  world.layer,
+                  Layer.succeed(WorkAdmission.WorkAdmission, { heldFromBoot } as never),
+                ),
+              ),
+            ),
+          );
+          yield* settle;
+          yield* TestClock.adjust(OPTIONS.delay);
+          yield* settle;
+        }),
+      );
+      return world;
+    });
+
+  it.effect("scans after a normal start, never after a held one", () =>
+    Effect.gen(function* () {
+      expect((yield* started(false)).sent).toHaveLength(1);
+      const held = yield* started(true);
+      expect(held.pageReads).toHaveLength(0);
+      expect(held.sent).toHaveLength(0);
     }),
   );
 });

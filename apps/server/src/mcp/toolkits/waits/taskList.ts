@@ -186,15 +186,20 @@ export const listTasks = Effect.fn("waits.taskList")(function* (input: TaskListI
   const unrecorded = tasks.filter((task) => task.result === "none").length;
   const {
     partial,
+    cutShort,
     ...linked
   }: Partial<Pick<TaskListResult, "orphans" | "unreachable">> & {
     readonly partial?: ReadonlyArray<EnvironmentId>;
+    readonly cutShort?: ReadonlyArray<EnvironmentId>;
   } = input.checkLinked === true ? yield* findOrphans(threadScope, caller.id, all) : {};
   const orphanCount = linked.orphans?.length ?? 0;
   const partialNote =
-    partial === undefined || partial.length === 0
+    (partial === undefined || partial.length === 0
       ? ""
-      : ` Orphans were looked for only in the newest ${ORPHAN_PAGES * LINKED_PAGE_SIZE} threads of ${partial.join(", ")}.`;
+      : ` Orphans were looked for only in the newest ${ORPHAN_PAGES * LINKED_PAGE_SIZE} threads of ${partial.join(", ")}.`) +
+    (cutShort === undefined || cutShort.length === 0
+      ? ""
+      : ` A later page of ${cutShort.join(", ")} did not answer, so orphans there may be missing.`);
   return {
     tasks,
     owed,
@@ -215,14 +220,15 @@ export const listTasks = Effect.fn("waits.taskList")(function* (input: TaskListI
 /**
  * Threads in linked environments whose `delegatedFrom` names this thread but that no task here
  * follows: a launch whose record never ran. Reads the newest `ORPHAN_PAGES` pages of each
- * environment's threads; one with more is named in `partial`.
+ * environment's threads; one with more is named in `partial`, one whose later page did not answer
+ * in `cutShort`.
  */
 const findOrphans = Effect.fn("waits.taskList.orphans")(function* (
   scope: McpThreadInvocationScope,
   callerId: ThreadId,
   tasks: ReadonlyArray<OrchestrationV2Subagent>,
 ) {
-  const none = { orphans: [], unreachable: [], partial: [] };
+  const none = { orphans: [], unreachable: [], partial: [], cutShort: [] };
   // An agent of a linked environment would be pointed at this machine's links.
   if (scope.linkedEnvironments === false || scope.client?.linked === true) return none;
   const forwarding = yield* PeerForwarding.PeerForwarding;
@@ -233,6 +239,7 @@ const findOrphans = Effect.fn("waits.taskList.orphans")(function* (
   );
   const unreachable: Array<EnvironmentId> = [];
   const partial: Array<EnvironmentId> = [];
+  const cutShort: Array<EnvironmentId> = [];
   const orphans: Array<{ environmentId: EnvironmentId; threadId: ThreadId; title: string }> = [];
   yield* Effect.forEach(
     links.links.filter((link) => link.status !== "expired"),
@@ -249,7 +256,8 @@ const findOrphans = Effect.fn("waits.taskList.orphans")(function* (
       ).pipe(
         Effect.map((read) => {
           if (read.state === "unreachable") unreachable.push(link.environmentId);
-          if (read.state === "partial") partial.push(link.environmentId);
+          if (read.state === "limit") partial.push(link.environmentId);
+          if (read.state === "cut-short") cutShort.push(link.environmentId);
           for (const orphan of orphansOf(read.threads, scope.environmentId, callerId, followed)) {
             orphans.push({
               environmentId: orphan.environmentId,
@@ -261,5 +269,5 @@ const findOrphans = Effect.fn("waits.taskList.orphans")(function* (
       ),
     { concurrency: REMOTE_READ_CONCURRENCY, discard: true },
   );
-  return { orphans, unreachable, partial };
+  return { orphans, unreachable, partial, cutShort };
 });
