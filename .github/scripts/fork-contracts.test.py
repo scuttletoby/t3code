@@ -1526,7 +1526,7 @@ def scan_mutant(mutate):
     wfs = copy.deepcopy(real)
     try:
         mutate(wfs)
-    except (KeyError, TypeError):  # nothing to break: the check above has already failed
+    except (KeyError, TypeError, StopIteration):  # nothing to break: the check above has already failed
         return False
     return bool(secret_scan_problems(wfs))
 
