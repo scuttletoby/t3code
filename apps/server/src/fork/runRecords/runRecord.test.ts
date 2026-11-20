@@ -54,6 +54,7 @@ describe("parseTaskLabels", () => {
       {
         role: "review lens",
         kind: "lens: data",
+        kindRefused: null,
         estimate: { wallMs: 90 * MINUTE_MS, tokens: 2_500_000 },
         estimateRefused: null,
       },
@@ -64,12 +65,14 @@ describe("parseTaskLabels", () => {
     assert.deepStrictEqual(parseTaskLabels("Please look at the logs."), {
       role: null,
       kind: null,
+      kindRefused: null,
       estimate: null,
       estimateRefused: null,
     });
     assert.deepStrictEqual(parseTaskLabels(null), {
       role: null,
       kind: null,
+      kindRefused: null,
       estimate: null,
       estimateRefused: null,
     });
@@ -143,6 +146,7 @@ describe("parseTaskLabels", () => {
     assert.deepStrictEqual(parseTaskLabels("[run-estimate: 2M]"), {
       role: null,
       kind: null,
+      kindRefused: null,
       estimate: null,
       estimateRefused: "2M",
     });
@@ -172,11 +176,108 @@ describe("parseTaskLabels", () => {
     });
   });
 
+  it("reads the first closed tag that fits: an earlier unclosed or long mention never hides it", () => {
+    const real = "[run-estimate: 40m]";
+    for (const mention of [
+      "see the [run-estimate: format below\n",
+      "see the [run-estimate: format below\r\n",
+      `[run-estimate: 40m ${"x".repeat(MAX_TAG_CHARS)}]\n`,
+      // On the same line: the next `[` ends the unclosed mention.
+      "see [run-estimate: ",
+    ]) {
+      assert.deepStrictEqual(
+        readEstimateTag(`${mention}${real}`),
+        { estimate: { wallMs: 40 * MINUTE_MS }, refused: null },
+        JSON.stringify(mention),
+      );
+    }
+    // With no closed tag that fits, the first one is refused, not a later one.
+    assert.deepStrictEqual(readEstimateTag("see [run-estimate: \n[run-estimate: 40m"), {
+      estimate: null,
+      refused: "",
+    });
+    // Many unclosed openers before the real tag: each is passed over, the real one still read.
+    const openers = "[run-estimate: ".repeat(200_000);
+    assert.deepStrictEqual(readEstimateTag(`${openers}${real}`)?.estimate, {
+      wallMs: 40 * MINUTE_MS,
+    });
+  });
+
+  it("refuses the first closed tag that does not read: a later tag never replaces a typo", () => {
+    // The review's case: the real tag has a typo, and a later example of the format reads.
+    assert.deepStrictEqual(
+      readEstimateTag("[run-estimate: 30-40m]\nTag format: [run-estimate: 1h 2M tokens]"),
+      { estimate: null, refused: "30-40m" },
+    );
+    for (const [first, refused] of [
+      ["[run-estimate: about 40m]", "about 40m"],
+      ["[run-estimate: soon]", "soon"],
+      // An empty tag (a template left blank) is refused too, as an empty kind tag is.
+      ["[run-estimate: ]", ""],
+      // After an unclosed mention, the first closed tag still decides.
+      ["see [run-estimate: \n[run-estimate: 1-2h]", "1-2h"],
+    ] as const) {
+      assert.deepStrictEqual(
+        readEstimateTag(`${first}\nold brief said [run-estimate: 2h]`),
+        { estimate: null, refused },
+        first,
+      );
+    }
+  });
+
+  it("decides the kind by the first closed tag too, and refuses an empty or unclosed one", () => {
+    assert.strictEqual(parseTaskLabels("see [run-kind: format [run-kind: fix]").kind, "fix");
+    assert.strictEqual(parseTaskLabels("see the [run-kind: format\n[run-kind: fix]").kind, "fix");
+    const labels = (text: string) => {
+      const { kind, kindRefused } = parseTaskLabels(text);
+      return { kind, kindRefused };
+    };
+    // An empty closed tag is refused, for the kind as for the estimate; a later tag does not win.
+    assert.deepStrictEqual(labels("[run-kind: ]\n[run-kind: fix]"), {
+      kind: null,
+      kindRefused: "",
+    });
+    assert.deepStrictEqual(parseTaskLabels("[run-estimate: ]\n[run-estimate: 40m]"), {
+      ...parseTaskLabels(null),
+      estimateRefused: "",
+    });
+    // A `[` ends the tag: a kind that holds one is refused (and logged), never silently dropped.
+    assert.deepStrictEqual(labels("[run-kind: lens [x]]"), { kind: null, kindRefused: "lens" });
+    assert.deepStrictEqual(labels("[run-kind: fix"), { kind: null, kindRefused: "fix" });
+    assert.deepStrictEqual(labels(`[run-kind: ${"y".repeat(100)}`), {
+      kind: null,
+      kindRefused: `${"y".repeat(MAX_TAG_CHARS)}…`,
+    });
+    assert.deepStrictEqual(labels("no kind here"), { kind: null, kindRefused: null });
+  });
+
+  it("counts and cuts whole characters, never half an emoji or a letter's accent", () => {
+    const emoji = "\u{1F600}"; // two UTF-16 units
+    const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"; // one character, eight units
+    const accent = "e\u0301"; // e and a combining accent: one character
+    for (const char of [emoji, family, accent]) {
+      // 80 characters fit even though they are more than 80 units.
+      const atLimit = char.repeat(MAX_TAG_CHARS);
+      assert.strictEqual(parseTaskLabels(`[run-kind: ${atLimit}]`).kind, atLimit);
+      const refused = readEstimateTag(`[run-estimate: ${atLimit}]`)?.refused;
+      assert.strictEqual(refused, atLimit, "refused as unreadable, not as too long");
+      // One more is cut back to 80 whole characters.
+      const over = `${"a".repeat(MAX_TAG_CHARS - 1)}${char.repeat(2)}`;
+      const cut = `${"a".repeat(MAX_TAG_CHARS - 1)}${char}…`;
+      assert.strictEqual(readEstimateTag(`[run-estimate: ${over}]`)?.refused, cut);
+      assert.strictEqual(parseTaskLabels(`[run-kind: ${over}]`).kind, cut);
+      // The cut text survives a record line unchanged: no lone surrogate.
+      assert.strictEqual(JSON.parse(JSON.stringify(cut)), cut);
+      assert.isTrue(cut.isWellFormed());
+    }
+  });
+
   it("cuts a long kind tag rather than dropping it", () => {
     const long = `lens: ${"data ".repeat(30)}`.trim();
     assert.strictEqual(parseTaskLabels(`[run-kind: ${long}]`).kind, `${long.slice(0, 80)}…`);
     assert.strictEqual(parseTaskLabels("[run-kind:  lens: data ]").kind, "lens: data");
     assert.strictEqual(parseTaskLabels("[run-kind: ]").kind, null);
+    assert.strictEqual(parseTaskLabels("[run-kind: ]").kindRefused, "");
   });
 
   it("reads a token scale written right before the word tokens", () => {
@@ -271,6 +372,7 @@ describe("buildRunRecord", () => {
       parent: { threadId: "parent", taskId: "task:child", environmentId: null },
       role: "writer",
       kind: "fix",
+      kindRefused: null,
       estimate: { wallMs: 40 * MINUTE_MS, tokens: 2_000_000 },
       estimateRefused: null,
       continuationOf: null,
@@ -317,6 +419,23 @@ describe("buildRunRecord", () => {
     );
     assert.deepStrictEqual(fromRun?.estimate, { wallMs: 40 * MINUTE_MS });
     assert.strictEqual(fromRun?.estimateRefused, null);
+  });
+
+  it("keeps a refused kind tag's text: no task title and no kind from the run's message", () => {
+    const record = buildRunRecord(
+      input({
+        task: task("parent", "child", "[run-kind: ]\nDo it.", "Fix the cursor"),
+        runMessage: "[run-kind: other]",
+      }),
+    );
+    assert.strictEqual(record?.kind, null);
+    assert.strictEqual(record?.kindRefused, "");
+    // Without a tag in the task, the run's message gives it, and nothing is refused.
+    const fromRun = buildRunRecord(
+      input({ task: task("parent", "child", "Do it.", "Fix"), runMessage: "[run-kind: other]" }),
+    );
+    assert.strictEqual(fromRun?.kind, "other");
+    assert.strictEqual(fromRun?.kindRefused, null);
   });
 
   it("records a run stopped half-way as cut off, with the usage seen until then", () => {

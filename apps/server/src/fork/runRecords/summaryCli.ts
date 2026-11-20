@@ -39,14 +39,14 @@ export function runSummaryCli(argv: ReadonlyArray<string>, io: SummaryCliIo): st
       return next;
     };
     if (arg === "--days") days = Number(value());
-    else if (arg === "--to") toMs = Date.parse(value()) + DAY_MS;
+    else if (arg === "--to") toMs = parseDay(value()) + DAY_MS;
     else if (arg === "--state-dir") stateDir = value();
     else if (arg === "--json") json = true;
     else if (arg.startsWith("--")) throw new Error(`unknown option ${arg}`);
     else extraFiles.push(arg);
   }
   if (!Number.isFinite(days) || days <= 0) throw new Error("--days needs a positive number");
-  if (!Number.isFinite(toMs)) throw new Error("--to needs a date like 2026-11-20");
+  if (!Number.isFinite(toMs)) throw new Error("--to needs a real date written like 2026-11-20");
   const fromMs = toMs - days * DAY_MS;
   const inWindow = (record: RunRecord) => {
     const ended = Date.parse(record.endedAt);
@@ -72,6 +72,17 @@ export function runSummaryCli(argv: ReadonlyArray<string>, io: SummaryCliIo): st
     rates: readRates(io.readFile(NodePath.join(stateDir, "usage-model-rates.json"))),
   });
   return json ? `${JSON.stringify(summary, null, 2)}\n` : formatRunRecordsSummary(summary);
+}
+
+/**
+ * A day as `YYYY-MM-DD`, at 00:00 UTC; NaN for anything else. `Date.parse` alone takes impossible
+ * days (`2026-02-30` becomes March 2), months (`2026-11`) and local-time forms (`2026/11/20`).
+ */
+function parseDay(text: string): number {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(text);
+  if (match === null) return Number.NaN;
+  const ms = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return new Date(ms).toISOString().slice(0, 10) === text ? ms : Number.NaN;
 }
 
 function readRates(text: string | null): RateTable | null {
