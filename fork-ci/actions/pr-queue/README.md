@@ -591,14 +591,14 @@ notice it posts, with six arguments after the ones in the config:
 <command> [config arguments...] <repo> <pr> <head> <kind> <reason> <link>
 ```
 
-| Argument | Meaning                                                                                                                                                                                                                        |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `repo`   | `owner/name`.                                                                                                                                                                                                                  |
-| `pr`     | The pull request number.                                                                                                                                                                                                       |
-| `head`   | The full 40-hex head sha the notice is for.                                                                                                                                                                                    |
-| `kind`   | `conflict` (merge state `DIRTY`), `red` (a required check failed), `stuck` (one ended without passing, or never reported) or `base-red` (it failed as on its base, and the queue updates it by itself once the base is green). |
-| `reason` | The notice's own words, such as `required check build is red`.                                                                                                                                                                 |
-| `link`   | The page of the check's newest run, or the pull request's page when there is none (a conflict, a check that never reported).                                                                                                   |
+| Argument | Meaning                                                                                                                                                                                                                                                                                                                                                                                           |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `repo`   | `owner/name`.                                                                                                                                                                                                                                                                                                                                                                                     |
+| `pr`     | The pull request number.                                                                                                                                                                                                                                                                                                                                                                          |
+| `head`   | The full 40-hex head sha the notice is for.                                                                                                                                                                                                                                                                                                                                                       |
+| `kind`   | `conflict` (merge state `DIRTY`), `red` (a required check failed), `stuck` (one ended without passing, or never reported) or `base-red` (it failed as on its base, and the queue updates it by itself once the base is green).                                                                                                                                                                    |
+| `reason` | The notice's own words, such as `required check build is red`.                                                                                                                                                                                                                                                                                                                                    |
+| `link`   | The page of the check's newest run, or the pull request's page when there is none (a conflict, a check that never reported) or it is not plainly a page of the repository on `https://github.com/` (a status can link any host): printable ASCII only, and no backslash, `.` or `..` path segment (also percent-encoded) or encoded `/` or `\` that a browser would follow to another repository. |
 
 What the command does is the project's: wake the agent thread that armed the
 pull request, send a message, write a file. The fork holds no such command;
@@ -613,16 +613,34 @@ a project names its own in its own config, for example
   still conflicts is a new notice and runs it again; so does a new reason on the
   same head (a red after a cancelled check). A notice an older release posted
   counts too: adding the key wakes nobody for a pull request told before. A dry
-  run posts nothing and runs nothing.
+  run posts nothing and runs nothing. The record is the comment itself: a
+  queue comment someone deleted or edited, or a write token of another login
+  (only the queue's own login's comments count), posts the notice again and so
+  runs the command once more for every pull request passed over then. That is
+  one burst, not a loop: the new comments are the record from then on.
 - **A failed comment runs nothing.** The next run posts the comment and runs
   the command then.
 - **Never in the queue's way.** A command that is missing, cannot start, exits
   non-zero or runs longer than `notify_timeout_seconds` is a `::warning::` in
   the run log, and the run goes on to the next pull request; the exit code of
-  the run does not change. A command that runs too long is stopped with every
-  process of its session (it starts a session of its own). After the command
-  exits, a helper it left running in the background is not stopped: its output
-  goes to a file, not a pipe, so it cannot hold the run either.
+  the run does not change, nor does a temp file the queue cannot make for its
+  output. A command that runs too long is stopped with every process of its
+  session (it starts a session of its own) and every process still linked to
+  those by its parent, so a child in a process group or session of its own
+  (coreutils `timeout`, `setsid`) goes too while its parent runs. That walk
+  reads `/proc` (Linux); without it (another system, a sandbox) the command's
+  own process group is killed, as `kill -9 -<pid>` would. A daemon whose
+  parent already ended is beyond that; the runner's end-of-job cleanup stops
+  it. After the command exits, a helper it left running in the background is
+  not stopped: its output goes to a file, not a pipe, so it cannot hold the run
+  either.
+- **Five minutes per run in all.** The commands of one run take at most 300
+  seconds together, so slow notices cannot reach the job's 20-minute limit and
+  cut the run half-way: each gets `notify_timeout_seconds` or what is left.
+  Once it is spent, the run posts no more notices for as long as
+  `notify_command` is set (the log says so): the next run, with five fresh
+  minutes, posts them and runs the command. So no notice is lost to the
+  budget, and none runs twice.
 - **Not tried again.** A command that failed, or a run stopped between the
   comment and the command, does not run it again later: the comment says the
   pull request was told, and the queue keeps no state of its own for this. The
@@ -631,12 +649,24 @@ a project names its own in its own config, for example
   queue's environment without any variable whose name holds `TOKEN` (the
   queue's read and write tokens, `GH_TOKEN`, `ACTIONS_RUNTIME_TOKEN`, ...), no
   stdin, and the job's working folder. It still runs as the same user as the
-  queue, so it can read the queue's own environment (write token included)
-  through `/proc`, and the checkout's saved read token in the working folder.
-  Trust it like the queue itself: only a command from the project's own
-  config, never one built from pull request text. Its
-  output (stdout and stderr, the first 4,000 characters) is shown in the run
-  log, each line after `notify|`, so it cannot write a workflow command.
+  queue, so it can read the queue's own start-up environment (write token
+  included) through `/proc`. The reusable workflow leaves no job token in the
+  working folder or `RUNNER_TEMP`: right after its two checkouts, a step
+  removes what `actions/checkout` saved (the `includeIf` entries and the
+  `git-credentials-*.config` files they point at, and any
+  `http.<url>.extraheader`) and fails unless none is left. It does not use
+  `persist-credentials: false`, whose cleanup fails on a repository with
+  gitlinks but no `.gitmodules`. A job of your own that runs the action should
+  drop the token the same way. Trust the command like the
+  queue itself: only a command from the project's own config, never one built
+  from pull request text, and never one that hands what it can read to someone
+  else. Its output (stdout and stderr, the first 4,000 characters) is shown in
+  the run log, each line after `notify|` and with the runner's workflow
+  commands stopped around it (`::stop-commands::` with a token the command
+  cannot know), so it cannot write a workflow command in either form (`::` or
+  `##[`). The commands are turned back on even when a line of the output cannot
+  be printed (a stdout that is not UTF-8): the rest of it is left out, with a
+  `::warning::`.
 - **GitHub's text is an argument, never a shell line.** A check or base name
   can hold anything; it reaches the command as one argument.
 
