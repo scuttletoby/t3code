@@ -394,6 +394,24 @@ class Link(unittest.TestCase):
         self.assertIn('is not a socket of uid', err)
         self.assertEqual(set(os.listdir('/proc/self/fd')), fds)
 
+    def test_launch_closes_the_checked_socket_file_and_names_a_missing_proc(self):
+        """#427: the file opened for the check is closed after the connect, refused or not. Without /proc the error
+        names the socket, not a desktop that looks off."""
+        os.mkdir(self.dir, 0o700)
+        with socket.socket(socket.AF_UNIX) as s:
+            s.bind(self.sock)                                              # bound, never listening: refused
+        class NoProc(socket.socket):
+            def connect(self, address):
+                raise FileNotFoundError(2, 'No such file or directory')
+        fds = set(os.listdir('/proc/self/fd'))
+        for _ in range(2):                                                 # and again: nothing is left open
+            self.assertEqual(self.launch('active')[0], wire.NO_SESSION)
+            with mock.patch.object(desk.socket, 'socket', NoProc):
+                code, _, err = self.launch('active')
+            self.assertEqual(code, 1, err)
+            self.assertIn('cannot reach', err)
+        self.assertEqual(set(os.listdir('/proc/self/fd')), fds)
+
     def test_launch_connects_to_the_socket_it_checked_not_one_swapped_in(self):
         """#202, #427: root's launch checks the socket, then connects, in a directory the desk user owns. Swapped in
         between for a link to another socket (a stand-in for a root daemon's), or for another socket outright, the

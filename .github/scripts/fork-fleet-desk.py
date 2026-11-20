@@ -372,7 +372,7 @@ def launch(pool, verb, args, stdin, path, out=sys.stdout, err=sys.stderr, wait=N
         s.settimeout(max(0.01, min(CLIENT, deadline - time.monotonic())))
         try:
             s.connect(f'/proc/self/fd/{fd}')
-        except (ConnectionRefusedError, FileNotFoundError):
+        except ConnectionRefusedError:
             raise no_session from None
         except socket.timeout:
             raise Refused(f'pool {pool}: the desk session takes no connection (busy or stuck): {verb} was not sent',
