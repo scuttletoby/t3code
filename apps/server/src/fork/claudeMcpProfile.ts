@@ -12,6 +12,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   DEFAULT_SERVER_SETTINGS,
+  MCP_CARRIED_PROFILES_REFUSE,
   MCP_PROFILE_ALL,
   type OrchestrationV2AppThread,
   type ServerSettings,
@@ -311,10 +312,9 @@ const planKey = (plan: ClaudeMcpProfilePlan): string | undefined =>
   plan.servers === "all" ? undefined : ["mcp", ...plan.servers].join("\u0000");
 
 /**
- * The settings as a load decodes them from settings.json, without reading provider secrets: the
- * MCP profile keys hold none. `undefined` when this server has no settings file to read here.
- * As the load: no file means the policy's defaults, a file that does not decode loads as them too
- * (upstream's rule), and the policy's locks are laid over either. A file that cannot be read fails.
+ * settings.json as a load decodes it (no provider secrets: MCP keys hold none); `undefined` with no
+ * file to read here. No file gives the policy's defaults; a file that does not decode gives them
+ * with `mcpCarriedProfiles` `refuse`, as it may say so. Locks are laid over both; a read error fails.
  */
 const settingsFileReader = Effect.gen(function* () {
   const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
@@ -332,7 +332,11 @@ const settingsFileReader = Effect.gen(function* () {
     const decoded = ServerSettingsService.decodeSettingsFileText(raw, managed.withDefaults);
     const readable =
       Exit.isSuccess(decoded) && !ServerSettingsService.settingsFileLegacyKeysUnreadable(raw);
-    return managed.applyLocks(readable ? decoded.value : managed.defaults);
+    return managed.applyLocks(
+      readable
+        ? decoded.value
+        : { ...managed.defaults, mcpCarriedProfiles: MCP_CARRIED_PROFILES_REFUSE },
+    );
   });
 });
 
