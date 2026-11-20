@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
+# How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
+# with the other script tests, where LauncherAsRoot's 9 tests skip, and that class again as root, where none may.
+# fork-ci: skips at most 9
+# fork-ci: run as root with FORK_FLEET_ROOT_TESTS=1 only LauncherAsRoot
 import ast, copy, datetime, glob, grp, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat
 import shlex, subprocess, sys, tempfile, textwrap, time
 import unittest, urllib.error, urllib.parse
@@ -4550,8 +4554,11 @@ class Wiring(unittest.TestCase):
         job = self.tests['jobs']['workflows']
         self.assertEqual(job['runs-on'], HOSTED)
         runs = [st.get('run') for st in job['steps']]
-        # -v: the log names every test, a skipped one with its reason.
-        root = runs.index('sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py -v LauncherAsRoot')
+        # The runner makes this file's own run (its `fork-ci: run` line: as root, the switch, only this class, with -v,
+        # so the log names every test) and records that none skipped (#664).
+        root = runs.index('node .github/scripts/fork-ci-tests.cjs --run .github/scripts/fork-fleet.test.py')
+        with open(__file__) as f:
+            self.assertIn('\n# fork-ci: run as root with FORK_FLEET_ROOT_TESTS=1 only LauncherAsRoot\n', f.read())
         # check-net's test needs the real nft, which the hosted image may lack: installed in a step before it.
         self.assertTrue(any('apt-get install -y -qq nftables' in (r or '') for r in runs[:root]), runs)
 

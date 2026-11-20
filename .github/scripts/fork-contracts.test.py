@@ -46,19 +46,26 @@ copies that must fail (so a check that stops seeing its problem goes red too):
   quiet        nothing in fork-tests.yml may fail quietly: no continue-on-error on a job or a step. A step whose
                run's code lines (not its comment lines) name a fork test, fork-kit, fork-ci or a test file is a
                test step, held to an allowlist, so its exit status is its tests': its run is only lines of the
-               allowed test forms (python3 with -I/-B/-u, then a listed .py test, optionally -v <TestClass>;
-               node with the runner and path prefixes, or node --test; or bash; then listed tests), each
-               optionally after VAR=value words from a fixed set (the switches that turn tests on, and two
-               values a new step or sudo would lose) and optionally ending in 2>&1; `sudo env` only before
-               python3 and only for a test REQUIRED_VARS marks as testing as root (and always for those). Its
-               keys, env and if: are from a fixed set (no working-directory, shell only bash, an if: only on
-               upstream's tests), its job has no defaults, env or container, a fixed if: and no step naming
+               allowed test forms (the runner with path prefixes, or `--run <listed fork test>` for the runs the
+               test's own `fork-ci: run` lines declare: as root, with its switches, one class; for upstream's
+               tests only python3 with -I/-B/-u and a listed .py test, optionally -v <TestClass>, node --test or
+               bash and listed tests), each optionally after XDG_RUNTIME_DIR and ending in 2>&1; no sudo, and a
+               fork test run by nothing but the runner. Its keys, env and if: are from a fixed set (no
+               working-directory, shell only bash, an if: only on upstream's tests, a runner step always with
+               the records folder), its job has no defaults, env or container, a fixed if: and no step naming
                GITHUB_ENV, GITHUB_PATH or BASH_ENV, and the workflow has no defaults or env. Every test
-               .github/fork-ci-tests.txt lists as run by fork-tests.yml is run whole by such a line, with the
-               variable that switches it on (a new test that skips without a switch must be added to
-               REQUIRED_VARS). The runner calls read from those same accepted lines, job by job, are the three
-               pinned ones (RUNNER_PARTS), and put each listed or present test in exactly one part, by the
-               runner's own inPart. Anything else is refused with the allowed form.
+               .github/fork-ci-tests.txt lists as run by fork-tests.yml is run whole by such a line, and each test
+               with own runs by exactly one `--run` line. The runner calls read from those same accepted lines, job
+               by job, are the three pinned ones (RUNNER_PARTS), and put each listed or present test in exactly one
+               part, by the runner's own inPart. Anything else is refused with the allowed form.
+  records      what each listed fork test ran is proved at run time (#664): each job that calls the runner
+               uploads its records (one artifact per job, leg and attempt, none found fails it) and
+               fork_ci_result downloads them all and runs the pinned check right after, with RECORD_JOBS (each such
+               job and its legs) as the workflow has them. The check's own script, run here on records the real
+               runner writes, fails a job or leg without records, a record of another run, attempt, job, leg or
+               commit, a listed test (or own run) not recorded, recorded twice, failed, without a test count,
+               with none run or more skipped than its `fork-ci: skips at most` line allows (an own run: none), and
+               a records file cut off.
   policies     every workflow with a pull_request_target trigger is listed in
                .github/fork-actions-policies.json (#401): allowed (the fork workflows the repository's
                Actions policy allows; each there, with that trigger and no other) or upstream_blocked;
@@ -1763,17 +1770,21 @@ for label, mutate in {
 # relies on is held to an allowlist, not a blocklist: a blocklist of shell tricks keeps missing one (`sh -c '... ||
 # true'`, `set -n`, a function named node, `python3 -m py_compile <test>`). The allowlist:
 #   - its run is only lines (backslash continuations joined, whole comment lines skipped) of one TEST_FORMS shape;
-#   - the step has only STEP_KEYS: shell only `bash`, env only STEP_ENV, an if: only STEP_IFS and only on a step that
-#     runs upstream's tests alone (the `test` job runs those in its first shard); no working-directory;
+#     the fork's own tests run only through the runner (a part, or `--run <test>` for the runs the test's own
+#     `fork-ci: run` lines declare: as root, with its switches, one class), which records what each ran (#664);
+#   - the step has only STEP_KEYS: shell only `bash`, env only STEP_ENV (a runner step always has the records folder),
+#     an if: only STEP_IFS and only on a step that runs upstream's tests alone (the `test` job runs those in its first
+#     shard); no working-directory;
 #   - its job has only JOB_KEYS (no defaults, env, container or services), its if: is one of JOB_IFS, and no run step
 #     of the job names GITHUB_ENV, GITHUB_PATH or BASH_ENV (each changes what a later step's command runs);
 #   - the workflow has no defaults or env.
-# Every test .github/fork-ci-tests.txt lists as run by fork-tests.yml must be run whole by such a line, with the
-# variable that switches it on (REQUIRED_VARS). The runner's parts are read from the same accepted lines (YAML parsed,
-# quotes removed as bash removes them), never from the file's text, so a call kept in a YAML comment or a step name
-# counts for nothing. Anything else is refused with the allowed form in the message.
-# Not checked here (#664): what a step that is not a test step does to the next one's interpreter or files (beyond
-# GITHUB_ENV, GITHUB_PATH and BASH_ENV), and a gated test missing from REQUIRED_VARS.
+# Every test .github/fork-ci-tests.txt lists as run by fork-tests.yml is run whole by such a line, and every test with
+# own runs (OWN_RUNS, read by the runner's ownRuns) by exactly one `--run` line. The runner's parts are read from the
+# same accepted lines (YAML parsed, quotes removed as bash removes them), never from the file's text, so a call kept in
+# a YAML comment or a step name counts for nothing. Anything else is refused with the allowed form in the message.
+# This is the fast first check; the records (below) prove at run time what each listed fork test ran.
+# Not checked here: what a step that is not a test step does to the next one's interpreter or files (beyond
+# GITHUB_ENV, GITHUB_PATH and BASH_ENV); a test that needs a switch it does not declare skips, which its record shows.
 
 # The tests .github/fork-ci-tests.txt lists, read by fork-ci-tests.cjs's own readList (which spells each `run by`
 # path one way: `./a/b` is `a/b`), and those it says this file runs.
@@ -1793,32 +1804,40 @@ FORK_OWN_TEST = re.compile(r"(?:fork-kit/|fork-ci/|\.github/scripts/fork-)\S*\.t
 TEST_MENTION = re.compile(r"fork-ci-tests|fork-kit|fork-ci/|\.test\.(?:py|sh|cjs|mjs|js)\b")
 RUNNER = ".github/scripts/fork-ci-tests.cjs"
 
-# The VAR=value words a test line may start with (each at most once), exactly as written: the switches that turn the
-# root and heavy tests on, and the two values sudo or a new step would otherwise lose.
-ALLOWED_VARS = {"GH_APPS_ROOT_TESTS=1", "HEAVY_REAL_TESTS=1", "FORK_FLEET_ROOT_TESTS=1",
-                'GITHUB_ACTIONS="$GITHUB_ACTIONS"', 'XDG_RUNTIME_DIR="/run/user/$(id -u)"'}
-# A test run on its own line needs its switch (and sudo where it tests as root): without it the test skips and
-# passes. Only these run under `sudo env`: as root a test that skips for root (skipIf(geteuid() == 0)) passes, and sudo
-# drops FORK_CI_TEST_SHARD. A new test that skips without a switch must be added here (#664 reads it from the test).
-REQUIRED_VARS = {"fork-kit/gh-apps/tests/root.test.py": (True, "GH_APPS_ROOT_TESTS=1"),
-                 "fork-kit/heavy/tests/heavy.test.py": (False, "HEAVY_REAL_TESTS=1"),
-                 ".github/scripts/fork-fleet.test.py": (True, "FORK_FLEET_ROOT_TESTS=1")}
+# The VAR=value words a test line may start with (each at most once), exactly as written: the one value the heavy
+# test's step sets for it (a new step would lose it). A test's own switches are not here: the test declares them in its
+# `fork-ci: run` line and the runner sets them (#664), so no line can drop or misspell one.
+ALLOWED_VARS = {'XDG_RUNTIME_DIR="/run/user/$(id -u)"'}
+# The own runs of each listed test a part or fork-tests.yml runs, and the `fork-ci:` lines the runner cannot read, both
+# by the runner's own ownRuns.
+_OWN = json.loads(subprocess.run(
+    ["node", "-e", "const fs = require('fs'); const path = require('path'); const r = require(process.argv[1]); "
+     "const read = (f) => { try { return fs.readFileSync(path.join(process.argv[2], f), 'utf8'); } "
+     "catch { return null; } }; "
+     "console.log(JSON.stringify(r.readList(read('.github/fork-ci-tests.txt'))"
+     ".filter((e) => !e.runBy || e.runBy === '.github/workflows/fork-tests.yml')"
+     ".map((e) => [e.file, r.ownRuns(e, read(e.file))])))",
+     str(scripts_dir / "fork-ci-tests.cjs"), str(root)],
+    check=True, capture_output=True, text=True).stdout)
+OWN_RUNS = {file: own["runs"] for file, own in _OWN if own["runs"]}
+DECLARATION_PROBLEMS = [p for _, own in _OWN for p in own["problems"]]
 PY_FLAGS = {"-I", "-B", "-u"}
 STEP_KEYS = {"name", "id", "run", "env", "if", "shell", "timeout-minutes"}
-STEP_ENV = {"FORK_CI_TEST_SHARD": "${{ matrix.shard }}/${{ strategy.job-total }}"}
+RECORDS_VAR, RECORDS_DIR = "FORK_CI_TEST_RECORDS", "${{ runner.temp }}/fork-test-records"
+STEP_ENV = {"FORK_CI_TEST_SHARD": "${{ matrix.shard }}/${{ strategy.job-total }}", RECORDS_VAR: RECORDS_DIR}
 STEP_IFS = {"matrix.shard == 1"}
 JOB_KEYS = {"name", "if", "needs", "runs-on", "timeout-minutes", "strategy", "permissions", "steps"}
 JOB_IFS = {"${{ " + PR_GUARD + " }}",
            "${{ " + PR_GUARD + " && (!cancelled() && needs.changes.outputs.test != 'false') }}"}
 TEST_FORMS = (
     "a fork test step's run is only lines of these forms, each optionally ending in 2>&1, with no trailing # comment: "
-    "`[sudo env] [VAR=value ...] python3 [-I] [-B] [-u] <listed .py test> [-v <TestClass>]` (no arguments after a "
-    "test the list says fork-tests.yml runs: it runs whole; `sudo env` only, and always, for "
-    + ", ".join(sorted(t for t, (root_, _) in REQUIRED_VARS.items() if root_)) + "), "
-    f"`[VAR=value ...] node {RUNNER} [<path prefix> | '!<path prefix>' ...]`, "
-    "`[VAR=value ...] node --test <listed .cjs/.mjs/.js test> ...` or "
-    "`[VAR=value ...] bash <listed .sh test>`, a test path written as listed (or with ./), VAR=value one of "
-    + ", ".join(sorted(ALLOWED_VARS)))
+    f"`[VAR=value ...] node {RUNNER} [<path prefix> | '!<path prefix>' ...]` (a part of the fork's tests), "
+    f"`[VAR=value ...] node {RUNNER} --run <listed fork test>` (the runs its `fork-ci: run` lines declare: as root, "
+    "with its switches, one class), and for upstream's tests only `python3 [-I] [-B] [-u] <listed .py test> "
+    "[-v <TestClass>]` (no arguments after a test the list says fork-tests.yml runs: it runs whole), "
+    "`node --test <listed .cjs/.mjs/.js test> ...` or `bash <listed .sh test>`; a test path written as listed (or "
+    "with ./), VAR=value one of " + ", ".join(sorted(ALLOWED_VARS)) +
+    f"; a step that calls the runner has env {RECORDS_VAR}: {RECORDS_DIR} (the records fork-ci-result checks)")
 
 TOKEN = re.compile(r"""(?:[^\s'"]+|'[^']*'|"(?:[^"\\]|\\.)*")+""")
 PLAIN = re.compile(r"""'([\w./!+-]+)'|"([\w./!+-]+)"|([\w./!+-]+)""")
@@ -1849,9 +1868,10 @@ def test_path(word):
 
 
 def test_line(line):
-    """The tests one shell line runs whole, as {"tests": [...], "partial": [...], "parts": [...]} (partial: run with
-    arguments that pick some of them; parts: the runner's arguments as bash hands them to it, or None when the line
-    does not call the runner), or a string saying why the line is not one of the allowed forms."""
+    """The tests one shell line runs, as {"tests": [...], "partial": [...], "parts": [...], "own": test} (tests: run
+    whole; partial: run with arguments that pick some of them; parts: the runner's arguments as bash hands them to it,
+    or None when the line does not call the runner for a part; own: the test of a `--run` call, else None), or a string
+    saying why the line is not one of the allowed forms."""
     w = words(line)
     if not w:
         return "a quote that is not closed"
@@ -1861,20 +1881,19 @@ def test_line(line):
                "of its own)"
     if w[-1] == "2>&1":
         w = w[:-1]
-    sudo = w[:2] == ["sudo", "env"]
-    if sudo:
-        w = w[2:]
     env = []
     while w and re.match(r"[A-Za-z_]\w*=", w[0]):
         if w[0] not in ALLOWED_VARS or w[0] in env:
-            return f"{w[0]} is not an allowed VAR=value (or comes twice)"
+            return f"{w[0]} is not an allowed VAR=value (or comes twice); a test's own switch goes in its " \
+                   "`fork-ci: run with <NAME>_TESTS=value` line"
         env.append(w.pop(0))
     if not w:
         return "no command"
     cmd, args = w[0], w[1:]
-    if sudo and cmd != "python3":
-        return f"`sudo env` comes only before python3 (and a test that tests as root), not before `{cmd}`"
-    parts = None
+    if cmd == "sudo":
+        return "no sudo on a test line: a test that runs as root says so in its `fork-ci: run as root` line, and " \
+               f"`{RUNNER} --run` runs it under sudo"
+    parts = own = None
     if cmd == "python3":
         while args and args[0] in PY_FLAGS and args[0] not in args[1:]:
             args = args[1:]
@@ -1887,11 +1906,16 @@ def test_line(line):
         found = {"tests": [path], "partial": []}
         if rest:
             found = {"tests": [], "partial": [path]}
+    elif cmd == "node" and args and test_path(args[0]) == RUNNER and args[1:2] == ["--run"]:
+        own = test_path(args[2]) if len(args) == 3 else None
+        if own not in LISTED_FILES or not FORK_OWN_TEST.fullmatch(own):
+            return f"{RUNNER} --run takes one listed fork test"
+        found = {"tests": [own], "partial": []}
     elif cmd == "node" and args and test_path(args[0]) == RUNNER:
         for a in args[1:]:
             text = plain(a)
             if text is None or not re.fullmatch(r"!?[\w.][\w./-]*", text):
-                return f"{RUNNER} takes only path prefixes (`fork-kit/`, '!fork-kit/')"
+                return f"{RUNNER} takes only path prefixes (`fork-kit/`, '!fork-kit/') or --run <listed fork test>"
         found = {"tests": [RUNNER], "partial": []}
         parts = [plain(a) for a in args[1:]]
     elif cmd == "node" and args[:1] == ["--test"] and len(args) > 1:
@@ -1904,13 +1928,12 @@ def test_line(line):
         found = {"tests": [test_path(args[0])], "partial": []}
     else:
         return f"`{cmd}` with these arguments is not a test command"
-    for t in found["tests"] + found["partial"]:
-        need_sudo, var = REQUIRED_VARS.get(t, (False, None))
-        if var and var not in env:
-            return f"{t} needs {var} (without it the test skips and passes)"
-        if need_sudo != sudo:
-            return f"{t} runs {'only' if need_sudo else 'never'} under sudo env"
-    return {**found, "parts": parts}
+    if own is None and parts is None:
+        for t in found["tests"] + found["partial"]:
+            if FORK_OWN_TEST.fullmatch(t):
+                return f"{t} is a fork test: only {RUNNER} runs it (in its part, or `--run {t}` for the runs its " \
+                       "`fork-ci: run` lines declare), so that fork-ci-result sees what it ran"
+    return {**found, "parts": parts, "own": own}
 
 
 def step_runs(step):
@@ -1928,13 +1951,15 @@ def is_test_step(step):
 
 
 def test_step_problems(step):
-    """Why a test step is not of the allowed shape (empty: it is), the tests it runs whole and its runner calls."""
-    problems, ran, calls = [], [], []
+    """Why a test step is not of the allowed shape (empty: it is), the tests it runs whole, its runner part calls and the
+    tests of its `--run` calls."""
+    problems, ran, calls, owns = [], [], [], []
     for key in sorted(set(step) - STEP_KEYS):
         problems.append(f"{key}: is not allowed on a test step (only {', '.join(sorted(STEP_KEYS))})")
     if "shell" in step and step["shell"] != "bash":
         problems.append(f"shell: {step['shell']} (only bash, which keeps -e)")
-    for k, v in (step.get("env") or {}).items():
+    env = step.get("env") or {}
+    for k, v in env.items():
         if STEP_ENV.get(k) != v:
             problems.append(f"env {k}: is not allowed on a test step (only {STEP_ENV})")
     lines = [(n, line) for n, line in step_runs(step) if line.strip()]
@@ -1948,12 +1973,17 @@ def test_step_problems(step):
             ran += found["tests"]
             if found["parts"] is not None:
                 calls.append(found["parts"])
+            if found["own"] is not None:
+                owns.append(found["own"])
+    if (calls or owns) and env.get(RECORDS_VAR) != RECORDS_DIR:
+        problems.append(f"calls the runner without env {RECORDS_VAR}: {RECORDS_DIR} (no records: fork-ci-result "
+                        "would see none of its tests run)")
     if "if" in step:
         own = [t for t in ran if t == RUNNER or FORK_OWN_TEST.fullmatch(t)]
         if own or not ran or str(step["if"]) not in STEP_IFS:
             problems.append(f"if: {step['if']} (a step of the fork's own tests has none; upstream's may have only "
                             f"{', '.join(sorted(STEP_IFS))})")
-    return problems, ran, calls
+    return problems, ran, calls, owns
 
 
 # The runner calls each job makes, as read from its accepted test lines: one call per job (two in one job run one after
@@ -1988,8 +2018,22 @@ def part_problems(calls_by_job):
     return problems
 
 
-def quiet_problems(wf, tests=RUN_BY_HERE):
-    problems, ran, calls_by_job = [], set(), {}
+def own_problems(owns, own_runs=None):
+    """Why the `--run` calls (one test each) are not exactly one for each test with own runs."""
+    own_runs = OWN_RUNS if own_runs is None else own_runs
+    problems = []
+    for t in sorted(set(own_runs) | set(owns)):
+        if t not in own_runs:
+            problems.append(f"{t}: run by `{RUNNER} --run` in fork-tests.yml, but it declares no own run (a part runs "
+                            "it), so the runner refuses it")
+        elif owns.count(t) != 1:
+            problems.append(f"{t}: its own runs (`fork-ci: run` lines) are made by {owns.count(t)} `{RUNNER} --run` "
+                            "lines in fork-tests.yml, not exactly one")
+    return problems
+
+
+def quiet_problems(wf, tests=RUN_BY_HERE, own_runs=None):
+    problems, ran, calls_by_job, owns, record_jobs = [], set(), {}, [], set()
     for key in ("defaults", "env"):
         if key in wf:
             problems.append(f"fork-tests.yml: workflow-level {key}: is not allowed (it reaches every test step)")
@@ -2016,17 +2060,115 @@ def quiet_problems(wf, tests=RUN_BY_HERE):
                                 "changes what a later step's command runs)")
             mention = test_mention(step)
             if mention:
-                found, step_ran, calls = test_step_problems(step)
+                found, step_ran, calls, step_owns = test_step_problems(step)
                 problems += [f"{where}, a test step (its run names `{mention}`): {why}" for why in found]
                 if not found:
                     ran.update(step_ran)
                     calls_by_job.setdefault(j, []).extend(calls)
+                    owns += step_owns
+                    if calls or step_owns:
+                        record_jobs.add(j)
     calls_by_job = {j: calls for j, calls in calls_by_job.items() if calls}
     problems += part_problems(calls_by_job)
+    problems += own_problems(owns, own_runs)
+    problems += record_problems(wf, record_jobs)
     for t in tests:
         if t not in ran:
             problems.append(f"{t}: .github/fork-ci-tests.txt says fork-tests.yml runs it, but no test step runs it "
                             f"whole; {TEST_FORMS}")
+    return problems
+
+
+# --- records (#664) ------------------------------------------------------------------------------
+# The quiet checks above read the workflow; the records prove at run time what each listed fork test ran. The runner
+# (fork-ci-tests.cjs, RECORDS there) writes one file per call into FORK_CI_TEST_RECORDS: its keyed run (run id,
+# attempt, job), the commit, the shard, every key the run owes (`all`), the keys this call owed and, per test run, its
+# exit status and the tests its output says ran, skipped and failed. Each job that calls the runner (RECORD_JOBS) ends
+# its runner steps with RECORD_UPLOAD: one artifact per job, leg and attempt (artifact names are unique in a run and
+# kept across attempts, so no attempt, leg or job can write over another's), none uploaded fails the job. fork_ci_result
+# downloads them all (RECORD_DOWNLOAD) and its RECORD_CHECK step, right after it, fails the run unless each job and leg
+# uploaded records, the newest attempt of each is of this run, job, leg and commit, and each key of `all` is recorded
+# exactly once with a passing run that ran a test and skipped no more than its test allows. The check's own script is
+# run below on records the real runner writes.
+RECORD_UPLOAD = {
+    "name": "Upload the fork test records",
+    "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+    "with": {"name": "fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}",
+             "path": RECORDS_DIR + "/", "if-no-files-found": "error"},
+}
+RECORD_DOWNLOAD = {
+    "name": "Download the fork test records",
+    "uses": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+    "with": {"pattern": "fork-test-records-*", "path": RECORDS_DIR},
+}
+RECORD_CHECK = "Require a record of every listed fork test"
+RECORD_CHECK_ENV = {"RECORDS": RECORDS_DIR, "RUN_ID": "${{ github.run_id }}",
+                    "RUN_ATTEMPT": "${{ github.run_attempt }}", "SHA": "${{ needs.changes.outputs.sha }}"}
+CHECK_START, CHECK_END = "python3 -I - <<'CHECK'\n", "\nCHECK\n"
+
+
+def legs(job):
+    """A job's number of legs: 1, or its shard matrix's size; None for another matrix."""
+    matrix = (job.get("strategy") or {}).get("matrix")
+    if matrix is None:
+        return 1
+    if not isinstance(matrix, dict) or set(matrix) != {"shard"} or not isinstance(matrix["shard"], list):
+        return None
+    return len(matrix["shard"])
+
+
+def check_script(run):
+    """The record check's Python, from its step's run, or None if the run is not exactly that heredoc."""
+    run = str(run)
+    if not run.startswith(CHECK_START) or not run.endswith(CHECK_END):
+        return None
+    body = run[len(CHECK_START):-len(CHECK_END)]
+    return None if "\nCHECK\n" in body + "\n" or body.startswith("CHECK\n") else body + "\n"
+
+
+def record_problems(wf, record_jobs):
+    """Why the jobs that call the runner do not each upload their records as pinned, or fork_ci_result does not check
+    them all as pinned."""
+    jobs = wf.get("jobs") or {}
+    problems, want = [], {}
+    for j in sorted(record_jobs):
+        job_steps = jobs[j].get("steps") or []
+        n = legs(jobs[j])
+        if n is None:
+            problems.append(f"fork-tests.yml/{j}: a job that calls the runner has no matrix but `shard` (its legs)")
+            continue
+        want[j] = n
+        uploads = [i for i, st in enumerate(job_steps) if st == RECORD_UPLOAD]
+        near = [i for i, st in enumerate(job_steps) if "fork-test-records" in json.dumps(st.get("with") or {})]
+        runner_steps = [i for i, st in enumerate(job_steps) if RUNNER in str(st.get("run", ""))]
+        if len(uploads) != 1 or near != uploads:
+            problems.append(f"fork-tests.yml/{j}: calls the runner, so it has exactly one records upload step, as "
+                            f"pinned: {RECORD_UPLOAD}")
+        elif uploads[0] < max(runner_steps):
+            problems.append(f"fork-tests.yml/{j}: its records upload step comes before its last runner step")
+    result = jobs.get("fork_ci_result") or {}
+    steps = result.get("steps") or []
+    downloads = [i for i, st in enumerate(steps) if st == RECORD_DOWNLOAD]
+    checks = [i for i, st in enumerate(steps) if st.get("name") == RECORD_CHECK]
+    if len(downloads) != 1 or len(checks) != 1 or checks[0] != downloads[0] + 1:
+        problems.append(f"fork-tests.yml/fork_ci_result: no pinned records download ({RECORD_DOWNLOAD}) right "
+                        f"before one {RECORD_CHECK!r} step")
+        return problems
+    st = steps[checks[0]]
+    env = dict(st.get("env") or {})
+    try:
+        record_jobs_env = json.loads(env.pop("RECORD_JOBS", "null"))
+    except ValueError:
+        record_jobs_env = None
+    if set(st) != {"name", "env", "run"} or env != RECORD_CHECK_ENV:
+        problems.append(f"fork-tests.yml/fork_ci_result: the {RECORD_CHECK!r} step is not only its name, its run and "
+                        f"env {RECORD_CHECK_ENV} with RECORD_JOBS")
+    if record_jobs_env != want:
+        problems.append(f"fork-tests.yml/fork_ci_result: RECORD_JOBS is {record_jobs_env}, not {want} (each job that "
+                        "calls the runner, with its legs)")
+    if check_script(st.get("run")) is None:
+        problems.append(f"fork-tests.yml/fork_ci_result: the {RECORD_CHECK!r} step's run is not only the python3 "
+                        "heredoc (CHECK)")
     return problems
 
 
@@ -2041,10 +2183,10 @@ check("quiet: the list's run-by-fork-tests.yml entries are read (the kit-as-root
       {"fork-kit/gh-apps/tests/root.test.py", "fork-kit/heavy/tests/heavy.test.py",
        ".github/scripts/fork-owned-reads.test.py", ".github/scripts/test-delta.test.cjs"} <= set(RUN_BY_HERE))
 
-def quiet_mutant(mutate, whole=None):
+def quiet_mutant(mutate, whole=None, own_runs=None):
     wf = copy.deepcopy(fork_tests)
     (whole or (lambda w: mutate(w["jobs"])))(wf)
-    return quiet_problems(wf)
+    return quiet_problems(wf, own_runs=own_runs)
 
 
 HEAVY = "fork-kit/heavy/tests/heavy.test.py"
@@ -2079,6 +2221,41 @@ def heavy_run(run):
 
 def job_set(job, key, value):
     return lambda jobs: jobs[job].__setitem__(key, value)
+
+
+UPSTREAM_PY = "stage-preview-bundle.test.py"
+FLEET_TEST = ".github/scripts/fork-fleet.test.py"
+
+
+def upstream_py_run(run):
+    """Upstream's .py test step's run rewritten by `run` (a function of it)."""
+    return lambda jobs: (lambda st: st.__setitem__("run", run(st["run"])))(test_step(jobs, "test", UPSTREAM_PY))
+
+
+def without_step(job, needle):
+    return lambda jobs: jobs[job]["steps"].remove(test_step(jobs, job, needle))
+
+
+def upload_step(jobs, job):
+    return next(st for st in jobs[job]["steps"] if "upload-artifact" in str(st.get("uses", "")))
+
+
+def upload_set(job, key, value):
+    return lambda jobs: upload_step(jobs, job)["with"].__setitem__(key, value)
+
+
+def without_step_uses(job, needle):
+    return lambda jobs: jobs[job]["steps"].remove(upload_step(jobs, job))
+
+
+def move_upload_before(jobs, job, needle):
+    steps = jobs[job]["steps"]
+    upload = steps.pop(steps.index(upload_step(jobs, job)))
+    steps.insert(steps.index(test_step(jobs, job, needle)), upload)
+
+
+def result_step(jobs, name):
+    return next(st for st in jobs["fork_ci_result"]["steps"] if st.get("name") == name)
 
 
 HEAVY_LINE = next(line for _, line in step_runs(heavy_step(fork_tests["jobs"])) if HEAVY in line)
@@ -2167,12 +2344,16 @@ QUIET_REFUSED = {
     "a function named python3 before the test": heavy_run(lambda line: "python3() { :; }\n" + line),
     "an alias node=true before the kit tests": kit_run(f"shopt -s expand_aliases\nalias node=true\n{KIT}"),
     # arguments that run nothing,
-    "python3 -c pass <heavy test>": heavy_run(lambda line: line.replace("python3 -I -B", "python3 -c pass")),
-    "python3 -c 'import sys; sys.exit(0)' <heavy test>": heavy_run(
-        lambda line: line.replace("python3 -I -B", "python3 -c 'import sys; sys.exit(0)'")),
-    "python3 -m py_compile <heavy test>": heavy_run(lambda line: line.replace("python3 -I -B", "python3 -m py_compile")),
-    "<heavy test> --help": heavy_run(lambda line: line + " --help"),
-    "<heavy test> with one test class picked": heavy_run(lambda line: line + " -v SomeClass"),
+    "python3 -c pass <upstream .py test>": upstream_py_run(lambda run: run.replace("python3 -B", "python3 -c pass")),
+    "python3 -c 'import sys; sys.exit(0)' <upstream .py test>": upstream_py_run(
+        lambda run: run.replace("python3 -B", "python3 -c 'import sys; sys.exit(0)'")),
+    "python3 -m py_compile <upstream .py test>": upstream_py_run(
+        lambda run: run.replace("python3 -B", "python3 -m py_compile")),
+    "<upstream .py test> --help": upstream_py_run(lambda run: run.rstrip("\n") + " --help"),
+    "<heavy test's own run> --help": heavy_run(lambda line: line + " --help"),
+    "<heavy test's own run> with one test class picked": heavy_run(lambda line: line + " -v SomeClass"),
+    "--run with two tests": heavy_run(lambda line: line + f" {ROOT_TEST}"),
+    "--run of an upstream test": heavy_run(lambda line: line.replace(HEAVY, ".github/scripts/test-delta.test.cjs")),
     "node --check <runner> fork-kit/": kit_run(f"node --check {RUNNER} fork-kit/"),
     "node -e 0 <runner> fork-kit/": kit_run(f"node -e 0 {RUNNER} fork-kit/"),
     "the runner with --help": kit_run(f"{KIT} --help"),
@@ -2190,26 +2371,77 @@ QUIET_REFUSED = {
         1, {"run": 'echo "NODE_OPTIONS=--require=/tmp/x.js" >> "$GITHUB_ENV"'}),
     "an earlier step that puts a folder on GITHUB_PATH": lambda jobs: jobs["kit_root_tests"]["steps"].insert(
         1, {"run": 'echo /tmp/f >> "$GITHUB_PATH"'}),
-    # sudo env before anything but python3 and a test that tests as root: as root a test that skips for root passes,
-    # and FORK_CI_TEST_SHARD is lost.
+    # sudo anywhere: a test that runs as root says so itself (`fork-ci: run as root`), and the runner runs it so,
     "sudo env before the kit runner": kit_run(f"sudo env {KIT}"),
     "sudo env before a listed .sh test run by bash": kit_run(f"{KIT}\nsudo env bash .github/scripts/fork-follow.test.sh"),
     "sudo env before node --test <upstream tests>": lambda jobs: (lambda st: st.__setitem__(
         "run", "sudo env " + st["run"]))(test_step(jobs, "test", "test-delta.test.cjs")),
-    "sudo env before a .py test that does not test as root": lambda jobs: test_step(
-        jobs, "lint", "fork-owned-reads.test.py").__setitem__(
-        "run", "sudo env python3 -I -B .github/scripts/fork-owned-reads.test.py"),
-    "sudo -E (the whole environment to root)": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
-        "run", ROOT_LINE.replace("sudo env", "sudo -E env")),
-    # and the switch that turns a test on dropped.
-    "the heavy test without HEAVY_REAL_TESTS=1": heavy_run(lambda line: line.replace("HEAVY_REAL_TESTS=1 ", "")),
-    "the root test without GH_APPS_ROOT_TESTS=1": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST)
-        .__setitem__("run", ROOT_LINE.replace("GH_APPS_ROOT_TESTS=1 ", "")),
-    "the root test without sudo": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
-        "run", ROOT_LINE.replace("sudo env ", "")),
-    "the fleet launcher as root without FORK_FLEET_ROOT_TESTS=1": lambda jobs: test_step(
-        jobs, "workflows", "LauncherAsRoot").__setitem__(
-        "run", "sudo env python3 -B .github/scripts/fork-fleet.test.py -v LauncherAsRoot"),
+    "sudo before the root test's own run": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
+        "run", f"sudo -E {ROOT_LINE}"),
+    # a fork test run by hand, so nothing records what it ran (the pre-#664 lines),
+    "the fleet launcher run directly as root": lambda jobs: test_step(jobs, "workflows", FLEET_TEST).__setitem__(
+        "run", f"sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B {FLEET_TEST} -v LauncherAsRoot"),
+    "the root test run directly as root": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
+        "run", f'sudo env GH_APPS_ROOT_TESTS=1 GITHUB_ACTIONS="$GITHUB_ACTIONS" python3 -I -B {ROOT_TEST}'),
+    "the heavy test run directly": heavy_run(
+        lambda line: f'XDG_RUNTIME_DIR="/run/user/$(id -u)" python3 -I -B {HEAVY}'),
+    "the owned-reads test run directly": lambda jobs: test_step(jobs, "lint", "fork-owned-reads.test.py").__setitem__(
+        "run", "python3 -I -B .github/scripts/fork-owned-reads.test.py"),
+    "a listed fork .sh test run by bash": kit_run(f"{KIT}\nbash .github/scripts/fork-follow.test.sh"),
+    "a fork .cjs test run by node --test": kit_run(f"{KIT}\nnode --test .github/scripts/fork-ci-tests.test.cjs"),
+    # a switch set on the line, not declared by the test (the test's own line is what the runner reads),
+    "HEAVY_REAL_TESTS=1 before the heavy test's own run": heavy_run(lambda line: "HEAVY_REAL_TESTS=1 " + line),
+    # an own run made twice, or not at all,
+    "the heavy test's own run made twice": heavy_run(lambda line: f"{line}\n{line}"),
+    "the fleet launcher's own run dropped": without_step("workflows", FLEET_TEST),
+    "the owned-reads test's own run dropped": without_step("lint", "fork-owned-reads.test.py"),
+    # the records not written or not uploaded,
+    "the kit shards' runner step without the records folder": lambda jobs: test_step(jobs, "kit_tests", RUNNER)[
+        "env"].pop(RECORDS_VAR),
+    "the root test's own run without the records folder": lambda jobs: test_step(
+        jobs, "kit_root_tests", ROOT_TEST).pop("env"),
+    "the records folder elsewhere": lambda jobs: test_step(jobs, "kit_tests", RUNNER)["env"].__setitem__(
+        RECORDS_VAR, "/tmp/r"),
+    "the kit shards' records upload dropped": without_step_uses("kit_tests", "upload-artifact"),
+    "the lint job's records upload dropped": without_step_uses("lint", "upload-artifact"),
+    "a records upload that may find no files": upload_set("kit_tests", "if-no-files-found", "warn"),
+    "a records upload named without the attempt": upload_set(
+        "kit_tests", "name", "fork-test-records-${{ github.job }}-${{ strategy.job-index }}"),
+    "a records upload named without the leg": upload_set(
+        "kit_tests", "name", "fork-test-records-${{ github.job }}-${{ github.run_attempt }}"),
+    "a records upload of another folder": upload_set("workflows", "path", "/tmp/r/"),
+    "a records upload under an if:": lambda jobs: upload_step(jobs, "kit_root_tests").__setitem__("if", "success()"),
+    "a records upload before the heavy test's own run": lambda jobs: move_upload_before(jobs, "kit_root_tests", HEAVY),
+    "a second records upload in a job": lambda jobs: jobs["lint"]["steps"].append(copy.deepcopy(
+        upload_step(jobs, "lint"))),
+    "a kit shard matrix with another key": lambda jobs: jobs["kit_tests"]["strategy"]["matrix"].__setitem__(
+        "os", ["a", "b"]),
+    "a fourth kit shard RECORD_JOBS does not know": lambda jobs: jobs["kit_tests"]["strategy"]["matrix"]["shard"]
+        .append(4),
+    # and fork-ci-result not checking them.
+    "fork_ci_result without the records download": lambda jobs: jobs["fork_ci_result"]["steps"].remove(
+        result_step(jobs, "Download the fork test records")),
+    "fork_ci_result without the records check": lambda jobs: jobs["fork_ci_result"]["steps"].remove(
+        result_step(jobs, RECORD_CHECK)),
+    "the records check under an if:": lambda jobs: result_step(jobs, RECORD_CHECK).__setitem__("if", "failure()"),
+    "the records check with continue-on-error": lambda jobs: result_step(jobs, RECORD_CHECK).__setitem__(
+        "continue-on-error", True),
+    "the records check before the download": lambda jobs: (lambda steps: steps.insert(
+        1, steps.pop(steps.index(result_step(jobs, RECORD_CHECK)))))(jobs["fork_ci_result"]["steps"]),
+    "the records download of one artifact": lambda jobs: result_step(jobs, "Download the fork test records")[
+        "with"].__setitem__("pattern", "fork-test-records-workflows-*"),
+    "RECORD_JOBS without lint": lambda jobs: result_step(jobs, RECORD_CHECK)["env"].__setitem__(
+        "RECORD_JOBS", '{"workflows": 1, "action_tests": 1, "kit_tests": 3, "kit_root_tests": 1}'),
+    "RECORD_JOBS with two kit shards": lambda jobs: result_step(jobs, RECORD_CHECK)["env"].__setitem__(
+        "RECORD_JOBS", '{"workflows": 1, "action_tests": 1, "kit_tests": 2, "kit_root_tests": 1, "lint": 1}'),
+    "the records check's SHA from the event": lambda jobs: result_step(jobs, RECORD_CHECK)["env"].__setitem__(
+        "SHA", "${{ github.sha }}"),
+    "the records check's attempt fixed at 1": lambda jobs: result_step(jobs, RECORD_CHECK)["env"].__setitem__(
+        "RUN_ATTEMPT", "1"),
+    "the records check || true": lambda jobs: result_step(jobs, RECORD_CHECK).__setitem__(
+        "run", result_step(jobs, RECORD_CHECK)["run"] + "true\n"),
+    "the records check after set +e": lambda jobs: result_step(jobs, RECORD_CHECK).__setitem__(
+        "run", "set +e\n" + result_step(jobs, RECORD_CHECK)["run"]),
     "a test path with a glob": heavy_run(lambda line: line.replace(HEAVY, "fork-kit/heavy/tests/*.test.py")),
     "a quote left open": heavy_run(lambda line: line + " '"),
     "a runner part that starts with -": kit_run(f"node {RUNNER} --x"),
@@ -2263,35 +2495,43 @@ check("quiet: the real runner calls are the pinned ones, read from the accepted 
 REASONS = {
     "a trailing # comment on the kit runner line": (
         kit_run(f"{KIT}  # shard"), "a trailing comment (# shard) is not allowed"),
-    "sudo env before the kit runner": (QUIET_REFUSED["sudo env before the kit runner"],
-                                       "`sudo env` comes only before python3"),
+    "sudo env before the kit runner": (QUIET_REFUSED["sudo env before the kit runner"], "no sudo on a test line"),
+    "the heavy test run directly": (QUIET_REFUSED["the heavy test run directly"],
+                                    f"{HEAVY} is a fork test: only {RUNNER} runs it"),
+    "a switch on the heavy test's line": (QUIET_REFUSED["HEAVY_REAL_TESTS=1 before the heavy test's own run"],
+                                          "a test's own switch goes in its `fork-ci: run with"),
+    "a runner step without the records folder": (
+        QUIET_REFUSED["the kit shards' runner step without the records folder"],
+        f"calls the runner without env {RECORDS_VAR}", False),
     "a set-up step named a test step by its code": (
         lambda jobs: jobs["kit_root_tests"]["steps"].insert(1, {"run": "cp fork-kit/heavy/x /tmp/x"}),
         "a test step (its run names `fork-kit`)"),
     "a test step that runs nothing": (kit_run(f"echo {KIT}"), "`echo` with these arguments is not a test command"),
 }
-for label, (mutate, reason) in REASONS.items():
+# Each names the allowed forms too, but for the records folder (its own message says what is missing).
+for label, (mutate, reason, *forms) in REASONS.items():
     found = quiet_mutant(mutate)
-    check(f"quiet: {label} is refused, saying why", any(reason in p and TEST_FORMS in p for p in found),
+    check(f"quiet: {label} is refused, saying why",
+          any(reason in p and (TEST_FORMS in p or forms == [False]) for p in found),
           "; ".join(found))
 check("quiet: a step that runs nothing but names a test is refused with the allowed forms",
       any("names a test but runs none; " + TEST_FORMS in p for p in test_step_problems({"run": "# x\n\n"})[0]))
 check("quiet: the heavy test as its step runs it today is seen as run whole, and its step as a test step",
-      test_line(HEAVY_LINE) == {"tests": [HEAVY], "partial": [], "parts": None} and is_test_step(heavy_step(fork_tests["jobs"])))
+      test_line(HEAVY_LINE) == {"tests": [HEAVY], "partial": [], "parts": None, "own": HEAVY}
+      and is_test_step(heavy_step(fork_tests["jobs"])))
 QUIET_ACCEPTED = {
     "shell: bash and a runner line split by \\ with a quoted part": lambda jobs: test_step(
         jobs, "kit_tests", RUNNER).update(shell="bash", run=f"node {RUNNER} \\\n  'fork-kit/'\n"),
     "the heavy test's path quoted": heavy_run(lambda line: line.replace(HEAVY, f'"{HEAVY}"')),
     "the heavy test's path with ./": heavy_run(lambda line: line.replace(HEAVY, f"./{HEAVY}")),
     "the runner with ./ and 2>&1": kit_run(f"node ./{RUNNER} fork-kit/ 2>&1"),
-    "the heavy test with 2>&1 and -u": heavy_run(lambda line: line.replace("-I -B", "-I -B -u") + " 2>&1"),
+    "the heavy test's own run with 2>&1": heavy_run(lambda line: line + " 2>&1"),
+    "upstream's .py test with -I -B -u and 2>&1": upstream_py_run(
+        lambda run: run.rstrip("\n").replace("python3 -B", "python3 -I -B -u") + " 2>&1\n"),
     "a whole comment line before the test": heavy_run(lambda line: "# the heavy kit\n" + line),
-    "the switch variables in another order": heavy_run(
-        lambda line: line.replace(f'XDG_RUNTIME_DIR="/run/user/$(id -u)" HEAVY_REAL_TESTS=1',
-                                  f'HEAVY_REAL_TESTS=1 XDG_RUNTIME_DIR="/run/user/$(id -u)"')),
-    "two test lines in one step": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
-        "run", f"{ROOT_LINE}\n{HEAVY_LINE}\n"),
-    "a listed .sh test run by bash": kit_run(f"{KIT}\nbash .github/scripts/fork-follow.test.sh"),
+    "two own runs in one step (the heavy one's step gone)": lambda jobs: (
+        jobs["kit_root_tests"]["steps"].remove(heavy_step(jobs)),
+        test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__("run", f"{ROOT_LINE}\n{HEAVY_LINE}\n")),
     "a step timeout and id": lambda jobs: heavy_step(jobs).update({"timeout-minutes": 5, "id": "heavy"}),
     # A kit path in a set-up step's comment line only: the step runs no test, so it is not a test step.
     "a set-up step with a kit path in a comment line": lambda jobs: next(
@@ -2305,6 +2545,243 @@ for label, mutate in QUIET_ACCEPTED.items():
 check("quiet: upstream's test steps under if: matrix.shard == 1 pass",
       not quiet_mutant(lambda jobs: None) and any(
           "if" in st and ".test." in str(st.get("run", "")) for st in fork_tests["jobs"]["test"]["steps"]))
+
+# An own run's switch declared by the test itself: without the line, `--run` of it is refused; with a line no step
+# makes, the run is missing.
+check("quiet: the heavy test's `fork-ci: run` line gone (its switch with it) fails",
+      any(f"{HEAVY}: run by `{RUNNER} --run`" in p
+          for p in quiet_mutant(lambda jobs: None, own_runs={t: r for t, r in OWN_RUNS.items() if t != HEAVY})))
+check("quiet: a test that declares an own run no step makes fails",
+      any("made by 0" in p for p in quiet_mutant(lambda jobs: None, own_runs={
+          **OWN_RUNS, ".github/scripts/fork-follow.test.sh": [{"root": False, "vars": [], "only": None}]})))
+check("records: every `fork-ci:` line of a listed test is one the runner reads", not DECLARATION_PROBLEMS,
+      "; ".join(DECLARATION_PROBLEMS))
+check("records: the own runs are read from the tests' own lines (root and gh-apps switch, heavy switch, the fleet "
+      "launcher as root in one class, owned-reads plain)",
+      OWN_RUNS.get(ROOT_TEST) == [{"root": True, "vars": ["GH_APPS_ROOT_TESTS=1"], "only": None}]
+      and OWN_RUNS.get(HEAVY) == [{"root": False, "vars": ["HEAVY_REAL_TESTS=1"], "only": None}]
+      and OWN_RUNS.get(FLEET_TEST) == [{"root": True, "vars": ["FORK_FLEET_ROOT_TESTS=1"], "only": "LauncherAsRoot"}]
+      and OWN_RUNS.get(".github/scripts/fork-owned-reads.test.py") == [{"root": False, "vars": [], "only": None}],
+      json.dumps(OWN_RUNS))
+
+# The record check's own script (from the workflow, as fork_ci_result runs it) on records the real runner writes
+# (its record and writeRecords), so a change to either side's format fails here. The good set: every job and leg of
+# RECORD_JOBS uploaded, each key of `all` recorded once. Each change below is a state the check must refuse: a job,
+# leg or attempt missing or stale, a record from another run, attempt, job, leg or commit, a test missing, run
+# twice, failed, with no count, none run or too many skipped, a record cut off half-way.
+CHECK_STEP = result_step(fork_tests["jobs"], RECORD_CHECK)
+CHECK_SCRIPT = check_script(CHECK_STEP["run"])
+REAL_RECORD_JOBS = json.loads(CHECK_STEP["env"]["RECORD_JOBS"])
+FIX_RUN, FIX_SHA = "4242", "c0ffee" + "0" * 34
+PY_OK = {"status": 0, "seconds": "1.0", "stdout": "", "stderr": "....\n" + "-" * 70 + "\nRan 4 tests in 0.1s\n\nOK\n"}
+PY_SKIP1 = {**PY_OK, "stderr": "Ran 4 tests in 0.1s\n\nOK (skipped=1)\n"}
+PY_ALL_SKIPPED = {**PY_OK, "stderr": "Ran 2 tests in 0.1s\n\nOK (skipped=2)\n"}
+PY_NONE = {**PY_OK, "stderr": "\nRan 0 tests in 0.000s\n\nNO TESTS RAN\n"}
+JS_OK = {"status": 0, "seconds": "1.0", "stdout": "# tests 3\n# pass 3\n# fail 0\n# skipped 0\n# todo 0\n",
+         "stderr": ""}
+SH_OK = {"status": 0, "seconds": "1.0", "stdout": "ok one\nok two\nall passed\n", "stderr": ""}
+SH_SILENT = {"status": 0, "seconds": "1.0", "stdout": "all passed\n", "stderr": ""}
+ROOT_RUN = {"root": True, "vars": ["X_TESTS=1"], "only": None}
+CLASS_RUN = {"root": True, "vars": ["Y_TESTS=1"], "only": "AsRoot"}
+PLAIN_RUN = {"root": False, "vars": [], "only": None}
+
+
+def good_records():
+    """{artifact: [call]}: every job and leg of the real RECORD_JOBS, attempt 1, each call's results as
+    [key, test, own run or None, its result, skips allowed]."""
+    assert REAL_RECORD_JOBS == {"workflows": 1, "action_tests": 1, "kit_tests": 3, "kit_root_tests": 1, "lint": 1}
+    calls = {
+        ("workflows", 0): [("part", ["!fork-kit/"], [["fork-a.test.py", "fork-a.test.py", None, PY_SKIP1, 1],
+                                                     ["fork-s.test.sh", "fork-s.test.sh", None, SH_OK, 0]]),
+                           ("run", "fork-f.test.py", [["fork-f.test.py --run only AsRoot", "fork-f.test.py",
+                                                       CLASS_RUN, PY_OK, 0]])],
+        ("action_tests", 0): [("part", ["fork-ci/"], [["fork-ci/b.test.cjs", "fork-ci/b.test.cjs", None, JS_OK, 0]])],
+        ("kit_tests", 0): [("part", ["fork-kit/"], [["fork-kit/k1.test.py", "fork-kit/k1.test.py", None, PY_OK, 0]])],
+        ("kit_tests", 1): [("part", ["fork-kit/"], [["fork-kit/k2.test.py", "fork-kit/k2.test.py", None, PY_OK, 0]])],
+        ("kit_tests", 2): [("part", ["fork-kit/"], [])],
+        ("kit_root_tests", 0): [("run", "fork-kit/r.test.py", [["fork-kit/r.test.py --run", "fork-kit/r.test.py",
+                                                                ROOT_RUN, PY_OK, 0]]),
+                                ("run", "fork-kit/h.test.py", [["fork-kit/h.test.py --run", "fork-kit/h.test.py",
+                                                                PLAIN_RUN, PY_OK, 0]])],
+        ("lint", 0): [("run", "fork-o.test.py", [["fork-o.test.py --run", "fork-o.test.py", PLAIN_RUN, PY_OK, 0]])],
+    }
+    every = sorted(row[0] for leg in calls.values() for _, _, rows in leg for row in rows)
+    out = {}
+    for (job, index), leg in calls.items():
+        records = []
+        for n, (kind, what, rows) in enumerate(leg):
+            body = {"job": job, "attempt": 1, "run_id": FIX_RUN, "sha": FIX_SHA, "results": rows,
+                    "owed": sorted(row[0] for row in rows)}
+            if kind == "part":
+                body.update(name=f"part-{index + 1}of{REAL_RECORD_JOBS[job]}-{'_'.join(what)}",
+                            call={"parts": what, "shard": f"{index + 1}/{REAL_RECORD_JOBS[job]}"}, all=every)
+            else:
+                body.update(name=f"run-{what}", call={"run": what}, all=None)
+            records.append(body)
+        out[f"fork-test-records-{job}-{index}-1"] = records
+    return out
+
+
+WRITE_RECORDS = (
+    "const fs = require('fs'); const path = require('path'); const r = require(process.argv[1]); "
+    "const [folder, artifacts] = [process.argv[2], JSON.parse(fs.readFileSync(0, 'utf8'))]; "
+    "for (const [name, calls] of Object.entries(artifacts)) { fs.mkdirSync(path.join(folder, name), "
+    "{ recursive: true }); for (const c of calls) r.writeRecords({ dir: path.join(folder, name), run_id: c.run_id, "
+    "run_attempt: c.attempt, job: c.job }, c.name, { sha: c.sha, call: c.call, all: c.all, owed: c.owed, "
+    "results: c.results.map(([key, file, run, result, allowed]) => r.record(key, file, run, result, allowed)) }); }")
+
+
+def run_check(artifacts, attempt=1, tweak=None):
+    """The check's exit status and output on these records (tweak: changes the written files)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = pathlib.Path(tmp) / "records"
+        folder.mkdir()
+        subprocess.run(["node", "-e", WRITE_RECORDS, str(scripts_dir / "fork-ci-tests.cjs"), str(folder)],
+                       input=json.dumps(artifacts), check=True, capture_output=True, text=True)
+        if tweak:
+            tweak(folder)
+        env = {"PATH": os.environ["PATH"], "RECORDS": str(folder), "RUN_ID": FIX_RUN, "RUN_ATTEMPT": str(attempt),
+               "SHA": FIX_SHA, "RECORD_JOBS": CHECK_STEP["env"]["RECORD_JOBS"],
+               "GITHUB_STEP_SUMMARY": str(pathlib.Path(tmp) / "summary")}
+        done = subprocess.run(["python3", "-I", "-"], input=CHECK_SCRIPT, env=env, capture_output=True, text=True,
+                              cwd=tmp)
+        return done.returncode, done.stdout + done.stderr
+
+
+def changed(change):
+    records = good_records()
+    change(records)
+    return records
+
+
+def leg(records, job, index=0, attempt=1):
+    return records[f"fork-test-records-{job}-{index}-{attempt}"]
+
+
+def row(records, key):
+    return next(r for calls in records.values() for c in calls for r in c["results"] if r[0] == key)
+
+
+def drop_key(records, key):
+    for calls in records.values():
+        for c in calls:
+            c["results"] = [r for r in c["results"] if r[0] != key]
+            c["owed"] = [k for k in c["owed"] if k != key]
+
+
+def set_row(key, result=None, allowed=None):
+    def change(records):
+        r = row(records, key)
+        if result is not None:
+            r[3] = result
+        if allowed is not None:
+            r[4] = allowed
+    return change
+
+
+def again(records, job, index=0, attempt=2, change=None):
+    """The leg re-run in another attempt: its artifact again, under that attempt."""
+    calls = copy.deepcopy(leg(records, job, index))
+    for c in calls:
+        c["attempt"] = attempt
+        if change:
+            change(c)
+    records[f"fork-test-records-{job}-{index}-{attempt}"] = calls
+
+
+def edit_file(artifact, change):
+    """A written records file changed on disk (as no runner writes it)."""
+    def tweak(folder):
+        file = sorted((folder / artifact).iterdir())[0]
+        file.write_text(change(file.read_text()))
+    return tweak
+
+
+check("records: the record check's script is read from its step", CHECK_SCRIPT is not None
+      and "raise SystemExit" in CHECK_SCRIPT)
+status, out = run_check(good_records())
+check("records: a run with every job's and leg's records, each listed test recorded once and run, passes",
+      status == 0 and "9 runs of listed tests" in out, out)
+status, out = run_check(changed(lambda r: again(r, "kit_tests", 1)), attempt=2)
+check("records: a leg re-run in attempt 2 (its attempt-1 records kept) passes on the newest", status == 0, out)
+status, out = run_check(good_records(), attempt=2)
+check("records: attempt 2 that re-ran no record job (attempt 1's records stand) passes", status == 0, out)
+RECORDS_REFUSED = {
+    # A job or leg that uploaded nothing.
+    "no records at all (nothing downloaded)": (lambda r: r.clear(), {}, "uploaded no fork test records"),
+    "a kit leg without records": (lambda r: r.pop("fork-test-records-kit_tests-1-1"), {},
+                                  "kit_tests (leg 2 of 3): uploaded no fork test records"),
+    "the lint job without records": (lambda r: r.pop("fork-test-records-lint-0-1"), {}, "lint (leg 1 of 1)"),
+    "an empty records artifact": (lambda r: r.__setitem__("fork-test-records-lint-0-1", []), {}, "empty"),
+    # A record that is not this run's, attempt's, job's, leg's or commit's.
+    "a record of another run": (lambda r: leg(r, "lint")[0].update(run_id="4241"), {},
+                                "written by another run, attempt or job"),
+    "attempt 1's record in attempt 2's artifact": (lambda r: (again(r, "lint", change=lambda c: c.update(attempt=1))),
+                                                   {"attempt": 2}, "written by another run, attempt or job"),
+    "another job's record in an artifact": (lambda r: leg(r, "lint")[0].update(job="workflows"), {},
+                                            "written by another run, attempt or job"),
+    "a leg's record under another leg's name": (lambda r: (r.__setitem__(
+        "fork-test-records-kit_tests-0-1", copy.deepcopy(leg(r, "kit_tests", 1))),
+        leg(r, "kit_tests", 1)[0]["results"].clear(), leg(r, "kit_tests", 1)[0]["owed"].clear()), {},
+        "shard 2/3, not leg 1/3"),
+    "a record of another commit": (lambda r: leg(r, "action_tests")[0].update(sha="f" * 40), {}, "tests ffff"),
+    "an artifact of an attempt after this one": (lambda r: again(r, "lint", attempt=3), {"attempt": 2},
+                                                 "no records artifact of a job, leg and attempt of this run"),
+    "an artifact of a job that runs no fork test": (lambda r: r.__setitem__(
+        "fork-test-records-build-0-1", copy.deepcopy(leg(r, "lint"))), {}, "fork-test-records-build-0-1"),
+    "an artifact of a fourth kit leg": (lambda r: r.__setitem__(
+        "fork-test-records-kit_tests-3-1", copy.deepcopy(leg(r, "kit_tests", 2))), {}, "kit_tests-3-1"),
+    # A re-run whose newest attempt failed: the passing older one never stands in.
+    "a leg re-run in attempt 2 whose test failed (attempt 1 passed)": (lambda r: again(
+        r, "kit_tests", 1, change=lambda c: c["results"][0].__setitem__(3, {**PY_OK, "status": 1})),
+        {"attempt": 2}, "fork-kit/k2.test.py failed (exit 1)"),
+    # A listed test missing, twice, or extra.
+    "a listed test no job recorded": (lambda r: drop_key(r, "fork-kit/k2.test.py"), {},
+                                      "fork-kit/k2.test.py: listed, but no job recorded it"),
+    "an own run no job recorded": (lambda r: drop_key(r, "fork-f.test.py --run only AsRoot"), {},
+                                   "fork-f.test.py --run only AsRoot: listed, but no job recorded it"),
+    "a test recorded twice": (lambda r: leg(r, "kit_tests", 2)[0].update(
+        results=[copy.deepcopy(row(r, "fork-kit/k1.test.py"))], owed=["fork-kit/k1.test.py"]), {},
+        "recorded twice"),
+    "a test recorded that is not to run": (lambda r: leg(r, "kit_tests", 2)[0].update(
+        results=[["fork-kit/x.test.py", "fork-kit/x.test.py", None, PY_OK, 0]], owed=["fork-kit/x.test.py"]), {},
+        "fork-kit/x.test.py: recorded, but not among the tests to run"),
+    "a call that owed a test it has no result of": (lambda r: leg(r, "kit_tests", 2)[0].update(
+        owed=["fork-kit/k1.test.py"]), {}, "results do not match what it owed"),
+    "two parts that disagree on the tests to run": (lambda r: leg(r, "action_tests")[0].update(
+        all=leg(r, "action_tests")[0]["all"] + ["fork-kit/y.test.py"]), {}, "its tests to run differ"),
+    "no part record (nothing says what is to run)": (lambda r: [
+        c.update(call={"run": "x"}, all=None) for calls in r.values() for c in calls], {},
+        "no part records: the tests to run are unknown"),
+    # A test that did not really run.
+    "a test that failed": (set_row("fork-kit/k1.test.py", {**PY_OK, "status": 1}), {},
+                           "fork-kit/k1.test.py failed (exit 1)"),
+    "a test that ran zero tests": (set_row("fork-kit/k1.test.py", PY_NONE), {},
+                                   "fork-kit/k1.test.py ran no test (0 found, 0 skipped)"),
+    "a test that skipped all its tests (allowed 2)": (set_row("fork-kit/k1.test.py", PY_ALL_SKIPPED, 2), {},
+                                                      "ran no test (2 found, 2 skipped)"),
+    "a test that skipped one more than it may": (set_row("fork-kit/k1.test.py", PY_SKIP1), {},
+                                                 "fork-kit/k1.test.py skipped 1 tests, 0 allowed"),
+    "an own run that skipped one (it may skip none, whatever its record allows)": (
+        set_row("fork-kit/r.test.py --run", PY_SKIP1, 5), {}, "fork-kit/r.test.py --run skipped 1 tests, 0 allowed"),
+    "a test whose output shows no test count": (set_row("fork-s.test.sh", SH_SILENT), {},
+                                                "fork-s.test.sh: no test count"),
+    "a test with a failure its exit status hid": (set_row("fork-s.test.sh", {
+        **SH_OK, "stdout": "ok one\nFAIL two\n"}), {}, "fork-s.test.sh: 1 failed"),
+}
+for label, (change, how, reason) in RECORDS_REFUSED.items():
+    status, out = run_check(changed(change), **how)
+    check(f"records: {label} fails, saying why", status == 1 and reason in out, out)
+# Stopped half-way: a records file cut off, or a records folder that is not there.
+for label, tweak, reason in [
+    ("a records file cut off half-way", edit_file("fork-test-records-lint-0-1", lambda text: text[:len(text) // 2]),
+     "unreadable"),
+    ("a records file of another version", edit_file("fork-test-records-lint-0-1",
+                                                    lambda text: text.replace('"v": 1', '"v": 2')), "not a version 1"),
+    ("a records folder that is not there", lambda folder: shutil.rmtree(folder), "uploaded no fork test records"),
+]:
+    status, out = run_check(good_records(), tweak=tweak)
+    check(f"records: {label} fails, saying why", status == 1 and reason in out, out)
 
 # --- policies ----------------------------------------------------------------------------------
 # GitHub blocks pull_request_target (from 2026-12-02) unless a repository Actions policy allows it
