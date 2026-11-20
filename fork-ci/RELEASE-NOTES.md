@@ -31,6 +31,7 @@ nothing.
 
 **Upgrade:** check each self-hosted runner that uses git-clean before you move the pin. Each of these was emptied
 before and now fails the step on every job until it is fixed:
+
 - a work folder (`_work`) that is a symlink (for example to a bigger disk): configure the runner with the real path
   (`./config.sh --work <real path>`) or mount the disk there instead;
 - a mount point inside a workspace: unmount it;
