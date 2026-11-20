@@ -913,6 +913,90 @@ test("from upstream, an upstream file named like a fork file fails on the comman
   });
 });
 
+// A file upstream names like a fork file stopped every fork-follow after the rebase until a pull
+// request excluded it. Right after a rebase that writes a lowered list, the list excludes it.
+test("after a rebase, the lowered list excludes an upstream file a pull request's run takes for a fork file", () => {
+  withRepo(({ dir, commit, fromUpstream }) => {
+    const upstream = commit(
+      { "src/exact.ts": UP, "src/forkJoin.ts": UP, "src/usage/Up.ts": UP, ...BASE },
+      "upstream",
+    );
+    // Old state: a list with no "forkFiles" key, and one whose entries take upstream's files.
+    const forkFiles = ["src/usage/", "src/exact.ts", "src/fork-own.ts"];
+    const series = commit(
+      { ...seams({ files: SEAM, forkFiles }), "src/fork-own.ts": UP },
+      "fork series",
+    );
+    const out = path.join(dir, "..", `${path.basename(dir)}-lowered.json`);
+    try {
+      // Before the rebase, or after it with no list to write, it is still refused: nothing would
+      // commit the exclusion, and main's pull request runs would keep the hole.
+      for (const args of [[], ["--after-rebase"]]) {
+        const refused = fromUpstream(...args, upstream, series);
+        assert.equal(refused.status, 1, args.join(" "));
+        assert.match(refused.stderr, /- src\/forkJoin\.ts: upstream has it/);
+      }
+      const result = fromUpstream("--after-rebase", "--lowered-list", out, upstream, series);
+      assert.equal(result.status, 0, result.stderr);
+      const why = "(upstream has it; a pull request's run took it for a fork file)";
+      assert.deepEqual(result.stdout.match(/^Lowered: .*$/gm), [
+        `Lowered: src/exact.ts: "forkFiles" entry removed ${why}`,
+        `Lowered: src/forkJoin.ts: "forkFiles" "!src/forkJoin.ts" added ${why}`,
+        `Lowered: src/usage/Up.ts: "forkFiles" "!src/usage/Up.ts" added ${why}`,
+      ]);
+      const lowered = parseConfig(fs.readFileSync(out, "utf8"));
+      assert.deepEqual(lowered.forkFiles, [
+        "src/usage/",
+        "src/fork-own.ts",
+        "!src/forkJoin.ts",
+        "!src/usage/Up.ts",
+      ]);
+      // Main's pull request runs judge upstream's three as upstream's; the fork's own stay its own.
+      const isForkFile = forkFileTest(lowered.forkFiles);
+      for (const file of ["src/exact.ts", "src/forkJoin.ts", "src/usage/Up.ts"]) {
+        assert.equal(isForkFile(file), false, file);
+      }
+      assert.equal(isForkFile("src/fork-own.ts"), true);
+      assert.equal(isForkFile("src/usage/Own.ts"), true);
+      // Runs again with the lowered list committed: nothing more to lower or refuse.
+      fs.rmSync(out);
+      const committed = commit({ [CONFIG]: JSON.stringify(lowered) }, "lowered");
+      for (const args of [["--after-rebase", "--lowered-list", out], ["--after-rebase"], []]) {
+        const again = fromUpstream(...args, upstream, committed);
+        assert.equal(again.status, 0, `${args.join(" ")}: ${again.stderr}`);
+        assert.doesNotMatch(again.stdout, /Lowered/);
+      }
+      assert.equal(fs.existsSync(out), false);
+      // A fork change in such a file is refused, never excluded away, and nothing is written.
+      const changed = commit(
+        { [CONFIG]: JSON.stringify({ files: SEAM, forkFiles }), "src/forkJoin.ts": `${UP}x();\n` },
+        "fork line",
+      );
+      const stopped = fromUpstream("--after-rebase", "--lowered-list", out, upstream, changed);
+      assert.equal(stopped.status, 1);
+      assert.match(stopped.stderr, /- src\/forkJoin\.ts: upstream file with 1 fork line/);
+      assert.equal(fs.existsSync(out), false);
+    } finally {
+      fs.rmSync(out, { force: true });
+    }
+  });
+});
+
+test("lowerList excludes a hidden upstream file in a list with no forkFiles, or replaces its own entry", () => {
+  const none = `${JSON.stringify({ files: {} }, null, 2)}\n`;
+  const hidden = (...files) => ({ pending: new Map(), lost: new Map(), hidden: new Set(files) });
+  assert.deepEqual(JSON.parse(lowerList(none, hidden("src/forkJoin.ts")).text), {
+    files: {},
+    forkFiles: ["!src/forkJoin.ts"],
+  });
+  // Named like the fork's and listed: the entry alone would not exclude it, so a `!` replaces it.
+  const listed = `${JSON.stringify({ files: {}, forkFiles: ["fork/up.ts"] }, null, 2)}\n`;
+  const result = lowerList(listed, hidden("fork/up.ts"));
+  assert.deepEqual(JSON.parse(result.text).forkFiles, ["!fork/up.ts"]);
+  assert.match(result.changes[0], /^fork\/up\.ts: "forkFiles" entry replaced by "!fork\/up\.ts"/);
+  assert.equal(lowerList(none, hidden()), undefined);
+});
+
 // Both cases passed in both modes before.
 test("a rename or delete cannot hide an upstream file, from upstream or on a pull request", () => {
   withRepo(({ dir, git, commit, run, fromUpstream }) => {

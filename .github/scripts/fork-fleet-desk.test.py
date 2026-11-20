@@ -2,7 +2,8 @@
 """Tests of fork-fleet-desk.py (the desk link's always-on side) and of fork-fleet-desk-wire.py, its wire format, with
 the contract between the wire and fork-fleet-launch.sh and fork-fleet.py. A fake desk agent on pipes, real Unix sockets
 in a temp directory; no root, no ssh, no network. Run: python3 <this>. Linux only."""
-import importlib.util, inspect, io, json, os, pwd, re, signal, socket, subprocess, sys, tempfile, threading, time, types
+import importlib.util, inspect, io, json, os, pwd, re, signal, socket, stat, subprocess, sys, tempfile, threading, time
+import types
 import unittest
 from unittest import mock
 
@@ -61,8 +62,9 @@ class Agent:
 
 
 class Log(io.StringIO):
-    """serve's log; `settled` is set once it says 'session open' (after listen(): the socket takes connections). The
-    socket file alone is no sign: it appears at bind(), before listen(), and a connect in between is refused."""
+    """serve's log, or the desk agent's (fork-fleet-desk-agent.test.py, which relays serve's stderr); `settled` is set
+    once serve says 'session open' (after listen(): the socket takes connections). The socket file alone is no sign:
+    it appears at bind(), before listen(), and a connect in between is refused."""
 
     def __init__(self):
         super().__init__()
@@ -371,53 +373,104 @@ class Link(unittest.TestCase):
         self.assertEqual(result.get('code'), 1)
         self.assertIn('never sent', log.getvalue())
 
-    def test_launch_refuses_a_socket_of_another_owner(self):
+    def test_launch_refuses_a_socket_of_another_owner_or_a_link(self):
         os.mkdir(self.dir, 0o700)
         with socket.socket(socket.AF_UNIX) as s:
             s.bind(self.sock)
-        real = os.lstat
-        def fake(p, *a, **k):
-            st = real(p, *a, **k)
-            return types.SimpleNamespace(st_mode=st.st_mode, st_uid=4242) if p == self.sock else st
-        with mock.patch.object(desk.os, 'lstat', fake):
-            code, _, err = self.launch('active')
+        real = os.fstat
+        def fake(fd, *a, **k):
+            st = real(fd, *a, **k)
+            return types.SimpleNamespace(st_mode=st.st_mode, st_uid=4242) if stat.S_ISSOCK(st.st_mode) else st
+        fds = set(os.listdir('/proc/self/fd'))
+        for _ in range(2):                                                 # and again: nothing is left open
+            with mock.patch.object(desk.os, 'fstat', fake):
+                code, _, err = self.launch('active')
+            self.assertEqual(code, 1, err)
+            self.assertIn('is not a socket of uid', err)
+        os.rename(self.sock, self.sock + '.real')
+        os.symlink(self.sock + '.real', self.sock)                        # a link to a socket: never followed
+        code, _, err = self.launch('active')
         self.assertEqual(code, 1, err)
+        self.assertIn('is not a socket of uid', err)
+        self.assertEqual(set(os.listdir('/proc/self/fd')), fds)
 
-    def test_launch_sends_nothing_to_a_listener_that_is_not_the_directory_owner(self):
-        """#202: root's launch lstats the socket, then connects, in a directory the desk user owns. Swapped in between
-        for a link to another socket (a stand-in for a root daemon's), the peer is not the owner: refused, unsent."""
+    def test_launch_closes_the_checked_socket_file_and_names_a_missing_proc(self):
+        """#427: the file opened for the check is closed after the connect, refused or not. Without /proc the error
+        names the socket, not a desktop that looks off."""
+        os.mkdir(self.dir, 0o700)
+        with socket.socket(socket.AF_UNIX) as s:
+            s.bind(self.sock)                                              # bound, never listening: refused
+        class NoProc(socket.socket):
+            def connect(self, address):
+                raise FileNotFoundError(2, 'No such file or directory')
+        fds = set(os.listdir('/proc/self/fd'))
+        for _ in range(2):                                                 # and again: nothing is left open
+            self.assertEqual(self.launch('active')[0], wire.NO_SESSION)
+            with mock.patch.object(desk.socket, 'socket', NoProc):
+                code, _, err = self.launch('active')
+            self.assertEqual(code, 1, err)
+            self.assertIn('cannot reach', err)
+        self.assertEqual(set(os.listdir('/proc/self/fd')), fds)
+
+    def test_launch_connects_to_the_socket_it_checked_not_one_swapped_in(self):
+        """#202, #427: root's launch checks the socket, then connects, in a directory the desk user owns. Swapped in
+        between for a link to another socket (a stand-in for a root daemon's), or for another socket outright, the
+        stand-in is never even reached: launch connects through the inode it checked, the owner's serve's."""
         agent = Agent(lambda f: wire.answer(0, 'ok\n'))
         t, _, _ = self.serve(agent)
-        daemon_path = os.path.join(self.tmp.name, 'daemon.sock')
-        daemon = socket.socket(socket.AF_UNIX)
-        self.addCleanup(daemon.close)
-        daemon.bind(daemon_path)
-        daemon.listen(1)
-        real = os.lstat
+        real = stat.S_ISSOCK
+        for swap in ('link', 'socket', 'link'):                           # and again, on the same session
+            with self.subTest(swap):
+                daemon_path = os.path.join(self.tmp.name, 'daemon.sock')
+                daemon = socket.socket(socket.AF_UNIX)
+                daemon.bind(daemon_path)
+                daemon.listen(1)
+                daemon.setblocking(False)
 
-        def lstat_then_swap(p, *a, **k):
-            st = real(p, *a, **k)
-            if p == self.sock:
-                os.rename(self.sock, self.sock + '.serve')
-                os.symlink(daemon_path, self.sock)
-            return st
-        with mock.patch.object(desk.os, 'lstat', lstat_then_swap), \
-                mock.patch.object(desk, 'peer', fake_peer(0, 0, 'launch')):
+                def check_then_swap(mode):                                 # launch's check of the socket file
+                    os.rename(self.sock, self.sock + '.serve')
+                    if swap == 'link':
+                        os.symlink(daemon_path, self.sock)
+                    else:
+                        os.rename(daemon_path, self.sock)
+                    return real(mode)
+                try:
+                    with mock.patch.object(desk.stat, 'S_ISSOCK', check_then_swap):
+                        self.assertEqual(self.launch('active', wait=2)[:2], (0, 'ok\n'))
+                    with self.assertRaises(BlockingIOError):              # the stand-in saw no connect at all
+                        daemon.accept()
+                finally:
+                    daemon.close()
+                    os.remove(self.sock)
+                    if swap == 'link':
+                        os.remove(daemon_path)
+                    os.rename(self.sock + '.serve', self.sock)
+        self.assertEqual(self.launch('active')[:2], (0, 'ok\n'))          # unswapped: served as before
+        agent.hang_up(); t.join(5)
+
+    def test_launch_sends_nothing_to_a_listener_that_is_not_the_directory_owner(self):
+        """#202: the socket file is the owner's, but who listens on it is not (SO_PEERCRED faked): refused, unsent."""
+        agent = Agent(lambda f: wire.answer(0, 'ok\n'))
+        t, _, _ = self.serve(agent)
+        with mock.patch.object(desk, 'peer', fake_peer(0, 0, 'launch')):
             code, _, err = self.launch('active', wait=2)
         self.assertEqual(code, 1, err)
         self.assertIn('listens as uid 0', err)
-        daemon.settimeout(5)
-        conn, _ = daemon.accept()
-        with conn:
-            conn.settimeout(5)
-            self.assertEqual(conn.recv(65536), b'')                        # connected, closed, sent nothing
-        os.remove(self.sock)
-        os.rename(self.sock + '.serve', self.sock)
         with mock.patch.object(desk, 'peer', fake_peer(4242, 4242, 'launch')):   # any other user: the same
             self.assertEqual(self.launch('active')[0], 1)
         self.assertEqual([f for f in agent.got if 'id' in f], [])
         self.assertEqual(self.launch('active')[:2], (0, 'ok\n'))          # the owner's own serve: served
         agent.hang_up(); t.join(5)
+
+    def test_peer_ids_are_unsigned(self):
+        """#427: SO_PEERCRED's uid and gid are unsigned: one of 2**31 or more reads as itself, never as a negative."""
+        class Sock:
+            def getsockopt(self, *_):
+                return desk.struct.pack('iII', 7, 2**32 - 2, 2**31)
+        self.assertEqual(tuple(desk.peer(Sock())), (7, 2**32 - 2, 2**31))
+        a, b = socket.socketpair(socket.AF_UNIX)
+        with a, b:                                                         # the real call: this process at both ends
+            self.assertEqual(tuple(desk.peer(a)), (os.getpid(), os.geteuid(), os.getegid()))
 
     def test_a_lock_of_another_owner_is_refused_even_when_this_user_may_open_it(self):
         """#202: the owner check on POOL.lock, not only the PermissionError of a 0600 root lock: a lock someone else
@@ -538,7 +591,7 @@ class Link(unittest.TestCase):
                 time.sleep(self.t)
                 raise socket.timeout()
             def getsockopt(self, *_):   # the listener is this user, the directory's owner
-                return desk.struct.pack('3i', os.getpid(), os.geteuid(), os.getegid())
+                return desk.struct.pack('iII', os.getpid(), os.geteuid(), os.getegid())
             def __enter__(self):
                 return self
             def __exit__(self, *a):

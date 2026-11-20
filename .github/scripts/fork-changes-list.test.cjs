@@ -99,6 +99,78 @@ test("pinnedIds fails closed on a table entry that is not a `{ ... }` object lit
   );
 });
 
+test("pinnedIds fails closed on a row whose scope and key could be read from the wrong place (#417)", () => {
+  const first = ROW("server", "waitFor");
+  const after = ROW("client", "after");
+  // TABLE puts the first row on line 6, so the entry after it starts on line 12.
+  const shapes = {
+    // Without the count of "scope:", the nested note's scope and key would read as the row's.
+    "nested scope and key": [
+      '  { scope: SCOPE, key: "x", note: { scope: "server", key: "a" } },\n',
+      /line 12: 2 "scope:" but 1 read/u,
+    ],
+    // The comment's "scope:" no longer counts, so the row's real (spread) scope is refused.
+    "spread with a comment": [
+      '  {\n    ...BASE, // scope: "server", key: "a"\n    off: true,\n  },\n',
+      /line 12: a spread in a row/u,
+    ],
+    "spread on one line": [
+      '  { ...BASE, scope: "server", key: "a" },\n',
+      /line 12: a spread in a row/u,
+    ],
+    "a comment only": [
+      '  {\n    /* scope: "server", key: "a" */\n    key: "x",\n  },\n',
+      /line 12: 0 "scope:" but 0 read/u,
+    ],
+    // A string's "scope:" does not count, so a row whose own scope is not written as `scope:` is refused.
+    "shorthand scope, a string with a scope and key": [
+      `  { scope, key, note: "scope: 'server', key: 'fake'" },\n`,
+      /line 12: 0 "scope:" but 1 read/u,
+    ],
+    "quoted scope, a string with a scope and key": [
+      `  { "scope": "client", "key": "real", note: "scope: 'server', key: 'fake'" },\n`,
+      /line 12: 0 "scope:" but 1 read/u,
+    ],
+    "real scope and key, a string with another pair": [
+      `  { scope: "client", key: "real", note: "scope: 'server', key: 'fake'" },\n`,
+      /line 12: 1 "scope:" but 2 read/u,
+    ],
+    // Two entries on one line read as one row, so the second would go unread.
+    "two objects on one line": [
+      '  { scope: "client", key: "b" }, { scope: "server", key: "c" },\n',
+      /line 12: more than one `\{ \.\.\. \}` on a row's line/u,
+    ],
+    // A closing line the reader does not know: name it, not the two rows it then reads as one.
+    "unrecognised close": [
+      '  {\n    scope: "server",\n    key: "a",\n  }, // end\n',
+      /line 15: `\}, \/\/ end` at the rows' indent, but the row opened on line 12 has not closed/u,
+    ],
+  };
+  for (const [shape, [entry, error]] of Object.entries(shapes)) {
+    assert.throws(() => pinnedIds(TABLE(first + entry + after)), error, shape);
+  }
+});
+
+test("pinnedIds reads past comments, strings and nested objects in a row (#417)", () => {
+  // A nested object's `},` sits deeper than the rows' two-space indent, so it does not end the row.
+  const nested =
+    '  {\n    scope: "server",\n    key: "nested",\n    default: {\n      enabled: false,\n    },\n' +
+    "    off: true,\n  },\n";
+  const commented =
+    '  {\n    // the scope: is "server"\n    scope: "server", // see https://example.invalid/a\n' +
+    '    key: "commented",\n    reason: "waits... { not a brace }",\n  },\n';
+  assert.deepEqual(
+    pinnedIds(
+      TABLE(
+        nested +
+          commented +
+          '  { scope: "client", key: "theme", default: { mode: "dark" }, off: "light" },\n',
+      ),
+    ),
+    ["client.theme", "server.commented", "server.nested"],
+  );
+});
+
 test("pinnedIds reads a one-line row and passes a comment between rows", () => {
   assert.deepEqual(
     pinnedIds(
