@@ -5430,6 +5430,19 @@ class Notify(unittest.TestCase):
                     self.addCleanup(subprocess.run, ['kill', '-9', str(pid)], capture_output=True)
                 self.assertEqual(self.wait_gone(pids), [], 'a child of the stopped command still runs')
 
+    def test_without_proc_the_whole_process_group_is_still_killed(self):   # review of #680: never less than killpg
+        real = os.listdir
+
+        def no_proc(path='.'):   # a sandbox or a non-Linux runner: /proc cannot be listed
+            if str(path) == '/proc':
+                raise PermissionError(13, 'Permission denied', path)
+            return real(path)
+        with unittest.mock.patch.object(Q.os, 'listdir', no_proc):
+            code, out, updated = self.sweep(self.queue('hang', notify_timeout_seconds=1))
+        self.assertEqual((code, updated), (0, [8]))
+        self.assertIn('ran longer than 1 s and was stopped', out)
+        self.assertEqual(self.wait_gone([self.helper_pid()]), [], 'a child in the command\'s own group still runs')
+
     def test_its_output_can_write_no_workflow_command_of_either_form(self):   # #675 item 3: ##[ is read mid-line
         code, out, _ = self.sweep(self.queue('commands'))
         self.assertEqual(code, 0)
@@ -5442,6 +5455,39 @@ class Notify(unittest.TestCase):
                                                 '  notify| ##[stop-commands]guessed', '  notify| ::warning::new form'])
         self.assertIn('#7: notify_command ran for conflict', '\n'.join(lines[end + 1:]))   # the queue's own, after
         self.assertNotIn(token, '\n'.join(lines[start + 1:end]))
+
+    def test_commands_are_turned_back_on_even_if_its_output_cannot_be_printed(self):   # review of #680: a finally
+        class Ascii(io.StringIO):   # a stdout that cannot write every character (a non-UTF-8 locale)
+            def write(self, x):
+                if 'legacy' in x:
+                    raise UnicodeEncodeError('ascii', x, 0, 1, 'ordinal not in range(128)')
+                return super().write(x)
+        out = Ascii()
+        with contextlib.redirect_stdout(out):
+            self.queue('commands').notify(7, self.H, 'conflict', 'merge conflict with main')
+        lines = out.getvalue().splitlines()
+        token = lines[0].split('::')[2]
+        self.assertTrue(lines[0].startswith('::stop-commands::'))
+        self.assertEqual(lines[1], f'::{token}::')   # right after the line that failed: nothing else of it is shown
+        self.assertIn('::warning::pr-queue: notify_command for #7 (conflict): its output could not all be shown', lines[2])
+        self.assertIn('#7: notify_command ran for conflict', lines[3])
+
+    def test_a_spent_budget_posts_nothing_and_the_next_run_tells_it(self):   # review of #680: no wake is lost
+        q = self.queue()
+        q.notify_spent = Q.NOTIFY_BUDGET   # earlier notices of this run took it all
+        code, out, updated = self.sweep(q)
+        self.assertEqual((code, updated, self.comments, self.calls()), (0, [8], [], []))
+        self.assertIn('#7: this run\'s notify commands used their 300 s, so it does not post this notice yet', out)
+        self.sweep(self.queue())   # the next run: a fresh budget, so it posts the notice and runs the command
+        self.sweep(self.queue())   # and the one after that runs nothing again
+        self.assertEqual((len(self.comments), len(self.calls())), (1, 1))
+
+    def test_a_spent_budget_without_a_command_still_posts(self):   # the budget is only notify_command's
+        raw = {**CFG_RAW}
+        q = make_queue(self.dir, config.parse(json.dumps(raw)))
+        q.notify_spent = Q.NOTIFY_BUDGET
+        self.sweep(q)
+        self.assertEqual(len(self.comments), 1)
 
     def test_slow_notices_share_one_budget_per_run(self):   # #675 item 4: four slow ones must not reach the job limit
         with unittest.mock.patch.object(Q, 'NOTIFY_BUDGET', 3.5):
@@ -5465,20 +5511,57 @@ class Notify(unittest.TestCase):
         self.sweep(self.queue())   # the comment is the record: not tried again
         self.assertEqual(self.calls(), [])
 
+    def test_output_that_cannot_be_read_back_is_not_called_could_not_start(self):   # review of #680, nit
+        real = tempfile.TemporaryFile
+
+        class Unreadable:
+            def __init__(self):
+                self.f = real()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                self.f.close()
+
+            def fileno(self):
+                return self.f.fileno()
+
+            def seek(self, *a):
+                return self.f.seek(*a)
+
+            def read(self, *a):
+                raise OSError(5, 'Input/output error')
+        with unittest.mock.patch.object(Q.tempfile, 'TemporaryFile', Unreadable):
+            code, out, _ = self.sweep(self.queue())
+        self.assertEqual((code, len(self.calls())), (0, 1))
+        self.assertIn('notify_command for #7 (conflict) ran, but its output could not be read', out)
+        self.assertNotIn('could not start', out)
+
     def test_a_link_to_another_host_or_repository_is_replaced_by_the_prs(self):   # #675 item 6
         for bad in ('https://evil.example/owner/proj/actions/runs/1', 'https://github.com/other/proj/actions/runs/1',
-                    'https://github.com.evil.example/owner/proj/x', 'https://github.com/owner/projx/actions/runs/1'):
+                    'https://github.com.evil.example/owner/proj/x', 'https://github.com/owner/projx/actions/runs/1',
+                    # review of #680: a browser resolves these to another repository, or they hold control characters
+                    'https://github.com/owner/proj/../../evil/repo', 'https://github.com/owner/proj/%2e%2e/%2E%2e/evil/r',
+                    'https://github.com/owner/proj/.%2e/.%2E/evil/r', 'https://github.com/owner/proj/x/%2F..%2f..',
+                    'https://github.com/owner/proj/..\\..\\evil', 'https://github.com/owner/proj/x%5c..%5C..',
+                    'https://github.com/owner/proj/./x', 'https://github.com/owner/proj/x\x1b[2J',
+                    'https://github.com/owner/proj/x\x00', 'https://github.com/owner/proj/x\ty', 'https://github.com/owner/proj/é'):
             with self.subTest(bad=bad):
                 self.comments = []
                 if os.path.exists(self.log):
                     os.remove(self.log)
                 self.sweep(self.queue(), state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE', bad),))
-                self.assertEqual(self.calls()[0]['argv'][5], 'https://github.com/owner/proj/pull/7')
-        self.comments = []
-        os.remove(self.log)
-        run = 'https://github.com/Owner/Proj/actions/runs/11/job/22'   # GitHub's names ignore case
-        self.sweep(self.queue(), state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE', run),))
-        self.assertEqual(self.calls()[0]['argv'][5], run)
+                calls = self.calls()   # a NUL must not stop the command from starting
+                self.assertEqual([c['argv'][5] for c in calls], ['https://github.com/owner/proj/pull/7'])
+        for run in ('https://github.com/Owner/Proj/actions/runs/11/job/22',   # GitHub's names ignore case
+                    'https://github.com/owner/proj/actions/runs/11?check_suite_focus=..#step:3:..',   # not the path
+                    'https://github.com/owner/proj/blob/main/a..b%20c'):
+            with self.subTest(good=run):
+                self.comments = []
+                os.remove(self.log)
+                self.sweep(self.queue(), state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE', run),))
+                self.assertEqual(self.calls()[0]['argv'][5], run)
 
     def test_a_deleted_queue_comment_runs_the_command_once_more_then_never(self):   # #675 item 7: old state gone
         self.sweep(self.queue())

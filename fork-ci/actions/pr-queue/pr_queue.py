@@ -617,6 +617,19 @@ def notify_env():
     return {k: v for k, v in os.environ.items() if k not in TOKEN_VARS and 'TOKEN' not in k.upper()}
 
 
+def repo_page(link, page):
+    """Whether `link` (GitHub's text: a status targetUrl can be anything) is a page under `page`
+    (https://github.com/<repo>/, any case) and stays there in a browser: printable ASCII only (no space, control
+    character or NUL, which would also stop the command from starting), no backslash (browsers read it as /), and no
+    path segment that is . or .. once percent-decoded, nor an encoded / or \\ (%2f, %5c)."""
+    if not (isinstance(link, str) and re.fullmatch(r'[!-~]+', link) and link.lower().startswith(page.lower())):
+        return False
+    path = re.split(r'[?#]', link[len(page):], maxsplit=1)[0]
+    if '\\' in path or re.search(r'%(2f|5c)', path, re.I):
+        return False
+    return not any(urllib.parse.unquote(seg) in ('.', '..') for seg in path.split('/'))
+
+
 NOTIFY_OUTPUT = 4000   # characters of the command's output the run log shows
 NOTIFY_BUDGET = 300    # seconds all notify_command runs of one run may take together: the job stops at 20 minutes
 
@@ -625,7 +638,7 @@ def notify_tree(root):
     """The processes to stop with a notify_command (pid `root`, not yet waited for) that ran too long: its session,
     which holds a child that made a process group of its own (coreutils timeout does), and every process still linked
     to one of those by its parent, which holds a child that made a session of its own (setsid) while its parent runs.
-    Read from /proc; only `root` where there is none. A child whose parent already ended (a daemon) is beyond it: the
+    Read from /proc; only `root` where there is none (stop_notify then kills root's process group as well). A child whose parent already ended (a daemon) is beyond it: the
     runner's end-of-job cleanup stops that one (README.md, "Notify\")."""
     procs = {}
     try:
@@ -652,7 +665,9 @@ def notify_tree(root):
 
 def stop_notify(root):
     """Kill notify_tree(root): stop each process first, then kill them all, so that none forks or moves away (a child
-    whose parent is killed first leaves the tree) between the read and the kill."""
+    whose parent is killed first leaves the tree) between the read and the kill. Then root's process group goes too, in
+    one kill: without /proc that is all there is to find, and never less than the group. Safe: root leads its own session
+    (start_new_session), so its group is never the queue's, and its pid, not yet waited for, cannot be reused."""
     stopped = set()
     for _ in range(20):   # a process that forks on every stop cannot keep it going forever
         new = notify_tree(root) - stopped
@@ -669,6 +684,10 @@ def stop_notify(root):
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
+    try:
+        os.killpg(root, signal.SIGKILL)
+    except OSError:   # the group has no process left
+        pass
 
 
 def git_env(env, remote=None):
@@ -1379,7 +1398,9 @@ class Queue:
         after a push the reason is not known for the new head, and a mark for it would silence its real notice.
         `still`: what the PR must still show when it is read for this (the list is older), else nothing is said.
         Once the comment is posted, notify_command runs (notify) with `kind` and `link`: the comment is the record that
-        this head and reason were told, on GitHub, so a later run, a restart or another runner never runs it again."""
+        this head and reason were told, on GitHub, so a later run, a restart or another runner never runs it again.
+        So while a notify_command is set and this run's NOTIFY_BUDGET is spent, nothing is posted: the next run, with a
+        fresh budget, posts it and runs the command. No notice is lost, and none runs twice."""
         pr = self.view(n, gh=self.gh_write)   # viewerDidAuthor: the login that posts the queue's comments
         if not pr:
             print(f'#{n}: could not read it to say why it waits')
@@ -1394,6 +1415,10 @@ class Queue:
         if any(c.get('viewerDidAuthor') is True and (c.get('body') or '').startswith(told)
                for c in pr.get('comments') or []):
             return
+        if self.cfg.notify_command and self.notify_left() < 1:   # the comment would say it was told, and wake no one
+            print(f"#{n}: this run's notify commands used their {NOTIFY_BUDGET} s, so it does not post this notice "
+                  'yet: the next run tells it (and runs notify_command)')
+            return
         r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
                           f'{told} so this armed PR waits and the queue passes over it. {way_out}')
         if r.returncode != 0:
@@ -1405,27 +1430,29 @@ class Queue:
         """Run the config's notify_command for a notice tell() just posted: argv + repo, PR, head, kind, reason, link
         (README.md, "Notify"). Never part of the queue's result: a command that is missing, fails or runs longer than
         notify_timeout_seconds (then it and its processes are killed: stop_notify) is a warning, and the run goes on.
-        All commands of a run share NOTIFY_BUDGET seconds; once that is spent, a notice runs nothing (a warning).
-        It is not tried again: the posted comment says it was told, and a later run must not wake anyone again."""
+        All commands of a run share NOTIFY_BUDGET seconds; tell() posts no notice once that is spent, so the next run
+        posts and runs it. A command that fails, hangs or cannot start is not tried again: the posted comment says it
+        was told, and a later run must not wake anyone again."""
         cmd = self.cfg.notify_command
         if not cmd:
             return
-        page = f'https://github.com/{self.repo}/'   # only a page of this repository: a status targetUrl can be any host
-        if not (isinstance(link, str) and link.lower().startswith(page.lower()) and re.fullmatch(r'\S+', link)):
+        page = f'https://github.com/{self.repo}/'
+        if not repo_page(link, page):
             link = f'{page}pull/{n}'
         argv = [*cmd, self.repo, str(n), head, kind, reason, link]
-        left = NOTIFY_BUDGET - getattr(self, 'notify_spent', 0.0)
-        if left < 1:
+        left = self.notify_left()
+        if left < 1:   # tell() posts nothing then; a direct call still stays inside the budget
             print(f'::warning::pr-queue: notify_command for #{n} ({kind}) not run: this run\'s notify commands took '
                   f'{NOTIFY_BUDGET} s together. The PR comment stands; nothing is tried again')
             return
         limit = min(self.cfg.notify_timeout_seconds, left)
         sys.stdout.flush()
-        start, code = time.monotonic(), None
+        start, code, ran = time.monotonic(), None, False
         try:
             with tempfile.TemporaryFile() as out:   # a file, not a pipe: a helper it leaves running cannot hold the run
                 p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                      env=notify_env(), start_new_session=True)
+                ran = True
                 try:
                     code = p.wait(timeout=limit)
                 except subprocess.TimeoutExpired:
@@ -1434,8 +1461,9 @@ class Queue:
                     code = None
                 out.seek(0)
                 said = out.read(NOTIFY_OUTPUT + 1).decode('utf-8', 'replace')
-        except (OSError, ValueError) as e:   # cannot start, or no temp file (a full disk)
-            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) could not start: {e}. The PR comment '
+        except (OSError, ValueError) as e:   # cannot start, no temp file (a full disk), or its output cannot be read
+            what = 'ran, but its output could not be read' if ran else 'could not start'
+            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) {what}: {e}. The PR comment '
                   'stands; nothing is tried again')
             return
         finally:
@@ -1444,11 +1472,20 @@ class Queue:
             # Its output is not the queue's: no workflow command from it, neither ::cmd:: (the prefix: the runner
             # reads it only at a line's start) nor the older ##[cmd] (read anywhere in a line), so the runner stops
             # reading commands until a token the command cannot know.
-            resume = secrets.token_hex(16)
+            # The resume line is printed whatever happens to the lines before it (an encoding error on a non-UTF-8
+            # stdout), or the runner would ignore every later ::warning:: of the step.
+            resume, shown = secrets.token_hex(16), None
             print(f'::stop-commands::{resume}')
-            for line in said[:NOTIFY_OUTPUT].splitlines():
-                print(f'  notify| {line}')
-            print(f'::{resume}::')
+            try:
+                for line in said[:NOTIFY_OUTPUT].splitlines():
+                    print(f'  notify| {line}')
+            except (OSError, ValueError) as e:
+                shown = e
+            finally:
+                print(f'::{resume}::')
+            if shown:
+                print(f'::warning::pr-queue: notify_command for #{n} ({kind}): its output could not all be shown: '
+                      f'{shown}')
         if code is None:
             print(f'::warning::pr-queue: notify_command for #{n} ({kind}) ran longer than {limit:.3g} s and was '
                   'stopped. The PR comment stands; nothing is tried again')
@@ -1457,6 +1494,10 @@ class Queue:
                   'nothing is tried again')
         else:
             print(f'#{n}: notify_command ran for {kind} on {head[:12]}')
+
+    def notify_left(self):
+        """Seconds of NOTIFY_BUDGET this run's notify commands have not used yet (one Queue per run)."""
+        return NOTIFY_BUDGET - getattr(self, 'notify_spent', 0.0)
 
     def tell_red(self, n, head, check, what='is red', fix='Fix the cause and push', kind='red', link=None):
         """tell() for a required check: once per head, check and reason."""
