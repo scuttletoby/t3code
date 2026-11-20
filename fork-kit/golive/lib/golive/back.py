@@ -35,7 +35,7 @@ from golive.keptruntime import installed_t3
 UPDATE_TIMEOUT, HTTP_TIMEOUT, MB = 900, 5, 1024 * 1024
 T3_STUB = None  # tests only: a program run in place of any t3 the kit runs
 FOLLOWS = ('back', 'switch')
-_FORK = re.compile(r'\.fork\.\d+$')
+_FORK = live.FORK_BUILD
 
 
 def base_of(version):
