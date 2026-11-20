@@ -30,7 +30,7 @@ RULES = tuple(source[len('rule:'):] for _, source in CLASSES if isinstance(sourc
 DELETED = re.compile(r' \((\d+ B|\d+\.\d [KMG]B|size not known), (' + '|'.join(RULES) + r'): ')
 UNITS = {'B': 1, 'KB': 1024, 'MB': 1024 ** 2, 'GB': 1024 ** 3}
 # The other lines a run writes to the log (engine.py): understood, and not a delete.
-OTHER_LINES = ('deleting ', 'compressing ', 'kept first ', 'FAILED ', 'REFUSED ', 'total: ', 'stopped: ')
+OTHER_LINES = ('deleting ', 'compressing ', 'linking ', 'kept first ', 'FAILED ', 'REFUSED ', 'total: ', 'stopped: ')
 MARK_VERSION = 1
 
 
@@ -182,6 +182,10 @@ def measure(cfg, sizer, name, source, docker):
         for folder in cfg.cold_folders:     # without folders the rule looks at nothing
             if os.path.lexists(folder.path):
                 sized.add(sizer.size(folder.path))
+    elif source == 'rule:dedupe':
+        for folder in cfg.dedupe_folders:   # without folders the rule looks at nothing
+            if os.path.lexists(folder.path):
+                sized.add(sizer.size(folder.path))
     elif source == 'rule:agent-scratch':
         if not cfg.scratch_enabled:
             sized.note = 'off'              # as in a plan: the rule looks at nothing
@@ -225,6 +229,7 @@ class Freed:
     def __init__(self):
         self.bytes, self.deletes, self.unknown, self.skipped = 0, 0, 0, 0
         self.compresses = 0     # files compress-cold replaced by a checked copy: what they freed is in bytes
+        self.links = 0          # duplicates dedupe replaced by a hard link: what they freed is in bytes
         self.since, self.problem, self.mark, self.mark_problem = None, None, None, None
         self.trimmed = False    # the last report's line is gone: deletes before the oldest line left are not counted
 
@@ -328,7 +333,7 @@ def freed(cfg):
     for line in lines[start:]:
         found = LINE.match(line)
         rest = found.group(2) if found else ''
-        verb = next((v for v in ('deleted', 'compressed') if rest.startswith(v + ' ')), None) if found else None
+        verb = next((v for v in ('deleted', 'compressed', 'linked') if rest.startswith(v + ' ')), None) if found else None
         if verb is not None:
             size = deleted_size(rest, verb)
             if size is None:
@@ -336,6 +341,8 @@ def freed(cfg):
             else:
                 if verb == 'compressed':
                     out.compresses += 1
+                elif verb == 'linked':
+                    out.links += 1
                 else:
                     out.deletes += 1
                 if size == 'unknown':
@@ -468,6 +475,8 @@ def _report(cfg, say, docker, host, disk_of, mounts, locked, out=None, mark=True
         counted = f'{got.deletes} delete' + ('' if got.deletes == 1 else 's')
         if got.compresses:
             counted += f', {got.compresses} compressed file' + ('' if got.compresses == 1 else 's')
+        if got.links:
+            counted += f', {got.links} linked file' + ('' if got.links == 1 else 's')
         if got.unknown:
             counted += f', {got.unknown} of unknown size'
         tail = f'freed since {got.since} ' + ('at least ' if got.trimmed else '') + f'{gb(got.bytes)} ({counted})'

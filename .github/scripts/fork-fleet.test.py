@@ -2,7 +2,7 @@
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
 import copy, datetime, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat, subprocess, sys
-import tempfile, time
+import ast, glob, tempfile, time
 import unittest, urllib.error, urllib.parse
 from contextlib import redirect_stdout
 from functools import partial
@@ -1490,7 +1490,6 @@ class Dispatch(unittest.TestCase):
             ff.main(['dispatch', '--pool', 'nope', '--token-file', '/nonexistent', '--once'], env={})
 
 
-@unittest.skipUnless(sys.platform.startswith('linux') and os.geteuid() != 0, 'Linux, not as root')
 def walls_probe():
     """check-net's walls' probe, the Python code the launcher runs in the unit (its WALLS)."""
     with open(LAUNCH) as f:
@@ -1498,6 +1497,7 @@ def walls_probe():
     return text.split("read -r -d '' WALLS <<'EOF' || true\n", 1)[1].split('\nEOF\n', 1)[0]
 
 
+@unittest.skipUnless(sys.platform.startswith('linux') and os.geteuid() != 0, 'Linux, not as root')
 class Launcher(unittest.TestCase):
     """fork-fleet-launch.sh with a fake systemd-run, systemctl, chown, pgrep, setpriv, ip, nft, iptables and id (it
     runs here as this user, not root; LauncherAsRoot runs the real ones). The fake systemd-run records each unit it
@@ -1801,17 +1801,27 @@ class Launcher(unittest.TestCase):
         readlink says where this host's /etc/resolv.conf leads). A plain file: the jobs' file is bound at
         /etc/resolv.conf, a mount point of its own, with no link there. A link (systemd-resolved's, into /run): the
         jobs' file is bound at its target, and the unit's root links /etc/resolv.conf to it, as no whole /etc brings
-        that link any more (issue #243). The host's kind changed between two starts (a WSL distro told to stop making
-        its link): each root is made anew, with no link left from before. A target that is no plain path: refused
-        before any unit starts."""
+        that link any more (issue #243). The host's kind changed between two starts of one unit name (a WSL distro
+        told to stop making its link, or told to make it again): the root is made anew, with no link left from before
+        and the new one made. Issue #408 item 3: one name for every start, so the starts share a root. The first unit
+        has ended and its copy is gone, but its root is still there and the unit is still loaded (so no prune takes
+        the root): job_fs itself must make it anew. A target that is no plain path: refused before any unit
+        starts."""
         self.write('rec/resolv-target', '/run/x y/resolv.conf\n', 0o644)
         self.refused('/etc/resolv.conf leads to /run/x y/resolv.conf: not a plain file path')
         resolv = os.path.realpath(self.path('resolv.conf'))
         listed = {p: os.readlink(p) for p in job_paths() if os.path.islink(p)}
-        for name, target in (('fleet-vm-t3code-11', '/run/systemd/resolve/stub-resolv.conf'),
-                             ('fleet-vm-t3code-12', '/etc/resolv.conf')):
-            with self.subTest(target):
+        name = self.NAME
+        for n, target in enumerate(('/run/systemd/resolve/stub-resolv.conf', '/etc/resolv.conf',
+                                    '/run/systemd/resolve/stub-resolv.conf')):
+            with self.subTest(n=n, target=target):
                 self.write('rec/resolv-target', target + '\n', 0o644)
+                if n:
+                    # Still loaded (once, as the last start's user: the other slot's user is free), so prune
+                    # keeps its root; its copy gone, so start does not refuse the name.
+                    shutil.rmtree(self.path(f'var/runners/{name}'))
+                    self.write('rec/units', f'fork-fleet-{name}.service loaded failed failed x\n', 0o644)
+                    self.assertTrue(os.path.isdir(self.path(f'run/{name}.root')))
                 self.start(name)
                 args = self.rec_text('systemd-run').splitlines()
                 props = [args[i + 1] for i, a in enumerate(args) if a == '-p']
@@ -4684,6 +4694,26 @@ class AnyRepository(unittest.TestCase):
             got, written = self.run_script(good, ['--with-attempt'])
             self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
             self.assertIn('runners={"plugins":["self-hosted","proj-build"]', written)
+
+
+class TestFiles(unittest.TestCase):
+    def test_no_skip_decorator_on_a_helper(self):
+        """Issue #408 item 6: a unittest skip decorator on a module-level helper (walls_probe had LauncherAsRoot's
+        opposite, "not as root") turns every call of it into a skip, so a root test that calls it never ran, and
+        the class it was meant for (Launcher) lost its guard. Skips go on test classes and test methods only, in
+        every test file of the fork's scripts and kits."""
+        repo = os.path.dirname(os.path.dirname(HERE))
+        files = sorted({*glob.glob(os.path.join(HERE, '*.test.py')),
+                        *glob.glob(os.path.join(repo, 'fork-kit', '**', '*.test.py'), recursive=True)})
+        self.assertIn(os.path.abspath(__file__), files)
+        bad = []
+        for path in files:
+            with open(path, encoding='utf-8') as f:
+                tree = ast.parse(f.read(), path)
+            bad += [f'{os.path.relpath(path, repo)}: {n.name}' for n in tree.body
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and any('skip' in ast.unparse(d) for d in n.decorator_list)]
+        self.assertEqual(bad, [])
 
 
 class OldBugs(unittest.TestCase):
