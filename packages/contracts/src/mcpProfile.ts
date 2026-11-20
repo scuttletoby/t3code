@@ -158,6 +158,38 @@ const readMcpProfileRef = (value: unknown): string =>
       ? ""
       : `(unreadable ${Array.isArray(value) ? "list" : typeof value})`;
 
+/**
+ * `mcpCarriedProfiles`: what this machine does with the MCP profile a linked machine sends with a
+ * task it delegates here. `apply` (the default) cuts the task down to it. `refuse` takes no part in
+ * carrying: a task that carries a profile narrower than `all` is refused here, and this machine
+ * tells linked machines so, so they do not send one. Neither ever gives a task more.
+ */
+export const MCP_CARRIED_PROFILES_APPLY = "apply";
+export const MCP_CARRIED_PROFILES_REFUSE = "refuse";
+export const McpCarriedProfiles = Schema.Literals([
+  MCP_CARRIED_PROFILES_APPLY,
+  MCP_CARRIED_PROFILES_REFUSE,
+]);
+export type McpCarriedProfiles = typeof McpCarriedProfiles.Type;
+
+/**
+ * `mcpCarriedProfiles` as the settings file holds it: `refuse` (any case, outer spaces ignored)
+ * reads as `refuse`, anything else as `apply`, the default. Either value only narrows, so a bad one
+ * widens nothing, and the rest of the file still loads. A save writes only the two values.
+ */
+export const McpCarriedProfilesFromSettingsFile = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    McpCarriedProfiles,
+    SchemaTransformation.transform<McpCarriedProfiles, unknown>({
+      decode: (value) =>
+        typeof value === "string" && value.trim().toLowerCase() === MCP_CARRIED_PROFILES_REFUSE
+          ? MCP_CARRIED_PROFILES_REFUSE
+          : MCP_CARRIED_PROFILES_APPLY,
+      encode: (value) => value,
+    }),
+  ),
+);
+
 /** A profile reference as the settings file holds it; see {@link readMcpProfileRef}. */
 export const McpProfileRef = Schema.Unknown.pipe(
   Schema.decodeTo(
