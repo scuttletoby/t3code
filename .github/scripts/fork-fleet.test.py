@@ -1509,7 +1509,7 @@ def shown(**over):
 
 SHOWN = shown()
 SHOW_ARGS = ('show -p TimeoutStopUSec -p TimeoutAbortUSec -p RuntimeMaxUSec -p RuntimeRandomizedExtraUSec -p KillMode '
-             '-p SendSIGKILL -p FinalKillSignal -p Type -p LoadState -p ActiveState -p ControlGroup --')
+             '-p SendSIGKILL -p FinalKillSignal -p Type -p LoadState -p ActiveState -p ControlGroup --all --')
 # A unit systemd no longer has, as `systemctl show` prints it (systemd 255): the manager's defaults, no Type, no cgroup.
 GONE = shown(LoadState='not-found', ActiveState='inactive', ControlGroup='', Type='', TimeoutStopUSec='infinity',
              RuntimeMaxUSec='infinity')
@@ -1546,25 +1546,34 @@ class Launcher(unittest.TestCase):
                      # kill_unit's look at the unit after a kill (recorded): ActiveState the first line of
                      # $REC/active-state, each look the next while there is one, else inactive; ControlGroup the
                      # first line of $REC/cgroup (the same way), else none; fails when $REC/state-fails exists.
+                     # Without --all an empty property is left out, as some systemd versions do (#667).
                      'show) if [[ $3 == ActiveState ]]; then printf "%s\\n" "$*" >> "$REC/states"; '
+                     '[[ ! -e $REC/systemctl-hangs ]] || exec sleep 60; '
                      '[[ ! -e $REC/state-fails ]] || exit 1; for f in active-state cgroup; do v=; '
                      '[[ ! -e $REC/$f ]] || { v=$(head -n 1 -- "$REC/$f"); (($(wc -l < "$REC/$f") < 2)) || '
                      'sed -i 1d -- "$REC/$f"; }; [[ $f != active-state ]] || echo "ActiveState=${v:-inactive}"; '
-                     '[[ $f != cgroup ]] || echo "ControlGroup=$v"; done; exit 0; fi; '
+                     '[[ $f != cgroup ]] || [[ -z $v && " $* " != *" --all "* ]] || echo "ControlGroup=$v"; '
+                     'done; exit 0; fi; '
                      # start's look at what systemd applies to the unit: $REC/timeouts, else the launcher's own
-                     # (SHOWN); fails when $REC/show-fails exists. Any other show: the unit's user.
+                     # (SHOWN), its empty properties left out without --all; fails when $REC/show-fails exists.
+                     # Any other show: the unit's user.
                      'if [[ $2 == -p ]]; then printf "%s\\n" "$*" >> "$REC/shown"; '
-                     '[[ ! -e $REC/show-fails ]] || exit 1; if [[ -e $REC/timeouts ]]; then cat -- "$REC/timeouts"; '
-                     f'else printf %s {shlex.quote(SHOWN)}; fi; exit 0; fi; '
+                     '[[ ! -e $REC/show-fails ]] || exit 1; { if [[ -e $REC/timeouts ]]; then cat -- "$REC/timeouts"; '
+                     f'else printf %s {shlex.quote(SHOWN)}; fi; }} | if [[ " $* " == *" --all "* ]]; then cat; '
+                     'else grep -v "=$"; fi; exit 0; fi; '
                      'cat -- "$REC/user-${!#}" 2>/dev/null; exit 0 ;; '
                      'stop) printf "%s\\n" "$*" >> "$REC/stopped" ;; '
-                     'kill) printf "%s\\n" "$*" >> "$REC/killed"; [[ ! -e $REC/kill-fails ]] ;; '
+                     # $REC/kill-leaves: the name of a file the kill makes (procs-UID: that user's processes
+                     # stay; pgrep-fails); $REC/systemctl-hangs: kill and kill_unit's show never answer.
+                     'kill) printf "%s\\n" "$*" >> "$REC/killed"; [[ ! -e $REC/systemctl-hangs ]] || exec sleep 60; '
+                     '[[ ! -e $REC/kill-leaves ]] || : > "$REC/$(cat -- "$REC/kill-leaves")"; '
+                     '[[ ! -e $REC/kill-fails ]] ;; '
                      'set-property) printf "%s\\n" "$*" >> "$REC/set-property"; [[ ! -e $REC/set-property-fails ]] ;; '
                      '*) exit 2 ;; esac\n',
         'chown': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/chown"\n',
         # Processes of a runner user: a file $REC/procs-UID; setpriv's kill(-1) ends them unless procs-stay exists.
         'pgrep': '#!/usr/bin/env bash\n[[ $1 == -u ]] || exit 3\nprintf "%s\\n" "$2" >> "$REC/pgrep"\n'
-                 '[[ -e $REC/procs-$2 ]]\n',
+                 '[[ ! -e $REC/pgrep-fails ]] || exit 2\n[[ -e $REC/procs-$2 ]]\n',
         'setpriv': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/setpriv"\n'
                    '[[ -e $REC/procs-stay ]] || rm -f -- "$REC"/procs-*\n',
         # nft list: the table is there when $REC/nft is (the last one applied); nft -f -: applies (records) it.
@@ -1830,7 +1839,7 @@ class Launcher(unittest.TestCase):
                 self.assertEqual(self.rec_text('stopped'), f'stop --no-block -- fork-fleet-{name}.service\n')
                 # Issue #636 item 2: "killed" only once systemd showed it inactive (and, #656, with no cgroup).
                 self.assertEqual(self.rec_text('states'),
-                                 f'show -p ActiveState -p ControlGroup -- fork-fleet-{name}.service\n')
+                                 f'show -p ActiveState -p ControlGroup --all -- fork-fleet-{name}.service\n')
                 self.assertFalse(os.path.exists(self.path(f'run/{name}.env')))
         for i, text in enumerate((two('5min', '5min'), two('300s', '1min 30s'), two('4min 59.5s', '1s'),
                                   two('0h 1min', '500ms 30us'), two('4min 59.999999s', '4min 59s 999ms 999us'),
@@ -1856,7 +1865,7 @@ class Launcher(unittest.TestCase):
         inactive with its cgroup kept still has processes in it (KillMode=process stops only the main one, and systemd
         keeps a cgroup that is not empty): not killed, and a kill that failed says so. State: a unit that dies on the
         third look is killed, and so is one whose cgroup goes on the third look; a unit already gone when the kill
-        failed (no unit to kill) is killed."""
+        failed (no unit to kill) is gone (#667: it said killed)."""
         unit = 'fork-fleet-{}.service'
         cg = '/system.slice/' + unit + '\n'
         for i, (states, cgroups, kill_fails, says, looks) in enumerate((
@@ -1872,7 +1881,7 @@ class Launcher(unittest.TestCase):
                                       '/system.slice/' + unit + '; the kill failed): refused', 10),
                 ('active\n', None, True, 'could not kill it (ActiveState=active; the kill failed)', 10),
                 ('inactive\n', cg * 2 + '\n', False, 'killed and refused', 3),
-                ('inactive\n', None, True, 'killed and refused', 1))):
+                ('inactive\n', None, True, 'gone and refused', 1))):
             name = f'fleet-vm-t3code-{80 + i}'
             with self.subTest(states=states, cgroups=cgroups, kill_fails=kill_fails):
                 for f in ('show-fails', 'units', 'killed', 'stopped', 'states', 'active-state', 'state-fails',
@@ -1892,7 +1901,8 @@ class Launcher(unittest.TestCase):
                 self.assertNotEqual(got.returncode, 0)
                 self.assertIn(f'fork-fleet-{name}.service has TimeoutStopUSec=infinity: endless', got.stderr)
                 self.assertIn(says.replace('{}', name), got.stderr)
-                self.assertEqual(('killed and refused' in got.stderr), looks < 10, got.stderr)
+                self.assertEqual(('could not kill it' not in got.stderr), looks < 10, got.stderr)
+                self.assertEqual(('killed and refused' in got.stderr), looks < 10 and not kill_fails, got.stderr)
                 self.assertEqual(self.rec_text('killed'), f'kill --signal=KILL -- fork-fleet-{name}.service\n')
                 self.assertEqual(len(self.rec_text('states').splitlines()), looks)
 
@@ -1925,19 +1935,19 @@ class Launcher(unittest.TestCase):
         """Issue #656 item 1: a drop-in with another Type= (oneshot; notify with TimeoutStartSec=infinity) keeps
         systemd-run waiting for the start job, and the agent's own limit (100 s) killed the launcher before it read
         the unit, which then ran unchecked (RuntimeMaxSec does not apply to a oneshot). systemd-run now has until
-        START_BY seconds after the launcher began: past it the unit is killed and the start refused, and with no time
-        left (a long lock wait) nothing starts at all. State: the refused start leaves no environment file, its copy is
-        prune's, as a start stopped half-way; any other failure of systemd-run is still its own exit (nothing to
-        kill); a systemd-run that returns in time is checked as before."""
+        START_BY seconds after the launcher began: past it the unit is killed and the start refused, and with too
+        little time left (a long lock wait) nothing starts at all. State: the refused start leaves no environment
+        file, its copy is prune's, as a start stopped half-way; a systemd-run that returns in time is checked as
+        before (test_start_*); one that fails is test_start_kills_the_unit_of_a_systemd_run_that_failed."""
         self.write('bin/systemd-run', '#!/usr/bin/env bash\n'
                    'printf "%s\\n" "$@" > "$REC/systemd-run"\nexec sleep 60\n'.replace('$REC', self.rec), 0o755)
-        launcher = self.launcher_with(START_BY=3)
+        launcher = self.launcher_with(START_BY=3, START_MIN=1)
         got = subprocess.run(['bash', launcher, 'start', self.NAME], input=self.INPUT, env=self.env(),
                              capture_output=True, text=True, timeout=30)   # before: it waited for systemd-run (60 s)
         self.assertNotEqual(got.returncode, 0)
         unit = f'fork-fleet-{self.NAME}.service'
         self.assertRegex(got.stderr, rf'start: {unit} did not start within [1-3]s \(the start still waited: a Type= '
-                                     'that is not exec\?\): a job could run on past its limit; killed and refused')
+                                     r'that is not exec\?\): a job could run on past its limit; killed and refused')
         self.assertEqual(self.rec_text('killed'), f'kill --signal=KILL -- {unit}\n')
         self.assertEqual(self.rec_text('stopped'), f'stop --no-block -- {unit}\n')
         self.assertIsNone(self.rec_text('shown'))   # nothing it could trust to read
@@ -1947,29 +1957,147 @@ class Launcher(unittest.TestCase):
         got = subprocess.run(['bash', self.launcher_with(START_BY=0), 'start', 'fleet-vm-t3code-12'], input=self.INPUT,
                              env=self.env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(got.returncode, 0)
-        self.assertIn('START_BY (0 s) left no time to start and check a unit: refused', got.stderr)
+        self.assertIn('START_BY (0 s) left too little time (under 10 s) to start and check a unit: refused',
+                      got.stderr)
         self.assertIsNone(self.rec_text('systemd-run'))
-        # In time: checked as before (test_start_*); a systemd-run that fails is its own exit, and nothing is killed.
-        self.write('bin/systemd-run', self.FAKES['systemd-run'].replace('$REC', self.rec), 0o755)
-        os.remove(os.path.join(self.rec, 'killed'))
-        os.remove(os.path.join(self.rec, 'stopped'))
-        self.write('rec/systemd-run-exit', '3', 0o644)
-        got = subprocess.run(['bash', self.launcher_with(START_BY=3), 'start', 'fleet-vm-t3code-13'],
+
+    def test_start_kills_a_systemd_run_that_ignores_its_deadline(self):
+        """#667 (lens B minor 4: mutants that stayed green): a systemd-run that ignores SIGTERM is killed 2 s after
+        the deadline (timeout -k 2: without it the launcher waits as long as systemd-run does, past the agent's
+        limit), exits 137, and that is the deadline too (did not start in time), not a failure of its own."""
+        self.write('bin/systemd-run', '#!/usr/bin/env bash\n'
+                   'printf "%s\\n" "$@" > "$REC/systemd-run"\ntrap "" TERM\nexec sleep 60\n'.replace('$REC', self.rec),
+                   0o755)
+        began = time.monotonic()
+        got = subprocess.run(['bash', self.launcher_with(START_BY=3, START_MIN=1), 'start', self.NAME],
                              input=self.INPUT, env=self.env(), capture_output=True, text=True, timeout=30)
-        self.assertEqual(got.returncode, 3, got.stderr)
-        self.assertIsNone(self.rec_text('killed'))
+        self.assertLess(time.monotonic() - began, 20)
+        unit = f'fork-fleet-{self.NAME}.service'
+        self.assertEqual(got.returncode, 1, got.stderr)
+        self.assertRegex(got.stderr, rf'start: {unit} did not start within [1-3]s .*; killed and refused')
+        self.assertEqual(self.rec_text('killed'), f'kill --signal=KILL -- {unit}\n')
+
+    def test_start_never_runs_systemd_run_with_too_little_time(self):
+        """#667 (lens A nit 4, lens B minor 4): with less than START_MIN (10 s) left before START_BY, nothing starts.
+        Never `timeout 0`, which is no deadline at all (a mutant that let wait be 0 stayed green: the old test's
+        SECONDS was 1 or more by then), and never so little time that timeout could stop systemd-run after it asked
+        for the unit but before systemd made it. bash takes SECONDS from its environment, which is how this test
+        puts the launcher 80, 75 or 60 s into its run (the agent's own environment is fixed and has none)."""
+        for i, (secs, starts) in enumerate(((80, False), (75, False), (90, False), (60, True))):
+            with self.subTest(seconds=secs):
+                name = f'fleet-vm-t3code-{140 + i}'
+                with suppress(FileNotFoundError):
+                    os.remove(os.path.join(self.rec, 'systemd-run'))
+                got = subprocess.run(['bash', LAUNCH, 'start', name], input=self.INPUT,
+                                     env={**self.env(), 'SECONDS': str(secs)}, capture_output=True, text=True,
+                                     timeout=60)
+                if starts:
+                    self.assertEqual(got.returncode, 0, got.stderr)
+                    args = self.rec_text('systemd-run').splitlines()
+                    self.assertEqual(args[args.index('--unit') + 1], f'fork-fleet-{name}')
+                    continue
+                self.assertNotEqual(got.returncode, 0)
+                self.assertRegex(got.stderr, rf'start: ({secs}|{secs + 1}|{secs + 2})s in already, START_BY \(80 s\) '
+                                             r'left too little time \(under 10 s\) to start and check a unit: refused')
+                self.assertIsNone(self.rec_text('systemd-run'))
+                self.assertFalse(os.path.exists(self.path(f'run/{name}.env')))
+
+    def test_start_kills_the_unit_of_a_systemd_run_that_failed(self):
+        """#667 (the major of both lenses): systemd-run without --no-block fails whenever the start job does (failed,
+        timeout), after the unit was made and run.sh ran, and a drop-in (KillMode=none with a failing ExecStartPost=)
+        can leave the job running in a failed unit, past RuntimeMaxSec and unchecked. Before, any exit but the
+        deadline's was "its own" and nothing was killed; now it is killed and refused like any other, with
+        systemd-run's own exit when the kill worked. A failed unit whose cgroup stays (KillMode=none: what it started
+        is left in it) is not killed and says so. State: a systemd-run that never made the unit (D-Bus, say) has
+        nothing to kill (the kill fails: no such unit) and nothing left: gone; and the kill can reach no other
+        start's unit (a name that ran already is refused before, test_a_name_that_ran_already_is_refused)."""
+        unit = 'fork-fleet-{}.service'
+        for i, (cgroups, kill_fails, code, says) in enumerate((
+                (None, False, 3, 'killed and refused'),
+                (None, True, 1, 'gone and refused'),
+                ('/system.slice/' + unit + '\n', False, 1,
+                 'could not kill it (ActiveState=failed, but processes left in ControlGroup=/system.slice/' + unit +
+                 '): refused; kill it by hand: systemctl kill --signal=KILL -- ' + unit))):
+            name = f'fleet-vm-t3code-{150 + i}'
+            with self.subTest(cgroups=cgroups, kill_fails=kill_fails):
+                for f in ('killed', 'stopped', 'states', 'cgroup', 'kill-fails', 'shown'):
+                    with suppress(FileNotFoundError):
+                        os.remove(os.path.join(self.rec, f))
+                self.write('rec/systemd-run-exit', str(code), 0o644)
+                self.write('rec/active-state', 'failed\n', 0o644)
+                if cgroups is not None:
+                    self.write('rec/cgroup', cgroups.replace('{}', name), 0o644)
+                if kill_fails:
+                    self.write('rec/kill-fails', '', 0o644)
+                got = self.launch('start', name, stdin=self.INPUT)
+                self.assertIn(f'start: fork-fleet-{name}.service failed to start (its start exited {code}): what '
+                              'it started could run on, unchecked; ' + says.replace('{}', name), got.stderr)
+                self.assertEqual(got.returncode, 1 if cgroups else code, got.stderr)
+                self.assertEqual(self.rec_text('killed'), f'kill --signal=KILL -- fork-fleet-{name}.service\n')
+                self.assertEqual(self.rec_text('stopped'), f'stop --no-block -- fork-fleet-{name}.service\n')
+                self.assertIsNone(self.rec_text('shown'))   # never read as if it ran: it did not start
+                self.assertFalse(os.path.exists(self.path(f'run/{name}.env')))
+        os.remove(os.path.join(self.rec, 'systemd-run-exit'))
+
+    def test_start_says_killed_only_once_the_runner_user_has_no_process(self):
+        """#667 (lens B minor 2): older systemd lets a stopped unit's cgroup go whatever is left in it, so a
+        KillMode=process leftover shows inactive with no ControlGroup. kill_unit also asks pgrep for the runner user's
+        processes (each job has a user of its own, free_user): any left, or a pgrep that fails, is "could not kill
+        it". State: processes that are still there on every look are never killed."""
+        uid = pwd.getpwnam(self.USERS[0]).pw_uid
+        for i, (leaves, says) in enumerate(((f'procs-{uid}', f'no ControlGroup; {self.USERS[0]} has processes left'),
+                                            ('pgrep-fails', 'no ControlGroup; pgrep failed (2)'))):
+            name = f'fleet-vm-t3code-{160 + i}'
+            with self.subTest(leaves):
+                for f in ('killed', 'states', 'kill-leaves', 'pgrep-fails', f'procs-{uid}', 'pgrep', 'units'):
+                    with suppress(FileNotFoundError):
+                        os.remove(os.path.join(self.rec, f))
+                self.write('rec/timeouts', shown(TimeoutStopUSec='infinity'), 0o644)
+                self.write('rec/kill-leaves', leaves, 0o644)
+                got = self.launch('start', name, stdin=self.INPUT)
+                self.assertEqual(got.returncode, 1, got.stderr)
+                self.assertIn(f'could not kill it (ActiveState=inactive, {says}): refused; kill it by hand', got.stderr)
+                self.assertEqual(len(self.rec_text('states').splitlines()), 10)
+                self.assertIn(f'{uid}\n' * 10, self.rec_text('pgrep'))
+        for f in ('kill-leaves', 'pgrep-fails', f'procs-{uid}', 'timeouts'):
+            with suppress(FileNotFoundError):
+                os.remove(os.path.join(self.rec, f))
+
+    def test_start_bounds_each_systemctl_call_of_its_check_and_kill(self):
+        """#667 (both lenses' nit on the time budget): a systemctl that never answers (D-Bus defaults to 25 s a call,
+        and kill_unit makes up to 12) cannot hold start past KILL_BY: each call runs at most CALL_MAX and none past
+        KILL_BY, and a call that runs out fails closed (could not kill it, the kill failed)."""
+        self.write('bin/systemd-run', '#!/usr/bin/env bash\nexec sleep 60\n', 0o755)
+        self.write('rec/systemctl-hangs', '', 0o644)
+        began = time.monotonic()
+        got = subprocess.run(['bash', self.launcher_with(START_BY=3, START_MIN=1, KILL_BY=7, CALL_MAX=2), 'start',
+                              self.NAME], input=self.INPUT, env=self.env(), capture_output=True, text=True, timeout=30)
+        took = time.monotonic() - began
+        os.remove(os.path.join(self.rec, 'systemctl-hangs'))
+        self.assertLess(took, 7 + 4, got.stderr)   # KILL_BY, SECONDS's rounding, the last call and its KILL
+        self.assertEqual(got.returncode, 1, got.stderr)
+        self.assertIn(f'fork-fleet-{self.NAME}.service did not start within', got.stderr)
+        self.assertIn('could not kill it (unreadable; the kill failed): refused', got.stderr)
 
     def test_start_by_is_under_the_agents_start_limit(self):
-        """Issue #656: START_BY leaves the check, kill_unit's looks and the refusal time inside the agent's own limit
-        for `start` (fork-fleet-desk-wire.py's VERBS): at least 15 s."""
+        """Issue #656, #667 (both lenses' nit: the real budget): systemd-run's TERM comes at START_BY and its KILL 2 s
+        later (timeout -k 2), and bash's SECONDS may be up to 1 s behind; then at least 5 s to kill and look before
+        KILL_BY. The last systemctl call may begin just before KILL_BY (1 s, and its KILL 1 s later), and the refusal
+        must still come at least 5 s inside the agent's own limit for `start` (fork-fleet-desk-wire.py's VERBS).
+        START_MIN is never 0 (`timeout 0` is no deadline) and CALL_MAX gives a call time to answer."""
         with open(LAUNCH) as f:
             text = f.read()
-        by = int(re.search(r'^START_BY=(\d+)$', text, re.M).group(1))
-        tries = int(re.search(r'^KILL_TRIES=(\d+)$', text, re.M).group(1))
+        n = {k: int(re.search(rf'^{k}=(\d+)$', text, re.M).group(1))
+             for k in ('START_BY', 'START_MIN', 'KILL_BY', 'CALL_MAX')}
+        self.assertIn('  timeout -k 2 "$wait" "$SYSTEMD_RUN" ', text)
+        self.assertIn('  timeout -k 1 "$t" "$SYSTEMCTL" "$@"\n', text)
         wire = importlib.util.spec_from_file_location('wire656', os.path.join(HERE, 'fork-fleet-desk-wire.py'))
         mod = importlib.util.module_from_spec(wire)
         wire.loader.exec_module(mod)
-        self.assertGreaterEqual(mod.VERBS['start'][2] - by - tries * 0.5, 15)
+        self.assertLessEqual(n['START_BY'] + 2 + 1 + 5, n['KILL_BY'])
+        self.assertGreaterEqual(mod.VERBS['start'][2] - (n['KILL_BY'] + 1 + 1 + 1), 5)
+        self.assertGreaterEqual(n['START_MIN'], 10)
+        self.assertTrue(1 <= n['CALL_MAX'] <= n['KILL_BY'] - n['START_BY'] - 3)
 
     def test_start_stop_max_is_the_walls_own(self):
         """Issue #365 item 1: start's STOP_MAX and the walls' are one number (each refuses what the other would)."""
@@ -2066,6 +2194,37 @@ class Launcher(unittest.TestCase):
         self.write('rec/units', '', 0o644)
         self.assertEqual(self.launch('prune').returncode, 0)
         self.assertFalse(os.path.lexists(root))   # it goes with its unit
+
+    def test_every_folder_of_a_jobs_root_is_open_to_its_user(self):
+        """#667 (shellcheck SC2174): a listed path that is a link here, two folders down (/usr/share/a/b), is made in
+        the unit's root with each folder on the way open to the job (0755), though the launcher runs with umask 077:
+        `mkdir -p -m` sets the last folder's mode only, so the ones above it were root's alone and the job could not
+        reach the link. Any such link of this host's /usr/share does (none there: skipped). Started again over the
+        same root (made anew, #408), the same."""
+        def entries(d):
+            try:
+                return sorted(os.scandir(d), key=lambda e: e.name)
+            except OSError:
+                return []
+        link = next((c.path for a in entries('/usr/share') if a.is_dir(follow_symlinks=False)
+                     for b in entries(a.path) if b.is_dir(follow_symlinks=False)
+                     for c in entries(b.path) if c.is_symlink() and re.fullmatch(r'(/[A-Za-z0-9._@+-]+)+', c.path)),
+                    None)
+        if link is None:
+            self.skipTest('no link two folders down in /usr/share here')
+        self.conf(ALLOW_PATHS=link)
+        root = self.path(f'run/{self.NAME}.root')
+        for n in range(2):
+            with self.subTest(start=n):
+                if n:
+                    shutil.rmtree(self.path(f'var/runners/{self.NAME}'))
+                    self.write('rec/units', f'fork-fleet-{self.NAME}.service loaded failed failed x\n', 0o644)
+                self.start(self.NAME)
+                self.assertEqual(os.readlink(root + link), os.readlink(link))
+                folders = [d for d, dirs, files in os.walk(root)]
+                self.assertIn(os.path.dirname(root + link), folders)
+                self.assertEqual({d: oct(stat.S_IMODE(os.stat(d).st_mode)) for d in folders},
+                                 {d: oct(0o755) for d in folders})
 
     def test_the_jobs_resolv_conf_on_either_kind_of_host(self):
         """Issue #370 item 5 (#360 lens security-b m2): job_fs's two resolv.conf branches, on any host (the fake
@@ -3383,8 +3542,8 @@ class Launcher(unittest.TestCase):
             text = f.read()
         fns = [re.search(rf'^{n}\(\) \{{(?:[^\n]*\}}\n|\n.*?^\}}\n)', text, re.M | re.S).group(0)
                for n in ('shown', 'warn', 'die', 'job_etc')]
-        self.assertIn(self.ETC_THERE, fns[-1])
-        if not before:
+        if not before:   # the text is pinned only here: on main, the behaviour tests fail on what they test
+            self.assertIn(self.ETC_THERE, fns[-1])
             fns[-1] = fns[-1].replace(self.ETC_THERE, '    :\n')
         fake = os.path.join(self.d, 'uname-bin')
         os.makedirs(fake, exist_ok=True)
@@ -4486,9 +4645,13 @@ class LauncherAsRoot(unittest.TestCase):
         # Issue #656 item 1: a Type= other than exec. One that returns at once (simple) is read and refused; one that
         # keeps systemd-run waiting (oneshot: the job waits on its FIFO; RuntimeMaxSec does not apply) is killed at
         # START_BY (a copy with 20 s), before the agent's limit could kill the launcher and leave it unchecked.
-        launcher = Launcher.launcher_with(self, START_BY=20)
+        # #667: a start job that fails (ExecStartPost=/bin/false) makes systemd-run fail after the job ran, and
+        # KillMode=none leaves the job (blocked on its FIFO) running in the failed unit: killed too.
+        launcher = Launcher.launcher_with(self, START_BY=20, START_MIN=5)
         for name, drop, why in (('fleet-vm-t3code-36', 'Type=simple', 'has Type=simple, not exec'),
-                                ('fleet-vm-t3code-37', 'Type=oneshot', 'did not start within ')):
+                                ('fleet-vm-t3code-37', 'Type=oneshot', 'did not start within '),
+                                ('fleet-vm-t3code-38', 'KillMode=none\nExecStartPost=/bin/false',
+                                 'failed to start (its start exited ')):
             unit = f'fork-fleet-{name}.service'
             dropin = f'/run/systemd/system/{unit}.d'
             self.assertFalse(os.path.lexists(dropin))
@@ -4503,6 +4666,7 @@ class LauncherAsRoot(unittest.TestCase):
             self.assertIn(f'{unit} {why}', got.stderr)
             self.assertIn('killed and refused', got.stderr)
             self.assertNotEqual(subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=60).returncode, 0)
+            self.assertEqual(subprocess.run(['pgrep', '-u', ','.join(self.USERS)], timeout=60).returncode, 1, name)
 
 
 def rw_mounts(said):

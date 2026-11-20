@@ -240,7 +240,10 @@ Two more things limit what a job can do:
   entries or a folder that holds one, whatever its name: a bind mount or hard
   link of `/etc/shadow` or `/etc/ssl/private` at `/opt/keys` (or of any other
   folder named `private` under `/etc`), or of `/etc` itself (issues #613,
-  #636). The walls look only at the path jobs see and the folders above it,
+  #636). A link named `private` under `/etc` makes what it leads to secret
+  too (a bind of `/srv/app-keys`, or of a folder inside it, for
+  `/etc/app/private -> /srv/app-keys`), but not the folders above that (a
+  link to `/usr/share` must not refuse all of `/usr`; issue #656). The walls look only at the path jobs see and the folders above it,
   never inside it or inside a secret folder, so three things are not found,
   each of which only root can make: a single file or a sub-folder of a secret
   folder bind-mounted or hard-linked on its own somewhere else (a hard link of
@@ -277,9 +280,13 @@ Two more things limit what a job can do:
   cannot be read, it kills and stops the unit and refuses the start; it says
   "killed" only once systemd shows the unit inactive or failed and no longer
   gives it a cgroup (issue #656: systemd keeps a stopped unit's cgroup while
-  processes are left in it, as a `KillMode=process` leaves them), and
-  otherwise "could not kill it", with whether the kill itself failed and the
-  command to do it by hand. A unit that already ended and was collected
+  processes are left in it, as a `KillMode=process` leaves them), and the
+  runner user it ran as has no process left (older systemd lets the cgroup go
+  even then; each job has a runner user of its own; #667), and otherwise
+  "could not kill it", with whether the kill itself failed and the command to
+  do it by hand ("gone" when there was nothing to kill and nothing is left).
+  It reads with `systemctl show --all`, as some systemd versions leave out an
+  empty property (the `ControlGroup` of a unit that is gone) without it. A unit that already ended and was collected
   (`LoadState=not-found`, `ActiveState=inactive` and no cgroup: systemd no
   longer has it, and `show` prints the manager's defaults) has nothing to
   check; a not-found unit that still runs (its file removed under it) is
@@ -292,10 +299,18 @@ Two more things limit what a job can do:
   limit (100 s) kill the launcher before that read, and the unit run
   unchecked: `systemd-run` must return within `START_BY` (80 s) of the
   launcher's own start (the lock wait counts), or the launcher kills the unit
-  and refuses the start, as above (issue #656). Nothing is checked only when
-  the launcher is killed some other way between `systemd-run` and that read
-  (a person, the OOM killer), which needs such a drop-in as well, so two
-  faults at once; and a
+  and refuses the start, as above (issue #656). With less than `START_MIN`
+  (10 s) left it starts nothing (never `timeout 0`, which is no deadline, nor
+  so little time that `systemd-run` could be stopped after it asked for the
+  unit but before systemd made it). A `systemd-run` that fails is killed the
+  same way (#667): it fails whenever the start job does, after the unit was
+  made and the job ran, and a drop-in (`KillMode=none` with a failing
+  `ExecStartPost=`, say) can leave the job running in a failed unit. Each
+  `systemctl` call of that check and kill is bounded too (at most 5 s, and
+  none past `KILL_BY`, 92 s), so the refusal comes inside the agent's limit;
+  a call that runs out fails, which fails closed. Nothing is checked only
+  when the launcher is killed some other way between `systemd-run` and that
+  read (a person, the OOM killer) while such a drop-in is there; and a
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
   drops it anywhere else. The walls know the launcher they ship with: its

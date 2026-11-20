@@ -26,7 +26,8 @@ PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 # passwd in /var/lib/extrausers; the mail spools have a file per user name; SSSD's cache holds passwd and group, its
 # mc readable by all; the DHCP leases name the LAN's hosts: ISC dhclient's on Debian and RHEL, dhcpcd's, dnsmasq's and
 # NetworkManager's, issue #656). A path of these, of an entry named private under /etc, or a folder of one, at another
-# path (a bind mount or hard link: the same device and inode) is the same (secret_inodes).
+# path (a bind mount or hard link: the same device and inode) is the same (secret_inodes); so is what a link named
+# private under /etc leads to, but not the folders above that (issue #656).
 SECRET_ETC = ('/etc/shadow', '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/etc/sudoers', '/etc/sudoers.d',
               '/etc/ssh', '/etc/ssl/private', '/etc/pki/tls/private', '/etc/pki/CA/private', '/etc/default',
               '/etc/sysconfig', '/etc/environment', '/etc/environment.d', '/etc/profile', '/etc/profile.d',
@@ -179,7 +180,7 @@ JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutA
 # The sha256 of the launcher (fork-fleet-launch.sh) these walls ship with, whose start() gives every job unit its own
 # stop timeouts (launcher_shipped). The kit's one pin: fork-fleet-walls/wsl2 reads it from here (issue #365 item 2).
 # A changed launcher must change it (fork-fleet-walls.test.py checks it against the launcher in the repo).
-LAUNCHER_SHA256 = '8d16728d8e16e5b581708c1b8f7b2b793f553b7ce6598d6d5c5cc698c63e255b'
+LAUNCHER_SHA256 = 'b642e7ff3c7bf5f02d646686250a94908c742b328b55ccf8df3323f8531a9635'
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
 UNIT_BLANKS = ' \t\n\r'
@@ -371,10 +372,14 @@ def secret_inodes():
     entries, holders = {}, {}
     found = [path for pattern in SECRET_ETC + SECRET_ELSEWHERE
              for path in sorted(glob.glob(glob.escape(ROOT) + pattern))]
-    for path in found + private_entries():
+    private, links = private_entries()
+    for path in found + private + links:
         rel = path[len(ROOT):]
         st = stat_or_none(rel)
         if st is None:
+            continue
+        if path in links:   # its target (stat follows the link) is secret, the folders above that target are not
+            entries.setdefault((st.st_dev, st.st_ino), f'{rel}, a link named private (to what it leads to)')
             continue
         entries.setdefault((st.st_dev, st.st_ino), rel)
         folder = rel
@@ -387,16 +392,19 @@ def secret_inodes():
 
 
 def private_entries():
-    """Every folder or file named private under /etc, as paths under ROOT, sorted: [] when there is no /etc. One that
-    cannot be listed: cannot tell (ValueError). No link (issue #656): os.walk lists a link to a folder with the folders,
-    and its target (what stat follows to) is no folder named private; secret_etc refuses the link's own path by name."""
+    """Every folder or file named private under /etc, then every link named private there, as paths under ROOT, each
+    list sorted: ([], []) when there is no /etc. One that cannot be listed: cannot tell (ValueError). A link (issue
+    #656) is not walked into, and secret_inodes counts its target as secret but not the folders above that target
+    (a link to /usr/share must not refuse all of /usr, and one to /srv/app-keys still protects the keys); secret_etc
+    refuses the link's own path by name."""
     def failed(e):
         if not isinstance(e, (FileNotFoundError, NotADirectoryError)):   # gone while walked: nothing there
             raise ValueError(f'cannot list {(e.filename or "?")[len(ROOT):]} ({e.strerror})')
     if not os.path.isdir(ROOT + '/etc'):
-        return []
-    return sorted(os.path.join(top, d) for top, dirs, files in os.walk(ROOT + '/etc', onerror=failed)
-                  for d in dirs + files if d == 'private' and not os.path.islink(os.path.join(top, d)))
+        return [], []
+    named = [os.path.join(top, d) for top, dirs, files in os.walk(ROOT + '/etc', onerror=failed)
+             for d in dirs + files if d == 'private']
+    return sorted(p for p in named if not os.path.islink(p)), sorted(p for p in named if os.path.islink(p))
 
 
 def stat_or_none(path):

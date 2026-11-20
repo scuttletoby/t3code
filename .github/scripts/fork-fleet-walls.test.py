@@ -1582,19 +1582,31 @@ class EveryWallsFile(WallsRunner):
             with self.assertRaisesRegex(ValueError, 'cannot list /etc/locked'):
                 m.secret_inodes()
         m.ROOT = self.root({'usr/': ''})
-        self.assertEqual(m.private_entries(), [])
-        # Issue #656: a file named private under /etc is one too; a link named private is not followed (its target,
-        # here /usr/share, is no secret: the link's own path is, by name, in secret_etc).
-        m.ROOT = self.root({'etc/app/private': 'k\n', 'usr/share/doc/': ''})
-        os.symlink('../../usr/share', os.path.join(m.ROOT, 'etc/private'))
+        self.assertEqual(m.private_entries(), ([], []))
+        # Issue #656: a file named private under /etc is one too. A link named private (#667's lens A, minor 2) makes
+        # what it leads to secret, and what is in that, but not the folders above it: /etc/private -> /usr/share must
+        # not refuse /usr or / (the false refusal of #649's nit), and /etc/b/private -> /srv/app-keys still protects
+        # the keys; the link's own path is secret by name (secret_etc). A dangling one has nothing to protect.
+        m.ROOT = self.root({'etc/app/private': 'k\n', 'usr/share/doc/': '', 'srv/app-keys/sub/key': 'k\n'})
+        os.symlink('../usr/share', os.path.join(m.ROOT, 'etc/private'))
         os.makedirs(os.path.join(m.ROOT, 'etc/b'))
-        os.symlink('/usr/share/doc', os.path.join(m.ROOT, 'etc/b/private'))
-        self.assertEqual(m.private_entries(), [os.path.join(m.ROOT, 'etc/app/private')])
+        os.symlink('../../srv/app-keys', os.path.join(m.ROOT, 'etc/b/private'))
+        os.makedirs(os.path.join(m.ROOT, 'etc/c'))
+        os.symlink('/gone', os.path.join(m.ROOT, 'etc/c/private'))
+        self.assertEqual(m.private_entries(), ([os.path.join(m.ROOT, 'etc/app/private')],
+                                               [os.path.join(m.ROOT, f'etc/{d}private') for d in ('b/', 'c/', '')]))
         inodes = m.secret_inodes()
-        self.assertIsNone(m.same_as_secret('/usr/share/doc', inodes))
-        self.assertIsNone(m.same_as_secret('/usr/share', inodes))
-        self.assertIn('/etc/app/private', m.same_as_secret('/etc/app/private', inodes) or '')
+        for p in ('/usr', '/srv'):
+            self.assertIsNone(m.same_as_secret(p, inodes), p)
+        for p, what in (('/usr/share', '/etc/private, a link named private'),
+                        ('/usr/share/doc', '/etc/private, a link named private'),
+                        ('/srv/app-keys', '/etc/b/private, a link named private'),
+                        ('/srv/app-keys/sub', '/etc/b/private, a link named private'),
+                        ('/etc/app/private', '/etc/app/private')):
+            self.assertIn(what, m.same_as_secret(p, inodes) or '', p)
         self.assertTrue(m.secret_etc('/etc/private') and m.secret_etc('/etc/b/private'))
+        # Runs again: the same answer.
+        self.assertEqual(m.secret_inodes(), inodes)
         # Runs again: the same answer.
         root = root_with([('etc/shadow', 'opt/s')])
         self.assertEqual(self.fake_paths('/opt/s /opt/s', root), self.fake_paths('/opt/s /opt/s', root))
