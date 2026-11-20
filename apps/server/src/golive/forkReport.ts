@@ -242,10 +242,15 @@ function readDatabase(databasePath: string, problems: Array<Problem>): ForkRepor
 
   // A stop between the WAL checks and the read deletes the WAL; SQLite creates an empty -wal (left:
   // removing it could unlink a starting server's WAL) and the read fails. A failed read runs once
-  // more, at once; a stop still tidying can fail that too, so the problem names the live server.
+  // more, at once; a stop still tidying can fail that too, so the problem names the live server,
+  // but only when the WAL or -shm changed meanwhile: one beside a steady server is the file's own.
+  const walFilesBefore = walFilesOf(realPath);
   let read = readOnce(realPath, empty);
   if (read.database.state === "unreadable") read = readOnce(realPath, empty);
-  const server = read.database.state === "unreadable" ? liveServerOf(databasePath) : null;
+  const server =
+    read.database.state === "unreadable" && walFilesOf(realPath) !== walFilesBefore
+      ? liveServerOf(databasePath)
+      : null;
   problems.push(
     ...read.problems.map((problem) =>
       server === null
@@ -257,6 +262,21 @@ function readDatabase(databasePath: string, problems: Array<Problem>): ForkRepor
     ),
   );
   return read.database;
+}
+
+/**
+ * Which `-wal` and `-shm` files are beside the database: a server keeps both, the same files, while
+ * it holds it open, and a stop deletes them. A file made again in their place has a new birth time.
+ */
+function walFilesOf(realPath: string): string {
+  return ["-wal", "-shm"]
+    .map((suffix) => {
+      const stat = lookAt(`${realPath}${suffix}`, false);
+      return typeof stat === "object"
+        ? `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`
+        : String(stat);
+    })
+    .join(" ");
 }
 
 /**
@@ -299,6 +319,17 @@ function v1ToImport(databasePath: string, problems: Array<Problem>): string | nu
       code: "database-unreadable",
       message: `${v1Path} is not a file; a start would try to import it as the V1 database and fail.`,
     });
+    return null;
+  }
+  // A start's import opens it to read it.
+  const unreadable = cannot(
+    v1Path,
+    NodeFS.constants.R_OK,
+    "be read",
+    "a start would try to import it as the V1 database and fail",
+  );
+  if (unreadable !== null) {
+    problems.push({ code: "database-unreadable", message: unreadable });
     return null;
   }
   return v1Path;
@@ -543,6 +574,9 @@ const whereEachFeature = (
 /** The report as the command prints it: indented JSON. */
 export const formatForkReport = (report: ForkReport): string => JSON.stringify(report, null, 2);
 
+/** The folders a start creates in the home itself, beside userdata (`deriveServerPaths`). */
+const HOME_FOLDERS = ["worktrees", "caches"] as const;
+
 /** Why a start could not use this home, or null; a stat error is reported, never thrown. */
 function whyNoHome(
   home: string,
@@ -568,10 +602,31 @@ function whyNoHome(
   }
   // A folder it may not enter hides the database and settings.json; name the folder, not only them.
   // One it may enter but not write fails a start, which writes its lock, logs and database there.
+  // A start also creates worktrees and caches in the home (`ensureServerDirectories`).
+  const toCreate = HOME_FOLDERS.filter((name) => lookAt(NodePath.join(home, name)) === undefined);
   return (
     cannot(stateDir, NodeFS.constants.X_OK, "be entered", "a start would fail") ??
-    cannot(stateDir, NodeFS.constants.W_OK, "be written", "a start would fail")
+    cannot(stateDir, NodeFS.constants.W_OK, "be written", "a start would fail") ??
+    (toCreate.length === 0
+      ? null
+      : cannot(
+          home,
+          NodeFS.constants.W_OK,
+          "be written",
+          `a start could not create ${toCreate.join(" and ")} in it`,
+        ))
   );
+}
+
+/**
+ * `lookAt`, looking once more when the stat found nothing but the path is there now, not as a link:
+ * a first start made it meanwhile, so the home is read as it is now, not reported as a race.
+ */
+function lookAgainIfAppeared(path: string): ReturnType<typeof lookAt> {
+  const first = lookAt(path);
+  if (first !== undefined) return first;
+  const itself = lookAt(path, false);
+  return typeof itself === "object" && !itself.isSymbolicLink() ? lookAt(path) : first;
 }
 
 /** Why `path`, which a stat did not find, is not there: `missing` when nothing is, else why. */
@@ -610,9 +665,14 @@ export function readForkReport(
   const home = NodePath.resolve(baseDir);
   const stateDir = NodePath.join(home, "userdata");
   const problems: Array<Problem> = [];
-  const homeStat = lookAt(home);
+  const homeStat = lookAgainIfAppeared(home);
   const exists = typeof homeStat === "object" && homeStat.isDirectory();
-  const homeProblem = whyNoHome(home, homeStat, exists ? lookAt(stateDir) : null, stateDir);
+  const homeProblem = whyNoHome(
+    home,
+    homeStat,
+    exists ? lookAgainIfAppeared(stateDir) : null,
+    stateDir,
+  );
   if (homeProblem !== null) problems.push({ code: "home-missing", message: homeProblem });
   const databasePath = NodePath.join(stateDir, "statev2.sqlite");
   let database: ForkReport["database"];
