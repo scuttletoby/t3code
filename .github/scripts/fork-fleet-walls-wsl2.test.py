@@ -357,7 +357,7 @@ DEVICES = '    -p RemoveIPC=yes -p PrivateDevices=yes\n'
 RESOLV_BIND = '    -p "BindReadOnlyPaths=$resolv_bind"\n'
 FS_RO = '-p "BindReadOnlyPaths=${ro[*]}")'
 START = ' "${props[@]}" -p "ReadWritePaths=$dir" \\\n'
-RUN = '  "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name"'
+RUN = '  timeout -k 2 "$wait" "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name"'   # issue #656: by START_BY
 FILTER = '    -p "SystemCallFilter=~io_uring_setup:ENOSYS io_uring_enter:ENOSYS io_uring_register:ENOSYS"\n'
 # Changes to the real launcher's sandbox() (old line -> new text) that open a wall, with what its FAIL line says. They
 # were fixture cases while the walls read a launcher on the fake machine; the kit's launcher is not on it.

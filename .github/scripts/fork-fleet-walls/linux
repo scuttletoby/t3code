@@ -24,8 +24,10 @@ PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 # etc_secrets reads what is left. SECRET_ELSEWHERE: the same outside /etc (Debian's /var/backups holds passwd.bak and
 # group.bak, mode 0644; /var/log the login records wtmp, btmp and lastlog and auth.log; libnss-extrausers keeps its
 # passwd in /var/lib/extrausers; the mail spools have a file per user name; SSSD's cache holds passwd and group, its
-# mc readable by all; the DHCP leases name the LAN's hosts). A path of these, of a folder named private under /etc, or
-# a folder of one, at another path (a bind mount or hard link: the same device and inode) is the same (secret_inodes).
+# mc readable by all; the DHCP leases name the LAN's hosts: ISC dhclient's on Debian and RHEL, dhcpcd's, dnsmasq's and
+# NetworkManager's, issue #656). A path of these, of an entry named private under /etc, or a folder of one, at another
+# path (a bind mount or hard link: the same device and inode) is the same (secret_inodes); so is what a link named
+# private under /etc leads to, but not the folders above that (issue #656).
 SECRET_ETC = ('/etc/shadow', '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/etc/sudoers', '/etc/sudoers.d',
               '/etc/ssh', '/etc/ssl/private', '/etc/pki/tls/private', '/etc/pki/CA/private', '/etc/default',
               '/etc/sysconfig', '/etc/environment', '/etc/environment.d', '/etc/profile', '/etc/profile.d',
@@ -38,7 +40,8 @@ SECRET_ETC = ('/etc/shadow', '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/
               '/etc/netrc', '/etc/.git', '/etc/passwd*', '/etc/group*', '/etc/hosts*', '/etc/subuid*', '/etc/subgid*',
               '/etc/networks', '/etc/ethers')
 SECRET_ELSEWHERE = ('/var/backups', '/var/log', '/var/lib/extrausers', '/var/mail', '/var/spool/mail', '/var/lib/sss',
-                    '/var/lib/misc/dnsmasq.leases', '/var/lib/dhcp')
+                    '/var/lib/misc/dnsmasq.leases', '/var/lib/dhcp', '/var/lib/dhclient', '/var/lib/dhcpcd',
+                    '/var/lib/NetworkManager')
 # Those the launcher refuses itself, as its never() writes them (a test reads never()'s patterns and keeps the two
 # sets one, both ways, and runs the launcher on each and on every other entry above): only an older launcher binds
 # one, so the fix is to re-run the installer, whose launcher then names where the line is.
@@ -47,7 +50,8 @@ LAUNCHER_REFUSES = ('/etc', '/etc/passwd', '/etc/group', '/etc/hosts', '/etc/pas
                     '/var/backups', '/var/backups/*', '/var/lib', '/var/lib/extrausers', '/var/lib/extrausers/*',
                     '/var/mail', '/var/mail/*', '/var/spool', '/var/spool/mail', '/var/spool/mail/*', '/var/lib/sss',
                     '/var/lib/sss/*', '/var/lib/misc', '/var/lib/misc/dnsmasq.leases', '/var/lib/dhcp',
-                    '/var/lib/dhcp/*')
+                    '/var/lib/dhcp/*', '/var/lib/dhclient', '/var/lib/dhclient/*', '/var/lib/dhcpcd',
+                    '/var/lib/dhcpcd/*', '/var/lib/NetworkManager', '/var/lib/NetworkManager/*')
 # What a job can still read that may hold a secret (etc_secrets_wall, issue #243 items 5 and 6), besides every file
 # of its /etc view: the host's own programs and settings in /usr/local (LOCAL_TOPS); the packages' units (UNIT_TOPS)
 # and environment files every login or user session reads (ENV_TOPS: systemd's environment.d, fish's vendor_conf.d);
@@ -176,7 +180,7 @@ JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutA
 # The sha256 of the launcher (fork-fleet-launch.sh) these walls ship with, whose start() gives every job unit its own
 # stop timeouts (launcher_shipped). The kit's one pin: fork-fleet-walls/wsl2 reads it from here (issue #365 item 2).
 # A changed launcher must change it (fork-fleet-walls.test.py checks it against the launcher in the repo).
-LAUNCHER_SHA256 = '5dfa2a8d5499e55f510281ccab3f342a38ccdd41bf072be85e2b5addd7413806'
+LAUNCHER_SHA256 = 'b642e7ff3c7bf5f02d646686250a94908c742b328b55ccf8df3323f8531a9635'
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
 UNIT_BLANKS = ' \t\n\r'
@@ -361,17 +365,21 @@ def secret_etc(p):
 
 
 def secret_inodes():
-    """{(device, inode): what} of each SECRET_ETC and SECRET_ELSEWHERE entry this host has and each folder named
+    """{(device, inode): what} of each SECRET_ETC and SECRET_ELSEWHERE entry this host has and each entry named
     private under /etc (secret_etc's own rule, issue #636) ('the secret path'), and of each folder above one ('a folder
     that holds the secret path', '/' too): a bind mount or hard link of one at another path is the same device and
     inode (issue #613 item 7). One that is not there is skipped; one that cannot be read: cannot tell (ValueError)."""
     entries, holders = {}, {}
     found = [path for pattern in SECRET_ETC + SECRET_ELSEWHERE
              for path in sorted(glob.glob(glob.escape(ROOT) + pattern))]
-    for path in found + private_folders():
+    private, links = private_entries()
+    for path in found + private + links:
         rel = path[len(ROOT):]
         st = stat_or_none(rel)
         if st is None:
+            continue
+        if path in links:   # its target (stat follows the link) is secret, the folders above that target are not
+            entries.setdefault((st.st_dev, st.st_ino), f'{rel}, a link named private (to what it leads to)')
             continue
         entries.setdefault((st.st_dev, st.st_ino), rel)
         folder = rel
@@ -383,16 +391,20 @@ def secret_inodes():
     return {**holders, **entries}   # an entry that also holds one is named as the entry
 
 
-def private_folders():
-    """Every folder named private under /etc (links not followed below /etc), as paths under ROOT, sorted: [] when
-    there is no /etc. One that cannot be listed: cannot tell (ValueError)."""
+def private_entries():
+    """Every folder or file named private under /etc, then every link named private there, as paths under ROOT, each
+    list sorted: ([], []) when there is no /etc. One that cannot be listed: cannot tell (ValueError). A link (issue
+    #656) is not walked into, and secret_inodes counts its target as secret but not the folders above that target
+    (a link to /usr/share must not refuse all of /usr, and one to /srv/app-keys still protects the keys); secret_etc
+    refuses the link's own path by name."""
     def failed(e):
         if not isinstance(e, (FileNotFoundError, NotADirectoryError)):   # gone while walked: nothing there
             raise ValueError(f'cannot list {(e.filename or "?")[len(ROOT):]} ({e.strerror})')
     if not os.path.isdir(ROOT + '/etc'):
-        return []
-    return sorted(os.path.join(top, d) for top, dirs, _ in os.walk(ROOT + '/etc', onerror=failed)
-                  for d in dirs if d == 'private')
+        return [], []
+    named = [os.path.join(top, d) for top, dirs, files in os.walk(ROOT + '/etc', onerror=failed)
+             for d in dirs + files if d == 'private']
+    return sorted(p for p in named if not os.path.islink(p)), sorted(p for p in named if os.path.islink(p))
 
 
 def stat_or_none(path):
@@ -452,23 +464,26 @@ def mounts_wall():
         # Issue #636: both ways out when both kinds are there (an older launcher's line and the owner's), not one a run.
         older = [launcher_refuses(dest) or launcher_refuses(real) for dest, real in named]
         if all(older):
-            fix = ('bound by an older launcher, which does not refuse it itself: re-run the installer (its launcher '
-                   'then refuses it and names where the line is)')
-        elif any(older):   # both at once: short, so the line's 400-character cap keeps both ways out
-            fix = 'an older launcher binds some: re-run the installer; take the rest out of ALLOW_PATHS or JOB_PATHS'
+            fix, more = ('bound by an older launcher, which does not refuse it itself: re-run the installer',
+                         'its launcher then refuses it and names where the line is')
+        elif any(older):   # both at once: both ways out
+            fix, more = ('an older launcher binds some: re-run the installer; take the rest out of ALLOW_PATHS or '
+                         'JOB_PATHS', 'the installer\'s own list never has one')
         else:
-            fix = ('take it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names (the installer\'s '
-                   'own list never has one), and allow only the files a build needs')
-        return (f'jobs see {", ".join(secret[:3])}: a path that holds this host\'s secrets or account names, or a '
-                f'folder of one; {fix}')
+            fix, more = ('take it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names',
+                         'the installer\'s own list never has one; allow only the files a build needs')
+        # Issue #656: the way out, short, before the paths, and the rest after them: long paths fill the line's
+        # 400-character cap (main) and cut what comes after them, never the way out.
+        return (f'jobs see a path that holds this host\'s secrets or account names, or a folder of one: {fix}; the '
+                f'paths: {", ".join(secret[:3])} ({more})')
     # Issue #613 item 7: nor one of those at another path (a bind mount, a hard link): the same device and inode.
     inodes = secret_inodes()
     same = sorted({f'{dest} (the same as {what})' for dest, real in but_resolv(view)
                    for what in [same_as_secret(real, inodes)] if what})
     if same:
-        return (f'jobs see {", ".join(same[:3])}: a bind mount or hard link of a path that holds this host\'s secrets '
-                'or account names; take it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names, and '
-                'allow only the files a build needs')
+        return ('jobs see a bind mount or hard link of a path that holds this host\'s secrets or account names: take '
+                f'it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names; the paths: '
+                f'{", ".join(same[:3])} (allow only the files a build needs)')
     for _, real in view:
         point, kind = on_local_disk(table, real)
         if kind not in LOCAL_FS:
