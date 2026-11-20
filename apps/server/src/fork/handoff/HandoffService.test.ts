@@ -16,6 +16,7 @@ import {
   type OrchestrationV2ThreadProjection,
   RunId,
   RuntimeRequestId,
+  type ServerSettings as ServerSettingsValue,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -70,6 +71,8 @@ const threadChanged = (data: OrchestrationV2ThreadProjection) =>
 const harness = (state: {
   data: OrchestrationV2ThreadProjection;
   settings: Partial<HandoffSettings>;
+  /** The thread's project override (over the defaults), or none. */
+  project?: Partial<HandoffSettings> | undefined;
   /** Runs inside the mocked dispatch, after the command is recorded. */
   onDispatch?: (command: OrchestrationV2ServerCommand) => Effect.Effect<void>;
 }) =>
@@ -120,6 +123,14 @@ const harness = (state: {
         getSettings: Effect.sync(() => ({
           ...DEFAULT_SERVER_SETTINGS,
           handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.settings },
+          projectSettingsOverrides:
+            state.project === undefined
+              ? {}
+              : ({
+                  [state.data.thread.projectId]: {
+                    handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.project },
+                  },
+                } as unknown as ServerSettingsValue["projectSettingsOverrides"]),
         })),
       }),
     );
@@ -282,6 +293,71 @@ describe("HandoffService", () => {
       change(state as never);
       state.data = { ...state.data, contextTransfers: [] };
       yield* emit(threadChanged(state.data), "handOffWhenDue", 1);
+      expect(sent).toEqual([]);
+    }),
+  );
+
+  it.effect.each([
+    { server: on, project: { mode: "off" }, sends: 0 },
+    { server: on, project: { mode: "compact" }, sends: 0 },
+    { server: {}, project: on, sends: 1 },
+    // The project's own thread entry wins over its mode, as for the server's.
+    { server: on, project: { mode: "off", threads: { [threadId]: "handoff" } }, sends: 1 },
+    { server: on, project: { mode: "handoff", threads: { [threadId]: "off" } }, sends: 0 },
+  ] as ReadonlyArray<{
+    server: Partial<HandoffSettings>;
+    project: Partial<HandoffSettings>;
+    sends: number;
+  }>)(
+    "a project's own setting decides for its threads, past the size limit (sends $sends)",
+    ({ server, project, sends }) =>
+      Effect.gen(function* () {
+        const state = { data: projection({ usedTokens: 400_000 }), settings: server, project };
+        const { sent, emit, reads } = yield* harness(state);
+        yield* emit(runUpdated(run()), "handOffWhenDue", 1);
+        expect(messages(sent)).toHaveLength(sends);
+        // Off for the thread reads nothing more than its settings.
+        if (sends === 0) expect(reads.count).toBe(0);
+      }),
+  );
+
+  it.effect(
+    "its project switched off while the handoff waits on a busy thread: sends nothing",
+    () =>
+      Effect.gen(function* () {
+        const quiet = projection({ usedTokens: 160_000 });
+        const state = {
+          data: {
+            ...quiet,
+            runtimeRequests: [
+              { id: RuntimeRequestId.make("request-1"), status: "pending" },
+            ] as unknown as OrchestrationV2ThreadProjection["runtimeRequests"],
+          },
+          settings: on,
+          project: undefined as Partial<HandoffSettings> | undefined,
+        };
+        const { sent, emit } = yield* harness(state);
+        yield* emit(runUpdated(run()), "readThread", 1);
+        state.project = { mode: "off" };
+        state.data = quiet;
+        yield* emit(threadChanged(state.data), "handOffWhenDue", 1);
+        expect(sent).toEqual([]);
+      }),
+  );
+
+  it.effect("its project switched off while the idle timer sleeps: sends nothing", () =>
+    Effect.gen(function* () {
+      const state = {
+        data: projection({ usedTokens: 100_000, cacheExpiresInMs: 10 * MINUTE_MS }),
+        settings: on,
+        project: undefined as Partial<HandoffSettings> | undefined,
+      };
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* TestClock.adjust(MINUTE_MS);
+      state.project = { mode: "off" };
+      yield* TestClock.adjust(10 * MINUTE_MS);
+      yield* emit(null, "handOffWhenDue", 1);
       expect(sent).toEqual([]);
     }),
   );

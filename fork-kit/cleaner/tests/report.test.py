@@ -86,7 +86,7 @@ class Classes(Case):
         cf = self.c.config
         sources = [s for _, s in cf.CLASSES]
         self.assertEqual(sorted(s for s in sources if isinstance(s, str)),
-                         ['rule:agent-scratch', 'rule:compress-cold', 'rule:docker', 'rule:tmp', 'rule:worktrees'])
+                         ['rule:agent-scratch', 'rule:compress-cold', 'rule:dedupe', 'rule:docker', 'rule:tmp', 'rule:worktrees'])
         self.assertEqual(sorted(p for s in sources if isinstance(s, tuple) for p in s), sorted(cf.MUST_KEEP))
         self.assertEqual(cf.MUST_KEEP, cf.AGENT_HOMES + cf.T3_DATA)
         # Every rule of the rule list (rules.RULES, which plan() runs) has its class, and every class names a rule.
@@ -107,8 +107,11 @@ class Classes(Case):
         os.chmod(cold, 0o300)
         scratch = self.mkdir('scratch')
         os.chmod(scratch, 0o300)
+        dd = self.mkdir('dd')
+        os.chmod(dd, 0o300)
         cfg = self.repo_cfg(docker={'enabled': True}, tmp={'root': self.tmp, 'patterns': {'job-*': 1}},
                             compressCold={'folders': [{'path': cold, 'days': 7}]},
+                            dedupe={'folders': [{'path': dd, 'days': 7}]},
                             agentScratch={'enabled': True, 'root': scratch})
 
         def dangling():
@@ -600,10 +603,10 @@ MUTATIONS = {
                                      'test_the_next_report_counts_only_what_came_after'),
     'freed: one report at a time': ('report', 'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)', 'pass', Freed,
                                     'test_two_reports_at_once_the_second_waits_its_turn'),
-    'every rule has a class': ('rules', "RULES = {'worktrees': plan_worktrees,", "RULES = {'dedupe': plan_tmp, 'worktrees': plan_worktrees,",
+    'every rule has a class': ('rules', "RULES = {'worktrees': plan_worktrees,", "RULES = {'no-such-rule': plan_tmp, 'worktrees': plan_worktrees,",
                                Classes, 'test_every_rule_and_every_must_keep_path_has_a_class'),
     'a plan names only listed rules': ('rules', 'planner(cfg, facts, out, measure)\n',
-                                       "planner(cfg, facts, out, measure)\n    out.kept.append(Kept('/x', 'dedupe', 'x', 'x'))\n",
+                                       "planner(cfg, facts, out, measure)\n    out.kept.append(Kept('/x', 'no-such-rule', 'x', 'x'))\n",
                                        Classes, 'test_every_rule_a_plan_runs_is_in_the_rule_list'),
     'worktrees: one unreadable does not hide the rest': ("report", "sized.unread.append(f'{path} ({ex})')",
                                                          "sized.problems.append(f'{path} ({ex})')",
