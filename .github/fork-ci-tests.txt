@@ -87,7 +87,7 @@ fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
 fork-kit/golive/tests/copy.test.py ~36s
 fork-kit/golive/tests/gap.test.py ~84s
-fork-kit/golive/tests/install.test.py ~80s
+fork-kit/golive/tests/install.test.py ~168s
 fork-kit/golive/tests/journal.test.py
 fork-kit/golive/tests/rehearse.test.py ~56s
 fork-kit/golive/tests/switch.test.py ~109s
