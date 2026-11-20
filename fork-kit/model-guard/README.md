@@ -61,7 +61,10 @@ Where the effort is read:
   `[{"id": "effort", "value": "high"}]`, under any of the option ids `effort`, `reasoningEffort`,
   `reasoning_effort`, `reasoning`, `thinking_level` (the same list T3's usage pacing gate uses; a test keeps them in
   step), and on a row of another driver than Claude also the row's own `effortOptionIds` (see **Options of other
-  drivers**). Every effort named must be allowed.
+  drivers**). Every effort named must be allowed, and the effort must be named under the id the row's driver reads
+  it from: `effort` on a `claudeAgent` row (T3's Claude driver reads no other, `apps/server/src/claudeModelOptions.ts`),
+  each of the row's `effortOptionIds` on another driver's row. So `{"thinking_level": "high"}` alone is refused for
+  a Claude model: Claude would run its default or inherited effort.
 - **Options are read the way T3 reads them** (`packages/contracts/src/model.ts`, `ProviderOptionSelections`): T3
   trims option ids and text values (JavaScript's `trim`, which the hook copies) and takes the first entry of an id.
   So `{" effort": "max", "effort": "high"}` runs `max`. The hook trims the same way and refuses an id given twice
@@ -72,10 +75,25 @@ Where the effort is read:
   marks it `role: "reasoning"`, `packages/provider-acp/src/server/sessionConfig.ts`), which T3's usage pacing gate
   counts but the hook cannot see; and `t3_thread_launch` keeps option ids T3 does not know. So a T3 pick of a row
   whose driver is not `claudeAgent` may name only the five effort ids above, `ultracode`, and the ids its row lists:
-  `effortOptionIds` (the driver's own reasoning controls, read as efforts, so their values must be in `efforts`) and
-  `otherOptionIds` (options that change neither the model nor its reasoning, such as a mode; passed unchecked, so
-  list only ones you have read). Any other id is refused, and the refusal names the two keys. Claude rows are not
-  touched: T3 checks their options against its own option list.
+  - `effortOptionIds`: the driver's own reasoning controls, read as efforts, so their values must be in `efforts`.
+    A pick must name **each** of them (#618 review): T3's ACP adapter applies only the ids the agent's session
+    exposes, so a pick that says `{"effort": "low"}` and leaves `thought_level` out runs the agent's default, or on
+    `delegate_task` the parent's level (the given options are laid over the parent's). A row with this key must
+    list `efforts`. A driver that reads one of the five shared ids (Codex reads `reasoningEffort`) should list that
+    id here, so a pick must name it and not another shared id the driver ignores.
+  - `otherOptionIds`: options that change neither the model nor its reasoning; passed unchecked, so list only ones
+    you have read. Never list a mode whose choices repeat the reasoning levels (some agents' modes mirror their
+    thought levels, `mirroredModeChoiceSets` in `sessionConfig.ts`): it sets the reasoning as well, so list it in
+    `effortOptionIds`. The policy refuses T3's session mode `_t3/session-mode` here, and any id that contains
+    `model`, `effort`, `reason`, `think`, `thought`, `ultracode`, `provider`, `driver` or `instance` (any case).
+
+  Any other id is refused, and the refusal names the two keys. A `claudeAgent` row takes only the ids T3's Claude
+  driver reads (`effort`, `ultracode`, `contextWindow`, `fastMode`, `thinking`; a test keeps them in step with T3's
+  bundled model list) and the five shared effort ids: a model selection has no driver and T3 runs it on the named
+  instance, so on another driver's instance that offers the same model name an id such as `thought_level` would set
+  the reasoning, unchecked. When one model name is in a Claude row and a row of another driver, a pick with no
+  driver must suit both, which none can if the other row has `effortOptionIds`; use `delegate_task` with
+  `driverKind` for that model.
 - **Ultracode** is checked as what the server runs. The option `ultracode` (only `true` or `false`; any other value
   is refused, since T3 would use the default) runs the model in
   ultracode at effort xhigh, and the old effort value `"ultracode"` means xhigh with the option on (unless the option
@@ -117,15 +135,22 @@ Where the effort is read:
     reports each `false` row whose model now has the option (the effort choice `ultracode` or the option itself),
     has no option list, or is not in the list, and says so when a list cannot be read or none is named. It is a
     report, not a control: the hook keeps passing such picks until the row is fixed, so run the self-check after
-    every T3 update. When in doubt, leave the key out: the default is the safe side.
+    every T3 update. The user T3 runs as, and so its agents, can rewrite T3's cache and hide a stale row from the
+    report; that is acceptable for a report, and the copy of the shipped list (step 2, root's) still shows it. When in doubt, leave the key out: the default is the safe side.
   - **Custom models with no options:** T3 checks no options for a model it has no option list for, so it neither
     drops an inherited `ultracode` nor refuses `ultracode: false`. Do not set `"ultracodeOption": false` for one;
     name `"ultracode": false` in its picks instead.
   - A pick that names `"ultracode": false` passes on a `false` row too, so briefs may keep naming it everywhere.
 
-What v0 does not check: which provider instance or account a T3 call names (`providerInstanceId`, `environmentId`),
-and the model of the session that makes the call. What an `otherOptionIds` option does: the owner vouches for it by
-listing it. Between two self-checks, a T3 model list that changed under an `"ultracodeOption": false` row.
+What v0 does not check:
+- which provider instance or account a T3 call names (`instanceId`, `providerInstanceId`, `environmentId`), and the
+  model of the session that makes the call. So a model only in Claude rows that another driver's instance also
+  offers runs there with that agent's default reasoning: `effort` passes the check, and the agent may ignore it
+  (the guard only keeps such a pick from naming the agent's own reasoning id).
+- whether a row's driver reads the shared effort id a pick names, on a row of another driver without
+  `effortOptionIds`: a driver that ignores `effort` runs its default. List the id it reads in `effortOptionIds`.
+- what an `otherOptionIds` option does: the owner vouches for it by listing it.
+- between two self-checks, a T3 model list that changed under an `"ultracodeOption": false` row.
 
 ### Decisions
 
@@ -221,7 +246,8 @@ listing it. Between two self-checks, a T3 model list that changed under an `"ult
 
 Rules of the file: JSON with no key given twice and no unknown key; lists not empty and without repeats; texts not
 empty. Option ids have no spaces around them (T3 trims them) and are never `ultracode`, and an effort id (one of
-the five or the row's own) is never an `otherOptionIds` id. The file must be owned by root, not writable by group or others, and not a link (the same rules as the
+the five or the row's own) is never an `otherOptionIds` id. `effortOptionIds` needs `efforts`; `otherOptionIds` never
+holds `_t3/session-mode` or an id naming a model or reasoning control (see **Options of other drivers**). The file must be owned by root, not writable by group or others, and not a link (the same rules as the
 machine file), so an agent cannot widen its own policy.
 
 ## Turn it on (owner, as root)
@@ -247,11 +273,14 @@ machine file), so an agent cannot widen its own policy.
    | `t3ModelManifests` | no       | T3's model lists the self-check reads (#600); absolute paths            |
 
    `t3ModelManifests` is needed when the policy has an `"ultracodeOption": false` row (the self-check reports it
-   missing otherwise; mode `off` needs none). Name T3's cached list, `<T3 home>/userdata/model-manifest.json`
-   (T3 keeps it in its state folder and reloads it about every hour; `apps/server/src/provider/ModelManifest.ts`),
-   for each T3 on the machine, and a copy of the list that T3 version ships
-   (`apps/server/src/provider/model-manifest.json`): T3 uses the list it ships while its cache is missing or older,
-   and the self-check reports a row that any named list finds stale. Each must be a plain file, not a link. Only the
+   missing otherwise; mode `off` needs none). Name T3's cached list, `model-manifest.json` in T3's state folder
+   (`userdata/` under T3's home, or `dev/` for a dev T3, `apps/server/src/config.ts`; T3 reloads it about every
+   hour, `apps/server/src/provider/ModelManifest.ts`), for each T3 on the machine, and a copy of the list that T3
+   version ships (`apps/server/src/provider/model-manifest.json`). **Copy the shipped list again after every T3
+   update**: T3 uses the list it ships while its cache is missing, older than that list or fails T3's own stricter
+   schema check (unique model names, each model and profile it names present), and the self-check reads the cache
+   more loosely, so it may read a cache T3 ignores. T3 also ignores errors writing its cache, so the list it runs can
+   be newer than the file. The self-check reports a row that any named list finds stale. Each must be a plain file, not a link. Only the
    self-check reads them; a call's answer never depends on them.
    **Upgrade the kit before adding the key**: an older kit refuses an unknown key, and so every checked call
    (fail closed).
