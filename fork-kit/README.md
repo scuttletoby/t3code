@@ -18,10 +18,11 @@ Every kit follows the same pattern:
 | [cleaner](cleaner/README.md)         | `fork-cleaner`: free disk space by rules (`worktrees` with merged branches, `tmp`, `agent-scratch`, `docker`; `compress-cold` and `dedupe` delete no content) and never what could be needed; daily timer (Linux, systemd) |
 | [desk](desk/README.md)               | A desktop's side of a fork fleet desk pool: runner users, walls, desk agent; one folder (Linux, WSL2)                                                                                                                      |
 | [gh-apps](gh-apps/README.md)         | GitHub App tokens for agents through `gh-as`, without giving agents the keys (Linux)                                                                                                                                       |
-| [golive](golive/README.md)           | Move a T3 boot service to a new build with a cold copy first; core and `check` so far (Linux)                                                                                                                              |
+| [golive](golive/README.md)           | Move a T3 boot service to a new build with a cold copy first, and back; installs from `ci-release` (Linux)                                                                                                                 |
 | [heavy](heavy/README.md)             | `heavy <command>`: run builds and tests in a capped slice, stop what they leave behind (Linux, systemd)                                                                                                                    |
 | [model-guard](model-guard/README.md) | A Claude Code hook that keeps agents' model picks (T3 tools and `Agent`) inside a policy file (Linux)                                                                                                                      |
 | [pc-agents](pc-agents/README.md)     | Run T3's agents on a Windows PC in a walled WSL2 distro, checked before every start (WSL2)                                                                                                                                 |
 
 [common](common/README.md) is code the kits share, copied into each kit's version folder: the loader of the one
-private machine file (`/etc/fork-kit/machine.json`) where the facts of one machine live.
+private machine file (`/etc/fork-kit/machine.json`) where the facts of one machine live, and the installer and
+bootstrap of the cleaner and golive kits.

@@ -392,6 +392,7 @@ class Prs(Files, unittest.TestCase):
         self.assertEqual(argv[-3:], ['--', f'https://github.com/{REPO}.git', 'refs/pull/7/head'])
         self.assertNotIn('secret-token', ' '.join(argv))
         self.assertEqual((env['GIT_CONFIG_KEY_0'], env['GIT_TERMINAL_PROMPT']), ('http.extraheader', '0'))
+        self.assertEqual({k: env[k] for k in G.pr_queue.GIT_ENV}, G.pr_queue.GIT_ENV)   # no system attributes either
         self.assertIn(base64.b64encode(b'x-access-token:secret-token').decode(), env['GIT_CONFIG_VALUE_0'])
         for said in ('', f'{self.H}\trefs/pull/8/head\n', 'abc\trefs/pull/7/head\n'):
             with self.subTest(said=said), unittest.mock.patch.object(G.subprocess, 'run', lambda *a, **k: answer(0, said)):

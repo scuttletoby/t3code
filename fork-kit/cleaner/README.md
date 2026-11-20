@@ -12,19 +12,19 @@ The core, its rules (four that delete, `compress-cold` and `dedupe` that delete 
 to replace still delete on a host, the timer runs in compare mode: it plans, reports and compares what it would
 delete with what they would, and deletes nothing.
 
-| Part         | File                                                    | What it does                                                  |
-| ------------ | ------------------------------------------------------- | ------------------------------------------------------------- |
-| config       | `lib/cleaner/config.py`                                 | reads the `cleaner` section of the machine file               |
-| facts        | `lib/cleaner/facts.py`                                  | reads the process list, systemd units, git, GitHub and Docker |
-| guard        | `lib/cleaner/guard.py`                                  | the hard refusals: asked about every path, twice              |
-| rules        | `lib/cleaner/rules.py`                                  | `worktrees`, `docker`, `tmp`, `agent-scratch`: what and why   |
-| compress     | `lib/cleaner/compress.py`                               | `compress-cold`: cold files replaced by a checked zstd copy   |
-| dedupe       | `lib/cleaner/dedupe.py`                                 | `dedupe`: the same bytes in two files become one hard link    |
-| `plan`,`run` | `lib/cleaner/engine.py`                                 | the two commands, the lock and the log                        |
-| `report`     | `lib/cleaner/report.py`                                 | one line: GB per class, and what runs freed                   |
-| `compare`    | `lib/cleaner/compare.py`                                | its plan next to the dry runs of the tools it replaces        |
-| `daily`      | `lib/cleaner/daily.py`                                  | what the timer runs: compare mode or run mode                 |
-| installer    | `sbin/fork-cleaner-install`, `bootstrap.sh`, `systemd/` | the version folder, the links, the timer                      |
+| Part         | File                                    | What it does                                                  |
+| ------------ | --------------------------------------- | ------------------------------------------------------------- |
+| config       | `lib/cleaner/config.py`                 | reads the `cleaner` section of the machine file               |
+| facts        | `lib/cleaner/facts.py`                  | reads the process list, systemd units, git, GitHub and Docker |
+| guard        | `lib/cleaner/guard.py`                  | the hard refusals: asked about every path, twice              |
+| rules        | `lib/cleaner/rules.py`                  | `worktrees`, `docker`, `tmp`, `agent-scratch`: what and why   |
+| compress     | `lib/cleaner/compress.py`               | `compress-cold`: cold files replaced by a checked zstd copy   |
+| dedupe       | `lib/cleaner/dedupe.py`                 | `dedupe`: the same bytes in two files become one hard link    |
+| `plan`,`run` | `lib/cleaner/engine.py`                 | the two commands, the lock and the log                        |
+| `report`     | `lib/cleaner/report.py`                 | one line: GB per class, and what runs freed                   |
+| `compare`    | `lib/cleaner/compare.py`                | its plan next to the dry runs of the tools it replaces        |
+| `daily`      | `lib/cleaner/daily.py`                  | what the timer runs: compare mode or run mode                 |
+| installer    | `sbin/fork-cleaner-install`, `systemd/` | the version folder, the links, the timer                      |
 
 ## Commands
 
@@ -829,10 +829,11 @@ makes the compare `incomplete` (exit 1, which wins over 3); what it printed stil
 
 ## Install
 
-From a commit of the fork's protected release branch, as root:
+From a commit of the fork's protected release branch, as root, with the bootstrap every kit shares
+(`fork-kit/common/bootstrap.sh`):
 
 ```
-sh bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
+sh fork-kit-bootstrap.sh --kit cleaner --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
 ```
 
 The bootstrap checks the commit is on `ci-release`, downloads exactly that commit and runs
@@ -851,7 +852,14 @@ that is a link is refused, never copied), so a link to a file only root may read
 world-readable copy. A copy of the same release that changed is made again beside it, self-tested, and only then
 swapped in, in one step (`renameat2` exchange; two renames where the filesystem has none): a copy that stops half
 way or fails its self-test leaves the copy in use as it was. The bootstrap passes only `--timer` or `--no-timer`
-on to the installer; any other option is refused.
+on to the installer; any other option is refused. The steps every kit shares are in
+`fork-kit/common/kit_install.py` ([common](../common/README.md#the-installer)).
+
+Update only through the bootstrap, with the newer release commit. An installed `fork-cleaner-install` from
+before the shared installer (`fork-kit/common/kit_install.py`) copies no `common/kit_install.py`, so the installer
+it leaves cannot load: it then refuses and says to run the bootstrap, which makes the copy whole again. The
+self-test now runs the copied installer's `--help` too, so a copy like that is refused from here on. `uninstall`
+refuses while a process or a transient unit runs code from `/usr/local/libexec/fork-cleaner` (a `daily` run).
 
 The installer writes no machine file: the `cleaner` section is the owner's, written by hand.
 
