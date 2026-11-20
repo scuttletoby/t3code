@@ -99,14 +99,14 @@ class Install(unittest.TestCase):
             f.write(data if isinstance(data, str) else json.dumps(data))
         os.chmod(self.path(path), 0o644)
 
-    def turn_on(self, only_managed=True, mode=None, section=None, model_keys=True):
+    def turn_on(self, only_managed=True, mode=None, section=None, model_keys=True, rows=()):
         """What the person who runs the machine does (README "Turn it on"): policy, machine file (naming T3's model
         list, as the example policy has an "ultracodeOption": false row), and the managed settings of their own:
         only managed hooks, and Claude Code's model keys made from the policy."""
         policy = self.path('/etc/fork-kit/model-policy.json')
         with open(os.path.join(KIT, 'model-policy.example.json')) as f:
             data = json.load(f)
-        data = dict(data, mode=mode or data['mode'])
+        data = dict(data, mode=mode or data['mode'], allow=data['allow'] + list(rows))
         self.write('/etc/fork-kit/model-policy.json', data)
         self.write(T3_CACHE, t3_cache())
         section = dict({'policyFile': policy, 't3ModelManifests': [self.path(T3_CACHE)]}, **(section or {}))
@@ -640,6 +640,24 @@ class Install(unittest.TestCase):
         os.unlink(self.path(T3_CACHE))
         self.assertEqual(self.self_check()[0], 0)
 
+    def test_self_check_reports_a_row_with_no_known_effort_id(self):
+        """#629: a row with efforts of a driver whose effort id the guard does not pin, without effortOptionIds:
+        every T3 pick of it is refused, so the self-check names it, the same each run, and not in mode off."""
+        cursor = {'driver': 'cursor', 'model': 'example-cursor-0', 'efforts': ['low']}
+        self.turn_on(rows=[cursor])
+        self.assertEqual(self.install()[0], 0)
+        code, out = self.self_check()
+        self.assertEqual(code, 1)
+        self.assertIn("cursor 'example-cursor-0' lists efforts, but the guard knows no option id", out)
+        self.assertIn('effortOptionIds', out)
+        self.assertEqual((code, out), self.self_check())
+        self.turn_on(rows=[dict(cursor, effortOptionIds=['reasoning'])])   # the id named: clean
+        self.assertEqual(self.self_check()[0], 0)
+        self.turn_on(rows=[{'driver': 'codex', 'model': 'example-codex-0', 'efforts': ['low']}])   # pinned: clean
+        self.assertEqual(self.self_check()[0], 0)
+        self.turn_on(mode='off', rows=[cursor])
+        self.assertEqual(self.self_check()[0], 0)
+
     def test_self_check_reports_no_policy(self):
         self.turn_on()
         self.assertEqual(self.install()[0], 0)
@@ -731,6 +749,9 @@ GUARD_MUTATIONS = {
     # #600
     "T3's model lists are checked": ("        problems += ultracode_option_problems(policy, cfg['t3ModelManifests'])",
                                      '        pass', 'test_self_check_reports_a_stale_ultracode_option_row'),
+    # #629
+    'rows with no known effort id are reported': ('        problems += effort_id_problems(policy)', '        pass',
+                                                  'test_self_check_reports_a_row_with_no_known_effort_id'),
 }
 
 
