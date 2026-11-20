@@ -62,6 +62,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpCarriedProfiles`](#servermcpcarriedprofiles)                     | `"apply"`                   | yes | [#640](https://github.com/scuttletoby/t3code/issues/640) |
 | [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`            | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
