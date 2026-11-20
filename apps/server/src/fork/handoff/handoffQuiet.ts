@@ -31,15 +31,19 @@ export const RELAY_COMPLETION_HOLD_MS = 5_000;
  */
 export const HANDOFF_SETTLE_MS = 2 * RELAY_COMPLETION_HOLD_MS;
 
+/** How often a settle checks the relay's view between events (`handoffRelayView.ts`). */
+export const HANDOFF_SETTLE_CHECK_MS = 1_000;
+
 type QuietMessage = Pick<
   OrchestrationV2ConversationMessage,
   "id" | "runId" | "createdBy" | "creationSource"
 >;
 
 /**
- * A completed first-send handoff run, sent by the server, no message of the person's in it, and
- * requested at least the relay's hold after the person's run finished (so their alert went out).
- * Anything else, a retry included, alerts as the turn's finish.
+ * A completed first-send handoff run, not marked loud (its settle saw the relay show the person's
+ * finish at every check), sent by the server, no message of the person's in it, and requested at
+ * least the relay's hold after the person's run finished (so their alert went out). Anything else,
+ * a retry included, alerts as the turn's finish.
  */
 export function isQuietHandoffRun(
   threadId: ThreadId,
@@ -49,7 +53,7 @@ export function isQuietHandoffRun(
 ): boolean {
   if (run.status !== "completed") return false;
   const handoff = parseHandoffMessageId(threadId, run.userMessageId);
-  if (handoff === null || handoff.retry) return false;
+  if (handoff === null || handoff.retry || handoff.loud) return false;
   const prompt = messages.find((message) => message.id === run.userMessageId);
   if (prompt?.createdBy !== "agent" || prompt.creationSource !== "server") return false;
   if (messages.some((message) => message.runId === run.id && message.createdBy === "user")) {
@@ -75,7 +79,7 @@ const latestRunIsQuietHandoff = Effect.fn("HandoffQuiet.latestRunIsQuietHandoff"
   const run = runs.find((candidate) => candidate.id === latestRunId);
   // Most runs stop here: only a first send's handoff id costs the other reads.
   const handoff = run === undefined ? null : parseHandoffMessageId(thread.id, run.userMessageId);
-  if (run === undefined || handoff === null || handoff.retry) return false;
+  if (run === undefined || handoff === null || handoff.retry || handoff.loud) return false;
   const [prompt, steered, source] = yield* Effect.all([
     projections.getThreadRecords(thread.id, ["messages"], { messageIds: [run.userMessageId] }),
     projections.getThreadRecords(thread.id, ["messages"], {

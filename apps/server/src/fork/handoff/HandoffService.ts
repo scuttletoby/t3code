@@ -1,8 +1,8 @@
 /**
  * Fork: hands a long thread off to a fresh session in the same thread (design 4.4). At each turn end
  * it asks `handoffDecision`, sleeps to the idle window or waits for a busy thread to change, settles
- * (`HANDOFF_SETTLE_MS`), then sends one fresh-context message through `dispatchHandoff`, which drops
- * or cancels a late one.
+ * (`HANDOFF_SETTLE_MS`, watching the relay's view), then sends one fresh-context message through
+ * `dispatchHandoff`, which drops or cancels a late one.
  */
 import {
   CommandId,
@@ -11,10 +11,12 @@ import {
   type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FiberMap from "effect/FiberMap";
 import * as FiberSet from "effect/FiberSet";
 import * as Layer from "effect/Layer";
@@ -26,9 +28,15 @@ import { forkParked } from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
 import { dispatchHandoff, readHandoffRecords } from "./handoffDispatch.ts";
-import { HANDOFF_RETRY_SUFFIX, handoffThreadFacts, parseHandoffMessageId } from "./handoffFacts.ts";
+import {
+  HANDOFF_LOUD_SUFFIX,
+  HANDOFF_RETRY_SUFFIX,
+  handoffThreadFacts,
+  parseHandoffMessageId,
+} from "./handoffFacts.ts";
 import { handoffMessageText } from "./handoffMessage.ts";
-import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
+import { HANDOFF_SETTLE_CHECK_MS, HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
+import { relayShowsFinish } from "./handoffRelayView.ts";
 import { threadHandoffSettings } from "./handoffOwner.ts";
 
 /** Part 3 reads the turn items of this many latest runs; the budget keeps the newest of them. */
@@ -40,6 +48,9 @@ export const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   // One per waiting thread; any event of that thread completes it, so the wait reads again.
   const wakes = new Map<ThreadId, Deferred.Deferred<void>>();
+  // Completed by a request or run change of any thread (a child's request shows on its parent), so
+  // a settle checks the relay's view again at once; replaced each time.
+  let anyRequestOrRun = Deferred.makeUnsafe<void>();
   const withStores = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(
       Effect.provideService(Orchestrator.OrchestratorV2, orchestrator),
@@ -105,8 +116,31 @@ export const make = Effect.gen(function* () {
     function* (threadId: ThreadId, sourceRunId: RunId) {
       let runId = sourceRunId;
       let trigger: HandoffTrigger = "turn-end";
-      // When a read first found the handoff due at a quiet thread; a sleep or a wait clears it.
-      let dueSinceMs: number | undefined;
+      // The settle under way: its fixed-length timer (a monotonic sleep, not wall-clock times) and
+      // whether any check found the relay not showing the finish. Busy work or a sleep ends it.
+      let settle: { readonly timer: Fiber.Fiber<void>; loud: boolean } | undefined;
+      const endSettle = Effect.suspend(() => {
+        const timer = settle?.timer;
+        settle = undefined;
+        return timer === undefined ? Effect.void : Fiber.interrupt(timer);
+      });
+      /** Unsure (a failed read) counts as not shown: the handoff then alerts. */
+      const checkRelayView = Effect.suspend(() =>
+        relayShowsFinish(threadId).pipe(
+          Effect.provideService(Orchestrator.OrchestratorV2, orchestrator),
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterruptsOnly(cause),
+            (cause) =>
+              Effect.logWarning("handoff relay view unread; the handoff run alerts", {
+                threadId,
+                cause: Cause.pretty(cause),
+              }).pipe(Effect.as(false)),
+          ),
+          Effect.map((shown) => {
+            if (!shown && settle !== undefined) settle.loud = true;
+          }),
+        ),
+      );
       while (true) {
         // Set before the read, so a change between the read and the wait is not missed.
         const wake = yield* Deferred.make<void>();
@@ -115,11 +149,11 @@ export const make = Effect.gen(function* () {
         if (read === null) return;
         const latest = handoffThreadFacts(read.records).lastRun;
         // A late update of an earlier run replaced the latest run's timer or wait: take it over, as
-        // upstream's idle compaction does. That run's turn end decides again, with the same ids. A
-        // timer that wakes to a newer run leaves it to that run's own turn end (`newer-run`).
+        // upstream's idle compaction does. That run's turn end decides again, with the same ids, and
+        // settles afresh. A timer that wakes to a newer run leaves it to that run's own turn end.
         if (trigger === "turn-end" && latest?.state === "completed" && latest.id !== runId) {
           runId = latest.id as RunId;
-          dueSinceMs = undefined;
+          yield* endSettle;
           continue;
         }
         const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
@@ -134,8 +168,8 @@ export const make = Effect.gen(function* () {
           idleTokens: read.settings.idleTokens,
           nowMs,
         });
+        if (decision.kind !== "handoff") yield* endSettle;
         if (decision.kind === "skip") return;
-        if (decision.kind !== "handoff") dueSinceMs = undefined;
         if (decision.kind === "sleep") {
           yield* Effect.sleep(Duration.millis(decision.untilMs - nowMs));
           trigger = "idle-timer";
@@ -147,16 +181,48 @@ export const make = Effect.gen(function* () {
           yield* Deferred.await(wake);
           continue;
         }
-        // Settle first: the relay holds a "finished" alert while a run may continue, so a handoff
-        // run that starts in that hold would drop the person's alert for their own turn. After the
-        // settle the alert went out, and the handoff run stays quiet (handoffQuiet.ts).
-        dueSinceMs ??= nowMs;
-        if (nowMs < dueSinceMs + HANDOFF_SETTLE_MS) {
-          yield* Effect.sleep(Duration.millis(dueSinceMs + HANDOFF_SETTLE_MS - nowMs));
+        // Settle first, on upstream's own view: the relay holds a "finished" alert while a run may
+        // continue, longer while a child, a PR watch or a request shows, and a handoff run that
+        // starts in that hold drops the person's alert for their own turn. Only a settle that saw
+        // the finish shown at every check sends a quiet handoff (handoffQuiet.ts); else it alerts.
+        settle ??= {
+          timer: yield* Effect.forkChild(Effect.sleep(Duration.millis(HANDOFF_SETTLE_MS))),
+          loud: false,
+        };
+        yield* checkRelayView;
+        if (settle.timer.pollUnsafe() === undefined) {
+          // Until the settle ends: an event of this thread reads it all again (busy work ends the
+          // settle); any thread's request or run, or a second passing, checks the relay's view.
+          while (true) {
+            const next = yield* Effect.raceFirst(
+              Effect.raceFirst(
+                Fiber.join(settle.timer).pipe(Effect.as("read" as const)),
+                Deferred.await(wake).pipe(Effect.as("read" as const)),
+              ),
+              Effect.raceFirst(
+                Deferred.await(anyRequestOrRun),
+                Effect.sleep(Duration.millis(HANDOFF_SETTLE_CHECK_MS)),
+              ).pipe(Effect.as("check" as const)),
+            );
+            if (next === "read") break;
+            yield* checkRelayView;
+          }
           continue;
         }
         const run = read.records.runs.find((candidate) => candidate.id === runId);
-        if (run !== undefined) yield* send(threadId, run, decision, read);
+        const loud = settle.loud;
+        settle = undefined;
+        if (run !== undefined) {
+          yield* send(
+            threadId,
+            run,
+            {
+              commandId: decision.commandId,
+              messageId: loud ? `${decision.messageId}${HANDOFF_LOUD_SUFFIX}` : decision.messageId,
+            },
+            read,
+          );
+        }
         return;
       }
     },
@@ -245,6 +311,11 @@ export const make = Effect.gen(function* () {
           if (wake !== undefined) {
             wakes.delete(event.threadId);
             yield* Deferred.succeed(wake, undefined);
+          }
+          if (event.type === "runtime-request.updated" || event.type === "run.updated") {
+            const changed = anyRequestOrRun;
+            anyRequestOrRun = Deferred.makeUnsafe<void>();
+            yield* Deferred.succeed(changed, undefined);
           }
           if (event.type !== "run.updated") return;
           const run = event.payload;

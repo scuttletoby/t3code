@@ -1,7 +1,7 @@
 /**
  * Fork: what the phone gets around a handoff. The real handoff service and upstream's real relay
- * (with its 5 s "finished" hold) share one test clock and one thread, wired as server.ts does.
- * The person's turn alerts once; a handoff run after that alert is quiet.
+ * share one test clock and one thread; the relay also sees T3 children, PR watches and monitor
+ * wakes. The person's turn alerts once; a handoff sent while the finish was not shown alerts.
  */
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { describe, expect, it } from "@effect/vitest";
@@ -10,7 +10,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   EventId,
-  type MessageId,
+  MessageId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type OrchestrationV2ServerCommand,
@@ -50,6 +50,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as HandoffService from "./HandoffService.ts";
 import {
   at,
+  awarenessShell,
   handoffMessageId,
   MINUTE_MS,
   NOW_MS,
@@ -57,7 +58,7 @@ import {
   run,
   threadId,
 } from "./handoff.testkit.ts";
-import { HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
+import { HANDOFF_LOUD_SUFFIX, HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
 import { HANDOFF_SETTLE_MS, quietHandoffAwareness } from "./handoffQuiet.ts";
 
 const PublishPayload = Schema.Struct({ state: Schema.NullOr(RelayAgentActivityState) });
@@ -85,39 +86,37 @@ const world = Effect.fnUntraced(function* (usage: {
     updatedAt: at(-MINUTE_MS),
     /** Resolved when the service next reads its settings, at the start of handling an event. */
     serverRead: null as Deferred.Deferred<void> | null,
+    /** Resolved when the service next reads the child's awareness row. */
+    childViewRead: null as Deferred.Deferred<void> | null,
   };
   const latest = () => state.data.runs.reduce((a, b) => (b.ordinal > a.ordinal ? b : a));
-  const shell = (): AgentAwarenessThread => {
-    const last = latest();
-    const request = state.data.runtimeRequests.find((one) => one.status === "pending");
-    return {
-      id: threadId,
-      projectId: base.thread.projectId,
-      title: base.thread.title,
-      lineage: base.thread.lineage,
-      modelSelection: base.thread.modelSelection,
-      creationSource: "web",
-      status: last.status,
-      activityRunStatus: null,
-      latestRunId: last.id,
-      latestRunCompletedAt: last.completedAt,
-      latestRunStopRequested: false,
-      latestRunBackgroundWake: false,
-      activeRunId: last.status === "running" ? last.id : null,
-      pendingRuntimeRequest:
-        request === undefined
-          ? null
-          : { id: request.id, kind: "command", createdAt: state.updatedAt },
-      pendingBackgroundTasks: [],
-      pendingGuestMessageCount: 0,
-      hasActionableProposedPlan: false,
-      settledOverride: null,
-      archivedAt: null,
-      snoozedUntil: null,
-      snoozedAt: null,
+  /** What only the relay sees. `open`: a T3 child below the thread (null none, true asking). */
+  const kid = { open: null as boolean | null, watch: false, child: false, monitorWake: false };
+  const shell = (): AgentAwarenessThread =>
+    awarenessShell(state.data, {
       updatedAt: state.updatedAt,
-    };
-  };
+      // As upstream's shell: an awaited PR watch, a running T3 child's row, a monitor.
+      pendingBackgroundTasks: [
+        ...(kid.watch
+          ? [
+              {
+                taskId: "pull-request-watch:github.com/o/r#1",
+                kind: "monitor" as const,
+                awaited: true as const,
+                description: "Watching pull request #1",
+              },
+            ]
+          : []),
+        ...(kid.child
+          ? [{ taskId: "child-task", kind: "subagent" as const, description: "T3 child" }]
+          : []),
+        ...(kid.monitorWake
+          ? [{ taskId: "monitor-1", kind: "monitor" as const, description: "tail the log" }]
+          : []),
+      ],
+      // The person's run was a monitor's wake; the handoff run is not.
+      latestRunBackgroundWake: kid.monitorWake && latest().id === runId1,
+    });
 
   /** The thread's records; filters are ignored, every reader picks what it needs by id. */
   const projections = {
@@ -173,6 +172,16 @@ const world = Effect.fnUntraced(function* (usage: {
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.fromQueue(events),
           dispatch,
+          // Upstream's own reads, as the relay gets them (without the quiet wrapper).
+          getAgentAwarenessSnapshot: (requested?: ThreadId) =>
+            Effect.gen(function* () {
+              const snapshot = yield* threads.getAgentAwarenessSnapshot(requested);
+              if (requested === childId && state.childViewRead !== null) {
+                yield* Deferred.succeed(state.childViewRead, undefined);
+              }
+              return snapshot;
+            }),
+          listActiveShellIndex: () => Effect.suspend(() => threads.listActiveShellIndex()),
         }),
         Layer.succeed(ProjectionStore.ProjectionStoreV2, projections),
         Layer.mock(ServerSettings.ServerSettingsService)({
@@ -195,13 +204,53 @@ const world = Effect.fnUntraced(function* (usage: {
     [RELAY_ISSUER_SECRET, new TextEncoder().encode("https://relay.example.test")],
     [RELAY_ENVIRONMENT_CREDENTIAL_SECRET, new TextEncoder().encode("credential-1")],
   ]);
+  const childShell = (): AgentAwarenessThread =>
+    ({
+      ...shell(),
+      id: childId,
+      lineage: childLineage,
+      status: "running",
+      activityRunStatus: "running",
+      latestRunId: RunId.make("child-run"),
+      activeRunId: RunId.make("child-run"),
+      pendingRuntimeRequest: kid.open
+        ? {
+            id: RuntimeRequestId.make("child-request"),
+            kind: "command",
+            createdAt: state.updatedAt,
+          }
+        : null,
+    }) as AgentAwarenessThread;
   const threads = {
     getAgentAwarenessSnapshot: (requested?: ThreadId) =>
       Effect.sync(() => ({
         snapshotSequence: 1,
-        threads: requested === undefined || requested === threadId ? [shell()] : [],
+        threads:
+          requested === undefined || requested === threadId
+            ? [shell()]
+            : requested === childId && kid.open !== null
+              ? [childShell()]
+              : [],
       })),
-    listActiveShellIndex: () => Effect.succeed([]),
+    listActiveShellIndex: () =>
+      Effect.sync(() =>
+        kid.open === null
+          ? []
+          : [
+              {
+                id: childId,
+                projectId: base.thread.projectId,
+                lineage: childLineage,
+                settledOverride: null,
+                settledAt: null,
+                pinnedAt: null,
+                pinOrderKey: null,
+                snoozedUntil: null,
+                mayBeLive: true,
+                hasRemoteTasks: false,
+              },
+            ],
+      ),
   } as unknown as ThreadManagement.ThreadManagementService["Service"];
   const phases: Array<string | null> = [];
   const fetch: typeof globalThis.fetch = Object.assign(
@@ -322,7 +371,7 @@ const world = Effect.fnUntraced(function* (usage: {
   const runIds = () => state.data.runs.map((one) => one.id);
   // The person's turn is running.
   yield* relay.publishThread(threadId);
-  return { state, phases, change, wait, endRun, runIds, events, latest, sends };
+  return { state, phases, change, wait, endRun, runIds, events, latest, sends, kid, relay };
 });
 
 const busy = (data: OrchestrationV2ThreadProjection): OrchestrationV2ThreadProjection => ({
@@ -491,6 +540,218 @@ describe("handoff alerts through upstream's relay", () => {
       expect(phases).toEqual(["running", "completed", "running", "failed", "running", "completed"]);
     }),
   );
+
+  it.effect(
+    "relay-visible work that comes and goes inside the settle: the handoff run alerts",
+    () =>
+      Effect.gen(function* () {
+        const { phases, wait, endRun, change, runIds } = yield* world({ usedTokens: 160_000 });
+        yield* wait(MINUTE_MS);
+        yield* endRun(runId1, "completed");
+        yield* wait(2_000);
+        // e.g. a T3 child's approval shown on the parent; T3 children are no handoff blocker
+        yield* change(busy, null);
+        yield* wait(5_000);
+        yield* change((data) => ({ ...data, runtimeRequests: [] }), null);
+        yield* wait(3_000);
+        expect(runIds()).toEqual([runId1, handoffRunId]);
+        yield* wait(MINUTE_MS);
+        yield* endRun(handoffRunId, "completed");
+        yield* wait(5_000);
+        yield* wait(5_000);
+        expect(phases).toContain("completed");
+      }),
+  );
+
+  it.effect.each([3_000, 7_000, 12_000])(
+    `a T3 child's approval answered %d ms after the turn end: "finished" still alerts`,
+    (answerAt) =>
+      Effect.gen(function* () {
+        const { phases, wait, endRun, runIds, kid, relay } = yield* world({ usedTokens: 160_000 });
+        yield* wait(MINUTE_MS - 1_000);
+        kid.open = true; // the T3 child (not a handoff blocker) asks for approval
+        yield* relay.publishThread(childId);
+        yield* wait(1_000);
+        yield* endRun(runId1, "completed"); // the person's turn ends
+        yield* wait(answerAt);
+        kid.open = false; // the person answers the child
+        yield* relay.publishThread(childId);
+        yield* wait(0);
+        yield* wait(15_000 - answerAt);
+        expect(runIds()).toEqual([runId1, handoffRunId]);
+        yield* wait(MINUTE_MS);
+        yield* endRun(handoffRunId, "completed");
+        yield* wait(5_000);
+        yield* wait(5_000);
+        expect(phases).toContain("completed");
+      }),
+  );
+
+  it.effect(
+    'an awaited PR watch across a size handoff: "finished" alerts when the watch ends',
+    () =>
+      Effect.gen(function* () {
+        const { phases, wait, endRun, runIds, kid, relay } = yield* world({ usedTokens: 160_000 });
+        yield* wait(MINUTE_MS - 1_000);
+        kid.watch = true; // the agent watches its PR; checks pending
+        yield* wait(1_000);
+        yield* endRun(runId1, "completed");
+        yield* wait(HANDOFF_SETTLE_MS);
+        expect(runIds()).toEqual([runId1, handoffRunId]);
+        yield* wait(MINUTE_MS);
+        yield* endRun(handoffRunId, "completed");
+        yield* wait(5 * MINUTE_MS);
+        kid.watch = false; // checks done, watch ends
+        yield* relay.publishThread(threadId);
+        yield* wait(5_000);
+        yield* wait(5_000);
+        expect(phases).toContain("completed");
+      }),
+  );
+
+  it.effect(
+    "a T3 child running at the turn end: the handoff goes, loud, and alerts when the child ends",
+    () =>
+      Effect.gen(function* () {
+        const { phases, wait, endRun, runIds, kid, relay, sends } = yield* world({
+          usedTokens: 160_000,
+        });
+        yield* wait(MINUTE_MS - 1_000);
+        kid.child = true; // a T3 child works on; children never block the handoff
+        yield* wait(1_000);
+        yield* endRun(runId1, "completed");
+        yield* wait(HANDOFF_SETTLE_MS);
+        expect(runIds()).toEqual([runId1, handoffRunId]);
+        expect(yield* Queue.take(sends)).toBe(`${handoffMessageId}${HANDOFF_LOUD_SUFFIX}`);
+        yield* wait(MINUTE_MS);
+        yield* endRun(handoffRunId, "completed");
+        yield* wait(5 * MINUTE_MS);
+        kid.child = false;
+        yield* relay.publishThread(threadId);
+        yield* wait(5_000);
+        yield* wait(5_000);
+        // The relay never showed the person's finish; the loud handoff run's end is it.
+        expect(phases).toEqual(["running", "completed"]);
+      }),
+  );
+
+  it.effect("a monitor's wake run at the turn end: the handoff run alerts", () =>
+    Effect.gen(function* () {
+      const { phases, wait, endRun, runIds, kid, sends } = yield* world({ usedTokens: 160_000 });
+      kid.monitorWake = true; // the person's run was a monitor's wake; the monitor runs on
+      yield* wait(MINUTE_MS);
+      yield* endRun(runId1, "completed");
+      yield* wait(HANDOFF_SETTLE_MS);
+      expect(runIds()).toEqual([runId1, handoffRunId]);
+      expect(yield* Queue.take(sends)).toBe(`${handoffMessageId}${HANDOFF_LOUD_SUFFIX}`);
+      yield* wait(MINUTE_MS);
+      yield* endRun(handoffRunId, "completed");
+      yield* wait(5_000);
+      yield* wait(5_000);
+      expect(phases).toEqual(["running", "completed"]);
+    }),
+  );
+
+  it.effect("a T3 child's request opened and answered between two events still makes it loud", () =>
+    Effect.gen(function* () {
+      // Checked on the child's request events too, not only once a second.
+      const { phases, wait, endRun, runIds, kid, relay, sends, events, state } = yield* world({
+        usedTokens: 160_000,
+      });
+      yield* wait(MINUTE_MS);
+      yield* endRun(runId1, "completed");
+      yield* wait(6_500);
+      kid.open = true;
+      const read = yield* Deferred.make<void>();
+      state.childViewRead = read;
+      yield* relay.publishThread(childId);
+      yield* Queue.offer(events, {
+        id: EventId.make("event:child-request"),
+        type: "runtime-request.updated",
+        threadId: childId,
+        occurredAt: yield* DateTime.now,
+        payload: {},
+      } as unknown as OrchestrationV2DomainEvent);
+      yield* Deferred.await(read); // the service checked on the event, not on its next second
+      state.childViewRead = null;
+      kid.open = false;
+      yield* relay.publishThread(childId);
+      yield* wait(HANDOFF_SETTLE_MS);
+      expect(runIds()).toEqual([runId1, handoffRunId]);
+      expect(yield* Queue.take(sends)).toBe(`${handoffMessageId}${HANDOFF_LOUD_SUFFIX}`);
+      yield* wait(MINUTE_MS);
+      yield* endRun(handoffRunId, "completed");
+      yield* wait(5_000);
+      yield* wait(5_000);
+      expect(phases.at(-1)).toBe("completed");
+    }),
+  );
+
+  it.effect("busy work inside the settle starts it over once the work ends", () =>
+    Effect.gen(function* () {
+      const { phases, wait, endRun, change, runIds, sends } = yield* world({ usedTokens: 160_000 });
+      yield* wait(MINUTE_MS);
+      yield* endRun(runId1, "completed");
+      yield* wait(4_000);
+      yield* change(busy, "thread"); // the thread's own request: a blocker, the service waits
+      yield* wait(4_000);
+      yield* change((data) => ({ ...data, runtimeRequests: [] }), "thread");
+      // A settle kept from before the work would send at 10 s, inside the relay's new hold.
+      yield* wait(HANDOFF_SETTLE_MS - 1_000);
+      expect(runIds()).toEqual([runId1]);
+      yield* wait(1_000);
+      expect(runIds()).toEqual([runId1, handoffRunId]);
+      // The new settle saw the finish shown throughout: quiet.
+      expect(yield* Queue.take(sends)).toBe(handoffMessageId);
+      yield* wait(MINUTE_MS);
+      yield* endRun(handoffRunId, "completed");
+      yield* wait(5_000);
+      yield* wait(5_000);
+      // The request inside the relay's hold replaced the held "finished"; it alerts after the work.
+      expect(phases).toEqual(["running", "waiting_for_approval", "completed", "running", null]);
+    }),
+  );
+
+  it.effect("a later turn taken over inside the settle settles afresh", () =>
+    Effect.gen(function* () {
+      const { wait, endRun, change, runIds, sends } = yield* world({ usedTokens: 160_000 });
+      yield* wait(MINUTE_MS);
+      yield* endRun(runId1, "completed");
+      yield* wait(6_000);
+      // A newer turn of the person's, already finished, whose own event comes late: the waiting
+      // service takes it over at its next read.
+      const now = yield* DateTime.now;
+      yield* change(
+        (data) => ({
+          ...data,
+          runs: [
+            ...data.runs,
+            run({
+              id: laterRunId,
+              ordinal: data.runs.length + 1,
+              userMessageId: MessageId.make("message-later"),
+              requestedAt: now,
+              startedAt: now,
+              completedAt: now,
+            }),
+          ],
+        }),
+        "thread",
+      );
+      yield* wait(HANDOFF_SETTLE_MS - 1_000);
+      expect(runIds()).toEqual([runId1, laterRunId]);
+      yield* wait(1_000);
+      expect(runIds()).toEqual([runId1, laterRunId, handoffRunId]);
+      expect(yield* Queue.take(sends)).toBe(`handoff:${threadId}:${laterRunId}`);
+    }),
+  );
 });
 
 const runId1 = RunId.make("run-1");
+const laterRunId = RunId.make("run-later");
+const childId = "child-thread" as ThreadId;
+const childLineage = {
+  rootThreadId: threadId,
+  parentThreadId: threadId,
+  relationshipToParent: "subagent" as const,
+};

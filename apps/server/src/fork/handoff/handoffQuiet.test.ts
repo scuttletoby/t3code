@@ -36,7 +36,7 @@ import {
   runId,
   threadId,
 } from "./handoff.testkit.ts";
-import { HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
+import { HANDOFF_LOUD_SUFFIX, HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
 import {
   HANDOFF_SETTLE_MS,
   isQuietHandoffRun,
@@ -220,6 +220,19 @@ describe("handoff run: no relay alert", () => {
     }).pipe(Effect.provide(testDatabase)),
   );
 
+  it.effect("a handoff sent as one that alerts does alert, after a restart too", () =>
+    Effect.gen(function* () {
+      const loudId = MessageId.make(`${handoffMessageId}${HANDOFF_LOUD_SUFFIX}`);
+      yield* seed({
+        runs: [run(), { ...handoffRun, userMessageId: loudId }],
+        messages: [userMessage, { ...handoffMessage, id: loudId }],
+      });
+      // The mark is in the stored message id: each server reads it fresh.
+      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBe("completed");
+      expect(yield* publishOnce(awarenessThread(handoffRunId))).toBe("completed");
+    }).pipe(Effect.provide(testDatabase)),
+  );
+
   it.effect("the next real turn alerts as before, after a restart too", () =>
     Effect.gen(function* () {
       yield* seed({ runs: [run(), handoffRun], messages: [userMessage, handoffMessage] });
@@ -366,6 +379,13 @@ describe("isQuietHandoffRun", () => {
     // The retry of a failed send: the last alert said it failed.
     const retryId = MessageId.make(`${handoffMessageId}${HANDOFF_RETRY_SUFFIX}`);
     expect(quiet({ userMessageId: retryId }, [{ ...handoffMessage, id: retryId }])).toBe(false);
+    // Sent as one that alerts: the settle did not see the person's finish shown all the way.
+    const loudId = MessageId.make(`${handoffMessageId}${HANDOFF_LOUD_SUFFIX}`);
+    expect(quiet({ userMessageId: loudId }, [{ ...handoffMessage, id: loudId }])).toBe(false);
+    const loudRetryId = MessageId.make(`${loudId}${HANDOFF_RETRY_SUFFIX}`);
+    expect(quiet({ userMessageId: loudRetryId }, [{ ...handoffMessage, id: loudRetryId }])).toBe(
+      false,
+    );
     // An old run without the mark: an ordinary message id.
     expect(quiet({ userMessageId: MessageId.make("message-1") }, [userMessage])).toBe(false);
     // The handoff id, but not sent by the server as an agent.

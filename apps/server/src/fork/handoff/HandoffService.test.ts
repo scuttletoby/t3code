@@ -33,6 +33,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as HandoffService from "./HandoffService.ts";
 import {
   at,
+  awarenessShell,
   handoffMessageId,
   MINUTE_MS,
   modelSelection,
@@ -44,6 +45,7 @@ import {
 } from "./handoff.testkit.ts";
 import { HANDOFF_RULES } from "./handoffMessage.ts";
 import { HANDOFF_SETTLE_MS, RELAY_COMPLETION_HOLD_MS } from "./handoffQuiet.ts";
+import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
 
 const runUpdated = (payload: OrchestrationV2Run): OrchestrationV2DomainEvent => ({
   id: EventId.make(`event:${payload.id}:${payload.status}`),
@@ -76,6 +78,8 @@ const harness = (state: {
   project?: Partial<HandoffSettings> | undefined;
   /** Runs inside the mocked dispatch, after the command is recorded. */
   onDispatch?: (command: OrchestrationV2ServerCommand) => Effect.Effect<void>;
+  /** The relay's view: read as the records show it (default), missing, or failing. */
+  view?: "records" | "missing" | "fails";
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
@@ -106,6 +110,18 @@ const harness = (state: {
     const dependencies = Layer.mergeAll(
       Layer.mock(Orchestrator.OrchestratorV2)({
         streamDomainEvents: Stream.fromQueue(events),
+        // The relay's view: the thread as its records show it, no live children.
+        getAgentAwarenessSnapshot: () =>
+          state.view === "fails"
+            ? Effect.die(new Error("awareness read failed"))
+            : Effect.sync(() => ({
+                snapshotSequence: 1,
+                threads:
+                  state.view === "missing"
+                    ? []
+                    : [awarenessShell(state.data, { updatedAt: state.data.updatedAt })],
+              })),
+        listActiveShellIndex: () => Effect.succeed([]),
         dispatch: (command) =>
           Effect.sync(() => sent.push(command)).pipe(
             Effect.andThen(state.onDispatch?.(command) ?? Effect.void),
@@ -202,6 +218,25 @@ describe("HandoffService", () => {
       expect(message?.text).toContain("Recent conversation:");
       expect(message?.text.endsWith(HANDOFF_RULES)).toBe(true);
     }),
+  );
+
+  it.effect.each(["fails", "missing"] as const)(
+    "a relay view that %s sends the handoff as one that alerts, with the same command id",
+    (view) =>
+      Effect.gen(function* () {
+        const state = { data: projection({ usedTokens: 160_000 }), settings: on, view };
+        const { sent, emit } = yield* harness(state);
+        yield* emit(runUpdated(run()), "readThread", 1);
+        yield* settle;
+        yield* emit(null, "handOffWhenDue", 1);
+        const [message, ...rest] = messages(sent);
+        expect(rest).toEqual([]);
+        // Unsure whether the person's finish was shown: alert. The command id still dedupes.
+        expect(message).toMatchObject({
+          commandId: `server:handoff:${threadId}:${runId}`,
+          messageId: `${handoffMessageId}${HANDOFF_LOUD_SUFFIX}`,
+        });
+      }),
   );
 
   it.effect("without a model setting uses the thread's model and warns there is no effort", () =>
