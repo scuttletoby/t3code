@@ -16,8 +16,51 @@ fork build), with a cold copy of the data first and a way back. It is built in s
 | `back`, `status`  | `lib/golive/back.py`        | the way back (W1-W3); read only: is T3 up and right?         |
 | kept runtime      | `lib/golive/keptruntime.py` | the old build's runtime, kept for W1 (upstream prunes it)    |
 | `switch`, verify  | `lib/golive/switch.py`      | the move itself, verify, the automatic way back, the guard   |
+| installer         | `sbin/t3-golive-install`    | the version folder, the links, the install record            |
 
-The owner's runbook is `docs/fork/go-live.md`. Install from `ci-release` comes later.
+The owner's runbook is `docs/fork/go-live.md`.
+
+## Install
+
+From a commit of the fork's protected release branch, as root, with the bootstrap every kit shares:
+
+```
+curl -fsSL --proto =https https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/fork-kit/common/bootstrap.sh -o fork-kit-bootstrap.sh
+sh fork-kit-bootstrap.sh --kit golive --repo FORK_OWNER/FORK --sha RELEASE_SHA
+```
+
+The bootstrap checks the commit is on `ci-release`, downloads exactly that commit and runs
+`sbin/t3-golive-install install`. That copies `bin/`, `sbin/`, `lib/golive/`, this page and
+`fork-kit/common/{machine_file,kit_install}.py` into `/usr/local/libexec/t3-golive/versions/<sha>/` (root-owned,
+with `MANIFEST.sha256`), imports every module and runs `t3-golive --help` and `t3-golive-install --help` as a
+self-test, switches
+`current` to it and links `/usr/local/bin/t3-golive` and `/usr/local/sbin/t3-golive-install`. It writes
+`/etc/t3-golive/installed.tsv`; `t3-golive-install self-check` reports drift from it. Safe to run again or to stop
+at any step; one installer at a time. The steps are the cleaner's (`fork-kit/common/kit_install.py`, see
+[common](../common/README.md#the-installer)); golive adds these rules:
+
+- **A copy made by hand.** A plain file at `/usr/local/bin/t3-golive` (a copy made before this installer) is kept
+  in `/usr/local/libexec/t3-golive/replaced/t3-golive.<sha256, 16>` (in the install record too) and the kit's link
+  replaces it in one step, so the command is never missing. `uninstall` puts back the copy kept last (by the order
+  in `replaced/order`, not by file times). A link there that is not the kit's, or a folder, is refused and left
+  alone.
+- **A hand install in the kit's own layout.** Where `/usr/local/bin/t3-golive` already is the kit's link
+  (`/usr/local/libexec/t3-golive/current/bin/t3-golive`) and `current` a link into `versions/`, the install takes
+  it over: it switches `current` to the new release and leaves the hand version folder where it was (not in the
+  install record). There is no plain copy to keep, so `uninstall` then removes `t3-golive` entirely, with the hand
+  folder, like any install of the kit.
+- **No uninstall under a run, or while one needs settling.** A golive run, the holder that keeps T3 stopped and
+  the switch guard (and its timer) run the code of the version they started with (its real path), so an install
+  keeps old version folders (installing the same release over a changed copy swaps in the same code). `uninstall`
+  takes `<stateDir>/lock` (the machine file's `golive.stateDir`) and refuses while a run holds it, while the
+  journal's last run needs settling (a killed switch, a failed W1: T3 may be stopped and its home held), and while
+  a process or a transient systemd unit (the holder, a switch guard timer still pending) runs code from
+  `/usr/local/libexec/t3-golive` or through the kit's links. Settle first (`t3-golive status`, then `back` or
+  `settle`). A machine file it cannot read, a journal it cannot trust, and a lock or journal that is not a plain
+  file (the state folder is the T3 user's) refuse too.
+- **Update through the bootstrap.** Run the bootstrap again with the newer release commit.
+
+The installer writes no machine file and nothing in a T3 home; `uninstall` leaves both, and the state folder.
 
 ## `t3-golive check`
 
@@ -342,10 +385,17 @@ start: the new launcher then idled and verify waited for minutes.
   rule of "held on every poll for 100 ms" could not tell frequent probes from the launcher when load stretched the
   polls (#546). For an older build the kit lets go just before the start, as before (its server would meet the
   kit's lock and idle). The kit lets go at its first look (every 20 ms) after the launcher's claim, well inside
-  the 250 ms its server waits for the owner lock (#534). The verify step journals how the lock was let go
-  (`handover`: `launcher`, `timeout`, `start failed`, `before the start ...`), for `launcher` the measured delay
-  (`handoverMs`: at most this many ms from the claim to the let-go; with `handoverLate` when it reached 250 ms, so
-  a server that idled on a very busy host is named), and any marker renewal that failed (`renewFailed`).
+  the 250 ms its server waits for the owner lock (#534). The look is a read of `/proc/locks` and nothing else:
+  the service is read (`systemctl show`, at most 2 s) only until it runs, and its MainPID is kept while that
+  process lives (#550). The 20 s fallback is not harmless: the new server gives up after its 250 ms, its launcher
+  idles, and T3 is down for about a minute (a pending update trial can lose its database backup). So before
+  every stop for a build that takes the serving lock (copy, switch, W1), the kit checks that it sees a lock of its
+  own in `/proc/locks` under its own pid; where it cannot (`/proc/locks` unreadable, a `/proc` of another pid
+  namespace), it could never see the launcher's, and the run refuses with T3 not stopped (#550). The verify step
+  journals how the lock was let go (`handover`: `launcher`, `timeout`, `start failed`, `before the start ...`),
+  for `launcher` the measured delay (`handoverMs`: at most this many ms from the claim to the let-go; with
+  `handoverLate` when it reached 250 ms, so a server that idled on a very busy host is named), and any marker
+  renewal that failed (`renewFailed`).
 - **Root cause, a run that ends with T3 stopped (#530).** A W1 (and a switch) may end, fail or be killed with T3
   stopped on purpose (the home may be half-restored). A lock held by the run's own process would be gone with it,
   and the next SSH launch would start a server on that home. So right after the stop the kit starts a holder, a
@@ -439,6 +489,7 @@ empty state?
 | ... the run is killed with T3 stopped                                               | Nothing renews the marker: it runs out within 60 s. A dead copy holds no lock (its guard starts T3 at once). A W1 or switch that stopped T3 leaves the kit's holder (above): the home stays owned and launches keep waiting until the same `back` (or the switch guard) hands it to T3, `settle` stops it, or the machine reboots. A rerun is refused (`Unfinished`) as for any killed run; a W1's own rerun follows it and takes the holder over                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ... a newer marker (upstream's own update) is there at the end                      | Left alone: the kit removes only the bytes it wrote last (`marker: left: ...` in the verify step)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ... the target build takes no serving lock (an older build)                         | Older than `0.1.10-nightly.20261114.4695`: the kit lets go of the owner lock just before the start, as before; the marker still holds fresh launches                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ... the kit cannot see its own lock in `/proc/locks`                                | The copy, switch or W1 refuses before the stop, T3 not stopped and no marker written: the kit could not tell the new launcher, would keep the owner lock 20 s after the start, and the new server would give up after 250 ms (T3 down about a minute). Builds that take no serving lock are not affected (`tests/gap.test.py`, #550)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ... an SSH client older than 0.1.10, or a server started by hand, takes the home    | Backstop: verify stops within about 10 s and names the server (pid, command) and the remedy. The copy reports T3 did not come back. The switch's W1 refuses too, so nothing is put back: the switch ends failed, says that the target waits for the home unverified, and ends the remedy with `t3-golive back --way w1 --lose-work-since <time>` (`tests/gap.test.py` SwitchBackstop); the kit never stops it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | W1, W2 or W3 while a server the boot service did not start serves the home          | Refused before anything changes (`...; nothing was changed`). Behind a way back that stopped T3 (or with the service disabled) the remedy is: quit the desktop app, `kill <pid>`, the same back again, never start the service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
@@ -782,6 +833,8 @@ python3 -I -B fork-kit/golive/tests/back.test.py       # back W1-W3 and status, 
 python3 -I -B fork-kit/golive/tests/rehearse.test.py   # rehearse R0-R5 with a stub t3 (old and fork build)
 python3 -I -B fork-kit/golive/tests/switch.test.py     # switch, verify, way back, guard on a fake machine
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
+python3 -I -B fork-kit/golive/tests/install.test.py    # the installer: a hand copy, no uninstall under a run
+python3 -I -B fork-kit/common/tests/kit_install.test.py
 python3 -I -B fork-kit/common/tests/machine_file.test.py
 ```
 

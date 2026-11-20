@@ -29,8 +29,8 @@ fork-cleaner daily    what the timer runs: plan, report and compare (cleaner.dai
                       or run and report ("run", refused while a timer in cleaner.daily.oldTimers is on or unknown)
 
 What may go is decided by four rules (worktrees, docker, tmp, agent-scratch) and the "cleaner" section of the machine
-file; a fifth (compress-cold) replaces cold files in the folders it names by a checked zstd copy, and deletes no
-content.
+file; two more delete no content: compress-cold replaces cold files in the folders it names by a checked zstd copy,
+and dedupe turns files with the same bytes in the folders it names into hard links of one of them.
 What must stay is decided by the code and cannot be turned off. Exit code: 0 done, 1 something could not be read or
 deleted (it was kept), 2 wrong command or no usable machine file (nothing was done), 3 (compare and daily only)
 every step worked and the compare found paths only fork-cleaner would delete.'''
@@ -351,12 +351,20 @@ def _execute(cfg, facts, really, say, log):
     for kept in sorted(plan.kept, key=lambda k: (k.rule, k.path)):
         shown = f'docker volume {kept.path}' if kept.rule == 'docker' and kept.path != 'docker' else kept.path
         say(one_line(f'kept {shown} ({kept.rule}: {kept.code}{": " + kept.detail if kept.detail else ""})'))
+    for note in plan.notes:
+        say(one_line(note))
     failed = delete_all(cfg, facts, plan.items, really, out, log, journal)
+    if really:
+        for after in plan.after:
+            problem = after()
+            if problem is not None:
+                out(problem)
 
     refused = [item for item in plan.items if item.done == 'refused']
     done = [item for item in plan.items if item.done == ('deleted' if really else None)]
-    gone = [item for item in done if item.kind != 'compress']
+    gone = [item for item in done if item.kind not in rules.KEEPS_CONTENT]
     packed = [item for item in done if item.kind == 'compress']
+    linked = [item for item in done if item.kind == 'dedupe']
     verb = 'deleted' if really else 'would delete'
     for (rule, kind), group in _groups(done, lambda i: (i.rule, i.kind)):
         words = rules.WORDS.get(kind, ('would delete', 'deleting', 'deleted'))
@@ -375,6 +383,7 @@ def _execute(cfg, facts, really, say, log):
     kept = len(plan.kept) + len(refused)
     out(f'total: {verb} {len(gone)} ({sized(gone)})'
         + (f', {"compressed" if really else "would compress"} {len(packed)} ({_compressed(packed, really)})' if packed else '')
+        + (f', {"linked" if really else "would link"} {len(linked)} ({sized(linked)}{" freed" if really else ""})' if linked else '')
         + f', kept {kept}' + (f', failed {failed}' if really else ''))
 
     unread = unread_journal or any(k.code in ('could not read', 'half deleted') for k in plan.kept)

@@ -51,19 +51,21 @@ def unit_home(unit_text):
 class SystemdUser:
     name = 'systemd (user)'
 
-    def _run(self, argv):
+    def _run(self, argv, timeout=None):
         try:
-            p = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT, stdin=subprocess.DEVNULL)
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout or TIMEOUT,
+                               stdin=subprocess.DEVNULL)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise AdapterError(f'{argv[0]} failed: {e}') from None
         if p.returncode != 0:
             raise AdapterError(f'{" ".join(argv[:4])} exited {p.returncode}: {p.stderr.strip()[:300]}')
         return p.stdout
 
-    def service(self):
-        """{'loaded', 'active', 'enabled', 'mainPid', 'unitPath', 'home'} of the boot service; read only."""
+    def service(self, timeout=None):
+        """{'loaded', 'active', 'enabled', 'mainPid', 'unitPath', 'home'} of the boot service; read only. timeout:
+        seconds systemctl may take (default TIMEOUT; the handover gives it less, handoff.SERVICE_READ_TIMEOUT)."""
         out = self._run([SYSTEMCTL, '--user', 'show', UNIT,
-                         '--property=LoadState,ActiveState,UnitFileState,FragmentPath,MainPID'])
+                         '--property=LoadState,ActiveState,UnitFileState,FragmentPath,MainPID'], timeout)
         props = dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
         unit_path = props.get('FragmentPath') or None
         home = None

@@ -13,6 +13,30 @@ nothing.
 
 ## After ci/v14
 
+### git-clean: the wipe stays in the workspace while another process changes it (#428)
+
+- Going back up by `..` must land in the folder the wipe came from (device and inode): a folder moved out of the
+  workspace while the wipe is inside it is emptied, and the step stops red there instead of emptying where it landed.
+- A read-only folder is made writable without following a symlink swapped in for it (`fchmodat` with
+  `AT_SYMLINK_NOFOLLOW`; on glibc older than 2.32, which refuses that for every path, through an `O_PATH` fd as newer
+  glibc does itself).
+- The workspace is opened from the runner's work folder one name at a time, never through a symlink, so a folder
+  swapped for a symlink after the path checks is refused instead of followed. A work folder (`_work`, above
+  `RUNNER_WORKSPACE`) that is a symlink is refused.
+- A mount point inside the workspace (from `/proc/self/mountinfo`, a bind mount too) refuses the step before anything
+  is removed. A folder on another device met during the walk (a btrfs subvolume, a mount made meanwhile) is not
+  entered: the step fails with its path.
+- Each folder is listed once (a wide folder was re-listed after each child: 6,000 folders took 20 s).
+- weakened-tests: the refusal note no longer says the earlier report was for another head (wrong on a re-run).
+
+**Upgrade:** check each self-hosted runner that uses git-clean before you move the pin. Each of these was emptied
+before and now fails the step on every job until it is fixed:
+
+- a work folder (`_work`) that is a symlink (for example to a bigger disk): configure the runner with the real path
+  (`./config.sh --work <real path>`) or mount the disk there instead;
+- a mount point inside a workspace: unmount it;
+- a btrfs subvolume inside a workspace: remove it once by hand (`btrfs subvolume delete <path>`).
+
 ### pr-queue: a person's auto-merge switch during an update stands (#518)
 
 - The queue reads the pull request right before turning auto-merge off: one that is off by then (or closed) is left
