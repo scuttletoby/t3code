@@ -392,6 +392,32 @@ class Desk(unittest.TestCase):
                 code, _, err = self.install()   # back to the old release for the next stop
                 self.assertEqual(code, 0, err)
 
+    def test_files_a_release_removes_are_gone_before_the_new_pin_goes_in(self):
+        """#579 lenses: a run stopped just before the pin holder's rename has already removed the files the new
+        release drops, so no old walls file is left beside the new pin; the next run ends the swap."""
+        self.assertEqual(self.install()[0], 0)
+        new = self.release('release2', {'.github/scripts/fork-fleet-walls/wsl2': None,
+                                        '.github/scripts/fork-fleet-walls/wsl2.fixture.json': None,
+                                        '.github/scripts/fork-fleet-walls/linux': '#!/bin/sh\n# new\n'})
+        gone = self.path('/opt/fork-fleet/fork-fleet-walls/wsl2')
+        self.assertTrue(os.path.exists(gone))
+        pin, real, seen = self.path('/opt/fork-fleet/' + self.m.PIN_HOLDER), os.replace, []
+
+        def spy(a, b, *k, **kw):
+            if str(b) == pin and '/.kit-stage-' in str(a):
+                seen.append(os.path.exists(gone))
+                raise SystemExit('stopped before the pin')
+            return real(a, b, *k, **kw)
+        with unittest.mock.patch.object(self.m.os, 'replace', spy):
+            self.assertIn('stopped before the pin', str(self.install(sha=SHA2, source=new)[0]))
+        self.assertEqual(seen, [False])
+        self.assertFalse(os.path.exists(gone))
+        code, _, err = self.install(sha=SHA2, source=new)   # runs again: ends the swap
+        self.assertEqual(code, 0, err)
+        self.assertIn('# new', self.read('/opt/fork-fleet/' + self.m.PIN_HOLDER))
+        self.assertFalse(os.path.exists(gone))
+        self.assertEqual(self.m.installed_problems(), [])
+
     def test_project_fleet_config_is_used_and_kept(self):
         project = os.path.join(self.tmp, 'project.json')
         self.write(project, json.dumps({'pools': [{'name': 'desktop'}], 'project': True}))
