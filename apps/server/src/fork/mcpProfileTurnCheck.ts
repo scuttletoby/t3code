@@ -1,7 +1,8 @@
 /**
  * Fork: a turn on a provider outside `MCP_PROFILE_DRIVERS` would get every MCP server and T3 tool,
  * so it refuses at start when its thread's profile is narrower than `all` or cannot be worked out.
- * Checked where the turn runs, so every route to it is covered. Compaction calls no tools: unchecked.
+ * Checked where the turn runs, so every route is covered; so is compaction (a `/compact` prompt on
+ * some providers). A steer joins a turn that was checked as it started.
  */
 import { MCP_PROFILE_ALL, type ProviderDriverKind } from "@t3tools/contracts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -25,6 +26,31 @@ type TurnIds = Pick<
   ProviderAdapter.ProviderAdapterV2TurnInput,
   "appThread" | "threadId" | "runId" | "providerThread"
 >;
+
+/**
+ * `source` with `overrides` in place of those properties, every other one read from `source` at each
+ * access: a spread would freeze a getter (ACP, Pi and OpenCode v2 replace `providerSession` as the
+ * session changes). Over an empty target, so a frozen `source` or a prototype method still works.
+ */
+const withOverrides = <T extends object>(source: T, overrides: Partial<T>): T => {
+  const overridden = (key: PropertyKey): key is keyof T => Object.hasOwn(overrides, key);
+  return new Proxy({} as T, {
+    get: (_, key) => (overridden(key) ? overrides[key] : Reflect.get(source, key, source)),
+    has: (_, key) => overridden(key) || Reflect.has(source, key),
+    ownKeys: () => [...new Set([...Reflect.ownKeys(source), ...Reflect.ownKeys(overrides)])],
+    getOwnPropertyDescriptor: (_, key) => {
+      if (overridden(key)) {
+        return { configurable: true, enumerable: true, writable: false, value: overrides[key] };
+      }
+      const own = Reflect.getOwnPropertyDescriptor(source, key);
+      // Reported configurable: the empty target has no such property to match.
+      return own === undefined ? undefined : { ...own, configurable: true };
+    },
+    getPrototypeOf: () => Reflect.getPrototypeOf(source),
+    set: (_, key, value) => !overridden(key) && Reflect.set(source, key, value, source),
+    deleteProperty: (_, key) => !overridden(key) && Reflect.deleteProperty(source, key),
+  });
+};
 
 /** Whether threads on this driver apply MCP profiles; any other is checked at each turn start. */
 const appliesMcpProfiles = (driver: ProviderDriverKind): boolean => MCP_PROFILE_DRIVERS.has(driver);
@@ -78,22 +104,23 @@ const makeWrap = (profileFor: ProfileFor) => {
     const known = wrapped.get(instance);
     if (known !== undefined) return known;
     const adapter = instance.orchestrationAdapter;
-    const next: ProviderInstance = {
-      ...instance,
-      orchestrationAdapter: {
-        ...adapter,
-        openSession: (input) =>
-          adapter.openSession(input).pipe(
-            Effect.map((runtime): ProviderAdapter.ProviderAdapterV2SessionRuntime => ({
-              ...runtime,
-              startTurn: refuseUnless(instance, runtime.startTurn),
-              ...(runtime.resumeTurn === undefined
-                ? {}
-                : { resumeTurn: refuseUnless(instance, runtime.resumeTurn) }),
-            })),
-          ),
-      },
-    };
+    const checked = (
+      runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+    ): ProviderAdapter.ProviderAdapterV2SessionRuntime =>
+      withOverrides(runtime, {
+        startTurn: refuseUnless(instance, runtime.startTurn),
+        ...(runtime.resumeTurn === undefined
+          ? {}
+          : { resumeTurn: refuseUnless(instance, runtime.resumeTurn) }),
+        ...(runtime.compactThread === undefined
+          ? {}
+          : { compactThread: refuseUnless(instance, runtime.compactThread) }),
+      });
+    const next = withOverrides(instance, {
+      orchestrationAdapter: withOverrides(adapter, {
+        openSession: (input) => adapter.openSession(input).pipe(Effect.map(checked)),
+      }),
+    });
     wrapped.set(instance, next);
     return next;
   };
@@ -119,6 +146,7 @@ export const layer = Layer.effect(
       }),
       listInstances: registry.listInstances.pipe(Effect.map((instances) => instances.map(wrap))),
     });
-    // The real boot test (holdWork.boot.test.ts) reads this span: server.ts wires the check.
+    // The real boot test (holdWork.boot.test.ts) reads these spans: server.ts wires the check, and
+    // the orchestration layer's getInstance calls run inside it.
   }).pipe(Effect.withSpan("McpProfileTurnCheck.make")),
 );

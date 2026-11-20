@@ -60,7 +60,7 @@ const T3_ONLY = { name: "t3-only", servers: [], t3Tools: "all" } as const;
 type Mcp = Partial<
   Pick<
     ServerSettings,
-    "mcpProfile" | "mcpSubagentProfile" | "mcpThreadProfiles" | "mcpCarriedProfiles"
+    "mcpProfile" | "mcpProfiles" | "mcpSubagentProfile" | "mcpThreadProfiles" | "mcpCarriedProfiles"
   >
 > & { readonly projectSettingsOverrides?: Record<string, { readonly mcpProfile?: string }> };
 
@@ -183,9 +183,11 @@ const withCheck = <A, E>(
     ServerSettingsService.ServerSettingsService,
     ServerSettingsError
   > = ServerSettingsService.ServerSettingsService.layerTest(settings as never),
+  /** More instances in the registry, after the three fakes. */
+  extra: ReadonlyArray<ProviderInstance> = [],
 ) => {
   const calls: Calls = [];
-  const raw = [CLAUDE, CODEX, OPENCODE].map((id) => fakeInstance(id, calls));
+  const raw = [...[CLAUDE, CODEX, OPENCODE].map((id) => fakeInstance(id, calls)), ...extra];
   return Effect.gen(function* () {
     const store = yield* ProjectionStore.ProjectionStoreV2;
     for (const thread of stored) {
@@ -277,9 +279,13 @@ describe("mcpProfileTurnCheck", () => {
         assert.match(yield* start(own, CODEX), REFUSED);
         assert.match(yield* start(own, CODEX, "resume"), REFUSED);
         assert.include(yield* start(own, OPENCODE), "opencode (provider instance opencode-work)");
-        // Compaction summarises and calls no tools, so it is not held back.
-        assert.strictEqual(yield* start(own, CODEX, "compact"), "ok");
-        assert.deepStrictEqual(calls, ["start:claudeAgent:switched", "compact:codex:switched"]);
+        // Some providers compact by running a `/compact` prompt: it is held back too.
+        assert.match(yield* start(own, CODEX, "compact"), REFUSED);
+        assert.strictEqual(yield* start(own, CLAUDE, "compact"), "ok");
+        assert.deepStrictEqual(calls, [
+          "start:claudeAgent:switched",
+          "compact:claudeAgent:switched",
+        ]);
       }),
     ),
   );
@@ -290,7 +296,30 @@ describe("mcpProfileTurnCheck", () => {
         const message = yield* start(appThread("own"), CODEX);
         assert.include(message, "so this turn was not started");
         assert.include(message, 'Switch the thread to a Claude instance, or pick "all"');
+        // Retrying cannot help, so upstream's turn-start guidance is not what the user reads.
+        assert.notInclude(message, "Retry");
+        assert.notInclude(message, "server logs");
       }),
+    ),
+  );
+
+  it.effect("every outside server but fewer T3 tools is narrower than all: it refuses", () =>
+    withCheck(
+      {
+        mcpProfiles: { "servers-only": { servers: "all", t3Tools: ["threads"] } },
+        mcpProfile: "servers-only",
+      } as Mcp,
+      [],
+      ({ calls, start }) =>
+        Effect.gen(function* () {
+          const own = appThread("own");
+          assert.include(
+            yield* start(own, CODEX),
+            'MCP profile "servers-only" is narrower than "all", and codex',
+          );
+          assert.strictEqual(yield* start(own, CLAUDE), "ok");
+          assert.deepStrictEqual(calls, ["start:claudeAgent:own"]);
+        }),
     ),
   );
 
@@ -482,4 +511,147 @@ describe("mcpProfileTurnCheck", () => {
       );
     }),
   );
+  /** Session runtimes as providers build them; each reads `providerSession` from `current`. */
+  const SHAPES: ReadonlyArray<
+    readonly [
+      string,
+      (current: () => unknown, calls: Calls) => ProviderAdapter.ProviderAdapterV2SessionRuntime,
+    ]
+  > = [
+    [
+      "an object with a getter and startTurn only",
+      (current, calls) =>
+        ({
+          get providerSession() {
+            return current();
+          },
+          startTurn: () => Effect.sync(() => void calls.push("start")),
+        }) as never,
+    ],
+    [
+      "an object with a getter, resumeTurn and compactThread (ACP, Pi, OpenCode v2)",
+      (current, calls) =>
+        ({
+          get providerSession() {
+            return current();
+          },
+          startTurn: () => Effect.sync(() => void calls.push("start")),
+          resumeTurn: () => Effect.sync(() => void calls.push("resume")),
+          compactThread: () => Effect.sync(() => void calls.push("compact")),
+        }) as never,
+    ],
+    [
+      "a class instance whose getter is on its prototype",
+      (current, calls) => {
+        class Runtime {
+          get providerSession() {
+            return current();
+          }
+          startTurn() {
+            return Effect.sync(() => void calls.push("start"));
+          }
+        }
+        return new Runtime() as never;
+      },
+    ],
+  ];
+
+  const DRIVER_KINDS = ["pi", "opencode", "cursor"] as const;
+
+  describe.each(DRIVER_KINDS)("a wrapped %s session", (driverKind) => {
+    it.effect.each(SHAPES)("%s keeps its live getters and its checks", ([, shape]) =>
+      Effect.gen(function* () {
+        const instanceId = ProviderInstanceId.make(`${driverKind}-live`);
+        const driver = ProviderDriverKind.make(driverKind);
+        let current: { readonly model: string } = { model: "first" };
+        let enabled = true;
+        const sessionCalls: Calls = [];
+        const runtime = shape(() => current, sessionCalls);
+        const instance = {
+          instanceId,
+          driverKind: driver,
+          get enabled() {
+            return enabled;
+          },
+          orchestrationAdapter: {
+            instanceId,
+            driver,
+            openSession: () => Effect.succeed(runtime),
+          },
+        } as unknown as ProviderInstance;
+        const input = { ...turn(ThreadId.make("own"), instanceId), appThread: appThread("own") };
+        const wrappedInstance = Effect.gen(function* () {
+          const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+          const wrapped = (yield* registry.getInstance(instanceId))!;
+          assert.notStrictEqual(wrapped, instance);
+          return wrapped;
+        });
+        const open = wrappedInstance.pipe(
+          Effect.flatMap((wrapped) => wrapped.orchestrationAdapter.openSession({} as never)),
+        );
+        const refused = <E>(run: Effect.Effect<void, E>) =>
+          Effect.exit(run).pipe(Effect.map((exit) => exit._tag === "Failure"));
+
+        // Profile `all`: the turn runs and the session reads as it is now, not as it was opened.
+        yield* withCheck(
+          {},
+          [],
+          () =>
+            Effect.gen(function* () {
+              const session = yield* open;
+              assert.strictEqual(
+                (session.providerSession as never as typeof current).model,
+                "first",
+              );
+              current = { model: "second" };
+              assert.strictEqual(
+                (session.providerSession as never as typeof current).model,
+                "second",
+              );
+              yield* session.startTurn(input);
+              assert.deepStrictEqual(sessionCalls, ["start"]);
+              // The instance's own getters stay live as well.
+              const wrapped = yield* wrappedInstance;
+              enabled = false;
+              assert.isFalse(wrapped.enabled);
+              enabled = true;
+            }).pipe(Effect.scoped),
+          undefined,
+          [instance],
+        );
+
+        // A narrower profile: refused, and still live; a spread copy (upstream's
+        // ProviderSessionManager decorates the runtime with one) keeps the check.
+        current = { model: "first" };
+        yield* withCheck(
+          { mcpProfile: "t3-only" },
+          [],
+          () =>
+            Effect.gen(function* () {
+              const session = yield* open;
+              current = { model: "third" };
+              assert.strictEqual(
+                (session.providerSession as never as typeof current).model,
+                "third",
+              );
+              assert.isTrue(yield* refused(session.startTurn(input)));
+              assert.isTrue(yield* refused({ ...session }.startTurn(input)));
+              if (session.resumeTurn !== undefined) {
+                assert.isTrue(
+                  yield* refused(
+                    session.resumeTurn({ ...input, messageId: input.message.messageId }),
+                  ),
+                );
+              }
+              if (session.compactThread !== undefined) {
+                assert.isTrue(yield* refused(session.compactThread(input)));
+              }
+              assert.deepStrictEqual(sessionCalls, ["start"]);
+            }).pipe(Effect.scoped),
+          undefined,
+          [instance],
+        );
+      }),
+    );
+  });
 });

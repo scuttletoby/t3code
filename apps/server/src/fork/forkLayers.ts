@@ -69,7 +69,8 @@ export const handoffThreadsSkipIdleCompaction = HandoffOwner.layer;
 /**
  * Right below upstream's orchestration layer in server.ts, so every turn reads its adapter from it:
  * upstream's provider instance registry, except that a provider that cannot apply MCP profiles
- * refuses a turn whose profile is narrower than `all` (fork/mcpProfileTurnCheck.ts).
+ * refuses a turn whose profile is narrower than `all` (fork/mcpProfileTurnCheck.ts). The real boot
+ * test (holdWork.boot.test.ts) checks that the orchestration layer's reads go through it.
  */
 export const mcpProfileTurnCheck = McpProfileTurnCheck.layer;
 

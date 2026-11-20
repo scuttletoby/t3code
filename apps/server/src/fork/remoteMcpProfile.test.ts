@@ -171,7 +171,8 @@ const makeHarness = (
   settings: Record<string, unknown>,
   peer: Box,
   capabilities: Capabilities = CLAUDE_THERE,
-  instance = "claude",
+  /** `null`: the call names no instance there. */
+  instance: string | null = "claude",
   driverKind?: string,
 ) =>
   Effect.gen(function* () {
@@ -288,9 +289,10 @@ const makeHarness = (
       ),
     ).pipe(Effect.map(Context.get(RemoteDelegation.RemoteDelegation)));
 
+    const { providerInstanceId: _named, ...unnamed } = input.target;
     const target = {
-      ...input.target,
-      providerInstanceId: ProviderInstanceId.make(instance),
+      ...unnamed,
+      ...(instance === null ? {} : { providerInstanceId: ProviderInstanceId.make(instance) }),
       ...(driverKind === undefined ? {} : { driverKind: ProviderDriverKind.make(driverKind) }),
     };
     return {
@@ -361,7 +363,44 @@ it.effect.each<readonly [string, string, string]>([
 );
 
 it.effect(
-  "a call naming a Claude driver asks the machine's providers once, and carries (#672)",
+  "a call naming a Claude driver and no instance asks the machine's providers once, and carries (#672)",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(T3_ONLY, "carries", CLAUDE_THERE, null, "claudeAgent");
+        yield* harness.delegate;
+        assert.deepStrictEqual(harness.carried(), [
+          { name: "t3-only", servers: [], t3Tools: "all" },
+        ]);
+        // Upstream's instance pick asked; the carry reads the driver it picked by.
+        assert.strictEqual(harness.capabilityAsks(), 1);
+        // Run again: one more ask, not two.
+        yield* harness.delegate;
+        assert.strictEqual(harness.capabilityAsks(), 2);
+      }),
+    ),
+);
+
+it.effect(
+  "a call naming the Codex driver and no instance is refused, before any launch, after one ask (#672)",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(T3_ONLY, "carries", CLAUDE_THERE, null, "codex");
+        const exit = yield* Effect.exit(harness.delegate);
+        assert.include(JSON.stringify(exit), "capability_denied");
+        assert.include(
+          JSON.stringify(exit),
+          "Provider instance codex on box uses driver codex, which does not apply",
+        );
+        assert.strictEqual(harness.capabilityAsks(), 1);
+        assert.deepStrictEqual(harness.launched, []);
+      }),
+    ),
+);
+
+it.effect(
+  "a call naming a Claude driver and a listed Claude instance looks the instance up, and carries",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -376,28 +415,31 @@ it.effect(
         assert.deepStrictEqual(harness.carried(), [
           { name: "t3-only", servers: [], t3Tools: "all" },
         ]);
-        // Upstream's instance pick asked; the carry reads the driver the call named and was checked.
-        assert.strictEqual(harness.capabilityAsks(), 1);
-        // Run again: one more ask, not two.
-        yield* harness.delegate;
+        // Upstream's check and the carry's lookup: a named instance is not taken on trust.
         assert.strictEqual(harness.capabilityAsks(), 2);
       }),
     ),
 );
 
 it.effect(
-  "a call naming the Codex driver is refused, before any launch, after one ask (#672)",
+  "refuses, before any launch, an instance the machine does not list, named with a Claude driver",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const harness = yield* makeHarness(T3_ONLY, "carries", CLAUDE_THERE, "codex", "codex");
+        // Upstream passes a named instance on unchecked when that machine does not list it.
+        const harness = yield* makeHarness(T3_ONLY, "carries", CLAUDE_THERE, "gone", "claudeAgent");
         const exit = yield* Effect.exit(harness.delegate);
+        assert.isTrue(Exit.isFailure(exit));
         assert.include(JSON.stringify(exit), "capability_denied");
         assert.include(
           JSON.stringify(exit),
-          "Provider instance codex on box uses driver codex, which does not apply",
+          "box lists no provider instance gone, so it cannot be told",
         );
-        assert.strictEqual(harness.capabilityAsks(), 1);
+        assert.deepStrictEqual(harness.launched, []);
+        // Run again (the instance may have been added there since): asked again, still refused.
+        const again = yield* Effect.exit(harness.delegate);
+        assert.include(JSON.stringify(again), "capability_denied");
+        assert.strictEqual(harness.capabilityAsks(), 4);
         assert.deepStrictEqual(harness.launched, []);
       }),
     ),

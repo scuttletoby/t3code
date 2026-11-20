@@ -45,10 +45,14 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
   return Effect.fn("RemoteMcpProfile.carry")(function* (
     parent: LineageThread,
     scope: McpInvocationContext.McpThreadInvocationScope,
-    /** With `driverKind`, peer/RemoteDelegation.ts has picked or checked the instance by it there. */
+    /**
+     * With `driverKind` and no `providerInstanceId`, peer/RemoteDelegation.ts picked the instance
+     * there from the instances it lists for that driver.
+     */
     target: {
       readonly environmentId: EnvironmentId;
       readonly driverKind?: ProviderDriverKind | undefined;
+      readonly providerInstanceId?: ProviderInstanceId | undefined;
     },
     /** The provider instance there the launch names: where the task would run. */
     instanceId: ProviderInstanceId,
@@ -100,12 +104,12 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
         message: `${peer.link.label} runs a T3 Code version that does not apply this thread's MCP profile ("${resolved.name}") to a task, so the task was not sent: there it would get every MCP server that machine's own profile allows. Update T3 Code on ${peer.link.label}, or delegate the task on this machine.`,
       });
     }
-    // Only a Claude thread applies a profile there. A named driver was checked against that
-    // machine's list by upstream's resolveRemoteInstance in this call, so it is not asked twice;
-    // without one, the list is asked here for each task. The turn there is checked again as it
-    // starts (fork/mcpProfileTurnCheck.ts).
+    // Only Claude applies a profile there. With no instance named, upstream picked one from that
+    // machine's list by this driver, so the list is not asked twice. A named instance is passed on
+    // even when unlisted, so it is looked up here. Its turn is checked again there as it starts.
+    const pickedByDriver = target.providerInstanceId === undefined ? target.driverKind : undefined;
     const driverKind =
-      target.driverKind ??
+      pickedByDriver ??
       (yield* forwarding.call(scope, RemoteCapabilitiesTool, environmentId, {})).providers.find(
         (provider) => provider.providerInstanceId === instanceId,
       )?.driverKind;
