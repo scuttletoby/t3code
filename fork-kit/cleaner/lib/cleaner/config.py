@@ -231,6 +231,10 @@ COMPRESS_SPEC = {
 FOLDER_SPEC = {
     'path': (str, machine_file.REQUIRED, _path),        # the folder; files at any depth in it are looked at
     'days': (int, machine_file.REQUIRED, _at_least(MIN_COLD_DAYS)),     # days without a change (or a read: compressCold)
+    # On an overlay, bindfs or union filesystem (guard.LAYERED), or below one: the folders behind it (an upper or
+    # lower folder, a bindfs source, and the folders above them) are not shown, so the folder is kept unless this
+    # says its owner has checked that no git folder or KEEP file is there (#624).
+    'layered': (bool, False, None),
 }
 # `dedupe` (dedupe.py, #486): files with the same bytes in these folders, none changed for its folder's `days`,
 # become hard links of one of them. Each folder is a FOLDER_SPEC. Without folders the rule does nothing.
@@ -248,8 +252,9 @@ SOURCE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 # What each key can do. 'keeps more': it can only make the cleaner keep more. 'picks': it names what a rule looks
 # at or turns a rule on; every candidate still passes every refusal. 'floor': a number that cannot go below its
 # floor. 'own file': the cleaner's own log (it must be a new file or the cleaner's, never a must-keep path).
-# 'loosens': it takes a refusal away for what it names. Only `regenerable` does, and only for literal names it
-# lists (never a wildcard and never a credential-looking name). 'compare only': read by `fork-cleaner compare`
+# 'loosens': it takes a refusal away for what it names. `regenerable` does, only for literal names it lists (never
+# a wildcard and never a credential-looking name), and `layered`, only the layered-filesystem refusal for the one
+# folder it is set on (every other check, the markers above it it can see among them, still holds). 'compare only': read by `fork-cleaner compare`
 # alone, which runs another tool's dry run and reads its output; it decides no delete. The compressCold keys pick
 # folders, also in must-keep paths: that rule deletes no content (it keeps every file, as a copy read back and
 # checked before the original goes), and every other refusal still holds there (compress.py).
@@ -263,7 +268,7 @@ KEY_KINDS = {
     'daily.keepDays': 'floor', 'daily.compare': 'compare only', 'compare.name': 'compare only',
     'compare.command': 'compare only', 'compare.pattern': 'compare only',
     'compressCold': 'picks', 'compressCold.folders': 'picks', 'compressCold.keepFreeGB': 'floor',
-    'folders.path': 'picks', 'folders.days': 'floor',
+    'folders.path': 'picks', 'folders.days': 'floor', 'folders.layered': 'loosens',
     # dedupe deletes no content either (every name keeps its bytes and metadata); its folders never are or hold a
     # must-keep path, and every refusal holds in them (dedupe.py).
     'dedupe': 'picks', 'dedupe.folders': 'picks',
@@ -319,8 +324,8 @@ class Repo:
 class ColdFolder:
     """One folder of compress-cold: its files untouched for `days` are compressed."""
 
-    def __init__(self, path, days):
-        self.path, self.days = path, days
+    def __init__(self, path, days, layered=False):
+        self.path, self.days, self.layered = path, days, layered
 
 
 class Source:
@@ -486,7 +491,7 @@ class Config:
                 if _holds(path, other.path) or _holds(other.path, path):
                     raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {other.path}, '
                                                         'another of its folders')
-            folders.append(ColdFolder(path, folder['days']))
+            folders.append(ColdFolder(path, folder['days'], folder['layered']))
         return tuple(folders)
 
     def _dedupe(self, section, where, log_text, out_text, archive=()):
@@ -519,7 +524,7 @@ class Config:
                 if _holds(path, other.path) or _holds(other.path, path):
                     raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {other.path}, '
                                                         'another of its folders')
-            folders.append(ColdFolder(path, folder['days']))
+            folders.append(ColdFolder(path, folder['days'], folder['layered']))
         return tuple(folders)
 
     def _apart(self, path, text, at, log_text, out_text, archive):

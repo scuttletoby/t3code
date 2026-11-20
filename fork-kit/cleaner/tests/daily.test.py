@@ -373,6 +373,9 @@ class Command(Case):
             section = json.load(f)['cleaner']
         self.assertEqual(section['tmp']['root'], '/tmp')
         section['tmp']['root'] = self.tmp           # the test's home is inside /tmp, which no root may hold
+        # The same for agent scratch's default root, /tmp/claude-<uid>, the temp folder of some agents (#624).
+        self.assertNotIn('root', section['agentScratch'])
+        section['agentScratch']['root'] = self.mkdir('scratch-root')
         cfg = self.c.config.Config(section, home=self.home)
         self.assertEqual(cfg.daily_mode, 'compare')
         self.assertEqual([s.name for s in cfg.sources], ['example-retention'])

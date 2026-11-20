@@ -1,5 +1,6 @@
 import * as Predicate from "effect/Predicate";
 import { Tool } from "effect/ai";
+import { withoutMachineOnlyFields } from "../fork/advertisedMachineFields.ts"; // Fork: MCP profile carry
 
 type Json = unknown;
 type JsonObject = { [key: string]: Json };
@@ -90,6 +91,7 @@ const compact = (schema: Json, optional: boolean): Json => {
           )
         : compact(value, false);
   }
+  result = withoutMachineOnlyFields(result); // Fork: a field only a linked machine sets
   if (Array.isArray(result.anyOf)) {
     const branches = result.anyOf
       .flatMap((branch) => (isBareAnyOf(branch) ? branch.anyOf : [branch]))
