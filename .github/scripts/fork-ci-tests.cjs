@@ -25,12 +25,10 @@ const BEFORE_REGEX = new Set(
   "return typeof instanceof in of new delete void throw case do else yield await".split(" "),
 );
 
-// A JavaScript or TypeScript file's text with its comments blanked (newlines kept), read by a small tokeniser: a
-// string ('...' or "..."), a template literal (its `${...}` read as code, nested to any depth) or a regular
-// expression is kept whole, so a `//` or `/*` inside one (upstream's `'**/*'`) starts no comment. A `/` is a regular
-// expression where a value cannot end before it (after an operator, `(`, `,`, a keyword such as `return`, or at the
-// start), else a division. Checked against TypeScript's parser on every JS/TS file of the tree: the same comments,
-// but for JSX text, where a `//` blanks the rest of its line (removed code: the test counts as not run, the safe side).
+// A JS/TS file's text with its comments blanked (newlines kept): strings, template literals (`${}` nested) and
+// regular expressions stay whole, so a `//` or `/*` in one (upstream's `'**/*'`) is no comment. A `/` is a regular
+// expression where no value ends before it. Same comments as TypeScript's parser on the tree's JS/TS files, but JSX
+// text: there a `//` blanks the rest of its line (removed code: the test counts as not run, the safe side).
 function jsCode(text) {
   let out = "";
   let i = 0;
