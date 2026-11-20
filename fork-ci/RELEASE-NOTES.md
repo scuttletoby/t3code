@@ -21,7 +21,7 @@ nothing.
   "Notify"). The posted comment is the record: a later run, a restart or another runner does not run it again for
   the same head and reason.
 - A command that is missing, fails or runs too long is a warning in the run log and never changes what the run does
-  or its exit code. It gets no token.
+  or its exit code. No token is passed in its environment, but it runs as the queue's user (README, "Notify").
 
 **Upgrade:** move the pin first, then add `notify_command` to the config: a queue of an older release refuses the
 unknown key and touches no pull request.

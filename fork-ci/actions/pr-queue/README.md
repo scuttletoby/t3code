@@ -627,9 +627,14 @@ a project names its own in its own config, for example
   comment and the command, does not run it again later: the comment says the
   pull request was told, and the queue keeps no state of its own for this. The
   notice on the pull request still stands, and the run log names the failure.
-- **No token.** The command gets the queue's environment without any variable
-  whose name holds `TOKEN` (the queue's read and write tokens, `GH_TOKEN`,
-  `ACTIONS_RUNTIME_TOKEN`, ...), no stdin, and the job's working folder. Its
+- **No token in its environment, but not a sandbox.** The command gets the
+  queue's environment without any variable whose name holds `TOKEN` (the
+  queue's read and write tokens, `GH_TOKEN`, `ACTIONS_RUNTIME_TOKEN`, ...), no
+  stdin, and the job's working folder. It still runs as the same user as the
+  queue, so it can read the queue's own environment (write token included)
+  through `/proc`, and the checkout's saved read token in the working folder.
+  Trust it like the queue itself: only a command from the project's own
+  config, never one built from pull request text. Its
   output (stdout and stderr, the first 4,000 characters) is shown in the run
   log, each line after `notify|`, so it cannot write a workflow command.
 - **GitHub's text is an argument, never a shell line.** A check or base name
