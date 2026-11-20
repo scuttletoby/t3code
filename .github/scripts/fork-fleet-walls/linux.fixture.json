@@ -45,7 +45,17 @@
     "opt/gcp/key.json": {
       "text": "{}\n",
       "mode": "600"
-    }
+    },
+    "etc/passwd": "root:x:0:0:root:/root:/bin/bash\nrunner:x:990:990::/var/lib/runner:/usr/sbin/nologin\n",
+    "etc/ssl/certs/ca.pem": "-----BEGIN CERTIFICATE-----\nMIIBExampleOnly\n-----END CERTIFICATE-----\n",
+    "etc/ssl/openssl.cnf": "[ req_attributes ]\nchallengePassword = A challenge password\n",
+    "usr/local/bin/deploy.sh": {
+      "text": "#!/bin/sh\nexport GH_TOKEN=\"$(cat ~/.config/gh-token)\"\nexport DB_PASSWORD_FILE=~/.db-pw\nexec deploy \"$@\"\n",
+      "mode": "755"
+    },
+    "usr/lib/systemd/system/telegraf.service": "[Service]\nEnvironmentFile=-/etc/default/telegraf\nLoadCredential=influx:/etc/telegraf/influx.token\nEnvironment=INFLUX_TOKEN_FILE=%d/influx\n",
+    "etc/default/telegraf": "INFLUX_TOKEN=hunter2hunter2\n",
+    "usr/lib/environment.d/10-path.conf": "PATH=/usr/local/bin:/usr/bin\n"
   },
   "fail": {
     "os": [
@@ -184,6 +194,28 @@
       {
         "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/mnt/tools\n",
         "mnt/tools/": ""
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/etc/shadow\n",
+        "etc/shadow": {
+          "text": "root:*:1::::::\n",
+          "mode": "600"
+        }
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/etc/ssl\n",
+        "etc/ssl/private/": ""
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/etc/default\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/etc/cron.d\n",
+        "etc/cron.d/backup": "0 3 * * * root backup\n"
+      },
+      {
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/etc/myapp/private\n",
+        "etc/myapp/private/": ""
       }
     ],
     "job-units": [
@@ -214,73 +246,61 @@
     ],
     "etc-secrets": [
       {
-        "etc/fstab": "UUID=0 / ext4 defaults 0 1\n//nas.example/share /srv/share cifs username=u,password=hunter2 0 0\n"
+        "etc/ssl/certs/server.pem": "-----BEGIN CERTIFICATE-----\nMIIBExampleOnly\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIE\n-----END PRIVATE KEY-----\n"
       },
       {
-        "etc/auto.nas": "share -fstype=cifs,username=u,pass=hunter2 ://nas.example/share\n"
+        "etc/ssl/certs/server.key": "not even PEM\n"
       },
       {
-        "etc/nas.cred": "username=u\npassword=p\n"
+        "usr/local/bin/backup.sh": {
+          "text": "#!/bin/sh\nexport RESTIC_PASSWORD=hunter2\nrestic backup\n",
+          "mode": "755"
+        }
       },
       {
-        "etc/samba/.smbcredentials": "username=u\npassword=p\n"
+        "usr/local/bin/sync": {
+          "text": "#!/usr/bin/env python3\nTOKEN = \"ghp_FAKEFAKEFAKEFAKEFAKEFAKE\"\n",
+          "mode": "755"
+        }
       },
       {
-        "etc/fstab": "//nas.example/s /srv/s cifs credentials=/etc/nas.secret 0 0\n",
-        "etc/nas.secret": "password=p\n"
+        "usr/local/etc/app.env": "DB_PASSWORD=hunter2\n"
       },
       {
-        "etc/systemd/system/srv-nas.mount": "[Mount]\nWhat=//nas.example/share\nWhere=/srv/nas\nType=cifs\nOptions=username=me,password=hunter2,uid=1000\n"
+        "usr/local/etc/proxy.conf": "https_proxy=http://me:hunter2@proxy.example:3128\n"
       },
       {
-        "etc/systemd/system/srv-nas.mount": "[Mount]\nWhat=//nas.example/share\nWhere=/srv/nas\nType=cifs\nOptions=pass=hunter2\n"
+        "usr/local/etc/nas.cred": "username=u\npassword=p\n"
       },
       {
-        "etc/systemd/system/srv-media.mount.d/creds.conf": "[Mount]\nOptions=credentials=/etc/nas.secret\n",
-        "etc/nas.secret": "password=p\n"
+        "usr/lib/systemd/system/backup.service": "[Service]\nEnvironment=RESTIC_PASSWORD=hunter2\n"
       },
       {
-        "etc/systemd/system/srv-nas.automount.d/x.conf": "[Automount]\nOptions=username=u,password=hunter2\n"
+        "usr/lib/systemd/system/nightly.service": "[Service]\nSetCredential=restic.password:hunter2\n"
       },
       {
-        "etc/environment": "PATH=\"/usr/bin:/bin\"\nGITHUB_TOKEN=ghp_example\n"
+        "usr/lib/systemd/system/restic.service": "[Service]\nEnvironment=RESTIC_PASSWORD_FILE=/usr/share/restic/pw\n",
+        "usr/share/restic/pw": "hunter2\n"
       },
       {
-        "etc/profile.d/tools.sh": "export EDITOR=vi\nexport OPENAI_API_KEY='sk-example'\n"
+        "usr/lib/systemd/system/telegraf.service": "[Service]\nEnvironmentFile=/usr/share/telegraf/env\n",
+        "usr/share/telegraf/env": "INFLUX_TOKEN=hunter2hunter2\n"
       },
       {
-        "etc/profile.d/nas.csh": "setenv NAS_PASSWORD hunter2\n"
+        "usr/lib/systemd/system/restic.service": "[Service]\nEnvironment=\"RESTIC_PASSWORD_COMMAND=cat /x\"\n"
       },
       {
-        "etc/environment.d/50-ci.conf": "GH_PAT=not-a-real-token\n"
+        "usr/lib/environment.d/50-ci.conf": "GH_PAT=not-a-real-token\n"
       },
       {
-        "etc/profile": "export EDITOR=vi DEPLOY_TOKEN=not-a-real-token\n"
+        "usr/share/fish/vendor_conf.d/gh.fish": "set -gx GH_TOKEN abc123secretvalue\n"
       },
       {
-        "etc/bash.bashrc": "[ -n \"$DEPLOY_TOKEN\" ] || export DEPLOY_TOKEN=\"${DEPLOY_TOKEN:-not-a-real-token}\"\n"
+        "usr/lib/credstore/restic.password": "hunter2\n"
       },
       {
-        "etc/environment": "https_proxy=http://me:hunter2@proxy.example:3128\n"
-      },
-      {
-        "etc/systemd/system/backup.service": "[Service]\nEnvironment=RESTIC_PASSWORD=hunter2\nExecStart=/usr/bin/backup\n"
-      },
-      {
-        "etc/default/backup": "RESTIC_PASSWORD=hunter2\n"
-      },
-      {
-        "etc/systemd/system/nightly.service": "[Service]\nEnvironment = A=1 \\\n  RESTIC_PASSWORD=hunter2\n"
-      },
-      {
-        "etc/systemd/system/nightly.service": "[Service]\nSetCredential=restic.password:hunter2\n"
-      },
-      {
-        "usr/lib/systemd/system/telegraf.service": "[Service]\nEnvironmentFile=-/etc/default/telegraf\n",
-        "etc/default/telegraf": "INFLUX_TOKEN=hunter2hunter2\n"
-      },
-      {
-        "etc/fish/conf.d/gh.fish": "set -gx GH_TOKEN abc123secretvalue\n"
+        "etc/fork-fleet/launch.conf": "ALLOW_PATHS=/etc/myapp\n",
+        "etc/myapp/app.conf": "API_KEY=hunter2hunter2\n"
       }
     ]
   }
