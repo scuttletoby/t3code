@@ -803,6 +803,22 @@ class Killed(Case):
         code, lines = self.run_cleaner(self.dd_cfg(), now=self.now + 40 * DAY)
         self.assertEqual((code, self.ino(b)), (0, self.ino(a)), lines)
 
+    def test_part_removal_hides_no_foreign_change(self):
+        # lens A round 2: a killed link, then a foreign in-place write that sets the time back; the next run removes
+        # the part, and must not take that inode time as its own.
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        with self.kill_mark(1), self.assertRaises(KeyboardInterrupt):
+            self.run_cleaner(self.dd_cfg())
+        st = os.stat(a)
+        with open(a, 'r+b') as f:
+            f.write(body('z'))
+        os.utime(a, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.run_cleaner(self.dd_cfg())
+        c = self.put('c.bin', data=body('z'))
+        self.old(c)
+        code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.ino(c), self.ino(a), lines)
+
     def test_killed_after_the_rename(self):
         a, b, c = self.put('a.bin', days=50), self.put('b.bin'), self.put('c.bin')
         with self.kill_mark(2), self.assertRaises(KeyboardInterrupt):
@@ -923,6 +939,240 @@ class Cached(Case):
         self.assertFalse(os.path.exists(cfg.dedupe_own))
 
 
+def scribble(path, keep_time=False):
+    """Writes into the file in place (open, write, close: no descriptor is left for a lease to see); `keep_time`
+    sets its modification time back, as `rsync --inplace -t` does, so only its inode time is new."""
+    st = os.stat(path)
+    with open(path, 'r+b') as f:
+        f.write(b'NEW' * 100)
+    if keep_time:
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+class Gaps(Case):
+    """Round 2 of the reviews of #563: the kept file written, or one of its names moved, in the last moments before
+    the rename, and a KEEP file or git folder above a configured folder. Each must leave the duplicate's own bytes."""
+
+    def assertUntouched(self, a, b, lines, why):
+        self.assertEqual(self.read(b), body(), ('b.bin lost its bytes', lines))
+        self.assertNotEqual(self.ino(a), self.ino(b), lines)
+        self.assertFalse(any(line.startswith('linked ') for line in lines), lines)
+        self.assertTrue(any(line.startswith(f'FAILED {b} ') and why in line for line in lines), lines)
+        self.assertEqual(sorted(self.files()), ['a.bin', 'b.bin'])
+        # Runs again: the kept file holds other bytes now, so nothing is joined, and the duplicate is still its own.
+        code, lines = self.run_cleaner(self.dd_cfg(), now=self.now + 60 * DAY)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(self.read(b), body(), lines)
+        self.assertNotEqual(self.ino(a), self.ino(b), lines)
+
+    def wrap_take(self, before):
+        real = self.c.dedupe._Leases.take
+
+        def take(leases, parent, name, ident, which):
+            before(which)
+            return real(leases, parent, name, ident, which)
+        return mock.patch.object(self.c.dedupe._Leases, 'take', take)
+
+    # lens A, blocking 1
+    def test_kept_file_written_just_before_its_lease(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        with self.wrap_take(lambda which: which == a and scribble(a)):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertUntouched(a, b, lines, 'is not what the last check saw')
+
+    def test_kept_file_written_with_its_time_set_back_just_before_its_lease(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        with self.wrap_take(lambda which: which == a and scribble(a, keep_time=True)):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertUntouched(a, b, lines, 'is not what the last check saw')
+
+    def test_duplicate_written_with_its_time_set_back_just_before_its_lease(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        before = self.read(b)
+        with self.wrap_take(lambda which: which == b and scribble(b, keep_time=True)):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.read(b), before)           # the write stays where it was made
+        self.assertEqual(self.read(a), body(), lines)
+        self.assertNotEqual(self.ino(a), self.ino(b), lines)
+        self.assertTrue(any(line.startswith(f'FAILED {b} ') for line in lines), lines)
+
+    def test_kept_file_written_during_the_link_without_leases(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        real = os.link
+
+        def link(src, dst, **kw):
+            if dst.endswith('.cleaner-link'):
+                scribble(a)
+            return real(src, dst, **kw)
+        with mock.patch.object(self.c.dedupe._Leases, 'take', lambda *a, **k: None), \
+                mock.patch.object(self.c.dedupe.os, 'link', link):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertUntouched(a, b, lines, 'changed while it was linked')
+
+    def test_kept_file_written_with_its_time_set_back_before_the_link_without_leases(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        real = self.c.dedupe.Cache.part
+
+        def part(cache, path):
+            scribble(a, keep_time=True)
+            return real(cache, path)
+        with mock.patch.object(self.c.dedupe._Leases, 'take', lambda *a, **k: None), \
+                mock.patch.object(self.c.dedupe.Cache, 'part', part):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertUntouched(a, b, lines, 'is not what the last check saw')
+
+    def test_kept_file_written_with_its_time_set_back_after_the_link_without_leases(self):
+        # Right after the link's inode time was written down: only that inode time shows the write.
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        real, done = self.c.dedupe.Cache.record, []
+
+        def record(cache, ident, ctime_ns):
+            real(cache, ident, ctime_ns)
+            if not done:
+                done.append(ident)
+                scribble(a, keep_time=True)
+        with mock.patch.object(self.c.dedupe._Leases, 'take', lambda *a, **k: None), \
+                mock.patch.object(self.c.dedupe.Cache, 'record', record):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertUntouched(a, b, lines, 'changed while it was linked')
+
+    def test_the_run_line_says_what_was_checked(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertTrue(any(line.startswith(f'linked {b} ') and 'compared byte for byte, both unchanged at the last '
+                            'look before the rename' in line for line in lines), lines)
+
+    # lens B, major 1
+    def linked_pair_then_copy(self):
+        a, b = self.put('a.bin', days=50), self.put('b.bin')
+        self.run_cleaner(self.dd_cfg())
+        self.assertEqual(self.ino(a), self.ino(b))
+        c = self.put('c.bin', days=40)
+        self.old(c)
+        return a, b, c
+
+    def test_other_name_of_keeper_moved_outside_between_last_check_and_link(self):
+        a, b, c = self.linked_pair_then_copy()
+        outside, real = self.path('elsewhere.bin'), self.c.dedupe.Cache.part
+
+        def part(cache, path):
+            if not os.path.exists(outside):
+                os.rename(b, outside)
+            return real(cache, path)
+        with mock.patch.object(self.c.dedupe.Cache, 'part', part):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.ino(c), self.ino(outside), lines)
+        self.assertTrue(any(line.startswith(f'FAILED {c} ') for line in lines), lines)
+        self.assertEqual(self.read(c), body())
+
+    def test_other_name_of_keeper_renamed_to_db_between_link_and_rename(self):
+        a, b, c = self.linked_pair_then_copy()
+        db, real = os.path.join(self.dd, 'b.sqlite'), os.link
+
+        def link(src, dst, **kw):
+            real(src, dst, **kw)
+            if dst.endswith('.cleaner-link') and not os.path.exists(db):
+                os.rename(b, db)
+        with mock.patch.object(self.c.dedupe.os, 'link', link):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.ino(c), self.ino(db), lines)
+        self.assertTrue(any(line.startswith(f'FAILED {c} ') for line in lines), lines)
+        self.assertEqual(sorted(self.files()), ['a.bin', 'b.sqlite', 'c.bin'])     # the part is gone
+
+    def test_other_name_of_keeper_moved_at_the_lease_check(self):
+        # The count of names stays the same; the move happens at the last look at the leases.
+        a, b, c = self.linked_pair_then_copy()
+        outside, real = self.path('elsewhere.bin'), self.c.dedupe._Leases.broken
+
+        def broken(leases):
+            if not os.path.exists(outside):
+                os.rename(b, outside)
+            return real(leases)
+        with mock.patch.object(self.c.dedupe._Leases, 'broken', broken):
+            code, lines = self.run_cleaner(self.dd_cfg())
+        self.assertNotEqual(self.ino(c), self.ino(outside), lines)
+        self.assertEqual(self.read(c), body())
+
+    # lens A, major 2
+    def test_folder_inside_a_git_work_tree(self):
+        repo = os.path.join(self.dd, 'repo')
+        os.makedirs(os.path.join(repo, '.git'))
+        a = self.put('repo', 'assets', 'a.bin', days=50)
+        b = self.put('repo', 'assets', 'b.bin')
+        cfg = self.dd_cfg(folders=[{'path': os.path.join(repo, 'assets'), 'days': 30}])
+        code, lines = self.run_cleaner(cfg)
+        self.assertNotEqual(self.ino(a), self.ino(b), ('linked inside a git work tree', lines))
+        self.assertTrue(any(line.startswith(f'kept {os.path.join(repo, "assets")} (dedupe: git folder') for line in lines),
+                        lines)
+
+    def test_folder_inside_a_bare_repository(self):
+        repo = os.path.join(self.dd, 'repo.git')
+        for name in ('objects', 'refs'):
+            os.makedirs(os.path.join(repo, name))
+        open(os.path.join(repo, 'HEAD'), 'w').close()
+        a = self.put('repo.git', 'objects', 'x', 'a.bin', days=50)
+        b = self.put('repo.git', 'objects', 'x', 'b.bin')
+        cfg = self.dd_cfg(folders=[{'path': os.path.join(repo, 'objects', 'x'), 'days': 30}])
+        code, lines = self.run_cleaner(cfg)
+        self.assertNotEqual(self.ino(a), self.ino(b), lines)
+
+    def test_folder_under_a_keep_file(self):
+        open(os.path.join(self.dd, 'KEEP'), 'w').close()
+        a = self.put('sub', 'deeper', 'a.bin', days=50)
+        b = self.put('sub', 'deeper', 'b.bin')
+        cfg = self.dd_cfg(folders=[{'path': os.path.join(self.dd, 'sub', 'deeper'), 'days': 30}])
+        code, lines = self.run_cleaner(cfg)
+        self.assertNotEqual(self.ino(a), self.ino(b), ('linked under a KEEP file', lines))
+        self.assertTrue(any('(dedupe: KEEP file' in line for line in lines), lines)
+
+    def test_a_keep_file_above_made_between_the_plan_and_the_link(self):
+        a = self.put('sub', 'a.bin', days=50)
+        b = self.put('sub', 'b.bin')
+        cfg = self.dd_cfg(folders=[{'path': os.path.join(self.dd, 'sub'), 'days': 30}])
+        real = self.c.dedupe.recheck
+
+        def recheck(cfg, facts, item):
+            open(os.path.join(self.dd, 'KEEP'), 'w').close()
+            return real(cfg, facts, item)
+        with mock.patch.object(self.c.dedupe, 'recheck', recheck):
+            code, lines = self.run_cleaner(cfg)
+        self.assertNotEqual(self.ino(a), self.ino(b), lines)
+        self.assertEqual(self.read(b), body())
+
+    def test_a_keep_folder_above_is_not_a_keep_file(self):
+        os.makedirs(os.path.join(self.dd, 'KEEP'))
+        a = self.put('KEEP', 'a.bin', days=50)
+        b = self.put('KEEP', 'b.bin')
+        cfg = self.dd_cfg(folders=[{'path': os.path.join(self.dd, 'KEEP'), 'days': 30}])
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
+
+    # minors
+    def test_dax_and_verity_flags_are_compared(self):
+        self.assertEqual(self.c.dedupe.FLAGS_MASK & 0x02000000, 0x02000000)     # FS_DAX_FL, chattr +x
+        self.assertEqual(self.c.dedupe.FLAGS_MASK & 0x00100000, 0x00100000)     # FS_VERITY_FL
+
+    def test_mail_boxes_and_partial_downloads_are_written_in_place(self):
+        names = ('mbox', 'inbox.mbox', 'big.iso.part', 'big.iso.crdownload', 'big.iso.partial', 'big.iso.!qb')
+        for name in names:
+            self.put(name)
+        plan = self.plan(self.dd_cfg())
+        for name in names:
+            self.assertKept(plan, os.path.join(self.dd, name), 'written in place')
+
+    def test_files_in_two_folders_are_linked_to_each_other_and_the_readme_says_so(self):
+        one, two = self.mkdir('dd', 'one'), self.mkdir('dd', 'two')
+        a, b = self.put('one', 'a.bin', days=50), self.put('two', 'b.bin', days=40)
+        cfg = self.dd_cfg(folders=[{'path': one, 'days': 30}, {'path': two, 'days': 7}])
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
+        with open(os.path.join(fx.KIT, 'README.md')) as f:
+            readme = ' '.join(f.read().split())
+        self.assertIn('two configured folders may be linked to each other', readme)
+        self.assertIn('a folder above it up to `/`', readme)
+        self.assertNotIn('two system calls between that last check', readme)
+
+
 MUTATIONS = {
     'days': ('dedupe', 'if age < folder.days * DAY:', 'if False:', Dedupe, 'test_files_changed_lately_small_or_with_other_bytes_are_not_taken'),
     'small files': ('dedupe', "if name.endswith(PART) or st.st_size < MIN_BYTES:", "if name.endswith(PART):",
@@ -988,6 +1238,24 @@ MUTATIONS = {
     'one filesystem': ('dedupe', 'by_size.setdefault((entry[2].st_dev, entry[2].st_size), [])', 'by_size.setdefault((0, entry[2].st_size), [])',
                        Refused, 'test_never_across_filesystems'),
     'no links followed': ('dedupe', "if os.path.realpath(path) != path:", "if False:", Refused, 'test_a_folder_reached_through_a_link_is_kept'),
+    'the look before the link': ('dedupe', "            if kst is None or not _keeper_same(kst, item):\n                raise Untouched(f'{item.keeper} is not what",
+                                 "            if False:\n                raise Untouched(f'{item.keeper} is not what",
+                                 Gaps, 'test_kept_file_written_with_its_time_set_back_just_before_its_lease'),
+    'every name read before the rename': ('dedupe', "if kst is None or (kst.st_dev, kst.st_ino) != kident:\n                    why =",
+                                          "if False:\n                    why =",
+                                          Gaps, 'test_other_name_of_keeper_renamed_to_db_between_link_and_rename'),
+    'the kept file as compared before the rename': ('dedupe', "elif ((pst.st_size, pst.st_mtime_ns) != item.keeper_look.stamp[:2]",
+                                                    "elif ((pst.st_size, pst.st_mtime_ns) == (None, None)",
+                                                    Gaps, 'test_kept_file_written_during_the_link_without_leases'),
+    'the inode time before the rename': ('dedupe', "or pst.st_ctime_ns != run.ctime.get(kident)):", "):",
+                                         Gaps, 'test_kept_file_written_with_its_time_set_back_after_the_link_without_leases'),
+    'a KEEP file above': ('dedupe', 'if keep is not None and not stat.S_ISDIR(keep.st_mode):', 'if False:',
+                          Gaps, 'test_folder_under_a_keep_file'),
+    'a git folder above': ('dedupe', "if os.path.lexists(os.path.join(here, '.git')) or all(", "if False or all(",
+                           Gaps, 'test_folder_inside_a_git_work_tree'),
+    'mail boxes and partial downloads': ('dedupe', "'*.swap', 'mbox', '*.mbox', '*.part', '*.crdownload', '*.partial', '*.!qb')", "'*.swap')",
+                                         Gaps, 'test_mail_boxes_and_partial_downloads_are_written_in_place'),
+    'verity and DAX flags': ('dedupe', ' | FS_VERITY_FL | FS_DAX_FL', '', Gaps, 'test_dax_and_verity_flags_are_compared'),
     'config: must keep': ('config', "                held = must_keep_match(self.must_keep, form)\n                if held is not None:",
                           "                held = None\n                if held is not None:", Keys, 'test_folders_it_may_never_take_are_refused'),
     'config: other rules': ('config', "            for other in self.cold_folders:", "            for other in ():", Keys, 'test_folders_it_may_never_take_are_refused'),

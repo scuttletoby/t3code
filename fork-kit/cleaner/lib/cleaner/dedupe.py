@@ -20,16 +20,17 @@ the next run removes that part (a name whose content another name still holds) a
 names are all gone holds the only copy of its content and stays (named in the plan).
 
 What it never takes: links (never followed), other filesystems and mount points (a hard link cannot cross one
-either), other owners' files, credential and lock names, must-keep names, folders with a KEEP file, git folders
-(git needs its files as they are), kinds written in place (IN_PLACE: databases and their journals, logs, game
-region files, disk images), files changed in the last `days`, files in use (open, locked, named by a process or a
+either), other owners' files, credential and lock names, must-keep names, folders with a KEEP file and git folders,
+in or above a configured folder up to `/` (git needs its files as they are), kinds written in place (IN_PLACE:
+databases and their journals, logs, game region files, disk images, mail boxes, partial downloads), files changed in the last `days`, files in use (open, locked, named by a process or a
 systemd unit), immutable or append-only files, files with more than one name already (linking one of their names
 frees nothing), and files under MIN_BYTES. A file that changes while it is read or compared is kept as it is.
 config.py refuses folders in or holding a must-keep path and folders another rule takes.
 
 The kept file is judged by EVERY one of its names: it is kept, and nothing is joined to it, when any of its names
 is outside the folders or is a name the rule refuses (a database, a log, a credential, in use through that name).
-At the link its names are counted again: a name made or removed since the plan, by anyone but this run, stops it.
+At the link its names are counted and each one read again, last just before the rename: a name made, removed or
+moved since the plan, by anyone but this run, stops it. Files in two configured folders may be linked to each other.
 
 What a person must know: names of one file share every later write INTO any of them. `cp` onto an existing file,
 shell `>` and `>>`, `curl -o`, `wget -O`, `unzip -o`, `rsync --inplace`, `dd` and most programs that open a file
@@ -55,16 +56,18 @@ PART = '.cleaner-link'
 PART_NAME = re.compile(r'^\.(.+)\.[0-9a-f]{8}' + re.escape(PART) + '$')
 NAME_MAX = 255
 # Names programs write in place: databases and their journals, logs, append-only records, Minecraft region and
-# chunk files, virtual machine and disk images, swap files. Never complete: the README says to name only folders of
+# chunk files, virtual machine and disk images, swap files, mail boxes, partial downloads a client resumes. Never complete: the README says to name only folders of
 # write-once copies.
 IN_PLACE = ('*.db', '*.db-*', '*.db3', '*.sqlite', '*.sqlite3', '*.sqlite-*', '*.sqlite3-*', '*-wal', '*-shm',
             '*-journal', '*.journal', '*.wal', '*.mdb', '*.ldb', '*.ibd', '*.log', '*.log.*', '*.jsonl', '*.ndjson',
             '*.pid', '*.mca', '*.mcr', '*.mcc', '*.qcow2', '*.img', '*.raw', '*.vmdk', '*.vdi', '*.vhd', '*.vhdx',
-            '*.swp', '*.swap')
+            '*.swp', '*.swap', 'mbox', '*.mbox', '*.part', '*.crdownload', '*.partial', '*.!qb')
 SIDECARS = ('-wal', '-shm', '-journal')
-# chattr flags a person can set (linux/fs.h FS_FL_USER_MODIFIABLE) plus data journalling and no-copy-on-write: two
-# files with other flags are not the same (a link would give one the other's).
-FLAGS_MASK = 0x000380FF | 0x00004000 | 0x00800000
+# chattr flags a person can set (linux/fs.h FS_FL_USER_MODIFIABLE) plus data journalling, no-copy-on-write, verity
+# (read-only, checked) and DAX (`chattr +x`): two files with other flags are not the same (a link would give one the
+# other's).
+FS_VERITY_FL, FS_DAX_FL = 0x00100000, 0x02000000
+FLAGS_MASK = 0x000380FF | 0x00004000 | 0x00800000 | FS_VERITY_FL | FS_DAX_FL
 WARNING = ('dedupe: names of one file share every later write into any of them (cp onto an existing file, shell >, '
            'downloads, most programs): name only folders of copies written once and then only read')
 
@@ -248,8 +251,34 @@ def _start(cfg, facts, folder):
     bound = mounts.bound(path, st.st_dev)
     if bound is not None:
         return None, Refusal('in use', f'a bind mount shows {bound} of its filesystem somewhere else (a container or a sandbox)')
+    refusal = _above_refusal(path)
+    if refusal is not None:
+        return None, refusal
     folder.dev = st.st_dev
     return st, None
+
+
+def _above_refusal(path):
+    """A KEEP file or a git folder in a folder above the configured folder, up to `/`: everything under it is
+    kept, as below it (a work tree's files are git's; a KEEP file keeps its whole folder). Read at the plan and again
+    before each link."""
+    here = os.path.dirname(path)
+    while True:
+        try:
+            keep = os.lstat(os.path.join(here, KEEP_FILE))
+        except FileNotFoundError:
+            keep = None
+        except OSError as ex:
+            return Refusal('could not read', f'{here}: {ex.strerror}')
+        if keep is not None and not stat.S_ISDIR(keep.st_mode):
+            return Refusal('KEEP file', f'{guard._keep_reason(os.path.join(here, KEEP_FILE))} ({here}, above {path})')
+        if os.path.lexists(os.path.join(here, '.git')) or all(os.path.lexists(os.path.join(here, n))
+                                                              for n in ('HEAD', 'objects', 'refs')):
+            return Refusal('git folder', f'{here}, above {path}: git needs its files as they are')
+        up = os.path.dirname(here)
+        if up == here:
+            return None
+        here = up
 
 
 def _folder_refusal(cfg, facts, folder, here, st, names):
@@ -714,9 +743,12 @@ class _Leases:
     """Write leases (fcntl F_SETLEASE) on the duplicate and the kept file, from after the last read of the process
     list until the rename. The kernel grants one only while no other descriptor of the file is open (through any
     name, by any process), and any later open breaks it. So a file opened in that time is seen at the last check and
-    the duplicate stays; what is left is the time between that check and the rename, two system calls. Where the
-    filesystem or the process takes no leases (a thread, leases off), the run goes on without them: the process list
-    was read just before."""
+    the duplicate stays. Both files are looked at once more after the leases (a write before a lease was taken shows
+    in their times). What is left: an open between the last look at the leases and the rename (a few system calls:
+    the names and the part are read in between); a name of the kept file moved after the last look at the part (one
+    system call). Where the filesystem or the process takes no leases (a thread, leases off), the run goes on without
+    them: the process list was read just before, and a write that sets the content time back between the look
+    before the link and the look after it (one system call) is not seen."""
 
     def __init__(self):
         self.fds, self.old = [], None
@@ -813,6 +845,14 @@ def link(item):
             part = f'.{name}.{secrets.token_hex(4)}{PART}'
             if not run.cache.part(os.path.join(os.path.dirname(path), part)):
                 raise Untouched(f'{run.cache.own_log}: could not be written, so a part could not be named: nothing changed')
+            # Both files once more, after both leases and right before the link: a write since the comparison (an
+            # open, write and close before a lease was taken, even one that set the content time back) changed the
+            # size, the content time or the inode time. From the lease on, a write needs an open, which breaks it.
+            now, kst = _stat_at(parent, name), _stat_at(kparent, kname)
+            if now is None or not _same(now, item.look) or now.st_nlink != 1:
+                raise Untouched(f'{path} is not what the last check saw: nothing changed')
+            if kst is None or not _keeper_same(kst, item):
+                raise Untouched(f'{item.keeper} is not what the last check saw: nothing changed')
             try:
                 os.link(kname, part, src_dir_fd=kparent, dst_dir_fd=parent, follow_symlinks=False)
             except OSError as ex:
@@ -824,19 +864,35 @@ def link(item):
             os.fsync(parent)
             raise Untouched(f'{path}: its part {part} is not a link of {item.keeper}: the duplicate stays')
         run.mark(kident, pst.st_ctime_ns)       # the part's link: this run's own change, so a kill still knows it
-        # Read just before the rename: an editor's save onto the duplicate since the comparison, a name of the kept
-        # file made or removed by anyone else, or an open of either file (a broken lease) is seen, and the
-        # duplicate stays.
-        now, pst = _stat_at(parent, name), _stat_at(parent, part)
+        # Read just before the rename, in this order: the duplicate (an editor's save onto it since the comparison),
+        # the leases (an open of either file), every name of the kept file (each still a name of it: one moved,
+        # renamed or replaced is seen), and last the part: the kept file's size and content time as compared and its
+        # inode time as this run's link left it (any write, link, rename or removal of any of its names since changes
+        # that), and as many names as known.
+        now = _stat_at(parent, name)
         why = None
         if now is None or not _same(now, item.look) or now.st_nlink != 1:
             why = f'{path} changed while it was compared'
-        elif pst is None or (pst.st_dev, pst.st_ino) != kident or pst.st_nlink != len(knames) + 1:
-            why = f'the kept file {item.keeper} got or lost a name while it was linked'
         else:
             opened = leases.broken()
             if opened is not None:
                 why = f'{opened} was opened while it was linked'
+        if why is None:
+            for kpath in sorted(knames):
+                try:
+                    kst = os.lstat(kpath)
+                except OSError:
+                    kst = None
+                if kst is None or (kst.st_dev, kst.st_ino) != kident:
+                    why = f'the kept file {item.keeper}: its name {kpath} was moved or replaced while it was linked'
+                    break
+        if why is None:
+            pst = _stat_at(parent, part)
+            if pst is None or (pst.st_dev, pst.st_ino) != kident or pst.st_nlink != len(knames) + 1:
+                why = f'the kept file {item.keeper} got or lost a name while it was linked'
+            elif ((pst.st_size, pst.st_mtime_ns) != item.keeper_look.stamp[:2]
+                  or pst.st_ctime_ns != run.ctime.get(kident)):
+                why = f'the kept file {item.keeper} changed while it was linked'
         if why is not None:
             _unlink_part(parent, part, kident)
             _mark_names(run, kident)
@@ -856,7 +912,7 @@ def link(item):
         leases.release()
         os.close(parent)
     item.result = (f'{path} ({human(item.size)}, {RULE}: {item.why}; now a hard link of {item.keeper}, compared byte '
-                   'for byte)')
+                   'for byte, both unchanged at the last look before the rename)')
 
 
 def _compare(parent, name, kparent, kname, item):

@@ -587,8 +587,9 @@ never a folder where anything writes into files: no build caches, no game or ser
 images, no working copies. The rule refuses the kinds it knows are written in place (databases `*.db`, `*.db3`,
 `*.sqlite*`, `*.mdb`, `*.ldb`, `*.ibd`, `*.wal`, and every file with a `-wal`, `-shm` or `-journal` beside it; logs
 `*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`; Minecraft region files `*.mca`, `*.mcr`, `*.mcc`;
-disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`, `*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`), but such a
-list can never be complete. Every plan and run that links says it again in one line (`dedupe: names of one file
+disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`, `*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`; mail boxes
+`mbox`, `*.mbox`; partial downloads a client resumes in place `*.part`, `*.crdownload`, `*.partial`, `*.!qb`), but
+such a list can never be complete. Every plan and run that links says it again in one line (`dedupe: names of one file
 share every later write ...`). On btrfs or XFS a tool that shares blocks with a reflink (`FIDEDUPERANGE`) is the
 safer choice: later writes do not reach the other copies. This rule makes hard links because the hosts it was made
 for are ext4, which has no reflinks.
@@ -597,6 +598,9 @@ for are ext4, which has no reflinks.
 oldest, of those whose names are **all** in the folders and **all** taken by the rule. A file with one name outside
 the folders, one name the rule refuses (a database, a log, a credential or lock name, a must-keep name) or one name
 in use is never kept, and nothing is joined to it; its names stay as they are (`hard-linked`, with the reason).
+**Files in two configured folders may be linked to each other** (on one filesystem): a copy in one folder can become
+a name of a file in another, and each name is judged by the `days` of its own folder. So a write into a name in one
+folder reaches the other folder too.
 
 **The order, for each set of the same bytes.** The plan groups files by filesystem and size (only those are read),
 then by sha256 and metadata. Before each link the run looks at the duplicate and at **every** name of the kept file
@@ -604,14 +608,24 @@ again from their configured folder down (the same checks as the plan), compares 
 (the sha256 only finds the candidates), and reads the stamps of both before and after the compare. Then the process
 list and the locks are read again for the duplicate and every name of the kept file, and the cleaner takes a write
 lease on both files (`fcntl F_SETLEASE`): the kernel grants one only while no other descriptor of the file is open,
-and any later open breaks it. A new name of the kept file is made beside the duplicate (`.<name>.<8 hex>
-.cleaner-link`, written into the cleaner's own list first), its identity is checked, and just before the rename the
-duplicate is read once more (same file, size and times, one name), the kept file's names are counted (a name made or
-removed by anyone else since the plan stops it) and both leases must still be whole (an open of either file since
-stops it). Then the new name is renamed over the duplicate. What is left is the time of the two system calls between
-that last check and the rename. Where the filesystem gives no leases, the run goes on with the process list read just
-before. The duplicate's name then shows the kept file's times; mode, owner, group, extended attributes and chattr
-flags were the same already.
+and any later open breaks it. Both files are read once more after the leases and right before the link (size,
+content time and inode time as compared: a write made before a lease was taken shows there, even one that set the
+content time back). A new name of the kept file is made beside the duplicate (`.<name>.<8 hex>.cleaner-link`,
+written into the cleaner's own list first), its identity is checked, and just before the rename, in this order: the
+duplicate is read once more (same file, size and times, one name), both leases must still be whole (an open of
+either file since stops it), **every** name of the kept file is read again (each still a name of it: one moved,
+renamed or replaced stops it), and last the new name shows the kept file with its size and content time as
+compared, the inode time this run's link gave it (any write, link, rename or removal of a name since changes it) and
+as many names as known. Then the new name is renamed over the duplicate.
+
+What is left, said plainly: a writer that opens the duplicate between the last look at the leases and the rename (a
+few system calls: the names and the new name are read in between) waits for the lease, then writes into the old
+duplicate, which no longer has a name, so that write is lost; a name of the kept file moved in the one system call
+between the last look at the new name and the rename is not seen. Where the filesystem gives no leases, the run goes
+on with the process list read just before, and an in-place write into the kept file that sets its content time back
+during the link itself (between the look before the link and the look after it) is not seen either. The duplicate's
+name then shows the kept file's times; mode, owner, group, extended attributes and chattr flags were the same
+already.
 
 **The inode time.** Each link and rename changes the kept file's inode time (ctime), which the cleaner counts as a
 change. So it writes the inode time its own last step gave each file into a list beside its log
@@ -626,8 +640,10 @@ another version, a link or someone else's: an empty cache (files are read again,
 as new as their inode time until their `days` pass).
 
 **Never taken**, on top of what the config refuses: links (never followed, folders neither), folders with a `KEEP`
-file, git folders, other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
-files, credential and lock names, must-keep names, the in-place kinds above, files under 64 KB, files with more
+file and git folders (`.git`, or a bare repository), in a configured folder or in a folder above it up to `/` (read
+at the plan and again before each link; a `~/.git` of dotfiles keeps every folder under the home), other filesystems
+and mount points, a folder shown somewhere else by a bind mount, other owners' files, credential and lock names,
+must-keep names, the in-place kinds above, files under 64 KB, files with more
 than one name (unless all of them are in the folders and taken by the rule, as after an earlier run: then it is the
 file kept), files in use (a process has it open or names it, it has a lock, a unit names it or a folder above it),
 and a file whose metadata differs from the others' (kept with `other metadata`: a link would give it theirs). A
@@ -638,7 +654,8 @@ another rule deletes from, a folder of `compressCold`, or a folder in or above a
 
 **The plan** says `would link <file> (<size>, dedupe: the same bytes as <kept file>, not changed for N days ...)`
 and, for the rule, `dedupe: would link N files (<size>)`; the total line adds `would link N (<size>)`. A run says
-`linked <file> (...; now a hard link of <kept file>, compared byte for byte)`. The report has a class
+`linked <file> (...; now a hard link of <kept file>, compared byte for byte, both unchanged at the last look before
+the rename)`. The report has a class
 `dedupe folders` (the configured folders, whole) and its freed figure counts linked files.
 
 **What happens when ...**
@@ -653,8 +670,8 @@ and, for the rule, `dedupe: would link N files (<size>)`; the total line adds `w
   the last name of its bytes is kept and named (`part without its file`). A failed rename removes the part and keeps
   the duplicate. No entry goes into the journal of half deletes: there is nothing half gone.
 - **a file changes or is opened:** while the plan reads it: kept as `changed`. Between the plan and the run, or
-  while it is compared or linked: refused or failed, both files stay as they are. A kept file replaced, or given or
-  losing a name, after the plan: refused.
+  while it is compared or linked: refused or failed, both files stay as they are (the next run sees other bytes and
+  joins nothing). A kept file replaced, or given, losing or moving a name, after the plan: refused.
 - **the folder is missing or empty:** nothing to do.
 - **the cache is missing, broken or cannot be written:** files are read again; a cache that cannot be written is
   named in one line and the run goes on.
