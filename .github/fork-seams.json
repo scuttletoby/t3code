@@ -30,6 +30,13 @@
         "...applyForkSettingsPatch(current, forkPatch),"
       ]
     },
+    "apps/server/src/policy/managedSettings.ts": {
+      "why": "The fork settings that read a bad value (null included) as off or a default can only be managed as a whole, since upstream refuses a path inside a setting that can be empty; the list of manageable settings stops at them (policy/forkManagedSettings.ts). A policy path inside one is still refused, as upstream does.",
+      "added": [
+        "import { FORK_WHOLE_MANAGED_SETTINGS } from \"./forkManagedSettings.ts\"; // Fork: lenient settings",
+        "if (FORK_WHOLE_MANAGED_SETTINGS.has(path)) return [[path, value]]; // Fork: lenient settings"
+      ]
+    },
     "apps/server/src/server.ts": {
       "why": "The fork's service layers are wired here in one place each, from fork/forkLayers.ts (#384), so this file keeps as few fork lines as it can. The ten lines in \"added\" were its pending lines (ceiling 10) when it moved here (#361). The last line in \"added\" gives the runtime's workers upstream's orchestrator with one change: an idle compaction send to a thread whose handoff mode is \"handoff\" is skipped, so the handoff service alone owns that thread (fork/handoff, #361).",
       "added": [

@@ -17,9 +17,12 @@ import {
   HttpServerResponse,
 } from "effect/http";
 
+import { ServerSettingsError } from "@t3tools/contracts";
+
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerHttp from "../http.ts";
+import * as ServerSettingsService from "../serverSettings.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 
 /** A linked machine's token, an MCP client's token, or none. */
@@ -37,7 +40,11 @@ const layerFakeAuth = Layer.succeed(EnvironmentAuth.EnvironmentAuth, {
  * A server with upstream's static app page, plus this route when `withRoute` (this version), or
  * another answer at the features path (a proxy or a machine that is not this version).
  */
-const serve = (withRoute: boolean | Layer.Layer<never, never, HttpRouter.HttpRouter>) =>
+const serve = (
+  withRoute:
+    | boolean
+    | Layer.Layer<never, never, HttpRouter.HttpRouter | EnvironmentAuth.EnvironmentAuth>,
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -54,13 +61,16 @@ const serve = (withRoute: boolean | Layer.Layer<never, never, HttpRouter.HttpRou
     const services = yield* Layer.build(
       HttpRouter.serve(layerApp, { disableListenLog: true, disableLogger: true }).pipe(
         Layer.provideMerge(layerFakeAuth),
+        Layer.provideMerge(ServerSettingsService.ServerSettingsService.layerTest()),
         Layer.provideMerge(ServerConfig.layer({ ...config, staticDir })),
         Layer.provideMerge(NodeHttpServer.layerTest),
       ),
     );
     const client = Context.get(services, HttpClient.HttpClient);
+    const settings = Context.get(services, ServerSettingsService.ServerSettingsService);
     return {
       client,
+      settings,
       /** What the delegating machine's reader makes of this server, with `token`. */
       read: (token: string) =>
         ForkFeatures.readForkFeatures(client, { url: "", token, timeout: "5 seconds" }),
@@ -99,6 +109,42 @@ describe("fork features route in the server's router", () => {
         expect((yield* server.client.execute(HttpClientRequest.get("/some/page"))).status).toBe(
           200,
         );
+      }),
+    ),
+  );
+
+  it.effect("answers false while this machine is set to refuse carried profiles (#640)", () =>
+    provided(
+      Effect.gen(function* () {
+        const server = yield* serve(true);
+        yield* server.settings.updateSettings({ mcpCarriedProfiles: "refuse" });
+        expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: false });
+        // Each ask reads the setting again: set back, the next ask says yes.
+        yield* server.settings.updateSettings({ mcpCarriedProfiles: "apply" });
+        expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: true });
+      }),
+    ),
+  );
+
+  it.effect("settings that cannot be read answer what this version does", () =>
+    provided(
+      Effect.gen(function* () {
+        const server = yield* serve(
+          ForkFeatures.layer.pipe(
+            Layer.provide(
+              Layer.mock(ServerSettingsService.ServerSettingsService)({
+                getSettings: Effect.fail(
+                  new ServerSettingsError({
+                    settingsPath: "settings.json",
+                    operation: "read-secret",
+                    cause: new Error("secret store unreadable"),
+                  }),
+                ),
+              }),
+            ),
+          ),
+        );
+        expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: true });
       }),
     ),
   );
