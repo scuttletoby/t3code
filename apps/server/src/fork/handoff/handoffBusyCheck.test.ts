@@ -34,6 +34,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import { dispatchHandoff, type HandoffDispatchCommand } from "./handoffDispatch.ts";
+import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
 
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "gpt-5.1-codex" };
@@ -375,6 +376,26 @@ it.effect("a retry of a retry is dropped, even right after the failed retry", ()
       handoffCommand(threadId, `${first.id}:retry1`, "", ":retry1"),
     );
     assert.equal(outcome, "dropped");
+    assert.equal(handoffRuns(yield* runs(threadId)).length, 2);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a handoff sent as one that alerts lands, and so does its own retry; no other", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:handoff-loud");
+    const first = yield* quietThread(threadId);
+    const loud = `${first.id}${HANDOFF_LOUD_SUFFIX}`;
+    assert.equal(yield* sendHandoff(threadId, loud), "sent");
+    // Runs again (a restart, a second server): the same source run never hands off twice.
+    assert.equal(yield* sendHandoff(threadId, loud, ":again"), "dropped");
+    assert.equal(yield* sendHandoff(threadId, first.id, ":quiet"), "dropped");
+    yield* complete(handoffRuns(yield* runs(threadId))[0]!, { status: "failed" });
+    // The retry must name the send it follows: a quiet retry of a loud send is dropped.
+    assert.equal(
+      yield* dispatchHandoff(handoffCommand(threadId, first.id, "", ":retry1")),
+      "dropped",
+    );
+    assert.equal(yield* dispatchHandoff(handoffCommand(threadId, loud, "", ":retry1")), "sent");
     assert.equal(handoffRuns(yield* runs(threadId)).length, 2);
   }).pipe(Effect.provide(layerTest)),
 );
