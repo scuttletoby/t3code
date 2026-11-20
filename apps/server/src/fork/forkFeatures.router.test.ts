@@ -17,9 +17,13 @@ import {
   HttpServerResponse,
 } from "effect/http";
 
+import { ServerSettingsError } from "@t3tools/contracts";
+
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerHttp from "../http.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as ServerSettingsService from "../serverSettings.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 
 /** A linked machine's token, an MCP client's token, or none. */
@@ -37,7 +41,19 @@ const layerFakeAuth = Layer.succeed(EnvironmentAuth.EnvironmentAuth, {
  * A server with upstream's static app page, plus this route when `withRoute` (this version), or
  * another answer at the features path (a proxy or a machine that is not this version).
  */
-const serve = (withRoute: boolean | Layer.Layer<never, never, HttpRouter.HttpRouter>) =>
+const serve = (
+  withRoute:
+    | boolean
+    | Layer.Layer<
+        never,
+        never,
+        | HttpRouter.HttpRouter
+        | EnvironmentAuth.EnvironmentAuth
+        | ServerConfig.ServerConfig
+        | FileSystem.FileSystem
+        | ManagedPolicy.ManagedPolicy
+      >,
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -54,13 +70,17 @@ const serve = (withRoute: boolean | Layer.Layer<never, never, HttpRouter.HttpRou
     const services = yield* Layer.build(
       HttpRouter.serve(layerApp, { disableListenLog: true, disableLogger: true }).pipe(
         Layer.provideMerge(layerFakeAuth),
+        Layer.provideMerge(ServerSettingsService.ServerSettingsService.layerTest()),
+        Layer.provideMerge(ManagedPolicy.layerTest()),
         Layer.provideMerge(ServerConfig.layer({ ...config, staticDir })),
         Layer.provideMerge(NodeHttpServer.layerTest),
       ),
     );
     const client = Context.get(services, HttpClient.HttpClient);
+    const settings = Context.get(services, ServerSettingsService.ServerSettingsService);
     return {
       client,
+      settings,
       /** What the delegating machine's reader makes of this server, with `token`. */
       read: (token: string) =>
         ForkFeatures.readForkFeatures(client, { url: "", token, timeout: "5 seconds" }),
@@ -101,6 +121,81 @@ describe("fork features route in the server's router", () => {
         );
       }),
     ),
+  );
+
+  it.effect("answers false while this machine is set to refuse carried profiles (#640)", () =>
+    provided(
+      Effect.gen(function* () {
+        const server = yield* serve(true);
+        yield* server.settings.updateSettings({ mcpCarriedProfiles: "refuse" });
+        expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: false });
+        // Each ask reads the setting again: set back, the next ask says yes.
+        yield* server.settings.updateSettings({ mcpCarriedProfiles: "apply" });
+        expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: true });
+      }),
+    ),
+  );
+
+  /** A server whose settings read fails (it reads provider secrets too). */
+  const failingSettings = ForkFeatures.layer.pipe(
+    Layer.provide(
+      Layer.mock(ServerSettingsService.ServerSettingsService)({
+        getSettings: Effect.fail(
+          new ServerSettingsError({
+            settingsPath: "settings.json",
+            operation: "read-secret",
+            cause: new Error("secret store unreadable"),
+          }),
+        ),
+      }),
+    ),
+  );
+
+  /** Writes settings.json: its text, or "unreadable" (a directory in its place). */
+  const writeSettingsFile = (file: string) =>
+    Effect.gen(function* () {
+      const { settingsPath } = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      if (file === "unreadable") yield* fs.makeDirectory(settingsPath, { recursive: true });
+      else yield* fs.writeFileString(settingsPath, file);
+    });
+
+  // The route reads the settings as a Claude turn does: the same answer in each state.
+  it.effect.each<readonly [string, string | undefined, boolean]>([
+    ["no settings.json: the defaults, apply", undefined, true],
+    ["a settings.json that says apply", JSON.stringify({ mcpCarriedProfiles: "apply" }), true],
+    ["a settings.json that says refuse", JSON.stringify({ mcpCarriedProfiles: "refuse" }), false],
+    ["a settings.json that does not decode", "{ not json", false],
+    ["an empty settings.json", "", false],
+    ["a settings.json that cannot be read either", "unreadable", false],
+  ])("a failed settings read with %s answers as the turn reads it", ([, file, expected]) =>
+    provided(
+      Effect.gen(function* () {
+        if (file !== undefined) yield* writeSettingsFile(file);
+        const server = yield* serve(failingSettings);
+        expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: expected });
+        // Asked again, the same answer.
+        expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: expected });
+      }),
+    ),
+  );
+
+  it.effect(
+    "a settings.json that does not decode answers false though the read gave the defaults (#661)",
+    () =>
+      provided(
+        Effect.gen(function* () {
+          // Upstream gives every setting its default for a file that was broken at load (or went
+          // bad since), apply too; the file may say refuse.
+          const server = yield* serve(true);
+          expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: true });
+          yield* writeSettingsFile("{ not json");
+          expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: false });
+          // Fixed, the next ask says yes again.
+          yield* writeSettingsFile("{}");
+          expect(yield* server.read("link-token")).toEqual({ mcpProfileCarry: true });
+        }),
+      ),
   );
 
   it.effect.each<readonly [string, Record<string, string>]>([

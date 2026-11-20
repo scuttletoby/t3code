@@ -83,6 +83,7 @@ GATE_FILES = ('.github/workflows/' + GATE_WORKFLOW, 'fork-ci/actions/head-check'
 LIST_JQ = '.[] | [.number, .draft, .head.sha, .base.ref] | @json'
 HEAD_JQ = '.[] | [.number, .head.sha, .head.repo.full_name] | @json'   # head.repo is null for a deleted fork
 BRANCH_MAX = 255
+GIT_REF_CONTROL = re.compile(r'[\x00-\x1f\x7f]')   # git refuses these in a ref name (check-ref-format)
 SERVER = 'https://github.com'
 
 
@@ -324,13 +325,23 @@ def review_run_pr(repo, run, gh, out):
         out(f'nothing to judge: the run that finished was started by {event or "no event"!r}, not by a review or an '
             f'inline review comment ({", ".join(REVIEW_EVENTS)})')
         return [], None
-    if not (pr_queue.SHA.fullmatch(sha) and pr_queue.REPO_RE.fullmatch(head_repo) and 0 < len(branch) <= BRANCH_MAX
-            and branch.isprintable()):
-        # A warning, not a log line: a review run always has these fields (GitHub's, of a pull request event), so a
-        # run without them means GitHub's fields are not what this lookup expects, and no review would ever re-run the
-        # gate while every run stays green. The annotation makes that seen (the live check after setup looks for it).
+    if not (pr_queue.SHA.fullmatch(sha) and pr_queue.REPO_RE.fullmatch(head_repo) and branch
+            and not GIT_REF_CONTROL.search(branch)):
+        # A warning, not a log line: a review run of a pull request event has these fields, so a run without them (or
+        # with a branch git cannot have) most likely means GitHub's fields are not what this lookup expects, and no
+        # review would ever re-run the gate while every run stays green. The annotation makes that seen (the live
+        # check after setup looks for it). One known harmless cause: a fork deleted while its pull request is open
+        # leaves the run without a head repository, and nothing could be judged then anyway.
         out("::warning::head gate: nothing to judge: the review trigger's run does not name a head (head sha, head "
-            'repository, head branch); dispatch the gate with the pull request number')
+            'repository, head branch), or its head repository is gone (a deleted fork); dispatch the gate with the '
+            'pull request number')
+        return [], None
+    if len(branch) > BRANCH_MAX or not branch.isprintable():
+        # A name git allows (a no-break or zero-width space, an emoji joined by a zero-width joiner) that the gate does
+        # not look up: GitHub's fields are fine, so a plain line, never the warning above. The name is not logged.
+        out('nothing to judge: the head branch of the review run has characters the gate does not look up (an '
+            f'invisible or joining one), or is longer than {BRANCH_MAX}; post an issue comment or dispatch the gate '
+            'with the pull request number')
         return [], None
     owner = urllib.parse.quote(head_repo.split('/')[0], safe='')
     query = (f'repos/{repo}/pulls?state=open&per_page=100&head={owner}:'
@@ -338,7 +349,7 @@ def review_run_pr(repo, run, gh, out):
     r = read(gh, '--paginate', query, '--jq', HEAD_JQ)
     if r.returncode != 0:
         return None, f'could not list the open pull requests with the head of the review run: {said(r)}'
-    matches = []
+    matches, listed = [], set()
     for line in r.stdout.splitlines():
         try:
             n, head, from_repo = json.loads(line)
@@ -347,12 +358,17 @@ def review_run_pr(repo, run, gh, out):
         if not (type(n) is int and n > 0 and isinstance(head, str)
                 and pr_queue.SHA.fullmatch(head.lower()) and (from_repo is None or isinstance(from_repo, str))):
             return None, 'GitHub listed something that is not a pull request'
+        listed.add(n)
         if head.lower() == sha and isinstance(from_repo, str) and from_repo.lower() == head_repo.lower():
             matches.append(n)
     where = f'{sha} of {head_repo} branch {branch!r}'
     if not matches:
+        # How many GitHub listed tells the live check's two failures apart (setup step 8): none for an open pull
+        # request means the head=owner:branch filter is not GitHub's; some means the head sha or repository differs.
         out(f'nothing to judge: no open pull request has the head {head_check.escape(where)} (closed or merged since, '
-            'or the head moved on: its push ran the gate)')
+            'or the head moved on: its push ran the gate); GitHub listed '
+            + (f'{len(listed)} open pull request{"s" if len(listed) > 1 else ""} on that branch, none with this head'
+               if listed else 'no open pull request on that branch'))
         return [], None
     # One branch into two bases: every match has this head, and the gate judges a head, not a pull request (preflight
     # lists every open pull request with it again; the number only names the job). So it is judged once. The listing

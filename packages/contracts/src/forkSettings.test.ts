@@ -28,6 +28,9 @@ import SETTINGS_SOURCE from "./settings.ts?raw";
 import { PROJECT_FILE_BACKED_SETTINGS, T3ProjectFile } from "./t3ProjectFile.ts";
 
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+const decodeProjectOverrides = Schema.decodeUnknownSync(ProjectSettingsOverrides);
+const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
+const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const PROJECT = ProjectId.make("project-1");
 
 /**
@@ -79,6 +82,60 @@ describe("fork settings seam", () => {
     const good = { "lint-ok": { argv: ["/bin/true"] } };
     expect(patch(good).projectSettingsOverrides?.[PROJECT]).toMatchObject({ waitChecks: good });
     expect(() => patch({ "Bad Name": { argv: ["/bin/true"] } })).toThrow();
+  });
+
+  it("reads a project's hand-written null as left out (the server's), never as off or null", () => {
+    // `null` is the save's "clear", so a file that holds it means the same thing. It reads as the
+    // key left out: a `null` kept would reach readers as the project's own value.
+    for (const key of ["playtest", "handoff", "reviewRules"] as const) {
+      const project = decodeProjectOverrides({ [key]: null, defaultAutoPull: false });
+      expect(Object.hasOwn(project, key), key).toBe(false);
+      const settings = decodeServerSettings({
+        projectSettingsOverrides: { [PROJECT]: { [key]: null, defaultAutoPull: false } },
+      });
+      expect(Object.hasOwn(settings.projectSettingsOverrides[PROJECT] ?? {}, key), key).toBe(false);
+      // A save of another key writes the file without it (the same meaning), and so does the next.
+      const written = encodeServerSettings(settings).projectSettingsOverrides?.[PROJECT];
+      expect(written, key).toEqual({ defaultAutoPull: false });
+      const again = encodeServerSettings(
+        decodeServerSettings({ projectSettingsOverrides: { [PROJECT]: written } }),
+      ).projectSettingsOverrides?.[PROJECT];
+      expect(again, key).toEqual(written);
+      // A project entry that held only the `null` reads as empty.
+      expect(decodeProjectOverrides({ [key]: null }), key).toEqual({});
+    }
+  });
+
+  it("never writes a project's null to the file, while a patch's null (the clear) goes over the wire", () => {
+    const encodePatch = Schema.encodeSync(ServerSettingsPatch);
+    for (const key of ["playtest", "handoff", "reviewRules"] as const) {
+      // No path puts a `null` in memory today; if one ever did, the save drops it (the same
+      // meaning: the server's value), so it never reaches the file to be read back.
+      const inMemory = (entry: Record<string, unknown>) =>
+        ({
+          ...decodeServerSettings({}),
+          projectSettingsOverrides: { [PROJECT]: entry },
+        }) as unknown as ServerSettings;
+      const written = encodeServerSettings(inMemory({ [key]: null, defaultAutoPull: false }))
+        .projectSettingsOverrides?.[PROJECT];
+      expect(written, key).toEqual({ defaultAutoPull: false });
+      expect(
+        encodeServerSettings(inMemory({ [key]: null })).projectSettingsOverrides?.[PROJECT],
+        key,
+      ).toEqual({});
+      // The written file reads back the same, and writes the same again (runs again).
+      const reread = decodeServerSettings(
+        JSON.parse(JSON.stringify({ projectSettingsOverrides: { [PROJECT]: written } })),
+      );
+      expect(encodeServerSettings(reread).projectSettingsOverrides?.[PROJECT], key).toEqual(
+        written,
+      );
+      // The patch has its own schema for these keys: a client's clear keeps its `null` both ways.
+      const clear = { projectSettingsOverrides: { [PROJECT]: { [key]: null } } };
+      const sent = JSON.parse(JSON.stringify(encodePatch(decodePatch(clear))));
+      expect(sent, key).toEqual(clear);
+      expect(decodePatch(sent).projectSettingsOverrides?.[PROJECT], key).toEqual({ [key]: null });
+    }
   });
 
   it("gives every fork setting a patch field and a patch rule", () => {

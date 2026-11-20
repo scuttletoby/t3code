@@ -4,6 +4,7 @@
  * fork's defaults on. Nothing reads it yet; wired in only through forkSettings.ts.
  */
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
@@ -14,8 +15,16 @@ import { ProviderDriverKind } from "./providerInstance.ts";
 export const ReviewRulesPreset = Schema.Literals(["off", "recommended"]);
 export type ReviewRulesPreset = typeof ReviewRulesPreset.Type;
 
-/** A lens name as the repo's config writes it (`review`, `approach`, `security`). */
-export const ReviewLensName = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,39}$/u));
+/**
+ * A lens name as the repo's config writes it (`review`, `approach`, `security`). Not a name every
+ * object already has (`constructor`): looked up by name, it would find a function, not a runner.
+ */
+export const ReviewLensName = Schema.String.check(
+  Schema.isPattern(/^[a-z][a-z0-9-]{0,39}$/u),
+  Schema.makeFilter((name: string) => !(name in Object.prototype), {
+    expected: "a lens name that is not a built-in object key such as `constructor`",
+  }),
+);
 export type ReviewLensName = typeof ReviewLensName.Type;
 
 /** Who runs a lens: a driver kind and a model, not a provider instance (ids differ per machine). */
@@ -127,15 +136,31 @@ export function effectiveReviewRules(
     return { preset: "off" };
   }
   const preset = REVIEW_RULES_RECOMMENDED;
+  // No prototype: a lens without an entry finds nothing, whatever its name.
+  const lensRunners: Record<ReviewLensName, ReviewRunner> = Object.assign(
+    Object.create(null) as Record<ReviewLensName, ReviewRunner>,
+    preset.lensRunners,
+    value.lensRunners,
+  );
   return {
     preset: "recommended",
     runner: value.runner ?? preset.runner,
-    lensRunners: { ...preset.lensRunners, ...value.lensRunners },
+    lensRunners,
     stateQuestion: value.stateQuestion ?? preset.stateQuestion,
     minors: value.minors ?? preset.minors,
     configPath: value.configPath ?? preset.configPath,
     reportMaxChars: value.reportMaxChars ?? preset.reportMaxChars,
   };
+}
+
+/** Who runs `lens`: its own entry in `lensRunners`, else `runner`. Never a prototype's key. */
+export function reviewLensRunner(
+  rules: Extract<EffectiveReviewRules, { readonly preset: "recommended" }>,
+  lens: string,
+): ReviewRunner {
+  return (
+    (Object.hasOwn(rules.lensRunners, lens) ? rules.lensRunners[lens] : undefined) ?? rules.runner
+  );
 }
 
 /** A key nobody defined (a typo, or a field from a newer build) is an error, never dropped. */
@@ -191,7 +216,11 @@ export type ReviewRulesPatch = typeof ReviewRulesPatch.Type;
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** A project's unreadable value as a client holds it (off, the text kept) and sends it back. */
+/**
+ * A project's unreadable value as a client holds it (off, the text kept) and sends it back. The
+ * server also takes it only when its text is the one stored for that project
+ * ({@link isKeptReviewRulesUnchanged}), so a save never brings text in.
+ */
 const isKeptUnreadable = (raw: unknown): boolean =>
   isRecord(raw) &&
   Object.hasOwn(raw, "unreadable") &&
@@ -219,3 +248,21 @@ export const ReviewRulesProjectPatch = Schema.Unknown.pipe(
     }),
   ),
 );
+
+/**
+ * Whether a project's value in a save is either readable or the very unreadable text stored for
+ * that project. Kept text that differs (another text, one for a project that stores none, a stale
+ * client's after the person fixed it elsewhere) could read as on in a later build that knows its
+ * keys, and has no size cap; the server refuses it (forkSettingsPatch.ts).
+ */
+export function isKeptReviewRulesUnchanged(
+  stored: ReviewRules | null | undefined,
+  next: ReviewRules | null | undefined,
+): boolean {
+  if (next == null || !Object.hasOwn(next, "unreadable")) return true;
+  return (
+    stored != null &&
+    Object.hasOwn(stored, "unreadable") &&
+    Equal.equals(stored.unreadable, next.unreadable)
+  );
+}

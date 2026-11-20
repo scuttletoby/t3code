@@ -17,6 +17,7 @@ import {
   type ServerSettingsPatch,
   isBuiltInMcpProfileName,
   isDefinableMcpProfileName,
+  isKeptReviewRulesUnchanged,
   isPlaytestProgramFullyQualified,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -33,7 +34,16 @@ const FORK_PATCH_KEYS = Object.keys(FORK_PATCH_RULES) as ReadonlyArray<ForkServe
 
 export type ForkSettingsPatch = Pick<ServerSettingsPatch, ForkServerSettingKey>;
 
-/** Splits a patch into its fork fields and the rest (upstream's), which keeps every other key. */
+/** The project keys whose `null` is a save's "clear" (`playtest`, `handoff`, `reviewRules`). */
+const NULL_CLEARED_PROJECT_KEYS = Object.entries(FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT)
+  .filter(([, clear]) => clear === null)
+  .map(([key]) => key);
+
+/**
+ * Splits off the fork fields, and drops a project's {@link NULL_CLEARED_PROJECT_KEYS} `null` from
+ * upstream's part, which upstream would store. Upstream's whole-entry merge then removes the key;
+ * the fork's server save keeps a left-out key, so it must get the unsplit patch to see the clear.
+ */
 export function splitForkSettingsPatch<P extends ServerSettingsPatch>(
   patch: P,
 ): readonly [ForkSettingsPatch, Omit<P, ForkServerSettingKey>] {
@@ -44,11 +54,28 @@ export function splitForkSettingsPatch<P extends ServerSettingsPatch>(
     fork[key] = rest[key];
     delete rest[key];
   }
+  const projects = rest.projectSettingsOverrides;
+  if (isRecord(projects)) {
+    let cleaned: Record<string, unknown> | undefined;
+    for (const [projectId, entry] of Object.entries(projects)) {
+      if (!isRecord(entry)) continue;
+      const nulls = NULL_CLEARED_PROJECT_KEYS.filter(
+        (key) => Object.hasOwn(entry, key) && entry[key] === null,
+      );
+      if (nulls.length === 0) continue;
+      const kept: Record<string, unknown> = { ...entry };
+      for (const key of nulls) delete kept[key];
+      cleaned ??= { ...projects };
+      cleaned[projectId] = kept;
+    }
+    if (cleaned !== undefined) rest.projectSettingsOverrides = cleaned;
+  }
   return [fork as ForkSettingsPatch, rest as Omit<P, ForkServerSettingKey>];
 }
 
-const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function applyRule(rule: ForkPatchRule, stored: unknown, patch: unknown): unknown {
   if (rule === "replace") return patch;
@@ -136,6 +163,9 @@ export function keepLeftOutForkProjectKeys(
       if (!Object.hasOwn(entry, key)) {
         if (isSet(value)) kept[key] = value;
       } else if ((entry as Readonly<Record<string, unknown>>)[key] === CLEAR_VALUES[key]) {
+        // `""` (MCP keys): upstream stored it, so delete it. `null`: the split already kept it from
+        // upstream, so the delete is a no-op; it stays so a `next` that does hold a `null`
+        // (upstream's merge of an unsplit patch) still comes out without it.
         cleared.push(key);
       }
     }
@@ -273,9 +303,9 @@ function mcpProfileRefProblem(
 
 /**
  * Why the server must refuse this save of fork settings or of an interval (any setting's, see
- * forkSettingsIntervals.ts), or `undefined`. Checks `next` (the
- * settings after the patch) against `current`, so it also sees a project's or thread's value that
- * a client sent back unchanged. Deleting a profile still in use is not refused yet (a later PR).
+ * forkSettingsIntervals.ts), or `undefined`. Checks `next` against `current`, so it also sees a
+ * value a client sent back unchanged (kept `reviewRules` text must be the stored one). Deleting a
+ * profile still in use is not refused yet (a later PR).
  */
 export function forkSettingsWriteProblem(
   current: ServerSettings,
@@ -308,6 +338,9 @@ export function forkSettingsWriteProblem(
         ]
       : undefined;
     problems.push(
+      isKeptReviewRulesUnchanged(stored?.reviewRules, overrides.reviewRules)
+        ? undefined
+        : `Project ${projectId}'s reviewRules sends back unreadable text that is not the one stored for it (it was changed elsewhere): reload the settings and save again, or set the project's review rules anew.`,
       mcpProfileRefProblem(
         next,
         `Project ${projectId}'s mcpProfile`,

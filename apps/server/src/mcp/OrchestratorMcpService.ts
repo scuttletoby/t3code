@@ -1744,7 +1744,7 @@ const make = Effect.gen(function* () {
     };
   });
 
-  // Fork: the fork's delegation checks (usage pacing, agent slots), called at their seats.
+  // Fork: the fork's delegation checks (pacing, slots, a child's own options) at their seats.
   const delegateChecks = yield* DelegateChecks.make({ resolveTarget, scanWorkspace });
 
   const requestKey = (clientRequestId: string | undefined): Effect.Effect<string> =>
@@ -2764,7 +2764,7 @@ const make = Effect.gen(function* () {
         // The task's child runs as an ordinary thread there; this thread keeps the task.
         const { taskId } = yield* remoteDelegation.delegate(scope, {
           ...input,
-          target: { ...input.target, environmentId },
+          target: yield* delegateChecks.remoteTarget({ ...input.target, environmentId }), // Fork: its own options
         });
         return yield* input.mode === "wait"
           ? awaitTask(scope, taskId, taskId, input.timeoutMs)
@@ -2856,8 +2856,7 @@ const make = Effect.gen(function* () {
         }
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
-      // Fork: seat 2 of the fork's delegation checks, last before the dispatch. Its hold lasts
-      // until the dispatch and the child's run preparation end, or the call's scope closes.
+      // Fork: seat 2 of the checks, last before the dispatch (its hold: fork/delegateChecks.ts).
       const forkHold = yield* delegateChecks.afterWorkspace({
         isRetry: isRetryOfAcceptedDelegation,
         callerThreadId: scope.thread.threadId,
@@ -3203,11 +3202,11 @@ const make = Effect.gen(function* () {
                 cwd,
                 skipProjectEnablementFilter: isRetryOfAcceptedCreation,
               });
-              // Fork: the seat of the fork's delegation checks for created threads (may change the target).
               const { target } = yield* delegateChecks.beforeCreateThread({
                 isRetry: isRetryOfAcceptedCreation,
                 callerThreadId: scope.thread.threadId,
                 parent,
+                requested: request.target,
                 target: resolvedTarget,
               });
               const runtimeMode = yield* resolveRuntimeMode(

@@ -54,7 +54,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`         | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                        | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
 | [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
 | [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
@@ -62,10 +62,11 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.mcpProfile`](#servermcpprofile)                                     | `"all"`                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpSubagentProfile`](#servermcpsubagentprofile)                     | `"inherit"`                 | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`server.mcpThreadProfiles`](#servermcpthreadprofiles)                       | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
+| [`server.mcpCarriedProfiles`](#servermcpcarriedprofiles)                     | `"apply"`                   | yes | [#640](https://github.com/scuttletoby/t3code/issues/640) |
 | [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`            | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                     | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                     | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
@@ -289,7 +290,8 @@ fields out to keep them fixed. Efforts an agent may not use are the model policy
 setting's.
 
 Fields: `runner` and each `lensRunners` entry are `{driver, model, effort}` (a driver kind, not a
-provider instance); `stateQuestion` is 20 to 600 characters; `minors` is `same-round`, `issue` or
+provider instance), and a lens name is not a built-in object key such as `constructor`;
+`stateQuestion` is 20 to 600 characters; `minors` is `same-round`, `issue` or
 `free`; `configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
 from 1000 to 65000.
 
@@ -315,8 +317,12 @@ Which models (and efforts) agents may pick, per provider driver. `mode` is `off`
 model, as upstream's do), `advise` (agents are only told) or `enforce` (a pick off the list is
 refused). Each `allow` row names a `driver` and a `model`; `efforts` (non-empty) limits the efforts
 for that model, and a row without it checks only the model. `defaultEffort` must be one of the
-row's `efforts`; `useFor` is a short note shown to agents when they pick. Nothing reads the setting
-yet: the check comes in a later pull request.
+row's `efforts`; `useFor` is a short note shown to agents when they pick. The check comes in a later
+pull request. Today the server reads only whether the policy is on (`advise` or `enforce`): then a
+child that `delegate_task` (here or on a linked machine) or `create_threads` starts with a call that
+names its model keeps only the options the call names, none of its parent's others (an agent, a
+session mode, a service tier, an effort). With `off` it keeps upstream's way: a call that names the
+parent's model takes the parent's options under its own.
 
 Only the person can change it; agents cannot. A save must give both `mode` and `allow` (it replaces
 the stored value whole) and is refused for a bad row, a `defaultEffort` not in its row's `efforts`,
@@ -397,7 +403,13 @@ says so; with no profile set there, the thread gets `all` as before), a profile 
 `t3Tools` is not `"all"` (the T3 tool filter comes in a later pull request), or a session that
 still shows a server the profile leaves out, or does not list its servers within 5 minutes. A
 managed Claude policy on the machine or `--mcp-config` in the Claude launch arguments can make
-Claude load a server T3's list leaves out. Other providers do not apply profiles yet.
+Claude load a server T3's list leaves out.
+
+Only Claude threads apply profiles. A Codex thread, or one on any other provider, gets every MCP
+server and every T3 tool whatever its profile says. So a thread whose profile is narrower than
+`all` does not delegate a task to a Codex (or other non-Claude) instance on another machine: the
+call is refused before anything is sent (see below). A task such an instance got anyway, from a
+machine on a T3 from before this, runs with every tool.
 
 Each tool call is checked too: a call to an MCP server the profile leaves out (also one an agent
 file declares, or one added while the session runs) is refused at the moment of the call: Claude
@@ -430,7 +442,14 @@ token, never a browser, and any other caller gets a plain 404. Only `mcpProfileC
 an older T3 answers that path with its app page, which reads as "cannot", and no answer in time
 (the whole answer, its body too) refuses the task too. A redirect is not followed, and only a 200
 answer counts. It asks again for each task, so an update or a downgrade there counts at once.
-A thread with `all` delegates to any machine, without asking. A task that arrives from a machine
+A machine whose owner set `mcpCarriedProfiles` to `refuse`, or whose settings cannot be read now,
+answers `mcpProfileCarry: false`, so the call is refused the same way, before anything is sent, and
+says that machine does not take such a task now. When the machine says it applies one, the
+delegating machine then asks its `orchestrator_capabilities` (through the link, as any call there)
+which driver the task's provider instance runs, and refuses the call unless it is Claude: an
+instance it does not list, or no answer, refuses it too
+([#661](https://github.com/scuttletoby/t3code/issues/661)). A thread with `all` delegates to any
+machine and any instance there, without asking. A task that arrives from a machine
 on an older T3 carries nothing, so it gets this machine's profile for its role as before, and the
 server log says so.
 
@@ -457,6 +476,40 @@ machine (see `server.mcpProfiles`).
 The person's pick of profile per thread, by thread id. A pick wins over every default. At most 500
 picks are kept: a save that would add more is refused until old picks are removed. No pick is ever
 dropped to make room.
+
+### `server.mcpCarriedProfiles`
+
+Whether this machine takes tasks that another machine delegated with a profile narrower than `all`
+([#640](https://github.com/scuttletoby/t3code/issues/640)). `apply` (the default) cuts such a task
+down to the carried profile, as `server.mcpProfiles` says. `refuse` takes no part in carrying: the
+features route answers `mcpProfileCarry: false`, so a narrower-profile thread on another machine is
+refused before it sends. A task that arrives with one anyway (sent before the setting changed), or
+with a profile this machine cannot read, does not start its turn on Claude, nor do its sub-agents,
+and says why (a sub-agent's refusal gives the reason at the top of the chain). A sender of this
+version does not send a narrower profile to a Codex or other non-Claude instance here, whichever
+value is set, as only Claude threads apply profiles (see `server.mcpProfiles`). Neither value is an
+"ignore the carried profile" value, as a thread could then get more tools by delegating to this
+machine. A task that carries `all`, or nothing (from an older T3), runs as before, and the owner's
+pick for a task here (`mcpThreadProfiles`) still stands. It is read again for each turn and each
+ask, so a change counts from the next one. Only `apply` (in any case, with spaces around it) reads
+as `apply`; any other value, such as a typo of `refuse` or an empty one, reads as `refuse`, and the
+file's other settings keep their values.
+
+`settings.json` is checked on each read too, the same way for a Claude turn, for a delegation's
+check of its own thread's profile, and for the features route's answer. When it does not decode
+(also when it already did not decode when the server loaded it, which gives every setting its
+default), this setting reads as `refuse`, as the file may say so: a narrower carried task is
+refused, and the route answers `false`. A managed policy that locks this setting wins over that.
+This machine's own threads keep the settings the server read (for a file that did not decode at
+load, the defaults: `all` unless a policy says otherwise), so they still start, also the thread
+that fixes the file. When the settings cannot be read in full (they read provider secrets too),
+the MCP profile settings come from `settings.json` alone; when that cannot be read either, a turn
+or a delegation is refused and the route answers `false`, never anything wider. Only the person can
+change it; agents cannot.
+
+```json
+{ "mcpCarriedProfiles": "refuse" }
+```
 
 ### `server.handoff`
 
@@ -500,7 +553,13 @@ A project's own playtest adapter. It replaces the server's `playtest` for that p
 a project sets every step it uses. Not set: the project uses the server's. A project value that is
 not valid reads as off for that project; it never falls back to the server's adapter. A project save
 that leaves this key out (an older client) keeps the stored value; only `null` clears it, and the
-fork's `clearProjectSettingsOverridesWithForkKeys` sends that. Unlike the server's value it is
+fork's `clearProjectSettingsOverridesWithForkKeys` sends that. A `null` written into the file by
+hand means the same: it reads as the key left out (not set, the server's), and the next save drops
+it. This changed with [#302](https://github.com/scuttletoby/t3code/issues/302): before, a
+hand-written project `null` read as off, so a file that still holds one (no save of that project
+since) now takes the server's adapter, or for `handoff` the server's mode, and can turn playtest or
+handoff on for that project. Write `{"enabled": false}` (`handoff`: `{"mode": "off"}`) to keep a
+project off. Unlike the server's value it is
 saved with every field written out, so a project that is off says so in the file. A repository's `t3.json` cannot set
 it: that file is in the repository, which agents edit.
 
@@ -510,8 +569,11 @@ A project's own review rules. It replaces the server's `reviewRules` for that pr
 `{"preset": "off"}` turns review rules off for one project on a machine where they are on, and a
 project with `recommended` does not take the server's fields written out. Not set: the server's. A
 project value that is not valid reads as off for that project, never as the server's, and is kept
-as written. A project save that leaves this key out (an older client) keeps the stored value; only
-`null` clears it, as for `playtest`.
+as written. A project save takes that kept text back only unchanged: a save that sends other
+unreadable text, or text for a project whose stored value reads well (a client that has not reloaded
+since the value was fixed elsewhere), is refused. A project save that leaves this key out (an older
+client) keeps the stored value; only `null` clears it, as for `playtest`. A lens named like a
+built-in object key (`constructor`) is not valid.
 
 ### `projectOverride.mcpProfile`
 
@@ -534,7 +596,8 @@ Not set: the project uses the server's. A project value that is not valid reads 
 project, and the next save of the project writes it back as a full `off` value; it never falls back
 to the server's value. A thread's own mode in the project's or the server's `threads` wins over
 either `mode`, the project's entry first. A project save that leaves this key out (an
-older client) keeps the stored value; only `null` clears it.
+older client) keeps the stored value; only `null` clears it (also when written by hand, as for
+`playtest`, including the change for old files).
 
 ### A setting the fork removed
 

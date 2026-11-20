@@ -151,3 +151,39 @@ describe("MCP profile settings patch", () => {
     expect(() => decodePatch(patch)).toThrow();
   });
 });
+
+describe("mcpCarriedProfiles setting (#640)", () => {
+  it.each<readonly [string, unknown, string]>([
+    ["absent (an old file)", undefined, "apply"],
+    ["refuse", "refuse", "refuse"],
+    ["refuse, spaced and in capitals", " Refuse ", "refuse"],
+    ["apply", "apply", "apply"],
+    ["apply, spaced and in capitals", " Apply ", "apply"],
+    ["null (not set)", null, "apply"],
+    // A typo or a newer build's value only refuses, never opens up to apply.
+    ["a word it does not know", "ignore", "refuse"],
+    ["a typo of refuse", "refused", "refuse"],
+    ["an empty value", "", "refuse"],
+    ["not text", 1, "refuse"],
+  ])("reads %s and keeps every other setting", (_name, value, expected) => {
+    const file = {
+      mcpProfile: "t3-only",
+      ...(value === undefined ? {} : { mcpCarriedProfiles: value }),
+    };
+    const settings = decodeFile(file);
+    expect(settings.mcpCarriedProfiles).toBe(expected);
+    expect(settings.mcpProfile).toBe("t3-only");
+  });
+
+  it("saves the value back as read", () => {
+    expect(encodeFile(decodeFile({ mcpCarriedProfiles: "refuse" })).mcpCarriedProfiles).toBe(
+      "refuse",
+    );
+  });
+
+  it("takes only apply or refuse in a patch", () => {
+    expect(decodePatch({ mcpCarriedProfiles: "refuse" }).mcpCarriedProfiles).toBe("refuse");
+    expect(decodePatch({ mcpCarriedProfiles: "apply" }).mcpCarriedProfiles).toBe("apply");
+    expect(() => decodePatch({ mcpCarriedProfiles: "ignore" })).toThrow();
+  });
+});

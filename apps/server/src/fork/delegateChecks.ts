@@ -12,6 +12,7 @@ import {
   type OrchestratorMcpTarget,
   PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
   type OrchestrationV2ThreadProjection,
+  type ProviderOptionSelection,
   type RuntimeMode,
   type ServerProvider,
   type ThreadId,
@@ -95,6 +96,8 @@ export interface BeforeCreateThreadInput {
   readonly isRetry: boolean;
   readonly callerThreadId: ThreadId;
   readonly parent: Parent;
+  /** The target the caller asked for, before the parent's options were laid under it. */
+  readonly requested: OrchestratorMcpTarget | undefined;
   readonly target: DelegateTarget;
 }
 
@@ -108,7 +111,10 @@ export interface DelegateChecks {
   readonly beforeWorkspace: (
     input: BeforeWorkspaceInput,
   ) => Effect.Effect<BeforeWorkspaceResult, OrchestratorMcpFailure>;
-  /** `delegate_task`, on the final target, last before the dispatch. */
+  /**
+   * `delegate_task`, on the final target, last before the dispatch. Its hold lasts until the
+   * dispatch and the child's run preparation end, or the call's scope closes.
+   */
   readonly afterWorkspace: (
     input: AfterWorkspaceInput,
   ) => Effect.Effect<DelegateHold, OrchestratorMcpFailure, Scope.Scope>;
@@ -116,6 +122,10 @@ export interface DelegateChecks {
   readonly beforeCreateThread: (
     input: BeforeCreateThreadInput,
   ) => Effect.Effect<BeforeCreateThreadResult, OrchestratorMcpFailure>;
+  /** A remote `delegate_task`'s target, before it is sent: {@link remoteTarget} under the policy. */
+  readonly remoteTarget: <Target extends OrchestratorMcpTarget>(
+    target: Target,
+  ) => Effect.Effect<Target>;
 }
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
@@ -180,6 +190,56 @@ const FAILED_SCAN_BACKOFF_MS = PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS;
 const backingOff = (retryAtMs: number | undefined, nowMs: number): retryAtMs is number =>
   retryAtMs !== undefined && retryAtMs > nowMs && retryAtMs - nowMs <= FAILED_SCAN_BACKOFF_MS;
 
+/**
+ * The option ids a call names: its own, and `ultracode` when it names the old effort `ultracode`,
+ * which T3 reads as `xhigh` plus the ultracode option (`withLegacyUltracodeEffort`).
+ */
+const namedOptionIds = (requested: OrchestratorMcpTarget): ReadonlySet<string> => {
+  const options = requested.options ?? [];
+  const ids = new Set(options.map((option) => option.id));
+  if (options.some((option) => option.id === "effort" && option.value === "ultracode")) {
+    ids.add("ultracode");
+  }
+  return ids;
+};
+
+/**
+ * The one rule for a child's options on every launch path, applied while a model policy is on: a
+ * call that names its model keeps only the options it names, as a policy and the model guard check
+ * only the call. A call that names no model keeps the parent's options, as upstream does.
+ */
+export const ownOptions = (
+  options: ReadonlyArray<ProviderOptionSelection> | undefined,
+  requested: OrchestratorMcpTarget | undefined,
+): ReadonlyArray<ProviderOptionSelection> | undefined => {
+  if (requested?.model === undefined || options === undefined) return options;
+  const named = namedOptionIds(requested);
+  return options.filter((option) => named.has(option.id));
+};
+
+/** A model policy is on (`advise` or `enforce`): {@link ownOptions} applies. */
+const policyOn = (settings: { readonly modelPolicy: { readonly mode: string } }) =>
+  settings.modelPolicy.mode !== "off";
+
+/** `ownOptions` on a resolved target: the same object back when nothing is dropped. */
+export const withOwnOptions = (
+  target: DelegateTarget,
+  requested: OrchestratorMcpTarget | undefined,
+): DelegateTarget => {
+  const options = ownOptions(target.modelSelection.options, requested);
+  return options === undefined || options.length === target.modelSelection.options?.length
+    ? target
+    : { ...target, modelSelection: { ...target.modelSelection, options } };
+};
+
+/**
+ * {@link ownOptions} for a remote `delegate_task`, whose `RemoteDelegation.ts` sends a call's own
+ * options as given and lays the parent's under none: a call that names its model and no option
+ * sends `[]`. Its retry sends the same. The checks' `remoteTarget` applies it under a policy.
+ */
+export const remoteTarget = <Target extends OrchestratorMcpTarget>(target: Target): Target =>
+  target.model === undefined || target.options !== undefined ? target : { ...target, options: [] };
+
 const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void };
 
 /**
@@ -199,6 +259,20 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
    * (expired, or set before the clock went back) are dropped on each write.
    */
   const failedScans = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
+  /**
+   * Whether {@link ownOptions} applies: a model policy is on. A settings read that fails counts as
+   * on, as a policy that cannot be read is enforced (`modelPolicy.ts`), and a child that starts on
+   * its model's defaults is the safe side.
+   */
+  const ownOptionsOn = serverSettings.getSettings.pipe(
+    Effect.map(policyOn),
+    Effect.orElseSucceed(() => true),
+  );
+  /** {@link withOwnOptions} while the policy is on; settings are read only when it could drop one. */
+  const ownTarget = (target: DelegateTarget, requested: OrchestratorMcpTarget | undefined) =>
+    withOwnOptions(target, requested) === target
+      ? Effect.succeed(target)
+      : Effect.map(ownOptionsOn, (on) => (on ? withOwnOptions(target, requested) : target));
 
   /**
    * The usage pacing gate (`usagePacingGate` setting, off by default). A setting or a pace that
@@ -274,19 +348,26 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
           const notListed = { cannot: `it does not list ${model} for this folder` };
           // A current model list is an answer, whoever published it (another path may have, during
           // a back-off): the reply gives it, not "no result".
-          const answered = folderScan(providers, candidate, cwd, nowMs).models;
+          const before = folderScan(providers, candidate, cwd, nowMs);
           const key = `${candidate}\u0000${cwd}`;
           const noAnswer = (retryAtMs: number) => ({
             cannot: `it does not list ${model} and its scan of this folder gave no result (scanned again after ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))})`,
           });
           const retryAtMs = (yield* Ref.get(failedScans)).get(key);
-          if (answered && (!mayScan || backingOff(retryAtMs, nowMs))) return notListed;
+          // `enforce` scans unless a back-off holds, and the registry runs a probe for any snapshot
+          // that is not settled (slash commands still loading too). So the advice answers from the
+          // list only where `enforce` would: during a back-off, or from a settled list.
+          if (before.models && (backingOff(retryAtMs, nowMs) || (!mayScan && before.settled))) {
+            return notListed;
+          }
           // A back-off that `enforce` recorded holds in `advise` too: `enforce` would not scan now,
           // so the advice must not say it would.
           if (backingOff(retryAtMs, nowMs)) return noAnswer(retryAtMs);
           if (!mayScan) {
             return {
-              cannot: `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
+              cannot: before.models
+                ? `it does not list ${model} for this folder in a scan that is still loading its slash commands (advice only, so it was not scanned again)`
+                : `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
               wouldScan: true,
             };
           }
@@ -315,7 +396,11 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         }
         const modes = yield* Effect.all([modeOn(input.target), modeOn(resolved.success)]);
         return Option.isSome(modes[1]) && Option.getOrNull(modes[0]) === modes[1].value
-          ? { target: resolved.success }
+          ? {
+              target: policyOn(settings.value)
+                ? withOwnOptions(resolved.success, input.requested)
+                : resolved.success,
+            }
           : { cannot: "it would run the task in another runtime mode" };
       }),
     });
@@ -374,14 +459,26 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
     );
 
   const checks: DelegateChecks = {
+    // Before the pacer, so it paces the child's own options; a target it moves to keeps them too.
     beforeWorkspace: (input) =>
-      input.isRetry ? Effect.succeed({ target: input.target }) : paceTarget(input),
+      input.isRetry
+        ? Effect.succeed({ target: input.target })
+        : Effect.flatMap(ownTarget(input.target, input.requested), (target) =>
+            paceTarget({ ...input, target }),
+          ),
     afterWorkspace: (input) =>
       input.isRetry || Option.isNone(slotGate)
         ? Effect.succeed(NO_HOLD)
         : acquireSlot(slotGate.value, input),
-    // No fork check on created threads yet; model policy (M3) and placement (P1) add theirs here.
-    beforeCreateThread: (input) => Effect.succeed({ target: input.target }),
+    // Placement (P1) adds its check here.
+    beforeCreateThread: (input) =>
+      input.isRetry
+        ? Effect.succeed({ target: input.target })
+        : Effect.map(ownTarget(input.target, input.requested), (target) => ({ target })),
+    remoteTarget: (target) =>
+      remoteTarget(target) === target
+        ? Effect.succeed(target)
+        : Effect.map(ownOptionsOn, (on) => (on ? remoteTarget(target) : target)),
   };
   return checks;
 });
