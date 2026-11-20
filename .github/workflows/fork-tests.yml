@@ -7,7 +7,8 @@ name: Fork tests
 # private remote cache), Test splits over two runners and Test Web over three.
 # Upstream's composite actions and change detector (.github/actions,
 # .github/scripts/ci-changes.cjs) are used as they are, so a rebase brings their
-# changes. The `workflows` job lints the fork workflows (actionlint) and fails
+# changes. The `workflows` job lints the fork workflows (actionlint) and the
+# fleet launcher (shellcheck), and fails
 # when upstream's ci.yml or release.yml test jobs change and this copy did not
 # follow (.github/scripts/fork-tests-drift.cjs). The fork's own script tests run
 # side by side in `workflows`, `action_tests`, the `kit_tests` shards and
@@ -399,18 +400,36 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color .github/workflows/fork-*.yml
 
+      # The fleet launcher runs as root on each fleet host: every shellcheck finding is fixed or
+      # disabled with its reason there (#667). Pinned release, verified by checksum, as a fleet
+      # runner need not have it; a few seconds.
+      - name: Lint the fleet launcher (shellcheck)
+        env:
+          VERSION: 0.10.0
+          SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+        run: |
+          archive="shellcheck-v${VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${VERSION}/${archive}"
+          echo "$SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" "shellcheck-v${VERSION}/shellcheck"
+          "$RUNNER_TEMP/shellcheck-v${VERSION}/shellcheck" .github/scripts/fork-fleet-launch.sh
+
       # The tests under .github/scripts, checked against .github/fork-ci-tests.txt (the fork-kit/
       # ones run in kit_tests, the fork-ci/ and fleet walls' ones in action_tests, beside this job):
       # the fork's tests run here, longest first by their weight in the list; the others must be
       # named by the job or script that runs them. An unlisted test, or a listed one deleted from
       # history, fails; a listed one whose pull request has not merged yet is a note. Every test is
       # in exactly one job's part (fork-ci-tests.test.cjs).
-      - name: Fork script tests
+      # A step that runs fork tests is only their command (fork-contracts.test.py, quiet), so the set-up
+      # is a step of its own.
+      - name: Install PyYAML
         run: |
-          if compgen -G '.github/scripts/fork-*.test.py' >/dev/null && ! python3 -c 'import yaml' 2>/dev/null; then
+          if ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
-          node .github/scripts/fork-ci-tests.cjs '!fork-kit/' '!fork-ci/' '!.github/scripts/fork-fleet-walls'
+      - name: Fork script tests
+        run: node .github/scripts/fork-ci-tests.cjs '!fork-kit/' '!fork-ci/' '!.github/scripts/fork-fleet-walls'
 
       # The fleet launcher with real runner users (created and deleted by the test):
       # one slot's user cannot read another's copy, nothing a job leaves (files in
@@ -505,12 +524,13 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # These tests, checked against .github/fork-ci-tests.txt as in `workflows`.
-      - name: Fork action and fleet walls tests
+      - name: Install PyYAML
         run: |
           if ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
-          node .github/scripts/fork-ci-tests.cjs fork-ci/ .github/scripts/fork-fleet-walls
+      - name: Fork action and fleet walls tests
+        run: node .github/scripts/fork-ci-tests.cjs fork-ci/ .github/scripts/fork-fleet-walls
 
   # The host kits' tests (fork-kit/), split from `workflows` so the fork's script tests run
   # side by side: one job of all of them was the longest in the run. They are CPU-bound (every
@@ -627,7 +647,9 @@ jobs:
       # linger starts the runner user's manager, and the slice gets a unit with a memory
       # limit (heavy refuses a slice without one). HEAVY_REAL_TESTS=1: no manager fails
       # the step instead of skipping it; so does a slice without the limit (the show line).
-      - name: heavy kit with a real systemd user manager
+      # The set-up is a step of its own (the test step is only its command), so the test step
+      # sets XDG_RUNTIME_DIR itself.
+      - name: Start a systemd user manager with a heavy slice
         run: |
           sudo loginctl enable-linger "$(id -un)"
           sudo systemctl start "user@$(id -u).service"
@@ -637,7 +659,8 @@ jobs:
           printf '[Slice]\nMemoryMax=2G\n' > ~/.config/systemd/user/heavy.slice
           systemctl --user daemon-reload
           systemctl --user show heavy.slice -p LoadState,FragmentPath,MemoryMax
-          HEAVY_REAL_TESTS=1 python3 -I -B fork-kit/heavy/tests/heavy.test.py
+      - name: heavy kit with a real systemd user manager
+        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" HEAVY_REAL_TESTS=1 python3 -I -B fork-kit/heavy/tests/heavy.test.py
 
   # Every commit a pull request or a push to main adds, history included: a
   # secret committed and then deleted is still public. Release runs test a

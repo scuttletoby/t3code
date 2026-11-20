@@ -121,7 +121,7 @@ class Setup(Case):
         self.terminate()
         self.same_wsl2_walls()   # all pass, as `wsl --terminate` left them: this test is about the writes
         self.assertEqual(self.setup_run()[0], 0)
-        whole = {p: v[4] for p, v in self.snapshot().items()}
+        whole = self.same_files()
         real_put, writes = cli.put, []
 
         def counting(*a, **kw):
@@ -153,7 +153,7 @@ class Setup(Case):
                 self.assertFalse([line for line in self.log() if line.startswith('enable')], f'stopped at write {stop}')
             code, out = self.setup_run()
             self.assertEqual(code, 0, f'stopped at write {stop} ({writes[stop - 1]}): {out}')
-            self.assertEqual({p: v[4] for p, v in self.snapshot().items()}, whole, f'stopped at write {stop}')
+            self.assertEqual(self.same_files(), whole, f'stopped at write {stop}')
             self.assertIn('enable --now t3code-agents.service pc-agents-walls.timer pc-agents-update.timer', self.log())
 
     def test_t3_install_fails_then_works(self):
@@ -642,7 +642,7 @@ class RestartPending(Case):
 
     def test_upgrade_killed_at_any_write_fails_check_until_run_again(self):
         def files():
-            return {p: v[4] for p, v in self.snapshot().items() if p not in (k.PENDING, k.RECORD)}
+            return self.same_files(skip=(k.PENDING, k.RECORD))
         upgrade = {**CONFIG, 'memoryMax': '4G', 'maxRuntimeMode': 'approval-required'}
         real_put, writes = cli.put, []
         self.addCleanup(setattr, cli, 'put', real_put)
@@ -656,6 +656,24 @@ class RestartPending(Case):
         cli.put = real_put
         self.assertGreater(len(writes), 10)
         whole = files()   # the upgrade run all the way: a rerun after any stop must leave the same files
+        # Compared by mode, owner and group too, not content alone: a rerun that left one file with another mode or
+        # group differs. (Owner: every file here is the test's own, and only root could chown one. Group: the test's
+        # user can move a file to another group it is in, when it is in one.)
+        some = next(p for p, v in sorted(whole.items()) if stat.S_ISREG(v[0]))
+        os.chmod(self.path(some), stat.S_IMODE(whole[some][0]) ^ 0o044)
+        self.assertNotEqual(files(), whole, some)
+        os.chmod(self.path(some), stat.S_IMODE(whole[some][0]))
+        self.assertEqual(files(), whole)
+        gid = os.lstat(self.path(some)).st_gid
+        other = next((g for g in os.getgroups() if g != gid), None)
+        if other is None:   # said, so a run where this part did not happen shows it
+            print('setup.test.py: the group part of the killed-upgrade self-check is skipped: the test user is in '
+                  'one group only', file=sys.stderr)
+        else:
+            os.chown(self.path(some), -1, other)
+            self.assertNotEqual(files(), whole, some)
+            os.chown(self.path(some), -1, gid)
+            self.assertEqual(files(), whole)
         for stop in range(1, len(writes) + 1):
             self.restore(upgradable)
             before = files()
