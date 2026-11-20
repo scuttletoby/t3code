@@ -146,10 +146,12 @@ export const withFolderModels = (
       });
 
 /**
- * Whether an instance's scan of a folder gave an answer: a snapshot for it that is current and not
- * pending. Without one, a missing model may only mean the scan failed.
+ * How an instance's last scan of a folder stands. `models`: its model list is an answer (a current
+ * snapshot whose models are not pending; only its slash commands may be). Without that, a missing
+ * model may only mean the scan failed. `settled`: current and nothing pending, so the registry
+ * does not scan it again before it expires (it rescans a pending snapshot on every call).
  */
-const scannedFolder = (
+const folderScan = (
   providers: ReadonlyArray<ServerProvider>,
   instanceId: ServerProvider["instanceId"],
   cwd: string,
@@ -158,15 +160,25 @@ const scannedFolder = (
   const snapshot = providers
     .find((provider) => provider.instanceId === instanceId)
     ?.workspaceSnapshots?.find((entry) => entry.cwd === cwd);
-  return (
-    snapshot !== undefined &&
-    !isProviderWorkspaceSnapshotPending(snapshot) &&
-    isProviderWorkspaceSnapshotCurrent(snapshot, nowMs)
-  );
+  const current = snapshot !== undefined && isProviderWorkspaceSnapshotCurrent(snapshot, nowMs);
+  return {
+    models: current && snapshot.modelsPending !== true,
+    settled: current && !isProviderWorkspaceSnapshotPending(snapshot),
+  };
 };
 
-/** A folder scan that gave no answer is not run again for the same instance and folder for this long. */
+/**
+ * A folder scan that gave no settled answer is not run again for the same instance and folder for
+ * this long (the registry would run its probe again on every call).
+ */
 const FAILED_SCAN_BACKOFF_MS = PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS;
+
+/**
+ * A back-off still runs: its end is ahead, and no further than one back-off ahead. An end further
+ * away means the wall clock went back; it then ends now, not after the jump as well.
+ */
+const backingOff = (retryAtMs: number | undefined, nowMs: number): retryAtMs is number =>
+  retryAtMs !== undefined && retryAtMs > nowMs && retryAtMs - nowMs <= FAILED_SCAN_BACKOFF_MS;
 
 const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void };
 
@@ -182,8 +194,9 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
   const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
   /**
-   * Folder scans for a switch target that gave no answer: instance and folder -> the time a scan may
-   * run again. Memory only: a restart costs one more scan. Expired entries are dropped on each write.
+   * Folder scans for a switch target that gave no settled answer: instance and folder -> the time a
+   * scan may run again. Memory only: a restart costs one more scan. Entries that no longer back off
+   * (expired, or set before the clock went back) are dropped on each write.
    */
   const failedScans = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
 
@@ -258,31 +271,38 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         // Only a missing model is worth a scan; any other refusal stands as it is.
         if (input.cwd !== undefined && missing(resolved)) {
           const cwd = input.cwd;
+          const notListed = { cannot: `it does not list ${model} for this folder` };
+          // A current model list is an answer, whoever published it (another path may have, during
+          // a back-off): the reply gives it, not "no result".
+          const answered = folderScan(providers, candidate, cwd, nowMs).models;
           if (!mayScan) {
-            return {
-              cannot: scannedFolder(providers, candidate, cwd, nowMs)
-                ? `it does not list ${model} for this folder`
-                : `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
-            };
+            return answered
+              ? notListed
+              : {
+                  cannot: `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
+                  wouldScan: true,
+                };
           }
           const key = `${candidate}\u0000${cwd}`;
           const noAnswer = (retryAtMs: number) => ({
             cannot: `it does not list ${model} and its scan of this folder gave no result (scanned again after ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))})`,
           });
           const retryAtMs = (yield* Ref.get(failedScans)).get(key);
-          if (retryAtMs !== undefined && nowMs < retryAtMs) return noAnswer(retryAtMs);
+          if (backingOff(retryAtMs, nowMs)) return answered ? notListed : noAnswer(retryAtMs);
           const scanned = yield* host.scanWorkspace(candidate, cwd);
           resolved = yield* sameTaskOn(candidate, scanned);
-          // A failed scan leaves the list as it was: say so, and do not scan again on every call.
-          const failed = missing(resolved) && !scannedFolder(scanned, candidate, cwd, nowMs);
+          // A failed scan leaves the list as it was, and a pending one is scanned again on every
+          // call: do not scan again on every call. Say "no result" only without a model list.
+          const after = folderScan(scanned, candidate, cwd, nowMs);
+          const backOff = missing(resolved) && !after.settled;
           const nextRetryMs = nowMs + FAILED_SCAN_BACKOFF_MS;
           yield* Ref.update(failedScans, (current) => {
-            const next = new Map([...current].filter(([, until]) => until > nowMs));
-            if (failed) next.set(key, nextRetryMs);
+            const next = new Map([...current].filter(([, until]) => backingOff(until, nowMs)));
+            if (backOff) next.set(key, nextRetryMs);
             else next.delete(key);
             return next;
           });
-          if (failed) return noAnswer(nextRetryMs);
+          if (missing(resolved) && !after.models) return noAnswer(nextRetryMs);
         }
         if (resolved._tag === "Failure") {
           return {
