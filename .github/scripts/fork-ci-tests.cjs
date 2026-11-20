@@ -1,8 +1,6 @@
 // Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit is listed in .github/fork-ci-tests.txt and
-// runs here by extension (RUNNER), FORK_CI_TEST_JOBS at once (default: CPU count), or `run by <file>` (it names the
-// test; not an upstream workflow; a fork test only fork-tests.yml or as RUN_ELSEWHERE says). Python tests run through
-// fork-ci-unittest.py, which counts each test. Unlisted or runner-less tests fail; a listed one that is gone fails once
-// history had it.
+// runs here by extension (RUNNER, Python through fork-ci-unittest.py), FORK_CI_TEST_JOBS at once, or `run by <file>`
+// (a fork test: only fork-tests.yml or RUN_ELSEWHERE). Unlisted, runner-less, or gone-once-listed tests fail.
 // Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all), FORK_CI_TEST_SHARD one shard of it.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
@@ -425,14 +423,10 @@ function expectedKeys(entries, present, read) {
 const OK_LINES_END = /^all passed: (\d+) ok, (\d+) skipped$/;
 const OK_LINES_FORM = '"all passed: <n> ok, <n> skipped"';
 
-// What a test's output says it ran, { format, tests, skipped, names, failed, note }, or null (no count: no test known
-// to have run). `names`: the skipped tests by name (one each; a skip without a name is red, recordProblems()).
-// - Python: the lines fork-ci-unittest.py wrote for each unittest run (`unittest`, one JSON object each: every test
-//   by its own outcome, so a class or module skip counts each test it skips), else the ok lines below.
-// - node --test: its last totals on stdout (todo counts as skipped; node names no skip, so one is always red).
-// - else the fork's ok lines on stdout: `ok <what>`, `FAIL <what>` and `skip <name> [why]`, ending in OK_LINES_FORM
-//   with the test's own count, so a test that stopped early (an `exit 0` half-way) or whose count of its lines differs
-//   (a child's ok lines in its output) counts nothing (`note` says why). Only stdout: stderr is a child's or a trace.
+// What a test ran, { format, tests, skipped, names (skipped, by name), failed, note }, or null (no count). Python:
+// fork-ci-unittest.py's `unittest` lines (each test by its own outcome). node --test: its last totals (no skip names).
+// Else stdout's `ok`, `FAIL` and `skip <name>` lines, which must end in OK_LINES_FORM with the same counts: a test
+// that stopped early or miscounts counts nothing (`note` says why).
 function countTests(file, stdout, stderr, unittest = []) {
   const ext = file.match(TEST_FILE)?.[1];
   if (ext === "py" && unittest.length) {
@@ -646,11 +640,10 @@ function jobCount(env = process.env) {
   return Number.isInteger(jobs) && jobs > 0 ? jobs : os.availableParallelism();
 }
 
-// The command of a test's run: by its extension (RUNNER), or for an own run (ownRuns()) Python with -I -B and the class
-// picked, under `sudo -n env` as root (sudo keeps none of the environment, so the switches, GITHUB_ACTIONS and the
-// counts file are handed on there), else with the switches added to the environment. A Python test runs through
-// UNITTEST_SHIM, which writes its counts to `counts` (null: none). Neither the records folder nor a counts file of the
-// caller reaches a test: a test of this runner that runs it must not write records or counts of its own.
+// A test's command: by extension (RUNNER), Python through UNITTEST_SHIM writing to `counts`; an own run (ownRuns())
+// with -I -B and its class, as root under `sudo -n env` (which keeps no environment, so switches, GITHUB_ACTIONS and
+// the counts file go on its line). The caller's records folder and counts file never reach the test: a test of this
+// runner must not write into them.
 function command(file, run = null, env = process.env, counts = null) {
   const childEnv = { ...env };
   delete childEnv.FORK_CI_TEST_RECORDS;

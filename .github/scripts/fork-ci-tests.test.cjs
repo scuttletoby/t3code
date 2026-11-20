@@ -1346,7 +1346,7 @@ test("a part fails on a skip its test does not declare or a declared one that ra
 });
 
 // A class whose setUpClass raises SkipTest: unittest's summary counts it as one skip and leaves its tests out of
-// `Ran N`, so 3 unrun tests looked like 1 (#664, review A's blocking point). Each test counts here, by name.
+// `Ran N`, so 3 unrun tests looked like 1. Each test counts here, by name.
 const CLASS_SKIP_PY =
   "import unittest\n" +
   "class Off(unittest.TestCase):\n" +
