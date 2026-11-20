@@ -37,12 +37,8 @@ import {
   threadId,
 } from "./handoff.testkit.ts";
 import { HANDOFF_LOUD_SUFFIX, HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
-import {
-  HANDOFF_SETTLE_MS,
-  isQuietHandoffRun,
-  quietHandoffAwareness,
-  RELAY_COMPLETION_HOLD_MS,
-} from "./handoffQuiet.ts";
+import { HANDOFF_SETTLE_MS, quietHandoffAwareness } from "./handoffQuiet.ts";
+import { isQuietHandoffRun, RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
 
 const environmentId = EnvironmentId.make("environment");
 const base = projection({ usedTokens: 0 });
