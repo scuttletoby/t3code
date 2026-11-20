@@ -557,14 +557,21 @@ function findListedGone(config, { atBase, atHead }) {
 /**
  * Upstream's files the head still has that a pull request's run would take for the fork's own (a
  * hole in that run). `upstreamFiles`: every path upstream has; `atHead`: a path's text in head.
+ * Refused, except where a lowered list is written (right after a rebase): there each goes to
+ * `lowered.hidden`, and lowerList excludes it in "forkFiles". That only narrows what a pull
+ * request's run takes for the fork's own (the run from upstream already judges it as upstream's),
+ * so no upstream file, whatever its name, stops fork-follow or reaches main unexcluded.
  */
-function findHiddenUpstreamFiles(upstreamFiles, isForkFile, atHead) {
-  return upstreamFiles
-    .filter((file) => isForkFile(file) && atHead(file) !== undefined)
-    .map(
-      (file) =>
-        `${file}: upstream has it, but a pull request's run takes it for a fork file (its name or "forkFiles"); exclude it with "!${file}".`,
-    );
+function findHiddenUpstreamFiles(upstreamFiles, isForkFile, atHead, lowered) {
+  const hidden = upstreamFiles.filter((file) => isForkFile(file) && atHead(file) !== undefined);
+  if (lowered !== undefined) {
+    for (const file of hidden) lowered.hidden.add(file);
+    return [];
+  }
+  return hidden.map(
+    (file) =>
+      `${file}: upstream has it, but a pull request's run takes it for a fork file (its name or "forkFiles"); exclude it with "!${file}".`,
+  );
 }
 
 /**
@@ -880,7 +887,9 @@ const MOVED_WHY =
  * `text` with the counts in `lowered` ({ pending, lost }: Maps of file to count) lowered, as { text, changes },
  * or undefined when nothing changes. Only lowers; a count at 0 removes the entry. A "pending" file with no fork
  * line left that "lost" still names moves to "files" with no seam line (no fork line may come back, no line may
- * be lost). Two-space JSON, parsed again before it is returned, so a lowered list is never one the check refuses.
+ * be lost). Each upstream file in `lowered.hidden` (a Set) stops being a fork file: its own "forkFiles" entry
+ * goes, and a `!` entry excludes it where a name or another pattern still takes it. Two-space JSON, parsed again
+ * before it is returned, so a lowered list is never one the check refuses.
  */
 function lowerList(text, lowered) {
   const raw = JSON.parse(text);
@@ -925,6 +934,21 @@ function lowerList(text, lowered) {
         changes.push(`${file}: "pending" ${ceiling} -> ${to}`);
         return [[file, to]];
       }),
+    );
+  }
+  for (const file of lowered.hidden ?? []) {
+    const patterns = raw.forkFiles ?? [];
+    const kept = patterns.filter((pattern) => pattern !== file);
+    const named = forkFileTest(kept)(file);
+    if (named) kept.push(`!${file}`);
+    raw.forkFiles = kept;
+    const what = !named
+      ? "entry removed"
+      : kept.length === patterns.length
+        ? `entry replaced by "!${file}"`
+        : `"!${file}" added`;
+    changes.push(
+      `${file}: "forkFiles" ${what} (upstream has it; a pull request's run took it for a fork file)`,
     );
   }
   // Appended through defineProperty: a file named `__proto__` stays an own key.
@@ -1038,7 +1062,9 @@ function main(argv) {
     }
   }
   const lowered =
-    parsed.loweredList === undefined ? undefined : { pending: new Map(), lost: new Map() };
+    parsed.loweredList === undefined
+      ? undefined
+      : { pending: new Map(), lost: new Map(), hidden: new Set() };
   const unlisted = findUnlistedChanges(config, {
     changed,
     atBase,
@@ -1087,6 +1113,7 @@ function main(argv) {
           git(["ls-tree", "-r", "-z", "--name-only", mergeBase]).split("\0").filter(Boolean),
           isForkFile,
           atHead,
+          lowered,
         )
       : []),
   ];
