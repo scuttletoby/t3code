@@ -1214,6 +1214,48 @@ class Gaps(Case):
         self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
         self.assertEqual(self.read(b), body())
 
+    def test_a_mount_taken_away_after_the_list_was_read_keeps_both(self):
+        """#624: the list (this process's own) names a mount at `fs` showing the whole disk, with a view of its folder
+        /data holding the files; `fs` was unmounted after the list was read, so a `.git` there would not be seen.
+        Kept, on a second run too; once the kernel shows the disk at `fs` again, the next run links."""
+        dev = os.lstat(self.dir).st_dev
+        device = f'{os.major(dev)}:{os.minor(dev)}'
+        fs, view = self.mkdir('dd', 'fs'), self.mkdir('dd', 'view')
+        self.mount_lines[:] = [('/', device, '/'), (fs, device, '/'), (view, device, '/data')]
+        self.mount_ids, self.mount_types, self.mount_own = [(1, 0), (2, 1), (3, 1)], ['ext4'] * 3, True
+        a = self.put('view', 'in', 'a.bin', days=50)
+        b = self.put('view', 'in', 'b.bin')
+        cfg = self.dd_cfg(folders=[{'path': os.path.dirname(a), 'days': 30}])
+        table = {'/': 1, fs: 2, view: 3}
+        with self.kernel({'/': 1, view: 3}):
+            for _ in range(2):
+                code, lines = self.run_cleaner(cfg)
+                self.assertNotEqual(self.ino(a), self.ino(b), lines)
+                self.assertTrue(any(f'{fs} is not on the mount the mount list names' in line for line in lines), lines)
+        with self.kernel(table):
+            code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
+        self.assertEqual(self.read(b), body())
+
+    def test_a_folder_on_a_layered_filesystem_keeps_both(self):
+        """#624: the dedupe folder is on an overlay (or below a folder on one): what is above its upper and lower
+        folders is not shown, so it is kept, on a second run too, unless its entry says `layered: true`."""
+        a = self.put('in', 'a.bin', days=50)
+        b = self.put('in', 'b.bin')
+        folder = os.path.dirname(a)
+        for kind, lines_, types_ in (('overlay', [(folder, '0:77', '/')], ['ext4', 'overlay']),
+                                     ('fuse.bindfs', [], ['fuse.bindfs'])):
+            with self.subTest(kind=kind):
+                self.mount_lines[:] = [('/', '0:0', '/')] + lines_
+                self.mount_types = types_
+                cfg = self.dd_cfg(folders=[{'path': folder, 'days': 30}])
+                for _ in range(2):
+                    code, lines = self.run_cleaner(cfg)
+                    self.assertNotEqual(self.ino(a), self.ino(b), lines)
+                    self.assertTrue(any(f'is on {kind} at' in line for line in lines), lines)
+        code, lines = self.run_cleaner(self.dd_cfg(folders=[{'path': folder, 'days': 30, 'layered': True}]))
+        self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
+
     def test_a_marker_made_while_the_bytes_are_compared_stops_the_link(self):
         """#604: every name's folders are read once more after the comparison: a KEEP file made then above the
         duplicate's folder or above the kept file's folder leaves both. Once it is gone, the next run links."""
@@ -1352,8 +1394,8 @@ MUTATIONS = {
                                    "if os.path.lexists(os.path.join(here, '.git')):", Gaps, 'test_a_marker_above_that_cannot_be_read_keeps_it'),
     'the folders above on its own filesystem': ('guard', 'stack.extend((place, True) for place in reversed(places))', 'pass',
                                                 Gaps, 'test_a_git_folder_above_a_bind_mount_on_its_own_filesystem'),
-    'the folders above, with the mount list': ('dedupe', 'refusal = guard.above_refusal(path, mounts)',
-                                               "refusal = guard.above_refusal(path, type(mounts)(lines=[('/', '0:0', '/')]))",
+    'the folders above, with the mount list': ('dedupe', 'refusal = guard.above_refusal(path, mounts, folder.layered)',
+                                               "refusal = guard.above_refusal(path, type(mounts)(lines=[('/', '0:0', '/')]), folder.layered)",
                                                Gaps, 'test_a_git_folder_above_a_bind_mount_on_its_own_filesystem'),
     'the last check reads down to the file': ('dedupe', "        refusal = _folder_refusal(cfg, facts, folder, here, hst, names)\n        if refusal is not None:\n            return refusal\n    try:\n        fst = os.lstat(path)",
                                               "        refusal = _folder_refusal(cfg, facts, folder, here, hst, names) if part is None else None\n        if refusal is not None:\n            return refusal\n    try:\n        fst = os.lstat(path)",
@@ -1368,6 +1410,14 @@ MUTATIONS = {
     'config: other rules': ('config', "            for other in self.cold_folders:", "            for other in ():", Keys, 'test_folders_it_may_never_take_are_refused'),
     'report: links counted': ('report', "elif verb == 'linked':\n                    out.links += 1", "elif False:\n                    out.links += 1",
                               Report, 'test_the_report_counts_what_links_freed_and_sizes_the_folders'),
+    'dedupe: a layered filesystem keeps both': ('dedupe', 'refusal = guard.above_refusal(path, mounts, folder.layered)',
+                                                'refusal = guard.above_refusal(path, mounts, True)',
+                                                Gaps, 'test_a_folder_on_a_layered_filesystem_keeps_both'),
+    'dedupe: layered true links': ('dedupe', 'refusal = guard.above_refusal(path, mounts, folder.layered)',
+                                   'refusal = guard.above_refusal(path, mounts, False)',
+                                   Gaps, 'test_a_folder_on_a_layered_filesystem_keeps_both'),
+    'dedupe: the mount list must still be true': ('guard', 'if (want is None or now[0] != want\n', 'if (False\n',
+                                                  Gaps, 'test_a_mount_taken_away_after_the_list_was_read_keeps_both'),
 }
 
 

@@ -1117,6 +1117,179 @@ class Above(Case):
         self.assertKept(self.plan(cfg), cold, 'could not read', f'{x}/fs: No such file or directory')
         self.assertUntouched(cfg, path)
 
+    # --- the mount list checked against the kernel, and layered filesystems (#624) -----------------------------------
+    def own_view(self, name, kind='ext4', device=None):
+        """`view`, with a mount list that is this process's own: ids, filesystem types and (unless `device` is
+        given) the device the kernel gives the test's folders. Lines: / (id 1), `fs` (2), `view` (3).
+        (fs, view, cold folder, file, config, {point: id} of the list)"""
+        if device is None:
+            dev = os.lstat(self.dir).st_dev
+            device = f'{os.major(dev)}:{os.minor(dev)}'
+        self.mount_lines[:] = [('/', device, '/')]
+        fs, cold, path, cfg = self.view(name, device=device)
+        self.mount_ids, self.mount_types, self.mount_own = [(1, 0), (2, 1), (3, 1)], [kind] * 3, True
+        return fs, os.path.dirname(cold), cold, path, cfg, {'/': 1, fs: 2, os.path.dirname(cold): 3}
+
+    def test_a_mount_taken_away_after_the_list_was_read_keeps_it(self):
+        """#624: the list names a mount at `fs` that shows the whole disk, but it was unmounted after the list was
+        read: `fs` is now an empty folder of the filesystem above, where no marker is. What is above the view is not
+        known: kept, on a second run too. Once the kernel shows the disk at `fs` again, the next run compresses."""
+        fs, view, cold, path, cfg, table = self.own_view('taken')
+        now = dict(table)
+        del now[fs]
+        with self.kernel(now):
+            for _ in range(2):
+                self.assertKept(self.plan(cfg), cold, 'could not read', f'{fs} is not on the mount the mount list names')
+                self.assertUntouched(cfg, path)
+        self.age(path, 40)              # the checks above read it
+        with self.kernel(table):
+            code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, sorted(os.listdir(cold))), (0, ['old.jsonl.zst']), lines)
+
+    def test_a_mount_put_over_a_folder_after_the_list_was_read_keeps_it(self):
+        """#624: a mount the list does not name is over a folder now (the list is old): over the view of the whole
+        disk above, or over the cold folder itself. The folder read is not the one the list names: kept."""
+        for over in ('fs', 'cold'):
+            with self.subTest(over=over):
+                fs, view, cold, path, cfg, table = self.own_view(f'over{over}')
+                shown = fs if over == 'fs' else cold
+                with self.kernel({**table, shown: 99}):
+                    self.assertKept(self.plan(cfg), cold, 'could not read', f'{shown} is not on the mount the mount list names')
+                    self.assertUntouched(cfg, path)
+
+    def test_a_folder_that_changes_while_its_markers_are_read_keeps_it(self):
+        """#624: the kernel is asked once before the markers of a folder above are read and once after: a mount
+        taken away in between (the markers read may be the empty mount point's) keeps it."""
+        fs, view, cold, path, cfg, table = self.own_view('changes')
+        now, real = dict(table), self.c.guard.marker
+
+        def marker(here):
+            got = real(here)
+            if here == fs:
+                now.pop(fs, None)
+            return got
+        with self.kernel(now), mock.patch.object(self.c.guard, 'marker', marker):
+            self.assertKept(self.plan(cfg), cold, 'could not read', f'{fs} is not on the mount the mount list names')
+            self.assertUntouched(cfg, path)
+        self.assertNotIn(fs, now)
+        # Another folder put in its place on the same mount while its markers were read (the ones read were the
+        # old folder's): the kernel names the same mount and device, but not the same folder.
+        swapped = []
+
+        def swap(here):
+            got = real(here)
+            if here == fs and not swapped:
+                os.rename(fs, fs + '.old')
+                os.mkdir(fs)
+                swapped.append(here)
+            return got
+        with self.kernel(table), mock.patch.object(self.c.guard, 'marker', swap):
+            self.assertKept(self.plan(cfg), cold, 'could not read', f'{fs} changed while its markers were read')
+        self.assertEqual(swapped, [fs])
+        os.rmdir(fs)
+        os.rename(fs + '.old', fs)
+        self.age(path, 40)
+        with self.kernel(table):
+            code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, sorted(os.listdir(cold))), (0, ['old.jsonl.zst']), lines)
+
+    def test_the_device_is_compared_where_the_type_gives_it(self):
+        """#624: on ext4 (and every type but btrfs, bcachefs and overlay) a folder has the device mountinfo names:
+        a mount id that matches with another device is not that mount (an id used again), so it is kept. On btrfs a
+        subvolume has a device of its own, so there only the mount id counts."""
+        for kind, kept in (('ext4', True), ('xfs', True), ('btrfs', False), ('bcachefs', False)):
+            with self.subTest(kind=kind):
+                fs, view, cold, path, cfg, table = self.own_view(f'dev{kind}', kind=kind, device='250:250')
+                with self.kernel(table):
+                    if kept:
+                        self.assertKept(self.plan(cfg), cold, 'could not read', 'is not on the mount the mount list names')
+                        self.assertUntouched(cfg, path)
+                    else:
+                        code, lines = self.run_cleaner(cfg)
+                        self.assertEqual((code, sorted(os.listdir(cold))), (0, ['old.jsonl.zst']), lines)
+
+    def test_a_mount_id_that_cannot_be_read_keeps_it(self):
+        fs, view, cold, path, cfg, table = self.own_view('noid')
+
+        def mount_id_of(fd):
+            raise self.c.facts.Unreadable('/proc/self/fdinfo: gone')
+        with mock.patch.object(self.c.guard, 'mount_id_of', mount_id_of):
+            self.assertKept(self.plan(cfg), cold, 'could not read', 'gone')
+            self.assertUntouched(cfg, path)
+
+    def test_the_real_mount_list_and_the_kernel_agree(self):
+        """#624: with this machine's own list, the test's folder passes (or, on an overlay or another layered
+        filesystem, is refused for that alone). The same list with one more line, a mount on the test's folder that
+        is not there (a list read before it was taken away), keeps it."""
+        real = self.c.facts.read_mounts()
+        self.assertTrue(real.own)
+        self.assertFalse(self.c.facts.read_mounts(self.file(self.path('mountinfo'), '1 0 8:1 / / rw - ext4 /dev/sda1 rw\n'),
+                                                  proc=None).own)
+        guard, cold = self.c.guard, self.mkdir('real', 'cold')
+        got = guard.above_refusal(cold, real)
+        here, layered = cold, False
+        while True:
+            layered = layered or real.type_of(real.held(here)) in guard.LAYERED
+            if here == '/':
+                break
+            here = os.path.dirname(here)
+        if layered:
+            self.assertEqual((got.code, 'shows folders of other filesystems' in got.detail), ('could not read', True), got)
+        self.assertIsNone(guard.above_refusal(cold, real, layered=True))
+        index = real.held(self.dir)
+        stale = self.c.facts.Mounts(
+            real.points | {self.dir}, real.lines + [(self.dir, real.lines[index][1], '/')], (), {}, (), real.whole,
+            real.ids + [(max(mid for mid, _ in real.ids) + 1, real.ids[index][0])], real.types + [real.types[index]],
+            own=True)
+        got = guard.above_refusal(cold, stale, layered=True)
+        self.assertEqual((got.code, f'{cold} is not on the mount the mount list names' in got.detail),
+                         ('could not read', True), got)
+        fd = os.open(cold, os.O_PATH)
+        try:
+            self.assertEqual(self.c.facts.mount_id_of(fd), real.id_of(index))
+        finally:
+            os.close(fd)
+
+    def test_a_folder_on_a_layered_filesystem_keeps_it(self):
+        """#624: an overlay, bindfs or union filesystem shows folders of others (its upper and lower folders, a
+        bindfs source) with mount root `/`: the folders above those are not shown, and a `.git` or KEEP there would
+        be missed. A cold folder on one, or below a folder on one, is kept (on a second run too) unless its config
+        says `layered: true`; then it is compressed, and a marker it can see still keeps it."""
+        for kind in ('overlay', 'fuse.bindfs', 'fuse.mergerfs', 'fuse', 'fuse.overlayfs'):
+            for where in ('cold', 'root'):
+                with self.subTest(kind=kind, where=where):
+                    cold, path, cfg = self.nested(f'layer{kind}{where}', 'cold')
+                    if where == 'cold':
+                        self.mount_lines[:] = [('/', '0:0', '/'), (cold, '0:77', '/')]
+                        self.mount_types = ['ext4', kind]
+                    else:
+                        self.mount_lines[:] = [('/', '0:0', '/')]
+                        self.mount_types = [kind]
+                    for _ in range(2):
+                        self.assertKept(self.plan(cfg), cold, 'could not read', f'is on {kind} at')
+                        self.assertUntouched(cfg, path)
+                    entry = {'path': cold, 'days': 30, 'layered': True}
+                    marked = self.cfg(compressCold={'folders': [entry], 'keepFreeGB': 1})
+                    os.mkdir(os.path.join(os.path.dirname(cold), '.git'))
+                    self.assertKept(self.plan(marked), cold, 'git folder')
+                    self.assertUntouched(marked, path)
+                    os.rmdir(os.path.join(os.path.dirname(cold), '.git'))
+                    self.age(path, 40)
+                    code, lines = self.run_cleaner(marked)
+                    self.assertEqual((code, sorted(os.listdir(cold))), (0, ['old.jsonl.zst']), lines)
+        self.mount_lines[:], self.mount_types = [('/', '0:0', '/')], ['ext4']     # sshfs, ext4: not layered
+        for kind in ('ext4', 'fuse.sshfs', 'tmpfs'):
+            self.mount_types = [kind]
+            cold, path, cfg = self.nested(f'plain{kind}', 'cold')
+            code, lines = self.run_cleaner(cfg)
+            self.assertEqual((code, sorted(os.listdir(cold))), (0, ['old.jsonl.zst']), lines)
+
+    def test_layered_is_a_yes_or_no_and_no_by_default(self):
+        cold, path, cfg = self.nested('flag', 'cold')
+        self.assertEqual([f.layered for f in cfg.cold_folders], [False])
+        with self.assertRaises(machine_file.MachineFileError):
+            self.cfg(compressCold={'folders': [{'path': cold, 'days': 30, 'layered': 'yes'}], 'keepFreeGB': 1})
+
     def test_a_nested_btrfs_subvolume_needs_its_folders_above(self):
         """#620: only a subvolume directly in the btrfs top folder (`/@data`: one part) needs no view of the folder
         above. A subvolume deeper down, mounted whole (`/projects/repo/data`, `/@/home`), has ordinary folders above
@@ -1189,6 +1362,23 @@ class Above(Case):
         self.file(self.path('kept', 'KEEP'), '')
         self.assertEqual(fx.first_unmarked([repo, keep, plain]), plain)
         self.assertIsNone(fx.first_unmarked([repo, keep]))
+
+    def test_the_tests_make_their_folders_where_no_other_user_can_write_above(self):
+        """#624: a group-writable $TMPDIR (or one under a group-writable folder) makes the machine file be refused
+        rightly, so the fixture passes over it; a sticky one (like /tmp) is fine, and so is the same call again."""
+        shared, under, sticky, plain = (self.mkdir('shared'), self.mkdir('open', 'tmp'), self.mkdir('sticky'),
+                                        self.mkdir('plain'))
+        os.chmod(shared, 0o770)
+        os.chmod(self.path('open'), 0o777)
+        os.chmod(sticky, 0o1777)
+        try:
+            self.assertEqual(fx.first_unmarked([shared, under, sticky, plain]), sticky)
+            self.assertEqual(fx.first_unmarked([shared, under, plain]), plain)
+            self.assertEqual(fx.first_unmarked([shared, under, plain]), plain)
+            self.assertIsNone(fx.first_unmarked([shared, under, self.path('gone')]))
+        finally:
+            for one in (shared, self.path('open'), sticky):
+                os.chmod(one, 0o700)
 
     def test_a_marker_made_between_the_plan_and_the_run_stops_it(self):
         for marker in ('KEEP', '.git'):
@@ -1351,12 +1541,12 @@ MUTATIONS = {
     'a marker below that cannot be read': ('compress', "    except OSError as ex:\n        return Refusal('could not read', f'{here}: {ex.strerror}')\n    if found is not None and found[0] == 'KEEP file':",
                                            "    except OSError as ex:\n        found = None\n    if found is not None and found[0] == 'KEEP file':",
                                            Above, 'test_a_marker_that_cannot_be_read_keeps_it'),
-    'the folders above, at the plan': ('compress', '    refusal = guard.above_refusal(path, mounts)\n    if refusal is not None:\n        return None, refusal\n',
+    'the folders above, at the plan': ('compress', '    refusal = guard.above_refusal(path, mounts, folder.layered)\n    if refusal is not None:\n        return None, refusal\n',
                                        '', Above, 'test_folder_under_a_keep_file'),
     # Read at the plan only (kept on the folder): the refusal comes from nothing else, so only a marker made
     # after the plan shows it.
-    'the folders above, at the last check': ('compress', '    refusal = guard.above_refusal(path, mounts)\n',
-                                             "    if not hasattr(folder, 'above'):\n        folder.above = guard.above_refusal(path, mounts)\n    refusal = folder.above\n",
+    'the folders above, at the last check': ('compress', '    refusal = guard.above_refusal(path, mounts, folder.layered)\n',
+                                             "    if not hasattr(folder, 'above'):\n        folder.above = guard.above_refusal(path, mounts, folder.layered)\n    refusal = folder.above\n",
                                              Above, 'test_a_marker_made_between_the_plan_and_the_run_stops_it'),
     'the folders again after the copy is written': ('compress', 'refusal = _folders(cfg, facts, item)\n        refusal = refusal if isinstance(refusal, Refusal) else _in_use(',
                                                     'refusal = _in_use(', Above, 'test_a_marker_made_while_the_copy_is_written_keeps_the_original'),
@@ -1370,8 +1560,8 @@ MUTATIONS = {
     'only a top btrfs subvolume needs no view': ('guard', "if not places and not ((device, root) in mounts.whole and up == '/'):",
                                                  'if not places and (device, root) not in mounts.whole:',
                                                  Above, 'test_a_nested_btrfs_subvolume_needs_its_folders_above'),
-    'a place shown must be a folder now': ('guard', 'hst = os.lstat(here)\n                if not stat.S_ISDIR(hst.st_mode):',
-                                           "hst = os.lstat('/')\n                if not stat.S_ISDIR(hst.st_mode):",
+    'a place shown must be a folder now': ('guard', 'hst = os.lstat(here)\n            except OSError as ex:',
+                                           "hst = os.lstat('/')\n            except OSError as ex:",
                                            Above, 'test_a_place_the_mount_list_shows_that_is_not_a_folder_now_keeps_it'),
     'the cold folder itself a mount point': ('guard', "if here == point and root != '/':", "if here == point and root != '/' and look:",
                                              Above, 'test_the_cold_folder_itself_a_bind_mount_point'),
@@ -1382,8 +1572,8 @@ MUTATIONS = {
                                    Above, 'test_a_view_under_a_mount_placed_beneath_is_not_used'),
     'views through a chain of mounts': ('guard', "if here == point and root != '/':", "if here == point and root != '/' and path.startswith(here + '/'):",
                                         Above, 'test_views_are_followed_through_a_chain_of_mounts'),
-    'no mount line holds it': ('guard', "        if line is None:\n            return Refusal('could not read', f'no mount in the mount list holds {here}')\n",
-                               "        if line is None:\n            line = (None, None, '/')\n", Above, 'test_a_mount_list_that_does_not_show_the_folder_keeps_it'),
+    'no mount line holds it': ('guard', "        if index is None:\n            return Refusal('could not read', f'no mount in the mount list holds {here}')\n",
+                               "        if index is None:\n            index = 0\n", Above, 'test_a_mount_list_that_does_not_show_the_folder_keeps_it'),
     'databases': ('compress', 'if name.endswith(SIDECARS) or any(name + s in names for s in SIDECARS):', 'if False:',
                   Refused, 'test_what_it_never_takes'),
     'hard links': ('compress', 'if st.st_nlink > 1:', 'if False:', Refused, 'test_what_it_never_takes'),
@@ -1404,6 +1594,27 @@ MUTATIONS = {
                                              "('daily.outDir', out_text, self.daily_dir)):",
                                              Config, 'test_never_where_agent_scratch_deletes_or_keeps_first'),
     'the report counts compressing': ("report", "if verb == 'compressed':", 'if False:', Report, 'test_the_report_counts_what_compressing_freed'),
+    'a layered filesystem keeps it': ('guard', 'if kind in LAYERED and not layered:', 'if False:',
+                                      Above, 'test_a_folder_on_a_layered_filesystem_keeps_it'),
+    'layered: true takes that away': ('guard', 'if kind in LAYERED and not layered:', 'if kind in LAYERED:',
+                                      Above, 'test_a_folder_on_a_layered_filesystem_keeps_it'),
+    'cold: layered is passed on': ('compress', 'refusal = guard.above_refusal(path, mounts, folder.layered)',
+                                   'refusal = guard.above_refusal(path, mounts, False)',
+                                   Above, 'test_a_folder_on_a_layered_filesystem_keeps_it'),
+    'layered is no by default': ('config', "'layered': (bool, False, None),", "'layered': (bool, True, None),",
+                                 Above, 'test_layered_is_a_yes_or_no_and_no_by_default'),
+    'the kernel finds the listed mount': ('guard', 'if (want is None or now[0] != want\n', 'if (False\n',
+                                          Above, 'test_a_mount_taken_away_after_the_list_was_read_keeps_it'),
+    'a mount put over a folder': ('guard', 'if (want is None or now[0] != want\n', 'if (want is None\n',
+                                  Above, 'test_a_mount_put_over_a_folder_after_the_list_was_read_keeps_it'),
+    'the device is compared': ('guard', "and f'{os.major(now[1])}:{os.minor(now[1])}' != device):", 'and False):',
+                               Above, 'test_the_device_is_compared_where_the_type_gives_it'),
+    'not on btrfs and bcachefs': ('guard', '(kind is None or kind not in OTHER_DEVICES)', '(True)',
+                                  Above, 'test_the_device_is_compared_where_the_type_gives_it'),
+    'the folder must not change while read': ('guard', 'if after != before:', 'if False:',
+                                              Above, 'test_a_folder_that_changes_while_its_markers_are_read_keeps_it'),
+    'no mount id keeps it': ('guard', "return Refusal('could not read', f'the mount {here} is on ({ex})'), None",
+                             'return None, None', Above, 'test_a_mount_id_that_cannot_be_read_keeps_it'),
 }
 
 

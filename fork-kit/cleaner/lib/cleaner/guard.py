@@ -8,8 +8,8 @@ delete itself. A path may go only when every check here passes; a check that can
 import fnmatch, os, stat
 
 from .config import REGENERABLE, must_keep_match
-from .facts import (Processes, Unreadable, elsewhere, git, git_code, local_tags, lonely, orphan_doubt, orphaned_worktree, present,
-                    remote_refs, remote_urls, remotes, worktree_list)
+from .facts import (Processes, Unreadable, elsewhere, git, git_code, local_tags, lonely, mount_id_of, orphan_doubt,
+                    orphaned_worktree, present, remote_refs, remote_urls, remotes, worktree_list)
 
 LOCK_NAMES = ('*.lock', 'lock', '.lock', '*.lck')
 # Names that look like they hold a key, a token or a password. Compared without regard to upper and lower case.
@@ -86,6 +86,14 @@ def _keep_reason(keep):
 
 BARE = ('HEAD', 'objects', 'refs')     # a bare repository: all three in one folder
 ABOVE_LIMIT = 1000                   # folders the walk above may read; more (a loop of mounts?) refuses
+# Filesystems that show folders of other filesystems as their own: an overlay's upper and lower folders, a bindfs
+# source, the branches of a union. The folders above those (a work tree's `.git`, a KEEP file) are not shown, and
+# their mount root is `/`, so the walk above cannot see them. `fuse` without a subtype: what it shows is not known.
+LAYERED = ('overlay', 'aufs', 'fuse', 'fuse.overlayfs', 'fuse.bindfs', 'fuse.mergerfs', 'fuse.unionfs',
+           'fuse.unionfs-fuse', 'fuse.mhddfs')
+# Filesystems whose folders do not have the device number mountinfo names (btrfs and bcachefs: one per subvolume;
+# overlay: its own scheme). On every other type the two must be the same.
+OTHER_DEVICES = ('btrfs', 'bcachefs', 'overlay')
 
 
 def marker(here):
@@ -106,7 +114,41 @@ def marker(here):
     return None
 
 
-def above_refusal(path, mounts):
+def _where_now(here):
+    """(mount id, device, inode) of the folder `here` as the kernel finds it now, never through a link. Raises
+    OSError or Unreadable."""
+    fd = os.open(here, os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        return mount_id_of(fd), st.st_dev, st.st_ino
+    finally:
+        os.close(fd)
+
+
+def _mount_refusal(path, here, mounts, index):
+    """When the list is this process's own (`mounts.own`): why the folder `here` is not on the mount the list says
+    holds it (line `index`), now; else None. The mount id the kernel gives the folder must be that line's, and so
+    must its device where the type gives folders the device mountinfo names (not OTHER_DEVICES). A mount taken
+    away, put over it or moved after the list was read, so the folder read is not the one the list names, keeps
+    it. Returns (refusal, what the kernel gave: compare it after the read)."""
+    if not mounts.own:
+        return None, None
+    try:
+        now = _where_now(here)
+    except OSError as ex:
+        return Refusal('could not read', f'{here}: {ex.strerror}'), None
+    except Unreadable as ex:
+        return Refusal('could not read', f'the mount {here} is on ({ex})'), None
+    want, kind, device = mounts.id_of(index), mounts.type_of(index), mounts.lines[index][1]
+    if (want is None or now[0] != want
+            or (kind is None or kind not in OTHER_DEVICES) and f'{os.major(now[1])}:{os.minor(now[1])}' != device):
+        return Refusal('could not read', f'{here} is not on the mount the mount list names ({mounts.lines[index][0]}, '
+                                         f'{device}) now: the list is old, or a mount was taken away or put over it, '
+                                         f'so what is above {path} is not known'), None
+    return None, now
+
+
+def above_refusal(path, mounts, layered=False):
     """A KEEP file or a git folder (`marker`) in a folder above the configured folder `path`: everything under it is
     kept, as below it (a work tree's files are git's; a KEEP file keeps its whole folder). None when there is none.
     The rules that only look from a configured folder down (compress-cold, dedupe) ask this at the plan and again
@@ -120,7 +162,15 @@ def above_refusal(path, mounts):
     folder holds the subvolumes, not a user's files. A subvolume deeper down (`/@/home`, `/srv/repo/data`) has
     ordinary folders above it, which are read like any other or refuse. A folder above that cannot be read refuses
     too, and so does a place the mount list names that is not a folder now (the list is old, or another mount
-    covers it): its markers cannot be read there."""
+    covers it): its markers cannot be read there.
+
+    With the process's own mount list (`mounts.own`), every folder the walk passes is also checked against it, once
+    before its markers are read and once after: the kernel must find it on the mount the list says holds it, and
+    find the same folder both times (`_mount_refusal`). A mount taken away, put over a folder or moved after the
+    list was read keeps it. A folder on a filesystem that shows folders of others as its own (LAYERED: overlay,
+    bindfs, a union) refuses too: the folders above an overlay's upper and lower folders or a bindfs source are not
+    shown, and a marker there would be missed. `layered` (the folder's `layered` key) takes that refusal away for
+    a folder its owner has checked; every other check still holds."""
     stack, seen = [(path, False)], set()
     while stack:
         here, look = stack.pop()
@@ -129,12 +179,28 @@ def above_refusal(path, mounts):
         seen.add((here, look))
         if len(seen) > ABOVE_LIMIT:
             return Refusal('could not read', f'more than {ABOVE_LIMIT} folders above {path} through its mounts')
+        index = mounts.held(here)
+        if index is None:
+            return Refusal('could not read', f'no mount in the mount list holds {here}')
+        point, device, root = mounts.lines[index]
+        kind = mounts.type_of(index)
+        if kind in LAYERED and not layered:
+            return Refusal('could not read', f'{here} is on {kind} at {point}, which shows folders of other filesystems: '
+                                             f'a KEEP file or a git folder above them could not be seen (name the '
+                                             'folder with "layered": true once you have checked them)')
         if look:
             try:
                 hst = os.lstat(here)
-                if not stat.S_ISDIR(hst.st_mode):
-                    return Refusal('could not read', f'{here} is a link or not a folder now, where '
-                                                     f'the mount list shows a folder above {path}')
+            except OSError as ex:
+                return Refusal('could not read', f'{here}: {ex.strerror}')
+            if not stat.S_ISDIR(hst.st_mode):
+                return Refusal('could not read', f'{here} is a link or not a folder now, where '
+                                                 f'the mount list shows a folder above {path}')
+        refusal, before = _mount_refusal(path, here, mounts, index)
+        if refusal is not None:
+            return refusal
+        if look:
+            try:
                 found = marker(here)
             except OSError as ex:
                 return Refusal('could not read', f'{here}: {ex.strerror}')
@@ -142,10 +208,12 @@ def above_refusal(path, mounts):
                 return Refusal('KEEP file', f'{found[1]} ({here}, above {path})')
             if found is not None:
                 return Refusal('git folder', f'{here}, above {path}: git needs its files as they are')
-        line = mounts.holding(here)
-        if line is None:
-            return Refusal('could not read', f'no mount in the mount list holds {here}')
-        point, device, root = line
+            refusal, after = _mount_refusal(path, here, mounts, index)
+            if refusal is not None:
+                return refusal
+            if after != before:
+                return Refusal('could not read', f'{here} changed while its markers were read (another folder or '
+                                                 f'mount is there now): what is above {path} is not known')
         if here == point and root != '/':
             # `here` shows the folder `root` of its filesystem: the folder above that one is above it too.
             if not root.startswith('/'):
