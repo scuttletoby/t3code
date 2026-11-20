@@ -7,7 +7,7 @@ breaks each guard in a copy of the installer (or of kit_install.py) and shows it
 
   python3 -I -B fork-kit/golive/tests/install.test.py
 """
-import fcntl, hashlib, json, os, shutil, stat, sys, unittest
+import contextlib, fcntl, hashlib, json, os, pwd, select, shutil, signal, stat, sys, time, unittest
 from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -346,13 +346,13 @@ class Install(fx.FakeHost):
         self.assertEqual(code, 0, err)
         self.assertFalse(os.path.lexists(self.path(STATE)))
 
-    def lock_host(self, *folders):
-        """A fresh fake host with those folders, the machine file naming STATE, and the kit installed; every file
+    def lock_host(self, *folders, state=STATE):
+        """A fresh fake host with those folders, the machine file naming state, and the kit installed; every file
         here is a user's (SYSTEM_UID matches no one)."""
         shutil.rmtree(self.root)
         for folder in folders:
             os.makedirs(self.path(folder))
-        self.machine_file({'stateDir': STATE, 'home': '/srv/t3'})
+        self.machine_file({'stateDir': state, 'home': '/srv/t3'})
         self.assertEqual(self.install()[0], 0)
         self.m.SYSTEM_UID = -1
 
@@ -375,7 +375,7 @@ class Install(fx.FakeHost):
                 os.symlink(target, self.path(at))
                 before = self.files_under(self.path(other))
                 ran, run_as = [], self.m.run_as
-                with mock.patch.object(self.m, 'run_as', lambda *a: (ran.append(a[:2]), run_as(*a))):
+                with mock.patch.object(self.m, 'run_as', lambda *a, **k: (ran.append(a[:2]), run_as(*a, **k))):
                     code, _, err = self.run_main('uninstall')
                 self.assertEqual(code, 1, err)
                 self.assertIn(f'{at} is a link of uid {os.geteuid()}, who could point it at another user', err)
@@ -389,11 +389,11 @@ class Install(fx.FakeHost):
         self.lock_host(other, '/var/lib')                           # swapped after the walk, before the child
         ran, run_as = [], self.m.run_as
 
-        def swapped_first(*a):
+        def swapped_first(*a, **k):
             os.rename(self.path('/var/lib'), self.path('/var/lib.old'))
             os.symlink(other, self.path('/var/lib'))
             ran.append(a[:2])
-            return run_as(*a)
+            return run_as(*a, **k)
         with mock.patch.object(self.m, 'run_as', swapped_first):
             code, out, err = self.run_main('uninstall')
         self.assertEqual(code, 0, err)
@@ -401,26 +401,377 @@ class Install(fx.FakeHost):
         self.assertTrue(os.path.isfile(self.path('/var/lib.old/golive-state/lock')))
         self.assertEqual(len(ran), 1)
 
-    def test_a_link_of_roots_on_the_way_is_gone_along(self):
-        """/var -> /data/var, made by root (an admin's layout, as /home -> /var/home): the lock is made in the real
-        folder, as that folder's owner, whatever the link's spelling."""
-        fake_root, fstat = os.geteuid() + 4242, os.fstat
+    @contextlib.contextmanager
+    def owners(self, folders=(), links=None, uid=None):
+        """While the installer walks to the state folder and makes the lock: os.fstat with those host folders (and
+        every link, where links is set) shown as owned by uid (SYSTEM_UID by default: root, a uid no one here
+        has). Only then: the machine file is read and the kit removed as on any other host."""
+        fake, real, walking = self.m.SYSTEM_UID if uid is None else uid, os.fstat, []
+        ids = {(st.st_dev, st.st_ino) for st in (os.lstat(self.path(f)) for f in folders)}
 
-        def links_are_roots(fd):
-            st = fstat(fd)
-            return os.stat_result(st[:4] + (fake_root,) + st[5:]) if stat.S_ISLNK(st.st_mode) else st
-        for target in ('/data/var', 'data/var', '/data/../data/./var'):
-            with self.subTest(target=target):
-                self.lock_host('/data/var/lib')
-                os.symlink(target, self.path('/var'))
-                self.m.SYSTEM_UID = fake_root                       # root: owns the link, not the folders
-                with mock.patch.object(os, 'fstat', links_are_roots):
+        def fstat(fd):
+            st = real(fd)
+            if walking and ((stat.S_ISLNK(st.st_mode) and links) or (st.st_dev, st.st_ino) in ids):
+                return os.stat_result(st[:4] + (fake,) + st[5:])
+            return st
+
+        def during(fn):
+            def call(*a, **k):
+                walking.append(1)
+                try:
+                    return fn(*a, **k)
+                finally:
+                    walking.pop()
+            return call
+        with mock.patch.object(os, 'fstat', fstat), \
+                mock.patch.object(self.m, 'real_folder', during(self.m.real_folder)), \
+                mock.patch.object(self.m, 'make_lock', during(self.m.make_lock)):
+            yield
+
+    def root_host(self, *folders, state=STATE):
+        """lock_host, with root a uid no one here has: as on a host, /, and links, are root's (owners)."""
+        self.lock_host(*folders, state=state)
+        self.m.SYSTEM_UID = os.geteuid() + 4242
+
+    def test_a_link_of_roots_on_the_way_is_gone_along(self):
+        """/var -> /data/var, made by root in a folder of root's (an admin's layout, as /home -> /var/home): the
+        lock is made in the real folder, as that folder's owner, whatever the link's spelling. A relative link is
+        read from its own folder, not from /. Run again, with the lock there now, it is opened the same way."""
+        cases = {                           # link: (target, folders, roots, where the lock goes)
+            'absolute': ('/var', '/data/var', ['/data/var/lib'], ['/'], '/data/var/lib'),
+            'relative': ('/var', 'data/var', ['/data/var/lib'], ['/'], '/data/var/lib'),
+            'with .. and .': ('/var', '/data/../data/./var', ['/data/var/lib'], ['/'], '/data/var/lib'),
+            'relative, deeper': ('/var/lib', 'real-lib', ['/var/real-lib'], ['/', '/var'], '/var/real-lib'),
+        }
+        for what, (at, target, folders, roots, real) in cases.items():
+            with self.subTest(what=what):
+                self.root_host(*folders)
+                os.symlink(target, self.path(at))
+                with self.owners(roots, links=True):
                     code, out, err = self.run_main('uninstall')
                 self.assertEqual(code, 0, err)
                 self.assertIn(f'made {STATE}/lock (as uid {os.geteuid()})', out)
-                st = os.lstat(self.path('/data/var/lib/golive-state/lock'))
+                st = os.lstat(self.path(f'{real}/golive-state/lock'))
                 self.assertEqual((stat.S_ISREG(st.st_mode), stat.S_IMODE(st.st_mode)), (True, 0o600))
-                self.assertEqual(stat.S_IMODE(os.lstat(self.path('/data/var/lib/golive-state')).st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(os.lstat(self.path(f'{real}/golive-state')).st_mode), 0o700)
+                self.assertEqual(self.install()[0], 0)              # runs again: the lock is there now
+                with self.owners(roots, links=True):
+                    code, out, err = self.run_main('uninstall')
+                self.assertEqual(code, 0, err)
+                self.assertNotIn('made', out)
+                self.assertFalse(os.path.lexists(self.path(LIBEXEC)))
+
+    def test_a_link_of_roots_is_gone_along_only_from_a_folder_of_roots(self):
+        """A link root owns is trusted only where no one else could have put it: in a folder of root's that no one
+        else may write in. In a user's folder (moved there from elsewhere, or hard-linked where
+        fs.protected_hardlinks is off), or in a folder others may write in, it refuses, before anything is made or
+        run as anyone."""
+        cases = {                           # where /var is: (folder owned by root?, its mode)
+            "a user's folder": (False, 0o755),
+            "a folder of root's anyone may write in": (True, 0o777),
+            "a sticky folder of root's anyone may write in": (True, 0o1777),
+            "a folder of root's its group may write in": (True, 0o775),
+        }
+        for what, (roots, mode) in cases.items():
+            with self.subTest(what=what):
+                self.root_host('/var', '/data/lib')
+                os.chmod(self.path('/var'), mode)
+                os.symlink('/data/lib', self.path('/var/lib'))
+                before, ran, run_as = self.files_under(self.path('/data')), [], self.m.run_as
+                with self.owners(['/', '/var'] if roots else ['/'], links=True), \
+                        mock.patch.object(self.m, 'run_as', lambda *a, **k: (ran.append(a), run_as(*a, **k))):
+                    code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1, err)
+                owner = self.m.SYSTEM_UID if roots else os.geteuid()
+                self.assertIn(f"/var/lib is a link of root's in a folder that someone other than root may write in "
+                              f'(uid {owner}, mode {mode:o})', err)
+                self.assertEqual((ran, self.files_under(self.path('/data'))), ([], before))
+                self.assertTrue(os.path.isdir(self.version()))
+
+    def test_the_walk_refuses_what_is_not_a_plain_way_there(self):
+        """A file on the way refuses as not a folder; a link it cannot read, a loop of links and "x/.." where x is
+        missing refuse too, with a message, never a traceback or a wait."""
+        self.lock_host('/var')
+        with open(self.path('/var/lib'), 'w'):
+            pass
+        code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1, err)
+        self.assertIn('/var/lib cannot be opened as a folder (Not a directory)', err)
+        cases = {
+            'a link it cannot read': ('data/var', ['/data/var/lib'], 'cannot be read (Permission denied)'),
+            'a loop of links': ('/var', [], 'too many links on the way'),
+            'a missing folder before ..': ('nothere/../data/var', ['/data/var/lib'], 'a missing folder before ".."'),
+        }
+        for what, (target, folders, says) in cases.items():
+            with self.subTest(what=what):
+                self.root_host(*folders)
+                os.symlink(target, self.path('/var'))
+                readlink = os.readlink
+                cannot = mock.Mock(side_effect=PermissionError(13, 'Permission denied'))
+                with self.owners(['/'], links=True), self.no_hang(10), \
+                        mock.patch.object(os, 'readlink', cannot if what == 'a link it cannot read' else readlink):
+                    code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1, err)
+                self.assertIn(says, err)
+                self.assertTrue(os.path.isdir(self.version()))
+                self.assertFalse(os.path.lexists(self.path('/data/var/lib/golive-state')))
+
+    def test_below_a_users_folder_every_folder_is_that_users(self):
+        """A folder of another user's (or of root's) below the T3 user's folder may have been moved there by the
+        T3 user: the lock would be made as its owner, or opened where they chose. Refused, with the lock there or
+        not, before anything is made or run as anyone."""
+        for owner in ('another user', 'root'):
+            for lock in (False, True):
+                with self.subTest(owner=owner, lock=lock):
+                    self.lock_host(STATE)
+                    if lock:
+                        with open(self.path(f'{STATE}/lock'), 'w'):
+                            pass
+                    uid = os.geteuid() + 1 if owner == 'another user' else os.geteuid() + 4242
+                    if owner == 'root':
+                        self.m.SYSTEM_UID = uid
+                    ran, run_as = [], self.m.run_as
+                    with self.owners([STATE], uid=uid), \
+                            mock.patch.object(self.m, 'run_as', lambda *a, **k: (ran.append(a), run_as(*a, **k))):
+                        code, _, err = self.run_main('uninstall')
+                    self.assertEqual(code, 1, err)
+                    self.assertIn(f'{STATE} belongs to uid {uid}, inside a folder of uid {os.geteuid()}', err)
+                    self.assertEqual(ran, [])
+                    self.assertEqual(os.listdir(self.path(STATE)), ['lock'] if lock else [])
+                    self.assertTrue(os.path.isdir(self.version()))
+
+    def test_a_folder_on_fuse_refuses(self):
+        """A FUSE filesystem (a user's own, where /etc/fuse.conf has user_allow_other) can show any owner and any
+        link, root's too: no folder on the way may be on one, nor on a filesystem that cannot be told. Refused
+        with the lock there or not, before anything is made or run as anyone."""
+        kind, real = None, self.m.mount_type
+
+        def mount_type(fd):
+            st, at = os.fstat(fd), os.lstat(self.path('/var/lib'))
+            return kind if (st.st_dev, st.st_ino) == (at.st_dev, at.st_ino) else real(fd)
+        for kind in ('fuse', 'fuseblk', 'fuse.sshfs', None):
+            for lock in (False, True):
+                with self.subTest(kind=kind, lock=lock):
+                    self.lock_host(STATE)
+                    if lock:
+                        with open(self.path(f'{STATE}/lock'), 'w'):
+                            pass
+                    ran, run_as = [], self.m.run_as
+                    with mock.patch.object(self.m, 'mount_type', mount_type), \
+                            mock.patch.object(self.m, 'run_as', lambda *a, **k: (ran.append(a), run_as(*a, **k))):
+                        code, _, err = self.run_main('uninstall')
+                    self.assertEqual(code, 1, err)
+                    self.assertIn(f'/var/lib is on a filesystem of type {kind or "that cannot be told"}', err)
+                    self.assertEqual((ran, os.listdir(self.path(STATE))), ([], ['lock'] if lock else []))
+                    self.assertTrue(os.path.isdir(self.version()))
+
+    def test_the_filesystem_type_comes_from_the_mount_id(self):
+        """From /proc/self/fdinfo/<fd> and /proc/self/mountinfo, never from the filesystem itself (a FUSE program
+        could make that wait): optional fields or none, a subtype, and an unknown mount (None)."""
+        fdinfo = os.path.join(self.host, 'fdinfo')
+        os.makedirs(fdinfo)
+        self.m.FDINFO, self.m.MOUNTINFO = fdinfo, os.path.join(self.host, 'mountinfo')
+        with open(self.m.MOUNTINFO, 'w') as f:
+            f.write('22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n'
+                    '42 22 0:50 / /home/t3/mnt rw,nosuid,nodev,relatime shared:5 master:2 - fuse.sshfs t3@x:/ rw\n'
+                    '43 22 0:51 / /- rw - fuseblk /dev/sdb1 rw\n')
+        for mount, kind in (('22', 'ext4'), ('42', 'fuse.sshfs'), ('43', 'fuseblk'), ('99', None)):
+            with self.subTest(mount=mount):
+                with open(os.path.join(fdinfo, '7'), 'w') as f:
+                    f.write(f'pos:\t0\nflags:\t012200000\nmnt_id:\t{mount}\nino:\t2\n')
+                self.assertEqual(self.m.mount_type(7), kind)
+        self.assertIsNone(self.m.mount_type(8))                     # no fdinfo
+        self.m.FDINFO, self.m.MOUNTINFO = '/proc/self/fdinfo', '/proc/self/mountinfo'
+        fd = os.open(self.root, os.O_PATH)
+        self.addCleanup(os.close, fd)
+        self.assertTrue(self.m.mount_type(fd))                      # this host's own
+
+    def test_an_existing_lock_and_journal_are_opened_through_the_walk(self):
+        """Where the lock is there already (every host where golive has run), it and the journal are opened in the
+        folder the walk reached, not by their path: a link of the T3 user's to another user's state folder
+        refuses, and that user's lock and journal are not opened."""
+        other = '/home/other/state'
+        for target in (other, '../../home/other/state'):
+            with self.subTest(target=target):
+                self.lock_host(other, '/var/lib')
+                for name in ('lock', 'journal.jsonl'):
+                    with open(self.path(f'{other}/{name}'), 'w'):
+                        pass
+                os.symlink(target, self.path(STATE))
+                opened, real = [], os.open
+
+                def watched(path, *a, **k):
+                    opened.append(path)
+                    return real(path, *a, **k)
+                with mock.patch.object(os, 'open', watched):
+                    code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1, err)
+                self.assertIn(f'{STATE} is a link of uid {os.geteuid()}', err)
+                self.assertFalse([p for p in opened if os.path.basename(str(p)) in ('lock', 'journal.jsonl')])
+                self.assertTrue(os.path.isdir(self.version()))
+
+    def test_the_lock_is_made_with_the_user_entrys_group(self):
+        """As the folder's owner, with that user's own group from the user entry (not the folder's group, nor
+        root's); a uid with no user entry refuses, with nothing made."""
+        self.lock_host('/var/lib')
+        ran, run_as = [], self.m.run_as
+        entry = mock.Mock(pw_gid=4343)
+        with mock.patch.object(pwd, 'getpwuid', lambda uid: entry), \
+                mock.patch.object(self.m, 'run_as', lambda *a, **k: (ran.append(a[:2]), run_as(*a, **k))):
+            code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertNotEqual(os.lstat(self.path('/var/lib')).st_gid, 4343)
+        self.assertEqual(ran, [(os.geteuid(), 4343)])
+        self.lock_host('/var/lib')
+        ran = []
+        with mock.patch.object(pwd, 'getpwuid', mock.Mock(side_effect=KeyError(os.geteuid()))), \
+                mock.patch.object(self.m, 'run_as', lambda *a, **k: (ran.append(a[:2]), run_as(*a, **k))):
+            code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1, err)
+        self.assertIn(f'belongs to uid {os.geteuid()}, which has no user entry', err)
+        self.assertEqual(ran, [])
+        self.assertFalse(os.path.lexists(self.path(STATE)))
+
+    def test_the_folders_made_are_as_golive_makes_them(self):
+        """The same modes golive's own first run gives them (journal.lock: os.makedirs, the state folder 0700, the
+        folders above it as umask leaves them), and stateDir spelled as golive spells it ("x/.." dropped)."""
+        J = self.mod.journal
+        for state in ('/var/lib/a/b/golive-state', '/var/lib/nothere/../a/b/golive-state'):
+            with self.subTest(state=state):
+                self.lock_host('/var/lib', state=state)
+                code, out, err = self.run_main('uninstall')
+                self.assertEqual(code, 0, err)
+                with J.lock(self.path('/var/lib/twin/b/golive-state'), 'switch', exclusive=True):
+                    pass
+                modes = [stat.S_IMODE(os.lstat(self.path(f'/var/lib/{top}{rest}')).st_mode)
+                         for top in ('a', 'twin') for rest in ('', '/b', '/b/golive-state', '/b/golive-state/lock')]
+                self.assertEqual(modes[:4], modes[4:])
+                self.assertEqual(modes[:4], [0o755, 0o755, 0o700, 0o600])
+                self.assertFalse(os.path.lexists(self.path('/var/lib/nothere')))
+
+    def test_what_is_made_is_never_reached_through_a_link(self):
+        """The folders and the lock the child makes, and root's opening them again after it, go through no link
+        the T3 user puts there meanwhile: nothing is made or opened in the other folder, and uninstall refuses."""
+        other = '/home/other'
+        made_at = {'the state folder, by the child': 'golive-state', 'the lock, by the child': 'lock'}
+        for what, name in made_at.items():
+            with self.subTest(what=what):
+                self.lock_host(other, '/var/lib')
+                before, mkdir = self.files_under(self.path(other)), os.mkdir
+
+                def then_swapped(path, mode=0o777, *, dir_fd=None, name=name):
+                    mkdir(path, mode, dir_fd=dir_fd)
+                    if path != 'golive-state':
+                        return
+                    if name == 'golive-state':
+                        os.rename(path, 'golive-state.old', src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                        os.symlink(self.path(other), path, dir_fd=dir_fd)
+                    else:
+                        os.symlink(self.path(f'{other}/lock'), self.path(f'{STATE}/lock'))
+                with mock.patch.object(os, 'mkdir', then_swapped):
+                    code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1, err)
+                self.assertIn(f'cannot make {STATE}/lock as uid {os.geteuid()}', err)
+                self.assertEqual(self.files_under(self.path(other)), before)
+                self.assertTrue(os.path.isdir(self.version()))
+        with self.subTest(what='the state folder, by root after the child'):
+            self.lock_host(other, '/var/lib')
+            with open(self.path(f'{other}/lock'), 'w'):
+                pass
+            run_as = self.m.run_as
+
+            def then_swapped(*a, **k):
+                run_as(*a, **k)
+                os.rename(self.path(STATE), self.path(f'{STATE}.old'))
+                os.symlink(self.path(other), self.path(STATE))
+            with mock.patch.object(self.m, 'run_as', then_swapped):
+                code, _, err = self.run_main('uninstall')
+            self.assertEqual(code, 1, err)
+            self.assertIn(f'{STATE} cannot be opened without following a link', err)
+            self.assertTrue(os.path.isdir(self.version()))
+
+    def test_the_child_holds_none_of_roots_files_and_is_ended(self):
+        """The child runs as the user, who may stop it: it holds none of root's open files (install.lock among
+        them) but the folder it needs, and has /dev/null as stdout. Stopped (or kept waiting), it is ended after
+        CHILD_SECONDS; root's run ended first (Ctrl-C), it is ended too. Either way it is gone, not left holding
+        anything."""
+        log = os.path.join(self.host, 'log')
+        extra = os.open(os.path.join(self.host, 'install.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, extra)
+        keep = os.open(self.host, os.O_PATH | os.O_DIRECTORY)
+        self.addCleanup(os.close, keep)
+
+        def look():
+            seen = []
+            for fd in (extra, keep):
+                try:
+                    os.fstat(fd)
+                    seen.append('open')
+                except OSError:
+                    seen.append('closed')
+            with open(log, 'w') as f:
+                f.write(' '.join(seen + [os.readlink('/proc/self/fd/1')]))
+        self.m.run_as(os.geteuid(), os.getegid(), look, 'look', keep=(keep,))
+        with open(log) as f:
+            self.assertEqual(f.read(), 'closed open /dev/null')
+        pidfile = os.path.join(self.host, 'pid')
+
+        def child_pid():
+            for _ in range(200):
+                if os.path.exists(pidfile):
+                    with open(pidfile) as f:
+                        return int(f.read() or 0) or None
+                time.sleep(0.05)
+            return None
+
+        def gone(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(pid, 0)
+
+        def start(then):
+            def fn():
+                with open(pidfile + '.tmp', 'w') as f:
+                    f.write(str(os.getpid()))
+                os.rename(pidfile + '.tmp', pidfile)
+                then()
+            return fn
+        stop = start(lambda: os.kill(os.getpid(), signal.SIGSTOP))
+        wait = start(lambda: time.sleep(30))
+        self.m.CHILD_SECONDS = 1
+        with self.no_hang(15), self.assertRaisesRegex(self.mod.kit_install.Refused, r'it took over 1 s'):
+            self.m.run_as(os.geteuid(), os.getegid(), stop, 'make it')
+        pid = child_pid()
+        self.addCleanup(gone, pid)
+        with self.assertRaises(ProcessLookupError):                 # killed and reaped
+            os.kill(pid, 0)
+        os.unlink(pidfile)
+        self.m.CHILD_SECONDS = 30
+        real = select.select
+
+        def interrupted(*a):
+            if child_pid() is not None:
+                raise KeyboardInterrupt
+            return real(*a)
+        with self.no_hang(10), mock.patch.object(select, 'select', interrupted), \
+                self.assertRaises(KeyboardInterrupt):
+            self.m.run_as(os.geteuid(), os.getegid(), wait, 'make it')
+        pid = child_pid()
+        self.addCleanup(gone, pid)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_put_back_leaves_no_restore_folder_of_its_own(self):
+        """put_back alone (not only _remove's loop after it) leaves no <path>.restore."""
+        self.hand_copy()
+        kept = os.path.join(self.host, 'kept')
+        with open(kept, 'w') as f:
+            f.write(HAND_COPY)
+        self.m.put_back(COMMAND, kept, (0o750, os.geteuid(), os.getegid()))
+        self.assertEqual(os.listdir(self.path('/usr/local/bin')), ['t3-golive'])
+        with open(self.path(COMMAND)) as f:
+            self.assertEqual(f.read(), HAND_COPY)
 
     def test_a_lock_gone_before_root_opens_it_refuses(self):
         """Made by the user's child, then gone before root opens it (the T3 user removed it): no lock is held, so
@@ -428,8 +779,8 @@ class Install(fx.FakeHost):
         self.lock_host(STATE)
         run_as = self.m.run_as
 
-        def then_removed(*a):
-            run_as(*a)
+        def then_removed(*a, **k):
+            run_as(*a, **k)
             os.unlink(self.path(f'{STATE}/lock'))
         with mock.patch.object(self.m, 'run_as', then_removed):
             code, _, err = self.run_main('uninstall')
@@ -698,21 +1049,20 @@ MUTATIONS = {
         '                self.drop_restore_leftover(path)\n', '                os.unlink(self.p(path))\n',
         'test_a_leftover_restore_file_is_removed_by_install_and_uninstall'),
     'uninstall: makes the lock a first run would take': (
-        'installer', '            fd = self.make_lock(state)\n', '            pass\n',
+        'installer', '                made = self.make_lock(state, fd, where, rest)\n', '                made = None\n',
         'test_uninstall_makes_the_lock_a_first_run_would_take'),
     "uninstall: makes no lock in root's folder": (
-        'installer', '            if uid == self.SYSTEM_UID:\n                return None\n', '',
+        'installer', '        if uid == self.SYSTEM_UID:\n            return None\n', '',
         'test_uninstall_makes_the_lock_a_first_run_would_take'),
     'uninstall: the way to the lock is walked with no link followed': (
-        'installer', 'new = os.open(part, kit_install.DIR_FLAGS | os.O_NONBLOCK, dir_fd=fd)',
-        'new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)',
+        'installer', 'new = os.open(part, WALK, dir_fd=fd)', 'new = os.open(part, WALK & ~os.O_NOFOLLOW, dir_fd=fd)',
         'test_the_lock_is_never_made_through_a_link_the_t3_user_could_plant'),
     "uninstall: a link on the way to the lock that is not root's refuses": (
         'installer', '            if st.st_uid != self.SYSTEM_UID:\n', '            if False:\n',
         'test_the_lock_is_never_made_through_a_link_the_t3_user_could_plant'),
     'uninstall: the lock is made in the folder walked to, not by its path': (
-        'installer', '                at = fd\n                for i, part in enumerate(rest):',
-        '                at = os.open(self.p(where), os.O_RDONLY)\n                for i, part in enumerate(rest):',
+        'installer', '            at = fd\n            for i, part in enumerate(rest):',
+        '            at = os.open(self.p(where), os.O_RDONLY)\n            for i, part in enumerate(rest):',
         'test_the_lock_is_never_made_through_a_link_the_t3_user_could_plant'),
     "uninstall: a link of root's on the way is gone along": (
         'installer', "                        todo = [x for x in (target if target.startswith('/') else",
@@ -727,10 +1077,10 @@ MUTATIONS = {
     "uninstall: the lock is made with none of root's groups": (
         'installer', '                    os.setgroups([])\n', '', 'test_the_lock_is_made_as_the_user_with_no_root_rights'),
     'uninstall: refused under a golive run': (
-        'installer', '                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n',
+        'installer', '                fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n',
         '                pass\n', 'test_uninstall_is_refused_while_a_golive_run_holds_its_lock'),
     'uninstall: refused while a run needs settling': (
-        'installer', '            self.refuse_unsettled(state)\n            yield\n        finally:',
+        'installer', '            self.refuse_unsettled(state, folder)\n            yield\n        finally:',
         '            yield\n        finally:',
         'test_uninstall_is_refused_while_a_run_needs_settling'),
     'uninstall: a journal it cannot trust refuses': (
@@ -748,6 +1098,81 @@ MUTATIONS = {
         'installer', 'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)',
         'os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)',
         'test_a_special_file_in_the_state_folder_refuses_and_never_blocks'),
+    'uninstall: a relative link of root\'s is read from its own folder': (
+        'installer', "else f'{done}/{target}'", "else f'/{target}'", 'test_a_link_of_roots_on_the_way_is_gone_along'),
+    "uninstall: a link of root's only from a folder of root's": (
+        'installer', '                if folder.st_uid != self.SYSTEM_UID or folder.st_mode & 0o022:',
+        '                if folder.st_mode & 0o022:', 'test_a_link_of_roots_is_gone_along_only_from_a_folder_of_roots'),
+    "uninstall: a link of root's only from a folder no one else may write in": (
+        'installer', '                if folder.st_uid != self.SYSTEM_UID or folder.st_mode & 0o022:',
+        '                if folder.st_uid != self.SYSTEM_UID:',
+        'test_a_link_of_roots_is_gone_along_only_from_a_folder_of_roots'),
+    'uninstall: something on the way that is not a link refuses as such': (
+        'installer', '                if not stat.S_ISLNK(st.st_mode):', '                if False:',
+        'test_the_walk_refuses_what_is_not_a_plain_way_there'),
+    'uninstall: a link that cannot be read refuses': (
+        'installer', "            except OSError as e:\n                raise self.Refused(f'{shown} cannot be read",
+        "            except KeyError as e:\n                raise self.Refused(f'{shown} cannot be read",
+        'test_the_walk_refuses_what_is_not_a_plain_way_there'),
+    'uninstall: a loop of links ends': (
+        'installer', '                        if hops > 40:', '                        if False:',
+        'test_the_walk_refuses_what_is_not_a_plain_way_there'),
+    'uninstall: a missing folder before ".." refuses': (
+        'installer', "                        if '..' in todo:", '                        if False:',
+        'test_the_walk_refuses_what_is_not_a_plain_way_there'),
+    "uninstall: below a user's folder, every folder is that user's": (
+        'installer', '        if uid != owner:\n', '        if False:\n',
+        'test_below_a_users_folder_every_folder_is_that_users'),
+    'uninstall: no folder on FUSE': (
+        'installer', "        if kind is None or kind.split('.')[0] in ('fuse', 'fuseblk'):", '        if kind is None:',
+        'test_a_folder_on_fuse_refuses'),
+    'uninstall: no folder whose filesystem cannot be told': (
+        'installer', "        if kind is None or kind.split('.')[0] in ('fuse', 'fuseblk'):",
+        "        if kind is not None and kind.split('.')[0] in ('fuse', 'fuseblk'):", 'test_a_folder_on_fuse_refuses'),
+    'uninstall: the filesystem type after the "-" of mountinfo': (
+        'installer', "return fields[fields.index('-', 6) + 1]", 'return fields[7]',
+        'test_the_filesystem_type_comes_from_the_mount_id'),
+    'uninstall: the lock is made with the group of the user entry': (
+        'installer', '            gid = pwd.getpwuid(uid).pw_gid', '            gid = os.fstat(fd).st_gid',
+        'test_the_lock_is_made_with_the_user_entrys_group'),
+    "uninstall: the lock is made with none of root's group": (
+        'installer', '            gid = pwd.getpwuid(uid).pw_gid', '            gid = 0',
+        'test_the_lock_is_made_with_the_user_entrys_group'),
+    'uninstall: a uid with no user entry refuses': (
+        'installer', '        except KeyError:\n            raise self.Refused(',
+        '        except KeyError:\n            gid = 0\n        if False:\n            raise self.Refused(',
+        'test_the_lock_is_made_with_the_user_entrys_group'),
+    'uninstall: the folders above the state folder as golive makes them': (
+        'installer', '0o700 if i == len(rest) - 1 else 0o777', '0o700',
+        'test_the_folders_made_are_as_golive_makes_them'),
+    'uninstall: stateDir spelled as golive spells it': (
+        'installer', 'return os.path.normpath(state) if', 'return state if',
+        'test_the_folders_made_are_as_golive_makes_them'),
+    'uninstall: the child makes the folders through no link': (
+        'installer', 'at = os.open(part, kit_install.DIR_FLAGS | os.O_NONBLOCK, dir_fd=at)',
+        'at = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK, dir_fd=at)',
+        'test_what_is_made_is_never_reached_through_a_link'),
+    'uninstall: the child makes the lock through no link': (
+        'installer', "os.close(os.open('lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK",
+        "os.close(os.open('lock', os.O_RDWR | os.O_CREAT | os.O_NONBLOCK",
+        'test_what_is_made_is_never_reached_through_a_link'),
+    'uninstall: root opens what the child made through no link': (
+        'installer', 'new = os.open(part, WALK, dir_fd=at)', 'new = os.open(part, WALK & ~os.O_NOFOLLOW, dir_fd=at)',
+        'test_what_is_made_is_never_reached_through_a_link'),
+    "uninstall: the child holds none of root's files": (
+        'installer', "                for k in mine:      # before the rights are dropped: from then on that user may "
+        "stop it\n                    os.closerange(low, k)\n                    low = max(low, k + 1)\n"
+        "                os.closerange(low, os.sysconf('SC_OPEN_MAX'))\n", '',
+        'test_the_child_holds_none_of_roots_files_and_is_ended'),
+    'uninstall: a stopped child is ended': (
+        'installer', '                if left <= 0 or not select.select([r], [], [], left)[0]:', '                if False:',
+        'test_the_child_holds_none_of_roots_files_and_is_ended'),
+    'uninstall: the child is ended when root stops': (
+        'installer', '                    os.kill(pid, signal.SIGKILL)\n', '                    pass\n',
+        'test_the_child_holds_none_of_roots_files_and_is_ended'),
+    'hand copy: put_back removes its own .restore': (
+        'engine', '        os.rmdir(stage)\n        self.say(', '        self.say(',
+        'test_put_back_leaves_no_restore_folder_of_its_own'),
     'uninstall: a machine file it cannot read refuses': (
         'installer', '        except machine_file.MachineFileError as e:\n            raise',
         '        except machine_file.MachineFileError as e:\n            return None\n            raise',
