@@ -158,7 +158,7 @@ check() { # check NAME EXPECTED_STATUS [GREP_PATTERN [ABSENT_PATTERN [ALSO_PATTE
   set +e
   out="$(cd "$clone" && GITLEAKS="$gitleaks" GITHUB_STEP_SUMMARY="$root/summary" "$script" 2>&1)"
   status=$?
-  first="$(sed -n '/^### Secret scan$/,$ { /^### /d; /^$/d; p; }' "$root/summary" 2> /dev/null | head -n 1)"
+  first="$(sed -n '/^### Secret scan$/,$ { /^### /d; /^$/d; p; q; }' "$root/summary" 2> /dev/null)"
   set -e
   if [[ "$status" -ne "$expected" ]]; then
     echo "FAIL $name: exit $status, expected $expected"
@@ -807,6 +807,14 @@ $bad"
     check "daily sweep: a list of tips known gone with a carriage return fails ($(printf '%q' "$bad"))" 2 \
     "::error::Secret scan: line 2 of $gone_list on the default branch .* has a carriage return"
 done
+# A NUL byte would be dropped by the shell and its entry still count, while diffs show the file as
+# binary (a reviewer would not see that entry): a list holding one fails.
+git checkout -q main
+commit_bytes "$gone_list" "the list of tips known gone, with a NUL" < <(printf '%s checked by hand (test)\n%s\0 reason\n' "$gone3" "$gone4")
+git push -q origin main
+OLD_HEADS="" EVENT_NAME=schedule \
+  check "daily sweep: a list of tips known gone with a NUL byte fails" 2 \
+  "::error::Secret scan: $gone_list on the default branch .* has a NUL byte"
 git rm -q "$gone_list"
 mkdir -p .github
 ln -s ../app.txt "$gone_list"

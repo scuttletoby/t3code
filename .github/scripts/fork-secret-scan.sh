@@ -342,6 +342,12 @@ read_gone_list() {
     echo "::error::Secret scan: cannot read $gone_list $where (the reviewed list of tips known gone; see the messages above)" >&2
     exit 2
   fi
+  # Read again from the local object (fetched above). A NUL byte is dropped by the shell (its entry
+  # would still count) and makes diffs show the file as binary, hiding that entry: refuse it.
+  if [[ "$(git cat-file blob "$oid" | LC_ALL=C tr -cd '\000' | wc -c)" -ne 0 ]]; then
+    echo "::error::Secret scan: $gone_list $where has a NUL byte, so the list of tips known gone cannot be trusted. Save it as plain text on the default branch (a reviewed pull request)." >&2
+    exit 2
+  fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
     # A carriage return anywhere fails, so `<id>\r` and `<id> why\r` (and a CRLF comment) are judged
