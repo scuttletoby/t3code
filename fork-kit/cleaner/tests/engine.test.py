@@ -799,7 +799,7 @@ class Config(Case):
             | {f'dedupe.{k}' for k in cf.DEDUPE_SPEC}
         self.assertEqual(set(cf.KEY_KINDS), keys)
         self.assertLessEqual(set(cf.KEY_KINDS.values()), {'own file', 'floor', 'keeps more', 'picks', 'loosens', 'compare only'})
-        self.assertEqual([k for k, v in cf.KEY_KINDS.items() if v == 'loosens'], ['repos.regenerable'])
+        self.assertEqual([k for k, v in cf.KEY_KINDS.items() if v == 'loosens'], ['repos.regenerable', 'folders.layered'])
 
     def test_the_launcher_runs(self):
         exe = os.path.join(fx.KIT, 'bin', 'fork-cleaner')

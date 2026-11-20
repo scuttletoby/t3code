@@ -19,6 +19,7 @@ import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
 import * as DelegatedOrphanScan from "./delegatedResults/DelegatedOrphanScan.ts";
 import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
+import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffQuiet from "./handoff/handoffQuiet.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
@@ -80,6 +81,8 @@ export const layerRoutes = Layer.mergeAll(
   ServerAutoUpdate.layer,
   // GET /api/fork/activity: 404 unless activityProbe is on; loopback programs only.
   ActivityProbe.layer,
+  // GET /api/fork/features: what this version does for a linked machine; its token only.
+  ForkFeatures.layer,
   // Linked threads a parent here launched but whose task the last stop lost: one reminder each.
   DelegatedOrphanScan.layer,
 );

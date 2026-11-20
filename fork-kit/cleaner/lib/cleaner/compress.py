@@ -348,7 +348,7 @@ def _start(cfg, facts, folder):
     bound = mounts.bound(path, st.st_dev)
     if bound is not None:
         return None, Refusal('in use', f'a bind mount shows {bound} of its filesystem somewhere else (a container or a sandbox)')
-    refusal = guard.above_refusal(path, mounts)
+    refusal = guard.above_refusal(path, mounts, folder.layered)
     if refusal is not None:
         return None, refusal
     # relatime (the usual default) updates the access time at the first read after a change, and at least once a
