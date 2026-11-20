@@ -251,34 +251,11 @@ def _start(cfg, facts, folder):
     bound = mounts.bound(path, st.st_dev)
     if bound is not None:
         return None, Refusal('in use', f'a bind mount shows {bound} of its filesystem somewhere else (a container or a sandbox)')
-    refusal = _above_refusal(path)
+    refusal = guard.above_refusal(path)
     if refusal is not None:
         return None, refusal
     folder.dev = st.st_dev
     return st, None
-
-
-def _above_refusal(path):
-    """A KEEP file or a git folder in a folder above the configured folder, up to `/`: everything under it is
-    kept, as below it (a work tree's files are git's; a KEEP file keeps its whole folder). Read at the plan and again
-    before each link."""
-    here = os.path.dirname(path)
-    while True:
-        try:
-            keep = os.lstat(os.path.join(here, KEEP_FILE))
-        except FileNotFoundError:
-            keep = None
-        except OSError as ex:
-            return Refusal('could not read', f'{here}: {ex.strerror}')
-        if keep is not None and not stat.S_ISDIR(keep.st_mode):
-            return Refusal('KEEP file', f'{guard._keep_reason(os.path.join(here, KEEP_FILE))} ({here}, above {path})')
-        if os.path.lexists(os.path.join(here, '.git')) or all(os.path.lexists(os.path.join(here, n))
-                                                              for n in ('HEAD', 'objects', 'refs')):
-            return Refusal('git folder', f'{here}, above {path}: git needs its files as they are')
-        up = os.path.dirname(here)
-        if up == here:
-            return None
-        here = up
 
 
 def _folder_refusal(cfg, facts, folder, here, st, names):
