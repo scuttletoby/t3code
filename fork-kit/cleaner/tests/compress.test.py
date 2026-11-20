@@ -893,10 +893,10 @@ MUTATIONS = {
                                        Config, 'test_folders_it_refuses'),
     'config: never a must-keep path whole': ('config', 'if held:', 'if False:', Config, 'test_folders_it_refuses'),
     'config: no overlap with another rule': ('config', "raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {root}, a folder '\n"
-                                             "                                                        'another rule deletes from')", 'pass',
+                                             "                                                    'another rule deletes from')", 'pass',
                                              Config, 'test_folders_it_refuses'),
-    'config: never the agent-scratch root': ('config', "for root in self.roots() | ({self.scratch_root} if self.scratch_enabled else set()):\n                if _holds(path, root)",
-                                             "for root in self.roots():\n                if _holds(path, root)",
+    'config: never the agent-scratch root': ('config', "for root in self.roots() | ({self.scratch_root} if self.scratch_enabled else set()):\n            if _holds(path, root)",
+                                             "for root in self.roots():\n            if _holds(path, root)",
                                              Config, 'test_never_where_agent_scratch_deletes_or_keeps_first'),
     'config: never the keep-first archive': ('config', "('daily.outDir', out_text, self.daily_dir)) + archive:",
                                              "('daily.outDir', out_text, self.daily_dir)):",
