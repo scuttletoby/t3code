@@ -54,6 +54,8 @@ does not match itself as a pattern, and the queue then refuses to start.
 | `update_when_base_was_red` | no       | `true` updates a behind pull request whose required checks failed only because the base commit they tested failed them too (section "The base was red"). Set it only when the job of every required check runs the `tested-base` action. Default `false`.                                                                                                                                                                                                                                                                                                                               |
 | `head_check_app`           | no       | The id of the GitHub App that alone posts `head_check` (the head gate, `../head-check/README.md`, "The gate"). The queue then counts only that App's newest check run of that name and ignores a job or commit status of the same name from anyone else; it skips a pull request whose gate check it cannot read. Add it only after every queue that reads this config runs a release that knows it: an older release refuses an unknown key.                                                                                                                                           |
 | `review`                   | no       | Which changed paths need which lens reads, and the round cap (section "Review rules"). Without it the queue and the gate behave as before.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `notify_command`           | no       | A command the queue runs once for each new notice it posts on an armed pull request it passes over (a conflict, a red, cancelled or missing check), so that someone learns of it without GitHub notifications: an argv list (no shell), the command a bare name on `PATH` or an absolute path. Section "Notify". Unset: no command, as before.                                                                                                                                                                                                                                          |
+| `notify_timeout_seconds`   | no       | How long `notify_command` may run before it is stopped (default 30, 1-300). Only with `notify_command`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ## Review rules
 
@@ -382,7 +384,8 @@ again every `poll_seconds`, for at most `wait_seconds`, before it is passed
 over, so a younger pull request is not updated ahead of it.
 
 An armed pull request that cannot merge does not hold the queue. It is told
-why on the pull request, once per head, check and reason, and passed over:
+why on the pull request, once per head, check and reason, and passed over (with
+`notify_command`, that command runs for each such notice: section "Notify"):
 
 - a conflict with its base (merge state `DIRTY`): GitHub cannot merge it and
   the queue cannot update it, and GitHub leaves auto-merge on without a word.
@@ -575,6 +578,70 @@ each queue its own `--state-file` and `--cache`.
 
 `--lock-file` (default: `STATE.lock`) keeps two runs from overlapping.
 `--dry-run` takes no lock and writes nothing: no `STATE`, no cache, no comment.
+
+## Notify
+
+An armed pull request the queue passes over (section "The queue": a conflict, a
+red check, a check that ended without passing or never reported) is told on the
+pull request. That comment alone wakes nobody whose GitHub notifications are
+off. With `notify_command` the queue also runs that command, once for each
+notice it posts, with six arguments after the ones in the config:
+
+```
+<command> [config arguments...] <repo> <pr> <head> <kind> <reason> <link>
+```
+
+| Argument | Meaning                                                                                                                                                                                                                        |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `repo`   | `owner/name`.                                                                                                                                                                                                                  |
+| `pr`     | The pull request number.                                                                                                                                                                                                       |
+| `head`   | The full 40-hex head sha the notice is for.                                                                                                                                                                                    |
+| `kind`   | `conflict` (merge state `DIRTY`), `red` (a required check failed), `stuck` (one ended without passing, or never reported) or `base-red` (it failed as on its base, and the queue updates it by itself once the base is green). |
+| `reason` | The notice's own words, such as `required check build is red`.                                                                                                                                                                 |
+| `link`   | The page of the check's newest run, or the pull request's page when there is none (a conflict, a check that never reported).                                                                                                   |
+
+What the command does is the project's: wake the agent thread that armed the
+pull request, send a message, write a file. The fork holds no such command;
+a project names its own in its own config, for example
+`"notify_command": ["/usr/local/bin/queue-notify", "--channel", "ci"]`.
+
+- **Once per notice.** The command runs right after the queue posted the
+  comment, and only then: the comment (the queue's own login, per head and
+  reason) is the record that this head and reason were told. A later run, a
+  run after a restart, or a run on another runner sees the comment and posts
+  nothing, so the command does not run again. A new head that is still red or
+  still conflicts is a new notice and runs it again; so does a new reason on the
+  same head (a red after a cancelled check). A notice an older release posted
+  counts too: adding the key wakes nobody for a pull request told before. A dry
+  run posts nothing and runs nothing.
+- **A failed comment runs nothing.** The next run posts the comment and runs
+  the command then.
+- **Never in the queue's way.** A command that is missing, cannot start, exits
+  non-zero or runs longer than `notify_timeout_seconds` is a `::warning::` in
+  the run log, and the run goes on to the next pull request; the exit code of
+  the run does not change. A command that runs too long is stopped with every
+  process of its session (it starts a session of its own). After the command
+  exits, a helper it left running in the background is not stopped: its output
+  goes to a file, not a pipe, so it cannot hold the run either.
+- **Not tried again.** A command that failed, or a run stopped between the
+  comment and the command, does not run it again later: the comment says the
+  pull request was told, and the queue keeps no state of its own for this. The
+  notice on the pull request still stands, and the run log names the failure.
+- **No token in its environment, but not a sandbox.** The command gets the
+  queue's environment without any variable whose name holds `TOKEN` (the
+  queue's read and write tokens, `GH_TOKEN`, `ACTIONS_RUNTIME_TOKEN`, ...), no
+  stdin, and the job's working folder. It still runs as the same user as the
+  queue, so it can read the queue's own environment (write token included)
+  through `/proc`, and the checkout's saved read token in the working folder.
+  Trust it like the queue itself: only a command from the project's own
+  config, never one built from pull request text. Its
+  output (stdout and stderr, the first 4,000 characters) is shown in the run
+  log, each line after `notify|`, so it cannot write a workflow command.
+- **GitHub's text is an argument, never a shell line.** A check or base name
+  can hold anything; it reaches the command as one argument.
+
+Add the key only after every queue that reads the config runs a release that
+knows it: an older release refuses an unknown key.
 
 ## The base was red
 
