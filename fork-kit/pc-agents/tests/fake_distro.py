@@ -208,6 +208,21 @@ class Case(unittest.TestCase):
         hundreds of times for its writes, not its watch (the watch has tests of its own)."""
         self.settle = k.SETTLE = 0
 
+    def same_wsl2_walls(self):
+        """The fleet's wsl2 walls (fork-fleet-walls.py describe, a subprocess with about 80 more: some 0.3 s, most of
+        a setup run here) are looked at once for real, and every later look gets that answer: for a test that runs
+        setup hundreds of times for its writes. Its fake root is then compared file by file with a whole run's, so a
+        write a rerun leaves out still fails it; the walls' own answers have their tests (check.test.py, the fleet
+        walls' tests)."""
+        real, seen = cli.wsl2_walls, []
+
+        def once():
+            if not seen:
+                seen.append(real())
+            return list(seen[0])
+        cli.wsl2_walls = once
+        self.addCleanup(setattr, cli, 'wsl2_walls', real)
+
     def keep(self):
         """A copy of the fake root as it is now, for restore(): the same machine again, without the setup runs that
         made it."""
