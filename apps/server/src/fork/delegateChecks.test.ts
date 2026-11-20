@@ -17,6 +17,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as DelegateChecks from "./delegateChecks.ts";
@@ -106,6 +107,7 @@ const untouched = Layer.mergeAll(
     getSettings: Effect.die("settings read"),
   }),
   Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+  Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.die("providers read") }),
   Layer.mock(SlotGate.SlotGate)({
     acquire: () => Effect.die("slot acquired"),
     started: () => Effect.die("slot started"),
@@ -114,10 +116,11 @@ const untouched = Layer.mergeAll(
 );
 const host: DelegateChecks.DelegateChecksHost = {
   resolveTarget: () => Effect.die("target resolved"),
+  scanWorkspace: () => Effect.die("folder scanned"),
 };
 
 describe("fork delegation checks: runs again", () => {
-  it.effect("a retry of an accepted delegation reads no setting and takes no slot", () =>
+  it.effect("a retry of an accepted delegation reads, scans and holds nothing", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
       const before = yield* checks.beforeWorkspace({
@@ -125,7 +128,7 @@ describe("fork delegation checks: runs again", () => {
         parent,
         requested: undefined,
         runtimeMode: undefined,
-        providers: [],
+        cwd: "/work/project",
         target,
       });
       assert.deepStrictEqual(before, { target });
