@@ -235,6 +235,12 @@ export const make = Effect.fn("RunRecorder.make")(function* (options: {
           tag: record.estimateRefused,
         });
       }
+      if (record.kindRefused != null) {
+        yield* Effect.logWarning("run kind tag refused: empty or not closed", {
+          runId: run.id,
+          tag: record.kindRefused,
+        });
+      }
       yield* append(record);
       // Known in this process at once: if the cursor save fails (a full disk), a retry from the
       // old cursor writes no second line.
