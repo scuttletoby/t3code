@@ -321,6 +321,21 @@ class Contract:
         self.assertIn('cannot be read', err)
         self.assertTrue(os.path.isdir(self.version()))
 
+    def test_a_unit_file_that_is_a_link_is_never_read(self):
+        """A user's transient unit that is a link (x.service -> a file only root may read): systemd writes no
+        links, so it is passed over, never opened through the link. Here the file it points at names the kit's
+        code, so a read through the link would hold uninstall."""
+        self.assertEqual(self.install()[0], 0)
+        target = self.transient(os.path.join(self.host, 'elsewhere'), 'secret',
+                                f'[Service]\nExecStart="{self.first_link()}" "daily"\n')
+        units = os.path.join(self.m.RUN, 'user', '1000', 'systemd', 'transient')
+        os.makedirs(units)
+        os.symlink(target, os.path.join(units, 'x.service'))
+        with self.no_hang():
+            code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.lexists(self.path(self.m.LIBEXEC)))
+
     def test_a_release_whose_installer_differs_is_refused(self):
         """An installed installer given a newer release would copy its own file list, not the release's (and could
         leave out a file the release needs): refused before anything is written, naming the bootstrap. A copy of
@@ -682,6 +697,10 @@ MUTATIONS = {
     'uninstall: this uninstall and what started it do not count': (
         'engine', '            if int(name) in mine:', '            if int(name) == os.getpid():',
         'test_what_is_not_the_kit_never_holds_uninstall'),
+    'uninstall: a unit file is opened without following a link': (
+        'engine', 'ufd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)',
+        'ufd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)',
+        'test_a_unit_file_that_is_a_link_is_never_read'),
     'uninstall: a FIFO among the units is never waited on': (
         'engine', 'ufd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)',
         'ufd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)',

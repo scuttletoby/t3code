@@ -102,7 +102,11 @@ transient systemd unit (systemd-run's unit file: a detached run, a timer still p
 real path, where a folder above it is a link) or one of the kit's links; this uninstall and the processes that
 started it do not count, and a process list it cannot read refuses. The unit folders are opened with no link
 followed and never waited on, each step owned by root (or, below `<run>/user/<uid>`, that user) and on one
-filesystem; a unit folder or file it cannot read that way refuses. Updates go through the bootstrap.
+filesystem; a unit folder or file it cannot read that way refuses. Known limit: `<run>/user/<uid>` itself is that
+user's, so where `/etc/fuse.conf` has `user_allow_other` they can mount a FUSE filesystem of their own over it, and
+root's `uninstall` can then wait there forever, with both locks held (as it can reading the command line of a
+process whose memory is FUSE-backed). It fails safe: nothing is removed yet, and Ctrl-C ends it and frees the
+locks. Updates go through the bootstrap.
 
 `bootstrap.sh --kit cleaner|golive --repo OWNER/REPO --sha SHA [kit options]` checks the commit is on the protected
 release branch, downloads exactly that commit and runs the kit's installer; it passes on only the kit's own options.

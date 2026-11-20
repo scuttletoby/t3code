@@ -621,7 +621,11 @@ class Installer:
         root's. <run>/user/<uid>/systemd/transient is that user's, who could put a link (to /proc/self, say), a FIFO,
         another folder or a mount there: each step is opened with no link followed and never waited on, must be
         owned by root or that user, and must be on the filesystem of <run>/user/<uid>. Refused when one cannot be
-        opened like that, so root's uninstall never reads where a user points it."""
+        opened like that, so root's uninstall never reads where a user points it. Known limit: <run>/user/<uid>
+        itself is that user's, so where /etc/fuse.conf has user_allow_other they can mount a FUSE filesystem of
+        their own over it (allow_other), and root's open there then waits on their program, maybe forever, with
+        both locks held (as a read of /proc/<pid>/cmdline of a process with a FUSE-backed command line can). That
+        fails safe: nothing is removed yet, and Ctrl-C ends the wait and frees both locks."""
         try:
             run = os.open(self.RUN, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         except FileNotFoundError:
@@ -727,17 +731,26 @@ class Installer:
         return found
 
     def drop_restore_leftover(self, path):
-        """<path>.restore, left by an uninstall that stopped while putting an old file back."""
+        """<path>.restore, the folder of root's an uninstall that stopped while putting an old file back left (with
+        or without the copy in it). Only root can make it there: path's folder is root's."""
         tmp = self.p(path) + '.restore'
-        if os.path.lexists(tmp) and not os.path.isdir(tmp):
+        if os.path.isdir(tmp) and not os.path.islink(tmp):
+            shutil.rmtree(tmp)
+        elif os.path.lexists(tmp):
             os.unlink(tmp)
 
     def put_back(self, path, kept, meta):
         """The kept old file at path, with its mode and owner (meta), in one step: the link (or nothing) there is
-        replaced by the whole file, so the command is never missing."""
-        real = self.p(path)
+        replaced by the whole file, so the command is never missing. The copy is made in <path>.restore, a folder
+        only root can enter (0700), and only renamed out of it once it has its mode: between chown and chmod the
+        old owner owns the copy, and could write their own bytes into it before chmod adds a set-gid bit of a
+        group they are not in, were it where they could open it. (chmod cannot go first: chown clears set-id
+        bits; and an owner can always open their own file for writing, whatever its mode.) The folder is on
+        path's filesystem, so the rename is one step."""
+        real, stage = self.p(path), self.p(path) + '.restore'
         self.drop_restore_leftover(path)
-        tmp = real + '.restore'
+        os.mkdir(stage, 0o700)
+        tmp = os.path.join(stage, os.path.basename(real))
         shutil.copyfile(kept, tmp)
         if meta is None:                    # an order from before the mode and owner were kept
             os.chmod(tmp, stat.S_IMODE(os.stat(kept).st_mode))
@@ -746,6 +759,7 @@ class Installer:
             os.chown(tmp, uid, gid)
             os.chmod(tmp, mode)             # after chown, which clears a set-id bit
         os.replace(tmp, real)
+        os.rmdir(stage)
         self.say(f'put the old {path} back')
 
     def _remove(self):
