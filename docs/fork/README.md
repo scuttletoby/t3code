@@ -416,8 +416,8 @@ A thread whose profile is narrower than `all` cannot start a thread that gets mo
 profile ([#681](https://github.com/scuttletoby/t3code/issues/681)). `t3_thread_launch` from it is
 refused, before anything is made, when the new thread's profile in the target project (the project's
 `mcpProfile`, else the server's) is not within the launcher's: a profile is within another when its
-servers and T3 tools are a part of the other's. A launch on another machine is refused for such a
-thread too, as that machine gives the thread its own profile; `delegate_task` carries the
+servers and T3 tools are a part of the other's. A launch on another machine, and a new `schedule_task` there,
+are refused for such a thread too, as that machine gives the thread its own profile; `delegate_task` carries the
 launcher's profile instead. A launcher whose profile cannot be worked out is refused, never taken
 as `all`. A thread on `all`, and the owner's own client, launch as before.
 
