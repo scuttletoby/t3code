@@ -623,7 +623,8 @@ few system calls: the names and the new name are read in between) waits for the 
 duplicate, which no longer has a name, so that write is lost; a name of the kept file moved in the one system call
 between the last look at the new name and the rename is not seen. Where the filesystem gives no leases, the run goes
 on with the process list read just before, and an in-place write into the kept file that sets its content time back
-during the link itself (between the look before the link and the look after it) is not seen either. The duplicate's
+during the link itself (between the look before the link and the look after it), or within the same tick of the
+kernel's inode clock as the link (a few milliseconds), is not seen either. The duplicate's
 name then shows the kept file's times; mode, owner, group, extended attributes and chattr flags were the same
 already.
 

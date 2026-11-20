@@ -748,7 +748,8 @@ class _Leases:
     the names and the part are read in between); a name of the kept file moved after the last look at the part (one
     system call). Where the filesystem or the process takes no leases (a thread, leases off), the run goes on without
     them: the process list was read just before, and a write that sets the content time back between the look
-    before the link and the look after it (one system call) is not seen."""
+    before the link and the look after it (one system call), or in the same tick of the inode clock as the link (a
+    few milliseconds), is not seen."""
 
     def __init__(self):
         self.fds, self.old = [], None

@@ -1030,6 +1030,7 @@ class Gaps(Case):
             real(cache, ident, ctime_ns)
             if not done:
                 done.append(ident)
+                time.sleep(0.02)    # a tick of the kernel's coarse inode clock after the link (README: same tick)
                 scribble(a, keep_time=True)
         with mock.patch.object(self.c.dedupe._Leases, 'take', lambda *a, **k: None), \
                 mock.patch.object(self.c.dedupe.Cache, 'record', record):
