@@ -14,6 +14,7 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
+  ProviderDriverKind,
   RunId,
   RuntimeRequestId,
   type ServerSettings as ServerSettingsValue,
@@ -32,15 +33,21 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as HandoffService from "./HandoffService.ts";
 import {
+  adapterRegistry,
   at,
   awarenessShell,
   handoffMessageId,
   MINUTE_MS,
   modelSelection,
   NOW_MS,
+  otherInstanceConfig,
+  otherInstanceId,
   projection,
   run,
   runId,
+  runnableCases,
+  runnableThread,
+  runnableSettings,
   threadId,
 } from "./handoff.testkit.ts";
 import { HANDOFF_RULES } from "./handoffMessage.ts";
@@ -80,6 +87,12 @@ const harness = (state: {
   onDispatch?: (command: OrchestrationV2ServerCommand) => Effect.Effect<void>;
   /** The relay's view: read as the records show it (default), missing, or failing. */
   view?: "records" | "missing" | "fails";
+  /** The server's provider instances (none: the built-in ones, on). */
+  providerInstances?: ServerSettingsValue["providerInstances"];
+  /** Provider instances the thread's project turns on or off, by id. */
+  projectProviderInstances?: Record<string, { readonly enabled: boolean }> | undefined;
+  /** Instance ids upstream's registry does not have (removed); read at each lookup. */
+  missing?: Set<string>;
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
@@ -139,17 +152,24 @@ const harness = (state: {
       Layer.mock(ServerSettings.ServerSettingsService)({
         getSettings: Effect.sync(() => ({
           ...DEFAULT_SERVER_SETTINGS,
+          providerInstances: state.providerInstances ?? {},
           handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.settings },
           projectSettingsOverrides:
-            state.project === undefined
+            state.project === undefined && state.projectProviderInstances === undefined
               ? {}
               : ({
                   [state.data.thread.projectId]: {
-                    handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.project },
+                    ...(state.project === undefined
+                      ? {}
+                      : { handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.project } }),
+                    ...(state.projectProviderInstances === undefined
+                      ? {}
+                      : { providerInstances: state.projectProviderInstances }),
                   },
                 } as unknown as ServerSettingsValue["projectSettingsOverrides"]),
         })),
       }),
+      adapterRegistry(() => state.missing ?? new Set()),
     );
     yield* HandoffService.make.pipe(
       Effect.flatMap((service) => service.start()),
@@ -169,6 +189,8 @@ const harness = (state: {
     return { sent, emit, reads, events };
   });
 
+/** For a test that hangs, not fails, when a check is gone: it ends in milliseconds when right. */
+const SHORT_TIMEOUT_MS = 5_000;
 const on = { mode: "handoff" } as const;
 /** The wait at a quiet thread before a send, so the relay's alert for the person's turn goes first. */
 const settle = TestClock.adjust(HANDOFF_SETTLE_MS);
@@ -646,6 +668,178 @@ describe("HandoffService", () => {
       expect(sent.filter((command) => command.type === "queued-run.cancel")).toMatchObject([
         { runId: "run-3" },
       ]);
+    }),
+  );
+});
+
+describe("HandoffService: a handoff that cannot run (#608)", () => {
+  const big = () => projection({ usedTokens: 160_000 });
+  const chosen = { instanceId: otherInstanceId, model: "claude-opus-5-5" };
+  const otherOn = otherInstanceConfig(true);
+
+  // The same table as the compaction wrapper's test (handoffOwner.test.ts): a handoff is sent
+  // exactly when the wrapper lets handoff own the thread, so the two never disagree.
+  it.effect.each(runnableCases)("$name: sends a handoff: $runs", (entry) =>
+    Effect.gen(function* () {
+      const data = runnableThread(entry, big());
+      const parts = runnableSettings(entry, data.thread.projectId);
+      const state = {
+        data,
+        settings: { ...on, ...parts.handoff } as Partial<HandoffSettings>,
+        providerInstances: parts.providerInstances as ServerSettingsValue["providerInstances"],
+        projectProviderInstances: parts.projectProviderInstances[data.thread.projectId],
+        missing: parts.missing,
+      };
+      const { sent, emit, reads } = yield* harness(state);
+      yield* emit(runUpdated(data.runs[0]!), "readThread", 1);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 1);
+      expect(messages(sent)).toHaveLength(entry.runs ? 1 : 0);
+      // It sends on the instance it checked: the setting's, else the thread's own.
+      if (entry.runs)
+        expect(messages(sent)[0]?.modelSelection?.instanceId).toBe(
+          entry.target ?? data.thread.modelSelection.instanceId,
+        );
+      // One that cannot run reads no records, as with handoff off.
+      if (!entry.runs) expect(reads.count).toBe(0);
+    }),
+  );
+
+  it.effect(
+    "its instance removed while the idle timer sleeps (changed half-way): sends nothing",
+    () =>
+      Effect.gen(function* () {
+        const state = {
+          data: projection({ usedTokens: 100_000, cacheExpiresInMs: 10 * MINUTE_MS }),
+          settings: { ...on, modelSelection: chosen } as Partial<HandoffSettings>,
+          providerInstances: otherOn as ServerSettingsValue["providerInstances"],
+          missing: new Set<string>(),
+        };
+        const { sent, emit } = yield* harness(state);
+        yield* emit(runUpdated(run()), "readThread", 1);
+        yield* TestClock.adjust(MINUTE_MS);
+        state.missing.add(otherInstanceId);
+        yield* TestClock.adjust(10 * MINUTE_MS);
+        yield* emit(null, "handOffWhenDue", 1);
+        expect(sent).toEqual([]);
+      }),
+  );
+
+  it.effect("its instance turned off inside the settle: the read after it sends nothing", () =>
+    Effect.gen(function* () {
+      const state = {
+        data: big(),
+        settings: { ...on, modelSelection: chosen } as Partial<HandoffSettings>,
+        providerInstances: otherOn as ServerSettingsValue["providerInstances"],
+      };
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* TestClock.adjust(HANDOFF_SETTLE_MS / 2);
+      state.providerInstances = otherInstanceConfig(false);
+      yield* TestClock.adjust(HANDOFF_SETTLE_MS / 2);
+      yield* emit(null, "handOffWhenDue", 1);
+      expect(sent).toEqual([]);
+    }),
+  );
+
+  it.effect(
+    "removed, then added back: the same run reported again (runs again) hands off once",
+    () =>
+      Effect.gen(function* () {
+        const state = {
+          data: big(),
+          settings: { ...on, modelSelection: chosen } as Partial<HandoffSettings>,
+          providerInstances: otherOn as ServerSettingsValue["providerInstances"],
+          missing: new Set<string>([otherInstanceId]),
+        };
+        const { sent, emit } = yield* harness(state);
+        yield* emit(runUpdated(run()), "handOffWhenDue", 1);
+        expect(sent).toEqual([]);
+        // Nothing was remembered: the next report reads afresh.
+        state.missing.clear();
+        yield* emit(runUpdated(run()), "readThread", 2);
+        yield* settle;
+        yield* emit(null, "handOffWhenDue", 2);
+        expect(messages(sent)).toMatchObject([
+          { messageId: handoffMessageId, modelSelection: chosen },
+        ]);
+      }),
+    // Without the registry check the first report settles and waits on the test clock forever.
+    SHORT_TIMEOUT_MS,
+  );
+
+  // The retry sends on the failed run's own model. The setting now names B (on), but the run went
+  // to A, which was turned off or removed before the run failed: the retry must not start on A.
+  it.effect.each([
+    { name: "turned off", builtIn: false, missing: [] },
+    { name: "removed", builtIn: true, missing: [modelSelection.instanceId] },
+  ])("the setting switched to B and the run's instance A $name: no retry to A", (entry) =>
+    Effect.gen(function* () {
+      const data = big();
+      const failed = run({
+        id: RunId.make("run-2"),
+        ordinal: 2,
+        userMessageId: handoffMessageId,
+        status: "failed",
+        modelSelection,
+      });
+      const state = {
+        data: {
+          ...data,
+          runs: [...data.runs, failed],
+          messages: [{ ...data.messages[0]!, id: handoffMessageId, text: "[T3 handoff 1]" }],
+        },
+        settings: { ...on, modelSelection: chosen } as Partial<HandoffSettings>,
+        providerInstances: {
+          ...otherOn,
+          [modelSelection.instanceId]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            enabled: entry.builtIn,
+          },
+        } as ServerSettingsValue["providerInstances"],
+        missing: new Set<string>(entry.missing),
+      };
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(failed), "handoffRunEnded", 1);
+      expect(sent).toEqual([]);
+      // A on and registered again: the same failed run reported again is retried, on A.
+      state.providerInstances = {
+        ...otherOn,
+        [modelSelection.instanceId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+        },
+      } as ServerSettingsValue["providerInstances"];
+      state.missing.clear();
+      yield* emit(runUpdated(failed), "handoffRunEnded", 2);
+      expect(messages(sent)).toMatchObject([
+        { messageId: `${handoffMessageId}:retry1`, modelSelection },
+      ]);
+    }),
+  );
+
+  it.effect("a failed handoff run whose instance is gone now is not sent again", () =>
+    Effect.gen(function* () {
+      const data = big();
+      const failed = run({
+        id: RunId.make("run-2"),
+        ordinal: 2,
+        userMessageId: handoffMessageId,
+        status: "failed",
+      });
+      const state = {
+        data: {
+          ...data,
+          runs: [...data.runs, failed],
+          messages: [{ ...data.messages[0]!, id: handoffMessageId, text: "[T3 handoff 1]" }],
+        },
+        settings: on as Partial<HandoffSettings>,
+        // No modelSelection: the thread's own instance, which is no longer registered.
+        missing: new Set<string>([modelSelection.instanceId]),
+      };
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(failed), "handoffRunEnded", 1);
+      expect(sent).toEqual([]);
     }),
   );
 });

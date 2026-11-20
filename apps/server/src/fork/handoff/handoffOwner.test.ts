@@ -19,6 +19,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import * as TestClock from "effect/testing/TestClock";
@@ -27,7 +28,21 @@ import * as IdleCompactionService from "../../orchestration-v2/IdleCompactionSer
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ServerSettings from "../../serverSettings.ts";
-import { at, MINUTE_MS, NOW_MS, projection, run, runId, threadId } from "./handoff.testkit.ts";
+import {
+  adapterRegistry,
+  at,
+  MINUTE_MS,
+  NOW_MS,
+  otherInstanceConfig,
+  otherInstanceId,
+  projection,
+  run,
+  runId,
+  runnableCases,
+  runnableSettings,
+  runnableThread,
+  threadId,
+} from "./handoff.testkit.ts";
 import * as HandoffOwner from "./handoffOwner.ts";
 
 const projectId = projection({ usedTokens: 0 }).thread.projectId;
@@ -46,42 +61,65 @@ interface State {
   ownerSettingsFail?: boolean;
   /** The thread's project override is one from before handoff existed: no `handoff` key. */
   oldProjectOverride?: boolean;
+  /** The server's provider instances (none: the built-in ones, on). */
+  providerInstances?: ServerSettingsValue["providerInstances"];
+  /** Provider instances the thread's project turns on or off, by id. */
+  projectProviderInstances?: Record<string, { readonly enabled: boolean }>;
+  /** Instance ids upstream's registry does not have (removed); read at each lookup. */
+  missing?: Set<string>;
 }
 
 const settingsOf = (state: State): ServerSettingsValue => ({
   ...DEFAULT_SERVER_SETTINGS,
   // Upstream's idle compaction on, for the thread's built-in Claude instance.
   idleCompaction: "beforeCacheExpires",
-  providerInstances: {},
+  providerInstances: state.providerInstances ?? {},
   handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.server },
-  projectSettingsOverrides: (state.oldProjectOverride === true
-    ? { [projectId]: {} }
-    : state.project === undefined
-      ? {}
-      : {
-          [projectId]: { handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.project } },
-        }) as unknown as ServerSettingsValue["projectSettingsOverrides"],
+  projectSettingsOverrides: (state.oldProjectOverride === true ||
+  state.project !== undefined ||
+  state.projectProviderInstances !== undefined
+    ? {
+        [projectId]: {
+          ...(state.project === undefined
+            ? {}
+            : { handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.project } }),
+          ...(state.projectProviderInstances === undefined
+            ? {}
+            : { providerInstances: state.projectProviderInstances }),
+        },
+      }
+    : {}) as unknown as ServerSettingsValue["projectSettingsOverrides"],
 });
 
 /**
- * Upstream's idle compaction worker behind `HandoffOwner.make`, with mocked stores read at every
+ * Upstream's idle compaction worker behind one `HandoffOwner.make`, with mocked stores read at every
  * call (a test may change `state` while compaction waits). Returns the commands that reached
- * upstream's orchestrator and a wait for the worker's `count`th finished decision.
+ * upstream's orchestrator, a wait for the worker's `completions`th finished decision, and `report`,
+ * which reports the run once more to the same worker and wrapper and waits for that decision.
  */
 const compaction = (state: State, completions = 1) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
     const sent: Array<OrchestrationV2ServerCommand> = [];
     let ended = 0;
-    const done = yield* Deferred.make<void>();
+    const waiters: Array<{ readonly count: number; readonly done: Deferred.Deferred<void> }> = [];
+    const decided = (count: number) =>
+      Effect.gen(function* () {
+        const done = yield* Deferred.make<void>();
+        waiters.push({ count, done });
+        if (ended >= count) Deferred.doneUnsafe(done, Effect.void);
+        yield* Deferred.await(done);
+      });
     const tracer = Tracer.make({
       span(options) {
         const span = new Tracer.NativeSpan(options);
         const end = span.end.bind(span);
         span.end = (...args) => {
           end(...args);
-          if (span.name === "IdleCompactionService.compactWhenDue" && ++ended >= completions)
-            Deferred.doneUnsafe(done, Effect.void);
+          if (span.name !== "IdleCompactionService.compactWhenDue") return;
+          ended += 1;
+          for (const waiter of waiters)
+            if (ended >= waiter.count) Deferred.doneUnsafe(waiter.done, Effect.void);
         };
         return span;
       },
@@ -94,8 +132,11 @@ const compaction = (state: State, completions = 1) =>
       occurredAt: at(),
       payload: run(),
     } as const;
+    const events = yield* Queue.unbounded<typeof completed>();
+    for (let index = 0; index < completions; index++) yield* Queue.offer(events, completed);
+    let reported = completions;
     const upstream = Layer.mock(Orchestrator.OrchestratorV2)({
-      streamDomainEvents: Stream.make(...Array.from({ length: completions }, () => completed)),
+      streamDomainEvents: Stream.fromQueue(events),
       dispatch: (command) =>
         Effect.sync(() => {
           sent.push(command);
@@ -126,6 +167,7 @@ const compaction = (state: State, completions = 1) =>
     const wrapped = Layer.effect(Orchestrator.OrchestratorV2, HandoffOwner.make).pipe(
       Layer.provide(upstream),
       Layer.provide(ownerSettings),
+      Layer.provide(adapterRegistry(() => state.missing ?? new Set())),
       Layer.provideMerge(stores),
     );
     yield* IdleCompactionService.make.pipe(
@@ -133,7 +175,11 @@ const compaction = (state: State, completions = 1) =>
       Effect.provide(wrapped),
       Effect.withTracer(tracer),
     );
-    return { sent, done: Deferred.await(done) };
+    const report = Effect.suspend(() => {
+      reported += 1;
+      return Queue.offer(events, completed).pipe(Effect.andThen(decided(reported)));
+    });
+    return { sent, done: decided(completions), report };
   });
 
 /** A long Claude thread whose prompt cache expires in `expiresInMs` (compaction starts 2 min before). */
@@ -278,18 +324,31 @@ describe("one owner per thread: idle compaction and handoff", () => {
       }),
   );
 
-  it.effect("the thread is back and its settings readable at the next run: handoff owns it", () =>
-    Effect.gen(function* () {
-      // A missing thread or a failed read is not remembered: the next send reads afresh.
-      const state: State = { data: longThread(), server: { mode: "handoff" }, threadMissing: true };
-      const first = yield* compaction(state);
-      yield* first.done;
-      expect(compactions(first.sent)).toHaveLength(1);
-      state.threadMissing = false;
-      const second = yield* compaction(state);
-      yield* second.done;
-      expect(second.sent).toEqual([]);
-    }),
+  it.effect.each([
+    {
+      name: "the thread is missing",
+      patch: { threadMissing: true },
+      clear: { threadMissing: false },
+    },
+    {
+      name: "the settings cannot be read",
+      patch: { ownerSettingsFail: true },
+      clear: { ownerSettingsFail: false },
+    },
+  ] as ReadonlyArray<{ name: string; patch: Partial<State>; clear: Partial<State> }>)(
+    "$name, then back, in one wrapper: not remembered, handoff owns the next run",
+    ({ patch, clear }) =>
+      Effect.gen(function* () {
+        // One worker and one wrapper see both reports, so a result kept inside the wrapper shows.
+        const state: State = { data: longThread(), server: { mode: "handoff" }, ...patch };
+        const { sent, done, report } = yield* compaction(state);
+        yield* done;
+        expect(compactions(sent)).toHaveLength(1);
+        Object.assign(state, clear);
+        yield* report;
+        expect(compactions(sent)).toHaveLength(1);
+        expect(sent).toHaveLength(1);
+      }),
   );
 
   it.effect.each([
@@ -372,5 +431,107 @@ describe("server.ts wiring", () => {
         expect(firstInPipe).toContain("Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction)");
         expect(server.split("ForkLayers.handoffThreadsSkipIdleCompaction")).toHaveLength(2);
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("one owner per thread: a handoff that cannot run (#608)", () => {
+  const chosen = { instanceId: otherInstanceId, model: "claude-opus-5-5" };
+  const otherOn = otherInstanceConfig(true);
+
+  // The same table as the handoff service's test (HandoffService.test.ts): compaction is skipped
+  // exactly when a handoff is sent, so the two never disagree.
+  it.effect.each(runnableCases)("$name: handoff owns the thread: $runs", (entry) =>
+    Effect.gen(function* () {
+      const parts = runnableSettings(entry, projectId);
+      const projectInstances = parts.projectProviderInstances[projectId];
+      const state: State = {
+        data: runnableThread(entry, longThread()),
+        server: { mode: "handoff", ...parts.handoff },
+        providerInstances: parts.providerInstances as ServerSettingsValue["providerInstances"],
+        ...(projectInstances === undefined ? {} : { projectProviderInstances: projectInstances }),
+        missing: parts.missing,
+      };
+      const { sent, done } = yield* compaction(state);
+      yield* done;
+      expect(compactions(sent)).toHaveLength(entry.runs ? 0 : 1);
+      expect(sent).toHaveLength(entry.runs ? 0 : 1);
+    }),
+  );
+
+  it.effect(
+    "its instance removed after compaction began to wait (changed half-way): compacts",
+    () =>
+      Effect.gen(function* () {
+        const state: State = {
+          data: longThread(10 * MINUTE_MS),
+          server: { mode: "handoff", modelSelection: chosen },
+          providerInstances: otherOn,
+          missing: new Set(),
+        };
+        const { sent, done } = yield* compaction(state);
+        yield* TestClock.adjust(MINUTE_MS);
+        state.missing?.add(otherInstanceId);
+        yield* TestClock.adjust(7 * MINUTE_MS);
+        yield* done;
+        expect(compactions(sent)).toHaveLength(1);
+      }),
+  );
+
+  it.effect(
+    "its instance added back after compaction began to wait: decided at the send, none",
+    () =>
+      Effect.gen(function* () {
+        const state: State = {
+          data: longThread(10 * MINUTE_MS),
+          server: { mode: "handoff", modelSelection: chosen },
+          providerInstances: otherOn,
+          missing: new Set([otherInstanceId]),
+        };
+        const { sent, done } = yield* compaction(state);
+        yield* TestClock.adjust(MINUTE_MS);
+        state.missing?.clear();
+        yield* TestClock.adjust(7 * MINUTE_MS);
+        yield* done;
+        expect(sent).toEqual([]);
+      }),
+  );
+
+  it.effect("removed, then added back, in one wrapper: not remembered either way", () =>
+    Effect.gen(function* () {
+      const state: State = {
+        data: longThread(),
+        server: { mode: "handoff", modelSelection: chosen },
+        providerInstances: otherOn,
+        missing: new Set([otherInstanceId]),
+      };
+      const { sent, done, report } = yield* compaction(state);
+      yield* done;
+      expect(compactions(sent)).toHaveLength(1);
+      state.missing?.clear();
+      yield* report;
+      expect(compactions(sent)).toHaveLength(1);
+      state.missing?.add(otherInstanceId);
+      yield* report;
+      expect(compactions(sent)).toHaveLength(2);
+    }),
+  );
+
+  it.effect(
+    "its instance removed, the same run reported twice (runs again): as upstream alone",
+    () =>
+      Effect.gen(function* () {
+        const alone = yield* compaction({ data: longThread(), server: {} }, 2);
+        yield* alone.done;
+        const state: State = {
+          data: longThread(),
+          server: { mode: "handoff", modelSelection: chosen },
+          providerInstances: otherOn,
+          missing: new Set([otherInstanceId]),
+        };
+        const { sent, done } = yield* compaction(state, 2);
+        yield* done;
+        expect(compactions(alone.sent).length).toBeGreaterThan(0);
+        expect(compactions(sent)).toHaveLength(compactions(alone.sent).length);
+      }),
   );
 });
