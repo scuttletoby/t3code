@@ -57,18 +57,31 @@ export const threadHandoff = Effect.fn("HandoffOwner.threadHandoff")(function* (
   const resolved = threadHandoffSettings(current, thread.projectId, thread.id);
   if (resolved.mode !== "handoff") return { ...resolved, blocked: null };
   const instanceId = (resolved.settings.modelSelection ?? thread.modelSelection).instanceId;
-  if (!resolveProjectProviderInstanceEnabled(current, thread.projectId, instanceId))
-    return { ...resolved, blocked: { instanceId, reason: "instance-off" } as HandoffBlocked };
+  return {
+    ...resolved,
+    blocked: yield* handoffInstanceBlocked(current, thread.projectId, instanceId),
+  };
+});
+
+/**
+ * Whether a handoff send to `instanceId` would be blocked: turned off for the project (upstream's
+ * rule), or not registered (upstream's lookup, where a send to it fails). `threadHandoff` asks it for
+ * the instance the setting names; the retry of a failed handoff run also asks it for the run's own.
+ */
+export const handoffInstanceBlocked = Effect.fn("HandoffOwner.handoffInstanceBlocked")(function* (
+  current: Pick<ServerSettingsValue, "projectSettingsOverrides" | "providerInstances">,
+  projectId: ProjectId,
+  instanceId: ProviderInstanceId,
+) {
+  if (!resolveProjectProviderInstanceEnabled(current, projectId, instanceId))
+    return { instanceId, reason: "instance-off" } as HandoffBlocked;
   const adapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   // Any lookup failure means the send would fail the same way: count it as missing.
   const registered = yield* adapters.get(instanceId).pipe(
     Effect.as(true),
     Effect.orElseSucceed(() => false),
   );
-  return {
-    ...resolved,
-    blocked: registered ? null : ({ instanceId, reason: "instance-missing" } as HandoffBlocked),
-  };
+  return registered ? null : ({ instanceId, reason: "instance-missing" } as HandoffBlocked);
 });
 
 /** Handoff owns a thread when its mode is `handoff` and the handoff can run. */

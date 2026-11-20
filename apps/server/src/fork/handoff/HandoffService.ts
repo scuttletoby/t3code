@@ -38,7 +38,7 @@ import {
 import { handoffMessageText } from "./handoffMessage.ts";
 import { HANDOFF_SETTLE_CHECK_MS, HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 import { relayShowsFinish } from "./handoffRelayView.ts";
-import { threadHandoff } from "./handoffOwner.ts";
+import { handoffInstanceBlocked, threadHandoff } from "./handoffOwner.ts";
 
 /** Part 3 reads the turn items of this many latest runs; the budget keeps the newest of them. */
 const TRANSCRIPT_RUNS = 20;
@@ -288,6 +288,20 @@ export const make = Effect.gen(function* () {
       });
       const message = messages[0];
       if (read === null || message === undefined) return;
+      // The retry sends on the run's own model, which may not be the one the setting names now:
+      // check that instance too, by the same rule. Off or gone: no retry; its text stays.
+      const blocked = yield* handoffInstanceBlocked(
+        yield* serverSettings.getSettings,
+        read.records.thread.projectId,
+        run.modelSelection.instanceId,
+      ).pipe(Effect.provideService(ProviderAdapterRegistry.ProviderAdapterRegistryV2, adapters));
+      if (blocked !== null) {
+        return yield* Effect.logWarning("handoff not sent again: its run's instance cannot run", {
+          threadId,
+          runId: run.id,
+          ...blocked,
+        });
+      }
       yield* withStores(
         dispatchHandoff({
           type: "message.dispatch",

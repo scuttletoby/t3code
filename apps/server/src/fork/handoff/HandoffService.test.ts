@@ -14,6 +14,7 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
+  ProviderDriverKind,
   RunId,
   RuntimeRequestId,
   type ServerSettings as ServerSettingsValue,
@@ -45,6 +46,7 @@ import {
   run,
   runId,
   runnableCases,
+  runnableThread,
   runnableSettings,
   threadId,
 } from "./handoff.testkit.ts";
@@ -187,6 +189,8 @@ const harness = (state: {
     return { sent, emit, reads, events };
   });
 
+/** For a test that hangs, not fails, when a check is gone: it ends in milliseconds when right. */
+const SHORT_TIMEOUT_MS = 5_000;
 const on = { mode: "handoff" } as const;
 /** The wait at a quiet thread before a send, so the relay's alert for the person's turn goes first. */
 const settle = TestClock.adjust(HANDOFF_SETTLE_MS);
@@ -677,7 +681,7 @@ describe("HandoffService: a handoff that cannot run (#608)", () => {
   // exactly when the wrapper lets handoff own the thread, so the two never disagree.
   it.effect.each(runnableCases)("$name: sends a handoff: $runs", (entry) =>
     Effect.gen(function* () {
-      const data = big();
+      const data = runnableThread(entry, big());
       const parts = runnableSettings(entry, data.thread.projectId);
       const state = {
         data,
@@ -687,10 +691,15 @@ describe("HandoffService: a handoff that cannot run (#608)", () => {
         missing: parts.missing,
       };
       const { sent, emit, reads } = yield* harness(state);
-      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* emit(runUpdated(data.runs[0]!), "readThread", 1);
       yield* settle;
       yield* emit(null, "handOffWhenDue", 1);
       expect(messages(sent)).toHaveLength(entry.runs ? 1 : 0);
+      // It sends on the instance it checked: the setting's, else the thread's own.
+      if (entry.runs)
+        expect(messages(sent)[0]?.modelSelection?.instanceId).toBe(
+          entry.target ?? data.thread.modelSelection.instanceId,
+        );
       // One that cannot run reads no records, as with handoff off.
       if (!entry.runs) expect(reads.count).toBe(0);
     }),
@@ -755,6 +764,58 @@ describe("HandoffService: a handoff that cannot run (#608)", () => {
           { messageId: handoffMessageId, modelSelection: chosen },
         ]);
       }),
+    // Without the registry check the first report settles and waits on the test clock forever.
+    SHORT_TIMEOUT_MS,
+  );
+
+  // The retry sends on the failed run's own model. The setting now names B (on), but the run went
+  // to A, which was turned off or removed before the run failed: the retry must not start on A.
+  it.effect.each([
+    { name: "turned off", builtIn: false, missing: [] },
+    { name: "removed", builtIn: true, missing: [modelSelection.instanceId] },
+  ])("the setting switched to B and the run's instance A $name: no retry to A", (entry) =>
+    Effect.gen(function* () {
+      const data = big();
+      const failed = run({
+        id: RunId.make("run-2"),
+        ordinal: 2,
+        userMessageId: handoffMessageId,
+        status: "failed",
+        modelSelection,
+      });
+      const state = {
+        data: {
+          ...data,
+          runs: [...data.runs, failed],
+          messages: [{ ...data.messages[0]!, id: handoffMessageId, text: "[T3 handoff 1]" }],
+        },
+        settings: { ...on, modelSelection: chosen } as Partial<HandoffSettings>,
+        providerInstances: {
+          ...otherOn,
+          [modelSelection.instanceId]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            enabled: entry.builtIn,
+          },
+        } as ServerSettingsValue["providerInstances"],
+        missing: new Set<string>(entry.missing),
+      };
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(failed), "handoffRunEnded", 1);
+      expect(sent).toEqual([]);
+      // A on and registered again: the same failed run reported again is retried, on A.
+      state.providerInstances = {
+        ...otherOn,
+        [modelSelection.instanceId]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          enabled: true,
+        },
+      } as ServerSettingsValue["providerInstances"];
+      state.missing.clear();
+      yield* emit(runUpdated(failed), "handoffRunEnded", 2);
+      expect(messages(sent)).toMatchObject([
+        { messageId: `${handoffMessageId}:retry1`, modelSelection },
+      ]);
+    }),
   );
 
   it.effect("a failed handoff run whose instance is gone now is not sent again", () =>

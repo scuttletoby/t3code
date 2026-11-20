@@ -230,6 +230,8 @@ export const runnableCases: ReadonlyArray<{
   readonly projectOff?: boolean;
   /** `target` (or the thread's own instance) is not in upstream's registry: removed. */
   readonly missing?: boolean;
+  /** The thread runs on this instance (`runnableThread`), not the built-in `claudeAgent`. */
+  readonly threadInstance?: ProviderInstanceId;
   readonly runs: boolean;
 }> = [
   {
@@ -278,11 +280,43 @@ export const runnableCases: ReadonlyArray<{
     missing: true,
     runs: false,
   },
+  // The thread on another instance, so its own instance is not the built-in one that is on.
+  {
+    name: "no modelSelection, the thread on another instance, on and registered",
+    target: null,
+    threadInstance: otherInstanceId,
+    config: "on",
+    runs: true,
+  },
+  {
+    name: "no modelSelection, the thread on another instance, removed from the registry",
+    target: null,
+    threadInstance: otherInstanceId,
+    config: "on",
+    missing: true,
+    runs: false,
+  },
 ];
+
+/** The thread of `data` as a `runnableCases` entry puts it: on its `threadInstance`, if any. */
+export const runnableThread = (
+  entry: (typeof runnableCases)[number],
+  data: OrchestrationV2ThreadProjection,
+): OrchestrationV2ThreadProjection => {
+  const other = entry.threadInstance;
+  if (other === undefined) return data;
+  const onOther = { instanceId: other, model: "claude-opus-5-5" };
+  return {
+    ...data,
+    thread: { ...data.thread, providerInstanceId: other, modelSelection: onOther },
+    runs: data.runs.map((one) => ({ ...one, providerInstanceId: other, modelSelection: onOther })),
+    providerThreads: data.providerThreads.map((one) => ({ ...one, providerInstanceId: other })),
+  };
+};
 
 /** The settings parts a `runnableCases` entry sets, over the thread's project id. */
 export const runnableSettings = (entry: (typeof runnableCases)[number], projectId: ProjectId) => {
-  const id = entry.target ?? instanceId;
+  const id = entry.target ?? entry.threadInstance ?? instanceId;
   return {
     handoff:
       entry.target === null

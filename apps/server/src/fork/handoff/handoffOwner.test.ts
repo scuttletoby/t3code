@@ -40,6 +40,7 @@ import {
   runId,
   runnableCases,
   runnableSettings,
+  runnableThread,
   threadId,
 } from "./handoff.testkit.ts";
 import * as HandoffOwner from "./handoffOwner.ts";
@@ -444,7 +445,7 @@ describe("one owner per thread: a handoff that cannot run (#608)", () => {
       const parts = runnableSettings(entry, projectId);
       const projectInstances = parts.projectProviderInstances[projectId];
       const state: State = {
-        data: longThread(),
+        data: runnableThread(entry, longThread()),
         server: { mode: "handoff", ...parts.handoff },
         providerInstances: parts.providerInstances as ServerSettingsValue["providerInstances"],
         ...(projectInstances === undefined ? {} : { projectProviderInstances: projectInstances }),

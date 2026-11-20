@@ -38,13 +38,19 @@ would send, so a setting changed while compaction waited counts. With any other 
 idle compaction works as before. If the thread is missing, or the thread or the settings cannot be
 read at that moment, compaction goes ahead. Nothing is remembered between two checks.
 
-Two cases where neither acts for a while:
+Three cases where neither acts for a while (each one idle spell; the next turn end decides again):
 
 - **Handoff switched on while compaction waits.** The handoff service already decided "off" at the
   turn end, and compaction is now skipped at the send. Nothing acts on that idle spell; the handoff
   starts from the thread's next turn end.
 - **The handoff's instance added back while compaction waits.** The same: the handoff service found
   it could not run at the turn end, and compaction now finds that it can (see below).
+- **The handoff's instance turned off or removed after compaction skipped.** The mirror case. Both
+  timers fire shortly before the cache expires, and the handoff also waits out the settle, so
+  compaction's send can come first, find a handoff that can run, and skip. If the instance is then
+  turned off or removed before the handoff's own read (after the idle sleep, or in the settle), the
+  handoff stops too. The same goes for the mode switched from `handoff` to `off` after compaction
+  skipped.
 
 ### A handoff that cannot run
 
@@ -70,7 +76,12 @@ end; the provider's own compaction at its context limit still applies.
   compaction checks at its own send.
 - **Added back or turned on again.** The next turn end (or the next check of a waiting compaction)
   sees it, and handoff owns the thread again. That one idle spell may have neither (above).
-- The retry of a failed handoff run keeps the run's own model; the check reads the current setting.
+- **The retry of a failed handoff run** sends on the run's own model, which may differ from the
+  one the setting names now. So it checks both: the setting's instance (as every step does) and the
+  run's own (`handoffInstanceBlocked`, the same rule). If either is off or not registered, nothing
+  is sent again, the text stays in the thread and the log says why. Nothing is stored for this: the
+  run carries its model. Idle compaction already decided for that spell (upstream starts it only
+  after a completed run), so the next turn end decides again.
 
 To change what happens, fix `modelSelection` where it applies (the project's override, if it has
 one, replaces the server's handoff settings whole), or set the mode to `off` or `compact`. A
@@ -178,6 +189,7 @@ written out in full. The message says when no effort is set.
   `Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction)`, first in the pipe of
   `layerRuntimeCoreDependenciesBase`, and a test checks it is there. `threadHandoff` (same file) is
   the one place that picks a thread's settings and decides whether its handoff can run, for both the
-  wrapper and the service; one table of cases (`runnableCases` in `handoff.testkit.ts`) tests both.
+  wrapper and the service; its instance check, `handoffInstanceBlocked`, also checks a retry's own
+  instance. One table of cases (`runnableCases` in `handoff.testkit.ts`) tests both.
 - The message reuses upstream's handoff budget (`handoffBudget`) and transcript reading
   (`ContextHandoffService.ts`); nothing is copied.
