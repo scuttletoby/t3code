@@ -172,13 +172,18 @@ Two more things limit what a job can do:
   calls) and 32-bit system calls (they end the process). Host step 6 proves the
   network and the walls from inside a runner.
 - **Files and devices (every pool), one rule:** a job's unit has a root
-  folder of its own, empty but for symlinks. Of the host's files it sees only
+  folder of its own, empty but for symlinks and its own `passwd`, `group` and
+  `hosts` (below). Of the host's files it sees only
   the paths in `fork-fleet-job-paths.txt` (`/usr`, the `/bin` and `/lib`
-  links, and an allow list of `/etc`: `passwd`, `group`, `hosts`, the TLS
-  certificates, `alternatives`, the `ld.so` files, the time zone and a few
-  more a build needs; never `/etc` whole, so no login file, unit, cron entry,
-  `/etc/default` or backup tool's folder is there: issue #243), each
-  read-only and one mount (nothing mounted under it), the
+  links, and an allow list of `/etc`: the TLS certificates, `alternatives`,
+  the `ld.so` files, the time zone and a few more a build needs; never `/etc`
+  whole, so no login file, unit, cron entry, `/etc/default` or backup tool's
+  folder is there: issue #243), each read-only and one mount (nothing mounted
+  under it). Its `passwd`, `group` and `hosts` are the launcher's, written new
+  in the unit's root at each start, never this host's (issue #370): only
+  root, nobody and the job's own user and group, and `localhost` and this
+  host's name on loopback, so no account name, home folder or LAN host name
+  of this host's is there; a list that still names them is refused. Also the
   launcher's `ALLOW_PATHS`, the hook and its own copy. So a share or drive
   mounted anywhere else (`/mnt`, `/media`, `/srv`, `/data`, a Windows drive at
   `/c`) is not there. `MountFlags=private`: a mount the host makes after the job
