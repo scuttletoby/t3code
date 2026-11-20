@@ -94,6 +94,7 @@ Where the effort is read:
   the reasoning, unchecked. When one model name is in a Claude row and a row of another driver, a pick with no
   driver must suit both, which none can if the other row has `effortOptionIds`; use `delegate_task` with
   `driverKind` for that model.
+
 - **Ultracode** is checked as what the server runs. The option `ultracode` (only `true` or `false`; any other value
   is refused, since T3 would use the default) runs the model in
   ultracode at effort xhigh, and the old effort value `"ultracode"` means xhigh with the option on (unless the option
@@ -143,6 +144,7 @@ Where the effort is read:
   - A pick that names `"ultracode": false` passes on a `false` row too, so briefs may keep naming it everywhere.
 
 What v0 does not check:
+
 - which provider instance or account a T3 call names (`instanceId`, `providerInstanceId`, `environmentId`), and the
   model of the session that makes the call. So a model only in Claude rows that another driver's instance also
   offers runs there with that agent's default reasoning: `effort` passes the check, and the agent may ignore it
