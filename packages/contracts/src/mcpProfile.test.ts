@@ -158,8 +158,13 @@ describe("mcpCarriedProfiles setting (#640)", () => {
     ["refuse", "refuse", "refuse"],
     ["refuse, spaced and in capitals", " Refuse ", "refuse"],
     ["apply", "apply", "apply"],
-    ["a word it does not know", "ignore", "apply"],
-    ["not text", 1, "apply"],
+    ["apply, spaced and in capitals", " Apply ", "apply"],
+    ["null (not set)", null, "apply"],
+    // A typo or a newer build's value only refuses, never opens up to apply.
+    ["a word it does not know", "ignore", "refuse"],
+    ["a typo of refuse", "refused", "refuse"],
+    ["an empty value", "", "refuse"],
+    ["not text", 1, "refuse"],
   ])("reads %s and keeps every other setting", (_name, value, expected) => {
     const file = {
       mcpProfile: "t3-only",
