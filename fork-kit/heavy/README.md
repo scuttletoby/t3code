@@ -23,6 +23,7 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 | `systemctl --user stop UNIT` | stops what `HEAVY_KEEP=1` kept (the name is in heavy's message)                              |
 | `heavy sweep [--dry-run]`    | one leftover sweep (below); the user timer runs it every 5 minutes                           |
 | `heavy sweep --json`         | looks only: what a sweep would stop or report, as JSON                                       |
+| `heavy leftovers`            | looks only: each leftover older than a limit, with its owner and age (below)                 |
 | `heavy docker-label`         | the owner label for a container a test starts (below)                                        |
 | `heavy --kind K <cmd>`       | waits in the memory queue until the job fits, then runs it (`--mb`, `--wait`: below)         |
 | `heavy queue [--json]`       | what the memory queue runs and holds, and the figures behind it                              |
@@ -42,8 +43,26 @@ or a shell's `kill %1` do, reaches the command once). heavy then waits up to the
 command that handles Ctrl-C, a REPL or a server saving its data, has time) for the command, and stops the whole
 scope (TERM, then KILL after the grace time again). A second signal stops it at once. A command that handles the
 signal and exits keeps its own exit code. USR1 and USR2 are passed on. If heavy is killed with
-`kill -9`, the command is killed with it (as before, when heavy and the command were one process); anything the
-command had started keeps running in its scope (the leftover sweep below is for that case).
+`kill -9`, the command is killed with it (as before, when heavy and the command were one process), and heavy's
+**guard** stops the rest of the scope (below).
+
+**Everything it started.** When the command ends, and after a signal to heavy, heavy stops every process left in
+its scope: children, double-forked daemons (`setsid`, `nohup`, `( cmd & )`) and anything else in it, since they
+all stay in the scope's cgroup. Then it removes the Docker containers the command labelled as its own
+(`heavy docker-label`, below) with their anonymous volumes, and says so: `heavy: removed 1 leftover container
+(test-db)`. Only a container whose owner label names this user and this exact scope is touched; others, and
+containers without the label, never. No Docker, or none this user can reach: nothing to do, nothing said. Docker
+down: one line (`could not remove the containers of ...`); the leftover sweep looks again. `HEAVY_KEEP=1` keeps
+the scope's containers with it, unless heavy was stopped by a signal.
+
+**The guard.** heavy starts a small helper (named `scope-guard`) in a session of its own, outside the scope, that
+waits for heavy. heavy tells it "done" after its own clean-up. When heavy goes away without that (`kill -9`, a
+crash, an out-of-memory kill), the guard does heavy's clean-up: it stops the scope and removes its containers, and
+prints `heavy: heavy was killed: stopped 2 leftover processes (sleeper)`. It ignores the signals heavy handles
+(a terminal's Ctrl-C, a service stop's TERM) and a kill of heavy's process group, holds no file of heavy's but
+stderr (so a pipe after heavy ends once it is done), and is never in the scope it cleans. Not for `HEAVY_KEEP=1`
+(a kept scope outlives heavy on purpose) or a nested heavy (the outer one has a guard). Only a kill of the guard
+too (`kill -9` on both) leaves the scope; the leftover sweep finds it then.
 
 **Never uncapped.** heavy refuses (exit 1, the reason on stderr, the command not run) when the systemd user
 manager cannot be reached, when the slice has no unit file (systemd would make an empty one up on the fly, with no
@@ -164,8 +183,8 @@ refuses it.
 - **Two callers at the same instant:** taking a place and every admission happen under one `flock` on the queue's
   `lock` file, so two callers always get two places, in order.
 - **heavy itself is killed** (`kill -9`) after its job was admitted: the command inherits the ticket's lock, so the
-  job keeps its reservation until the processes it started are gone. (Those processes have one more open file than
-  before: the ticket.)
+  job keeps its reservation until the processes it started are gone, which heavy's guard sees to at once. (Those
+  processes have one more open file than before: the ticket; the guard holds none.)
 - **Stops half-way through a write:** `peaks.json` and `waits.log` are written to `<file>.<pid>.tmp` and renamed;
   a failed write removes its temporary file, and the next writer removes ones whose process is gone.
 - **The admit command's program is missing** (removed or not yet installed): settings still load, `heavy queue`
@@ -179,11 +198,11 @@ refuses it.
 
 ## Leftover sweep
 
-heavy cleans up after its own command. Some things still escape: what a command left after heavy was killed with
-`kill -9`, test runs started without heavy, and Docker containers (the Docker daemon starts them, so they are never
-in heavy's scope). `heavy sweep` finds them. A user timer (`heavy-sweep.timer`, installed with `--sweep-timer`)
-runs it every 5 minutes for each user who enables it. It only ever looks at the processes and containers of the
-user it runs as.
+heavy cleans up after its own command, also when it is killed (its guard, above). Some things still escape: a scope
+whose heavy and guard were both killed, test runs started without heavy, and Docker containers without the owner
+label (the Docker daemon starts them, so they are never in heavy's scope). `heavy sweep` finds them. A user timer
+(`heavy-sweep.timer`, installed with `--sweep-timer`) runs it every 5 minutes for each user who enables it. It only
+ever looks at the processes and containers of the user it runs as.
 
 It finds:
 
@@ -244,6 +263,25 @@ heavy sweep 2026-01-01T12:00:00Z, stopping: 2 processes stopped, 1 containers re
   report only: pid 5120 java (3h0m old, cpu 140%, unit app.service): java -jar server.jar; busy and long-lived; not test-shaped
 ```
 
+**Look only: `heavy leftovers`.** Names everything above that is older than a limit, each with its owner and
+age, and stops, removes and writes nothing (no log, no report, no lock), so a capacity check or a person can run it
+before a heavy job, as often as wanted:
+
+```
+$ heavy leftovers --older-than 1h
+heavy leftovers 2026-01-01T12:00:00Z: 2 older than 1h0m, look only, default rules (no heavy.sweep settings)
+  would stop heavy-pytest-0a1b2c3d.scope (3h0m old): its heavy is gone; 2 processes
+  report only: container 3f2a9c1b7d4e old-db (mariadb:11, 1d5h old, running); no owner label
+```
+
+`--older-than` takes seconds or `30m`, `2h`, `1d`; the default is `minAgeSeconds`. One limit for all: an idle
+leftover is named as soon as it is older than the limit (the sweep waits for `longLivedSeconds` before it counts
+an idle one). The owner is the unit a process runs in, the heavy scope itself, or a container's owner label (`no
+label` for one without). `would stop` and `would remove` say what a sweep with stopping on would do; the rest is
+only reported. It works without the `heavy.sweep` settings (the defaults, which have no `testPatterns`) and
+refuses a broken machine file like the sweep. `--json` gives `{"v": 1, "olderThanSeconds", "defaults", "items":
+[{"kind", "action", "owner", "ageSeconds", "why", ...}], "notes"}` (an empty scope has `"ageSeconds": null`).
+
 **Dry run first.** Until the owner sets `"stop": true`, a sweep stops and removes nothing and says what it would
 do (`would stop`, `would remove`). `heavy sweep --dry-run` does the same whatever the setting. Read a few reports,
 add what is yours to `knownUnits`, `knownContainers` or `ignorePatterns`, then turn stopping on.
@@ -283,7 +321,9 @@ docker run -d --label "$(heavy docker-label)" mariadb:11
 `heavy docker-label` prints `fork-kit.heavy.owner=<owner>`; `--value` prints only the value (for an API such as
 Testcontainers' `withLabel("fork-kit.heavy.owner", value)`). The owner is the heavy scope when the test runs
 under heavy (heavy passes the scope name to the command as `HEAVY_SCOPE`), else the calling process with its
-start time. A container whose label names another user is never touched.
+start time. A container whose label names another user is never touched. Under heavy, heavy itself removes
+the container when its command ends or heavy is killed (above); the sweep is for a label with an owner pid and for
+a scope whose heavy and guard are both gone.
 
 **Setup scripts outside heavy.** The owner must be the process that lives as long as the container is in use:
 the test, not a setup script, Makefile line or `npm` script that starts the container and exits (the sweep
@@ -307,6 +347,8 @@ the owner as gone).
 | a pid reused before the stop                                               | the start time differs: not signalled, reported as reused                     |
 | a container already gone                                                   | reported as already gone, not a problem                                       |
 | no Docker, or the daemon down                                              | a note in the report; processes are still swept                               |
+| `heavy leftovers` with no machine file, no section or no `sweep` key       | the defaults; it only looks                                                   |
+| `heavy leftovers` run again, or while a sweep runs                         | the same answer (no lock, no state of its own); never in the sweep's way      |
 | no machine file, a broken one, no section, an unknown key, a newer version | refused with the reason; nothing checked or stopped; exit 1                   |
 | the timer fires before the file exists                                     | the same refusal, every 5 minutes, until the owner writes it                  |
 | the systemd user manager unreachable                                       | refused; nothing stopped                                                      |
@@ -402,7 +444,7 @@ clock; real processes where the kernel matters (a waiter killed with -9, a crash
 instant). Its red check breaks each admission and clean-up rule and shows the test for it then fails.
 `heavy.test.py` runs queued jobs with the real systemd user manager in a private queue folder (`HEAVY_QUEUE_ROOT`,
 never the user's live queue): one that runs, one that fails and still leaves its peak, one whose heavy is killed
-with -9 (the reservation stays until its command ends) and one give-up (exit 76).
+with -9 (its guard stops the scope, and the reservation ends with it) and one give-up (exit 76).
 
 `python3 -I -B fork-kit/heavy/tests/sweep.test.py`: the sweep on a fake host (a fake `/proc`, fake `systemctl`
 and `docker` from `tests/fake_tools.py`, a temporary machine file), no root and nothing real swept. Its red check
@@ -414,4 +456,10 @@ treats them.
 and `python3 -I -B fork-kit/heavy/tests/heavy.test.py` (the wrapper with the real systemd user manager and a slice
 with a memory limit, `HEAVY_TEST_SLICE`, default `heavy.slice`; it skips without one, and fails instead with
 `HEAVY_REAL_TESTS=1`, as in CI). `HEAVY_TEST_BIN=fork-kit/heavy/tests/old-heavy.sh` runs the wrapper tests against
-the one-line wrapper from before: every leftover test fails (the red check).
+the one-line wrapper from before: every leftover test fails (the red check). With `HEAVY_TEST_BIN` set to the
+`bin/heavy` of an older kit (`git archive <commit> fork-kit | tar -x -C <folder>`), the tests of what came later
+fail: a heavy killed with -9 (the guard stops a double-forked child and removes a container), a container a test
+started, a rerun of the same test after a kill (the same container name), and the guard's name. Container tests use
+a fake `docker` (`HEAVY_DOCKER`, `tests/fake_tools.py`), never the machine's. Run `heavy.test.py` itself without
+heavy: inside a heavy scope the heavy under test would run nested, so it refuses there; every command it runs gets
+a heavy scope of its own.
