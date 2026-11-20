@@ -4,6 +4,10 @@ the rest (fork-kit/heavy/README.md, "Leftover sweep").
   heavy sweep               one sweep: stop or report, write the log and the short report
   heavy sweep --dry-run     the same, but stop nothing (also the default until heavy.sweep.stop is true)
   heavy sweep --json        look only (no stop, no log, no lock): {"v": 1, "leftovers": [...], ...} on stdout
+  heavy leftovers [--older-than AGE] [--json]
+                            look only: what is left behind (processes, heavy scopes, containers) older than AGE
+                            (seconds, or 30m, 2h, 1d; default heavy.sweep.minAgeSeconds), each with its owner and
+                            age; stops nothing, writes nothing, and works without the heavy.sweep settings
   heavy docker-label        print the owner label for a container a test starts: fork-kit.heavy.owner=<owner>
   heavy docker-label --value [--owner-pid PID]   only the value; --owner-pid names the owner process
 
@@ -25,6 +29,8 @@ It finds, for the user it runs as:
 
 Settings: the "heavy" section of the machine file (fork-kit/common/README.md), key "sweep". No file, no
 section, an unknown key or a newer version: nothing is checked or stopped, the reason is printed, exit 1.
+`heavy leftovers` uses the defaults when the file or the section is not there (it only looks), and refuses a
+broken one like the sweep.
 """
 import contextlib, datetime, fcntl, fnmatch, importlib.machinery, importlib.util, json, os, re, shlex, signal, stat
 import subprocess, sys, tempfile, time
@@ -138,6 +144,7 @@ SPEC = {
     'ignorePatterns': (list, list(DEFAULT_IGNORE), _regexes),
 }
 SECTION_SPEC = {'sweep': (dict, machine_file.REQUIRED, None), 'queue': (dict, None, None)}  # queue: heavy_queue.py
+LOOK_SPEC = dict(SECTION_SPEC, sweep=(dict, None, None))       # heavy leftovers: no sweep settings is the defaults
 
 
 class Refused(Exception):
@@ -430,13 +437,17 @@ class Sweep:
 
     # ---------- settings ----------
 
-    def settings(self):
-        section = machine_file.read_section('heavy', self.machine_path, self.owner_uid)
+    def settings(self, optional=False):
+        """heavy.sweep with its defaults. optional (heavy leftovers): no file, no heavy section or no sweep key in
+        it is the defaults (cfg['defaults'] is True); a broken file is still refused."""
+        section = machine_file.read_section('heavy', self.machine_path, self.owner_uid, optional=optional)
         path = self.machine_path or machine_file.default_path()
-        machine_file.fields(section, SECTION_SPEC, f'{path}: heavy')
-        cfg = machine_file.fields(section['sweep'], SPEC, f'{path}: heavy.sweep')
+        section = machine_file.fields({} if section is None else section, LOOK_SPEC if optional else SECTION_SPEC,
+                                      f'{path}: heavy')
+        cfg = machine_file.fields(section['sweep'] or {}, SPEC, f'{path}: heavy.sweep')
         cfg['report'] = os.path.expanduser(cfg['report'])
         cfg['path'] = path
+        cfg['defaults'] = section['sweep'] is None
         return cfg
 
     # ---------- processes ----------
@@ -610,6 +621,8 @@ class Sweep:
     # ---------- docker ----------
 
     def docker_path(self):
+        if self.docker is None and os.environ.get('HEAVY_DOCKER'):     # tests: a fake docker (also bin/heavy's)
+            self.docker = os.environ['HEAVY_DOCKER']
         if self.docker is not None:
             return self.docker if self.docker and os.access(self.docker, os.X_OK) else ''
         for folder in ('/usr/bin', '/bin', '/usr/local/bin'):
@@ -802,8 +815,8 @@ class Sweep:
             return None
         created = parse_created(c.get('Created'))
         age = self._now() - created if created is not None else 0
-        base = {'kind': 'container', 'id': cid, 'full_id': full, 'name': clip(name), 'image': clip(image), 'age': age, 'running': running,
-                'procs': []}
+        base = {'kind': 'container', 'id': cid, 'full_id': full, 'name': clip(name), 'image': clip(image), 'age': age,
+                'running': running, 'procs': [], 'owner': clip(labels[LABEL]) if LABEL in labels else 'no label'}
         if LABEL not in labels:
             if running and age >= cfg['minAgeSeconds']:
                 return dict(base, action='report', why='no owner label')
@@ -837,7 +850,8 @@ class Sweep:
         for item in plan:
             ps = item['procs']
             if item['kind'] in ('scope', 'empty-scope'):
-                head = f'{item["unit"]}: {item["why"]}' + (f'; {len(ps)} processes' if ps else '')
+                head = (f'{item["unit"]}' + (f' ({duration(max(p.age for p in ps))} old)' if ps else '')
+                        + f': {item["why"]}' + (f'; {len(ps)} processes' if ps else ''))
                 if item['action'] == 'report':
                     counts['reported'] += 1
                     lines.append(f'report only: {head}')
@@ -1017,8 +1031,26 @@ def folder_problem(folder, uid):
     return None
 
 
+def item_owner(item):
+    """Who left it: the unit a process runs in, the heavy scope itself, or a container's owner label."""
+    if item['kind'] in ('scope', 'empty-scope'):
+        return item['unit']
+    if item['kind'] == 'container':
+        return item.get('owner') or 'no label'
+    return item['procs'][0].unit or '?'
+
+
+def item_age(item):
+    """Seconds: the oldest process in it, or the container's age; None for an empty scope (nothing to date it by)."""
+    if item['kind'] == 'container':
+        return item['age']
+    return max(p.age for p in item['procs']) if item['procs'] else None
+
+
 def item_json(item):
-    out = {'kind': item['kind'], 'action': item['action'], 'why': item['why']}
+    out = {'kind': item['kind'], 'action': item['action'], 'why': item['why'], 'owner': item_owner(item)}
+    age = item_age(item)
+    out['ageSeconds'] = None if age is None else round(age)
     if item['kind'] in ('scope', 'empty-scope'):
         out['unit'] = item['unit']
     if item['kind'] == 'container':
@@ -1029,11 +1061,63 @@ def item_json(item):
     return out
 
 
-def refuse(text, as_json, out, err):
+def refuse(text, as_json, out, err, verb='sweep'):
     if as_json:
         print(json.dumps({'v': 1, 'error': text}), file=out)
-    print(f'heavy sweep: {text}', file=err)
+    print(f'heavy {verb}: {text}', file=err)
     return 1
+
+
+def parse_age(text):
+    """Seconds from 90, 90s, 30m, 2h or 1d; None when it is not one of those."""
+    m = re.fullmatch(r'(\d{1,9})([smhd]?)', text or '')
+    return None if not m else int(m.group(1)) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[m.group(2)]
+
+
+def leftovers_main(argv, sweep=None, out=None, err=None):
+    """heavy leftovers: name what is left behind, older than a limit, with its owner and age. Stops nothing, writes
+    nothing (no log, no report, no lock), so a capacity check or a person can run it any time, as often as wanted."""
+    out, err = out or sys.stdout, err or sys.stderr
+    usage = 'usage: heavy leftovers [--older-than AGE] [--json]   (AGE: seconds, or 30m, 2h, 1d)'
+    as_json, limit, args = False, None, list(argv)
+    while args:
+        a = args.pop(0)
+        if a in ('-h', '--help'):
+            print(usage, file=out)
+            return 0
+        if a == '--json':
+            as_json = True
+        elif a == '--older-than' and args and parse_age(args[0]) is not None:
+            limit = parse_age(args.pop(0))
+        elif a.startswith('--older-than=') and parse_age(a.partition('=')[2]) is not None:
+            limit = parse_age(a.partition('=')[2])
+        else:
+            print(usage, file=err)
+            return 2
+    s = sweep or Sweep()
+    try:
+        cfg = s.settings(optional=True)
+    except MachineFileError as e:
+        return refuse(f'{e}; nothing checked', as_json, out, err, 'leftovers')
+    limit = cfg['minAgeSeconds'] if limit is None else limit
+    # one limit for everything: a leftover older than it is named whether it is busy or idle
+    cfg = dict(cfg, minAgeSeconds=limit, longLivedSeconds=limit)
+    stamp = datetime.datetime.fromtimestamp(s._now(), datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    s.log_file = None
+    try:
+        plan, _counts, lines = s.run(cfg, act=False)
+    except Refused as e:
+        return refuse(f'{e}; nothing checked', as_json, out, err, 'leftovers')
+    where = 'default rules (no heavy.sweep settings)' if cfg['defaults'] else f'rules from {cfg["path"]}'
+    if as_json:
+        print(json.dumps({'v': 1, 'at': stamp, 'olderThanSeconds': limit, 'defaults': cfg['defaults'],
+                          'items': [item_json(i) for i in plan], 'notes': s.notes}, sort_keys=True), file=out)
+        return 0
+    head = (f'heavy leftovers {stamp}: ' + (f'{len(plan)} older than {duration(limit)}' if plan
+                                              else f'none older than {duration(limit)}')
+            + f', look only, {where}')
+    out.write('\n'.join([head] + [f'  {line}' for line in lines] + [f'  note: {n}' for n in s.notes]) + '\n')
+    return 0
 
 
 SHORT_LIVED = SHELLS | {'make', 'gmake', 'env', 'xargs', 'timeout', 'nohup', 'nice', 'setsid', 'stdbuf', 'time',
@@ -1116,8 +1200,11 @@ if __name__ == '__main__':
     verb, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ('', [])
     if verb == 'sweep':
         sys.exit(sweep_main(rest))
+    if verb == 'leftovers':
+        sys.exit(leftovers_main(rest))
     if verb == 'docker-label':
         sys.exit(label_main(rest))
-    print('usage: heavy_sweep.py sweep [--dry-run|--json] | docker-label [--value] [--owner-pid PID]',
+    print('usage: heavy_sweep.py sweep [--dry-run|--json] | leftovers [--older-than AGE] [--json] | '
+          'docker-label [--value] [--owner-pid PID]',
           file=sys.stderr)
     sys.exit(2)
