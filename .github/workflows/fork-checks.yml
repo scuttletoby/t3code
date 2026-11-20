@@ -70,13 +70,27 @@ jobs:
           UPSTREAM_FILES: apps/server/src/orchestration-v2/Orchestrator.ts apps/server/src/provider/agentContextBudget.json
         run: node .github/scripts/fork-upstream-files-check.cjs "$BASE_SHA" "$HEAD_SHA" "$UPSTREAM_FILES"
 
+      # A pull request that moves a "pending" file to "files" has its entry held to the fork lines
+      # counted from upstream (#552): the check then fetches upstream's default branch read-only
+      # (commits and trees only, from the fork's base on: about a second), and only then. Upstream
+      # unknown or unreachable: a warning, and the check as before (fork-follow's run on main still
+      # refuses a wrong entry, as it fails closed).
       - name: Fork lines in upstream files
         if: ${{ !cancelled() }}
         env:
+          GH_TOKEN: ${{ github.token }}
           DEFAULT_SHA: ${{ github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: node .github/scripts/fork-seam-check.cjs --config-ref "$DEFAULT_SHA" "$BASE_SHA" "$HEAD_SHA"
+        run: |
+          set -euo pipefail
+          upstream=()
+          if parent="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty' 2>&1)" && [[ -n "$parent" ]]; then
+            upstream=(--upstream "$GITHUB_SERVER_URL/$parent.git")
+          else
+            echo "Note: no upstream for the seam check (${parent:-not a fork}); a move to \"files\" is checked by fork-follow only."
+          fi
+          node .github/scripts/fork-seam-check.cjs --config-ref "$DEFAULT_SHA" ${upstream[@]+"${upstream[@]}"} "$BASE_SHA" "$HEAD_SHA"
 
   outside_pr:
     name: Outside pull request
