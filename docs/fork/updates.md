@@ -67,12 +67,17 @@ watches; it changes nothing on the machine, and `0` turns it off.
   goes, or moves to `files` with `"added": []`. With some left it may move to `files` as a
   declared seam only in a list-only change to that file (its text unchanged), when the new entry's
   `added` lists exactly as many copies as are left, each one the file has, and its `announced`
-  none the file has; the run from upstream then holds every one of them to that entry. A pull
-  request's run has no upstream, so it cannot tell which lines are the fork's: the owner checks
-  them by running `node .github/scripts/fork-seam-check.cjs --from-upstream "$(git merge-base
-  origin/main upstream/main)" <pull request head>` (upstream's main fetched as `upstream/main`),
-  which refuses any fork line the entry leaves out
-  ([#552](https://github.com/scuttletoby/t3code/issues/552) moves this check into CI). Left
+  none the file has; the run from upstream then holds every one of them to that entry. Which
+  lines they are, the pull request's run tells from upstream: for a change to the list,
+  fork-checks fetches upstream's default branch read-only (`fork-seam-upstream.sh`, no token) and
+  passes the merge-base of the head and that branch as `--upstream-base`, and the new entry's
+  `added` must then list exactly the copies the file has beyond that commit
+  ([#552](https://github.com/scuttletoby/t3code/issues/552)). When the fetch fails, or main's own
+  copy does not count to its ceiling from that commit (it is not the one main sits on, as with a
+  stable tag off upstream's default branch), the run notes it and only counts the lines; the
+  next run from upstream refuses main for a wrong entry, and the owner can check it by hand with
+  `node .github/scripts/fork-seam-check.cjs --from-upstream "$(git merge-base origin/main
+  upstream/main)" <pull request head>` (upstream's main fetched as `upstream/main`). Left
   higher, the next run from upstream refuses main for the spare room; set lower or dropped, for
   the lines still there. Neither in `pending` nor moved may a change gain a fork line (an upstream
   line swapped for one is one more), whatever its list says. It reads its own list only to

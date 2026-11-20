@@ -1,7 +1,9 @@
-// Usage: [--config-ref <rev>] <base> <head> | --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>.
+// Usage: [--config-ref <rev>] [--upstream-base <rev>] <base> <head>
+//      | --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>.
 // Refuses <head>'s upstream-file changes beyond .github/fork-seams.json: a PR uses <base>'s list (its own only for
 // "pending" ceilings it must lower); --from-upstream reads <head>'s. --after-rebase notes a too-high ceiling and
-// --lowered-list writes the lowered list. Reads git objects only (and writes only that file).
+// --lowered-list writes the lowered list. --upstream-base (a PR's run: the upstream commit <head> sits on) holds a
+// "pending" file the change moves to "files" to its exact fork lines. Reads git objects only (and writes only that file).
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -465,6 +467,63 @@ function findUnlistedChanges(
     }
   }
   return { reasons, ceilings, rises, notes };
+}
+
+/**
+ * Why a "pending" file a pull request moves to "files" lists other lines than its fork lines: its new
+ * entry's "added" must list exactly the copies `atHead` has beyond `atUpstream` (the upstream commit
+ * the head sits on), as the run from upstream holds them. The pull request's run counts them from
+ * main's ceiling alone, so an upstream line listed in place of a fork line passed it (#552).
+ * `upstreamName` names that commit in the reasons. A file the head lacks is refused elsewhere.
+ * The run from upstream holds main's ceiling exactly, so main's copy (`atMain`) counted from the
+ * right commit has exactly `ceilings[file]` fork lines. Any other count means the commit is not the
+ * one main sits on (a stable tag off upstream's default branch, a rewritten branch): that file is a
+ * note, not judged, as a wrong commit would count upstream's own lines as the fork's.
+ */
+function findMovedEntryMismatches(
+  moved,
+  ownFiles,
+  { atUpstream, atHead, atMain, ceilings, upstreamName },
+) {
+  const reasons = [];
+  const notes = [];
+  for (const file of moved) {
+    const head = atHead(file);
+    if (head === undefined) continue;
+    const up = atUpstream(file);
+    const entry = `moved to "files" in this change's ${CONFIG}`;
+    if (up === undefined) {
+      reasons.push(
+        `${file}: ${entry}, but the upstream commit ${upstreamName} does not have it, so its fork lines cannot be counted (upstream moved or removed it?): keep it in "pending" until the list is fixed.`,
+      );
+      continue;
+    }
+    const main = atMain(file);
+    const inMain = main === undefined ? undefined : total(addedLines(up, main));
+    if (inMain !== ceilings[file]) {
+      notes.push(
+        `${file}: ${entry}; counted from upstream ${upstreamName}, main's copy has ${inMain ?? "no"} fork lines, not its ceiling of ${ceilings[file]}, so that is not the upstream commit main sits on, and which lines the entry lists is not checked here (fork-follow's run on main checks them).`,
+      );
+      continue;
+    }
+    const fork = new Map(addedLines(up, head));
+    const listed = lineCounts(ownFiles[file].added.join("\n"));
+    const times = (count) => (count === 1 ? "" : ` ${count}×`);
+    for (const line of new Set([...fork.keys(), ...listed.keys()])) {
+      const has = fork.get(line) ?? 0;
+      const lists = listed.get(line) ?? 0;
+      if (has > lists) {
+        reasons.push(
+          `${file}: ${entry}: the file has \`${line}\`${times(has)} beyond upstream ${upstreamName}, and the entry lists it ${lists === 0 ? "not at all" : `${lists}×`}: list each fork line the file has, as often as it has it.`,
+        );
+      } else if (lists > has) {
+        reasons.push(
+          `${file}: ${entry}: the entry lists \`${line}\`${times(lists)}, and the file has it ${has === 0 ? `no more often than upstream ${upstreamName} (an upstream line, not a fork line)` : `only ${has}× beyond upstream ${upstreamName}`}: list only the fork lines the file has.`,
+        );
+      }
+    }
+  }
+  return { reasons, notes };
 }
 
 /**
@@ -989,15 +1048,19 @@ function parseArgs(argv) {
   };
   const configRef = option("--config-ref");
   const loweredList = option("--lowered-list");
-  if (!configRef || !loweredList) return undefined;
+  const upstreamBase = option("--upstream-base");
+  if (!configRef || !loweredList || !upstreamBase) return undefined;
   if (args.length !== 2 || args.some((arg) => arg.startsWith("--"))) return undefined;
   // A pull request's run never runs from upstream; only a run from upstream has a rebase behind it.
   if (fromUpstream ? configRef.value !== undefined : afterRebase) return undefined;
+  // From upstream, the upstream commit is <upstream> itself.
+  if (fromUpstream && upstreamBase.value !== undefined) return undefined;
   // Only a run after a rebase lowers the list: fork-follow commits it into the rebased series.
   if (loweredList.value !== undefined && !afterRebase) return undefined;
   return {
     configRef: configRef.value,
     loweredList: loweredList.value,
+    upstreamBase: upstreamBase.value,
     fromUpstream,
     afterRebase,
     base: args[0],
@@ -1009,7 +1072,7 @@ function main(argv) {
   const parsed = parseArgs(argv);
   if (!parsed) {
     console.error(
-      "Usage: fork-seam-check.cjs [--config-ref <rev>] <base> <head>\n" +
+      "Usage: fork-seam-check.cjs [--config-ref <rev>] [--upstream-base <rev>] <base> <head>\n" +
         "       fork-seam-check.cjs --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>",
     );
     return 2;
@@ -1030,6 +1093,16 @@ function main(argv) {
     if (stale) {
       console.error(stale);
       return 1;
+    }
+  }
+  // The upstream commit the head sits on (fork-checks: the merge-base of the head and upstream's
+  // default branch). Any other commit would count upstream's own changes as fork lines.
+  const upstreamBase = parsed.upstreamBase;
+  if (upstreamBase !== undefined) {
+    try {
+      git(["merge-base", "--is-ancestor", `${upstreamBase}^{commit}`, head]);
+    } catch {
+      throw new Error(`--upstream-base ${upstreamBase} is not a commit in the head's history.`);
     }
   }
   const configRef = parsed.configRef ?? (upstream ? head : base);
@@ -1056,6 +1129,25 @@ function main(argv) {
       ownPending = undefined; // The list judged it is main's; a malformed own one is said below.
     }
   }
+  // "pending" files this change's own list moves to "files" (findUnlistedChanges holds their count).
+  const moved =
+    ownFiles === undefined
+      ? []
+      : Object.keys(config.pending).filter(
+          (file) => Object.hasOwn(ownFiles, file) && !Object.hasOwn(ownPending, file),
+        );
+  const movedEntries = (() => {
+    if (moved.length === 0 || upstreamBase === undefined) return { reasons: [], notes: [] };
+    const at = git(["rev-parse", "--verify", `${upstreamBase}^{commit}`]).trim();
+    return findMovedEntryMismatches(moved, ownFiles, {
+      atUpstream: (file) => textAt(at, file),
+      atHead: (file) => textAt(head, file),
+      // The copy main's list judges: the list's commit (fork-checks: the default branch).
+      atMain: (file) => textAt(configRef, file),
+      ceilings: config.pending,
+      upstreamName: at.slice(0, 12),
+    });
+  })();
   const lowered =
     parsed.loweredList === undefined
       ? undefined
@@ -1122,7 +1214,17 @@ function main(argv) {
       )
     : [];
   const from = parsed.configRef ? `--config-ref ${configRef}` : upstream ? "the head" : "the base";
-  const notes = [...findListedGone(config, { atBase, atHead }), ...unlisted.notes, ...lost.notes];
+  const notes = [
+    ...findListedGone(config, { atBase, atHead }),
+    ...unlisted.notes,
+    ...lost.notes,
+    ...movedEntries.notes,
+  ];
+  if (moved.length > 0 && upstreamBase === undefined) {
+    notes.push(
+      `this change moves ${moved.join(", ")} from "pending" to "files", and this run has no upstream commit (--upstream-base), so it counts the fork lines its entry lists but cannot tell which they are; the next run from upstream (fork-follow) refuses main for a wrong one. Check them as docs/fork/updates.md says.`,
+    );
+  }
   for (const note of notes) console.log(printable(`Note: ${note}`));
   if (editsList) {
     console.log(
@@ -1144,7 +1246,15 @@ function main(argv) {
       `Fix the list in this change: merged, it is main's list, and a malformed one stops every later pull request and fork-follow run.`,
     );
   }
-  const refused = [...reasons, ...late, ...rises, ...ceilings, ...expired, ...landed];
+  const refused = [
+    ...reasons,
+    ...movedEntries.reasons,
+    ...late,
+    ...rises,
+    ...ceilings,
+    ...expired,
+    ...landed,
+  ];
   if (refused.length === 0) {
     if (listProblem !== undefined) return 1;
     if (lowered !== undefined) {
@@ -1187,6 +1297,11 @@ function main(argv) {
       `Lower each "pending" ceiling and "lost" count named above (or remove the entry, or set the value its line names) in ${CONFIG}: in this change's list where the line says so, otherwise with a pull request to main.`,
     );
   }
+  if (movedEntries.reasons.length > 0) {
+    console.error(
+      `A file moved from "pending" to "files" lists exactly its fork lines (the head's copies beyond the upstream commit it sits on) under "added" in its new entry; a line upstream has is never a seam line (docs/fork/updates.md).`,
+    );
+  }
   if (late.length > 0) {
     console.error(
       `Announce each line named above again (${SINCE_AGAIN}) in ${CONFIG} with a list-only pull request to main, then update this change from main (docs/fork/updates.md, "Adding a seam line").`,
@@ -1215,6 +1330,7 @@ module.exports = {
   findHiddenUpstreamFiles,
   findListedGone,
   findLostLines,
+  findMovedEntryMismatches,
   findSeamBreaches,
   findStaleSeamLines,
   findUnlistedChanges,

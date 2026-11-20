@@ -13,6 +13,7 @@ const {
   findSeamBreaches,
   findListedGone,
   findLostLines,
+  findMovedEntryMismatches,
   findStaleSeamLines,
   findUnlistedChanges,
   forkFileTest,
@@ -2754,15 +2755,277 @@ test("the command line lets a pull request make a pending file a seam, and fork-
       grows.stderr,
       /- p\.ts: "pending" \(fork lines to move out\), and this change adds 1 more line than it removes\./,
     );
-    // Which lines are the fork lines, the pull request's run cannot tell (it has no upstream): an
-    // upstream line listed in place of one passes there, and the run from upstream refuses it, so
-    // no line is hidden. The owner reviews the entry as any seam entry.
+    // Which lines are the fork lines, the pull request's run cannot tell without the upstream
+    // commit (--upstream-base, which fork-checks passes when it can fetch upstream): an upstream
+    // line listed in place of one passes there, and the run from upstream refuses it, so no line
+    // is hidden.
     const swapped = branch("swapped", asSeam("forkA(); // Fork", "}"));
     assert.equal(run("--config-ref", main, main, swapped).status, 0);
     const caught = fromUpstream(upstream, swapped);
     assert.equal(caught.status, 1);
     assert.match(caught.stderr, /p\.ts: adds `forkB\(\); \/\/ Fork`/);
   });
+});
+
+// #552: with the upstream commit the head sits on, a moved entry lists exactly the file's fork lines.
+test('with the upstream commit, a pending file moved to "files" lists exactly its fork lines', () => {
+  const up = { "p.ts": "a();\n}\nb();\n}\n" };
+  const head = { "p.ts": "a();\n}\nforkA();\nb();\n}\n}\nforkA();\n" };
+  // A list-only move: main's copy is the head's, with its 3 fork lines, main's exact ceiling.
+  const run = (
+    added,
+    { atUpstream = (file) => up[file], atHead = (file) => head[file], ...more } = {},
+  ) =>
+    findMovedEntryMismatches(["p.ts"], promoted(...added), {
+      atUpstream,
+      atHead,
+      atMain: atHead,
+      ceilings: { "p.ts": 3 },
+      upstreamName: "u",
+      ...more,
+    });
+  const check = (added, options) => {
+    const { reasons, notes } = run(added, options);
+    assert.deepEqual(notes, []);
+    return reasons;
+  };
+  const what = `p.ts: moved to "files" in this change's ${CONFIG}`;
+  // Exactly the copies beyond upstream, in any order.
+  assert.deepEqual(check(["forkA();", "}", "forkA();"]), []);
+  assert.deepEqual(check(["}", "forkA();", "forkA();"]), []);
+  // An upstream line in place of a fork line: the count is right, the lines are not.
+  assert.deepEqual(check(["forkA();", "}", "a();"]), [
+    `${what}: the file has \`forkA();\` 2× beyond upstream u, and the entry lists it 1×: list each fork line the file has, as often as it has it.`,
+    `${what}: the entry lists \`a();\`, and the file has it no more often than upstream u (an upstream line, not a fork line): list only the fork lines the file has.`,
+  ]);
+  // Too many copies of a fork line, and a fork line left out.
+  assert.deepEqual(check(["forkA();", "forkA();", "forkA();", "}"]), [
+    `${what}: the entry lists \`forkA();\` 3×, and the file has it only 2× beyond upstream u: list only the fork lines the file has.`,
+  ]);
+  assert.deepEqual(check(["forkA();", "forkA();"]), [
+    `${what}: the file has \`}\` beyond upstream u, and the entry lists it not at all: list each fork line the file has, as often as it has it.`,
+  ]);
+  // Empty state: "added": [] passes only with no fork line, and an empty file lists nothing.
+  const bare = { atHead: (file) => up[file], ceilings: { "p.ts": 0 } };
+  assert.deepEqual(check([], bare), []);
+  assert.equal(check([]).length, 2);
+  const empty = { atUpstream: () => "", atHead: () => "", ceilings: { "p.ts": 0 } };
+  assert.deepEqual(check([], empty), []);
+  // Missing state: an upstream commit without the file fails closed; a head without it is refused
+  // elsewhere ("deletes it").
+  assert.deepEqual(check(["forkA();"], { atUpstream: () => undefined }), [
+    `${what}, but the upstream commit u does not have it, so its fork lines cannot be counted (upstream moved or removed it?): keep it in "pending" until the list is fixed.`,
+  ]);
+  assert.deepEqual(check(["forkA();"], { atHead: () => undefined }), []);
+  // Not the upstream commit main sits on (main's copy does not count to its ceiling from it, as
+  // fork-follow holds it): a note, nothing judged, as upstream's own lines would count as fork lines.
+  const older = { atUpstream: () => "a();\n}\n" };
+  assert.deepEqual(run(["forkA();", "}", "forkA();"], older), {
+    reasons: [],
+    notes: [
+      `${what}; counted from upstream u, main's copy has 5 fork lines, not its ceiling of 3, so that is not the upstream commit main sits on, and which lines the entry lists is not checked here (fork-follow's run on main checks them).`,
+    ],
+  });
+  assert.match(
+    run([], { atMain: () => undefined }).notes[0],
+    /main's copy has no fork lines, not its ceiling of 3/,
+  );
+  // Runs again: the same answer.
+  assert.deepEqual(check(["forkA();", "}", "a();"]), check(["forkA();", "}", "a();"]));
+});
+
+test("the command line holds a moved entry to the fork lines from --upstream-base, and only notes it without", () => {
+  withRepo(({ git, commit, run }) => {
+    const older = commit({ "p.ts": "export const x = 1;\n" }, "older upstream");
+    const up = "export const x = 1;\nif (a) {\n}\n";
+    const upstream = commit({ "p.ts": up }, "upstream");
+    const forked = `${up}forkA(); // Fork\nforkB(); // Fork\n`;
+    const main = commit(
+      { ...seams({ files: {}, pending: { "p.ts": 2 } }), "p.ts": forked },
+      "main",
+    );
+    const branch = (name, files) => {
+      git("checkout", "-q", "-b", name, main);
+      return commit(files, name);
+    };
+    const asSeam = (...added) => seams({ files: { "p.ts": { why: "w", added } } });
+    const pr = (head, ...more) => run("--config-ref", main, ...more, main, head);
+    const noted =
+      /Note: this change moves p\.ts from "pending" to "files", and this run has no upstream commit/;
+    // The right lines pass with the upstream commit, and without it (a note says what is unchecked).
+    const right = branch("right", asSeam("forkB(); // Fork", "forkA(); // Fork"));
+    const withUp = pr(right, "--upstream-base", upstream);
+    assert.equal(withUp.status, 0, withUp.stderr);
+    assert.doesNotMatch(withUp.stdout, noted);
+    const without = pr(right);
+    assert.equal(without.status, 0, without.stderr);
+    assert.match(without.stdout, noted);
+    // An upstream line in place of a fork line passed the pull request's run before (#552).
+    const swapped = branch("swapped", asSeam("forkA(); // Fork", "}"));
+    assert.equal(pr(swapped).status, 0);
+    const refused = pr(swapped, "--upstream-base", upstream);
+    assert.equal(refused.status, 1, refused.stdout);
+    const short = upstream.slice(0, 12);
+    assert.match(
+      refused.stderr,
+      new RegExp(
+        `- p\\.ts: moved to "files" .*: the file has \`forkB\\(\\); // Fork\` beyond upstream ${short}, and the entry lists it not at all`,
+      ),
+    );
+    assert.match(
+      refused.stderr,
+      /- p\.ts: moved to "files" .*: the entry lists `\}`, and the file has it no more often than upstream/,
+    );
+    assert.match(
+      refused.stderr,
+      /A file moved from "pending" to "files" lists exactly its fork lines/,
+    );
+    // Runs again: the same result.
+    assert.equal(pr(swapped, "--upstream-base", upstream).stderr, refused.stderr);
+    // An older upstream commit than main's base (main's copy then has 4 "fork lines", not its
+    // ceiling of 2) judges nothing: a note, and the run is as it was without one.
+    const old = pr(swapped, "--upstream-base", older);
+    assert.equal(old.status, 0, old.stderr);
+    assert.match(
+      old.stdout,
+      /Note: p\.ts: moved to "files" .*; counted from upstream [0-9a-f]{12}, main's copy has 4 fork lines, not its ceiling of 2, so that is not the upstream commit main sits on/,
+    );
+    // A change that moves nothing is not touched by it (the upstream commit is only read for a move).
+    const plain = branch("plain", { "q.ts": "fork file\n" });
+    assert.equal(pr(plain, "--upstream-base", upstream).status, 0);
+    assert.doesNotMatch(pr(plain).stdout, noted);
+    // An upstream commit outside the head's history would count upstream's own changes: it stops
+    // the run, as does a rev that names nothing; from upstream the option is a usage error.
+    git("checkout", "-q", "--orphan", "other");
+    const elsewhere = commit({ "p.ts": "elsewhere\n" }, "elsewhere");
+    const outside = pr(swapped, "--upstream-base", elsewhere);
+    assert.equal(outside.status, 3);
+    assert.match(outside.stderr, /--upstream-base [0-9a-f]+ is not a commit in the head's history/);
+    assert.equal(pr(swapped, "--upstream-base", "no-such-rev").status, 3);
+    assert.equal(run("--from-upstream", "--upstream-base", upstream, upstream, swapped).status, 2);
+    assert.equal(pr(swapped, "--upstream-base").status, 2);
+  });
+});
+
+// fork-checks' helper: the upstream commit, fetched only for a change to the list (#552).
+test("fork-seam-upstream.sh prints the upstream commit for a list change only, and a note when it cannot", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-seam-upstream-"));
+  const sh = (cwd, args, env = {}) =>
+    spawnSync("bash", [path.join(__dirname, "fork-seam-upstream.sh"), ...args], {
+      cwd,
+      encoding: "utf8",
+      // Never GitHub: the API is a file:// URL unless a case names another.
+      env: {
+        ...process.env,
+        UPSTREAM_URL: "",
+        GITHUB_REPOSITORY: "me/fork",
+        GITHUB_API_URL: "file:///nonexistent",
+        ...env,
+      },
+    });
+  const git = (cwd, ...args) =>
+    execFileSync("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t", ...args], {
+      encoding: "utf8",
+    }).trim();
+  const commit = (cwd, files, message) => {
+    for (const [file, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(cwd, file)), { recursive: true });
+      fs.writeFileSync(path.join(cwd, file), text);
+    }
+    git(cwd, "add", "-A");
+    git(cwd, "commit", "-q", "--allow-empty", "-m", message);
+    return git(cwd, "rev-parse", "HEAD");
+  };
+  try {
+    // Upstream lives where a fake gh's parent name points: <server>/o/up.git.
+    const up = path.join(root, "o", "up.git");
+    fs.mkdirSync(up, { recursive: true });
+    git(up, "init", "-q");
+    git(up, "config", "uploadpack.allowFilter", "true");
+    const upstream = commit(up, { "p.ts": "a();\n" }, "upstream");
+    const fork = path.join(root, "fork");
+    execFileSync("git", ["clone", "-q", up, fork]);
+    commit(fork, seams({ files: {}, pending: { "p.ts": 1 } }), "main");
+    commit(fork, { "p.ts": "a();\nforkA();\n" }, "fork line");
+    const mainTip = git(fork, "rev-parse", "HEAD");
+    git(fork, "checkout", "-q", "-b", "move");
+    const move = commit(
+      fork,
+      seams({ files: { "p.ts": { why: "w", added: ["forkA();"] } } }),
+      "move",
+    );
+    git(fork, "checkout", "-q", "-b", "plain", mainTip);
+    const plain = commit(fork, { "q.ts": "fork\n" }, "plain");
+    git(fork, "remote", "remove", "origin");
+    // Upstream moves on after main's base: the answer is still the commit the head sits on.
+    commit(up, { "r.ts": "later\n" }, "later upstream");
+    const url = `file://${up}`;
+    const fetched = () =>
+      spawnSync("git", ["-C", fork, "rev-parse", "--verify", "-q", "refs/seam-upstream/head"])
+        .status === 0;
+    // GitHub's API as files: repos/<name> answers with the repository, its parent o/up.
+    const api = path.join(root, "api");
+    const answer = (body) => {
+      fs.mkdirSync(path.join(api, "repos", "me"), { recursive: true });
+      if (body === null) fs.rmSync(path.join(api, "repos", "me", "fork"), { force: true });
+      else fs.writeFileSync(path.join(api, "repos", "me", "fork"), JSON.stringify(body));
+    };
+    const viaApi = { GITHUB_API_URL: `file://${api}`, GITHUB_SERVER_URL: `file://${root}` };
+    // No list change: nothing printed, nothing fetched, no API request (none could answer).
+    const none = sh(fork, [mainTip, plain], viaApi);
+    assert.deepEqual([none.status, none.stdout, none.stderr], [0, "", ""]);
+    assert.equal(fetched(), false);
+    // A list change: upstream is the repository's parent.
+    answer({ full_name: "me/fork", parent: { full_name: "o/up" } });
+    const found = sh(fork, [mainTip, move], viaApi);
+    assert.deepEqual([found.status, found.stdout, found.stderr], [0, `${upstream}\n`, ""]);
+    // Runs again (the ref is already there): the same answer. UPSTREAM_URL needs no API call.
+    const again = sh(fork, [mainTip, move], {
+      GITHUB_API_URL: "file:///nonexistent",
+      UPSTREAM_URL: url,
+    });
+    assert.deepEqual([again.status, again.stdout], [0, `${upstream}\n`]);
+    // The base branch moved on since the branch's merge-base: the list change is still the branch's.
+    const later = commit(fork, {}, "later main");
+    assert.equal(sh(fork, [later, move], { UPSTREAM_URL: url }).stdout, `${upstream}\n`);
+    // Each failure: a note, nothing printed, exit 0 (the check then runs as before).
+    const skipped = (env, why) => {
+      const result = sh(fork, [mainTip, move], env);
+      assert.deepEqual([result.status, result.stdout], [0, ""], result.stderr);
+      assert.match(result.stderr, why);
+      assert.match(result.stderr, /fork-follow's run on main checks them\)\./);
+    };
+    answer(null);
+    skipped(
+      viaApi,
+      /Note: could not read which repository this one is a fork of \(file:\/\/.*\/repos\/me\/fork\),/,
+    );
+    answer({ full_name: "me/fork" });
+    skipped(viaApi, /Note: this repository is not a fork,/);
+    answer({ parent: { full_name: "o/up --upload-pack=x" } });
+    skipped(viaApi, /Note: the parent's name is not owner\/name,/);
+    fs.writeFileSync(path.join(api, "repos", "me", "fork"), "<html>rate limited</html>");
+    skipped(viaApi, /Note: could not read which repository this one is a fork of/);
+    skipped(
+      { UPSTREAM_URL: `file://${root}/missing.git` },
+      /Note: could not fetch upstream's default branch/,
+    );
+    const stranger = path.join(root, "stranger");
+    git(root, "init", "-q", stranger);
+    commit(stranger, { "s.ts": "s\n" }, "unrelated");
+    skipped(
+      { UPSTREAM_URL: `file://${stranger}` },
+      /Note: the head has no commit in common with upstream's default branch/,
+    );
+    // Old or missing state: a base that names nothing.
+    const gone = sh(fork, ["0000000000000000000000000000000000000000", move], {
+      UPSTREAM_URL: url,
+    });
+    assert.deepEqual([gone.status, gone.stdout], [0, ""]);
+    assert.match(gone.stderr, /Note: no merge-base of 0+ and [0-9a-f]+,/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // Two branches from one merge-base could each add the one listed copy of a seam line: each run
