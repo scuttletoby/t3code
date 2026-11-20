@@ -70,11 +70,13 @@ watches; it changes nothing on the machine, and `0` turns it off.
   none the file has; the run from upstream then holds every one of them to that entry. Which
   lines they are, the pull request's run tells from upstream: for a change to the list,
   fork-checks fetches upstream's default branch read-only (`fork-seam-upstream.sh`, no token) and
-  passes the merge-base of the head and that branch as `--upstream-base`, and the new entry's
-  `added` must then list exactly the copies the file has beyond that commit
-  ([#552](https://github.com/scuttletoby/t3code/issues/552)). When the fetch fails, or main's own
-  copy does not count to its ceiling from that commit (it is not the one main sits on, as with a
-  stable tag off upstream's default branch), the run notes it and only counts the lines; the
+  passes the merge-base of main (never the head, which the pull request controls) and that branch
+  as `--upstream-base`, and the new entry's `added` must then list exactly the copies the file
+  has beyond that commit ([#552](https://github.com/scuttletoby/t3code/issues/552)). When the
+  fetch fails (a warning on the pull request; the repository variable `UPSTREAM_URL` saves the
+  unauthenticated API request that finds upstream), or main's own copy does not count to its
+  ceiling from that commit (it is not the one main sits on, as with a stable tag off upstream's
+  default branch), the run notes it and only counts the lines; the
   next run from upstream refuses main for a wrong entry, and the owner can check it by hand with
   `node .github/scripts/fork-seam-check.cjs --from-upstream "$(git merge-base origin/main
   upstream/main)" <pull request head>` (upstream's main fetched as `upstream/main`). Left

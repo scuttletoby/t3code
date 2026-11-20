@@ -1,9 +1,7 @@
 // Usage: [--config-ref <rev>] [--upstream-base <rev>] <base> <head>
-//      | --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>.
-// Refuses <head>'s upstream-file changes beyond .github/fork-seams.json: a PR uses <base>'s list (its own only for
-// "pending" ceilings it must lower); --from-upstream reads <head>'s. --after-rebase notes a too-high ceiling and
-// --lowered-list writes the lowered list. --upstream-base (a PR's run: the upstream commit <head> sits on) holds a
-// "pending" file the change moves to "files" to its exact fork lines. Reads git objects only (and writes only that file).
+//      | --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>. Refuses <head>'s upstream-file
+// changes beyond .github/fork-seams.json: a PR uses <base>'s list (its own only for "pending" ceilings it must lower),
+// --from-upstream <head>'s; --upstream-base checks a moved entry's lines. Writes only --lowered-list (--after-rebase).
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -470,15 +468,9 @@ function findUnlistedChanges(
 }
 
 /**
- * Why a "pending" file a pull request moves to "files" lists other lines than its fork lines: its new
- * entry's "added" must list exactly the copies `atHead` has beyond `atUpstream` (the upstream commit
- * the head sits on), as the run from upstream holds them. The pull request's run counts them from
- * main's ceiling alone, so an upstream line listed in place of a fork line passed it (#552).
- * `upstreamName` names that commit in the reasons. A file the head lacks is refused elsewhere.
- * The run from upstream holds main's ceiling exactly, so main's copy (`atMain`) counted from the
- * right commit has exactly `ceilings[file]` fork lines. Any other count means the commit is not the
- * one main sits on (a stable tag off upstream's default branch, a rewritten branch): that file is a
- * note, not judged, as a wrong commit would count upstream's own lines as the fork's.
+ * Why a "pending" file a pull request moves to "files" lists other lines than the copies `atHead` has beyond
+ * `atUpstream` (the upstream commit main sits on). Main's copy (`atMain`) must count `ceilings[file]` fork lines
+ * from it, as the run from upstream holds it; else it is the wrong commit, and the file only gets a note.
  */
 function findMovedEntryMismatches(
   moved,
@@ -1095,14 +1087,16 @@ function main(argv) {
       return 1;
     }
   }
-  // The upstream commit the head sits on (fork-checks: the merge-base of the head and upstream's
-  // default branch). Any other commit would count upstream's own changes as fork lines.
+  // The upstream commit main sits on (fork-checks: the merge-base of the default branch and upstream's,
+  // never of the head, which a pull request controls). A head without it predates main's base.
   const upstreamBase = parsed.upstreamBase;
   if (upstreamBase !== undefined) {
     try {
       git(["merge-base", "--is-ancestor", `${upstreamBase}^{commit}`, head]);
     } catch {
-      throw new Error(`--upstream-base ${upstreamBase} is not a commit in the head's history.`);
+      throw new Error(
+        `--upstream-base ${upstreamBase} is not a commit in the head's history: update this change from main.`,
+      );
     }
   }
   const configRef = parsed.configRef ?? (upstream ? head : base);

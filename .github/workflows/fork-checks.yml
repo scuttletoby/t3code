@@ -71,19 +71,21 @@ jobs:
         run: node .github/scripts/fork-upstream-files-check.cjs "$BASE_SHA" "$HEAD_SHA" "$UPSTREAM_FILES"
 
       # A pull request that edits the list may move a "pending" file to "files": then the upstream
-      # commit the head sits on (fork-seam-upstream.sh fetches upstream's default branch read-only,
-      # only then, and with no token) lets the check hold the new entry to exactly the file's fork
-      # lines (#552). Without it the check counts them only; fork-follow's run on main checks which.
+      # commit main sits on (fork-seam-upstream.sh fetches upstream's default branch read-only, only
+      # then, and with no token) lets the check hold the new entry to exactly the file's fork lines.
+      # Without it the check counts them only (with a warning); fork-follow's run on main checks which.
+      # The repository variable UPSTREAM_URL, when set, saves the helper's unauthenticated API request.
       - name: Fork lines in upstream files
         if: ${{ !cancelled() }}
         env:
           DEFAULT_SHA: ${{ github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          UPSTREAM_URL: ${{ vars.UPSTREAM_URL }}
         run: |
           set -euo pipefail
           upstream_base=()
-          up="$(bash .github/scripts/fork-seam-upstream.sh "$BASE_SHA" "$HEAD_SHA")"
+          up="$(bash .github/scripts/fork-seam-upstream.sh "$DEFAULT_SHA" "$BASE_SHA" "$HEAD_SHA")"
           if [[ -n "$up" ]]; then upstream_base=(--upstream-base "$up"); fi
           node .github/scripts/fork-seam-check.cjs --config-ref "$DEFAULT_SHA" "${upstream_base[@]}" "$BASE_SHA" "$HEAD_SHA"
 
