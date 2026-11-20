@@ -39,6 +39,8 @@ class Config:
     head_check_app: int = None
     delete_branch: bool = False   # read and checked, never used: the queue deletes no branch (README.md, "Config")
     review: object = None         # review_config.ReviewRules, or None without the key (head_check judges by it)
+    notify_command: tuple = ()    # argv the queue runs once per new notice (pr_queue.Queue.notify); () = none
+    notify_timeout_seconds: int = 30
 
     def ready(self, n):
         """The command that re-arms PR n after a lens read, as the project writes it."""
@@ -64,6 +66,14 @@ def _no_duplicates(pairs):
 
 def _int(lo, hi):
     return lambda v: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+
+
+def _notify_command(v):
+    """An argv list, never a shell line: the queue appends GitHub's text (a check name, a base name) to it, and in a
+    shell line that text could run. Its first item is a bare name (found on PATH) or an absolute path: a relative path
+    would be found in the job's workspace, which the next checkout empties."""
+    return (isinstance(v, list) and v != [] and all(isinstance(a, str) and '\0' not in a for a in v)
+            and _text(v[0]) and (v[0].startswith('/') or '/' not in v[0]))
 
 
 def _review(v):
@@ -100,6 +110,11 @@ KEYS = {
                        'the id of the GitHub App that alone posts head_check (the head gate): the queue then counts '
                        'only that App\'s check runs of that name'),
     'review': (False, _review, 'the review rules block (README.md, "Review rules")'),
+    'notify_command': (False, _notify_command,
+                       'a non-empty list: the command and its first arguments (argv, no shell), the command a bare '
+                       'name on PATH or an absolute path; the queue appends repo, PR, head, kind, reason and link '
+                       '(README.md, "Notify")'),
+    'notify_timeout_seconds': (False, _int(1, 300), 'whole seconds, 1-300: how long notify_command may run'),
 }
 
 
@@ -136,12 +151,16 @@ def parse(text, where='config'):
         problems.append(f'head_check {raw["head_check"]!r} is not one of required_checks')
     if not problems and raw.get('poll_seconds', 5) > raw.get('wait_seconds', 60):
         problems.append('poll_seconds is longer than wait_seconds')
+    if not problems and 'notify_timeout_seconds' in raw and 'notify_command' not in raw:
+        problems.append('notify_timeout_seconds without notify_command: there is no command to time')
     if problems:
         raise ConfigError(f'{where}: ' + '; '.join(problems))
     override = raw.pop('override')
     if 'review' in raw:
         import review_config
         raw['review'] = review_config.parse_review(raw['review'], 'review')
+    if 'notify_command' in raw:
+        raw['notify_command'] = tuple(raw['notify_command'])
     return Config(required_checks=frozenset(raw.pop('required_checks')), bot_logins=tuple(raw.pop('bot_logins')),
                   lens_author_associations=tuple(raw.pop('lens_author_associations')),
                   override_prefix=override['prefix'], override_association=override['author_association'], **raw)

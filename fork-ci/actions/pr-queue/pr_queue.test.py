@@ -5186,5 +5186,251 @@ class GateApp(unittest.TestCase):
             config.parse(json.dumps({**CFG_RAW, 'head_check_app': self.APP}))
 
 
+
+NOTIFY_SCRIPT = """#!{python} -I
+import json, os, subprocess, sys, time
+log, mode = sys.argv[1], sys.argv[2]
+with open(log, 'a') as f:
+    f.write(json.dumps({{'argv': sys.argv[3:], 'tokens': sorted(k for k in os.environ if 'TOKEN' in k.upper()),
+                        'stdin': sys.stdin.read()}}) + '\\n')
+if mode == 'fail':
+    print('::error::from the command')
+    sys.exit(3)
+if mode in ('hang', 'background'):
+    helper = subprocess.Popen(['sleep', '60'])
+    with open(log + '.pid', 'w') as f:
+        f.write(str(helper.pid))
+    print('left a helper', flush=True)
+    if mode == 'hang':
+        time.sleep(60)
+"""
+
+
+class Notify(unittest.TestCase):
+    """#129: notify_command runs once for each notice the queue posts on an armed PR it passes over (a conflict, a red
+    check, a stuck one), so someone learns of it with GitHub notifications off. The state question: it runs again only
+    for a new head or reason, never on a later poll or after a restart (the posted comment is the record); a failed
+    comment runs nothing until the comment is posted; a missing, failing or hanging command never holds the queue."""
+    H, NEW = 'd4' * 20, 'e5' * 20
+    RUN = 'https://github.com/owner/proj/actions/runs/11/job/22'
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='pr-queue-notify-')
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.script = os.path.join(self.dir, 'notify')
+        with open(self.script, 'w') as f:
+            f.write(NOTIFY_SCRIPT.format(python=sys.executable))
+        os.chmod(self.script, 0o755)
+        self.log = os.path.join(self.dir, 'calls.jsonl')
+        self.comments = []   # what gh pr view shows: the comments the queue posted so far (it remembers nothing else)
+
+    def queue(self, mode='ok', **extra):
+        """A new Queue each time: a later run, or a run after a restart, as the cron starts them."""
+        raw = {**CFG_RAW, 'notify_command': [self.script, self.log, mode], **extra}
+        return make_queue(self.dir, config.parse(json.dumps(raw)))
+
+    def calls(self):
+        try:
+            with open(self.log) as f:
+                return [json.loads(x) for x in f]
+        except FileNotFoundError:
+            return []
+
+    def helper_pid(self):
+        with open(self.log + '.pid') as f:
+            pid = int(f.read())
+        self.addCleanup(lambda: subprocess.run(['kill', '-9', str(pid)], capture_output=True))
+        return pid
+
+    def sweep(self, q, state='DIRTY', head=None, runs=(), dry=False, fail=(), name='build', wf=()):
+        """PR 7 (older, `state`, check `name` with `runs`) and PR 8 (behind). Returns (code, log, PRs updated)."""
+        head = head or self.H
+        rollup = [{'__typename': 'CheckRun', 'workflowName': 'ci', 'name': name, 'startedAt': t, 'conclusion': c,
+                   'status': 'COMPLETED', 'detailsUrl': u} for t, c, u in runs]
+        listed = [{'number': 7, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1}, 'mergeStateStatus': state,
+                   'createdAt': '2026-11-07T00:00:07Z', 'statusCheckRollup': rollup, 'headRefOid': head,
+                   'baseRefName': 'main'},
+                  {'number': 8, 'title': 't', 'isDraft': False, 'autoMergeRequest': {'m': 1},
+                   'mergeStateStatus': 'BEHIND', 'createdAt': '2026-11-07T00:00:08Z', 'statusCheckRollup': [],
+                   'headRefOid': 'f6' * 20, 'baseRefName': 'main'}]
+        updated = []
+
+        def gh(*a):
+            if a[:2] == ('pr', 'list'):
+                return ok(json.dumps(listed))
+            if a[:3] == ('pr', 'view', '7'):
+                return ok(json.dumps({'headRefOid': head, 'mergeStateStatus': state, 'autoMergeRequest': {'m': 1},
+                                      'comments': [own(c) for c in self.comments]}))
+            if a[:3] == ('pr', 'comment', '7'):
+                if 'comment' in fail:
+                    return failed('boom')
+                self.comments.append(a[-1])
+                return ok()
+            if a[:2] == ('run', 'list'):
+                return ok(json.dumps(list(wf)))
+            raise AssertionError(a)
+        q.gh = q.gh_write = gh
+        q.update = lambda n, d: updated.append(n) or 0
+        code, out = run_quiet(q.run, dry)
+        return code, out, updated
+
+    def test_a_conflict_runs_the_command_once_with_its_arguments(self):
+        code, out, updated = self.sweep(self.queue())
+        self.assertEqual((code, updated), (0, [8]))
+        self.assertEqual([c['argv'] for c in self.calls()], [[
+            'owner/proj', '7', self.H, 'conflict', 'merge conflict with main', 'https://github.com/owner/proj/pull/7']])
+        self.assertIn(f'#7: notify_command ran for conflict on {self.H[:12]}', out)
+
+    def test_it_runs_once_per_head_and_reason_not_on_every_poll_or_after_a_restart(self):
+        self.sweep(self.queue())
+        for _ in range(3):   # later runs: each a new Queue (a restart), the comment on GitHub the only record
+            self.sweep(self.queue())
+        self.assertEqual(len(self.calls()), 1, 'a later run woke someone again for the same head and reason')
+        self.assertEqual(len(self.comments), 1)
+        self.sweep(self.queue(), head=self.NEW)   # a push that still conflicts: a new notice
+        self.sweep(self.queue(), head=self.NEW)
+        self.assertEqual([c['argv'][2] for c in self.calls()], [self.H, self.NEW])
+        red = (('2026-11-09T02:00:00Z', 'FAILURE', self.RUN),)
+        self.sweep(self.queue(), state='BEHIND', head=self.NEW, runs=red)   # conflict resolved, then red: a new reason
+        self.sweep(self.queue(), state='BEHIND', head=self.NEW, runs=red)
+        self.assertEqual([c['argv'][3] for c in self.calls()], ['conflict', 'conflict', 'red'])
+
+    def test_a_notice_posted_before_the_key_was_added_wakes_nobody(self):   # old state: told by an older release
+        self.sweep(make_queue(self.dir))   # a queue without notify_command posts the notice
+        self.assertEqual((len(self.comments), self.calls()), (1, []))
+        self.sweep(self.queue())
+        self.assertEqual((len(self.comments), self.calls()), (1, []))
+
+    def test_a_red_check_links_its_newest_run(self):
+        old = 'https://github.com/owner/proj/actions/runs/10/job/20'
+        runs = (('2026-11-09T01:00:00Z', 'FAILURE', old), ('2026-11-09T02:00:00Z', 'FAILURE', self.RUN))
+        code, _, updated = self.sweep(self.queue(), state='BEHIND', runs=runs)
+        self.assertEqual((code, updated), (0, [8]))
+        self.assertEqual([c['argv'] for c in self.calls()], [[
+            'owner/proj', '7', self.H, 'red', 'required check build is red', self.RUN]])
+
+    def test_a_cancelled_check_on_an_up_to_date_pr_is_stuck(self):
+        runs = (('2026-11-09T02:00:00Z', 'CANCELLED', self.RUN),)
+        self.sweep(self.queue(), state='BLOCKED', runs=runs, wf=({'status': 'completed', 'workflowName': 'ci'},))
+        self.assertEqual([c['argv'][3:] for c in self.calls()],
+                         [['stuck', 'required check build ended CANCELLED', self.RUN]])
+
+    def test_a_red_as_on_its_base_is_base_red(self):   # the queue updates it by itself: the adapter decides by kind
+        q = self.queue()
+        q.red_from_old_base = lambda p, cache: ('main is still red', 'build', True)
+        q.cfg = config.parse(json.dumps({**CFG_RAW, 'notify_command': [self.script, self.log, 'ok'],
+                                         'update_when_base_was_red': True}))
+        self.sweep(q, state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE', self.RUN),))
+        self.assertEqual([c['argv'][3:] for c in self.calls()],
+                         [['base-red', 'required check build failed as on main', self.RUN]])
+
+    def test_a_link_that_is_not_a_web_page_is_replaced_by_the_prs(self):   # GitHub's text, never trusted as a link
+        for bad in ('', 'javascript:x', 'http://plain', 'https://a b', None):
+            with self.subTest(bad=bad):
+                self.comments = []
+                if os.path.exists(self.log):
+                    os.remove(self.log)
+                self.sweep(self.queue(), state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE', bad),))
+                self.assertEqual(self.calls()[0]['argv'][5], 'https://github.com/owner/proj/pull/7')
+
+    def test_a_failed_comment_runs_nothing_and_the_next_run_does_both(self):   # stopped half-way: nothing told yet
+        code, _, updated = self.sweep(self.queue(), fail=('comment',))
+        self.assertEqual((code, updated, self.calls()), (0, [8], []))
+        self.sweep(self.queue())
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_dry_run_runs_nothing(self):
+        code, _, updated = self.sweep(self.queue(), dry=True)
+        self.assertEqual((code, self.calls(), self.comments), (0, [], []))
+
+    def test_without_the_key_nothing_runs(self):   # empty/old config: today's behaviour
+        q = make_queue(self.dir)
+        self.assertEqual(q.cfg.notify_command, ())
+        with unittest.mock.patch.object(Q.subprocess, 'Popen', side_effect=AssertionError('ran a command')):
+            code, _, updated = self.sweep(q)
+        self.assertEqual((code, updated, len(self.comments)), (0, [8], 1))
+
+    def test_a_missing_command_is_a_warning_and_the_queue_moves_on(self):
+        for cmd in ([os.path.join(self.dir, 'nope')], ['pr-queue-notify-not-on-path'], [self.dir]):   # last: a folder
+            with self.subTest(cmd=cmd):
+                self.comments = []
+                q = make_queue(self.dir, config.parse(json.dumps({**CFG_RAW, 'notify_command': cmd})))
+                code, out, updated = self.sweep(q)
+                self.assertEqual((code, updated), (0, [8]))
+                self.assertIn('::warning::pr-queue: notify_command for #7 (conflict) could not start', out)
+
+    def test_a_failing_command_is_a_warning_and_is_not_run_again(self):
+        code, out, updated = self.sweep(self.queue('fail'))
+        self.assertEqual((code, updated), (0, [8]))
+        self.assertIn('::warning::pr-queue: notify_command for #7 (conflict) exited 3', out)
+        self.assertIn('  notify| ::error::from the command', out)
+        self.assertNotRegex(out, r'(?m)^::error::', 'the command wrote a workflow command into the run log')
+        self.sweep(self.queue('fail'))
+        self.assertEqual(len(self.calls()), 1, 'a failed command was run again on the next poll')
+
+    def test_a_hanging_command_is_stopped_with_its_session_and_never_holds_the_queue(self):
+        start = time.monotonic()
+        code, out, updated = self.sweep(self.queue('hang', notify_timeout_seconds=1))
+        self.assertLess(time.monotonic() - start, 15, 'the queue waited for a hanging command')
+        self.assertEqual((code, updated), (0, [8]))
+        self.assertIn('ran longer than 1 s and was stopped', out)
+        self.assertIn('  notify| left a helper', out)
+        pid = self.helper_pid()
+        for _ in range(50):   # killed with the session: gone once its new parent reaped it
+            r = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+            if not r.stdout.strip() or r.stdout.strip().startswith('Z'):
+                break
+            time.sleep(0.1)
+        else:
+            self.fail('a process the hanging command started still runs')
+
+    def test_a_helper_left_running_after_the_command_exits_does_not_hold_the_run(self):   # output is a file, no pipe
+        start = time.monotonic()
+        code, out, updated = self.sweep(self.queue('background'))   # default limit: 30 s
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertEqual((code, updated), (0, [8]))
+        self.assertIn('#7: notify_command ran for conflict', out)
+        self.assertEqual(subprocess.run(['kill', '-0', str(self.helper_pid())]).returncode, 0,
+                         'the queue stopped a helper of a command that ended in time')
+
+    def test_the_command_gets_no_token_and_no_stdin(self):
+        env = {Q.READ_TOKEN: 'r', Q.WRITE_TOKEN: 'w', 'GH_TOKEN': 'g', 'GITHUB_TOKEN': 'x',
+               'ACTIONS_RUNTIME_TOKEN': 'a', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN': 'i', 'MY_api_token': 'm', 'KEEP': 'k'}
+        with unittest.mock.patch.dict(os.environ, env):
+            self.sweep(self.queue())
+        self.assertEqual((self.calls()[0]['tokens'], self.calls()[0]['stdin']), ([], ''))
+
+    def test_githubs_text_is_one_argument_never_a_shell_line(self):
+        name = 'b $(touch PWNED) `touch PWNED2`; touch PWNED3'
+        q = self.queue(required_checks=['build', 'test', 'review-check', name])
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        self.addCleanup(os.chdir, cwd)
+        self.sweep(q, state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE', self.RUN),), name=name)
+        self.assertEqual(self.calls()[0]['argv'][4], f'required check {name} is red')
+        self.assertEqual([x for x in os.listdir(self.dir) if x.startswith('PWNED')], [])
+
+    def test_the_config_keys_are_checked(self):
+        good = config.parse(json.dumps({**CFG_RAW, 'notify_command': ['queue-notify', '--to', 'a b', ''],
+                                        'notify_timeout_seconds': 5}))
+        self.assertEqual((good.notify_command, good.notify_timeout_seconds), (('queue-notify', '--to', 'a b', ''), 5))
+        self.assertEqual((CFG.notify_command, CFG.notify_timeout_seconds), ((), 30))
+        for bad in ('queue-notify --to x', [], [''], [' x'], ['./notify'], ['bin/notify'], ['/x', 3], ['/x\0'],
+                    ['/x', 'a\0b'], {'cmd': '/x'}, None):
+            with self.subTest(bad=bad), self.assertRaisesRegex(config.ConfigError, 'notify_command is'):
+                config.parse(json.dumps({**CFG_RAW, 'notify_command': bad}))
+        for bad in (0, 301, True, '5', 1.5):
+            with self.subTest(bad=bad), self.assertRaisesRegex(config.ConfigError, 'notify_timeout_seconds is'):
+                config.parse(json.dumps({**CFG_RAW, 'notify_command': ['/x'], 'notify_timeout_seconds': bad}))
+        with self.assertRaisesRegex(config.ConfigError, 'notify_timeout_seconds without notify_command'):
+            config.parse(json.dumps({**CFG_RAW, 'notify_timeout_seconds': 5}))
+
+    def test_a_release_without_the_key_refuses_a_config_with_it(self):   # the rollout order: code first, then key
+        old = {k: v for k, v in config.KEYS.items() if not k.startswith('notify_')}
+        with unittest.mock.patch.object(config, 'KEYS', old), \
+                self.assertRaisesRegex(config.ConfigError, "unknown key 'notify_command'"):
+            config.parse(json.dumps({**CFG_RAW, 'notify_command': ['/x']}))
+
+
 if __name__ == '__main__':
     unittest.main()
