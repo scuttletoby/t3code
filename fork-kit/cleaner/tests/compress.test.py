@@ -6,7 +6,7 @@ RedCheck breaks each rule in a copy of the code and shows its test then fails.
 
   python3 -I -B fork-kit/cleaner/tests/compress.test.py
 """
-import json, os, re, shutil, struct, subprocess, sys, time, unittest
+import errno, json, os, re, shutil, struct, subprocess, sys, time, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -790,6 +790,123 @@ class Config(Case):
         self.assertEqual(cfg.keep_free, 5 * GB)
 
 
+class Above(Case):
+    """A KEEP file or a git folder in a folder above the cold folder, up to `/`, keeps it whole, as one in it does
+    (#578). Read at the plan and again at the last check. The state cases: a second run, a run stopped half-way
+    before the marker came, a marker made between the plan and the run, and a marker that is gone, empty, a folder
+    or cannot be read."""
+
+    def nested(self, *parts):
+        """A cold folder at `parts` with one cold file in it: (folder, file, config)."""
+        cold = self.mkdir(*parts)
+        path = self.file(os.path.join(cold, 'old.jsonl'), text(), 40)
+        return cold, path, self.cfg(compressCold={'folders': [{'path': cold, 'days': 30}], 'keepFreeGB': 1})
+
+    def assertUntouched(self, cfg, path):
+        code, lines = self.run_cleaner(cfg)
+        self.assertFalse(os.path.exists(path + '.zst'), ('compressed under a marker', lines))
+        with open(path) as f:
+            self.assertEqual(f.read(), text())
+        return code, lines
+
+    def test_folder_inside_a_git_work_tree(self):
+        os.makedirs(self.path('repo', '.git'))
+        cold, path, cfg = self.nested('repo', 'logs', 'sessions')
+        self.assertKept(self.plan(cfg), cold, 'git folder', f'{self.path("repo")}, above {cold}')
+        code, lines = self.assertUntouched(cfg, path)
+        self.assertEqual(code, 0, lines)
+
+    def test_folder_inside_a_linked_worktree(self):
+        self.file(self.path('wt', '.git'), 'gitdir: /elsewhere/.git/worktrees/wt\n')
+        cold, path, cfg = self.nested('wt', 'sessions')
+        self.assertKept(self.plan(cfg), cold, 'git folder')
+        self.assertUntouched(cfg, path)
+
+    def test_folder_inside_a_bare_repository(self):
+        for name in ('objects', 'refs'):
+            os.makedirs(self.path('repo.git', name))
+        self.file(self.path('repo.git', 'HEAD'), 'ref: refs/heads/main\n')
+        cold, path, cfg = self.nested('repo.git', 'objects', 'info')
+        self.assertKept(self.plan(cfg), cold, 'git folder')
+        self.assertUntouched(cfg, path)
+
+    def test_folder_under_a_keep_file(self):
+        self.file(self.path('KEEP'), 'audit copies\n')
+        path = self.big('sessions', 'old.jsonl')
+        cfg = self.cold_cfg()
+        self.assertKept(self.plan(cfg), self.cold, 'KEEP file', f'audit copies ({self.dir}, above {self.cold})')
+        code, lines = self.assertUntouched(cfg, path)
+        self.assertEqual(code, 0, lines)
+
+    def test_an_empty_keep_file_above_keeps_it_too(self):
+        self.file(self.path('KEEP'), '')
+        path = self.big('old.jsonl')
+        self.assertKept(self.plan(self.cold_cfg()), self.cold, 'KEEP file', 'no reason given')
+        self.assertUntouched(self.cold_cfg(), path)
+
+    def test_a_keep_folder_above_is_not_a_keep_file(self):
+        cold, path, cfg = self.nested('KEEP', 'cold')
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 0, lines)
+        self.assertFalse(os.path.exists(path), lines)
+        self.assertEqual(self.unpack(path + '.zst'), text())
+
+    def test_a_marker_above_that_cannot_be_read_keeps_it(self):
+        path, keep, real = self.big('old.jsonl'), self.path('KEEP'), os.lstat
+
+        def lstat(target, *args, **kwargs):
+            if target == keep:
+                raise PermissionError(errno.EACCES, 'Permission denied', target)
+            return real(target, *args, **kwargs)
+        with mock.patch.object(os, 'lstat', lstat):
+            self.assertKept(self.plan(self.cold_cfg()), self.cold, 'could not read', self.dir)
+            self.assertUntouched(self.cold_cfg(), path)
+
+    def test_a_marker_made_between_the_plan_and_the_run_stops_it(self):
+        for marker in ('KEEP', '.git'):
+            with self.subTest(marker=marker):
+                cold, path, cfg = self.nested(f'with{marker}', 'cold')
+                real = self.c.compress.recheck
+
+                def recheck(cfg, facts, item):
+                    self.file(self.path(f'with{marker}', marker), 'made late\n')
+                    return real(cfg, facts, item)
+                with mock.patch.object(self.c.compress, 'recheck', recheck):
+                    code, lines = self.assertUntouched(cfg, path)
+                self.assertTrue(any('KEEP file' in line or 'git folder' in line for line in lines), lines)
+
+    def test_a_second_run_still_leaves_it_and_a_marker_removed_lets_the_next_run_compress(self):
+        keep = self.file(self.path('KEEP'), 'for now\n')
+        path = self.big('old.jsonl')
+        for _ in range(2):
+            self.assertKept(self.plan(self.cold_cfg()), self.cold, 'KEEP file', 'for now')
+            self.assertUntouched(self.cold_cfg(), path)
+        os.remove(keep)
+        self.age(path, 40)              # the checks above read it
+        code, lines = self.run_cleaner(self.cold_cfg())
+        self.assertEqual((code, self.files()), (0, ['old.jsonl.zst']), lines)
+        self.assertEqual(self.unpack(path + '.zst'), text())
+
+    def test_a_run_stopped_half_way_before_the_marker_came_leaves_everything(self):
+        written = self.big('written', 'old.jsonl')
+        part = self.file(os.path.join(self.cold, 'written', '.old.jsonl.zst.0badc0de.cleaner-part'), 'half a copy')
+        linked = self.big('linked', 'old.jsonl')
+        self.pack(linked, linked + '.zst')
+        self.age(linked, 40)
+        before = self.files()
+        os.makedirs(self.path('.git'))
+        plan = self.plan(self.cold_cfg())
+        self.assertKept(plan, self.cold, 'git folder')
+        self.assertEqual(plan.items, [])
+        code, lines = self.run_cleaner(self.cold_cfg())
+        self.assertEqual((code, self.files()), (0, before), lines)
+        with open(part) as f:
+            self.assertEqual(f.read(), 'half a copy')
+        for path in (written, linked):
+            with open(path) as f:
+                self.assertEqual(f.read(), text())
+
+
 MUTATIONS = {
     'cold: a read counts': ('compress', 'return max(guard.changed(st), st.st_atime)', 'return guard.changed(st)',
                             Compress, 'test_files_changed_or_read_lately_stay'),
@@ -882,6 +999,20 @@ MUTATIONS = {
     'KEEP': ('compress', 'if KEEP_FILE in names:', 'if False:', Refused, 'test_what_it_never_takes'),
     'git folders': ('compress', "if '.git' in names or {'HEAD', 'objects', 'refs'} <= set(names):", 'if False:',
                     Refused, 'test_what_it_never_takes'),
+    'a KEEP file above': ('guard', 'if keep is not None and not stat.S_ISDIR(keep.st_mode):', 'if False:',
+                          Above, 'test_folder_under_a_keep_file'),
+    'a git folder above': ('guard', "in_git = _lstat_or_none(os.path.join(here, '.git')) is not None or all(",
+                           'in_git = False or all(', Above, 'test_folder_inside_a_git_work_tree'),
+    'a bare repository above': ('guard', "_lstat_or_none(os.path.join(here, n)) is not None for n in ('HEAD', 'objects', 'refs'))",
+                                "False for n in ('HEAD', 'objects', 'refs'))", Above, 'test_folder_inside_a_bare_repository'),
+    'a folder above that cannot be read': ('guard', '    except FileNotFoundError:\n        return None\n\n\ndef _unpushed',
+                                           '    except OSError:\n        return None\n\n\ndef _unpushed',
+                                           Above, 'test_a_marker_above_that_cannot_be_read_keeps_it'),
+    'the folders above, at the plan': ('compress', '    refusal = guard.above_refusal(path)\n    if refusal is not None:\n        return None, refusal\n',
+                                       '', Above, 'test_folder_under_a_keep_file'),
+    'the folders above, at the last check': ('compress', '    st, refusal = _start(cfg, facts, folder)\n    if refusal is not None:\n        return refusal\n',
+                                             "    st, refusal = _start(cfg, facts, folder)\n    if refusal is not None and refusal.code not in ('KEEP file', 'git folder'):\n        return refusal\n",
+                                             Above, 'test_a_marker_made_between_the_plan_and_the_run_stops_it'),
     'databases': ('compress', 'if name.endswith(SIDECARS) or any(name + s in names for s in SIDECARS):', 'if False:',
                   Refused, 'test_what_it_never_takes'),
     'hard links': ('compress', 'if st.st_nlink > 1:', 'if False:', Refused, 'test_what_it_never_takes'),
