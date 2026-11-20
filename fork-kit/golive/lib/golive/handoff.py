@@ -29,10 +29,15 @@ waited through the copy found the home free for the second before the new launch
   the same lock for a moment, in a process of its own, and that probe must not free the home in the middle of
   `t3 update`. Only the holder's identity tells the two apart: a poll sees the lock held at one instant, and probes
   that come often enough (or a poll stretched by load) look like a lock held the whole time. The service is read
-  (`systemctl show`, with a short timeout) only until it runs: its MainPID is kept between looks while that
-  process lives, so a look after the claim is a read of /proc/locks, no subprocess (#550). Before the stop, the
-  kit checks that it can see a lock of its own in /proc/locks (handover_blind): where it cannot, it could never
-  tell the launcher, would keep the owner lock HANDOVER_WAIT after the start, and the new server (it waits 250 ms)
+  (`systemctl show`) by a thread of its own, never by the look: about once a second while it does not run, at once
+  when a look finds someone holding the serving lock, and not at all once it runs: its MainPID is kept while that
+  process lives, so a look after the claim is a read of /proc/locks, no subprocess (#550, #580). Before the stop,
+  and before the run touches anything (its pre hooks), the kit checks that it can see the launcher in /proc/locks
+  (handover_blind): where the running build takes the serving lock, that its launcher holds it now, by the very
+  look the handover makes (nobody holding it, a claim that gave up: that the service's main process is in this
+  /proc, in its unit, and a lock of its own; /proc/locks leaves out the locks of another pid namespace); for an
+  older running build, a lock of its own. Where it cannot, it could never tell the
+  new launcher, would keep the owner lock HANDOVER_WAIT after the start, and the new server (it waits 250 ms)
   would give up: T3 down about a minute, a pending update trial's database backup lost. The run refuses then,
   T3 not stopped. A build older than
   SERVING_LOCK_SINCE takes no serving lock, and its server would meet the kit's lock, idle and leave the home free
@@ -61,7 +66,7 @@ ways back refuse before they change anything. The kit never stops a server it di
 """
 import contextlib, fcntl, hashlib, json, os, signal, sqlite3, sys, tempfile, threading, time
 
-from golive import live
+from golive import live, osadapter
 
 OWNER_LOCK = 'server-owner.sqlite'    # under userdata/ (coldcopy.OWNER_LOCK)
 MARKER = 'desktop-update-in-progress'  # contracts DESKTOP_UPDATE_IN_PROGRESS_MARKER_FILE (tests/contract.test.py)
@@ -79,10 +84,21 @@ HANDOVER_WAIT = 20.0  # seconds the kit keeps the owner lock after a start while
 # Seconds between two looks for the launcher. It holds the serving lock from #claimServing on, and its server then
 # waits 250 ms for the owner lock (serverOwnership.ts busy_timeout): the kit lets go well inside that.
 HANDOVER_POLL = 0.02
-# The handover reads the boot service (systemctl) at most this long per call, and, while it does not run yet, at
-# most this often (more often only when someone holds the serving lock): once it runs, its MainPID is kept (#550).
-SERVICE_READ_TIMEOUT = 2.0
-SERVICE_REREAD = 0.2
+# Seconds between two reads of the boot service (systemctl) while it does not run yet, in a thread of its own; a
+# look that finds someone holding the serving lock has it read at once; once it runs its MainPID is kept (#550, #580).
+SERVICE_REREAD = 1.0
+# Seconds at least between the starts of two such reads: a look that finds the serving lock held while the service
+# does not run asks for one every HANDOVER_POLL, and a holder that stays (a process that is not the unit's) would
+# otherwise have systemctl run back to back until the handover ends (#580).
+SERVICE_FLOOR = 0.1
+# Seconds the pre-stop look waits before it looks once more at a serving lock held by a process that is not the
+# service's main process: an SSH launch's `home-owned` probe holds it only for a moment (#580).
+PROBE_RELOOK = 0.3
+# Where a process's cgroup is read ({pid}); tests only change it.
+CGROUP_OF = '/proc/{pid}/cgroup'
+# A build the kit cannot name before the stop: an update caught at the stop starts whatever build the service
+# state names then (coldcopy.UpdateAtStop). It counts as one that takes the serving lock (takes_serving_lock).
+ANY_BUILD = None
 SERVER_LOCK_WAIT_MS = 250  # serverOwnership.ts busy_timeout (contract.test.py): a later handover may leave it idle
 HOLDER_TAKE_WAIT = 30.0  # seconds the holder waits for the owner lock (the stopped server may still be exiting)
 HOLDER_LET_GO_WAIT = 5.0  # seconds a stopped holder has to let go of the owner lock before it is killed
@@ -176,16 +192,44 @@ def _runs(svc):
 
 
 def _read(service):
+    return service()  # the adapter's usual timeout: no look waits for it (#580); the reader keeps what it raises
+
+
+_pause = time.sleep  # tests only change it
+
+
+class Blind(str):
+    """Why the kit must not stop T3 (handover_blind). service_unread: the reason is that the boot service could not
+    be read, so a stop by hand would fail too (W1 then names no stop as the way out)."""
+    service_unread = False
+
+
+class _ServiceUnread(str):
+    pass
+
+
+def in_unit(pid):
+    """None when process `pid` is in this /proc and runs in the boot service's unit (its cgroup path names
+    t3code.service, read as osadapter.inside_service reads its own); else why not. systemd names the unit's MainPID
+    in its own pid namespace: a kit in a child pid namespace with a /proc of its own finds no such process there, or
+    another one, in another cgroup."""
     try:
-        return service(timeout=SERVICE_READ_TIMEOUT)
-    except Exception:  # noqa: BLE001  (systemctl failed or was slow for a moment: look again)
-        return {}
+        with open(CGROUP_OF.replace('{pid}', str(pid)), encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return (f'the boot service\'s main process (pid {pid}) is not in this /proc: a /proc of another pid '
+                'namespace?')
+    if any(osadapter.UNIT in line.split(':', 2)[-1].split('/') for line in lines):
+        return None
+    return (f'pid {pid}, the boot service\'s main process, is a process outside {osadapter.UNIT} in this /proc: a '
+            '/proc of another pid namespace?')
 
 
 def sees_own_lock(home):
     """None when this process sees a POSIX lock of its own (the kind SQLite takes) on a file beside the serving lock
     listed under its own pid in /proc/locks, as launcher_serving needs it to see the launcher's; else why not. The
-    file has no name (O_TMPFILE): nothing is left behind, even by a kill."""
+    file has no name where the filesystem supports that (O_TMPFILE), so not even a kill leaves it behind; elsewhere
+    tempfile names it and unlinks it at once, and only a kill in those microseconds leaves an empty file."""
     try:
         f = tempfile.TemporaryFile(dir=os.path.join(home, 'runtime'))
     except OSError:
@@ -204,18 +248,70 @@ def sees_own_lock(home):
     return None
 
 
-def handover_blind(home, versions):
-    """Before the kit stops T3: None, or why it must not (said before '; T3 was not stopped'). versions: the builds
-    this run may start after the stop; for builds that take no serving lock the kit lets go before the start, and
-    it needs to see nobody's lock."""
+def launcher_unseen(home, service):
+    """None when the boot service's launcher holds the serving lock now as the handover will look for it
+    (launcher_serving); else why not. service: reads the boot service (adapter.service).
+    Another process holding it may be an SSH launch's probe, held for a moment: the look waits PROBE_RELOOK and looks
+    once more before it says so.
+    Nobody holding it is not enough to refuse: upstream's launcher waits 250 ms for the lock and then serves without
+    it (serviceLauncher.ts #claimServing: an SSH probe held it at that moment), and the launcher the kit starts after
+    the stop claims it again from the start. Nor is it enough to go on: since Linux 4.12 /proc/locks leaves out the
+    locks whose holder is not in the pid namespace of that /proc (fs/locks.c locks_show), so a kit in a child pid
+    namespace with a /proc of its own sees nobody holding it while the launcher does, and could never see the new
+    one either. So then the service's main process must be in this /proc, in the unit (in_unit), and the kit must
+    see its own lock (sees_own_lock: it also catches a /proc/locks that names the file under another inode, which
+    reads as nobody)."""
+    try:
+        svc = service()
+    except Exception as e:  # noqa: BLE001  (the stop needs systemctl too: refuse with what it said)
+        return _ServiceUnread(f'the boot service cannot be read: {e}')
+    serving = os.path.join(home, 'runtime', SERVING_LOCK)
+    holders = lock_holders(serving)
+    if launcher_serving(home, svc, holders):
+        return None
+    if holders:  # not the launcher: maybe an SSH launch's probe, there for a moment
+        _pause(PROBE_RELOOK)
+        holders = lock_holders(serving)
+        if launcher_serving(home, svc, holders):
+            return None
+    if holders is None:
+        return '/proc/locks cannot be read'
+    pid = svc.get('mainPid') if svc.get('active') else None
+    if not pid:
+        return 'the boot service has no running main process'
+    if not holders:
+        return in_unit(pid) or sees_own_lock(home)
+    return (f'/proc/locks lists pid {", ".join(map(str, sorted(holders)))} as the holder of runtime/{SERVING_LOCK}, '
+            f'not the boot service\'s main process (pid {pid}), twice {PROBE_RELOOK:g} s apart: a /proc of another '
+            'pid namespace, a launcher that is not the service\'s main process or takes another kind of lock, or an '
+            'SSH launch\'s probe that held it that long (then the same command again goes on)')
+
+
+def handover_blind(home, versions, running=None, service=None):
+    """Before the kit stops T3: None, or why it must not (the caller adds '; T3 was not stopped' or '; nothing was
+    changed'). versions: the builds this run may start after the stop (ANY_BUILD: one it cannot name); for builds
+    that take no serving lock the kit lets go before the start, and it needs to see nobody's lock. running: the
+    build T3 runs now, service: reads the boot service (adapter.service). When the running build takes the serving
+    lock, its launcher must show as serving now (launcher_unseen, #580): the look the handover depends on, made on
+    the real launcher, so a kit in a child pid namespace (/proc/locks leaves the launcher's lock out, or names it
+    under another pid), a launcher that is not the service's main process, or a lock of another kind refuse here.
+    Nobody holding it (a claim that gave up) passes only where the service's main process is in this /proc, in the
+    unit, and the kit sees its own lock. Otherwise (an older running build, or none named) the kit must see a lock
+    of its own (sees_own_lock, #550). Returns a Blind (a str)."""
     if not any(takes_serving_lock(v) for v in versions):
         return None
-    why = sees_own_lock(home)
+    if running is not None and service is not None and takes_serving_lock(running):
+        why = launcher_unseen(home, service)
+    else:
+        why = sees_own_lock(home)
     if why is None:
         return None
-    return (f'the kit cannot tell the boot service\'s launcher by its locks here ({why}): after the start it would '
-            f'keep the home\'s owner lock {HANDOVER_WAIT:g} s, the new server gives up after {SERVER_LOCK_WAIT_MS} ms, '
-            'and T3 would stay down for about a minute (a pending update trial can lose its database backup)')
+    out = Blind(f'the kit cannot tell the boot service\'s launcher by its locks here ({why}): after the start it '
+                f'would keep the home\'s owner lock {HANDOVER_WAIT:g} s, the new server gives up after '
+                f'{SERVER_LOCK_WAIT_MS} ms, and T3 would stay down for about a minute (a pending update trial can lose '
+                'its database backup)')
+    out.service_unread = isinstance(why, _ServiceUnread)
+    return out
 
 
 def takes_serving_lock(version):
@@ -242,6 +338,8 @@ class Gap:
         # the last 'launcher' handover: at most this many ms between the launcher's claim of the serving lock and the
         # kit letting go of the owner lock (from the start of the kit's last look that did not find it serving)
         self.handover_ms = None
+        # the last starting()'s failed reads of the service (its reader goes on after each): count and last error
+        self.read_failed = None
         self._stop = threading.Event()
         self._thread = None
         self._mutex = threading.Lock()
@@ -279,12 +377,12 @@ class Gap:
     def starting(self, fn, version, service):
         """Run fn (it starts T3 `version`: a service start, or `t3 update`), and let go of the owner lock only once
         the new launcher holds its serving lock (or HANDOVER_WAIT after fn returned, or fn failed). service: reads
-        the boot service (adapter.service; called with timeout=SERVICE_READ_TIMEOUT). Returns fn's result.
+        the boot service (adapter.service), in a thread of its own (reader). Returns fn's result.
         Afterwards the kit holds no lock on the home; a holder (#530) is left holding unless the launcher took the
         home or the service is active.
         A handover to the launcher measures its delay (handover_ms, an upper bound: the claim came after the start of
         the last look that did not find the launcher serving, and the lock was let go before the clock is read)."""
-        self.handover, self.handover_ms = None, None
+        self.handover, self.handover_ms, self.read_failed = None, None, None
         if self.lock is not None and not takes_serving_lock(version):
             self.let_go()
             self.handover = 'before the start (a build that takes no serving lock)'
@@ -296,19 +394,38 @@ class Gap:
 
         looked = [time.monotonic()]  # the start of the last look that did not find the launcher serving
 
+        svc, kick, ended = [{}], threading.Event(), threading.Event()  # svc[0]: the service as last read
+        failed = [0, None]  # the reader's failed passes: count, last error (served() journals them)
+
+        def reader():  # the looks never wait for systemctl: a slow read delays only the answer it brings (#580)
+            last = None  # when the last read started
+            while True:
+                kick.clear()
+                if ended.is_set():  # after the clear: an end set just before it is not missed
+                    return
+                try:
+                    if not _runs(svc[0]):  # kept while its main process runs (#550)
+                        if last is not None and ended.wait(max(0.0, last + SERVICE_FLOOR - time.monotonic())):
+                            return
+                        last = time.monotonic()
+                        svc[0] = _read(service)
+                except Exception as e:  # noqa: BLE001  (systemctl failed, or an error of the reader's own: it must
+                    svc[0] = {}         # not end the reads, the kit would keep the owner lock HANDOVER_WAIT)
+                    failed[0], failed[1] = failed[0] + 1, f'{type(e).__name__}: {e}'
+                kick.wait(SERVICE_REREAD)
+
         def watch():  # HANDOVER_WAIT counts from fn's return (`t3 update` installs first, then restarts T3)
-            svc, next_read = {}, 0.0  # the service as last read: kept while its main process runs (#550)
             try:
                 while not done.is_set():
                     began = time.monotonic()
                     holders = lock_holders(serving)  # someone holds it: the launcher, or an SSH launch's probe
-                    if not _runs(svc) and (holders or began >= next_read):
-                        svc, next_read = _read(service), time.monotonic() + SERVICE_REREAD
-                    if holders and launcher_serving(self.home, svc, holders):
-                            outcome['how'] = 'launcher'
-                            self.let_go()
-                            outcome['ms'] = (time.monotonic() - looked[0]) * 1000
-                            return
+                    if holders and launcher_serving(self.home, svc[0], holders):
+                        outcome['how'] = 'launcher'
+                        self.let_go()
+                        outcome['ms'] = (time.monotonic() - looked[0]) * 1000
+                        return
+                    if holders and not _runs(svc[0]):
+                        kick.set()  # the launcher may have just claimed it: read the service now
                     looked[0] = began
                     if returned and time.monotonic() >= returned[0] + HANDOVER_WAIT:
                         outcome['how'] = 'timeout'
@@ -316,6 +433,8 @@ class Gap:
                     done.wait(HANDOVER_POLL)
                 outcome['how'] = 'start failed'
             finally:
+                ended.set()
+                kick.set()
                 # T3 did not come up (fn raised, or returned without starting it: `t3 update` exited non-zero or timed
                 # out, a target that never runs): the holder keeps the home owned past this run (#530). It goes only
                 # to a launcher, or when the service runs (an old launcher that took no serving lock).
@@ -323,6 +442,8 @@ class Gap:
                     self.lock = None
                 else:
                     self.let_go()
+        # not joined: a read in flight ends by itself (the adapter's timeout), and nothing reads its answer then
+        threading.Thread(target=reader, name='golive-service-read', daemon=True).start()
         watcher = threading.Thread(target=watch, name='golive-handover', daemon=True)
         watcher.start()
         try:
@@ -335,6 +456,8 @@ class Gap:
         finally:
             watcher.join()
             self.handover = outcome.get('how', 'start failed')
+            if failed[0]:
+                self.read_failed = f'{failed[0]} time(s), last: {failed[1]}'
             if 'ms' in outcome:
                 self.handover_ms = round(outcome['ms'])
 
@@ -354,8 +477,9 @@ class Gap:
     def served(self):
         """The new server is verified: stop renewing and remove the marker if it is still the kit's. Returns the
         facts for the verify step: 'marker' (what was done to it), 'handover' (how the owner lock was let go),
-        'handoverMs' (handover_ms; with 'handoverLate' when it reached the server's 250 ms wait), and 'renewFailed'
-        when a renewal failed (the marker may have run out mid-stop; the owner lock still held).
+        'handoverMs' (handover_ms; with 'handoverLate' when it reached the server's 250 ms wait), 'renewFailed'
+        when a renewal failed (the marker may have run out mid-stop; the owner lock still held), and
+        'serviceReadFailed' when a read of the service during the start failed (the reader read again).
         A newer marker renamed in between the read and the unlink would still be removed: a window of microseconds,
         the same as upstream's own DesktopBackendPool.releaseUpdateMarker."""
         self.close()
@@ -370,6 +494,8 @@ class Gap:
                                          'and may have idled (the home is then free until its launcher tries again)')
         if self.failed:
             facts['renewFailed'] = f'{self.failed} time(s), last: {self.error}'
+        if self.read_failed:  # the handover may have come late, or by the timeout, for want of a read
+            facts['serviceReadFailed'] = self.read_failed
         return facts
 
     def _remove(self):
@@ -572,8 +698,8 @@ def _same_holder(a, b):
 
 
 def _active(service):
-    """Read after a start that did not reach a launcher: not in a hurry, so the adapter's usual timeout, not the
-    short one (a slow systemctl would keep the home held behind a T3 that runs)."""
+    """Read after a start that did not reach a launcher, with the adapter's usual timeout (a slow systemctl must
+    not keep the home held behind a T3 that runs)."""
     try:
         return bool(service().get('active'))
     except Exception:  # noqa: BLE001  (cannot tell: the safe side keeps the home owned)
