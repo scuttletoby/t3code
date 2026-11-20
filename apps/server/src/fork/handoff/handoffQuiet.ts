@@ -4,13 +4,7 @@
  * agent), so a restart keeps it; the relay sees the run as upstream's stopped run
  * (`latestRunStopRequested`). Every other run alerts as before.
  */
-import {
-  type OrchestrationV2ConversationMessage,
-  type OrchestrationV2Run,
-  RunId,
-  type ThreadId,
-} from "@t3tools/contracts";
-import * as DateTime from "effect/DateTime";
+import { RunId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -18,12 +12,7 @@ import type { AgentAwarenessThread } from "../../orchestration-v2/ProjectionStor
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import { parseHandoffMessageId } from "./handoffFacts.ts";
-
-/**
- * Upstream's relay holds a "finished" alert this long, because a run can end moments before its
- * continuation starts; a run that starts in the hold drops it (`AgentAwarenessRelay.ts`).
- */
-export const RELAY_COMPLETION_HOLD_MS = 5_000;
+import { isQuietHandoffRun, RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
 
 /**
  * The handoff service waits this long at a quiet thread before it sends (`HandoffService.ts`), so
@@ -33,38 +22,6 @@ export const HANDOFF_SETTLE_MS = 2 * RELAY_COMPLETION_HOLD_MS;
 
 /** How often a settle checks the relay's view between events (`handoffRelayView.ts`). */
 export const HANDOFF_SETTLE_CHECK_MS = 1_000;
-
-type QuietMessage = Pick<
-  OrchestrationV2ConversationMessage,
-  "id" | "runId" | "createdBy" | "creationSource"
->;
-
-/**
- * A completed first-send handoff run, not marked loud (its settle saw the relay show the person's
- * finish at every check), sent by the server, no message of the person's in it, and requested at
- * least the relay's hold after the person's run finished (so their alert went out). Anything else,
- * a retry included, alerts as the turn's finish.
- */
-export function isQuietHandoffRun(
-  threadId: ThreadId,
-  run: Pick<OrchestrationV2Run, "id" | "status" | "userMessageId" | "requestedAt">,
-  messages: ReadonlyArray<QuietMessage>,
-  sourceRun: Pick<OrchestrationV2Run, "id" | "completedAt"> | undefined,
-): boolean {
-  if (run.status !== "completed") return false;
-  const handoff = parseHandoffMessageId(threadId, run.userMessageId);
-  if (handoff === null || handoff.retry || handoff.loud) return false;
-  const prompt = messages.find((message) => message.id === run.userMessageId);
-  if (prompt?.createdBy !== "agent" || prompt.creationSource !== "server") return false;
-  if (messages.some((message) => message.runId === run.id && message.createdBy === "user")) {
-    return false;
-  }
-  if (sourceRun?.id !== handoff.runId || sourceRun.completedAt == null) return false;
-  return (
-    DateTime.toEpochMillis(run.requestedAt) - DateTime.toEpochMillis(sourceRun.completedAt) >=
-    RELAY_COMPLETION_HOLD_MS
-  );
-}
 
 /** Reads the thread's latest run, its messages and source run; says whether it is a quiet handoff run. */
 const latestRunIsQuietHandoff = Effect.fn("HandoffQuiet.latestRunIsQuietHandoff")(function* (
