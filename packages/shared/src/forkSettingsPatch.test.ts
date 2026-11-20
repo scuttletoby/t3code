@@ -7,7 +7,7 @@ import {
   PlaytestSettings,
   ProjectId,
   ProviderInstanceId,
-  type ServerSettings,
+  ServerSettings,
   ServerSettingsPatch,
   ThreadId,
 } from "@t3tools/contracts";
@@ -34,6 +34,7 @@ const codex = ProviderInstanceId.make("codex-b");
 
 const greenCheck = Schema.decodeSync(WaitCheck)({ argv: ["/bin/true"] });
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+const decodeServerSettings = Schema.decodeSync(ServerSettings);
 const decodePlaytest = Schema.decodeUnknownSync(PlaytestSettings);
 const playtestAdapter = (program: string) => {
   const step = (name: string) => ({ argv: [program, name] });
@@ -358,6 +359,78 @@ describe("fork settings save check (MCP profile references)", () => {
     ],
   ] as const)("refuses %s, saying how to fix it", (_name, patch, message) => {
     expect(problemAfter(patch)).toMatch(message);
+  });
+});
+
+describe("fork settings save check (a project's kept reviewRules text)", () => {
+  const project = ProjectId.make("project-1");
+  const other = ProjectId.make("project-2");
+  const BAD = { preset: "strict", runner: { driver: "claudeAgent" } };
+  // As the file holds it: one project's bad hand edit, another project off.
+  const stored = decodeServerSettings({
+    projectSettingsOverrides: {
+      [project]: { reviewRules: BAD, defaultAutoPull: false },
+      [other]: { reviewRules: { preset: "off" } },
+    },
+  });
+  // A client resends a project's whole entry as it holds it (decoded, then sent).
+  const resend = (settings: ServerSettings, id: ProjectId, entry: Record<string, unknown>) =>
+    decodePatch({
+      projectSettingsOverrides: {
+        [id]: { ...settings.projectSettingsOverrides[id], ...entry },
+      },
+    });
+  const save = (settings: ServerSettings, patch: ServerSettingsPatch) => {
+    const next = applyServerSettingsPatch(settings, patch);
+    return { next, problem: forkSettingsWriteProblem(settings, next) };
+  };
+  const kept = (unreadable: unknown) => ({ reviewRules: { preset: "off", unreadable } });
+
+  it("takes the stored text back unchanged, and the same save again", () => {
+    const first = save(stored, resend(stored, project, { defaultAutoPull: true }));
+    expect(first.problem).toBeUndefined();
+    expect(first.next.projectSettingsOverrides[project]?.reviewRules).toEqual(
+      stored.projectSettingsOverrides[project]?.reviewRules,
+    );
+    // Runs again from what the first save left: still the same text, still accepted.
+    const again = save(first.next, resend(first.next, project, { defaultAutoPull: true }));
+    expect(again.problem).toBeUndefined();
+    expect(again.next).toEqual(first.next);
+  });
+
+  it.each([
+    ["other text than the stored one", project, kept({ preset: "recommended", lenses: ["x"] })],
+    ["text for a project that stores none", ProjectId.make("project-3"), kept(BAD)],
+    ["text for a project whose stored value reads well", other, kept(BAD)],
+    ["a large text nobody stored", project, kept("x".repeat(100_000))],
+  ])("refuses %s, so a save never brings text in", (_name, id, entry) => {
+    const problem = save(stored, resend(stored, id, entry)).problem;
+    expect(problem).toContain(`Project ${id}'s reviewRules`);
+  });
+
+  it("refuses a stale client's text after the person fixed the value elsewhere", () => {
+    const fixed = save(stored, resend(stored, project, { reviewRules: { preset: "recommended" } }));
+    expect(fixed.problem).toBeUndefined();
+    // The stale client still holds the old entry and resends it whole.
+    expect(save(fixed.next, resend(stored, project, { defaultAutoPull: true })).problem).toContain(
+      `Project ${project}'s reviewRules`,
+    );
+  });
+
+  it("lets a person replace or clear the kept text, and an older client leave it out", () => {
+    for (const reviewRules of [{ preset: "off" }, { preset: "recommended" }, null]) {
+      expect(
+        save(stored, resend(stored, project, { reviewRules })).problem,
+        JSON.stringify(reviewRules),
+      ).toBeUndefined();
+    }
+    expect(
+      save(
+        stored,
+        decodePatch({ projectSettingsOverrides: { [project]: { defaultAutoPull: true } } }),
+      ).problem,
+    ).toBeUndefined();
+    expect(save(stored, decodePatch({ enableAgentBrowserAccess: false })).problem).toBeUndefined();
   });
 });
 

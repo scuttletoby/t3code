@@ -124,7 +124,7 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     off: true,
     reason:
       "No review lens is listed, changed or checked until a person sets the preset; the repo's CI gate stays the guarantee.",
-    decidedIn: "#99",
+    decidedIn: "#291",
   },
   {
     scope: "server",
@@ -231,7 +231,7 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     default: undefined,
     off: true,
     reason: "A project without its own review rules uses the server's.",
-    decidedIn: "#99",
+    decidedIn: "#291",
   },
 ];
 

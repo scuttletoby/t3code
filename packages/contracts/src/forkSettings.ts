@@ -215,13 +215,15 @@ export const ForkProjectOverrideFields = {
   /** Absent or empty: the server's `mcpSubagentProfile`. Read leniently, as the server's. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileRef),
   /**
-   * A bad value reads as off for that project, never as the server's adapter (`null` too). `null`
-   * is only a save's "clear", which the save removes, so it is never stored or read.
+   * A bad value reads as off for that project, never as the server's adapter. `null` is a save's
+   * "clear", which the save removes; a hand-written one means the same, not set (the server's).
+   * `Schema.Null` comes first: the lenient file schema takes any value, `null` included.
    */
-  playtest: Schema.optionalKey(Schema.Union([PlaytestSettingsFromSettingsFile, Schema.Null])),
+  playtest: Schema.optionalKey(Schema.Union([Schema.Null, PlaytestSettingsFromSettingsFile])),
   /** As `playtest`: a bad value reads as off for that project, never as the server's. */
-  handoff: Schema.optionalKey(Schema.Union([HandoffSettingsFromSettingsFile, Schema.Null])),
-  reviewRules: Schema.optionalKey(Schema.Union([ReviewRulesFromSettingsFile, Schema.Null])),
+  handoff: Schema.optionalKey(Schema.Union([Schema.Null, HandoffSettingsFromSettingsFile])),
+  /** As `playtest`; a bad value is also kept as written (reviewRules.ts). */
+  reviewRules: Schema.optionalKey(Schema.Union([Schema.Null, ReviewRulesFromSettingsFile])),
 } satisfies Record<(typeof FORK_PROJECT_SCOPED_KEYS)[number], unknown>;
 
 /**

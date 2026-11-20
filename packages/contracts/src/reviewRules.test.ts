@@ -12,6 +12,7 @@ import {
   ReviewRulesPatch,
   type ReviewRules,
   effectiveReviewRules,
+  reviewLensRunner,
 } from "./reviewRules.ts";
 import { ProjectSettingsOverrides, ServerSettings, ServerSettingsPatch } from "./settings.ts";
 
@@ -39,6 +40,8 @@ const BAD: ReadonlyArray<readonly [string, unknown]> = [
     { ...ON, lensRunners: { approach: { driver: "codex", model: "m" } } },
   ],
   ["a bad lens name", { ...ON, lensRunners: { Approach: RUNNER } }],
+  // A reader that looks a lens up by name would find Object.prototype's own function.
+  ["a lens named after an object built-in", { ...ON, lensRunners: { constructor: RUNNER } }],
   ["a short state question", { ...ON, stateQuestion: "  Does it rerun?        " }],
   ["a long state question", { ...ON, stateQuestion: "x".repeat(601) }],
   ["an unknown minors", { ...ON, minors: "later" }],
@@ -167,8 +170,34 @@ describe("effectiveReviewRules", () => {
     ).toEqual(expected);
   });
 
-  it("treats a project's null as no override", () => {
+  it("treats a project's null as no override, also when the file holds it", () => {
     expect(effectiveReviewRules(read(ON), null)).toEqual(RECOMMENDED);
+    // A hand-written `null` is the save's "clear": the server's, not off with a warning.
+    const project = decodeProject({ reviewRules: null }).reviewRules;
+    expect(project).toBeNull();
+    expect(effectiveReviewRules(read(ON), project)).toEqual(RECOMMENDED);
+  });
+
+  it("reads a value that carries unreadable text as off, whatever its preset says", () => {
+    const kept = { preset: "recommended", unreadable: 1 } as unknown as ReviewRules;
+    expect(effectiveReviewRules(kept)).toEqual({ preset: "off" });
+    expect(effectiveReviewRules(read(ON), kept)).toEqual({ preset: "off" });
+  });
+
+  it("looks a lens's runner up by its own name only, never through the prototype", () => {
+    const rules = effectiveReviewRules(read({ ...ON, lensRunners: { security: RUNNER } }));
+    if (rules.preset === "off") throw new Error("expected the rules on");
+    expect(reviewLensRunner(rules, "security")).toEqual(RUNNER);
+    expect(reviewLensRunner(rules, "approach")).toEqual(
+      REVIEW_RULES_RECOMMENDED.lensRunners.approach,
+    );
+    for (const name of ["review", "constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      expect(reviewLensRunner(rules, name), name).toEqual(REVIEW_RULES_RECOMMENDED.runner);
+      expect((rules.lensRunners as Record<string, unknown>)[name], name).toBeUndefined();
+      // Also for a map built elsewhere, with Object.prototype behind it.
+      const plain = { ...rules, lensRunners: { ...rules.lensRunners } };
+      expect(reviewLensRunner(plain, name), name).toEqual(REVIEW_RULES_RECOMMENDED.runner);
+    }
   });
 });
 
@@ -202,5 +231,8 @@ describe("reviewRules saves", () => {
     expect(() => project({ preset: "off", unreadable: ON })).toThrow();
     expect(() => project({ preset: "recommended", unreadable: { preset: "strict" } })).toThrow();
     expect(() => project({ preset: "strict" })).toThrow();
+    // Only `preset` may stand beside the kept text: a field next to it would be dropped unread.
+    expect(() => project({ ...kept, runner: RUNNER })).toThrow();
+    expect(() => project({ unreadable: { preset: "strict" }, minors: "free" })).toThrow();
   });
 });

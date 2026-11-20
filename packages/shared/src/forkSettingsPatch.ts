@@ -17,6 +17,7 @@ import {
   type ServerSettingsPatch,
   isBuiltInMcpProfileName,
   isDefinableMcpProfileName,
+  isKeptReviewRulesUnchanged,
   isPlaytestProgramFullyQualified,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -273,9 +274,9 @@ function mcpProfileRefProblem(
 
 /**
  * Why the server must refuse this save of fork settings or of an interval (any setting's, see
- * forkSettingsIntervals.ts), or `undefined`. Checks `next` (the
- * settings after the patch) against `current`, so it also sees a project's or thread's value that
- * a client sent back unchanged. Deleting a profile still in use is not refused yet (a later PR).
+ * forkSettingsIntervals.ts), or `undefined`. Checks `next` against `current`, so it also sees a
+ * value a client sent back unchanged (kept `reviewRules` text must be the stored one). Deleting a
+ * profile still in use is not refused yet (a later PR).
  */
 export function forkSettingsWriteProblem(
   current: ServerSettings,
@@ -308,6 +309,9 @@ export function forkSettingsWriteProblem(
         ]
       : undefined;
     problems.push(
+      isKeptReviewRulesUnchanged(stored?.reviewRules, overrides.reviewRules)
+        ? undefined
+        : `Project ${projectId}'s reviewRules sends back unreadable text that is not the one stored for it (it was changed elsewhere): reload the settings and save again, or set the project's review rules anew.`,
       mcpProfileRefProblem(
         next,
         `Project ${projectId}'s mcpProfile`,

@@ -28,6 +28,9 @@ import SETTINGS_SOURCE from "./settings.ts?raw";
 import { PROJECT_FILE_BACKED_SETTINGS, T3ProjectFile } from "./t3ProjectFile.ts";
 
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+const decodeProjectOverrides = Schema.decodeUnknownSync(ProjectSettingsOverrides);
+const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
+const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const PROJECT = ProjectId.make("project-1");
 
 /**
@@ -79,6 +82,21 @@ describe("fork settings seam", () => {
     const good = { "lint-ok": { argv: ["/bin/true"] } };
     expect(patch(good).projectSettingsOverrides?.[PROJECT]).toMatchObject({ waitChecks: good });
     expect(() => patch({ "Bad Name": { argv: ["/bin/true"] } })).toThrow();
+  });
+
+  it("reads a project's hand-written null as not set (the server's), never as off", () => {
+    // `null` is the save's "clear", so a file that holds it means the same thing.
+    for (const key of ["playtest", "handoff", "reviewRules"] as const) {
+      const project = decodeProjectOverrides({ [key]: null });
+      expect(project[key], key).toBeNull();
+      const settings = decodeServerSettings({
+        projectSettingsOverrides: { [PROJECT]: { [key]: null } },
+      });
+      expect(settings.projectSettingsOverrides[PROJECT]?.[key], key).toBeNull();
+      // Written back as it was by a save of another key.
+      const written = encodeServerSettings(settings).projectSettingsOverrides?.[PROJECT];
+      expect(written?.[key], key).toBeNull();
+    }
   });
 
   it("gives every fork setting a patch field and a patch rule", () => {

@@ -54,7 +54,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.waitFor`](#serverwaitfor)                                           | `{"enabled":false}`         | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.waitChecks`](#serverwaitchecks)                                     | `{}`                        | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
 | [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
 | [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
@@ -65,7 +65,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`            | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                     | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                     | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
-| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                     | yes | [#99](https://github.com/scuttletoby/t3code/issues/99)   |
+| [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                     | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
@@ -261,7 +261,8 @@ fields out to keep them fixed. Efforts an agent may not use are the model policy
 setting's.
 
 Fields: `runner` and each `lensRunners` entry are `{driver, model, effort}` (a driver kind, not a
-provider instance); `stateQuestion` is 20 to 600 characters; `minors` is `same-round`, `issue` or
+provider instance), and a lens name is not a built-in object key such as `constructor`;
+`stateQuestion` is 20 to 600 characters; `minors` is `same-round`, `issue` or
 `free`; `configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
 from 1000 to 65000.
 
@@ -472,7 +473,8 @@ A project's own playtest adapter. It replaces the server's `playtest` for that p
 a project sets every step it uses. Not set: the project uses the server's. A project value that is
 not valid reads as off for that project; it never falls back to the server's adapter. A project save
 that leaves this key out (an older client) keeps the stored value; only `null` clears it, and the
-fork's `clearProjectSettingsOverridesWithForkKeys` sends that. Unlike the server's value it is
+fork's `clearProjectSettingsOverridesWithForkKeys` sends that. A `null` written into the file by
+hand means the same: not set, the server's. Unlike the server's value it is
 saved with every field written out, so a project that is off says so in the file. A repository's `t3.json` cannot set
 it: that file is in the repository, which agents edit.
 
@@ -482,8 +484,11 @@ A project's own review rules. It replaces the server's `reviewRules` for that pr
 `{"preset": "off"}` turns review rules off for one project on a machine where they are on, and a
 project with `recommended` does not take the server's fields written out. Not set: the server's. A
 project value that is not valid reads as off for that project, never as the server's, and is kept
-as written. A project save that leaves this key out (an older client) keeps the stored value; only
-`null` clears it, as for `playtest`.
+as written. A project save takes that kept text back only unchanged: a save that sends other
+unreadable text, or text for a project whose stored value reads well (a client that has not reloaded
+since the value was fixed elsewhere), is refused. A project save that leaves this key out (an older
+client) keeps the stored value; only `null` clears it, as for `playtest`. A lens named like a
+built-in object key (`constructor`) is not valid.
 
 ### `projectOverride.mcpProfile`
 
@@ -506,7 +511,8 @@ Not set: the project uses the server's. A project value that is not valid reads 
 project, and the next save of the project writes it back as a full `off` value; it never falls back
 to the server's value. A thread's own mode in the project's or the server's `threads` wins over
 either `mode`, the project's entry first. A project save that leaves this key out (an
-older client) keeps the stored value; only `null` clears it.
+older client) keeps the stored value; only `null` clears it (also when written by hand, as for
+`playtest`).
 
 ### A setting the fork removed
 
