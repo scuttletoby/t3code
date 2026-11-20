@@ -173,9 +173,10 @@ const make = Effect.gen(function* () {
   let stored: StoredReservations | null = null;
   /**
    * Threads allowed a start while the wait store could not be read, so their stored holds were not
-   * used up then. The next good store read uses those holds up and clears this. No grant comes in
-   * between (a grant needs a good read, or waits off, which clears this too), so a hold granted
-   * after the start is never taken.
+   * used up then. The next good store read uses those holds up and clears this. No counted grant
+   * comes in between (a grant under a count limit needs a good read, or waits off, which clears
+   * this too), so a counted hold granted after the start is never taken. A grant under no count
+   * limit can come in between and be used up too; it counts against nothing.
    */
   const unreadStarts = new Set<string>();
 
