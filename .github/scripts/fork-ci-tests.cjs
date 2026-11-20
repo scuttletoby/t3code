@@ -308,7 +308,7 @@ function presentTests(root = ROOT) {
   );
 }
 
-// `--run <test>` runs a test's declared own runs; with FORK_CI_TEST_RECORDS set (CI) each call records what ran (#664).
+// `--run <test>` runs a test's declared own runs; with FORK_CI_TEST_RECORDS set (CI) each call records what ran.
 // FORK_OWN: the fork's own tests (upstream's, in fork-tests.yml's `test` job, are not recorded).
 const FORK_OWN = /^(?:fork-kit\/|fork-ci\/|\.github\/scripts\/fork-)\S*\.test\.\w+$/;
 const THIS_WORKFLOW = ".github/workflows/fork-tests.yml";
