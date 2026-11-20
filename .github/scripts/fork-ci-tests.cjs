@@ -1,7 +1,7 @@
 // Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit is listed in .github/fork-ci-tests.txt and
 // runs here by extension (RUNNER), FORK_CI_TEST_JOBS at once (default: CPU count), or `run by <file>` (not an upstream
 // workflow; it names the test). Unlisted or runner-less tests fail; a listed one that is gone fails once history had it.
-// Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all); order() sets the start order.
+// Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all), FORK_CI_TEST_SHARD one shard of it.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -78,6 +78,9 @@ function readList(text) {
     });
 }
 
+// A test without a weight counts this much when shards are split: one over 30 s fails until it has one.
+const UNWEIGHTED = 10;
+
 // The files to run in start order: those without a weight first (a new test may be long), in list order, then the
 // heaviest first (equal weights in list order). With every slot busy from the start, the longest test sets the time.
 function order(files, entries) {
@@ -85,6 +88,35 @@ function order(files, entries) {
   const position = new Map(entries.map((entry, index) => [entry.file, index]));
   const rank = (file) => weight.get(file) ?? Infinity;
   return files.toSorted((a, b) => rank(b) - rank(a) || position.get(a) - position.get(b));
+}
+
+// Shard `index` (1-based) of `count`: the files heaviest first (as order() starts them), each onto the shard with the
+// least weight so far (the lowest number on a tie). Only the list and the files decide, so every shard of a run makes
+// the same split: each file is in exactly one shard.
+function shard(files, entries, index, count) {
+  const weight = new Map(entries.map((entry) => [entry.file, entry.weight ?? UNWEIGHTED]));
+  const load = new Array(count).fill(0);
+  const mine = [];
+  for (const file of order(
+    files,
+    entries.map((entry) => ({ ...entry, weight: weight.get(entry.file) })),
+  )) {
+    const lightest = load.indexOf(Math.min(...load));
+    load[lightest] += weight.get(file) ?? UNWEIGHTED;
+    if (lightest === index - 1) mine.push(file);
+  }
+  return mine;
+}
+
+// FORK_CI_TEST_SHARD as { index, count }: unset or empty is the whole part (1/1); anything else but `<i>/<n>` with
+// 1 <= i <= n throws, so a broken matrix cannot quietly run one shard's tests or none.
+function readShard(env = process.env) {
+  const value = env.FORK_CI_TEST_SHARD ?? "";
+  if (value === "") return { index: 1, count: 1 };
+  const match = value.match(/^([1-9]\d*)\/([1-9]\d*)$/);
+  if (!match || Number(match[1]) > Number(match[2]))
+    throw new Error(`FORK_CI_TEST_SHARD="${value}": expected <index>/<count>, 1 <= index <= count`);
+  return { index: Number(match[1]), count: Number(match[2]) };
 }
 
 // Whether `file` is in the part the arguments name: under one of the `<prefix>` ones (any, when there are none),
@@ -98,15 +130,27 @@ function inPart(file, parts) {
   );
 }
 
-// A note for the log when a test's weight is missing or far from its time: the order then needs a new weight.
-function weightNote(file, weight, seconds) {
-  if (weight === null)
-    return seconds > 30
-      ? `${file} took ${Math.round(seconds)} s and has no weight: add "~${Math.round(seconds)}s"`
-      : null;
-  // Off by more than half or double and by more than 30 s: load on the runner moves times less than that.
-  return Math.abs(seconds - weight) > 30 && (seconds > 2 * weight || seconds < weight / 2)
-    ? `${file} took ${Math.round(seconds)} s, its weight is ~${weight}s: update it`
+// How fast this runner ran the tests against their weights: the median of time / weight over the passed tests with a
+// weight of at least 10 s (1 with fewer than three). A slow runner takes about the same factor longer on each.
+function runSpeed(runs, weights) {
+  const ratios = runs
+    .filter((run) => run.status === 0 && (weights.get(run.file) ?? 0) >= 10)
+    .map((run) => Number(run.seconds) / weights.get(run.file))
+    .toSorted((a, b) => a - b);
+  if (ratios.length < 3) return 1;
+  const middle = Math.floor(ratios.length / 2);
+  return ratios.length % 2 ? ratios[middle] : (ratios[middle - 1] + ratios[middle]) / 2;
+}
+
+// Why a test's weight must change (null: it need not), from its time on a runner of `speed` (runSpeed()): a weight
+// missing on a test over 30 s, or off by more than half or double and by more than 30 s (load moves times less than
+// that). Shards are split by the weights, so a stale one can push a shard to its time limit: it fails the run.
+function weightNote(file, weight, seconds, speed = 1) {
+  const usual = Math.max(1, Math.round(seconds / speed));
+  const took = `${file} took ${Math.round(seconds)} s${speed === 1 ? "" : ` (~${usual}s on a usual runner)`}`;
+  if (weight === null) return usual > 30 ? `${took} and has no weight: add "~${usual}s"` : null;
+  return Math.abs(usual - weight) > 30 && (usual > 2 * weight || usual < weight / 2)
+    ? `${took}, its weight is ~${weight}s: make it "~${usual}s"`
     : null;
 }
 
@@ -214,6 +258,7 @@ function runTest(file) {
 }
 
 async function main(parts = process.argv.slice(2)) {
+  const { index, count } = readShard();
   const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8")).filter((entry) =>
     inPart(entry.file, parts),
   );
@@ -223,10 +268,21 @@ async function main(parts = process.argv.slice(2)) {
   const rows = [];
   let failed =
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
-  for (const run of await runAll(order(result.run, entries), jobCount(), runTest)) {
+  const mine = shard(result.run, entries, index, count);
+  const runs = await runAll(order(mine, entries), jobCount(), runTest);
+  const speed = runSpeed(runs, weight);
+  const stale = [];
+  for (const run of runs) {
     if (run.status !== 0) failed += 1;
-    const note = weightNote(run.file, weight.get(run.file), Number(run.seconds));
-    if (note) console.log(`::notice file=${run.file}::${note}`);
+    // A failed test's time says nothing about its usual one.
+    const note =
+      run.status === 0 &&
+      weightNote(run.file, weight.get(run.file) ?? null, Number(run.seconds), speed);
+    if (note) {
+      failed += 1;
+      stale.push(note);
+      console.log(`::error file=${run.file}::${note} in ${LIST}`);
+    }
     rows.push(
       `| \`${run.file}\` | ${run.status === 0 ? "passed" : "**failed**"} | ${run.seconds} s | ${weight.get(run.file) ? `~${weight.get(run.file)}s` : ""} |`,
     );
@@ -243,12 +299,13 @@ async function main(parts = process.argv.slice(2)) {
   for (const { file, why } of result.notRun)
     console.log(`::error file=${file}::${file} is not run: ${why}`);
   // A part that runs nothing is a wrong argument (a typo, a renamed folder): its tests would never run.
-  const empty = parts.length > 0 && result.run.length === 0;
+  const empty = (parts.length > 0 || count > 1) && mine.length === 0;
+  const named = [...parts, ...(count > 1 ? [`shard ${index}/${count}`] : [])].join(" ");
   if (empty) {
     failed += 1;
     console.log(
-      `::error::the part ${parts.join(" ")} runs no test here: fix the argument of this ` +
-        `fork-ci-tests.cjs call (a typo or a renamed folder?), or its tests never run.`,
+      `::error::the part ${named} runs no test here: fix the argument of this fork-ci-tests.cjs call ` +
+        `(a typo or a renamed folder?) or its number of shards, or its tests never run.`,
     );
   }
   for (const { file, runBy } of result.elsewhere)
@@ -266,9 +323,17 @@ async function main(parts = process.argv.slice(2)) {
     fs.appendFileSync(
       summary,
       [
-        `### Fork script tests${parts.length ? ` (${parts.join(" ")})` : ""}`,
+        `### Fork script tests${named ? ` (${named})` : ""}`,
         "",
         ...(empty ? [`**No test runs in this part: check its argument.**`, ""] : []),
+        ...(stale.length
+          ? [
+              `**Weights to update in \`${LIST}\`** (this runner's speed: ${speed.toFixed(2)}x the weights):`,
+              "",
+              ...stale.map((note) => `- ${note}`),
+              "",
+            ]
+          : []),
         "| Test | Result | Time | Weight |",
         "| --- | --- | --- | --- |",
         ...rows,
@@ -282,7 +347,10 @@ module.exports = {
   plan,
   readList,
   order,
+  shard,
+  readShard,
   inPart,
+  runSpeed,
   weightNote,
   findTests,
   presentTests,
