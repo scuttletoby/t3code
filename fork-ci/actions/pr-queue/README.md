@@ -268,6 +268,29 @@ or `lens –`, quoted or not), or a `read at` with a hex sha outside a `>` quote
 (a fenced or indented block is no quote). To name a sha a lens read in such a
 comment, quote that line with `>`.
 
+A quote does not help a lens field: a line like `the security lens — fixed in
+<sha>` blocks for good, quoted or not, and `not a lens:` cannot clear it. In a
+fix-round or note comment, put each sha on a line of its own, with no `lens`
+and `:`, `=`, `—` or `–` before it on that line:
+
+```
+not a lens: fix round 2 for the security and state lenses
+- security, major: fixed, with a test that fails on the old head.
+- state, minor: left as is, because ...
+Fixed in:
+<sha>
+```
+
+A comment holds one lens: below a valid header, a line that starts with
+`lens:`, `lens —`, `lens –` or `lens=` and names a sha is a second header, and
+the comment reads nothing. (`LENS = '...'`, with a blank before the `=`, is no
+second header: a report's test code assigns sample headers that way.)
+
+Fenced blocks are read as GitHub renders them: only a line of the same
+character, at least as long and with nothing after it, closes a fence
+(```` ```js ```` inside an open fence is code), and a backtick line with
+another backtick after it is inline code, not a fence.
+
 A comment that looks like a report but is not one valid read is a lens of its
 own, keyed by that comment. Posting the report again the right way adds a new
 read and leaves the old comment blocking, and hiding it is not enough either.
