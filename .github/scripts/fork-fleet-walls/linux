@@ -17,8 +17,10 @@ PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 # folder that holds one, nor any folder named private under /etc): passwords and keys, sudo's rules, ssh's host keys,
 # TLS private keys, every service's environment (/etc/default, /etc/sysconfig), the login and session files, cron,
 # systemd's units and credentials, the mount tables (a share's password), network and VPN secrets, this kit's own
-# conf, and the usual backup and mail tools' folders. A lint of known names (ALLOW_PATHS is a project's explicit
-# choice); etc_secrets reads what is left.
+# conf, the usual backup and mail tools' folders, and every file that names this host's accounts or LAN hosts
+# (passwd, group and hosts, which a job has its own of, their backup copies and subuid/subgid; issue #594). A lint of
+# known names (ALLOW_PATHS is a project's explicit choice); etc_secrets reads what is left. SECRET_ELSEWHERE: the same
+# outside /etc (Debian's /var/backups holds passwd.bak and group.bak, mode 0644).
 SECRET_ETC = ('/etc/shadow', '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/etc/sudoers', '/etc/sudoers.d',
               '/etc/ssh', '/etc/ssl/private', '/etc/pki/tls/private', '/etc/pki/CA/private', '/etc/default',
               '/etc/sysconfig', '/etc/environment', '/etc/environment.d', '/etc/profile', '/etc/profile.d',
@@ -28,7 +30,9 @@ SECRET_ETC = ('/etc/shadow', '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/
               '/etc/wpa_supplicant', '/etc/wireguard', '/etc/openvpn', '/etc/ipsec.secrets', '/etc/ipsec.d',
               '/etc/ppp', '/etc/samba', '/etc/krb5.keytab', '/etc/letsencrypt', '/etc/docker', '/etc/containers',
               '/etc/apt/auth.conf', '/etc/apt/auth.conf.d', '/etc/restic', '/etc/borgmatic', '/etc/msmtprc',
-              '/etc/netrc', '/etc/.git')
+              '/etc/netrc', '/etc/.git', '/etc/passwd', '/etc/passwd-', '/etc/group', '/etc/group-', '/etc/hosts',
+              '/etc/subuid', '/etc/subuid-', '/etc/subgid', '/etc/subgid-')
+SECRET_ELSEWHERE = ('/var/backups',)
 # What a job can still read that may hold a secret (etc_secrets_wall, issue #243 items 5 and 6), besides every file
 # of its /etc view: the host's own programs and settings in /usr/local (LOCAL_TOPS); the packages' units (UNIT_TOPS)
 # and environment files every login or user session reads (ENV_TOPS: systemd's environment.d, fish's vendor_conf.d);
@@ -157,7 +161,7 @@ JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutA
 # The sha256 of the launcher (fork-fleet-launch.sh) these walls ship with, whose start() gives every job unit its own
 # stop timeouts (launcher_shipped). The kit's one pin: fork-fleet-walls/wsl2 reads it from here (issue #365 item 2).
 # A changed launcher must change it (fork-fleet-walls.test.py checks it against the launcher in the repo).
-LAUNCHER_SHA256 = 'd515bbdd44c34d9517cffd29e97a4db43bce0cbd9ca96e43871ee55a8cf7f854'
+LAUNCHER_SHA256 = '806a2de7ed9c224be4a011a665e8b5ca38500a12620908b07eb37c8fcb2daf8d'
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
 UNIT_BLANKS = ' \t\n\r'
@@ -333,9 +337,10 @@ def but_resolv(view):
 
 def secret_etc(p):
     """Whether p is an /etc entry of SECRET_ETC, is in one, or is a folder that holds one; or has a folder named
-    private in it (ssl/private and the like, wherever a tool keeps one)."""
+    private in it (ssl/private and the like, wherever a tool keeps one). Outside /etc: whether p is a path of
+    SECRET_ELSEWHERE, in one, or a folder that holds one (/var)."""
     if not p.startswith('/etc/'):
-        return False
+        return any(p == s or p.startswith(s + '/') or s.startswith(p.rstrip('/') + '/') for s in SECRET_ELSEWHERE)
     return 'private' in p.split('/') or any(
         fnmatch.fnmatchcase(p, s) or fnmatch.fnmatchcase(p, s + '/*') or s.startswith(p + '/') for s in SECRET_ETC)
 
@@ -353,12 +358,13 @@ def mounts_wall():
     if whole:
         return (f'jobs see all of /etc ({", ".join(whole[:3])}): an older kit\'s list; re-run the installer, whose '
                 'list names only the /etc entries builds need')
-    # Issue #370 item 1: nor an /etc entry that holds secrets, or a folder of one (ALLOW_PATHS=/etc/shadow, /etc/ssl).
+    # Issue #370 item 1: nor an /etc entry that holds secrets, or a folder of one (ALLOW_PATHS=/etc/shadow, /etc/ssl);
+    # issue #594: nor one that names this host's accounts (/etc/passwd-, /etc/subuid, /var/backups).
     secret = sorted({dest if dest == real else f'{dest} (that is {real})' for dest, real in but_resolv(view)
                      if secret_etc(dest) or secret_etc(real)})
     if secret:
-        return (f'jobs see {", ".join(secret[:3])}: an /etc entry that holds this host\'s secrets, or a folder of '
-                'one; take it out of ALLOW_PATHS and allow only the files a build needs')
+        return (f'jobs see {", ".join(secret[:3])}: a path that holds this host\'s secrets or account names, or a '
+                'folder of one; take it out of ALLOW_PATHS and allow only the files a build needs')
     for _, real in view:
         point, kind = on_local_disk(table, real)
         if kind not in LOCAL_FS:
