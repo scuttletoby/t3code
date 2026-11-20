@@ -541,6 +541,63 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false, 
 }
 
 /**
+ * Listed "added" copies the fork does not use: room for a line nobody announced (a generic `}` the
+ * fork no longer adds is one more `}` a later change may add). From upstream each listed line allows
+ * no more copies than the head has over the base: more is a `ceilings` refusal, or right after a
+ * rebase (upstream may take a fork line word for word) a note, and `lowered.added` gets the copies in
+ * use. On a pull request, a change that drops copies of a listed line lists exactly main's copies less
+ * those in its own `ownFiles` entry (the own list only refuses: too few fails the run from upstream).
+ */
+function findSpareSeamLines(
+  files,
+  { atBase, atHead, upstream, afterRebase = false, ownFiles, lowered },
+) {
+  const ceilings = [];
+  const notes = [];
+  const times = (count) => (count === 1 ? "" : ` ${count}×`);
+  for (const [file, seam] of Object.entries(files)) {
+    const base = atBase(file);
+    const head = atHead(file);
+    if (base === undefined || head === undefined) continue; // Refused (or noted) elsewhere.
+    const listed = lineCounts(seam.added.join("\n"));
+    const baseCounts = lineCounts(base);
+    const headCounts = lineCounts(head);
+    if (upstream) {
+      const used = new Map();
+      const spare = [];
+      for (const [line, count] of listed) {
+        const over = Math.max(0, (headCounts.get(line) ?? 0) - (baseCounts.get(line) ?? 0));
+        used.set(line, Math.min(count, over));
+        if (over >= count) continue;
+        spare.push(
+          `${file}: "added" lists \`${line}\`${times(count)}, but the fork adds ${over === 0 ? "no copy" : `${over}×`} over upstream; ${over === 0 ? 'remove it from "added"' : `list it ${over}×`} (a spare copy lets a later change add the line unannounced).`,
+        );
+      }
+      if (spare.length > 0) {
+        lowered?.added.set(file, used);
+        (afterRebase ? notes : ceilings).push(...spare);
+      }
+      continue;
+    }
+    if (ownFiles === undefined) continue;
+    const own = Object.hasOwn(ownFiles, file)
+      ? lineCounts(ownFiles[file].added.join("\n"))
+      : new Map();
+    for (const [line, count] of listed) {
+      const dropped = (baseCounts.get(line) ?? 0) - (headCounts.get(line) ?? 0);
+      if (dropped <= 0) continue;
+      const want = Math.max(0, count - dropped);
+      const has = own.get(line) ?? 0;
+      if (has === want) continue;
+      ceilings.push(
+        `${file}: this change drops${times(dropped)} \`${line}\`, which main's list has${times(count)} under "added": ${want === 0 ? "remove it from" : `list it ${want}× under`} "added" in this change's ${CONFIG} (its list has ${has === 0 ? "none" : `${has}`}; a spare copy lets a later change add the line unannounced, too few fails the next run from upstream).`,
+      );
+    }
+  }
+  return { ceilings, notes };
+}
+
+/**
  * Listed seam and pending paths that neither the base nor the head has: nothing there to guard.
  * Upstream renamed (or removed) the file, so the list names both paths until the base moves on, and
  * the checks before and after fork-follow's rebase each see one. A note, not a refusal.
@@ -881,8 +938,9 @@ const MOVED_WHY =
   'Was "pending": fork-follow moved it here once it had no fork line left, as its "lost" entry still counts upstream lines it loses. No seam line: a fork line goes in a file of the fork\'s own.';
 
 /**
- * `text` with `lowered` ({ pending, lost } Maps of counts, `hidden` Set of upstream files) applied, as
- * { text, changes }, or undefined when nothing changes. Only lowers; a count at 0 removes the entry; a
+ * `text` with `lowered` ({ pending, lost } Maps of counts, `added` Map of each file's copies in use,
+ * `hidden` Set of upstream files) applied, as { text, changes }, or undefined when nothing changes.
+ * Only lowers; a count at 0 removes the entry; a spare "added" copy goes; a
  * "pending" file with no fork line left moves to "files"; each hidden file stops being a fork file
  * (its own "forkFiles" entry goes, or a `!` entry excludes it). Parsed again before it is returned.
  */
@@ -945,6 +1003,26 @@ function lowerList(text, lowered) {
     changes.push(
       `${file}: "forkFiles" ${what} (upstream has it; a pull request's run took it for a fork file)`,
     );
+  }
+  // Spare "added" copies go, the first listed copies stay: only narrows what a change may add.
+  for (const [file, used] of lowered.added ?? []) {
+    if (!Object.hasOwn(raw.files ?? {}, file)) continue;
+    const seam = raw.files[file];
+    const kept = new Map();
+    const removed = [];
+    const added = seam.added.filter((item) => {
+      const line = item.trim();
+      const count = (kept.get(line) ?? 0) + 1;
+      kept.set(line, count);
+      if (count <= (used.get(line) ?? Infinity)) return true;
+      removed.push(line);
+      return false;
+    });
+    if (removed.length === 0) continue;
+    changes.push(
+      `${file}: "added" ${seam.added.length} -> ${added.length} lines (spare: ${removed.map((line) => `\`${line}\``).join(", ")})`,
+    );
+    seam.added = added;
   }
   // Appended through defineProperty: a file named `__proto__` stays an own key.
   for (const file of moved) {
@@ -1059,7 +1137,7 @@ function main(argv) {
   const lowered =
     parsed.loweredList === undefined
       ? undefined
-      : { pending: new Map(), lost: new Map(), hidden: new Set() };
+      : { pending: new Map(), lost: new Map(), added: new Map(), hidden: new Set() };
   const unlisted = findUnlistedChanges(config, {
     changed,
     atBase,
@@ -1082,9 +1160,17 @@ function main(argv) {
     afterRebase: parsed.afterRebase,
     lowered,
   });
+  const spare = findSpareSeamLines(config.files, {
+    atBase,
+    atHead,
+    upstream,
+    afterRebase: parsed.afterRebase,
+    ownFiles,
+    lowered,
+  });
   // A ceiling above the count is fixed by lowering it, not by moving lines: its own hint. A count
   // that rose with a rebase names the operator's step in its own text.
-  const ceilings = [...unlisted.ceilings, ...lost.ceilings];
+  const ceilings = [...unlisted.ceilings, ...lost.ceilings, ...spare.ceilings];
   const rises = [...unlisted.rises, ...lost.rises];
   // A pull request's run dates an announcement by the commit whose list judges it (main's): its
   // own author sets its own date, and fork-checks' base can be older than the list's commit.
@@ -1122,7 +1208,12 @@ function main(argv) {
       )
     : [];
   const from = parsed.configRef ? `--config-ref ${configRef}` : upstream ? "the head" : "the base";
-  const notes = [...findListedGone(config, { atBase, atHead }), ...unlisted.notes, ...lost.notes];
+  const notes = [
+    ...findListedGone(config, { atBase, atHead }),
+    ...unlisted.notes,
+    ...lost.notes,
+    ...spare.notes,
+  ];
   for (const note of notes) console.log(printable(`Note: ${note}`));
   if (editsList) {
     console.log(
@@ -1184,7 +1275,7 @@ function main(argv) {
   }
   if (ceilings.length > 0) {
     console.error(
-      `Lower each "pending" ceiling and "lost" count named above (or remove the entry, or set the value its line names) in ${CONFIG}: in this change's list where the line says so, otherwise with a pull request to main.`,
+      `Lower each "pending" ceiling and "lost" count, and drop each spare "added" copy, named above (or remove the entry, or set the value its line names) in ${CONFIG}: in this change's list where the line says so, otherwise with a pull request to main.`,
     );
   }
   if (late.length > 0) {
@@ -1216,6 +1307,7 @@ module.exports = {
   findListedGone,
   findLostLines,
   findSeamBreaches,
+  findSpareSeamLines,
   findStaleSeamLines,
   findUnlistedChanges,
   forkFileTest,
