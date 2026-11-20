@@ -183,7 +183,12 @@ Two more things limit what a job can do:
   in the unit's root at each start, never this host's (issue #370): only
   root, nobody and the job's own user and group, and `localhost` and this
   host's name on loopback, so no account name, home folder or LAN host name
-  of this host's is there; a list that still names them is refused. Also the
+  of this host's is there; a list that still names them is refused. The job's
+  account there has `/bin/sh` as its shell, not the host account's
+  `/usr/sbin/nologin` (host step 1): tools that read the login shell get a real
+  one, and inside the sandbox it opens nothing more. This host's name gets a
+  loopback line only when it is letters, digits, `.`, `-` and `_`; with any
+  other character Java's `getLocalHost` fails in the job (issue #594). Also the
   launcher's `ALLOW_PATHS`, the hook and its own copy. So a share or drive
   mounted anywhere else (`/mnt`, `/media`, `/srv`, `/data`, a Windows drive at
   `/c`) is not there. `MountFlags=private`: a mount the host makes after the job
@@ -203,13 +208,17 @@ Two more things limit what a job can do:
   runner's group may; another `CANARY_DIR` must be root's, only root may
   write it or any folder above it, and no link may lead to it, or check-net
   refuses). An older kit whose list still names `/etc` whole is
-  refused by the launcher and fails `mounts`: re-run the installer. A
+  refused by the launcher and fails `mounts`: re-run the installer (the
+  refusal says so for the installer's own list; for an `ALLOW_PATHS` entry or
+  a `JOB_PATHS` file it names that line's file to edit instead). A
   project that needs another `/etc` entry adds it to `ALLOW_PATHS`, the file
   alone; an entry that holds this host's secrets, is in one, or is a folder
   that holds one (`shadow`, `sudoers`, `ssh`, `ssl` (it holds `ssl/private`),
   `/etc/default`, cron, `systemd`, `fstab`, this kit's own folder, any folder
   named `private`, ...) fails `mounts`, as written and where it really leads
-  (issue #370). The per-OS walls ask
+  (issue #370); so does one that names this host's accounts (`passwd`,
+  `group`, `hosts`, their backups `passwd-` and `group-`, `subuid`, `subgid`,
+  and `/var/backups` outside `/etc`: issue #594). The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`, and `tools` for the
   `systemd-run` and `systemctl` it runs) instead of keeping a list of their
   own. A systemd drop-in that changes the job units (`service.d`,

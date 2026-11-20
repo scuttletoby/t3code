@@ -4,18 +4,23 @@
  * A retry of an accepted request passes every seat untouched: it starts no new work.
  */
 import {
+  isProviderWorkspaceSnapshotCurrent,
+  isProviderWorkspaceSnapshotPending,
   type ModelSelection,
   type OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpFailure,
   type OrchestratorMcpTarget,
+  PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
   type OrchestrationV2ThreadProjection,
   type RuntimeMode,
   type ServerProvider,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import type * as Scope from "effect/Scope";
 
 import { resolveRuntimeMode } from "../mcp/delegatedTaskModes.ts";
@@ -125,9 +130,9 @@ const advertisedModel = (provider: ServerProvider, model: string) =>
 /**
  * The models a folder's own provider config adds, as the target lookup reads them: the same merge
  * as `withWorkspaceModels` in `mcp/OrchestratorMcpService.ts`, which this module cannot import (that
- * file imports this one).
+ * file imports this one). `delegateChecks.test.ts` checks that both give the same lists.
  */
-const withFolderModels = (
+export const withFolderModels = (
   providers: ReadonlyArray<ServerProvider>,
   cwd: string | undefined,
 ): ReadonlyArray<ServerProvider> =>
@@ -139,6 +144,29 @@ const withFolderModels = (
         )?.models;
         return models === undefined ? provider : { ...provider, models };
       });
+
+/**
+ * Whether an instance's scan of a folder gave an answer: a snapshot for it that is current and not
+ * pending. Without one, a missing model may only mean the scan failed.
+ */
+const scannedFolder = (
+  providers: ReadonlyArray<ServerProvider>,
+  instanceId: ServerProvider["instanceId"],
+  cwd: string,
+  nowMs: number,
+) => {
+  const snapshot = providers
+    .find((provider) => provider.instanceId === instanceId)
+    ?.workspaceSnapshots?.find((entry) => entry.cwd === cwd);
+  return (
+    snapshot !== undefined &&
+    !isProviderWorkspaceSnapshotPending(snapshot) &&
+    isProviderWorkspaceSnapshotCurrent(snapshot, nowMs)
+  );
+};
+
+/** A folder scan that gave no answer is not run again for the same instance and folder for this long. */
+const FAILED_SCAN_BACKOFF_MS = PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS;
 
 const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void };
 
@@ -153,6 +181,11 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
   const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
+  /**
+   * Folder scans for a switch target that gave no answer: instance and folder -> the time a scan may
+   * run again. Memory only: a restart costs one more scan. Expired entries are dropped on each write.
+   */
+  const failedScans = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
 
   /**
    * The usage pacing gate (`usagePacingGate` setting, off by default). A setting or a pace that
@@ -167,6 +200,11 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
       return { target: input.target };
     }
     const { instanceId, model, options } = input.target.modelSelection;
+    const nowMs = yield* Clock.currentTimeMillis;
+    // `advise` only says what `enforce` would do, so it runs no folder scan (a scan publishes a
+    // snapshot and takes the driver's probe time). A named instance still scans in `enforce`: the
+    // answer decides between holding the task and lowering its effort.
+    const mayScan = settings.value.usagePacingGate === "enforce";
     // Read after the target lookup, so any refresh or folder scan it ran is in the list.
     const providers = withFolderModels(yield* providerRegistry.getProviders, input.cwd);
     const provider = providers.find((candidate) => candidate.instanceId === instanceId);
@@ -191,7 +229,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
     const outcome = yield* UsagePacingGate.decide({
       mode: settings.value.usagePacingGate,
       lowerEffort: settings.value.usagePacingLowerEffort,
-      nowMs: yield* Clock.currentTimeMillis,
+      nowMs,
       instanceId,
       pinned: input.requested?.providerInstanceId !== undefined,
       providers,
@@ -213,14 +251,38 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         });
         if (!enabled) return { cannot: "this project turned it off" };
         let resolved = yield* sameTaskOn(candidate, providers);
+        const missing = (result: typeof resolved) =>
+          result._tag === "Failure" && result.failure.code === "model_unavailable";
         // The lookup scanned the folder for the requested instance only, and a fresh scan of one
         // instance drops the others' snapshots of it: scan it for this one too, then look again.
-        if (
-          input.cwd !== undefined &&
-          resolved._tag === "Failure" &&
-          resolved.failure.code === "model_unavailable"
-        ) {
-          resolved = yield* sameTaskOn(candidate, yield* host.scanWorkspace(candidate, input.cwd));
+        // Only a missing model is worth a scan; any other refusal stands as it is.
+        if (input.cwd !== undefined && missing(resolved)) {
+          const cwd = input.cwd;
+          if (!mayScan) {
+            return {
+              cannot: scannedFolder(providers, candidate, cwd, nowMs)
+                ? `it does not list ${model} for this folder`
+                : `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
+            };
+          }
+          const key = `${candidate}\u0000${cwd}`;
+          const noAnswer = (retryAtMs: number) => ({
+            cannot: `it does not list ${model} and its scan of this folder gave no result (scanned again after ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))})`,
+          });
+          const retryAtMs = (yield* Ref.get(failedScans)).get(key);
+          if (retryAtMs !== undefined && nowMs < retryAtMs) return noAnswer(retryAtMs);
+          const scanned = yield* host.scanWorkspace(candidate, cwd);
+          resolved = yield* sameTaskOn(candidate, scanned);
+          // A failed scan leaves the list as it was: say so, and do not scan again on every call.
+          const failed = missing(resolved) && !scannedFolder(scanned, candidate, cwd, nowMs);
+          const nextRetryMs = nowMs + FAILED_SCAN_BACKOFF_MS;
+          yield* Ref.update(failedScans, (current) => {
+            const next = new Map([...current].filter(([, until]) => until > nowMs));
+            if (failed) next.set(key, nextRetryMs);
+            else next.delete(key);
+            return next;
+          });
+          if (failed) return noAnswer(nextRetryMs);
         }
         if (resolved._tag === "Failure") {
           return {
