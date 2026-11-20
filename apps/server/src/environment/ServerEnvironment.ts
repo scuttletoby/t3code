@@ -301,7 +301,6 @@ export const make = Effect.gen(function* () {
       mcpHostedApproval: true,
       shellThreadFamilies: true,
       shellOlderSettled: true,
-      mcpProfileCarry: true, // Fork: applies a carried MCP profile
     },
   };
 

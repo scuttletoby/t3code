@@ -21,6 +21,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import { HttpClient } from "effect/http";
 import * as Logger from "effect/Logger";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -234,6 +235,11 @@ const makeHarness = (
             Layer.succeed(SecureRandom.SecureRandom, {
               uuidV4: Effect.succeed("00000000-0000-4000-8000-000000000000"),
             } as never),
+            // The features ask goes only with a profile narrower than `all`; none here.
+            Layer.succeed(
+              HttpClient.HttpClient,
+              HttpClient.make(() => Effect.die("no features ask expected")),
+            ),
           ),
         ),
       ),

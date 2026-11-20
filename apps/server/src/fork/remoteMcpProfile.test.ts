@@ -24,6 +24,8 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
+import { HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/http";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { advertisedJsonSchema } from "../mcp/advertisedJsonSchema.ts";
@@ -78,8 +80,50 @@ const input = {
   RemoteDelegation.RemoteDelegation["Service"]["delegate"]
 >[1];
 
-/** The linked machine as `PeerLinks.resolve` sees it: on this version, an older one, or silent. */
-type Box = "carries" | "older" | "silent" | { readonly hold: Deferred.Deferred<void> };
+/**
+ * The linked machine: on this version ("carries"), an older one whose server answers the features
+ * path with its app page ("older"), one that answers 404 ("refuses"), not linked or resolvable
+ * ("unlinked"), unreachable ("down"), never answering ("never"), or answering once `hold` is done.
+ */
+type Box =
+  | "carries"
+  | "older"
+  | "refuses"
+  | "unlinked"
+  | "down"
+  | "never"
+  | { readonly hold: Deferred.Deferred<void> };
+
+/** How `box` answers `request`, as its server would. */
+const answer = (peer: Box, request: HttpClientRequest.HttpClientRequest) => {
+  const respond = (response: Response) =>
+    Effect.succeed(HttpClientResponse.fromWeb(request, response));
+  if (typeof peer === "object")
+    return Deferred.await(peer.hold).pipe(
+      Effect.andThen(respond(Response.json({ mcpProfileCarry: true }))),
+    );
+  switch (peer) {
+    case "carries":
+      return respond(Response.json({ mcpProfileCarry: true }));
+    case "older":
+      return respond(
+        new Response("<!doctype html><p>app", { headers: { "content-type": "text/html" } }),
+      );
+    case "refuses":
+      return respond(new Response("Not Found", { status: 404 }));
+    case "never":
+      return Effect.never;
+    default:
+      return Effect.fail(
+        new HttpClientError.HttpClientError({
+          reason: new HttpClientError.TransportError({
+            request,
+            cause: new TypeError("fetch failed"),
+          }),
+        }),
+      );
+  }
+};
 
 /**
  * The delegation service with the box faked. `settings` is this machine's settings file; the
@@ -88,26 +132,21 @@ type Box = "carries" | "older" | "silent" | { readonly hold: Deferred.Deferred<v
 const makeHarness = (settings: Record<string, unknown>, peer: Box) =>
   Effect.gen(function* () {
     const launched: Array<Record<string, unknown>> = [];
-    let asked = 0;
-    const answered = Effect.sync(() => {
-      asked++;
-      return {
-        link: { label: "box" },
-        url: "https://box.test",
-        token: "token",
-        // An older machine's descriptor has no such flag.
-        capabilities: peer === "older" ? { peerLinks: true } : { mcpProfileCarry: true },
-      } as never;
+    /** Each ask of the box: where it went and with which token. */
+    const asks: Array<string> = [];
+    const resolve = () =>
+      peer === "unlinked"
+        ? Effect.fail(new PeerLinkError({ reason: "unreachable", message: "box did not answer." }))
+        : Effect.succeed({
+            link: { label: "box" },
+            url: "https://box.test",
+            token: "link-token",
+          } as never);
+    const asked = yield* Deferred.make<void>();
+    const http = HttpClient.make((request) => {
+      asks.push(`${request.url} ${request.headers.authorization}`);
+      return Deferred.succeed(asked, undefined).pipe(Effect.andThen(answer(peer, request)));
     });
-    const resolve =
-      peer === "silent"
-        ? () =>
-            Effect.fail(
-              new PeerLinkError({ reason: "unreachable", message: "box did not answer." }),
-            )
-        : typeof peer === "object"
-          ? () => Deferred.await(peer.hold).pipe(Effect.andThen(answered))
-          : () => answered;
 
     const forwarding = Layer.mock(PeerForwarding.PeerForwarding)({
       call: ((_scope: unknown, tool: { readonly name: string }, _env: unknown, params: never) =>
@@ -178,6 +217,7 @@ const makeHarness = (settings: Record<string, unknown>, peer: Box) =>
             Layer.succeed(SecureRandom.SecureRandom, {
               uuidV4: Effect.succeed("00000000-0000-4000-8000-000000000000"),
             } as never),
+            Layer.succeed(HttpClient.HttpClient, http),
           ),
         ),
       ),
@@ -186,7 +226,9 @@ const makeHarness = (settings: Record<string, unknown>, peer: Box) =>
     return {
       delegate: remote.delegate(scope, input),
       launched,
-      asked: () => asked,
+      asks,
+      /** Done once the box has been asked. */
+      asked: Deferred.await(asked),
       /** What the launch there carried as the parent's profile. */
       carried: () =>
         launched.map(
@@ -197,23 +239,29 @@ const makeHarness = (settings: Record<string, unknown>, peer: Box) =>
 
 const T3_ONLY = { mcpThreadProfiles: { [parentThreadId]: "t3-only" } };
 
+const ASKED = ["https://box.test/api/fork/features Bearer link-token"];
+
 it.effect("carries a t3-only parent's profile to a machine that applies it", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const harness = yield* makeHarness(T3_ONLY, "carries");
       yield* harness.delegate;
       assert.deepStrictEqual(harness.carried(), [{ name: "t3-only", servers: [], t3Tools: "all" }]);
-      assert.strictEqual(harness.asked(), 1);
+      // Asked once, at the address that answered as the box, with its link token.
+      assert.deepStrictEqual(harness.asks, ASKED);
     }),
   ),
 );
 
-it.effect("refuses, before any launch, a narrower profile to a machine on an older T3", () =>
+it.effect.each<readonly [string, Box]>([
+  ["on an older T3 (its app page answers)", "older"],
+  ["that answers 404", "refuses"],
+])("refuses, before any launch, a narrower profile to a machine %s", ([, peer]) =>
   Effect.scoped(
     Effect.gen(function* () {
       const harness = yield* makeHarness(
         { mcpProfiles: { docs: { servers: ["docs"], t3Tools: "all" } }, mcpProfile: "docs" },
-        "older",
+        peer,
       );
       const exit = yield* Effect.exit(harness.delegate);
       assert.isTrue(Exit.isFailure(exit));
@@ -222,17 +270,45 @@ it.effect("refuses, before any launch, a narrower profile to a machine on an old
         JSON.stringify(exit),
         'does not apply this thread\'s MCP profile (\\"docs\\")',
       );
+      assert.deepStrictEqual(harness.asks, ASKED);
       assert.deepStrictEqual(harness.launched, []);
     }),
   ),
 );
 
-it.effect("refuses a narrower profile when the machine cannot be asked", () =>
+it.effect("refuses a narrower profile when the machine is not linked", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const harness = yield* makeHarness(T3_ONLY, "silent");
+      const harness = yield* makeHarness(T3_ONLY, "unlinked");
       const exit = yield* Effect.exit(harness.delegate);
       assert.include(JSON.stringify(exit), "box did not answer.");
+      assert.deepStrictEqual(harness.asks, []);
+      assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
+);
+
+it.effect("refuses a narrower profile when the machine cannot be reached", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(T3_ONLY, "down");
+      const exit = yield* Effect.exit(harness.delegate);
+      assert.include(JSON.stringify(exit), "orchestration_error");
+      assert.include(JSON.stringify(exit), "box did not answer whether it applies");
+      assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
+);
+
+it.effect("refuses a narrower profile when the machine does not answer in time", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(T3_ONLY, "never");
+      const call = yield* harness.delegate.pipe(Effect.exit, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(PeerLinks.probeTimeout("https://box.test"));
+      const exit = yield* Fiber.join(call);
+      assert.include(JSON.stringify(exit), "box did not answer whether it applies");
       assert.deepStrictEqual(harness.launched, []);
     }),
   ),
@@ -247,7 +323,7 @@ it.effect.each<readonly [string, Record<string, unknown>]>([
       const harness = yield* makeHarness(settings, "older");
       yield* harness.delegate;
       assert.deepStrictEqual(harness.carried(), [{ name: "all", servers: "all", t3Tools: "all" }]);
-      assert.strictEqual(harness.asked(), 0);
+      assert.deepStrictEqual(harness.asks, []);
     }),
   ),
 );
@@ -272,7 +348,8 @@ it.effect(
         const hold = yield* Deferred.make<void>();
         const harness = yield* makeHarness(T3_ONLY, { hold });
         const call = yield* harness.delegate.pipe(Effect.forkChild);
-        yield* Effect.yieldNow;
+        // Stopped while the box is being asked.
+        yield* harness.asked;
         yield* Fiber.interrupt(call);
         assert.deepStrictEqual(harness.launched, []);
         yield* Deferred.succeed(hold, undefined);
@@ -281,6 +358,8 @@ it.effect(
         const [first, second] = harness.carried();
         assert.deepStrictEqual(first, { name: "t3-only", servers: [], t3Tools: "all" });
         assert.deepStrictEqual(second, first);
+        // Each run asks again: an answer is not kept, so an update or a downgrade there counts.
+        assert.strictEqual(harness.asks.length, 3);
       }),
     ),
 );

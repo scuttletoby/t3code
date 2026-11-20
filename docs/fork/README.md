@@ -386,8 +386,12 @@ field it does not know) refuses the task's turn rather than giving it more.
 
 A machine on a T3 from before this cannot apply a carried profile, so a thread whose profile is
 narrower than `all` does not delegate to it: the call is refused before anything is sent there,
-and says to update T3 on that machine (a machine says it can in its descriptor, as
-`mcpProfileCarry`). A thread with `all` delegates to any machine. A task that arrives from a machine
+and says to update T3 on that machine. Before sending, the delegating machine asks the other at
+`GET /api/fork/features` with that link's own token; the route answers only a linked machine's
+token, never a browser, and any other caller gets a plain 404. Only `mcpProfileCarry: true` counts:
+an older T3 answers that path with its app page, which reads as "cannot", and no answer in time
+refuses the task too. It asks again for each task, so an update or a downgrade there counts at once.
+A thread with `all` delegates to any machine, without asking. A task that arrives from a machine
 on an older T3 carries nothing, so it gets this machine's profile for its role as before, and the
 server log says so.
 

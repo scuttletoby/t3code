@@ -16,6 +16,7 @@ import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
+import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
@@ -69,6 +70,8 @@ export const layerRoutes = Layer.mergeAll(
   ServerAutoUpdate.layer,
   // GET /api/fork/activity: 404 unless activityProbe is on; loopback programs only.
   ActivityProbe.layer,
+  // GET /api/fork/features: what this version does for a linked machine; its token only.
+  ForkFeatures.layer,
 );
 
 /**

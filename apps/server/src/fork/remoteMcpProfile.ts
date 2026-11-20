@@ -1,13 +1,15 @@
 /**
  * Fork: a task delegated to a linked machine carries its parent's MCP profile (cut to there by
  * fork/mcpProfile.ts). An older machine drops it, so a profile narrower than `all` goes only to one
- * that says `mcpProfileCarry`; to any other the task is refused, never run there with more.
+ * whose fork/forkFeatures.ts route says it applies one; any other refuses, never runs with more.
  */
 import { type EnvironmentId, OrchestratorMcpFailure } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import { HttpClient } from "effect/http";
 
-import type * as PeerLinks from "../peer/PeerLinks.ts";
+import * as PeerLinks from "../peer/PeerLinks.ts";
 import { type LineageThread, makeThreadMcpProfiles } from "./claudeMcpProfile.ts";
+import { readForkFeatures } from "./forkFeatures.ts";
 import { carryMcpProfile, isEveryMcpTool } from "./mcpProfile.ts";
 
 /**
@@ -19,6 +21,7 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
   links: Pick<PeerLinks.PeerLinks["Service"], "resolve">,
 ) {
   const profileFor = yield* makeThreadMcpProfiles;
+  const http = yield* HttpClient.HttpClient;
   return Effect.fn("RemoteMcpProfile.carry")(function* (
     parent: LineageThread,
     environmentId: EnvironmentId,
@@ -44,7 +47,20 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
             new OrchestratorMcpFailure({ code: "orchestration_error", message: error.message }),
         ),
       );
-    if (peer.capabilities?.mcpProfileCarry !== true) {
+    const features = yield* readForkFeatures(http, {
+      url: peer.url,
+      token: peer.token,
+      timeout: PeerLinks.probeTimeout(peer.url),
+    }).pipe(
+      Effect.mapError(
+        () =>
+          new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: `${peer.link.label} did not answer whether it applies a carried MCP profile, so the task was not sent.`,
+          }),
+      ),
+    );
+    if (features.mcpProfileCarry !== true) {
       return yield* new OrchestratorMcpFailure({
         code: "capability_denied",
         message: `${peer.link.label} runs a T3 Code version that does not apply this thread's MCP profile ("${resolved.name}") to a task, so the task was not sent: there it would get every MCP server that machine's own profile allows. Update T3 Code on ${peer.link.label}, or delegate the task on this machine.`,
