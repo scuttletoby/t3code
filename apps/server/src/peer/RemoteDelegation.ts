@@ -45,6 +45,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as RemoteReplyRead from "../fork/remoteReplyRead.ts"; // Fork: replies across versions
+import * as RemoteMcpProfile from "../fork/remoteMcpProfile.ts"; // Fork: MCP profile carry
 import * as ProjectService from "../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -167,6 +168,7 @@ const make = Effect.gen(function* () {
   );
   // Followers live as long as this service, so shutting down stops them.
   const followers = yield* Scope.Scope;
+  const carryMcpProfile = yield* RemoteMcpProfile.makeCarry(links); // Fork: MCP profile carry
 
   // One follower runs per open task and holds what it read across a wait of
   // up to FOLLOW_WAIT_MS, so it reads its own task, never the parent's whole
@@ -345,6 +347,7 @@ const make = Effect.gen(function* () {
       const key = input.clientRequestId ?? (yield* random.uuidV4());
       const task = taskPrompt(input);
       const title = input.title ?? parent.thread.title;
+      const carried = yield* carryMcpProfile(parent.thread, target.environmentId); // Fork: before the launch
       // Fork: from the launch on, the task is recorded and followed even if this call is
       // interrupted (the parent's turn moved on), else the thread there runs with nothing here
       // following it or reporting its end. The reads above stay cancellable.
@@ -367,6 +370,7 @@ const make = Effect.gen(function* () {
             environmentId: hereId,
             threadId: parent.thread.id,
             title: parent.thread.title,
+            ...carried, // Fork: the parent's MCP profile
           },
         },
       );

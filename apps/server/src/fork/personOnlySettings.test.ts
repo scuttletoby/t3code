@@ -18,6 +18,7 @@ import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 import { beforeAll, describe, expect, it } from "vite-plus/test";
 
+import { withoutMachineOnlyFields } from "./advertisedMachineFields.ts";
 import {
   MCP_T3_TOOLKIT_GROUPS,
   MCP_T3_TOOL_NOT_ALLOWED,
@@ -129,9 +130,14 @@ const propertyNames = (schema: unknown): ReadonlyArray<string> => {
   return [...own, ...Object.values(record).flatMap(propertyNames)];
 };
 
-/** The person-only settings a tool's input names. */
+/**
+ * The person-only settings a tool's input names. A field only a linked machine sets is skipped: it
+ * is kept only on that machine's stamped call and only narrows (see advertisedMachineFields.ts).
+ */
 const personOnlyKeysIn = (tool: Tool.Any): ReadonlyArray<string> =>
-  propertyNames(Tool.getJsonSchema(tool)).flatMap((name) => {
+  propertyNames(
+    withoutMachineOnlyFields(Tool.getJsonSchema(tool) as { [key: string]: unknown }),
+  ).flatMap((name) => {
     const key = PERSON_ONLY.get(normalize(name));
     return key === undefined ? [] : [key];
   });
@@ -223,6 +229,24 @@ describe("person-only fork settings", () => {
       });
       expect(personOnlyKeysIn(tool), field).toEqual([key]);
     }
+  });
+
+  it("skips only the carried profile a linked machine sends, not one beside it", () => {
+    const tool = Tool.make("fake_launch", {
+      parameters: Schema.Struct({
+        mcpProfile: Schema.optionalKey(Schema.String),
+        delegatedFrom: Schema.optional(
+          Schema.NullOr(
+            Schema.Struct({
+              threadId: Schema.String,
+              mcpProfile: Schema.optionalKey(Schema.String),
+              reviewRules: Schema.optionalKey(Schema.String),
+            }),
+          ),
+        ),
+      }),
+    });
+    expect(personOnlyKeysIn(tool).toSorted()).toEqual(["mcpProfile", "reviewRules"]);
   });
 });
 
