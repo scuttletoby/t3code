@@ -79,6 +79,7 @@ export interface ResolvedPeerLink {
   /** The first address that answered as this peer. */
   readonly url: string;
   readonly token: string;
+  readonly capabilities?: ExecutionEnvironmentCapabilities; // Fork: as that address answered
 }
 
 export const LINKED_ENVIRONMENTS_OFF =
@@ -690,6 +691,7 @@ const make = Effect.gen(function* () {
         link: yield* withLabel(link, peer.label),
         url,
         token: new TextDecoder().decode(stored.value),
+        capabilities: peer.capabilities, // Fork: MCP profile carry
       };
     },
   );

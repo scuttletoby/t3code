@@ -375,10 +375,21 @@ nothing is checked. A
 profile change applies from the thread's next turn: a running turn, and a message sent into it,
 keep the session it started with.
 
-A task delegated to another machine has no parent thread there, so it gets that machine's profile
-for its role (`mcpSubagentProfile`, else `mcpProfile`), not the delegating thread's: server names on
-two machines need not mean the same servers. Carrying the parent's profile along is
-[#532](https://github.com/scuttletoby/t3code/issues/532).
+A task delegated to another machine carries its parent's profile along
+([#532](https://github.com/scuttletoby/t3code/issues/532)), and that machine cuts the task's own
+profile for its role (`mcpSubagentProfile`, else `mcpProfile`) down to it, as it cuts a child to
+its parent: `t3-only` or `[]` stays as it is, two lists keep only the server names both name, and it
+never gets more than that machine's own profile gives it. Server names are matched as written, so
+the two machines should use the same names. An owner's pick for the task there (`mcpThreadProfiles`)
+stands, as on one machine. A carried profile that machine cannot read (one from a newer T3 with a
+field it does not know) refuses the task's turn rather than giving it more.
+
+A machine on a T3 from before this cannot apply a carried profile, so a thread whose profile is
+narrower than `all` does not delegate to it: the call is refused before anything is sent there,
+and says to update T3 on that machine (a machine says it can in its descriptor, as
+`mcpProfileCarry`). A thread with `all` delegates to any machine. A task that arrives from a machine
+on an older T3 carries nothing, so it gets this machine's profile for its role as before, and the
+server log says so.
 
 ```json
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
@@ -395,8 +406,8 @@ one (for example after a hand edit) is refused instead of getting `all`.
 ### `server.mcpSubagentProfile`
 
 The profile a delegated child gets when nobody picked one for it. `inherit` (the default) gives it
-its parent's profile. A child on the same machine never gets more than its parent; a task
-delegated from another machine gets this machine's profile (see `server.mcpProfiles`).
+its parent's profile. A child never gets more than its parent, also a task delegated from another
+machine (see `server.mcpProfiles`).
 
 ### `server.mcpThreadProfiles`
 

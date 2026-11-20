@@ -1,0 +1,339 @@
+/**
+ * Fork: a remote `delegate_task` carries its parent's MCP profile in `delegatedFrom`, and
+ * sends a profile narrower than `all` only to a linked machine that says it applies one. Everything
+ * around the delegation is faked, the linked machine too: no second machine is needed.
+ */
+import { assert, it } from "@effect/vitest";
+import {
+  type EnvironmentId,
+  NodeId,
+  OrchestrationV2DelegatedFrom,
+  type OrchestratorMcpDelegateTaskInput,
+  PeerLinkError,
+  ProjectId,
+  ProviderInstanceId,
+  RunId,
+  ServerSettings,
+  ThreadId,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
+import * as SecureRandom from "effect/crypto/SecureRandom";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import { advertisedJsonSchema } from "../mcp/advertisedJsonSchema.ts";
+import type * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import { ProjectToolkit } from "../mcp/toolkits/project/tools.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import * as PeerForwarding from "../peer/PeerForwarding.ts";
+import * as PeerLinks from "../peer/PeerLinks.ts";
+import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
+import * as ProjectService from "../project/ProjectService.ts";
+import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import * as ServerSettingsService from "../serverSettings.ts";
+import { resolveMcpProfile } from "./mcpProfile.ts";
+
+const box = "environment-box" as EnvironmentId;
+const parentThreadId = ThreadId.make("thread:parent");
+const taskId = NodeId.make("node:task");
+const instanceId = ProviderInstanceId.make("claude");
+const modelSelection = { instanceId, model: "claude-opus" };
+const fromFile = Schema.decodeSync(ServerSettings);
+const launch = Schema.decodeUnknownSync(ProjectToolkit.tools.t3_thread_launch.parametersSchema);
+const launchAsSent = Schema.decodeUnknownSync(
+  Schema.toCodecJson(ProjectToolkit.tools.t3_thread_launch.parametersSchema),
+);
+const decodeDelegatedFrom = Schema.decodeSync(OrchestrationV2DelegatedFrom);
+
+const scope: McpInvocationContext.McpThreadInvocationScope = {
+  environmentId: "environment-here" as EnvironmentId,
+  requestNamespace: "provider-session:parent",
+  thread: {
+    threadId: parentThreadId,
+    providerSessionId: "provider-session:parent",
+    providerInstanceId: instanceId,
+  },
+  client: undefined,
+  capabilities: new Set(["orchestration"]),
+  issuedAt: 1,
+};
+
+const input = {
+  task: "Review the change on the box.",
+  target: {
+    environmentId: box,
+    providerInstanceId: instanceId,
+    model: "claude-opus",
+    projectId: ProjectId.make("project:box"),
+  },
+  mode: "async",
+  clientRequestId: "review-on-box",
+} as OrchestratorMcpDelegateTaskInput as Parameters<
+  RemoteDelegation.RemoteDelegation["Service"]["delegate"]
+>[1];
+
+/** The linked machine as `PeerLinks.resolve` sees it: on this version, an older one, or silent. */
+type Box = "carries" | "older" | "silent" | { readonly hold: Deferred.Deferred<void> };
+
+/**
+ * The delegation service with the box faked. `settings` is this machine's settings file; the
+ * delegating thread has no parent here.
+ */
+const makeHarness = (settings: Record<string, unknown>, peer: Box) =>
+  Effect.gen(function* () {
+    const launched: Array<Record<string, unknown>> = [];
+    let asked = 0;
+    const answered = Effect.sync(() => {
+      asked++;
+      return {
+        link: { label: "box" },
+        url: "https://box.test",
+        token: "token",
+        // An older machine's descriptor has no such flag.
+        capabilities: peer === "older" ? { peerLinks: true } : { mcpProfileCarry: true },
+      } as never;
+    });
+    const resolve =
+      peer === "silent"
+        ? () =>
+            Effect.fail(
+              new PeerLinkError({ reason: "unreachable", message: "box did not answer." }),
+            )
+        : typeof peer === "object"
+          ? () => Deferred.await(peer.hold).pipe(Effect.andThen(answered))
+          : () => answered;
+
+    const forwarding = Layer.mock(PeerForwarding.PeerForwarding)({
+      call: ((_scope: unknown, tool: { readonly name: string }, _env: unknown, params: never) =>
+        tool.name === "t3_thread_launch"
+          ? Effect.sync(() => {
+              launched.push(params);
+              return { threadId: ThreadId.make("thread:box-child"), runId: null, modelSelection };
+            })
+          : Effect.die(`unexpected call ${tool.name}`)) as never,
+    });
+    const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
+      getThreadEventSequence: () => Effect.succeed(0) as never,
+      getThreadRecords: ((
+        threadId: ThreadId,
+        _parts: unknown,
+        only?: { readonly subagentIds?: ReadonlyArray<NodeId> },
+      ) =>
+        // The follower's read of its task waits for good; this test is about the launch.
+        only?.subagentIds !== undefined
+          ? Effect.never
+          : Effect.succeed({
+              thread: {
+                id: threadId,
+                title: "Parent",
+                projectId: ProjectId.make("project:here"),
+                modelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                lineage: {
+                  parentThreadId: null,
+                  relationshipToParent: null,
+                  rootThreadId: threadId,
+                },
+              },
+              runs: [
+                {
+                  id: RunId.make("run:parent"),
+                  status: "running",
+                  ordinal: 1,
+                  rootNodeId: NodeId.make("node:parent-root"),
+                  providerInstanceId: instanceId,
+                },
+              ],
+              subagents: [{ id: taskId, remoteChild: { threadId: "thread:box-child" } }],
+            })) as never,
+      dispatch: () =>
+        Effect.succeed({
+          storedEvents: [{ event: { type: "subagent.updated", payload: { id: taskId } } }],
+        } as never),
+    });
+
+    const remote = yield* Layer.build(
+      RemoteDelegation.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            forwarding,
+            threads,
+            Layer.mock(PeerLinks.PeerLinks)({ get: () => Effect.succeedNone, resolve }),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({}),
+            Layer.mock(ServerEnvironment.ServerEnvironment)({
+              getEnvironmentId: Effect.succeed("environment-here" as EnvironmentId),
+            }),
+            Layer.mock(ServerSettingsService.ServerSettingsService)({
+              getSettings: Effect.succeed(fromFile(settings)),
+            }),
+            Layer.succeed(SecureRandom.SecureRandom, {
+              uuidV4: Effect.succeed("00000000-0000-4000-8000-000000000000"),
+            } as never),
+          ),
+        ),
+      ),
+    ).pipe(Effect.map(Context.get(RemoteDelegation.RemoteDelegation)));
+
+    return {
+      delegate: remote.delegate(scope, input),
+      launched,
+      asked: () => asked,
+      /** What the launch there carried as the parent's profile. */
+      carried: () =>
+        launched.map(
+          (params) => (params.delegatedFrom as { readonly mcpProfile?: unknown }).mcpProfile,
+        ),
+    };
+  });
+
+const T3_ONLY = { mcpThreadProfiles: { [parentThreadId]: "t3-only" } };
+
+it.effect("carries a t3-only parent's profile to a machine that applies it", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(T3_ONLY, "carries");
+      yield* harness.delegate;
+      assert.deepStrictEqual(harness.carried(), [{ name: "t3-only", servers: [], t3Tools: "all" }]);
+      assert.strictEqual(harness.asked(), 1);
+    }),
+  ),
+);
+
+it.effect("refuses, before any launch, a narrower profile to a machine on an older T3", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(
+        { mcpProfiles: { docs: { servers: ["docs"], t3Tools: "all" } }, mcpProfile: "docs" },
+        "older",
+      );
+      const exit = yield* Effect.exit(harness.delegate);
+      assert.isTrue(Exit.isFailure(exit));
+      assert.include(JSON.stringify(exit), "capability_denied");
+      assert.include(
+        JSON.stringify(exit),
+        'does not apply this thread\'s MCP profile (\\"docs\\")',
+      );
+      assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
+);
+
+it.effect("refuses a narrower profile when the machine cannot be asked", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(T3_ONLY, "silent");
+      const exit = yield* Effect.exit(harness.delegate);
+      assert.include(JSON.stringify(exit), "box did not answer.");
+      assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
+);
+
+it.effect.each<readonly [string, Record<string, unknown>]>([
+  ["no settings file (no keys)", {}],
+  ["profiles off, the defaults written out", { mcpProfile: "all", mcpSubagentProfile: "inherit" }],
+])("%s: carries all, and sends to an older machine without asking it", ([, settings]) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(settings, "older");
+      yield* harness.delegate;
+      assert.deepStrictEqual(harness.carried(), [{ name: "all", servers: "all", t3Tools: "all" }]);
+      assert.strictEqual(harness.asked(), 0);
+    }),
+  ),
+);
+
+it.effect("refuses when the parent's own profile cannot be worked out", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ mcpProfile: "gone" }, "carries");
+      const exit = yield* Effect.exit(harness.delegate);
+      assert.include(JSON.stringify(exit), "invalid_request");
+      assert.include(JSON.stringify(exit), 'MCP profile \\"gone\\" is not set up');
+      assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
+);
+
+it.effect(
+  "stopped while asking the machine, it launches nothing; run again, it carries the same",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const hold = yield* Deferred.make<void>();
+        const harness = yield* makeHarness(T3_ONLY, { hold });
+        const call = yield* harness.delegate.pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        yield* Fiber.interrupt(call);
+        assert.deepStrictEqual(harness.launched, []);
+        yield* Deferred.succeed(hold, undefined);
+        yield* harness.delegate;
+        yield* harness.delegate;
+        const [first, second] = harness.carried();
+        assert.deepStrictEqual(first, { name: "t3-only", servers: [], t3Tools: "all" });
+        assert.deepStrictEqual(second, first);
+      }),
+    ),
+);
+
+it("the receiving tool keeps the carried profile whole, and the receiver reads it back", () => {
+  const carried = { name: "t3-only", servers: [], t3Tools: "all" };
+  const from = { environmentId: "environment-here", threadId: "thread:parent", title: "P" };
+  // From an older sender: nothing carried.
+  assert.isUndefined(
+    launch({ projectId: "project:box", title: "Task", delegatedFrom: from }).delegatedFrom
+      ?.mcpProfile,
+  );
+  // A field a newer sender adds reaches the resolver, which refuses it rather than dropping it.
+  const newer = launch({
+    projectId: "project:box",
+    title: "Task",
+    delegatedFrom: { ...from, mcpProfile: { ...carried, newer: true } },
+  }).delegatedFrom?.mcpProfile;
+  assert.deepStrictEqual(newer, { ...carried, newer: true });
+  assert.deepStrictEqual(decodeDelegatedFrom({ ...from, mcpProfile: carried }).mcpProfile, carried);
+  const settings = fromFile({});
+  const lineage = [{ threadId: "task", delegated: true }];
+  assert.strictEqual(resolveMcpProfile(settings, lineage, newer)._tag, "CannotApply");
+  const resolved = resolveMcpProfile(settings, lineage, carried);
+  assert.deepStrictEqual(resolved._tag === "Resolved" && resolved.profile.servers, []);
+});
+
+it("agents are not shown the carried profile; a machine that does not know a field drops it", () => {
+  const advertised = advertisedJsonSchema(ProjectToolkit.tools.t3_thread_launch) as {
+    readonly properties: { readonly delegatedFrom: { readonly properties: object } };
+  };
+  assert.deepStrictEqual(Object.keys(advertised.properties.delegatedFrom.properties).toSorted(), [
+    "environmentId",
+    "threadId",
+    "title",
+  ]);
+  // How the tool decodes what a linked machine sends: a field it does not know (as `mcpProfile` is
+  // to a machine on an older T3) is dropped, not refused, so a launch with `all` still goes there.
+  const sent = launchAsSent({
+    projectId: "project:box",
+    title: "Task",
+    delegatedFrom: {
+      environmentId: "environment-here",
+      threadId: "thread:parent",
+      title: "P",
+      mcpProfile: { name: "all", servers: "all", t3Tools: "all" },
+      newer: true,
+    },
+  });
+  assert.deepStrictEqual(Object.keys(sent.delegatedFrom ?? {}).toSorted(), [
+    "environmentId",
+    "mcpProfile",
+    "threadId",
+    "title",
+  ]);
+});

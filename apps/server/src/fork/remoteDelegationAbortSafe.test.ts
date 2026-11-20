@@ -166,6 +166,11 @@ const makeHarness = (
                 modelSelection,
                 runtimeMode: "full-access",
                 interactionMode: "default",
+                lineage: {
+                  parentThreadId: null,
+                  relationshipToParent: null,
+                  rootThreadId: threadId,
+                },
               },
               runs: [
                 {
