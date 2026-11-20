@@ -232,6 +232,28 @@
         "...ForkHandoffShell.quietHandoffShellMark(projection, latestRun), // Fork: reads as stopped",
         "${ForkHandoffShell.quietHandoffRunOrSql(sql, \"presented\")}"
       ]
+    },
+    "apps/server/src/mcp/McpToolAccess.ts": {
+      "why": "A thread whose MCP profile is narrower than \"all\" cannot start a thread on another machine, which would get that machine's profile: the thread-starting tools' caller check goes through fork/launchMcpProfile.ts (#681).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-20",
+        "added": [
+          "import * as LaunchMcpProfile from \"../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
+          "(params: P) => LaunchMcpProfile.checkedElsewhere(writingCaller, (c) => started(c, params)), // Fork: MCP profile launch"
+        ]
+      }
+    },
+    "apps/server/src/mcp/toolkits/project/handlers.ts": {
+      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-20",
+        "added": [
+          "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
+          "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
