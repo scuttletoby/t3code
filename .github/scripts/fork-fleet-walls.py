@@ -11,8 +11,8 @@ refused: not supported yet.
   fork-fleet-walls.py describe   for setup: every wall, PASS or FAIL
 
 Exit: 0 every wall holds, 1 a wall does not hold, 2 a broken or unsafe walls file (or usage, or an installed kit
-whose walls files, launcher or this file are not what its MANIFEST.sha256 records: as_installed), 3 this OS is not
-supported yet (native Windows too). Anything but 0 from `check`: no runner starts.
+whose walls files, launcher, launcher inputs or this file are not what its MANIFEST.sha256 records: as_installed),
+3 this OS is not supported yet (native Windows too). Anything but 0 from `check`: no runner starts.
 
 Both verbs run the walls file's `describe` and hold it to the contract; `check` then prints only the FAIL lines. So
 `check` passes only on proof that every wall ran: each wall that <os>.fixture.json names (its `fail` keys, the list
@@ -45,6 +45,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 WALLS = os.path.join(HERE, 'fork-fleet-walls')
 LAUNCHER = os.path.join(HERE, 'fork-fleet-launch.sh')
 MANIFEST = os.path.join(HERE, 'MANIFEST.sha256')   # an installed kit's record (desk-install), when there is one
+LAUNCHER_INPUTS = ('fork-fleet-job-paths.txt', 'free_contract.py')   # what the launcher reads from beside itself
 PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 OS_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
 # What a terminal must never get raw from a walls file: control characters (ESC, CR, ...), line and bidi marks.
@@ -146,12 +147,14 @@ def plain_bytes(path):
 
 def as_installed():
     """In an installed kit (MANIFEST.sha256 beside this file), the walls' own files must be the ones its manifest
-    records: this file, the launcher, and every file of the walls folder, none more and none fewer (issue #584 item
-    2). desk-install renames a release's files in one by one and writes the manifest only after the last, so a run
+    records: this file, the launcher and the two files it reads beside itself (LAUNCHER_INPUTS: what jobs may see,
+    and the free-memory check), and every file of the walls folder, none more and none fewer (issue #584 item 2).
+    desk-install renames a release's files in one by one and writes the manifest only after the last, so a run
     stopped half-way leaves the old manifest beside a mix of old and new files: then any walls file, fixture,
-    launcher or this file that the new release changed, added or removed fails here (exit 2, no runner) until the
-    next run ends the swap. That closes every mix, also the ones the pin order leaves open (a new wsl2 beside an old
-    linux with the launcher unchanged). No manifest: no install (the repository, a staged copy), nothing to hold the
+    launcher, launcher input or this file that the new release changed, added or removed fails here (exit 2, no
+    runner) until the next run ends the swap. That closes every mix of these files, also the ones the pin order
+    leaves open (a new wsl2 beside an old linux with the launcher unchanged). The kit's other files (the desk agent,
+    the gate) are not judged by the walls. No manifest: no install (the repository, a staged copy), nothing to hold the
     files to; a first install has no older files to mix, and its agent is enabled only after the manifest."""
     if not os.path.lexists(MANIFEST):
         return
@@ -163,11 +166,20 @@ def as_installed():
     recorded = dict(reversed(line.split('  ', 1)) for line in text.splitlines() if '  ' in line)
     walls = {f'fork-fleet-walls/{n}' for n in os.listdir(WALLS)} | {r for r in recorded
                                                                     if r.startswith('fork-fleet-walls/')}
-    for rel in ['fork-fleet-walls.py', 'fork-fleet-launch.sh', *sorted(walls)]:
+    for rel in ['fork-fleet-walls.py', 'fork-fleet-launch.sh', *LAUNCHER_INPUTS, *sorted(walls)]:
         path = clean(os.path.join(HERE, rel))[:300]
         if rel not in recorded:
-            raise Broken(f'{path} is not in {MANIFEST}: an install stopped half-way (run it again), or a file that '
-                         'is not the kit\'s (remove it)')
+            try:
+                st = os.lstat(os.path.join(HERE, rel))
+            except OSError:
+                raise Broken(f'{path} is not in {MANIFEST}, nor there: an install stopped half-way? Install the kit '
+                             'again')
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():
+                raise Broken(f'{path} is not in {MANIFEST}: left by an install stopped half-way (of this or another '
+                             'release), or a backup: install the kit again (desk-install removes it)')
+            raise Broken(f'{path} is not in {MANIFEST} and is not a plain file of uid {os.geteuid()} (a link, folder, '
+                         'FIFO or another owner\'s), so an install leaves it: remove it by hand, then install the kit '
+                         'again')
         try:
             ok = hashlib.sha256(plain_bytes(os.path.join(HERE, rel))).hexdigest() == recorded[rel]
         except OSError as e:

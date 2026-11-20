@@ -12,6 +12,7 @@ SCRIPT = os.path.join(HERE, 'fork-fleet-walls.py')
 FOLDER = os.path.join(HERE, 'fork-fleet-walls')
 LAUNCHER = os.path.join(HERE, 'fork-fleet-launch.sh')
 JOB_PATHS = 'fork-fleet-job-paths.txt'   # the launcher's allow list of what jobs see, which the walls read too
+FREE = 'free_contract.py'   # the launcher's free-memory check, beside it in an installed kit
 _spec = importlib.util.spec_from_file_location('fork_fleet_walls', SCRIPT)
 fw = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fw)
@@ -37,8 +38,11 @@ def no_wait(seconds=10):
     """Fails a call that blocks (a FIFO opened without O_NONBLOCK waits for a writer forever) instead of hanging the
     run: SIGALRM after seconds raises Waited in it (issue #365 item 4). A block whose Waited was caught or reworded
     inside (a wrapper that turns it into launcher_safe's own refusal, so an assertRaisesRegex in the block passes)
-    still fails: the alarm is recorded, and the block's end raises Waited again (issue #584 item 3)."""
+    still fails: the alarm is recorded, and the block's end raises Waited again (issue #584 item 3), also when the
+    reworded exception leaves the block for an assertRaises outside no_wait (the #597 lenses)."""
     fired = []
+    again = (f'blocked for {seconds}s, and its Waited was caught or reworded in the call: opened without '
+             'O_NONBLOCK?')
 
     def late(*_):
         fired.append(seconds)
@@ -47,12 +51,15 @@ def no_wait(seconds=10):
     signal.alarm(seconds)
     try:
         yield
+    except BaseException as e:
+        if fired and not isinstance(e, Waited):
+            raise Waited(again) from e
+        raise
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old)
     if fired:
-        raise Waited(f'blocked for {seconds}s, and its Waited was caught or reworded in the call: opened without '
-                     'O_NONBLOCK?')
+        raise Waited(again)
 
 
 LINUX = json.loads(slurp(os.path.join(FOLDER, 'linux.fixture.json')))['pass']
@@ -115,6 +122,20 @@ class NoWait(unittest.TestCase):
             with no_wait(1), self.assertRaisesRegex(ValueError, 'is a link, or not owned by uid'):
                 wrapped()
 
+    def test_a_reworded_block_that_leaves_it_still_fails_whatever_the_order(self):
+        """The #597 lenses: the reworded exception travels through no_wait to an assertRaisesRegex outside it."""
+        def wrapped():
+            try:
+                time.sleep(5)
+            except Waited as e:
+                raise ValueError(f'/x is a link, or not owned by uid 0, or writable by others: {e}')
+        with self.assertRaisesRegex(Waited, 'caught or reworded'):
+            with self.assertRaisesRegex(ValueError, 'is a link, or not owned by uid'), no_wait(1):
+                wrapped()
+        with self.assertRaisesRegex(ValueError, 'not blocked'):   # an error with no alarm passes through as it is
+            with no_wait(1):
+                raise ValueError('not blocked')
+
     def test_runs_again_and_leaves_no_alarm(self):
         """Runs again: a block that fired leaves no state behind; the next one that does not block passes, and the
         alarm and the old SIGALRM handler are back as they were."""
@@ -154,6 +175,8 @@ class Case(unittest.TestCase):
         os.chmod(os.path.join(bin_dir, JOB_PATHS), 0o644)
         shutil.copy(LAUNCHER, bin_dir)   # the walls ask it what jobs see (`paths`)
         os.chmod(os.path.join(bin_dir, 'fork-fleet-launch.sh'), 0o755)
+        write(os.path.join(bin_dir, FREE), '# the free-memory check (the launcher\'s; the walls never run it)\n')
+        os.chmod(os.path.join(bin_dir, FREE), 0o644)
         os.chmod(bin_dir, 0o755)
         if walls is None:
             walls = {n: slurp(os.path.join(FOLDER, n)) for n in OSES}
@@ -256,7 +279,7 @@ class Installed(Case):
         folder but skip, as it is now."""
         here = os.path.dirname(script)
         walls = os.listdir(os.path.join(here, 'fork-fleet-walls'))
-        rels = sorted(r for r in ['fork-fleet-walls.py', 'fork-fleet-launch.sh', JOB_PATHS,
+        rels = sorted(r for r in ['fork-fleet-walls.py', 'fork-fleet-launch.sh', JOB_PATHS, FREE,
                                   *(f'fork-fleet-walls/{n}' for n in walls)] if r not in skip)
         path = os.path.join(here, 'MANIFEST.sha256')
         lines = []
@@ -299,6 +322,10 @@ class Installed(Case):
                                            slurp(os.path.join(FOLDER, 'linux.fixture.json')) + '\n'),
             'new dispatcher': lambda s: write(s, slurp(SCRIPT) + '# new\n'),
             'new launcher': lambda s: write(os.path.join(here(s), 'fork-fleet-launch.sh'), slurp(LAUNCHER) + '# n\n'),
+            # the #597 lenses: what the launcher reads beside itself (what jobs see; the free-memory check)
+            'new job-path list': lambda s: write(os.path.join(here(s), JOB_PATHS), slurp(os.path.join(HERE, JOB_PATHS))
+                                                 + '/opt/new\n'),
+            'new free-memory check': lambda s: write(os.path.join(here(s), FREE), '# new\n'),
             'a walls file the release adds': lambda s: [write(os.path.join(here(s), 'fork-fleet-walls', n), '{}')
                                                         for n in ('macos', 'macos.fixture.json')],
             'a walls file the release removes': lambda s: [os.unlink(os.path.join(here(s), 'fork-fleet-walls', n))
@@ -313,21 +340,68 @@ class Installed(Case):
                     p = run([script, verb], self.root(LINUX))
                     self.assertEqual((p.returncode, p.stdout), (2, ''), f'{verb}: {p.stderr}')
                     self.assertIn('MANIFEST.sha256', p.stderr)
-                    self.assertRegex(p.stderr, r'stopped half-way \(run it again\)|Run the install again')
+                    self.assertRegex(p.stderr, r'stopped half-way .*: install the kit again|Run the install again')
                 self.record(script)   # the next run ends the swap: the new manifest
                 p = self.os_verb(script)
                 self.assertEqual((p.returncode, p.stdout), (0, 'linux\n'), p.stderr)
 
     def test_a_file_the_manifest_does_not_name_is_refused(self):
-        """A manifest that leaves out a walls file, the dispatcher or the launcher."""
-        for rel in ('fork-fleet-walls/wsl2.fixture.json', 'fork-fleet-walls.py', 'fork-fleet-launch.sh'):
+        """A manifest that leaves out a walls file, the dispatcher, the launcher or one of its inputs: the refusal
+        names the way out, which differs by what is there (the #597 lenses): a plain file of this user an install
+        removes (walls folder) or replaces; a link, folder or FIFO it leaves for a person to remove."""
+        for rel in ('fork-fleet-walls/wsl2.fixture.json', 'fork-fleet-walls.py', 'fork-fleet-launch.sh', JOB_PATHS,
+                    FREE):
             with self.subTest(rel):
                 script = self.install()
                 self.record(script, skip=[rel])
                 p = self.os_verb(script)
                 self.assertEqual(p.returncode, 2, p.stderr)
                 self.assertIn(f'{rel} is not in ', p.stderr)
-                self.assertIn('not the kit\'s (remove it)', p.stderr)
+                self.assertIn('install the kit again (desk-install removes it)', p.stderr)
+        script = self.install()
+        self.record(script, skip=[FREE])
+        os.unlink(os.path.join(os.path.dirname(script), FREE))
+        p = self.os_verb(script)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn(f'{FREE} is not in ', p.stderr)
+        self.assertIn('nor there', p.stderr)
+        walls = lambda s: os.path.join(os.path.dirname(s), 'fork-fleet-walls')
+        others = {'a link': lambda s: os.symlink(os.path.join(walls(s), 'linux'), os.path.join(walls(s), 'macos')),
+                  'a folder': lambda s: os.mkdir(os.path.join(walls(s), '__pycache__'), 0o755),
+                  'a FIFO': lambda s: os.mkfifo(os.path.join(walls(s), 'macos'), 0o644)}
+        for what, put in others.items():
+            with self.subTest(what):
+                script = self.install()
+                self.record(script)
+                put(script)
+                with no_wait():
+                    p = self.os_verb(script)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn('is not in ', p.stderr)
+                self.assertIn('so an install leaves it: remove it by hand, then install the kit again', p.stderr)
+
+    def test_a_link_or_fifo_at_a_recorded_file_is_refused_and_never_waited_on(self):
+        """The #597 lenses: plain_bytes opens a recorded file with O_NOFOLLOW (a link to a file with the very bytes
+        the manifest records is still refused) and O_NONBLOCK (a FIFO is refused at once, not waited on), at a walls
+        file of another OS (safe() checks only this OS's) and at a launcher input. Without either flag this fails."""
+        for rel in ('fork-fleet-walls/wsl2', JOB_PATHS):
+            for what in ('link', 'fifo'):
+                with self.subTest(rel=rel, what=what):
+                    script = self.install()
+                    self.record(script)
+                    path = os.path.join(os.path.dirname(script), rel)
+                    if what == 'link':   # the very bytes recorded, outside every folder the check lists
+                        real = os.path.join(self.tmp, f'real{self.n}')
+                        os.rename(path, real)
+                        os.symlink(real, path)
+                    else:
+                        os.unlink(path)
+                        os.mkfifo(path, 0o644)
+                    spec = importlib.util.spec_from_file_location(f'walls_installed_{self.n}', script)
+                    m = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(m)   # its HERE: the kit folder beside the manifest
+                    with no_wait(5), self.assertRaisesRegex(m.Broken, f'{re.escape(rel)} cannot be read'):
+                        m.as_installed()
 
     def test_an_empty_or_unsafe_manifest_is_refused(self):
         """Empty or broken state: an empty manifest, one that is not UTF-8, a link, a FIFO (never waited on), or one
