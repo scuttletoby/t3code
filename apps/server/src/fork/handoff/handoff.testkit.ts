@@ -14,6 +14,8 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
+import type { AgentAwarenessThread } from "../../orchestration-v2/ProjectionStore.ts";
+
 export const NOW_MS = Date.parse("2026-11-15T12:00:00.000Z");
 export const MINUTE_MS = 60_000;
 export const at = (offset = 0) => DateTime.makeUnsafe(NOW_MS + offset);
@@ -142,5 +144,45 @@ export function projection(usage: {
     contextHandoffs: [],
     visibleTurnItems: [],
     updatedAt: at(),
+  };
+}
+
+/**
+ * The awareness row upstream's relay reads, derived from the records as upstream's projection does
+ * for the fields the handoff looks at: the latest run, its pending request. Background tasks (a T3
+ * child's row, a PR watch, a monitor) are not in the records the handoff reads, so a test passes them.
+ */
+export function awarenessShell(
+  data: OrchestrationV2ThreadProjection,
+  extra: Partial<AgentAwarenessThread> & { readonly updatedAt: DateTime.Utc },
+): AgentAwarenessThread {
+  const last = data.runs.reduce((a, b) => (b.ordinal > a.ordinal ? b : a));
+  const request = data.runtimeRequests.find((one) => one.status === "pending");
+  return {
+    id: data.thread.id,
+    projectId: data.thread.projectId,
+    title: data.thread.title,
+    lineage: data.thread.lineage,
+    modelSelection: data.thread.modelSelection,
+    creationSource: "web",
+    status: last.status,
+    activityRunStatus: null,
+    latestRunId: last.id,
+    latestRunCompletedAt: last.completedAt,
+    latestRunStopRequested: false,
+    latestRunBackgroundWake: false,
+    activeRunId: last.status === "running" ? last.id : null,
+    pendingRuntimeRequest:
+      request === undefined
+        ? null
+        : { id: request.id, kind: "command", createdAt: extra.updatedAt },
+    pendingBackgroundTasks: [],
+    pendingGuestMessageCount: 0,
+    hasActionableProposedPlan: false,
+    settledOverride: null,
+    archivedAt: null,
+    snoozedUntil: null,
+    snoozedAt: null,
+    ...extra,
   };
 }

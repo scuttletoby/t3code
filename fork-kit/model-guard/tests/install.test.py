@@ -19,6 +19,22 @@ import model_guard  # noqa: E402
 INSTALLER = os.path.join(KIT, 'sbin', 'model-guard-install')
 DROP_IN = '/etc/claude-code/managed-settings.d/model-guard.json'
 MANAGED = '/etc/claude-code/managed-settings.json'
+T3_CACHE = '/var/lib/t3/model-manifest.json'
+
+
+def t3_cache(older_offers_ultracode=False):
+    """T3's cached model list ({fetchedAtMs, manifest}) for the example policy's Claude models: example-older-0 has
+    an effort list without ultracode, unless asked."""
+    def profile(*efforts):
+        return {'capabilities': {'optionDescriptors': [
+            {'id': 'effort', 'label': 'Reasoning', 'type': 'select',
+             'options': [{'id': e, 'label': e} for e in efforts]}]}}
+    return {'fetchedAtMs': 1, 'manifest': {'version': 1, 'currentModels': {}, 'providers': {'claudeAgent': {
+        'profiles': {'new': profile('medium', 'high', 'xhigh', 'ultracode'),
+                     'old': profile('high', *(['ultracode'] if older_offers_ultracode else []))},
+        'models': [{'slug': m, 'name': m, 'status': 'current', 'profile': p}
+                   for m, p in (('example-large-1-0', 'new'), ('example-deep-2-0', 'new'),
+                                ('example-older-0', 'old'))]}}}}
 
 
 def load(source=None):
@@ -84,15 +100,18 @@ class Install(unittest.TestCase):
         os.chmod(self.path(path), 0o644)
 
     def turn_on(self, only_managed=True, mode=None, section=None, model_keys=True):
-        """What the person who runs the machine does (README "Turn it on"): policy, machine file, and the managed
-        settings of their own: only managed hooks, and Claude Code's model keys made from the policy."""
+        """What the person who runs the machine does (README "Turn it on"): policy, machine file (naming T3's model
+        list, as the example policy has an "ultracodeOption": false row), and the managed settings of their own:
+        only managed hooks, and Claude Code's model keys made from the policy."""
         policy = self.path('/etc/fork-kit/model-policy.json')
         with open(os.path.join(KIT, 'model-policy.example.json')) as f:
             data = json.load(f)
         data = dict(data, mode=mode or data['mode'])
         self.write('/etc/fork-kit/model-policy.json', data)
-        self.write('/etc/fork-kit/machine.json', {'version': 1, 'model-guard': dict({'policyFile': policy},
-                                                                                     **(section or {}))})
+        self.write(T3_CACHE, t3_cache())
+        section = dict({'policyFile': policy, 't3ModelManifests': [self.path(T3_CACHE)]}, **(section or {}))
+        self.write('/etc/fork-kit/machine.json', {'version': 1, 'model-guard': {
+            k: v for k, v in section.items() if v is not None}})   # None: the key is left out
         if only_managed:
             keys = model_guard.model_settings(model_guard.parse_policy(json.dumps(data), 'p')) if model_keys else {}
             self.write(MANAGED, dict({'allowManagedHooksOnly': True}, **keys))
@@ -600,6 +619,27 @@ class Install(unittest.TestCase):
         self.turn_on(mode='advise', model_keys=False)           # advise binds nothing, so it needs no keys
         self.assertEqual(self.self_check()[0], 0)
 
+    def test_self_check_reports_a_stale_ultracode_option_row(self):
+        """#600: the example policy's "ultracodeOption": false row against T3's cached model list, end to end."""
+        self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.self_check()[0], 0)
+        self.write(T3_CACHE, t3_cache(older_offers_ultracode=True))   # T3 reloaded its list: the model gained it
+        code, out = self.self_check()
+        self.assertEqual(code, 1)
+        self.assertIn("'example-older-0' has \"ultracodeOption\": false, but T3's model list", out)
+        self.assertIn('offers it the ultracode option', out)
+        os.unlink(self.path(T3_CACHE))                                 # no cache: said, never a silent pass
+        code, out = self.self_check()
+        self.assertEqual(code, 1)
+        self.assertIn('cannot be read', out)
+        self.turn_on(section={'t3ModelManifests': None})              # an old machine file names none
+        os.unlink(self.path(T3_CACHE))
+        self.assertIn('t3ModelManifests', self.self_check()[1])
+        self.turn_on(mode='off')                                       # off checks nothing, so it needs none
+        os.unlink(self.path(T3_CACHE))
+        self.assertEqual(self.self_check()[0], 0)
+
     def test_self_check_reports_no_policy(self):
         self.turn_on()
         self.assertEqual(self.install()[0], 0)
@@ -688,6 +728,9 @@ GUARD_MUTATIONS = {
                                       'test_self_check_wants_only_managed_hooks_unless_the_machine_file_allows_others'),
     "Claude Code's model keys are checked": ('            problems += model_settings_problems(usable, policy)',
                                             '            pass', 'test_self_check_wants_claude_codes_model_keys_in_enforce'),
+    # #600
+    "T3's model lists are checked": ("        problems += ultracode_option_problems(policy, cfg['t3ModelManifests'])",
+                                     '        pass', 'test_self_check_reports_a_stale_ultracode_option_row'),
 }
 
 
