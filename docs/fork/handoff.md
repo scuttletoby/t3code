@@ -162,7 +162,7 @@ written out in full. The message says when no effort is set.
   keeps it. A failed handoff run, its retry (the last alert said "failed"), a run the person
   steered a message into, and the next real turn alert as before. The rule is
   `fork/handoff/handoffShell.ts`, read in both of the shell's reads (JavaScript and SQL, one line
-  each in `ProjectionStore.ts`); `handoffQuiet.ts` keeps the relay's own check.
+  each in `ProjectionStore.ts`), and every shell reader, the relay included, gets it from there.
 
 ## Limits
 
@@ -172,6 +172,9 @@ written out in full. The message says when no effort is set.
 - The same run never hands off twice: the check before the send drops a second trigger, and every
   trigger for one run uses the same ids, so one that got past would replay the first. A cancelled
   handoff spends that run's ids; the next run's turn end decides.
+- A browser that is offline from before the person's turn ends until after the quiet handoff run
+  completes (asleep, network drop) gets no notice for that turn when it reconnects: it sees only the
+  quiet run. The relay's alert for the turn (phone and other devices) still goes out.
 
 ## For developers
 
