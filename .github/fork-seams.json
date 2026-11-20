@@ -38,7 +38,7 @@
       ]
     },
     "apps/server/src/server.ts": {
-      "why": "The fork's service layers are wired here in one place each, from fork/forkLayers.ts (#384), so this file keeps as few fork lines as it can. The ten lines in \"added\" were its pending lines (ceiling 10) when it moved here (#361). The last line in \"added\" gives the runtime's workers upstream's orchestrator with one change: an idle compaction send to a thread whose handoff mode is \"handoff\" is skipped, so the handoff service alone owns that thread (fork/handoff, #361). The line naming ForkLayers.mcpProfileTurnCheck gives the runtime upstream's provider instance registry with one change: a provider that cannot apply MCP profiles (all but Claude) refuses a turn whose thread's profile is narrower than \"all\", at turn start (fork/mcpProfileTurnCheck.ts, #672).",
+      "why": "The fork's service layers are wired here in one place each, from fork/forkLayers.ts (#384), so this file keeps as few fork lines as it can. The ten lines in \"added\" were its pending lines (ceiling 10) when it moved here (#361). The last line in \"added\" gives the runtime's workers upstream's orchestrator with one change: an idle compaction send to a thread whose handoff mode is \"handoff\" is skipped, so the handoff service alone owns that thread (fork/handoff, #361). The line naming ForkLayers.mcpProfileTurnCheck gives the runtime upstream's provider instance registry with one change: a provider that cannot apply MCP profiles (all but Claude) refuses a turn whose thread's profile is narrower than \"all\", at turn start (fork/mcpProfileTurnCheck.ts, #672). That line also carries upstream's next one, its task folders (upstream's `Layer.provideMerge(layerTaskFolders)`, the one upstream line it lost), wired exactly as before: Effect's pipe takes at most 20 steps, and upstream's 19 here plus the fork's two would be 21.",
       "added": [
         "import * as ForkLayers from \"./fork/forkLayers.ts\";",
         "// Fork (waits): the `pr` judge reads through the same pull request service and its caches.",
@@ -50,14 +50,9 @@
         "const layerWorkAdmission = yield* ForkLayers.makeWorkAdmissionLayer(config);",
         "Layer.provide(ForkLayers.holdWorkCloudLink(CloudLink.layer, ConnectReachability.layer)),",
         "Layer.provide(Layer.merge(layerActivation, layerWorkAdmission)),",
+        "Layer.provideMerge(ForkLayers.mcpProfileTurnCheck.pipe(Layer.provideMerge(layerTaskFolders))), // Fork: MCP profiles",
         "Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction), // Fork: one owner (fork/handoff)"
-      ],
-      "announced": {
-        "since": "2026-11-20",
-        "added": [
-          "Layer.provideMerge(ForkLayers.mcpProfileTurnCheck), // Fork: a narrowed MCP profile refuses off Claude"
-        ]
-      }
+      ]
     },
     "apps/server/src/serverSettings.ts": {
       "why": "Every settings write goes through upstream's patch and write paths here. The fork swaps in its patch (fork/serverSettingsPatch.ts, under upstream's name, so a project's MCP profile a client left out is kept) and calls its save check (fork/serverSettingsWriteCheck.ts) once in each write path. The load decodes the file after fork/settingsFileRead.ts (old auto-update names renamed, an unusable interval left out so it reads as its default). The lines from \"import { renameRetiredAutoUpdateKeys }\" on predate this list (#277): the load's decode of the file, which the fork report shares and which needs upstream's private decoders here, and the fallback when the file cannot be read. Each listed copy is one the fork adds over upstream; the run from upstream refuses a spare one (#311).",
@@ -407,8 +402,8 @@
       "gone": 1
     },
     "apps/server/src/server.ts": {
-      "lines": 6,
-      "gone": 6
+      "lines": 7,
+      "gone": 7
     },
     "apps/server/src/serverRuntimeStartup.ts": {
       "lines": 6,

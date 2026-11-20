@@ -764,7 +764,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
 ).pipe(
   Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction), // Fork: one owner (fork/handoff)
   Layer.provideMerge(layerOrchestrationApplication),
-  Layer.provideMerge(layerTaskFolders),
+  Layer.provideMerge(ForkLayers.mcpProfileTurnCheck.pipe(Layer.provideMerge(layerTaskFolders))), // Fork: MCP profiles
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
   Layer.provideMerge(Layer.merge(ProjectStore.layer, ThreadSearch.layer)),
   Layer.provideMerge(SecretCheck.layer),
