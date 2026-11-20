@@ -400,10 +400,12 @@ def swap(tmp, manifest, sha, before_change):
                     and sha256(p(f'{OPT}/{rel}')) == manifest[rel])
     changed = sorted((rel for rel in manifest if not same(rel)), key=lambda rel: (rel == PIN_HOLDER, rel))
     strays = sorted(rel for rel, removable in walls_strays(manifest).items() if removable)
-    gone = sorted((set(read_manifest()) - set(manifest)) | set(strays))
+    last = read_manifest()
+    gone = sorted((set(last) - set(manifest)) | set(strays))
     for rel in strays:
-        say(f'removing {OPT}/{rel}: in the kit\'s walls folder but not in this release (left by a stopped install, or '
-            'a backup)')
+        # The last release's own file that this one drops is no leftover (issue #613): say which it is.
+        why = 'the last release\'s, which this one drops' if rel in last else 'left by a stopped install, or a backup'
+        say(f'removing {OPT}/{rel}: in the kit\'s walls folder but not in this release ({why})')
     if changed or gone:
         before_change()
         run('systemctl', 'stop', TIMER, REFRESH, SEED_TIMER, SEED, AGENT, check=False)

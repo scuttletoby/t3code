@@ -506,6 +506,7 @@ class Desk(unittest.TestCase):
                 code, out, err = self.install(sha=sha, source=source)   # runs again: ends it
                 self.assertEqual(code, 0, err)
                 self.assertIn('removing /opt/fork-fleet/fork-fleet-walls/macos', out)
+                self.assertIn('(left by a stopped install, or a backup)', out)   # no manifest ever named it
                 self.assertFalse(os.path.lexists(stray))
                 self.assertFalse(os.path.lexists(stray + '.fixture.json'))
                 r = self.walls_os()
@@ -542,9 +543,12 @@ class Desk(unittest.TestCase):
                 entry = os.path.join(walls, 'macos')
                 put(entry)
                 signal.alarm(60)
+                self.clear_calls()
                 code, out, err = self.install(source=source)
                 self.assertEqual(code, 1, out)
                 self.assertIn('the installed walls refuse to run', err)
+                # Issue #613 comment 5: the walls run before the agent is enabled, started or restarted.
+                self.assertEqual(self.agent_starts(), [])
                 self.assertIn('macos is not in', err)
                 self.assertIn('remove it by hand, then install the kit again', err)
                 self.assertTrue(os.path.lexists(entry))
@@ -558,6 +562,63 @@ class Desk(unittest.TestCase):
                 code, _, err = self.install(source=source)
                 self.assertEqual(code, 0, err)
                 self.assertEqual(self.walls_os().returncode, 0)
+
+    def agent_starts(self):
+        # the calls since clear_calls() that would enable, start or restart the desk agent
+        return [c for c in self.calls() if c.split()[:1] == ['systemctl'] and self.m.AGENT in c.split()
+                and set(c.split()) & {'enable', 'start', 'restart'}]
+
+    def test_a_plain_file_of_another_owner_in_the_walls_folder_is_left(self):
+        """Issue #613 comment 4: install removes only a plain file of root from the walls folder. One of another
+        owner (lstat says so; a test cannot chown) is left, `check` says to remove it by hand, the installed walls
+        refuse to run, and install exits non-zero before the agent is enabled or started. The dispatcher names it
+        the same way (its own uid check). Runs again: the same answer while it is there."""
+        source = self.real_walls('real1')
+        self.assertEqual(self.install(source=source)[0], 0)
+        opt = self.path('/opt/fork-fleet')
+        stray = os.path.join(opt, 'fork-fleet-walls', 'macos')
+        self.write(stray, '#!/bin/sh\n')
+        real_lstat = os.lstat
+
+        def other_owner(path, *a, **k):
+            st = real_lstat(path, *a, **k)
+            if os.fspath(path) != stray:
+                return st
+            f = list(st)[:10]
+            f[4] = st.st_uid + 1
+            return os.stat_result(f)
+        walls = installed_walls(opt)
+        with unittest.mock.patch('os.lstat', other_owner):
+            self.assertEqual([x for x in self.m.installed_problems() if 'macos' in x],
+                             [f'/opt/fork-fleet/fork-fleet-walls/macos: not in the manifest, so the walls refuse to '
+                              'run: not a plain file of root (a link, folder, FIFO or another owner\'s), so install '
+                              'leaves it: remove it by hand, then install again'])
+            with self.assertRaisesRegex(walls.Broken, r'macos is not in .* not a plain file of uid .*remove it by '
+                                                      r'hand'):
+                walls.as_installed()
+            for _ in range(2):   # runs again: the same
+                self.clear_calls()
+                code, out, err = self.install(source=source)
+                self.assertEqual(code, 1, out)
+                self.assertNotIn('removing', out)
+                self.assertIn('the installed walls refuse to run', err)
+                self.assertEqual(self.agent_starts(), [])
+                self.assertTrue(os.path.exists(stray))
+
+    def test_a_walls_file_the_last_release_had_and_this_one_drops_is_named_so(self):
+        """Issue #613 (#597 round 2, nit 4): a walls file of the last release that this one no longer ships is
+        removed and named as the last release's, not as a stopped install's leftover or a backup."""
+        fixture = json.dumps({'fail': {'os': [{}]}})
+        adds = self.real_walls('real2', {'.github/scripts/fork-fleet-walls/macos': '#!/bin/sh\n',
+                                         '.github/scripts/fork-fleet-walls/macos.fixture.json': fixture})
+        self.assertEqual(self.install(sha=SHA2, source=adds)[0], 0)
+        code, out, err = self.install(source=self.real_walls('real1'))
+        self.assertEqual(code, 0, err)
+        self.assertIn('removing /opt/fork-fleet/fork-fleet-walls/macos: in the kit\'s walls folder but not in this '
+                      'release (the last release\'s, which this one drops)', out)
+        self.assertNotIn('left by a stopped install', out)
+        self.assertFalse(os.path.lexists(self.path('/opt/fork-fleet/fork-fleet-walls/macos')))
+        self.assertEqual(self.walls_os().returncode, 0)
 
     def test_project_fleet_config_is_used_and_kept(self):
         project = os.path.join(self.tmp, 'project.json')
@@ -1340,6 +1401,10 @@ def installed_walls(opt):
 
 
 class Release(unittest.TestCase):
+    def test_the_kit_ships_every_file_the_launcher_reads_beside_itself(self):
+        # #597 round 2 nit 6: the walls hold LAUNCHER_INPUTS to the manifest; each must be a file the kit installs.
+        self.assertLessEqual(set(installed_walls('/nonexistent').LAUNCHER_INPUTS), set(load().FILES))
+
     def test_every_file_the_kit_installs_is_in_this_repository(self):
         m = load()
         for src in [*m.FILES.values(), *m.UNITS.values(), m.WALLS]:
