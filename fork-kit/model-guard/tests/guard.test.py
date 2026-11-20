@@ -1217,6 +1217,10 @@ const c = log("agent(") || items.map(i => i.agent)
         self.assertEqual(one([{'slug': deep, 'profile': 'none'}]), [])
         self.assertEqual(one([{'slug': deep, 'profile': 'old'}], cache=False), [])     # a manifest itself
         self.assertEqual(one([{'slug': ' ' + deep, 'profile': ' old'}]), [])           # T3 trims
+        # T3's order: the entry whose slug is the model wins over one whose alias is it, either way round
+        alias_of = {'slug': 'example-deep-alt', 'aliases': [deep], 'profile': 'new'}
+        self.assertEqual(one([{'slug': deep, 'profile': 'old'}, alias_of]), [])
+        self.assertEqual(one([alias_of, {'slug': deep, 'profile': 'old'}]), [])
         cases = {
             'the effort ultracode': ([{'slug': deep, 'profile': 'new'}], 'offers it the ultracode option'),
             'the ultracode toggle': ([{'slug': deep, 'profile': 'toggle'}], 'offers it the ultracode option'),
@@ -1361,11 +1365,45 @@ const c = log("agent(") || items.map(i => i.agent)
                 self.assertIn(f"'{large}' ", problems[0])
                 self.assertIn(why, problems[0])
                 self.assertIn(fix, problems[0])
-        # a model not in the list (a custom model): a note, no problem
-        problems, notes = one([{'slug': 'example-other', 'profile': 'new'}], [row(['high'])])
+        # a model not in a list that has the others (a custom model): a note, no problem
+        custom = 'example-custom-1'
+        problems, notes = one(new, [row(['high']), row(['high'], model=custom)])
         self.assertEqual(problems, [])
         self.assertEqual(len(notes), 1)
-        self.assertIn(f"'{large}' is not in T3's model list", notes[0])
+        self.assertIn(f"'{custom}' is not in T3's model list", notes[0])
+        # a list with none of the rows' models (an empty list, or likely the wrong file): a problem, not notes only
+        for models in ([], [{'slug': 'example-other', 'profile': 'new'}]):
+            with self.subTest(models=models):
+                problems, notes = one(models, [row(['high']), row(['high'], model=custom)])
+                self.assertEqual(len(problems), 1, problems)
+                self.assertEqual(notes, [])
+                self.assertIn(f"has none of '{large}', '{custom}'", problems[0])
+        # T3's order (resolveClaudeCatalogModel): the entry whose slug is the model, and only without one the first
+        # entry whose alias is it; a valid row is never reported because another entry names the model too
+        alias_of = {'slug': 'example-large-alt', 'aliases': [large], 'profile': 'old'}
+        for models in ([{'slug': large, 'profile': 'new'}, alias_of], [alias_of, {'slug': large, 'profile': 'new'}]):
+            with self.subTest(models=models):
+                self.assertEqual(one(models, [row(['high', 'xhigh'])]), ([], []))
+        first, second = ({'slug': f'example-large-{n}', 'aliases': ['example-large'], 'profile': p}
+                         for n, p in ((7, 'new'), (8, 'old')))
+        self.assertEqual(one([first, second], [row(['high', 'xhigh'], model='example-large')]), ([], []))
+        problems, _ = one([second, first], [row(['high', 'xhigh'], model='example-large')])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('allows xhigh', problems[0])
+        # an effort select that offers ultracode but no xhigh: T3 puts xhigh in its place, so xhigh is offered
+        uc = {'capabilities': {'optionDescriptors': [{'id': 'effort', 'type': 'select', 'options': [
+            {'id': c, 'label': c} for c in ('low', 'high', 'ultracode')]}]}}
+        for rows in ([row(['high', 'xhigh'])], [row(['high', 'ultracode'])]):
+            with self.subTest(rows=rows):
+                self.assertEqual(self.offers([self.t3_list('uc.json', [{'slug': large, 'profile': 'uc'}],
+                                                           profiles={'uc': uc})], rows), ([], []))
+        # an "effort" that is not a select offers no level, as T3 reads none from it
+        multi = {'capabilities': {'optionDescriptors': [{'id': 'effort', 'type': 'multiSelect', 'options': [
+            {'id': 'high', 'label': 'high'}]}]}}
+        problems, _ = self.offers([self.t3_list('multi.json', [{'slug': large, 'profile': 'multi'}],
+                                                profiles={'multi': multi})], [row(['high'])])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('allows high', problems[0])
         # rows without efforts and rows of other drivers are not compared (T3's model list has option lists for
         # Claude models only); a policy with none of them needs no list
         others = [PLAIN, AGENT, {'driver': 'codex', 'model': 'example-codex', 'efforts': ['low']},
@@ -1852,18 +1890,6 @@ class Contract(unittest.TestCase):
                                    for p in (catalog.get('profiles') or {}).values()))
         self.assertEqual(with_lists, [model_guard.CLAUDE_DRIVER])
 
-    def test_agent_option_ids_match_the_servers_list(self):
-        """#643: T3's delegation checks drop an agent option a child would inherit from its parent when the call
-        names its model (apps/server/src/fork/delegateChecks.ts AGENT_OPTION_IDS), so the guard, which sees only the
-        call, refuses the same ids in a pick (DRIVER_MODEL_OPTION_IDS)."""
-        path = os.path.join(REPO, 'apps', 'server', 'src', 'fork', 'delegateChecks.ts')
-        with open(path, encoding='utf-8') as f:
-            block = re.search(r'const AGENT_OPTION_IDS[^=]*= \{(.*?)\};', f.read(), re.S)
-        self.assertIsNotNone(block, f'AGENT_OPTION_IDS not found in {path}: keep the guard\'s list in step')
-        server = {driver: tuple(re.findall(r'"([^"]+)"', ids))
-                  for driver, ids in re.findall(r'(\w+): \[([^\]]*)\]', block.group(1))}
-        self.assertEqual(server, model_guard.DRIVER_MODEL_OPTION_IDS)
-
     def test_claude_rows_take_the_option_ids_t3_ships_for_claude(self):
         """#618 review: a Claude row takes only the option ids T3's Claude models have (the select "effort", read as
         the effort, and the others) plus ultracode, which T3 adds to the models whose efforts include it."""
@@ -2250,6 +2276,18 @@ MUTATIONS = {
                                              'test_t3_model_list_levels_are_compared'),
     'levels: off needs no list': ("    if policy['mode'] == 'off' or not rows:", '    if not rows:',
                                   'test_t3_model_list_levels_are_compared'),
+    'levels: only a select offers levels': ("\n                  and d.get('type') == 'select' and", ' and',
+                                             'test_t3_model_list_levels_are_compared'),
+    'levels: ultracode stands for xhigh': ('            levels.add(ULTRACODE_RUNS_AT)', '            pass',
+                                           'test_t3_model_list_levels_are_compared'),
+    'levels: a list with none of the models': ("        if all(state == 'missing' for _, state in found.values()):",
+                                               '        if False:', 'test_t3_model_list_levels_are_compared'),
+    'a slug before an alias': ('    named = named or [e for e in entries if alias_of(e)][:1]',
+                               '    named = named + [e for e in entries if alias_of(e)][:1]',
+                               'test_t3_model_list_levels_are_compared'),
+    'only the first alias': ('    named = named or [e for e in entries if alias_of(e)][:1]',
+                             '    named = named or [e for e in entries if alias_of(e)]',
+                             'test_t3_model_list_levels_are_compared'),
     'levels: Claude rows only': ("r['driver'] == CLAUDE_DRIVER and r['efforts']]", "r['efforts']]",
                                  'test_t3_model_list_levels_are_compared'),
     'the machine file paths are checked': (

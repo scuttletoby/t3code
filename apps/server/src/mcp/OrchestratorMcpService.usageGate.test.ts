@@ -187,7 +187,7 @@ interface Dispatched {
  */
 const delegate = (input: {
   readonly settings?: Partial<
-    Pick<ServerSettingsValue, "usagePacingGate" | "usagePacingLowerEffort">
+    Pick<ServerSettingsValue, "usagePacingGate" | "usagePacingLowerEffort" | "modelPolicy">
   >;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly pacer?: "real" | "untouched" | "absent" | "failing";
@@ -509,47 +509,62 @@ describe("OrchestratorMcpService usage pacing gate", () => {
     }),
   );
 
-  it.effect("enforce, ahead: a moved pick does not take the parent's OpenCode agent (#643)", () =>
-    Effect.gen(function* () {
-      // An OpenCode parent that runs an agent; the call names the model, so the agent stays out,
-      // on the account the pacer moves the task to as well.
-      const opencode = (base: ServerProvider): ServerProvider => ({
-        ...base,
-        driver: ProviderDriverKind.make("opencode"),
-        models: base.models.map((model) => ({
-          ...model,
-          capabilities: {
-            optionDescriptors: [
-              ...(model.capabilities?.optionDescriptors ?? []),
-              {
-                id: "agent",
-                label: "Agent",
-                type: "select",
-                options: [
-                  { id: "build", label: "Build" },
-                  { id: "plan", label: "Plan" },
-                ],
-              },
+  it.effect(
+    "enforce, ahead: under a model policy, a moved pick that names its model takes none of the parent's options",
+    () =>
+      Effect.gen(function* () {
+        // An OpenCode parent that runs an agent and a level; the call names the model and no option,
+        // so with a model policy on neither reaches the child, on the account the pacer moves the
+        // task to as well. With the policy off the move keeps what upstream's lookup gives it.
+        const opencode = (base: ServerProvider): ServerProvider => ({
+          ...base,
+          driver: ProviderDriverKind.make("opencode"),
+          models: base.models.map((model) => ({
+            ...model,
+            capabilities: {
+              optionDescriptors: [
+                ...(model.capabilities?.optionDescriptors ?? []),
+                {
+                  id: "agent",
+                  label: "Agent",
+                  type: "select",
+                  options: [
+                    { id: "build", label: "Build" },
+                    { id: "plan", label: "Plan" },
+                  ],
+                },
+              ],
+            },
+          })),
+        });
+        const pick = (mode: "off" | "advise") =>
+          delegate({
+            settings: { ...enforce, modelPolicy: { mode, allow: [] } },
+            providers: [opencode(main(60)), opencode(second(10))],
+            parentOptions: [
+              { id: "reasoningEffort", value: "low" },
+              { id: "agent", value: "plan" },
             ],
-          },
-        })),
-      });
-      const { result, dispatched } = yield* delegate({
-        settings: enforce,
-        providers: [opencode(main(60)), opencode(second(10))],
-        parentOptions: [
-          { id: "reasoningEffort", value: "low" },
-          { id: "agent", value: "plan" },
-        ],
-        target: { model: MODEL },
-      });
-      assert.include(textOf(result), "runs on codex-second");
-      assert.deepStrictEqual(dispatched[0]?.modelSelection, {
-        instanceId: SECOND,
-        model: MODEL,
-        options: [{ id: "reasoningEffort", value: "low" }],
-      });
-    }),
+            target: { model: MODEL },
+          });
+        const { result, dispatched } = yield* pick("advise");
+        assert.include(textOf(result), "runs on codex-second");
+        assert.deepStrictEqual(dispatched[0]?.modelSelection, {
+          instanceId: SECOND,
+          model: MODEL,
+          options: [],
+        });
+        const off = yield* pick("off");
+        assert.include(textOf(off.result), "runs on codex-second");
+        assert.deepStrictEqual(off.dispatched[0]?.modelSelection, {
+          instanceId: SECOND,
+          model: MODEL,
+          options: [
+            { id: "reasoningEffort", value: "low" },
+            { id: "agent", value: "plan" },
+          ],
+        });
+      }),
   );
 
   it.effect("enforce, ahead: an instance the caller named is kept; the task is held", () =>

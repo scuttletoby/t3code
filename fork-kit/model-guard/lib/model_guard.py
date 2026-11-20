@@ -1106,13 +1106,17 @@ def _offers_ultracode(descriptor):
 
 
 def _model_entries(catalog, model):
-    """The option list of each entry of one T3 model list whose slug or alias names model (None: no option list)."""
-    def names(entry):
+    """The option list of each entry of one T3 model list that T3 resolves model to (None: no option list). T3 takes
+    the entry whose slug is model, and only when none is, the first whose alias is it (in any case). Several entries
+    with that slug (a list T3 refuses) all count, so the worst one wins."""
+    entries = [e for e in catalog['models'] if isinstance(e, dict)]
+    def alias_of(entry):
         aliases = entry.get('aliases') if isinstance(entry.get('aliases'), list) else []
-        return (isinstance(entry.get('slug'), str) and js_trim(entry['slug']) == model) or any(
-            isinstance(a, str) and js_trim(a).lower() == model.lower() for a in aliases)
+        return any(isinstance(a, str) and js_trim(a).lower() == model.lower() for a in aliases)
+    named = [e for e in entries if isinstance(e.get('slug'), str) and js_trim(e['slug']) == model]
+    named = named or [e for e in entries if alias_of(e)][:1]
     found = []
-    for entry in (e for e in catalog['models'] if isinstance(e, dict) and names(e)):
+    for entry in named:
         name = entry.get('profile')
         profile = catalog['profiles'].get(js_trim(name)) if isinstance(name, str) else None
         capabilities = profile.get('capabilities') if isinstance(profile, dict) else None
@@ -1124,7 +1128,7 @@ def _model_entries(catalog, model):
 def ultracode_option_in(catalog, model):
     """What one T3 model list says of model: 'option' (T3 offers it ultracode), 'no list' (it has no option list, so
     T3 checks no options), 'missing' (not in the list) or 'none' (an option list without ultracode). Every entry
-    whose slug or alias names the model counts; the worst one wins."""
+    T3 resolves the model to counts (_model_entries); the worst one wins."""
     entries = _model_entries(catalog, model)
     if not entries:
         return 'missing'
@@ -1176,8 +1180,9 @@ def ultracode_option_problems(policy, manifest_paths):
 def efforts_offered_in(catalog, model):
     """What one T3 model list says of the levels a Claude model offers: (the levels, None) or (None, 'missing' when
     no entry names it | 'no list' when an entry has no option list). A level is one choice of the "effort" select;
-    ultracode also when T3 offers the model the ultracode option (T3 turns the old effort into it). Every entry that
-    names the model counts: a level is offered only when each entry offers it (the worst one wins)."""
+    xhigh also when that select offers ultracode (T3 puts xhigh in its place when the list has none); ultracode also
+    when T3 offers the model the ultracode option (T3 turns the old effort into it). Every entry T3 resolves the
+    model to counts (_model_entries): a level is offered only when each offers it (the worst one wins)."""
     entries = _model_entries(catalog, model)
     if not entries:
         return None, 'missing'
@@ -1188,6 +1193,8 @@ def efforts_offered_in(catalog, model):
         levels = {c['id'] for d in descriptors if isinstance(d, dict) and d.get('id') == CLAUDE_EFFORT_ID
                   and d.get('type') == 'select' and isinstance(d.get('options'), list)
                   for c in d['options'] if isinstance(c, dict) and isinstance(c.get('id'), str)}
+        if ULTRACODE_EFFORT in levels:
+            levels.add(ULTRACODE_RUNS_AT)
         if any(_offers_ultracode(d) for d in descriptors):
             levels.add(ULTRACODE_EFFORT)
         offered = levels if offered is None else offered & levels
@@ -1198,8 +1205,8 @@ def effort_offer_problems(policy, manifest_paths):
     """(problems, notes) for the allowed levels of the policy's Claude rows against T3's model lists (#643): a level
     the model does not offer (T3's delegate_task refuses a pick of it, but its other paths, such as a launch, a
     configure or a project default, start the model with no level, so it runs its default), a model with no option
-    list, and a list that cannot be read or is not named. A model not in the list (a custom model) is a note: there
-    is nothing to compare. T3's model list holds option lists for Claude models only; other drivers' rows are not
+    list, a list that cannot be read or is not named, and a list that has none of the rows' models (likely the wrong
+    file). One model not in a list that has others (a custom model) is a note: there is nothing to compare. T3's model list holds option lists for Claude models only; other drivers' rows are not
     compared (README: list only the levels the model offers). Mode off checks nothing, so it needs none."""
     rows = [r for r in policy['allow'] if r['driver'] == CLAUDE_DRIVER and r['efforts']]
     if policy['mode'] == 'off' or not rows:
@@ -1216,9 +1223,14 @@ def effort_offer_problems(policy, manifest_paths):
             problems.append(f'T3 model list {path} {why}: the self-check cannot tell whether {models} offer the '
                             f'levels their rows allow')
             continue
+        found = {row['model']: efforts_offered_in(catalog, row['model']) for row in rows}
+        if all(state == 'missing' for _, state in found.values()):
+            problems.append(f'T3 model list {path} has none of {models}: it is likely not T3\'s model list, so the '
+                            f'self-check cannot tell whether they offer the levels their rows allow')
+            continue
         for row in rows:
             model = row['model']
-            offered, state = efforts_offered_in(catalog, model)
+            offered, state = found[model]
             if state == 'missing':
                 notes.append(f'{model!r} is not in T3\'s model list {path} (a custom model, or one T3 no longer '
                              f'lists), so its allowed levels are not compared')

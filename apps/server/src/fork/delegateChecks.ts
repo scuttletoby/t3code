@@ -12,6 +12,7 @@ import {
   type OrchestratorMcpTarget,
   PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
   type OrchestrationV2ThreadProjection,
+  type ProviderOptionSelection,
   type RuntimeMode,
   type ServerProvider,
   type ThreadId,
@@ -110,7 +111,10 @@ export interface DelegateChecks {
   readonly beforeWorkspace: (
     input: BeforeWorkspaceInput,
   ) => Effect.Effect<BeforeWorkspaceResult, OrchestratorMcpFailure>;
-  /** `delegate_task`, on the final target, last before the dispatch. */
+  /**
+   * `delegate_task`, on the final target, last before the dispatch. Its hold lasts until the
+   * dispatch and the child's run preparation end, or the call's scope closes.
+   */
   readonly afterWorkspace: (
     input: AfterWorkspaceInput,
   ) => Effect.Effect<DelegateHold, OrchestratorMcpFailure, Scope.Scope>;
@@ -118,6 +122,10 @@ export interface DelegateChecks {
   readonly beforeCreateThread: (
     input: BeforeCreateThreadInput,
   ) => Effect.Effect<BeforeCreateThreadResult, OrchestratorMcpFailure>;
+  /** A remote `delegate_task`'s target, before it is sent: {@link remoteTarget} under the policy. */
+  readonly remoteTarget: <Target extends OrchestratorMcpTarget>(
+    target: Target,
+  ) => Effect.Effect<Target>;
 }
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
@@ -183,36 +191,54 @@ const backingOff = (retryAtMs: number | undefined, nowMs: number): retryAtMs is 
   retryAtMs !== undefined && retryAtMs > nowMs && retryAtMs - nowMs <= FAILED_SCAN_BACKOFF_MS;
 
 /**
- * Options that pick the agent a driver runs (OpenCode's `agent`, Kiro's `mode`), which bring their
- * own prompt, tools and settings. The model guard (`fork-kit/model-guard`) refuses these ids in a
- * call and pins this list in a contract test.
+ * The option ids a call names: its own, and `ultracode` when it names the old effort `ultracode`,
+ * which T3 reads as `xhigh` plus the ultracode option (`withLegacyUltracodeEffort`).
  */
-const AGENT_OPTION_IDS: Readonly<Record<string, ReadonlyArray<string>>> = {
-  kiro: ["mode"],
-  opencode: ["agent"],
+const namedOptionIds = (requested: OrchestratorMcpTarget): ReadonlySet<string> => {
+  const options = requested.options ?? [];
+  const ids = new Set(options.map((option) => option.id));
+  if (options.some((option) => option.id === "effort" && option.value === "ultracode")) {
+    ids.add("ultracode");
+  }
+  return ids;
 };
-
-const ANY_AGENT_OPTION_ID = new Set(Object.values(AGENT_OPTION_IDS).flat());
 
 /**
- * A call that names its model drops the parent's inherited agent option, which the model guard
- * cannot see; an agent option the call names itself stays, and a call without a model keeps all.
- * `driver` undefined (an unknown instance) drops every agent id.
+ * The one rule for a child's options on every launch path, applied while a model policy is on: a
+ * call that names its model keeps only the options it names, as a policy and the model guard check
+ * only the call. A call that names no model keeps the parent's options, as upstream does.
  */
-export const withoutInheritedAgent = (
+export const ownOptions = (
+  options: ReadonlyArray<ProviderOptionSelection> | undefined,
+  requested: OrchestratorMcpTarget | undefined,
+): ReadonlyArray<ProviderOptionSelection> | undefined => {
+  if (requested?.model === undefined || options === undefined) return options;
+  const named = namedOptionIds(requested);
+  return options.filter((option) => named.has(option.id));
+};
+
+/** A model policy is on (`advise` or `enforce`): {@link ownOptions} applies. */
+const policyOn = (settings: { readonly modelPolicy: { readonly mode: string } }) =>
+  settings.modelPolicy.mode !== "off";
+
+/** `ownOptions` on a resolved target: the same object back when nothing is dropped. */
+export const withOwnOptions = (
   target: DelegateTarget,
   requested: OrchestratorMcpTarget | undefined,
-  driver: string | undefined,
 ): DelegateTarget => {
-  const options = target.modelSelection.options;
-  if (requested?.model === undefined || options === undefined) return target;
-  const ids = driver === undefined ? ANY_AGENT_OPTION_ID : new Set(AGENT_OPTION_IDS[driver] ?? []);
-  const named = new Set((requested.options ?? []).map((option) => option.id));
-  const kept = options.filter((option) => !ids.has(option.id) || named.has(option.id));
-  return kept.length === options.length
+  const options = ownOptions(target.modelSelection.options, requested);
+  return options === undefined || options.length === target.modelSelection.options?.length
     ? target
-    : { ...target, modelSelection: { ...target.modelSelection, options: kept } };
+    : { ...target, modelSelection: { ...target.modelSelection, options } };
 };
+
+/**
+ * {@link ownOptions} for a remote `delegate_task`, whose `RemoteDelegation.ts` sends a call's own
+ * options as given and lays the parent's under none: a call that names its model and no option
+ * sends `[]`. Its retry sends the same. The checks' `remoteTarget` applies it under a policy.
+ */
+export const remoteTarget = <Target extends OrchestratorMcpTarget>(target: Target): Target =>
+  target.model === undefined || target.options !== undefined ? target : { ...target, options: [] };
 
 const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void };
 
@@ -233,6 +259,20 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
    * (expired, or set before the clock went back) are dropped on each write.
    */
   const failedScans = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
+  /**
+   * Whether {@link ownOptions} applies: a model policy is on. A settings read that fails counts as
+   * on, as a policy that cannot be read is enforced (`modelPolicy.ts`), and a child that starts on
+   * its model's defaults is the safe side.
+   */
+  const ownOptionsOn = serverSettings.getSettings.pipe(
+    Effect.map(policyOn),
+    Effect.orElseSucceed(() => true),
+  );
+  /** {@link withOwnOptions} while the policy is on; settings are read only when it could drop one. */
+  const ownTarget = (target: DelegateTarget, requested: OrchestratorMcpTarget | undefined) =>
+    withOwnOptions(target, requested) === target
+      ? Effect.succeed(target)
+      : Effect.map(ownOptionsOn, (on) => (on ? withOwnOptions(target, requested) : target));
 
   /**
    * The usage pacing gate (`usagePacingGate` setting, off by default). A setting or a pace that
@@ -349,7 +389,11 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         }
         const modes = yield* Effect.all([modeOn(input.target), modeOn(resolved.success)]);
         return Option.isSome(modes[1]) && Option.getOrNull(modes[0]) === modes[1].value
-          ? { target: resolved.success }
+          ? {
+              target: policyOn(settings.value)
+                ? withOwnOptions(resolved.success, input.requested)
+                : resolved.success,
+            }
           : { cannot: "it would run the task in another runtime mode" };
       }),
     });
@@ -407,36 +451,13 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
       })),
     );
 
-  /**
-   * `withoutInheritedAgent` on the final target. The providers are read only when the target holds
-   * an agent option id, so a target without one reads nothing.
-   */
-  const dropInheritedAgent = Effect.fnUntraced(function* (
-    target: DelegateTarget,
-    requested: OrchestratorMcpTarget | undefined,
-  ) {
-    const options = target.modelSelection.options ?? [];
-    if (requested?.model === undefined || !options.some((o) => ANY_AGENT_OPTION_ID.has(o.id))) {
-      return target;
-    }
-    const providers = yield* providerRegistry.getProviders;
-    const driver = providers.find(
-      (provider) => provider.instanceId === target.modelSelection.instanceId,
-    )?.driver;
-    return withoutInheritedAgent(target, requested, driver);
-  });
-
   const checks: DelegateChecks = {
-    // After the pacer: a target it moves to is looked up with the options as resolved.
+    // Before the pacer, so it paces the child's own options; a target it moves to keeps them too.
     beforeWorkspace: (input) =>
       input.isRetry
         ? Effect.succeed({ target: input.target })
-        : paceTarget(input).pipe(
-            Effect.flatMap((result) =>
-              dropInheritedAgent(result.target, input.requested).pipe(
-                Effect.map((target) => ({ ...result, target })),
-              ),
-            ),
+        : Effect.flatMap(ownTarget(input.target, input.requested), (target) =>
+            paceTarget({ ...input, target }),
           ),
     afterWorkspace: (input) =>
       input.isRetry || Option.isNone(slotGate)
@@ -446,9 +467,11 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
     beforeCreateThread: (input) =>
       input.isRetry
         ? Effect.succeed({ target: input.target })
-        : dropInheritedAgent(input.target, input.requested).pipe(
-            Effect.map((target) => ({ target })),
-          ),
+        : Effect.map(ownTarget(input.target, input.requested), (target) => ({ target })),
+    remoteTarget: (target) =>
+      remoteTarget(target) === target
+        ? Effect.succeed(target)
+        : Effect.map(ownOptionsOn, (on) => (on ? remoteTarget(target) : target)),
   };
   return checks;
 });

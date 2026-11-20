@@ -315,8 +315,12 @@ Which models (and efforts) agents may pick, per provider driver. `mode` is `off`
 model, as upstream's do), `advise` (agents are only told) or `enforce` (a pick off the list is
 refused). Each `allow` row names a `driver` and a `model`; `efforts` (non-empty) limits the efforts
 for that model, and a row without it checks only the model. `defaultEffort` must be one of the
-row's `efforts`; `useFor` is a short note shown to agents when they pick. Nothing reads the setting
-yet: the check comes in a later pull request.
+row's `efforts`; `useFor` is a short note shown to agents when they pick. The check comes in a later
+pull request. Today the server reads only whether the policy is on (`advise` or `enforce`): then a
+child that `delegate_task` (here or on a linked machine) or `create_threads` starts with a call that
+names its model keeps only the options the call names, none of its parent's others (an agent, a
+session mode, a service tier, an effort). With `off` it keeps upstream's way: a call that names the
+parent's model takes the parent's options under its own.
 
 Only the person can change it; agents cannot. A save must give both `mode` and `allow` (it replaces
 the stored value whole) and is refused for a bad row, a `defaultEffort` not in its row's `efforts`,
