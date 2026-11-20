@@ -33,6 +33,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as HandoffService from "./HandoffService.ts";
 import {
   at,
+  awarenessShell,
   handoffMessageId,
   MINUTE_MS,
   modelSelection,
@@ -43,6 +44,8 @@ import {
   threadId,
 } from "./handoff.testkit.ts";
 import { HANDOFF_RULES } from "./handoffMessage.ts";
+import { HANDOFF_SETTLE_MS, RELAY_COMPLETION_HOLD_MS } from "./handoffQuiet.ts";
+import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
 
 const runUpdated = (payload: OrchestrationV2Run): OrchestrationV2DomainEvent => ({
   id: EventId.make(`event:${payload.id}:${payload.status}`),
@@ -75,6 +78,8 @@ const harness = (state: {
   project?: Partial<HandoffSettings> | undefined;
   /** Runs inside the mocked dispatch, after the command is recorded. */
   onDispatch?: (command: OrchestrationV2ServerCommand) => Effect.Effect<void>;
+  /** The relay's view: read as the records show it (default), missing, or failing. */
+  view?: "records" | "missing" | "fails";
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
@@ -105,6 +110,18 @@ const harness = (state: {
     const dependencies = Layer.mergeAll(
       Layer.mock(Orchestrator.OrchestratorV2)({
         streamDomainEvents: Stream.fromQueue(events),
+        // The relay's view: the thread as its records show it, no live children.
+        getAgentAwarenessSnapshot: () =>
+          state.view === "fails"
+            ? Effect.die(new Error("awareness read failed"))
+            : Effect.sync(() => ({
+                snapshotSequence: 1,
+                threads:
+                  state.view === "missing"
+                    ? []
+                    : [awarenessShell(state.data, { updatedAt: state.data.updatedAt })],
+              })),
+        listActiveShellIndex: () => Effect.succeed([]),
         dispatch: (command) =>
           Effect.sync(() => sent.push(command)).pipe(
             Effect.andThen(state.onDispatch?.(command) ?? Effect.void),
@@ -153,6 +170,8 @@ const harness = (state: {
   });
 
 const on = { mode: "handoff" } as const;
+/** The wait at a quiet thread before a send, so the relay's alert for the person's turn goes first. */
+const settle = TestClock.adjust(HANDOFF_SETTLE_MS);
 const messages = (sent: ReadonlyArray<OrchestrationV2ServerCommand>) =>
   sent.flatMap((command) => (command.type === "message.dispatch" ? [command] : []));
 
@@ -175,7 +194,13 @@ describe("HandoffService", () => {
         settings: { ...on, modelSelection: chosen },
       };
       const { sent, emit } = yield* harness(state);
-      yield* emit(runUpdated(run()), "handOffWhenDue", 1);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      // Not inside the relay's hold of the person's "finished" alert: only after the settle.
+      expect(HANDOFF_SETTLE_MS).toBeGreaterThan(RELAY_COMPLETION_HOLD_MS);
+      yield* TestClock.adjust(HANDOFF_SETTLE_MS - 1);
+      expect(sent).toEqual([]);
+      yield* TestClock.adjust(1);
+      yield* emit(null, "handOffWhenDue", 1);
       const [message, ...rest] = messages(sent);
       expect(rest).toEqual([]);
       expect(message).toMatchObject({
@@ -195,11 +220,32 @@ describe("HandoffService", () => {
     }),
   );
 
+  it.effect.each(["fails", "missing"] as const)(
+    "a relay view that %s sends the handoff as one that alerts, with the same command id",
+    (view) =>
+      Effect.gen(function* () {
+        const state = { data: projection({ usedTokens: 160_000 }), settings: on, view };
+        const { sent, emit } = yield* harness(state);
+        yield* emit(runUpdated(run()), "readThread", 1);
+        yield* settle;
+        yield* emit(null, "handOffWhenDue", 1);
+        const [message, ...rest] = messages(sent);
+        expect(rest).toEqual([]);
+        // Unsure whether the person's finish was shown: alert. The command id still dedupes.
+        expect(message).toMatchObject({
+          commandId: `server:handoff:${threadId}:${runId}`,
+          messageId: `${handoffMessageId}${HANDOFF_LOUD_SUFFIX}`,
+        });
+      }),
+  );
+
   it.effect("without a model setting uses the thread's model and warns there is no effort", () =>
     Effect.gen(function* () {
       const state = { data: projection({ usedTokens: 160_000 }), settings: on };
       const { sent, emit } = yield* harness(state);
-      yield* emit(runUpdated(run()), "handOffWhenDue", 1);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 1);
       expect(messages(sent)[0]?.modelSelection).toEqual(modelSelection);
       expect(messages(sent)[0]?.text).toContain("no effort set (warning)");
     }),
@@ -209,8 +255,13 @@ describe("HandoffService", () => {
     Effect.gen(function* () {
       const state = { data: projection({ usedTokens: 160_000 }), settings: on };
       const { sent, emit } = yield* harness(state);
-      yield* emit(runUpdated(run()), "handOffWhenDue", 1);
-      yield* emit(runUpdated(run()), "handOffWhenDue", 2);
+      // Each trigger reads, settles and reads again before it sends.
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 1);
+      yield* emit(runUpdated(run()), "readThread", 3);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 2);
       expect(new Set(messages(sent).map((message) => message.commandId))).toEqual(
         new Set([`server:handoff:${threadId}:${runId}`]),
       );
@@ -229,12 +280,14 @@ describe("HandoffService", () => {
       yield* TestClock.adjust(5 * MINUTE_MS);
       expect(sent).toEqual([]);
       yield* TestClock.adjust(MINUTE_MS);
+      expect(sent).toEqual([]);
+      yield* settle;
       expect(messages(sent).map((message) => message.messageId)).toEqual([handoffMessageId]);
 
       // An older run's timer: a newer run finished meanwhile (its own turn end decides).
       sent.length = 0;
       state.data = projection({ usedTokens: 100_000, cacheExpiresInMs: 20 * MINUTE_MS });
-      yield* emit(runUpdated(run()), "readThread", 3);
+      yield* emit(runUpdated(run()), "readThread", 4);
       state.data = {
         ...state.data,
         runs: [...state.data.runs, run({ id: RunId.make("run-2"), ordinal: 2 })],
@@ -244,7 +297,7 @@ describe("HandoffService", () => {
     }),
   );
 
-  it.effect("waits while the thread is busy and sends when the work ends", () =>
+  it.effect("waits while the thread is busy and sends a settle after the work ends", () =>
     Effect.gen(function* () {
       const quiet = projection({ usedTokens: 160_000 });
       const busy = {
@@ -260,8 +313,14 @@ describe("HandoffService", () => {
       // Something else changed, still busy: it reads again and keeps waiting.
       yield* emit(threadChanged(state.data), "readThread", 2);
       expect(sent).toEqual([]);
+      yield* TestClock.adjust(MINUTE_MS);
       state.data = quiet;
-      yield* emit(threadChanged(state.data), "handOffWhenDue", 1);
+      // The relay's "finished" alert for the turn starts its hold only now: the settle starts here.
+      yield* emit(threadChanged(state.data), "readThread", 3);
+      yield* TestClock.adjust(HANDOFF_SETTLE_MS - 1);
+      expect(sent).toEqual([]);
+      yield* TestClock.adjust(1);
+      yield* emit(null, "handOffWhenDue", 1);
       expect(messages(sent).map((message) => message.messageId)).toEqual([handoffMessageId]);
     }),
   );
@@ -314,7 +373,9 @@ describe("HandoffService", () => {
       Effect.gen(function* () {
         const state = { data: projection({ usedTokens: 400_000 }), settings: server, project };
         const { sent, emit, reads } = yield* harness(state);
-        yield* emit(runUpdated(run()), "handOffWhenDue", 1);
+        yield* emit(runUpdated(run()), "readThread", 1);
+        yield* settle;
+        yield* emit(null, "handOffWhenDue", 1);
         expect(messages(sent)).toHaveLength(sends);
         // Off for the thread reads nothing more than its settings.
         if (sends === 0) expect(reads.count).toBe(0);
@@ -461,6 +522,7 @@ describe("HandoffService", () => {
         yield* TestClock.adjust(5 * MINUTE_MS);
         expect(sent).toEqual([]);
         yield* TestClock.adjust(2 * MINUTE_MS);
+        yield* settle;
         expect(messages(sent).map((message) => message.messageId)).toEqual([run2HandoffId]);
       }),
   );
@@ -480,7 +542,9 @@ describe("HandoffService", () => {
       yield* emit(lateRun1(), "readThread", 3);
       expect(sent).toEqual([]);
       state.data = quiet;
-      yield* emit(threadChanged(state.data), "send", 1);
+      yield* emit(threadChanged(state.data), "readThread", 4);
+      yield* settle;
+      yield* emit(null, "send", 1);
       expect(messages(sent).map((message) => message.messageId)).toEqual([run2HandoffId]);
     }),
   );
@@ -569,13 +633,14 @@ describe("HandoffService", () => {
               yield* Deferred.await(gate);
             })
           : Effect.void;
-      const { sent, emit, events } = yield* harness(state);
-      yield* Queue.offer(events, runUpdated(run()));
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
       yield* Deferred.await(inSend);
       // A late update for the source run replaces the thread's fiber while it is inside the send.
       // The second one is handled only after the first replaced (interrupted) the sending fiber.
-      yield* emit(lateRun1(), "readThread", 2);
       yield* emit(lateRun1(), "readThread", 3);
+      yield* emit(lateRun1(), "readThread", 4);
       yield* Deferred.succeed(gate, undefined);
       yield* emit(null, "HandoffDispatch.dispatch", 1);
       expect(sent.filter((command) => command.type === "queued-run.cancel")).toMatchObject([
