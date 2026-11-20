@@ -18,7 +18,10 @@
 #                secret-scan job had as its head commit (the workflow asks GitHub's Actions API),
 #                with the job's token; whitespace-separated commit ids; may be empty. See "sweep,
 #                gone tips"
-#   AFTER        push: the branch tip after the push
+#   OLD_HEADS_FILE, SCANNED_GONE_FILE  a file holding that list, read instead of the variable when
+#                set (#637: the kernel caps one environment string at 128 KiB, and the sweep's
+#                list outgrew it); a file that cannot be read fails the job
+#   AFTER       push: the branch tip after the push
 #   PUSH_REF     push: the ref pushed (refs/heads/<name> or refs/tags/<name>); empty is read as the
 #                default branch
 #   UPSTREAM     owner/name of the repository this fork follows (the workflow reads this fork's
@@ -209,6 +212,20 @@
 # (objects/info/alternates) and the refs a range names, with no promisor remote, so git never
 # fetches there and a content still missing is a fatal git error, which fails the scan.
 set -euo pipefail
+
+# OLD_HEADS_FILE / SCANNED_GONE_FILE, when set, are read instead of the variable (#637), which is
+# then no longer exported; a file that cannot be read fails the job rather than leaving the list empty.
+for list in OLD_HEADS SCANNED_GONE; do
+  file_var="${list}_FILE"
+  [[ -n "${!file_var:-}" ]] || continue
+  if ! words="$(cat -- "${!file_var}" 2> /dev/null)"; then
+    echo "::error::Secret scan: cannot read $file_var (${!file_var}), so the tips it lists would go unscanned. Re-run the job." >&2
+    exit 2
+  fi
+  # Unexported first: a list this long in the environment stops every program the script starts.
+  export -n "$list"
+  printf -v "$list" '%s' "$words"
+done
 
 # GIT_NO_LAZY_FETCH: in a blob-less clone a missing commit would otherwise be fetched here, one by
 # one with no timeout, behind fetch_earlier's back.
