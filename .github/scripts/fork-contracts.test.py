@@ -2103,7 +2103,7 @@ RECORD_DOWNLOAD = {
 }
 RECORD_CHECK = "Require a record of every listed fork test"
 RECORD_CHECK_ENV = {"RECORDS": RECORDS_DIR, "RUN_ID": "${{ github.run_id }}",
-                    "RUN_ATTEMPT": "${{ github.run_attempt }}", "SHA": "${{ needs.changes.outputs.sha }}"}
+                    "RUN_ATTEMPT": "${{ github.run_attempt }}", "SHA": "${{ needs.changes.outputs.sha || github.sha }}"}
 CHECK_START, CHECK_END = "python3 -I - <<'CHECK'\n", "\nCHECK\n"
 
 
@@ -2434,8 +2434,10 @@ QUIET_REFUSED = {
         "RECORD_JOBS", '{"workflows": 1, "action_tests": 1, "kit_tests": 3, "kit_root_tests": 1}'),
     "RECORD_JOBS with two kit shards": lambda jobs: result_step(jobs, RECORD_CHECK)["env"].__setitem__(
         "RECORD_JOBS", '{"workflows": 1, "action_tests": 1, "kit_tests": 2, "kit_root_tests": 1, "lint": 1}'),
-    "the records check's SHA from the event": lambda jobs: result_step(jobs, RECORD_CHECK)["env"].__setitem__(
-        "SHA", "${{ github.sha }}"),
+    "the records check's SHA from the event alone (a release run tests another)": lambda jobs: result_step(
+        jobs, RECORD_CHECK)["env"].__setitem__("SHA", "${{ github.sha }}"),
+    "the records check's SHA from the release ref alone (empty on a pull request)": lambda jobs: result_step(
+        jobs, RECORD_CHECK)["env"].__setitem__("SHA", "${{ needs.changes.outputs.sha }}"),
     "the records check's attempt fixed at 1": lambda jobs: result_step(jobs, RECORD_CHECK)["env"].__setitem__(
         "RUN_ATTEMPT", "1"),
     "the records check || true": lambda jobs: result_step(jobs, RECORD_CHECK).__setitem__(
@@ -2640,7 +2642,7 @@ WRITE_RECORDS = (
     "results: c.results.map(([key, file, run, result, allowed]) => r.record(key, file, run, result, allowed)) }); }")
 
 
-def run_check(artifacts, attempt=1, tweak=None):
+def run_check(artifacts, attempt=1, tweak=None, sha=FIX_SHA):
     """The check's exit status and output on these records (tweak: changes the written files)."""
     with tempfile.TemporaryDirectory() as tmp:
         folder = pathlib.Path(tmp) / "records"
@@ -2650,7 +2652,7 @@ def run_check(artifacts, attempt=1, tweak=None):
         if tweak:
             tweak(folder)
         env = {"PATH": os.environ["PATH"], "RECORDS": str(folder), "RUN_ID": FIX_RUN, "RUN_ATTEMPT": str(attempt),
-               "SHA": FIX_SHA, "RECORD_JOBS": CHECK_STEP["env"]["RECORD_JOBS"],
+               "SHA": sha, "RECORD_JOBS": CHECK_STEP["env"]["RECORD_JOBS"],
                "GITHUB_STEP_SUMMARY": str(pathlib.Path(tmp) / "summary")}
         done = subprocess.run(["python3", "-I", "-"], input=CHECK_SCRIPT, env=env, capture_output=True, text=True,
                               cwd=tmp)
@@ -2722,6 +2724,9 @@ RECORDS_REFUSED = {
                                   "kit_tests (leg 2 of 3): uploaded no fork test records"),
     "the lint job without records": (lambda r: r.pop("fork-test-records-lint-0-1"), {}, "lint (leg 1 of 1)"),
     "an empty records artifact": (lambda r: r.__setitem__("fork-test-records-lint-0-1", []), {}, "empty"),
+    # No commit to compare with (a pull request's release-ref output is empty): red, never "all records match".
+    "an empty commit to compare with": (lambda r: None, {"sha": ""}, "is '', not a full SHA"),
+    "a short commit to compare with": (lambda r: None, {"sha": FIX_SHA[:12]}, "not a full SHA"),
     # A record that is not this run's, attempt's, job's, leg's or commit's.
     "a record of another run": (lambda r: leg(r, "lint")[0].update(run_id="4241"), {},
                                 "written by another run, attempt or job"),

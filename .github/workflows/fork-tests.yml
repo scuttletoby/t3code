@@ -1493,7 +1493,8 @@ jobs:
           RECORDS: ${{ runner.temp }}/fork-test-records
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-          SHA: ${{ needs.changes.outputs.sha }}
+          # The commit every job's checkout tests: a release run's resolved one, else the run's own.
+          SHA: ${{ needs.changes.outputs.sha || github.sha }}
           # Each job that runs listed fork tests, with its number of legs (fork-contracts.test.py keeps it so).
           RECORD_JOBS: '{"workflows": 1, "action_tests": 1, "kit_tests": 3, "kit_root_tests": 1, "lint": 1}'
         run: |
@@ -1506,6 +1507,8 @@ jobs:
           sha = os.environ['SHA']
           legs = json.loads(os.environ['RECORD_JOBS'])
           problems = []
+          if not re.fullmatch(r'[0-9a-f]{40}', sha):
+              problems.append(f'the commit to compare the records with is {sha!r}, not a full SHA')
 
           # The newest attempt's artifact of each job and leg.
           newest = {}
