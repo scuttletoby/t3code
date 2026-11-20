@@ -82,7 +82,7 @@ const WaitCancelTool = Tool.make("wait_cancel", {
 // Fork (issue 386): the caller's delegated tasks with unread results and live slot use.
 const TaskListTool = Tool.make("task_list", {
   description:
-    "List this thread's delegated tasks with an unread result (local and linked) and its running children per place, from live status. Marks nothing read; task_status does.",
+    "List this thread's delegated tasks with unread results and live child counts per place. Read only; task_status marks read.",
   parameters: TaskListInput,
   success: TaskListResult,
   failure: OrchestratorMcpFailure,

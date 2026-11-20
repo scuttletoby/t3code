@@ -16,14 +16,20 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
+  type ChildActivity,
   countByPlace,
   isDelegatedTask,
   isEndedTask,
   localActivity,
+  orphansOf,
   remoteActivity,
   resultDelivery,
   taskWhere,
 } from "../../../fork/delegatedResults/delegatedResults.ts";
+import {
+  LINKED_PAGE_SIZE,
+  listLinkedThreads,
+} from "../../../fork/delegatedResults/linkedThreads.ts";
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import type { McpThreadInvocationScope } from "../../McpInvocationContext.ts";
@@ -64,7 +70,7 @@ export const TaskListResult = Schema.Struct({
   tasks: Schema.Array(TaskListEntry),
   /** Ended tasks whose result never reached this thread. */
   owed: Schema.Number,
-  /** Ended tasks with no delivery record (from before it was kept): read them to be sure. */
+  /** Ended tasks with no delivery record (an old row, or a wait that never acknowledged it): read them to be sure. */
   unrecorded: Schema.Number,
   /** Children running now per place, from their live status; `unknown` could not be read. */
   slots: Schema.Array(Schema.Struct({ where: Where, live: Schema.Number, unknown: Schema.Number })),
@@ -80,9 +86,14 @@ export const TaskListResult = Schema.Struct({
 });
 export type TaskListResult = typeof TaskListResult.Type;
 
-/** The longest one linked environment may take to answer before it counts as unknown. */
+/**
+ * The longest one linked environment may take to answer before it counts as unknown. After one
+ * read there times out, its other tasks read as unknown without asking again.
+ */
 export const REMOTE_READ_TIMEOUT = Duration.seconds(5);
 const REMOTE_READ_CONCURRENCY = 4;
+/** Pages of `t3_thread_list` read per linked environment for orphans: its newest 500 threads. */
+export const ORPHAN_PAGES = 5;
 
 const iso = (time: DateTime.Utc | null) => (time === null ? null : DateTime.formatIso(time));
 
@@ -111,19 +122,30 @@ export const listTasks = Effect.fn("waits.taskList")(function* (input: TaskListI
   const listed =
     input.includeSettled === true ? all : all.filter((task) => resultDelivery(task) !== "settled");
 
-  const activityOf = (task: OrchestrationV2Subagent) =>
+  // Environments where one read timed out: their other tasks are not asked again.
+  const silent = new Set<EnvironmentId>();
+  const remoteRead = (task: OrchestrationV2Subagent): Effect.Effect<ChildActivity> => {
+    const environmentId = task.remoteChild!.environmentId;
+    if (silent.has(environmentId)) return Effect.succeed("unknown");
+    return remote.runStatus(threadScope, task).pipe(
+      Effect.timeoutOption(REMOTE_READ_TIMEOUT),
+      Effect.map((status) => {
+        if (status._tag === "None") silent.add(environmentId);
+        return remoteActivity(status._tag === "Some" ? status.value : null);
+      }),
+    );
+  };
+  const activityOf = (task: OrchestrationV2Subagent): Effect.Effect<ChildActivity> =>
     task.childThreadId !== null
       ? threads.getThreadShell(task.childThreadId).pipe(
           Effect.map(localActivity),
           Effect.orElseSucceed(() => "unknown" as const),
         )
-      : // A follower already recorded the end of a remote task; only an open one is read there.
-        isEndedTask(task)
+      : // A follower recorded the end of a remote task; it is read there only while it is open,
+        // or while the stop it owes there is not sent yet (its thread may still run there).
+        isEndedTask(task) && task.remoteChild?.stoppedThere !== false
         ? Effect.succeed("ended" as const)
-        : remote.runStatus(threadScope, task).pipe(
-            Effect.timeoutOption(REMOTE_READ_TIMEOUT),
-            Effect.map((status) => remoteActivity(status._tag === "Some" ? status.value : null)),
-          );
+        : remoteRead(task);
 
   const tasks = yield* Effect.forEach(
     listed,
@@ -162,9 +184,22 @@ export const listTasks = Effect.fn("waits.taskList")(function* (input: TaskListI
 
   const owed = tasks.filter((task) => task.result === "owed").length;
   const unrecorded = tasks.filter((task) => task.result === "none").length;
-  const linked: Partial<Pick<TaskListResult, "orphans" | "unreachable">> =
-    input.checkLinked === true ? yield* findOrphans(threadScope, caller.id, all) : {};
+  const {
+    partial,
+    cutShort,
+    ...linked
+  }: Partial<Pick<TaskListResult, "orphans" | "unreachable">> & {
+    readonly partial?: ReadonlyArray<EnvironmentId>;
+    readonly cutShort?: ReadonlyArray<EnvironmentId>;
+  } = input.checkLinked === true ? yield* findOrphans(threadScope, caller.id, all) : {};
   const orphanCount = linked.orphans?.length ?? 0;
+  const partialNote =
+    (partial === undefined || partial.length === 0
+      ? ""
+      : ` Orphans were looked for only in the newest ${ORPHAN_PAGES * LINKED_PAGE_SIZE} threads of ${partial.join(", ")}.`) +
+    (cutShort === undefined || cutShort.length === 0
+      ? ""
+      : ` A later page of ${cutShort.join(", ")} did not answer, so orphans there may be missing.`);
   return {
     tasks,
     owed,
@@ -172,72 +207,67 @@ export const listTasks = Effect.fn("waits.taskList")(function* (input: TaskListI
     slots: countByPlace([...tasks, ...otherActivity]),
     ...linked,
     next:
-      owed + unrecorded + orphanCount === 0
+      (owed + unrecorded + orphanCount === 0
         ? "Nothing unread. Slots show the children running now."
         : `Read each owed or unrecorded task with task_status; that marks it read.${
             orphanCount === 0
               ? ""
               : " An orphan runs there with no task here: read it with t3_thread_read and its environmentId."
-          }`,
+          }`) + partialNote,
   } satisfies TaskListResult;
 });
 
 /**
  * Threads in linked environments whose `delegatedFrom` names this thread but that no task here
- * follows: a launch whose record never ran. Reads the newest 100 threads of each environment.
+ * follows: a launch whose record never ran. Reads the newest `ORPHAN_PAGES` pages of each
+ * environment's threads; one with more is named in `partial`, one whose later page did not answer
+ * in `cutShort`.
  */
 const findOrphans = Effect.fn("waits.taskList.orphans")(function* (
   scope: McpThreadInvocationScope,
   callerId: ThreadId,
   tasks: ReadonlyArray<OrchestrationV2Subagent>,
 ) {
+  const none = { orphans: [], unreachable: [], partial: [], cutShort: [] };
   // An agent of a linked environment would be pointed at this machine's links.
-  if (scope.linkedEnvironments === false || scope.client?.linked === true) {
-    return { orphans: [], unreachable: [] };
-  }
+  if (scope.linkedEnvironments === false || scope.client?.linked === true) return none;
   const forwarding = yield* PeerForwarding.PeerForwarding;
   const links = yield* forwarding.links(scope).pipe(Effect.orElseSucceed(() => null));
-  if (links === null) return { orphans: [], unreachable: [] };
-  const known = new Set(
-    tasks.flatMap((task) =>
-      task.remoteChild === undefined
-        ? []
-        : [`${task.remoteChild.environmentId}\n${task.remoteChild.threadId}`],
-    ),
+  if (links === null) return none;
+  const followed = tasks.flatMap((task) =>
+    task.remoteChild === undefined ? [] : [task.remoteChild],
   );
   const unreachable: Array<EnvironmentId> = [];
+  const partial: Array<EnvironmentId> = [];
+  const cutShort: Array<EnvironmentId> = [];
   const orphans: Array<{ environmentId: EnvironmentId; threadId: ThreadId; title: string }> = [];
   yield* Effect.forEach(
     links.links.filter((link) => link.status !== "expired"),
     (link) =>
-      forwarding
-        .call(scope, OrchestratorToolkit.tools.t3_thread_list, link.environmentId, {
-          allProjects: true,
-          limit: 100,
-        })
-        .pipe(
-          Effect.timeoutOption(REMOTE_READ_TIMEOUT),
-          Effect.map((listed) => {
-            if (listed._tag === "None") return void unreachable.push(link.environmentId);
-            for (const thread of listed.value.threads) {
-              const from = thread.delegatedFrom;
-              if (
-                from !== undefined &&
-                from.environmentId === scope.environmentId &&
-                from.threadId === callerId &&
-                !known.has(`${link.environmentId}\n${thread.threadId}`)
-              ) {
-                orphans.push({
-                  environmentId: link.environmentId,
-                  threadId: thread.threadId,
-                  title: thread.title,
-                });
-              }
-            }
+      listLinkedThreads(
+        (cursor) =>
+          forwarding.call(scope, OrchestratorToolkit.tools.t3_thread_list, link.environmentId, {
+            allProjects: true,
+            limit: LINKED_PAGE_SIZE,
+            cursor,
           }),
-          Effect.orElseSucceed(() => void unreachable.push(link.environmentId)),
-        ),
+        link.environmentId,
+        { maxPages: ORPHAN_PAGES, timeout: REMOTE_READ_TIMEOUT },
+      ).pipe(
+        Effect.map((read) => {
+          if (read.state === "unreachable") unreachable.push(link.environmentId);
+          if (read.state === "limit") partial.push(link.environmentId);
+          if (read.state === "cut-short") cutShort.push(link.environmentId);
+          for (const orphan of orphansOf(read.threads, scope.environmentId, callerId, followed)) {
+            orphans.push({
+              environmentId: orphan.environmentId,
+              threadId: orphan.threadId,
+              title: orphan.title,
+            });
+          }
+        }),
+      ),
     { concurrency: REMOTE_READ_CONCURRENCY, discard: true },
   );
-  return { orphans, unreachable };
+  return { orphans, unreachable, partial, cutShort };
 });
