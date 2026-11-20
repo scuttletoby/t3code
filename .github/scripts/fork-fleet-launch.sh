@@ -1034,15 +1034,18 @@ never() {
   case $1 in /etc/passwd | /etc/group | /etc/hosts)
     die "$2: a job has the launcher's own, never this host's (an older kit's list?): $3" ;;
   esac
-  # The other usual files that name this host's accounts or LAN hosts, and each folder that holds one (issue #613; the
-  # walls' SECRET_ETC and SECRET_ELSEWHERE name them too, for an older launcher, and a test keeps the two lists one):
-  # passwd's and group's backup copies, subuid and subgid, tcp wrappers' rules, the network and ethers name files, the
-  # logs and login records (/var/log: wtmp, btmp, lastlog, auth.log), Debian's /var/backups (passwd.bak) and
-  # libnss-extrausers' folder.
+  # The other usual files that name this host's accounts or LAN hosts, and each folder that holds one (issues #613,
+  # #636; the walls' SECRET_ETC and SECRET_ELSEWHERE name them too, for an older launcher, and a test keeps the walls'
+  # LAUNCHER_REFUSES and these patterns one, both ways): passwd's, group's and hosts' backup copies (passwd-, passwd~,
+  # passwd.bak, passwd.OLD), subuid and subgid and theirs, tcp wrappers' rules and hosts.equiv, the network and ethers
+  # name files, the logs and login records (/var/log: wtmp, btmp, lastlog, auth.log), Debian's /var/backups
+  # (passwd.bak), libnss-extrausers' folder, the mail spools (a file per user name), SSSD's cache (passwd and group,
+  # readable by all) and the DHCP leases (the LAN's host names and MACs).
   case $1 in
-    /etc/passwd- | /etc/group- | /etc/subuid | /etc/subuid- | /etc/subgid | /etc/subgid- | /etc/hosts.allow | \
-      /etc/hosts.deny | /etc/networks | /etc/ethers | /var | /var/log | /var/log/* | /var/backups | /var/backups/* | \
-      /var/lib | /var/lib/extrausers | /var/lib/extrausers/*)
+    /etc/passwd* | /etc/group* | /etc/hosts* | /etc/subuid* | /etc/subgid* | /etc/networks | /etc/ethers | /var | \
+      /var/log | /var/log/* | /var/backups | /var/backups/* | /var/lib | /var/lib/extrausers | /var/lib/extrausers/* | \
+      /var/mail | /var/mail/* | /var/spool | /var/spool/mail | /var/spool/mail/* | /var/lib/sss | /var/lib/sss/* | \
+      /var/lib/misc | /var/lib/misc/dnsmasq.leases | /var/lib/dhcp | /var/lib/dhcp/*)
       die "$2: names this host's accounts or LAN hosts, or is a folder of such a file; a job never sees it: $3" ;;
   esac
   no_data "$1" "$2"
@@ -1147,6 +1150,12 @@ job_etc() {
   # (issue #594), though no DNS name has one. A name with any other character (a blank, a #) gets no line.
   [[ ! $name =~ ^[A-Za-z0-9_]([A-Za-z0-9._-]{0,252})$ || $name == localhost ]] || hosts+="127.0.1.1 $name"$'\n'
   mkdir -p -m 0755 -- "$root/etc"
+  # A FIFO there (or a link to one) would not refuse the write but hold it until someone reads it, and the start would
+  # hang till the agent's own limit (issue #636): refused before the write. Only root could plant one (the folder is
+  # root's, just made); what is planted after this check is the plain-file check's below.
+  for f in passwd group hosts; do
+    [[ ! -p $root/etc/$f ]] || die "$root/etc/$f is a FIFO, which would hold the write: refused"
+  done
   # One write a file, each checked: in a subshell left of ||, set -e is off, so a failed write would not stop the
   # next (issue #594); the first that fails (a file already there, a full disk) stops them all and refuses the start.
   (
@@ -1156,8 +1165,8 @@ job_etc() {
       printf '%s' "$hosts" >"$root/etc/hosts"
   ) || die "could not write $root/etc's passwd, group and hosts as new files: refused"
   # Each a plain file of its own now (issue #613 item 6): noclobber refuses only a regular file already there, so a link
-  # to /dev/null (or a FIFO) planted there would take the write and leave the job no passwd at all. Only root could
-  # plant one (the folder is root's, just made); refused all the same.
+  # to /dev/null planted there would take the write and leave the job no passwd at all. Only root could plant one
+  # (the folder is root's, just made); refused all the same.
   for f in passwd group hosts; do
     [[ -f $root/etc/$f && ! -L $root/etc/$f && -s $root/etc/$f ]] || die "$root/etc/$f is not the plain file just written: refused"
   done
@@ -1249,7 +1258,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv bad own blocked seen from linked f real
+  local name=$1 dir env_file line key value user resolv bad left own blocked seen from linked f real
   local -a props
   local -A got=()
   name_ok "$name"
@@ -1327,58 +1336,127 @@ start() {
   "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" --working-directory "$dir" \
     -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" "${props[@]}" -p "ReadWritePaths=$dir" \
     -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh"
-  # What systemd really applies (issue #365 item 1), drop-ins and defaults included, not what was asked for: a unit
-  # whose stop timeouts are over STOP_MAX (or cannot be read) is killed at once, and the start refused.
-  bad=$(stops_over "fork-fleet-$name.service")
+  # What systemd really applies (issues #365 item 1, #636), drop-ins and defaults included, not what was asked for: a
+  # unit that could run on past its limit (a stop timeout over STOP_MAX, a RuntimeMaxSec over MAX_SECONDS, a kill that
+  # leaves processes or never comes; or what cannot be read) is killed at once, and the start refused. Only a unit
+  # systemd shows gone or dead after the kill is said to be killed (issue #636).
+  bad=$(runs_on "fork-fleet-$name.service")
   if [[ -n $bad ]]; then
-    "$SYSTEMCTL" kill --signal=KILL -- "fork-fleet-$name.service" || true
-    "$SYSTEMCTL" stop --no-block -- "fork-fleet-$name.service" || true
-    die "start: fork-fleet-$name.service $bad: a job that ignores the stop at RuntimeMaxSec would run on; killed and refused"
+    left=$(kill_unit "fork-fleet-$name.service") || die "start: fork-fleet-$name.service $bad: a job could run on" \
+      "past its limit; could not kill it (ActiveState=${left:-unreadable}): refused; kill it by hand:" \
+      "systemctl kill --signal=KILL -- fork-fleet-$name.service"
+    die "start: fork-fleet-$name.service $bad: a job could run on past its limit; killed and refused"
   fi
 }
 
 # At most this long (seconds) may systemd wait for a job unit to stop before it kills it (the walls' STOP_MAX: a test
 # keeps the two one): at RuntimeMaxSec it asks the job to stop, and only kills it when that runs out.
 STOP_MAX=300
+# What runs_on reads of a job unit (`systemctl show`): each must be printed once, but RuntimeRandomizedExtraUSec, which
+# systemd before 250 has not (and so cannot add to RuntimeMaxSec either).
+JOB_SHOW=(TimeoutStopUSec TimeoutAbortUSec RuntimeMaxUSec RuntimeRandomizedExtraUSec KillMode SendSIGKILL
+  FinalKillSignal LoadState)
+# How often kill_unit looks (every half second) for the unit to be gone before it says it could not kill it.
+KILL_TRIES=10
 
-# Why the stop timeouts systemd applies to unit $1 (`systemctl show`: TimeoutStopUSec, TimeoutAbortUSec) are not each
-# at most STOP_MAX, or nothing. Read as systemd prints them (format_timespan: words such as 1min, 30s, 500ms, 1.5s,
-# infinity; 0 is endless for a stop timeout); any other word, a key missing or twice, or a show that fails: not at
-# most (fail closed).
-stops_over() {
-  local out line key n frac unit ms word seen=' '
-  local -a words
-  out=$("$SYSTEMCTL" show -p TimeoutStopUSec -p TimeoutAbortUSec -- "$1" 2>/dev/null) || {
-    echo "has stop timeouts systemctl show cannot read"
+# Why job unit $1, as systemd applies it, could run on past its limit, or nothing (issues #365 item 1, #636): a stop
+# timeout (TimeoutStopUSec, TimeoutAbortUSec) not at most STOP_MAX or a RuntimeMaxUSec not at most MAX_SECONDS (each
+# endless: infinity or 0, or longer), RuntimeRandomizedExtraUSec not 0, KillMode not control-group (what it leaves runs
+# on), SendSIGKILL not yes or FinalKillSignal not SIGKILL (a job that ignores the stop is never killed); any other key
+# or word, a key missing or twice, a LoadState but loaded, or a show that fails: fail closed. A unit systemd no longer
+# has (LoadState=not-found: it ended and --collect removed it) has nothing to check: show then prints the manager's
+# defaults, not the unit's, and nothing of it runs.
+runs_on() {
+  local out line key val
+  local -a args=() words
+  local -A got=()
+  for key in "${JOB_SHOW[@]}"; do args+=(-p "$key"); done
+  out=$("$SYSTEMCTL" show "${args[@]}" -- "$1" 2>/dev/null) || {
+    echo "has settings systemctl show cannot read"
     return
   }
   while IFS= read -r line; do
     [[ -n $line ]] || continue
-    [[ $line =~ ^(TimeoutStopUSec|TimeoutAbortUSec)=(.*)$ ]] || { echo "has a show line that is no stop timeout"; return; }
+    [[ $line =~ ^([A-Za-z]+)=(.*)$ && " ${JOB_SHOW[*]} " == *" ${BASH_REMATCH[1]} "* ]] ||
+      { echo "has a show line it did not ask for"; return; }
     key=${BASH_REMATCH[1]}
-    [[ $seen != *" $key "* ]] || { echo "has $key twice"; return; }
-    seen+="$key "
+    [[ -z ${got[$key]+x} ]] || { echo "has $key twice"; return; }
     read -ra words <<<"${BASH_REMATCH[2]}"
-    ((${#words[@]})) || { echo "has an empty $key"; return; }
-    [[ ${words[*]} != infinity && ${words[*]} != 0 ]] || { echo "has $key=${words[*]}: endless"; return; }
-    ms=0
-    for word in "${words[@]}"; do
-      [[ $word =~ ^([0-9]{1,9})(\.([0-9]{1,6}))?(us|ms|s|min|h|d|w|month|y)$ ]] ||
-        { echo "has $key=${words[*]}, not a time it can read"; return; }
-      n=$((10#${BASH_REMATCH[1]})) frac=${BASH_REMATCH[3]} unit=${BASH_REMATCH[4]}
-      # A fraction counts as one more of its unit (never less than systemd's).
-      [[ -z $frac ]] || n=$((n + 1))
-      case $unit in
-        us) ms=$((ms + (n + 999) / 1000)) ;;
-        ms) ms=$((ms + n)) ;;
-        s) ms=$((ms + n * 1000)) ;;
-        min) ms=$((ms + n * 60000)) ;;
-        *) ((n == 0)) || ms=$(((STOP_MAX + 1) * 1000)) ;;   # an hour or more: over, whatever the number
-      esac
-    done
-    ((ms > 0 && ms <= STOP_MAX * 1000)) || { echo "has $key=${words[*]}, over STOP_MAX ($STOP_MAX s) or endless"; return; }
+    got[$key]=${words[*]}
   done <<<"$out"
-  [[ $seen == *" TimeoutStopUSec "* && $seen == *" TimeoutAbortUSec "* ]] || echo "has stop timeouts systemctl show did not print"
+  [[ ${got[LoadState]-} != not-found ]] || return 0
+  for key in "${JOB_SHOW[@]}"; do
+    [[ -n ${got[$key]+x} || $key == RuntimeRandomizedExtraUSec ]] ||
+      { echo "has no $key: systemctl show did not print it"; return; }
+  done
+  [[ ${got[LoadState]} == loaded ]] || { echo "has LoadState=${got[LoadState]}, not loaded"; return; }
+  within TimeoutStopUSec "${got[TimeoutStopUSec]}" "$STOP_MAX" STOP_MAX || return 0
+  within TimeoutAbortUSec "${got[TimeoutAbortUSec]}" "$STOP_MAX" STOP_MAX || return 0
+  within RuntimeMaxUSec "${got[RuntimeMaxUSec]}" "$MAX_SECONDS" MAX_SECONDS || return 0
+  val=${got[RuntimeRandomizedExtraUSec]-0}
+  [[ $val == 0 ]] || { echo "has RuntimeRandomizedExtraUSec=$val, not 0: it runs on past RuntimeMaxSec"; return; }
+  [[ ${got[KillMode]} == control-group ]] ||
+    { echo "has KillMode=${got[KillMode]}, not control-group: what it leaves runs on"; return; }
+  [[ ${got[SendSIGKILL]} == yes ]] ||
+    { echo "has SendSIGKILL=${got[SendSIGKILL]}: a job that ignores the stop is never killed"; return; }
+  [[ ${got[FinalKillSignal]} == 9 ]] ||
+    { echo "has FinalKillSignal=${got[FinalKillSignal]}, not SIGKILL (9): a job that ignores the stop lives"; return; }
+}
+
+# Whether $1's value $2, a time as systemd prints it, is more than 0 and at most $3 seconds (the setting $4); else
+# says why and fails.
+within() {
+  local ms
+  [[ -n $2 ]] || { echo "has an empty $1"; return 1; }
+  [[ $2 != infinity && $2 != 0 ]] || { echo "has $1=$2: endless"; return 1; }
+  ms=$(span_ms "$2" "$(($3 * 1000))")
+  [[ -n $ms ]] || { echo "has $1=$2, not a time it can read"; return 1; }
+  ((ms > 0 && ms <= $3 * 1000)) || { echo "has $1=$2, over $4 ($3 s) or endless"; return 1; }
+}
+
+# The milliseconds of $1, a time as systemd prints it (format_timespan: words such as 1h, 1min, 30s, 500ms, 1.5s), or
+# more than $2 when it is longer than $2 ms; nothing when it is no such time (infinity and 0 are the caller's). A
+# fraction counts as one more of its unit and microseconds round up: never less than systemd's.
+span_ms() {
+  local ms=0 word n u cap=$(($2 + 1))
+  local -a words
+  read -ra words <<<"$1"
+  for word in "${words[@]}"; do
+    [[ $word =~ ^([0-9]{1,9})(\.([0-9]{1,6}))?(us|ms|s|min|h|d|w|month|y)$ ]] || return 0
+    n=$((10#${BASH_REMATCH[1]}))
+    [[ -z ${BASH_REMATCH[3]} ]] || n=$((n + 1))
+    case ${BASH_REMATCH[4]} in
+      us) n=$(((n + 999) / 1000)) u=1 ;;
+      ms) u=1 ;;
+      s) u=1000 ;;
+      min) u=60000 ;;
+      h) u=3600000 ;;
+      d) u=86400000 ;;
+      w) u=604800000 ;;
+      month) u=2629800000 ;;
+      y) u=31557600000 ;;
+    esac
+    if ((n > cap / u)); then ms=$cap; else ms=$((ms + n * u)); fi
+    if ((ms > cap)); then ms=$cap; fi
+  done
+  echo "$ms"
+}
+
+# Kills unit $1 (SIGKILL to all its processes, then a stop, so nothing starts them again) and looks every half second,
+# KILL_TRIES times, until systemd shows it inactive or failed (one --collect removed shows inactive). Fails, printing
+# the ActiveState it last showed (nothing when show failed), when it never does: a kill or stop may fail (D-Bus), and
+# then a unit that ignores the stop runs on.
+kill_unit() {
+  local state='' i
+  "$SYSTEMCTL" kill --signal=KILL -- "$1" || true
+  "$SYSTEMCTL" stop --no-block -- "$1" || true
+  for ((i = 0; i < KILL_TRIES; i++)); do
+    state=$("$SYSTEMCTL" show -p ActiveState --value -- "$1" 2>/dev/null) || state=''
+    [[ $state != inactive && $state != failed ]] || return 0
+    sleep 0.5
+  done
+  printf '%s' "$state"
+  return 1
 }
 
 # Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public addresses, which the
