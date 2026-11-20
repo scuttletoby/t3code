@@ -82,14 +82,14 @@ class Adapter(fx.FakeAdapter):
     """FakeAdapter plus disable(); a start the stub update asked for happens on the next look at the service (as
     upstream's install enables and starts the unit), unless the test says that build never starts."""
 
-    def service(self):
+    def service(self, timeout=None):
         asked = os.path.join(self.root, 'start-requested')
         if os.path.exists(asked):
             os.unlink(asked)
             if not os.path.exists(os.path.join(self.root, 'update-leaves-disabled')):
                 self._svc(UnitFileState='enabled')
             self.start()
-        return super().service()
+        return super().service(timeout)
 
     def start(self):
         """A build named in the test's `never-starts` file does not come up (a crash loop): the unit stays inactive."""
