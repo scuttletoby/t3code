@@ -212,18 +212,20 @@ const refuseLaunchElsewhere = Effect.fn("LaunchMcpProfile.elsewhere")(function* 
   });
 });
 
-/** McpToolAccess.startsThreads' linked-environment check: a narrowed caller is refused first. */
-export const checkedElsewhere = <
-  C extends { readonly caller: OrchestrationV2ThreadShell | undefined },
-  E,
-  R,
-  A,
-  E2,
-  R2,
->(
-  load: Effect.Effect<C, E, R>,
-  then: (caller: C) => Effect.Effect<A, E2, R2>,
-) =>
-  Effect.flatMap(load, (caller) =>
-    Effect.andThen(refuseLaunchElsewhere(caller.caller), then(caller)),
-  );
+/** The callers of `McpToolAccess.startsThreads` that start their threads on this machine. */
+const startingHere = new WeakSet<object>();
+
+/**
+ * McpToolAccess.startsThreads' own path, before it works out the new thread's modes: the thread
+ * starts on this machine, where `checkLaunchMcpProfile` checks it. A caller is loaded per call.
+ */
+export const startsHere = (caller: object): void => void startingHere.add(caller);
+
+/**
+ * McpToolAccess.startsThreads' modes, worked out on both paths: a caller its own path did not mark
+ * starts the thread on another machine, which a narrowed caller is refused (fail closed: any other
+ * path to the modes is treated as that).
+ */
+export const refuseUnlessHere = (caller: {
+  readonly caller: OrchestrationV2ThreadShell | undefined;
+}) => (startingHere.has(caller) ? Effect.void : refuseLaunchElsewhere(caller.caller));

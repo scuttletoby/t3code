@@ -14,12 +14,17 @@ import {
   ORPHANS_PER_MESSAGE,
   orphansOf,
   parentBusy,
+  legacyReminderSetId,
   REMINDER_MAX_AGE_MS,
-  reminderIds,
+  reminderBatches,
+  reminderBatchIds,
+  reminderKey,
+  REMINDERS_PER_MESSAGE,
   reminderText,
   remoteActivity,
   resultDelivery,
   toldOrphanKeys,
+  toldReminderKeys,
 } from "./delegatedResults.ts";
 import { at, delegatedTask, NOW, PARENT } from "./delegatedResults.testkit.ts";
 
@@ -95,18 +100,69 @@ describe("isRemindable", () => {
   });
 });
 
-describe("reminderIds", () => {
-  it("is the same for the same owed tasks in any order, so a repeat is deduped", () => {
-    const one = reminderIds(PARENT, [NodeId.make("a"), NodeId.make("b")]);
-    const two = reminderIds(PARENT, [NodeId.make("b"), NodeId.make("a"), NodeId.make("a")]);
-    expect(two).toEqual(one);
-    expect(one.messageId.startsWith(`delegated-reminder:${PARENT}:`)).toBe(true);
+describe("reminder ids", () => {
+  const ids = (...names: ReadonlyArray<string>) => names.map((name) => NodeId.make(name));
+  const tasks = (...names: ReadonlyArray<string>) => names.map((id) => delegatedTask({ id }));
+  const named = (batches: ReadonlyArray<ReadonlyArray<{ readonly id: string }>>) =>
+    batches.map((batch) => batch.map((task) => task.id));
+
+  it("is the same for the same tasks in any order, so a repeat is deduped", () => {
+    const one = reminderBatchIds(PARENT, ids("a", "b"));
+    expect(reminderBatchIds(PARENT, ids("b", "a", "a"))).toEqual(one);
+    expect(one.messageId).toBe(
+      `delegated-reminder:${PARENT}:${[reminderKey(NodeId.make("a")), reminderKey(NodeId.make("b"))].toSorted().join(".")}`,
+    );
     expect(one.commandId).toBe(`${one.messageId}:0`);
   });
-  it("differs when another result becomes owed", () => {
-    expect(reminderIds(PARENT, [NodeId.make("a")])).not.toEqual(
-      reminderIds(PARENT, [NodeId.make("a"), NodeId.make("b")]),
+
+  it("reads back each task a message or command id named, for this parent only", () => {
+    const sent = reminderBatchIds(PARENT, ids("a", "b"));
+    const keys = new Set([reminderKey(NodeId.make("a")), reminderKey(NodeId.make("b"))]);
+    expect(toldReminderKeys(PARENT, [sent.messageId])).toEqual(keys);
+    expect(toldReminderKeys(PARENT, [sent.commandId])).toEqual(keys);
+    const other = reminderBatchIds(ThreadId.make("other"), ids("c"));
+    const orphan = orphanBatchIds(PARENT, [linked("a")]);
+    expect(toldReminderKeys(PARENT, [other.messageId, orphan.messageId])).toEqual(new Set());
+  });
+
+  it("reminds only tasks not reminded yet: a grown set names just the new one", () => {
+    // Task a was reminded, then b ended while a was still unread: a is not reminded again.
+    const first = reminderBatchIds(PARENT, ids("a"));
+    expect(named(reminderBatches(PARENT, tasks("a", "b"), [first.messageId]))).toEqual([["b"]]);
+    // Its receipt alone (the message not projected yet, a restart) says the same.
+    expect(named(reminderBatches(PARENT, tasks("a", "b"), [first.commandId]))).toEqual([["b"]]);
+    // Run again with both told: nothing. An empty or missing record: all of them.
+    const second = reminderBatchIds(PARENT, ids("b"));
+    expect(reminderBatches(PARENT, tasks("a", "b"), [first.messageId, second.messageId])).toEqual(
+      [],
     );
+    expect(named(reminderBatches(PARENT, tasks("b", "a", "a"), []))).toEqual([["a", "b"]]);
+    expect(reminderBatches(PARENT, [], [])).toEqual([]);
+  });
+
+  it("splits many tasks into messages that each name every one of theirs", () => {
+    const many = Array.from({ length: REMINDERS_PER_MESSAGE + 2 }, (_, index) =>
+      delegatedTask({ id: `t-${String(index).padStart(2, "0")}` }),
+    );
+    const batches = reminderBatches(PARENT, many, []);
+    expect(batches.map((batch) => batch.length)).toEqual([REMINDERS_PER_MESSAGE, 2]);
+    expect(reminderText(batches[0]!)).not.toContain("more");
+  });
+
+  it("takes a reminder of the first format for exactly the owed set, or one task, as told", () => {
+    // That format's id, as the first reminder made it (sha256 of the sorted ids, 16 hex digits).
+    expect(legacyReminderSetId(PARENT, ids("a", "b"))).toBe(
+      "delegated-reminder:thread-parent:7e18f737311b2dc3",
+    );
+    expect(legacyReminderSetId(PARENT, ids("a"))).toBe(
+      "delegated-reminder:thread-parent:ca978112ca1bbdca",
+    );
+    expect(toldReminderKeys(PARENT, [legacyReminderSetId(PARENT, ids("a"))])).toEqual(new Set());
+    const legacyBoth = `${legacyReminderSetId(PARENT, ids("a", "b"))}:0`;
+    expect(reminderBatches(PARENT, tasks("a", "b"), [legacyBoth])).toEqual([]);
+    // One task told the old way: a grown set names only the new task.
+    const legacyA = legacyReminderSetId(PARENT, ids("a"));
+    expect(named(reminderBatches(PARENT, tasks("a", "b"), [legacyA]))).toEqual([["b"]]);
   });
 });
 
@@ -220,7 +276,7 @@ describe("orphan reminder", () => {
       orphanKey(linked("r-1")),
     );
     expect(a.messageId).not.toEqual(
-      reminderIds(PARENT, [NodeId.make("r-1"), NodeId.make("r-2")]).messageId,
+      reminderBatchIds(PARENT, [NodeId.make("r-1"), NodeId.make("r-2")]).messageId,
     );
   });
 

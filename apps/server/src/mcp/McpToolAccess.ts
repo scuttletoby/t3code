@@ -266,6 +266,7 @@ export const startsThreads = <P, A, E, R>(
   linked: "stamped" | { readonly refused: string },
 ) => {
   const started = Effect.fn("McpToolAccess.started")(function* (caller: Caller, params: P) {
+    yield* LaunchMcpProfile.refuseUnlessHere(caller); // Fork: MCP profile launch
     const requested = modes(params);
     return {
       runtimeMode: yield* resolveRuntimeMode(caller.limits.runtimeMode, requested.runtimeMode),
@@ -280,10 +281,11 @@ export const startsThreads = <P, A, E, R>(
     (params: P) =>
       Effect.gen(function* () {
         const caller = yield* writingCaller;
+        LaunchMcpProfile.startsHere(caller); // Fork: MCP profile launch
         if (linked !== "stamped") yield* assertNotLinked(caller, linked.refused);
         return yield* handle(params, yield* started(caller, params));
       }),
-    (params: P) => LaunchMcpProfile.checkedElsewhere(writingCaller, (c) => started(c, params)), // Fork: MCP profile launch
+    (params: P) => Effect.flatMap(writingCaller, (caller) => started(caller, params)),
   );
 };
 
