@@ -257,17 +257,21 @@ def machine_path():
     return p(MACHINE_FILE) if PREFIX else None
 
 
-def check_policy(guard, so='nothing was written'):
+def check_policy(guard, so='nothing was written', warn=False):
     """Refuse a first install (no drop-in yet) while the machine file names no valid policy: from the settings step
-    on, the hook refuses every checked call of every session until it does."""
+    on, the hook refuses every checked call of every session until it does. When the hook already runs, a rerun
+    still repairs; with warn, it says when this version cannot read the policy (an upgrade to a kit that reads it
+    otherwise, or a policy broken already), as the hook then refuses every checked call."""
     _, _, drop_in = managed_paths(guard)
-    if os.path.lexists(p(drop_in)):
-        return   # the hook already runs: rewriting its entry changes nothing a broken policy does not already do
     try:
         guard.load_policy(machine_path(), ROOT_UID)
     except guard.PolicyError as e:
-        raise Refused(f'no valid model policy ({e}). Write the policy and the machine file first (README.md, "Turn '
-                      f'it on"; mode "off" or "advise" changes nothing), then run again: {so}') from None
+        if not os.path.lexists(p(drop_in)):
+            raise Refused(f'no valid model policy ({e}). Write the policy and the machine file first (README.md, '
+                          f'"Turn it on"; mode "off" or "advise" changes nothing), then run again: {so}') from None
+        if warn:   # the hook already runs: rewriting its entry changes nothing a broken policy does not already do
+            say(f'WARNING: this version cannot use the model policy, so the hook refuses every checked call until '
+                f'it can: {e}')
 
 
 def self_test(dest):
@@ -335,7 +339,7 @@ def _install(a, done):
     folder, drop_ins, drop_in = managed_paths(guard)
     check_old_state(guard)
     # the new version's own reading of the policy, right before the hook turns on
-    check_policy(guard, so='the hook is not turned on yet')
+    check_policy(guard, so='the hook is not turned on yet', warn=True)
     for path in (folder, drop_ins):
         ensure_dir(path)
     write_file(drop_in, guard.drop_in_text())

@@ -126,9 +126,13 @@ def _text(value):
     return None if value.strip() else 'must not be empty'
 
 
+# "ultracodeOption": false says T3 offers this Claude model no ultracode option (its effort list has no ultracode,
+# ClaudeModelCatalog.ts withUltracodeToggle), so a T3 pick of it need not name ultracode, and T3 refuses one that does
 ROW = {'driver': (str, machine_file.REQUIRED, _text), 'model': (str, machine_file.REQUIRED, _text),
        'efforts': (list, None, _words), 'defaultEffort': (str, None, _text), 'aliases': (list, None, _words),
-       'useFor': (str, None, None)}
+       'useFor': (str, None, None), 'ultracodeOption': (bool, True, None)}
+# the guard's own /etc folder: an uninstall removes everything in it, so the policy may not live there
+ETC_DIR = os.path.dirname(INSTALLED)
 
 
 def parse_policy(text, path):
@@ -154,6 +158,10 @@ def parse_policy(text, path):
         row = machine_file.fields(raw, ROW, where)
         if row['defaultEffort'] is not None and row['defaultEffort'] not in (row['efforts'] or ()):
             raise PolicyError(f'{where}.defaultEffort: {row["defaultEffort"]!r} is not one of its efforts')
+        if not row['ultracodeOption'] and row['driver'] != CLAUDE_DRIVER:
+            raise PolicyError(f'{where}.ultracodeOption: only {CLAUDE_DRIVER} rows have an ultracode option')
+        if not row['ultracodeOption'] and ULTRACODE_EFFORT in (row['efforts'] or ()):
+            raise PolicyError(f'{where}.ultracodeOption: false, so the model cannot run the effort ultracode')
         for name in [row['model']] + (row['aliases'] or []):
             # a name (model or alias) means one row of a driver, never two
             if (row['driver'], name) in names:
@@ -167,7 +175,13 @@ def load_policy(machine_path=None, owner_uid=0):
     """(the machine section, the policy). Both files root-owned (owner_uid in tests); raises PolicyError."""
     machine_path = machine_path or machine_file.default_path()
     section = machine_file.read_section(KIT, machine_path, owner_uid)
-    absolute = lambda v: None if os.path.isabs(v) else 'must be an absolute path'  # noqa: E731
+    def absolute(v):
+        if not os.path.isabs(v):
+            return 'must be an absolute path'
+        for path in (os.path.normpath(v), os.path.realpath(v)):
+            if path == ETC_DIR or path.startswith(ETC_DIR + os.sep):
+                return f'must not be in {ETC_DIR}, which an uninstall removes'
+        return None
     cfg = machine_file.fields(section, {
         'policyFile': (str, machine_file.REQUIRED, absolute),
         'allowOtherHooks': (bool, False, None),
@@ -181,6 +195,8 @@ def describe(row):
     extra = [f'default {row["defaultEffort"]}'] if row['defaultEffort'] else []
     if row['aliases']:
         extra.append('Agent tool: ' + ' or '.join(repr(a) for a in row['aliases']))
+    if not row['ultracodeOption']:
+        extra.append('no ultracode option')
     text = f'{row["driver"]} {row["model"]} ({efforts}' + ''.join(f'; {e}' for e in extra) + ')'
     return text + (f': use for {row["useFor"]}' if row['useFor'] else '')
 
@@ -188,45 +204,73 @@ def describe(row):
 # ---------- one call
 
 
-def _efforts_in(options, where, problems):
-    """The efforts an options value ({id: value} or [{id, value}]) runs, as T3 runs them: ultracode on means the
-    effort "ultracode" (it runs at xhigh, so that xhigh is not named again)."""
+# JavaScript's String.prototype.trim: its WhiteSpace and LineTerminator characters (not Python's str.strip, which
+# trims \x1c-\x1f and keeps U+FEFF)
+JS_SPACE = '\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029' \
+           '\u202f\u205f\u3000\ufeff'
+
+
+def js_trim(text):
+    return text.strip(JS_SPACE)
+
+
+def _option_pairs(options, where, problems):
+    """The (id, value) pairs of an options value ({id: value} or [{id, value}]) as T3 reads them
+    (packages/contracts/src/model.ts ProviderOptionSelections): ids and text values trimmed. T3 drops a value that is
+    not a text or a boolean, or an empty id or text, and then uses the default; its lookups take the first entry of
+    an id. So such a value is refused, and so is an id given twice after trimming. None when refused."""
     if options is None:
         return []
     if isinstance(options, dict):
-        pairs = list(options.items())
+        raw = list(options.items())
     elif isinstance(options, list) and all(isinstance(o, dict) for o in options):
-        pairs = [(o.get('id'), o.get('value')) for o in options]
+        raw = [(o.get('id'), o.get('value')) for o in options]
     else:
         problems.append(f'{where}.options is neither an object nor a list of {{id, value}}')
-        return []
+        return None
+    pairs, seen = [], set()
+    for key, value in raw:
+        name = js_trim(key) if isinstance(key, str) else ''
+        if not name:
+            problems.append(f'{where}.options has an option id {key!r} that is not a non-empty text')
+            return None
+        if name in seen:
+            problems.append(f'{where}.options names {name!r} twice (T3 trims option ids, so {key!r} is {name!r})')
+            return None
+        seen.add(name)
+        if name == ULTRACODE_OPTION_ID and not isinstance(value, bool):
+            problems.append(f'{where}.options.ultracode must be true or false (T3 uses the default for {value!r})')
+            return None
+        if isinstance(value, str) and js_trim(value):
+            value = js_trim(value)
+        elif not isinstance(value, bool):
+            problems.append(f'{where}.options.{name}: {value!r} is not a non-empty text or true/false (T3 drops it '
+                            f'and uses the default)')
+            return None
+        pairs.append((name, value))
+    return pairs
+
+
+def _efforts_in(pairs):
+    """The efforts option pairs run, as T3 runs them: ultracode on means the effort "ultracode" (it runs at xhigh,
+    so that xhigh is not named again)."""
     efforts = [value for key, value in pairs if key in EFFORT_OPTION_IDS]
     ultracode = [value for key, value in pairs if key == ULTRACODE_OPTION_ID]
     if ULTRACODE_EFFORT in efforts:       # the old effort value: xhigh, with the option on unless it is given
         efforts = [ULTRACODE_RUNS_AT if e == ULTRACODE_EFFORT else e for e in efforts]
         ultracode = ultracode or [True]
-    if any(v not in (False, None) for v in ultracode):
+    if True in ultracode:
         efforts = [e for e in efforts if e != ULTRACODE_RUNS_AT] + [ULTRACODE_EFFORT]
     return efforts
-
-
-def _names_ultracode(options):
-    """Whether an options value names the ultracode option itself. (The old effort value "ultracode" needs no
-    check here: it is checked as the effort ultracode, which a row without it refuses.)"""
-    if isinstance(options, dict):
-        return ULTRACODE_OPTION_ID in options
-    if isinstance(options, list):
-        return any(isinstance(o, dict) and o.get('id') == ULTRACODE_OPTION_ID for o in options)
-    return False
 
 
 def check_pick(where, model, efforts, driver, rows, agent, problems, matched):
     """One model pick against the rows; adds problems, or the rows it matched. Without a driver every row naming
     the model must accept the pick. A row without "efforts" accepts only a pick that names no effort."""
-    if not isinstance(model, str) or not model.strip() or model == 'inherit':
+    if not isinstance(model, str) or not js_trim(model) or js_trim(model) == 'inherit':
         problems.append(f'{where} names no model (every call must name one; the guard cannot see the parent\'s)')
         return
-    model = model.strip()  # T3 trims it too
+    model = js_trim(model)  # T3 trims it too
     if driver is not None and not isinstance(driver, str):
         problems.append(f'{where} has a driver that is not a text')
         return
@@ -571,17 +615,24 @@ def check_call(kind, args, rows):
         if not isinstance(value, dict):
             problems.append(f'{where} is missing: name its model and options.effort (nothing is inherited)')
             return
-        efforts = _efforts_in(value.get('options'), where, problems)
+        pairs = _option_pairs(value.get('options'), where, problems)
+        if pairs is None:
+            return
         model, driver = value.get('model'), value.get('driverKind')
-        check_pick(where, model, efforts, driver, rows, False, problems, matched)
-        # T3 takes a Claude model's catalog default for ultracode when the call leaves it out
-        # (apps/server/src/claudeModelOptions.ts, ClaudeModelCatalog.ts ultracodeByDefault): on, where the default
-        # effort is ultracode. So a pick whose row does not allow ultracode must say ultracode: false itself.
-        if driver in (None, CLAUDE_DRIVER) and isinstance(model, str) and not _names_ultracode(value.get('options')) \
-                and any(r['driver'] == CLAUDE_DRIVER and r['model'] == model.strip()
+        check_pick(where, model, _efforts_in(pairs), driver, rows, False, problems, matched)
+        # A Claude pick that leaves ultracode out can still run it: delegate_task with the parent's model and instance
+        # starts from the parent's options and lays the given ones over them (OrchestratorMcpService.ts resolveTarget,
+        # "Given values override inherited"), so under a parent running ultracode the child runs it too; and T3 takes
+        # the catalog's default where the default effort is ultracode (ClaudeModelCatalog.ts ultracodeByDefault).
+        # So a pick whose row does not allow ultracode must say ultracode: false itself, unless the row says the
+        # model has no ultracode option (T3 refuses the option there, and nothing can turn it on).
+        if driver in (None, CLAUDE_DRIVER) and isinstance(model, str) \
+                and ULTRACODE_OPTION_ID not in (key for key, _ in pairs) \
+                and any(r['driver'] == CLAUDE_DRIVER and r['model'] == js_trim(model) and r['ultracodeOption']
                         and ULTRACODE_EFFORT not in (r['efforts'] or ()) for r in rows):
-            problems.append(f'{where}: options must name ultracode (false; T3 turns it on for {model.strip()!r} when '
-                            f'the call leaves it out and the model\'s default effort is ultracode)')
+            problems.append(f'{where}: options must name ultracode (false): without it {js_trim(model)!r} can run '
+                            f'ultracode (inherited from the parent thread, or the model\'s default). If T3 offers '
+                            f'this model no ultracode option, the policy row says "ultracodeOption": false')
 
     if kind in NO_MODEL_TOOLS:
         for key in args:
@@ -778,19 +829,26 @@ def model_settings_problems(files, policy):
     want = model_settings(policy)
     if not want['availableModels']:
         return []  # no claudeAgent row: the guard refuses every Claude pick, and availableModels cannot say "none"
-    have, env = {}, {}
+    have, env, lists = {}, {}, []
     for _, data in files:
         if not isinstance(data, dict):
             continue
         for key in ('availableModels', 'enforceAvailableModels', 'maxEffortLevel'):
             if key in data:
                 have[key] = data[key]
+        if 'availableModels' in data:
+            lists.append(data['availableModels'])
         if isinstance(data.get('env'), dict):
             env.update(data['env'])
     problems = []
-    if not isinstance(have.get('availableModels'), list) or sorted(have['availableModels']) != want['availableModels']:
-        problems.append(f'availableModels is {have.get("availableModels")!r}, not the claudeAgent rows\' models '
-                        f'{want["availableModels"]!r}')
+    if any(not isinstance(v, list) or not all(isinstance(m, str) for m in v) for v in lists):
+        problems.append(f'availableModels is not a list of texts in every file ({lists!r})')
+    # the last file's list must be the rows' models, and no earlier one may name more: the check holds whether
+    # Claude Code takes the last list or joins the lists of all managed files
+    elif not lists or sorted(set(lists[-1])) != want['availableModels'] \
+            or not {m for v in lists for m in v} <= set(want['availableModels']):
+        problems.append(f'availableModels is {have.get("availableModels")!r} (in all files {lists!r}), not the '
+                        f'claudeAgent rows\' models {want["availableModels"]!r}')
     if have.get('enforceAvailableModels') is not True:
         problems.append('enforceAvailableModels is not true')
     if 'maxEffortLevel' in want and have.get('maxEffortLevel') != want['maxEffortLevel']:

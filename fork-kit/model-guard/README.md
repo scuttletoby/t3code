@@ -29,6 +29,7 @@ Linux, Python 3 standard library only. No state: the hook reads the machine file
 | the row has no `efforts` and the call names an effort (any, `max` too)                             | pass   | pass + note                  | refuse, listing the rows  |
 | ultracode is on (see below) and the row does not list the effort `ultracode`                       | pass   | pass + note                  | refuse, listing the rows  |
 | a T3 pick of a Claude model whose row lacks `ultracode` does not name the option `ultracode`       | pass   | pass + note                  | refuse, listing the rows  |
+| a T3 option id given twice once trimmed, an empty id, or a value T3 drops (see below)              | pass   | pass + note                  | refuse, listing the rows  |
 | `create_threads`: any thread breaks a rule above, or `threads` is empty                            | pass   | pass + note                  | refuse, listing the rows  |
 | `t3_thread_launch` without `modelSelection`                                                        | pass   | pass + note                  | refuse                    |
 | `t3_thread_configure` without `modelSelection` (it only reads)                                     | pass   | pass                         | pass                      |
@@ -58,18 +59,46 @@ Where the effort is read:
   `[{"id": "effort", "value": "high"}]`, under any of the option ids `effort`, `reasoningEffort`,
   `reasoning_effort`, `reasoning`, `thinking_level` (the same list T3's usage pacing gate uses; a test keeps them in
   step). Every effort named must be allowed.
-- **Ultracode** is checked as what the server runs. The option `ultracode` (any value but `false`) runs the model in
+- **Options are read the way T3 reads them** (`packages/contracts/src/model.ts`, `ProviderOptionSelections`): T3
+  trims option ids and text values (JavaScript's `trim`, which the hook copies) and takes the first entry of an id.
+  So `{" effort": "max", "effort": "high"}` runs `max`. The hook trims the same way and refuses an id given twice
+  once trimmed, an empty id, and a value that is neither a non-empty text nor `true`/`false` (T3 drops it and uses
+  the default). This holds on every path that takes options: `delegate_task`, `create_threads`,
+  `t3_thread_launch`, `t3_thread_configure` and a project's `defaultModelSelection`.
+- **Ultracode** is checked as what the server runs. The option `ultracode` (only `true` or `false`; any other value
+  is refused, since T3 would use the default) runs the model in
   ultracode at effort xhigh, and the old effort value `"ultracode"` means xhigh with the option on (unless the option
   is given). Either way the guard counts the effort `ultracode` instead of `xhigh`, so
   `{"effort": "xhigh", "ultracode": true}` needs `ultracode` in the row's `efforts`, and `{"effort": "high",
   "ultracode": true}` needs both `high` and `ultracode`. A test reads this mapping from `packages/shared/src/model.ts`
   so the two stay in step.
-- **A T3 pick that leaves ultracode out.** T3 fills in a Claude model's catalog default for the option when a call
-  leaves it out, and that default is on for a model whose default effort is ultracode
-  (`apps/server/src/provider/ClaudeModelCatalog.ts`, `apps/server/src/claudeModelOptions.ts`); the hook
-  cannot see the catalog. So a T3 pick of a `claudeAgent` model whose row does not list `ultracode` must name the
-  option itself, `{"ultracode": false}` (or `[{"id": "ultracode", "value": false}]`), next to its effort. Rows of
-  other drivers, and rows that allow `ultracode`, need not.
+- **A T3 pick that leaves ultracode out** can still run ultracode, two ways, and the hook sees neither:
+  - **inherited from the parent.** `delegate_task` with the parent's model and provider instance starts from the
+    parent thread's options and lays the given ones over them (`OrchestratorMcpService.ts`, `resolveTarget`: "Given
+    values override inherited"). So `{"effort": "high"}` under a parent that runs ultracode starts a child that
+    runs ultracode too. This route was open before the rule;
+  - **the catalog default.** T3 fills in a Claude model's default for the option when a call leaves it out, and
+    that default is on for a model whose default effort is ultracode
+    (`apps/server/src/provider/ClaudeModelCatalog.ts`, `apps/server/src/claudeModelOptions.ts`). No bundled model
+    has that default today; a custom or later one may.
+
+  So a T3 pick of a `claudeAgent` model whose row does not list `ultracode` must name the option itself,
+  `{"ultracode": false}` (or `[{"id": "ultracode", "value": false}]`), next to its effort. Rows of other drivers,
+  and rows that allow `ultracode`, need not.
+
+  **What a T3 call must pass in `enforce`** (`delegate_task`, `create_threads`, `t3_thread_launch`,
+  `t3_thread_configure`, a project's `defaultModelSelection`): the model, and in `options` the effort and
+  `"ultracode": false`. For example `{"model": "example-large-1-0", "options": {"effort": "high", "ultracode":
+  false}}`. Agent instructions and briefs that make these calls should say so before `enforce` is turned on, or
+  their first call is refused (the refusal says what to add). `Agent` and `Workflow` calls have no ultracode option
+  and need nothing more.
+
+  **Models with no ultracode option.** T3 offers the option only to Claude models whose effort list has
+  `ultracode` (`ClaudeModelCatalog.ts`, `withUltracodeToggle`), and refuses it for the others ("Unknown option
+  ultracode"). The row of such a model says `"ultracodeOption": false`: a T3 pick of it then need not name
+  `ultracode` (and cannot). The row may not list the effort `ultracode`, and only `claudeAgent` rows take the key.
+  Set it only for a model T3 really offers no ultracode option: on a model that has one, a pick that leaves the
+  option out can inherit ultracode from its parent.
 
 What v0 does not check: which provider instance or account a T3 call names (`providerInstanceId`, `environmentId`),
 and the model of the session that makes the call.
@@ -147,17 +176,18 @@ and the model of the session that makes the call.
 
 [model-policy.example.json](model-policy.example.json) is a full example with made-up model names.
 
-| Key             | Required | What                                                                         |
-| --------------- | -------- | ---------------------------------------------------------------------------- |
-| `version`       | no       | `1` (the default); a newer one is refused until the kit is updated           |
-| `mode`          | yes      | `off`, `advise` or `enforce`                                                 |
-| `allow`         | yes      | the rows; an empty list refuses every pick in `enforce`                      |
-| `driver`        | yes      | T3's driver kind (`claudeAgent` for Claude)                                  |
-| `model`         | yes      | the exact model id T3 uses                                                   |
-| `efforts`       | no       | the efforts allowed with it; without the key, a call may name no effort      |
-| `defaultEffort` | no       | one of `efforts`; shown in the refusal so the agent knows what to pick       |
-| `aliases`       | no       | the short names the `Agent` tool may use for this row                        |
-| `useFor`        | no       | what the model is for; shown to the agent with every pick of it (no refusal) |
+| Key               | Required | What                                                                         |
+| ----------------- | -------- | ---------------------------------------------------------------------------- |
+| `version`         | no       | `1` (the default); a newer one is refused until the kit is updated           |
+| `mode`            | yes      | `off`, `advise` or `enforce`                                                 |
+| `allow`           | yes      | the rows; an empty list refuses every pick in `enforce`                      |
+| `driver`          | yes      | T3's driver kind (`claudeAgent` for Claude)                                  |
+| `model`           | yes      | the exact model id T3 uses                                                   |
+| `efforts`         | no       | the efforts allowed with it; without the key, a call may name no effort      |
+| `defaultEffort`   | no       | one of `efforts`; shown in the refusal so the agent knows what to pick       |
+| `aliases`         | no       | the short names the `Agent` tool may use for this row                        |
+| `useFor`          | no       | what the model is for; shown to the agent with every pick of it (no refusal) |
+| `ultracodeOption` | no       | `false`: T3 offers this Claude model no ultracode option (default `true`)    |
 
 Rules of the file: JSON with no key given twice and no unknown key; lists not empty and without repeats; texts not
 empty. The file must be owned by root, not writable by group or others, and not a link (the same rules as the
@@ -166,7 +196,8 @@ machine file), so an agent cannot widen its own policy.
 ## Turn it on (owner, as root)
 
 1. Write the policy, for example `/etc/fork-kit/model-policy.json`, root-owned, mode 644, in folders that are
-   root-owned and not writable by others all the way up to `/`. Start with `"mode": "advise"` (or `"off"`).
+   root-owned and not writable by others all the way up to `/`. Start with `"mode": "advise"` (or `"off"`). Not in
+   `/etc/model-guard`: an uninstall removes that folder, so a policy there is refused.
 2. Name it in the machine file `/etc/fork-kit/machine.json` (see [common](../common/README.md)):
 
    ```json
@@ -237,8 +268,12 @@ machine file), so an agent cannot widen its own policy.
 
 5. Run `model-guard --self-check`. When advise mode has shown no surprises (`journalctl -t model-guard`), put
    Claude Code's own model keys in `managed-settings.json` (see
-   [Claude Code's model keys](#claude-codes-model-keys)), then set `"mode": "enforce"`. The self-check prints the
-   keys to put there. The change counts from the next call; nothing needs restarting.
+   [Claude Code's model keys](#claude-codes-model-keys)). The self-check prints the keys to put there.
+6. **Try one T3 session with these keys before you rely on them.** They were tried live only with Claude Code on its
+   own. T3 may send Claude Code a model id other than the policy's (a `[1m]` suffix, an alias's API id) and maps
+   some efforts itself (for example `xhigh` runs as `max` on some models), so start a T3 thread on each Claude row
+   and check that it runs. Make the delegate instructions name `"ultracode": false` (see
+   [Rules](#rules)), then set `"mode": "enforce"`. The change counts from the next call; nothing needs restarting.
 
 ## What `enforce` does not stop
 
@@ -281,11 +316,13 @@ each request used read from the request:
 
 So in `enforce` the self-check asks for these keys, made from the policy's `claudeAgent` rows, and prints the exact
 JSON to put in `managed-settings.json` when they are missing or differ (the installer never writes the owner's
-settings). For the example policy:
+settings). Several managed files: a later file's key wins, and `env` is merged by name. Claude Code may instead
+join `availableModels` lists across the files, so the self-check wants the last list to be the rows' models and
+no earlier list to name any other. For the example policy:
 
 ```json
 {
-  "availableModels": ["example-deep-2-0", "example-large-1-0"],
+  "availableModels": ["example-deep-2-0", "example-large-1-0", "example-older-0"],
   "enforceAvailableModels": true,
   "maxEffortLevel": "xhigh",
   "env": {
@@ -301,13 +338,15 @@ A row's alias that is one of Claude Code's own (`opus`, `sonnet`, `haiku`, `fabl
 `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` set to that row's model, so the alias means what the policy says, whatever Claude
 Code's built-in map is after an update. Other aliases are only the guard's. `maxEffortLevel` is the highest effort
 of any `claudeAgent` row (`ultracode` counts as `xhigh`), so it caps but cannot tell rows apart: the guard still
-checks each row's own efforts. `deniedModels` and `disableWorkflows` are not asked for: the allow list already
+checks each row's own efforts. (Claude Code also takes a cap per model, `modelSettings`; the self-check does not
+ask for it yet, as it was not tried live.) `deniedModels` and `disableWorkflows` are not asked for: the allow list already
 covers the first, and the guard checks Workflow. In `advise` and `off` the self-check does not ask for them, because
 they bind in every mode.
 
 Not covered: Claude Code also takes managed settings from a remote server or an OS policy (MDM), and those win over
 the files. The self-check reads only the files, so on such a machine check those sources too. T3's own Claude
-sessions were not tried live; they run the same Claude Code, so the same keys apply.
+sessions were not tried live; they run the same Claude Code, so the same keys should apply, but try one
+first ("Turn it on", step 6).
 
 ## Self-check (the drift check)
 

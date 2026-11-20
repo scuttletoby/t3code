@@ -234,6 +234,31 @@ class Install(unittest.TestCase):
         self.assertEqual(set(self.snapshot()) | {'/etc/model-guard/install.lock'}, set(before))
         self.assertEqual(self.install(sha=SHA2)[0], 0)      # run again: a new lock file, and it goes on
 
+    def test_a_lock_folder_an_uninstall_removed_before_the_open_is_refused(self):
+        """#589 review: an uninstall can remove the guard's /etc folder between the installer's ensure_dir and its
+        open of the lock file. The open then finds no folder: refused with "run again", nothing more written."""
+        self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        real_ensure_dir, calls = self.m.ensure_dir, []
+
+        def ensure_dir_then_uninstall(path):
+            real_ensure_dir(path)
+            if path == self.m.ETC and not calls:
+                calls.append(path)
+                shutil.rmtree(self.path(self.m.ETC))      # the uninstall's last step, between the two calls
+        before = self.snapshot()
+        with mock.patch.object(self.m, 'ensure_dir', ensure_dir_then_uninstall):
+            code, _, err = self.install(sha=SHA2)
+        self.assertEqual(calls, [self.m.ETC])
+        self.assertEqual(code, 1)
+        self.assertIn('just uninstalled the kit: run again', err)
+        # nothing written: only the guard's /etc folder (the uninstall's) is gone
+        self.assertEqual(set(self.snapshot()), {k for k in before if not k.startswith(self.m.ETC)})
+        code, _, err = self.install(sha=SHA2)                   # run again: it goes on
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.self_check()[0], 0)
+
     def test_leftovers_of_a_stopped_run_are_cleared(self):
         self.turn_on()
         self.assertEqual(self.install()[0], 0)
@@ -412,7 +437,27 @@ class Install(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.self_check()[0], 0)
         os.unlink(self.path('/etc/fork-kit/model-policy.json'))   # the hook runs already: a rerun still repairs
-        self.assertEqual(self.install()[0], 0)
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertIn('WARNING: this version cannot use the model policy', out)
+
+    def test_an_upgrade_that_cannot_read_the_policy_warns(self):
+        """#589 review: when the hook already runs, the settings step still repairs, but says when the new version
+        cannot read the policy (say a kit that reads it otherwise), since the hook then refuses every checked call."""
+        self.turn_on()
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('WARNING', out)
+        self.write('/etc/fork-kit/model-policy.json', {'version': 99, 'mode': 'off', 'allow': []})
+        code, out, err = self.install(sha=SHA2)
+        self.assertEqual(code, 0, err)
+        self.assertIn('WARNING: this version cannot use the model policy', out)
+        self.assertIn('update the kit', out)
+        self.assertEqual(self.current(), f'/usr/local/libexec/model-guard/versions/{SHA2}')
+        self.turn_on()
+        code, out, err = self.install(sha=SHA2)                 # runs again with a policy it reads: no warning
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('WARNING', out)
 
     def test_a_drop_in_someone_else_owns_is_written_again(self):
         self.turn_on()
@@ -588,11 +633,17 @@ INSTALLER_MUTATIONS = {
                                       'test_managed_settings_folder_that_is_not_ours_is_refused'),
     'the drop-in is written': ('    write_file(drop_in, guard.drop_in_text())\n', '',
                                'test_fresh_install_links_record_and_self_check'),
-    'a first install needs a policy': ('    if os.path.lexists(p(drop_in)):\n        return   # the hook already runs',
-                                       '    if True:\n        return   # the hook already runs',
+    'a first install needs a policy': ('        if not os.path.lexists(p(drop_in)):\n            raise Refused',
+                                       '        if False:\n            raise Refused',
                                        'test_a_first_install_without_a_valid_policy_writes_nothing'),
-    'the settings step checks the policy again': ("    check_policy(guard, so='the hook is not turned on yet')",
+    'the settings step checks the policy again': ("    check_policy(guard, so='the hook is not turned on yet', warn=True)",
                                                   '    pass', 'test_the_settings_step_checks_the_policy_again'),
+    'an upgrade that cannot read the policy warns': ('        if warn:', '        if False:',
+                                                     'test_an_upgrade_that_cannot_read_the_policy_warns'),
+    'a lock folder gone before the open is refused': (
+        "    except FileNotFoundError:\n        raise Refused('another model-guard-install just uninstalled",
+        "    except KeyError:\n        raise Refused('another model-guard-install just uninstalled",
+        'test_a_lock_folder_an_uninstall_removed_before_the_open_is_refused'),
     'a file root does not own is written again': ('                    and owner_of(real) == ROOT_UID:',
                                                   '                    :',
                                                   'test_a_drop_in_someone_else_owns_is_written_again'),
