@@ -123,7 +123,7 @@
       ]
     },
     "apps/server/src/peer/RemoteDelegation.ts": {
-      "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) rewrites this block, and its intent differs: after an interrupted, uncertain launch it stops the child there, while this seam keeps the child and follows it. Whoever brings #30249 in through fork-follow must choose on purpose between stopping and keeping (and expect a merge conflict on this block), then drop this seam or keep it. Also #386: lastReply reads a task's reply through fork/remoteReplyRead.ts, which decodes the answer again without the thread's details when the full read does not decode, so a linked environment on another version (thread details missing a field this version requires) still delivers the reply. Tested in apps/server/src/fork/remoteReplyRead.test.ts.",
+      "why": "#386: a remote delegate_task interrupted after its launch there (the parent's turn moved on) still records and follows its task: the launch, record and follow run as one uninterruptible step. A launch recorded with no task here is stopped there with a warning, as a failed record is. Tested in apps/server/src/fork/remoteDelegationAbortSafe.test.ts. Upstream PR pingdotgg/t3code#30249 (record before launch) rewrites this block, and its intent differs: after an interrupted, uncertain launch it stops the child there, while this seam keeps the child and follows it. Whoever brings #30249 in through fork-follow must choose on purpose between stopping and keeping (and expect a merge conflict on this block), then drop this seam or keep it. Also #386: lastReply reads a task's reply through fork/remoteReplyRead.ts, which decodes the answer again without the thread's details when the full read does not decode, so a linked environment on another version (thread details missing a field this version requires) still delivers the reply. Tested in apps/server/src/fork/remoteReplyRead.test.ts. Also #532: a remote delegate_task carries its parent's resolved MCP profile in delegatedFrom (fork/remoteMcpProfile.ts), worked out before the uninterruptible launch so a refusal or an interrupt sends nothing; a profile narrower than all goes only to an environment whose GET /api/fork/features (fork/forkFeatures.ts, answered only to its link token) says mcpProfileCarry. Tested in apps/server/src/fork/remoteMcpProfile.test.ts.",
       "added": [
         "// Fork: from the launch on, the task is recorded and followed even if this call is",
         "// interrupted (the parent's turn moved on), else the thread there runs with nothing here",
@@ -138,7 +138,16 @@
         "import * as RemoteReplyRead from \"../fork/remoteReplyRead.ts\"; // Fork: replies across versions",
         "const replyForwarding = RemoteReplyRead.replyReads(forwarding); // Fork: lastReply reads with it",
         "const forwarding = replyForwarding; // Fork: a reply there on another version is still read."
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-20",
+        "added": [
+          "import * as RemoteMcpProfile from \"../fork/remoteMcpProfile.ts\"; // Fork: MCP profile carry",
+          "const carryMcpProfile = yield* RemoteMcpProfile.makeCarry(links); // Fork: MCP profile carry",
+          "const carried = yield* carryMcpProfile(parent.thread, target.environmentId); // Fork: before the launch",
+          "...carried, // Fork: the parent's MCP profile"
+        ]
+      }
     },
     "apps/web/src/components/ChatView.browser.test.tsx": {
       "why": "#474: upstream's test \"an interrupted image-only first send of a new thread says it may not have been sent\" presses Enter once the pasted image's tile shows. The tile shows while the image still compresses, and the composer refuses a send then (\"Still compressing a pasted image\"), so on a loaded runner the launch never came and the test went red. The fork line waits until the tile's preview button is enabled, which is when the image is ready. Drop this seam when upstream's test waits for the ready image itself.",
@@ -193,6 +202,37 @@
     "apps/web/src/components/settings/SettingsSidebarNav.tsx": {
       "why": "The fork's Settings page \"Fork\" (/settings/fork) needs its icon in the nav's icon table, which every SettingsPath must have.",
       "added": ["GitForkIcon,", "\"/settings/fork\": GitForkIcon, // Fork"]
+    },
+    "apps/server/src/peer/RemoteDelegation.test.ts": {
+      "why": "#532: a remote delegate_task carries its parent's MCP profile in delegatedFrom, so the upstream test of what the launch there names as its parent expects it (all, as that test's parent has no profile). Tested in apps/server/src/fork/remoteMcpProfile.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-20",
+        "added": [
+          "mcpProfile: { name: \"all\", servers: \"all\", t3Tools: \"all\" }, // Fork: the parent's MCP profile"
+        ]
+      }
+    },
+    "apps/server/src/mcp/advertisedJsonSchema.ts": {
+      "why": "#532: the MCP profile a linked environment carries in delegatedFrom is left out of the input schema agents see (fork/advertisedMachineFields.ts): only a machine sets it, so no thread pays tokens for it and upstream's agentContextBudget.json stays upstream's. Decoding still reads it. Tested in apps/server/src/fork/remoteMcpProfile.test.ts and upstream's AgentContextBudget.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-20",
+        "added": [
+          "import { withoutMachineOnlyFields } from \"../fork/advertisedMachineFields.ts\"; // Fork: MCP profile carry",
+          "result = withoutMachineOnlyFields(result); // Fork: a field only a linked machine sets"
+        ]
+      }
+    },
+    "packages/contracts/src/orchestrationV2.ts": {
+      "why": "#532: delegatedFrom carries the delegating thread's resolved MCP profile (optional; read strictly by apps/server/src/fork/mcpProfile.ts, which refuses one it cannot read rather than widening). An older sender leaves it out. Tested in apps/server/src/fork/mcpProfile.test.ts and remoteMcpProfile.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-20",
+        "added": [
+          "mcpProfile: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)), // Fork: the parent's MCP profile"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
