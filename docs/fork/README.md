@@ -473,13 +473,19 @@ Whether this machine takes tasks that another machine delegated with a profile n
 ([#640](https://github.com/scuttletoby/t3code/issues/640)). `apply` (the default) cuts such a task
 down to the carried profile, as `server.mcpProfiles` says. `refuse` takes no part in carrying: the
 features route answers `mcpProfileCarry: false`, so a narrower-profile thread on another machine is
-refused before it sends, and a task that arrives with one anyway (sent before the setting changed)
-does not start its turn, nor do its sub-agents, and says why. Neither value gives a task more than
+refused before it sends. A task that arrives with one anyway (sent before the setting changed), or
+with a profile this machine cannot read, does not start its turn on Claude, nor do its sub-agents,
+and says why. On Codex or any other provider such a task still runs, with every tool: only Claude
+threads apply profiles (see `server.mcpProfiles`). Neither value gives a task more than
 it would get: there is no "ignore the carried profile" value, as a thread could then get more tools
 by delegating to this machine. A task that carries `all`, or nothing (from an older T3), runs as
 before, and the owner's pick for a task here (`mcpThreadProfiles`) still stands. It is read again
 for each turn and each ask, so a change counts from the next one. A value it does not know reads as
-`apply`. Only the person can change it; agents cannot.
+`apply`. When a Claude turn cannot read the settings in full and falls back to `settings.json`
+alone, and that file does not decode either, it reads as `refuse`: the file may say `refuse`, so a
+narrower carried task is refused rather than cut. A file that did not decode when the server loaded
+it gives every setting its default, this one `apply` (a narrower carried task is still cut, never
+given more). Only the person can change it; agents cannot.
 
 ```json
 { "mcpCarriedProfiles": "refuse" }
