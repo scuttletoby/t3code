@@ -436,6 +436,17 @@ gate_src = GATE_PY.read_text()
 check("README setup: the warning it names is head_gate's own text",
       "the review trigger's run does not name a head" in setup.replace("\n   ", " ")
       and "the review trigger's run does not name a head" in gate_src)
+# #651: step 8 tells the two "no open pull request" failures apart by the count head_gate logs, and says which pull
+# request to pick (a branch the gate looks up, a fork that still exists), so a skipped name is not read as a failure.
+step8 = setup.replace("\n   ", " ")
+check("README setup: step 8 tells the filter from the head apart by the count the gate logs, in the gate's words",
+      "no open pull request on that branch" in step8 and "filter differs" in step8 and "a count means" in step8
+      and "GitHub listed " in gate_src and "'no open pull request on that branch'" in gate_src,
+      step8[-600:])
+check("README setup: step 8 picks a plain branch name and a fork that still exists",
+      "branch name is plain" in step8 and "fork still exists" in step8 and "does not look them up" in step8, step8[-600:])
+check("README setup: step 8 says an older pin logs the warning as a plain line",
+      "logs it as a plain line" in step8, step8[-600:])
 notes = (root / "fork-ci/RELEASE-NOTES.md").read_text()
 entry = next((e for e in notes.split("\n### ")[1:] if "review-trigger.example.yml" in e and "#375" in e.split("\n")[0]),
              "")
@@ -443,7 +454,13 @@ upgrade = entry[entry.find("**Upgrade:**"):] if "**Upgrade:**" in entry else ""
 check("release notes: the review trigger has an entry whose Upgrade copies the trigger and the caller's workflow_run, "
       "if and concurrency, pin first, then the live check (setup step 8)",
       all(w in upgrade for w in ("review-trigger.example.yml", "gate-caller.example.yml", "`workflow_run`", "`if`",
-                                 "`concurrency`", "pinned to an older release", "setup step 8")), upgrade[:300])
+                                 "`concurrency`", "pinned to an older release", "is refused", "setup step 8")),
+      upgrade[:300])
+# #651: ci/v15 has the trigger, so a pin at ci/v15..ci/v19 needs no move first ("a release that has this entry" said it
+# did); the refusal is for ci/v14 and before.
+check("release notes: the Upgrade's pin is ci/v15 or later, and the refused older pin is ci/v14 or before",
+      "at `ci/v15` or later" in upgrade and "(`ci/v14` or before) is refused" in upgrade
+      and "a release that has this entry" not in upgrade, upgrade[:400])
 
 if failures:
     print(f"\n{len(failures)} failed")
