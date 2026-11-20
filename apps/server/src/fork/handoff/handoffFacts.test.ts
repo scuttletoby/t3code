@@ -25,15 +25,34 @@ type Records = OrchestrationV2ThreadProjection;
 const kinds = (records: Records) => handoffBlockers(records).map((blocker) => blocker.kind);
 
 describe("parseHandoffMessageId", () => {
-  it("reads the source run and the retry, and nothing else", () => {
+  it("reads the source run, the loud mark and the retry, and nothing else", () => {
     expect(parseHandoffMessageId(threadId, handoffMessageId)).toEqual({
       runId,
+      loud: false,
       retry: false,
     });
     expect(parseHandoffMessageId(threadId, `${handoffMessageId}:retry1`)).toEqual({
       runId,
+      loud: false,
       retry: true,
     });
+    expect(parseHandoffMessageId(threadId, `${handoffMessageId}:loud`)).toEqual({
+      runId,
+      loud: true,
+      retry: false,
+    });
+    expect(parseHandoffMessageId(threadId, `${handoffMessageId}:loud:retry1`)).toEqual({
+      runId,
+      loud: true,
+      retry: true,
+    });
+    // The marks in the wrong order name no real run, and the loud mark still alerts.
+    expect(parseHandoffMessageId(threadId, `${handoffMessageId}:retry1:loud`)).toEqual({
+      runId: `${runId}:retry1`,
+      loud: true,
+      retry: false,
+    });
+    expect(parseHandoffMessageId(threadId, `handoff:${threadId}::loud`)).toBeNull();
     expect(parseHandoffMessageId(ThreadId.make("other"), handoffMessageId)).toBeNull();
     expect(parseHandoffMessageId(threadId, "message-1")).toBeNull();
     expect(parseHandoffMessageId(threadId, `handoff:${threadId}:`)).toBeNull();
