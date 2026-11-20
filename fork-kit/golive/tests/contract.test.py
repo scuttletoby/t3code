@@ -116,7 +116,8 @@ UPSTREAM = [
      'handoff.MARKER: runtime/desktop-update-in-progress'),
     ('packages/contracts/src/desktopBootstrap.ts',
      f'export const DESKTOP_UPDATE_IN_PROGRESS_TTL_MS = {handoff.TTL_MS:_};',
-     'handoff.TTL_MS: the marker runs out 60 s after it is written'),
+     'handoff.TTL_MS: expiresAt = startedAt + 60 s; startedAt is CLOCK_SLACK_MS (1 s) back, so the marker runs out '
+     '59 s after it is written'),
     ('apps/server/src/desktopUpdate/DesktopUpdateMarker.ts',
      'Schema.Struct({ startedAt: Schema.Number, expiresAt: Schema.Number }),',
      'handoff.publish: {"startedAt": ms, "expiresAt": ms}'),

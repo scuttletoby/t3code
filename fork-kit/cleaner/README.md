@@ -8,22 +8,23 @@ is in the code and cannot be switched off.
 It lives in `fork-kit` because it runs on a machine (not in CI and not inside T3), reads its facts from the
 machine file like every kit, and ships with the kits in `ci-release`. `fork-ci` holds only what CI itself runs.
 
-The core, four rules, an [installer](#install) and one [daily timer](#the-daily-timer). While the tools it is
+The core, its rules (four that delete, `compress-cold` and `dedupe` that delete no content), an [installer](#install) and one [daily timer](#the-daily-timer). While the tools it is
 to replace still delete on a host, the timer runs in compare mode: it plans, reports and compares what it would
 delete with what they would, and deletes nothing.
 
-| Part         | File                                                    | What it does                                                  |
-| ------------ | ------------------------------------------------------- | ------------------------------------------------------------- |
-| config       | `lib/cleaner/config.py`                                 | reads the `cleaner` section of the machine file               |
-| facts        | `lib/cleaner/facts.py`                                  | reads the process list, systemd units, git, GitHub and Docker |
-| guard        | `lib/cleaner/guard.py`                                  | the hard refusals: asked about every path, twice              |
-| rules        | `lib/cleaner/rules.py`                                  | `worktrees`, `docker`, `tmp`, `agent-scratch`: what and why   |
-| compress     | `lib/cleaner/compress.py`                               | `compress-cold`: cold files replaced by a checked zstd copy   |
-| `plan`,`run` | `lib/cleaner/engine.py`                                 | the two commands, the lock and the log                        |
-| `report`     | `lib/cleaner/report.py`                                 | one line: GB per class, and what runs freed                   |
-| `compare`    | `lib/cleaner/compare.py`                                | its plan next to the dry runs of the tools it replaces        |
-| `daily`      | `lib/cleaner/daily.py`                                  | what the timer runs: compare mode or run mode                 |
-| installer    | `sbin/fork-cleaner-install`, `bootstrap.sh`, `systemd/` | the version folder, the links, the timer                      |
+| Part         | File                                    | What it does                                                  |
+| ------------ | --------------------------------------- | ------------------------------------------------------------- |
+| config       | `lib/cleaner/config.py`                 | reads the `cleaner` section of the machine file               |
+| facts        | `lib/cleaner/facts.py`                  | reads the process list, systemd units, git, GitHub and Docker |
+| guard        | `lib/cleaner/guard.py`                  | the hard refusals: asked about every path, twice              |
+| rules        | `lib/cleaner/rules.py`                  | `worktrees`, `docker`, `tmp`, `agent-scratch`: what and why   |
+| compress     | `lib/cleaner/compress.py`               | `compress-cold`: cold files replaced by a checked zstd copy   |
+| dedupe       | `lib/cleaner/dedupe.py`                 | `dedupe`: the same bytes in two files become one hard link    |
+| `plan`,`run` | `lib/cleaner/engine.py`                 | the two commands, the lock and the log                        |
+| `report`     | `lib/cleaner/report.py`                 | one line: GB per class, and what runs freed                   |
+| `compare`    | `lib/cleaner/compare.py`                | its plan next to the dry runs of the tools it replaces        |
+| `daily`      | `lib/cleaner/daily.py`                  | what the timer runs: compare mode or run mode                 |
+| installer    | `sbin/fork-cleaner-install`, `systemd/` | the version folder, the links, the timer                      |
 
 ## Commands
 
@@ -554,6 +555,131 @@ too.
 - **the cleaner is older than the machine file:** an older cleaner refuses the unknown `compressCold` key and every
   daily run exits 2. Install this cleaner on a machine first, then add the key.
 
+## `dedupe`: one copy of the same bytes
+
+Another rule that deletes no content (#486). Files in the folders of `dedupe.folders` that hold the same bytes,
+with the same mode, owner, group, extended attributes and chattr flags, become hard links of one of them: every name
+stays, each reads the same bytes as before, and the disk holds them once. Without folders the rule does nothing.
+
+```jsonc
+// in the "cleaner" section
+"dedupe": {
+  "folders": [
+    { "path": "~/mirrors", "days": 30 },
+    { "path": "/srv/build-output/releases", "days": 14 }
+  ]
+}
+```
+
+| Key                     | Default  | Meaning                                                          |
+| ----------------------- | -------- | ---------------------------------------------------------------- |
+| `dedupe.folders[].path` | required | a folder; files at any depth in it are looked at                 |
+| `dedupe.folders[].days` | required | days without a change (7 or more): newer files are not looked at |
+
+**The risk it takes: read this before you name a folder.** Names of one hard-linked file are one file, so any
+write **into** one name changes every name, and the other names' old bytes are gone. Most ways of writing a file do
+that: `cp` onto an existing file, shell `>` and `>>`, `curl -o`, `wget -O`, `unzip -o`, `rsync --inplace`, `dd`,
+and most programs (`open(path, 'w')`, a Java `FileOutputStream`). Only a tool that writes a new file and renames it
+over the name gives that name its own file again: `rsync` (by default), `git`, package managers, and editors that
+save that way. The `days` rule does not help here: a file nobody touched for a month can get a `cp` the next day.
+So name **only folders of copies written once and then only read** (mirrors, release outputs, downloaded archives),
+never a folder where anything writes into files: no build caches, no game or server worlds, no virtual machine
+images, no working copies. The rule refuses the kinds it knows are written in place (databases `*.db`, `*.db3`,
+`*.sqlite*`, `*.mdb`, `*.ldb`, `*.ibd`, `*.wal`, and every file with a `-wal`, `-shm` or `-journal` beside it; logs
+`*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`; Minecraft region files `*.mca`, `*.mcr`, `*.mcc`;
+disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`, `*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`; mail boxes
+`mbox`, `*.mbox`; partial downloads a client resumes in place `*.part`, `*.crdownload`, `*.partial`, `*.!qb`), but
+such a list can never be complete. Every plan and run that links says it again in one line (`dedupe: names of one file
+share every later write ...`). On btrfs or XFS a tool that shares blocks with a reflink (`FIDEDUPERANGE`) is the
+safer choice: later writes do not reach the other copies. This rule makes hard links because the hosts it was made
+for are ext4, which has no reflinks.
+
+**The kept file is judged by every one of its names.** The file kept is the one with the most names, then the
+oldest, of those whose names are **all** in the folders and **all** taken by the rule. A file with one name outside
+the folders, one name the rule refuses (a database, a log, a credential or lock name, a must-keep name) or one name
+in use is never kept, and nothing is joined to it; its names stay as they are (`hard-linked`, with the reason).
+**Files in two configured folders may be linked to each other** (on one filesystem): a copy in one folder can become
+a name of a file in another, and each name is judged by the `days` of its own folder. So a write into a name in one
+folder reaches the other folder too.
+
+**The order, for each set of the same bytes.** The plan groups files by filesystem and size (only those are read),
+then by sha256 and metadata. Before each link the run looks at the duplicate and at **every** name of the kept file
+again from their configured folder down (the same checks as the plan), compares the two files **byte for byte**
+(the sha256 only finds the candidates), and reads the stamps of both before and after the compare. Then the process
+list and the locks are read again for the duplicate and every name of the kept file, and the cleaner takes a write
+lease on both files (`fcntl F_SETLEASE`): the kernel grants one only while no other descriptor of the file is open,
+and any later open breaks it. Both files are read once more after the leases and right before the link (size,
+content time and inode time as compared: a write made before a lease was taken shows there, even one that set the
+content time back). A new name of the kept file is made beside the duplicate (`.<name>.<8 hex>.cleaner-link`,
+written into the cleaner's own list first), its identity is checked, and just before the rename, in this order: the
+duplicate is read once more (same file, size and times, one name), both leases must still be whole (an open of
+either file since stops it), **every** name of the kept file is read again (each still a name of it: one moved,
+renamed or replaced stops it), and last the new name shows the kept file with its size and content time as
+compared, the inode time this run's link gave it (any write, link, rename or removal of a name since changes it) and
+as many names as known. Then the new name is renamed over the duplicate.
+
+What is left, said plainly: a writer that opens the duplicate between the last look at the leases and the rename (a
+few system calls: the names and the new name are read in between) waits for the lease, then writes into the old
+duplicate, which no longer has a name, so that write is lost; a name of the kept file moved in the one system call
+between the last look at the new name and the rename is not seen. Where the filesystem gives no leases, the run goes
+on with the process list read just before, and an in-place write into the kept file that sets its content time back
+during the link itself (between the look before the link and the look after it), or within the same tick of the
+kernel's inode clock as the link (a few milliseconds), is not seen either. The duplicate's
+name then shows the kept file's times; mode, owner, group, extended attributes and chattr flags were the same
+already.
+
+**The inode time.** Each link and rename changes the kept file's inode time (ctime), which the cleaner counts as a
+change. So it writes the inode time its own last step gave each file into a list beside its log
+(`<logFile>.dedupe-own`, at each step, and `<logFile>.dedupe` after the run); a file whose inode time is still that
+one is judged by its content time. All copies of a set are linked in one run, and a copy that arrives later joins
+them. Any other change of the inode time counts as usual.
+
+**The cache.** `<logFile>.dedupe` also keeps the sha256 of each file read, with its identity, size and both times:
+a file that has not changed since is not read again to find candidates (the link still compares byte for byte). A
+plan writes nothing; a run writes it in one step (a new file renamed over the old one). Missing, unreadable, of
+another version, a link or someone else's: an empty cache (files are read again, and files the cleaner linked look
+as new as their inode time until their `days` pass).
+
+**Never taken**, on top of what the config refuses: links (never followed, folders neither), folders with a `KEEP`
+file and git folders (`.git`, or a bare repository), in a configured folder or in a folder above it up to `/` (read
+at the plan and again before each link; a `~/.git` of dotfiles keeps every folder under the home), other filesystems
+and mount points, a folder shown somewhere else by a bind mount, other owners' files, credential and lock names,
+must-keep names, the in-place kinds above, files under 64 KB, files with more
+than one name (unless all of them are in the folders and taken by the rule, as after an earlier run: then it is the
+file kept), files in use (a process has it open or names it, it has a lock, a unit names it or a folder above it),
+and a file whose metadata differs from the others' (kept with `other metadata`: a link would give it theirs). A
+name like a part that the cleaner did not write down is a person's and stays (`not a part`). The config refuses a
+folder that is `/`, the home folder or above it, in or above a must-keep path or in a must-keep name (also where a link to one
+leads), the cleaner's own log or daily folder (and the keep-first archive while `agent-scratch` is on), a folder
+another rule deletes from, a folder of `compressCold`, or a folder in or above another of its folders.
+
+**The plan** says `would link <file> (<size>, dedupe: the same bytes as <kept file>, not changed for N days ...)`
+and, for the rule, `dedupe: would link N files (<size>)`; the total line adds `would link N (<size>)`. A run says
+`linked <file> (...; now a hard link of <kept file>, compared byte for byte, both unchanged at the last look before
+the rename)`. The report has a class
+`dedupe folders` (the configured folders, whole) and its freed figure counts linked files.
+
+**What happens when ...**
+
+- **it runs again:** the names are one file already; nothing new is done, and unchanged files are not read again.
+- **it stops half-way:** the duplicate is either as it was or a name of the kept file, never gone. Killed before
+  the new name: nothing changed. Killed between the new name and the rename: the duplicate is as it was and the
+  part `.<name>.<8 hex>.cleaner-link` stays; the next run removes that part (only while it is one the cleaner wrote
+  down and still a name of a file with other names) and links again. Killed right after a link or rename, before its
+  inode time was written down: the kept file looks changed and waits its `days`, then the run goes on. Killed while
+  the cache is written: the old cache stays, and the list of its own steps still holds what it did. A part that is
+  the last name of its bytes is kept and named (`part without its file`). A failed rename removes the part and keeps
+  the duplicate. No entry goes into the journal of half deletes: there is nothing half gone.
+- **a file changes or is opened:** while the plan reads it: kept as `changed`. Between the plan and the run, or
+  while it is compared or linked: refused or failed, both files stay as they are (the next run sees other bytes and
+  joins nothing). A kept file replaced, or given, losing or moving a name, after the plan: refused.
+- **the folder is missing or empty:** nothing to do.
+- **the cache is missing, broken or cannot be written:** files are read again; a cache that cannot be written is
+  named in one line and the run goes on.
+- **the machine file is older and has no `dedupe`:** the rule does nothing.
+- **the cleaner is older than the machine file:** an older cleaner refuses the unknown `dedupe` key and every daily
+  run exits 2. Install this cleaner on a machine first, then add the key.
+
 ## The machine file
 
 The `cleaner` section of the machine file ([common](../common/README.md)). A whole file, with made-up values:
@@ -703,10 +829,11 @@ makes the compare `incomplete` (exit 1, which wins over 3); what it printed stil
 
 ## Install
 
-From a commit of the fork's protected release branch, as root:
+From a commit of the fork's protected release branch, as root, with the bootstrap every kit shares
+(`fork-kit/common/bootstrap.sh`):
 
 ```
-sh bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
+sh fork-kit-bootstrap.sh --kit cleaner --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
 ```
 
 The bootstrap checks the commit is on `ci-release`, downloads exactly that commit and runs
@@ -725,7 +852,14 @@ that is a link is refused, never copied), so a link to a file only root may read
 world-readable copy. A copy of the same release that changed is made again beside it, self-tested, and only then
 swapped in, in one step (`renameat2` exchange; two renames where the filesystem has none): a copy that stops half
 way or fails its self-test leaves the copy in use as it was. The bootstrap passes only `--timer` or `--no-timer`
-on to the installer; any other option is refused.
+on to the installer; any other option is refused. The steps every kit shares are in
+`fork-kit/common/kit_install.py` ([common](../common/README.md#the-installer)).
+
+Update only through the bootstrap, with the newer release commit. An installed `fork-cleaner-install` from
+before the shared installer (`fork-kit/common/kit_install.py`) copies no `common/kit_install.py`, so the installer
+it leaves cannot load: it then refuses and says to run the bootstrap, which makes the copy whole again. The
+self-test now runs the copied installer's `--help` too, so a copy like that is refused from here on. `uninstall`
+refuses while a process or a transient unit runs code from `/usr/local/libexec/fork-cleaner` (a `daily` run).
 
 The installer writes no machine file: the `cleaner` section is the owner's, written by hand.
 
@@ -801,6 +935,7 @@ python3 -I -B fork-kit/cleaner/tests/worktrees.test.py
 python3 -I -B fork-kit/cleaner/tests/engine.test.py
 python3 -I -B fork-kit/cleaner/tests/report.test.py
 python3 -I -B fork-kit/cleaner/tests/compress.test.py
+python3 -I -B fork-kit/cleaner/tests/dedupe.test.py
 python3 -I -B fork-kit/cleaner/tests/scratch.test.py
 python3 -I -B fork-kit/cleaner/tests/daily.test.py
 python3 -I -B fork-kit/cleaner/tests/install.test.py

@@ -67,6 +67,7 @@ fork-ci/actions/weakened-tests/weakened_tests.test.py
 fork-ci/laws/laws.test.py
 fork-kit/cleaner/tests/compress.test.py
 fork-kit/cleaner/tests/daily.test.py
+fork-kit/cleaner/tests/dedupe.test.py
 fork-kit/cleaner/tests/engine.test.py
 fork-kit/cleaner/tests/guard.test.py
 fork-kit/cleaner/tests/install.test.py
@@ -74,6 +75,7 @@ fork-kit/cleaner/tests/report.test.py
 fork-kit/cleaner/tests/scratch.test.py
 fork-kit/cleaner/tests/worktrees.test.py ~8s
 fork-kit/common/tests/free_contract.test.py ~5s
+fork-kit/common/tests/kit_install.test.py ~20s
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py ~65s
 fork-kit/desk/tests/windows.test.py ~8s
@@ -82,6 +84,7 @@ fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
 fork-kit/golive/tests/copy.test.py ~26s
 fork-kit/golive/tests/gap.test.py ~9s
+fork-kit/golive/tests/install.test.py ~8s
 fork-kit/golive/tests/journal.test.py
 fork-kit/golive/tests/rehearse.test.py ~22s
 fork-kit/golive/tests/switch.test.py ~77s

@@ -3,7 +3,7 @@
 of every walls file in fork-fleet-walls/; the contract each must pass on fake machines from its <os>.fixture.json is
 in fork-fleet-walls-contract.test.py, which uses this file's helpers. A new walls file (and its fixture) is tested
 without a change to either file. Run: python3 <this>. Linux only."""
-import ast, base64, contextlib, hashlib, importlib.machinery, importlib.util, io, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, unittest
+import ast, base64, contextlib, errno, hashlib, importlib.machinery, importlib.util, io, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -903,7 +903,7 @@ class EveryWallsFile(WallsRunner):
         this uid's alone (launcher_safe on what it opened), or no plain file (a FIFO: opened without blocking), before
         it reads it; ask() refuses the same later, so this tests launcher_shipped alone. A safe copy of the launcher
         passes; a safe one with other bytes does not. Issue #365 item 4: a call that blocks (the FIFO opened without
-        O_NONBLOCK) fails in no_wait's time, never hangs the run."""
+        O_NONBLOCK) fails in no_wait's time, never hangs the run, and never passes as a refusal (issue #408 item 2)."""
         m = fw_linux()
         folder = os.path.join(self.tmp, 'kit')
         os.makedirs(folder, mode=0o755)
@@ -926,10 +926,17 @@ class EveryWallsFile(WallsRunner):
         os.chmod(writable, 0o775)
         fifo = os.path.join(folder, 'fifo.sh')
         os.mkfifo(fifo, 0o755)
-        for path, error in ((link, OSError), (writable, ValueError), (fifo, ValueError)):
+        # Each refusal by its own message (issue #408 item 2, the #390 security lens's M7b): a Waited reworded into a
+        # ValueError (a FIFO opened without O_NONBLOCK, behind a wrapper) is not launcher_safe's refusal.
+        with self.subTest('link.sh'):
+            m.LAUNCHER = link
+            with no_wait(), self.assertRaises(OSError) as got:
+                m.launcher_shipped()
+            self.assertEqual(got.exception.errno, errno.ELOOP)   # O_NOFOLLOW's own refusal
+        for path in (writable, fifo):
             with self.subTest(os.path.basename(path)):
                 m.LAUNCHER = path
-                with no_wait(), self.assertRaises(error):
+                with no_wait(), self.assertRaisesRegex(ValueError, 'is a link, or not owned by uid'):
                     m.launcher_shipped()
 
     def job_units(self, change, links=()):

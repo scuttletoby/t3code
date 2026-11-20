@@ -1253,7 +1253,8 @@ def _run_copy(cfg, adapter, owner_says_go, say):
             failed_hook = _server_changed(cfg, adapter, server) or _home_problem(cfg)
         if failed_hook is None and not _guard_alive(adapter, unit):
             failed_hook = f'the guard {unit} is not running any more ({look})'
-        failed_hook = failed_hook or open_gap(cfg.home)
+        # before the marker: a run refused here leaves none behind for SSH launches to wait on
+        failed_hook = failed_hook or handoff.handover_blind(cfg.home, [server['version']]) or open_gap(cfg.home)
         if failed_hook is not None:
             again = _hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
             if again:  # jobs may stay paused: not a clean refusal, the owner must look (settle)

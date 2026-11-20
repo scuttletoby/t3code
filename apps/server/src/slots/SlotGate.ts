@@ -4,7 +4,7 @@
  * is memory only; slots held by delivered slot waits come from the wait store (`attachReservations`).
  */
 import type { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
-import type { SlotRuleStatus } from "@t3tools/contracts/waitFor";
+import type { SlotRuleStatus, WaitToolFailure } from "@t3tools/contracts/waitFor";
 import {
   accountOnlyThreads,
   agentSlotsMode,
@@ -50,10 +50,22 @@ export type SlotAcquire =
 
 /** Slots held by delivered slot waits, as the wait store keeps them (`reservedUntil`). */
 export interface StoredReservations {
-  /** The live ones; read only while waits are on. */
-  readonly read: Effect.Effect<ReadonlyArray<SlotReservation>>;
+  /**
+   * The live ones; read only while waits are on. Fails when the store (or the settings) cannot be
+   * read: that is never an empty store.
+   */
+  readonly read: Effect.Effect<ReadonlyArray<SlotReservation>, WaitToolFailure>;
   /** The gate let the holder start an agent: clear the wait's `reservedUntil` (a write). */
   readonly used: (key: string) => Effect.Effect<void>;
+}
+
+/**
+ * The live held slots, one read. `whole: false`: the wait store could not be read, so `held` is the
+ * gate's memory only (a lower count, never a good read).
+ */
+interface HeldRead {
+  readonly held: ReadonlyArray<SlotReservation>;
+  readonly whole: boolean;
 }
 
 /** One slot wait asking for a slot; `key` is its wait id. */
@@ -74,7 +86,7 @@ export type SlotGrant =
   /** An earlier request of the same thread was granted in this call: asked again next time. */
   | { readonly type: "sameThread" }
   | { readonly type: "full"; readonly decision: Extract<SlotDecision, { readonly type: "refuse" }> }
-  /** The running agents cannot be counted now: never "free". */
+  /** The running agents or the held slots cannot be counted now: never "free". */
   | { readonly type: "unread"; readonly message: string };
 
 /** What `wait_list` shows while slots are on (agents running, starting or held). */
@@ -126,7 +138,10 @@ export class SlotGate extends Context.Service<
      * the thread held before counts again.
      */
     readonly drop: (keys: ReadonlyArray<string>) => Effect.Effect<void>;
-    /** For `wait_list`: null while slots are off, or when the running agents cannot be read. */
+    /**
+     * For `wait_list`: null while slots are off, or when the running agents or the held slots
+     * cannot be read.
+     */
     readonly usage: Effect.Effect<SlotUsage | null>;
     /** For `wait_list`: the capacity rule beside the gate; null unless the mode is `observe`. */
     readonly observed: Effect.Effect<SlotRuleStatus | null>;
@@ -156,6 +171,12 @@ const make = Effect.gen(function* () {
   const hiddenKeys = () =>
     new Set([...replacing.values()].flatMap((olds) => olds.map((old) => old.key)));
   let stored: StoredReservations | null = null;
+  /**
+   * Threads started while the wait store could not be read: the next good read uses their stored
+   * holds up and clears this. A counted grant needs a good read (or waits off, which clears this),
+   * so none comes in between; an uncounted one may, and counts against nothing.
+   */
+  const unreadStarts = new Set<string>();
 
   /**
    * Threads with an active run, settled or not (settling a thread does not stop its run), nobody
@@ -201,10 +222,9 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Every live held slot: granted in memory and kept in the wait store, one per wait (counted one
-   * per thread, `onePerThread`). None while waits are off (nothing of the store is read then). A
-   * store that cannot be read holds none. Taken now; the store's part is read when the returned
-   * effect runs, without the used and hidden keys of now (the capacity rule reads it later).
+   * Every live held slot (memory and wait store, one per wait); none while waits are off. A store
+   * that cannot be read gives `whole: false` (memory only). Taken now; the store's part is read when
+   * the returned effect runs, without the used and hidden keys of now (the rule reads it later).
    */
   const heldAt = Effect.fn("SlotGate.heldAt")(function* (waitsOn: boolean, nowMs: number) {
     for (const [key, untilMs] of usedKeys) if (untilMs <= nowMs) usedKeys.delete(key);
@@ -213,14 +233,30 @@ const make = Effect.gen(function* () {
       if (olds.every((old) => old.untilMs <= nowMs)) replacing.delete(key);
     }
     const memory = yield* Ref.updateAndGet(held, (current) => liveReservations(current, nowMs));
-    if (!waitsOn) return Effect.succeed<ReadonlyArray<SlotReservation>>([]);
+    if (!waitsOn) {
+      // Stored holds do not count while waits are off; a start then never uses them up either.
+      unreadStarts.clear();
+      return Effect.succeed<HeldRead>({ held: [], whole: true });
+    }
     const skipped = new Set([...usedKeys.keys(), ...hiddenKeys()]);
     const source = stored;
+    const live = (reservations: ReadonlyArray<SlotReservation>) =>
+      liveReservations(reservations, nowMs).filter((reservation) => !skipped.has(reservation.key));
     return (source === null ? Effect.succeed([]) : source.read).pipe(
-      Effect.map((fromStore) =>
-        liveReservations([...memory, ...fromStore], nowMs).filter(
-          (reservation) => !skipped.has(reservation.key),
-        ),
+      Effect.map((fromStore): HeldRead => {
+        // A start allowed while the store was unread uses its thread's stored holds up now.
+        for (const reservation of fromStore) {
+          if (!unreadStarts.has(reservation.threadId)) continue;
+          usedKeys.set(reservation.key, reservation.untilMs);
+          skipped.add(reservation.key);
+        }
+        unreadStarts.clear();
+        return { held: live([...memory, ...fromStore]), whole: true };
+      }),
+      Effect.catch((cause) =>
+        Effect.logWarning("agent slots: the slots held in the wait store cannot be read", {
+          cause,
+        }).pipe(Effect.as<HeldRead>({ held: live(memory), whole: false })),
       ),
     );
   });
@@ -282,7 +318,11 @@ const make = Effect.gen(function* () {
     },
   ) {
     const observe = yield* observing;
-    if (Option.isNone(observe)) return yield* decision;
+    if (Option.isNone(observe)) {
+      // A decision outside observe mode may grant a hold the rule's notes must never take.
+      yield* observer.outside;
+      return yield* decision;
+    }
     const { startGraceMs, gateRecords, waitsOn } = observe.value;
     const atMs = yield* Clock.currentTimeMillis;
     const starting = yield* Ref.get(entries);
@@ -298,7 +338,7 @@ const make = Effect.gen(function* () {
       today: answers(result),
       atMs,
       starting,
-      held: heldBefore,
+      held: Effect.map(heldBefore, (read) => (read.whole ? read.held : undefined)),
       callerThreadId: caller?.threadId,
       startGraceMs,
       gateRecords,
@@ -379,7 +419,10 @@ const make = Effect.gen(function* () {
       const read = counted ? yield* readRunning : undefined;
       const running = read?.running.filter((agent) => agent.threadId !== input.callerThreadId);
       const kept = yield* keepStarting(read?.visible, nowMs, limits);
-      const reservations = yield* liveHeld(waitsOn, nowMs);
+      // A store that cannot be read: its holds go uncounted (memory only), as unread counts never
+      // stop a delegation; the caller's stored holds are used up at the next good read.
+      const heldRead = yield* liveHeld(waitsOn, nowMs);
+      const reservations = heldRead.held;
       const decision = slotDecision({
         limits: running === undefined ? { ...limits, machine: null, account: () => null } : limits,
         running: running ?? [],
@@ -401,6 +444,7 @@ const make = Effect.gen(function* () {
       ]);
       // The agent it held a slot for starts now: its held slot is used up, with every older copy.
       const used = yield* useUp(reservations, input.callerThreadId);
+      if (!heldRead.whole) unreadStarts.add(input.callerThreadId);
       return asDecided({ type: "allow", token }, used);
     },
     (decided, input) =>
@@ -447,7 +491,8 @@ const make = Effect.gen(function* () {
       const kept = yield* keepStarting(read?.visible, nowMs, limits);
       const memoryBytes = yield* freeMemoryBytes(limits);
       const reserveMs = settings.value.agentSlots.reserveSeconds * 1000;
-      let reservations = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
+      const heldRead = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
+      let reservations = heldRead.held;
       const grants: Array<SlotGrant> = [];
       const grantedThreads = new Set<string>();
       for (const request of requests) {
@@ -457,8 +502,14 @@ const make = Effect.gen(function* () {
           continue;
         }
         const own = limitsFor(request);
-        if (read === undefined && limitsCount(own, request.account ?? "")) {
-          grants.push({ type: "unread", message: "The running agents cannot be counted now." });
+        if ((read === undefined || !heldRead.whole) && limitsCount(own, request.account ?? "")) {
+          grants.push({
+            type: "unread",
+            message:
+              read === undefined
+                ? "The running agents cannot be counted now."
+                : "The held slots cannot be counted now.",
+          });
           continue;
         }
         const decision = slotDecision({
@@ -553,7 +604,9 @@ const make = Effect.gen(function* () {
       limits === null
         ? []
         : liveStarting(yield* Ref.get(entries), read.visible, nowMs, limits.startGraceMs);
-    const reservations = onePerThread(yield* liveHeld(settings.value.waitFor.enabled, nowMs));
+    const heldRead = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
+    if (!heldRead.whole) return null;
+    const reservations = onePerThread(heldRead.held);
     // Holds hidden by a re-ask not kept yet: on their own account only, as `decide` counts them.
     const hidden = hiddenHeld(settings.value.waitFor.enabled, nowMs, "");
     const accountMax = (id: string) => {
