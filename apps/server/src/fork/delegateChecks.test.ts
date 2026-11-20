@@ -1,13 +1,14 @@
 // @effect-diagnostics nodeBuiltinImport:off - reads the upstream source to count its fork lines.
 /**
  * Fork: the delegation checks' seam. The upstream `OrchestratorMcpService.ts` keeps only the seat
- * calls; this file fails if a fork check is inlined there again. What the checks do is tested in
- * `OrchestratorMcpService.usageGate.test.ts` and `OrchestratorMcpService.slotGate.test.ts`.
+ * calls; this file fails if a fork check is inlined there again. The checks themselves are tested
+ * here, in the usage and slot gate tests, and on every launch path in `delegateOwnOptions.test.ts`.
  */
 import * as NodeFS from "node:fs";
 
 import { assert, describe, it } from "@effect/vitest";
 import {
+  type OrchestratorMcpTarget,
   ProjectId,
   ProviderInstanceId,
   type OrchestrationV2ThreadProjection,
@@ -51,11 +52,15 @@ describe("fork delegation checks: upstream seat calls", () => {
       beforeWorkspace: [delegateTask, 1],
       afterWorkspace: [delegateTask, 1],
       beforeCreateThread: [createThreads, 1],
+      // The remote path has no seat: it takes its target's own options through the same rule.
+      remoteTarget: [delegateTask, 1],
     } as const;
     for (const [seat, [body, expected]] of Object.entries(seats)) {
       assert.strictEqual(count(body, `delegateChecks.${seat}(`), expected, `seat ${seat}`);
       assert.strictEqual(count(source, `delegateChecks.${seat}(`), expected, `seat ${seat} (file)`);
     }
+    // Only through the checks, which read the model policy.
+    assert.strictEqual(count(source, "DelegateChecks.remoteTarget("), 0, "remote target (bare)");
     // Every use of the built checks is one of the seats.
     const uses = source.match(/\bdelegateChecks\.(?!ts\b)\w+/g) ?? [];
     assert.deepStrictEqual(
@@ -140,18 +145,219 @@ describe("fork delegation checks: runs again", () => {
     }).pipe(Effect.scoped, Effect.provide(untouched)),
   );
 
-  it.effect("create_threads' seat checks nothing yet and keeps the target, retry or not", () =>
+  it.effect("create_threads' seat on a retry reads nothing and keeps the target", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
       for (const isRetry of [false, true]) {
+        // A target without options reads nothing, retry or not.
         const result = yield* checks.beforeCreateThread({
           isRetry,
           callerThreadId,
           parent,
+          requested: { model: "gpt-5.4" },
           target,
         });
         assert.deepStrictEqual(result, { target });
       }
+      // A retry keeps even an option the call did not name: it starts no work (the receipt holds
+      // the target it was first dispatched with).
+      const withAgent = agentTarget([{ id: "agent", value: "build" }]);
+      const retry = yield* checks.beforeCreateThread({
+        isRetry: true,
+        callerThreadId,
+        parent,
+        requested: { model: "big-pickle" },
+        target: withAgent,
+      });
+      assert.deepStrictEqual(retry, { target: withAgent });
+      const before = yield* checks.beforeWorkspace({
+        isRetry: true,
+        parent,
+        requested: { model: "big-pickle" },
+        runtimeMode: undefined,
+        cwd: undefined,
+        target: withAgent,
+      });
+      assert.deepStrictEqual(before, { target: withAgent });
+    }).pipe(Effect.provide(untouched)),
+  );
+});
+
+const agentTarget = (
+  options: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>,
+): DelegateChecks.DelegateTarget => ({
+  modelSelection: { instanceId: ProviderInstanceId.make("opencode"), model: "big-pickle", options },
+  supportedRuntimeModes: undefined,
+});
+/** Pacing off, a model policy in `mode` (a failed read for `unreadable`). */
+const pacingOff = (mode: "off" | "advise" | "enforce" | "unreadable") =>
+  Layer.mergeAll(
+    Layer.mock(ServerSettings.ServerSettingsService)({
+      getSettings:
+        mode === "unreadable"
+          ? Effect.fail(new Error("settings unreadable") as never)
+          : Effect.succeed({ usagePacingGate: "off", modelPolicy: { mode, allow: [] } } as never),
+    }),
+    Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+    Layer.mock(ProviderRegistry.ProviderRegistry)({
+      getProviders: Effect.succeed([] as ReadonlyArray<ServerProvider>),
+    }),
+  );
+
+type Target = OrchestratorMcpTarget;
+
+describe("fork delegation checks: a child's own options", () => {
+  const effort = { id: "variant", value: "high" } as const;
+  const agent = { id: "agent", value: "build" } as const;
+  const mode = { id: "_t3/session-mode", value: "code" } as const;
+
+  it("a call that names its model keeps only the options it names", () => {
+    const cases = [
+      {
+        name: "model named: no option of the parent's, of any kind",
+        requested: { model: "big-pickle" },
+        options: [effort, agent, mode, { id: "serviceTier", value: "fast" }],
+        kept: [],
+      },
+      {
+        name: "model and an option named",
+        requested: { model: "big-pickle", options: [agent] },
+        options: [effort, agent, mode],
+        kept: [agent],
+      },
+      {
+        name: "an old effort ultracode keeps the switch it stands for",
+        requested: { model: "big-pickle", options: [{ id: "effort", value: "ultracode" }] },
+        options: [
+          { id: "effort", value: "xhigh" },
+          { id: "ultracode", value: true },
+          { id: "fastMode", value: true },
+        ],
+        kept: [
+          { id: "effort", value: "xhigh" },
+          { id: "ultracode", value: true },
+        ],
+      },
+      {
+        name: "no model named: the parent's options stay, as upstream",
+        requested: undefined,
+        options: [effort, agent],
+        kept: [effort, agent],
+      },
+      {
+        name: "no model named, options named: upstream merge stays",
+        requested: { options: [effort] },
+        options: [effort, agent],
+        kept: [effort, agent],
+      },
+    ] as const;
+    for (const testCase of cases) {
+      const given = agentTarget(testCase.options);
+      const result = DelegateChecks.withOwnOptions(given, testCase.requested);
+      assert.deepStrictEqual(result.modelSelection.options, testCase.kept, testCase.name);
+      assert.deepStrictEqual(
+        DelegateChecks.ownOptions(testCase.options, testCase.requested),
+        testCase.kept,
+        `${testCase.name} (options)`,
+      );
+      assert.deepStrictEqual(result.modelSelection.model, given.modelSelection.model);
+      // Runs again: the result is a fixed point.
+      assert.deepStrictEqual(
+        DelegateChecks.withOwnOptions(result, testCase.requested),
+        result,
+        `${testCase.name} (again)`,
+      );
+    }
+    // No options at all (a child on another model, an old thread): same object back.
+    assert.strictEqual(DelegateChecks.withOwnOptions(target, { model: "gpt-5.4" }), target);
+    assert.strictEqual(DelegateChecks.ownOptions(undefined, { model: "gpt-5.4" }), undefined);
+  });
+
+  it("a remote target that names its model sends exactly its own options", () => {
+    const box = "environment:box" as never;
+    assert.deepStrictEqual(
+      DelegateChecks.remoteTarget<Target>({ environmentId: box, model: "m" }),
+      {
+        environmentId: box,
+        model: "m",
+        options: [],
+      },
+    );
+    const named = { environmentId: box, model: "m", options: [agent] };
+    assert.strictEqual(DelegateChecks.remoteTarget(named), named);
+    // Runs again: the same target.
+    const bare = DelegateChecks.remoteTarget<Target>({ environmentId: box, model: "m" });
+    assert.strictEqual(DelegateChecks.remoteTarget(bare), bare);
+    // No model named: as it came (the other side inherits, as upstream does).
+    const unnamed = { environmentId: box, options: [effort] };
+    assert.strictEqual(DelegateChecks.remoteTarget(unnamed), unnamed);
+  });
+
+  const requested = { model: "big-pickle", options: [effort] };
+  const given = agentTarget([effort, agent]);
+  /** Both local seats and the remote target, under one settings layer. */
+  const seats = Effect.gen(function* () {
+    const checks = yield* DelegateChecks.make(host);
+    const created = yield* checks.beforeCreateThread({
+      isRetry: false,
+      callerThreadId,
+      parent,
+      requested,
+      target: given,
+    });
+    const before = yield* checks.beforeWorkspace({
+      isRetry: false,
+      parent,
+      requested,
+      runtimeMode: undefined,
+      cwd: undefined,
+      target: given,
+    });
+    const remote = yield* checks.remoteTarget<Target>({ model: "big-pickle" });
+    return { created: created.target, before: before.target, remote };
+  });
+
+  // An unreadable setting counts as on: a policy that cannot be read is enforced.
+  it.effect.each(["advise", "enforce", "unreadable"] as const)(
+    "with the model policy %s, every path applies it to the final target",
+    (mode) =>
+      Effect.gen(function* () {
+        assert.deepStrictEqual(yield* seats, {
+          created: agentTarget([effort]),
+          before: agentTarget([effort]),
+          remote: { model: "big-pickle", options: [] },
+        });
+      }).pipe(Effect.provide(pacingOff(mode))),
+  );
+
+  it.effect("with the model policy off, every path keeps upstream's inheritance", () =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual(yield* seats, {
+        created: given,
+        before: given,
+        remote: { model: "big-pickle" },
+      });
+    }).pipe(Effect.provide(pacingOff("off"))),
+  );
+
+  it.effect("a call with nothing to drop reads no setting, on any path", () =>
+    Effect.gen(function* () {
+      const checks = yield* DelegateChecks.make(host);
+      const own = agentTarget([effort]);
+      for (const req of [requested, undefined, { options: [effort] }]) {
+        const created = yield* checks.beforeCreateThread({
+          isRetry: false,
+          callerThreadId,
+          parent,
+          requested: req,
+          target: own,
+        });
+        assert.strictEqual(created.target, own);
+      }
+      const named = { model: "m", options: [agent] };
+      assert.strictEqual(yield* checks.remoteTarget(named), named);
+      const unnamed = { options: [agent] };
+      assert.strictEqual(yield* checks.remoteTarget(unnamed), unnamed);
     }).pipe(Effect.provide(untouched)),
   );
 });

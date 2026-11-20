@@ -166,5 +166,6 @@ already holds, `status` says `server`, and after the edit it says `policy`.
 Later, and each a decision of its own: `"usagePacingGate": "enforce"` (tasks are held, moved or run at a
 lower effort; off again: `"advise"`), and `"automaticUpdates": true` (the boot service updates itself to
 the newest fork release at a quiet point; off again: `false`), and `"modelPolicy"` with `"mode": "advise"`
-or `"enforce"` and its `allow` rows (nothing reads it yet; off again: `"mode": "off"`). What each setting does:
+or `"enforce"` and its `allow` rows (nothing checks a pick yet; a child whose call names its model then keeps
+only the options the call names; off again: `"mode": "off"`). What each setting does:
 [the fork's settings](README.md#each-setting).
