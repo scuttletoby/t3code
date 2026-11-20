@@ -19,6 +19,7 @@ T = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(T)   # first: its guard puts a fake gh on PATH, drops tokens and isolates git
 
 import argparse, base64, io, json, shutil, subprocess, tempfile, types, unittest, unittest.mock  # noqa: E402
+import urllib.parse  # noqa: E402
 
 sys.path.insert(0, HERE)
 import head_check as H  # noqa: E402
@@ -474,6 +475,24 @@ class ReviewRun(Files, unittest.TestCase):
                 self.assertEqual((code, self.found()), (0, []), out)
                 self.assertIn('nothing to judge', out)
                 self.assertIn('no open pull request', out)
+                self.assertNotIn('::', out)   # a plain line: a closed pull request is normal
+
+    def test_no_match_says_how_many_github_listed_on_the_branch(self):   # #651: the live check's two failures
+        # None listed for an open pull request: the head=owner:branch filter is not GitHub's. Some listed: the head
+        # sha or repository differs (or the head moved on). A number listed twice (pages overlap) counts once.
+        for rows, said in (([], 'GitHub listed no open pull request on that branch'),
+                           ([(12, self.OTHER, REPO)], 'GitHub listed 1 open pull request on that branch, none with '
+                                                      'this head'),
+                           ([(12, self.H, None)], 'GitHub listed 1 open pull request on that branch'),
+                           ([(12, self.OTHER, REPO), (12, self.OTHER, REPO)], 'GitHub listed 1 open pull request '),
+                           ([(12, self.OTHER, REPO), (14, self.H, 'someone/else')],
+                            'GitHub listed 2 open pull requests on that branch, none with this head')):
+            with self.subTest(rows=rows):
+                code, out, _ = self.review(rows)
+                self.assertEqual((code, self.found()), (0, []), out)
+                self.assertEqual(len(out.splitlines()), 1, out)
+                self.assertIn(said, out)
+                self.assertIn('no open pull request has the head', out)
 
     def test_two_open_pull_requests_with_the_head_judge_it_once(self):   # #379: same branch into two bases
         # The gate judges a head, not a pull request (preflight lists every open pull request with it again), so the
@@ -551,18 +570,43 @@ class ReviewRun(Files, unittest.TestCase):
 
     def test_a_run_of_another_event_or_with_odd_fields_judges_nothing_and_reads_nothing(self):
         for run in ({'event': 'pull_request'}, {'event': 'push'}, {'event': ''}, {'sha': 'abc'}, {'sha': ''},
-                    {'repo': ''}, {'repo': 'no-slash'}, {'branch': ''}, {'branch': 'a\nb'}, {'branch': 'x' * 256}):
+                    {'sha': None}, {'repo': ''}, {'repo': None}, {'repo': 'no-slash'}, {'branch': ''},
+                    {'branch': None}, {'branch': 'a\nb'}, {'branch': 'a\x7fb'}, {'branch': 'a\tb'}, {}):
             with self.subTest(run=run):
-                code, out, gh = self.review(run=run)
+                if not run:   # nothing at all: a run with none of the fields
+                    code, out, gh = self.review(run={'sha': None, 'repo': None, 'branch': None}, query='-')
+                else:
+                    code, out, gh = self.review(run=run, query='-')
                 self.assertEqual((code, self.found(), gh.calls), (0, [], []), out)
                 self.assertIn('nothing to judge', out)
-                # #379: a review run always has its head fields, so odd ones mean GitHub's fields are not what the
-                # lookup expects (no review would ever re-run the gate): a warning the live check can see, one line.
-                # Another event is normal (an older caller without the event clause): a plain log line.
+                # #379: a review run of a pull request event has its head fields, so missing or malformed ones (a
+                # branch git cannot have) most likely mean GitHub's fields are not what the lookup expects (no
+                # review would ever re-run the gate): a warning the live check can see, one line. Another event is
+                # normal (an older caller without the event clause): a plain log line.
                 odd = 'event' not in run
                 self.assertEqual(out.startswith('::warning::head gate: nothing to judge: '), odd, out)
                 self.assertEqual(out.count('::'), 2 if odd else 0, out)
                 self.assertNotIn('::error::', out)
+                if odd:   # #651: a fork deleted while its pull request is open leaves no head repository
+                    self.assertIn('or its head repository is gone (a deleted fork)', out)
+
+    def test_a_branch_git_allows_but_the_gate_does_not_look_up_is_a_plain_line(self):   # #651
+        # Git allows these (check-ref-format --branch): a no-break space, a zero-width space, an emoji joined by a
+        # zero-width joiner, a name longer than BRANCH_MAX. GitHub's fields are fine, so never the warning that says
+        # they are not; the head is skipped as before (the fallback covers it), and the name is not logged.
+        for branch in ('feat/\u00a0x', 'a\u200bb', 'fix-\U0001F468\u200d\U0001F469', '\u202eevil', 'x' * 256):
+            with self.subTest(branch=branch):
+                code, out, gh = self.review(run={'branch': branch}, query='-')
+                self.assertEqual((code, self.found(), gh.calls), (0, [], []), out)
+                self.assertEqual(out, 'nothing to judge: the head branch of the review run has characters the gate '
+                                      'does not look up (an invisible or joining one), or is longer than 255; post an '
+                                      'issue comment or dispatch the gate with the pull request number')
+        for branch in ('x' * 255, 'feat/é-ü', 'fix-\U0001F468'):   # printable, at most BRANCH_MAX: looked up
+            with self.subTest(branch=branch):
+                rows = [(12, self.H, REPO)]
+                code, out, gh = self.review(rows, {'branch': branch},
+                                            query=self.query(REPO.split('/')[0], urllib.parse.quote(branch, safe='/')))
+                self.assertEqual((code, self.found()), (0, [{'pr': 12, 'sha': self.H}]), out)
 
     def test_the_listing_reads_only_the_fields_it_uses(self):   # #379: no draft (preflight fails a draft's head)
         self.assertEqual(G.HEAD_JQ, '.[] | [.number, .head.sha, .head.repo.full_name] | @json')
