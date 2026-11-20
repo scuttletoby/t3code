@@ -467,7 +467,7 @@ export interface ThreadManagementServiceShape {
   readonly getShellSnapshot: (
     options?: Pick<
       ShellSnapshotOptions,
-      "location" | "projectId" | "unsettledOnly" | "activeRunOnly" | "worktreePath" | "threadIds"
+      "location" | "projectId" | "unsettledOnly" | "worktreePath" | "threadIds"
     >,
   ) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>;
   readonly listActiveSubagentThreadIds: Orchestrator.OrchestratorV2["Service"]["listActiveSubagentThreadIds"];
