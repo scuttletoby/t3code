@@ -51,7 +51,8 @@ import {
   threadId,
 } from "./handoff.testkit.ts";
 import { HANDOFF_RULES } from "./handoffMessage.ts";
-import { HANDOFF_SETTLE_MS, RELAY_COMPLETION_HOLD_MS } from "./handoffQuiet.ts";
+import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
+import { RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
 import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
 
 const runUpdated = (payload: OrchestrationV2Run): OrchestrationV2DomainEvent => ({
