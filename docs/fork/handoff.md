@@ -35,7 +35,21 @@ entry), upstream's idle compaction skips that thread, so a compaction and a hand
 on it. The handoff settings alone decide what happens when it sits idle: `idleTokens` `0` means no
 idle action at all. The check happens at the moment compaction would send, so a setting changed
 while compaction waited counts. With any other mode, upstream's idle compaction works as before.
-If the thread or the settings cannot be read at that moment, compaction goes ahead.
+If the thread is missing, or the thread or the settings cannot be read at that moment, compaction
+goes ahead.
+
+Two cases where neither acts for a while:
+
+- **Handoff switched on while compaction waits.** The handoff service already decided "off" at the
+  turn end, and compaction is now skipped at the send. Nothing acts on that idle spell; the handoff
+  starts from the thread's next turn end.
+- **A handoff that cannot run.** Handoff on also stops idle compaction when the handoff itself can
+  never be delivered, for example when `modelSelection` points at a provider instance that was
+  turned off or removed. (Upstream's compaction checks that its instance is on; the handoff does
+  not.) Each turn end tries a handoff, it fails, the one retry fails, and the thread stays as it is.
+  It does not grow forever: the size backstop tries again at every turn end, and the provider's own
+  compaction still applies. To get compaction back, fix `modelSelection` or set the thread's or
+  project's mode to `off` or `compact`.
 
 ## Only at a quiet thread
 
