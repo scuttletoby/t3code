@@ -226,7 +226,7 @@ export function ModelPolicySettings() {
         {...searchableSetting("model-policy")}
         settingKeys={["modelPolicy"]}
         lockPaths={["modelPolicy"]}
-        description={`Which models agents may pick with delegate_task. ${option?.description ?? ""} Nothing reads the policy yet.`}
+        description={`Which models agents may pick with delegate_task. ${option?.description ?? ""} Nothing checks a pick yet. While it is on, a child that names its model keeps only the options it names.`}
         resetAction={
           isDefault ? null : (
             <SettingResetButton

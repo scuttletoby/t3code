@@ -240,7 +240,7 @@
     "apps/server/src/cloud/selfUpdate.ts": 4,
     "apps/server/src/config.ts": 2,
     "apps/server/src/mcp/McpHttpServer.ts": 10,
-    "apps/server/src/mcp/OrchestratorMcpService.ts": 35,
+    "apps/server/src/mcp/OrchestratorMcpService.ts": 34,
     "apps/server/src/mcp/toolkits/environment/handlers.test.ts": 63,
     "apps/server/src/mcp/toolkits/project/handlers.test.ts": 48,
     "apps/server/src/orchestration-v2/EffectWorker.ts": 28,
