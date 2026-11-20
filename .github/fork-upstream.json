@@ -1,0 +1,4 @@
+{
+  "//": "Upstream's git URL. .github/scripts/fork-seam-check.cjs reads main's copy (never a pull request's) when a pull request moves a \"pending\" file to \"files\", to count the fork's lines from upstream (docs/fork/updates.md). fork-follow finds upstream as this repository's GitHub parent instead.",
+  "url": "https://github.com/pingdotgg/t3code.git"
+}
