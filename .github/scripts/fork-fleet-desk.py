@@ -21,11 +21,12 @@ pool's runners are started through that session.
   desktop's warm caches, never a session (fork-fleet-desk-seed.py; its lock DIR/POOL.seed.lock).
 DIR is /run/fork-fleet-desk, made at boot by systemd-tmpfiles (runbook): owned by the desk-link user, its group the
 socket group (who may connect: the dispatcher's user, or root), mode 0710 or 0750. The socket is 0660 in that group,
-and serve lets in only root, its own user and members of that group (SO_PEERCRED); launch sends only to a socket whose
-peer is the directory's owner. Not as root (tests), $FORK_FLEET_DESK_DIR may name another DIR; for serve that only
-moves its own socket away from the dispatcher (sshd passes no such variable unless its AcceptEnv names it).
-$FORK_FLEET_DESK_USER names the desk-link user for `launch` (default USER). The link keeps no state of its own: the
-live session is the state. Wire format: fork-fleet-desk-wire.py. Standard library only.
+and serve lets in only root, its own user and members of that group (SO_PEERCRED); launch connects only through the
+socket inode it checked (of the directory's owner) and sends only when its peer is that owner too. Not as root (tests),
+$FORK_FLEET_DESK_DIR may name another DIR; for serve that only moves its own socket away from the dispatcher (sshd
+passes no such variable unless its AcceptEnv names it). $FORK_FLEET_DESK_USER names the desk-link user for `launch`
+(default USER). The link keeps no state of its own: the live session is the state. Wire format: fork-fleet-desk-wire.py.
+Standard library only.
 """
 import grp, importlib.util, os, pwd, selectors, signal, socket, stat, struct, sys, time
 
@@ -85,7 +86,7 @@ def desk_uid(env):
 
 def peer(sock):
     """(pid, uid, gid) of the process at the other end of a connected Unix socket (SO_PEERCRED)."""
-    return struct.unpack('3i', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    return struct.unpack('iII', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('iII')))
 
 
 def pool_ok(pool):
@@ -358,24 +359,29 @@ def launch(pool, verb, args, stdin, path, out=sys.stdout, err=sys.stderr, wait=N
     owners = tuple(u for u in (0, os.geteuid(), desk_uid(env)) if u is not None)
     try:
         owner = safe_dir(path, owners).st_uid
-        st = os.lstat(sock_path)
+        # The directory's owner may swap the socket file at any time (root's launch): the inode checked here is the
+        # one connected to, through /proc/self/fd, so a swapped-in path is never reached (#427).
+        fd = os.open(sock_path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         raise no_session from None
+    st = os.fstat(fd)
     if not stat.S_ISSOCK(st.st_mode) or st.st_uid != owner:
+        os.close(fd)
         raise Refused(f'{sock_path} is not a socket of uid {owner}')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(max(0.01, min(CLIENT, deadline - time.monotonic())))
         try:
-            s.connect(sock_path)
-        except (ConnectionRefusedError, FileNotFoundError):
+            s.connect(f'/proc/self/fd/{fd}')
+        except ConnectionRefusedError:
             raise no_session from None
         except socket.timeout:
             raise Refused(f'pool {pool}: the desk session takes no connection (busy or stuck): {verb} was not sent',
                           wire.NO_SESSION) from None
         except OSError as e:
             raise Refused(f'cannot reach {sock_path}: {e.strerror}') from None
-        # The directory's owner may swap the socket between the lstat and the connect (root's launch): who listens
-        # must be that owner, or nothing is sent.
+        finally:
+            os.close(fd)
+        # Who listens on that inode must be the directory's owner too, or nothing is sent.
         try:
             uid = peer(s)[1]
         except OSError as e:
