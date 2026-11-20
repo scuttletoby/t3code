@@ -21,18 +21,16 @@ import * as DelegatedOrphanScan from "./delegatedResults/DelegatedOrphanScan.ts"
 import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
-import * as HandoffQuiet from "./handoff/handoffQuiet.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
 
 /**
- * Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none, and a
- * completed handoff run does not alert (fork/handoff/handoffQuiet.ts; only the relay's thread reads
- * change, nothing else sees them).
+ * Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. A
+ * completed handoff run does not alert through upstream's own shell read (fork/handoff/handoffShell.ts).
  */
 export const holdWorkAgentActivity = <E, R>(
   relayLayer: Layer.Layer<AgentAwarenessRelay.AgentAwarenessRelay, E, R>,
-) => HoldWorkConnect.agentActivityLayer(relayLayer.pipe(Layer.provide(HandoffQuiet.layer)));
+) => HoldWorkConnect.agentActivityLayer(relayLayer);
 
 /**
  * Upstream's Connect link with its reachability merged in, as server.ts had it, except that a held

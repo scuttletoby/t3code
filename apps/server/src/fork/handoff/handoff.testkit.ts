@@ -18,6 +18,7 @@ import * as Layer from "effect/Layer";
 
 import type { AgentAwarenessThread } from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
+import { quietHandoffShellMark } from "./handoffShell.ts";
 
 export const NOW_MS = Date.parse("2026-11-15T12:00:00.000Z");
 export const MINUTE_MS = 60_000;
@@ -172,7 +173,9 @@ export function awarenessShell(
     activityRunStatus: null,
     latestRunId: last.id,
     latestRunCompletedAt: last.completedAt,
+    // As upstream's shell, with the fork's quiet handoff mark (`handoffShell.ts`).
     latestRunStopRequested: false,
+    ...quietHandoffShellMark(data, last),
     latestRunBackgroundWake: false,
     activeRunId: last.status === "running" ? last.id : null,
     pendingRuntimeRequest:

@@ -338,6 +338,14 @@ describe("MCP profile resolver: names that match nothing", () => {
     ]);
   });
 
+  it("never looks up an empty name: a blank pick or default falls through (#661)", () => {
+    // So a "missing" refusal always has a name to show.
+    const settings = { ...fromFile({}), mcpProfile: " ", mcpThreadProfiles: { t1: "" } };
+    expect(resolved(resolveMcpProfile(settings, [top("t1")])).name).toBe("all");
+    const sub = { ...settings, mcpSubagentProfile: "" };
+    expect(resolved(resolveMcpProfile(sub, [child("t1"), top("p1")])).name).toBe("all");
+  });
+
   it("ignores a stale pick for a thread that no longer exists", () => {
     const settings = fromFile({ mcpProfiles: PROFILES, mcpThreadProfiles: { deleted: "lean" } });
     expect(resolved(resolveMcpProfile(settings, [top("t1")])).name).toBe("all");
@@ -510,7 +518,7 @@ describe("MCP profile resolver: a machine set to refuse carried profiles (#640)"
         expect(sub.message).toContain("The parent thread's MCP profile cannot be applied");
         if (file === REFUSE) {
           expect(task.message).toContain(
-            "delegated here with an MCP profile this version cannot read, and",
+            "delegated here with an MCP profile this version cannot read (",
           );
         } else {
           expect(task.message).toMatch(/^The MCP profile of the thread on another machine/);
@@ -520,6 +528,42 @@ describe("MCP profile resolver: a machine set to refuse carried profiles (#640)"
     // A carried name is still shown.
     const named = refused(resolveMcpProfile(fromFile(REFUSE), [child("task")], carried([])));
     expect(named.message).toContain('with its MCP profile "remote", and');
+  });
+
+  it("does not tell the owner to set apply for a carried profile apply cannot read (#661)", () => {
+    for (const value of [{ ...carried([]), resources: [] }, "t3-only", carried("none")]) {
+      const task = refused(resolveMcpProfile(fromFile(REFUSE), [child("task")], value));
+      expect(task.problem).toBe("carried-refused");
+      expect(task.message).not.toContain('set mcpCarriedProfiles to "apply"');
+      // It says why it cannot be read, as apply would.
+      const apply = refused(resolveMcpProfile(fromFile({}), [child("task")], value));
+      expect(apply.problem).toBe("carried");
+      const issue = /\(([^)]*)\)/.exec(apply.message)?.[1];
+      expect(issue).toBeTruthy();
+      expect(task.message).toContain(`(${issue})`);
+    }
+  });
+
+  it("tells a sub-agent, and its sub-agent, the reason at the top of the chain (#661)", () => {
+    const settings = fromFile(REFUSE);
+    const value = carried([]);
+    const task = refused(resolveMcpProfile(settings, [child("task")], value));
+    for (const lineage of [
+      [child("sub"), child("task")],
+      [child("grand"), child("sub"), child("task")],
+    ]) {
+      const sub = refused(resolveMcpProfile(settings, lineage, value));
+      expect(sub.problem).toBe("parent");
+      expect(sub.message).toContain(`The reason up the chain: ${task.message}`);
+      // Once, however deep: each generation passes the root reason on, not its own message.
+      expect(sub.message.split("The reason up the chain").length).toBe(2);
+      expect(sub.message.split('mcpCarriedProfiles is "refuse"').length).toBe(2);
+    }
+    // A local parent whose profile is gone: the child says which and why.
+    const local = fromFile({ mcpThreadProfiles: { p1: "gone" } });
+    const own = refused(resolveMcpProfile(local, [top("p1")]));
+    const sub = refused(resolveMcpProfile(local, [child("c1"), top("p1")]));
+    expect(sub.message).toContain(`The reason up the chain: ${own.message}`);
   });
 
   it("makes every caller say what this machine does with a carried profile (#653)", () => {
