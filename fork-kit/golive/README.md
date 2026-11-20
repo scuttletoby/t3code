@@ -32,13 +32,21 @@ found in `PATH`. It writes only the kit's own lock file. It refuses, with every 
   runtime holds exactly the archive's files;
 - free disk is at least 2 x database + floor (database + floor on each disk when backups are on another one);
 - the staged build's read-only report (`t3 __fork-report --base-dir <home>`, run with an empty HOME and a bare
-  PATH) is ok, is of the target version, and shows no fork feature switched on. It runs only beside a T3 that the
-  checks above found running steadily (service active, its own server live, no update pending, no marker): a
+  PATH) is ok, is of the target version, and says what the fork features are: each one's value (`fork.features`),
+  those switched on (`featuresOn`) and where (`featuresWhere`); a report without the list or the values refuses.
+  The switch keeps the features as they are (fork #529), so they go into the result (`features`: values, the
+  names on and their places, sorted). While the live build is upstream (no `.fork.N`: the first switch) every one
+  must be off. While it is a fork build, its own report (the live server's binary, run the same way beside it)
+  must read the same values in the same places: a target that reads one otherwise (a new feature on by default, a
+  key or policy default the old build read another way, `usagePacingGate` `advise` -> `enforce`) refuses, naming
+  each feature that differs, before anything stops; set it in settings so both builds read the same. A live fork
+  build that gives no report this kit reads (an older report version) passes only with all off. It runs only beside a
+  T3 that the checks above found running steadily (service active, its own server live, no update pending, no marker): a
   report reading the home while T3 stops keeps SQLite from tidying its WAL at the stop (nothing is lost, but the WAL
   with its frames and `-shm` stay, and a copy takes that WAL without its `-shm`). Otherwise it is not run, and says
   so. The live server is read again after it: if T3 stopped, restarted or began an update meanwhile (the owner or
   the auto-updater), the report's answer is not used and check refuses (`--json` then holds no `counts`,
-  `pendingMigrations` or `providers`);
+  `pendingMigrations`, `providers` or `features`);
 - the machine file section is complete, and no golive run needs settling (see below).
 
 Exit 0: ready (the plan is printed), or nothing to do, and only when no check failed: a refusal always wins.
@@ -224,7 +232,7 @@ only). From step 1 on, SIGINT, SIGTERM and SIGHUP are noted, never raised: the r
 stops at its next one (the verify at once) and puts T3 back as below; a signal before the stop refuses with the
 post hooks run. An interrupt that still gets through leaves no end line, as a kill does, so the guard acts on the
 run. Each `t3` the run starts runs in its own process group with a fixed environment and dies with the run. It
-refuses, with nothing changed, unless `check` passes (the fork-features-off check is part of it);
+refuses, with nothing changed, unless `check` passes (it gives the list of fork features on, which the switch keeps);
 the live report gives every count (an unknown count refuses: the verify could not tell what must be kept); the
 staged target archive is whole and its sha256 is the one the last `rehearse` run journalled (`targetSha256`: a
 rehearsal from before this field, or of another build, refuses with "rehearse again"); that rehearsal passed for
@@ -243,7 +251,10 @@ migrate plus ready, rounded up. Then, each a journalled step:
    refuses, T3 not stopped): a second transient unit runs `switch-guard --run <id> --wait` and its timer fires `switch-guard --run
    <id>` after the latest the run can end (`switch.guard_after`: every wait at its longest, the verify limit twice,
    the way back, plus 10 minutes). Not up: refused, T3 not stopped.
-2. `pre-hooks`, then quiet again; a failure runs the post hooks and refuses (T3 not stopped).
+2. `pre-hooks`, then quiet again, then the fork features read again by the staged build and the live fork build
+   (beside the running T3, with the server checked before and after, as check reads them); a failure, or other
+   features than check's (an owner switched one since), runs the post hooks and refuses (T3 not stopped). A rerun
+   reads them again.
 3. `stopping`: stop the service, wait until the server is gone and its ownership lock is free (held from here to
    the update), and see that nothing changed while it stopped. The step's facts name the copy folder, the old
    build and the time limit: the guard reads them.
@@ -259,8 +270,9 @@ migrate plus ready, rounded up. Then, each a journalled step:
    (`runtimeSha256`: every path, kind and content sum) for the verify.
 7. `before`: the stopped home's report, read now (nothing can write), by the target build just installed and
    checked (never the stage, which nothing checked since the prechecks): the counts the verify compares with, the
-   provider instances; it fails unless every count is known, the report is ok, fork features are off and the
-   pending migrations are those the rehearsal ran.
+   provider instances and the fork features; it fails unless every count is known, the report is ok, the fork
+   features (values, names on, places) are exactly those check read and the pending migrations are those the
+   rehearsal ran.
 8. `update` (the owner lock the kit holds goes to the new launcher once that holds its serving lock: see "The gap"
    below): `<home's target t3> update <target> --base-dir <home> --yes` with a fixed environment (no `T3CODE_RELEASE_BASE_URL` or other variable reaches it); the target is installed already,
    so it downloads nothing. A managed mirror policy (`/etc/t3code/policy.json`) is still asked whether the target is
@@ -271,9 +283,9 @@ migrate plus ready, rounded up. Then, each a journalled step:
    service active; the server is the target, from this home's runtime; service state names the target with no
    update pending; no markers; something answers HTTP on its port; the links point at the target; the target's
    report says no migration is pending, counts are not lower than in step 5, provider instances are the same
-   (compared by SHA256 only), fork features are all off and it is ok; and the runtime the server runs is still
-   byte for byte what step 6 recorded (checked first and when all else holds: a mismatch fails at once, it cannot
-   heal; a restaged archive does not matter any more).
+   (compared by SHA256 only), the fork features are those of step 7 and it is ok; and the runtime the server runs
+   is still byte for byte what step 6 recorded (checked first and when all else holds: a mismatch fails at once, it
+   cannot heal; a restaged archive does not matter any more).
 10. `post-hooks`. Exit 0: verified.
 
 A failure or a late verify goes back on its own. From step 8 on (its `update` started) that is #397's W1,
@@ -503,6 +515,14 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   only) is not checked by the removal, and the last `rmdir` goes by path (it only ever removes an empty folder).
 - **R1**: `__service-preflight` of the old build and of the fork build on the clone: both `ready`. The fork build's
   read-only report of the clone is the "before" report.
+- **Features off** (step `features-off`, fork #529): with a fork feature on (`waitFor`, `handoff`, ...) the R3
+  server could act on the clone: deliver waits or send messages. Each feature the before report says is on is
+  removed from the clone's `settings.json` (the server's value, a thread's entry in it, or a project override's;
+  a missing value reads as off), never from the home's or the copy's; the restore in R5 puts the copy's back. A
+  report again must say all off, and becomes the before report. The facts (and the result's `featuresOff`) name
+  the features, where they were on and what was removed. All off: the file is not touched. So a rehearsal never
+  runs the target with the features that go live (`waitFor` on against the migrated database, say): a passed
+  rehearsal says nothing about them, and the switch's verify on the live home is the first run with them on.
 - **R2**: `<fork t3> auth session list --json --base-dir <clone>`, with no server: a read-only command whose
   database layer migrates under the ownership lock. Timed: seconds, database growth, the migrations (the before
   report's `pendingMigrations`). A report after it must show exactly those applied and none pending (or it says no
@@ -516,10 +536,10 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   preflight on the migrated clone says `blocked` (`ready` when there were no migrations; its reason is journalled);
   `coldcopy.restore` puts the copy back into the clone and the old build's preflight says `ready`.
 
-The clone keeps `settings.json` as it is (R5 checks it is unchanged), so the R3 server reads the live provider
-settings: the provider program paths and homes (`binaryPath`, `homePath`) and any trace address. Its provider status
-checks may start those provider programs against the live provider homes (a login refresh, for example) and send
-traces to the same collector. No T3 data of the live home is reached.
+Apart from its fork features, the clone keeps `settings.json` as it is (R5 checks it is unchanged from then on),
+so the R3 server reads the live provider settings: the provider program paths and homes (`binaryPath`, `homePath`)
+and any trace address. Its provider status checks may start those provider programs against the live provider
+homes (a login refresh, for example) and send traces to the same collector. No T3 data of the live home is reached.
 
 The result (from and target version, copy, SHA256 of its manifest, migrations, seconds, growth, port) is the
 journal's last step, `result`, of a run that ended `ok`. A rehearsal is a **scratch run**
@@ -527,37 +547,41 @@ journal's last step, `result`, of a run that ended `ok`. A rehearsal is a **scra
 stopped needs no `settle` (`check` notes it); the next run throws the old clone away and makes a new one, never
 reusing one half-migrated. A run that needs settling still blocks it.
 
-| Situation                                               | What happens                                                                  |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Runs again after a good or failed rehearsal             | The old clone (it bears the mark) is removed and redone from the copy         |
-| Killed at any step (R0-R5, mid-restore)                 | The server dies with the run; nothing to settle; the next run redoes it       |
-| Killed while it removes the old folder                  | The mark goes last: the folder still bears it (or is empty); next run ends it |
-| A mount (or a swap to a link) after R0, before removal  | The guard runs again in the clone step: the run fails, nothing is removed     |
-| A swap (link, other folder) after that check            | The run fails; what is at the path now is never removed                       |
-| A mount point at or under the folder                    | Refused; never removed                                                        |
-| No mount list (not Linux, no `/proc`, an empty list)    | Refused before any step: rehearse cannot run there at all                     |
-| Reading the mount list failed this time                 | Refused before any step, naming the error; run again                          |
-| Mount tree cannot tell which mount is on top            | Refused before any step (a parent missing, a cycle, two on one point)         |
-| Python older than 3.11                                  | Refused before any step; an old rehearsal folder is kept                      |
-| `--copy` inside the rehearsal folder, or a link into it | Refused before any step: the clone step would remove it                       |
-| R2 left migrations pending                              | The run fails before R3: the server would migrate unmeasured                  |
-| A server still holds an old rehearsal home              | Refused before any step; stop it (its pid is in that home's runtime record)   |
-| `t3-rehearsal` without the mark, or a link              | Refused; never removed                                                        |
-| Live home by a link or bind path, or bound in a clone   | Refused (real path; file ids both ways and inside) before any removal         |
-| `backupDir` a bind of a folder inside the live home     | Refused before any step (mount list: the folder each is on its filesystem)    |
-| `backupDir` a bind from `userdata`'s own partition      | Refused before any step (and from a link's target, any mount under the home)  |
-| A live `userdata` link into or around the folder        | Refused before any step, any depth, dangling too; the old folder is kept      |
-| Such a link added after R0                              | The clone step's guard, or R0 on the clone, fails the run; nothing ran on it  |
-| A live `userdata` link that loops or cannot be followed | Refused before any step, naming the link; the old folder is kept              |
-| A live folder removed or made a file in a walk          | Refused (after R0: the run fails), saying run again; the run again passes     |
-| A link in the copy leads out of it                      | Left out of the clone and named (also one added after R0)                     |
-| The copy's `settings.json` or database a link out       | Refused before any step (`-wal`, `-journal`, any case): a file, a new copy    |
-| An old clone holding links out                          | Removed as any old clone: the removal never follows a link                    |
-| Copy with no manifest, not matching it, of another home | Refused (`--copy` or `t3-golive copy`)                                        |
-| Copy from another build than the live one               | Refused: take a new copy                                                      |
-| Port taken between the check and the start              | The server exits; R3 fails, the rerun passes once the port is free            |
-| Server never ready, or not saying work is held          | Stopped; the run fails                                                        |
-| Server dies during R4, or any R4 check fails            | The run fails naming every problem; the server is stopped                     |
+| Situation                                                 | What happens                                                                  |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Runs again after a good or failed rehearsal               | The old clone (it bears the mark) is removed and redone from the copy         |
+| Killed at any step (R0-R5, mid-restore)                   | The server dies with the run; nothing to settle; the next run redoes it       |
+| Killed while it removes the old folder                    | The mark goes last: the folder still bears it (or is empty); next run ends it |
+| A mount (or a swap to a link) after R0, before removal    | The guard runs again in the clone step: the run fails, nothing is removed     |
+| A swap (link, other folder) after that check              | The run fails; what is at the path now is never removed                       |
+| A mount point at or under the folder                      | Refused; never removed                                                        |
+| No mount list (not Linux, no `/proc`, an empty list)      | Refused before any step: rehearse cannot run there at all                     |
+| Reading the mount list failed this time                   | Refused before any step, naming the error; run again                          |
+| Mount tree cannot tell which mount is on top              | Refused before any step (a parent missing, a cycle, two on one point)         |
+| Python older than 3.11                                    | Refused before any step; an old rehearsal folder is kept                      |
+| `--copy` inside the rehearsal folder, or a link into it   | Refused before any step: the clone step would remove it                       |
+| R2 left migrations pending                                | The run fails before R3: the server would migrate unmeasured                  |
+| A fork feature on in the copy                             | Switched off in the clone's `settings.json` only, named in the facts          |
+| A feature still on after that (the machine's policy)      | The run fails before R2, naming where it is on: no server starts              |
+| Features on and the copy's `settings.json` not plain JSON | The run fails before R2: the kit cannot clear them; nothing ran on the clone  |
+| Killed while it clears them                               | Nothing to settle; the next run clones afresh and clears them again           |
+| A server still holds an old rehearsal home                | Refused before any step; stop it (its pid is in that home's runtime record)   |
+| `t3-rehearsal` without the mark, or a link                | Refused; never removed                                                        |
+| Live home by a link or bind path, or bound in a clone     | Refused (real path; file ids both ways and inside) before any removal         |
+| `backupDir` a bind of a folder inside the live home       | Refused before any step (mount list: the folder each is on its filesystem)    |
+| `backupDir` a bind from `userdata`'s own partition        | Refused before any step (and from a link's target, any mount under the home)  |
+| A live `userdata` link into or around the folder          | Refused before any step, any depth, dangling too; the old folder is kept      |
+| Such a link added after R0                                | The clone step's guard, or R0 on the clone, fails the run; nothing ran on it  |
+| A live `userdata` link that loops or cannot be followed   | Refused before any step, naming the link; the old folder is kept              |
+| A live folder removed or made a file in a walk            | Refused (after R0: the run fails), saying run again; the run again passes     |
+| A link in the copy leads out of it                        | Left out of the clone and named (also one added after R0)                     |
+| The copy's `settings.json` or database a link out         | Refused before any step (`-wal`, `-journal`, any case): a file, a new copy    |
+| An old clone holding links out                            | Removed as any old clone: the removal never follows a link                    |
+| Copy with no manifest, not matching it, of another home   | Refused (`--copy` or `t3-golive copy`)                                        |
+| Copy from another build than the live one                 | Refused: take a new copy                                                      |
+| Port taken between the check and the start                | The server exits; R3 fails, the rerun passes once the port is free            |
+| Server never ready, or not saying work is held            | Stopped; the run fails                                                        |
+| Server dies during R4, or any R4 check fails              | The run fails naming every problem; the server is stopped                     |
 
 ## `t3-golive back [--way w1|w2|w3] [--lose-work-since <time>] [--here]`
 
