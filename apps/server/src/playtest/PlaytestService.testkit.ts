@@ -180,6 +180,10 @@ export const runnerControl = Effect.gen(function* () {
     Effect.provide(ProcessRunner.layer),
   );
   let returned: Deferred.Deferred<void> | null = null;
+  let held: {
+    readonly reached: Deferred.Deferred<void>;
+    readonly gate: Deferred.Deferred<void>;
+  } | null = null;
   const runner = ProcessRunner.ProcessRunner.of({
     run: (input) =>
       real.run(input).pipe(
@@ -188,6 +192,17 @@ export const runnerControl = Effect.gen(function* () {
             const signal = returned;
             returned = null;
             return signal === null ? Effect.void : Deferred.succeed(signal, undefined);
+          }),
+        ),
+        Effect.tap(() =>
+          Effect.suspend(() => {
+            const hold = held;
+            held = null;
+            return hold === null
+              ? Effect.void
+              : Deferred.succeed(hold.reached, undefined).pipe(
+                  Effect.andThen(Deferred.await(hold.gate)),
+                );
           }),
         ),
       ),
@@ -199,6 +214,16 @@ export const runnerControl = Effect.gen(function* () {
       const signal = yield* Deferred.make<void>();
       returned = signal;
       return Deferred.await(signal);
+    }),
+    /**
+     * The next step's process has exited (its `finished|step` line is in the log), but the service
+     * does not get the answer: `reached` when it waits there, `release` hands the answer over.
+     */
+    holdNextReturn: Effect.gen(function* () {
+      const reached = yield* Deferred.make<void>();
+      const gate = yield* Deferred.make<void>();
+      held = { reached, gate };
+      return { reached: Deferred.await(reached), release: Deferred.succeed(gate, undefined) };
     }),
   };
 });
