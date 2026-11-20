@@ -58,6 +58,7 @@ HANDOVER_WAIT = 20.0  # seconds the kit keeps the owner lock after a start while
 # Seconds between two looks for the launcher. It holds the serving lock from #claimServing on, and its server then
 # waits 250 ms for the owner lock (serverOwnership.ts busy_timeout): the kit lets go well inside that.
 HANDOVER_POLL = 0.02
+SERVER_LOCK_WAIT_MS = 250  # serverOwnership.ts busy_timeout (contract.test.py): a later handover may leave it idle
 FOREIGN_GRACE = 10.0  # seconds a server not started by the boot service must stay before verify stops on it
 _now_ms = lambda: int(time.time() * 1000)  # noqa: E731  (Date.now(), as upstream's reader compares)
 
@@ -147,6 +148,9 @@ class Gap:
         # how the last starting() let go of the owner lock: 'launcher' (it held its serving lock), 'timeout' (none did
         # within HANDOVER_WAIT), 'start failed', 'before the start' (a build that takes no serving lock); None: none
         self.handover = None
+        # the last 'launcher' handover: at most this many ms between the launcher's claim of the serving lock and the
+        # kit letting go of the owner lock (from the start of the kit's last look that did not find it serving)
+        self.handover_ms = None
         self._stop = threading.Event()
         self._thread = None
         self._mutex = threading.Lock()
@@ -184,8 +188,10 @@ class Gap:
     def starting(self, fn, version, service):
         """Run fn (it starts T3 `version`: a service start, or `t3 update`), and let go of the owner lock only once
         the new launcher holds its serving lock (or HANDOVER_WAIT after fn returned, or fn failed). service: reads
-        the boot service (adapter.service). Returns fn's result. Afterwards the kit holds no lock on the home."""
-        self.handover = None
+        the boot service (adapter.service). Returns fn's result. Afterwards the kit holds no lock on the home.
+        A handover to the launcher measures its delay (handover_ms, an upper bound: the claim came after the start of
+        the last look that did not find the launcher serving, and the lock was let go before the clock is read)."""
+        self.handover, self.handover_ms = None, None
         if self.lock is not None and not takes_serving_lock(version):
             self.let_go()
             self.handover = 'before the start (a build that takes no serving lock)'
@@ -196,8 +202,10 @@ class Gap:
         serving = os.path.join(self.home, 'runtime', SERVING_LOCK)
 
         def watch():  # HANDOVER_WAIT counts from fn's return (`t3 update` installs first, then restarts T3)
+            looked = time.monotonic()  # the start of the last look that did not find the launcher serving
             try:
                 while not done.is_set():
+                    began = time.monotonic()
                     if lock_holders(serving):  # someone holds it: the launcher, or an SSH launch's probe
                         try:
                             svc = service()
@@ -205,7 +213,10 @@ class Gap:
                             svc = {}
                         if launcher_serving(self.home, svc):
                             outcome['how'] = 'launcher'
+                            self.let_go()
+                            outcome['ms'] = (time.monotonic() - looked) * 1000
                             return
+                    looked = began
                     if returned and time.monotonic() >= returned[0] + HANDOVER_WAIT:
                         outcome['how'] = 'timeout'
                         return
@@ -225,6 +236,8 @@ class Gap:
         finally:
             watcher.join()
             self.handover = outcome.get('how', 'start failed')
+            if 'ms' in outcome:
+                self.handover_ms = round(outcome['ms'])
 
     def close(self):
         """Stop renewing, let go of any lock. The marker stays to run out by itself (within 60 s)."""
@@ -238,14 +251,21 @@ class Gap:
 
     def served(self):
         """The new server is verified: stop renewing and remove the marker if it is still the kit's. Returns the
-        facts for the verify step: 'marker' (what was done to it), 'handover' (how the owner lock was let go), and
-        'renewFailed' when a renewal failed (the marker may have run out mid-stop; the owner lock still held).
+        facts for the verify step: 'marker' (what was done to it), 'handover' (how the owner lock was let go),
+        'handoverMs' (handover_ms; with 'handoverLate' when it reached the server's 250 ms wait), and 'renewFailed'
+        when a renewal failed (the marker may have run out mid-stop; the owner lock still held).
         A newer marker renamed in between the read and the unlink would still be removed: a window of microseconds,
         the same as upstream's own DesktopBackendPool.releaseUpdateMarker."""
         self.close()
         facts = {'marker': self._remove()}
         if self.handover is not None:
             facts['handover'] = self.handover
+        if self.handover_ms is not None:  # the journal keeps how close the handover came to the server's wait
+            facts['handoverMs'] = self.handover_ms
+            if self.handover_ms >= SERVER_LOCK_WAIT_MS:
+                facts['handoverLate'] = (f'the kit let go up to {self.handover_ms} ms after the launcher took its '
+                                         f'serving lock; its server waits {SERVER_LOCK_WAIT_MS} ms for the owner lock '
+                                         'and may have idled (the home is then free until its launcher tries again)')
         if self.failed:
             facts['renewFailed'] = f'{self.failed} time(s), last: {self.error}'
         return facts
