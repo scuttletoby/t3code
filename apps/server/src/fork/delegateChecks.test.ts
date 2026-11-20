@@ -11,12 +11,15 @@ import {
   ProjectId,
   ProviderInstanceId,
   type OrchestrationV2ThreadProjection,
+  type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as DelegateChecks from "./delegateChecks.ts";
@@ -106,6 +109,7 @@ const untouched = Layer.mergeAll(
     getSettings: Effect.die("settings read"),
   }),
   Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+  Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.die("providers read") }),
   Layer.mock(SlotGate.SlotGate)({
     acquire: () => Effect.die("slot acquired"),
     started: () => Effect.die("slot started"),
@@ -114,10 +118,11 @@ const untouched = Layer.mergeAll(
 );
 const host: DelegateChecks.DelegateChecksHost = {
   resolveTarget: () => Effect.die("target resolved"),
+  scanWorkspace: () => Effect.die("folder scanned"),
 };
 
 describe("fork delegation checks: runs again", () => {
-  it.effect("a retry of an accepted delegation reads no setting and takes no slot", () =>
+  it.effect("a retry of an accepted delegation reads, scans and holds nothing", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
       const before = yield* checks.beforeWorkspace({
@@ -125,7 +130,7 @@ describe("fork delegation checks: runs again", () => {
         parent,
         requested: undefined,
         runtimeMode: undefined,
-        providers: [],
+        cwd: "/work/project",
         target,
       });
       assert.deepStrictEqual(before, { target });
@@ -149,4 +154,44 @@ describe("fork delegation checks: runs again", () => {
       }
     }).pipe(Effect.provide(untouched)),
   );
+});
+
+describe("fork delegation checks: the copied folder model merge", () => {
+  it("gives the same lists as the target lookup's withWorkspaceModels (#596)", () => {
+    const model = (slug: string) => ({ slug, name: slug, isCustom: false });
+    const snapshot = (cwd: string, models?: ReadonlyArray<ReturnType<typeof model>>) => ({
+      cwd,
+      checkedAt: "2026-11-13T12:00:00.000Z",
+      slashCommands: [],
+      skills: [],
+      ...(models === undefined ? {} : { models }),
+    });
+    const providers = [
+      // No snapshots, a snapshot of another folder, one without models, one that adds a model,
+      // and an empty model list.
+      { instanceId: "none", models: [model("a")] },
+      { instanceId: "other", models: [model("a")], workspaceSnapshots: [snapshot("/elsewhere")] },
+      { instanceId: "plain", models: [model("a")], workspaceSnapshots: [snapshot("/work")] },
+      {
+        instanceId: "adds",
+        models: [model("a")],
+        workspaceSnapshots: [
+          snapshot("/elsewhere", []),
+          snapshot("/work", [model("a"), model("b")]),
+        ],
+      },
+      { instanceId: "empty", models: [model("a")], workspaceSnapshots: [snapshot("/work", [])] },
+    ] as unknown as ReadonlyArray<ServerProvider>;
+    for (const cwd of [undefined, "/work", "/elsewhere", "/missing"]) {
+      assert.deepStrictEqual(
+        DelegateChecks.withFolderModels(providers, cwd),
+        OrchestratorMcpService.withWorkspaceModels(providers, cwd),
+        `cwd ${cwd}`,
+      );
+    }
+    assert.deepStrictEqual(
+      DelegateChecks.withFolderModels(providers, "/work")[3]?.models.map((entry) => entry.slug),
+      ["a", "b"],
+    );
+  });
 });

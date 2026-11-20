@@ -9,9 +9,12 @@ install copies bin/model-guard, sbin/model-guard-install, lib/model_guard.py, RE
 and fork-kit/common/machine_file.py of one release into /usr/local/libexec/model-guard/versions/<sha>/ (with
 MANIFEST.sha256), checks the copy, switches the link `current` to it, links /usr/local/bin/model-guard and
 /usr/local/sbin/model-guard-install to it, writes the hook's own Claude Code managed settings file
-(managed-settings.d/model-guard.json; /etc/claude-code on Linux) and records every path in
-/etc/model-guard/installed.tsv. It never writes the policy file, the machine file or any other settings file. Safe
-to run again, and to stop at any step; a second installer started meanwhile is refused (a lock).
+(managed-settings.d/model-guard.json; /etc/claude-code on Linux), records every path in
+/etc/model-guard/installed.tsv and removes older version folders. It never writes the policy file, the machine
+file or any other settings file, and refuses a first install while no valid policy is named (the hook would refuse
+every checked call until one is). Safe to run again, and to stop at any step; a second installer started meanwhile
+is refused (a lock). uninstall removes the kit in the reverse order and keeps the short command
+model-guard-install until its own folder goes, so a stopped uninstall is finished by running it again.
 """
 import argparse, contextlib, fcntl, hashlib, importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile
 
@@ -33,7 +36,9 @@ SOURCE_FILES = ('bin/model-guard', 'sbin/model-guard-install', 'lib/model_guard.
                 'model-policy.example.json', 'common/machine_file.py')
 EXECUTABLE = {'bin/model-guard', 'sbin/model-guard-install'}
 SHA_RE = re.compile(r'^[0-9a-f]{40}\Z')
-STEPS = ('check', 'folders', 'copy', 'self-test', 'switch', 'links', 'settings', 'record')
+STEPS = ('check', 'folders', 'copy', 'self-test', 'switch', 'links', 'settings', 'record', 'prune')
+UNINSTALL_STEPS = ('drop-in', 'hook-link', 'record', 'old-versions', 'installer-link', 'libexec', 'lock')
+MACHINE_FILE = '/etc/fork-kit/machine.json'
 
 
 class Refused(Exception):
@@ -68,12 +73,20 @@ def ensure_dir(path):
     os.chmod(real, 0o755)
 
 
+def owner_of(real):
+    """Who owns a path (not following a link). Tests swap it to see a path owned by someone else."""
+    return os.lstat(real).st_uid
+
+
 def write_file(path, text):
-    """Atomic: a temporary file in the same folder, renamed over the old one. Unchanged text is not rewritten."""
+    """Atomic: a temporary file in the same folder, renamed over the old one. A plain root-owned 644 file with the
+    same text is not rewritten."""
     real = p(path)
     with contextlib.suppress(OSError):
         with open(real, encoding='utf-8') as f:
-            if f.read() == text and stat.S_IMODE(os.stat(real).st_mode) == 0o644:
+            st = os.lstat(real)
+            if f.read() == text and stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o644 \
+                    and owner_of(real) == ROOT_UID:
                 return
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix='.' + os.path.basename(real) + '.', suffix='.tmp')
     try:
@@ -123,14 +136,24 @@ OWN_LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__
 
 @contextlib.contextmanager
 def install_lock():
-    """One installer at a time: a second one is refused while the first runs (it never waits)."""
+    """One installer at a time: a second one is refused while the first runs (it never waits). An uninstall removes
+    the lock file while it holds it, so the lock held must still be the file at LOCK."""
     ensure_dir(ETC)
-    fd = os.open(p(LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
+    try:
+        fd = os.open(p(LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
+    except FileNotFoundError:
+        raise Refused('another model-guard-install just uninstalled the kit: run again') from None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise Refused('another model-guard-install is running: wait for it to finish and run again') from None
+        try:
+            same = os.path.samestat(os.fstat(fd), os.lstat(p(LOCK)))
+        except FileNotFoundError:
+            same = False
+        if not same:
+            raise Refused('another model-guard-install just uninstalled the kit: run again')
         yield
     finally:
         os.close(fd)
@@ -215,7 +238,7 @@ def check_old_state(guard):
     for path in (folder, drop_ins):
         real = p(path)
         if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)
-                                      or os.lstat(real).st_uid != ROOT_UID):
+                                      or owner_of(real) != ROOT_UID):
             raise Refused(f'{path} exists and is not a root-owned folder: fix it by hand and run again')
     if os.path.lexists(p(drop_in)) and not stat.S_ISREG(os.lstat(p(drop_in)).st_mode):
         raise Refused(f'{drop_in} exists and is not a plain file: remove it by hand and run again')
@@ -230,6 +253,28 @@ def check_old_state(guard):
         raise Refused(f'{CURRENT} exists and is not a link: remove it by hand and run again')
 
 
+def machine_path():
+    return p(MACHINE_FILE) if PREFIX else None
+
+
+def check_policy(guard, so='nothing was written', warn=False):
+    """Refuse a first install (no drop-in yet) while the machine file names no valid policy: from the settings step
+    on, the hook refuses every checked call of every session until it does. When the hook already runs, a rerun
+    still repairs; with warn, it says when this version cannot read the policy (an upgrade to a kit that reads it
+    otherwise, or a policy broken already), as the hook then refuses every checked call."""
+    _, _, drop_in = managed_paths(guard)
+    try:
+        guard.load_policy(machine_path(), ROOT_UID)
+    except guard.PolicyError as e:
+        if not os.path.lexists(p(drop_in)):
+            raise Refused(f'no valid model policy ({e}). Write the policy and the machine file first (README.md, '
+                          f'"Turn it on"; mode "off" or "advise" changes nothing), then run again: {so}') from None
+        if warn:   # the hook already runs: rewriting its entry changes nothing a broken policy does not already do
+            # this runs after the switch: the hook already runs this version, so the warning says what is true now
+            say(f'WARNING: this version is already in use and cannot use the model policy, so the hook already '
+                f'refuses every checked call; fix the policy (no rerun needed): {e}')
+
+
 def self_test(dest):
     """The new copy answers a checked call with no policy reachable by refusing it (fail closed)."""
     problems = tree_problems(dest)
@@ -239,7 +284,8 @@ def self_test(dest):
     if r.returncode != 0 or 'model-guard' not in r.stdout:
         problems.append(f'bin/model-guard --help failed: {(r.stderr or r.stdout).strip()[:200]}')
     probe = ('import sys; sys.path.insert(0, sys.argv[1]); import io, json, model_guard as m; '
-             'out = io.StringIO(); m.run_hook(io.StringIO(sys.argv[2]), out, machine_path=sys.argv[3]); '
+             'out = io.StringIO(); kw = {"record": None} if "record" in m.run_hook.__code__.co_varnames else {}; '
+             'm.run_hook(io.StringIO(sys.argv[2]), out, machine_path=sys.argv[3], **kw); '
              'print(json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"])')
     with tempfile.TemporaryDirectory() as empty:
         r = subprocess.run([sys.executable, '-I', '-B', '-c', probe, os.path.join(dest, 'lib'),
@@ -263,13 +309,17 @@ def install(a, stop_after=None):
     for rel in SOURCE_FILES:
         if not os.path.isfile(source_file(a.source or '', rel)):
             raise Refused(f'--source {a.source}: {rel} is missing (point it at the fork-kit/model-guard folder)')
-    check_old_state(load_guard(OWN_LIB))
+    own = load_guard(OWN_LIB)
+    check_old_state(own)
+    check_policy(own)
     with install_lock():
         return _install(a, done)
 
 
 def _install(a, done):
-    check_old_state(load_guard(OWN_LIB))   # again, now that no other installer runs
+    own = load_guard(OWN_LIB)
+    check_old_state(own)   # again, now that no other installer runs
+    check_policy(own)
     done('check')
     for path in (ETC, LIBEXEC, VERSIONS):
         ensure_dir(path)
@@ -289,6 +339,8 @@ def _install(a, done):
     guard = load_guard(os.path.join(dest, 'lib'))
     folder, drop_ins, drop_in = managed_paths(guard)
     check_old_state(guard)
+    # the new version's own reading of the policy, right before the hook turns on
+    check_policy(guard, so='the hook is not turned on yet', warn=True)
     for path in (folder, drop_ins):
         ensure_dir(path)
     write_file(drop_in, guard.drop_in_text())
@@ -300,27 +352,68 @@ def _install(a, done):
     write_file(INSTALLED, '# path\tkind\twant (written by model-guard-install; read by model-guard --self-check)\n'
                + ''.join('\t'.join(r) + '\n' for r in rows))
     done('record')
+    prune_versions(a.sha)
+    done('prune')
     say(f'installed release {a.sha}')
     for path, kind, want in rows:
         say(f'  {path}  {kind}  {want}')
-    say(f'the hook now runs in every Claude Code session on this machine ({drop_in}), and refuses every checked '
-        'call until the machine file names a valid policy: see README.md, "Turn it on"; then run '
-        'model-guard --self-check')
+    say(f'the hook now runs in every Claude Code session on this machine ({drop_in}); run model-guard --self-check')
     return 0
 
 
-def uninstall():
+def prune_versions(keep):
+    """Remove every version folder but `keep` (the one `current` points at), and copies a stopped run left."""
+    versions = p(VERSIONS)
+    for name in sorted(os.listdir(versions)):
+        if name == keep:
+            continue
+        path = os.path.join(versions, name)
+        if os.path.islink(path) or not os.path.isdir(path):
+            os.unlink(path)
+        else:
+            shutil.rmtree(path)
+        say(f'removed the old version folder {VERSIONS}/{name}')
+
+
+def uninstall(stop_after=None):
+    """Remove the kit in UNINSTALL_STEPS order. The short command (the installer link) stays until its version
+    folder goes next, and the lock file goes last, so a stopped run is finished by running it again."""
+    def done(step):
+        if step == stop_after:
+            raise SystemExit(f'stopped after {step} (test)')
+
     if os.geteuid() != ROOT_UID:
         raise Refused('run this as root')
     _, _, drop_in = managed_paths(load_guard(OWN_LIB))
     with install_lock():
-        if os.path.lexists(p(drop_in)) and stat.S_ISREG(os.lstat(p(drop_in)).st_mode):
-            os.unlink(p(drop_in))   # first: from here on no session runs the hook
-        for path, target in LINKS.items():
-            if ours(path, target):
-                os.unlink(p(path))
+        if os.path.lexists(p(drop_in)):
+            if stat.S_ISREG(os.lstat(p(drop_in)).st_mode):
+                os.unlink(p(drop_in))   # first: from here on no session runs the hook
+            else:
+                say(f'{drop_in} is not a plain file, so it was left alone: remove it by hand')
+        done('drop-in')
+        if ours(HOOK, LINKS[HOOK]):
+            os.unlink(p(HOOK))
+        done('hook-link')
+        if os.path.isdir(p(ETC)) and not os.path.islink(p(ETC)):
+            for name in os.listdir(p(ETC)):
+                path = os.path.join(p(ETC), name)
+                if path != p(LOCK):
+                    shutil.rmtree(path) if os.path.isdir(path) and not os.path.islink(path) else os.unlink(path)
+        done('record')
+        current = os.path.basename(os.readlink(p(CURRENT))) if os.path.islink(p(CURRENT)) else None
+        if os.path.isdir(p(VERSIONS)) and not os.path.islink(p(VERSIONS)):
+            prune_versions(current)
+        done('old-versions')
+        if ours(INSTALLER, LINKS[INSTALLER]):
+            os.unlink(p(INSTALLER))
+        done('installer-link')
         shutil.rmtree(p(LIBEXEC), ignore_errors=True)
-        shutil.rmtree(p(ETC), ignore_errors=True)
+        done('libexec')
+        os.unlink(p(LOCK))   # last, still held: a new installer starting now makes its own lock and folder
+        with contextlib.suppress(OSError):
+            os.rmdir(p(ETC))
+        done('lock')
     say('uninstalled. Another settings file that still runs "/usr/local/bin/model-guard || exit 2" now refuses '
         'every checked call: remove that PreToolUse entry too')
     return 0
@@ -340,10 +433,9 @@ def main(argv, stop_after=None):
         if a.cmd == 'install':
             return install(a, stop_after)
         if a.cmd == 'uninstall':
-            return uninstall()
+            return uninstall(stop_after)
         model_guard = load_guard(OWN_LIB)
-        machine = PREFIX + '/etc/fork-kit/machine.json' if PREFIX else None
-        return model_guard.self_check(machine_path=machine, owner_uid=ROOT_UID, prefix=PREFIX)
+        return model_guard.self_check(machine_path=machine_path(), owner_uid=ROOT_UID, prefix=PREFIX)
     except Refused as e:
         print(f'model-guard-install: {e}', file=sys.stderr)
         return 1

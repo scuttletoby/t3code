@@ -6,7 +6,7 @@ project name in it were replaced (owner, proj); the replaced corpus was checked 
 committed, with the source's override prefix set to `proj ready --head`. Where the port differs from the source on
 purpose, the replay says so (Corpus).
 """
-import copy, json, os, re, sys, unittest
+import copy, json, os, random, re, sys, unittest
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
@@ -98,6 +98,28 @@ class Gaps(unittest.TestCase):
         self.assertIsNone(SOURCE.lens_problem(post('Notes\n```\nlens: effaced\n```')))
         self.assertIn(lens.EMBEDDED, SOURCE.lens_problem(post('Notes\n```\nlens: effaced1\n```')))
 
+    def test_a_second_header_in_any_field_form_below_a_valid_one_counts(self):   # issue #303 point 3
+        first, hex = f'lens: tests · reviewer: x · read at: {SHA_B}\n\n', NotALens.HEX
+        for second in (f'Lens — security · read at: {hex}', f'lens= security {hex[:10]}',
+                       f'**Lens** – security ({hex[:7]})', f'- lens=security read at {hex}',
+                       f'lens: security reviewed at {hex[:10]}'):
+            with self.subTest(second=second):
+                self.assertIn('2 times', SOURCE.lens_problem(post(first + second)))
+                self.assertEqual(SOURCE.reviewed_head(pr(post(first + second)))[:2], (True, None))
+        for note in ('Lens — security: nothing found', 'the security lens — see above', f'see lens= {hex} later',
+                     f"    LENS = 'lens: correctness · reviewer: a · read at: {hex[:7]}'"):   # test code in a report
+            with self.subTest(note=note):   # no sha, or the field is not at the line start: still one valid read
+                self.assertIsNone(SOURCE.lens_problem(post(first + note)))
+
+    def test_plain_lines_follow_githubs_fences(self):   # issue #303 point 3: the same fence rule as unquoted_lines
+        self.assertEqual(lens.plain_lines('a\n```\nx\n```js\nb\n```\nc'), ['a', 'c'])   # ```js is code, not a close
+        self.assertEqual(lens.plain_lines('a\n```x```\nb'), ['a', '```x```', 'b'])   # inline code, no fence
+        self.assertEqual(lens.plain_lines('a\n~~~ x ~~~\nb\n~~~\nc'), ['a', 'c'])   # a tilde info string may hold one
+        self.assertEqual(lens.plain_lines('a\n````\n```\nb\n````\nc'), ['a', 'c'])
+        self.assertEqual(lens.plain_lines('a\n```\nb'), ['a'])   # unclosed: to the end
+        # the rendered `safe to merge` line below the inner fence is plain text, and blocks
+        self.assertIsNotNone(SOURCE.lens_problem(post('Notes\n```\nx\n```py\ny\n```\nsafe to merge: no\n```')))
+
 
 class NotALens(unittest.TestCase):
     """Issue #77: below a `not a lens:` first line, a lens read written another way (no colon after `lens`, another
@@ -153,6 +175,65 @@ class NotALens(unittest.TestCase):
                 quoted = lens.no_lens_text(line)
                 self.assertFalse(lens.loose_header(lens.norm_line(quoted)), quoted)
                 self.assertIsNone(self.problem(f'Auto-merge OFF: {quoted}'), quoted)
+
+    def test_the_queues_quote_of_nested_markup_never_reads_as_a_lens_line(self):   # issue #303 point 1
+        for field in (':', '=', '—', '–'):
+            for line in (f'lens<<a>b>{field} sec {self.HEX[:10]} NOT SAFE', f'lens[[](z)](w){field} sec {self.HEX}',
+                         f'lens<<<a>b>c>{field} sec {self.HEX[:10]}', f'lens[[[](z)](y)](w){field} {self.HEX}',
+                         f'read<<a>b> at {self.HEX}', f'safe<<a>b> to merge: no ({self.HEX[:10]})'):
+                with self.subTest(line=line):
+                    quoted = lens.no_lens_text(line)
+                    for narrow in (False, True):
+                        self.assertFalse(lens.loose_header(lens.norm_line(quoted, narrow)), quoted)
+                    self.assertIsNone(self.problem(f'pr_queue turned auto-merge OFF: {quoted}'), quoted)
+
+    def test_the_queues_quote_of_any_text_reads_the_same_when_cleaned_again(self):   # issue #303 point 1
+        rnd = random.Random(303)
+        parts = ['lens', 'read', ' at', 'safe', ' to ', 'merge', ':', '=', '—', '–', '<', '>', '<a>', '<b ', '[', ']',
+                 '](x)', '(', ')', '!', '*', '`', '_', '|', ' ', '\u00a0', 'x', self.HEX[:10], '#']
+        for _ in range(20000):
+            text = ''.join(rnd.choice(parts) for _ in range(rnd.randrange(1, 16)))
+            quoted = lens.no_lens_text(text)
+            with self.subTest(text=text):
+                for narrow in (False, True):
+                    self.assertEqual(lens.clean_inline(quoted, narrow), quoted)
+                self.assertIsNone(self.problem(f'pr_queue turned auto-merge OFF: {quoted}'))
+
+    def test_a_note_names_a_sha_on_its_own_line_not_after_a_lens_field(self):   # issue #303 point 2: the README rule
+        self.assertIn(lens.EMBEDDED, self.problem(f'not a lens: round 2\nthe security lens — fixed in {self.HEX[:8]}'))
+        quoted = f'not a lens: round 2\n> the security lens — fixed in {self.HEX[:8]}'   # a quote does not help
+        self.assertIn(lens.EMBEDDED, self.problem(quoted))
+        self.assertIsNone(self.problem(f'not a lens: round 2\nthe security lens — fixed in:\n{self.HEX[:8]}'))
+        self.assertIsNone(self.problem(f'not a lens: round 2\nthe security lens: fixed.\n> read at {self.HEX}'))
+
+    def test_a_quote_marker_after_a_tab_is_code_not_a_quote(self):   # #283 bypass M9: `\s*>` would clear it
+        self.assertIsNotNone(self.problem(f'not a lens: notes\n\n\t> read at {self.HEX}'))
+
+    def test_only_a_fence_of_the_same_kind_and_length_closes_one(self):   # #283 bypass M10: any fence line closed
+        for body in (f'not a lens: notes\n~~~\n```\n> read at {self.HEX}\n~~~',
+                     f'not a lens: notes\n````\n```\n> read at {self.HEX}\n````',
+                     f'not a lens: notes\n```\n~~~\n> read at {self.HEX}\n```'):
+            with self.subTest(body=body):
+                self.assertIn(lens.OPT_OUT_READ, self.problem(body))
+
+    def test_a_fence_line_with_an_info_string_does_not_close_a_fence(self):   # issue #303 point 3, GFM
+        for close in ('``` y', '```js', '~~~ y'):
+            body = (f'not a lens: r2\n{close[:3]}\nx\n{close}\n> correctness lens NOT SAFE read at {self.HEX}\n'
+                    f'{close[:3]}')
+            with self.subTest(close=close):
+                self.assertIn(lens.OPT_OUT_READ, self.problem(body))
+        self.assertIsNone(self.problem(f'not a lens: r2\n```\nx\n```  \n> read at {self.HEX}'))   # blanks only: closes
+
+    def test_a_longer_closing_fence_closes_one_and_only_blanks_may_follow_it(self):   # GFM; #591 lens mutants
+        self.assertIsNone(self.problem(f'not a lens: r2\n```\nx\n````\n> read at {self.HEX}'))
+        # a no-break space is no space or tab: the fence stays open, the quote is code
+        self.assertIn(lens.OPT_OUT_READ, self.problem(f'not a lens: r2\n```\nx\n```\u00a0\n> read at {self.HEX}'))
+
+    def test_a_fence_opens_and_closes_only_after_at_most_3_spaces(self):   # GFM; #591 lens mutants
+        self.assertIn(lens.OPT_OUT_READ, self.problem(f'not a lens: r2\n   ```\n> read at {self.HEX}'))
+        self.assertIsNone(self.problem(f'not a lens: r2\n    ```\n\n> read at {self.HEX}'))   # indented code, no fence
+        self.assertIn(lens.OPT_OUT_READ,
+                      self.problem(f'not a lens: r2\n```\nx\n    ```\n> read at {self.HEX}\n```'))
 
     def test_the_way_out_names_the_quote_and_never_reads_as_a_report(self):
         self.assertIn('`>`', lens.NO_HEADER_WAY_OUT)
@@ -221,6 +302,14 @@ class Advice(unittest.TestCase):
     def test_advice_that_holds_a_lens_word_is_cleaned_like_any_text(self):   # also one markdown hides
         for text, out in (('`lens: x`', 'lens- x'), ('re`ad at`: x', 'read @: x'), ('**safe to merge**', 'safe to land')):
             self.assertEqual(lens.no_lens_text(text, keep_markdown=True), out)
+
+    def test_advice_whose_narrow_reading_holds_a_lens_word_is_cleaned(self):   # issue #303: the reader reads both ways
+        text = '<lens= x 0123abcd99 <q></b>'   # one tag read the wide way; `<lens= x 0123abcd99` read the narrow way
+        self.assertEqual(lens.clean_inline(text), '')
+        out = lens.no_lens_text(text, keep_markdown=True)
+        self.assertNotEqual(out, text)
+        self.assertIsNone(SOURCE.lens_problem(post(f'pr_queue turned auto-merge OFF: {out}')))
+        self.assertIsNotNone(SOURCE.lens_problem(post(f'pr_queue turned auto-merge OFF: {text}')))
 
 
 class ProjectRules(unittest.TestCase):
