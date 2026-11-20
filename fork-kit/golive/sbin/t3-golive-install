@@ -10,14 +10,16 @@ fork-kit/common/{machine_file,kit_install}.py of one release into /usr/local/lib
 MANIFEST.sha256), checks the copy (every module imports, `t3-golive --help`), switches the link `current` to it and
 links /usr/local/bin/t3-golive and /usr/local/sbin/t3-golive-install to it. An old /usr/local/bin/t3-golive that is
 a plain file (a hand copy from before this installer) is kept in /usr/local/libexec/t3-golive/replaced/ and put back
-by uninstall. Old version folders stay: the detached units of a run (its guard, the switch guard's timer) run the
-version that started them. uninstall is refused while a golive run holds the kit's lock (golive.stateDir of the
-machine file), while the journal there has a run that needs settling (a killed switch, a failed W1: T3 may be
-stopped and its home held), and while a process or a transient unit (the holder, a switch guard's pending timer)
-runs code from /usr/local/libexec/t3-golive. Safe to run again, and to stop at any step; one installer at a time. The steps every kit shares are
-in fork-kit/common/kit_install.py.
+by uninstall, in one step and with the mode and owner it had. Old version folders stay: the detached units of a run
+(its guard, the switch guard's timer) run the version that started them. uninstall is refused while a golive run
+holds the kit's lock (golive.stateDir of the machine file), while the journal there has a run that needs settling (a
+killed switch, a failed W1: T3 may be stopped and its home held), and while a process or a transient unit (the
+holder, a switch guard's pending timer) runs code from /usr/local/libexec/t3-golive. Where no golive run has made
+the lock yet, uninstall makes it first (as the state folder's owner, never as root, reaching that folder through no
+link but root's) and holds it, so no first run starts under it. Safe to run again, and to stop at any step; one
+installer at a time. The steps every kit shares are in fork-kit/common/kit_install.py.
 """
-import contextlib, fcntl, os, stat, sys, tempfile
+import contextlib, fcntl, os, pwd, stat, sys, tempfile
 _kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 _common = os.path.join(_kit, 'common')
 sys.path[:0] = [_common if os.path.isdir(_common) else os.path.join(os.path.dirname(_kit), 'common'),
@@ -35,6 +37,7 @@ COMMAND = '/usr/local/bin/t3-golive'
 
 class GoliveInstaller(kit_install.Installer):
     PROG = 't3-golive-install'
+    PROGRAM = __file__
     KIT = 'golive'
     ETC = '/etc/t3-golive'
     LIBEXEC = '/usr/local/libexec/t3-golive'
@@ -47,6 +50,8 @@ class GoliveInstaller(kit_install.Installer):
     MODULES = ('__init__', 'back', 'check', 'coldcopy', 'config', 'handoff', 'journal', 'keptruntime', 'live',
                'osadapter', 'rehearse', 'switch')
     HELP = ('bin/t3-golive', 'switch-guard')
+    SYSTEM_UID = 0          # tests only: root, as the owner of a link make_lock goes along, and of a folder it makes
+                            # no lock in
 
     def state_dir(self):
         """golive.stateDir of the machine file, or None where no golive section is set (no run ever here)."""
@@ -61,7 +66,8 @@ class GoliveInstaller(kit_install.Installer):
     @contextlib.contextmanager
     def uninstall_guard(self):
         """A run holds <stateDir>/lock: removing the code under it would leave its guard nothing to run. Held for
-        the whole uninstall, so no run starts in between. Under it, a run the journal says needs settling refuses
+        the whole uninstall, so no run starts in between; where there is no lock file yet (no run here ever), it is
+        made first (make_lock), so a first run cannot start in between either. Under it, a run the journal says needs settling refuses
         too: such a run has ended, but what it left (T3 stopped, the holder, a pending guard) still needs this
         kit's code (`t3-golive status`, `settle`, `back`). The lock and the journal are opened without following a
         link and without waiting: anything but a plain file there refuses (the state folder is the T3 user's)."""
@@ -70,7 +76,9 @@ class GoliveInstaller(kit_install.Installer):
             yield
             return
         fd = self.open_state_file(state, 'lock')
-        if fd is None:              # no golive run has ever taken the lock here; its journal is read all the same
+        if fd is None:              # no golive run has ever taken the lock here: make it, as a first run would
+            fd = self.make_lock(state)
+        if fd is None:              # it would go in a folder of root's: nothing made (make_lock says why)
             self.refuse_unsettled(state)
             yield
             return
@@ -85,12 +93,157 @@ class GoliveInstaller(kit_install.Installer):
         finally:
             os.close(fd)
 
-    def open_state_file(self, state, name):
-        """A plain file of the state folder, opened read-only with no link followed and no wait; None when there
-        is none. Refused when it is anything else (a FIFO would block root's uninstall forever)."""
+    def make_lock(self, state):
+        """<stateDir>/lock where there is none yet (no golive run has ever been here), made the way golive's first
+        run makes it (journal.lock: a missing state folder 0700, the file 0600) and as the user who would run it:
+        the owner of the deepest folder of stateDir that is there. The way there is opened from / one step at a
+        time with no link followed (real_folder): a link of root's (/home -> /var/home) is read and gone along, any
+        other link refuses, as the T3 user could point it at another user's folder. What is missing is then made
+        relative to that open folder, in a child process with its owner's rights (no groups but that user's own),
+        never root's, and root opens the lock the same way. So the lock covers that first run too: one that starts
+        during this uninstall finds it held. None, with nothing made, when that owner is root: a golive run as a
+        user makes the lock there only in a folder anyone may make folders in (a sticky one such as /tmp), an odd
+        place for stateDir that this leaves as it was (no lock made, so a first run could start in the gap)."""
+        lock = os.path.join(state, 'lock')
+        fd, where, rest = self.real_folder(state, lock)
+        try:
+            uid = os.fstat(fd).st_uid
+            if uid == self.SYSTEM_UID:
+                return None
+            try:
+                gid = pwd.getpwuid(uid).pw_gid
+            except KeyError:
+                raise self.Refused(f'{where} belongs to uid {uid}, which has no user entry: uninstall cannot make '
+                                   f'{lock} as that user; make it by hand (as the user golive runs as, mode 0600) '
+                                   'and run again') from None
+
+            def make():
+                at = fd
+                for i, part in enumerate(rest):
+                    with contextlib.suppress(FileExistsError):
+                        os.mkdir(part, 0o700 if i == len(rest) - 1 else 0o777, dir_fd=at)
+                    at = os.open(part, kit_install.DIR_FLAGS | os.O_NONBLOCK, dir_fd=at)
+                os.close(os.open('lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                 0o600, dir_fd=at))
+            self.run_as(uid, gid, make, f'make {lock} as uid {uid}')
+            self.say(f'made {lock} (as uid {uid}), the lock a golive run takes, and holds it while it uninstalls')
+            at = fd
+            try:
+                for part in rest:
+                    new = os.open(part, kit_install.DIR_FLAGS | os.O_NONBLOCK, dir_fd=at)
+                    if at != fd:
+                        os.close(at)
+                    at = new
+                lfd = self.open_state_file(state, 'lock', dir_fd=at)
+            except FileNotFoundError:
+                lfd = None
+            except OSError as e:
+                raise self.Refused(f'{state} cannot be opened without following a link ({e.strerror}): uninstall '
+                                   'cannot see whether a golive run is going; look at it and run again') from None
+            finally:
+                if at != fd:
+                    os.close(at)
+            if lfd is None:
+                raise self.Refused(f'{lock} is gone again: run uninstall again')
+            return lfd
+        finally:
+            os.close(fd)
+
+    def real_folder(self, path, lock):
+        """The deepest folder of path that is there, open, reached from / one step at a time with no link
+        followed: (fd, its path with no link on it, the names below it that are missing). A link of root's
+        (SYSTEM_UID) on the way is read and gone along; any other link, or anything there that is not a folder,
+        refuses."""
+        why = (f'uninstall makes {lock} as the owner of the folder it goes in, and will not reach that folder '
+               'through a link root does not own')
+        todo, hops = [x for x in path.split('/') if x not in ('', '.')], 0
+        while True:
+            fd, done, again = os.open(self.p('/'), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC), '', False
+            try:
+                while todo and not again:
+                    part = todo.pop(0)
+                    if part == '..':            # done has no link on it: its parent is the real one
+                        todo, again = [x for x in os.path.dirname(done or '/').split('/') if x] + todo, True
+                        continue
+                    try:
+                        new = os.open(part, kit_install.DIR_FLAGS | os.O_NONBLOCK, dir_fd=fd)
+                    except FileNotFoundError:
+                        if '..' in todo:
+                            raise self.Refused(f'{path}: a missing folder before "..": uninstall cannot make '
+                                               f'{lock}; fix golive.stateDir and run again') from None
+                        return fd, done or '/', [part] + todo
+                    except OSError as e:
+                        target = self.root_link(fd, part, f'{done}/{part}', e, why)
+                        hops += 1
+                        if hops > 40:
+                            raise self.Refused(f'{path}: too many links on the way: {why}') from None
+                        todo = [x for x in (target if target.startswith('/') else f'{done}/{target}').split('/')
+                                if x not in ('', '.')] + todo
+                        again = True
+                        continue
+                    os.close(fd)
+                    fd, done = new, f'{done}/{part}'
+                if not again:
+                    return fd, done or '/', []
+            except BaseException:
+                os.close(fd)
+                raise
+            os.close(fd)
+
+    def root_link(self, fd, name, shown, err, why):
+        """The target of the link name in the open folder fd, where it is root's; refused when it is another's, or
+        not a link (err, the error opening it as a folder, says why)."""
+        try:
+            lfd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+        except OSError as e:
+            raise self.Refused(f'{shown} cannot be read ({e.strerror}): {why}') from None
+        try:
+            st = os.fstat(lfd)
+            if not stat.S_ISLNK(st.st_mode):
+                raise self.Refused(f'{shown} cannot be opened as a folder ({err.strerror}): {why}')
+            if st.st_uid != self.SYSTEM_UID:
+                raise self.Refused(f'{shown} is a link of uid {st.st_uid}, who could point it at another user\'s '
+                                   f'folder: {why}. Make golive.stateDir a path without it, or make the lock by '
+                                   'hand (as the user golive runs as, mode 0600), and run again')
+            return os.readlink('', dir_fd=lfd)
+        finally:
+            os.close(lfd)
+
+    def run_as(self, uid, gid, fn, what):
+        """fn() in a child process with that user's rights (no groups but gid), not root's. Refused when it fails."""
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:                # the child: never back into the caller's code
+            code = 1
+            try:
+                os.close(r)
+                if uid != os.geteuid():
+                    os.setgroups([])
+                    os.setgid(gid)
+                    os.setuid(uid)
+                fn()
+                code = 0
+            except BaseException as e:      # noqa: B036 -- reported to the parent, then the child exits
+                with contextlib.suppress(OSError):
+                    os.write(w, str(e).encode('utf-8', 'replace')[:500])
+            finally:
+                os._exit(code)
+        os.close(w)
+        with os.fdopen(r, 'rb') as f:
+            why = f.read().decode('utf-8', 'replace')
+        _, status = os.waitpid(pid, 0)
+        if os.waitstatus_to_exitcode(status) != 0:
+            raise self.Refused(f'cannot {what} ({why or "it failed"}): uninstall takes that lock so that no golive '
+                               'run starts under it; look at the state folder and run again')
+
+    def open_state_file(self, state, name, dir_fd=None):
+        """A plain file of the state folder (or of dir_fd, that folder open), opened read-only with no link
+        followed and no wait; None when there is none. Refused when it is anything else (a FIFO would block root's
+        uninstall forever)."""
         path = os.path.join(state, name)
         try:
-            fd = os.open(self.p(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            fd = os.open(self.p(path) if dir_fd is None else name,
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
         except FileNotFoundError:
             return None
         except OSError as e:
