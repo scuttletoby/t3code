@@ -3,28 +3,31 @@
 #   <test>                  run by Fork tests (fork-kit/ in the kit job, fork-ci/ and the
 #                           fleet walls' in the action job, the rest in the workflows job),
 #                           by extension (sh, py, cjs, mjs, js)
-#   <test> ~<seconds>s      the same, with its usual time on CI: the longest start first.
-#                           Tests without one start before them. A test over 30 s without
-#                           one, or far from its weight, gets a note in the log to fix it.
+#   <test> ~<seconds>s      the same, with its usual time on CI: the longest start first,
+#                           and a part split into shards (FORK_CI_TEST_SHARD) is split by
+#                           them. Tests without one start first and count as 10 s. A test
+#                           over 30 s without one, or far from its weight (more than 30 s
+#                           and more than double or under half, after allowing for the
+#                           runner's speed), fails its job, which says the weight to write.
 #   <test> run by <file>    run by <file>, which must name the test's path (not one
 #                           of upstream's workflows: they are disabled in the fork)
 # A present test that is not listed fails. A listed file that is not present yet
 # is a note; one that was present and then deleted fails.
-.github/scripts/fork-ci-tests.test.cjs ~10s
+.github/scripts/fork-ci-tests.test.cjs ~11s
 .github/scripts/fork-checks-ran.test.py
 .github/scripts/fork-contracts.test.py
 .github/scripts/fork-fleet-desk-agent.test.py ~23s
 .github/scripts/fork-fleet-desk-key.test.py ~10s
-.github/scripts/fork-fleet-desk-seed.test.py ~10s
-.github/scripts/fork-fleet-desk.test.py ~8s
-.github/scripts/fork-fleet.test.py ~47s
-.github/scripts/fork-fleet-refresh.test.py ~46s
-.github/scripts/fork-fleet-walls.test.py ~75s
-.github/scripts/fork-fleet-walls-contract.test.py ~100s
-.github/scripts/fork-fleet-walls-wsl2.test.py ~36s
+.github/scripts/fork-fleet-desk-seed.test.py ~34s
+.github/scripts/fork-fleet-desk.test.py ~9s
+.github/scripts/fork-fleet.test.py ~67s
+.github/scripts/fork-fleet-refresh.test.py ~59s
+.github/scripts/fork-fleet-walls.test.py ~71s
+.github/scripts/fork-fleet-walls-contract.test.py ~96s
+.github/scripts/fork-fleet-walls-wsl2.test.py ~40s
 .github/scripts/fork-gate-trust-docs.test.py
 .github/scripts/fork-head-gate-workflow.test.py
-.github/scripts/fork-follow.test.sh ~32s
+.github/scripts/fork-follow.test.sh ~41s
 .github/scripts/fork-interaction-limit.test.sh
 .github/scripts/fork-owned-paths.test.py
 .github/scripts/fork-owned-reads.test.py run by .github/workflows/fork-tests.yml
@@ -35,8 +38,8 @@
 .github/scripts/fork-release.test.sh ~5s
 .github/scripts/fork-run-alert.test.sh
 .github/scripts/fork-reusable-permissions.test.py
-.github/scripts/fork-schema-check.test.cjs ~7s
-.github/scripts/fork-seam-check.test.cjs
+.github/scripts/fork-schema-check.test.cjs ~6s
+.github/scripts/fork-seam-check.test.cjs ~23s
 .github/scripts/fork-temp-files.test.sh
 .github/scripts/fork-secret-scan.test.sh run by .github/workflows/fork-secret-scan.yml
 .github/scripts/fork-test-shards.test.cjs
@@ -44,50 +47,50 @@
 .github/scripts/fork-upstream-files-check.test.cjs
 .github/scripts/fork-vitest-gc-check.test.cjs
 .github/scripts/fork-workflow-triggers.test.cjs
-fork-ci/actions/ci-demand/ci_demand.test.py ~13s
-fork-ci/actions/docs-scope/docs-scope.test.py ~16s
+fork-ci/actions/ci-demand/ci_demand.test.py ~17s
+fork-ci/actions/docs-scope/docs-scope.test.py ~12s
 fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/fleet-watch/fleet_watch.test.py
-fork-ci/actions/git-clean/git_clean.test.py
+fork-ci/actions/git-clean/git_clean.test.py ~8s
 fork-ci/actions/gradle-cache/gradle_cache.test.py
-fork-ci/actions/head-check/head_check.test.py ~12s
+fork-ci/actions/head-check/head_check.test.py ~28s
 fork-ci/actions/head-check/head_gate.test.py
-fork-ci/actions/job-changed/job-changed.test.py ~16s
+fork-ci/actions/job-changed/job-changed.test.py ~21s
 fork-ci/actions/pinned/pinned.test.py
 fork-ci/actions/pr-queue/lens.test.py
-fork-ci/actions/pr-queue/pr_queue.test.py ~23s
-fork-ci/actions/pr-queue/pr_queue_laws.test.py ~22s
+fork-ci/actions/pr-queue/pr_queue.test.py ~42s
+fork-ci/actions/pr-queue/pr_queue_laws.test.py ~23s
 fork-ci/actions/pr-queue/review_config.test.py
 fork-ci/actions/pr-queue/review_glob.test.py
 fork-ci/actions/pr-queue/review_judge.test.py
 fork-ci/actions/pr-queue/tested-base/tested_base.test.py
-fork-ci/actions/test-select/test-select.test.py ~15s
+fork-ci/actions/test-select/test-select.test.py ~26s
 fork-ci/actions/test-select/trace-check.test.py
 fork-ci/actions/weakened-tests/weakened_tests.test.py
 fork-ci/laws/laws.test.py
-fork-kit/cleaner/tests/compress.test.py
-fork-kit/cleaner/tests/daily.test.py
-fork-kit/cleaner/tests/dedupe.test.py
+fork-kit/cleaner/tests/compress.test.py ~15s
+fork-kit/cleaner/tests/daily.test.py ~19s
+fork-kit/cleaner/tests/dedupe.test.py ~22s
 fork-kit/cleaner/tests/engine.test.py
-fork-kit/cleaner/tests/guard.test.py
-fork-kit/cleaner/tests/install.test.py
+fork-kit/cleaner/tests/guard.test.py ~12s
+fork-kit/cleaner/tests/install.test.py ~11s
 fork-kit/cleaner/tests/report.test.py
 fork-kit/cleaner/tests/scratch.test.py
-fork-kit/cleaner/tests/worktrees.test.py ~8s
-fork-kit/common/tests/free_contract.test.py ~5s
-fork-kit/common/tests/kit_install.test.py ~20s
+fork-kit/cleaner/tests/worktrees.test.py ~43s
+fork-kit/common/tests/free_contract.test.py ~6s
+fork-kit/common/tests/kit_install.test.py ~93s
 fork-kit/common/tests/machine_file.test.py
-fork-kit/desk/tests/install.test.py ~65s
-fork-kit/desk/tests/windows.test.py ~8s
-fork-kit/golive/tests/back.test.py ~35s
+fork-kit/desk/tests/install.test.py ~103s
+fork-kit/desk/tests/windows.test.py ~65s
+fork-kit/golive/tests/back.test.py ~100s
 fork-kit/golive/tests/check.test.py
 fork-kit/golive/tests/contract.test.py
-fork-kit/golive/tests/copy.test.py ~26s
-fork-kit/golive/tests/gap.test.py ~9s
-fork-kit/golive/tests/install.test.py ~8s
+fork-kit/golive/tests/copy.test.py ~36s
+fork-kit/golive/tests/gap.test.py ~84s
+fork-kit/golive/tests/install.test.py ~80s
 fork-kit/golive/tests/journal.test.py
-fork-kit/golive/tests/rehearse.test.py ~22s
-fork-kit/golive/tests/switch.test.py ~77s
+fork-kit/golive/tests/rehearse.test.py ~56s
+fork-kit/golive/tests/switch.test.py ~109s
 fork-kit/gh-apps/tests/install.test.py
 fork-kit/gh-apps/tests/mint.test.py
 fork-kit/gh-apps/tests/policy.test.py
@@ -95,16 +98,16 @@ fork-kit/gh-apps/tests/run.test.py
 fork-kit/gh-apps/tests/wrapper.test.py
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
-fork-kit/heavy/tests/install.test.py
-fork-kit/heavy/tests/queue.test.py ~30s
-fork-kit/heavy/tests/sweep.test.py ~25s
+fork-kit/heavy/tests/install.test.py ~8s
+fork-kit/heavy/tests/queue.test.py ~18s
+fork-kit/heavy/tests/sweep.test.py ~31s
 # A real systemd user manager (the step starts one for the runner user).
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml
 fork-kit/model-guard/tests/guard.test.py
-fork-kit/model-guard/tests/install.test.py
-fork-kit/pc-agents/tests/check.test.py ~22s
-fork-kit/pc-agents/tests/setup.test.py ~110s
-fork-kit/pc-agents/tests/update.test.py ~110s
+fork-kit/model-guard/tests/install.test.py ~21s
+fork-kit/pc-agents/tests/check.test.py ~32s
+fork-kit/pc-agents/tests/setup.test.py ~153s
+fork-kit/pc-agents/tests/update.test.py ~66s
 
 # Upstream's tests, run where fork-tests.yml follows upstream's ci.yml.
 .github/scripts/check-nightly-release.test.cjs run by .github/workflows/fork-tests.yml
