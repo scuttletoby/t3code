@@ -38,6 +38,9 @@ const filesMatching = (pattern: RegExp, options: { readonly skipAdapters?: boole
     .filter(({ text }) => pattern.test(text))
     .map(({ file }) => file);
 
+// The same order as `sources`, so a list of expected files compares equal however its names are cased.
+const byName = (files: ReadonlyArray<string>) => files.toSorted((a, b) => a.localeCompare(b));
+
 const read = (file: string) => {
   const source = sources.find((candidate) => candidate.file === file);
   if (source === undefined) throw new Error(`missing source ${file}`);
@@ -71,7 +74,7 @@ describe("agent turn start paths stay behind the work gate", () => {
     ["OrchestrationEffectExecutorV2", ["orchestration-v2/EffectWorker.ts"]],
     ["OrchestrationEffectWorkerV2", ["orchestration-v2/EffectWorker.ts"]],
   ] as const)("only the gated outbox uses %s", (service, files) => {
-    expect(filesMatching(new RegExp(`\\b${service}\\b`))).toEqual([...files].sort());
+    expect(filesMatching(new RegExp(`\\b${service}\\b`))).toEqual(byName(files));
   });
 
   // Services that hold provider sessions or adapters, outside the adapters themselves. Each file
@@ -109,6 +112,10 @@ describe("agent turn start paths stay behind the work gate", () => {
     [
       "ProviderAdapterRegistryV2",
       [
+        // Fork: only checks that the handoff's instance is registered; the handoff send is an
+        // outbox effect.
+        "fork/handoff/HandoffService.ts",
+        "fork/handoff/handoffOwner.ts",
         // Lists provider instances.
         "mcp/OrchestratorMcpService.ts",
         // Reads capabilities; turns are outbox effects.
@@ -123,18 +130,18 @@ describe("agent turn start paths stay behind the work gate", () => {
     ],
   ] as const)("only known files use %s", (service, files) => {
     expect(filesMatching(new RegExp(`\\b${service}\\b`), { skipAdapters: true })).toEqual(
-      [...files].sort(),
+      byName(files),
     );
   });
 
   // The name, not a call: a method taken into a local or passed on still counts.
   it("only the turn services mention startTurn outside the adapters", () => {
     expect(filesMatching(/\bstartTurn\b/, { skipAdapters: true })).toEqual(
-      [
+      byName([
         "orchestration-v2/ProviderSessionManager.ts",
         "orchestration-v2/ProviderTurnStartService.ts",
         "orchestration-v2/RunExecutionService.ts",
-      ].sort(),
+      ]),
     );
   });
 

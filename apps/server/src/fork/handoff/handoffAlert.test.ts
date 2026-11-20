@@ -49,6 +49,7 @@ import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as HandoffService from "./HandoffService.ts";
 import {
+  adapterRegistry,
   at,
   awarenessShell,
   handoffMessageId,
@@ -193,6 +194,7 @@ const world = Effect.fnUntraced(function* (usage: {
             };
           }),
         }),
+        adapterRegistry(),
       ),
     ),
   );
