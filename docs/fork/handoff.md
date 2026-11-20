@@ -86,14 +86,20 @@ written out in full. The message says when no effort is set.
 - **One retry.** A handoff run that fails is sent once more with the same text. If that also fails,
   the text stays in the thread and the server log says so; the next turn end decides again. A
   handoff the person stopped stays stopped: an interrupted handoff run is never sent again.
+- **No relay alert.** A completed handoff run does not alert through the relay (phone and other
+  devices): the relay sees it as upstream shows a stopped run. The mark is the run's own message
+  (its `handoff:` id, sent by the server as an agent), stored with the run, so a restart keeps it.
+  A failed handoff run, a run the person steered a message into, and the next real turn alert as
+  before (`fork/handoff/handoffQuiet.ts`).
 
 ## Limits
 
 - Timers and waits live in memory. After a server restart, the next turn end, or a late update of
   an older run, decides again. A crash between the send and the cancel leaves a queued handoff
   queued; it runs after the newer run.
-- A handoff run still notifies like any finished run (the browser notice and the relay). Keeping it
-  silent needs a marker the app can read; that comes with the settings screen.
+- The browser notice still fires for a completed handoff run. The browser reads only the thread
+  shell, which upstream's `ProjectionStore.ts` builds, and the fork may not add lines there yet
+  (`.github/fork-seams.json`, `pending`).
 - The same run never hands off twice: the check before the send drops a second trigger, and every
   trigger for one run uses the same ids, so one that got past would replay the first. A cancelled
   handoff spends that run's ids; the next run's turn end decides.

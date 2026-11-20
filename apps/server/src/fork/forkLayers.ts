@@ -9,6 +9,7 @@ import * as ServerAutoUpdate from "../cloud/autoUpdate.ts";
 import type * as CloudLink from "../cloud/CloudLink.ts";
 import * as HoldWorkConnect from "../cloud/holdWorkConnect.ts";
 import type * as ServerConfig from "../config.ts";
+import type * as AgentAwarenessRelay from "../relay/AgentAwarenessRelay.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as HeadlessUsageRefresher from "../usage/HeadlessUsageRefresher.ts";
@@ -17,10 +18,17 @@ import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
+import * as HandoffQuiet from "./handoff/handoffQuiet.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 
-/** Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. */
-export const holdWorkAgentActivity = HoldWorkConnect.agentActivityLayer;
+/**
+ * Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none, and a
+ * completed handoff run does not alert (fork/handoff/handoffQuiet.ts; only the relay's thread reads
+ * change, nothing else sees them).
+ */
+export const holdWorkAgentActivity = <E, R>(
+  relayLayer: Layer.Layer<AgentAwarenessRelay.AgentAwarenessRelay, E, R>,
+) => HoldWorkConnect.agentActivityLayer(relayLayer.pipe(Layer.provide(HandoffQuiet.layer)));
 
 /**
  * Upstream's Connect link with its reachability merged in, as server.ts had it, except that a held
