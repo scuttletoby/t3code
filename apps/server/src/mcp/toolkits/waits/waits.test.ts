@@ -17,6 +17,8 @@ import { McpSchema, McpServer, Tool } from "effect/ai";
 import { TestClock } from "effect/testing";
 
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
+import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import { ServerSettingsService } from "../../../serverSettings.ts";
 import type { WaitDelivery } from "../../../waits/WaitDelivery.ts";
 import * as WaitService from "../../../waits/WaitService.ts";
@@ -98,6 +100,9 @@ const toolsLayer = (input: {
   const base = Layer.mergeAll(
     ServerSettingsService.layerTest(input.settings ?? {}),
     threadsLayer(input.shells ?? new Map([[CALLER, callerShell()]])),
+    // task_list's services; these tests never call it.
+    Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+    Layer.mock(PeerForwarding.PeerForwarding)({}),
   );
   const made = WaitService.make({
     filePath: input.filePath,
@@ -691,14 +696,16 @@ it.layer(NodeServices.layer)("wait tools", (it) => {
         const { filePath } = yield* workspace;
         yield* Effect.gen(function* () {
           const server = yield* McpServer.McpServer;
-          const listed = server.tools.map(({ tool }) => ({
+          const all = server.tools.map(({ tool }) => ({
             name: tool.name,
             description: tool.description ?? "",
           }));
           assert.deepStrictEqual(
-            listed.map((tool) => tool.name),
-            ["wait_for", "wait_list", "wait_cancel"],
+            all.map((tool) => tool.name),
+            ["wait_for", "wait_list", "wait_cancel", "task_list"],
           );
+          // task_list shares the toolkit; its own budget is ForkAgentContextBudget's.
+          const listed = all.filter((tool) => tool.name.startsWith("wait_"));
           const total = listed.reduce((sum, tool) => sum + tool.description.length, 0);
           assert.isAtMost(total, 900);
           const waitFor = listed[0]!.description;
