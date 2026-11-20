@@ -18,6 +18,12 @@ handoff.HANDOVER_WAIT = 0.05
 
 LIVE, TARGET = '0.1.9', '0.1.10-nightly.20261114.4682.fork.1'
 
+# The kit's holder (#530) as FakeAdapter.run_detached starts it: a real process, `hold --home <home>` at the end of
+# its command line as the real unit's, so the kit finds it in /proc/locks the same way. Machine.close stops them.
+HOLDER = (f'import sys; sys.path[:0] = {[os.path.join(KIT, "lib"), COMMON]!r}\n'
+          'from golive import handoff\nsys.exit(handoff.serve_holder(sys.argv[3]))')
+HOLDERS = []  # [(unit, Popen)]
+
 STUB_T3 = '''#!{python} -I
 import json, os, sys
 root = os.path.dirname(os.path.realpath(sys.argv[sys.argv.index('--base-dir') + 1]))
@@ -113,6 +119,20 @@ class Machine:
         if self.server is not None:
             kill(self.server)
             self.server = None
+        for held in [h for h in HOLDERS if h[1].args[-1].startswith(self.root + os.sep)]:
+            kill(held[1])
+            HOLDERS.remove(held)
+        for pid in [int(p) for p in os.listdir('/proc') if p.isdigit()]:  # holders a kit run in a subprocess left
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    argv = f.read().decode(errors='replace').split('\0')[:-1]
+            except OSError:
+                continue
+            if argv[-3:-1] == ['hold', '--home'] and argv[-1].startswith(self.root + os.sep):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
          osadapter.CGROUP_FILE, path, live.fork_report) = self._saved
         os.environ['PATH'] = path or ''
@@ -233,6 +253,7 @@ class FakeAdapter(osadapter.SystemdUser):
     def __init__(self, root, machine=None, on=None):
         self.root, self.machine, self.on = root, machine, on or {}
         self.guard_up, self.guard_alive = True, True  # a detached guard logs that it waits, and keeps running
+        self.holder_up = True  # a detached holder (`hold`) really runs: False, as if systemd-run had failed
 
     def _svc(self, **props):
         path = os.path.join(self.root, 'service.json')
@@ -272,12 +293,22 @@ class FakeAdapter(osadapter.SystemdUser):
             raise osadapter.AdapterError(f'not a safe unit name: {unit!r}')
         self._record('run_detached', unit, argv, *([guard_after_seconds, guard_argv] if guard_argv else []),
                      *([list(properties)] if properties else []))
+        if argv[1:2] == ['hold']:  # the holder: one unit of a name at a time, as systemd-run
+            if any(u == unit and p.poll() is None for u, p in HOLDERS):
+                raise osadapter.AdapterError(f'systemd-run: Unit {unit}.service was already loaded or has a fragment')
+            if not self.holder_up:
+                raise osadapter.AdapterError('systemd-run: Failed to start transient service unit')
+            HOLDERS.append((unit, subprocess.Popen([sys.executable, '-I', '-c', HOLDER, *argv[1:]],
+                                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                   stderr=subprocess.DEVNULL, start_new_session=True)))
         if self.guard_up and argv[1:3] in (['guard', '--run'], ['switch-guard', '--run']):  # copy's guard; switch's
             from golive import coldcopy
             run_id = argv[argv.index('--run') + 1]
             coldcopy._guard_log(os.path.join(self.root, 'kit-state'), {'run': run_id, 'waiting': True})
 
     def unit_active(self, unit):
+        if unit.startswith('t3-golive-hold-'):
+            return any(u == unit and p.poll() is None for u, p in HOLDERS)
         return self.guard_alive
 
 

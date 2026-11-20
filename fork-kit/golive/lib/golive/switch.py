@@ -649,10 +649,12 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
     say(f'stopping {osadapter.UNIT} (t3 {old}) to switch to {cfg.target_version}')
     error, lock, noted = None, None, 0
     try:
-        with run.step('stopping', **rec, marker=handoff.marker_path(cfg.home)):
+        with run.step('stopping', **rec, marker=handoff.marker_path(cfg.home)) as facts:
             adapter.stop()
             coldcopy._wait_stopped(adapter, server['pid'])
-            lock = coldcopy.hold_owner_lock(os.path.join(cfg.home, 'userdata'), coldcopy.STOP_WAIT)
+            # by the holder: a switch killed before its guard puts T3 back leaves the home owned (#530)
+            lock, held = coldcopy.hold_home(adapter, cfg.home, coldcopy.STOP_WAIT)
+            facts.update(held)
             if handoff.adopt(cfg.home, lock):  # held until the update's restart hands the home over
                 lock = None
             coldcopy._same_after_stop(cfg, server)
@@ -792,10 +794,13 @@ def guard(cfg, adapter, run_id, wait, say=print, lose_work_since=None):
             except (journal.Damaged, OSError) as e:
                 runs = None
                 did.append(f'journal unreadable, so T3 is started if it is not active: {e}')
-                if not adapter.service()['active']:
+                svc = adapter.service()
+                if not svc['active'] and not svc['enabled']:  # the switch never disables it; its W1 does, on purpose
+                    did.append(f'{osadapter.UNIT} is not enabled: left stopped (a W1 that stopped may hold it)')
+                elif not svc['active']:
                     coldcopy.open_gap(cfg.home)  # left to run out: this guard does not wait for T3
-                    try:
-                        adapter.start()
+                    try:  # the killed run's holder (#530) lets go to the launcher
+                        handoff.starting(cfg.home, adapter.start, None, adapter.service)
                     finally:
                         handoff.close(cfg.home)
                     did.append(f'started {osadapter.UNIT}')
