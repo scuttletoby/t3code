@@ -26,6 +26,7 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
 import { TestClock } from "effect/testing";
 
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -188,10 +189,15 @@ const delegate = (input: {
   readonly retryOfAccepted?: boolean;
   readonly runtimeMode?: RuntimeMode;
   readonly settingsUnreadable?: boolean;
+  /** The parent project's folder; without it the project is not found. */
+  readonly workspaceRoot?: string;
+  /** What the registry holds once the folder is scanned (the folder's own provider config). */
+  readonly scanned?: ReadonlyArray<ServerProvider>;
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
     const dispatched: Array<Dispatched> = [];
+    const registry = yield* Ref.make(input.providers);
     const task = {
       id: taskId,
       threadId: parentThreadId,
@@ -266,8 +272,9 @@ const delegate = (input: {
           }),
       }),
       Layer.mock(ProviderRegistry.ProviderRegistry)({
-        getProviders: Effect.succeed(input.providers),
-        refreshInstance: () => Effect.succeed(input.providers),
+        getProviders: Ref.get(registry),
+        refreshInstance: () => Ref.get(registry),
+        refreshWorkspaceSnapshot: () => Ref.setAndGet(registry, input.scanned ?? input.providers),
       }),
       Layer.succeed(
         ProviderAdapterRegistry.ProviderAdapterRegistryV2,
@@ -279,7 +286,13 @@ const delegate = (input: {
             } as unknown as ProviderAdapter.ProviderAdapterV2["Service"]),
         }),
       ),
-      Layer.mock(ProjectService.ProjectService)({ getById: () => Effect.succeedNone }),
+      Layer.mock(ProjectService.ProjectService)({
+        getById: () =>
+          input.workspaceRoot === undefined
+            ? Effect.succeedNone
+            : Effect.succeedSome({ id: projectId, workspaceRoot: input.workspaceRoot } as never),
+        workspaceScanDirectory: (cwd) => Effect.succeed(cwd),
+      }),
       Layer.mock(SecretRequests.SecretRequests)({}),
       Layer.mock(RemoteDelegation.RemoteDelegation)({}),
       Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
@@ -310,6 +323,23 @@ const delegate = (input: {
   });
 
 const enforce = { usagePacingGate: "enforce" } as const;
+
+const ROOT = "/work/project";
+const LOCAL = "local/coder";
+
+/** The provider as its folder scan sees it: the project's own config adds `models`. */
+const inFolder = (
+  base: ServerProvider,
+  models: ServerProvider["models"] = [
+    ...base.models,
+    { ...base.models[0]!, slug: LOCAL, name: LOCAL },
+  ],
+): ServerProvider => ({
+  ...base,
+  workspaceSnapshots: [
+    { cwd: ROOT, checkedAt: at(-MINUTE), slashCommands: [], skills: [], models },
+  ],
+});
 
 describe("OrchestratorMcpService usage pacing gate", () => {
   it.effect("off (the default): no pace is read, even when the account is full", () =>
@@ -517,6 +547,76 @@ describe("OrchestratorMcpService usage pacing gate", () => {
         assert.include(result.success.usagePacingNote ?? "", text);
         assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: MAIN, model: MODEL });
       }
+    }),
+  );
+
+  it.effect("enforce, ahead: moves a model only the project's own config adds (#559)", () =>
+    Effect.gen(function* () {
+      const providers = [inFolder(main(60)), inFolder(second(10))];
+      // Already scanned, and scanned only by this call's target lookup (the gate reads it after).
+      for (const registry of [providers, [main(60), second(10)]]) {
+        const { result, dispatched } = yield* delegate({
+          settings: enforce,
+          providers: registry,
+          scanned: providers,
+          workspaceRoot: ROOT,
+          target: { model: LOCAL },
+        });
+        assert.isTrue(result._tag === "Success");
+        if (result._tag !== "Success") return;
+        assert.include(result.success.usagePacingNote ?? "", "runs on codex-second");
+        assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: SECOND, model: LOCAL });
+      }
+    }),
+  );
+
+  it.effect("enforce, over the even pace: lowers the effort of a project config model (#559)", () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* delegate({
+        settings: { ...enforce, usagePacingLowerEffort: { high: "medium" } },
+        providers: [inFolder(main(60))],
+        workspaceRoot: ROOT,
+        target: { model: LOCAL },
+      });
+      assert.isTrue(result._tag === "Success");
+      if (result._tag !== "Success") return;
+      assert.include(result.success.usagePacingNote ?? "", "medium instead of high");
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, {
+        instanceId: MAIN,
+        model: LOCAL,
+        options: [{ id: "reasoningEffort", value: "medium" }],
+      });
+    }),
+  );
+
+  it.effect("no, an empty or an unscanned project config: paced as before (#559)", () =>
+    Effect.gen(function* () {
+      for (const [providers, workspaceRoot] of [
+        [[main(60), second(10)], undefined],
+        [[main(60), second(10)], ROOT],
+        [[inFolder(main(60), main(60).models), inFolder(second(10), second(10).models)], ROOT],
+      ] as const) {
+        const { result, dispatched } = yield* delegate({
+          settings: enforce,
+          providers,
+          ...(workspaceRoot === undefined ? {} : { workspaceRoot }),
+        });
+        assert.isTrue(result._tag === "Success");
+        if (result._tag !== "Success") return;
+        assert.include(result.success.usagePacingNote ?? "", "runs on codex-second");
+        assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: SECOND, model: MODEL });
+      }
+      // A model nothing lists still fails as it did, and is not paced.
+      const { result } = yield* delegate({
+        settings: enforce,
+        providers: [inFolder(main(60), main(60).models)],
+        workspaceRoot: ROOT,
+        target: { model: LOCAL },
+        pacer: "untouched",
+      });
+      assert.isTrue(result._tag === "Failure");
+      if (result._tag !== "Failure") return;
+      assert.strictEqual(result.failure.code, "model_unavailable");
     }),
   );
 
