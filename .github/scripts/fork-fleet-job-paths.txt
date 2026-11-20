@@ -16,12 +16,11 @@
 /lib32
 /lib64
 /libx32
-# Users and names: whoami, git, ssh and Node's os.userInfo() read passwd and group through nsswitch.conf; hosts has
-# localhost; host.conf and gai.conf steer glibc's resolver (resolv.conf is the launcher's own, RESOLV_CONF).
-/etc/passwd
-/etc/group
+# Users and names: whoami, git, ssh and Node's os.userInfo() read passwd and group through nsswitch.conf. passwd, group
+# and hosts are never here (issue #370): the launcher writes a job's own (root, nobody, the job's user; localhost), as
+# the host's name every account, its GECOS (often a person's name), its home folders and the LAN's host names.
+# host.conf and gai.conf steer glibc's resolver (resolv.conf is the launcher's own, RESOLV_CONF).
 /etc/nsswitch.conf
-/etc/hosts
 /etc/host.conf
 /etc/gai.conf
 # TLS: the CA bundle and OpenSSL's config (curl, git, Python, the runner; /usr/lib/ssl links here). Not ssl/private.
