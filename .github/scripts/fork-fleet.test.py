@@ -2,7 +2,7 @@
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
 import ast, copy, datetime, glob, grp, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat
-import subprocess, sys, tempfile, time
+import subprocess, sys, tempfile, textwrap, time
 import unittest, urllib.error, urllib.parse
 from contextlib import redirect_stdout
 from functools import partial
@@ -4915,24 +4915,291 @@ class AnyRepository(unittest.TestCase):
             self.assertIn('runners={"plugins":["self-hosted","proj-build"]', written)
 
 
+SKIPS = frozenset({'skip', 'skipIf', 'skipUnless'})   # unittest's skip decorators, by the name they are called by
+SKIP_TEST = 'SkipTest'   # what they raise: a decorator whose wrapper raises it skips the same way
+
+
+def skip_misuse(source, name='<test file>'):
+    """Every skip decorator (issue #408 item 6, issue #584 item 1) in source that is not on a test class or a test
+    method, as 'line: what'. A skip on anything else (a helper function or method, setUp, a nested or `if`-guarded
+    helper, a mixin class that is no TestCase) turns into a skip for every test that calls or inherits it, as
+    walls_probe's "not as root" did to the root tests. Applied without `@` (`probe = unittest.skip("x")(probe)`) it is
+    the same, so that is found too, on a function or class of this file.
+    What a skip is, found to a fixpoint: `unittest.skip`/`skipIf`/`skipUnless` (also through `import unittest as u`,
+    and `getattr(unittest, "skipIf")`), a name imported from unittest under its own name or another, a name or
+    attribute assigned from a skip (`x = unittest.skipIf(..)`, `self.x = ...`, `x = partial(unittest.skip, ...)`: only
+    the outermost target, so `self` is never one), and a decorator factory: a function whose body calls or returns a
+    skip, or raises unittest.SkipTest (a wrapper that skips its caller). A body that only names a word `skip` (a local
+    `skip = 0`, `opts.skip`) is no factory.
+    A test class is a class with a base named *TestCase, a test class of this file, or a class from another module (as
+    `fx.Case`: this file cannot tell, so it is taken as one); a mixin is a class with no base, `object`, or mixins of
+    this file only. A test method is a `test*` function in a class's body (also under an `if` or `try` there; a
+    mixin's test methods are tests of every class that takes it).
+    Known misses (a lint, not a proof): pytest marks, and a skip reached in ways this file cannot see (a skip
+    imported from a helper module). Every *.test.py of the repository is checked, upstream's scripts/ ones too, so an
+    upstream sync can turn this red. Raises SyntaxError on a file that does not parse: a test file the check cannot
+    read is not a pass."""
+    tree = ast.parse(source, name)
+    nodes = list(ast.walk(tree))
+    parent = {c: n for n in nodes for c in ast.iter_child_nodes(n)}
+
+    def tokens(node):
+        """What node refers to that could be a skip: ('n', name) and ('a', attribute, the name it hangs on or '')."""
+        found = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name):
+                found.add(('n', n.id))
+            elif isinstance(n, ast.Attribute):
+                found.add(('a', n.attr, n.value.id if isinstance(n.value, ast.Name) else ''))
+            elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == 'getattr'
+                  and len(n.args) >= 2 and isinstance(n.args[0], ast.Name) and isinstance(n.args[1], ast.Constant)
+                  and isinstance(n.args[1].value, str)):
+                found.add(('a', n.args[1].value, n.args[0].id))
+        return frozenset(found)
+
+    def last(node):
+        while isinstance(node, (ast.Subscript, ast.Call)):
+            node = node.value if isinstance(node, ast.Subscript) else node.func
+        return node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else ''
+
+    modules, names, attrs = {'unittest'}, set(), set()   # unittest's names here; skip names; skip attributes
+    for n in nodes:
+        if isinstance(n, ast.Import):
+            modules |= {a.asname for a in n.names if a.name == 'unittest' and a.asname}
+        elif isinstance(n, ast.ImportFrom) and n.module == 'unittest':
+            names |= {a.asname or a.name for a in n.names if a.name in SKIPS | {SKIP_TEST}}
+
+    def skips(found):
+        return any(t[1] in names if t[0] == 'n' else
+                   t[1] in attrs or t[1] in SKIPS | {SKIP_TEST} and t[2] in modules for t in found)
+
+    def outermost(target):
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for t in target.elts:
+                yield from outermost(t)
+        elif isinstance(target, ast.Name):
+            yield 'n', target.id
+        elif isinstance(target, ast.Attribute):
+            yield 'a', target.attr
+    assigns = [(tokens(n.value), [t for x in (n.targets if isinstance(n, ast.Assign) else [n.target])
+                                  for t in outermost(x)])
+               for n in nodes if isinstance(n, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and n.value is not None]
+    functions = {}   # a function's name: what its body (nested functions too) calls, returns or raises
+
+    def body_of(node, inside):
+        """One walk of the tree: each call, return and raise counts for every function it is inside."""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for x in [*node.decorator_list, node.args, *([node.returns] if node.returns else [])]:
+                body_of(x, inside)
+            inside = (*inside, node.name)
+            functions.setdefault(node.name, set())
+            for x in node.body:
+                body_of(x, inside)
+            return
+        if inside:
+            what = (node.func if isinstance(node, ast.Call) else node.value if isinstance(node, ast.Return)
+                    else node.exc if isinstance(node, ast.Raise) else None)
+            if what is not None:
+                found = tokens(what)
+                for f in inside:
+                    functions[f] |= found
+        for x in ast.iter_child_nodes(node):
+            body_of(x, inside)
+    body_of(tree, ())
+    local = {n.name for n in nodes if isinstance(n, ast.ClassDef)}
+    classes = [n for n in nodes if isinstance(n, ast.ClassDef)]
+    cases, size = set(), -1
+    while size != len(names) + len(attrs) + len(cases):
+        size = len(names) + len(attrs) + len(cases)
+        for found, targets in assigns:
+            if skips(found):
+                names |= {x for k, x in targets if k == 'n'}
+                attrs |= {x for k, x in targets if k == 'a'}
+        names |= {f for f, found in functions.items() if skips(found)}
+        cases |= {n.name for n in classes if any(last(b).endswith('TestCase') or last(b) in cases
+                                                 or not (isinstance(b, ast.Name) and b.id in {*local, 'object'})
+                                                 for b in n.bases)}
+
+    def owner(n):
+        up = parent.get(n)
+        while isinstance(up, (ast.If, ast.Try, ast.ExceptHandler, ast.With)) or type(up).__name__ == 'TryStar':
+            up = parent.get(up)
+        return up
+
+    def misplaced(n):
+        """Why a skip on definition n is wrong, or None when n is a test class or a test method."""
+        if isinstance(n, ast.ClassDef):
+            return None if n.name in cases else f'class {n.name} (no TestCase: every class that takes it is skipped)'
+        if isinstance(owner(n), ast.ClassDef) and n.name.startswith('test'):
+            return None
+        return f'{n.name} (no test method: every test that calls it is skipped)'
+    defs = {}
+    for n in nodes:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defs.setdefault(n.name, n)
+    bad = []
+    for n in nodes:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if any(skips(tokens(d)) for d in n.decorator_list) and misplaced(n):
+                bad.append(f'{n.lineno}: {misplaced(n)}')
+        elif (isinstance(n, ast.Call) and len(n.args) == 1 and not n.keywords and isinstance(n.args[0], ast.Name)
+              and n.args[0].id in defs and skips(tokens(n.func)) and misplaced(defs[n.args[0].id])):
+            bad.append(f'{n.lineno}: {misplaced(defs[n.args[0].id])}')   # a skip applied without @
+    return sorted(set(bad), key=lambda x: int(x.split(':')[0]))
+
+
+def fork_test_files(repo):
+    """Every *.test.py of the repository (the fork's scripts, kits and CI actions, and scripts/), outside .git,
+    node_modules and every other hidden folder but .github."""
+    found = []
+    for top, dirs, files in os.walk(repo):
+        dirs[:] = sorted(d for d in dirs if d != 'node_modules' and (d == '.github' or not d.startswith('.')))
+        found += [os.path.join(top, f) for f in sorted(files) if f.endswith('.test.py')]
+    return found
+
+
 class TestFiles(unittest.TestCase):
     def test_no_skip_decorator_on_a_helper(self):
-        """Issue #408 item 6: a unittest skip decorator on a module-level helper (walls_probe had LauncherAsRoot's
-        opposite, "not as root") turns every call of it into a skip, so a root test that calls it never ran, and
-        the class it was meant for (Launcher) lost its guard. Skips go on test classes and test methods only, in
-        every test file of the fork's scripts and kits."""
+        """Issue #408 item 6: a unittest skip decorator on a helper (walls_probe had LauncherAsRoot's opposite, "not
+        as root") turns every call of it into a skip, so a root test that calls it never ran, and the class it was
+        meant for (Launcher) lost its guard. Skips go on test classes and test methods only (skip_misuse), in every
+        Python test file of the repository (issue #584 item 1: fork-ci/ and scripts/ too)."""
         repo = os.path.dirname(os.path.dirname(HERE))
-        files = sorted({*glob.glob(os.path.join(HERE, '*.test.py')),
-                        *glob.glob(os.path.join(repo, 'fork-kit', '**', '*.test.py'), recursive=True)})
-        self.assertIn(os.path.abspath(__file__), files)
+        files = fork_test_files(repo)
+        rel = {os.path.relpath(f, repo) for f in files}
+        # the fork's own: always there (CI's sparse checkout has fork-ci/ and fork-kit/), so a checkout that drops
+        # one fails here rather than checking fewer files; upstream's scripts/ file only while upstream keeps it
+        for must in (os.path.relpath(os.path.abspath(__file__), repo), 'fork-kit/desk/tests/install.test.py',
+                     'fork-ci/actions/pinned/pinned.test.py'):
+            self.assertIn(must, rel)
+        upstream = 'scripts/seed-issue-21397.test.py'
+        self.assertEqual(upstream in rel, os.path.exists(os.path.join(repo, upstream)))
         bad = []
         for path in files:
             with open(path, encoding='utf-8') as f:
-                tree = ast.parse(f.read(), path)
-            bad += [f'{os.path.relpath(path, repo)}: {n.name}' for n in tree.body
-                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and any('skip' in ast.unparse(d) for d in n.decorator_list)]
+                bad += [f'{os.path.relpath(path, repo)}:{x}' for x in skip_misuse(f.read(), path)]
         self.assertEqual(bad, [])
+
+
+class SkipMisuse(unittest.TestCase):
+    """skip_misuse on each form issue #584 item 1 names (the #579 lenses), and on the forms it must leave alone."""
+    HEAD = 'import functools, os, unittest\nfrom unittest import TestCase\n'
+
+    def misuse(self, body):
+        return [x.split(' ', 2)[1] for x in skip_misuse(self.HEAD + textwrap.dedent(body))]
+
+    def test_each_form_of_a_skipped_helper_is_found(self):
+        forms = {
+            'module helper': ('@unittest.skipUnless(os.geteuid() != 0, "x")\ndef probe(): pass\n', ['probe']),
+            'async helper': ('@unittest.skipIf(True, "x")\nasync def probe(): pass\n', ['probe']),
+            'bare import': ('from unittest import skipUnless\n@skipUnless(True, "x")\ndef probe(): pass\n',
+                            ['probe']),
+            'import alias': ('from unittest import skipIf as only\n@only(True, "x")\ndef probe(): pass\n', ['probe']),
+            'assigned alias': ('only_user = unittest.skipUnless(os.geteuid() != 0, "x")\n@only_user\n'
+                               'def probe(): pass\n', ['probe']),
+            'alias of an alias': ('a = unittest.skip("x")\nb = a\n@b\ndef probe(): pass\n', ['probe']),
+            'partial alias': ('only = functools.partial(unittest.skipIf, True)\n@only("x")\ndef probe(): pass\n',
+                              ['probe']),
+            'decorator factory': ('def only_root(f):\n    return unittest.skipUnless(True, "x")(f)\n'
+                                  '@only_root\ndef probe(): pass\n', ['probe']),
+            'helper method': ('class T(unittest.TestCase):\n    @unittest.skipIf(True, "x")\n'
+                              '    def probe_helper(self): pass\n    def test_a(self): self.probe_helper()\n',
+                              ['probe_helper']),
+            'setUp': ('class T(TestCase):\n    @unittest.skip("x")\n    def setUp(self): pass\n', ['setUp']),
+            'nested helper': ('def outer():\n    @unittest.skip("x")\n    def probe(): pass\n    return probe\n',
+                              ['probe']),
+            'helper under if': ('if os.name == "posix":\n    @unittest.skip("x")\n    def probe(): pass\n',
+                                ['probe']),
+            'test function outside a class': ('@unittest.skip("x")\ndef test_alone(): pass\n', ['test_alone']),
+            'test function nested in a test': ('class T(TestCase):\n    def test_a(self):\n'
+                                               '        @unittest.skip("x")\n        def test_b(): pass\n',
+                                               ['test_b']),
+            'mixin class': ('@unittest.skipUnless(True, "x")\nclass Mixin:\n    def test_a(self): pass\n'
+                            'class T(Mixin, unittest.TestCase): pass\n', ['class']),
+            'alias on a mixin': ('only = unittest.skip("x")\n@only\nclass Mixin(object): pass\n', ['class']),
+            'mixin of a mixin': ('class A: pass\n@unittest.skip("x")\nclass B(A): pass\n', ['class']),
+            # the #597 lenses
+            'applied without @': ('def probe(): pass\nprobe = unittest.skip("x")(probe)\n', ['probe']),
+            'alias applied without @': ('only = unittest.skip("x")\nclass Mixin: pass\nMixin = only(Mixin)\n',
+                                        ['class']),
+            'wrapper that raises SkipTest': ('def only_root(f):\n    @functools.wraps(f)\n    def inner(*a):\n'
+                                             '        raise unittest.SkipTest("not root")\n    return inner\n'
+                                             '@only_root\ndef probe(): pass\n', ['probe']),
+            'getattr': ('@getattr(unittest, "skipIf")(True, "x")\ndef probe(): pass\n', ['probe']),
+            'module alias': ('import unittest as ut\n@ut.skip("x")\ndef probe(): pass\n', ['probe']),
+            'attribute alias': ('class T(TestCase):\n    only = unittest.skip("x")\n'
+                                '    @only\n    def probe(self): pass\n', ['probe']),
+        }
+        for form, (body, want) in forms.items():
+            with self.subTest(form):
+                self.assertEqual(self.misuse(body), want)
+
+    def test_skips_on_tests_and_other_decorators_pass(self):
+        ok = '''
+            only = unittest.skipIf(True, "x")
+            class Base(unittest.TestCase):
+                pass
+            @unittest.skipUnless(True, "x")
+            class A(Base):
+                @only
+                def test_a(self): self.skipTest("a helper may call skipTest")
+                @unittest.skip("x")
+                async def test_b(self): pass
+                @functools.lru_cache()
+                def helper(self): return "skip"
+            class Mixin:
+                @unittest.skip("x")
+                def test_c(self): pass
+            @unittest.skip("x")
+            class B(Mixin, unittest.IsolatedAsyncioTestCase): pass
+            @only
+            class C(TestCase): pass
+            @unittest.skip("x")
+            class Case(fx.Case): pass
+            @unittest.mock.patch("os.getcwd", skip=True)
+            def patched(): pass
+            class D(TestCase):
+                def setUp(self):
+                    self.only = unittest.skipIf(True, "x")   # `self` is no skip after this
+                def test_d(self):
+                    @functools.wraps(self.test_d)
+                    def inner(): pass
+                if os.name == "posix":
+                    @unittest.skip("x")
+                    def test_posix(self): pass
+                test_e = unittest.skip("x")(lambda self: None)
+            def run(opts): return opts.skip
+            def retry(f): return run(f)
+            @retry
+            def flaky(): pass
+            def parse(rows):
+                skip = 0
+                return skip
+            @parse
+            def rows(): pass
+            def need_root():
+                raise unittest.SkipTest("root only")   # a helper a test calls, as self.skipTest: fine
+            class E(TestCase):
+                def test_f(self): need_root()
+            '''
+        self.assertEqual(self.misuse(ok), [])
+
+    def test_empty_and_unreadable_files(self):
+        """Empty or missing state: an empty file or folder has nothing to find; a file that does not parse is not a
+        pass. The check reads and never writes, so it gives the same answer every time it runs."""
+        self.assertEqual(skip_misuse(''), [])
+        with self.assertRaises(SyntaxError):
+            skip_misuse('def broken(:\n')
+        body = '@unittest.skip("x")\ndef probe(): pass\n'
+        self.assertEqual(self.misuse(body), self.misuse(body))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(fork_test_files(d), [])
+            for folder in ('node_modules/x', '.git/y', '.hidden', '.github/scripts', 'fork-ci/z', 'scripts'):
+                os.makedirs(os.path.join(d, folder))
+                with open(os.path.join(d, folder, 'a.test.py'), 'w') as f:
+                    f.write('')
+            self.assertEqual([os.path.relpath(f, d) for f in fork_test_files(d)],
+                             ['.github/scripts/a.test.py', 'fork-ci/z/a.test.py', 'scripts/a.test.py'])
 
 
 class OldBugs(unittest.TestCase):
