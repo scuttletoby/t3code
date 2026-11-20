@@ -672,6 +672,7 @@ class Wipe(Base):
         code, out = self.run_cli('prepare', '--path', '.')
         self.assertEqual(code, 2, out)
         self.assertIn('(above RUNNER_WORKSPACE) is a symlink', out)
+        self.assertIn('config.sh --work <real path>', out)   # the refusal says how to fix it
         self.assertEqual(os.listdir(os.path.join(elsewhere, 'proj', 'proj')), ['f'])
 
     def test_each_folder_is_listed_once(self):   # a re-listing after each child is quadratic in a wide folder
@@ -687,6 +688,134 @@ class Wipe(Base):
         self.assertEqual(os.listdir(self.ws), [])
         self.assertEqual(len([p for p in listed if isinstance(p, int)]), 1 + 40 + 40)
 
+    def old_glibc(self):
+        """os.chmod as Python behaves on glibc older than 2.32: fchmodat(AT_SYMLINK_NOFOLLOW) answers ENOTSUP for every
+        path, which Python raises as ValueError (with dir_fd)."""
+        real = os.chmod
+
+        def chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
+            if not follow_symlinks:
+                raise ValueError('chmod: cannot use dir_fd and follow_symlinks together')
+            return real(path, mode, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        return unittest.mock.patch.object(G.os, 'chmod', chmod)
+
+    def test_old_glibc_read_only_folders_are_emptied(self):
+        """A read-only folder (a Go module cache, `chmod -R a-w`) is emptied on glibc < 2.32 too, through the O_PATH
+        fallback: otherwise it stops every run red until a person deletes it."""
+        self.fill()   # a 0o000 folder holding a 0o500 one
+        self.tree('gomod/pkg@v1/go.mod')
+        os.chmod(os.path.join(self.ws, 'gomod', 'pkg@v1'), 0o555)
+        os.chmod(os.path.join(self.ws, 'gomod'), 0o555)
+        with self.old_glibc():
+            self.assertIsNone(G.wipe(self.env()))
+        self.assertEqual(os.listdir(self.ws), [])
+        self.assert_outside_kept()
+
+    def test_old_glibc_a_read_only_folder_swapped_for_a_symlink_keeps_the_targets_mode(self):
+        """The fallback opens the name with O_NOFOLLOW and requires a folder: a symlink swapped in is not followed."""
+        for target in ('keep', ''):   # a file, and a folder, outside
+            with self.subTest(target=target):
+                victim = os.path.join(self.outside, target)
+                os.chmod(victim, 0o600 if target else 0o755)
+                self.tree('sub/locked/f')
+                os.chmod(os.path.join(self.ws, 'sub', 'locked'), 0o500)
+                with self.old_glibc(), self.swap_for_symlink('sub/locked', victim):
+                    why = G.wipe(self.env())
+                self.assertIn('could not remove', why or '')
+                self.assertIn('its mode is not changed', why)
+                self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o600 if target else 0o755)
+                self.assert_outside_kept()
+                with self.old_glibc():
+                    self.assertIsNone(G.wipe(self.env()))   # runs again: the symlink goes as a link
+                self.assertEqual(os.listdir(self.ws), [])
+                self.rm(os.path.join(self.d, 'swapped'))
+
+    def swap_after_the_check(self, swapped):
+        """Another process swaps the folder `swapped` (the work folder, RUNNER_WORKSPACE or the workspace) for a symlink
+        right after workspace() checked the paths: the wipe opens the workspace one name at a time from the work
+        folder, never through a symlink. Nothing where the link points is emptied; the next run is refused by path
+        until the link is gone, then empties the workspace."""
+        self.tree('f', 'sub/g')
+        elsewhere = os.path.join(self.d, 'elsewhere')
+        inner = os.path.normpath(os.path.join(elsewhere, os.path.relpath(self.ws, swapped)))
+        os.makedirs(inner)
+        with open(os.path.join(inner, 'victim'), 'w') as f:
+            f.write('x')
+        aside, real = os.path.join(self.d, 'aside'), G.workspace
+
+        def workspace(env):
+            out = real(env)
+            os.rename(swapped, aside)
+            os.symlink(elsewhere, swapped)
+            return out
+
+        with unittest.mock.patch.object(G, 'workspace', workspace):
+            why = G.wipe(self.env())
+        self.assertEqual(os.listdir(inner), ['victim'])
+        self.assertIn('cannot be opened without following a symlink', why or '')
+        self.assertIn(swapped, why)
+        self.assertIn('refused', G.wipe(self.env()))   # runs again: refused by path while the link stays
+        self.assertEqual(os.listdir(inner), ['victim'])
+        os.unlink(swapped)
+        os.rename(aside, swapped)
+        self.assertEqual(sorted(os.listdir(self.ws)), ['f', 'sub'])   # nothing was removed
+        self.assert_outside_kept()
+        self.assertIsNone(G.wipe(self.env()))   # put back: the next run empties it
+        self.assertEqual((os.listdir(self.ws), os.listdir(inner)), ([], ['victim']))
+
+    def test_the_work_folder_swapped_after_the_check_is_not_followed(self):
+        self.swap_after_the_check(os.path.join(self.d, '_work'))
+
+    def test_the_runner_workspace_swapped_after_the_check_is_not_followed(self):
+        self.swap_after_the_check(self.runner)
+
+    def test_the_workspace_swapped_after_the_check_is_not_followed(self):   # O_NOFOLLOW on the last name: as before
+        self.swap_after_the_check(self.ws)
+
+    def test_a_workspace_moved_away_after_the_check_is_not_touched(self):
+        """The workspace is moved out and a new folder made in its place after the check: the wipe empties the folder
+        at the workspace's place, never the one moved away."""
+        self.tree('f', 'sub/g')
+        aside, real = os.path.join(self.outside, 'moved'), G.workspace
+
+        def workspace(env):
+            out = real(env)
+            os.rename(self.ws, aside)
+            os.mkdir(self.ws)
+            with open(os.path.join(self.ws, 'new'), 'w') as f:
+                f.write('x')
+            return out
+
+        with unittest.mock.patch.object(G, 'workspace', workspace):
+            self.assertIsNone(G.wipe(self.env()))
+        self.assertEqual((os.listdir(self.ws), sorted(os.listdir(aside))), ([], ['f', 'sub']))
+
+    def test_a_mount_point_inside_the_workspace_is_refused_before_anything_is_removed(self):
+        """A bind mount of a folder on the same file system has the workspace's device, so the walk's device check
+        would enter it and empty its source: every mount point inside the workspace is refused up front (root mounts
+        one; a test cannot, so /proc/self/mountinfo is given)."""
+        self.tree('my mnt/f', 'other/f')
+        info = os.path.join(self.d, 'mountinfo')
+        esc = lambda p: p.replace('\\', '\\134').replace(' ', '\\040')
+        lines = [f'22 1 8:1 / / rw - ext4 /dev/sda1 rw',
+                 f'40 22 8:1 {esc(self.outside)} {esc(self.ws)} rw - ext4 /dev/sda1 rw',   # the workspace itself: fine
+                 f'41 22 8:1 {esc(self.outside)} {esc(os.path.join(self.ws, "my mnt"))} rw - ext4 /dev/sda1 rw',
+                 f'42 22 8:1 / {esc(self.outside)} rw - ext4 /dev/sda1 rw']                  # outside: fine
+        with open(info, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        before = sorted(os.listdir(self.ws))
+        with unittest.mock.patch.object(G, 'MOUNTINFO', info):
+            why = G.wipe(self.env())
+            self.assertEqual(why, f'refused to empty the workspace: {os.path.join(self.ws, "my mnt")} is mounted '
+                                  f'inside the workspace: unmount it first')
+            self.assertEqual(sorted(os.listdir(self.ws)), before)   # nothing removed
+            self.assertEqual(G.wipe(self.env()), why)                # runs again: refused the same way
+        self.assertEqual(G.mounts_inside(self.ws), [])               # this test machine: none
+        with unittest.mock.patch.object(G, 'MOUNTINFO', os.path.join(self.d, 'missing')):
+            self.assertIsNone(G.wipe(self.env()))   # unmounted (or no /proc): the next run empties it
+        self.assertEqual(os.listdir(self.ws), [])
+        self.assert_outside_kept()
+
     def test_another_file_system_is_not_entered(self):
         """A mount point inside the workspace (root sets one up; a test cannot): the folder reports another device."""
         self.tree('mnt/f', 'other/f')
@@ -698,7 +827,7 @@ class Wipe(Base):
 
         with unittest.mock.patch.object(G.os, 'fstat', fstat):
             why = G.wipe(self.env())
-            self.assertIn('another file system is mounted here', why or '')
+            self.assertIn('another device (a mount or btrfs subvolume)', why or '')
             self.assertIn(os.path.join(self.ws, 'mnt'), why)
             self.assertEqual(os.listdir(os.path.join(self.ws, 'mnt')), ['f'])
             self.assertEqual(G.wipe(self.env()), why)   # runs again: refused the same way while the mount is there
