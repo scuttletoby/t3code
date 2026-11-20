@@ -26,9 +26,13 @@ spec = importlib.util.spec_from_file_location("fork_ci_release", root / ".github
 rel = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rel)
 failures = []
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks = []
 
 
 def check(name, ok, detail=""):
+    if ok:
+        oks.append(1)
     print(("ok   " if ok else "FAIL ") + name + ("" if ok or not detail else f"\n     | {detail}"))
     if not ok:
         failures.append(name)
@@ -445,5 +449,5 @@ check("workflow: the smoke test checks the unpacked files and the released SHA",
       "verify-download" in json.dumps(jobs["smoke"]) and "needs.release.outputs.sha" in json.dumps(jobs["smoke"])
       and f"_actions/scuttletoby/t3code/{cfg['branch']}" in json.dumps(jobs["smoke"]))
 
-print(f"\n{len(failures)} failed" if failures else "\nall passed")
+print(f"\n{len(failures)} failed" if failures else f"\nall passed: {len(oks)} ok, 0 skipped")
 sys.exit(1 if failures else 0)

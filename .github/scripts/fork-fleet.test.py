@@ -2,8 +2,17 @@
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
 # How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
-# with the other script tests, where LauncherAsRoot's 9 tests skip, and that class again as root, where none may.
-# fork-ci: skips at most 9
+# with the other script tests, where LauncherAsRoot's tests skip (each named below: a new one there needs its line),
+# and that class again as root, where none may.
+# fork-ci: may skip LauncherAsRoot.test_one_slots_user_cannot_read_or_change_the_others
+# fork-ci: may skip LauncherAsRoot.test_nothing_a_job_leaves_reaches_the_next_job_of_its_user
+# fork-ci: may skip LauncherAsRoot.test_root_deletes_nothing_in_dev_shm
+# fork-ci: may skip LauncherAsRoot.test_check_nets_probe_names_drives_and_sockets
+# fork-ci: may skip LauncherAsRoot.test_check_net_proves_a_runners_network
+# fork-ci: may skip LauncherAsRoot.test_refresh_net_takes_only_roots_lookup_stamp
+# fork-ci: may skip LauncherAsRoot.test_the_walls_proof_refuses_a_host_with_a_pools_users
+# fork-ci: may skip LauncherAsRoot.test_the_walls_hold_in_a_real_systemd_unit
+# fork-ci: may skip LauncherAsRoot.test_the_real_job_unit_writes_its_copy_and_nothing_else
 # fork-ci: run as root with FORK_FLEET_ROOT_TESTS=1 only LauncherAsRoot
 import ast, copy, datetime, glob, grp, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat
 import shlex, subprocess, sys, tempfile, textwrap, time

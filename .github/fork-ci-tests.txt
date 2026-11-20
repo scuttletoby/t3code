@@ -15,10 +15,18 @@
 #   fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>]
 #                           an own run, by `fork-ci-tests.cjs --run <test>` in fork-tests.yml;
 #                           it may skip no test
-#   fork-ci: skips at most <n>
-#                           its run in a part may skip up to n tests (else none)
+#   fork-ci: may skip <test>
+#                           its run in a part skips this test (Class.test_method, or an ok-lines
+#                           test's skip name), one line each: it must skip exactly the named ones
+#                           (fork-contracts.test.py pins them all)
+# A fork test is run by fork-tests.yml (a part, or `run by .github/workflows/fork-tests.yml`
+# for own runs); another `run by` only where RUN_ELSEWHERE in fork-ci-tests.cjs names it.
 # Each run leaves a record that fork-ci-result checks: a listed test with no record, or
-# one that ran no test or skipped more than it may, fails.
+# one that ran no test, skipped a test it does not name, or did not skip one it names, fails.
+# Every test is counted by its own outcome: Python through fork-ci-unittest.py (a class or
+# module skip counts each test in it); an ok-lines test (`ok <what>`, `FAIL <what>`,
+# `skip <name> [why]` on stdout) ends with "all passed: <n> ok, <n> skipped" (its own
+# count), else it counts nothing.
 # A present test that is not listed fails. A listed file that is not present yet
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs ~11s

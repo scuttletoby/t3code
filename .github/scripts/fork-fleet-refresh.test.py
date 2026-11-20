@@ -2,9 +2,9 @@
 """Tests of fork-fleet-launch.sh refresh (the runner template's refresh) and its timer, fork-fleet-refresh.timer.
 A fake https release server on 127.0.0.1 (a certificate made here) and temp folders only: nothing is downloaded from
 GitHub, nothing runs as root. Run: python3 <this>. Linux only; needs curl, openssl, tar and flock."""
-# On a GitHub-hosted runner one test skips: its user manager lacks what the test probes (systemd-run, a seccomp
-# filter, a sandbox, the offline security check). The CI runner records the count (fork-ci-tests.cjs).
-# fork-ci: skips at most 1
+# On a GitHub-hosted runner one test skips: its user manager applies no sandbox (no user namespaces for it). The CI
+# runner records each skipped test by name and it must be exactly this one (fork-ci-tests.cjs).
+# fork-ci: may skip Refresh.test_a_real_run_in_the_services_sandbox
 import configparser, hashlib, http.server, io, json, os, platform, re, resource, shutil, signal, ssl, stat, subprocess
 import sys, tarfile, tempfile, threading, time, unittest
 

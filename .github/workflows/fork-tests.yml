@@ -455,6 +455,7 @@ jobs:
           name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fork-test-records/
           if-no-files-found: error
+          retention-days: 7
 
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
@@ -554,6 +555,7 @@ jobs:
           name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fork-test-records/
           if-no-files-found: error
+          retention-days: 7
 
   # The host kits' tests (fork-kit/), split from `workflows` so the fork's script tests run
   # side by side: one job of all of them was the longest in the run. They are CPU-bound (every
@@ -648,6 +650,7 @@ jobs:
           name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fork-test-records/
           if-no-files-found: error
+          retention-days: 7
 
   # The kits' tests that need root or a real systemd user manager, on their own runner: they
   # change the machine (users, sudoers, linger), and beside the shards they add no time.
@@ -707,6 +710,7 @@ jobs:
           name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fork-test-records/
           if-no-files-found: error
+          retention-days: 7
 
   # Every commit a pull request or a push to main adds, history included: a
   # secret committed and then deleted is still public. Release runs test a
@@ -764,6 +768,7 @@ jobs:
           name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fork-test-records/
           if-no-files-found: error
+          retention-days: 7
 
       - name: Cache Electron download
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -1498,7 +1503,8 @@ jobs:
       # uploaded them in the attempt it passed in (its upload step fails on none), so the newest attempt of
       # each job and leg is the one that counts; an older one, another run's or another commit's never does.
       # Red: a job or leg with no records, a listed test with no record (or two), one that failed, showed no
-      # test count, ran none, or skipped more than its `fork-ci: skips at most` line allows (an own run: none).
+      # test count, ran none, or skipped other tests than exactly those its `fork-ci: may skip <test>` lines
+      # name (each skip by name; an own run: none).
       - name: Download the fork test records
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -1541,19 +1547,27 @@ jobs:
                   if (job, index) not in newest:
                       problems.append(f'{job} (leg {index + 1} of {count}): uploaded no fork test records')
 
+          def names(value):
+              ok = isinstance(value, list) and all(type(n) is str for n in value) and len(set(value)) == len(value)
+              return value if ok else None
+
           def judge(row, where):
               key = row['key']
               tests, skipped, failed = row.get('tests'), row.get('skipped'), row.get('failed')
-              allowed = 0 if row.get('own') is not False else row.get('allowed')
+              # Each skipped test by name, and the ones the test declares it may skip (an own run: none).
+              skipped_tests = names(row.get('skipped_tests'))
+              allowed = [] if row.get('own') is not False else names(row.get('allowed'))
               if row.get('status') != 0:
                   return [f'{key} failed (exit {row.get("status")}) ({where})']
-              if not all(type(n) is int and n >= 0 for n in (tests, skipped, failed, allowed)):
+              if not all(type(n) is int and n >= 0 for n in (tests, skipped, failed)):
                   return [f'{key}: no test count, so no test is known to have run ({where})']
               out = []
               if tests - skipped <= 0:
                   out.append(f'{key} ran no test ({tests} found, {skipped} skipped) ({where})')
-              if skipped > allowed:
-                  out.append(f'{key} skipped {skipped} tests, {allowed} allowed ({where})')
+              if skipped_tests is None or allowed is None or len(skipped_tests) != skipped:
+                  out.append(f'{key} skipped {skipped} tests, not each once by name ({where})')
+              elif set(skipped_tests) != set(allowed):
+                  out.append(f'{key} skipped {sorted(skipped_tests)}, but may and must skip {sorted(allowed)} ({where})')
               if failed:
                   out.append(f'{key}: {failed} failed ({where})')
               return out
