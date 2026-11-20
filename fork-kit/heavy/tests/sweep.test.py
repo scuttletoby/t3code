@@ -729,7 +729,7 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn(['systemctl', '--user', 'stop', '--', 'heavy-pytest-0a1b2c3d.scope'], self.host.calls('systemctl'))
         self.assertFalse(self.host.exists(3002) or self.host.exists(3003))
-        self.assertIn('stopped heavy-pytest-0a1b2c3d.scope: its heavy is gone; 2 processes', out)
+        self.assertIn('stopped heavy-pytest-0a1b2c3d.scope (20m old): its heavy is gone; 2 processes', out)
 
     def test_young_scope_whose_heavy_is_gone_waits(self):
         self.orphan(3002, 'node worker.js', unit=self.scope(), age=30)
@@ -822,7 +822,7 @@ class SweepTests(unittest.TestCase):
         self.host.save()
         code, out, _ = self.run_sweep()
         self.nothing_stopped()
-        self.assertIn(f'report only: {unit}: its heavy is gone, but it holds a session or multiplexer; 2 processes',
+        self.assertIn(f'report only: {unit} (3h0m old): its heavy is gone, but it holds a session or multiplexer; 2 processes',
                       out)
 
     def test_scope_holding_only_another_users_processes_is_reported_not_stopped(self):
@@ -997,6 +997,147 @@ class SweepTests(unittest.TestCase):
         code, out, _ = self.run_sweep('--json')
         self.assertEqual(code, 1)
         self.assertIn('not there', json.loads(out)['error'])
+
+    # ---------- heavy leftovers: look only, by owner and age ----------
+
+    def run_leftovers(self, *argv, docker=True):
+        out, err = io.StringIO(), io.StringIO()
+        code = self.mod.leftovers_main(list(argv), sweep=self.sweep(docker), out=out, err=err)
+        return code, out.getvalue(), err.getvalue()
+
+    def leftover_host(self):
+        self.orphan(2001, 'python3 -m pytest a', age=1200, cpu=0)          # idle, 20 minutes: not long-lived
+        self.orphan(2002, 'java -jar x.jar', age=3 * 3600, cpu=0, unit='app.slice/other.service')
+        self.orphan(2003, 'python3 -m pytest b', age=120, cpu=99)           # young: never named
+        self.host.add(2010, MANAGER, 'node', 'node a.test.js', f'{CG}/heavy.slice/heavy-node-0a1b2c3d.scope', 900)
+        self.host.container('a', 'db1', 7200, owner=f'uid={UID},scope=heavy-gone-0a1b2c3d.scope')
+        self.host.container('b', 'old-db', 29 * 3600)                       # running, no label: only ever named
+
+    def test_leftovers_without_the_sweep_settings_names_them_by_owner_and_age_and_stops_nothing(self):
+        # no machine file, or one with no heavy section, or one with only heavy.queue: the default rules
+        self.leftover_host()
+        for name, data in (('no file', None), ('no heavy', {'version': 1}),
+                           ('queue only', {'version': 1, 'heavy': {'queue': {}}})):
+            with self.subTest(case=name):
+                if data is None:
+                    os.unlink(self.machine)
+                else:
+                    self.write_machine(data)
+                code, out, err = self.run_leftovers()
+                self.assertEqual(code, 0, err)
+                head, *lines = out.splitlines()
+                self.assertRegex(head, r'^heavy leftovers \S+: 5 older than 10m, look only, default rules ')
+                text = '\n'.join(lines)
+                # idle for 20 minutes, which the sweep (long-lived: 2 hours) leaves alone: named here
+                self.assertIn('report only: pid 2001 python3 (20m old, cpu 0%, unit t3code.service)', text)
+                self.assertIn('pid 2002 java (3h0m old, cpu 0%, unit other.service)', text)
+                self.assertIn('would stop heavy-node-0a1b2c3d.scope (15m old): its heavy is gone', text)
+                self.assertIn('would remove: container aaaaaaaaaaaa db1 (mariadb:11, 2h0m old, running); '
+                              'owner heavy-gone-0a1b2c3d.scope is gone', text)
+                self.assertIn('report only: container bbbbbbbbbbbb old-db (mariadb:11, 1d5h old, running); '
+                              'no owner label', text)
+                self.assertNotIn('2003', text)
+                self.nothing_stopped()
+                self.assertFalse(os.path.exists(self.report))       # no log, no report, no lock
+                self.assertEqual(self.host.calls('systemctl', 'stop') + self.host.calls('docker', 'rm'), [])
+
+    def test_leftovers_older_than_a_limit(self):
+        self.leftover_host()
+        code, out, _ = self.run_leftovers('--older-than', '1h')
+        self.assertEqual(code, 0)
+        self.assertRegex(out.splitlines()[0], r': 3 older than 1h0m, look only, rules from ')
+        self.assertNotIn('pid 2001', out)
+        self.assertIn('pid 2002 java', out)
+        code, out, _ = self.run_leftovers('--older-than=60')
+        self.assertIn('pid 2003 python3', out)                  # 2 minutes old: older than one
+        code, out, _ = self.run_leftovers('--older-than', '30d')
+        self.assertRegex(out.splitlines()[0], r': none older than 30d0h, look only')
+        self.assertEqual(len(out.splitlines()), 1, out)
+        for bad in (['--older-than'], ['--older-than', '-5'], ['--older-than', '2w'], ['--stop'], ['x']):
+            with self.subTest(argv=bad):
+                code, _, err = self.run_leftovers(*bad)
+                self.assertEqual(code, 2)
+                self.assertIn('usage: heavy leftovers', err)
+        self.nothing_stopped()
+
+    def test_leftovers_json_gives_owner_and_age(self):
+        self.leftover_host()
+        code, out, _ = self.run_leftovers('--json', '--older-than', '10m')
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual((data['v'], data['olderThanSeconds'], data['defaults']), (1, 600, False))
+        got = {(i['kind'], i['owner'], i['ageSeconds'], i['action']) for i in data['items']}
+        self.assertEqual(got, {('process', 't3code.service', 1200, 'stop'),          # test-shaped
+                               ('process', 'other.service', 3 * 3600, 'report'),
+                               ('scope', 'heavy-node-0a1b2c3d.scope', 900, 'stop'),
+                               ('container', f'uid={UID},scope=heavy-gone-0a1b2c3d.scope', 7200, 'remove'),
+                               ('container', 'no label', 29 * 3600, 'report')})
+        self.nothing_stopped()
+
+    def test_leftovers_refuses_a_broken_machine_file(self):
+        self.leftover_host()
+        for name, data in (('broken', '{"version": 1,'), ('newer', {'version': 2}),
+                           ('unknown key', {'version': 1, 'heavy': {'sweep': {'stopp': True}}}),
+                           ('too young', {'version': 1, 'heavy': {'sweep': {'minAgeSeconds': 5}}})):
+            with self.subTest(case=name):
+                self.write_machine(data)
+                code, out, err = self.run_leftovers()
+                self.assertEqual(code, 1, err)
+                self.assertIn('heavy leftovers:', err)
+                self.assertIn('nothing checked', err)
+                self.assertEqual(out, '')
+                self.assertEqual(self.host.calls(), [])
+        self.write_machine()
+        os.chmod(self.machine, 0o666)
+        code, _, err = self.run_leftovers('--json')
+        self.assertEqual(code, 1)
+        self.assertIn('writable by group or others', err)
+
+    def test_leftovers_runs_again_with_the_same_answer_and_after_a_sweep_none_of_what_it_removed(self):
+        self.leftover_host()
+        first = self.run_leftovers()
+        second = self.run_leftovers()
+        strip = lambda r: (r[0], r[1].split(':', 1)[1])          # everything but the time stamp
+        self.assertEqual(strip(first), strip(second))
+        self.nothing_stopped()
+        code, _, _ = self.run_sweep()                           # the sweep stops the dead scope, removes db1
+        self.assertEqual(code, 0)
+        code, out, _ = self.run_leftovers()
+        self.assertNotIn('heavy-node-0a1b2c3d.scope', out)
+        self.assertNotIn(' db1 ', out)
+        self.assertIn('old-db', out)                            # never the sweep's to remove
+        self.assertTrue(self.host.exists(2001) and self.host.exists(2002))
+
+    def test_heavy_leftovers_from_the_wrapper_looks_only(self):
+        # through bin/heavy, on this machine's own processes: it looks, never stops, and needs no sweep settings
+        # (a machine with none uses the defaults); never the machine's Docker (HEAVY_DOCKER names no program)
+        env = dict(os.environ, HEAVY_DOCKER=os.path.join(self.root, 'no-docker'), HOME=self.root)
+        r = subprocess.run([HEAVY, 'leftovers', '--older-than', '30d', '--json'], capture_output=True, text=True,
+                           timeout=120, env=env)
+        if r.returncode == 1 and 'nothing checked' in r.stderr:
+            self.skipTest(f"this machine's machine file is refused: {r.stderr.strip()}")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual((data['v'], data['olderThanSeconds']), (1, 30 * 86400))
+        self.assertIn('docker: not installed; containers not checked', data['notes'])
+        self.assertFalse(os.path.exists(os.path.join(self.root, '.local')))     # no report folder, no log
+        r = subprocess.run([HEAVY, 'leftovers', '--older-than', 'soon'], capture_output=True, text=True, timeout=60,
+                           env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('usage: heavy leftovers', r.stderr)
+
+    def test_leftovers_with_docker_missing_or_down_still_names_the_processes(self):
+        self.leftover_host()
+        code, out, _ = self.run_leftovers(docker=False)
+        self.assertEqual(code, 0)
+        self.assertIn('pid 2001', out)
+        self.assertIn('note: docker: not installed; containers not checked', out)
+        self.host.load()['dockerDown'] = True
+        self.host.save()
+        code, out, _ = self.run_leftovers()
+        self.assertEqual(code, 0)
+        self.assertIn('pid 2002', out)
+        self.assertIn('Cannot connect to the Docker daemon', out)
 
     # ---------- containers ----------
 
@@ -1298,6 +1439,21 @@ MUTATIONS = {
                            'test_container_is_removed_by_its_full_id_never_by_a_name_or_a_prefix'),
     'report folder checked': ('problem = folder_problem(folder, s.uid)', 'problem = None',
                               'test_report_folder_others_could_change_is_refused'),
+    'leftovers: no settings is the defaults': ("machine_file.read_section('heavy', self.machine_path, self.owner_uid, "
+                                               "optional=optional)",
+                                               "machine_file.read_section('heavy', self.machine_path, self.owner_uid)",
+                                               'test_leftovers_without_the_sweep_settings_names_them_by_owner_and_age_and_stops_nothing'),
+    'leftovers: one limit, busy or idle': ('cfg = dict(cfg, minAgeSeconds=limit, longLivedSeconds=limit)',
+                                           'cfg = dict(cfg, minAgeSeconds=limit)',
+                                           'test_leftovers_without_the_sweep_settings_names_them_by_owner_and_age_and_stops_nothing'),
+    'leftovers: look only': ('plan, _counts, lines = s.run(cfg, act=False)', 'plan, _counts, lines = s.run(cfg, act=True)',
+                             'test_leftovers_without_the_sweep_settings_names_them_by_owner_and_age_and_stops_nothing'),
+    'leftovers: a broken file refused': ("    except MachineFileError as e:\n"
+                                         "        return refuse(f'{e}; nothing checked', as_json, out, err, 'leftovers')",
+                                         "    except MachineFileError as e:\n"
+                                         "        cfg = dict(machine_file.fields({}, SPEC, 'x'), path='?', defaults=True)",
+                                         'test_leftovers_refuses_a_broken_machine_file'),
+    'leftovers: owner in json': ("'owner': item_owner(item)}", "}", 'test_leftovers_json_gives_owner_and_age'),
     'command line masked': ("cmd = redact(' '.join(own)) if own else", "cmd = ' '.join(own) if own else",
                             'test_short_secrets_inside_inline_code_never_reach_the_log_the_report_or_the_journal'),
     'only the own command shown': ("own = own_command(argv, shown=True) if not is_session(self) else argv[:1]",

@@ -20,7 +20,7 @@
 .github/scripts/fork-fleet-desk-key.test.py ~10s
 .github/scripts/fork-fleet-desk-seed.test.py ~34s
 .github/scripts/fork-fleet-desk.test.py ~9s
-.github/scripts/fork-fleet.test.py ~67s
+.github/scripts/fork-fleet.test.py ~136s
 .github/scripts/fork-fleet-refresh.test.py ~59s
 .github/scripts/fork-fleet-walls.test.py ~71s
 .github/scripts/fork-fleet-walls-contract.test.py ~96s
@@ -100,7 +100,7 @@ fork-kit/gh-apps/tests/wrapper.test.py
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
 fork-kit/heavy/tests/install.test.py ~8s
 fork-kit/heavy/tests/queue.test.py ~18s
-fork-kit/heavy/tests/sweep.test.py ~31s
+fork-kit/heavy/tests/sweep.test.py ~52s
 # A real systemd user manager (the step starts one for the runner user).
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml
 fork-kit/model-guard/tests/guard.test.py

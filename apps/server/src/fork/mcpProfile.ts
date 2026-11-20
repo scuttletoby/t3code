@@ -173,16 +173,17 @@ const KNOWN_GROUPS: ReadonlySet<string> = new Set(MCP_T3_TOOL_GROUPS);
 const PROFILE_FIELDS: ReadonlySet<string> = new Set(["servers", "t3Tools"]);
 const CARRIED_FIELDS: ReadonlySet<string> = new Set(["name", ...PROFILE_FIELDS]);
 
-/** True when the profile is today's behaviour: every outside server and every T3 tool. */
 /**
  * The drivers whose threads apply an MCP profile: Claude only (fork/claudeMcpProfile.ts). Any
- * other provider gives a thread every MCP server and T3 tool, so a delegation refuses to send a
- * narrower profile to one on another machine (fork/remoteMcpProfile.ts).
+ * other provider would give a thread every MCP server and T3 tool, so a turn there whose profile
+ * is narrower than `all` is refused as it starts (fork/mcpProfileTurnCheck.ts), and a delegation
+ * refuses to send a narrower profile to one on another machine (fork/remoteMcpProfile.ts).
  */
 export const MCP_PROFILE_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set([
   ProviderDriverKind.make("claudeAgent"),
 ]);
 
+/** True when the profile is today's behaviour: every outside server and every T3 tool. */
 export const isEveryMcpTool = (profile: McpProfileSet): boolean =>
   profile.servers === "all" && profile.t3Tools === "all";
 
