@@ -76,12 +76,12 @@ class Walls(Case):
             'file:pc-agents-walls.timer': edit('/etc/systemd/system/pc-agents-walls.timer', '2min', '1d'),
             'sudoers': lambda: self.write('/etc/sudoers.d/90-agent', 'agent ALL=(ALL) NOPASSWD: ALL\n'),
         }
-        clean = {p: v[4] for p, v in self.snapshot().items()}
+        clean = self.same_files()
         for wall, change in cases.items():
             with self.subTest(wall=wall):
                 shutil.rmtree(self.root)
                 self.setUp()
-                self.assertEqual({p: v[4] for p, v in self.snapshot().items()}, clean)
+                self.assertEqual(self.same_files(), clean)
                 change()
                 self.fails(wall, *(['wsl2:resolv'] if wall == 'file:resolv.conf' else []))
 
