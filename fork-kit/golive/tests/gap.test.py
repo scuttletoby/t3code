@@ -486,6 +486,7 @@ class CopyRace(copy_t.CopyBase):
         """#580 (lens B): upstream's launcher waits 250 ms for the serving lock and then serves without it (an SSH probe
         held it then). Nobody holding it says nothing about the launcher the copy starts, which claims it again: the
         kit's own lock decides, and the copy goes on and hands the home to the new launcher. Run again: the same."""
+        self.distinct_stamps()  # two copies: each its own second
         self.serving.close()
         old = self.m.server.pid
         self.copy()
