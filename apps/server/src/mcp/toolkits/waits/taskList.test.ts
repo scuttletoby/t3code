@@ -1,7 +1,8 @@
 /**
- * Fork (issue 386): `task_list` through the registered tool. The state question: a linked
- * environment that went away (its tasks read as unknown, never as live slots), settled results
- * (left out unless asked), old rows with no delivery record, and an empty thread.
+ * Fork (issues 386, 625): `task_list` through the registered tool. The state question: a linked
+ * environment that went away (its tasks read as unknown, never as live slots, and it is asked
+ * once), a stop still owed there, settled results (left out unless asked), old rows with no
+ * delivery record, an environment with more threads than one page, and an empty thread.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
@@ -27,11 +28,15 @@ import { Waits } from "../../../waits/WaitWorker.ts";
 import * as McpHttpServer from "../../McpHttpServer.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccessTestkit from "../../McpToolAccess.testkit.ts";
-import { REMOTE_READ_TIMEOUT } from "./taskList.ts";
+import { ORPHAN_PAGES, REMOTE_READ_TIMEOUT } from "./taskList.ts";
 
 const HERE = EnvironmentId.make("env-here");
 const ENV_UP = EnvironmentId.make("env-up");
 const ENV_GONE = EnvironmentId.make("env-gone");
+/** Answers every page with more to come: more threads than `task_list` reads. */
+const ENV_BIG = EnvironmentId.make("env-big");
+/** Answers its first page, never its second. */
+const ENV_CUT = EnvironmentId.make("env-cut");
 
 const remoteTask = (id: string, environmentId: EnvironmentId, status = "running") =>
   delegatedTask({
@@ -89,8 +94,12 @@ interface World {
   readonly children?: ReadonlyArray<ThreadId>;
 }
 
+/** Reads of a run there, per environment; tests read it. */
+const runStatusReads = new Map<EnvironmentId, number>();
+
 const toolsLayer = (world: World) => {
   let omitSettled: boolean | undefined;
+  runStatusReads.clear();
   const services = Layer.mergeAll(
     ServerSettingsService.layerTest({}),
     Layer.mock(ThreadManagement.ThreadManagementService)({
@@ -130,14 +139,17 @@ const toolsLayer = (world: World) => {
     Layer.mock(Waits)({}),
     Layer.mock(RemoteDelegation.RemoteDelegation)({
       // The environment that went away never answers; the other one says the run is going.
-      runStatus: (_scope, task) =>
-        task.remoteChild?.environmentId === ENV_GONE ? Effect.never : Effect.succeed("running"),
+      runStatus: (_scope, task) => {
+        const environmentId = task.remoteChild!.environmentId;
+        runStatusReads.set(environmentId, (runStatusReads.get(environmentId) ?? 0) + 1);
+        return environmentId === ENV_GONE ? Effect.never : Effect.succeed("running");
+      },
     }),
     Layer.mock(PeerForwarding.PeerForwarding)({
       links: () =>
         Effect.succeed({
           environmentId: HERE,
-          links: [ENV_UP, ENV_GONE].map((environmentId) => ({
+          links: [ENV_UP, ENV_GONE, ENV_BIG, ENV_CUT].map((environmentId) => ({
             environmentId,
             label: environmentId,
             status: "reachable" as const,
@@ -147,40 +159,86 @@ const toolsLayer = (world: World) => {
           })),
           notListed: "",
         }),
-      call: ((_scope: unknown, _tool: unknown, environmentId: EnvironmentId) =>
-        environmentId === ENV_GONE
+      call: ((
+        _scope: unknown,
+        _tool: unknown,
+        environmentId: EnvironmentId,
+        params: { readonly cursor: number },
+      ) =>
+        environmentId === ENV_GONE || (environmentId === ENV_CUT && params.cursor > 0)
           ? Effect.never
-          : Effect.succeed({
-              projectId: null,
-              currentThreadId: null,
-              nextCursor: null,
-              total: 3,
-              threads: [
-                // Followed by a task here.
-                {
-                  threadId: ThreadId.make("remote-r-up"),
-                  title: "known",
-                  delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
-                },
-                // Launched by this thread, but its record never ran.
-                {
-                  threadId: ThreadId.make("remote-lost"),
-                  title: "lost one",
-                  delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
-                },
-                // Another thread's child.
-                {
-                  threadId: ThreadId.make("remote-other"),
-                  title: "other",
-                  delegatedFrom: {
-                    environmentId: HERE,
-                    threadId: ThreadId.make("thread-other"),
-                    title: "o",
-                  },
-                },
-                { threadId: ThreadId.make("remote-own"), title: "its own thread" },
-              ],
-            })) as never,
+          : environmentId === ENV_CUT
+            ? Effect.succeed({
+                projectId: null,
+                currentThreadId: null,
+                nextCursor: 100,
+                total: 200,
+                threads: [],
+              })
+            : environmentId === ENV_BIG
+              ? Effect.succeed({
+                  projectId: null,
+                  currentThreadId: null,
+                  nextCursor: params.cursor + 100,
+                  total: 10_000,
+                  threads: [{ threadId: ThreadId.make(`big-${params.cursor}`), title: "busy" }],
+                })
+              : params.cursor > 0
+                ? // The second page: an older thread this one launched, also lost.
+                  Effect.succeed({
+                    projectId: null,
+                    currentThreadId: null,
+                    nextCursor: null,
+                    total: 101,
+                    threads: [
+                      {
+                        threadId: ThreadId.make("remote-lost-older"),
+                        title: "older lost one",
+                        delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
+                      },
+                    ],
+                  })
+                : Effect.succeed({
+                    projectId: null,
+                    currentThreadId: null,
+                    nextCursor: 100,
+                    total: 101,
+                    threads: [
+                      // Followed by a task here.
+                      {
+                        threadId: ThreadId.make("remote-r-up"),
+                        title: "known",
+                        delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
+                      },
+                      // Launched by this thread, but its record never ran.
+                      {
+                        threadId: ThreadId.make("remote-lost"),
+                        title: "lost one",
+                        delegatedFrom: { environmentId: HERE, threadId: PARENT, title: "p" },
+                      },
+                      // Another thread's child.
+                      {
+                        threadId: ThreadId.make("remote-other"),
+                        title: "other",
+                        delegatedFrom: {
+                          environmentId: HERE,
+                          threadId: ThreadId.make("thread-other"),
+                          title: "o",
+                        },
+                      },
+                      // Launched by a thread of the same id in another environment.
+                      {
+                        threadId: ThreadId.make("remote-foreign"),
+                        title: "foreign",
+                        delegatedFrom: {
+                          environmentId: EnvironmentId.make("env-other"),
+                          threadId: PARENT,
+                          title: "p",
+                        },
+                      },
+                      { threadId: ThreadId.make("remote-own"), title: "its own thread" },
+                    ],
+                  })) as never,
     }),
   ).pipe(Layer.provideMerge(NodeServices.layer));
   return McpHttpServer.layerForkTools.pipe(
@@ -320,12 +378,65 @@ describe("task_list", () => {
   it.effect("finds a thread launched in a linked environment that no task follows", () =>
     Effect.gen(function* () {
       const listed = yield* withTimeouts(callTaskList({ checkLinked: true }));
+      // Its second page too; never one launched by another environment's thread of that id.
       expect(listed.orphans).toEqual([
         { environmentId: ENV_UP, threadId: "remote-lost", title: "lost one" },
+        { environmentId: ENV_UP, threadId: "remote-lost-older", title: "older lost one" },
       ]);
       expect(listed.unreachable).toEqual([ENV_GONE]);
       expect(listed.next).toContain("t3_thread_read");
+      // The environment with more threads than it reads is named.
+      expect(listed.next).toContain(`newest ${ORPHAN_PAGES * 100} threads of ${ENV_BIG}.`);
+      // One whose later page did not answer is named for that, not for the page limit.
+      expect(listed.next).toContain(`A later page of ${ENV_CUT} did not answer`);
+      // Settled tasks are read to know what is followed, but listed only when asked.
+      expect(listed.tasks.map((task) => task.taskId)).not.toContain("l-read");
     }).pipe(Effect.provide(toolsLayer(mixedWorld))),
+  );
+
+  it.effect("reads a remote task there while the stop it owes there is not sent", () =>
+    Effect.gen(function* () {
+      const listed = yield* callTaskList({});
+      const byId = Object.fromEntries(listed.tasks.map((task) => [task.taskId, task]));
+      expect(byId["r-stop"]).toMatchObject({ activity: "live", where: ENV_UP });
+      expect(byId["r-stopped"]).toMatchObject({ activity: "ended", where: ENV_UP });
+      expect(listed.slots).toEqual([{ where: ENV_UP, live: 1, unknown: 0 }]);
+      // Only the one whose stop is owed was read there.
+      expect(runStatusReads.get(ENV_UP)).toBe(1);
+    }).pipe(
+      Effect.provide(
+        toolsLayer({
+          tasks: [
+            {
+              ...remoteTask("r-stop", ENV_UP, "completed"),
+              remoteChild: { ...remoteTask("r-stop", ENV_UP).remoteChild!, stoppedThere: false },
+            },
+            {
+              ...remoteTask("r-stopped", ENV_UP, "completed"),
+              remoteChild: { ...remoteTask("r-stopped", ENV_UP).remoteChild!, stoppedThere: true },
+            },
+          ],
+          shells: new Map(),
+        }),
+      ),
+    ),
+  );
+
+  it.effect("waits for an environment that does not answer once, not once per task", () =>
+    Effect.gen(function* () {
+      // Eight open tasks there, four read at a time: after the first timeouts the rest are
+      // unknown without a read (it was two rounds of reads, eight in all).
+      const listed = yield* withTimeouts(callTaskList({}));
+      expect(listed.slots).toEqual([{ where: ENV_GONE, live: 0, unknown: 8 }]);
+      expect(runStatusReads.get(ENV_GONE)).toBe(4);
+    }).pipe(
+      Effect.provide(
+        toolsLayer({
+          tasks: Array.from({ length: 8 }, (_, index) => remoteTask(`g-${index}`, ENV_GONE)),
+          shells: new Map(),
+        }),
+      ),
+    ),
   );
 
   it.effect("an empty thread lists nothing and owes nothing", () =>
