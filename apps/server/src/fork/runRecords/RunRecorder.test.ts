@@ -567,6 +567,50 @@ it.layer(NodeServices.layer)("RunRecorder", (it) => {
     }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
   });
 
+  it.effect("a typo in the real tag is refused and logged, not replaced by a later example", () => {
+    const warnings: Array<[string, unknown]> = [];
+    const logger = Logger.make(({ logLevel, message }) => {
+      const [text, fields] = Array.isArray(message) ? message : [message];
+      if (logLevel === "Warn" && /^run (estimate|kind) tag refused/u.test(String(text))) {
+        warnings.push([
+          String(text).split(" ")[1]!,
+          (fields as { tag?: unknown } | undefined)?.tag,
+        ]);
+      }
+    });
+    return Effect.gen(function* () {
+      const { world, start, records } = yield* harness;
+      world.subagents[0] = task(
+        "parent",
+        "child",
+        "Act as the writer sub-agent for this task.\n\n[run-kind: lens [x]] [run-estimate: 30-40m]\nTag format: [run-estimate: 1h 2M tokens]\nFix it.",
+        "Fix the cursor",
+      );
+      endRun(world, run("child", "run-1"), { answer: "Done." });
+      yield* start;
+      // Runs again (a restart replays the end): still one line, each warning once.
+      storeUpdate(world, run("child", "run-1"));
+      yield* start;
+      const all = yield* records;
+      assert.deepStrictEqual(
+        all.map((record) => [
+          record.estimate,
+          record.estimateRefused,
+          record.kind,
+          record.kindRefused,
+        ]),
+        [[null, "30-40m", null, "lens"]],
+      );
+      assert.deepStrictEqual(warnings, [
+        ["estimate", "30-40m"],
+        ["kind", "lens"],
+      ]);
+      const summary = summarizeRunRecords(all, { toMs: NOW_MS + 1 });
+      assert.strictEqual(summary.refusedEstimates, 1);
+      assert.strictEqual(summary.refusedKinds, 1);
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
+
   it.effect("an earlier mention of the tag does not hide the real one, and is not logged", () => {
     const refusedTags: Array<unknown> = [];
     const logger = Logger.make(({ logLevel, message }) => {

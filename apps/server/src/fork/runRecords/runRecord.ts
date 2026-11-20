@@ -68,6 +68,11 @@ export interface RunRecord {
    * kept, never guessed at. Absent in records written before this field.
    */
   readonly estimateRefused?: string | null;
+  /**
+   * The kind tag's text when it was refused (empty, or never closed); then `kind` is null, not the
+   * task title. Absent in records written before this field.
+   */
+  readonly kindRefused?: string | null;
   /** The run this one continues after a restart, a Continue, or a usage-limit reset. */
   readonly continuationOf: string | null;
   readonly providerInstanceId: string;
@@ -103,15 +108,31 @@ const ROLE_PREFIX = /^Act as the ([^\n]{1,60}?) sub-agent for this task\./u;
  */
 export const MAX_TAG_CHARS = 80;
 /**
- * Up to the closing `]`, any length: one pass over the line, no backtracking. A `[` ends a tag, so
- * an unclosed mention (`see the [run-kind: format`) never swallows a later tag on its line.
+ * Every kind or estimate tag in a text, up to its `]`, any length: one pass over the line, no
+ * backtracking. One without its `]` (on the same line, before the next `[`) is read too, so that it
+ * can be refused, not lost; the next `[` ends it, so an unclosed mention (`see the [run-kind:
+ * format`) never swallows a later tag on its line. So a tag's text cannot hold `[` or `]`.
  */
-const KIND_TAG = /\[run-kind:([^\][\n]*)\]/iu;
-/**
- * Every estimate tag in a text. One without its `]` (on the same line, before the next `[`) is read
- * too, so that it is refused, not lost; the next `[` ends it, so it never swallows a later tag.
- */
+const KIND_TAGS = /\[run-kind:([^\][\n]*)(\]?)/giu;
 const ESTIMATE_TAGS = /\[run-estimate:([^\][\n]*)(\]?)/giu;
+/**
+ * The tag that decides: the first closed tag that `fits`, passing over unclosed openers (and tags
+ * that do not fit), which are mentions of the tag rather than the tag. With none, the first opener,
+ * to be refused. Null when the text has no tag at all.
+ */
+function decidingTag(
+  text: string,
+  tags: RegExp,
+  fits: (tag: string) => boolean,
+): { readonly text: string; readonly closed: boolean } | null {
+  let first: string | null = null;
+  for (const match of text.matchAll(tags)) {
+    const tag = match[1]!.trim();
+    if (match[2] === "]" && fits(tag)) return { text: tag, closed: true };
+    first ??= tag;
+  }
+  return first === null ? null : { text: first, closed: false };
+}
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 /**
  * The text's first `MAX_TAG_CHARS` characters, or null when it has no more than that. Characters
@@ -231,20 +252,17 @@ function readEstimateText(text: string): RunEstimate | null {
 }
 
 /**
- * `[run-estimate: 1h 30m 2.5M tokens]` in a text, null when there is none. The first tag that reads
- * wins, so an earlier mention of the tag never hides the real one. With none that reads, the first
- * is refused (too long, unclosed, empty or unreadable) and kept cut short, so the summary counts it.
+ * `[run-estimate: 1h 30m 2.5M tokens]` in a text, null when there is none. The first closed tag
+ * that fits `MAX_TAG_CHARS` decides; a later one never replaces it, so a typo is refused, not hidden.
+ * Empty or unreadable, it is refused; with no such tag, the first (unclosed or too long) is.
  */
 export function readEstimateTag(text: string): EstimateTag | null {
-  let refused: string | null = null;
-  for (const match of text.matchAll(ESTIMATE_TAGS)) {
-    const tag = match[1]!.trim();
-    const estimate =
-      match[2] !== "]" || tag === "" || overTagLimit(tag) !== null ? null : readEstimateText(tag);
-    if (estimate !== null) return { estimate, refused: null };
-    refused ??= capTagText(tag);
-  }
-  return refused === null ? null : { estimate: null, refused };
+  const tag = decidingTag(text, ESTIMATE_TAGS, (candidate) => overTagLimit(candidate) === null);
+  if (tag === null) return null;
+  const estimate = tag.closed && tag.text !== "" ? readEstimateText(tag.text) : null;
+  return estimate !== null
+    ? { estimate, refused: null }
+    : { estimate: null, refused: capTagText(tag.text) };
 }
 
 /** The estimate in a text, or null when there is none or it was refused. */
@@ -252,25 +270,40 @@ export function parseEstimate(text: string): RunEstimate | null {
   return readEstimateTag(text)?.estimate ?? null;
 }
 
-/** `[run-kind: ...]` in a text, cut to `MAX_TAG_CHARS`; null when there is none or it is empty. */
-function readKindTag(text: string): string | null {
-  const kind = KIND_TAG.exec(text)?.[1]?.trim();
-  return kind === undefined || kind === "" ? null : capTagText(kind);
+/**
+ * `[run-kind: ...]` in a text, cut to `MAX_TAG_CHARS`; null when there is none. The first closed tag
+ * decides, as for the estimate. It is refused when it is empty; with no closed tag, the first
+ * unclosed one is refused (`[run-kind: lens [x]]`, whose `[` ends the tag).
+ */
+function readKindTag(
+  text: string,
+): { readonly kind: string | null; readonly refused: string | null } | null {
+  const tag = decidingTag(text, KIND_TAGS, () => true);
+  if (tag === null) return null;
+  return tag.closed && tag.text !== ""
+    ? { kind: capTagText(tag.text), refused: null }
+    : { kind: null, refused: capTagText(tag.text) };
 }
 
 /** The labels a parent puts in a delegated task's text. */
 export function parseTaskLabels(text: string | null): {
   readonly role: string | null;
   readonly kind: string | null;
+  /** The kind tag's text when it was refused; see `readKindTag`. */
+  readonly kindRefused: string | null;
   readonly estimate: RunEstimate | null;
   /** The estimate tag's text when it could not be read; see `readEstimateTag`. */
   readonly estimateRefused: string | null;
 } {
-  if (text === null) return { role: null, kind: null, estimate: null, estimateRefused: null };
+  if (text === null) {
+    return { role: null, kind: null, kindRefused: null, estimate: null, estimateRefused: null };
+  }
+  const kind = readKindTag(text);
   const estimate = readEstimateTag(text);
   return {
     role: ROLE_PREFIX.exec(text.trimStart())?.[1]?.trim() ?? null,
-    kind: readKindTag(text),
+    kind: kind?.kind ?? null,
+    kindRefused: kind?.refused ?? null,
     estimate: estimate?.estimate ?? null,
     estimateRefused: estimate?.refused ?? null,
   };
@@ -392,6 +425,8 @@ export function buildRunRecord(input: RunRecordInput): RunRecord | null {
         ? { threadId: thread.parentThreadId, taskId: task?.id ?? null, environmentId: null }
         : null;
   const delegated = parent !== null;
+  // The first text that has a tag decides; a refused tag is never replaced by a guess.
+  const kindFrom = fromTask.kind !== null || fromTask.kindRefused !== null ? fromTask : fromRun;
   const iso = (ms: number) => new Date(ms).toISOString();
   return {
     v: RUN_RECORD_VERSION,
@@ -403,10 +438,11 @@ export function buildRunRecord(input: RunRecordInput): RunRecord | null {
     parent,
     role: fromTask.role ?? fromRun.role,
     kind:
-      fromTask.kind ??
-      fromRun.kind ??
-      (delegated ? (task?.title ?? (task === null ? thread.title : null)) : null),
-    // The first text that has a tag decides; a refused tag is never replaced by a guess.
+      kindFrom.kind ??
+      (kindFrom.kindRefused === null && delegated
+        ? (task?.title ?? (task === null ? thread.title : null))
+        : null),
+    kindRefused: kindFrom.kindRefused,
     ...(fromTask.estimate !== null || fromTask.estimateRefused !== null
       ? { estimate: fromTask.estimate, estimateRefused: fromTask.estimateRefused }
       : { estimate: fromRun.estimate, estimateRefused: fromRun.estimateRefused }),

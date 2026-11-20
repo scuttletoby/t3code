@@ -175,6 +175,26 @@ describe("summarizeRunRecords", () => {
     );
   });
 
+  it("counts runs whose kind tag was refused, empty text too, and old lines without the field", () => {
+    const old = record("old");
+    delete (old as { kindRefused?: unknown }).kindRefused;
+    const summary = summarizeRunRecords(
+      [
+        record("empty", { kind: null, kindRefused: "" }),
+        record("unclosed", { kind: null, kindRefused: "lens" }),
+        record("none", { kindRefused: null }),
+        old,
+      ],
+      { toMs: NOW_MS },
+    );
+    assert.strictEqual(summary.refusedKinds, 2);
+    assert.include(formatRunRecordsSummary(summary), "2 runs had a kind tag that was refused");
+    assert.notInclude(
+      formatRunRecordsSummary(summarizeRunRecords([record("plain")], { toMs: NOW_MS })),
+      "kind tag that was refused",
+    );
+  });
+
   it("counts only runs that ended in the window, each run once", () => {
     const summary = summarizeRunRecords(
       [
