@@ -172,9 +172,10 @@ describe("effectiveReviewRules", () => {
 
   it("treats a project's null as no override, also when the file holds it", () => {
     expect(effectiveReviewRules(read(ON), null)).toEqual(RECOMMENDED);
-    // A hand-written `null` is the save's "clear": the server's, not off with a warning.
+    // A hand-written `null` is the save's "clear": it reads as left out, so the server's, not off
+    // with a warning.
     const project = decodeProject({ reviewRules: null }).reviewRules;
-    expect(project).toBeNull();
+    expect(project).toBeUndefined();
     expect(effectiveReviewRules(read(ON), project)).toEqual(RECOMMENDED);
   });
 

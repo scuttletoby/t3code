@@ -34,7 +34,16 @@ const FORK_PATCH_KEYS = Object.keys(FORK_PATCH_RULES) as ReadonlyArray<ForkServe
 
 export type ForkSettingsPatch = Pick<ServerSettingsPatch, ForkServerSettingKey>;
 
-/** Splits a patch into its fork fields and the rest (upstream's), which keeps every other key. */
+/** The project keys whose `null` is a save's "clear" (`playtest`, `handoff`, `reviewRules`). */
+const NULL_CLEARED_PROJECT_KEYS = Object.entries(FORK_PROJECT_KEYS_KEPT_WHEN_LEFT_OUT)
+  .filter(([, clear]) => clear === null)
+  .map(([key]) => key);
+
+/**
+ * Splits a patch into its fork fields and the rest (upstream's). A project entry's `null` for a
+ * {@link NULL_CLEARED_PROJECT_KEYS} key is left out of the rest: upstream would store it as the
+ * project's own value. Left out, the key is removed, which is what the clear means.
+ */
 export function splitForkSettingsPatch<P extends ServerSettingsPatch>(
   patch: P,
 ): readonly [ForkSettingsPatch, Omit<P, ForkServerSettingKey>] {
@@ -45,11 +54,28 @@ export function splitForkSettingsPatch<P extends ServerSettingsPatch>(
     fork[key] = rest[key];
     delete rest[key];
   }
+  const projects = rest.projectSettingsOverrides;
+  if (isRecord(projects)) {
+    let cleaned: Record<string, unknown> | undefined;
+    for (const [projectId, entry] of Object.entries(projects)) {
+      if (!isRecord(entry)) continue;
+      const nulls = NULL_CLEARED_PROJECT_KEYS.filter(
+        (key) => Object.hasOwn(entry, key) && entry[key] === null,
+      );
+      if (nulls.length === 0) continue;
+      const kept: Record<string, unknown> = { ...entry };
+      for (const key of nulls) delete kept[key];
+      cleaned ??= { ...projects };
+      cleaned[projectId] = kept;
+    }
+    if (cleaned !== undefined) rest.projectSettingsOverrides = cleaned;
+  }
   return [fork as ForkSettingsPatch, rest as Omit<P, ForkServerSettingKey>];
 }
 
-const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function applyRule(rule: ForkPatchRule, stored: unknown, patch: unknown): unknown {
   if (rule === "replace") return patch;

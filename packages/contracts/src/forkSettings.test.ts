@@ -84,18 +84,25 @@ describe("fork settings seam", () => {
     expect(() => patch({ "Bad Name": { argv: ["/bin/true"] } })).toThrow();
   });
 
-  it("reads a project's hand-written null as not set (the server's), never as off", () => {
-    // `null` is the save's "clear", so a file that holds it means the same thing.
+  it("reads a project's hand-written null as left out (the server's), never as off or null", () => {
+    // `null` is the save's "clear", so a file that holds it means the same thing. It reads as the
+    // key left out: a `null` kept would reach readers as the project's own value.
     for (const key of ["playtest", "handoff", "reviewRules"] as const) {
-      const project = decodeProjectOverrides({ [key]: null });
-      expect(project[key], key).toBeNull();
+      const project = decodeProjectOverrides({ [key]: null, defaultAutoPull: false });
+      expect(Object.hasOwn(project, key), key).toBe(false);
       const settings = decodeServerSettings({
-        projectSettingsOverrides: { [PROJECT]: { [key]: null } },
+        projectSettingsOverrides: { [PROJECT]: { [key]: null, defaultAutoPull: false } },
       });
-      expect(settings.projectSettingsOverrides[PROJECT]?.[key], key).toBeNull();
-      // Written back as it was by a save of another key.
+      expect(Object.hasOwn(settings.projectSettingsOverrides[PROJECT] ?? {}, key), key).toBe(false);
+      // A save of another key writes the file without it (the same meaning), and so does the next.
       const written = encodeServerSettings(settings).projectSettingsOverrides?.[PROJECT];
-      expect(written?.[key], key).toBeNull();
+      expect(written, key).toEqual({ defaultAutoPull: false });
+      const again = encodeServerSettings(
+        decodeServerSettings({ projectSettingsOverrides: { [PROJECT]: written } }),
+      ).projectSettingsOverrides?.[PROJECT];
+      expect(again, key).toEqual(written);
+      // A project entry that held only the `null` reads as empty.
+      expect(decodeProjectOverrides({ [key]: null }), key).toEqual({});
     }
   });
 

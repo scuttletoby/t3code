@@ -474,7 +474,12 @@ a project sets every step it uses. Not set: the project uses the server's. A pro
 not valid reads as off for that project; it never falls back to the server's adapter. A project save
 that leaves this key out (an older client) keeps the stored value; only `null` clears it, and the
 fork's `clearProjectSettingsOverridesWithForkKeys` sends that. A `null` written into the file by
-hand means the same: not set, the server's. Unlike the server's value it is
+hand means the same: it reads as the key left out (not set, the server's), and the next save drops
+it. This changed with [#302](https://github.com/scuttletoby/t3code/issues/302): before, a
+hand-written project `null` read as off, so a file that still holds one (no save of that project
+since) now takes the server's adapter, or for `handoff` the server's mode, and can turn playtest or
+handoff on for that project. Write `{"enabled": false}` (`handoff`: `{"mode": "off"}`) to keep a
+project off. Unlike the server's value it is
 saved with every field written out, so a project that is off says so in the file. A repository's `t3.json` cannot set
 it: that file is in the repository, which agents edit.
 
@@ -512,7 +517,7 @@ project, and the next save of the project writes it back as a full `off` value; 
 to the server's value. A thread's own mode in the project's or the server's `threads` wins over
 either `mode`, the project's entry first. A project save that leaves this key out (an
 older client) keeps the stored value; only `null` clears it (also when written by hand, as for
-`playtest`).
+`playtest`, including the change for old files).
 
 ### A setting the fork removed
 
