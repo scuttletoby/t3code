@@ -154,6 +154,39 @@ function weightNote(file, weight, seconds, speed = 1) {
     : null;
 }
 
+// One shard's results: its failed tests, the passed ones whose weight must change (weightNote(), at the runner's
+// speed) and that speed. A failed test's time says nothing about its usual one: it gets no weight note.
+function judge(runs, weights) {
+  const speed = runSpeed(runs, weights);
+  const stale = [];
+  for (const run of runs) {
+    const note =
+      run.status === 0 &&
+      weightNote(run.file, weights.get(run.file) ?? null, Number(run.seconds), speed);
+    if (note) stale.push({ file: run.file, note });
+  }
+  return { failed: runs.filter((run) => run.status !== 0).map((run) => run.file), stale, speed };
+}
+
+// The seconds `files` should take on a usual runner, `jobs` at once: their weights (UNWEIGHTED for none) over the
+// slots, never less than the heaviest (the kit shards' shape test plans each shard the same way).
+function expectedSeconds(files, weights, jobs) {
+  const each = files.map((file) => weights.get(file) ?? UNWEIGHTED);
+  return Math.max(each.reduce((total, seconds) => total + seconds, 0) / jobs, ...each, 0);
+}
+
+// A warning (null: none) when a shard took more than twice its expected time and over a minute more. Each weight is
+// judged at the shard's own speed (runSpeed()), so a slowdown all its tests share (a slow runner, or a change that
+// slows them all) is no stale weight: without this, only the job's time limit would show it. A runner can be slow,
+// so it warns and does not fail.
+function slowNote(files, weights, jobs, seconds) {
+  const expected = expectedSeconds(files, weights, jobs);
+  return seconds > 2 * expected && seconds - expected > 60
+    ? `the tests here took ${Math.round(seconds)} s in all, ~${Math.round(expected)}s expected from their weights ` +
+        `(${jobs} at once): a slowdown all of them share, which no weight shows; the job's time limit is next`
+    : null;
+}
+
 function findTests(dir, root = ROOT) {
   const out = [];
   for (const entry of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {
@@ -269,20 +302,19 @@ async function main(parts = process.argv.slice(2)) {
   let failed =
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
   const mine = shard(result.run, entries, index, count);
-  const runs = await runAll(order(mine, entries), jobCount(), runTest);
-  const speed = runSpeed(runs, weight);
-  const stale = [];
+  const jobs = jobCount();
+  const started = Date.now();
+  const runs = await runAll(order(mine, entries), jobs, runTest);
+  const seconds = (Date.now() - started) / 1000;
+  const judged = judge(runs, weight);
+  const { speed } = judged;
+  const stale = judged.stale.map(({ note }) => note);
+  failed += judged.failed.length + stale.length;
+  for (const { file, note } of judged.stale)
+    console.log(`::error file=${file}::${note} in ${LIST}`);
+  const slow = slowNote(mine, weight, jobs, seconds);
+  if (slow) console.log(`::warning::${slow}`);
   for (const run of runs) {
-    if (run.status !== 0) failed += 1;
-    // A failed test's time says nothing about its usual one.
-    const note =
-      run.status === 0 &&
-      weightNote(run.file, weight.get(run.file) ?? null, Number(run.seconds), speed);
-    if (note) {
-      failed += 1;
-      stale.push(note);
-      console.log(`::error file=${run.file}::${note} in ${LIST}`);
-    }
     rows.push(
       `| \`${run.file}\` | ${run.status === 0 ? "passed" : "**failed**"} | ${run.seconds} s | ${weight.get(run.file) ? `~${weight.get(run.file)}s` : ""} |`,
     );
@@ -326,6 +358,7 @@ async function main(parts = process.argv.slice(2)) {
         `### Fork script tests${named ? ` (${named})` : ""}`,
         "",
         ...(empty ? [`**No test runs in this part: check its argument.**`, ""] : []),
+        ...(slow ? [`**Slow:** ${slow}.`, ""] : []),
         ...(stale.length
           ? [
               `**Weights to update in \`${LIST}\`** (this runner's speed: ${speed.toFixed(2)}x the weights):`,
@@ -352,6 +385,9 @@ module.exports = {
   inPart,
   runSpeed,
   weightNote,
+  judge,
+  expectedSeconds,
+  slowNote,
   findTests,
   presentTests,
   runAll,
