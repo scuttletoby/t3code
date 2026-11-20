@@ -499,7 +499,7 @@ describe("WaitService slot waits", () => {
   );
 
   it.effect(
-    "a store that cannot be loaded is not an empty one: no grant, used up later (#415)",
+    "a store that cannot be loaded is not an empty one: no grant, used up later and cleared (#415, #574)",
     () =>
       Effect.gen(function* () {
         yield* TestClock.setTime(NOW);
@@ -547,6 +547,15 @@ describe("WaitService slot waits", () => {
           yield* gate.release(allowed.type === "allow" ? allowed.token : null);
           // T1's start used its slot up: the slot is free for another thread, not held twice.
           assert.strictEqual(yield* delegate(OUTSIDER), "allow");
+          // Cleared in the file too, not only hidden in this gate's memory.
+          const used = stored(store.files).find((wait) => wait.id === "w_aaaaaaaaaa");
+          assert.strictEqual(used?.state, "delivered");
+          assert.isUndefined(used?.reservedUntil);
+        }).pipe(Effect.provide(serverLayer(world, slotsOn(1))));
+        // A restart: a new gate on the same file does not count T1's used slot again.
+        yield* Effect.gen(function* () {
+          const { delegate } = yield* startService(store.fs, send.delivery);
+          assert.strictEqual(yield* delegate(T2), "allow");
         }).pipe(Effect.provide(serverLayer(world, slotsOn(1))));
       }),
   );
