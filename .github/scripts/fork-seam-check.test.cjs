@@ -913,8 +913,8 @@ test("from upstream, an upstream file named like a fork file fails on the comman
   });
 });
 
-// #432: a file upstream names like a fork file stopped every fork-follow after the rebase until a
-// pull request excluded it. Right after a rebase that writes a lowered list, the list excludes it.
+// A file upstream names like a fork file stopped every fork-follow after the rebase until a pull
+// request excluded it. Right after a rebase that writes a lowered list, the list excludes it.
 test("after a rebase, the lowered list excludes an upstream file a pull request's run takes for a fork file", () => {
   withRepo(({ dir, commit, fromUpstream }) => {
     const upstream = commit(
