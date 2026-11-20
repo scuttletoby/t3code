@@ -2460,7 +2460,13 @@ QUIET_WHOLE_REFUSED = {
     "workflow-level env: PATH": lambda wf: wf.__setitem__("env", {"PATH": "/tmp/f:/usr/bin"}),
 }
 for label, mutate in QUIET_REFUSED.items():
-    check(f"quiet: {label} fails", bool(quiet_mutant(mutate)), "")
+    try:  # a mutant whose step is gone (a workflow from before it) is a named FAIL, not a traceback
+        found = quiet_mutant(mutate)
+    except (KeyError, IndexError, StopIteration, TypeError, AttributeError) as error:
+        found = None
+        check(f"quiet: {label} fails", False, f"the mutant could not be made: {type(error).__name__}: {error}")
+    if found is not None:
+        check(f"quiet: {label} fails", bool(found), "")
 for label, mutate in QUIET_WHOLE_REFUSED.items():
     check(f"quiet: {label} fails", bool(quiet_mutant(None, whole=mutate)))
 # A refused line says what is allowed (the form), so the fix is plain from the message alone.
@@ -2510,7 +2516,10 @@ REASONS = {
 }
 # Each names the allowed forms too, but for the records folder (its own message says what is missing).
 for label, (mutate, reason, *forms) in REASONS.items():
-    found = quiet_mutant(mutate)
+    try:
+        found = quiet_mutant(mutate)
+    except (KeyError, IndexError, StopIteration, TypeError, AttributeError) as error:
+        found = [f"the mutant could not be made: {type(error).__name__}: {error}"]
     check(f"quiet: {label} is refused, saying why",
           any(reason in p and (TEST_FORMS in p or forms == [False]) for p in found),
           "; ".join(found))
