@@ -142,7 +142,13 @@
         "const carryMcpProfile = yield* RemoteMcpProfile.makeCarry(links); // Fork: MCP profile carry",
         "const carried = yield* carryMcpProfile(parent.thread, scope, target, instanceId); // Fork: before the launch",
         "...carried, // Fork: the parent's MCP profile"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-20",
+        "added": [
+          "const carried = yield* carryMcpProfile(parent.thread, scope, target, instanceId); // Fork: before the launch"
+        ]
+      }
     },
     "apps/web/src/components/ChatView.browser.test.tsx": {
       "why": "#474: upstream's test \"an interrupted image-only first send of a new thread says it may not have been sent\" presses Enter once the pasted image's tile shows. The tile shows while the image still compresses, and the composer refuses a send then (\"Still compressing a pasted image\"), so on a loaded runner the launch never came and the test went red. The fork line waits until the tile's preview button is enabled, which is when the image is ready. Drop this seam when upstream's test waits for the ready image itself.",
@@ -216,6 +222,14 @@
       "added": [
         "mcpProfile: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)), // Fork: the parent's MCP profile"
       ]
+    },
+    "apps/server/src/orchestration-v2/ProjectionStore.ts": {
+      "why": "#350: a completed quiet handoff run (the fork's relay of a finished run to the agent that handed off) reads as upstream's stopped run (latestRunStopRequested) in both thread shell reads, the JavaScript one and the SQL one, so the browser's turn notice and the relay stay quiet through upstream's own gates. The rule is in apps/server/src/fork/handoff/handoffShell.ts; tested in apps/server/src/fork/handoff/handoffShell.test.ts. Drop it if upstream gets its own quiet mark for a run.",
+      "added": [
+        "import * as ForkHandoffShell from \"../fork/handoff/handoffShell.ts\"; // Fork: quiet handoff runs",
+        "...ForkHandoffShell.quietHandoffShellMark(projection, latestRun), // Fork: reads as stopped",
+        "${ForkHandoffShell.quietHandoffRunOrSql(sql, \"presented\")}"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -236,11 +250,9 @@
     "apps/server/src/mcp/toolkits/environment/handlers.test.ts": 63,
     "apps/server/src/mcp/toolkits/project/handlers.test.ts": 48,
     "apps/server/src/orchestration-v2/EffectWorker.ts": 28,
-    "apps/server/src/orchestration-v2/ProjectionStore.ts": 7,
     "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": 127,
     "apps/server/src/orchestration-v2/ThreadLaunchService.test.ts": 84,
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": 13,
-    "apps/server/src/orchestration-v2/ThreadManagementService.ts": 1,
     "apps/server/src/orchestration-v2/runtimeLayer.test.ts": 259,
     "apps/server/src/orchestration-v2/runtimeLayer.ts": 28,
     "apps/server/src/processRunner.ts": 35,
@@ -299,7 +311,6 @@
     "apps/server/src/mcp/OrchestratorMcpService.slotGate.test.ts",
     "apps/server/src/mcp/OrchestratorMcpService.usageGate.test.ts",
     "apps/server/src/mcp/toolkits/waits/",
-    "apps/server/src/orchestration-v2/ProjectionStore.activeRunOnly.test.ts",
     "apps/server/src/playtest/",
     "apps/server/src/policy/managedSettings.forkKeys.test.ts",
     "apps/server/src/provider/ForkAgentContextBudget.test.ts",
@@ -372,10 +383,6 @@
       "lines": 2,
       "gone": 1
     },
-    "apps/server/src/orchestration-v2/ProjectionStore.ts": {
-      "lines": 1,
-      "gone": 1
-    },
     "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": {
       "lines": 1,
       "gone": 1
@@ -383,10 +390,6 @@
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": {
       "lines": 7,
       "gone": 3
-    },
-    "apps/server/src/orchestration-v2/ThreadManagementService.ts": {
-      "lines": 1,
-      "gone": 1
     },
     "apps/server/src/processRunner.ts": {
       "lines": 2,

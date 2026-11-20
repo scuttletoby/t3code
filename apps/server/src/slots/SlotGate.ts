@@ -32,9 +32,9 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 
-import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ActiveRunShells from "./ActiveRunShells.ts";
 import { makeSlotObserver } from "./SlotObserver.ts";
 
 /** Names one `starting` entry; `release` or `started` with it. */
@@ -153,7 +153,7 @@ export const COUNT_READ_TIMEOUT = Duration.seconds(5);
 
 const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
-  const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+  const activeRunShells = yield* ActiveRunShells.ActiveRunShells;
   const hostResources = yield* HostResources.HostResources;
   const semaphore = yield* Semaphore.make(1);
   const entries = yield* Ref.make<ReadonlyArray<StartingEntry>>([]);
@@ -193,9 +193,7 @@ const make = Effect.gen(function* () {
    * memory floor still applies) and never make a slot wait "free". Interruptible on its own, so
    * the timeout works inside the caller's uninterruptible acquire.
    */
-  const readRunning = Effect.interruptible(
-    threadManagement.getShellSnapshot({ activeRunOnly: true }),
-  ).pipe(
+  const readRunning = Effect.interruptible(activeRunShells.read).pipe(
     // A timeout fails with a TimeoutError, which the catch below logs like any other read failure.
     Effect.timeout(COUNT_READ_TIMEOUT),
     Effect.map((snapshot) => {
@@ -730,4 +728,11 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(SlotGate, make);
+/** The gate over a given read of the running agents (tests give their own). */
+export const layerOver = Layer.effect(SlotGate, make);
+
+/**
+ * The server's gate, reading the running agents through `ActiveRunShells`. One constant, so
+ * runtimeLayer.ts and server.ts share one gate (layers memoize by reference).
+ */
+export const layer = layerOver.pipe(Layer.provide(ActiveRunShells.layer));
