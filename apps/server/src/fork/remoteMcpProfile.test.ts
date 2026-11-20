@@ -81,13 +81,13 @@ const input = {
 >[1];
 
 /**
- * The linked machine: on this version ("carries"), an older one whose server answers the features
- * path with its app page ("older"), one that answers 404 ("refuses"), not linked or resolvable
- * ("unlinked"), unreachable ("down"), never answering ("never"), sending 200 headers and then
- * never the end of the body ("stalls"), or answering once `hold` is done.
+ * The linked machine: this version ("carries", or "set to refuse"), older (its app page answers),
+ * 404 ("refuses"), not linked ("unlinked"), unreachable ("down"), silent ("never"), headers then
+ * no body ("stalls"), or answering once `hold` is done.
  */
 type Box =
   | "carries"
+  | "set to refuse"
   | "older"
   | "refuses"
   | "unlinked"
@@ -107,6 +107,8 @@ const answer = (peer: Box, request: HttpClientRequest.HttpClientRequest) => {
   switch (peer) {
     case "carries":
       return respond(Response.json({ mcpProfileCarry: true }));
+    case "set to refuse":
+      return respond(Response.json({ mcpProfileCarry: false }));
     case "older":
       return respond(
         new Response("<!doctype html><p>app", { headers: { "content-type": "text/html" } }),
@@ -280,6 +282,40 @@ it.effect.each<readonly [string, Box]>([
       );
       assert.deepStrictEqual(harness.asks, ASKED);
       assert.deepStrictEqual(harness.launched, []);
+    }),
+  ),
+);
+
+it.effect(
+  "refuses, before any launch, a narrower profile to a machine set to refuse it (#640)",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(T3_ONLY, "set to refuse");
+        const exit = yield* Effect.exit(harness.delegate);
+        assert.include(JSON.stringify(exit), "capability_denied");
+        assert.include(JSON.stringify(exit), "box is set not to take a task");
+        assert.include(
+          JSON.stringify(exit),
+          'have the owner set mcpCarriedProfiles to \\"apply\\" on box',
+        );
+        assert.deepStrictEqual(harness.asks, ASKED);
+        assert.deepStrictEqual(harness.launched, []);
+        // Run again: asked again, refused again; nothing was launched in between.
+        yield* Effect.exit(harness.delegate);
+        assert.deepStrictEqual(harness.asks, [...ASKED, ...ASKED]);
+        assert.deepStrictEqual(harness.launched, []);
+      }),
+    ),
+);
+
+it.effect("sends all, which cuts nothing, to a machine set to refuse without asking it", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({}, "set to refuse");
+      yield* harness.delegate;
+      assert.deepStrictEqual(harness.carried(), [{ name: "all", servers: "all", t3Tools: "all" }]);
+      assert.deepStrictEqual(harness.asks, []);
     }),
   ),
 );

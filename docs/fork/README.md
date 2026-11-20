@@ -369,7 +369,12 @@ says so; with no profile set there, the thread gets `all` as before), a profile 
 `t3Tools` is not `"all"` (the T3 tool filter comes in a later pull request), or a session that
 still shows a server the profile leaves out, or does not list its servers within 5 minutes. A
 managed Claude policy on the machine or `--mcp-config` in the Claude launch arguments can make
-Claude load a server T3's list leaves out. Other providers do not apply profiles yet.
+Claude load a server T3's list leaves out.
+
+Only Claude threads apply profiles. A Codex thread, or one on any other provider, gets every MCP
+server and every T3 tool whatever its profile says: on its own machine, and as a task another
+machine delegated with a narrower profile. The carry below, and its refusal to send to a machine
+that cannot apply a profile, only limit a task that runs on Claude there.
 
 Each tool call is checked too: a call to an MCP server the profile leaves out (also one an agent
 file declares, or one added while the session runs) is refused at the moment of the call: Claude
@@ -402,7 +407,9 @@ token, never a browser, and any other caller gets a plain 404. Only `mcpProfileC
 an older T3 answers that path with its app page, which reads as "cannot", and no answer in time
 (the whole answer, its body too) refuses the task too. A redirect is not followed, and only a 200
 answer counts. It asks again for each task, so an update or a downgrade there counts at once.
-A thread with `all` delegates to any machine, without asking. A task that arrives from a machine
+A machine whose owner set `mcpCarriedProfiles` to `refuse` answers `mcpProfileCarry: false`, so
+the call is refused the same way, before anything is sent, and says that machine is set not to take
+such a task. A thread with `all` delegates to any machine, without asking. A task that arrives from a machine
 on an older T3 carries nothing, so it gets this machine's profile for its role as before, and the
 server log says so.
 
@@ -429,6 +436,24 @@ machine (see `server.mcpProfiles`).
 The person's pick of profile per thread, by thread id. A pick wins over every default. At most 500
 picks are kept: a save that would add more is refused until old picks are removed. No pick is ever
 dropped to make room.
+
+### `server.mcpCarriedProfiles`
+
+Whether this machine takes tasks that another machine delegated with a profile narrower than `all`
+([#640](https://github.com/scuttletoby/t3code/issues/640)). `apply` (the default) cuts such a task
+down to the carried profile, as `server.mcpProfiles` says. `refuse` takes no part in carrying: the
+features route answers `mcpProfileCarry: false`, so a narrower-profile thread on another machine is
+refused before it sends, and a task that arrives with one anyway (sent before the setting changed)
+does not start its turn, nor do its sub-agents, and says why. Neither value gives a task more than
+it would get: there is no "ignore the carried profile" value, as a thread could then get more tools
+by delegating to this machine. A task that carries `all`, or nothing (from an older T3), runs as
+before, and the owner's pick for a task here (`mcpThreadProfiles`) still stands. It is read again
+for each turn and each ask, so a change counts from the next one. A value it does not know reads as
+`apply`. Only the person can change it; agents cannot.
+
+```json
+{ "mcpCarriedProfiles": "refuse" }
+```
 
 ### `server.handoff`
 
