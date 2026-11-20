@@ -18,12 +18,44 @@ const SETTING_ID = /`((?:server|projectOverride|client)\.[A-Za-z0-9]+)`/gu;
 const ROW_OPEN = /^ {2}\{$/u;
 const ROW_CLOSE = /^ {2}\},?$/u;
 const ROW_ONE_LINE = /^ {2}\{.*\},?$/u;
+/** A line at the rows' own indent: inside a row, only its closing `},` may be there. */
+const ROW_INDENT = /^ {2}\S/u;
 const ROW_SCOPE_KEY = /\bscope:\s*(["'])(\w+)\1,\s*key:\s*(["'])([A-Za-z0-9]+)\3/gu;
+
+/**
+ * A row's text without its comments (`code`), and also without the contents of its strings (`bare`), so neither a
+ * comment nor a string can stand in for the row's own `scope:`, spread or braces.
+ */
+function stripRow(text) {
+  let code = "";
+  let bare = "";
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (char === "/" && (text[index + 1] === "/" || text[index + 1] === "*")) {
+      const close = text[index + 1] === "/" ? "\n" : "*/";
+      const end = text.indexOf(close, index + 2);
+      index = end === -1 ? text.length : close === "\n" ? end - 1 : end + 1;
+      code += " ";
+      bare += " ";
+    } else if (char === '"' || char === "'" || char === "`") {
+      let end = index + 1;
+      while (end < text.length && text[end] !== char) end += text[end] === "\\" ? 2 : 1;
+      code += text.slice(index, end + 1);
+      bare += char + char;
+      index = end;
+    } else {
+      code += char;
+      bare += char;
+    }
+  }
+  return { code, bare };
+}
 
 /**
  * `<scope>.<key>` of each row of FORK_SETTING_DEFAULTS in forkDefaults.ts's text. Fails closed, so no row goes
  * unchecked: throws on a missing or empty table, an entry between rows that is not a `{ ... }` row (spread, helper
- * call), a row still open at the `];`, or a row that is not exactly one `scope: "<scope>", key: "<key>"`.
+ * call), a row whose closing `},` line is not found, a row still open at the `];`, a spread or a second object on a
+ * row's line, or a row that is not exactly one `scope: "<scope>", key: "<key>"` (comments not counted).
  */
 function pinnedIds(text) {
   const head = /^export const FORK_SETTING_DEFAULTS\b[^=]*=\s*\[/mu.exec(text);
@@ -48,6 +80,11 @@ function pinnedIds(text) {
       if (ROW_CLOSE.test(line)) {
         rows.push({ at: open, text: lines.slice(open, index + 1).join("\n") });
         open = -1;
+      } else if (ROW_INDENT.test(line)) {
+        throw new Error(
+          `${where(index)}\`${line.trim()}\` at the rows' indent, but the row opened on line ` +
+            `${firstLine + open} has not closed (end each row with "},", alone on its line)`,
+        );
       }
     } else if (ROW_OPEN.test(line)) open = index;
     else if (ROW_ONE_LINE.test(line)) rows.push({ at: index, text: line });
@@ -63,8 +100,24 @@ function pinnedIds(text) {
     );
   if (rows.length === 0) throw new Error(`${DEFAULTS}: no row read from FORK_SETTING_DEFAULTS`);
   const ids = rows.map((row) => {
-    const read = [...row.text.matchAll(ROW_SCOPE_KEY)];
-    const scopes = [...row.text.matchAll(/\bscope:/gu)].length;
+    const { code, bare } = stripRow(row.text);
+    if (bare.includes("...")) {
+      throw new Error(
+        `${where(row.at)}a spread in a row (write each row's scope and key in the row itself)`,
+      );
+    }
+    const objects = bare.trim().replace(/,$/u, "");
+    let depth = 0;
+    for (let index = 0; index < objects.length; index++) {
+      if (objects[index] === "{") depth++;
+      else if (objects[index] === "}" && --depth === 0 && index !== objects.length - 1) {
+        throw new Error(
+          `${where(row.at)}more than one \`{ ... }\` on a row's line (one row per line)`,
+        );
+      }
+    }
+    const read = [...code.matchAll(ROW_SCOPE_KEY)];
+    const scopes = [...code.matchAll(/\bscope:/gu)].length;
     if (read.length !== 1 || scopes !== 1) {
       throw new Error(
         `${where(row.at)}${scopes} "scope:" but ${read.length} read as ` +
