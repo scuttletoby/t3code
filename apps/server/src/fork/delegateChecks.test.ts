@@ -11,11 +11,13 @@ import {
   ProjectId,
   ProviderInstanceId,
   type OrchestrationV2ThreadProjection,
+  type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -152,4 +154,50 @@ describe("fork delegation checks: runs again", () => {
       }
     }).pipe(Effect.provide(untouched)),
   );
+});
+
+describe("fork delegation checks: the copied folder model merge", () => {
+  it("gives the same lists as the target lookup's withWorkspaceModels (#596)", () => {
+    const model = (slug: string) => ({ slug, name: slug, isCustom: false });
+    const snapshot = (cwd: string, models?: ReadonlyArray<ReturnType<typeof model>>) => ({
+      cwd,
+      checkedAt: "2026-11-13T12:00:00.000Z",
+      slashCommands: [],
+      skills: [],
+      ...(models === undefined ? {} : { models }),
+    });
+    const providers = [
+      // No snapshots, a snapshot of another folder, one without models, one that adds a model,
+      // and an empty model list.
+      { instanceId: "none", models: [model("a")] },
+      { instanceId: "other", models: [model("a")], workspaceSnapshots: [snapshot("/elsewhere")] },
+      { instanceId: "plain", models: [model("a")], workspaceSnapshots: [snapshot("/work")] },
+      {
+        instanceId: "adds",
+        models: [model("a")],
+        workspaceSnapshots: [
+          snapshot("/elsewhere", []),
+          snapshot("/work", [model("a"), model("b")]),
+        ],
+      },
+      { instanceId: "empty", models: [model("a")], workspaceSnapshots: [snapshot("/work", [])] },
+      // Pending snapshots: a pending filter on one side only fails the check.
+      ...(["modelsPending", "slashCommandsPending"] as const).map((flag) => ({
+        instanceId: flag,
+        models: [model("a")],
+        workspaceSnapshots: [{ ...snapshot("/work", [model("a"), model("c")]), [flag]: true }],
+      })),
+    ] as unknown as ReadonlyArray<ServerProvider>;
+    for (const cwd of [undefined, "/work", "/elsewhere", "/missing"]) {
+      assert.deepStrictEqual(
+        DelegateChecks.withFolderModels(providers, cwd),
+        OrchestratorMcpService.withWorkspaceModels(providers, cwd),
+        `cwd ${cwd}`,
+      );
+    }
+    assert.deepStrictEqual(
+      DelegateChecks.withFolderModels(providers, "/work")[3]?.models.map((entry) => entry.slug),
+      ["a", "b"],
+    );
+  });
 });
