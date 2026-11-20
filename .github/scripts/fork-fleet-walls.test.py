@@ -1163,7 +1163,7 @@ class EveryWallsFile(WallsRunner):
                  '/etc/systemd/system': {'etc/systemd/system/': ''},
                  '/etc/auto.master': {'etc/auto.master': '/net -hosts\n'},
                  '/etc/myapp/private': {'etc/myapp/private/': ''},
-                 '/etc/passwd,/etc/fstab': {}}
+                 '/etc/nsswitch.conf,/etc/fstab': {}}   # a harmless entry beside one that is not
         for allow, files in fails.items():
             with self.subTest(allow):
                 p = run([os.path.join(self.folder, 'linux'), 'check'],
