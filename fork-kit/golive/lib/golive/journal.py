@@ -322,30 +322,38 @@ def run(state_dir, command, may_follow=(), scratch=False):
             r._holds_lock = False
 
 
-def settle(state_dir, reason):
+def settle(state_dir, reason, then=None):
     """The owner says the home is right again (`t3-golive settle`). Holds the lock exclusively (Busy).
     Returns ('settled', run) after journalling the reason against the run that needed settling, ('moved', path)
     after moving a damaged journal aside, or (None, None) when nothing needed settling. A journal from a newer
-    kit raises Newer and is left alone. Running it again changes nothing."""
+    kit raises Newer and is left alone. Running it again changes nothing. then: called after any of these, still
+    under the lock (no run can start in between), e.g. to stop what such a run left holding the home."""
     reason = (reason or '').strip()
     if not reason:
         raise ValueError('settle needs a reason: what was done to put the T3 home right')
     with lock(state_dir, 'settle', exclusive=True):
-        _, path = _paths(state_dir)
-        try:
-            last = unfinished(state_dir)
-        except Newer:
-            raise
-        except Damaged:
-            aside = f'{path}.damaged-{datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
-            if os.path.lexists(aside):
-                aside = f'{aside}-{os.getpid()}'
-            os.rename(path, aside)
-            _fsync_dir(state_dir)
-            return 'moved', aside
-        if last is None:
-            return None, None
-        r = Run(state_dir, last['command'])
-        r.id = last['id']
-        r._append('settle', detail=reason[:500])
-        return 'settled', last
+        got = _settle(state_dir, reason)
+        if then is not None:
+            then()
+        return got
+
+
+def _settle(state_dir, reason):
+    _, path = _paths(state_dir)
+    try:
+        last = unfinished(state_dir)
+    except Newer:
+        raise
+    except Damaged:
+        aside = f'{path}.damaged-{datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
+        if os.path.lexists(aside):
+            aside = f'{aside}-{os.getpid()}'
+        os.rename(path, aside)
+        _fsync_dir(state_dir)
+        return 'moved', aside
+    if last is None:
+        return None, None
+    r = Run(state_dir, last['command'])
+    r.id = last['id']
+    r._append('settle', detail=reason[:500])
+    return 'settled', last

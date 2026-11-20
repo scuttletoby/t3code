@@ -13,7 +13,7 @@ moves a damaged journal aside), so changing runs may start again. It writes only
 import argparse, hashlib, json, os, sys
 
 import machine_file
-from golive import config as config_mod, journal, live, osadapter
+from golive import config as config_mod, handoff, journal, live, osadapter
 
 MB = 1024 * 1024
 
@@ -124,6 +124,10 @@ def _checks(cfg, adapter, result, add, info, own_id):
                                    f'(active: {svc["active"]}, enabled: {svc["enabled"]})')
     else:
         add('boot service', True, f'{osadapter.UNIT} serves this home')
+
+    holder = handoff.holder_seen(cfg.home, adapter.unit_active)
+    if holder is not None:  # #530: a W1 or switch left the home held on purpose
+        add('home holder', False, holder)
 
     server = None
     try:
@@ -308,11 +312,15 @@ def _print(code, result, out):
 
 
 def _settle(cfg, reason, out, err):
+    stopped = []  # the owner says the home is right: a holder a W1 or switch left (#530) has nothing to keep
     try:
-        what, value = journal.settle(cfg.state_dir, reason)
+        what, value = journal.settle(cfg.state_dir, reason, then=lambda: stopped.append(handoff.stop_holder(cfg.home)))
     except (journal.Busy, journal.Newer, ValueError) as e:
         print(f't3-golive: {e}', file=err)
         return 1
+    if stopped and stopped[0] is not None:
+        print(f'stopped the kit\'s holder {handoff.holder_unit(cfg.home)} (pid {stopped[0]}): the home is not kept '
+              'owned any more, and T3 is left as it is', file=out)
     if what == 'settled':
         print(f'settled: {journal.describe(value)}; reason: {reason.strip()}', file=out)
     elif what == 'moved':
@@ -363,6 +371,8 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p = sub.add_parser('guard', help=argparse.SUPPRESS)
     p.add_argument('--run', required=True)
+    p = sub.add_parser('hold', help=argparse.SUPPRESS)  # the holder's unit (handoff.serve_holder)
+    p.add_argument('--home', required=True)
     p = sub.add_parser('switch', help='move the live T3 to the target build, verify it, go back on its own if not',
                        description='Needs a passed, fresh rehearsal of this staged build (its archive sha256) from '
                                    'the live build. Keeps the old runtime outside the home, then at a quiet point: '
@@ -386,6 +396,8 @@ def main(argv, out=sys.stdout, err=sys.stderr):
                    help="after a reboot, to let it run W1: the switch copy's time, as `t3-golive back` prints it")
     p.add_argument('--wait', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.command == 'hold':  # it only holds the lock of the home it was started for: no machine file needed
+        return handoff.serve_holder(args.home)
     try:
         cfg = config_mod.load()
     except machine_file.MachineFileError as e:
