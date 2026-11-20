@@ -10,7 +10,8 @@ import {
   ForkSettingsWriteError,
 } from "@t3tools/shared/forkSettingsPatch";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { assert, it } from "@effect/vitest";
+import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -20,6 +21,7 @@ import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ServerConfig from "./config.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
+import * as PlaytestKit from "./playtest/PlaytestService.testkit.ts";
 import * as ServerSettingsModule from "./serverSettings.ts";
 
 const layerServerSettings = () =>
@@ -686,3 +688,53 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork model polic
     }).pipe(Effect.provide(layerServerSettings())),
   );
 });
+
+describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "fork playtest with a project's hand-written null",
+  () => {
+    it.live("uses the server's adapter for that project: a session starts and ends", () =>
+      PlaytestKit.live(
+        Effect.gen(function* () {
+          const fx = yield* PlaytestKit.fixture;
+          const dir = yield* fx.adapterDir("a");
+          const config = yield* ServerConfig.ServerConfig;
+          const fs = yield* FileSystem.FileSystem;
+          // An old file: the project's playtest hand-written as `null` (once read as off).
+          yield* fs.writeFileString(
+            config.settingsPath,
+            JSON.stringify({
+              playtest: PlaytestKit.adapter(fx, dir),
+              projectSettingsOverrides: {
+                [PlaytestKit.PROJECT]: { playtest: null, defaultAutoPull: false },
+              },
+            }),
+          );
+          const settings = yield* ServerSettingsModule.ServerSettingsService;
+          const loaded = yield* settings.getSettings;
+          const resolved = resolveProjectSettings(loaded, PlaytestKit.PROJECT);
+          assert.strictEqual(resolved.sources.playtest, "environment");
+          assert.deepStrictEqual(resolved.settings.playtest, loaded.playtest);
+
+          const service = yield* PlaytestKit.makeService(fx, settings);
+          const started = yield* service.start({ threadId: PlaytestKit.THREAD, target: "dev-1" });
+          assert.strictEqual(started.outcome, "started");
+          const ended = yield* service.end({ threadId: PlaytestKit.THREAD, reason: "agent" });
+          assert.strictEqual(ended.outcome, "ended");
+          assert.deepStrictEqual(
+            (yield* PlaytestKit.ran(dir)).filter((line) => !line.startsWith("finished")),
+            ["claim:0", "release:0"],
+          );
+
+          // A save of another key writes the entry without the `null`; still the server's.
+          yield* settings.updateSettings(decodePatch({ enableAgentBrowserAccess: false }));
+          const file = (yield* readFile) as { projectSettingsOverrides: Record<string, unknown> };
+          assert.deepStrictEqual(file.projectSettingsOverrides[PlaytestKit.PROJECT], {
+            defaultAutoPull: false,
+          });
+          const after = resolveProjectSettings(yield* settings.getSettings, PlaytestKit.PROJECT);
+          assert.strictEqual(after.sources.playtest, "environment");
+        }).pipe(Effect.provide(layerServerSettings().pipe(Layer.provide(NodeCrypto.layer)))),
+      ),
+    );
+  },
+);
