@@ -40,6 +40,7 @@ import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ActiveRunShells from "../slots/ActiveRunShells.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -207,25 +208,6 @@ const serverLayer = (
         ),
       isProviderInstanceEnabledForProject: () => Effect.succeed(true),
       assertProviderInstanceEnabled: () => Effect.void,
-      getShellSnapshot: (options) =>
-        Effect.gen(function* () {
-          assert.deepStrictEqual(options, { activeRunOnly: true });
-          world.snapshotReads += 1;
-          yield* Effect.yieldNow;
-          return {
-            schemaVersion: 1,
-            snapshotSequence: 1,
-            threads: world.running.map(
-              (thread) =>
-                ({
-                  id: ThreadId.make(thread.id),
-                  providerInstanceId: thread.instanceId,
-                  activeRunId: RunId.make(`run:${thread.id}`),
-                }) as unknown as OrchestrationV2ThreadShell,
-            ),
-            archivedThreads: [],
-          };
-        }),
       dispatch: (command) =>
         Effect.gen(function* () {
           // Lets concurrent calls interleave between the gate and the dispatch.
@@ -301,6 +283,25 @@ const serverLayer = (
           }),
         ),
     }),
+    Layer.mock(ActiveRunShells.ActiveRunShells)({
+      read: Effect.gen(function* () {
+        world.snapshotReads += 1;
+        yield* Effect.yieldNow;
+        return {
+          schemaVersion: 1,
+          snapshotSequence: 1,
+          threads: world.running.map(
+            (thread) =>
+              ({
+                id: ThreadId.make(thread.id),
+                providerInstanceId: thread.instanceId,
+                activeRunId: RunId.make(`run:${thread.id}`),
+              }) as unknown as OrchestrationV2ThreadShell,
+          ),
+          archivedThreads: [],
+        };
+      }),
+    }),
     Layer.mock(ProjectService.ProjectService)({ getById: () => Effect.succeedNone }),
     Layer.mock(SecretRequests.SecretRequests)({}),
     Layer.mock(RemoteDelegation.RemoteDelegation)({}),
@@ -312,7 +313,7 @@ const serverLayer = (
   const withGate =
     options.withGate === false
       ? dependencies
-      : SlotGate.layer.pipe(Layer.provideMerge(dependencies));
+      : SlotGate.layerOver.pipe(Layer.provideMerge(dependencies));
   return OrchestratorMcpService.layer.pipe(Layer.provideMerge(withGate));
 };
 
