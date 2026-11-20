@@ -224,6 +224,17 @@ class NotALens(unittest.TestCase):
                 self.assertIn(lens.OPT_OUT_READ, self.problem(body))
         self.assertIsNone(self.problem(f'not a lens: r2\n```\nx\n```  \n> read at {self.HEX}'))   # blanks only: closes
 
+    def test_a_longer_closing_fence_closes_one_and_only_blanks_may_follow_it(self):   # GFM; #591 lens mutants
+        self.assertIsNone(self.problem(f'not a lens: r2\n```\nx\n````\n> read at {self.HEX}'))
+        # a no-break space is no space or tab: the fence stays open, the quote is code
+        self.assertIn(lens.OPT_OUT_READ, self.problem(f'not a lens: r2\n```\nx\n```\u00a0\n> read at {self.HEX}'))
+
+    def test_a_fence_opens_and_closes_only_after_at_most_3_spaces(self):   # GFM; #591 lens mutants
+        self.assertIn(lens.OPT_OUT_READ, self.problem(f'not a lens: r2\n   ```\n> read at {self.HEX}'))
+        self.assertIsNone(self.problem(f'not a lens: r2\n    ```\n\n> read at {self.HEX}'))   # indented code, no fence
+        self.assertIn(lens.OPT_OUT_READ,
+                      self.problem(f'not a lens: r2\n```\nx\n    ```\n> read at {self.HEX}\n```'))
+
     def test_the_way_out_names_the_quote_and_never_reads_as_a_report(self):
         self.assertIn('`>`', lens.NO_HEADER_WAY_OUT)
         self.assertEqual(lens.no_lens_text(lens.NO_HEADER_WAY_OUT, keep_markdown=True), lens.NO_HEADER_WAY_OUT)

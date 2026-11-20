@@ -284,11 +284,13 @@ Fixed in:
 A comment holds one lens: below a valid header, a line that starts with
 `lens:`, `lens —`, `lens –` or `lens=` and names a sha is a second header, and
 the comment reads nothing. (`LENS = '...'`, with a blank before the `=`, is no
-second header: a report's test code assigns sample headers that way.)
+second header: a report's test code assigns sample headers that way.) Lines in
+code blocks count too, so a report quotes sample headers with placeholders
+(`<sha>`), never a real-looking sha (seven or more hex digits).
 
 Fenced blocks are read as GitHub renders them: only a line of the same
 character, at least as long and with nothing after it, closes a fence
-(```` ```js ```` inside an open fence is code), and a backtick line with
+(` ```js ` inside an open fence is code), and a backtick line with
 another backtick after it is inline code, not a fence.
 
 A comment that looks like a report but is not one valid read is a lens of its
