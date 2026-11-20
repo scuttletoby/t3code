@@ -320,6 +320,17 @@ Setup (the repository owner's steps; nothing here creates them):
    ([pr-queue](../pr-queue/README.md)), so the queue counts only that App's
    check runs. Release the code first, then bump the pins, then add the key:
    an older queue refuses a key it does not know.
+8. The live check, once, after the review trigger is in: post a review on one
+   open pull request and check that the gate ran for it. The caller's run on
+   `workflow_run` logs `review run: #N has the head …`, and the check run on
+   that head is new. The GitHub fields the lookup uses (the review run's head
+   branch, head repository and head sha, and the list filter
+   `head=owner:branch`) are tested only against fakes. If the run warns
+   "the review trigger's run does not name a head", or logs "no open pull
+   request has the head" for a review on an open pull request whose head did
+   not move, they differ: reviews then never run the gate again. Report it
+   on the fork and use the fallback (an issue comment or a dispatch, see
+   "Run again after a review") until it is fixed.
 
 After a change to the caller, a new pin, or a change to the queue config or
 the lens rules on the default branch, dispatch the backfill again: it judges
@@ -431,7 +442,10 @@ head "not passed" unless it judged the head and the head passed.
     pull request read and git's `refs/pull/N/head` both fail every try.
   - A review trigger's run whose pull request cannot be found: the list of
     open pull requests with its head fails every try (the guard job fails), or
-    no open pull request has its head (nothing to judge, the log says why).
+    no open pull request has its head (nothing to judge, the log says why). A
+    run that names no head (its head fields missing or odd) judges nothing
+    with a warning: GitHub's fields are not what the lookup expects (setup
+    step 8).
     More than one is no such case: the head is judged once, in the job for
     the lowest number.
   - The backfill cannot list the open pull requests after its tries, or finds

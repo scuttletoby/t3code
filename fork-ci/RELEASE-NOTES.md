@@ -242,6 +242,25 @@ then behind, and the update that brings it up to date is a new head, judged on t
   refuses the fix too ("not JSON"), and an owner has to push the fix by hand, as for any base config that does not
   parse.
 
+### head-check gate: reviews and inline review comments run the gate again (#375, #392, #379)
+
+A new example workflow, `review-trigger.example.yml` ("Head gate review trigger"), runs on reviews and inline review
+comments and does nothing but finish. The gate caller runs on `workflow_run` of it and judges the head of the open pull
+request whose head branch, head repository and head sha are the run's (the number comes from the API, never from the
+run). Two open pull requests on one head (one branch into two bases) are judged once, in the job for the lowest number.
+Before this, a review left the check showing the older answer until the next push or issue comment. First in `ci/v15`.
+After `ci/v19` (#379), a review run whose head fields are missing or odd judges nothing with a warning (before: a plain
+log line).
+
+**Upgrade:** nothing breaks if you only move the pin: a caller without the new trigger never runs on `workflow_run`.
+To use it, in one pull request on the default branch, after the pin is at a release that has this entry: copy
+`review-trigger.example.yml` to `.github/workflows/` unchanged, and add the caller's `workflow_run` trigger, its `if`
+(with the event clause) and its `concurrency` from `gate-caller.example.yml`. The pin moves first or in that pull
+request: a caller with `workflow_run` pinned to an older release is refused on that event (its guard job fails, nothing
+is posted). Then do the
+live check once ([head-check README](actions/head-check/README.md), setup step 8): post a review on one open pull
+request and check that the gate ran for it. The GitHub fields the lookup uses are tested only against fakes.
+
 ### pr-queue and head-check: stricter rule order in `review` (#378)
 
 A rule of the same weight above another rule that lacks one of its lenses is now a rule-order problem, and only the

@@ -804,7 +804,7 @@ describe("UsagePacingGate decide, advice before a folder scan (#616)", () => {
         // Would hold: the scan may switch it.
         [
           advise([ahead, second([weekly(10)])], { scanFirstOn: [SECOND] }),
-          '"enforce" would first scan this folder for claude_second: if it lists the model, it would run this task on claude_second; if not, it would hold this task.',
+          '"enforce" would first scan this folder for claude_second: if it lists the model and the task can run there, it would run this task on claude_second; if not, it would hold this task.',
         ],
         // Would lower the effort: the scan may switch it.
         [
@@ -820,19 +820,19 @@ describe("UsagePacingGate decide, advice before a folder scan (#616)", () => {
             scanFirstOn: [SECOND],
             lowerEffort: { high: "high" },
           }),
-          'lets effort high run. "enforce" would first scan this folder for claude_second: if it lists the model, it would run this task on claude_second; if not, it would run it as asked.',
+          'lets effort high run. "enforce" would first scan this folder for claude_second: if it lists the model and the task can run there, it would run this task on claude_second; if not, it would run it as asked.',
         ],
         // Another account can run it: the one with more room is scanned first.
         [
           advise([ahead, second([weekly(10)]), third([weekly(30)])], { scanFirstOn: [SECOND] }),
-          'claude_third has room; "enforce" would first scan this folder for claude_second: if it lists the model, it would run this task on claude_second; if not, it would run this task on claude_third.',
+          'claude_third has room; "enforce" would first scan this folder for claude_second: if it lists the model and the task can run there, it would run this task on claude_second; if not, it would run this task on claude_third.',
         ],
         // Two to scan.
         [
           advise([ahead, second([weekly(10)]), third([weekly(30)])], {
             scanFirstOn: [SECOND, THIRD],
           }),
-          "for claude_second, claude_third: if one lists the model, it would run this task on the first that lists it; if not, it would hold this task.",
+          "for claude_second, claude_third: if one lists the model and the task can run there, it would run this task on the first of them where it can; if not, it would hold this task.",
         ],
         // A named instance: a scan only picks the reason for the hold.
         [
@@ -846,7 +846,7 @@ describe("UsagePacingGate decide, advice before a folder scan (#616)", () => {
             pinned: true,
             lowerEffort: { high: "medium" },
           }),
-          "if it lists the model, it would hold this task; if not, it would run this task at effort medium",
+          "if it lists the model and the task can run there, it would hold this task; if not, it would run this task at effort medium",
         ],
       ];
       for (const [decided, text] of cases) {
@@ -863,12 +863,31 @@ describe("UsagePacingGate decide, advice before a folder scan (#616)", () => {
 
   it.effect("enforce ignores the mark: it scanned already", () =>
     Effect.gen(function* () {
-      const outcome = yield* advise([main([weekly(60)]), second([weekly(10)])], {
+      const ahead = main([weekly(60)]);
+      const outcome = yield* advise([ahead, second([weekly(10)])], {
         mode: "enforce",
         scanFirstOn: [SECOND],
       });
       assert.strictEqual(outcome.action, "hold");
       assert.notInclude(noteOf(outcome), "would first scan");
+      // The note both modes share: the owner lets this effort run.
+      const runs = yield* advise([ahead, second([weekly(10)])], {
+        mode: "enforce",
+        scanFirstOn: [SECOND],
+        lowerEffort: { high: "high" },
+      });
+      assert.strictEqual(runs.action, "pass");
+      assert.include(noteOf(runs), "The usagePacingLowerEffort setting lets effort high run.");
+      assert.notInclude(noteOf(runs), "would first scan");
+      assert.notInclude(noteOf(runs), '"enforce"');
+      // A lower effort.
+      const lowered = yield* advise([ahead, second([weekly(10)])], {
+        mode: "enforce",
+        scanFirstOn: [SECOND],
+        lowerEffort: { high: "medium" },
+      });
+      assert.strictEqual(lowered.action, "lowerEffort");
+      assert.notInclude(noteOf(lowered), "would first scan");
     }),
   );
 });

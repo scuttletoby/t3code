@@ -424,6 +424,27 @@ if caller_group("push", 1) is not None:
           "caller's run (the gate job's own group is per head: a newer job there reads the newest state)",
           lost == [("review", 2)], str(lost))
 
+# #379: the review trigger's live check is a written setup step, and the release notes tell a pin move what to copy.
+# The fields the lookup relies on are tested above only against fakes, so whoever sets the trigger up checks them once.
+readme = (root / "fork-ci/actions/head-check/README.md").read_text()
+setup = readme[readme.find("\nSetup ("):]
+setup = setup[:setup.find("\n\n", setup.find("\n8. "))] if "\n8. " in setup else ""
+check("README setup: step 8 is the live check (post a review, the gate runs; the warning that says the fields differ)",
+      "post a review on one" in setup and "review run: #N has the head" in setup
+      and "does not name a head" in setup and "head=owner:branch" in setup and "fallback" in setup, setup[-300:])
+gate_src = GATE_PY.read_text()
+check("README setup: the warning it names is head_gate's own text",
+      "the review trigger's run does not name a head" in setup.replace("\n   ", " ")
+      and "the review trigger's run does not name a head" in gate_src)
+notes = (root / "fork-ci/RELEASE-NOTES.md").read_text()
+entry = next((e for e in notes.split("\n### ")[1:] if "review-trigger.example.yml" in e and "#375" in e.split("\n")[0]),
+             "")
+upgrade = entry[entry.find("**Upgrade:**"):] if "**Upgrade:**" in entry else ""
+check("release notes: the review trigger has an entry whose Upgrade copies the trigger and the caller's workflow_run, "
+      "if and concurrency, pin first, then the live check (setup step 8)",
+      all(w in upgrade for w in ("review-trigger.example.yml", "gate-caller.example.yml", "`workflow_run`", "`if`",
+                                 "`concurrency`", "pinned to an older release", "setup step 8")), upgrade[:300])
+
 if failures:
     print(f"\n{len(failures)} failed")
     sys.exit(1)

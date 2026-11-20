@@ -156,6 +156,7 @@ describe("person-only fork settings", () => {
         "mcpProfile",
         "mcpSubagentProfile",
         "mcpThreadProfiles",
+        "mcpCarriedProfiles",
         "reviewRules",
         "modelPolicy",
       ]),

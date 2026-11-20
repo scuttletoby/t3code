@@ -12,9 +12,12 @@ import * as SchemaTransformation from "effect/SchemaTransformation";
 import { TrimmedString } from "./baseSchemas.ts";
 import { HandoffSettingsFromSettingsFile, HandoffSettingsPatch } from "./handoff.ts";
 import {
+  MCP_CARRIED_PROFILES_APPLY,
   MCP_PROFILE_ALL,
   MCP_SUBAGENT_INHERIT,
   MCP_THREAD_PROFILES_MAX,
+  McpCarriedProfiles,
+  McpCarriedProfilesFromSettingsFile,
   McpProfileName,
   McpProfilePatch,
   McpProfileRef,
@@ -101,6 +104,10 @@ export const ForkServerSettingsFields = {
   ),
   /** The owner's MCP profile pick per thread; it wins over the defaults above. */
   mcpThreadProfiles: McpThreadProfiles,
+  /** What a task a linked machine delegates here gets of the profile it carries; `apply` cuts it. */
+  mcpCarriedProfiles: McpCarriedProfilesFromSettingsFile.pipe(
+    Schema.withDecodingDefault(Effect.succeed(MCP_CARRIED_PROFILES_APPLY)),
+  ),
   /** Playtest sessions and their adapter's steps; off by default. A bad value reads as off. */
   playtest: PlaytestSettingsFromSettingsFile.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   /** Handoff instead of compaction for long threads; off by default. A bad value reads as off. */
@@ -135,6 +142,8 @@ export const ForkServerSettingsPatchFields = {
   /** `inherit` or a profile name; the server also refuses a name no profile has. */
   mcpSubagentProfile: Schema.optionalKey(McpProfileName),
   mcpThreadProfiles: Schema.optionalKey(McpThreadProfilesPatch),
+  /** Strict: `apply` or `refuse`. */
+  mcpCarriedProfiles: Schema.optionalKey(McpCarriedProfiles),
   /** Strict: a save refuses a bad step, or `enabled` without all four steps. */
   playtest: Schema.optionalKey(PlaytestSettings),
   /** Strict: a save refuses a bad value, an unknown field, or `source: command` without a command. */
@@ -180,6 +189,7 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   mcpSubagentProfile: "replace",
   // One pick per thread, so two picks at once keep both; a save past the cap is refused.
   mcpThreadProfiles: { replaceEntries: { maxEntries: MCP_THREAD_PROFILES_MAX } },
+  mcpCarriedProfiles: "replace",
   // Whole, so a step left out is removed and the strict check sees the value that is saved.
   playtest: "replace",
   // Whole, so the strict check (thread cap included) sees the value that is saved.
