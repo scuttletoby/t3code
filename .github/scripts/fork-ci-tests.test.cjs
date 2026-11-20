@@ -824,7 +824,7 @@ test("no listed shell test pipes into a reader that stops early", () => {
   assert.deepEqual(found, []);
 });
 
-// --- records (#664) ---------------------------------------------------------------------------------------------
+// The records of what each test ran (#664).
 
 test("countTests reads unittest's summary from stderr, node's totals from stdout, else ok/FAIL lines", () => {
   const py = "fork-ci/a.test.py";

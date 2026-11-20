@@ -2,8 +2,6 @@
 // runs here by extension (RUNNER), FORK_CI_TEST_JOBS at once (default: CPU count), or `run by <file>` (not an upstream
 // workflow; it names the test). Unlisted or runner-less tests fail; a listed one that is gone fails once history had it.
 // Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all), FORK_CI_TEST_SHARD one shard of it.
-// `--run <test>` runs a test's own runs instead (as root, with a switch, one class: what its `fork-ci: run` lines
-// declare). With FORK_CI_TEST_RECORDS set (CI), each call writes a record of what each test ran there (RECORDS below).
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -310,8 +308,8 @@ function presentTests(root = ROOT) {
   );
 }
 
-// --- What each test ran (#664) -------------------------------------------------------------------------------------
-// The fork's own tests (upstream's, in fork-tests.yml's `test` job, keep upstream's steps there and are not recorded).
+// `--run <test>` runs a test's declared own runs; with FORK_CI_TEST_RECORDS set (CI) each call records what ran (#664).
+// FORK_OWN: the fork's own tests (upstream's, in fork-tests.yml's `test` job, are not recorded).
 const FORK_OWN = /^(?:fork-kit\/|fork-ci\/|\.github\/scripts\/fork-)\S*\.test\.\w+$/;
 const THIS_WORKFLOW = ".github/workflows/fork-tests.yml";
 const DECLARATION = /^\s*(?:#|\/\/)\s*fork-ci:(.*)$/;
@@ -320,12 +318,8 @@ const SWITCH = /^[A-Z][A-Z0-9_]*_TESTS=[\w./:-]*$/;
 const RUN_FORM = '"fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>]"';
 const SKIPS_FORM = '"fork-ci: skips at most <n>"';
 
-// A test file's `fork-ci:` lines (whole comment lines, `#` or `//`), which say how CI runs it:
-//   fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>]
-//       an own run, made by `fork-ci-tests.cjs --run <test>` in fork-tests.yml (as root under sudo, with the switches
-//       that turn the test on, only one class of a Python test); it must skip no test.
-//   fork-ci: skips at most <n>
-//       its run in a part may skip up to n tests (else none: a test that skips without its switch is caught).
+// A test's whole-line `fork-ci:` comments: RUN_FORM is an own run (made by `--run <test>`, it may skip no test);
+// SKIPS_FORM lets its run in a part skip up to n tests (else none). The forms are in .github/fork-ci-tests.txt.
 // Returns { runs: [{ root, vars, only }], skips, problems }.
 function declarations(text, file = "") {
   const out = { runs: [], skips: 0, problems: [] };
@@ -409,12 +403,9 @@ function expectedKeys(entries, present, read) {
   return keys.toSorted();
 }
 
-// What a test's output says it ran, { format, tests, skipped, failed }, or null when it says nothing (no test ran):
-//   - unittest's summary, the end of stderr (a test's own output, or its subprocesses', comes before it there; its
-//     stdout is buffered and can come after it in the log, so stdout is not read for it);
-//   - node --test's totals (TAP `# tests N`, the spec reporter's `ℹ tests N`), the last ones on stdout; todo counts as
-//     skipped;
-//   - else the fork's own `ok <name>` and `FAIL <name>` lines (its shell tests and plain Python ones).
+// What a test's output says it ran, { format, tests, skipped, failed }, or null (no count: no test known to have run):
+// unittest's summary at the very end of stderr (stdout is buffered, so never read for it); node --test's last totals
+// on stdout (todo counts as skipped); else the fork's `ok <name>` and `FAIL <name>` lines.
 function countTests(file, stdout, stderr) {
   const ext = file.match(TEST_FILE)?.[1];
   if (ext === "py") {
