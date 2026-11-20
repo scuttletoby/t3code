@@ -2136,19 +2136,31 @@ class Launcher(unittest.TestCase):
 
     def test_paths_refuses_all_of_etc_as_an_older_kit_lists_it(self):
         """Issue #243 item 4: an older kit's list (or a JOB_PATHS of one's own, or ALLOW_PATHS) that still names /etc
-        whole is refused, by `paths` (the walls) and by start (no runner with the old view): re-run the installer."""
+        whole is refused, by `paths` (the walls) and by start (no runner with the old view). Issue #594: the refusal
+        names the way out where the line came from: re-run the installer for its own list (beside the launcher), else
+        the JOB_PATHS file or ALLOW_PATHS in launch.conf, which no installer rewrites."""
         root = self.walls_root('JOB_PATHS=/etc/fork-fleet/job-paths\n',
                                files=(('/etc/fork-fleet/job-paths', '/usr\n/etc\n'), ('/etc/passwd', '')))
         got = self.paths(root)
         self.assertNotEqual(got.returncode, 0)
-        self.assertIn('/etc: all of /etc is never in a job\'s view (an older kit\'s list?): re-run the installer',
-                      got.stderr)
+        self.assertIn('/etc: all of /etc is never in a job\'s view (an older kit\'s list?): take it out of '
+                      f'{root}/etc/fork-fleet/job-paths (JOB_PATHS in /etc/fork-fleet/launch.conf)', got.stderr)
+        self.assertNotIn('re-run the installer', got.stderr)
         self.assertEqual(got.stdout, '')
         with open(root + '/etc/fork-fleet/launch.conf', 'w') as f:
             f.write('ALLOW_PATHS=/etc\n')
         got = self.paths(root)
         self.assertNotEqual(got.returncode, 0)
-        self.assertIn('all of /etc is never in a job\'s view', got.stderr)
+        self.assertIn('/etc: all of /etc is never in a job\'s view (an older kit\'s list?): take it out of '
+                      'ALLOW_PATHS in /etc/fork-fleet/launch.conf', got.stderr)
+        with open(root + '/etc/fork-fleet/launch.conf', 'w') as f:
+            f.write('')
+        with open(self.path('kit/fork-fleet-job-paths.txt'), 'a') as f:   # the installer's own list, an old one
+            f.write('/etc\n')
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('/etc: all of /etc is never in a job\'s view (an older kit\'s list?): re-run the installer',
+                      got.stderr)
         self.write('job-paths.txt', '/usr\n/etc\n', 0o644)
         self.refused('all of /etc is never in a job\'s view')
 
@@ -3061,13 +3073,15 @@ class Launcher(unittest.TestCase):
 
     def test_a_list_that_still_names_passwd_group_or_hosts_is_refused(self):
         """Issue #370 item 3, old state: an older kit's list (or ALLOW_PATHS) that names the host's passwd, group or
-        hosts would bind them over the job's own. Refused, by `paths` (the walls) and by start: re-run the
-        installer. Nothing is started, nothing is left."""
+        hosts would bind them over the job's own. Refused, by `paths` (the walls) and by start, with the way out
+        where the line came from (issue #594): ALLOW_PATHS in launch.conf, the JOB_PATHS file, or the installer
+        for its own list. Nothing is started, nothing is left."""
         for p in ('/etc/passwd', '/etc/group', '/etc/hosts'):
             with self.subTest(p):
                 self.conf(ALLOW_PATHS=p)
                 got = self.refused(f'{p}: a job has the launcher\'s own, never this host\'s (an older kit\'s list?): '
-                                   're-run the installer')
+                                   f'take it out of ALLOW_PATHS in {self.path("launch.conf")}')
+                self.assertNotIn('re-run the installer', got.stderr)
                 self.assertFalse(os.path.lexists(self.path(f'run/{self.NAME}.root')))
                 self.assertFalse(os.path.lexists(self.path(f'var/runners/{self.NAME}')))
         root = self.walls_root('JOB_PATHS=/etc/fork-fleet/job-paths\n',
@@ -3075,8 +3089,84 @@ class Launcher(unittest.TestCase):
                                       ('/etc/passwd', 'alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n')))
         got = self.paths(root)
         self.assertNotEqual(got.returncode, 0)
-        self.assertIn('/etc/passwd: a job has the launcher\'s own', got.stderr)
+        self.assertIn('/etc/passwd: a job has the launcher\'s own, never this host\'s (an older kit\'s list?): take it '
+                      f'out of {root}/etc/fork-fleet/job-paths (JOB_PATHS in /etc/fork-fleet/launch.conf)', got.stderr)
         self.assertEqual(got.stdout, '')
+        with open(root + '/etc/fork-fleet/launch.conf', 'w') as f:
+            f.write('')
+        with open(self.path('kit/fork-fleet-job-paths.txt'), 'a') as f:   # the installer's own list, an old one
+            f.write('/etc/hosts\n')
+        got = self.paths(root)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('/etc/hosts: a job has the launcher\'s own, never this host\'s (an older kit\'s list?): re-run the '
+                      'installer', got.stderr)
+
+    def job_etc(self, root, user, name):
+        """The launcher's own job_etc, alone, writing into root for user, with `uname -n` saying name."""
+        with open(LAUNCH) as f:
+            text = f.read()
+        fns = [re.search(rf'^{n}\(\) \{{(?:[^\n]*\}}\n|\n.*?^\}}\n)', text, re.M | re.S).group(0)
+               for n in ('shown', 'warn', 'die', 'job_etc')]
+        fake = os.path.join(self.d, 'uname-bin')
+        os.makedirs(fake, exist_ok=True)
+        with open(os.path.join(fake, 'uname'), 'w') as f:
+            f.write('#!/bin/sh\nprintf \'%s\\n\' "$FAKE_NAME"\n')
+        os.chmod(os.path.join(fake, 'uname'), 0o755)
+        script = 'set -euo pipefail\numask 077\n' + ''.join(fns) + 'job_etc "$1" "$2" "$3"\n'
+        return subprocess.run(['bash', '-c', script, 'job_etc', root, user, '/w/home'], capture_output=True, text=True,
+                              env={'PATH': f'{fake}:/usr/sbin:/usr/bin:/sbin:/bin', 'FAKE_NAME': name}, timeout=60)
+
+    def test_job_etc_stops_at_the_first_write_that_fails(self):
+        """Issue #594 item 1 (both #590 lenses): job_etc writes passwd, group and hosts as new files, and the first
+        write that fails refuses the start and writes nothing after it. In a subshell left of `||` set -e is off, so
+        before only the last write (hosts) decided. State: a fresh root gets all three; run again on the same root
+        (a killed start's files there) it is refused, the files are left as they were; a planted file (any of the
+        three) or a full disk (a link to /dev/full, which noclobber lets through) stops it at that file."""
+        user = self.USERS[0]
+        root = os.path.join(self.d, 'etc-root')
+        got = self.job_etc(root, user, 'build-host')
+        self.assertEqual(got.returncode, 0, got.stderr)
+        names = ('passwd', 'group', 'hosts')
+        before = {}
+        for n in names:
+            with open(os.path.join(root, 'etc', n)) as f:
+                before[n] = f.read()
+        got = self.job_etc(root, user, 'other-host')   # again: every file is there
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn('could not write', got.stderr)
+        for n in names:
+            with open(os.path.join(root, 'etc', n)) as f:
+                self.assertEqual(f.read(), before[n], n)
+        for i, n in enumerate(names):
+            for kind in ('file', 'full'):
+                with self.subTest(n, kind=kind):
+                    root = os.path.join(self.d, f'etc-{n}-{kind}')
+                    os.makedirs(os.path.join(root, 'etc'))
+                    planted = os.path.join(root, 'etc', n)
+                    if kind == 'file':
+                        with open(planted, 'w') as f:
+                            f.write('alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n')
+                    else:
+                        os.symlink('/dev/full', planted)
+                    got = self.job_etc(root, user, 'build-host')
+                    self.assertNotEqual(got.returncode, 0)
+                    self.assertIn('could not write', got.stderr)
+                    for later in names[i + 1:]:
+                        self.assertFalse(os.path.lexists(os.path.join(root, 'etc', later)), later)
+
+    def test_job_etc_puts_this_hosts_name_on_loopback_with_an_underscore_too(self):
+        """Issue #594 item 5: a host name with _ (no DNS name, but a host may have one) gets its 127.0.1.1 line, so
+        Java's getLocalHost works in the job. One with a blank or a # (it would add a name or cut the line) and
+        localhost (already there) get none."""
+        for i, (name, line) in enumerate((('build-host', True), ('build_host', True), ('_b.x-1', True),
+                                          ('localhost', False), ('a b', False), ('a#b', False), ('', False))):
+            with self.subTest(name):
+                root = os.path.join(self.d, f'etc-name-{i}')
+                got = self.job_etc(root, self.USERS[0], name)
+                self.assertEqual(got.returncode, 0, got.stderr)
+                with open(os.path.join(root, 'etc/hosts')) as f:
+                    self.assertEqual(f.read(), '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n' +
+                                     (f'127.0.1.1 {name}\n' if line else ''))
 
     def test_check_nets_probe_reads_the_jobs_passwd_group_and_hosts(self):
         """Issue #370 item 3, check by looking: the probe fails when the job's passwd or group names any account or
@@ -3111,6 +3201,25 @@ class Launcher(unittest.TestCase):
                          ['FAIL  passwd, group, hosts: hold passwd (cannot read it), which are not the job\'s own'])
         self.assertEqual(probe(own[0] + 'broken line\n', own[1], own[2]),
                          ['FAIL  passwd, group, hosts: hold passwd broken line, which are not the job\'s own'])
+        # Issue #594: a host's passwd, group or hosts with an old non-UTF-8 name (Latin-1 GECOS) is read, never a crash:
+        # the host side prints its count (check-net goes on), and inside it is named with the bytes escaped.
+        latin = f'jos\xe9:x:{me + 1}:{me + 1}:Jos\xe9 Example:/home/jose:/bin/bash\n'.encode('latin-1')
+        for n in ('passwd', 'group', 'hosts'):
+            p = os.path.join(etc, n)
+            os.remove(p)
+            with open(p, 'wb') as f:
+                f.write(own[('passwd', 'group', 'hosts').index(n)].encode() +
+                        (latin if n == 'passwd' else b'nas\xe9:x:4242:\n' if n == 'group' else b'192.0.2.7 nas\xe9\n'))
+        code = walls_probe().replace("ETC = '/etc'\n", f'ETC = {etc!r}\n')
+        for mode, want in (('host', 'host: passwd, group, hosts: 3 entries a job\'s own leave out: the wall matters'),
+                           ('job', 'FAIL  passwd, group, hosts: hold group nas\\xe9, hosts 192.0.2.7, passwd jos\\xe9, '
+                                   'which are not the job\'s own')):
+            with self.subTest(mode):
+                got = subprocess.run(['python3', '-I', '-c', code, mode, '/', '', '', ''], capture_output=True,
+                                     timeout=60, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+                self.assertEqual(got.returncode if mode == 'host' else 0, 0, got.stderr)
+                self.assertNotIn(b'Traceback', got.stderr)
+                self.assertIn(want, got.stdout.decode('utf-8', 'replace').splitlines())
 
     def test_check_net_keeps_two_canaries_outside_the_list_while_it_runs(self):
         """Issue #243 item 2: check-net writes its two canaries in CANARY_DIR (/etc: no list line has them), one others

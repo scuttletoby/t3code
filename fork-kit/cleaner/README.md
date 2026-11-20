@@ -513,7 +513,9 @@ any read when the stored time is more than a day old. `days` is 7 or more, so a 
 seen.
 
 **Never taken**, on top of what the config refuses: links (never followed, folders neither), folders with a `KEEP`
-file, git folders, other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
+file and git folders (`.git`, or a bare repository), in a cold folder or in a folder above it up to `/` (read at the
+plan and again before each file; a `~/.git` of dotfiles keeps every folder under the home; a folder above that cannot
+be read keeps it too), other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
 files, credential and lock names, a database with a `-wal`, `-shm` or `-journal` beside it (and those files),
 hard-linked files, files already compressed (`.zst`, `.gz`, `.xz`, `.zip`, ...), files under 16 KB, a file whose
 `.zst` name is taken by something else, and a folder named like `*log-archive*` (#468 keeps log archives as they
@@ -855,7 +857,9 @@ way or fails its self-test leaves the copy in use as it was. The bootstrap passe
 on to the installer; any other option is refused. The steps every kit shares are in
 `fork-kit/common/kit_install.py` ([common](../common/README.md#the-installer)).
 
-Update only through the bootstrap, with the newer release commit. An installed `fork-cleaner-install` from
+Update only through the bootstrap, with the newer release commit. The installed `fork-cleaner-install` refuses a
+`--source` whose `sbin/fork-cleaner-install` or `common/kit_install.py` differs from its own (it would copy its own
+file list, not the newer release's) and names the bootstrap, which runs the release's own installer. One from
 before the shared installer (`fork-kit/common/kit_install.py`) copies no `common/kit_install.py`, so the installer
 it leaves cannot load: it then refuses and says to run the bootstrap, which makes the copy whole again. The
 self-test now runs the copied installer's `--help` too, so a copy like that is refused from here on. `uninstall`

@@ -63,7 +63,7 @@ class SystemdUser:
 
     def service(self, timeout=None):
         """{'loaded', 'active', 'enabled', 'mainPid', 'unitPath', 'home'} of the boot service; read only. timeout:
-        seconds systemctl may take (default TIMEOUT; the handover gives it less, handoff.SERVICE_READ_TIMEOUT)."""
+        seconds systemctl may take (default TIMEOUT)."""
         out = self._run([SYSTEMCTL, '--user', 'show', UNIT,
                          '--property=LoadState,ActiveState,UnitFileState,FragmentPath,MainPID'], timeout)
         props = dict(line.split('=', 1) for line in out.splitlines() if '=' in line)

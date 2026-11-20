@@ -217,11 +217,15 @@ export interface GateInput<Target, R> {
   readonly paceOf: (
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<InstancePace | undefined, never, R>;
-  /** The same task on another instance, or undefined when it cannot run there. */
-  readonly targetOn: (
-    instanceId: ProviderInstanceId,
-  ) => Effect.Effect<Target | undefined, never, R>;
+  /**
+   * The same task on another instance with room, or why it cannot run there. In `advise` it must
+   * change nothing (no folder scan), so advice only says what `enforce` would do.
+   */
+  readonly targetOn: (instanceId: ProviderInstanceId) => Effect.Effect<TargetOn<Target>, never, R>;
 }
+
+/** `cannot` finishes "<instance> has room, but …", e.g. "this project turned it off". */
+export type TargetOn<Target> = { readonly target: Target } | { readonly cannot: string };
 
 /**
  * The gate. `off` reads nothing. `advise` works out what `enforce` would do and only says it: its
@@ -253,6 +257,8 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
   const ahead = `${from} is ahead of its usage pace (${describeWindows(standing.windows)})`;
   const current = input.providers.find((provider) => provider.instanceId === from);
   let roomOn: ProviderInstanceId | undefined;
+  // Accounts with room that cannot run this task, so the reply does not say none has room.
+  const cannot: Array<string> = [];
   if (current !== undefined) {
     const others = input.providers.filter(
       (provider) => provider.instanceId !== from && provider.driver === current.driver,
@@ -265,8 +271,12 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
       nowMs: input.nowMs,
     });
     for (const candidate of candidates) {
-      const target = yield* input.targetOn(candidate.instanceId);
-      if (target === undefined) continue;
+      const on = yield* input.targetOn(candidate.instanceId);
+      if ("cannot" in on) {
+        cannot.push(`${candidate.instanceId} has room, but ${on.cannot}`);
+        continue;
+      }
+      const { target } = on;
       roomOn = candidate.instanceId;
       if (input.pinned) break;
       return advising
@@ -282,7 +292,10 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
     }
   }
 
-  const noRoom = "no other account of this provider has room";
+  const noRoom =
+    cannot.length === 0
+      ? "no other account of this provider has room"
+      : `no other account of this provider can run it (${cannot.join("; ")})`;
   // A named instance with room elsewhere is the caller's to change, not an effort to lower.
   const step =
     standing.hard || roomOn !== undefined

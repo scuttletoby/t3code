@@ -497,7 +497,9 @@ describe("UsagePacingGate decide", () => {
       targetOn: (instanceId) =>
         Effect.sync(() => {
           calls.targetOn.push(instanceId);
-          return cannotRunOn?.includes(instanceId) === true ? undefined : { on: instanceId };
+          return cannotRunOn?.includes(instanceId) === true
+            ? { cannot: "it does not list this model" }
+            : { target: { on: instanceId } };
         }),
       ...input,
     }).pipe(Effect.map((outcome) => ({ outcome, calls })));
@@ -611,9 +613,21 @@ describe("UsagePacingGate decide", () => {
         on: SECOND,
       });
       assert.deepStrictEqual(next.calls.targetOn, [THIRD, SECOND]);
+      // The reply names each account with room and why it cannot run the task, not "no room".
       const none = yield* run(providers, { cannotRunOn: [THIRD, SECOND] });
       assert.strictEqual(none.outcome.action, "hold");
-      assert.include(noteOf(none.outcome), "No other account of this provider has room.");
+      assert.include(
+        noteOf(none.outcome),
+        "No other account of this provider can run it (claude_third has room, but it does not " +
+          "list this model; claude_second has room, but it does not list this model).",
+      );
+      assert.notInclude(noteOf(none.outcome), "has room.");
+      const lower = yield* run(providers, {
+        cannotRunOn: [THIRD, SECOND],
+        lowerEffort: { high: "medium" },
+      });
+      assert.strictEqual(lower.outcome.action, "lowerEffort");
+      assert.include(noteOf(lower.outcome), "no other account of this provider can run it (");
     }),
   );
 

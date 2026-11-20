@@ -40,6 +40,12 @@ interface State {
   project?: Partial<HandoffSettings>;
   /** The wrapper's thread lookup fails (a store error at that moment). */
   findFails?: boolean;
+  /** The wrapper's thread lookup finds no thread (deleted, or not projected yet). */
+  threadMissing?: boolean;
+  /** The wrapper's settings read fails (upstream's own settings reads still work). */
+  ownerSettingsFail?: boolean;
+  /** The thread's project override is one from before handoff existed: no `handoff` key. */
+  oldProjectOverride?: boolean;
 }
 
 const settingsOf = (state: State): ServerSettingsValue => ({
@@ -48,12 +54,13 @@ const settingsOf = (state: State): ServerSettingsValue => ({
   idleCompaction: "beforeCacheExpires",
   providerInstances: {},
   handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.server },
-  projectSettingsOverrides:
-    state.project === undefined
+  projectSettingsOverrides: (state.oldProjectOverride === true
+    ? { [projectId]: {} }
+    : state.project === undefined
       ? {}
-      : ({
+      : {
           [projectId]: { handoff: { ...DEFAULT_HANDOFF_SETTINGS, ...state.project } },
-        } as unknown as ServerSettingsValue["projectSettingsOverrides"]),
+        }) as unknown as ServerSettingsValue["projectSettingsOverrides"],
 });
 
 /**
@@ -101,15 +108,24 @@ const compaction = (state: State, completions = 1) =>
         findThread: () =>
           state.findFails === true
             ? Effect.fail(new Error("store unavailable") as never)
-            : Effect.sync(() => state.data.thread),
+            : Effect.sync(() => (state.threadMissing === true ? null : state.data.thread)),
         getThreadRecords: () => Effect.sync(() => state.data),
       }),
       Layer.mock(ServerSettings.ServerSettingsService)({
         getSettings: Effect.sync(() => settingsOf(state)),
       }),
     );
+    // The wrapper reads the same settings through its own handle, so a test can fail only its read.
+    const ownerSettings = Layer.mock(ServerSettings.ServerSettingsService)({
+      getSettings: Effect.suspend(() =>
+        state.ownerSettingsFail === true
+          ? Effect.fail(new Error("settings unreadable") as never)
+          : Effect.sync(() => settingsOf(state)),
+      ),
+    });
     const wrapped = Layer.effect(Orchestrator.OrchestratorV2, HandoffOwner.make).pipe(
       Layer.provide(upstream),
+      Layer.provide(ownerSettings),
       Layer.provideMerge(stores),
     );
     yield* IdleCompactionService.make.pipe(
@@ -215,6 +231,79 @@ describe("one owner per thread: idle compaction and handoff", () => {
       yield* done;
       expect(compactions(sent)).toHaveLength(1);
     }),
+  );
+
+  // Missing, empty or unreadable state: the wrapper cannot tell that handoff owns the thread, so
+  // upstream decides, exactly as with handoff off. Each case has handoff on for the server.
+  const unknownOwner: ReadonlyArray<{ name: string; patch: Partial<State> }> = [
+    { name: "the thread is missing", patch: { threadMissing: true } },
+    { name: "the settings cannot be read", patch: { ownerSettingsFail: true } },
+  ];
+
+  it.effect.each(unknownOwner)("$name: upstream decides, and compacts", ({ patch }) =>
+    Effect.gen(function* () {
+      const state: State = { data: longThread(), server: { mode: "handoff" }, ...patch };
+      const { sent, done } = yield* compaction(state);
+      yield* done;
+      expect(compactions(sent)).toHaveLength(1);
+      expect(sent).toHaveLength(1);
+    }),
+  );
+
+  it.effect.each(unknownOwner)(
+    "$name, the same run reported twice (runs again): as upstream alone",
+    ({ patch }) =>
+      Effect.gen(function* () {
+        const alone = yield* compaction({ data: longThread(), server: {} }, 2);
+        yield* alone.done;
+        const state: State = { data: longThread(), server: { mode: "handoff" }, ...patch };
+        const { sent, done } = yield* compaction(state, 2);
+        yield* done;
+        expect(compactions(alone.sent).length).toBeGreaterThan(0);
+        expect(compactions(sent)).toHaveLength(compactions(alone.sent).length);
+      }),
+  );
+
+  it.effect.each(unknownOwner)(
+    "$name only after compaction began to wait (stopped half-way): decided at the send, compacts",
+    ({ patch }) =>
+      Effect.gen(function* () {
+        const state: State = { data: longThread(10 * MINUTE_MS), server: { mode: "handoff" } };
+        const { sent, done } = yield* compaction(state);
+        yield* TestClock.adjust(MINUTE_MS);
+        Object.assign(state, patch);
+        yield* TestClock.adjust(7 * MINUTE_MS);
+        yield* done;
+        expect(compactions(sent)).toHaveLength(1);
+      }),
+  );
+
+  it.effect("the thread is back and its settings readable at the next run: handoff owns it", () =>
+    Effect.gen(function* () {
+      // A missing thread or a failed read is not remembered: the next send reads afresh.
+      const state: State = { data: longThread(), server: { mode: "handoff" }, threadMissing: true };
+      const first = yield* compaction(state);
+      yield* first.done;
+      expect(compactions(first.sent)).toHaveLength(1);
+      state.threadMissing = false;
+      const second = yield* compaction(state);
+      yield* second.done;
+      expect(second.sent).toEqual([]);
+    }),
+  );
+
+  it.effect.each([
+    { name: "handoff on for the server", server: { mode: "handoff" }, compacts: 0 },
+    { name: "handoff off for the server", server: {}, compacts: 1 },
+  ] as ReadonlyArray<{ name: string; server: Partial<HandoffSettings>; compacts: number }>)(
+    "an old project override with no handoff key, $name: the server's mode, compacts $compacts",
+    ({ server, compacts }) =>
+      Effect.gen(function* () {
+        const state: State = { data: longThread(), server, oldProjectOverride: true };
+        const { sent, done } = yield* compaction(state);
+        yield* done;
+        expect(compactions(sent)).toHaveLength(compacts);
+      }),
   );
 });
 
