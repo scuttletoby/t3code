@@ -182,8 +182,9 @@ The same switch turns on the delegated result reminder: when a `delegate_task` c
 result has still not reached the idle parent a couple of minutes later (upstream's own wake did not
 land), the parent gets one queued message naming those tasks. A result counts as unread while it is
 owed, and also when it has no delivery state at all: an old row, or a `mode: "wait"` task whose
-acknowledgement failed. The message is sent once per set of unread tasks, also across restarts,
-never to a stopped or archived thread, and never for results older than a day. A parent is busy, and
+acknowledgement failed. Each task is reminded once, also across restarts and when another result
+becomes owed later (the later message names only the new task); a message names at most ten tasks.
+It never goes to a stopped or archived thread, and never for results older than a day. A parent is busy, and
 waits for its own run end, while a run of it goes or a question of it is open (an open question
 holds the reminder until that run ends); background work it left running does not hold it. At
 start, every parent with a result unread from the last day is checked once, also when upstream had

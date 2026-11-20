@@ -124,7 +124,10 @@ export const parentGone = (
   shell: Pick<OrchestrationV2ThreadShell, "archivedAt" | "deletedAt"> | null,
 ): boolean => shell === null || shell.archivedAt !== null || shell.deletedAt !== null;
 
-const REMINDER_PREFIX = "delegated-reminder:";
+/** The start of every reminder id, of both formats (see `legacyReminderSetIds`). */
+export const REMINDER_ID_PREFIX = "delegated-reminder:";
+const reminderPrefix = (parentThreadId: ThreadId) => `${REMINDER_ID_PREFIX}${parentThreadId}:`;
+const TASK_KEY = /^[0-9a-f]{12}$/;
 
 const digestOf = (keys: ReadonlyArray<string>) =>
   NodeCrypto.createHash("sha256")
@@ -136,15 +139,83 @@ const idsFor = (prefix: string, parentThreadId: ThreadId, keys: ReadonlyArray<st
   return { messageId, commandId: `${messageId}:0` };
 };
 
+/** One task's own key: the same task always gives the same key. */
+export const reminderKey = (taskId: NodeId): string => digestOf([taskId]).slice(0, 12);
+
+/** At most this many tasks in one reminder, each listed by name. */
+export const REMINDERS_PER_MESSAGE = 10;
+
 /**
- * The same owed tasks always give the same id, so a check that runs again, after a restart too, is
- * answered from the message or its receipt instead of sending a second reminder.
+ * A reminder's ids name the key of each task it tells about, so the parent's message and receipt
+ * ids are the record of what it was told: a task is reminded once, also when the owed set grows
+ * (another task ends while one reminded is still unread), a check runs again, or after a restart.
  */
-export const reminderIds = (
+export const reminderBatchIds = (
   parentThreadId: ThreadId,
   taskIds: ReadonlyArray<NodeId>,
-): { readonly messageId: string; readonly commandId: string } =>
-  idsFor(REMINDER_PREFIX, parentThreadId, taskIds);
+): { readonly messageId: string; readonly commandId: string } => {
+  const keys = [...new Set(taskIds.map(reminderKey))].toSorted();
+  const messageId = `${reminderPrefix(parentThreadId)}${keys.join(".")}`;
+  return { messageId, commandId: `${messageId}:0` };
+};
+
+/** The task keys that earlier message or command ids of this parent named. */
+export const toldReminderKeys = (
+  parentThreadId: ThreadId,
+  ids: ReadonlyArray<string>,
+): ReadonlySet<string> => {
+  const prefix = reminderPrefix(parentThreadId);
+  const told = new Set<string>();
+  for (const id of ids) {
+    if (!id.startsWith(prefix)) continue;
+    for (const key of id.slice(prefix.length).replace(/:0$/, "").split(".")) {
+      if (TASK_KEY.test(key)) told.add(key);
+    }
+  }
+  return told;
+};
+
+/**
+ * Ids of the first reminder format: one message for a whole owed set (a 16-digit digest, never a
+ * task key). A message of that id for exactly the owed set, or for one task alone, means those
+ * were told. A legacy reminder for some other set cannot be read back, so its tasks may be
+ * reminded once more after the upgrade.
+ */
+export const legacyReminderSetId = (parentThreadId: ThreadId, taskIds: ReadonlyArray<NodeId>) =>
+  idsFor(REMINDER_ID_PREFIX, parentThreadId, taskIds).messageId;
+
+/** The owed tasks not reminded yet, sorted, in messages of at most `REMINDERS_PER_MESSAGE`. */
+export const reminderBatches = <T extends Pick<OrchestrationV2Subagent, "id">>(
+  parentThreadId: ThreadId,
+  owed: ReadonlyArray<T>,
+  sentIds: ReadonlyArray<string>,
+): ReadonlyArray<ReadonlyArray<T>> => {
+  const sent = new Set(sentIds.map((id) => id.replace(/:0$/, "")));
+  if (
+    owed.length > 0 &&
+    sent.has(
+      legacyReminderSetId(
+        parentThreadId,
+        owed.map((t) => t.id),
+      ),
+    )
+  ) {
+    return [];
+  }
+  const told = toldReminderKeys(parentThreadId, sentIds);
+  const fresh = [...new Map(owed.map((task) => [task.id, task])).values()]
+    .filter(
+      (task) =>
+        !told.has(reminderKey(task.id)) &&
+        !sent.has(legacyReminderSetId(parentThreadId, [task.id])),
+    )
+    .toSorted((a, b) => (a.id < b.id ? -1 : 1));
+  const batches: Array<ReadonlyArray<T>> = [];
+  for (let start = 0; start < fresh.length; start += REMINDERS_PER_MESSAGE) {
+    batches.push(fresh.slice(start, start + REMINDERS_PER_MESSAGE));
+  }
+  return batches;
+};
 
 const MAX_LISTED = 10;
 
