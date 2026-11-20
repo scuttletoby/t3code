@@ -1,9 +1,13 @@
 /**
- * Fork (agent slots): the shells of every thread with an active run, settled or archived too
- * (settling does not stop a run). Kept out of upstream's ProjectionStore: one read transaction
- * finds the active-run threads, then reads only their shells and keeps those with `activeRunId`.
+ * Fork (agent slots): shells of every thread with an active run, settled or archived too. The gate
+ * is a guard, so the pre-select drops only upstream's finished run statuses (a new status is still
+ * read), and upstream's own shell read decides by `activeRunId`. Kept out of upstream's store.
  */
-import { type OrchestrationV2ThreadShellSnapshot, ThreadId } from "@t3tools/contracts";
+import {
+  type OrchestrationV2ThreadShellSnapshot,
+  OrchestrationV2RunStatus,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -14,8 +18,23 @@ import type * as SqlError from "effect/sql/SqlError";
 import type * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 
-/** Run statuses upstream's shell takes as active (`active` in `selectShellThreadRows`). */
-const ACTIVE_RUN_STATUSES = ["preparing", "starting", "running"] as const;
+/** Statuses a run never leaves (upstream's `isTerminalRunStatus`): the only ones the pre-select drops. */
+export const FINISHED_RUN_STATUSES = OrchestrationV2RunStatus.literals.filter(
+  ThreadManagementService.isTerminalRunStatus,
+);
+
+/**
+ * The threads with a run in a status other than a finished one. It names no index: SQLite picks
+ * upstream's `(thread_id, status)` index on its own (a test checks the plan), and an index that is
+ * renamed, dropped or made partial only makes the read slower, never fails it. Exported for that test.
+ */
+export const unfinishedRunThreadIds = (sql: SqlClient.SqlClient) => sql<{
+  readonly thread_id: string;
+}>`
+  SELECT DISTINCT thread_id
+  FROM orchestration_v2_projection_runs
+  WHERE status NOT IN ${sql.in(FINISHED_RUN_STATUSES)}
+`;
 
 export class ActiveRunShells extends Context.Service<
   ActiveRunShells,
@@ -36,13 +55,9 @@ const make = Effect.gen(function* () {
   const read = Effect.gen(function* () {
     const decode = yield* sql
       .withTransaction(
+        // One read transaction: the shells come from the same state of the store as the ids.
         Effect.gen(function* () {
-          const rows = yield* sql<{ readonly thread_id: string }>`
-            SELECT DISTINCT thread_id
-            FROM orchestration_v2_projection_runs
-              INDEXED BY orchestration_v2_projection_runs_thread_status_idx
-            WHERE status IN ${sql.in(ACTIVE_RUN_STATUSES)}
-          `;
+          const rows = yield* unfinishedRunThreadIds(sql);
           return yield* threadManagement.readShellSnapshot({
             threadIds: rows.map((row) => ThreadId.make(row.thread_id)),
           });
