@@ -323,7 +323,7 @@ def code(text):
 
 
 REFUSED_TEXT = ('**No report for head {head}:** git-clean refused the checkout\'s git config (the job log says why), '
-                'so nothing was checked. An earlier report here was for another head.')
+                'so nothing was checked. It replaces any earlier report here.')
 
 
 def render(items, reason, why, merge_base, head, refused=False):

@@ -11,9 +11,11 @@ calls), `core.hooksPath`, `attr.tree` with a merge driver, an include of another
 before any of its own steps runs pull request code.
 
 prepare: on a self-hosted runner (RUNNER_ENVIRONMENT is not `github-hosted`) every entry of GITHUB_WORKSPACE is
-removed, symlinks as links (never what they point to), so nothing outside the workspace is touched. The workspace's
-real path must be its path below the runner's work folder (no symlink from RUNNER_WORKSPACE down). A GitHub-hosted
-runner starts each job on a fresh disk, so nothing is removed there. Then `check` runs on each path.
+removed, symlinks as links (never what they point to); no other file system mounted below it is entered, and a folder
+another process moves out of the workspace during the wipe stops it there (empty), so nothing else outside the
+workspace is touched. The workspace's real path must be its path below the runner's work folder (no symlink from the
+work folder down). A GitHub-hosted runner starts each job on a fresh disk, so nothing is removed there. Then `check`
+runs on each path.
 
 check: `DIR/.git` must be a folder (not a .git file or symlink, which point git elsewhere), with no `commondir`, none
 of the files that change history or objects (UNTRUSTED_FILES; `shallow` only as a depth-1 checkout writes it), and
@@ -23,7 +25,7 @@ holds nothing but the token header. Anything else is refused by name: nothing is
 
 Exit 0: done; 2: refused (the step fails, so the job's checkout and git calls never run).
 """
-import argparse, os, re, stat, subprocess, sys, tempfile
+import argparse, errno, os, re, stat, subprocess, sys, tempfile
 
 # Every fork-ci git call that reads a checkout runs with this environment and these flags (the actions' modules carry
 # copies: git_clean.test.py pins them to these). No global or system config or attributes (an earlier job may have
@@ -194,6 +196,8 @@ def workspace(env):
     runner, ws = os.path.normpath(runner), os.path.normpath(ws)
     if os.path.commonpath([ws, runner]) != runner or ws == runner:
         return None, f'GITHUB_WORKSPACE {ws} is not inside RUNNER_WORKSPACE {runner}'
+    if os.path.islink(os.path.dirname(runner)):
+        return None, f'the runner work folder {os.path.dirname(runner)} (above RUNNER_WORKSPACE) is a symlink'
     work = os.path.realpath(os.path.dirname(runner))
     expected = os.path.join(work, os.path.basename(runner), os.path.relpath(ws, runner))
     if real != expected:
@@ -215,45 +219,72 @@ DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 def empty(top):
     """Remove everything below the folder `top`, depth first with one folder open at a time and by name relative to
-    it (no recursion, no path longer than a name: any depth works). A symlink is removed as a link, never followed; a
-    folder is made writable before it is entered (a read-only one too). Raises OSError with the path that failed."""
-    fd, down = os.open(top, DIR_FLAGS), []
+    it (no recursion, no path longer than a name: any depth works). Each folder is listed once. A symlink is removed
+    as a link, never followed; a folder is made writable before it is entered (a read-only one too), never through a
+    symlink. Another file system mounted below `top` is not entered. Going back up by `..` must land in the folder the
+    walk came from (the same device and inode): a folder moved out of `top` while the walk is inside it is emptied
+    (it was `top`'s), but the walk stops there, before it removes anything where it landed. Raises OSError with the
+    path that failed."""
+    fd, down = os.open(top, DIR_FLAGS), []   # down: (name, the folder it is in, that folder's folders left to enter)
+
+    def where(name):
+        return os.path.join(top, *(d[0] for d in down), name)
+
+    def clear():
+        """Remove the folder's files and symlinks; [(name, lstat)] of its folders."""
+        folders = []
+        for name in sorted(os.listdir(fd)):
+            try:
+                st = os.lstat(name, dir_fd=fd)
+                if stat.S_ISDIR(st.st_mode):
+                    folders.append((name, st))
+                else:
+                    os.unlink(name, dir_fd=fd)
+            except OSError as e:
+                e.filename = where(name)
+                raise
+        return folders[::-1]   # entered in name order (pop)
+
     try:
+        here = os.fstat(fd)
+        device, here = here.st_dev, (here.st_dev, here.st_ino)
+        left = clear()
         while True:
-            folder = None
-            for name in sorted(os.listdir(fd)):
-                try:
-                    st = os.lstat(name, dir_fd=fd)
-                    if stat.S_ISDIR(st.st_mode):
-                        folder = folder or (name, st)
-                    else:
-                        os.unlink(name, dir_fd=fd)
-                except OSError as e:
-                    e.filename = os.path.join(top, *down, name)
-                    raise
-            if folder:
-                name, st = folder
+            if left:
+                name, st = left.pop()
                 try:
                     if st.st_mode & 0o700 != 0o700:
-                        os.chmod(name, stat.S_IMODE(st.st_mode) | 0o700, dir_fd=fd)
+                        try:   # fchmodat(AT_SYMLINK_NOFOLLOW): a folder swapped for a symlink is refused, not followed
+                            os.chmod(name, stat.S_IMODE(st.st_mode) | 0o700, dir_fd=fd, follow_symlinks=False)
+                        except (NotImplementedError, ValueError):   # what Python raises for a symlink there
+                            raise OSError(errno.ELOOP, 'its mode cannot be changed without following a symlink (it '
+                                                       'is one now, or this system cannot)')
                     child = os.open(name, DIR_FLAGS, dir_fd=fd)
+                    inner = os.fstat(child)
+                    if inner.st_dev != device:
+                        os.close(child)
+                        raise OSError(errno.EXDEV, 'another file system is mounted here: it is not entered')
                 except OSError as e:
-                    e.filename = os.path.join(top, *down, name)
+                    e.filename = where(name)
                     raise
+                down.append((name, here, left))
                 os.close(fd)
-                fd = child
-                down.append(name)
+                fd, here = child, (inner.st_dev, inner.st_ino)
+                left = clear()
             elif not down:
                 return
             else:   # this folder is empty: back up to its parent and remove it
                 parent = os.open('..', DIR_FLAGS, dir_fd=fd)
                 os.close(fd)
                 fd = parent
-                name = down.pop()
+                name, here, left = down.pop()
                 try:
+                    st = os.fstat(fd)
+                    if (st.st_dev, st.st_ino) != here:
+                        raise OSError(errno.ESTALE, 'moved out of the workspace during the wipe: stopped there')
                     os.rmdir(name, dir_fd=fd)
                 except OSError as e:
-                    e.filename = os.path.join(top, *down, name)
+                    e.filename = where(name)
                     raise
     finally:
         os.close(fd)

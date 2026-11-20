@@ -13,6 +13,18 @@ nothing.
 
 ## After ci/v14
 
+### git-clean: the wipe stays in the workspace while another process changes it (#428)
+
+- Going back up by `..` must land in the folder the wipe came from (device and inode): a folder moved out of the
+  workspace while the wipe is inside it is emptied, and the step stops red there instead of emptying where it landed.
+- A read-only folder is made writable without following a symlink swapped in for it (`fchmodat` with
+  `AT_SYMLINK_NOFOLLOW`); a work folder (`_work`, above `RUNNER_WORKSPACE`) that is a symlink is refused; another
+  file system mounted inside the workspace is not entered (the step fails with its path).
+- Each folder is listed once (a wide folder was re-listed after each child: 6,000 folders took 20 s).
+- weakened-tests: the refusal note no longer says the earlier report was for another head (wrong on a re-run).
+
+**Upgrade:** nothing. A mount inside a self-hosted workspace now fails the step until it is unmounted.
+
 ### pr-queue: a person's auto-merge switch during an update stands (#518)
 
 - The queue reads the pull request right before turning auto-merge off: one that is off by then (or closed) is left
