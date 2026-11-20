@@ -275,20 +275,21 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
           // A current model list is an answer, whoever published it (another path may have, during
           // a back-off): the reply gives it, not "no result".
           const answered = folderScan(providers, candidate, cwd, nowMs).models;
-          if (!mayScan) {
-            return answered
-              ? notListed
-              : {
-                  cannot: `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
-                  wouldScan: true,
-                };
-          }
           const key = `${candidate}\u0000${cwd}`;
           const noAnswer = (retryAtMs: number) => ({
             cannot: `it does not list ${model} and its scan of this folder gave no result (scanned again after ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))})`,
           });
           const retryAtMs = (yield* Ref.get(failedScans)).get(key);
-          if (backingOff(retryAtMs, nowMs)) return answered ? notListed : noAnswer(retryAtMs);
+          if (answered && (!mayScan || backingOff(retryAtMs, nowMs))) return notListed;
+          // A back-off that `enforce` recorded holds in `advise` too: `enforce` would not scan now,
+          // so the advice must not say it would.
+          if (backingOff(retryAtMs, nowMs)) return noAnswer(retryAtMs);
+          if (!mayScan) {
+            return {
+              cannot: `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
+              wouldScan: true,
+            };
+          }
           const scanned = yield* host.scanWorkspace(candidate, cwd);
           resolved = yield* sameTaskOn(candidate, scanned);
           // A failed scan leaves the list as it was, and a pending one is scanned again on every

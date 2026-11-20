@@ -54,6 +54,8 @@ export interface RunRecordsSummary {
   readonly medianTokenRatio: number | null;
   /** Runs whose `[run-estimate: ...]` tag could not be read; they count as giving none. */
   readonly refusedEstimates: number;
+  /** Runs whose `[run-kind: ...]` tag was refused (empty or not closed); they count as no kind. */
+  readonly refusedKinds: number;
 }
 
 const runTokens = (record: RunRecord) => record.usage.inputTokens + record.usage.outputTokens;
@@ -184,6 +186,7 @@ export function summarizeRunRecords(
     medianWallRatio: ratios((row) => [row.actualWallMs, row.estimate.wallMs]),
     medianTokenRatio: ratios((row) => [row.actualTokens, row.estimate.tokens]),
     refusedEstimates: inWindow.filter((record) => (record.estimateRefused ?? null) !== null).length,
+    refusedKinds: inWindow.filter((record) => (record.kindRefused ?? null) !== null).length,
   };
 }
 
@@ -232,6 +235,12 @@ export function formatRunRecordsSummary(summary: RunRecordsSummary): string {
     "List price = public per-token price, not what a plan bills.",
     "",
     table("By kind", summary.byKind),
+    ...(summary.refusedKinds === 0
+      ? []
+      : [
+          "",
+          `${summary.refusedKinds} runs had a kind tag that was refused (empty or not closed); they count as ${NONE}.`,
+        ]),
     "",
     table("By role", summary.byRole),
     "",

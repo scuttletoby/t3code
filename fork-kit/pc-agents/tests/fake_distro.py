@@ -211,9 +211,12 @@ class Case(unittest.TestCase):
     def same_wsl2_walls(self):
         """The fleet's wsl2 walls (fork-fleet-walls.py describe, a subprocess with about 80 more: some 0.3 s, most of
         a setup run here) are looked at once for real, and every later look gets that answer: for a test that runs
-        setup hundreds of times for its writes. Its fake root is then compared file by file with a whole run's, so a
-        write a rerun leaves out still fails it; the walls' own answers have their tests (check.test.py, the fleet
-        walls' tests)."""
+        setup hundreds of times for its writes. A write a rerun leaves out still fails such a test, in one of two
+        ways: setup.test.py's stopped-half-way and killed-upgrade tests compare the fake root file by file with a
+        whole run's; update.test.py's tests have the kit's own walls (check, whose file:* walls are not cached) say
+        so. A wsl2 wall added later that reads a file the kit writes gets the cached answer too: in update.test.py, a
+        write only that wall would catch goes unseen. The walls' own answers have their tests (check.test.py, the
+        fleet walls' tests)."""
         real, seen = cli.wsl2_walls, []
 
         def once():
