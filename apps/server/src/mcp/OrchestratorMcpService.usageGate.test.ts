@@ -199,8 +199,8 @@ const delegate = (input: {
   readonly scanFails?: (instanceId: ProviderInstanceId, nthScan: number, cwd: string) => boolean;
   /**
    * One call per entry, on the same service: at that many ms after NOW_MS, or with the parent's
-   * folder for that call and what another path (the UI, say) published just before it.
-   * Default: one call.
+   * folder for that call, what another path (the UI, say) published just before it, and a
+   * settings change the owner made just before it. Default: one call.
    */
   readonly calls?: ReadonlyArray<
     | number
@@ -208,6 +208,7 @@ const delegate = (input: {
         readonly atMs: number;
         readonly workspaceRoot?: string;
         readonly publish?: ReadonlyArray<ServerProvider>;
+        readonly settings?: Partial<Pick<ServerSettingsValue, "usagePacingGate">>;
       }
   >;
 }) =>
@@ -363,11 +364,15 @@ const delegate = (input: {
     );
     const results = yield* Effect.gen(function* () {
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const serverSettings = yield* ServerSettings.ServerSettingsService;
       return yield* Effect.forEach(input.calls ?? [0], (call, index) =>
         Effect.gen(function* () {
           const { atMs, ...rest } = typeof call === "number" ? { atMs: call } : call;
           if ("workspaceRoot" in rest) workspaceRoot = rest.workspaceRoot;
           if (rest.publish !== undefined) yield* Ref.set(registry, rest.publish);
+          if (rest.settings !== undefined) {
+            yield* serverSettings.updateSettings(rest.settings).pipe(Effect.orDie);
+          }
           yield* TestClock.setTime(NOW_MS + atMs);
         }).pipe(
           Effect.andThen(
@@ -382,7 +387,7 @@ const delegate = (input: {
           Effect.result,
         ),
       );
-    }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+    }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provideMerge(dependencies))));
     return { result: results.at(-1)!, results, dispatched, scans };
   });
 
@@ -1018,7 +1023,7 @@ describe("OrchestratorMcpService usage pacing gate", () => {
       // It says that enforce would scan first, and what it would do either way.
       assert.include(
         unscanned.result.success.usagePacingNote ?? "",
-        `"enforce" would first scan this folder for codex-second: if it lists the model, it would run this task on codex-second; if not, it would hold this task.`,
+        `"enforce" would first scan this folder for codex-second: if it lists the model and the task can run there, it would run this task on codex-second; if not, it would hold this task.`,
       );
       assert.deepStrictEqual(unscanned.scans, []);
       assert.deepStrictEqual(unscanned.dispatched[0]?.modelSelection, {
@@ -1049,6 +1054,71 @@ describe("OrchestratorMcpService usage pacing gate", () => {
       assert.include(pinned.result.failure.message, "codex-second has room: pass it as");
       assert.deepStrictEqual(pinned.scans, [{ instanceId: SECOND, cwd: ROOT }]);
     }),
+  );
+
+  it.effect(
+    "advise: a current list without the model is the reason; no scan is promised (#628)",
+    () =>
+      Effect.gen(function* () {
+        // Another path (the UI, say) published a current scan of the folder that lacks the model.
+        const { result, scans, dispatched } = yield* delegate({
+          settings: { usagePacingGate: "advise" },
+          providers: [inFolder(main(60)), inFolder(second(10), second(10).models)],
+          workspaceRoot: ROOT,
+          target: { model: LOCAL },
+        });
+        const note = textOf(result);
+        assert.include(
+          note,
+          `codex-second has room, but it does not list ${LOCAL} for this folder`,
+        );
+        assert.include(note, '"enforce" would hold this task.');
+        assert.notInclude(note, "would first scan");
+        assert.notInclude(note, "no current scan");
+        assert.deepStrictEqual(scans, []);
+        assert.deepStrictEqual(
+          dispatched.map((entry) => entry.modelSelection),
+          [{ instanceId: MAIN, model: LOCAL }],
+        );
+      }),
+  );
+
+  it.effect(
+    "advise right after enforce: a back-off enforce recorded holds in the advice (#628)",
+    () =>
+      Effect.gen(function* () {
+        const advise = { usagePacingGate: "advise" } as const;
+        // enforce scans and gets no answer; the owner switches to advise within the back-off, then
+        // the back-off ends.
+        const { results, scans } = yield* delegate({
+          settings: enforce,
+          providers: [inFolder(main(60)), second(10)],
+          scanFails: () => true,
+          workspaceRoot: ROOT,
+          target: { model: LOCAL },
+          calls: [
+            0,
+            { atMs: MINUTE, settings: advise },
+            { atMs: 5 * MINUTE - 1 },
+            { atMs: 5 * MINUTE },
+          ],
+        });
+        const noResult = `it does not list ${LOCAL} and its scan of this folder gave no result (scanned again after 2026-11-13T12:05:00.000Z)`;
+        assert.include(textOf(results[0]!), noResult);
+        // Within the back-off enforce would not scan, so the advice does not say it would.
+        for (const result of results.slice(1, 3)) {
+          assert.include(textOf(result), noResult);
+          assert.include(textOf(result), '"enforce" would hold this task.');
+          assert.notInclude(textOf(result), "would first scan");
+        }
+        // Once it ends, enforce would scan again, and the advice says so (without a scan).
+        assert.include(textOf(results[3]!), "no current scan of this folder (advice only");
+        assert.include(
+          textOf(results[3]!),
+          '"enforce" would first scan this folder for codex-second',
+        );
+        assert.deepStrictEqual(scans, [{ instanceId: SECOND, cwd: ROOT }]);
+      }),
   );
 
   it.effect("enforce, over the even pace: lowers the effort of a project config model (#559)", () =>
