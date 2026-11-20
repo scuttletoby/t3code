@@ -44,12 +44,15 @@ Two cases where neither acts for a while:
   turn end, and compaction is now skipped at the send. Nothing acts on that idle spell; the handoff
   starts from the thread's next turn end.
 - **A handoff that cannot run.** Handoff on also stops idle compaction when the handoff itself can
-  never be delivered, for example when `modelSelection` points at a provider instance that was
-  turned off or removed. (Upstream's compaction checks that its instance is on; the handoff does
-  not.) Each turn end tries a handoff, it fails, the one retry fails, and the thread stays as it is.
-  It does not grow forever: the size backstop tries again at every turn end, and the provider's own
-  compaction still applies. To get compaction back, fix `modelSelection` or set the thread's or
-  project's mode to `off` or `compact`.
+  never be delivered, because `modelSelection` points at a provider instance that was turned off or
+  removed. (Upstream's compaction checks that its instance is on; the handoff does not.) If the
+  instance was removed, nothing is sent: the thread shows nothing, and the only sign is a "handoff
+  skipped" warning in the server log at each attempt. If the run starts and fails, the one retry
+  fails too. Either way the thread stays as it is. It does not grow forever: the size backstop tries
+  again at every turn end, and the provider's own compaction still applies. To get compaction back,
+  fix `modelSelection` where it applies (the project's override, if it has one, replaces the
+  server's handoff settings whole), or set the mode to `off` or `compact`. A thread's own entry wins
+  over any mode, so if the thread has one, change that entry.
 
 ## Only at a quiet thread
 
