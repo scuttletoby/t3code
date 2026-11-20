@@ -22,9 +22,9 @@ import * as Path from "effect/Path";
 import { TestClock } from "effect/testing";
 
 import * as OrchestratorV2 from "../orchestration-v2/Orchestrator.ts";
-import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ActiveRunShells from "../slots/ActiveRunShells.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import { SlotCapacityHost } from "../slots/SlotObserver.ts";
 import type { WaitDelivery, WaitReceiver } from "./WaitDelivery.ts";
@@ -82,23 +82,22 @@ const snapshotOf = (world: World): OrchestrationV2ThreadShellSnapshot => ({
 
 /** One server: settings, the gate (built fresh on each provide, as on a restart) and its inputs. */
 const serverLayer = (world: World, settings: DeepPartial<ServerSettingsValue>) =>
-  SlotGate.layer.pipe(
+  SlotGate.layerOver.pipe(
     Layer.provideMerge(
       Layer.mergeAll(
         ServerSettings.layerTest(settings),
-        Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getShellSnapshot: () =>
-            Effect.gen(function* () {
-              world.snapshotReads += 1;
-              if (world.snapshotFails) {
-                return yield* new OrchestratorV2.OrchestratorProjectionError({ threadId: T1 });
-              }
-              const snapshot = snapshotOf(world);
-              const after = world.afterRead;
-              world.afterRead = null;
-              after?.();
-              return snapshot;
-            }),
+        Layer.mock(ActiveRunShells.ActiveRunShells)({
+          read: Effect.gen(function* () {
+            world.snapshotReads += 1;
+            if (world.snapshotFails) {
+              return yield* new OrchestratorV2.OrchestratorProjectionError({ threadId: T1 });
+            }
+            const snapshot = snapshotOf(world);
+            const after = world.afterRead;
+            world.afterRead = null;
+            after?.();
+            return snapshot;
+          }),
         }),
         Layer.mock(HostResources.HostResources)({
           read: Effect.succeed({
