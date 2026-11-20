@@ -217,7 +217,10 @@ export interface GateInput<Target, R> {
   readonly paceOf: (
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<InstancePace | undefined, never, R>;
-  /** The same task on another instance with room, or why it cannot run there. */
+  /**
+   * The same task on another instance with room, or why it cannot run there. In `advise` it must
+   * change nothing (no folder scan), so advice only says what `enforce` would do.
+   */
   readonly targetOn: (instanceId: ProviderInstanceId) => Effect.Effect<TargetOn<Target>, never, R>;
 }
 
