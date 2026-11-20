@@ -11,6 +11,7 @@ import type {
   Settings as ClaudeSettings,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
+  DEFAULT_SERVER_SETTINGS,
   MCP_PROFILE_ALL,
   MCP_SUBAGENT_INHERIT,
   type OrchestrationV2AppThread,
@@ -32,6 +33,7 @@ import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
 import {
   MCP_PROFILE_MAX_LINEAGE,
+  type McpProfileResolved,
   type McpProfileSet,
   type McpProfileThread,
   resolveMcpProfile,
@@ -220,7 +222,19 @@ export function claudeMcpServersOutsidePlan(
     .map((server) => server.name);
 }
 
-/** With no thread picks, project values or sub-agent rule, every thread in a lineage gets `mcpProfile`. */
+const profileThread = (settings: ServerSettings, thread: LineageThread): McpProfileThread => {
+  const project = settings.projectSettingsOverrides[thread.projectId];
+  return {
+    threadId: thread.id,
+    delegated: isDelegatedAppThread(thread),
+    project: { mcpProfile: project?.mcpProfile, mcpSubagentProfile: project?.mcpSubagentProfile },
+  };
+};
+
+/**
+ * With no thread picks, project values or sub-agent rule, every thread in a lineage gets
+ * `mcpProfile`. Only used where no thread store is wired (see `mcpProfileForThread`).
+ */
 const needsLineage = (settings: ServerSettings) =>
   Object.keys(settings.mcpThreadProfiles).length > 0 ||
   !(
@@ -231,25 +245,23 @@ const needsLineage = (settings: ServerSettings) =>
     (project) => !blank(project.mcpProfile) || !blank(project.mcpSubagentProfile),
   );
 
-const profileThread = (settings: ServerSettings, thread: LineageThread): McpProfileThread => {
-  const project = settings.projectSettingsOverrides[thread.projectId];
-  return {
-    threadId: thread.id,
-    delegated: isDelegatedAppThread(thread),
-    project: { mcpProfile: project?.mcpProfile, mcpSubagentProfile: project?.mcpSubagentProfile },
-  };
-};
+type FindThread = ((threadId: ThreadId) => Effect.Effect<LineageThread | null>) | undefined;
 
-/** The thread's profile as a Claude plan. `findThread` is `undefined` when no store is wired. */
-export const claudeMcpProfileForThread = Effect.fn("ClaudeMcpProfile.forThread")(function* (
+/**
+ * The thread's MCP profile, from its lineage here and, at its top, the profile the machine that
+ * delegated that thread here sent with it. `findThread` is `undefined` when no store is wired.
+ * Every provider's thread resolves through this; a Claude thread's plan is made from the result.
+ */
+const mcpProfileForThread = Effect.fn("ClaudeMcpProfile.profileForThread")(function* (
   settings: ServerSettings,
   thread: LineageThread,
-  t3ServerNames: ReadonlyArray<string>,
-  findThread: ((threadId: ThreadId) => Effect.Effect<LineageThread | null>) | undefined,
+  findThread: FindThread,
 ) {
   const lineage: Array<LineageThread> = [thread];
   let parentMissing = false;
-  let parentId = needsLineage(settings) ? thread.lineage.parentThreadId : null;
+  // Parents are read even with no profile set here: one of them may be a task another machine
+  // delegated, which carries the profile of its thread there.
+  let parentId = thread.lineage.parentThreadId;
   // One past the limit, or a repeat, is kept so the resolver refuses it.
   while (parentId !== null && lineage.length <= MCP_PROFILE_MAX_LINEAGE) {
     const repeated = lineage.find((entry) => entry.id === parentId);
@@ -259,21 +271,45 @@ export const claudeMcpProfileForThread = Effect.fn("ClaudeMcpProfile.forThread")
     lineage.push(parent);
     parentId = repeated === undefined ? parent.lineage.parentThreadId : null;
   }
+  const top = lineage[lineage.length - 1]!;
+  const delegatedFrom = parentMissing ? null : (top.delegatedFrom ?? null);
+  const carried = delegatedFrom?.mcpProfile;
+  if (delegatedFrom !== null && carried === undefined) {
+    // An older sender, or a task stored before carrying: its parent's profile there is unknown.
+    yield* Effect.logWarning(
+      "MCP profiles: the machine that delegated this thread's task sent no MCP profile (it runs an older T3), so the task gets this machine's profile for its role",
+      { threadId: thread.id, delegatedFrom: delegatedFrom.environmentId },
+    );
+  }
   const resolved = resolveMcpProfile(
     settings,
     lineage.map((entry) => profileThread(settings, entry)),
+    carried,
   );
   if (resolved._tag === "CannotApply") {
     return yield* new ClaudeMcpProfileError({ reason: resolved.message });
   }
-  // A local parent that is gone cannot cut the profile down, so the thread refuses. A task delegated
-  // from another machine has no parent here (`parentThreadId` is null): it never reaches this check
-  // and gets this machine's profile for its role, not its remote parent's (docs/fork/README.md).
-  if (parentMissing && resolved.source !== "thread-pick") {
+  // A parent the store cannot give may be a task another machine delegated with a narrower
+  // profile, so the thread refuses whatever the settings; only the owner's pick for it stands.
+  // With no store wired (the adapter built alone; the server always wires one), nothing here can
+  // carry a profile, so only settings that make a parent count refuse.
+  const refuses = findThread === undefined ? needsLineage(settings) : true;
+  if (parentMissing && refuses && resolved.source !== "thread-pick") {
     return yield* new ClaudeMcpProfileError({
       reason: `This thread's parent thread cannot be read, so its MCP profile cannot be worked out: ${FIX}.`,
     });
   }
+  return resolved;
+});
+
+/** The thread's profile as a Claude plan. `findThread` is `undefined` when no store is wired. */
+export const claudeMcpProfileForThread = Effect.fn("ClaudeMcpProfile.forThread")(function* (
+  settings: ServerSettings,
+  thread: LineageThread,
+  t3ServerNames: ReadonlyArray<string>,
+  findThread: FindThread,
+) {
+  const resolved = yield* mcpProfileForThread(settings, thread, findThread);
   const plan = claudeMcpProfilePlan(resolved.name, resolved.profile, t3ServerNames);
   return isRefusal(plan) ? yield* plan : plan;
 });
@@ -322,18 +358,24 @@ const settingsFileReader = Effect.gen(function* () {
 type McpOverrides = { readonly mcpServers?: Readonly<Record<string, unknown>> | undefined };
 
 /**
- * The thread's plan, or a refusal; without the settings service (tests), `all`. A settings read
- * that fails (it reads provider secrets too) falls back to settings.json alone, which holds every
- * MCP profile key; if that cannot be read either, the turn is refused, never widened to `all`.
+ * A thread's resolved profile, or a refusal; without the settings service (tests), the default
+ * settings' (`all`, cut to a profile another machine carried). A settings read that fails (it reads
+ * provider secrets too) falls back to settings.json alone, which holds every MCP profile key; if
+ * that cannot be read either, the thread is refused, never widened to `all`.
  */
-export const makeClaudeMcpProfiles = Effect.gen(function* () {
+export const makeThreadMcpProfiles = Effect.gen(function* () {
   const settingsService = yield* Effect.serviceOption(ServerSettingsService.ServerSettingsService);
   if (Option.isNone(settingsService)) {
     yield* Effect.logWarning(
-      "MCP profiles: no settings service here, so every Claude thread gets the all profile",
+      "MCP profiles: no settings service here, so every thread gets the all profile, cut only to one another machine sent",
     );
   }
   const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
+  if (Option.isNone(sql)) {
+    yield* Effect.logWarning(
+      "MCP profiles: no thread store here, so parent threads are not read; a child thread is refused only when a setting here makes its parent count",
+    );
+  }
   const store = Option.isSome(sql)
     ? yield* ProjectionStore.ProjectionStoreV2.pipe(
         Effect.provide(ProjectionStore.layer),
@@ -370,14 +412,25 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
     );
     return file;
   });
+  return Effect.fn("ClaudeMcpProfile.profileFor")(function* (thread: LineageThread) {
+    const settings = Option.isNone(settingsService)
+      ? DEFAULT_SERVER_SETTINGS
+      : yield* readSettings(settingsService.value);
+    return yield* mcpProfileForThread(settings, thread, findThread);
+  });
+});
+
+/** The thread's Claude plan, or a refusal, from {@link makeThreadMcpProfiles}. */
+export const makeClaudeMcpProfiles = Effect.gen(function* () {
+  const profileFor = yield* makeThreadMcpProfiles;
   const planFor = Effect.fn("ClaudeMcpProfile.planFor")(function* (
     thread: LineageThread,
     overrides: McpOverrides,
   ) {
-    if (Option.isNone(settingsService)) return ALL_PLAN;
-    const settings = yield* readSettings(settingsService.value);
+    const resolved: McpProfileResolved = yield* profileFor(thread);
     const t3ServerNames = Object.keys(overrides.mcpServers ?? {});
-    return yield* claudeMcpProfileForThread(settings, thread, t3ServerNames, findThread);
+    const plan = claudeMcpProfilePlan(resolved.name, resolved.profile, t3ServerNames);
+    return isRefusal(plan) ? yield* plan : plan;
   });
 
   return Effect.fn("ClaudeMcpProfile.plan")(function* (

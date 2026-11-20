@@ -320,7 +320,9 @@ jobs:
       # apps/, packages/: only the T3 source files the kits' contract tests pin
       # (fork-kit/golive/tests/contract.test.py; UsagePacingGate.ts: the effort option ids and
       # model.ts: the ultracode mapping, ModelManifest.ts and model-manifest.json: T3's model list and its
-      # cache, in fork-kit/model-guard/tests/guard.test.py); keep the lists in step.
+      # cache, builtInDrivers.ts, the drivers' kind files and the files where each reads its effort
+      # (claudeModelOptions.ts, the adapters) and Kiro's agent id (acpSupport.ts): the effort id of each
+      # built-in driver, in fork-kit/model-guard/tests/guard.test.py); keep the lists in step.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -334,6 +336,7 @@ jobs:
             /fork-kit/
             /scripts/
             /apps/server/src/auth/EnvironmentAuth.ts
+            /apps/server/src/claudeModelOptions.ts
             /apps/server/src/cli/auth.ts
             /apps/server/src/cli/config.ts
             /apps/server/src/cli/forkReport.ts
@@ -348,14 +351,35 @@ jobs:
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
+            /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts
+            /apps/server/src/provider/Drivers/AntigravityDriver.ts
+            /apps/server/src/provider/Drivers/ClaudeDriver.ts
+            /apps/server/src/provider/Drivers/CodexDriver.ts
             /apps/server/src/provider/ModelManifest.ts
+            /apps/server/src/provider/builtInDrivers.ts
             /apps/server/src/provider/model-manifest.json
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
             /apps/server/src/usage/UsagePacingGate.ts
             /packages/contracts/src/desktopBootstrap.ts
+            /packages/provider-acp-registry/src/client.ts
+            /packages/provider-cursor/src/client.ts
+            /packages/provider-fx/src/client.ts
+            /packages/provider-fx/src/server/acpSupport.ts
+            /packages/provider-grok/src/client.ts
+            /packages/provider-grok/src/server/adapter.ts
+            /packages/provider-kiro/src/client.ts
+            /packages/provider-kiro/src/server/acpSupport.ts
+            /packages/provider-kiro/src/server/adapter.ts
+            /packages/provider-muse/src/client.ts
+            /packages/provider-muse/src/server/adapter.ts
+            /packages/provider-opencode/src/client.ts
+            /packages/provider-opencode/src/server/adapter.ts
+            /packages/provider-opencode/src/server/v2/adapter.ts
+            /packages/provider-pi/src/client.ts
+            /packages/provider-pi/src/server/adapter.ts
             /packages/shared/src/cliRelease.ts
             /packages/shared/src/model.ts
             /packages/ssh/src/tunnel.ts
@@ -433,6 +457,7 @@ jobs:
             /fork-kit/
             /scripts/
             /apps/server/src/auth/EnvironmentAuth.ts
+            /apps/server/src/claudeModelOptions.ts
             /apps/server/src/cli/auth.ts
             /apps/server/src/cli/config.ts
             /apps/server/src/cli/forkReport.ts
@@ -445,14 +470,35 @@ jobs:
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
+            /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts
+            /apps/server/src/provider/Drivers/AntigravityDriver.ts
+            /apps/server/src/provider/Drivers/ClaudeDriver.ts
+            /apps/server/src/provider/Drivers/CodexDriver.ts
             /apps/server/src/provider/ModelManifest.ts
+            /apps/server/src/provider/builtInDrivers.ts
             /apps/server/src/provider/model-manifest.json
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
             /apps/server/src/usage/UsagePacingGate.ts
             /packages/contracts/src/desktopBootstrap.ts
+            /packages/provider-acp-registry/src/client.ts
+            /packages/provider-cursor/src/client.ts
+            /packages/provider-fx/src/client.ts
+            /packages/provider-fx/src/server/acpSupport.ts
+            /packages/provider-grok/src/client.ts
+            /packages/provider-grok/src/server/adapter.ts
+            /packages/provider-kiro/src/client.ts
+            /packages/provider-kiro/src/server/acpSupport.ts
+            /packages/provider-kiro/src/server/adapter.ts
+            /packages/provider-muse/src/client.ts
+            /packages/provider-muse/src/server/adapter.ts
+            /packages/provider-opencode/src/client.ts
+            /packages/provider-opencode/src/server/adapter.ts
+            /packages/provider-opencode/src/server/v2/adapter.ts
+            /packages/provider-pi/src/client.ts
+            /packages/provider-pi/src/server/adapter.ts
             /packages/shared/src/cliRelease.ts
             /packages/shared/src/model.ts
             /packages/ssh/src/tunnel.ts
@@ -495,6 +541,7 @@ jobs:
             /fork-kit/
             /scripts/
             /apps/server/src/auth/EnvironmentAuth.ts
+            /apps/server/src/claudeModelOptions.ts
             /apps/server/src/cli/auth.ts
             /apps/server/src/cli/config.ts
             /apps/server/src/cli/forkReport.ts
@@ -509,14 +556,35 @@ jobs:
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
+            /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts
+            /apps/server/src/provider/Drivers/AntigravityDriver.ts
+            /apps/server/src/provider/Drivers/ClaudeDriver.ts
+            /apps/server/src/provider/Drivers/CodexDriver.ts
             /apps/server/src/provider/ModelManifest.ts
+            /apps/server/src/provider/builtInDrivers.ts
             /apps/server/src/provider/model-manifest.json
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
             /apps/server/src/usage/UsagePacingGate.ts
             /packages/contracts/src/desktopBootstrap.ts
+            /packages/provider-acp-registry/src/client.ts
+            /packages/provider-cursor/src/client.ts
+            /packages/provider-fx/src/client.ts
+            /packages/provider-fx/src/server/acpSupport.ts
+            /packages/provider-grok/src/client.ts
+            /packages/provider-grok/src/server/adapter.ts
+            /packages/provider-kiro/src/client.ts
+            /packages/provider-kiro/src/server/acpSupport.ts
+            /packages/provider-kiro/src/server/adapter.ts
+            /packages/provider-muse/src/client.ts
+            /packages/provider-muse/src/server/adapter.ts
+            /packages/provider-opencode/src/client.ts
+            /packages/provider-opencode/src/server/adapter.ts
+            /packages/provider-opencode/src/server/v2/adapter.ts
+            /packages/provider-pi/src/client.ts
+            /packages/provider-pi/src/server/adapter.ts
             /packages/shared/src/cliRelease.ts
             /packages/shared/src/model.ts
             /packages/ssh/src/tunnel.ts
