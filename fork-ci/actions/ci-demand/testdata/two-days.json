@@ -90,12 +90,12 @@
           "name": "docs",
           "labels": ["self-hosted", "build"],
           "created_at": "2026-11-01T10:00:00Z",
-          "started_at": "2026-11-01T10:00:00Z",
-          "completed_at": "2026-11-01T10:00:00Z",
+          "started_at": null,
+          "completed_at": null,
           "status": "completed",
           "conclusion": "skipped",
           "run_attempt": 1,
-          "runner_name": null
+          "runner_name": ""
         }
       ]
     },
@@ -117,7 +117,7 @@
           "name": "test",
           "labels": ["self-hosted", "build"],
           "created_at": "2026-11-01T11:00:00Z",
-          "started_at": "2026-11-01T11:20:00Z",
+          "started_at": null,
           "completed_at": "2026-11-01T11:20:00Z",
           "status": "completed",
           "conclusion": "cancelled",

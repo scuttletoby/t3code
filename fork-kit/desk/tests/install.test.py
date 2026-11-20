@@ -4,7 +4,7 @@ holds stubs of the fleet files. No root, no systemd, no network, no real user.
 
   python3 -I -B fork-kit/desk/tests/install.test.py
 """
-import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess
+import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, re, shutil, stat, subprocess
 import sys, tempfile, types, unittest, unittest.mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -348,6 +348,75 @@ class Desk(unittest.TestCase):
                 't3code-fleet-seed.service fork-fleet-desk-agent.service')
         self.assertLess(calls.index(stop), calls.index('systemctl restart fork-fleet-desk-agent.service'))
         self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['sha'], SHA2)
+
+    def test_the_launcher_pin_goes_in_last_so_a_stopped_swap_never_pairs_a_new_pin_with_old_walls(self):
+        """Issue #408 item 1 (the #390 lenses): the walls pin the launcher in one file (PIN_HOLDER, the linux walls;
+        the wsl2 walls read that pin). A run stopped between any two renames of an upgrade never leaves the new pin
+        beside an older launcher, dispatcher or walls file (each would then be judged by a pin it was never checked
+        against), `check`'s install line fails meanwhile, and the next run ends the swap. Also stopped before the first rename."""
+        self.assertEqual(self.install()[0], 0)
+        changed = {'.github/scripts/fork-fleet-launch.sh': STUBS['.github/scripts/fork-fleet-launch.sh'] + '# new\n',
+                   '.github/scripts/fork-fleet-walls.py': STUBS['.github/scripts/fork-fleet-walls.py'] + '# new\n',
+                   '.github/scripts/fork-fleet-walls/linux': '#!/bin/sh\n# new\n',
+                   '.github/scripts/fork-fleet-walls/wsl2': '#!/bin/sh\n# new\n'}
+        new = self.release('release2', changed)
+        news = {f'/opt/fork-fleet/{rel}': slurp(os.path.join(new, src)) for rel, src in
+                [*[(r, s) for r, s in self.m.FILES.items() if s in changed],
+                 *[(f'fork-fleet-walls/{n}', f'{self.m.WALLS}/{n}') for n in ('linux', 'wsl2')]]}
+        pin = '/opt/fork-fleet/' + self.m.PIN_HOLDER
+        self.assertIn(pin, news)
+        real, after = os.replace, []
+
+        def stopped_after(n):
+            def spy(a, b, *k, **kw):
+                if '/.kit-stage-' in str(a):
+                    if len(after) == n:
+                        raise SystemExit(f'stopped after {n} renames')
+                    after.append(b)
+                return real(a, b, *k, **kw)
+            return spy
+        for n in range(len(news)):
+            with self.subTest(stopped_after=n):
+                after.clear()
+                with unittest.mock.patch.object(self.m.os, 'replace', stopped_after(n)):
+                    self.assertIn('stopped after', str(self.install(sha=SHA2, source=new)[0]))
+                self.assertEqual(len(after), n)
+                now = {path: self.read(path) == text for path, text in news.items()}
+                self.assertFalse(now[pin], f'the pin was renamed in while {[p for p, v in now.items() if not v]} '
+                                           'were still old')
+                self.assertTrue(self.m.installed_problems())   # check's install line fails meanwhile
+                code, _, err = self.install(sha=SHA2, source=new)   # runs again: ends the swap
+                self.assertEqual(code, 0, err)
+                self.assertEqual({path: self.read(path) for path in news}, news)
+                self.assertEqual(self.m.installed_problems(), [])
+                code, _, err = self.install()   # back to the old release for the next stop
+                self.assertEqual(code, 0, err)
+
+    def test_files_a_release_removes_are_gone_before_the_new_pin_goes_in(self):
+        """#579 lenses: a run stopped just before the pin holder's rename has already removed the files the new
+        release drops, so no old walls file is left beside the new pin; the next run ends the swap."""
+        self.assertEqual(self.install()[0], 0)
+        new = self.release('release2', {'.github/scripts/fork-fleet-walls/wsl2': None,
+                                        '.github/scripts/fork-fleet-walls/wsl2.fixture.json': None,
+                                        '.github/scripts/fork-fleet-walls/linux': '#!/bin/sh\n# new\n'})
+        gone = self.path('/opt/fork-fleet/fork-fleet-walls/wsl2')
+        self.assertTrue(os.path.exists(gone))
+        pin, real, seen = self.path('/opt/fork-fleet/' + self.m.PIN_HOLDER), os.replace, []
+
+        def spy(a, b, *k, **kw):
+            if str(b) == pin and '/.kit-stage-' in str(a):
+                seen.append(os.path.exists(gone))
+                raise SystemExit('stopped before the pin')
+            return real(a, b, *k, **kw)
+        with unittest.mock.patch.object(self.m.os, 'replace', spy):
+            self.assertIn('stopped before the pin', str(self.install(sha=SHA2, source=new)[0]))
+        self.assertEqual(seen, [False])
+        self.assertFalse(os.path.exists(gone))
+        code, _, err = self.install(sha=SHA2, source=new)   # runs again: ends the swap
+        self.assertEqual(code, 0, err)
+        self.assertIn('# new', self.read('/opt/fork-fleet/' + self.m.PIN_HOLDER))
+        self.assertFalse(os.path.exists(gone))
+        self.assertEqual(self.m.installed_problems(), [])
 
     def test_project_fleet_config_is_used_and_kept(self):
         project = os.path.join(self.tmp, 'project.json')
@@ -1089,6 +1158,15 @@ class Release(unittest.TestCase):
         for src in [*m.FILES.values(), *m.UNITS.values(), m.WALLS]:
             self.assertTrue(os.path.exists(os.path.join(REPO, src)), src)
         self.assertTrue(os.listdir(os.path.join(REPO, m.WALLS)))
+
+    def test_the_pin_holder_is_the_one_walls_file_that_pins_the_launcher(self):
+        """Issue #408 item 1: swap() renames PIN_HOLDER last; that only helps while it is the walls file that holds
+        the launcher's pin, and the only one."""
+        m = load()
+        folder = os.path.join(REPO, m.WALLS)
+        pins = [f'fork-fleet-walls/{n}' for n in sorted(os.listdir(folder))
+                if re.search(r'^LAUNCHER_SHA256\s*=', slurp(os.path.join(folder, n)), re.M)]
+        self.assertEqual(pins, [m.PIN_HOLDER])
 
     def test_bootstrap_checks_its_arguments_before_anything(self):
         boot = os.path.join(KIT, 'bootstrap.sh')

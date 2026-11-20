@@ -44,7 +44,8 @@ class CleanerInstaller(kit_install.Installer):
                     'common/kit_install.py', 'systemd/fork-cleaner.service', 'systemd/fork-cleaner.timer')
     EXECUTABLE = frozenset({'bin/fork-cleaner', 'sbin/fork-cleaner-install'})
     PACKAGE = 'cleaner'
-    MODULES = ('__init__', 'compare', 'compress', 'config', 'daily', 'engine', 'facts', 'guard', 'report', 'rules')
+    MODULES = ('__init__', 'compare', 'compress', 'config', 'daily', 'dedupe', 'engine', 'facts', 'guard', 'report',
+               'rules')
     HELP = ('bin/fork-cleaner', 'fork-cleaner daily')
     HAS_CONFIG = True
     KIT_STEPS = ('timer-units',)
