@@ -84,6 +84,37 @@ def _keep_reason(keep):
     return line[0].strip() if line and line[0].strip() else 'no reason given'
 
 
+def above_refusal(path):
+    """A KEEP file or a git folder (`.git`, or `HEAD`, `objects` and `refs`) in a folder above the configured folder
+    `path`, up to `/`: everything under it is kept, as below it (a work tree's files are git's; a KEEP file keeps its
+    whole folder). None when there is none. A folder above that cannot be read refuses. The rules that only look
+    from a configured folder down (compress-cold, dedupe) ask this at the plan and again at their last check."""
+    here = os.path.dirname(path)
+    while True:
+        try:
+            keep = _lstat_or_none(os.path.join(here, KEEP_FILE))
+            in_git = _lstat_or_none(os.path.join(here, '.git')) is not None or all(
+                _lstat_or_none(os.path.join(here, n)) is not None for n in ('HEAD', 'objects', 'refs'))
+        except OSError as ex:
+            return Refusal('could not read', f'{here}: {ex.strerror}')
+        if keep is not None and not stat.S_ISDIR(keep.st_mode):
+            return Refusal('KEEP file', f'{_keep_reason(os.path.join(here, KEEP_FILE))} ({here}, above {path})')
+        if in_git:
+            return Refusal('git folder', f'{here}, above {path}: git needs its files as they are')
+        up = os.path.dirname(here)
+        if up == here:
+            return None
+        here = up
+
+
+def _lstat_or_none(path):
+    """The lstat of `path`, None when nothing is there; any other error is raised (it is not "nothing there")."""
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
 def _unpushed(where, shown, bare):
     """A refusal when a commit or a tag of this git folder is on no other machine. A remote counts only with a
     live answer (`git ls-remote`), never by the folder's own remote-tracking refs, which go stale when a branch is
