@@ -75,6 +75,7 @@ Needs PyYAML, git and bash. Each check prints ok/FAIL; any FAIL exits 1.
 """
 
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -1017,7 +1018,7 @@ LOOKUP = re.compile(
     r'OLD_HEADS=""\n(?:.*\n)*?\s*if \[\[ "\$EVENT_NAME" == pull_request \]\]; then\n'
     r'\s*if ! OLD_HEADS="\$\(GH_TOKEN="\$LOOKUP_TOKEN" gh api --paginate -X GET "repos/\$GITHUB_REPOSITORY/activity" \\\n'
     r"""\s*-f "ref=refs/heads/\$HEAD_REF" -f per_page=100 --jq '\.\[\] \| \.before, \.after'\)"; then\n"""
-    r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n(?:.*\n)*?\s*export UPSTREAM OLD_HEADS(?: SCANNED_GONE)?\n')
+    r'\s*echo "::error::[^"\n]*" >&2\n\s*exit [1-9]\n\s*fi\n(?:.*\n)*?\s*unset LOOKUP_TOKEN\n')
 
 
 # The sweep's lookup (#239), allowed in this exact form only, right after the earlier-heads lookup:
@@ -1122,6 +1123,20 @@ SCANNED_LOOKUP_TEXT = (
     'unset LOOKUP_TOKEN\n')
 
 
+# The lists' hand-over to the scan (#637), in this exact form only, right before the scan script is
+# fetched: each id once, both lists in files under RUNNER_TEMP (written afresh each run), the files
+# exported, and the variables too only while they fit in one environment string (the kernel caps one
+# at 128 KiB; past that every program the step starts fails, "Argument list too long").
+HANDOFF_TEXT = (
+    'OLD_HEADS="$(tr -s \'[:space:]\' \'\\n\' <<< "$OLD_HEADS" | sort -u)"\n'
+    'printf \'%s\\n\' "$OLD_HEADS" > "$RUNNER_TEMP/old-heads"\n'
+    'printf \'%s\\n\' "$SCANNED_GONE" > "$RUNNER_TEMP/scanned-gone"\n'
+    'export UPSTREAM OLD_HEADS_FILE="$RUNNER_TEMP/old-heads" SCANNED_GONE_FILE="$RUNNER_TEMP/scanned-gone"\n'
+    'if [[ ${#OLD_HEADS} -le 100000 ]]; then export OLD_HEADS; fi\n'
+    'if [[ ${#SCANNED_GONE} -le 100000 ]]; then export SCANNED_GONE; fi\n'
+    'git fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"\n')
+
+
 def stripped_lines(run):
     return "".join(line.strip() + "\n" for line in run.splitlines())
 
@@ -1135,14 +1150,19 @@ def lookup_problems(scan):
                 continue
             if not LOOKUP.search(run):
                 problems.append(f"{SCAN_FILE}/{j}: the earlier-heads lookup is not in its exact form (fails the job "
-                                "on a failed lookup, reads .before and .after, exports OLD_HEADS)")
+                                "on a failed lookup, reads .before and .after)")
+            handoff = HANDOFF_TEXT in stripped_lines(run)
+            if not handoff:
+                problems.append(f"{SCAN_FILE}/{j}: the lists are not handed to the scan in files in their exact "
+                                "form (#637)")
             scanned_lookup = SCANNED_LOOKUP_TEXT in stripped_lines(run)
             if re.search(r"\bSCANNED_GONE\b", run) and (
-                    not scanned_lookup or len(re.findall(r"\bSCANNED_GONE\b", run)) != 3
-                    or "export UPSTREAM OLD_HEADS SCANNED_GONE\n" not in stripped_lines(run)):
+                    not scanned_lookup or not handoff
+                    or len(re.findall(r"\bSCANNED_GONE\b", run)) != 2 + len(re.findall(r"\bSCANNED_GONE\b", HANDOFF_TEXT))):
                 problems.append(f"{SCAN_FILE}/{j}: SCANNED_GONE is not set by the sweep's lookup of deleted tips a "
                                 "scan read in its exact form (#482), or is set or used outside it")
-            want = 3 + (1 if SWEEP_LOOKUP.search(run) else 0) + (1 if scanned_lookup else 0)
+            want = (2 + len(re.findall(r"\bOLD_HEADS\b", HANDOFF_TEXT)) + (1 if SWEEP_LOOKUP.search(run) else 0)
+                    + (1 if scanned_lookup else 0))
             if len(re.findall(r"\bOLD_HEADS\b", run)) != want:
                 problems.append(f"{SCAN_FILE}/{j}: OLD_HEADS is set or used outside the lookups")
             env = step.get("env") or {}
@@ -1402,7 +1422,7 @@ for label, mutate in {
         "run", scan_step(w)["run"].replace("--jq '.[] | .before, .after')\"; then",
                                            "--jq '.[] | .before, .after' || true)\"; then")),
     "the earlier heads emptied before the export": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace("export UPSTREAM OLD_HEADS", 'OLD_HEADS=""\nexport UPSTREAM OLD_HEADS')),
+        "run", scan_step(w)["run"].replace("unset LOOKUP_TOKEN\n", 'unset LOOKUP_TOKEN\nOLD_HEADS=""\n')),
     "the lookup reading the wrong field": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace(".[] | .before, .after", ".[] | .sha")),
     "the lookup's failure not failing the job": lambda w: scan_step(w).__setitem__(
@@ -1456,7 +1476,17 @@ for label, mutate in {
     "SCANNED_GONE set outside its lookup": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace("unset LOOKUP_TOKEN\n", 'SCANNED_GONE="$OLD_HEADS"\nunset LOOKUP_TOKEN\n')),
     "SCANNED_GONE not exported to the scan": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace("export UPSTREAM OLD_HEADS SCANNED_GONE\n", "export UPSTREAM OLD_HEADS\n")),
+        "run", scan_step(w)["run"].replace(' SCANNED_GONE_FILE="$RUNNER_TEMP/scanned-gone"\n', "\n")),
+    # #637: the lists handed over in files, the variables only while they fit.
+    "the earlier heads not handed over in a file": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace(' OLD_HEADS_FILE="$RUNNER_TEMP/old-heads"', "")),
+    "the earlier heads exported whatever their size (Argument list too long)": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("if [[ ${#OLD_HEADS} -le 100000 ]]; then export OLD_HEADS; fi", "export OLD_HEADS")),
+    "SCANNED_GONE exported whatever its size": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("if [[ ${#SCANNED_GONE} -le 100000 ]]; then export SCANNED_GONE; fi",
+                                           "export SCANNED_GONE")),
+    "the earlier heads' file appended to, not written afresh": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace('"$OLD_HEADS" > "$RUNNER_TEMP/old-heads"', '"$OLD_HEADS" >> "$RUNNER_TEMP/old-heads"')),
     # c2: the jobs' if: as GitHub evaluates it.
     "every push skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
         "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace("(github.event.deleted ||", "(true || github.event.deleted ||")),
@@ -1649,6 +1679,86 @@ r, gone, _, calls = sweep_lookup(not_a_clone, all_heads, "no-clone")
 check("secret-scan e2e: no clone (cat-file fails): the job fails before asking GitHub anything",
       r.returncode == 2 and gone is None and calls == "" and "cannot check which listed tips" in r.stderr,
       f"exit {r.returncode}: {r.stderr.strip()[-400:]}")
+
+# #637, end to end: the lists' hand-over, as the workflow has it (from the token's unset to the end),
+# in a clone whose origin's default branch holds a stub scan script that reports what it was given.
+# The sweep of 11-20's dispatch got past the lookup and then failed here: OLD_HEADS (every activity
+# entry's before and after, 131 KB) went out as one environment string, over the kernel's 128 KiB,
+# and the next program (git) could not start ("Argument list too long", exit 126). Also: a list
+# too long even with each id once (only the file carries it), small and empty lists, and the files
+# of an earlier or stopped run left in RUNNER_TEMP (written afresh, nothing of theirs read).
+def handoff_code(run):
+    start = run.find("unset LOOKUP_TOKEN\n")
+    return run[start:] if start >= 0 else "exit 99\n"
+
+
+handoff_origin = sweep_work / "handoff-origin"
+(handoff_origin / ".github" / "scripts").mkdir(parents=True)
+git(handoff_origin, "init", "-q", "-b", "main")
+(handoff_origin / ".github" / "scripts" / "fork-secret-scan.sh").write_text(r"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'env_old=%s\nenv_gone=%s\n' "${OLD_HEADS+set}" "${SCANNED_GONE+set}"
+printf 'env_old_words=%s\n' "$(wc -w <<< "${OLD_HEADS:-}")"
+printf 'file_old=%s\nfile_gone=%s\nupstream=%s\n' "${OLD_HEADS_FILE:-}" "${SCANNED_GONE_FILE:-}" "${UPSTREAM-unset}"
+""")
+git(handoff_origin, "add", "-A")
+git(handoff_origin, "commit", "-q", "-m", "stub scan script")
+handoff_clone = sweep_work / "handoff-clone"
+git(sweep_work, "clone", "-q", f"file://{handoff_origin}", str(handoff_clone))
+handoff_temp = sweep_work / "handoff-temp"
+handoff_temp.mkdir()
+
+
+def handoff(old_heads, scanned_gone, label, code=None):
+    """Runs the hand-over with these lists (shell variables, as the lookups leave them); returns
+    (exit, stub report, the words of the old-heads file, the words of the scanned-gone file)."""
+    (sweep_work / f"{label}.old").write_text(old_heads)
+    (sweep_work / f"{label}.gone").write_text(scanned_gone)
+    script = ('set -euo pipefail\nUPSTREAM=up/stream\nLOOKUP_TOKEN=x\n'
+              f'OLD_HEADS="$(cat {sweep_work / (label + ".old")})"\n'
+              f'SCANNED_GONE="$(cat {sweep_work / (label + ".gone")})"\n'
+              + (code or handoff_code(scan_step(real)["run"])))
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=handoff_clone,
+                       env={**base_env, "RUNNER_TEMP": str(handoff_temp), "CONFIG_BRANCH": "main",
+                            "GIT_CEILING_DIRECTORIES": str(sweep_work)}, capture_output=True, text=True)
+    report = dict(re.findall(r"^(\w+)=(.*)$", r.stdout, re.M))
+
+    def words(key):
+        path = report.get(key) or ""
+        return pathlib.Path(path).read_text().split() if path and pathlib.Path(path).is_file() else None
+    return r, report, words("file_old"), words("file_gone")
+
+
+def ids(n, salt):
+    return [hashlib.sha1(f"{salt}{i}".encode()).hexdigest() for i in range(n)]
+
+
+day_ids = ids(1700, "tip")  # the 11-20 shape: each id twice (a push's after is the next one's before)
+day_gone = ids(130, "gone")
+day_list = "\n".join(x for i in day_ids for x in (i, i)) + "\n"
+r, rep_, old_words, gone_words = handoff(day_list, " ".join(day_gone) + " ", "day")
+check("secret-scan e2e (#637): a list over 128 KiB: the scan script starts, the lists reach it in files (each id once), "
+      "the variables are still exported for an older script while they fit",
+      len(day_list) > 131072 and r.returncode == 0 and old_words == sorted(day_ids) and gone_words == day_gone
+      and rep_.get("env_old") == "set" and rep_.get("env_old_words") == str(len(day_ids))
+      and rep_.get("env_gone") == "set" and rep_.get("upstream") == "up/stream",
+      f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_} old={len(old_words or [])}")
+huge_ids = ids(3000, "huge")
+r, rep_, old_words, _ = handoff("\n".join(huge_ids), "", "huge")
+check("secret-scan e2e: a list over 128 KiB with each id once: only the file carries it, and the scan starts",
+      r.returncode == 0 and old_words == sorted(huge_ids) and rep_.get("env_old") == "",
+      f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_}")
+r, rep_, old_words, gone_words = handoff("", "", "nothing")
+check("secret-scan e2e: no tips listed, none gone: empty files, empty variables, the scan starts",
+      r.returncode == 0 and old_words == [] and gone_words == [] and rep_.get("env_old") == "set"
+      and rep_.get("env_old_words") == "0", f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_}")
+(handoff_temp / "old-heads").write_text("\n".join(huge_ids[:5]) + "\n")  # a run stopped half-way left these
+(handoff_temp / "scanned-gone").write_text(day_gone[0] + "\n")
+small = [sweep_main, *sweep_vanished]
+r, rep_, old_words, gone_words = handoff(" ".join(small + small), "", "again")
+check("secret-scan e2e: run again over an earlier or stopped run's files: only this run's lists are read",
+      r.returncode == 0 and old_words == sorted(small) and gone_words == [],
+      f"exit {r.returncode}: {r.stderr.strip()[-300:]} old={old_words} gone={gone_words}")
 
 check("secret-scan: the expression evaluator reads GitHub's rules (&& and || give an operand, == ignores case)",
       gh_eval("'a' && 'B' == 'b'", {}) and not gh_eval("'' || null", {}) and gh_eval("!x.y", {})
