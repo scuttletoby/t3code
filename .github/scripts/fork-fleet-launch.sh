@@ -110,11 +110,13 @@ readonly_verb=0
 [[ ${1-}:$# != paths:1 && ${1-}:$# != tools:1 ]] || readonly_verb=1
 if [[ -n $ROOT ]]; then
   ((readonly_verb && EUID != 0)) || die "FORK_FLEET_WALLS_ROOT is set: it is for the walls' tests only (paths and tools, not as root)"
+  # shellcheck disable=SC2015 # die when either fails
   ROOT=$(realpath -e -- "$ROOT") && [[ $ROOT =~ ^/[A-Za-z0-9._/-]+$ ]] || die "FORK_FLEET_WALLS_ROOT is no plain folder"
 fi
 conf=${FORK_FLEET_LAUNCH_CONF:-/etc/fork-fleet/launch.conf}
 # paths and tools on a host not set up yet (no conf at all): what jobs would get with the defaults below.
 conf_file=/dev/null
+# shellcheck disable=SC2015 # read the conf unless both hold
 ((readonly_verb)) && [[ ! -e $ROOT$conf && ! -L $ROOT$conf ]] || { owned_safe "$ROOT$conf" && conf_file=$ROOT$conf; }
 RUNNER_USERS='' TEMPLATE=/opt/fork-fleet/template/runner-template WORK_ROOT=/var/lib/fork-fleet/runners RUN_DIR=/run/fork-fleet HOOK=/opt/fork-fleet/hook.sh
 LINGER_DIR=/var/lib/systemd/linger RESERVE_MB=2048 MAX_SECONDS=3600 MEMINFO=/proc/meminfo NET_BASE=10.204
@@ -675,15 +677,15 @@ refresh() {
 # The runner users: each a user of its own, in no group but its own, not lingering, with a network of its own.
 check_users() {
   local user uid gid groups
-  local -A seen=() nets=()
+  local -A user_of=() nets=()
   [[ $RUNNER_USERS =~ ^[a-z_][a-z0-9_-]{0,31}(,[a-z_][a-z0-9_-]{0,31})*$ ]] || die "$conf: RUNNER_USERS is not a list of user names"
   for user in ${RUNNER_USERS//,/ }; do
     uid=$(id -u -- "$user" 2>/dev/null) || die "no user $user"
     gid=$(id -g -- "$user")
     groups=$(id -G -- "$user")
     [[ $uid != 0 && $uid != "$EUID" ]] || die "each runner user must be a user of its own, not $user"
-    [[ -z ${seen[$uid]+set} ]] || die "$conf: $user and ${seen[$uid]} are one user: each slot needs a user of its own"
-    seen[$uid]=$user
+    [[ -z ${user_of[$uid]+set} ]] || die "$conf: $user and ${user_of[$uid]} are one user: each slot needs a user of its own"
+    user_of[$uid]=$user
     [[ $groups == "$gid" ]] || die "$user is in other groups ($groups): a runner user is in its own group only"
     [[ ! -e $LINGER_DIR/$user ]] || die "$user lingers (loginctl disable-linger $user)"
     [[ -z ${nets[$((uid % 16384))]+set} ]] ||
@@ -1040,12 +1042,14 @@ never() {
   # passwd.bak, passwd.OLD), subuid and subgid and theirs, tcp wrappers' rules and hosts.equiv, the network and ethers
   # name files, the logs and login records (/var/log: wtmp, btmp, lastlog, auth.log), Debian's /var/backups
   # (passwd.bak), libnss-extrausers' folder, the mail spools (a file per user name), SSSD's cache (passwd and group,
-  # readable by all) and the DHCP leases (the LAN's host names and MACs).
+  # readable by all) and the DHCP leases (the LAN's host names and MACs: dnsmasq's, ISC dhclient's on Debian and RHEL,
+  # dhcpcd's and NetworkManager's; issue #656).
   case $1 in
     /etc/passwd* | /etc/group* | /etc/hosts* | /etc/subuid* | /etc/subgid* | /etc/networks | /etc/ethers | /var | \
       /var/log | /var/log/* | /var/backups | /var/backups/* | /var/lib | /var/lib/extrausers | /var/lib/extrausers/* | \
       /var/mail | /var/mail/* | /var/spool | /var/spool/mail | /var/spool/mail/* | /var/lib/sss | /var/lib/sss/* | \
-      /var/lib/misc | /var/lib/misc/dnsmasq.leases | /var/lib/dhcp | /var/lib/dhcp/*)
+      /var/lib/misc | /var/lib/misc/dnsmasq.leases | /var/lib/dhcp | /var/lib/dhcp/* | /var/lib/dhclient | \
+      /var/lib/dhclient/* | /var/lib/dhcpcd | /var/lib/dhcpcd/* | /var/lib/NetworkManager | /var/lib/NetworkManager/*)
       die "$2: names this host's accounts or LAN hosts, or is a folder of such a file; a job never sees it: $3" ;;
   esac
   no_data "$1" "$2"
@@ -1149,12 +1153,16 @@ job_etc() {
   # Its own name, as uname shows it to the job anyway (Java's getLocalHost and the like look it up); one with a _ too
   # (issue #594), though no DNS name has one. A name with any other character (a blank, a #) gets no line.
   [[ ! $name =~ ^[A-Za-z0-9_]([A-Za-z0-9._-]{0,252})$ || $name == localhost ]] || hosts+="127.0.1.1 $name"$'\n'
-  mkdir -p -m 0755 -- "$root/etc"
-  # A FIFO there (or a link to one) would not refuse the write but hold it until someone reads it, and the start would
-  # hang till the agent's own limit (issue #636): refused before the write. Only root could plant one (the folder is
-  # root's, just made); what is planted after this check is the plain-file check's below.
+  (umask 022 && mkdir -p -- "$root/etc")
+  # The folder was just made, so nothing may be there yet (issues #636, #656): noclobber opens what is not a regular
+  # file without O_EXCL, and a FIFO, a device (a link to a tty waits for carrier) or a link to one would not refuse
+  # the write but hold it, and the start would hang till the agent's own limit. Any entry at all is refused before
+  # the write. Only root could plant one (the folder is root's); what is planted after this check is the write's and
+  # the plain-file check's below.
   for f in passwd group hosts; do
-    [[ ! -p $root/etc/$f ]] || die "$root/etc/$f is a FIFO, which would hold the write: refused"
+    [[ ! -e $root/etc/$f && ! -L $root/etc/$f ]] ||
+      die "$root/etc/$f is there already (a file, link, FIFO or device), in a folder just made: refused before" \
+        "the write"
   done
   # One write a file, each checked: in a subshell left of ||, set -e is off, so a failed write would not stop the
   # next (issue #594); the first that fails (a file already there, a full disk) stops them all and refuses the start.
@@ -1187,14 +1195,15 @@ job_fs() {
   job_etc "$root" "$user" "${rw:+$rw/home}"
   linked=' /etc/passwd /etc/group /etc/hosts'
   for ((i = 0; i < ${#view_links[@]}; i += 2)); do
-    mkdir -p -m 0755 -- "$root${view_links[i]%/*}"
+    # Each folder on the way open to the job (#667): `mkdir -p -m` sets the last one only, and umask is 077 here.
+    (umask 022 && mkdir -p -- "$root${view_links[i]%/*}")
     ln -s -- "${view_links[i + 1]}" "$root${view_links[i]}"
     linked+=" ${view_links[i]}"
   done
   # A host whose /etc/resolv.conf is a link (systemd-resolved's, into /run) has the jobs' file bound at its target:
   # the job's /etc/resolv.conf is then that same link, as no whole /etc brings it any more (issue #243).
   if [[ $resolv != /etc/resolv.conf && ! -e $root/etc/resolv.conf && ! -L $root/etc/resolv.conf ]]; then
-    mkdir -p -m 0755 -- "$root/etc"
+    (umask 022 && mkdir -p -- "$root/etc")
     ln -s -- "$resolv" "$root/etc/resolv.conf"
     linked+=' /etc/resolv.conf'
   fi
@@ -1258,7 +1267,7 @@ sandbox() {
 }
 
 start() {
-  local name=$1 dir env_file line key value user resolv bad left own blocked seen from linked f real
+  local name=$1 dir env_file line key value user resolv bad left own blocked seen from linked f real wait code
   local -a props
   local -A got=()
   name_ok "$name"
@@ -1333,19 +1342,46 @@ start() {
   # ProtectSystem=strict: the job writes its copy and its own memory file systems, nothing else.
   # Stop timeouts of its own (at most the walls' STOP_MAX): systemd's defaults never decide how long a job that ignores
   # SIGTERM at RuntimeMaxSec runs on.
-  "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" --working-directory "$dir" \
-    -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" "${props[@]}" -p "ReadWritePaths=$dir" \
-    -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh"
+  # Within START_BY of this launcher's own start (issue #656): a drop-in (root's, made after the walls ran) with
+  # another Type= (oneshot, or notify with TimeoutStartSec=infinity) keeps systemd-run waiting for the start job, and
+  # the agent's limit would kill this launcher before the check below, leaving the unit unchecked (RuntimeMaxSec does
+  # not apply to a oneshot). Past the deadline the unit is killed and the start refused, as below. With less than
+  # START_MIN left, nothing starts: never `timeout 0`, which is no deadline at all, and never so little time that
+  # timeout could stop systemd-run after it asked for the unit but before systemd made it (kill_unit would then see
+  # nothing, and the unit come after).
+  wait=$((START_BY - SECONDS))
+  ((wait >= START_MIN)) ||
+    die "start: ${SECONDS}s in already, START_BY ($START_BY s) left too little time (under $START_MIN s) to start" \
+      "and check a unit: refused"
+  code=0
+  timeout -k 2 "$wait" "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" \
+    --working-directory "$dir" -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" \
+    "${props[@]}" -p "ReadWritePaths=$dir" \
+    -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh" || code=$?
   # What systemd really applies (issues #365 item 1, #636), drop-ins and defaults included, not what was asked for: a
   # unit that could run on past its limit (a stop timeout over STOP_MAX, a RuntimeMaxSec over MAX_SECONDS, a kill that
-  # leaves processes or never comes; or what cannot be read) is killed at once, and the start refused. Only a unit
-  # systemd shows gone or dead after the kill is said to be killed (issue #636).
-  bad=$(runs_on "fork-fleet-$name.service")
+  # leaves processes or never comes, a Type= that is not exec; or what cannot be read) is killed at once, and the start
+  # refused. Only a unit systemd shows gone or dead with no process left after the kill is said to be killed (issues
+  # #636, #656). A systemd-run that fails is killed too (#667): without --no-block it fails whenever the start job
+  # does (failed, timeout), after the unit was made and run.sh ran, and a drop-in (KillMode=none with a failing
+  # ExecStartPost=, say) can leave the job running in a failed unit, past RuntimeMaxSec and unchecked. That kill can
+  # reach no other start's unit: $dir was refused above if a runner of this name ran already, and prune removes it only
+  # once the unit is gone; a unit that never was shows gone.
+  why='a job could run on past its limit'
+  if ((code == 124 || code == 137)); then
+    bad="did not start within ${wait}s (the start still waited: a Type= that is not exec?)"
+  elif ((code != 0)); then
+    bad="failed to start (its start exited $code)" why='what it started could run on, unchecked'
+  else
+    bad=$(runs_on "fork-fleet-$name.service")
+  fi
   if [[ -n $bad ]]; then
-    left=$(kill_unit "fork-fleet-$name.service") || die "start: fork-fleet-$name.service $bad: a job could run on" \
-      "past its limit; could not kill it (ActiveState=${left:-unreadable}): refused; kill it by hand:" \
+    left=$(kill_unit "fork-fleet-$name.service" "$user") || die "start: fork-fleet-$name.service $bad: $why;" \
+      "could not kill it (${left:-unreadable}): refused; kill it by hand:" \
       "systemctl kill --signal=KILL -- fork-fleet-$name.service"
-    die "start: fork-fleet-$name.service $bad: a job could run on past its limit; killed and refused"
+    warn "start: fork-fleet-$name.service $bad: $why; $left and refused"
+    ((code == 0 || code == 124 || code == 137)) || exit "$code"
+    exit 1
   fi
 }
 
@@ -1355,23 +1391,35 @@ STOP_MAX=300
 # What runs_on reads of a job unit (`systemctl show`): each must be printed once, but RuntimeRandomizedExtraUSec, which
 # systemd before 250 has not (and so cannot add to RuntimeMaxSec either).
 JOB_SHOW=(TimeoutStopUSec TimeoutAbortUSec RuntimeMaxUSec RuntimeRandomizedExtraUSec KillMode SendSIGKILL
-  FinalKillSignal LoadState)
+  FinalKillSignal Type LoadState ActiveState ControlGroup)
 # How often kill_unit looks (every half second) for the unit to be gone before it says it could not kill it.
 KILL_TRIES=10
+# By when (seconds after this launcher began: bash's SECONDS) systemd-run must have returned (issue #656), and the
+# least time it may have (#667: see start). The lock wait counts: it is part of the agent's 100 s too.
+START_BY=80
+START_MIN=10
+# By when start's check and kill are done (seconds after this launcher began): each systemctl call of runs_on and
+# kill_unit runs at most CALL_MAX s and never past KILL_BY (systemctl), then gets a KILL 1 s later, and kill_unit looks
+# no more once KILL_BY is reached. A test keeps KILL_BY, with START_BY's own kill grace before it and the last call's
+# after it, inside the agent's own `start` limit (fork-fleet-desk-wire.py's VERBS, 100 s).
+KILL_BY=92
+CALL_MAX=5
 
 # Why job unit $1, as systemd applies it, could run on past its limit, or nothing (issues #365 item 1, #636): a stop
 # timeout (TimeoutStopUSec, TimeoutAbortUSec) not at most STOP_MAX or a RuntimeMaxUSec not at most MAX_SECONDS (each
 # endless: infinity or 0, or longer), RuntimeRandomizedExtraUSec not 0, KillMode not control-group (what it leaves runs
-# on), SendSIGKILL not yes or FinalKillSignal not SIGKILL (a job that ignores the stop is never killed); any other key
-# or word, a key missing or twice, a LoadState but loaded, or a show that fails: fail closed. A unit systemd no longer
-# has (LoadState=not-found: it ended and --collect removed it) has nothing to check: show then prints the manager's
-# defaults, not the unit's, and nothing of it runs.
+# on), SendSIGKILL not yes or FinalKillSignal not SIGKILL (a job that ignores the stop is never killed), Type not exec
+# (what start asked for: issue #656); any other key or word, a key missing or twice, a LoadState but loaded, or a show
+# that fails: fail closed. A unit systemd no longer has (it ended and --collect removed it) has nothing to check: show
+# then prints the manager's defaults, not the unit's, and nothing of it runs. That is LoadState=not-found with
+# ActiveState=inactive and no ControlGroup (issue #656): a unit whose file root removed while it runs (and a
+# daemon-reload) shows not-found too, but active, with its cgroup: checked, so refused.
 runs_on() {
   local out line key val
   local -a args=() words
   local -A got=()
   for key in "${JOB_SHOW[@]}"; do args+=(-p "$key"); done
-  out=$("$SYSTEMCTL" show "${args[@]}" -- "$1" 2>/dev/null) || {
+  out=$(systemctl_by show "${args[@]}" --all -- "$1" 2>/dev/null) || {
     echo "has settings systemctl show cannot read"
     return
   }
@@ -1384,12 +1432,14 @@ runs_on() {
     read -ra words <<<"${BASH_REMATCH[2]}"
     got[$key]=${words[*]}
   done <<<"$out"
-  [[ ${got[LoadState]-} != not-found ]] || return 0
+  [[ ${got[LoadState]-}:${got[ActiveState]-}:${got[ControlGroup]-x} != not-found:inactive: ]] || return 0
   for key in "${JOB_SHOW[@]}"; do
     [[ -n ${got[$key]+x} || $key == RuntimeRandomizedExtraUSec ]] ||
       { echo "has no $key: systemctl show did not print it"; return; }
   done
-  [[ ${got[LoadState]} == loaded ]] || { echo "has LoadState=${got[LoadState]}, not loaded"; return; }
+  [[ ${got[LoadState]} == loaded ]] ||
+    { echo "has LoadState=${got[LoadState]} (ActiveState=${got[ActiveState]}), not loaded"; return; }
+  [[ ${got[Type]} == exec ]] || { echo "has Type=${got[Type]}, not exec: not what start asked for"; return; }
   within TimeoutStopUSec "${got[TimeoutStopUSec]}" "$STOP_MAX" STOP_MAX || return 0
   within TimeoutAbortUSec "${got[TimeoutAbortUSec]}" "$STOP_MAX" STOP_MAX || return 0
   within RuntimeMaxUSec "${got[RuntimeMaxUSec]}" "$MAX_SECONDS" MAX_SECONDS || return 0
@@ -1436,26 +1486,68 @@ span_ms() {
       month) u=2629800000 ;;
       y) u=31557600000 ;;
     esac
-    if ((n > cap / u)); then ms=$cap; else ms=$((ms + n * u)); fi
-    if ((ms > cap)); then ms=$cap; fi
+    # One guard keeps ms at most cap and n * u from bash's 64-bit wrap (issue #656: a sum that wraps could come out
+    # a short time): n * u is added only when it fits in what is left under cap.
+    if ((n > (cap - ms) / u)); then ms=$cap; else ms=$((ms + n * u)); fi
   done
   echo "$ms"
 }
 
-# Kills unit $1 (SIGKILL to all its processes, then a stop, so nothing starts them again) and looks every half second,
-# KILL_TRIES times, until systemd shows it inactive or failed (one --collect removed shows inactive). Fails, printing
-# the ActiveState it last showed (nothing when show failed), when it never does: a kill or stop may fail (D-Bus), and
-# then a unit that ignores the stop runs on.
+# systemctl "$@" for start's check and kill: at most CALL_MAX s and never past KILL_BY (at least 1 s), then KILL 1 s
+# later (a D-Bus call that hangs fails, and every caller fails closed on that).
+systemctl_by() {
+  local t=$((KILL_BY - SECONDS))
+  ((t <= CALL_MAX)) || t=$CALL_MAX
+  ((t >= 1)) || t=1
+  timeout -k 1 "$t" "$SYSTEMCTL" "$@"
+}
+
+# Kills unit $1, which ran as runner user $2 (SIGKILL to all its processes, then a stop, so nothing starts them again),
+# and looks every half second, KILL_TRIES times and not past KILL_BY, until systemd shows it inactive or failed with no
+# ControlGroup (one --collect removed shows that too) and $2 has no process left. systemd keeps a stopped unit's cgroup
+# while processes are left in it (issue #656: a KillMode=process or none stops only the main one, and the unit shows
+# inactive while the rest run on), and lets it go once it is empty; older systemd lets it go anyway, so the runner
+# user's own processes are counted too (#667: free_user gives each job a user no other process has). `show --all`:
+# some systemd versions leave out a property that is empty, as ControlGroup is for a unit that is gone, unless --all
+# is given (it still prints only the -p keys). Prints "killed", or "gone" when the kill failed (no such unit: a
+# systemd-run that never made it) but nothing of it is left. Fails, printing what it last showed (nothing when show
+# failed) and whether the kill itself failed, when it never does: a kill or stop may fail (D-Bus), and then a unit
+# that ignores the stop, or what it left, runs on.
 kill_unit() {
-  local state='' i
-  "$SYSTEMCTL" kill --signal=KILL -- "$1" || true
-  "$SYSTEMCTL" stop --no-block -- "$1" || true
+  local out state='' cg='' line i killed=1 uid procs rc
+  uid=$(id -u -- "$2") || { printf 'its user %s is unreadable' "$2"; return 1; }
+  systemctl_by kill --signal=KILL -- "$1" || killed=0
+  systemctl_by stop --no-block -- "$1" || true
   for ((i = 0; i < KILL_TRIES; i++)); do
-    state=$("$SYSTEMCTL" show -p ActiveState --value -- "$1" 2>/dev/null) || state=''
-    [[ $state != inactive && $state != failed ]] || return 0
+    state='' cg='' procs=''
+    if out=$(systemctl_by show -p ActiveState -p ControlGroup --all -- "$1" 2>/dev/null); then
+      while IFS= read -r line; do
+        case $line in ActiveState=*) state=${line#*=} ;; ControlGroup=*) cg=${line#*=} cg=${cg:-none} ;; esac
+      done <<<"$out"
+    fi
+    if [[ ($state == inactive || $state == failed) && $cg == none ]]; then
+      rc=0
+      pgrep -u "$uid" >/dev/null || rc=$?
+      if ((rc == 1)); then
+        if ((killed)); then printf 'killed'; else printf 'gone'; fi
+        return 0
+      fi
+      procs="; $2 has processes left"
+      ((rc == 0)) || procs="; pgrep failed ($rc)"
+    fi
+    ((i + 1 < KILL_TRIES && SECONDS < KILL_BY)) || break
     sleep 0.5
   done
-  printf '%s' "$state"
+  if [[ -z $state ]]; then
+    printf 'unreadable'
+  elif [[ -n $procs ]]; then
+    printf 'ActiveState=%s, no ControlGroup%s' "$state" "$procs"
+  elif [[ $state == inactive || $state == failed ]]; then
+    printf 'ActiveState=%s, but processes left in ControlGroup=%s' "$state" "${cg:-unreadable}"
+  else
+    printf 'ActiveState=%s' "$state"
+  fi
+  ((killed)) || printf '; the kill failed'
   return 1
 }
 
