@@ -691,6 +691,13 @@ def installed_problems():
             problems.append(f'{OPT}/{rel}: differs from what was installed')
         elif not mode_ok:
             problems.append(f'{OPT}/{rel}: mode {stat.S_IMODE(st.st_mode):o}, not {file_mode(rel):o}: install again')
+    # A file in the walls folder that the manifest does not name: the walls refuse to run beside it (their manifest
+    # check, issue #584 item 2), and installing again does not remove it (root put it there, not the kit).
+    walls = os.path.dirname(PIN_HOLDER)
+    with contextlib.suppress(OSError):
+        problems += [f'{OPT}/{walls}/{n}: not in the manifest, so the walls refuse to run: an install stopped half-way '
+                     '(install again), or not the kit\'s (remove it)'
+                     for n in sorted(os.listdir(p(f'{OPT}/{walls}'))) if f'{walls}/{n}' not in manifest]
     folders = {OPT: 0o755, OPT + '/template': 0o755, ETC: 0o700, KEY: 0o600, KEY + '.pub': 0o644}
     folders.update({f'{OPT}/{os.path.dirname(rel)}': 0o755 for rel in manifest if os.path.dirname(rel)})
     for path, mode in sorted(folders.items()):

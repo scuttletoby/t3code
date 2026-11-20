@@ -156,7 +156,13 @@ parts run in the tests on a fake root.
   that fails is never installed. Files are renamed in one by one while the agent and the refresh timer are stopped,
   the walls file that pins the launcher (`fork-fleet-walls/linux`) last: a stop before it leaves the old pin, so
   a new launcher fails the walls until the next run ends the swap, and no older walls file meets a newer pin.
-  `SOURCE` is written
+  That order alone still lets a new `wsl2` meet an old `linux` (launcher unchanged), so the walls also hold their
+  own files to the manifest: `fork-fleet-walls.py`, the launcher and every file of `fork-fleet-walls/` must be what
+  `MANIFEST.sha256` records, none more and none fewer, or they exit 2 and no runner starts. The manifest is written
+  only after the last rename (and after the files a release drops are removed), so every mix a stop leaves is
+  refused, also after a reboot, until the next run ends the swap. A file in `fork-fleet-walls/` that no manifest
+  names (root left it there; installing again does not remove it) is refused the same way, and `check` names it:
+  remove it. `SOURCE` is written
   last, so `check` reports a half-done swap. Users are recorded in `/etc/fork-fleet/desk-kit.json` before they are
   made, so uninstall removes them even after a stop.
 - **Old record:** a record that names a project's fleet config while neither `/etc/fork-fleet/fleet-config.json`

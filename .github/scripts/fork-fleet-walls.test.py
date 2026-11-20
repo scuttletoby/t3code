@@ -3,7 +3,7 @@
 of every walls file in fork-fleet-walls/; the contract each must pass on fake machines from its <os>.fixture.json is
 in fork-fleet-walls-contract.test.py, which uses this file's helpers. A new walls file (and its fixture) is tested
 without a change to either file. Run: python3 <this>. Linux only."""
-import ast, base64, contextlib, errno, hashlib, importlib.machinery, importlib.util, io, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, unittest
+import ast, base64, contextlib, errno, hashlib, importlib.machinery, importlib.util, io, json, os, pathlib, re, shutil, signal, stat, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -35,8 +35,13 @@ class Waited(Exception):
 @contextlib.contextmanager
 def no_wait(seconds=10):
     """Fails a call that blocks (a FIFO opened without O_NONBLOCK waits for a writer forever) instead of hanging the
-    run: SIGALRM after seconds raises Waited in it (issue #365 item 4)."""
+    run: SIGALRM after seconds raises Waited in it (issue #365 item 4). A block whose Waited was caught or reworded
+    inside (a wrapper that turns it into launcher_safe's own refusal, so an assertRaisesRegex in the block passes)
+    still fails: the alarm is recorded, and the block's end raises Waited again (issue #584 item 3)."""
+    fired = []
+
     def late(*_):
+        fired.append(seconds)
         raise Waited(f'blocked for {seconds}s: opened without O_NONBLOCK?')
     old = signal.signal(signal.SIGALRM, late)
     signal.alarm(seconds)
@@ -45,6 +50,9 @@ def no_wait(seconds=10):
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old)
+    if fired:
+        raise Waited(f'blocked for {seconds}s, and its Waited was caught or reworded in the call: opened without '
+                     'O_NONBLOCK?')
 
 
 LINUX = json.loads(slurp(os.path.join(FOLDER, 'linux.fixture.json')))['pass']
@@ -91,6 +99,33 @@ def overlay(files, change):
 def run(cmd, root, **extra):
     env = {'PATH': fw.PATH, 'LC_ALL': 'C', 'FORK_FLEET_WALLS_ROOT': root, **extra}
     return subprocess.run(cmd, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+
+
+class NoWait(unittest.TestCase):
+    """no_wait itself (issue #584 item 3, the #579 lens B nit): a wrapper that rewords a block into the refusal the
+    test expects does not pass."""
+
+    def test_a_block_caught_and_reworded_in_the_call_still_fails(self):
+        def wrapped():
+            try:
+                time.sleep(5)
+            except Waited as e:
+                raise ValueError(f'/x is a link, or not owned by uid 0, or writable by others: {e}')
+        with self.assertRaisesRegex(Waited, 'caught or reworded'):
+            with no_wait(1), self.assertRaisesRegex(ValueError, 'is a link, or not owned by uid'):
+                wrapped()
+
+    def test_runs_again_and_leaves_no_alarm(self):
+        """Runs again: a block that fired leaves no state behind; the next one that does not block passes, and the
+        alarm and the old SIGALRM handler are back as they were."""
+        with self.assertRaises(Waited):
+            with no_wait(1):
+                time.sleep(5)
+        before = signal.getsignal(signal.SIGALRM)
+        with no_wait(1):
+            pass
+        self.assertEqual(signal.alarm(0), 0)
+        self.assertIs(signal.getsignal(signal.SIGALRM), before)
 
 
 class Case(unittest.TestCase):
@@ -207,6 +242,112 @@ class Refuse(Case):
     def test_no_walls_is_exit_3_even_in_an_open_folder(self):   # a checkout with umask 002
         script = self.install({'linux': '#!/bin/sh\nexit 0\n'})
         os.chmod(os.path.dirname(script) + '/fork-fleet-walls', 0o775)
+        p = run([script, 'check'], self.root(WSL1))
+        self.assertEqual(p.returncode, 3, p.stderr)
+
+
+class Installed(Case):
+    """Issue #584 item 2: in an installed kit (a MANIFEST.sha256 beside fork-fleet-walls.py), the walls' own files
+    must be what the manifest records, so a desk-install stopped half-way (the old manifest beside some new files)
+    never runs a mix of walls files; the next install ends the swap and writes the new manifest."""
+
+    def record(self, script, skip=()):
+        """The manifest desk-install's swap() writes (`<sha256>  <path>` lines, sorted), of every file in the kit
+        folder but skip, as it is now."""
+        here = os.path.dirname(script)
+        walls = os.listdir(os.path.join(here, 'fork-fleet-walls'))
+        rels = sorted(r for r in ['fork-fleet-walls.py', 'fork-fleet-launch.sh', JOB_PATHS,
+                                  *(f'fork-fleet-walls/{n}' for n in walls)] if r not in skip)
+        path = os.path.join(here, 'MANIFEST.sha256')
+        lines = []
+        for r in rels:
+            with open(os.path.join(here, r), 'rb') as f:
+                lines.append(f'{hashlib.sha256(f.read()).hexdigest()}  {r}\n')
+        write(path, ''.join(lines))
+        os.chmod(path, 0o644)
+        return path
+
+    def os_verb(self, script):
+        return run([script, 'os'], self.root(LINUX))
+
+    def test_a_kit_as_recorded_runs(self):
+        """Also old state: a manifest that names other files of the kit too (the agent, the units) is fine."""
+        script = self.install()
+        self.record(script)
+        with open(os.path.join(os.path.dirname(script), 'MANIFEST.sha256'), 'a') as f:
+            f.write('0' * 64 + '  units/fork-fleet-desk-agent.service\n')
+        p = self.os_verb(script)
+        self.assertEqual((p.returncode, p.stdout), (0, 'linux\n'), p.stderr)
+        p = run([script, 'describe'], self.root(LINUX))
+        self.assertNotIn('MANIFEST', p.stderr)
+        self.assertIn(p.returncode, (0, 1), p.stderr)
+
+    def test_no_manifest_is_no_install(self):
+        """Missing state: the repository and a staged copy have no manifest, and are not held to one."""
+        p = self.os_verb(self.install())
+        self.assertEqual((p.returncode, p.stdout), (0, 'linux\n'), p.stderr)
+
+    def test_each_mix_a_stopped_install_leaves_is_refused_until_the_next_run_ends_it(self):
+        """Stopped half-way: the old manifest beside a changed walls file (a new wsl2 beside the old linux, the mix
+        the pin order leaves open), a changed fixture, dispatcher or launcher, a walls file the new release adds, or
+        one it removes. Runs again: the next install writes the new manifest, and the kit runs."""
+        here = lambda script: os.path.dirname(script)
+        mixes = {
+            'new wsl2 beside the old linux': lambda s: write(os.path.join(here(s), 'fork-fleet-walls/wsl2'),
+                                                              slurp(os.path.join(FOLDER, 'wsl2')) + '# new\n'),
+            'new fixture': lambda s: write(os.path.join(here(s), 'fork-fleet-walls/linux.fixture.json'),
+                                           slurp(os.path.join(FOLDER, 'linux.fixture.json')) + '\n'),
+            'new dispatcher': lambda s: write(s, slurp(SCRIPT) + '# new\n'),
+            'new launcher': lambda s: write(os.path.join(here(s), 'fork-fleet-launch.sh'), slurp(LAUNCHER) + '# n\n'),
+            'a walls file the release adds': lambda s: [write(os.path.join(here(s), 'fork-fleet-walls', n), '{}')
+                                                        for n in ('macos', 'macos.fixture.json')],
+            'a walls file the release removes': lambda s: [os.unlink(os.path.join(here(s), 'fork-fleet-walls', n))
+                                                           for n in ('wsl2', 'wsl2.fixture.json')],
+        }
+        for mix, change in mixes.items():
+            with self.subTest(mix):
+                script = self.install()
+                self.record(script)
+                change(script)
+                for verb in ('os', 'check', 'describe'):
+                    p = run([script, verb], self.root(LINUX))
+                    self.assertEqual((p.returncode, p.stdout), (2, ''), f'{verb}: {p.stderr}')
+                    self.assertIn('MANIFEST.sha256', p.stderr)
+                    self.assertRegex(p.stderr, r'stopped half-way \(run it again\)|Run the install again')
+                self.record(script)   # the next run ends the swap: the new manifest
+                p = self.os_verb(script)
+                self.assertEqual((p.returncode, p.stdout), (0, 'linux\n'), p.stderr)
+
+    def test_a_file_the_manifest_does_not_name_is_refused(self):
+        """A manifest that leaves out a walls file, the dispatcher or the launcher."""
+        for rel in ('fork-fleet-walls/wsl2.fixture.json', 'fork-fleet-walls.py', 'fork-fleet-launch.sh'):
+            with self.subTest(rel):
+                script = self.install()
+                self.record(script, skip=[rel])
+                p = self.os_verb(script)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(f'{rel} is not in ', p.stderr)
+                self.assertIn('not the kit\'s (remove it)', p.stderr)
+
+    def test_an_empty_or_unsafe_manifest_is_refused(self):
+        """Empty or broken state: an empty manifest, one that is not UTF-8, a link, a FIFO (never waited on), or one
+        others can write. An OS without walls is still exit 3 first (asked before any safety check)."""
+        cases = {
+            'empty': lambda m: write(m, ''),
+            'not utf-8': lambda m: pathlib.Path(m).write_bytes(b'\xff\xfe  fork-fleet-walls.py\n'),
+            'link': lambda m: (os.rename(m, m + '.real'), os.symlink(m + '.real', m)),
+            'fifo': lambda m: (os.unlink(m), os.mkfifo(m, 0o644)),
+            'writable by others': lambda m: os.chmod(m, 0o666),
+        }
+        for name, spoil in cases.items():
+            with self.subTest(name):
+                script = self.install()
+                spoil(self.record(script))
+                p = self.os_verb(script)
+                self.assertEqual((p.returncode, p.stdout), (2, ''), p.stderr)
+                self.assertIn('MANIFEST.sha256', p.stderr)
+        script = self.install({'linux': '#!/bin/sh\nexit 0\n'})
+        write(self.record(script), '')
         p = run([script, 'check'], self.root(WSL1))
         self.assertEqual(p.returncode, 3, p.stderr)
 

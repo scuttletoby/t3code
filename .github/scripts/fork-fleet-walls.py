@@ -10,7 +10,8 @@ refused: not supported yet.
                                  lint, not a proof); prints the walls that do not
   fork-fleet-walls.py describe   for setup: every wall, PASS or FAIL
 
-Exit: 0 every wall holds, 1 a wall does not hold, 2 a broken or unsafe walls file (or usage), 3 this OS is not
+Exit: 0 every wall holds, 1 a wall does not hold, 2 a broken or unsafe walls file (or usage, or an installed kit
+whose walls files, launcher or this file are not what its MANIFEST.sha256 records: as_installed), 3 this OS is not
 supported yet (native Windows too). Anything but 0 from `check`: no runner starts.
 
 Both verbs run the walls file's `describe` and hold it to the contract; `check` then prints only the FAIL lines. So
@@ -38,11 +39,12 @@ FORK_FLEET_WALLS_ROOT is a test knob: refused (exit 2) when root runs this, as i
 a folder of this user that it alone can write (fake_root). A caller needs no clean environment for it. The launcher
 beside this file must be as safe as a walls file (it runs as root), and FORK_FLEET_LAUNCH_CONF a plain absolute path.
 Standard library only."""
-import glob, json, os, platform, re, stat, subprocess, sys
+import glob, hashlib, json, os, platform, re, stat, subprocess, sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 WALLS = os.path.join(HERE, 'fork-fleet-walls')
 LAUNCHER = os.path.join(HERE, 'fork-fleet-launch.sh')
+MANIFEST = os.path.join(HERE, 'MANIFEST.sha256')   # an installed kit's record (desk-install), when there is one
 PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 OS_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
 # What a terminal must never get raw from a walls file: control characters (ESC, CR, ...), line and bidi marks.
@@ -128,6 +130,55 @@ def safe(path, kind):
         raise Broken(f'{path} is not executable')
 
 
+def plain_bytes(path):
+    """path's bytes, opened without following a link and without waiting on a FIFO; OSError unless a plain file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f'{path} is not a plain file')
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b''.join(chunks)
+    finally:
+        os.close(fd)
+
+
+def as_installed():
+    """In an installed kit (MANIFEST.sha256 beside this file), the walls' own files must be the ones its manifest
+    records: this file, the launcher, and every file of the walls folder, none more and none fewer (issue #584 item
+    2). desk-install renames a release's files in one by one and writes the manifest only after the last, so a run
+    stopped half-way leaves the old manifest beside a mix of old and new files: then any walls file, fixture,
+    launcher or this file that the new release changed, added or removed fails here (exit 2, no runner) until the
+    next run ends the swap. That closes every mix, also the ones the pin order leaves open (a new wsl2 beside an old
+    linux with the launcher unchanged). No manifest: no install (the repository, a staged copy), nothing to hold the
+    files to; a first install has no older files to mix, and its agent is enabled only after the manifest."""
+    if not os.path.lexists(MANIFEST):
+        return
+    safe(MANIFEST, 'data')
+    try:
+        text = plain_bytes(MANIFEST).decode('utf-8')
+    except (OSError, UnicodeDecodeError) as e:
+        raise Broken(f'{MANIFEST}: cannot read it: {e.__class__.__name__}')
+    recorded = dict(reversed(line.split('  ', 1)) for line in text.splitlines() if '  ' in line)
+    walls = {f'fork-fleet-walls/{n}' for n in os.listdir(WALLS)} | {r for r in recorded
+                                                                    if r.startswith('fork-fleet-walls/')}
+    for rel in ['fork-fleet-walls.py', 'fork-fleet-launch.sh', *sorted(walls)]:
+        path = clean(os.path.join(HERE, rel))[:300]
+        if rel not in recorded:
+            raise Broken(f'{path} is not in {MANIFEST}: an install stopped half-way (run it again), or a file that '
+                         'is not the kit\'s (remove it)')
+        try:
+            ok = hashlib.sha256(plain_bytes(os.path.join(HERE, rel))).hexdigest() == recorded[rel]
+        except OSError as e:
+            ok, why = False, f'cannot be read ({e.__class__.__name__})'
+        else:
+            why = 'differs from it'
+        if not ok:
+            raise Broken(f'{path} {why}, not as {MANIFEST} records it: an install stopped half-way? Run the install '
+                         'again')
+
+
 def walls_file(name):
     """The walls file of OS name and the walls it must report, or None when that OS has none (not supported yet:
     asked before any safety check, so an OS with no walls is always exit 3)."""
@@ -139,6 +190,7 @@ def walls_file(name):
     fixture = path + '.fixture.json'
     safe(fixture, 'data')
     safe(LAUNCHER, 'file')
+    as_installed()
     try:
         with open(fixture, encoding='utf-8') as f:
             walls = json.load(f)['fail']

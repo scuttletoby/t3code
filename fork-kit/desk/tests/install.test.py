@@ -353,7 +353,8 @@ class Desk(unittest.TestCase):
         """Issue #408 item 1 (the #390 lenses): the walls pin the launcher in one file (PIN_HOLDER, the linux walls;
         the wsl2 walls read that pin). A run stopped between any two renames of an upgrade never leaves the new pin
         beside an older launcher, dispatcher or walls file (each would then be judged by a pin it was never checked
-        against), `check`'s install line fails meanwhile, and the next run ends the swap. Also stopped before the first rename."""
+        against), `check`'s install line fails meanwhile, the real walls refuse the mix (their manifest check, issue
+        #584 item 2), and the next run ends the swap. Also stopped before the first rename."""
         self.assertEqual(self.install()[0], 0)
         changed = {'.github/scripts/fork-fleet-launch.sh': STUBS['.github/scripts/fork-fleet-launch.sh'] + '# new\n',
                    '.github/scripts/fork-fleet-walls.py': STUBS['.github/scripts/fork-fleet-walls.py'] + '# new\n',
@@ -366,6 +367,8 @@ class Desk(unittest.TestCase):
         pin = '/opt/fork-fleet/' + self.m.PIN_HOLDER
         self.assertIn(pin, news)
         real, after = os.replace, []
+        walls = installed_walls(self.path('/opt/fork-fleet'))
+        walls.as_installed()
 
         def stopped_after(n):
             def spy(a, b, *k, **kw):
@@ -385,10 +388,16 @@ class Desk(unittest.TestCase):
                 self.assertFalse(now[pin], f'the pin was renamed in while {[p for p, v in now.items() if not v]} '
                                            'were still old')
                 self.assertTrue(self.m.installed_problems())   # check's install line fails meanwhile
+                if n:   # issue #584 item 2: the real walls refuse every mix of the stopped swap, the pin aside
+                    with self.assertRaisesRegex(walls.Broken, 'stopped half-way'):
+                        walls.as_installed()
+                else:   # stopped before the first rename: all old, as the old manifest records
+                    walls.as_installed()
                 code, _, err = self.install(sha=SHA2, source=new)   # runs again: ends the swap
                 self.assertEqual(code, 0, err)
                 self.assertEqual({path: self.read(path) for path in news}, news)
                 self.assertEqual(self.m.installed_problems(), [])
+                walls.as_installed()   # the new manifest: the walls run again
                 code, _, err = self.install()   # back to the old release for the next stop
                 self.assertEqual(code, 0, err)
 
@@ -417,6 +426,28 @@ class Desk(unittest.TestCase):
         self.assertIn('# new', self.read('/opt/fork-fleet/' + self.m.PIN_HOLDER))
         self.assertFalse(os.path.exists(gone))
         self.assertEqual(self.m.installed_problems(), [])
+
+    def test_a_file_the_kit_did_not_install_in_the_walls_folder_is_named(self):
+        """Issue #584 item 2, old state: the walls refuse to run beside a walls-folder file their manifest does not
+        name (an editor's backup root left there, say), and installing again does not remove it; `check` names it
+        with the fix, and once it is gone the walls run again."""
+        self.assertEqual(self.install()[0], 0)
+        walls = installed_walls(self.path('/opt/fork-fleet'))
+        walls.as_installed()
+        stray = '/opt/fork-fleet/fork-fleet-walls/linux~'
+        self.write(self.path(stray), 'old\n')
+        with self.assertRaisesRegex(walls.Broken, r'linux~ is not in .*remove it'):
+            walls.as_installed()
+        self.assertEqual([x for x in self.m.installed_problems() if 'linux~' in x],
+                         [f'{stray}: not in the manifest, so the walls refuse to run: an install stopped half-way '
+                          '(install again), or not the kit\'s (remove it)'])
+        code, _, err = self.install(sha=SHA2)   # runs again: still named, never deleted
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(self.path(stray)))
+        self.assertTrue(any('linux~' in x for x in self.m.installed_problems()))
+        os.unlink(self.path(stray))
+        self.assertEqual(self.m.installed_problems(), [])
+        walls.as_installed()
 
     def test_project_fleet_config_is_used_and_kept(self):
         project = os.path.join(self.tmp, 'project.json')
@@ -1152,6 +1183,23 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
 
+# A line that sets the launcher's pin: plain, annotated (`LAUNCHER_SHA256: str = ...`) or indented (issue #584 item 4);
+# never a comparison (==) or a read (LINUX.LAUNCHER_SHA256).
+PIN = re.compile(r'^[ \t]*LAUNCHER_SHA256[ \t]*(:[^=\n]*)?=(?!=)', re.M)
+
+
+def installed_walls(opt):
+    """The repository's real fork-fleet-walls.py as a module, as if installed in opt (its HERE): its as_installed()
+    holds opt's walls files to the MANIFEST.sha256 that desk-install wrote there."""
+    path = os.path.join(REPO, '.github', 'scripts', 'fork-fleet-walls.py')
+    spec = importlib.util.spec_from_file_location('fork_fleet_walls_installed', path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.HERE, m.WALLS = opt, os.path.join(opt, 'fork-fleet-walls')
+    m.LAUNCHER, m.MANIFEST = os.path.join(opt, 'fork-fleet-launch.sh'), os.path.join(opt, 'MANIFEST.sha256')
+    return m
+
+
 class Release(unittest.TestCase):
     def test_every_file_the_kit_installs_is_in_this_repository(self):
         m = load()
@@ -1165,8 +1213,23 @@ class Release(unittest.TestCase):
         m = load()
         folder = os.path.join(REPO, m.WALLS)
         pins = [f'fork-fleet-walls/{n}' for n in sorted(os.listdir(folder))
-                if re.search(r'^LAUNCHER_SHA256\s*=', slurp(os.path.join(folder, n)), re.M)]
+                if PIN.search(slurp(os.path.join(folder, n)))]
         self.assertEqual(pins, [m.PIN_HOLDER])
+
+    def test_the_pin_pattern_finds_every_way_to_write_a_pin(self):
+        """Issue #584 item 4 (the #579 lens B nit): a pin written with a type annotation or indented (under an `if`, in
+        a class) is still a pin, so a second pin holder cannot slip past the test above; a file that only reads or
+        compares the pin holds none."""
+        for text in ('LAUNCHER_SHA256 = "ab"', 'LAUNCHER_SHA256="ab"', 'LAUNCHER_SHA256: str = "ab"',
+                     'LAUNCHER_SHA256 : Final[str]="ab"', '    LAUNCHER_SHA256 = "ab"', '\tLAUNCHER_SHA256: str = "ab"',
+                     'X = 1\nif True:\n    LAUNCHER_SHA256 = "ab"\n', 'LAUNCHER_SHA256 = (\n    "ab")'):
+            with self.subTest(text):
+                self.assertTrue(PIN.search(text))
+        for text in ('', 'LINUX.LAUNCHER_SHA256', 'x = LINUX.LAUNCHER_SHA256', 'if got != LAUNCHER_SHA256:',
+                     'LAUNCHER_SHA256 == got', '    if LAUNCHER_SHA256 == got:', 'LAUNCHER_SHA256_OLD = "ab"',
+                     '# LAUNCHER_SHA256 = "ab"', 'OLD_LAUNCHER_SHA256 = "ab"', 'LAUNCHER_SHA256: str'):
+            with self.subTest(text):
+                self.assertIsNone(PIN.search(text))
 
     def test_bootstrap_checks_its_arguments_before_anything(self):
         boot = os.path.join(KIT, 'bootstrap.sh')
