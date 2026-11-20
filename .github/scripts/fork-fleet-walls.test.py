@@ -1385,14 +1385,6 @@ class EveryWallsFile(WallsRunner):
                  '/etc/systemd/system': {'etc/systemd/system/': ''},
                  '/etc/auto.master': {'etc/auto.master': '/net -hosts\n'},
                  '/etc/myapp/private': {'etc/myapp/private/': ''},
-                 # Issue #594: what names this host's accounts (a job has its own passwd, group and hosts; the
-                 # launcher refuses those three itself: an older one's, below).
-                 '/etc/passwd-': {'etc/passwd-': 'alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n'},
-                 '/etc/group-': {'etc/group-': 'sudo:x:27:alice\n'},
-                 '/etc/subuid': {'etc/subuid': 'alice:100000:65536\n'},
-                 '/etc/subgid': {'etc/subgid': 'alice:100000:65536\n'},
-                 '/var/backups': {'var/backups/passwd.bak': 'alice:x:1000:1000:Alice:/home/alice:/bin/bash\n'},
-                 '/var': {'var/backups/group.bak': 'sudo:x:27:alice\n'},   # a folder that holds it
                  '/etc/nsswitch.conf,/etc/fstab': {}}   # a harmless entry beside one that is not
         for allow, files in fails.items():
             with self.subTest(allow):
@@ -1400,6 +1392,29 @@ class EveryWallsFile(WallsRunner):
                         self.root(overlay(LINUX, {**files, conf: f'ALLOW_PATHS={allow}\n'})))
                 self.assertRegex(p.stdout, r'FAIL  mounts  .*a path that holds this host\'s secrets or account names')
                 self.assertIn(allow.split(',')[-1], p.stdout)
+                # Issue #613 item 3: the way out is the owner's line, not the installer.
+                self.assertIn('take it out of ALLOW_PATHS, or of the JOB_PATHS file', p.stdout)
+        # Issues #594, #613 item 2: what names this host's accounts or LAN hosts, and each folder of one: the launcher
+        # refuses each itself now (it used to start a job with ALLOW_PATHS=/etc/passwd-), so `mounts` cannot tell
+        # and names the launcher's refusal, which names ALLOW_PATHS.
+        accounts = {'/etc/passwd-': {'etc/passwd-': 'alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n'},
+                    '/etc/group-': {'etc/group-': 'sudo:x:27:alice\n'},
+                    '/etc/subuid': {'etc/subuid': 'alice:100000:65536\n'},
+                    '/etc/subgid-': {'etc/subgid-': 'alice:100000:65536\n'},
+                    '/etc/hosts.allow': {'etc/hosts.allow': 'sshd: 192.0.2.0/24\n'},
+                    '/var/backups': {'var/backups/passwd.bak': 'alice:x:1000:1000:Alice:/home/alice:/bin/bash\n'},
+                    '/var/backups/passwd.bak': {'var/backups/passwd.bak': 'alice:x:1000:1000::/home/alice:/bin/sh\n'},
+                    '/var/log/wtmp': {'var/log/wtmp': 'alice\n'},
+                    '/var/lib/extrausers': {'var/lib/extrausers/passwd': 'alice:x:1000:1000::/home/alice:/bin/sh\n'},
+                    '/var': {'var/backups/group.bak': 'sudo:x:27:alice\n'}}   # a folder that holds it
+        for allow, files in accounts.items():
+            with self.subTest(allow):
+                p = run([os.path.join(self.folder, 'linux'), 'check'],
+                        self.root(overlay(LINUX, {**files, conf: f'ALLOW_PATHS={allow}\n'})))
+                self.assertIn('FAIL  mounts  ', p.stdout)
+                self.assertIn(f'the launcher refuses what jobs would see: fork-fleet-launch: {allow}: names this host\'s accounts or LAN '
+                              'hosts', p.stdout)
+                self.assertIn('take it out of ALLOW_PATHS', p.stdout)
         for allow in ('', '/etc/myapp', '/etc/java-17-openjdk', '/etc/ssl/certs', '/var/cache', '/etc/host.conf',
                       '/etc/shadow', '/etc/ssh'):
             with self.subTest(allow or 'none'):   # the last two are not on this host: nothing bound
@@ -1427,12 +1442,119 @@ class EveryWallsFile(WallsRunner):
                            # backup of them through a link.
                            ('/usr /usr\\n/etc/passwd /etc/passwd\\n' + resolv, True),
                            ('/usr /usr\\n/etc/hosts /etc/hosts\\n' + resolv, True),
-                           ('/usr /usr\\n/opt/b /var/backups\\n' + resolv, True)):
+                           ('/usr /usr\\n/opt/b /var/backups\\n' + resolv, True),
+                           # Issue #613 item 1: each of these alone (no other line names it).
+                           ('/usr /usr\\n/etc/group /etc/group\\n' + resolv, True),
+                           ('/usr /usr\\n/etc/subuid- /etc/subuid-\\n' + resolv, True),
+                           ('/usr /usr\\n/etc/subgid- /etc/subgid-\\n' + resolv, True),
+                           ('/usr /usr\\n/opt/p /var/backups/passwd.bak\\n' + resolv, True),
+                           ('/usr /usr\\n/var/log/wtmp /var/log/wtmp\\n' + resolv, True),
+                           ('/usr /usr\\n/var/log/lastlog /var/log/lastlog\\n' + resolv, True),
+                           ('/usr /usr\\n/opt/x /var/lib/extrausers/passwd\\n' + resolv, True),
+                           ('/usr /usr\\n/etc/hosts.allow /etc/hosts.allow\\n' + resolv, True),
+                           ('/usr /usr\\n/etc/hosts.deny /etc/hosts.deny\\n' + resolv, True),
+                           ('/usr /usr\\n/etc/networks /etc/networks\\n' + resolv, True),
+                           ('/usr /usr\\n/etc/ethers /etc/ethers\\n' + resolv, True),
+                           ('/usr /usr\\n/var/lib/apt /var/lib/apt\\n' + resolv, False),
+                           ('/usr /usr\\n/var/cache /var/cache\\n' + resolv, False)):
             with self.subTest(lines):
                 write(launcher, f'#!/bin/sh\ncase $1 in paths) printf "{lines}" ;; *) exit 1 ;; esac\n')
                 os.chmod(launcher, 0o755)
                 p = run([os.path.join(self.folder, 'linux'), 'check'], self.root(LINUX))
                 (self.assertRegex if bad else self.assertNotRegex)(p.stdout, r'FAIL  mounts  .*holds this host')
+
+    def fake_paths(self, line, root):
+        """`linux check` on root with a launcher whose `paths` prints /usr, line and the jobs' resolv.conf."""
+        launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
+        write(launcher, f'#!/bin/sh\ncase $1 in paths) printf "/usr /usr\\n{line}\\n'
+                        '/etc/resolv.conf /etc/fork-fleet/resolv.conf\\n" ;; *) exit 1 ;; esac\n')
+        os.chmod(launcher, 0o755)
+        return run([os.path.join(self.folder, 'linux'), 'check'], root).stdout
+
+    def test_linux_mounts_names_where_the_line_is(self):
+        """Issue #613 item 3: a secret entry today's launcher refuses itself (LAUNCHER_REFUSES) is bound only by an
+        older launcher: re-run the installer, whose launcher then names the line. Any other (/etc/shadow) is the
+        owner's own line: ALLOW_PATHS or the JOB_PATHS file the conf names, never the installer's list."""
+        older = 'bound by an older launcher, which does not refuse it itself: re-run the installer'
+        owner = 'take it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names'
+        for line, want in (('/etc/passwd /etc/passwd', older), ('/opt/p /etc/passwd-', older),
+                           ('/var/log /var/log', older), ('/etc/shadow /etc/shadow', owner),
+                           ('/opt/k /etc/ssl/private', owner), ('/etc/ssh /etc/ssh', owner)):
+            with self.subTest(line):
+                got = self.fake_paths(line, self.root(LINUX))
+                self.assertIn('FAIL  mounts  ', got)
+                self.assertIn(want, got)
+                self.assertNotIn(owner if want == older else older, got)
+
+    def test_linux_mounts_finds_a_secret_at_another_path_by_its_inode(self):
+        """Issue #613 item 7: a bind mount or hard link of a secret entry at another path is the same device and
+        inode, so `mounts` fails on it whatever its name: the entry itself (a hard link of /etc/shadow, a bind of
+        /etc/ssl/private), a file in such a folder seen through the other path, and a folder that holds one (a bind of
+        /etc). A file or folder that only shares a parent (/etc/ssl/certs) passes. State: a host with no secret entry
+        has nothing to match; one that cannot be read cannot be told."""
+        def root_with(links=()):
+            root = self.root(overlay(LINUX, {'etc/shadow': {'text': 'root:*:1::::::\n', 'mode': '600'},
+                                             'etc/ssl/private/k.key': 'k\n', 'etc/ssl/certs/ca.pem': 'c\n',
+                                             'opt/keys/k.key': 'k\n', 'opt/e/': ''}))
+            for target, link in links:
+                os.link(os.path.join(root, target), os.path.join(root, link))
+            return root
+        got = self.fake_paths('/opt/s /opt/s', root_with([('etc/shadow', 'opt/s')]))
+        self.assertRegex(got, r'FAIL  mounts  .*jobs see /opt/s \(the same as /etc/shadow\): a bind mount or hard link')
+        got = self.fake_paths('/opt/c /opt/c', root_with([('etc/ssl/certs/ca.pem', 'opt/c')]))   # not a secret
+        self.assertNotIn('FAIL  mounts', got)
+        got = self.fake_paths('/opt/certs /etc/ssl/certs', root_with())
+        self.assertNotIn('FAIL  mounts', got)
+        # A folder bound elsewhere: os.stat of the other path gives the folder's device and inode, as a bind does.
+        real_stat = os.stat
+        for other, want in (('opt/keys', '/etc/ssl/private'),
+                            ('opt/keys/k.key', '/etc/ssl/private, a folder that holds it'),
+                            ('opt/e', '/etc, a folder that holds ')):
+            with self.subTest(other):
+                root = root_with()
+                m = fw_linux()
+                m.ROOT = root
+                bound = {os.path.join(root, 'opt/keys'): os.path.join(root, 'etc/ssl/private'),
+                         os.path.join(root, 'opt/e'): os.path.join(root, 'etc')}
+
+                def fake_stat(p, *a, **k):
+                    return real_stat(bound.get(p, p), *a, **k)
+                with mock.patch.object(m.os, 'stat', fake_stat):
+                    self.assertIn(want, m.same_as_secret('/' + other, m.secret_inodes()) or '')
+        # Missing state: a host with none of the secret entries has nothing to match; an entry that cannot be read
+        # cannot be told.
+        m = fw_linux()
+        m.ROOT = self.root({'usr/': ''})
+        self.assertIsNone(m.same_as_secret('/usr', m.secret_inodes()))
+        m.ROOT = root_with()
+        with mock.patch.object(m.os, 'stat', side_effect=PermissionError(13, 'Permission denied')):
+            with self.assertRaisesRegex(ValueError, 'cannot read /etc/shadow'):
+                m.secret_inodes()
+        # Runs again: the same answer.
+        root = root_with([('etc/shadow', 'opt/s')])
+        self.assertEqual(self.fake_paths('/opt/s /opt/s', root), self.fake_paths('/opt/s /opt/s', root))
+
+    def test_linux_secret_lists_and_the_launchers_own_refusals_are_one(self):
+        """Issue #613 item 2: the launcher refuses the account files itself (it used to start a job with
+        ALLOW_PATHS=/etc/passwd- or /var/backups; only the walls refused). The walls' LAUNCHER_REFUSES is exactly what
+        it refuses of their lists (it is how the walls tell an older launcher's line from the owner's), and each is in
+        the walls' own lists too, for an older launcher. Runs the launcher's `paths` on each."""
+        m = fw_linux()
+        launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
+        conf = 'etc/fork-fleet/launch.conf'
+        each = {p.replace('*', 'x') for p in (*m.SECRET_ETC, *m.SECRET_ELSEWHERE, *m.LAUNCHER_REFUSES)}
+        each |= {'/var/log/wtmp', '/var/lib/extrausers/passwd', '/var/backups/group.bak', '/etc/ssl', '/var/cache'}
+        for p in sorted(each):
+            with self.subTest(p):
+                got = run([launcher, 'paths'], self.root(overlay(LINUX, {conf: f'ALLOW_PATHS={p}\n'})))
+                refused = any(x in got.stderr for x in ('a job never sees it', 'never in a job\'s view',
+                                                        'a job has the launcher\'s own'))
+                self.assertEqual(refused, m.launcher_refuses(p), got.stderr)
+                self.assertEqual(got.returncode != 0, refused, got.stderr)
+                if refused:
+                    self.assertIn('take it out of ALLOW_PATHS', got.stderr)
+                if p != '/etc' and m.launcher_refuses(p):
+                    self.assertTrue(m.secret_etc(p), p)
 
     def test_linux_etc_secrets_reads_only_what_jobs_see(self):
         """Issue #243 items 5 and 6: jobs see an allow list of /etc, so a secret in a login file, a unit or

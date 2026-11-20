@@ -1034,6 +1034,17 @@ never() {
   case $1 in /etc/passwd | /etc/group | /etc/hosts)
     die "$2: a job has the launcher's own, never this host's (an older kit's list?): $3" ;;
   esac
+  # The other usual files that name this host's accounts or LAN hosts, and each folder that holds one (issue #613; the
+  # walls' SECRET_ETC and SECRET_ELSEWHERE name them too, for an older launcher, and a test keeps the two lists one):
+  # passwd's and group's backup copies, subuid and subgid, tcp wrappers' rules, the network and ethers name files, the
+  # logs and login records (/var/log: wtmp, btmp, lastlog, auth.log), Debian's /var/backups (passwd.bak) and
+  # libnss-extrausers' folder.
+  case $1 in
+    /etc/passwd- | /etc/group- | /etc/subuid | /etc/subuid- | /etc/subgid | /etc/subgid- | /etc/hosts.allow | \
+      /etc/hosts.deny | /etc/networks | /etc/ethers | /var | /var/log | /var/log/* | /var/backups | /var/backups/* | \
+      /var/lib | /var/lib/extrausers | /var/lib/extrausers/*)
+      die "$2: names this host's accounts or LAN hosts, or is a folder of such a file; a job never sees it: $3" ;;
+  esac
   no_data "$1" "$2"
 }
 
@@ -1121,7 +1132,7 @@ job_view() {
 # its GECOS (often a person's name) and home folder, and the LAN's host names. New files (noclobber) in a folder job_fs
 # just made, root's: nothing to lead a write astray. A job cannot change them (ProtectSystem=strict, and root's).
 job_etc() {
-  local root=$1 user=$2 home=${3:-/nonexistent} uid gid group name passwd groups hosts
+  local root=$1 user=$2 home=${3:-/nonexistent} uid gid group name passwd groups hosts f
   uid=$(id -u -- "$user") gid=$(id -g -- "$user") group=$(id -gn -- "$user")
   [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $group =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "$user: no plain uid, gid or group name"
   name=$(uname -n)
@@ -1144,6 +1155,12 @@ job_etc() {
     printf '%s' "$passwd" >"$root/etc/passwd" && printf '%s' "$groups" >"$root/etc/group" &&
       printf '%s' "$hosts" >"$root/etc/hosts"
   ) || die "could not write $root/etc's passwd, group and hosts as new files: refused"
+  # Each a plain file of its own now (issue #613 item 6): noclobber refuses only a regular file already there, so a link
+  # to /dev/null (or a FIFO) planted there would take the write and leave the job no passwd at all. Only root could
+  # plant one (the folder is root's, just made); refused all the same.
+  for f in passwd group hosts; do
+    [[ -f $root/etc/$f && ! -L $root/etc/$f && -s $root/etc/$f ]] || die "$root/etc/$f is not the plain file just written: refused"
+  done
 }
 
 # job_view for a unit: its root ($1, root's), its copy ($2, read-write; already a real path, in WORK_ROOT's), the
@@ -1310,6 +1327,58 @@ start() {
   "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" --working-directory "$dir" \
     -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" "${props[@]}" -p "ReadWritePaths=$dir" \
     -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh"
+  # What systemd really applies (issue #365 item 1), drop-ins and defaults included, not what was asked for: a unit
+  # whose stop timeouts are over STOP_MAX (or cannot be read) is killed at once, and the start refused.
+  bad=$(stops_over "fork-fleet-$name.service")
+  if [[ -n $bad ]]; then
+    "$SYSTEMCTL" kill --signal=KILL -- "fork-fleet-$name.service" || true
+    "$SYSTEMCTL" stop --no-block -- "fork-fleet-$name.service" || true
+    die "start: fork-fleet-$name.service $bad: a job that ignores the stop at RuntimeMaxSec would run on; killed and refused"
+  fi
+}
+
+# At most this long (seconds) may systemd wait for a job unit to stop before it kills it (the walls' STOP_MAX: a test
+# keeps the two one): at RuntimeMaxSec it asks the job to stop, and only kills it when that runs out.
+STOP_MAX=300
+
+# Why the stop timeouts systemd applies to unit $1 (`systemctl show`: TimeoutStopUSec, TimeoutAbortUSec) are not each
+# at most STOP_MAX, or nothing. Read as systemd prints them (format_timespan: words such as 1min, 30s, 500ms, 1.5s,
+# infinity; 0 is endless for a stop timeout); any other word, a key missing or twice, or a show that fails: not at
+# most (fail closed).
+stops_over() {
+  local out line key n frac unit ms word seen=' '
+  local -a words
+  out=$("$SYSTEMCTL" show -p TimeoutStopUSec -p TimeoutAbortUSec -- "$1" 2>/dev/null) || {
+    echo "has stop timeouts systemctl show cannot read"
+    return
+  }
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    [[ $line =~ ^(TimeoutStopUSec|TimeoutAbortUSec)=(.*)$ ]] || { echo "has a show line that is no stop timeout"; return; }
+    key=${BASH_REMATCH[1]}
+    [[ $seen != *" $key "* ]] || { echo "has $key twice"; return; }
+    seen+="$key "
+    read -ra words <<<"${BASH_REMATCH[2]}"
+    ((${#words[@]})) || { echo "has an empty $key"; return; }
+    [[ ${words[*]} != infinity && ${words[*]} != 0 ]] || { echo "has $key=${words[*]}: endless"; return; }
+    ms=0
+    for word in "${words[@]}"; do
+      [[ $word =~ ^([0-9]{1,9})(\.([0-9]{1,6}))?(us|ms|s|min|h|d|w|month|y)$ ]] ||
+        { echo "has $key=${words[*]}, not a time it can read"; return; }
+      n=$((10#${BASH_REMATCH[1]})) frac=${BASH_REMATCH[3]} unit=${BASH_REMATCH[4]}
+      # A fraction counts as one more of its unit (never less than systemd's).
+      [[ -z $frac ]] || n=$((n + 1))
+      case $unit in
+        us) ms=$((ms + (n + 999) / 1000)) ;;
+        ms) ms=$((ms + n)) ;;
+        s) ms=$((ms + n * 1000)) ;;
+        min) ms=$((ms + n * 60000)) ;;
+        *) ((n == 0)) || ms=$(((STOP_MAX + 1) * 1000)) ;;   # an hour or more: over, whatever the number
+      esac
+    done
+    ((ms > 0 && ms <= STOP_MAX * 1000)) || { echo "has $key=${words[*]}, over STOP_MAX ($STOP_MAX s) or endless"; return; }
+  done <<<"$out"
+  [[ $seen == *" TimeoutStopUSec "* && $seen == *" TimeoutAbortUSec "* ]] || echo "has stop timeouts systemctl show did not print"
 }
 
 # Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public addresses, which the
@@ -1486,16 +1555,22 @@ etc = etc_extra()
 def not_own():
     """Issue #370: what the job's passwd, group and hosts hold beyond job_fs's own (job_etc): an account or group but
     root's, nobody's and this process's own, or a name on an address but loopback. The host's would name every account
-    (GECOS, home) and the LAN's hosts."""
+    (GECOS, home) and the LAN's hosts. A passwd or group with no line of this process's own (an empty one: issue #613
+    item 6) is not job_etc's either."""
     out = []
-    for name, ids in (('passwd', {0, 65534, os.getuid()}), ('group', {0, 65534, os.getgid()})):
+    for name, ids, mine in (('passwd', {0, 65534, os.getuid()}, os.getuid()),
+                            ('group', {0, 65534, os.getgid()}, os.getgid())):
         try:
             # Bytes beyond ASCII (an old Latin-1 GECOS on the host) as \x escapes: read, never a crash (issue #594).
             with open(os.path.join(ETC, name), encoding='ascii', errors='backslashreplace') as f:
+                own = False
                 for x in f:
                     w = x.rstrip('\n').split(':')
                     if x.strip() and not (len(w) >= 4 and w[2].isdigit() and int(w[2]) in ids):
                         out.append(f'{name} {w[0]}')
+                    own = own or (len(w) >= 4 and w[2].isdigit() and int(w[2]) == mine)
+                if not own:
+                    out.append(f'{name} (no line of its own)')
         except OSError:
             out.append(f'{name} (cannot read it)')
     try:

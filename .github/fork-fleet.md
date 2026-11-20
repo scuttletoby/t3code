@@ -187,8 +187,12 @@ Two more things limit what a job can do:
   account there has `/bin/sh` as its shell, not the host account's
   `/usr/sbin/nologin` (host step 1): tools that read the login shell get a real
   one, and inside the sandbox it opens nothing more. This host's name gets a
-  loopback line only when it is letters, digits, `.`, `-` and `_`; with any
-  other character Java's `getLocalHost` fails in the job (issue #594). Also the
+  loopback line (`127.0.1.1`) only when it starts with a letter, digit or
+  `_`, has only letters, digits, `.`, `-` and `_` after that, is at most 253
+  characters, and is not `localhost` (which has its own line already); any
+  other name gets none, and Java's `getLocalHost` then fails in the job (issue
+  #594). Each of the three is checked after it is written: a plain file, not
+  empty, no link (a link to `/dev/null` there is refused: issue #613). Also the
   launcher's `ALLOW_PATHS`, the hook and its own copy. So a share or drive
   mounted anywhere else (`/mnt`, `/media`, `/srv`, `/data`, a Windows drive at
   `/c`) is not there. `MountFlags=private`: a mount the host makes after the job
@@ -216,9 +220,24 @@ Two more things limit what a job can do:
   that holds one (`shadow`, `sudoers`, `ssh`, `ssl` (it holds `ssl/private`),
   `/etc/default`, cron, `systemd`, `fstab`, this kit's own folder, any folder
   named `private`, ...) fails `mounts`, as written and where it really leads
-  (issue #370); so does one that names this host's accounts (`passwd`,
-  `group`, `hosts`, their backups `passwd-` and `group-`, `subuid`, `subgid`,
-  and `/var/backups` outside `/etc`: issue #594). The per-OS walls ask
+  (issue #370). The files that name this host's accounts or LAN hosts, and
+  each folder that holds one, the launcher refuses itself (issues #594, #613):
+  `passwd`, `group` and `hosts`, the backups `passwd-` and `group-`, `subuid`
+  and `subgid` and their backups, `hosts.allow`, `hosts.deny`, `networks`,
+  `ethers`, and outside `/etc` `/var/backups`, `/var/log` (`wtmp`, `btmp`,
+  `lastlog`, `auth.log`), `/var/lib/extrausers`, and `/var` and `/var/lib`
+  that hold them; it names the line's file (`ALLOW_PATHS`, a `JOB_PATHS` file,
+  or "re-run the installer" for its own list). `mounts` fails on each too, for
+  an older launcher that does not refuse it: re-run the installer. These are
+  the usual places, not every file that could name a user (a project's own
+  files are the project's to keep out). `mounts` also fails on a path jobs see
+  that is the same file or folder (device and inode) as one of these secret
+  entries or a folder that holds one, whatever its name: a bind mount or hard
+  link of `/etc/shadow` or `/etc/ssl/private` at `/opt/keys`, or of `/etc`
+  itself (issue #613). It cannot see a single file inside a secret folder
+  bind-mounted or hard-linked on its own somewhere else (a hard link of
+  `/var/log/auth.log` at `/opt/log`): the walls would have to read every file
+  in those folders. The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`, and `tools` for the
   `systemd-run` and `systemctl` it runs) instead of keeping a list of their
   own. A systemd drop-in that changes the job units (`service.d`,
@@ -236,7 +255,12 @@ Two more things limit what a job can do:
   drop-in, or as systemd's own default (`system.conf`: the first of `/etc`,
   `/run`, `/usr/local/lib` and `/usr/lib`, and every `system.conf.d`) while a
   job unit an older launcher started is still loaded (an endless one of a
-  unit's own fails too); and a
+  unit's own fails too). The launcher checks the outcome as well (issue #365):
+  right after `systemd-run` it reads the unit's applied `TimeoutStopUSec` and
+  `TimeoutAbortUSec` (`systemctl show`), and when either is endless, over 5
+  minutes, missing or not a time it can read, it kills and stops the unit and
+  refuses the start, so a drop-in made after the walls ran still cannot give a
+  job an endless stop; and a
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
   drops it anywhere else. The walls know the launcher they ship with: its
