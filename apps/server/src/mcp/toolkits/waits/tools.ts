@@ -17,8 +17,11 @@ import * as Schema from "effect/Schema";
 import { McpSchema, Tool, Toolkit } from "effect/ai";
 
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
+import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import { Waits } from "../../../waits/WaitWorker.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import { TaskListInput, TaskListResult } from "./taskList.ts";
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
@@ -76,4 +79,26 @@ const WaitCancelTool = Tool.make("wait_cancel", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
 
-export const WaitsToolkit = Toolkit.make(WaitForTool, WaitListTool, WaitCancelTool);
+// Fork (issue 386): the caller's delegated tasks with unread results and live slot use.
+const TaskListTool = Tool.make("task_list", {
+  description:
+    "List this thread's delegated tasks with an unread result (local and linked) and its running children per place, from live status. Marks nothing read; task_status does.",
+  parameters: TaskListInput,
+  success: TaskListResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: [
+    McpInvocationContext.McpInvocationContext,
+    ThreadManagementService.ThreadManagementService,
+    RemoteDelegation.RemoteDelegation,
+    PeerForwarding.PeerForwarding,
+  ],
+})
+  .annotate(Tool.Title, "List delegated tasks")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
+export const WaitsToolkit = Toolkit.make(WaitForTool, WaitListTool, WaitCancelTool, TaskListTool);

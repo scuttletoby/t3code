@@ -11,6 +11,7 @@ const {
   findExpiredAnnouncements,
   findHiddenUpstreamFiles,
   findSeamBreaches,
+  findSpareSeamLines,
   findListedGone,
   findLostLines,
   findStaleSeamLines,
@@ -38,6 +39,11 @@ const judge = (files, base, head, upstream = true) =>
   });
 const SEAM = { "a.ts": { why: "test", added: ["import { fork } from './fork';", "...fork,"] } };
 const BASE = { "a.ts": "import { x } from './x';\nconst s = {\n  a: 1,\n};\n" };
+// BASE with exactly SEAM's lines: from upstream each listed copy must be one the fork adds.
+const SEAMED = {
+  "a.ts":
+    "import { x } from './x';\nimport { fork } from './fork';\nconst s = {\n  ...fork,\n  a: 1,\n};\n",
+};
 
 test("the seam lines pass, wherever they sit and however they are indented", () => {
   const head =
@@ -869,6 +875,7 @@ test("every upstream file counts on the command line, from upstream and from mai
     const series = commit(
       {
         ...seams({ files: SEAM, pending: { "p.ts": 1 } }),
+        ...SEAMED,
         "p.ts": `${UP}forkOld();\n`,
         "fork/own.ts": UP,
       },
@@ -901,7 +908,7 @@ test("every upstream file counts on the command line, from upstream and from mai
 test("from upstream, an upstream file named like a fork file fails on the command line until excluded", () => {
   withRepo(({ commit, fromUpstream }) => {
     const upstream = commit({ "src/forkJoin.ts": UP, ...BASE }, "upstream");
-    const series = commit(seams({ files: SEAM }), "fork series");
+    const series = commit({ ...seams({ files: SEAM }), ...SEAMED }, "fork series");
     const refused = fromUpstream(upstream, series);
     assert.equal(refused.status, 1, refused.stdout);
     assert.match(
@@ -924,7 +931,7 @@ test("after a rebase, the lowered list excludes an upstream file a pull request'
     // Old state: a list with no "forkFiles" key, and one whose entries take upstream's files.
     const forkFiles = ["src/usage/", "src/exact.ts", "src/fork-own.ts"];
     const series = commit(
-      { ...seams({ files: SEAM, forkFiles }), "src/fork-own.ts": UP },
+      { ...seams({ files: SEAM, forkFiles }), ...SEAMED, "src/fork-own.ts": UP },
       "fork series",
     );
     const out = path.join(dir, "..", `${path.basename(dir)}-lowered.json`);
@@ -1012,7 +1019,7 @@ test("a rename or delete cannot hide an upstream file, from upstream or on a pul
       "upstream",
     );
     const main = commit(
-      { ...seams({ files: SEAM, forkFiles: ["src/forkstuff/"] }), "fork/own.ts": UP },
+      { ...seams({ files: SEAM, forkFiles: ["src/forkstuff/"] }), ...SEAMED, "fork/own.ts": UP },
       "fork main",
     );
     git("checkout", "-q", "-b", "rewrite", main);
@@ -1511,7 +1518,7 @@ test("--from-upstream reads the head's list even when the upstream commit has on
     git("checkout", "-q", "--orphan", "plain");
     git("rm", "-rfq", ".");
     const plain = commit(BASE, "upstream without a list");
-    const onPlain = commit(seams({ files: SEAM }), "series");
+    const onPlain = commit({ ...seams({ files: SEAM }), ...SEAMED }, "series");
     const noFlag = run(plain, onPlain);
     assert.equal(noFlag.status, 1);
     assert.match(noFlag.stderr, /^The base .* has no \.github\/fork-seams\.json/);
@@ -1531,10 +1538,11 @@ test("--from-upstream reads the head's list even when the upstream commit has on
 // A list from before "lost" (main's today): from upstream, every lost line is counted against 0.
 test('from upstream, a list with no "lost" counts refuses a seam file that lost an upstream line', () => {
   withRepo(({ commit, fromUpstream, run }) => {
+    const hook = { "a.ts": { why: "test", added: ["forkHook();"] } };
     const upstream = commit({ "a.ts": GUARD_BASE }, "upstream");
     const series = commit(
       {
-        ...seams({ files: GUARD_SEAM }),
+        ...seams({ files: hook }),
         "a.ts": "import { x } from './x';\ndoSensitive();\nforkHook();\n",
       },
       "fork series drops the guard",
@@ -1543,7 +1551,7 @@ test('from upstream, a list with no "lost" counts refuses a seam file that lost 
     assert.equal(result.status, 1);
     assert.match(result.stderr, /- a\.ts: 1 upstream line deleted, moved or re-indented/);
     const recorded = commit(
-      seams({ files: GUARD_SEAM, lost: { "a.ts": { lines: 1, gone: 1 } } }),
+      seams({ files: hook, lost: { "a.ts": { lines: 1, gone: 1 } } }),
       "record it",
     );
     assert.equal(fromUpstream(upstream, recorded).status, 0);
@@ -1818,7 +1826,7 @@ test("a new seam line lands green in two steps: announce, then add", () => {
   withRepo(({ git, commit, run, fromUpstream }) => {
     const upstream = commit({ ...BASE, "n.ts": UP }, "upstream");
     const day = "2026-11-18T12:00:00Z";
-    const main = commit(seams({ files: SEAM }), "fork main", day);
+    const main = commit({ ...seams({ files: SEAM }), ...SEAMED }, "fork main", day);
     const announce = (since = "2026-11-18") => ({
       files: {
         ...SEAM,
@@ -1907,12 +1915,12 @@ test("from upstream, an announced line upstream itself added stops the run befor
   withRepo(({ git, commit, run, fromUpstream }) => {
     const day = "2026-11-18T12:00:00Z";
     const upstream = commit({ ...BASE, "n.ts": UP }, "upstream", day);
-    const main = commit(seams(ANNOUNCED()), "step 1", day);
+    const main = commit({ ...seams(ANNOUNCED()), ...SEAMED }, "step 1", day);
     assert.equal(fromUpstream(upstream, main).status, 0);
     // Upstream's next nightly adds the same line; the series is rebased onto it.
     git("checkout", "-q", "-b", "next", upstream);
     const next = commit({ "n.ts": `${UP}  forkNew();\n` }, "upstream adds the line", day);
-    const rebased = commit(seams(ANNOUNCED()), "step 1, rebased", day);
+    const rebased = commit({ ...seams(ANNOUNCED()), ...SEAMED }, "step 1, rebased", day);
     const first = fromUpstream("--after-rebase", next, rebased);
     for (const result of [first, fromUpstream(next, rebased)]) {
       assert.equal(result.status, 1, result.stdout);
@@ -1934,7 +1942,11 @@ test("from upstream, an announced line upstream itself added stops the run befor
     const dropped = commit(seams({ files: SEAM }), "drop it", day);
     assert.equal(run(main, dropped).status, 0);
     git("checkout", "-q", "-f", "-B", "rebased", next);
-    const rebasedDropped = commit(seams({ files: SEAM }), "drop it, rebased", day);
+    const rebasedDropped = commit(
+      { ...seams({ files: SEAM }), ...SEAMED },
+      "drop it, rebased",
+      day,
+    );
     assert.equal(fromUpstream("--after-rebase", next, rebasedDropped).status, 0);
     assert.equal(fromUpstream(next, rebasedDropped).status, 0);
   });
@@ -2909,6 +2921,182 @@ test("--lowered-list writes the lowered list after a rebase only, and only when 
         ["--after-rebase", upstream, series, "--lowered-list"],
       ]) {
         assert.equal(fromUpstream(...args).status, 2, args.join(" "));
+      }
+      assert.equal(fs.existsSync(out), false);
+    } finally {
+      fs.rmSync(out, { force: true });
+    }
+  });
+});
+
+// A listed "added" copy the fork no longer adds (a generic `};` or `settings = {` left from
+// an older change) was room for a line nobody announced, and neither run noticed.
+const spare = (files, base, head, options = {}) =>
+  findSpareSeamLines(files, {
+    atBase: (file) => base[file],
+    atHead: (file) => head[file],
+    upstream: true,
+    ...options,
+  });
+
+test("from upstream, a listed seam copy the fork does not add is refused, naming the fix", () => {
+  // Exact: each listed copy is one over upstream's.
+  assert.deepEqual(spare(SEAM, BASE, SEAMED), { ceilings: [], notes: [] });
+  // `...fork,` is listed but not added: refused, with the fix.
+  const half = { "a.ts": SEAMED["a.ts"].replace("  ...fork,\n", "") };
+  assert.deepEqual(spare(SEAM, BASE, half).ceilings, [
+    'a.ts: "added" lists `...fork,`, but the fork adds no copy over upstream; remove it from "added" (a spare copy lets a later change add the line unannounced).',
+  ]);
+  // A line upstream also has (`};`) counts only the copies over upstream's.
+  const generic = { "a.ts": { why: "t", added: ["};", "};"] } };
+  const once = { "a.ts": `${BASE["a.ts"]}};\n` };
+  assert.deepEqual(spare(generic, BASE, once).ceilings, [
+    'a.ts: "added" lists `};` 2×, but the fork adds 1× over upstream; list it 1× (a spare copy lets a later change add the line unannounced).',
+  ]);
+  assert.deepEqual(spare(generic, BASE, BASE).ceilings.length, 1);
+  // Upstream dropped its copy and the fork kept one: that copy is now the fork's (over upstream).
+  const upstreamDropped = { "a.ts": BASE["a.ts"].replace("};\n", "}\n") };
+  assert.deepEqual(
+    spare({ "a.ts": { why: "t", added: ["};"] } }, upstreamDropped, BASE).ceilings,
+    [],
+  );
+  // An announced line is not added yet: never spare. A missing file is refused elsewhere.
+  const announced = {
+    "a.ts": { ...SEAM["a.ts"], announced: { since: "2026-11-18", added: ["n();"] } },
+  };
+  assert.deepEqual(spare(announced, BASE, SEAMED).ceilings, []);
+  assert.deepEqual(spare(SEAM, {}, SEAMED), { ceilings: [], notes: [] });
+  assert.deepEqual(spare(SEAM, BASE, {}), { ceilings: [], notes: [] });
+  // Right after a rebase (upstream took a fork line word for word) it is a note, and the copies
+  // in use go to the lowered list.
+  const lowered = { added: new Map() };
+  const after = spare(SEAM, BASE, half, { afterRebase: true, lowered });
+  assert.deepEqual(after.ceilings, []);
+  assert.equal(after.notes.length, 1);
+  assert.deepEqual(
+    lowered.added.get("a.ts"),
+    new Map([
+      ["import { fork } from './fork';", 1],
+      ["...fork,", 0],
+    ]),
+  );
+});
+
+test("from main, a change that drops a listed seam copy drops it from its own list, exactly", () => {
+  const pr = (head, ownFiles) => spare(SEAM, SEAMED, head, { upstream: false, ownFiles }).ceilings;
+  const half = { "a.ts": SEAMED["a.ts"].replace("  ...fork,\n", "") };
+  const lowered = { "a.ts": { why: "test", added: ["import { fork } from './fork';"] } };
+  // Kept in the own list (or no list edit at all): refused, naming the fix.
+  assert.deepEqual(pr(half, SEAM), [
+    `a.ts: this change drops \`...fork,\`, which main's list has under "added": remove it from "added" in this change's ${CONFIG} (its list has 1; a spare copy lets a later change add the line unannounced, too few fails the next run from upstream).`,
+  ]);
+  assert.deepEqual(pr(half, lowered), []);
+  // Dropping the entry too is exact here: the dropped line has no copy left to list.
+  assert.deepEqual(pr(half, {}), []);
+  // Unchanged text (a list-only change may fix main), a change that adds lines, or an own list
+  // that could not be read: not judged here.
+  assert.deepEqual(pr(SEAMED, {}), []);
+  assert.deepEqual(pr({ "a.ts": `${SEAMED["a.ts"]}more();\n` }, SEAM), []);
+  assert.deepEqual(pr(half, undefined), []);
+  // A generic line counts the copies dropped, whoever's they were: main lists `};` 2×, the
+  // change drops one copy, so its list keeps exactly one (none fails the run from upstream).
+  const generic = (count) => ({ "a.ts": { why: "t", added: Array(count).fill("};") } });
+  const thrice = { "a.ts": `${BASE["a.ts"]}};\n};\n` };
+  const twice = { "a.ts": `${BASE["a.ts"]}};\n` };
+  const judged = (own) =>
+    spare(generic(2), thrice, twice, { upstream: false, ownFiles: generic(own) }).ceilings;
+  assert.deepEqual(judged(1), []);
+  assert.match(
+    judged(2)[0],
+    /drops `};`, which main's list has 2× under "added": list it 1× under/,
+  );
+  assert.match(judged(0)[0], /list it 1× under "added" .*\(its list has none;/);
+});
+
+test("lowerList drops spare seam copies, keeps the copies in use, and only lowers", () => {
+  const text = `${JSON.stringify(
+    {
+      files: {
+        "a.ts": { why: "w", added: ["x();", "};", "y();", "};"] },
+        "b.ts": { why: "w", added: ["z();"] },
+      },
+    },
+    null,
+    2,
+  )}\n`;
+  const result = lowerList(text, {
+    pending: new Map(),
+    lost: new Map(),
+    added: new Map([
+      [
+        "a.ts",
+        new Map([
+          ["x();", 1],
+          ["};", 1],
+          ["y();", 0],
+        ]),
+      ],
+      ["b.ts", new Map([["z();", 1]])],
+      ["gone.ts", new Map([["q();", 0]])],
+    ]),
+  });
+  assert.deepEqual(JSON.parse(result.text).files, {
+    "a.ts": { why: "w", added: ["x();", "};"] },
+    "b.ts": { why: "w", added: ["z();"] },
+  });
+  assert.deepEqual(result.changes, ['a.ts: "added" 4 -> 2 lines (spare: `y();`, `};`)']);
+  // Nothing spare: nothing to write. A count above the list never adds a copy.
+  const none = {
+    pending: new Map(),
+    lost: new Map(),
+    added: new Map([["b.ts", new Map([["z();", 3]])]]),
+  };
+  assert.equal(lowerList(text, none), undefined);
+});
+
+test("the command line: a spare seam copy fails fork-follow's run, is lowered after a rebase, and a pull request drops its own", () => {
+  withRepo(({ dir, git, commit, run, fromUpstream }) => {
+    const upstream = commit(BASE, "upstream");
+    const main = commit({ ...seams({ files: SEAM }), ...SEAMED }, "fork main");
+    assert.equal(fromUpstream(upstream, main).status, 0);
+    // A pull request moves `...fork,` out but keeps it listed: refused in its own run.
+    git("checkout", "-q", "-b", "pr", main);
+    const half = { "a.ts": SEAMED["a.ts"].replace("  ...fork,\n", "") };
+    const kept = commit(half, "move it out");
+    const refused = run(main, kept);
+    assert.equal(refused.status, 1, refused.stdout);
+    assert.match(refused.stderr, /- a\.ts: this change drops `\.\.\.fork,`, which main's list has/);
+    assert.match(refused.stderr, /drop each spare "added" copy/);
+    // Merged as it is, the next run from upstream refuses main.
+    const nightly = fromUpstream(upstream, kept);
+    assert.equal(nightly.status, 1, nightly.stdout);
+    assert.match(nightly.stderr, /- a\.ts: "added" lists `\.\.\.fork,`, but the fork adds no copy/);
+    assert.doesNotMatch(nightly.stderr, /a file of the fork's own/);
+    // With its own list lowered it passes, and so does the run from upstream after the merge.
+    const own = { files: { "a.ts": { why: "test", added: ["import { fork } from './fork';"] } } };
+    const fixed = commit(seams(own), "drop it from the list");
+    assert.equal(run(main, fixed).status, 0);
+    assert.equal(fromUpstream(upstream, fixed).status, 0);
+    // Right after a rebase fork-follow lowers it itself; the lowered list passes and lowers
+    // nothing more (runs again: the same).
+    const out = path.join(dir, "..", `${path.basename(dir)}-spare.json`);
+    try {
+      const after = fromUpstream("--after-rebase", "--lowered-list", out, upstream, kept);
+      assert.equal(after.status, 0, after.stderr);
+      assert.match(after.stdout, /^Note: a\.ts: "added" lists `\.\.\.fork,`/m);
+      assert.match(
+        after.stdout,
+        /^Lowered: a\.ts: "added" 2 -> 1 lines \(spare: `\.\.\.fork,`\)$/m,
+      );
+      const loweredText = fs.readFileSync(out, "utf8");
+      assert.deepEqual(parseConfig(loweredText).files, own.files);
+      fs.rmSync(out);
+      git("checkout", "-q", "-f", "-B", "rebased", kept);
+      const committed = commit({ [CONFIG]: loweredText }, "fork-follow's lowering commit");
+      for (const args of [["--after-rebase", "--lowered-list", out], []]) {
+        const again = fromUpstream(...args, upstream, committed);
+        assert.equal(again.status, 0, again.stderr);
+        assert.doesNotMatch(again.stdout, /Lowered|Note/);
       }
       assert.equal(fs.existsSync(out), false);
     } finally {
