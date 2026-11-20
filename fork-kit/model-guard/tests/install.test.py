@@ -439,7 +439,7 @@ class Install(unittest.TestCase):
         os.unlink(self.path('/etc/fork-kit/model-policy.json'))   # the hook runs already: a rerun still repairs
         code, out, err = self.install()
         self.assertEqual(code, 0, err)
-        self.assertIn('WARNING: this version cannot use the model policy', out)
+        self.assertIn('WARNING: this version is already in use and cannot use the model policy', out)
 
     def test_an_upgrade_that_cannot_read_the_policy_warns(self):
         """#589 review: when the hook already runs, the settings step still repairs, but says when the new version
@@ -451,8 +451,9 @@ class Install(unittest.TestCase):
         self.write('/etc/fork-kit/model-policy.json', {'version': 99, 'mode': 'off', 'allow': []})
         code, out, err = self.install(sha=SHA2)
         self.assertEqual(code, 0, err)
-        self.assertIn('WARNING: this version cannot use the model policy', out)
+        self.assertIn('WARNING: this version is already in use and cannot use the model policy', out)
         self.assertIn('update the kit', out)
+        self.assertIn('so the hook already refuses every checked call', out)   # printed after the switch
         self.assertEqual(self.current(), f'/usr/local/libexec/model-guard/versions/{SHA2}')
         self.turn_on()
         code, out, err = self.install(sha=SHA2)                 # runs again with a policy it reads: no warning

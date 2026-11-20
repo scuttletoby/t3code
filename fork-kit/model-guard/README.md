@@ -25,6 +25,7 @@ Linux, Python 3 standard library only. No state: the hook reads the machine file
 | the call names no model, or `inherit`                                                              | pass   | pass + what enforce would do | refuse, listing the rows  |
 | the model (or, for `Agent` and `Workflow`, an alias) is in no row                                  | pass   | pass + note                  | refuse, listing the rows  |
 | the call names no `driverKind` and one of the rows of that model does not allow it                 | pass   | pass + note                  | refuse, listing the rows  |
+| a model selection (launch, configure, project default) names `driverKind` (see Driver below)       | pass   | pass + note                  | refuse, listing the rows  |
 | the row has efforts and the call names none, or one not in the row                                 | pass   | pass + note                  | refuse, listing the rows  |
 | the row has no `efforts` and the call names an effort (any, `max` too)                             | pass   | pass + note                  | refuse, listing the rows  |
 | ultracode is on (see below) and the row does not list the effort `ultracode`                       | pass   | pass + note                  | refuse, listing the rows  |
@@ -89,9 +90,9 @@ Where the effort is read:
   **What a T3 call must pass in `enforce`** (`delegate_task`, `create_threads`, `t3_thread_launch`,
   `t3_thread_configure`, a project's `defaultModelSelection`): the model, and in `options` the effort and
   `"ultracode": false`. For example `{"model": "example-large-1-0", "options": {"effort": "high", "ultracode":
-  false}}`. Agent instructions and briefs that make these calls should say so before `enforce` is turned on, or
-  their first call is refused (the refusal says what to add). `Agent` and `Workflow` calls have no ultracode option
-  and need nothing more.
+  false}}`, with no `driverKind` on a model selection. Agent instructions and briefs that make these calls should
+  say so before `enforce` is turned on, or their first call is refused (the refusal says what to add). `Agent` and
+  `Workflow` calls have no ultracode option and need nothing more.
 
   **Models with no ultracode option.** T3 offers the option only to Claude models whose effort list has
   `ultracode` (`ClaudeModelCatalog.ts`, `withUltracodeToggle`), and refuses it for the others ("Unknown option
@@ -99,9 +100,20 @@ Where the effort is read:
   `ultracode` (and cannot). The row may not list the effort `ultracode`, and only `claudeAgent` rows take the key.
   Set it only for a model T3 really offers no ultracode option: on a model that has one, a pick that leaves the
   option out can inherit ultracode from its parent.
+  - **Check such rows again after every T3 update.** The guard checks the key once, against what you know today.
+    T3 also reloads its model list (the model manifest) from upstream about every hour, so a model can gain the
+    ultracode option with no change on the machine. A `false` row then lets a pick that leaves the option out run
+    ultracode (inherited from the parent, or the model's default), and nothing says so. When in doubt, leave the
+    key out: the default is the safe side.
+  - **Custom models with no options:** T3 checks no options for a model it has no option list for, so it neither
+    drops an inherited `ultracode` nor refuses `ultracode: false`. Do not set `"ultracodeOption": false` for one;
+    name `"ultracode": false` in its picks instead.
+  - A pick that names `"ultracode": false` passes on a `false` row too, so briefs may keep naming it everywhere.
 
 What v0 does not check: which provider instance or account a T3 call names (`providerInstanceId`, `environmentId`),
-and the model of the session that makes the call.
+and the model of the session that makes the call. Nor a reasoning option that an ACP driver names by its own id
+(its agent marks it `role: "reasoning"`, which the hook cannot see) instead of one of the five effort ids above; this
+does not touch Claude rows (#601). A self-check for a stale `"ultracodeOption": false` row is #600.
 
 ### Decisions
 
@@ -144,8 +156,12 @@ and the model of the session that makes the call.
   model. The hook has no built-in list: a row's `aliases` are the only short names they may use for it, and the
   policy's author names them. Both always run on Claude, so they match only rows of driver `claudeAgent`. The T3
   tools take only the exact `model` of a row; an alias there is refused.
-- **Driver.** A T3 call that names `driverKind` must match the row's `driver`. T3's model selection usually names
-  no driver; then **every** row that names the model must allow the pick. Example: rows `{driver A, model X,
+- **Driver.** Only a `delegate_task` or `create_threads` target has a real `driverKind`: it must match the row's
+  `driver`, and T3 refuses an instance of another driver there. A model selection (`t3_thread_launch`,
+  `t3_thread_configure`, a project's `defaultModelSelection`) has no driver: T3 drops a `driverKind` key there and
+  runs the pick on the named instance, so the hook refuses a model selection that names `driverKind` (even the
+  right one) and never reads it. A pick with no driver is checked against **every** row that names the model, the
+  ultracode rule included: all of them must allow it. Example: rows `{driver A, model X,
   efforts [high]}` and `{driver B, model X, efforts [medium]}`, and a call `{model X, effort medium}` with no
   `driverKind`: refused, because row A does not allow it. This is the safe side: the hook cannot tell which driver
   the server will use. The same model name may be in rows of two drivers; one driver may not name a model or alias
@@ -197,7 +213,9 @@ machine file), so an agent cannot widen its own policy.
 
 1. Write the policy, for example `/etc/fork-kit/model-policy.json`, root-owned, mode 644, in folders that are
    root-owned and not writable by others all the way up to `/`. Start with `"mode": "advise"` (or `"off"`). Not in
-   `/etc/model-guard`: an uninstall removes that folder, so a policy there is refused.
+   `/etc/model-guard`: an uninstall removes that folder, so a policy there is refused, also when the path reaches
+   it through a link, another name of `/etc` (`/private/etc` on macOS) or another spelling on a case-insensitive
+   file system.
 2. Name it in the machine file `/etc/fork-kit/machine.json` (see [common](../common/README.md)):
 
    ```json

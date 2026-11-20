@@ -270,8 +270,9 @@ def check_policy(guard, so='nothing was written', warn=False):
             raise Refused(f'no valid model policy ({e}). Write the policy and the machine file first (README.md, '
                           f'"Turn it on"; mode "off" or "advise" changes nothing), then run again: {so}') from None
         if warn:   # the hook already runs: rewriting its entry changes nothing a broken policy does not already do
-            say(f'WARNING: this version cannot use the model policy, so the hook refuses every checked call until '
-                f'it can: {e}')
+            # this runs after the switch: the hook already runs this version, so the warning says what is true now
+            say(f'WARNING: this version is already in use and cannot use the model policy, so the hook already '
+                f'refuses every checked call; fix the policy (no rerun needed): {e}')
 
 
 def self_test(dest):

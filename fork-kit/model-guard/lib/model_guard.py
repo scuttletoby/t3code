@@ -171,6 +171,32 @@ def parse_policy(text, path):
     return {'mode': policy['mode'], 'allow': rows, 'version': policy['version']}
 
 
+def in_folder(path, folder):
+    """True when path is folder or inside it: by name, as written and resolved (links followed) on both sides, so
+    /private/etc/x is in /etc/x where /etc links to /private/etc; and, while the folder exists, by being the same
+    folder as one of path's resolved parents, which also catches another spelling on a case-insensitive file system
+    (/etc/Model-Guard on macOS)."""
+    names = {os.path.normpath(folder), os.path.realpath(folder)}
+    real = os.path.realpath(path)
+    for name in (os.path.normpath(path), real):
+        if any(name == n or name.startswith(n.rstrip(os.sep) + os.sep) for n in names):
+            return True
+    try:
+        want = os.stat(folder)
+    except OSError:
+        return False
+    while True:
+        try:
+            if os.path.samestat(os.stat(real), want):
+                return True
+        except OSError:
+            pass
+        parent = os.path.dirname(real)
+        if parent == real:
+            return False
+        real = parent
+
+
 def load_policy(machine_path=None, owner_uid=0):
     """(the machine section, the policy). Both files root-owned (owner_uid in tests); raises PolicyError."""
     machine_path = machine_path or machine_file.default_path()
@@ -178,9 +204,8 @@ def load_policy(machine_path=None, owner_uid=0):
     def absolute(v):
         if not os.path.isabs(v):
             return 'must be an absolute path'
-        for path in (os.path.normpath(v), os.path.realpath(v)):
-            if path == ETC_DIR or path.startswith(ETC_DIR + os.sep):
-                return f'must not be in {ETC_DIR}, which an uninstall removes'
+        if in_folder(v, ETC_DIR):
+            return f'must not be in {ETC_DIR}, which an uninstall removes'
         return None
     cfg = machine_file.fields(section, {
         'policyFile': (str, machine_file.REQUIRED, absolute),
@@ -607,17 +632,28 @@ def check_call(kind, args, rows):
     if kind == 'remote':
         action = args.get('action')
         if action not in REMOTE_READ_ACTIONS:
-            problems.append(f'RemoteTrigger {action!r} creates, changes or fires a cloud routine, which runs on a model '
-                            f'the guard cannot see (only {", ".join(REMOTE_READ_ACTIONS)} pass)')
+            problems.append(f'RemoteTrigger {action!r} creates, changes or fires a cloud routine, which runs on a '
+                            f'model the guard cannot see (only {", ".join(REMOTE_READ_ACTIONS)} pass)')
         return problems, matched
 
-    def target(where, value):
+    def target(where, value, selection=False):
         if not isinstance(value, dict):
             problems.append(f'{where} is missing: name its model and options.effort (nothing is inherited)')
+            return
+        if selection and 'driverKind' in value:
+            # A ModelSelection (t3_thread_launch, t3_thread_configure, a project's default) has only instanceId or
+            # provider, model and options; T3 drops any other key (packages/contracts/src/modelSelection.ts) and
+            # runs the pick on the instance, whatever driver this names. So the guard never reads it there: such a
+            # pick is checked against every row of its model, and a driverKind is refused so it cannot mislead.
+            problems.append(f'{where}.driverKind: T3 ignores it on a model selection (it runs the pick on the named '
+                            f'instance), so the guard cannot use it: leave it out, and every row of the model must '
+                            f'allow the pick')
             return
         pairs = _option_pairs(value.get('options'), where, problems)
         if pairs is None:
             return
+        # only a delegate_task or create_threads target has a real driverKind: T3 refuses an instance of another
+        # driver there (OrchestratorMcpService.ts resolveTarget). On a model selection it is refused above.
         model, driver = value.get('model'), value.get('driverKind')
         check_pick(where, model, _efforts_in(pairs), driver, rows, False, problems, matched)
         # A Claude pick that leaves ultracode out can still run it: delegate_task with the parent's model and instance
@@ -651,14 +687,14 @@ def check_call(kind, args, rows):
         for i, thread in enumerate(threads if isinstance(threads, list) else []):
             target(f'threads[{i}].target', thread.get('target') if isinstance(thread, dict) else None)
     elif kind == 't3_thread_launch':
-        target('modelSelection', args.get('modelSelection'))
-    elif kind == 't3_thread_configure' and 'modelSelection' in args:
-        target('modelSelection', args.get('modelSelection'))  # without it the call only reads the thread
+        target('modelSelection', args.get('modelSelection'), selection=True)
+    elif kind == 't3_thread_configure' and 'modelSelection' in args:   # without it the call only reads the thread
+        target('modelSelection', args.get('modelSelection'), selection=True)
     elif kind in ('t3_project_create', 't3_project_update') and args.get('defaultModelSelection') is not None:
         # the project's default model: schedule_task and other callers that name none run on it. Left out or null,
         # the call sets no model (the project falls back to a default this call does not set), so only a given
         # selection is checked.
-        target('defaultModelSelection', args.get('defaultModelSelection'))
+        target('defaultModelSelection', args.get('defaultModelSelection'), selection=True)
     return problems, matched
 
 

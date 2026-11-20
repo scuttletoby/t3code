@@ -244,6 +244,58 @@ class Guard(unittest.TestCase):
         self.passed(t, self.delegate(dict(GOOD_TARGET, driverKind='claudeAgent')))
         self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'medium', 'ultracode': False}}))
 
+    def test_a_model_selection_never_trusts_driver_kind(self):
+        """#589 round 2: a ModelSelection (t3_thread_launch, t3_thread_configure, a project's default) has no
+        driverKind; T3 drops the key and runs the pick on the named instance. So a driverKind there is refused, and
+        the pick is checked against every row of its model, the ultracode rule included. Policy from both reviews:
+        one model in rows of two drivers that allow different efforts."""
+        two = {'mode': 'enforce', 'allow': [LARGE, DEEP, {'driver': 'otherDriver', 'model': 'example-large-1',
+                                                          'efforts': ['xhigh', 'max']}]}
+        self.policy(two)
+        paths = {'t3_thread_launch': lambda sel: {'title': 'x', 'modelSelection': sel},
+                 't3_thread_configure': lambda sel: {'threadId': 't', 'modelSelection': sel},
+                 't3_project_create': lambda sel: {'title': 'p', 'defaultModelSelection': sel},
+                 't3_project_update': lambda sel: {'projectId': 'p', 'defaultModelSelection': sel}}
+        for path, wrap in paths.items():
+            tool = 'mcp__t3-code__' + path
+            for driver in ('otherDriver', 'claudeAgent', None, '', 7):
+                for effort in ('max', 'high'):
+                    with self.subTest(path=path, driver=driver, effort=effort):
+                        # the reviews' call: Claude runs it at max, which its own row does not allow
+                        self.refused(tool, wrap({'instanceId': 'claudeAgent', 'model': 'example-large-1',
+                                                 'driverKind': driver,
+                                                 'options': {'effort': effort, 'ultracode': False}}),
+                                     'driverKind: T3 ignores it on a model selection')
+            for effort, why in (('max', "effort 'max' is not allowed"), ('high', "effort 'high' is not allowed"),
+                                ('xhigh', "effort 'xhigh' is not allowed")):
+                with self.subTest(path=path, effort=effort):     # no effort both rows allow
+                    self.refused(tool, wrap({'instanceId': 'claudeAgent', 'model': 'example-large-1',
+                                             'options': {'effort': effort, 'ultracode': False}}), why)
+        # rows that agree: the pick passes, and the Claude row's ultracode rule still holds
+        self.policy({'mode': 'enforce', 'allow': [LARGE, {'driver': 'otherDriver', 'model': 'example-large-1',
+                                                          'efforts': ['high', 'max']}]})
+        for path, wrap in paths.items():
+            tool = 'mcp__t3-code__' + path
+            with self.subTest(path=path, agree=True):
+                self.passed(tool, wrap({'instanceId': 'a', 'model': 'example-large-1',
+                                        'options': {'effort': 'high', 'ultracode': False}}))
+                self.refused(tool, wrap({'instanceId': 'a', 'model': 'example-large-1',
+                                         'options': {'effort': 'high'}}), 'must name ultracode')
+                self.refused(tool, wrap({'instanceId': 'a', 'model': 'example-large-1', 'driverKind': 'otherDriver',
+                                         'options': {'effort': 'high', 'ultracode': False}}), 'T3 ignores it')
+        # delegate_task and create_threads keep driverKind: T3 refuses an instance of another driver there
+        self.policy(two)
+        other = {'model': 'example-large-1', 'driverKind': 'otherDriver', 'options': {'effort': 'max'}}
+        claude = dict(GOOD_TARGET, driverKind='claudeAgent')
+        self.passed('mcp__t3-code__delegate_task', self.delegate(other))
+        self.passed('mcp__t3-code__delegate_task', self.delegate(claude))
+        self.passed('mcp__t3-code__create_threads', {'threads': [{'target': other}, {'target': claude}]})
+        self.refused('mcp__t3-code__delegate_task', self.delegate(dict(claude, options={'effort': 'max',
+                                                                                         'ultracode': False})),
+                     "effort 'max' is not allowed")
+        self.refused('mcp__t3-code__create_threads', {'threads': [{'target': dict(other, driverKind='claudeAgent')}]},
+                     "effort 'max' is not allowed")
+
     def test_ultracode_is_checked_as_the_effort_that_runs(self):
         t = 'mcp__t3-code__delegate_task'
         xhigh = {'mode': 'enforce', 'allow': [dict(LARGE, efforts=['high', 'xhigh'])]}
@@ -629,6 +681,48 @@ const c = log("agent(") || items.map(i => i.agent)
                 self.refused('Agent', {'model': 'large', 'effort': 'high'}, 'must not be in /etc/model-guard')
         self.machine({'policyFile': self.policy_path})
         self.passed('Agent', {'model': 'large', 'effort': 'high'})
+
+    def test_the_guards_folder_is_found_through_links(self):
+        """#589 round 2: /etc may be a link (/etc -> /private/etc on macOS), and so may a folder on the policy's
+        path; either way a policy that really lives in the guard's folder is refused."""
+        real = os.path.join(self.dir, 'private-etc', 'model-guard')
+        os.makedirs(real)
+        os.symlink(os.path.join(self.dir, 'private-etc'), os.path.join(self.dir, 'etc'))
+        os.symlink(real, os.path.join(self.dir, 'into-guard'))
+        # the folder there (an installed kit), then not made yet (before the first install: found by name alone)
+        for exists in (True, False):
+            if not exists:
+                os.rmdir(real)
+            for etc_dir in (real, os.path.join(self.dir, 'etc', 'model-guard')):
+                for where in (os.path.join(real, 'p.json'), os.path.join(self.dir, 'etc', 'model-guard', 'p.json'),
+                              os.path.join(self.dir, 'into-guard', 'p.json'), os.path.join(self.dir, 'into-guard')):
+                    with self.subTest(exists=exists, etc_dir=etc_dir, where=where), \
+                            mock.patch.object(self.m, 'ETC_DIR', etc_dir):
+                        self.machine({'policyFile': where})
+                        self.refused('Agent', {'model': 'large', 'effort': 'high'}, f'must not be in {etc_dir}')
+                with mock.patch.object(self.m, 'ETC_DIR', etc_dir):
+                    self.machine({'policyFile': self.policy_path})
+                    self.passed('Agent', {'model': 'large', 'effort': 'high'})
+        self.assertFalse(self.m.in_folder(os.path.join(self.dir, 'private-etc', 'model-guard-2', 'p.json'), real))
+
+    def test_the_guards_folder_is_found_by_identity(self):
+        """A case-insensitive file system spells one folder many ways (/etc/Model-Guard is /etc/model-guard on
+        macOS), so names alone miss it. Simulated here: a second folder that the file system reports as the same."""
+        guard_dir, other = os.path.join(self.dir, 'guard'), os.path.join(self.dir, 'Guard-Spelled')
+        os.makedirs(os.path.join(guard_dir, 'sub'))
+        os.makedirs(os.path.join(other, 'sub'))
+        real_stat = os.stat
+        def same(path, *a, **k):   # noqa: E306
+            return real_stat(guard_dir if os.path.normpath(path) == other else path, *a, **k)
+        self.assertFalse(self.m.in_folder(os.path.join(other, 'sub', 'p.json'), guard_dir))
+        with mock.patch('os.stat', same):
+            for where in (other, os.path.join(other, 'p.json'), os.path.join(other, 'sub', 'p.json')):
+                with self.subTest(where):
+                    self.assertTrue(self.m.in_folder(where, guard_dir))
+            self.assertFalse(self.m.in_folder(os.path.join(self.dir, 'elsewhere', 'p.json'), guard_dir))
+        # a folder that does not exist yet is checked by name only
+        self.assertFalse(self.m.in_folder(os.path.join(other, 'p.json'), os.path.join(self.dir, 'missing')))
+        self.assertTrue(self.m.in_folder(os.path.join(self.dir, 'missing', 'p.json'), os.path.join(self.dir, 'missing')))
 
     # ---- the policy's version (#329)
 
@@ -1134,7 +1228,7 @@ MUTATIONS = {
     "JavaScript's trim": ('    return text.strip(JS_SPACE)', '    return text.strip()',
                           'test_options_are_read_the_way_t3_reads_them'),
     'the policy is not in the guard\'s /etc folder': (
-        "            if path == ETC_DIR or path.startswith(ETC_DIR + os.sep):", '            if False:',
+        "        if in_folder(v, ETC_DIR):", '        if False:',
         'test_the_policy_may_not_live_in_the_guards_own_folder'),
     'newer policy: update the kit': ("and data['version'] > POLICY_VERSION:", 'and False:',
                                      'test_a_newer_policy_says_update_the_kit_in_every_mode'),
@@ -1165,6 +1259,27 @@ MUTATIONS = {
                                     'test_workflow_of_and_keyword_properties_before_a_bracket'),
     'Workflow: agent only as a direct call': ("                if k + 1 >= len(toks) or toks[k + 1][:2] != ['punct', '(']:",
                                               '                if False:', 'test_workflow_that_cannot_be_read_is_refused'),
+    # #589 round 2
+    'a model selection refuses driverKind': ("        if selection and 'driverKind' in value:",
+                                             '        if False:', 'test_a_model_selection_never_trusts_driver_kind'),
+    'launch is a model selection': ("        target('modelSelection', args.get('modelSelection'), selection=True)\n"
+                                    "    elif kind == 't3_thread_configure'",
+                                    "        target('modelSelection', args.get('modelSelection'))\n"
+                                    "    elif kind == 't3_thread_configure'",
+                                    'test_a_model_selection_never_trusts_driver_kind'),
+    'configure is a model selection': ("the call only reads the thread\n        target('modelSelection', "
+                                       "args.get('modelSelection'), selection=True)",
+                                       "the call only reads the thread\n        target('modelSelection', "
+                                       "args.get('modelSelection'))", 'test_a_model_selection_never_trusts_driver_kind'),
+    'a project default is a model selection': ("args.get('defaultModelSelection'), selection=True)",
+                                               "args.get('defaultModelSelection'))",
+                                               'test_a_model_selection_never_trusts_driver_kind'),
+    'the guard folder resolved': ("    names = {os.path.normpath(folder), os.path.realpath(folder)}",
+                                  "    names = {os.path.normpath(folder)}", 'test_the_guards_folder_is_found_through_links'),
+    'the policy path resolved': ("    for name in (os.path.normpath(path), real):", "    for name in (os.path.normpath(path),):",
+                                 'test_the_guards_folder_is_found_through_links'),
+    'the guard folder by identity': ("            if os.path.samestat(os.stat(real), want):",
+                                     "            if False:", 'test_the_guards_folder_is_found_by_identity'),
 }
 SETTINGS_MUTATIONS = {
     'the matcher is exactly the guard\'s': ("    if entry['matcher'] != HOOK_MATCHER:", '    if False:',
