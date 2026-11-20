@@ -211,7 +211,8 @@ def _checks(cfg, adapter, result, add, info, own_id):
 
 
 STEADY = ('boot service', 'live server', 'no update in flight', 'no half switch', 'no markers')
-REPORT_ANSWERS = ('counts', 'pendingMigrations', 'providers')  # what _report takes from the report into the result
+# What _report takes from the report into the result.
+REPORT_ANSWERS = ('counts', 'pendingMigrations', 'providers', 'features')
 
 
 def server_changed(cfg, adapter, server):
@@ -263,11 +264,10 @@ def _report(cfg, report, result, add):
     version = report.get('version')
     add('report: target build', version == cfg.target_version, f'the staged build says it is {version}')
     fork = report.get('fork') if isinstance(report.get('fork'), dict) else {}
-    on = fork.get('featuresOn')
-    if not isinstance(on, list):
-        add('fork features off', False, 'the report has no fork.featuresOn list')
-    else:
-        add('fork features off', not on, f'switched on in settings: {live.features_on(fork)}' if on else 'all off')
+    state, said = features_answer(cfg, fork, result['live'])
+    if state is not None:  # the switch keeps them as they are: its re-read, `before` and verify require this
+        result['features'] = state
+    add('fork features', state is not None, said)
     problems = report.get('problems') if isinstance(report.get('problems'), list) else []
     named = '; '.join(f'{p.get("code")}: {p.get("message")}' for p in problems if isinstance(p, dict))
     readable = report.get('ok') is True
@@ -277,6 +277,42 @@ def _report(cfg, report, result, add):
     result['counts'] = db.get('counts')
     result['pendingMigrations'] = db.get('pendingMigrations')
     result['providers'] = providers_sum(report)  # switch's verify: the same after as before
+
+
+def features_answer(cfg, target_fork, server):
+    """(the fork features the switch keeps, what check says) or (None, why it refuses), from the staged target
+    build's report `target_fork` on the live home and, when the live build `server` is a fork build, its own report
+    (run beside the running T3, like the target's): a switch keeps the features as they are only when both builds
+    read the same values in the same places. A target that reads more (a new feature on by default, a key or a
+    policy default the old build read otherwise, `usagePacingGate` advise -> enforce) refuses before anything
+    stops. A live build that gives no report of its own (an older report version) passes only with all off."""
+    state, version = live.features_state(target_fork), server['version']
+    if state is None:
+        return None, 'the report has no fork.featuresOn list and fork.features map'
+    if not live.fork_build(version):
+        if state['on']:
+            return None, (f'switched on in settings while the live build {version} is not a fork build: the first '
+                          f'switch starts with all off ({live.features_on(target_fork)})')
+        return state, 'all off'
+    try:
+        own = live.fork_report(server['binary'], cfg.home)
+        was, why = live.features_state(own.get('fork')), 'it has no fork.featuresOn list and fork.features map'
+    except live.NotLive as e:
+        was, why = None, str(e)
+    if was is None:
+        if state['on']:
+            return None, (f'the live build {version} gives no report of its own fork features ({why}), so the kit '
+                          'cannot tell whether the target keeps them as they are, and the target reads some on '
+                          f'({live.features_on(target_fork)}): switch them off first, as for a first switch')
+        return state, f'all off (the live build {version} gives no report of its own: {why})'
+    differ = live.features_differ(was, state, f'in the live {version}', 'in the target')
+    if differ:
+        return None, (f'the target build reads other fork features than the live build: {differ}; the switch would '
+                      'go live with them changed: set them in settings so both builds read the same, or switch '
+                      'them off')
+    if state['on']:
+        return state, f'on, kept as they are (the live build reads the same): {live.features_on(target_fork)}'
+    return state, 'all off (the live build reads the same)'
 
 
 def providers_sum(report):

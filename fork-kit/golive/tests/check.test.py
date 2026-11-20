@@ -83,6 +83,128 @@ class Ready(CheckBase):
         self.assertIn('use the normal installer', ' '.join(result['info']))
 
 
+class ForkFeatures(CheckBase):
+    """Fork #529: from the second switch on the live build is a fork build, and features may be on. check records
+    which (the switch keeps them as they are: `before` and verify require the same list) instead of refusing."""
+    LIVE_FORK = '0.1.10-nightly.20261113.4600.fork.1'
+
+    def passes(self, live, fork):
+        self.m.standard(version=live)
+        self.m.set_report(fx.report(fork=fork))
+        before = self.m.snapshot()
+        code, result, err = self.check_json()
+        self.assertEqual((code, result['ok']), (0, True), (err, self.failed(result)))
+        self.assertEqual(self.m.snapshot(), before)
+        return result, {c['name']: c['detail'] for c in result['checks']}
+
+    ON = {'featuresOn': ['agentSlots', 'waitFor'], 'featuresWhere': {'agentSlots': ['server'], 'waitFor': ['server']},
+          'features': {**fx.report()['fork']['features'], 'agentSlots': 'on', 'waitFor': 'on'}}
+
+    def fork(self, **over):
+        return {**self.ON, **over, 'features': {**self.ON['features'], **over.pop('features', {})}}
+
+    def live_says(self, fork):
+        self.m.set_live_report(fx.report(version=self.LIVE_FORK, fork=fork))
+
+    def refused_by_live(self, live_fork, target_fork, *words):
+        self.m.standard(version=self.LIVE_FORK)
+        self.m.set_report(fx.report(fork=target_fork))
+        if live_fork is not None:
+            self.live_says(live_fork)
+        before = self.m.snapshot()
+        code, result, err = self.check_json()
+        self.assertEqual((code, result['ok']), (1, False), err)
+        failed = self.failed(result)
+        self.assertEqual(list(failed), ['fork features'], failed)
+        for word in words:
+            self.assertIn(word, failed['fork features'])
+        self.assertNotIn('features', result)  # nothing for a switch to keep
+        self.assertEqual(self.m.snapshot(), before)
+        return failed['fork features']
+
+    def test_a_fork_build_live_with_features_on_passes_and_records_them(self):
+        # Both builds read the same: the live build's own report, run beside the running T3, and the target's.
+        self.m.set_live_report(fx.report(version=self.LIVE_FORK, fork=self.ON))
+        result, detail = self.passes(self.LIVE_FORK, self.ON)
+        self.assertEqual(result['features']['on'], ['agentSlots', 'waitFor'])
+        self.assertEqual(result['features']['values']['waitFor'], 'on')
+        self.assertEqual(result['features']['where'], {'agentSlots': ['server'], 'waitFor': ['server']})
+        self.assertIn('kept as they are (the live build reads the same): agentSlots (server), waitFor (server)',
+                      detail['fork features'])
+        ran = [c['argv'][0] for c in self.m.calls('stub-t3-calls.jsonl')]
+        self.assertEqual(ran.count('__fork-report'), 2, 'the live build and the target each give one report')
+
+    def test_order_alone_is_no_change(self):
+        self.live_says(self.fork(featuresOn=['waitFor', 'agentSlots'], featuresWhere={
+            'waitFor': ['server', 'project:p1'], 'agentSlots': ['server']}))
+        self.passes(self.LIVE_FORK, self.fork(featuresWhere={'agentSlots': ['server'],
+                                                             'waitFor': ['project:p1', 'server']}))
+
+    def test_a_feature_the_target_reads_on_and_the_live_build_off_refuses_before_anything_stops(self):
+        # Lens B's case: the target adds feature X on by default (or reads a key the old build ignored).
+        live_fork = self.fork()
+        live_fork['features'] = {k: v for k, v in live_fork['features'].items() if k != 'newThing'}
+        said = self.refused_by_live(live_fork, self.fork(featuresOn=['agentSlots', 'waitFor', 'newThing'],
+                                                         features={'newThing': 'on'}),
+                                    'the target build reads other fork features than the live build',
+                                    f'newThing: not in its report in the live {self.LIVE_FORK}, "on" in the target')
+        self.assertNotIn('agentSlots', said)
+        self.assertEqual([c['argv'][0] for c in self.m.calls('stub-t3-calls.jsonl')].count('__fork-report'), 2)
+
+    def test_a_value_change_with_the_same_names_on_refuses(self):
+        # usagePacingGate advise -> enforce (design 4.7 stages exactly this): on in both, so the names agree.
+        self.refused_by_live(self.fork(featuresOn=['usagePacingGate'], features={'usagePacingGate': 'advise'}),
+                             self.fork(featuresOn=['usagePacingGate'], features={'usagePacingGate': 'enforce'}),
+                             'usagePacingGate: "advise" in the live', '"enforce" in the target')
+
+    def test_a_change_of_where_a_feature_is_on_refuses(self):
+        self.refused_by_live(self.fork(), self.fork(featuresWhere={'agentSlots': ['server'],
+                                                                   'waitFor': ['server', 'project:p1']}),
+                             'waitFor: on in server in the live', 'in project:p1, server in the target')
+
+    def test_a_feature_the_target_reads_off_and_the_live_build_on_refuses_too(self):
+        self.refused_by_live(self.fork(), self.fork(featuresOn=['agentSlots'], featuresWhere={
+            'agentSlots': ['server']}, features={'waitFor': 'off'}), 'waitFor: "on" in the live', '"off" in the target')
+
+    def test_a_live_build_without_a_report_of_its_own(self):
+        # Old state: an older fork build gives no report this kit reads (here a `sleep` copy fails, like a build
+        # without `__fork-report` or of another report version). With features on the kit cannot tell whether
+        # they are kept, so it refuses; with all off (the safe side) it passes and says why.
+        self.refused_by_live(None, self.ON, f'the live build {self.LIVE_FORK} gives no report of its own',
+                             'switch them off first')
+        for value in (fx.report(version=self.LIVE_FORK, reportVersion=2), 'no json here',
+                      fx.report(version=self.LIVE_FORK, fork={'featuresOn': None})):
+            with self.subTest(str(value)[:30]):
+                self.m.set_live_report(value)
+                self.refused_by_live(None, self.ON, 'gives no report of its own')
+        self.m.set_live_report(None)
+        result, detail = self.passes(self.LIVE_FORK, {'featuresOn': []})
+        self.assertEqual(result['features']['on'], [])
+        self.assertIn('all off (the live build', detail['fork features'])
+        self.assertIn('gives no report of its own', detail['fork features'])
+
+    def test_a_refusal_changes_nothing_and_a_rerun_passes_once_both_builds_agree(self):
+        # State: run again after the owner set the new feature off in settings (both builds now read it off).
+        self.refused_by_live(self.fork(), self.fork(featuresOn=['agentSlots', 'waitFor', 'newThing'],
+                                                    features={'newThing': 'on'}), 'newThing')
+        self.live_says(self.fork(features={'newThing': 'off'}))
+        self.passes(self.LIVE_FORK, self.fork(features={'newThing': 'off'}))
+
+    def test_a_target_report_without_the_features_map_refuses(self):
+        self.live_says(self.ON)
+        self.refused_by_live(self.ON, {**self.ON, 'features': None}, 'no fork.featuresOn list and fork.features map')
+
+    def test_all_off_is_recorded_as_an_empty_list(self):
+        # Empty state (an empty or missing settings file decodes to all off): the list is [] and check passes,
+        # on an upstream live build (the first switch) and on a fork build alike.
+        for live, said in ((fx.LIVE, 'all off'), (self.LIVE_FORK, 'all off (the live build reads the same)')):
+            with self.subTest(live):
+                self.m.set_live_report(fx.report(version=live))
+                result, detail = self.passes(live, {'featuresOn': []})
+                self.assertEqual(result['features']['on'], [])
+                self.assertEqual(detail['fork features'], said)
+
+
 class NothingToDoNeverHidesARefusal(CheckBase):
     """"Nothing to do" (exit 0) only when no check failed: a half switch, a half restore, a stopped service, a
     dead server or a run to settle always refuse, and the refusal names what was found."""
@@ -348,7 +470,7 @@ class Refusals(CheckBase):
                     self.assertIn('an update to 0.1.10 is pending', self.failed(result)['T3 steady during the report'])
                 # Fork #300 item 5: the answer is not used, so the result does not carry it either: a caller that
                 # reads counts or providers from a refused check finds none.
-                for key in ('counts', 'pendingMigrations', 'providers'):
+                for key in ('counts', 'pendingMigrations', 'providers', 'featuresOn'):
                     self.assertNotIn(key, result)
 
     def test_target_older_than_live(self):
@@ -397,17 +519,26 @@ class Refusals(CheckBase):
         self.m.set_report(fx.report(version='0.1.10-nightly.20261114.4682'))
         self.refused('report: target build')
 
-    def test_fork_feature_switched_on(self):
+    def test_fork_feature_switched_on_before_the_first_switch(self):
+        # The live build is upstream (no fork features): the first switch starts with all off (design 4.7).
         self.m.standard()
         self.m.set_report(fx.report(fork={'featuresOn': ['waitFor']}))
-        self.refused('fork features off', 'waitFor')
+        self.assertIn('not a fork build', self.refused('fork features', 'waitFor')['fork features'])
 
     def test_fork_feature_switched_on_names_where(self):
         # Where, so a deleted project's override or a stale thread entry can be cleared.
         self.m.standard()
         self.m.set_report(fx.report(fork={'featuresOn': ['handoff', 'waitFor'], 'featuresWhere': {
             'handoff': ['project:p1', 'project:p1/thread:t1'], 'waitFor': ['server']}}))
-        self.refused('fork features off', 'handoff (project:p1, project:p1/thread:t1), waitFor (server)')
+        self.refused('fork features', 'handoff (project:p1, project:p1/thread:t1), waitFor (server)')
+
+    def test_a_report_without_the_features_list_refuses(self):
+        # Missing state: a report that does not say which features are on cannot be kept as it is.
+        for fork in ({'featuresOn': None}, {'featuresOn': 'waitFor'}, {'featuresOn': [1]}):
+            with self.subTest(fork):
+                self.m.standard()
+                self.m.set_report(fx.report(fork=fork))
+                self.refused('fork features', 'no fork.featuresOn list')
 
     def test_report_not_ok_names_its_problems(self):
         self.m.standard()
