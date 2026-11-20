@@ -1058,12 +1058,23 @@ SCANNED_LOOKUP_TEXT = (
     'if [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then\n'
     'mapfile -t tips < <(tr -s \'[:space:]\' \'\\n\' <<< "$OLD_HEADS" | grep -E \'^[0-9a-f]{40}$\' | grep -vE'
     " '^0+$' | sort -u)\n"
+    '# Which of them this blob-less clone lacks: one git process for all, lazy fetching off\n'
+    '# (#637). A lazy fetch asks for the whole history again (no negotiation) and every lookup\n'
+    '# of a missing commit reads every pack, so one by one that outran the job\'s 30 minutes.\n'
+    'if ! lacked="$(printf \'%s^{commit}\\n\' "${tips[@]}" | GIT_NO_LAZY_FETCH=1 git cat-file'
+    ' --batch-check=\'%(objectname)\' 2> /dev/null)"; then\n'
+    'echo "::error::Secret scan: cannot check which listed tips this clone lacks. Re-run the job." >&2\n'
+    'exit 2\n'
+    'fi\n'
+    "mapfile -t missing < <(sed -n 's/^\\([0-9a-f]\\{40\\}\\)^{commit} missing$/\\1/p' <<< \"$lacked\")\n"
     'unserved=()\n'
-    'for tip in "${tips[@]}"; do\n'
-    'git cat-file -e "$tip^{commit}" 2> /dev/null \\\n'
-    '|| timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n'
+    'if [[ ${#missing[@]} -gt 0 ]] \\\n'
+    '&& ! timeout 600 git fetch --quiet --no-tags --filter=blob:none origin "${missing[@]}" 2> /dev/null; then\n'
+    'for tip in "${missing[@]}"; do\n'
+    'timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n'
     '|| unserved+=("$tip")\n'
     'done\n'
+    'fi\n'
     'deleted=()\n'
     "# shellcheck disable=SC2016 # $owner, $name and $id are GraphQL and jq variables, not the shell's\n"
     'for ((i = 0; i < ${#unserved[@]}; i += 100)); do\n'
@@ -1425,7 +1436,11 @@ for label, mutate in {
                       scan_step(w)["run"], count=1)),
     "absent tips asked about without git's fetch first (a tip dropped meanwhile fails)": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace(
-            '|| timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n', "")),
+            'timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n', "")),
+    "the lacked tips checked with lazy fetching on (#637)": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("| GIT_NO_LAZY_FETCH=1 git cat-file --batch-check", "| git cat-file --batch-check")),
+    "a failed check of the lacked tips that does not fail the job": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r"exit 2(\n\s*fi\n\s*mapfile -t missing)", r"true\1", scan_step(w)["run"], count=1)),
     "a runs lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
         "run", re.sub(r"exit 2(\n\s*fi\n\s*mapfile -t ids)", r"true\1", scan_step(w)["run"], count=1)),
     "a runs lookup that takes a run of another commit": lambda w: scan_step(w).__setitem__(
@@ -1500,6 +1515,140 @@ for label, mutate in {
 check("secret-scan: the sweep's activity lookup (#239) in its exact form passes",
       not scan_mutant(lambda w: scan_step(w).__setitem__("run", with_sweep_lookup(scan_step(w)["run"])))
       and SWEEP_LOOKUP.search(with_sweep_lookup(scan_step(real)["run"])) is not None)
+
+# #637, end to end: the sweep's lookup of the tips it lacks, as the workflow has it (bash -e -o
+# pipefail), in a blob-less clone of a local origin that still serves three tips no ref holds and
+# lacks one (gone), with a gh stub that answers as GitHub would. The sweep of 11-20 ran out of the
+# job's 30 minutes here: `git cat-file -e` per tip, with lazy fetching on, fetched each lacked tip
+# with the whole history again (no negotiation), and each lookup of a missing commit read every pack
+# that left. Now: one cat-file for all tips, no lazy fetch, one batch fetch, one by one only when a
+# gone tip fails the batch. Also: run again in the same clone, stopped half-way (one tip fetched
+# before), no tips at all, and no clone.
+def sweep_lookup_code(run):
+    start, end = run.find('SCANNED_GONE=""\n'), run.find("unset LOOKUP_TOKEN\n")
+    return run[start:end] if 0 <= start < end else "exit 99\n"
+
+
+sweep_work = pathlib.Path(tempfile.mkdtemp(prefix="fork-contracts-sweep-"))
+sweep_origin = sweep_work / "origin"
+sweep_origin.mkdir()
+git(sweep_origin, "init", "-q", "-b", "main")
+git(sweep_origin, "config", "uploadpack.allowFilter", "true")
+git(sweep_origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+(sweep_origin / "a.txt").write_text("a\n")
+git(sweep_origin, "add", "-A")
+git(sweep_origin, "commit", "-q", "-m", "main")
+sweep_main = git(sweep_origin, "rev-parse", "HEAD")
+sweep_vanished = []
+for n in range(3):  # a branch pushed, then deleted: no ref holds its tip, origin still serves it
+    git(sweep_origin, "checkout", "-q", "-b", f"side{n}", sweep_main)
+    (sweep_origin / "a.txt").write_text(f"side {n}\n")
+    git(sweep_origin, "commit", "-q", "-am", f"side {n}")
+    sweep_vanished.append(git(sweep_origin, "rev-parse", "HEAD"))
+    git(sweep_origin, "checkout", "-q", "main")
+    git(sweep_origin, "branch", "-q", "-D", f"side{n}")
+sweep_gone = "ab" * 20  # listed by the activity record, garbage-collected by GitHub
+sweep_stub = sweep_work / "bin"
+sweep_stub.mkdir()
+(sweep_stub / "gh").write_text(r"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  *graphql*)
+    for a in "$@"; do [[ "$a" != query=* ]] || q="$a"; done
+    for id in $(grep -oE 'c_[0-9a-f]{40}' <<< "$q" | cut -c3-); do
+      [[ " $FAKE_GONE " != *" $id "* ]] || echo "$id"
+    done ;;
+  *actions/runs/*/jobs*) [[ -z "${FAKE_SCANNED:-}" ]] || echo 9001 ;;
+  *actions/runs*) echo 101 ;;
+  *) echo "gh stub: unexpected call: $*" >&2; exit 97 ;;
+esac
+""")
+(sweep_stub / "gh").chmod(0o755)
+lookup_code = sweep_lookup_code(scan_step(real)["run"])
+
+
+def sweep_clone(label):
+    dest = sweep_work / label
+    git(sweep_work, "clone", "-q", "--filter=blob:none", "--no-checkout", f"file://{sweep_origin}", str(dest))
+    return dest
+
+
+def sweep_lookup(dest, old_heads, label, code=None):
+    """Runs the lookup in dest; returns (exit, SCANNED_GONE, git trace, gh calls)."""
+    trace, gh_log = sweep_work / f"{label}.trace", sweep_work / f"{label}.gh"
+    trace.write_text("")
+    gh_log.write_text("")
+    script = (code or lookup_code) + 'printf "SCANNED_GONE=[%s]\\n" "$SCANNED_GONE"\n'
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=dest,
+                       env={**base_env, "PATH": f"{sweep_stub}:{base_env['PATH']}", "GITHUB_REPOSITORY": "me/t3code",
+                            "EVENT_NAME": "schedule", "OLD_HEADS": old_heads, "LOOKUP_TOKEN": "x",
+                            "GH_LOG": str(gh_log), "FAKE_GONE": sweep_gone, "FAKE_SCANNED": "1",
+                            "GIT_TRACE": str(trace), "GIT_CEILING_DIRECTORIES": str(sweep_work)},
+                       capture_output=True, text=True)
+    found = re.search(r"SCANNED_GONE=\[(.*)\]", r.stdout)
+    return r, (found.group(1).strip() if found else None), trace.read_text(), gh_log.read_text()
+
+
+def commands(trace, name):
+    return len(re.findall(rf"trace: built-in: git {name}\b", trace))
+
+
+def lazy_fetches(trace):
+    return len(re.findall(r"run_command: git -c fetch\.negotiationAlgorithm=noop fetch", trace))
+
+
+def has_commit(dest, sha):
+    """Whether the clone holds sha, from its own objects only (a lookup of a missing one would fetch it)."""
+    return sha in git(dest, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)").split()
+
+
+# Whether this git honours GIT_NO_LAZY_FETCH (git 2.44, or 2.39.4 to 2.43.4 with the May 2024 fixes):
+# the probe tries it rather than reading the version, as fork-secret-scan.test.sh does. On CI a git
+# that ignores it fails; elsewhere the no-lazy-fetch half of the check is skipped.
+probe = sweep_clone("probe")
+lazy_honoured = subprocess.run(["git", "cat-file", "-e", f"{sweep_vanished[0]}^{{commit}}"], cwd=probe,
+                               env={**base_env, "GIT_NO_LAZY_FETCH": "1"}, capture_output=True).returncode != 0
+if not lazy_honoured and os.environ.get("CI") == "true":
+    check("secret-scan e2e: git on CI honours GIT_NO_LAZY_FETCH (else the no-lazy-fetch checks prove nothing)", False)
+
+all_heads = " ".join([sweep_main, *sweep_vanished, sweep_gone, "0" * 40, "not-a-sha"])
+fresh = sweep_clone("fresh")
+r, gone, trace, calls = sweep_lookup(fresh, all_heads, "fresh")
+check("secret-scan e2e (#637): a fresh blob-less clone: the deleted tip a scan read is SCANNED_GONE, the served "
+      "ones are fetched (GitHub is asked only about the deleted one), with one cat-file for all tips"
+      + ("" if lazy_honoured else " (lazy-fetch half skipped: this git ignores GIT_NO_LAZY_FETCH)"),
+      r.returncode == 0 and gone == sweep_gone and all(has_commit(fresh, v) for v in sweep_vanished)
+      and calls.count("graphql") == 1 and not any(v in calls for v in sweep_vanished)
+      and commands(trace, "cat-file") == 1 and (not lazy_honoured or lazy_fetches(trace) == 0),
+      f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone} cat-files={commands(trace, 'cat-file')} "
+      f"lazy={lazy_fetches(trace)} gh={calls.strip()!r}")
+r, gone, trace, calls = sweep_lookup(fresh, all_heads, "again")
+check("secret-scan e2e: run again in the same clone: the same answer, only the deleted tip fetched (batch + alone)",
+      r.returncode == 0 and gone == sweep_gone and commands(trace, "fetch") == 2 and lazy_fetches(trace) == 0
+      and calls.count("graphql") == 1, f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone} "
+      f"fetches={commands(trace, 'fetch')}")
+half = sweep_clone("half")
+git(half, "fetch", "-q", "--no-tags", "--filter=blob:none", "origin", sweep_vanished[1])
+r, gone, trace, calls = sweep_lookup(half, all_heads, "half")
+check("secret-scan e2e: stopped half-way (one served tip fetched before): the same answer, all served tips here",
+      r.returncode == 0 and gone == sweep_gone and all(has_commit(half, v) for v in sweep_vanished)
+      and (not lazy_honoured or lazy_fetches(trace) == 0), f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone}")
+served = sweep_clone("served")
+r, gone, trace, calls = sweep_lookup(served, " ".join(sweep_vanished), "served")
+check("secret-scan e2e: no tip gone: one batch fetch, nothing one by one, GitHub not asked",
+      r.returncode == 0 and gone == "" and commands(trace, "fetch") == 1 and calls == ""
+      and all(has_commit(served, v) for v in sweep_vanished),
+      f"exit {r.returncode}: {r.stderr.strip()[-400:]} fetches={commands(trace, 'fetch')} gh={calls.strip()!r}")
+r, gone, trace, calls = sweep_lookup(sweep_clone("empty"), "", "empty")
+check("secret-scan e2e: no tips listed: passes with nothing fetched or asked",
+      r.returncode == 0 and gone == "" and commands(trace, "fetch") == 0 and calls == "",
+      f"exit {r.returncode}: {r.stderr.strip()[-400:]}")
+not_a_clone = sweep_work / "not-a-clone"
+not_a_clone.mkdir()
+r, gone, _, calls = sweep_lookup(not_a_clone, all_heads, "no-clone")
+check("secret-scan e2e: no clone (cat-file fails): the job fails before asking GitHub anything",
+      r.returncode == 2 and gone is None and calls == "" and "cannot check which listed tips" in r.stderr,
+      f"exit {r.returncode}: {r.stderr.strip()[-400:]}")
 
 check("secret-scan: the expression evaluator reads GitHub's rules (&& and || give an operand, == ignores case)",
       gh_eval("'a' && 'B' == 'b'", {}) and not gh_eval("'' || null", {}) and gh_eval("!x.y", {})
