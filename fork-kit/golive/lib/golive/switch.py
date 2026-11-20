@@ -640,7 +640,7 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
         failed = f'the guard {unit} is not running any more'
     if failed is None and stops.got:
         failed = f'stopped by {stops.names()}'
-    failed = failed or coldcopy.open_gap(cfg.home)
+    failed = failed or handoff.handover_blind(cfg.home, [cfg.target_version, old]) or coldcopy.open_gap(cfg.home)
     if failed is not None:
         again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
         if again:
