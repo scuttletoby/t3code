@@ -488,6 +488,13 @@ def stop_grace(cfg):
     return guard_after(cfg, MIN_LIMIT)
 
 
+def _blind(cfg, adapter, server):
+    """handoff.handover_blind for a switch: after the stop it starts the target, or the old build on its way back,
+    or, after an update caught at the stop, whatever build the service state names then (#580)."""
+    return handoff.handover_blind(cfg.home, [cfg.target_version, server['version'], handoff.ANY_BUILD],
+                                  server['version'], adapter.service)
+
+
 def _prechecks(cfg, adapter, owner_says_go, say, run):
     """Every refusal before the first step. Returns what the switch needs."""
     code, result = check_mod.run_check(cfg, adapter, own_run=run)
@@ -513,7 +520,9 @@ def _prechecks(cfg, adapter, owner_says_go, say, run):
     if result.get('pendingMigrations') != rehearsal['migrations']:
         raise journal.Refused(f'the target would run migrations {result.get("pendingMigrations")}, the '
                               f'rehearsal ran {rehearsal["migrations"]}: rehearse again')
-    why = coldcopy._home_problem(cfg)
+    # and whether the kit can tell the new launcher after the stop: before the wait, a kept runtime, the guard and the
+    # pre hooks, so a refusal touches nothing and waits for nothing (#580)
+    why = coldcopy._home_problem(cfg) or _blind(cfg, adapter, server)
     if why is not None:
         raise journal.Refused(f'{why}; nothing was changed')
     try:
@@ -527,7 +536,8 @@ def _prechecks(cfg, adapter, owner_says_go, say, run):
     if not owner_says_go:
         coldcopy.wait_quiet(cfg, server['version'], say)
         _disk(cfg, coldcopy._plan_total(cfg), keep_bytes, install_bytes)
-    why = check_mod.server_changed(cfg, adapter, server)
+    # the wait may have taken hours: again
+    why = check_mod.server_changed(cfg, adapter, server) or _blind(cfg, adapter, server)
     if why is not None:
         raise journal.Refused(f'{why}; nothing was changed')
     dest = os.path.join(cfg.backup_dir, f't3-switch-{coldcopy._stamp()}-{server["version"]}')
@@ -640,7 +650,7 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
         failed = f'the guard {unit} is not running any more'
     if failed is None and stops.got:
         failed = f'stopped by {stops.names()}'
-    failed = failed or handoff.handover_blind(cfg.home, [cfg.target_version, old]) or coldcopy.open_gap(cfg.home)
+    failed = failed or _blind(cfg, adapter, server) or coldcopy.open_gap(cfg.home)
     if failed is not None:
         again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
         if again:

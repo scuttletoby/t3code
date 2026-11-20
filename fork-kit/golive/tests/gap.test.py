@@ -19,7 +19,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import golive_fixture as fx  # noqa: E402
 import back_fixture as bx  # noqa: E402
-from golive import back, coldcopy, config, handoff, journal, live, switch  # noqa: E402
+from golive import back, coldcopy, config, handoff, journal, live, osadapter, switch  # noqa: E402
+
+fx.LAUNCHER_SERVES = False  # the serving lock is modelled here (launcher_serves, Race.launcher), not by the fixture
 
 NODE = shutil.which('node')  # before a test's fake PATH
 
@@ -310,16 +312,76 @@ def marker_since(test, version):
     test.addCleanup(patcher.stop)
 
 
+# Above the kernel's largest pid (PID_MAX_LIMIT): a number that is no process's pid here.
+OTHER_NS = 4_194_304
+
+
 def kit_cannot_see_its_own_lock(test):
-    """/proc/locks lists the kit's own lock under no pid it knows (a /proc of another pid namespace), so it could
-    not see the launcher's either (#550). Every other lock reads as before."""
+    """The kit reads a /proc mounted from a pid namespace that is neither its own nor the service manager's (#550):
+    /proc/locks lists the locks, but under that namespace's pids, so neither the kit's own lock nor the launcher's
+    serving lock shows under a pid the kit knows. Only these two are modelled; every other lock reads as before.
+    (A kit in a child pid namespace with a /proc of its own is another case: kit_in_a_child_pid_namespace.)"""
     real = handoff.lock_holders
 
-    def blind(path):
-        return set() if path.startswith('/proc/self/fd/') else real(path)
-    patcher = mock.patch.object(handoff, 'lock_holders', blind)
+    def other_pids(path):
+        got = real(path)
+        if got is not None and (path.startswith('/proc/self/fd/') or os.path.basename(path) == handoff.SERVING_LOCK):
+            return {OTHER_NS + pid for pid in got}
+        return got
+    patcher = mock.patch.object(handoff, 'lock_holders', other_pids)
     patcher.start()
     test.addCleanup(patcher.stop)
+
+
+def kit_in_a_child_pid_namespace(test, main_unit=None):
+    """The kit runs in a child pid namespace with a /proc of its own (a container or sandbox; #580 round 2). Since
+    Linux 4.12, /proc/locks leaves out every lock whose holder is not in that namespace (fs/locks.c locks_show), so
+    the launcher's serving lock is not listed at all, while the kit's own lock is, under its own pid. The service's
+    MainPID, a pid of the host's namespace, is no process in this /proc (main_unit None) or another process, in
+    another unit (main_unit: that unit). Every other lock reads as before."""
+    real = handoff.lock_holders
+
+    def left_out(path):
+        if os.path.basename(path) == handoff.SERVING_LOCK:
+            return set() if real(path) is not None else None
+        return real(path)
+    patcher = mock.patch.object(handoff, 'lock_holders', left_out)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    test.m.in_unit(os.getpid(), main_unit)  # the fakes' MainPID
+    test.addCleanup(test.m.in_unit, os.getpid())
+
+
+def launcher_serves(test):
+    """T3 runs a build whose launcher holds runtime/service-serving.lock (serviceLauncher.ts #claimServing), in the
+    unit's main process (the fakes' MainPID: this test process), until the service stops. A launcher the kit
+    starts later is modelled by the test (Race.launcher)."""
+    conn = sqlite3.connect(test.m.path('home/runtime/service-serving.lock'), isolation_level=None,
+                           check_same_thread=False)
+    conn.execute('BEGIN EXCLUSIVE')
+    test.addCleanup(conn.close)
+    test.serving = conn  # a test closes it: a launcher whose claim gave up
+    stop = test.adapter.stop
+
+    def stop_and_let_go(*args):
+        conn.close()
+        return stop(*args)
+    test.adapter.stop = stop_and_let_go
+
+
+def serving_lock_held_by_another_process(test):
+    """The serving lock is held, but not by the unit's main process: a launcher that is not the service's main
+    process (a wrapper script), as /proc/locks shows it. Returns that process's pid."""
+    holder = subprocess.Popen(
+        [sys.executable, '-I', '-c', 'import sqlite3, sys\nc = sqlite3.connect(sys.argv[1], isolation_level=None)\n'
+         'c.execute("BEGIN EXCLUSIVE")\nprint("held", flush=True)\nsys.stdin.read()',
+         test.m.path('home/runtime/service-serving.lock')],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    test.addCleanup(holder.wait)
+    test.addCleanup(holder.stdout.close)
+    test.addCleanup(holder.stdin.close)
+    test.assertEqual(holder.stdout.readline(), 'held\n')
+    return holder.pid
 
 
 BLIND = "the kit cannot tell the boot service's launcher by its locks here"
@@ -331,6 +393,7 @@ class CopyRace(copy_t.CopyBase):
         self.race = Race(self, self.m)
         self.adapter = RaceAdapter(self.m.root, self.m, self.race)
         marker_since(self, fx.LIVE)  # the fake live build's launcher takes the serving lock
+        launcher_serves(self)  # and holds it now: the kit sees it before the stop (#580)
 
     def assert_no_hand_server(self):
         self.assertEqual(self.race.hands, [], self.race.log)
@@ -410,23 +473,98 @@ class CopyRace(copy_t.CopyBase):
             self.copy()
         self.assertNotIn('stop', self.calls())
 
-    def test_a_kit_that_cannot_see_its_own_lock_refuses_before_the_stop(self):
-        """#550: it could not tell the launcher after the start, and would keep the owner lock until the new server
-        gave up: T3 down for a minute. Refused before the marker, so no SSH launch waits on one; run again, it
-        refuses the same; an old build (no serving lock to see) still copies."""
-        kit_cannot_see_its_own_lock(self)
+    def assert_refused_before_touching_anything(self, pattern):
+        """Refused at plan time (#580): no guard, no pre hook, no stop, no marker; the same again on a rerun."""
         for _ in range(2):
-            with self.assertRaisesRegex(journal.Refused, f"{BLIND} .*T3 would stay down.*; T3 was not stopped"):
+            with self.assertRaisesRegex(journal.Refused, pattern):
                 self.copy()
-            self.assertNotIn('stop', self.calls())
+            self.assertEqual([c for c in self.calls() if c in ('run_detached', 'quiet', 'pre', 'post', 'stop')], [])
             self.assertFalse(os.path.exists(self.m.path('home/runtime/desktop-update-in-progress')))
             self.assertEqual([n for n in os.listdir(self.m.path('home/runtime')) if 'probe' in n or 'tmp' in n], [])
-        marker_since(self, NEW)
-        self.adapter.claims_serving = False
-        self.adapter.before_start = ['fresh']  # as in test_an_old_launcher_without_the_serving_lock_still_starts
+
+    def test_a_kit_that_cannot_see_its_own_lock_refuses_before_the_stop(self):
+        """#550: it could not tell the launcher after the start, and would keep the owner lock until the new server
+        gave up: T3 down for a minute. Refused before the guard and the pre hooks (#580), so nothing is touched and
+        no SSH launch waits on a marker; run again, it refuses the same."""
+        kit_cannot_see_its_own_lock(self)
+        self.assert_refused_before_touching_anything(f"{BLIND} .*T3 would stay down.*; nothing was changed")
+
+    def test_an_old_build_refuses_too_where_the_kit_is_blind(self):
+        """#580 (lens A): an update caught at the stop restarts whatever build the service state names then
+        (UpdateAtStop), possibly one that takes the serving lock: the copy cannot rule that out before the stop, so
+        it refuses on such a host even while an old build runs. A host that sees its own lock still copies (the
+        other tests here, and test_an_old_launcher_without_the_serving_lock_still_starts)."""
+        marker_since(self, NEW)  # the live build takes no serving lock
+        kit_cannot_see_its_own_lock(self)
+        self.assert_refused_before_touching_anything(f"{BLIND} \\(/proc/locks does not list this process")
+
+    def test_a_launcher_the_kit_cannot_see_holding_the_serving_lock_refuses_before_the_stop(self):
+        """#580 (lens B): the kit sees its own lock, but the running launcher does not show as the serving lock's
+        holder: a launcher that is not the service's main process (here: another process holds it), a kit in a
+        child pid namespace, a lock of another kind. The handover would never find the new launcher either."""
+        self.serving.close()  # the unit's main process does not hold it; another process does
+        other = serving_lock_held_by_another_process(self)
+        self.assert_refused_before_touching_anything(
+            f"{BLIND} \\(/proc/locks lists pid {other} as the holder of runtime/service-serving.lock, not the boot "
+            f"service's main process \\(pid {os.getpid()}\\)")
+
+    def test_a_launcher_whose_claim_gave_up_does_not_stop_the_copy(self):
+        """#580 (lens B): upstream's launcher waits 250 ms for the serving lock and then serves without it (an SSH probe
+        held it then). Nobody holding it says nothing about the launcher the copy starts, which claims it again: the
+        kit's own lock decides, and the copy goes on and hands the home to the new launcher. Run again: the same."""
+        self.distinct_stamps()  # two copies: each its own second
+        self.serving.close()
         old = self.m.server.pid
         self.copy()
         self.assert_t3_runs_again(old)
+        self.assert_no_hand_server()
+        [verify] = [s['data'] for s in self.last_run()['steps'] if s['step'] == 'verify' and s['phase'] == 'done']
+        self.assertEqual(verify['handover'], 'launcher')
+        self.race.stopped()  # the new launcher's claim gave up too
+        self.copy()
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+
+    def test_a_launcher_whose_claim_gave_up_on_a_host_blind_to_its_own_lock_refuses(self):
+        """Nobody holding the serving lock falls back to the kit's own lock, and a blind kit still refuses."""
+        self.serving.close()
+        kit_cannot_see_its_own_lock(self)
+        self.assert_refused_before_touching_anything(f"{BLIND} \\(/proc/locks does not list this process")
+
+    def test_a_kit_in_a_child_pid_namespace_refuses_before_the_stop(self):
+        """#580 round 2 (both lenses): in a child pid namespace with a /proc of its own, the kit sees its own lock
+        but nobody on the serving lock, though the launcher holds it (the kernel leaves that lock out). The kit could
+        never see the new launcher either: refused before anything is touched, the same on a rerun. Before, nobody
+        holding fell back to the kit's own lock alone, and the copy went on."""
+        kit_in_a_child_pid_namespace(self)
+        self.assert_refused_before_touching_anything(
+            f"{BLIND} \\(the boot service's main process \\(pid {os.getpid()}\\) is not in this /proc: a /proc of "
+            "another pid namespace\\?\\).*; nothing was changed")
+
+    def test_a_kit_in_a_child_pid_namespace_where_the_main_pid_is_another_process_refuses(self):
+        """The same, where the host's MainPID is a pid in use in the kit's namespace too, by a process of another
+        unit."""
+        kit_in_a_child_pid_namespace(self, main_unit='some-shell.scope')
+        self.assert_refused_before_touching_anything(
+            f"{BLIND} \\(pid {os.getpid()}, the boot service's main process, is a process outside t3code.service "
+            "in this /proc")
+
+    def test_a_kit_that_goes_blind_during_the_pre_hooks_still_refuses_before_the_stop(self):
+        """The last look before the stop checks again (#550): blind only from the pre hooks on, the copy refuses with
+        T3 not stopped, runs the post hooks, and leaves no marker."""
+        real = coldcopy._hooks
+
+        def hooks(run, name, *args):
+            if name == 'pre-hooks':
+                kit_cannot_see_its_own_lock(self)
+            return real(run, name, *args)
+        with mock.patch.object(coldcopy, '_hooks', hooks):
+            with self.assertRaisesRegex(journal.Refused, f'{BLIND} .*; T3 was not stopped'):
+                self.copy()
+        steps = [s['step'] for s in self.last_run()['steps']]
+        self.assertIn('post-hooks', steps)
+        self.assertNotIn('stop-service', steps)
+        self.assertNotIn('stop', self.calls())
+        self.assertFalse(os.path.exists(self.m.path('home/runtime/desktop-update-in-progress')))
 
 
 class CopyBackstop(copy_t.CopyBase):
@@ -511,13 +649,55 @@ class SwitchRace(switch_t.SwitchBase):
         """#550: the target and the way back (the old build) take the serving lock: the switch refuses before the
         stop where the kit could not tell their launcher."""
         marker_since(self, fx.LIVE)
+        launcher_serves(self)
         kit_cannot_see_its_own_lock(self)
         self.rehearsed()
-        with self.assertRaisesRegex(journal.Refused, f'{BLIND} .*; T3 was not stopped'):
+        self.assert_refused_before_touching_anything(f'{BLIND} .*; nothing was changed')
+
+    def assert_refused_before_touching_anything(self, pattern):
+        """Refused at plan time (#580): before keep-runtime, the guard and the pre hooks; the same on a rerun."""
+        for _ in range(2):
+            with self.assertRaisesRegex(journal.Refused, pattern):
+                self.switch()
+            self.assertEqual([s['step'] for s in self.last_run()['steps']], [])
+            self.assertEqual([c for c in self.calls() if c in ('run_detached', 'quiet', 'pre', 'post', 'stop')], [])
+            self.assertEqual(self.server()['version'], fx.LIVE)
+            self.assertFalse(os.path.exists(self.m.path('home/runtime/desktop-update-in-progress')))
+
+    def test_an_old_build_and_target_refuse_too_where_the_kit_is_blind(self):
+        """#580 (lens A): `t3 update` may land on another build than the target (the service state names it then);
+        the switch cannot rule out one that takes the serving lock, so a blind host refuses even here."""
+        marker_since(self, NEW)
+        kit_cannot_see_its_own_lock(self)
+        self.rehearsed()
+        self.assert_refused_before_touching_anything(f'{BLIND} \\(/proc/locks does not list this process')
+
+    def test_a_target_whose_claim_gave_up_and_that_fails_verify_is_put_back_by_w1(self):
+        """#580 (lens B): the target came up, its launcher's claim of the serving lock gave up (upstream serves on
+        without it), and verify failed. The automatic W1 looks at the running launcher before its stop: nobody holding
+        the lock falls back to the kit's own lock, so W1 puts T3 back (before, it refused, and the unverified target
+        kept running)."""
+        marker_since(self, fx.LIVE)  # the old build and the target both take the serving lock
+        launcher_serves(self)
+        self.tamper = True  # verify fails: not the rehearsed build
+        real = self.fake_t3
+
+        def update_then_claim_gives_up(binary, args, timeout):
+            got = real(binary, args, timeout)
+            if args[:2] == ['update', fx.TARGET]:
+                self.race.stopped()  # T3 runs the target; nobody holds the serving lock
+            return got
+        self.rehearsed()
+        with mock.patch.object(switch, '_t3', update_then_claim_gives_up), self.assertRaises(RuntimeError) as cm:
             self.switch()
-        self.assertNotIn('stopping', [s['step'] for s in self.last_run()['steps']])
-        self.assertEqual(self.server()['version'], fx.LIVE)
-        self.assertFalse(os.path.exists(self.m.path('home/runtime/desktop-update-in-progress')))
+        self.assertIn('rolled back', str(cm.exception))
+        self.assertNotIn('putting T3 back failed', str(cm.exception))
+        run = self.last_run()
+        self.assertEqual([s['step'] for s in run['steps'] if s['phase'] == 'done'][-3:],
+                         ['verify', 'rolled-back', 'post-hooks'])
+        with open(self.m.path('home/runtime/service-state.json')) as f:
+            self.assertEqual(json.load(f)['activeVersion'], fx.LIVE)
+        self.assertEqual(self.race.hands, [], self.race.log)
 
     def test_ssh_launches_probing_through_the_update_never_free_the_home(self):
         marker_since(self, fx.TARGET)
@@ -654,16 +834,124 @@ class W1Gap(back_t.BackBase):
         self.assertTrue(self.adapter.service()['active'])
 
     def test_a_w1_where_the_kit_cannot_see_its_own_lock_refuses_before_saying_it_stops_t3(self):
-        """#550: W1's update starts the old build, which takes the serving lock here."""
+        """#550: W1's update starts the old build, which takes the serving lock here. Refused before the runtime is
+        put back and the pre hooks run (#580): nothing changed, the same on a rerun."""
         marker_since(self, fx.LIVE)
+        launcher_serves(self)
         kit_cannot_see_its_own_lock(self)
+        before = self.m.snapshot()
         calls = len(self.calls())
-        with self.assertRaisesRegex(journal.Refused, f'{BLIND} .*; T3 was not stopped'):
-            self.back('w1', lose_work_since=self.at)
-        self.assertNotIn('stop', self.calls()[calls:])
+        for _ in range(2):
+            with self.assertRaises(journal.Refused) as cm:
+                self.back('w1', lose_work_since=self.at)
+            said = str(cm.exception)
+            self.assertRegex(said, f'{BLIND} .*; nothing was changed')
+            # the remedy (#580, lens A): a restart would start the build W1 leaves again; a stop by hand lets W1 go on
+            self.assertIn('to go back anyway, stop T3 (`systemctl --user stop t3code.service`), then at once run '
+                          f'`t3-golive back --way w1 --lose-work-since {self.at}`', said)
+            self.assertIn('until it runs, T3 is stopped with no update marker and no owner lock', said)
+            self.assertNotIn('systemctl --user restart', said)
+        self.assertEqual(self.calls()[calls:], [])
+        self.assertEqual(self.m.snapshot(), before)
         self.assertFalse(any('stopping T3' in s for s in self.said), self.said)
         self.assertTrue(self.adapter.service()['active'])
         self.assertTrue(self.adapter.service()['enabled'])
+        self.adapter.stop()  # the remedy, followed: W1 goes on, says what it may cost, and ends ok
+        got = self.back('w1', lose_work_since=self.at)
+        self.assertEqual(got['version'], fx.LIVE)
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+        self.assertEqual(len([s for s in self.said if s.startswith(f'note: {BLIND}')]), 1, self.said)
+
+    def fail_service_from_blind(self, after=0):
+        """In W1's pre-stop look (back._blind), `systemctl show` fails, after `after` reads that work (a failure in
+        the backstop's read just before it is an error that changed nothing: refuse_foreign)."""
+        real_blind, real_service, left = back._blind, self.adapter.service, []
+
+        def service(*args, **kw):
+            if left == [] or left[0] > 0:
+                if left:
+                    left[0] -= 1
+                return real_service(*args, **kw)
+            raise back.osadapter.AdapterError('systemctl --user show t3code.service exited 1: no user bus')
+
+        def blind(*args, **kw):
+            left[:] = [after]
+            try:
+                return real_blind(*args, **kw)
+            finally:
+                left[:] = []
+        self.adapter.service = service
+        return mock.patch.object(back, '_blind', blind)
+
+    def test_a_w1_that_cannot_read_the_service_refuses_and_names_no_stop_by_hand(self):
+        """#580 round 2 (lens A minor 2, lens B minor 3): W1 cannot tell whether T3 runs, nor look at its launcher.
+        It refuses before anything changes, the same on a rerun, and does not offer the stop by hand (it would fail
+        too, and the rerun would count the service as running again: a loop). Before, it read the unreadable
+        service as running, then found no live server and checked only its own lock: it went on."""
+        marker_since(self, fx.LIVE)
+        launcher_serves(self)
+        before = self.m.snapshot()
+        calls = len(self.calls())
+        with self.fail_service_from_blind():
+            for _ in range(2):
+                with self.assertRaises(journal.Refused) as cm:
+                    self.back('w1', lose_work_since=self.at)
+                said = str(cm.exception)
+                self.assertRegex(said, 'the boot service cannot be read \\(.*no user bus\\), so the kit cannot tell '
+                                       'whether T3 runs.*run the same W1 again once `systemctl --user show '
+                                       't3code.service` works; nothing was changed')
+                self.assertNotIn('systemctl --user stop', said)
+        self.assertEqual(self.calls()[calls:], [])
+        self.assertEqual(self.m.snapshot(), before)
+        self.assertFalse(any('stopping T3' in s for s in self.said), self.said)
+
+    def test_a_w1_whose_look_at_the_launcher_cannot_read_the_service_names_no_stop_by_hand(self):
+        """The same when only the look at the launcher (handoff.launcher_unseen) cannot read the service."""
+        marker_since(self, fx.LIVE)
+        launcher_serves(self)
+        before = self.m.snapshot()
+        with self.fail_service_from_blind(after=2):  # W1's own read and the live server's work
+            with self.assertRaises(journal.Refused) as cm:
+                self.back('w1', lose_work_since=self.at)
+        said = str(cm.exception)
+        self.assertRegex(said, f"{BLIND} \\(the boot service cannot be read: .*no user bus\\).*; run the same W1 "
+                               "again once `systemctl --user show t3code.service` works; nothing was changed")
+        self.assertNotIn('systemctl --user stop', said)
+        self.assertEqual(self.m.snapshot(), before)
+
+    def test_a_w1_in_a_child_pid_namespace_refuses_before_saying_it_stops_t3(self):
+        """#580 round 2: W1 starts the old build, which takes the serving lock; the kit cannot see the launcher's
+        lock (a /proc of its own), so it refuses with nothing changed, twice."""
+        marker_since(self, fx.LIVE)
+        launcher_serves(self)
+        kit_in_a_child_pid_namespace(self)
+        before = self.m.snapshot()
+        for _ in range(2):
+            with self.assertRaisesRegex(journal.Refused, f"{BLIND} \\(the boot service's main process .* is not in "
+                                                         "this /proc.*; nothing was changed"):
+                self.back('w1', lose_work_since=self.at)
+        self.assertEqual(self.m.snapshot(), before)
+        self.assertTrue(self.adapter.service()['active'])
+
+    def test_a_w1_rerun_on_a_host_that_went_blind_after_its_stop_goes_on_and_says_so(self):
+        """#580 (lens A): a W1 that stopped T3 and failed half-way; the host became blind since (a /proc of another
+        pid namespace). The rerun cannot make the gap any worse (T3 is down already): it goes on, ends ok, and says
+        that T3 may take about a minute to come up, never that "T3 was not stopped"."""
+        marker_since(self, fx.LIVE)
+        launcher_serves(self)
+        with mock.patch.object(coldcopy, 'restore', side_effect=RuntimeError('disk gone')):
+            with self.assertRaisesRegex(RuntimeError, 'disk gone'):
+                self.back('w1', lose_work_since=self.at)
+        self.assertFalse(self.adapter.service()['active'])
+        kit_cannot_see_its_own_lock(self)
+        got = self.back('w1', lose_work_since=self.at)
+        self.assertEqual(got['version'], fx.LIVE)
+        self.assertEqual(self.last_run()['end']['result'], 'ok')
+        notes = [s for s in self.said if s.startswith(f'note: {BLIND}')]
+        self.assertEqual(len(notes), 1, self.said)
+        self.assertIn('T3 is stopped already, so this W1 goes on', notes[0])
+        self.assertIn("as its update is a pending trial, that trial's database backup may be lost", notes[0])
+        self.assertNotIn('T3 was not stopped', ' '.join(self.said))
 
 
 class Holder(back_t.BackBase):
@@ -800,6 +1088,7 @@ class Holder(back_t.BackBase):
         """Lens review (blocking): to a build that takes the serving lock, `t3 update` exits non-zero (or times out),
         or the build never comes up: the handover's timeout must not let the holder go while T3 is not running."""
         marker_since(self, fx.LIVE)
+        launcher_serves(self)
         self.m.write('update.code', '3')
         with self.assertRaisesRegex(RuntimeError, 'exited 3'):
             self.back('w1', lose_work_since=self.at)
@@ -813,6 +1102,7 @@ class Holder(back_t.BackBase):
         """The same, when `t3 update` exits 0 but the build never runs (a crash loop): the verify fails, and a rerun
         (it only verifies again) keeps the home owned too."""
         marker_since(self, fx.LIVE)
+        launcher_serves(self)
         self.m.write('never-starts', fx.LIVE)
         for _ in range(2):
             with self.assertRaisesRegex(RuntimeError, 'did not come back'):
@@ -1221,7 +1511,345 @@ class Marker(unittest.TestCase):
         g.starting(start, NEW, service)
         self.assertEqual(g.handover, 'launcher')
         self.assertEqual(len(reads), 1, f'the service was read {len(reads)} times')
-        self.assertEqual(reads, [self.h.SERVICE_READ_TIMEOUT])
+        self.assertEqual(reads, [None])  # the adapter's usual timeout: the reader thread is in no hurry (#580)
+
+    def test_the_service_is_read_about_once_a_second_while_it_does_not_run(self):
+        """#580: while `t3 update` installs (T3 down, nobody holding the serving lock), the kit read the service every
+        0.2 s: a systemctl process each time, for the whole update. Now about once a second."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        reads = []
+
+        def service(timeout=None):
+            reads.append(time.monotonic())
+            return {'active': False, 'mainPid': 0}
+        g.starting(lambda: time.sleep(2.5), NEW, service)  # an update that installs 2.5 s, then starts nothing
+        self.assertEqual(g.handover, 'timeout')
+        self.assertLessEqual(len(reads), 5, f'the service was read {len(reads)} times in 2.5 s')
+
+    def test_a_systemctl_slower_than_two_seconds_still_finds_the_launcher(self):
+        """#580 (lens B): the look read the service with a 2 s cap, so a systemctl that took 2-3 s (a busy machine)
+        never gave a MainPID, and the kit let go only after HANDOVER_WAIT: a new server that gave up meanwhile left T3
+        down. The reader thread waits for it: the handover finds the launcher once the answer comes."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        serving = self.m.path('home/runtime/service-serving.lock')
+        owner = os.path.join(userdata, 'server-owner.sqlite')
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+
+        def service(timeout=None):
+            if timeout is not None and timeout <= 2.0:  # what a 2-3 s systemctl gives a 2 s cap
+                raise subprocess.TimeoutExpired(['systemctl', 'show'], timeout)
+            time.sleep(0.3)
+            return {'active': True, 'mainPid': os.getpid()}
+
+        def start():
+            launcher = sqlite3.connect(serving, isolation_level=None)
+            launcher.execute('BEGIN EXCLUSIVE')
+            end = time.monotonic() + 10
+            while held(owner) and time.monotonic() < end:
+                time.sleep(0.005)
+            launcher.close()
+        began = time.monotonic()
+        g.starting(start, NEW, service)
+        self.assertEqual(g.handover, 'launcher')
+        self.assertLess(time.monotonic() - began, 5)
+
+    def test_the_running_launcher_must_show_as_serving_before_the_stop(self):
+        """#580 (lens B): the pre-stop look made on the real launcher where the running build takes the serving lock:
+        its main process holding it passes; another holder, no holder, a service that cannot be read, or no main
+        process refuse, each saying which. An older running build keeps the check on the kit's own lock."""
+        serving = self.m.path('home/runtime/service-serving.lock')
+        sqlite3.connect(serving).close()
+        mine = lambda **_: {'active': True, 'mainPid': os.getpid()}  # noqa: E731
+        # nobody holds it (a claim that gave up, lens B): the kit's own lock decides, as for an older build
+        for _ in range(2):
+            self.assertIsNone(self.h.launcher_unseen(self.m.home, mine))
+            self.assertIsNone(self.h.handover_blind(self.m.home, [NEW], NEW, mine))
+            self.assertEqual(os.listdir(self.m.path('home/runtime')), ['service-serving.lock'])
+        with mock.patch.object(self.h, 'lock_holders', return_value=set()):  # a kit that sees no lock at all
+            self.assertIn('does not list this process', self.h.launcher_unseen(self.m.home, mine))
+            self.assertIn('does not list this process', self.h.handover_blind(self.m.home, [NEW], NEW, mine))
+        conn = sqlite3.connect(serving, isolation_level=None)
+        conn.execute('BEGIN EXCLUSIVE')
+        for _ in range(2):  # run again: the same, and nothing left behind
+            self.assertIsNone(self.h.launcher_unseen(self.m.home, mine))
+            self.assertIsNone(self.h.handover_blind(self.m.home, [NEW], NEW, mine))
+            self.assertEqual(sorted(os.listdir(self.m.path('home/runtime'))),
+                             ['service-serving.lock', 'service-serving.lock-journal'])  # the test's own
+        conn.close()
+        holder = subprocess.Popen(
+            [sys.executable, '-I', '-c', 'import sqlite3, sys\nc = sqlite3.connect(sys.argv[1], isolation_level=None)\n'
+             'c.execute("BEGIN EXCLUSIVE")\nprint("held", flush=True)\nsys.stdin.read()', serving],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.stdin.close)
+        self.assertEqual(holder.stdout.readline(), 'held\n')
+        why = self.h.handover_blind(self.m.home, [NEW], NEW, mine)
+        self.assertIn(f'(/proc/locks lists pid {holder.pid} as the holder of runtime/service-serving.lock, not the '
+                      f'boot service\'s main process (pid {os.getpid()})', why)
+        self.assertIn('T3 would stay down for about a minute', why)
+        self.assertIsNone(self.h.handover_blind(self.m.home, [NEW], '0.1.9', mine))  # an old build: its own lock
+        self.assertIsNone(self.h.handover_blind(self.m.home, ['0.1.9'], NEW, mine))  # nothing that takes it starts
+        self.assertIn('(the boot service has no running main process)', self.h.handover_blind(
+            self.m.home, [NEW], NEW, lambda **_: {'active': False, 'mainPid': 0}))
+
+        def fails(**_):
+            raise OSError('systemctl: no user bus')
+        why = self.h.handover_blind(self.m.home, [NEW], NEW, fails)
+        self.assertIn('(the boot service cannot be read: systemctl: no user bus)', why)
+        self.assertTrue(why.service_unread)  # W1 then names no stop by hand: it would fail too
+        self.assertFalse(self.h.handover_blind(self.m.home, [NEW], NEW, lambda **_: {'active': False}).service_unread)
+        with mock.patch.object(self.h, 'lock_holders', return_value=None):
+            self.assertIn('(/proc/locks cannot be read)', self.h.handover_blind(self.m.home, [NEW], NEW, mine))
+        # a build the kit cannot name (an update caught at the stop) counts as one that takes the lock
+        self.assertTrue(self.h.takes_serving_lock(self.h.ANY_BUILD))
+        with mock.patch.object(self.h, 'lock_holders', return_value={1}):
+            self.assertIn('does not list this process', self.h.handover_blind(self.m.home, ['0.1.9', self.h.ANY_BUILD]))
+
+    def test_in_a_child_pid_namespace_nobody_seems_to_hold_the_serving_lock_and_the_look_refuses(self):
+        """#580 round 2 (both lenses): /proc/locks of a child pid namespace leaves out the launcher's lock, so nobody
+        seems to hold it, while the kit's own lock shows. The service's main process must then be in this /proc, in
+        the unit: missing, or another unit's process, refuses; in the unit (a claim that gave up on a real host)
+        passes. Each twice, nothing left behind. Before, all three passed."""
+        serving = self.m.path('home/runtime/service-serving.lock')
+        sqlite3.connect(serving).close()
+        launcher = sqlite3.connect(serving, isolation_level=None)
+        launcher.execute('BEGIN EXCLUSIVE')  # the launcher holds it (this process: the fakes' MainPID) ...
+        self.addCleanup(launcher.close)
+        kit_in_a_child_pid_namespace(self)  # ... and the kit's /proc leaves that lock out
+        mine = lambda **_: {'active': True, 'mainPid': os.getpid()}  # noqa: E731
+        self.assertIsNone(self.h.sees_own_lock(self.m.home))  # the kit's own lock shows
+        for _ in range(2):
+            self.assertEqual(self.h.launcher_unseen(self.m.home, mine),
+                             f"the boot service's main process (pid {os.getpid()}) is not in this /proc: a /proc of "
+                             'another pid namespace?')
+            self.assertIn(BLIND, self.h.handover_blind(self.m.home, [NEW], NEW, mine))
+        self.m.in_unit(os.getpid(), 'some-shell.scope')  # the host's MainPID is a pid in use here too
+        for _ in range(2):
+            self.assertEqual(self.h.launcher_unseen(self.m.home, mine),
+                             f"pid {os.getpid()}, the boot service's main process, is a process outside "
+                             't3code.service in this /proc: a /proc of another pid namespace?')
+        self.m.in_unit(os.getpid())  # one namespace: the claim gave up, and the kit's own lock decides
+        for _ in range(2):
+            self.assertIsNone(self.h.launcher_unseen(self.m.home, mine))
+        self.assertEqual(sorted(os.listdir(self.m.path('home/runtime'))),
+                         ['service-serving.lock', 'service-serving.lock-journal'])  # the test's own
+
+    def test_the_unit_is_read_from_the_main_process_s_cgroup(self):
+        """in_unit reads /proc/<pid>/cgroup as osadapter reads the kit's own: cgroup v2's one line, or v1's lines."""
+        pid = 4242
+        self.assertIn('is not in this /proc', self.h.in_unit(pid))
+        self.m.write(f'proc/{pid}/cgroup', '0::/user.slice/user-1000.slice/user@1000.service/app.slice/'
+                                           't3code.service\n')
+        self.assertIsNone(self.h.in_unit(pid))
+        self.m.write(f'proc/{pid}/cgroup', '12:memory:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/'
+                                           'user@1000.service/app.slice/t3code.service\n')
+        self.assertIsNone(self.h.in_unit(pid))
+        self.m.write(f'proc/{pid}/cgroup', '0::/user.slice/user-1000.slice/user@1000.service/app.slice/'
+                                           't3code.service.d.scope\n')
+        self.assertIn('outside t3code.service', self.h.in_unit(pid))
+        self.m.write(f'proc/{pid}/cgroup', '0::/\n')  # a cgroup namespace of its own
+        self.assertIn('outside t3code.service', self.h.in_unit(pid))
+
+    def test_an_ssh_probe_on_the_serving_lock_at_the_look_is_looked_at_again(self):
+        """#580 round 2 (lens A minor 4): a claim that gave up leaves the serving lock free, so an SSH launch's
+        `home-owned` probe can hold it at the very moment of the pre-stop look. The look waits PROBE_RELOOK and looks
+        again: the probe is gone, and it passes (before, it refused, and in a switch's automatic W1 that ended the
+        way back). A holder that stays still refuses, and says it may be a probe."""
+        serving = self.m.path('home/runtime/service-serving.lock')
+        sqlite3.connect(serving).close()
+        mine = lambda **_: {'active': True, 'mainPid': os.getpid()}  # noqa: E731
+        for _ in range(2):
+            probe = subprocess.Popen(
+                [sys.executable, '-I', '-c', 'import sqlite3, sys\nc = sqlite3.connect(sys.argv[1], '
+                 'isolation_level=None)\nc.execute("BEGIN EXCLUSIVE")\nprint("held", flush=True)\nsys.stdin.readline()'
+                 '\nc.close()\nprint("let go", flush=True)\nsys.stdin.read()', serving],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            self.addCleanup(probe.wait)
+            self.addCleanup(probe.stdout.close)
+            self.addCleanup(probe.stdin.close)
+            self.assertEqual(probe.stdout.readline(), 'held\n')
+            waits = []
+
+            def pause(seconds):  # the probe ends while the look waits
+                waits.append(seconds)
+                probe.stdin.write('\n')
+                probe.stdin.flush()
+                self.assertEqual(probe.stdout.readline(), 'let go\n')
+            with mock.patch.object(self.h, '_pause', pause):
+                self.assertIsNone(self.h.launcher_unseen(self.m.home, mine))
+            self.assertEqual(waits, [self.h.PROBE_RELOOK])
+            probe.stdin.close()
+        holder = serving_lock_held_by_another_process(self)
+        with mock.patch.object(self.h, '_pause', lambda seconds: None):
+            why = self.h.launcher_unseen(self.m.home, mine)
+        self.assertIn(f'/proc/locks lists pid {holder} as the holder', why)
+        self.assertIn("or an SSH launch's probe that held it that long (then the same command again goes on)", why)
+
+    def test_a_holder_that_stays_does_not_have_the_service_read_back_to_back(self):
+        """#580 round 2 (lens A nit 5, lens B minor 4): while a process that is not the unit's holds the serving lock
+        and the service does not run, every 20 ms look asks for a read. Reads start at least SERVICE_FLOOR apart:
+        about 10 in a second, not one per look."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        serving = self.m.path('home/runtime/service-serving.lock')
+        sqlite3.connect(serving).close()
+        serving_lock_held_by_another_process(self)
+        reads = []
+
+        def service(timeout=None):
+            reads.append(time.monotonic())
+            return {'active': False, 'mainPid': 0}
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        with mock.patch.object(self.h, 'HANDOVER_WAIT', 0.0):
+            g.starting(lambda: time.sleep(1.0), NEW, service)
+        self.assertEqual(g.handover, 'timeout')
+        self.assertLessEqual(len(reads), 13, f'{len(reads)} reads in about a second')
+        gaps = [b - a for a, b in zip(reads, reads[1:])]
+        self.assertGreaterEqual(min(gaps), self.h.SERVICE_FLOOR * 0.9, gaps)
+
+    def test_the_reader_thread_ends_with_the_handover(self):
+        """#580 round 2 (lens A minor 3): the thread that reads the service ends once the handover has (it is not
+        joined: a read in flight ends by itself), both after a launcher took the home and after the timeout."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+
+        def readers():
+            return {t for t in threading.enumerate() if t.name == 'golive-service-read' and t.is_alive()}
+        for how in ('launcher', 'timeout', 'launcher'):
+            ready = threading.Event()
+            ready.set()
+            before = readers()
+            g = self.h.Gap(self.m.home)
+            g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+            with mock.patch.object(self.h, 'HANDOVER_WAIT', 0.1):
+                g.starting(self.claims_after(ready, hold=3) if how == 'launcher' else lambda: None, NEW, self.service)
+            self.assertEqual(g.handover, how)
+            end = time.monotonic() + 2
+            while readers() - before and time.monotonic() < end:
+                time.sleep(0.01)
+            self.assertEqual(readers() - before, set(), how)
+
+    def claims_after(self, ready, hold=10):
+        """A start (fn for Gap.starting): once `ready` is set, the launcher claims the serving lock and keeps it until
+        the kit let go of the owner lock, or `hold` s (a kit that never does fails fast)."""
+        serving = self.m.path('home/runtime/service-serving.lock')
+        owner = self.m.path('home/userdata/server-owner.sqlite')
+
+        def start():
+            ready.wait(10)
+            launcher = sqlite3.connect(serving, isolation_level=None)
+            launcher.execute('BEGIN EXCLUSIVE')
+            end = time.monotonic() + hold
+            while held(owner) and time.monotonic() < end:
+                time.sleep(0.005)
+            launcher.close()
+        return start
+
+    def test_a_look_that_finds_the_serving_lock_held_has_the_service_read_at_once(self):
+        """#580 (lens A): `t3 update` starts T3 just after a read found the service inactive. The look that finds the
+        serving lock held has the service read at once, not SERVICE_REREAD later (here 5 s, far past the 250 ms the
+        new server waits): the handover stays inside that wait."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        up, reads, read_inactive = threading.Event(), [], threading.Event()
+
+        def service(timeout=None):
+            reads.append(up.is_set())
+            if not up.is_set():
+                read_inactive.set()
+                return {'active': False, 'mainPid': 0}
+            return {'active': True, 'mainPid': os.getpid()}
+        start = self.claims_after(read_inactive)
+
+        def update():  # the read before the start saw it inactive; then systemd starts the launcher, which claims
+            read_inactive.wait(10)
+            up.set()
+            start()
+        for _ in range(2):  # run again: the same
+            g = self.h.Gap(self.m.home)
+            g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+            reads.clear(), up.clear(), read_inactive.clear()
+            with mock.patch.object(self.h, 'SERVICE_REREAD', 5.0):
+                began = time.monotonic()
+                g.starting(update, NEW, service)
+            self.assertEqual(g.handover, 'launcher')
+            self.assertLess(g.handover_ms, self.h.SERVER_LOCK_WAIT_MS)
+            self.assertLess(time.monotonic() - began, 4)
+            self.assertEqual(reads[:1], [False])
+
+    def test_the_service_is_not_read_again_while_it_runs(self):
+        """#580 (lens A): once the service runs, its MainPID is kept: no `systemctl show` a second while the launcher
+        has not claimed yet (here 2.5 s)."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        reads, later = [], threading.Event()
+
+        def service(timeout=None):
+            reads.append(time.monotonic())
+            return {'active': True, 'mainPid': os.getpid()}
+        threading.Timer(2.5, later.set).start()
+        g.starting(self.claims_after(later), NEW, service)
+        self.assertEqual(g.handover, 'launcher')
+        self.assertEqual(len(reads), 1, f'the service was read {len(reads)} times')
+
+    def test_an_error_in_the_reader_does_not_end_its_reads(self):
+        """#580 (lens B): an error outside the guarded systemctl call ended the reader thread, and the kit kept the
+        owner lock HANDOVER_WAIT: past the new server's wait. The reader reads again on its next pass."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        real, calls, ready = self.h._read, [], threading.Event()
+
+        def read(service):
+            calls.append(1)
+            if len(calls) == 1:
+                ready.set()
+                raise TypeError('an error of the reader itself')
+            return real(service)
+        with mock.patch.object(self.h, '_read', read):
+            began = time.monotonic()
+            g.starting(self.claims_after(ready, hold=3), NEW, self.service)
+        self.assertEqual(g.handover, 'launcher')
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertLess(time.monotonic() - began, 5)
+        # #580 round 2 (lens B minor 5): not silent: the verify step's journal facts say it
+        self.assertEqual(g.read_failed, '1 time(s), last: TypeError: an error of the reader itself')
+        self.assertEqual(g.served()['serviceReadFailed'], '1 time(s), last: TypeError: an error of the reader itself')
+
+    def test_a_failed_systemctl_read_during_the_start_is_journalled(self):
+        """A `systemctl show` that fails during the start is read again, and the verify step's facts count it; a start
+        with no failed read says nothing of it."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        calls, ready = [], threading.Event()
+
+        def service(timeout=None):
+            calls.append(1)
+            if len(calls) <= 2:
+                if len(calls) == 2:
+                    ready.set()
+                raise osadapter.AdapterError('systemctl --user show t3code.service exited 1: no user bus')
+            return {'active': True, 'mainPid': os.getpid()}
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        g.starting(self.claims_after(ready, hold=5), NEW, service)
+        self.assertEqual(g.handover, 'launcher')
+        self.assertEqual(g.served()['serviceReadFailed'], '2 time(s), last: AdapterError: systemctl --user show '
+                                                          't3code.service exited 1: no user bus')
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        g.starting(self.claims_after(threading.Event(), hold=0), NEW, self.service)
+        self.assertNotIn('serviceReadFailed', g.served())
 
     def test_a_main_process_that_is_gone_is_read_again(self):
         """Old state: the service read gave a MainPID that has exited since (Restart=always started a new launcher):
@@ -1238,18 +1866,20 @@ class Marker(unittest.TestCase):
             reads.append(timeout)
             return {'active': True, 'mainPid': gone.pid if len(reads) == 1 else os.getpid()}
 
-        def start():
+        def start():  # the launcher holds the lock until the kit let go, or 10 s: a kit that never does fails fast
             launcher = sqlite3.connect(serving, isolation_level=None)
             launcher.execute('BEGIN EXCLUSIVE')
-            end = time.monotonic() + PROBING_LIMIT
+            end = time.monotonic() + 10
             while held(owner) and time.monotonic() < end:
                 time.sleep(0.005)
             launcher.close()
         g = self.h.Gap(self.m.home)
         g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        began = time.monotonic()
         g.starting(start, NEW, service)
         self.assertEqual(g.handover, 'launcher')
         self.assertEqual(len(reads), 2)
+        self.assertLess(time.monotonic() - began, 5)
 
     def test_a_slow_service_read_after_a_start_with_no_launcher_still_sees_t3_run(self):
         """After a start that reached no launcher, the holder goes only when the service runs (#530). That read is not
@@ -1259,7 +1889,7 @@ class Marker(unittest.TestCase):
 
         def service(timeout=None):
             reads.append(timeout)
-            if timeout is not None and timeout <= self.h.SERVICE_READ_TIMEOUT:
+            if timeout is not None and timeout <= 2.0:  # the short read the start once made
                 raise subprocess.TimeoutExpired(['systemctl', 'show'], timeout)
             return {'active': True, 'mainPid': os.getpid()}
         self.assertTrue(self.h._active(service))
