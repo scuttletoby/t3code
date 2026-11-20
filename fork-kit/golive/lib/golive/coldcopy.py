@@ -674,6 +674,48 @@ def hold_owner_lock(userdata, wait_seconds):
             time.sleep(POLL)
 
 
+def hold_home(adapter, home, wait):
+    """The owner lock for a run that stopped T3 and may leave it stopped on purpose (W1, a switch: #530), right
+    after the stop: kept by the holder, a transient unit of its own (handoff.py), so the home stays owned when this
+    run fails or is killed. A holder an earlier run left is adopted: no gap, and never a second one. When none can
+    be started (no transient unit, /proc/locks unreadable) this process holds the lock itself, as before: the home
+    is then free once the run ends. Returns (the lock for handoff.adopt, the facts for the journal); raises
+    TimeoutError when a server still holds the home after `wait` seconds."""
+    pid = handoff.find_holder(home)
+    if pid is not None:
+        return handoff.Holder(home, pid), {'holder': pid, 'holderFrom': 'an earlier run that stopped T3'}
+    unit, why = handoff.holder_unit(home), None
+    if handoff.lock_holders(os.path.join(home, 'userdata', OWNER_LOCK)) is None:  # none it could find again
+        return hold_owner_lock(os.path.join(home, 'userdata'), wait), {
+            'holder': None, 'holderError': f'/proc/locks cannot be read, so {unit} was not started (the kit could '
+                                           'not find it again); this run holds the home itself: it is free once the '
+                                           'run ends'}
+    began = time.monotonic()
+    try:
+        adapter.run_detached(unit, [KIT_BIN, *handoff.holder_args(home)])
+    except osadapter.AdapterError as e:  # none at all, or one of that name still ending
+        why = str(e)
+    end = began + (min(wait, 2.0) if why else wait)
+    while True:
+        pid = handoff.find_holder(home)
+        if pid is not None:
+            return handoff.Holder(home, pid), {'holder': pid, 'holderUnit': unit}
+        if time.monotonic() >= end or (why is None and time.monotonic() > began + 1.0
+                                       and not _guard_alive(adapter, unit)):
+            break
+        time.sleep(POLL)
+    why = why or f'{unit} did not take the owner lock within {wait} s (look at: journalctl --user -u {unit})'
+    try:
+        lock = hold_owner_lock(os.path.join(home, 'userdata'), wait)
+    except TimeoutError:
+        pid = handoff.find_holder(home)  # it came up after all
+        if pid is None:
+            raise
+        return handoff.Holder(home, pid), {'holder': pid, 'holderUnit': unit}
+    return lock, {'holder': None, 'holderError': f'{why}; this run holds the home itself: it is free once the run '
+                                                 'ends'}
+
+
 def plan_restore(copy_dir, home, *, from_home, version, names=DEFAULT_RESTORE, floor_bytes=0):
     """Read only: may this copy be restored into `home`? `from_home` is the home the copy must have been taken of
     (the same home for `back`, the live home for a rehearsal) and `version` the T3 build that will start on the
@@ -1303,8 +1345,8 @@ def guard(cfg, adapter, run_id):
                     did.append(f'{osadapter.UNIT} is not enabled: left stopped (a back W1 that stopped may hold it)')
                 elif not svc['active']:
                     open_gap(cfg.home)  # a marker that runs out by itself: this guard does not wait for T3
-                    try:
-                        adapter.start()
+                    try:  # a holder some run left (#530) lets go to the launcher, as the kit's own lock does
+                        handoff.starting(cfg.home, adapter.start, None, adapter.service)
                     finally:
                         handoff.close(cfg.home)
                     did.append(f'started {osadapter.UNIT}')
