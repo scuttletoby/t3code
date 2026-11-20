@@ -413,6 +413,8 @@ const make = Effect.gen(function* () {
   /**
    * Clears the stored holds a later good read used up (`usedLater`), outside the semaphore. Each
    * key leaves the set once its write was tried (a failed write is logged; its copy ends by itself).
+   * With no store attached nothing is written and the keys still leave: such a hold would count
+   * again after a restart until it ends, the safe direction (fewer starts, never more).
    */
   const clearUsedLater = Effect.suspend(() => {
     const keys = [...usedLater];

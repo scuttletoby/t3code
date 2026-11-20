@@ -935,6 +935,14 @@ describe("SlotGate", () => {
             yield* gate.usage;
             yield* gate.usage;
             assert.strictEqual(storeWarnings(), 3);
+            // Waits off, then on again with the same reason: a new spell, warned again.
+            const settings = yield* ServerSettings.ServerSettingsService;
+            yield* settings.updateSettings({ waitFor: { enabled: false } });
+            yield* acquireAs(other);
+            yield* settings.updateSettings({ waitFor: { enabled: true } });
+            yield* gate.usage;
+            yield* gate.usage;
+            assert.strictEqual(storeWarnings(), 4);
             assert.isAbove(store.reads, 7);
           }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false }))),
         );
