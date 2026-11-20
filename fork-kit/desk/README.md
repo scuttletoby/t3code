@@ -153,7 +153,9 @@ parts run in the tests on a fake root.
   config choice is saved, so a run stopped between saving the choice and the swap fails `check` until the next run.
 - **Stopped half-way:** the next install ends it. A new release is staged in `/opt/fork-fleet/.kit-stage-*` and
   checked first (gate loads with the fleet config, the pool is in it, `bash -n`, the walls know this OS); a release
-  that fails is never installed. Files are renamed in one by one while the agent and the refresh timer are stopped;
+  that fails is never installed. Files are renamed in one by one while the agent and the refresh timer are stopped,
+  the walls file that pins the launcher (`fork-fleet-walls/linux`) last: a stop before it leaves the old pin, so
+  a new launcher fails the walls until the next run ends the swap, and no older walls file meets a newer pin.
   `SOURCE` is written
   last, so `check` reports a half-done swap. Users are recorded in `/etc/fork-fleet/desk-kit.json` before they are
   made, so uninstall removes them even after a stop.
