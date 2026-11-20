@@ -363,8 +363,10 @@ instead of retrying.
 
 A running agent is a thread whose shell shows an active run (settled or archived threads too), as
 upstream's own shell read decides (`apps/server/src/slots/ActiveRunShells.ts`); a test checks that
-for every run status. If upstream renames the index that read uses, the server logs an error naming
-that file once and goes on counting without the index.
+for every run status. The fork's part of that read names no index, so a renamed, dropped or partial
+index only makes it slower (a test checks that SQLite still uses upstream's index). Upstream's own
+shell read does name the index; if that read fails, the gate cannot count running agents and does
+not refuse because of them (the free-memory floor still applies), as for any failed count.
 
 Switch on: **Settings → Fork**, section Agent slots, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is
