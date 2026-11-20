@@ -20,6 +20,11 @@ const RUNNER = {
 };
 const UPSTREAM_WORKFLOW = /^\.github\/workflows\/(?!fork-)[^/]+\.ya?ml$/;
 
+// A runner file's lines but its comment lines (`#` or `//` first), so a path kept only in a comment names nothing.
+function codeLines(text) {
+  return text.split("\n").filter((line) => !/^\s*(?:#|\/\/)/.test(line));
+}
+
 // `entries`: [{ file, runBy, weight }]; `present`: test files in the tree;
 // `ever(file)` says whether the file is in the tested commit's history;
 // `read(file)` returns a runner file's text, or null when it does not exist.
@@ -43,7 +48,8 @@ function plan(entries, present, ever, read = () => null) {
     else {
       const text = read(runBy);
       if (text === null) why = `${runBy} does not exist`;
-      else if (!text.includes(file)) why = `${runBy} does not name ${file}`;
+      else if (!codeLines(text).some((line) => line.includes(file)))
+        why = `${runBy} does not name ${file} (a comment does not count)`;
     }
     if (why) notRun.push({ file, why });
     else elsewhere.push({ file, runBy });
@@ -290,7 +296,11 @@ function runTest(file) {
   });
 }
 
-async function main(parts = process.argv.slice(2)) {
+// `runTest` and `now` are the real ones unless a test hands in fakes (a shard's time, its slow warning).
+async function main(
+  parts = process.argv.slice(2),
+  { runTest: run = runTest, now = Date.now } = {},
+) {
   const { index, count } = readShard();
   const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8")).filter((entry) =>
     inPart(entry.file, parts),
@@ -303,9 +313,9 @@ async function main(parts = process.argv.slice(2)) {
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
   const mine = shard(result.run, entries, index, count);
   const jobs = jobCount();
-  const started = Date.now();
-  const runs = await runAll(order(mine, entries), jobs, runTest);
-  const seconds = (Date.now() - started) / 1000;
+  const started = now();
+  const runs = await runAll(order(mine, entries), jobs, run);
+  const seconds = (now() - started) / 1000;
   const judged = judge(runs, weight);
   const { speed } = judged;
   const stale = judged.stale.map(({ note }) => note);
@@ -392,6 +402,7 @@ module.exports = {
   presentTests,
   runAll,
   jobCount,
+  main,
 };
 
 if (require.main === module)

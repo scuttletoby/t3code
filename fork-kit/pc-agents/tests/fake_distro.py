@@ -212,11 +212,11 @@ class Case(unittest.TestCase):
         """The fleet's wsl2 walls (fork-fleet-walls.py describe, a subprocess with about 80 more: some 0.3 s, most of
         a setup run here) are looked at once for real, and every later look gets that answer: for a test that runs
         setup hundreds of times for its writes. A write a rerun leaves out still fails such a test, in one of two
-        ways: setup.test.py's stopped-half-way and killed-upgrade tests compare the fake root file by file with a
-        whole run's; update.test.py's tests have the kit's own walls (check, whose file:* walls are not cached) say
-        so. A wsl2 wall added later that reads a file the kit writes gets the cached answer too: in update.test.py, a
-        write only that wall would catch goes unseen. The walls' own answers have their tests (check.test.py, the
-        fleet walls' tests)."""
+        ways: setup.test.py's stopped-half-way and killed-upgrade tests compare the fake root file by file
+        (same_files(): kind, mode, owner, content) with a whole run's; update.test.py's tests have the kit's own walls
+        (check, whose file:* walls are not cached) say so. A wsl2 wall added later that reads a file the kit writes
+        gets the cached answer too: in update.test.py, a write only that wall would catch goes unseen. The walls' own
+        answers have their tests (check.test.py, the fleet walls' tests)."""
         real, seen = cli.wsl2_walls, []
 
         def once():
@@ -337,5 +337,10 @@ class Case(unittest.TestCase):
                     blob(full) if stat.S_ISREG(st.st_mode) else None
                 out[rel] = (st.st_mode, st.st_uid, st.st_mtime_ns, st.st_ino, body)
         return out
+
+    def same_files(self, skip=()):
+        """snapshot() as two runs that end the same must leave it: each path's kind and mode, owner and content (not
+        its mtime or inode), but the paths in skip."""
+        return {p: (v[0], v[1], v[4]) for p, v in self.snapshot().items() if p not in skip}
 
 

@@ -63,14 +63,24 @@ test("a listed test deleted from history fails", () => {
 
 test("a test run elsewhere must be named by its runner, which is not an upstream workflow", () => {
   const files = {
-    ".github/workflows/fork-tests.yml": "run: node --test x/named.test.cjs",
+    ".github/workflows/fork-tests.yml":
+      "run: node --test x/named.test.cjs\n" +
+      "      # x/commented.test.cjs\n" +
+      "      - run: |\n" +
+      "          # x/commented.test.cjs\n" +
+      "          cd x && node --test commented.test.cjs\n",
     ".github/workflows/ci.yml": "run: node --test x/upstream.test.cjs",
+    "scripts/smoke.ts": '// x/commented-ts.test.cjs\nrun(["--test", "x/named-ts.test.cjs"]);\n',
   };
   const entries = [
     { file: "x/named.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
     { file: "x/unnamed.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
     { file: "x/upstream.test.cjs", runBy: ".github/workflows/ci.yml" },
     { file: "x/nowhere.test.cjs", runBy: "scripts/missing.ts" },
+    // Named only in a YAML or shell comment (the run goes there by `cd`): not run (#646).
+    { file: "x/commented.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
+    { file: "x/commented-ts.test.cjs", runBy: "scripts/smoke.ts" },
+    { file: "x/named-ts.test.cjs", runBy: "scripts/smoke.ts" },
   ];
   const result = plan(
     entries,
@@ -81,12 +91,23 @@ test("a test run elsewhere must be named by its runner, which is not an upstream
   assert.deepEqual(result.run, []);
   assert.deepEqual(result.elsewhere, [
     { file: "x/named.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
+    { file: "x/named-ts.test.cjs", runBy: "scripts/smoke.ts" },
   ]);
   assert.deepEqual(
     result.notRun.map((n) => n.file),
-    ["x/unnamed.test.cjs", "x/upstream.test.cjs", "x/nowhere.test.cjs"],
+    [
+      "x/unnamed.test.cjs",
+      "x/upstream.test.cjs",
+      "x/nowhere.test.cjs",
+      "x/commented.test.cjs",
+      "x/commented-ts.test.cjs",
+    ],
   );
   assert.match(result.notRun[1].why, /upstream workflow/);
+  assert.match(
+    result.notRun[3].why,
+    /does not name x\/commented\.test\.cjs \(a comment does not count\)/,
+  );
 });
 
 test("the list ignores comments and blank lines and reads `run by` and weights", () => {
@@ -381,6 +402,8 @@ test("a shard over twice its expected time, and by over a minute, gets a warning
       "share, which no weight shows; the job's time limit is next",
   );
   assert.equal(slowNote(["e"], weights, 4, 65), null); // over twice, but under a minute more
+  assert.equal(slowNote(["e"], weights, 4, 70), null); // a minute more exactly is not over a minute (#646)
+  assert.notEqual(slowNote(["e"], weights, 4, 70.5), null);
   assert.match(slowNote(["e"], weights, 4, 71), /took 71 s in all, ~10s expected/);
   assert.match(slowNote(files, weights, 1, 600), /~250s expected .*\(1 at once\)/);
   // Every test 2.5 times its weight: the speed takes it all, no weight is stale, only the shard's time shows it.
@@ -657,6 +680,63 @@ test("a part that runs no test fails, so a wrong argument cannot skip its tests"
     assert.equal(run.status, 0, run.stdout + run.stderr);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// main() in this process, on a scratch copy (its ROOT), with a fake runTest and clock: the shard "took" `seconds`.
+async function mainTaking(seconds, list) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-main-"));
+  const script = path.join(root, ".github/scripts/fork-ci-tests.cjs");
+  fs.mkdirSync(path.dirname(script), { recursive: true });
+  fs.copyFileSync(require.resolve("./fork-ci-tests.cjs"), script);
+  fs.writeFileSync(path.join(root, ".github/fork-ci-tests.txt"), list.join("\n") + "\n");
+  for (const line of list) {
+    fs.mkdirSync(path.join(root, path.dirname(line.split(" ")[0])), { recursive: true });
+    fs.writeFileSync(path.join(root, line.split(" ")[0]), "exit 0\n");
+  }
+  const summary = path.join(root, "summary.md");
+  const saved = { ...process.env };
+  const exitCode = process.exitCode;
+  const log = console.log;
+  const out = [];
+  Object.assign(process.env, { FORK_CI_TEST_JOBS: "1", GITHUB_STEP_SUMMARY: summary });
+  delete process.env.FORK_CI_TEST_SHARD;
+  console.log = (...args) => out.push(args.join(" "));
+  const clock = [0, seconds * 1000];
+  try {
+    await require(script).main(["fork-ci/"], {
+      runTest: async (file) => ({ file, status: 0, seconds: "1.0" }),
+      now: () => clock.shift(),
+    });
+    return {
+      out: out.join("\n"),
+      summary: fs.readFileSync(summary, "utf8"),
+      exitCode: process.exitCode,
+    };
+  } finally {
+    console.log = log;
+    process.exitCode = exitCode;
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// #646: main() itself prints the warning and the summary's Slow line, and neither fails the run.
+test("a shard over twice its expected time and by over a minute warns in the log and the summary, and passes", async () => {
+  const list = ["fork-ci/a.test.sh ~5s", "fork-ci/b.test.sh ~5s"]; // 10 s on one slot
+  const slow = await mainTaking(71, list);
+  assert.equal(slow.exitCode, undefined, slow.out);
+  assert.match(
+    slow.out,
+    /^::warning::the tests here took 71 s in all, ~10s expected from their weights \(1 at once\)/m,
+  );
+  assert.match(slow.summary, /\*\*Slow:\*\* the tests here took 71 s in all/);
+  for (const seconds of [70, 20]) {
+    const usual = await mainTaking(seconds, list);
+    assert.equal(usual.exitCode, undefined, usual.out);
+    assert.doesNotMatch(usual.out, /::warning::/);
+    assert.doesNotMatch(usual.summary, /Slow/);
   }
 });
 
