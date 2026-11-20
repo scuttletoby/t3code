@@ -264,7 +264,8 @@ def saved_ok(body, kind):
     completed, with every field the counting reads (the API always sends them, null where empty); a job's
     `created_at` a date (else its queue wait is dropped) and, for a job that reached a runner and was not skipped, its
     start and end (else it would count as 0 seconds); and a list that is empty only when `total_count` is 0 (the
-    paging never asks for a page past the end, so an emptied list would count as no runs or no jobs)."""
+    paging never asks for a page past the end, so an emptied list would count as no runs or no jobs; should GitHub's
+    count ever run ahead of its list, that empty last page is fetched again each run: a request more, numbers right)."""
     if not body[kind] and body['total_count'] > 0:
         return False
     for x in body[kind]:

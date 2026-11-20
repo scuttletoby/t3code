@@ -64,7 +64,8 @@ Two choices to keep in mind when comparing before and after:
   is a new attempt, so a new page). A runs-list page is saved when every run in it is completed and the day ended over
   an hour ago, and is reused for 12 hours (a later re-run changes it). One check decides both what is saved and what
   is read back: a page that would be refused when read is never written, but fetched and counted live on each run,
-  like an unfinished page (GitHub has not been seen to send one). Writes are a `.part-` file then a rename, so a run
+  like an unfinished page (GitHub has not been seen to send one; were its `total_count` ever ahead of its list, the
+  empty last page would be one such page: a request more each run, the numbers still right). Writes are a `.part-` file then a rename, so a run
   killed mid-write leaves no half page under a name that is read. A file that is broken (bad JSON, nested too deep, a
   bad date, a body that is not an object, or a field missing or of the wrong type, such as `total_count` as text or a
   page without its runs or jobs; a list emptied while `total_count` is above 0; or a run or job in it that is not
