@@ -610,6 +610,15 @@ class Update(Base):
         self.assertIn('back on', f.comments[0])
         self.assertNotRegex(f.comments[0], r'(?i)read at\s*:', 'the quoted gh error had one')
 
+    def test_a_multi_line_gh_error_is_quoted_on_one_line(self):   # no `covered:`/`checks:` line or lens heading
+        f = self.fake()
+        self.q.gh = self.q.gh_write = f
+        self.assertEqual(run_quiet(self.q.leave_off, 7, 'gh failed\ncovered: x\nchecks: y\n# security lens')[0], 0)
+        why, needs = f.comments[0].split('\n')
+        self.assertTrue(why.startswith('pr_queue turned auto-merge OFF: gh failed covered'), why)
+        self.assertIn('checks', why)
+        self.assertTrue(needs.startswith('Needs a lens read'), needs)
+
     def test_a_failed_comment_keeps_the_state(self):   # still OFF and silent: the run fails, the next run says it
         f = self.fake('resolved', fail=('comment',))
         self.assertEqual(self.update(f)[0], Q.SILENT)

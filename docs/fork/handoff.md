@@ -28,6 +28,32 @@ settings first: with a mode other than `handoff` it reads nothing more and sends
 Token counts are the provider's own last reading for the active session. A provider that reports
 none never hands off.
 
+## One owner per thread
+
+With handoff on for a thread (mode `handoff`, from the server, its project or the thread's own
+entry), upstream's idle compaction skips that thread, so a compaction and a handoff never both act
+on it. The handoff settings alone decide what happens when it sits idle: `idleTokens` `0` means no
+idle action at all. The check happens at the moment compaction would send, so a setting changed
+while compaction waited counts. With any other mode, upstream's idle compaction works as before.
+If the thread is missing, or the thread or the settings cannot be read at that moment, compaction
+goes ahead.
+
+Two cases where neither acts for a while:
+
+- **Handoff switched on while compaction waits.** The handoff service already decided "off" at the
+  turn end, and compaction is now skipped at the send. Nothing acts on that idle spell; the handoff
+  starts from the thread's next turn end.
+- **A handoff that cannot run.** Handoff on also stops idle compaction when the handoff itself can
+  never be delivered, because `modelSelection` points at a provider instance that was turned off or
+  removed. (Upstream's compaction checks that its instance is on; the handoff does not.) If the
+  instance was removed, nothing is sent: the thread shows nothing, and the only sign is a "handoff
+  skipped" warning in the server log at each attempt. If the run starts and fails, the one retry
+  fails too. Either way the thread stays as it is. It does not grow forever: the size backstop tries
+  again at every turn end, and the provider's own compaction still applies. To get compaction back,
+  fix `modelSelection` where it applies (the project's override, if it has one, replaces the
+  server's handoff settings whole), or set the mode to `off` or `compact`. A thread's own entry wins
+  over any mode, so if the thread has one, change that entry.
+
 ## Only at a quiet thread
 
 A thread is quiet when none of these is true: a run is queued or running, a request (an approval or
@@ -95,8 +121,14 @@ written out in full. The message says when no effort is set.
   `handoffFacts.ts`, `handoffMessage.ts`, `handoffDecision.ts`). Settings:
   `packages/contracts/src/handoff.ts`.
 - `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes
-  through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. No upstream file is
-  edited: the service starts from `ForkLayers.layerRuntimeServices` (`apps/server/src/fork/forkLayers.ts`),
-  the fork file `server.ts` already wires.
+  through `dispatchHandoff` (`handoffDispatch.ts`), and a test checks that. The service starts from
+  `ForkLayers.layerRuntimeServices` (`apps/server/src/fork/forkLayers.ts`), which `server.ts`
+  already wires.
+- One owner per thread: `handoffOwner.ts` wraps upstream's orchestrator for the runtime's workers
+  and skips only an idle compaction send to a thread with handoff on. `IdleCompactionService.ts`
+  stays upstream's; `server.ts` gets one fork line,
+  `Layer.provide(ForkLayers.handoffThreadsSkipIdleCompaction)`, first in the pipe of
+  `layerRuntimeCoreDependenciesBase`, and a test checks it is there. `threadHandoffSettings` (same
+  file) is the one place that picks a thread's settings for both the wrapper and the service.
 - The message reuses upstream's handoff budget (`handoffBudget`) and transcript reading
   (`ContextHandoffService.ts`); nothing is copied.
