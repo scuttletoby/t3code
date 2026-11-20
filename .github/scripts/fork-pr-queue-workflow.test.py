@@ -153,10 +153,14 @@ pinned = all(re.fullmatch(r"actions/checkout@[0-9a-f]{40}", str(s.get("uses"))) 
 check("both checkouts are actions/checkout pinned by commit", pinned)
 cw, tw = caller.get("with") or {}, toolkit.get("with") or {}
 check("the caller's checkout holds only the config, in its own folder",
-      cw == {"path": "caller", "sparse-checkout": "${{ inputs.config }}", "sparse-checkout-cone-mode": False}, str(cw))
+      cw == {"path": "caller", "sparse-checkout": "${{ inputs.config }}", "sparse-checkout-cone-mode": False,
+             "persist-credentials": False}, str(cw))
 check("the toolkit is checked out at this workflow's own repository and commit, not the caller's",
       tw.get("repository") == "${{ steps.toolkit.outputs.repo }}" and tw.get("ref") == "${{ steps.toolkit.outputs.sha }}"
-      and set(tw) == {"repository", "ref", "path", "sparse-checkout"}, str(tw))
+      and set(tw) == {"repository", "ref", "path", "sparse-checkout", "persist-credentials"}, str(tw))
+# #675: no checkout leaves the job's token in the workspace, which notify_command (the project's own code) can read.
+check("no checkout keeps the job's token in the workspace (persist-credentials: false)",
+      all((s.get("with") or {}).get("persist-credentials") is False for s in (caller, toolkit)), f"{cw} {tw}")
 action_dir = str(tw.get("sparse-checkout"))
 check("the queue step runs the action from that checkout",
       queue.get("uses") == f"./{tw.get('path')}/{action_dir}" and (root / action_dir / "action.yml").is_file(),

@@ -47,8 +47,8 @@ and no comment says so yet (STATE stays, the next run finishes it).
     PR_QUEUE_READ_TOKEN=... PR_QUEUE_WRITE_TOKEN=... \
     pr_queue.py --repo OWNER/NAME --config FILE --state-file ABS --cache ABS [--lock-file ABS] [--dry-run]
 """
-import argparse, fcntl, hashlib, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, threading, time, \
-    urllib.parse, zlib
+import argparse, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat, subprocess, sys, tempfile, threading, \
+    time, urllib.parse, zlib
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -618,6 +618,57 @@ def notify_env():
 
 
 NOTIFY_OUTPUT = 4000   # characters of the command's output the run log shows
+NOTIFY_BUDGET = 300    # seconds all notify_command runs of one run may take together: the job stops at 20 minutes
+
+
+def notify_tree(root):
+    """The processes to stop with a notify_command (pid `root`, not yet waited for) that ran too long: its session,
+    which holds a child that made a process group of its own (coreutils timeout does), and every process still linked
+    to one of those by its parent, which holds a child that made a session of its own (setsid) while its parent runs.
+    Read from /proc; only `root` where there is none. A child whose parent already ended (a daemon) is beyond it: the
+    runner's end-of-job cleanup stops that one (README.md, "Notify\")."""
+    procs = {}
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return {root}
+    for d in names:
+        if not d.isdigit():
+            continue
+        try:
+            with open(f'/proc/{d}/stat', 'rb') as f:
+                stat_line = f.read().decode('ascii', 'replace')
+            fields = stat_line[stat_line.rindex(')') + 2:].split()   # state ppid pgrp session ...
+            procs[int(d)] = (int(fields[1]), int(fields[3]))
+        except (OSError, ValueError, IndexError):   # it ended while read
+            continue
+    tree = {root} | {pid for pid, (_, sid) in procs.items() if sid == root}
+    while True:
+        more = {pid for pid, (ppid, _) in procs.items() if ppid in tree} - tree
+        if not more:
+            return tree
+        tree |= more
+
+
+def stop_notify(root):
+    """Kill notify_tree(root): stop each process first, then kill them all, so that none forks or moves away (a child
+    whose parent is killed first leaves the tree) between the read and the kill."""
+    stopped = set()
+    for _ in range(20):   # a process that forks on every stop cannot keep it going forever
+        new = notify_tree(root) - stopped
+        if not new:
+            break
+        for pid in new:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:   # it ended, or is not the queue user's
+                pass
+        stopped |= new
+    for pid in stopped:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def git_env(env, remote=None):
@@ -1353,40 +1404,54 @@ class Queue:
     def notify(self, n, head, kind, reason, link=None):
         """Run the config's notify_command for a notice tell() just posted: argv + repo, PR, head, kind, reason, link
         (README.md, "Notify"). Never part of the queue's result: a command that is missing, fails or runs longer than
-        notify_timeout_seconds (then it and every process of its session are killed) is a warning, and the run goes on.
+        notify_timeout_seconds (then it and its processes are killed: stop_notify) is a warning, and the run goes on.
+        All commands of a run share NOTIFY_BUDGET seconds; once that is spent, a notice runs nothing (a warning).
         It is not tried again: the posted comment says it was told, and a later run must not wake anyone again."""
         cmd = self.cfg.notify_command
         if not cmd:
             return
-        if not (isinstance(link, str) and re.fullmatch(r'https://[^\s]+', link)):
-            link = f'https://github.com/{self.repo}/pull/{n}'
+        page = f'https://github.com/{self.repo}/'   # only a page of this repository: a status targetUrl can be any host
+        if not (isinstance(link, str) and link.lower().startswith(page.lower()) and re.fullmatch(r'\S+', link)):
+            link = f'{page}pull/{n}'
         argv = [*cmd, self.repo, str(n), head, kind, reason, link]
-        limit = self.cfg.notify_timeout_seconds
+        left = NOTIFY_BUDGET - getattr(self, 'notify_spent', 0.0)
+        if left < 1:
+            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) not run: this run\'s notify commands took '
+                  f'{NOTIFY_BUDGET} s together. The PR comment stands; nothing is tried again')
+            return
+        limit = min(self.cfg.notify_timeout_seconds, left)
         sys.stdout.flush()
-        with tempfile.TemporaryFile() as out:   # a file, not a pipe: a helper it leaves running cannot hold the run
-            try:
+        start, code = time.monotonic(), None
+        try:
+            with tempfile.TemporaryFile() as out:   # a file, not a pipe: a helper it leaves running cannot hold the run
                 p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                      env=notify_env(), start_new_session=True)
-            except (OSError, ValueError) as e:
-                print(f'::warning::pr-queue: notify_command for #{n} ({kind}) could not start: {e}. The PR comment '
-                      'stands; nothing is tried again')
-                return
-            try:
-                code = p.wait(timeout=limit)
-            except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except OSError:   # it ended right then
-                    pass
-                p.wait()
-                code = None
-            out.seek(0)
-            said = out.read(NOTIFY_OUTPUT + 1).decode('utf-8', 'replace')
-        for line in said[:NOTIFY_OUTPUT].splitlines():
-            print(f'  notify| {line}')   # never at the start of a line: no workflow command (::...) from its output
+                    code = p.wait(timeout=limit)
+                except subprocess.TimeoutExpired:
+                    stop_notify(p.pid)
+                    p.wait()
+                    code = None
+                out.seek(0)
+                said = out.read(NOTIFY_OUTPUT + 1).decode('utf-8', 'replace')
+        except (OSError, ValueError) as e:   # cannot start, or no temp file (a full disk)
+            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) could not start: {e}. The PR comment '
+                  'stands; nothing is tried again')
+            return
+        finally:
+            self.notify_spent = getattr(self, 'notify_spent', 0.0) + time.monotonic() - start
+        if said:
+            # Its output is not the queue's: no workflow command from it, neither ::cmd:: (the prefix: the runner
+            # reads it only at a line's start) nor the older ##[cmd] (read anywhere in a line), so the runner stops
+            # reading commands until a token the command cannot know.
+            resume = secrets.token_hex(16)
+            print(f'::stop-commands::{resume}')
+            for line in said[:NOTIFY_OUTPUT].splitlines():
+                print(f'  notify| {line}')
+            print(f'::{resume}::')
         if code is None:
-            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) ran longer than {limit} s and was stopped. '
-                  'The PR comment stands; nothing is tried again')
+            print(f'::warning::pr-queue: notify_command for #{n} ({kind}) ran longer than {limit:.3g} s and was '
+                  'stopped. The PR comment stands; nothing is tried again')
         elif code != 0:
             print(f'::warning::pr-queue: notify_command for #{n} ({kind}) exited {code}. The PR comment stands; '
                   'nothing is tried again')

@@ -5203,6 +5203,18 @@ if mode in ('hang', 'background'):
     print('left a helper', flush=True)
     if mode == 'hang':
         time.sleep(60)
+if mode in ('hang-group', 'hang-session'):   # #675: a child in its own process group (coreutils timeout) or session
+    new = {{'preexec_fn': os.setpgrp}} if mode == 'hang-group' else {{'start_new_session': True}}
+    pids = [subprocess.Popen(['sleep', '60'], **new).pid]
+    with open(log + '.pid', 'w') as f:
+        f.write(' '.join(map(str, pids)))
+    time.sleep(60)
+if mode == 'commands':   # #675: both forms of workflow command, mid-line and at a line's start
+    print('x ##[warning]legacy mid-line')
+    print('##[stop-commands]guessed')
+    print('::warning::new form')
+if mode == 'slow':
+    time.sleep(60)
 """
 
 
@@ -5392,6 +5404,88 @@ class Notify(unittest.TestCase):
         self.assertIn('#7: notify_command ran for conflict', out)
         self.assertEqual(subprocess.run(['kill', '-0', str(self.helper_pid())]).returncode, 0,
                          'the queue stopped a helper of a command that ended in time')
+
+    def wait_gone(self, pids):
+        for _ in range(50):
+            alive = []
+            for pid in pids:
+                r = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+                if r.stdout.strip() and not r.stdout.strip().startswith('Z'):
+                    alive.append(pid)
+            if not alive:
+                return []
+            time.sleep(0.1)
+        return alive
+
+    def test_a_hanging_command_is_stopped_with_children_in_their_own_group_or_session(self):   # #675 item 2
+        for mode in ('hang-group', 'hang-session'):
+            with self.subTest(mode=mode):
+                self.comments = []
+                code, out, updated = self.sweep(self.queue(mode, notify_timeout_seconds=1))
+                self.assertEqual((code, updated), (0, [8]))
+                self.assertIn('ran longer than 1 s and was stopped', out)
+                with open(self.log + '.pid') as f:
+                    pids = [int(x) for x in f.read().split()]
+                for pid in pids:
+                    self.addCleanup(subprocess.run, ['kill', '-9', str(pid)], capture_output=True)
+                self.assertEqual(self.wait_gone(pids), [], 'a child of the stopped command still runs')
+
+    def test_its_output_can_write_no_workflow_command_of_either_form(self):   # #675 item 3: ##[ is read mid-line
+        code, out, _ = self.sweep(self.queue('commands'))
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        start = next(i for i, x in enumerate(lines) if x.startswith('::stop-commands::'))
+        token = lines[start].split('::')[2]
+        self.assertRegex(token, r'^[0-9a-f]{32}$')
+        end = lines.index(f'::{token}::')
+        self.assertEqual(lines[start + 1:end], ['  notify| x ##[warning]legacy mid-line',
+                                                '  notify| ##[stop-commands]guessed', '  notify| ::warning::new form'])
+        self.assertIn('#7: notify_command ran for conflict', '\n'.join(lines[end + 1:]))   # the queue's own, after
+        self.assertNotIn(token, '\n'.join(lines[start + 1:end]))
+
+    def test_slow_notices_share_one_budget_per_run(self):   # #675 item 4: four slow ones must not reach the job limit
+        with unittest.mock.patch.object(Q, 'NOTIFY_BUDGET', 3.5):
+            q = self.queue('slow', notify_timeout_seconds=2)
+            start = time.monotonic()
+            run_quiet(q.notify, 7, self.H, 'red', 'required check build is red')
+            _, out = run_quiet(q.notify, 8, self.H, 'red', 'required check build is red')
+            self.assertRegex(out, r'ran longer than 1\.\d+ s')   # what was left, not the full limit
+            _, out = run_quiet(q.notify, 9, self.H, 'red', 'required check build is red')
+            self.assertLess(time.monotonic() - start, 10)
+        self.assertIn("notify_command for #9 (red) not run: this run's notify commands took 3.5 s together", out)
+        self.assertEqual([c['argv'][1] for c in self.calls()], ['7', '8'])
+        run_quiet(self.queue('ok').notify, 10, self.H, 'red', 'r')   # a new run (a new Queue) has the whole budget
+        self.assertEqual([c['argv'][1] for c in self.calls()], ['7', '8', '10'])
+
+    def test_no_temp_file_is_a_warning_not_the_end_of_the_run(self):   # #675 item 5: a full or unwritable temp dir
+        with unittest.mock.patch.object(Q.tempfile, 'TemporaryFile', side_effect=OSError(28, 'No space left')):
+            code, out, updated = self.sweep(self.queue())
+        self.assertEqual((code, updated, len(self.comments)), (0, [8], 1))
+        self.assertIn('::warning::pr-queue: notify_command for #7 (conflict) could not start', out)
+        self.sweep(self.queue())   # the comment is the record: not tried again
+        self.assertEqual(self.calls(), [])
+
+    def test_a_link_to_another_host_or_repository_is_replaced_by_the_prs(self):   # #675 item 6
+        for bad in ('https://evil.example/owner/proj/actions/runs/1', 'https://github.com/other/proj/actions/runs/1',
+                    'https://github.com.evil.example/owner/proj/x', 'https://github.com/owner/projx/actions/runs/1'):
+            with self.subTest(bad=bad):
+                self.comments = []
+                if os.path.exists(self.log):
+                    os.remove(self.log)
+                self.sweep(self.queue(), state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE', bad),))
+                self.assertEqual(self.calls()[0]['argv'][5], 'https://github.com/owner/proj/pull/7')
+        self.comments = []
+        os.remove(self.log)
+        run = 'https://github.com/Owner/Proj/actions/runs/11/job/22'   # GitHub's names ignore case
+        self.sweep(self.queue(), state='BEHIND', runs=(('2026-11-09T02:00:00Z', 'FAILURE', run),))
+        self.assertEqual(self.calls()[0]['argv'][5], run)
+
+    def test_a_deleted_queue_comment_runs_the_command_once_more_then_never(self):   # #675 item 7: old state gone
+        self.sweep(self.queue())
+        self.comments = []   # someone deleted the notice (or the write token's login changed: none is "own" now)
+        self.sweep(self.queue())
+        self.sweep(self.queue())
+        self.assertEqual(len(self.calls()), 2)
 
     def test_the_command_gets_no_token_and_no_stdin(self):
         env = {Q.READ_TOKEN: 'r', Q.WRITE_TOKEN: 'w', 'GH_TOKEN': 'g', 'GITHUB_TOKEN': 'x',
