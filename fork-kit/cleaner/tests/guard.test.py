@@ -424,8 +424,27 @@ class PathSafety(GuardCase):
                     self.c.facts.mount_id_of(fd, proc)
             self.file(os.path.join(proc, 'self', 'fdinfo', str(fd)), 'pos:\t0\nmnt_id:\t31\n')
             self.assertEqual(self.c.facts.mount_id_of(fd, proc), 31)
+            # Only a whole line `mnt_id: <number>` counts: not a longer name that ends in it, not a number with
+            # more after it.
+            self.file(os.path.join(proc, 'self', 'fdinfo', str(fd)), 'pos:\t0\nino_mnt_id:\t7\nmnt_id:\t31\n')
+            self.assertEqual(self.c.facts.mount_id_of(fd, proc), 31)
+            self.file(os.path.join(proc, 'self', 'fdinfo', str(fd)), 'pos:\t0\nmnt_id:\t31x\n')
+            with self.assertRaises(self.c.facts.Unreadable):
+                self.c.facts.mount_id_of(fd, proc)
         finally:
             os.close(fd)
+
+    def test_the_mount_list_read_again(self):
+        """#624: `own_mounts` reads this process's own list again with its ids and types, as `read_mounts` does,
+        for the check at the end of the walk above a folder: the same lines for the same folders when nothing changed."""
+        real, again = self.c.facts.read_mounts(), self.c.facts.own_mounts()
+        self.assertTrue(again.own)
+        here = os.path.realpath(self.dir)
+        for of in ('/', here):      # the lines that hold them (other lines may come and go meanwhile)
+            i, j = again.held(of), real.held(of)
+            self.assertEqual((again.lines[i], again.ids[i], again.type_of(i)), (real.lines[j], real.ids[j], real.type_of(j)))
+        with self.assertRaises(self.c.facts.Unreadable):
+            self.c.facts.own_mounts(self.path('gone'))
 
     def test_another_owner(self):
         d = self.folder('tmp', 'job-1')
@@ -1068,6 +1087,15 @@ MUTATIONS = {
     'the mount id is read from fdinfo': ('facts', "found = re.search(r'^mnt_id:\\s*(\\d+)\\s*$', text, re.M)",
                                          "found = re.search(r'^pos:\\s*(\\d+)\\s*$', text, re.M)",
                                          PathSafety, 'test_the_mount_id_of_an_open_folder'),
+    'the mount id is a whole line (start)': ('facts', "found = re.search(r'^mnt_id:\\s*(\\d+)\\s*$', text, re.M)",
+                                             "found = re.search(r'mnt_id:\\s*(\\d+)\\s*$', text, re.M)",
+                                             PathSafety, 'test_the_mount_id_of_an_open_folder'),
+    'the mount id is a whole line (end)': ('facts', "found = re.search(r'^mnt_id:\\s*(\\d+)\\s*$', text, re.M)",
+                                           "found = re.search(r'^mnt_id:\\s*(\\d+)\\s*', text, re.M)",
+                                           PathSafety, 'test_the_mount_id_of_an_open_folder'),
+    'the list read again is its own': ('facts', 'return Mounts({point for point, _, _ in lines}, lines, ids=ids, types=types, own=True)',
+                                       'return Mounts({point for point, _, _ in lines}, lines, ids=ids, types=None, own=True)',
+                                       PathSafety, 'test_the_mount_list_read_again'),
 }
 
 

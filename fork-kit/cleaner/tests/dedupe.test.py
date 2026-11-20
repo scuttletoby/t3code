@@ -1238,13 +1238,17 @@ class Gaps(Case):
         self.assertEqual(self.read(b), body())
 
     def test_a_folder_on_a_layered_filesystem_keeps_both(self):
-        """#624: the dedupe folder is on an overlay (or below a folder on one): what is above its upper and lower
-        folders is not shown, so it is kept, on a second run too, unless its entry says `layered: true`."""
+        """#624: the dedupe folder is on a type that is not LOCAL (an overlay, a FUSE or network share, an unknown
+        type), below a folder on one, or on a local mount of its own below one ('above'): what is above what that
+        type shows is not seen, so both are kept, on a second run too, unless its entry says `layered: true`."""
         a = self.put('in', 'a.bin', days=50)
         b = self.put('in', 'b.bin')
         folder = os.path.dirname(a)
-        for kind, lines_, types_ in (('overlay', [(folder, '0:77', '/')], ['ext4', 'overlay']),
-                                     ('fuse.bindfs', [], ['fuse.bindfs'])):
+        for kind, lines_, types_, first in (
+                ('overlay', [(folder, '0:77', '/')], ['ext4', 'overlay'], folder),
+                ('fuse.bindfs', [], ['fuse.bindfs'], folder),
+                ('nfs4', [(self.dd, '0:77', '/'), (folder, '0:0', '/')], ['ext4', 'nfs4', 'ext4'], self.dd),
+                ('somefs', [], ['somefs'], folder)):
             with self.subTest(kind=kind):
                 self.mount_lines[:] = [('/', '0:0', '/')] + lines_
                 self.mount_types = types_
@@ -1252,9 +1256,20 @@ class Gaps(Case):
                 for _ in range(2):
                     code, lines = self.run_cleaner(cfg)
                     self.assertNotEqual(self.ino(a), self.ino(b), lines)
-                    self.assertTrue(any(f'is on {kind} at' in line for line in lines), lines)
+                    self.assertTrue(any(f'{first} is on {kind} at' in line for line in lines), lines)
         code, lines = self.run_cleaner(self.dd_cfg(folders=[{'path': folder, 'days': 30, 'layered': True}]))
         self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
+
+    def test_only_local_filesystems_link(self):
+        """#624: LOCAL is an allow list, the same as for compress-cold: on each type in it the files are linked."""
+        kinds = ('ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'bcachefs', 'f2fs', 'zfs', 'jfs', 'nilfs2', 'tmpfs', 'devtmpfs',
+                 'ramfs', 'vfat', 'msdos', 'exfat', 'ntfs', 'ntfs3', 'hfsplus', 'fuseblk')
+        pairs = [(self.put(f'local{n}', 'a.bin', days=50), self.put(f'local{n}', 'b.bin')) for n in range(len(kinds))]
+        for kind, (a, b) in zip(kinds, pairs):
+            with self.subTest(kind=kind):
+                self.mount_lines[:], self.mount_types = [('/', '0:0', '/')], [kind]
+                code, lines = self.run_cleaner(self.dd_cfg(folders=[{'path': os.path.dirname(a), 'days': 30}]))
+                self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
 
     def test_a_marker_made_while_the_bytes_are_compared_stops_the_link(self):
         """#604: every name's folders are read once more after the comparison: a KEEP file made then above the
@@ -1383,14 +1398,14 @@ MUTATIONS = {
                                                     Gaps, 'test_kept_file_written_during_the_link_without_leases'),
     'the inode time before the rename': ('dedupe', "or pst.st_ctime_ns != run.ctime.get(kident)):", "):",
                                          Gaps, 'test_kept_file_written_with_its_time_set_back_after_the_link_without_leases'),
-    'a KEEP entry above': ('guard', "    if st is not None:\n        return 'KEEP file',", "    if False:\n        return 'KEEP file',",
+    'a KEEP entry above': ('guard', "    if st is not None:\n        if stat.S_ISDIR", "    if False:\n        if stat.S_ISDIR",
                            Gaps, 'test_folder_under_a_keep_file'),
-    'a KEEP folder counts': ('guard', "    if st is not None:\n        return 'KEEP file',",
-                             "    if st is not None and not stat.S_ISDIR(st.st_mode):\n        return 'KEEP file',",
+    'a KEEP folder counts': ('guard', "        if stat.S_ISDIR(st.st_mode):\n            return 'KEEP file', 'a folder named KEEP'",
+                             "        if stat.S_ISDIR(st.st_mode):\n            return None",
                              Gaps, 'test_a_keep_folder_above_keeps_it_as_one_below_does'),
-    'a git folder above': ('guard', "if _lstat_or_none(os.path.join(here, '.git')) is not None:", 'if False:',
+    'a git folder above': ('guard', "if at('.git') is not None:", 'if False:',
                            Gaps, 'test_folder_inside_a_git_work_tree'),
-    'a .git that cannot be read': ('guard', "if _lstat_or_none(os.path.join(here, '.git')) is not None:",
+    'a .git that cannot be read': ('guard', "if at('.git') is not None:",
                                    "if os.path.lexists(os.path.join(here, '.git')):", Gaps, 'test_a_marker_above_that_cannot_be_read_keeps_it'),
     'the folders above on its own filesystem': ('guard', 'stack.extend((place, True) for place in reversed(places))', 'pass',
                                                 Gaps, 'test_a_git_folder_above_a_bind_mount_on_its_own_filesystem'),
@@ -1418,6 +1433,14 @@ MUTATIONS = {
                                    Gaps, 'test_a_folder_on_a_layered_filesystem_keeps_both'),
     'dedupe: the mount list must still be true': ('guard', 'if (want is None or now[0] != want\n', 'if (False\n',
                                                   Gaps, 'test_a_mount_taken_away_after_the_list_was_read_keeps_both'),
+    'dedupe: every folder above is on a local type': ('guard', 'if kind not in LOCAL and not layered:',
+                                                      'if kind not in LOCAL and not layered and not look:',
+                                                      Gaps, 'test_a_folder_on_a_layered_filesystem_keeps_both'),
+    'dedupe: an allow list': ('guard', 'if kind not in LOCAL and not layered:',
+                              "if kind in ('overlay', 'aufs', 'fuse', 'fuse.bindfs', 'fuse.mergerfs') and not layered:",
+                              Gaps, 'test_a_folder_on_a_layered_filesystem_keeps_both'),
+    'dedupe: local types link': ('guard', "'msdos', 'exfat', 'ntfs', 'ntfs3', 'hfsplus', 'fuseblk')",
+                                 "'msdos', 'exfat', 'ntfs', 'ntfs3', 'hfsplus')", Gaps, 'test_only_local_filesystems_link'),
 }
 
 

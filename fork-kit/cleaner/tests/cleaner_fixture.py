@@ -6,7 +6,7 @@ server command on this machine: to the cleaner it is a remote on another machine
 Nothing here reads or changes a real worktree, real Docker, the real process list or anything in the real temp
 folder but the test's own folder. Git reads only the test's own config.
 """
-import itertools, json, os, shutil, stat, subprocess, sys, tempfile, time, types, unittest
+import contextlib, itertools, json, os, shutil, stat, subprocess, sys, tempfile, time, types, unittest
 from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -198,7 +198,7 @@ class Case(unittest.TestCase):
         self.mount_lines, self.bind_sources = [('/', '0:0', '/')], set()
         self.mount_whole = set()                            # (device, root) of whole btrfs subvolumes
         self.mount_ids = None                               # (mount id, parent id) of each line; None: not known
-        self.mount_types = None                             # the filesystem type of each line; None: not known
+        self.mount_types = None                             # the filesystem type of each line; None: ext4 each
         self.mount_own = False                              # the lines are the real ones of this namespace (#624)
         self.mount_options = {'/': ('rw', 'relatime')}       # {point: its per-mount options}
         self.fstab_points = set()                           # the mount points /etc/fstab names; None: unreadable
@@ -231,14 +231,27 @@ class Case(unittest.TestCase):
     def path(self, *parts):
         return os.path.join(self.dir, *parts)
 
-    def kernel(self, table):
+    def kernel(self, table, again=None):
         """Patches what the kernel says: the mount id of an open folder is the id `table` ({point: id}, changed by
-        the test as it goes) gives its deepest point."""
+        the test as it goes) gives its deepest point, and the mount list read again at the end of the walk
+        (guard._still_true) is the test's list as it is then, or what `again()` returns."""
         def mount_id_of(fd):
             at = os.readlink(f'/proc/self/fd/{fd}')
             held = [p for p in table if p == '/' or at == p or at.startswith(p + '/')]
             return table[max(held, key=len)]
-        return mock.patch.object(self.c.guard, 'mount_id_of', mount_id_of)
+        patches = contextlib.ExitStack()
+        patches.enter_context(mock.patch.object(self.c.guard, 'mount_id_of', mount_id_of))
+        patches.enter_context(mock.patch.object(self.c.guard, 'own_mounts', again or self.mounts_now))
+        return patches
+
+    def mount_types_now(self):
+        """The filesystem type of each line: `mount_types`, or ext4 for each when the test names none."""
+        return ['ext4'] * len(self.mount_lines) if self.mount_types is None else self.mount_types
+
+    def mounts_now(self):
+        """The test's mount list as the kernel would give it read again (`own_mounts`): lines, ids, types."""
+        return self.c.facts.Mounts({p for p, _, _ in self.mount_lines}, self.mount_lines, ids=self.mount_ids,
+                                   types=self.mount_types_now(), own=True)
 
     def mkdir(self, *parts):
         os.makedirs(self.path(*parts), exist_ok=True)
@@ -293,7 +306,7 @@ class Case(unittest.TestCase):
                    'dangling': lambda: [], 'now': self.now, 'transcripts': lambda: dict(self.transcript_times),
                    'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options,
                                                          self.fstab_points, self.mount_whole, self.mount_ids,
-                                                         self.mount_types, self.mount_own)}
+                                                         self.mount_types_now(), self.mount_own)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):

@@ -478,6 +478,14 @@ def read_mounts(path=OWN_MOUNTINFO, proc='/proc', fstab='/etc/fstab'):
     return Mounts(points, lines, sources, options, read_fstab(fstab), whole, ids, types, own=path == OWN_MOUNTINFO)
 
 
+def own_mounts(path=OWN_MOUNTINFO):
+    """This process's own mount list, read now: its lines, mount ids and types only (no other namespace, no
+    fstab), for guard.above_refusal to see that the lines it used are still the kernel's. Raises Unreadable."""
+    ids, types = [], []
+    lines = _mount_lines(path, ids=ids, types=types)
+    return Mounts({point for point, _, _ in lines}, lines, ids=ids, types=types, own=True)
+
+
 def mount_id_of(fd, proc='/proc'):
     """The mount id of the open file `fd` (`mnt_id` in /proc/self/fdinfo/<fd>: the id mountinfo gives each line).
     Raises Unreadable when it cannot be read."""
