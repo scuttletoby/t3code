@@ -147,6 +147,7 @@ export const OrchestrationV2DelegatedFrom = Schema.Struct({
   environmentId: EnvironmentId,
   threadId: ThreadId,
   title: Schema.String,
+  mcpProfile: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)), // Fork: the parent's MCP profile
 });
 export type OrchestrationV2DelegatedFrom = typeof OrchestrationV2DelegatedFrom.Type;
 

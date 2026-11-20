@@ -365,3 +365,94 @@ describe("MCP profile resolver: runs again", () => {
     expect({ settings: mcpKeys(), lineage }).toEqual(before);
   });
 });
+
+describe("MCP profile resolver: a profile another machine carried with its task (#532)", () => {
+  const carried = (servers: unknown, t3Tools: unknown = "all", name = "remote") => ({
+    name,
+    servers,
+    t3Tools,
+  });
+
+  it("cuts a task delegated here to its remote parent's t3-only, with nothing set here", () => {
+    const result = resolved(
+      resolveMcpProfile(fromFile({}), [child("task")], carried([], "all", "t3-only")),
+    );
+    expect(result.name).toBe("all");
+    expect(result.profile).toEqual({ servers: [], t3Tools: "all" });
+    expect(result.narrowedByParent).toBe(true);
+  });
+
+  it("keeps only the servers both machines' profiles name", () => {
+    const settings = fromFile({ mcpProfiles: PROFILES, mcpSubagentProfile: "docs" });
+    const result = resolved(
+      resolveMcpProfile(settings, [child("task")], carried(["docs", "github"])),
+    );
+    expect(result.profile.servers).toEqual(["docs"]);
+  });
+
+  it("gives a carried list as is to a task whose own profile here is all", () => {
+    const result = resolved(resolveMcpProfile(fromFile({}), [child("task")], carried(["docs"])));
+    expect(result.profile.servers).toEqual(["docs"]);
+  });
+
+  it("never widens past this machine's own profile for the task's role", () => {
+    const settings = fromFile({ mcpSubagentProfile: "t3-only" });
+    const result = resolved(
+      resolveMcpProfile(settings, [child("task")], carried("all", "all", "all")),
+    );
+    expect(result.name).toBe("t3-only");
+    expect(result.profile.servers).toEqual([]);
+    expect(result.narrowedByParent).toBe(false);
+  });
+
+  it("cuts a sub-agent of the delegated task through its parent here", () => {
+    const result = resolved(
+      resolveMcpProfile(fromFile({}), [child("sub"), child("task")], carried([], "all", "t3-only")),
+    );
+    expect(result.profile.servers).toEqual([]);
+  });
+
+  it("lets the owner's pick for the task here stand", () => {
+    const settings = fromFile({ mcpThreadProfiles: { task: "all" } });
+    const result = resolved(resolveMcpProfile(settings, [child("task")], carried([])));
+    expect(result.source).toBe("thread-pick");
+    expect(isEveryMcpTool(result.profile)).toBe(true);
+  });
+
+  it("keeps a T3 tool group this build does not know as nothing", () => {
+    const result = resolved(
+      resolveMcpProfile(fromFile({}), [child("task")], carried("all", ["threads", "newer"])),
+    );
+    expect(result.profile.t3Tools).toEqual(["threads"]);
+  });
+
+  it.each([
+    ["a field this version does not know", { ...carried([]), resources: [] }, "resources"],
+    ["no name", { servers: [], t3Tools: "all" }, "it has no name"],
+    ["not an object", "t3-only", "it is not an object"],
+    ["servers that are not a list", carried("none"), "`servers`"],
+  ])("refuses, never widens, a carried profile with %s", (_name, value, issue) => {
+    const result = refused(resolveMcpProfile(fromFile({}), [child("task")], value));
+    expect(result.problem).toBe("carried");
+    expect(result.message).toContain(issue);
+    expect(result.message).toContain("update T3 here");
+    // A sub-agent of that task is refused with it.
+    const sub = refused(resolveMcpProfile(fromFile({}), [child("sub"), child("task")], value));
+    expect(sub.problem).toBe("parent");
+  });
+
+  it("gives a task with nothing carried (an older sender) this machine's profile, as before", () => {
+    const settings = fromFile({ mcpSubagentProfile: "t3-only" });
+    expect(resolved(resolveMcpProfile(settings, [child("task")], undefined)).name).toBe("t3-only");
+    expect(isEveryMcpTool(resolved(resolveMcpProfile(fromFile({}), [child("task")])).profile)).toBe(
+      true,
+    );
+  });
+
+  it("gives the same answer when it runs again", () => {
+    const value = carried(["docs"]);
+    const first = resolveMcpProfile(fromFile({}), [child("task")], value);
+    expect(resolveMcpProfile(fromFile({}), [child("task")], value)).toEqual(first);
+    expect(value).toEqual(carried(["docs"]));
+  });
+});

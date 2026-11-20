@@ -18,6 +18,7 @@ import * as Deferred from "effect/Deferred";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import { HttpClient } from "effect/http";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -255,6 +256,11 @@ const followTask = (answer: unknown, options: { readonly betaOff?: boolean } = {
             Layer.succeed(SecureRandom.SecureRandom, {
               uuidV4: () => Effect.succeed("00000000-0000-4000-8000-000000000000"),
             } as never),
+            // The features ask goes only with a profile narrower than `all`; none here.
+            Layer.succeed(
+              HttpClient.HttpClient,
+              HttpClient.make(() => Effect.die("no features ask expected")),
+            ),
           ),
         ),
       ),

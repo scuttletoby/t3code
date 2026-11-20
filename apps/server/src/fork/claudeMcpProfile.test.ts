@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -31,6 +32,7 @@ import {
   makeClaudeMcpProfiles,
   planKeyFor,
 } from "./claudeMcpProfile.ts";
+import { type McpProfileCarried } from "./mcpProfile.ts";
 
 const fromFile = Schema.decodeSync(ServerSettings);
 const policyDocument = Schema.decodeUnknownSync(ManagedPolicyDocument);
@@ -272,10 +274,26 @@ describe("claudeMcpProfileForThread", () => {
       Effect.match({ onFailure: (refusal) => refusal.message, onSuccess: (plan) => plan.servers }),
     );
 
-  it.effect("with no profile set, a child gets all and no parent is read", () =>
-    Effect.gen(function* () {
-      assert.strictEqual(yield* forThread({}, thread("child", "gone"), noReads), "all");
-    }),
+  it.effect(
+    "with no profile set, a child whose parent cannot be read is refused, not given all",
+    () =>
+      Effect.gen(function* () {
+        // Any parent may be a task another machine delegated with a narrower profile, so a parent
+        // that cannot be read refuses the child even with nothing set here.
+        const gone = yield* forThread({}, thread("child", "gone"), store([]));
+        assert.include(String(gone), "parent thread cannot be read");
+        assert.strictEqual(yield* forThread({}, thread("top"), noReads), "all");
+        // With no store wired at all (the adapter built alone; the server always wires one),
+        // nothing here can carry a profile, so with nothing set the child keeps all, as before.
+        assert.strictEqual(yield* forThread({}, thread("child", "gone")), "all");
+        // The owner's pick for that very thread is final without its parents.
+        const picked = yield* forThread(
+          { mcpThreadProfiles: { child: "all" } },
+          thread("child", "gone"),
+          store([]),
+        );
+        assert.strictEqual(picked, "all");
+      }),
   );
 
   it.effect("an inheriting child is cut to its parent's pick, read from the store", () =>
@@ -303,6 +321,113 @@ describe("claudeMcpProfileForThread", () => {
       const file = { mcpThreadProfiles: { other: "all" } };
       const looping = yield* forThread(file, thread("a", "b"), store([thread("b", "a")]));
       assert.include(String(looping), "repeat a thread");
+    }),
+  );
+});
+
+describe("a task another machine delegated here (#532)", () => {
+  const T3_ONLY: McpProfileCarried = { name: "t3-only", servers: [], t3Tools: "all" };
+  /** A task launched here by a linked machine: no parent here, `delegatedFrom` names its thread there. */
+  const remoteTask = (id: string, mcpProfile?: Record<string, unknown>): LineageThread => ({
+    ...thread(id),
+    delegatedFrom: {
+      environmentId: "environment-there" as never,
+      threadId: ThreadId.make("thread-there"),
+      title: "Parent there",
+      ...(mcpProfile === undefined ? {} : { mcpProfile }),
+    },
+  });
+  const planned = (
+    file: Record<string, unknown>,
+    self: LineageThread,
+    threads: ReadonlyArray<LineageThread> = [],
+  ) =>
+    Effect.gen(function* () {
+      const warnings: Array<string> = [];
+      const servers = yield* claudeMcpProfileForThread(
+        fromFile(file),
+        self,
+        T3,
+        store(threads),
+      ).pipe(
+        Effect.match({
+          onFailure: (refusal) => refusal.message,
+          onSuccess: (plan) => plan.servers,
+        }),
+        Effect.provide(
+          Logger.layer(
+            [
+              Logger.make(({ message, logLevel }) => {
+                if (logLevel === "Warn") warnings.push(String([message].flat()[0]));
+              }),
+            ],
+            { mergeWithExisting: false },
+          ),
+        ),
+      );
+      return { servers, warnings };
+    });
+
+  it.effect("gets its remote parent's t3-only with nothing set here", () =>
+    Effect.gen(function* () {
+      const { servers, warnings } = yield* planned({}, remoteTask("task", T3_ONLY));
+      assert.deepStrictEqual(servers, []);
+      assert.deepStrictEqual(warnings, []);
+    }),
+  );
+
+  it.effect("passes the carried profile on to its own sub-agents here", () =>
+    Effect.gen(function* () {
+      const task = remoteTask("task", T3_ONLY);
+      const { servers } = yield* planned({}, thread("sub", "task"), [task]);
+      assert.deepStrictEqual(servers, []);
+    }),
+  );
+
+  it.effect("refuses a sub-agent whose task cannot be read here, never giving it all", () =>
+    Effect.gen(function* () {
+      // The task's row fails to read or decode (the store's read turns both into null), so its
+      // carried t3-only is unknown: refused with nothing set here, with a sub-agent rule of all
+      // and at any depth; only the owner's pick for the sub-agent itself stands.
+      const sub = thread("sub", "task");
+      assert.include(String((yield* planned({}, sub)).servers), "parent thread cannot be read");
+      const rule = yield* planned({ mcpSubagentProfile: "all" }, sub);
+      assert.include(String(rule.servers), "parent thread cannot be read");
+      const deep = yield* planned({}, thread("deep", "sub"), [sub]);
+      assert.include(String(deep.servers), "parent thread cannot be read");
+      const picked = yield* planned({ mcpThreadProfiles: { sub: "t3-only" } }, sub);
+      assert.deepStrictEqual(picked.servers, []);
+    }),
+  );
+
+  it.effect("refuses a carried profile this version cannot read", () =>
+    Effect.gen(function* () {
+      const { servers } = yield* planned({}, remoteTask("task", { ...T3_ONLY, resources: [] }));
+      assert.include(String(servers), "cannot be read by this version");
+    }),
+  );
+
+  it.effect(
+    "with nothing carried (an older sender, or a task stored before #532), gets this machine's profile and says so",
+    () =>
+      Effect.gen(function* () {
+        const { servers, warnings } = yield* planned(
+          { mcpSubagentProfile: "t3-only" },
+          remoteTask("task"),
+        );
+        assert.deepStrictEqual(servers, []);
+        assert.strictEqual(warnings.length, 1);
+        assert.include(warnings[0], "sent no MCP profile");
+        const all = yield* planned({}, remoteTask("task"));
+        assert.strictEqual(all.servers, "all");
+      }),
+  );
+
+  it.effect("plans a carried profile without the settings service too", () =>
+    Effect.gen(function* () {
+      const plan = yield* makeClaudeMcpProfiles;
+      const result = yield* plan(remoteTask("task", T3_ONLY), {});
+      assert.deepStrictEqual(result.servers, []);
     }),
   );
 });
