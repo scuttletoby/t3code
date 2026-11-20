@@ -512,8 +512,10 @@ class Launcher(Case):
     def test_one_pin_in_the_linux_file(self):
         """Issue #365 item 2: the launcher is pinned once, in the linux walls file. wsl2 has no copy of its own (no
         LAUNCHER_SHA256 at all, so the two cannot drift) and checks the launcher against the pin of the linux file it
-        loaded. A linux file that pins another launcher, or none (one from before the pin, #327: walls files of two
-        releases), and the launcher cannot be told: sockets FAILs as job-units does, never a pass."""
+        loaded. A linux file that pins another launcher, or this linux file with its pin line taken out, and the
+        launcher cannot be told: sockets FAILs as job-units does, never a pass. (A real linux file from before the pin,
+        #327, has no launcher_shipped either, so there job-units passes and sockets alone FAILs: still exit 1. Issue
+        #408 item 5 corrects the #390 claim that job-units fails there too.)"""
         self.assertNotRegex(slurp(os.path.join(FOLDER, 'wsl2')), r'LAUNCHER_SHA256\s*=')
         self.assertFalse(hasattr(wsl2, 'LAUNCHER_SHA256'))
         m = walls_with(self, self.fake())

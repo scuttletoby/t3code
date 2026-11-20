@@ -5,6 +5,20 @@ if it must, and then switches the fork's features on one at a time. Every value 
 What each command does, and every refusal, is in the kit's own page,
 [fork-kit/golive/README.md](../../fork-kit/golive/README.md).
 
+## Install the kit
+
+As root, from a commit of the fork's `ci-release` branch (the kit's page, section Install):
+
+```
+sh fork-kit-bootstrap.sh --kit golive --repo FORK_OWNER/FORK --sha RELEASE_SHA
+t3-golive-install self-check
+```
+
+A copy of `t3-golive` made by hand before is kept and replaced by the kit's link; `uninstall` puts it back. A
+hand install in the kit's own layout is taken over, and `uninstall` then removes it. To update the kit, run the
+bootstrap again with a newer release commit (not an installed installer from an older release). `uninstall`
+refuses while a run is going or needs settling, and while anything still runs the kit's code: settle first.
+
 ## The machine file
 
 Machine facts live in a private file outside the fork, the one every fork kit reads
