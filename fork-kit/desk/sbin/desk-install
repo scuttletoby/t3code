@@ -40,6 +40,10 @@ FILES = {'fork-fleet-launch.sh': '.github/scripts/fork-fleet-launch.sh',
          'machine_file.py': 'fork-kit/common/machine_file.py', 'README.md': 'fork-kit/desk/README.md',
          'free_contract.py': 'fork-kit/common/free_contract.py', 'free-memory': 'fork-kit/common/free/memory'}
 WALLS = '.github/scripts/fork-fleet-walls'   # copied whole: every OS's walls file and fixture
+# The one file that pins the launcher (its LAUNCHER_SHA256; the other walls files read that pin). swap() renames it in
+# last, so a run stopped half-way never pairs a new pin with walls or a launcher of the old release: any launcher
+# change then fails on the old pin until the next run ends the swap (issue #408 item 1).
+PIN_HOLDER = 'fork-fleet-walls/linux'
 SUBDIRS = ('units', 'fork-fleet-walls')   # the folders the manifest makes inside /opt/fork-fleet
 UNITS = {'fork-fleet-desk-agent.service': '.github/scripts/fork-fleet-desk-agent.service',
          't3code-fleet-refresh.service': '.github/scripts/fork-fleet-refresh.service',
@@ -364,18 +368,44 @@ def read_manifest():
     return {}
 
 
+def walls_strays(manifest):
+    """The walls folder's entries that manifest does not name, as {rel: removable}. removable: a plain file of root
+    (lstat: a link is never followed), which only the kit or root can have put in that root-only folder, so swap()
+    removes it. Anything else (a link, a folder, a FIFO, another owner's file) is left for a person to remove: the
+    walls refuse to run beside it. The walls folder is the kit's own (issue #597 review): a file there that no
+    manifest names is one a stopped install of another release renamed in (then a rollback's old manifest does not
+    name it either), or a backup root left."""
+    walls, found = os.path.dirname(PIN_HOLDER), {}
+    with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+        for n in sorted(os.listdir(p(f'{OPT}/{walls}'))):
+            if f'{walls}/{n}' in manifest:
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                st = os.lstat(p(f'{OPT}/{walls}/{n}'))
+                found[f'{walls}/{n}'] = stat.S_ISREG(st.st_mode) and st.st_uid == ROOT_UID
+    return found
+
+
 def swap(tmp, manifest, sha, before_change):
     """Each changed file renamed into /opt/fork-fleet (the agent stopped meanwhile, so no verb runs from half-old,
     half-new files, and the refresh and seed timers and services stopped too: they run its files); files of the old
-    release that are gone, removed. Unchanged files (same text, mode and owner root) are left as they are; one whose
-    mode or owner was changed is replaced by the staged copy. True when anything changed."""
+    release that are gone, and the walls folder's plain root files the new manifest does not name (walls_strays),
+    removed before the pin holder goes in. Unchanged files (same text, mode and owner root) are left as they are; one
+    whose mode or owner was changed is replaced by the staged copy; the launcher's pin holder (PIN_HOLDER) last. True
+    when anything changed."""
     def same(rel):
         with contextlib.suppress(OSError):
             st = os.lstat(p(f'{OPT}/{rel}'))
             return (stat.S_ISREG(st.st_mode) and st.st_uid == ROOT_UID and stat.S_IMODE(st.st_mode) == file_mode(rel)
                     and sha256(p(f'{OPT}/{rel}')) == manifest[rel])
-    changed = [rel for rel in sorted(manifest) if not same(rel)]
-    gone = sorted(set(read_manifest()) - set(manifest))
+    changed = sorted((rel for rel in manifest if not same(rel)), key=lambda rel: (rel == PIN_HOLDER, rel))
+    strays = sorted(rel for rel, removable in walls_strays(manifest).items() if removable)
+    last = read_manifest()
+    gone = sorted((set(last) - set(manifest)) | set(strays))
+    for rel in strays:
+        # The last release's own file that this one drops is no leftover (issue #613): say which it is.
+        why = 'the last release\'s, which this one drops' if rel in last else 'left by a stopped install, or a backup'
+        say(f'removing {OPT}/{rel}: in the kit\'s walls folder but not in this release ({why})')
     if changed or gone:
         before_change()
         run('systemctl', 'stop', TIMER, REFRESH, SEED_TIMER, SEED, AGENT, check=False)
@@ -384,6 +414,11 @@ def swap(tmp, manifest, sha, before_change):
         os.makedirs(p(f'{OPT}/{d}'), mode=0o755, exist_ok=True)
         os.chmod(p(f'{OPT}/{d}'), 0o755)
     for rel in changed:
+        if rel == PIN_HOLDER:
+            # files of the old release that are gone, out before the new pin: none is judged by a pin it never saw
+            for old in gone:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(p(f'{OPT}/{old}'))
         os.replace(os.path.join(tmp, rel), p(f'{OPT}/{rel}'))
     for rel in gone:
         with contextlib.suppress(FileNotFoundError):
@@ -562,6 +597,13 @@ def install(a, stop_after=None, stack=None):
     swap(tmp, manifest, a.sha, pending)
     state['sha'] = a.sha
     save_state(state)
+    # The installed walls, as the agent runs them before each job (their manifest check among them): an install they
+    # refuse never says "installed" (issue #597 review). Before the agent is enabled or started again.
+    r = py(p(OPT + '/fork-fleet-walls.py'), 'os')
+    if r.returncode:
+        raise Refused(f'the installed walls refuse to run (fork-fleet-walls.py os: exit {r.returncode}), so no runner '
+                      f'starts here:\n  {r.stderr.strip()[-600:]}\n  Fix what that names (desk-install check lists '
+                      'it too), then run this install again.')
     done('files')
     for path, (text, mode) in settings(m, users).items():
         put(path, text, mode)
@@ -681,6 +723,12 @@ def installed_problems():
             problems.append(f'{OPT}/{rel}: differs from what was installed')
         elif not mode_ok:
             problems.append(f'{OPT}/{rel}: mode {stat.S_IMODE(st.st_mode):o}, not {file_mode(rel):o}: install again')
+    # A walls-folder entry the manifest does not name: the walls refuse to run beside it (their manifest check, issue
+    # #584 item 2). Install removes a plain root file there (walls_strays), never a link, folder or FIFO.
+    problems += [f'{OPT}/{rel}: not in the manifest, so the walls refuse to run: ' + (
+        'install again (it removes it)' if removable else 'not a plain file of root (a link, folder, FIFO or another '
+        'owner\'s), so install leaves it: remove it by hand, then install again')
+        for rel, removable in walls_strays(manifest).items()]
     folders = {OPT: 0o755, OPT + '/template': 0o755, ETC: 0o700, KEY: 0o600, KEY + '.pub': 0o644}
     folders.update({f'{OPT}/{os.path.dirname(rel)}': 0o755 for rel in manifest if os.path.dirname(rel)})
     for path, mode in sorted(folders.items()):

@@ -2,7 +2,7 @@
 build (the live home's runtime) and the fork build (the staged release) are one stub `t3` that keeps its migrations
 in a real SQLite file. Nothing here starts, stops or reads a real T3 or ~/.t3; every stub run is checked to stay in
 the rehearsal home.  python3 -I -B fork-kit/golive/tests/rehearse.test.py"""
-import errno, hashlib, itertools, json, os, shutil, socket, sqlite3, subprocess, sys, time, types, unittest
+import contextlib, errno, hashlib, itertools, json, os, shutil, socket, sqlite3, subprocess, sys, time, types, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -63,14 +63,25 @@ elif a[0] == '__fork-report':
     c = sqlite3.connect('file:%s?mode=ro' % db, uri=True)
     counts = {{k: c.execute('SELECT COUNT(*) FROM %s' % k).fetchone()[0] for k in ('projects', 'threads')}}
     c.close()
-    with open(os.path.join(ud, 'settings.json')) as f:
-        s = json.load(f)
+    with open(os.path.join(ud, 'settings.json')) as f:  # lenient as the load: a `//` comment line is dropped
+        s = json.loads(''.join(l for l in f if not l.lstrip().startswith('//')))
+    feats, where = ('agentSlots', 'waitFor', 'reviewRules', 'handoff', 'playtest'), {{}}
+    for k in feats:  # a value that is there and truthy is on; a project's override too; "policyOn" locks one on
+        if s.get(k):
+            where.setdefault(k, []).append('server')
+    for pid, o in sorted((s.get('projectSettingsOverrides') or {{}}).items()):
+        for k in ('reviewRules', 'handoff', 'playtest'):
+            if isinstance(o, dict) and o.get(k):
+                where.setdefault(k, []).append('project:' + pid)
+    for k in M.get('policyOn', []):
+        where.setdefault(k, []).append('policy')
     r = {{'reportVersion': 1, 'version': VERSION,
          'database': {{'state': 'present', 'appliedMigrations': [{{'id': i, 'name': 'm%d' % i}} for i in got],
                       'pendingMigrations': list(range(max(got) + 1, HEAD + 1)), 'unknownMigrations': [],
                       'counts': dict(counts, projectsArchived=0, threadsArchived=0)}},
          'settings': {{'state': 'present', 'parseWarning': None, 'providerInstances': s.get('providerInstances', [])}},
-         'fork': {{'featuresOn': [], 'features': {{}}}}, 'problems': [], 'ok': True}}
+         'fork': {{'featuresOn': [k for k in feats if k in where], 'featuresWhere': where, 'features': {{}}}},
+         'problems': [], 'ok': True}}
     rt = os.path.join(ud, 'server-runtime.json')
     if os.path.exists(rt):
         r.update(M.get('report', {{}}))
@@ -144,6 +155,12 @@ def killing_copy_file(*args):
         os.kill(os.getpid(), 9)
     return copy_file(*args)
 coldcopy._copy_file = killing_copy_file
+replace = os.replace
+def killing_replace(src, dst, *a, **kw):  # the clone's settings.json written with its fork features off
+    if at == 'mid-features-off' and os.fspath(dst).endswith('settings.json'):
+        os.kill(os.getpid(), 9)
+    return replace(src, dst, *a, **kw)
+os.replace = killing_replace
 leaves = coldcopy.link_leaves
 def capped_leaves(rel, look):  # one that never stops (no hop limit) fails at once, not at the parent's timeout
     calls = [0]
@@ -201,8 +218,8 @@ def read_json(path):
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
+    """A free port outside the kernel's own range (as the rehearsal picks one), so nothing takes it by chance."""
+    with rehearse._pick({rehearse.LIVE_DEFAULT_PORT}) as s:
         return s.getsockname()[1]
 
 
@@ -340,8 +357,8 @@ class Rehearse(Base):
         self.assertEqual(self.m.snapshot(), live, 'the live home is never touched')
         self.assertEqual(self.m.snapshot(self.copy_dir), copy, 'the copy is never changed')
         self.assertEqual([s for s, phase in self.steps() if phase == 'done'],
-                         ['clone', 'preflight', 'migrate', 'serve', 'checks', 'stop-server', 'old-build-blocked',
-                          'restore', 'result'])
+                         ['clone', 'preflight', 'features-off', 'migrate', 'serve', 'checks', 'stop-server',
+                          'old-build-blocked', 'restore', 'result'])
         self.assertEqual(self.runs()[-1]['end']['result'], 'ok')
         facts = self.runs()[-1]['steps'][-1]['data']
         self.assertEqual(facts, result)
@@ -449,12 +466,111 @@ class Rehearse(Base):
             s.listen()
             self.refused('in use', port=s.getsockname()[1])
 
-    def test_a_port_taken_between_the_check_and_the_start_fails_and_the_rerun_passes(self):
-        port = free_port()
-        with socket.socket() as s, mock.patch.object(rehearse, '_port_free', return_value=True):
+    def neighbour_during_the_clone(self):
+        """Forced interleaving (fork #555): right after the clone step, another socket tries to bind the rehearsal's
+        port, as another program, or the kernel's own pick for one, can while the slow steps run. Returns the list
+        it fills (the port, and True or the bind's errno) and the patch to run under; a socket that got the port
+        listens there until the test ends."""
+        seen, clone = [], rehearse._clone
+
+        def clone_then_bind(run, cfg, p):
+            out = clone(run, cfg, p)
+            s = socket.socket()
+            self.addCleanup(s.close)
+            try:
+                s.bind(('127.0.0.1', p['port']))
+                s.listen()
+                seen.append((p['port'], True))
+            except OSError as e:
+                seen.append((p['port'], e.errno))
+            return out
+        return seen, mock.patch.object(rehearse, '_clone', clone_then_bind)
+
+    def test_the_port_is_held_from_the_check_to_the_start(self):
+        for given in (False, True):
+            seen, patch = self.neighbour_during_the_clone()
+            with self.subTest(port='given' if given else 'picked'), patch:
+                result = self.rehearse(port=free_port() if given else None)
+                self.assertEqual(seen, [(result['port'], errno.EADDRINUSE)])  # old code: the neighbour got it
+                with socket.socket() as s:
+                    s.bind(('127.0.0.1', result['port']))  # and the run let go of it at its end
+
+    def test_a_picked_port_lies_outside_the_kernels_own_range(self):
+        lo, hi = rehearse._ephemeral()
+        for _ in range(20):
+            with rehearse._choose_port(config.load(), None) as held:
+                port = held.getsockname()[1]
+            self.assertTrue(port < lo or port > hi, (port, lo, hi))
+            self.assertNotEqual(port, rehearse.LIVE_DEFAULT_PORT)
+
+    def test_a_picked_port_comes_from_above_the_kernels_range_first(self):
+        """Review of #561: the ports just below the range hold common service defaults (a stopped or restarting
+        service would lose its port for the whole run), so a pick comes from above the range while one is free there,
+        and from below only when none above is."""
+        self.m.write('port-range', '32768 60999')
+        with mock.patch.object(rehearse, 'PORT_RANGE', self.m.path('port-range')):
+            for _ in range(20):
+                with rehearse._choose_port(config.load(), None) as held:
+                    self.assertGreater(held.getsockname()[1], 60999)
+            real = rehearse._hold
+            with mock.patch.object(rehearse, '_hold', side_effect=lambda n: None if n > 60999 else real(n)):
+                with rehearse._choose_port(config.load(), None) as held:
+                    self.assertLess(held.getsockname()[1], 32768)
+
+    def test_no_free_port_at_all_is_a_clean_refusal(self):
+        """Review of #561: with every port taken the run is refused with a message, not a traceback."""
+        class NoPort(socket.socket):
+            def bind(self, addr):
+                raise OSError(errno.EADDRINUSE, 'Address already in use')
+        with mock.patch.object(rehearse, '_hold', return_value=None), mock.patch.object(rehearse.socket, 'socket', NoPort):
+            with self.assertRaisesRegex(rehearse.journal.Refused, 'no free port'):
+                rehearse._choose_port(config.load(), None)
+
+    def test_the_kernels_range_old_missing_or_garbled_falls_back_or_is_worked_around(self):
+        for text, want in ((None, rehearse.EPHEMERAL_FALLBACK), ('nonsense', rehearse.EPHEMERAL_FALLBACK),
+                           ('', rehearse.EPHEMERAL_FALLBACK), ('40000\t50000\n', (40000, 50000))):
+            with self.subTest(text=text):
+                path = self.m.path('port-range')
+                if text is None:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(path)
+                else:
+                    self.m.write('port-range', text)
+                with mock.patch.object(rehearse, 'PORT_RANGE', path):
+                    self.assertEqual(rehearse._ephemeral(), want)
+        self.m.write('port-range', '1024 65535')  # no port outside the range: the kernel's pick, still held
+        with mock.patch.object(rehearse, 'PORT_RANGE', self.m.path('port-range')):
+            with rehearse._choose_port(config.load(), None) as held:
+                self.assertNotEqual(held.getsockname()[1], 0)
+
+    def test_a_run_that_fails_before_the_start_lets_go_of_the_port(self):
+        seen, patch = self.neighbour_during_the_clone()
+        c = sqlite3.connect(self.m.path('home/userdata/statev2.sqlite'))
+        c.execute('INSERT INTO migrations VALUES (82)')
+        c.commit()
+        c.close()
+        self.make_copy(name=f't3-copy-20990105T000000Z-{fx.LIVE}')
+        with patch:
+            self.failed('R1: the preflight of t3 ' + fx.LIVE)
+        self.assertEqual(seen[0][1], errno.EADDRINUSE)  # still held after the clone
+        port = seen[0][0]
+        with socket.socket() as s:
             s.bind(('127.0.0.1', port))
-            s.listen()
+
+    def test_a_port_taken_in_the_instant_before_the_start_fails_and_the_rerun_passes(self):
+        """Only a program that binds that very port can take it once it is let go: R3 fails, the rerun passes."""
+        port, popen, taken = free_port(), subprocess.Popen, []
+
+        def bind_first(argv, *a, **kw):
+            if argv[1:2] == ['serve'] and '--help' not in argv and not taken:
+                s = socket.socket()
+                s.bind(('127.0.0.1', port))
+                s.listen()
+                taken.append(s)
+            return popen(argv, *a, **kw)
+        with mock.patch.object(rehearse.subprocess, 'Popen', bind_first):
             self.failed('exited before it was ready', port=port)
+        taken[0].close()
         self.assertEqual(self.rehearse(port=port)['port'], port)
 
     def test_a_server_never_ready_is_stopped_and_fails(self):
@@ -1519,10 +1635,125 @@ class Links(Base):
         self.assertEqual([(rel, why) for rel, _, why, _ in out], [('x', 'x goes above the tree')])
 
 
+SETTINGS_ON = {
+    'providerInstances': [{'id': 'codex', 'driver': 'codex', 'enabled': True},
+                          {'id': 'claude', 'driver': 'claude', 'enabled': True}],
+    'agentSlots': {'enabled': True}, 'waitFor': {'enabled': True}, 'waitChecks': {'ci': {}},
+    'projectSettingsOverrides': {'p1': {'handoff': {'mode': 'handoff'}, 'textGenerators': {'x': 1}}, 'p2': {}}}
+SETTINGS_OFF = {k: v for k, v in SETTINGS_ON.items() if k not in ('agentSlots', 'waitFor')}
+SETTINGS_OFF['projectSettingsOverrides'] = {'p1': {'textGenerators': {'x': 1}}, 'p2': {}}
+
+
+class FeaturesOff(Base):
+    """Fork #529 (2): with a fork feature on (waitFor, handoff, ...) the rehearsal's server on the clone could act,
+    deliver waits or send messages. The rehearsal switches every feature on off in the clone's settings.json only
+    (never the home's or the copy's), says so in its facts, and R4 still wants all off."""
+
+    def with_settings(self, text):
+        self.m.write('home/userdata/settings.json', text)
+        self.copy_dir = self.make_copy(name=f't3-copy-20990102T000000Z-{fx.LIVE}')
+
+    def clone_settings(self):
+        return os.path.join(self.root(), 'home', 'userdata', 'settings.json')
+
+    def served_with(self):
+        """Runs the rehearsal; returns it and the clone's settings.json as the R3 server found it."""
+        real, seen = rehearse._serve, []
+
+        def serve(p, empty):
+            with open(self.clone_settings(), 'rb') as f:
+                seen.append(f.read())
+            return real(p, empty)
+        with mock.patch.object(rehearse, '_serve', serve):
+            result = self.rehearse(copy_dir=self.copy_dir)
+        return result, seen[0]
+
+    def test_features_on_in_the_copy_are_off_in_the_clone_only_every_run(self):
+        self.with_settings(json.dumps(SETTINGS_ON))
+        live, copy = self.m.snapshot(), self.m.snapshot(self.copy_dir)
+        for run in (1, 2):  # runs again: the next run clones afresh and switches them off again
+            with self.subTest(run=run):
+                result, served = self.served_with()
+                self.assertEqual(json.loads(served), SETTINGS_OFF)
+                self.assertEqual(result['featuresOff'], {
+                    'featuresOn': ['agentSlots', 'waitFor', 'handoff'],
+                    'where': 'agentSlots (server), waitFor (server), handoff (project:p1)',
+                    'removed': ['agentSlots', 'waitFor', 'project:p1/handoff']})
+                [step] = [s['data'] for s in self.runs()[-1]['steps'] if s['step'] == 'features-off'
+                          and s['phase'] == 'done']
+                self.assertEqual(step['removed'], result['featuresOff']['removed'])
+                self.assertIn('are switched off in the clone only', ' '.join(self.said))
+                self.assertEqual(self.m.snapshot(), live, 'the live home is never touched')
+                self.assertEqual(self.m.snapshot(self.copy_dir), copy, 'the copy is never changed')
+                self.assertEqual(sha(self.clone_settings()), sha(os.path.join(self.copy_dir, 'userdata',
+                                                                                 'settings.json')),
+                                 'the restore puts the copy\'s settings back in the clone')
+
+    def test_all_off_leaves_the_clone_settings_as_they_are(self):
+        # Empty state: nothing on, nothing written (the server reads the copy's settings byte for byte).
+        result, served = self.served_with()
+        with open(os.path.join(self.copy_dir, 'userdata', 'settings.json'), 'rb') as f:
+            self.assertEqual(served, f.read())
+        self.assertEqual(result['featuresOff'], {'featuresOn': [], 'where': '', 'removed': []})
+        self.assertNotIn('switched off', ' '.join(self.said))
+
+    def test_a_feature_the_policy_locks_on_fails_before_any_server(self):
+        self.with_settings(json.dumps(SETTINGS_ON))
+        self.mode(fx.TARGET, policyOn=['waitFor'])
+        live = self.m.snapshot()
+        words = self.failed('stay on in the clone', copy_dir=self.copy_dir)
+        self.assertIn('waitFor (policy)', words)
+        self.assertNotIn(('serve', 'started'), self.steps())
+        self.assertEqual(self.m.snapshot(), live)
+
+    def test_settings_that_are_not_plain_json_fail_before_any_server(self):
+        self.with_settings('// the owner wrote a comment\n' + json.dumps(SETTINGS_ON))
+        live = self.m.snapshot()
+        self.failed('does not read as plain JSON', copy_dir=self.copy_dir)
+        self.assertNotIn(('serve', 'started'), self.steps())
+        self.assertEqual(self.m.snapshot(), live)
+
+    def test_a_report_without_the_list_fails(self):
+        real = rehearse._report
+        with mock.patch.object(rehearse, '_report', lambda p: {**real(p), 'fork': {}}):
+            self.failed('no fork.featuresOn list')
+        self.assertNotIn(('serve', 'started'), self.steps())
+
+    def test_missing_settings_with_a_policy_feature_on_fails(self):
+        # Missing state: no settings.json in the clone, a feature on by the policy alone: nothing to clear, so it
+        # fails, named.
+        p = {'home': self.m.path('nohome')}
+        report = {'fork': {'featuresOn': ['waitFor'], 'featuresWhere': {'waitFor': ['policy']}}}
+        with mock.patch.object(rehearse, '_report', lambda p: report):
+            with self.assertRaises(rehearse.Failed) as cm:
+                rehearse._features_off(p, report)
+        self.assertIn('waitFor (policy)', str(cm.exception))
+        self.assertFalse(os.path.exists(p['home']))
+
+    def test_killed_while_switching_them_off_runs_again(self):
+        self.with_settings(json.dumps(SETTINGS_ON))
+        live, copy = self.m.snapshot(), self.m.snapshot(self.copy_dir)
+        for at in ('features-off', 'mid-features-off'):
+            with self.subTest(at):
+                code = KILLED.format(paths=[os.path.join(fx.KIT, 'lib'), fx.COMMON], machine=config.MACHINE_FILE,
+                                     at=at)
+                p = subprocess.run([sys.executable, '-I', '-B', '-c', code], stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(p.returncode, -9, p.stderr)
+                self.assertIsNone(self.runs()[-1]['end'])
+                self.assertFalse(journal.needs_settling(self.runs()[-1]))
+                self.assertFalse(self.server_left())
+                self.assertEqual(self.m.snapshot(), live)
+                self.assertEqual(self.m.snapshot(self.copy_dir), copy)
+                result, served = self.served_with()
+                self.assertEqual(json.loads(served), SETTINGS_OFF)
+                self.assertEqual(result['featuresOff']['featuresOn'], ['agentSlots', 'waitFor', 'handoff'])
+
+
 class StoppedHalfWay(Base):
     def test_a_rehearsal_stopped_at_each_step_runs_again_with_nothing_to_settle(self):
-        points = ['clone', 'preflight', 'migrate', 'serve', 'checks', 'stop-server', 'old-build-blocked', 'restore',
-                  'mid-restore', 'result']
+        points = ['clone', 'preflight', 'features-off', 'migrate', 'serve', 'checks', 'stop-server',
+                  'old-build-blocked', 'restore', 'mid-restore', 'result']
         for at in points:
             with self.subTest(at):
                 code = KILLED.format(paths=[os.path.join(fx.KIT, 'lib'), fx.COMMON], machine=config.MACHINE_FILE,

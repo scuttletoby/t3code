@@ -286,7 +286,8 @@ def pull_head_by_git(repo, number, env):
     environment, never on the command line), for when the REST API is down or rate limited. Up to READ_TRIES tries."""
     # Not pr_queue.git_env: it drops GIT_CONFIG_COUNT/KEY_/VALUE_, which carry this call's own auth header.
     clean = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'TMPDIR')}
-    clean.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+    clean.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+                 GIT_ATTR_NOSYSTEM='1')
     token = env.get('GH_TOKEN', '')
     if token:
         basic = base64.b64encode(f'x-access-token:{token}'.encode()).decode()

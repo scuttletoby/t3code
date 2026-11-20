@@ -6,6 +6,7 @@ breaks each installer and self-check rule in a copy and shows its test then fail
 """
 import contextlib, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, types
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True   # the CI runner has no -B: a __pycache__ in an installed version folder is a change
 
@@ -18,6 +19,22 @@ import model_guard  # noqa: E402
 INSTALLER = os.path.join(KIT, 'sbin', 'model-guard-install')
 DROP_IN = '/etc/claude-code/managed-settings.d/model-guard.json'
 MANAGED = '/etc/claude-code/managed-settings.json'
+T3_CACHE = '/var/lib/t3/model-manifest.json'
+
+
+def t3_cache(older_offers_ultracode=False):
+    """T3's cached model list ({fetchedAtMs, manifest}) for the example policy's Claude models: example-older-0 has
+    an effort list without ultracode, unless asked."""
+    def profile(*efforts):
+        return {'capabilities': {'optionDescriptors': [
+            {'id': 'effort', 'label': 'Reasoning', 'type': 'select',
+             'options': [{'id': e, 'label': e} for e in efforts]}]}}
+    return {'fetchedAtMs': 1, 'manifest': {'version': 1, 'currentModels': {}, 'providers': {'claudeAgent': {
+        'profiles': {'new': profile('medium', 'high', 'xhigh', 'ultracode'),
+                     'old': profile('high', *(['ultracode'] if older_offers_ultracode else []))},
+        'models': [{'slug': m, 'name': m, 'status': 'current', 'profile': p}
+                   for m, p in (('example-large-1-0', 'new'), ('example-deep-2-0', 'new'),
+                                ('example-older-0', 'old'))]}}}}
 
 
 def load(source=None):
@@ -82,16 +99,32 @@ class Install(unittest.TestCase):
             f.write(data if isinstance(data, str) else json.dumps(data))
         os.chmod(self.path(path), 0o644)
 
-    def turn_on(self, only_managed=True, mode=None, section=None):
-        """What the person who runs the machine does after install: policy, machine file, and only managed hooks."""
+    def turn_on(self, only_managed=True, mode=None, section=None, model_keys=True, rows=()):
+        """What the person who runs the machine does (README "Turn it on"): policy, machine file (naming T3's model
+        list, as the example policy has an "ultracodeOption": false row), and the managed settings of their own:
+        only managed hooks, and Claude Code's model keys made from the policy."""
         policy = self.path('/etc/fork-kit/model-policy.json')
         with open(os.path.join(KIT, 'model-policy.example.json')) as f:
             data = json.load(f)
-        self.write('/etc/fork-kit/model-policy.json', dict(data, mode=mode or data['mode']))
-        self.write('/etc/fork-kit/machine.json', {'version': 1, 'model-guard': dict({'policyFile': policy},
-                                                                                     **(section or {}))})
+        data = dict(data, mode=mode or data['mode'], allow=data['allow'] + list(rows))
+        self.write('/etc/fork-kit/model-policy.json', data)
+        self.write(T3_CACHE, t3_cache())
+        section = dict({'policyFile': policy, 't3ModelManifests': [self.path(T3_CACHE)]}, **(section or {}))
+        self.write('/etc/fork-kit/machine.json', {'version': 1, 'model-guard': {
+            k: v for k, v in section.items() if v is not None}})   # None: the key is left out
         if only_managed:
-            self.write(MANAGED, {'allowManagedHooksOnly': True})
+            keys = model_guard.model_settings(model_guard.parse_policy(json.dumps(data), 'p')) if model_keys else {}
+            self.write(MANAGED, dict({'allowManagedHooksOnly': True}, **keys))
+
+    def fresh(self):
+        shutil.rmtree(self.root)
+        os.makedirs(self.root, mode=0o755)
+
+    def current(self):
+        return os.readlink(self.path('/usr/local/libexec/model-guard/current'))
+
+    def versions(self):
+        return sorted(os.listdir(self.path('/usr/local/libexec/model-guard/versions')))
 
     def self_check(self):
         code, out, _ = self.run_main('self-check')
@@ -102,18 +135,24 @@ class Install(unittest.TestCase):
         version = self.path(os.readlink(self.path('/usr/local/libexec/model-guard/current')))
         guard = self.m.load_guard(os.path.join(version, 'lib'))
         out = io.StringIO()
-        guard.run_hook(io.StringIO(json.dumps(call)), out, self.path('/etc/fork-kit/machine.json'), os.geteuid())
+        guard.run_hook(io.StringIO(json.dumps(call)), out, self.path('/etc/fork-kit/machine.json'), os.geteuid(),
+                       record=None)
         return json.loads(out.getvalue())['hookSpecificOutput'].get('permissionDecision') if out.getvalue() else None
 
     def test_fresh_install_links_record_and_self_check(self):
+        self.turn_on(only_managed=False)
+        with open(self.path('/etc/fork-kit/machine.json')) as f:
+            machine = f.read()
         code, out, err = self.install()
         self.assertEqual(code, 0, err)
-        self.assertIn('"Turn it on"', out)
+        self.assertIn('run model-guard --self-check', out)
         self.assertEqual(os.readlink(self.path('/usr/local/bin/model-guard')),
                          '/usr/local/libexec/model-guard/current/bin/model-guard')
         self.assertEqual(os.readlink(self.path('/usr/local/libexec/model-guard/current')),
                          f'/usr/local/libexec/model-guard/versions/{SHA1}')
-        self.assertFalse(os.path.exists(self.path('/etc/fork-kit')))       # never writes policy or machine file
+        self.assertEqual(sorted(os.listdir(self.path('/etc/fork-kit'))), ['machine.json', 'model-policy.json'])
+        with open(self.path('/etc/fork-kit/machine.json')) as f:
+            self.assertEqual(f.read(), machine)                             # never writes policy or machine file
         self.assertFalse(os.path.exists(self.path(MANAGED)))               # nor the managed settings themselves
         with open(self.path(DROP_IN)) as f:
             self.assertEqual(json.load(f), {'hooks': {'PreToolUse': [model_guard.hook_entry()]}})
@@ -123,14 +162,20 @@ class Install(unittest.TestCase):
         code, out = self.self_check()
         self.assertEqual(code, 0, out)
         self.assertIn('mode advise', out)
-        # the installed hook runs from its own version folder and refuses when it finds no policy
-        r = subprocess.run([sys.executable, '-I', '-B',
+        # the installed hook runs from its own version folder and refuses when it finds no policy (/etc/fork-kit
+        # outside the test folder; a stand-in system log, so the test writes nothing to the real one)
+        run = ('import runpy, sys, types; log = types.ModuleType("syslog"); log.LOG_USER = log.LOG_WARNING = 0; '
+               'log.openlog = lambda *a: None; log.syslog = lambda p, t: print("LOG " + t, file=sys.stderr); '
+               'sys.modules["syslog"] = log; sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")')
+        r = subprocess.run([sys.executable, '-I', '-B', '-c', run,
                             self.path(f'/usr/local/libexec/model-guard/versions/{SHA1}/bin/model-guard')],
                            input='{"tool_name": "Agent", "tool_input": {}}', capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.assertIn('LOG model-guard refused Agent', r.stderr)
 
     def test_runs_again_and_changes_nothing(self):
+        self.turn_on()
         self.assertEqual(self.install()[0], 0)
         before = self.snapshot()
         code, _, err = self.install()
@@ -140,13 +185,12 @@ class Install(unittest.TestCase):
     def test_every_stop_half_way_then_run_again(self):
         for step in self.m.STEPS:
             with self.subTest(step=step):
-                shutil.rmtree(self.root)
-                os.makedirs(self.root, mode=0o755)
+                self.fresh()
+                self.turn_on()
                 code, _, _ = self.install(stop_after=step)
                 self.assertEqual(code, f'stopped after {step} (test)')
                 code, _, err = self.install()
                 self.assertEqual(code, 0, err)
-                self.turn_on()
                 self.assertEqual(self.self_check()[0], 0)
 
     def test_an_upgrade_stopped_after_each_step_still_refuses_then_finishes(self):
@@ -154,10 +198,9 @@ class Install(unittest.TestCase):
                                                                'tool_input': {'model': 'large', 'effort': 'high'}}
         for step in self.m.STEPS:
             with self.subTest(step=step):
-                shutil.rmtree(self.root)
-                os.makedirs(self.root, mode=0o755)
-                self.assertEqual(self.install()[0], 0)
+                self.fresh()
                 self.turn_on(mode='enforce')
+                self.assertEqual(self.install()[0], 0)
                 self.assertEqual(self.self_check()[0], 0)
                 code, _, _ = self.install(sha=SHA2, stop_after=step)
                 self.assertEqual(code, f'stopped after {step} (test)')
@@ -173,9 +216,11 @@ class Install(unittest.TestCase):
                 self.assertEqual(code, 0, err)
                 self.assertEqual(os.readlink(self.path('/usr/local/libexec/model-guard/current')),
                                  f'/usr/local/libexec/model-guard/versions/{SHA2}')
+                self.assertEqual(self.versions(), [SHA2])
                 self.assertEqual(self.self_check()[0], 0)
 
     def test_a_second_installer_is_refused_while_one_runs(self):
+        self.turn_on()
         self.assertEqual(self.install()[0], 0)
         fd = os.open(self.path('/etc/model-guard/install.lock'), os.O_RDWR)
         self.addCleanup(os.close, fd)
@@ -189,16 +234,62 @@ class Install(unittest.TestCase):
         fcntl.flock(fd, fcntl.LOCK_UN)
         self.assertEqual(self.install(sha=SHA2)[0], 0)
 
+    def test_a_lock_file_an_uninstall_removed_is_not_a_lock(self):
+        """An uninstall removes the lock file while it holds it. An installer that opened that file just before
+        would get a lock no one else sees: it must refuse, not run next to the next installer."""
+        self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        real_flock, lock = fcntl.flock, self.path('/etc/model-guard/install.lock')
+
+        def flock_after_an_uninstall(fd, op):
+            os.unlink(lock)                 # the uninstall finished between this installer's open and its lock
+            return real_flock(fd, op)
+        before = self.snapshot()
+        with mock.patch.object(self.m.fcntl, 'flock', flock_after_an_uninstall):
+            code, _, err = self.install(sha=SHA2)
+        self.assertEqual(code, 1)
+        self.assertIn('just uninstalled the kit: run again', err)
+        self.assertEqual(self.current(), f'/usr/local/libexec/model-guard/versions/{SHA1}')
+        self.assertEqual(set(self.snapshot()) | {'/etc/model-guard/install.lock'}, set(before))
+        self.assertEqual(self.install(sha=SHA2)[0], 0)      # run again: a new lock file, and it goes on
+
+    def test_a_lock_folder_an_uninstall_removed_before_the_open_is_refused(self):
+        """#589 review: an uninstall can remove the guard's /etc folder between the installer's ensure_dir and its
+        open of the lock file. The open then finds no folder: refused with "run again", nothing more written."""
+        self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+        real_ensure_dir, calls = self.m.ensure_dir, []
+
+        def ensure_dir_then_uninstall(path):
+            real_ensure_dir(path)
+            if path == self.m.ETC and not calls:
+                calls.append(path)
+                shutil.rmtree(self.path(self.m.ETC))      # the uninstall's last step, between the two calls
+        before = self.snapshot()
+        with mock.patch.object(self.m, 'ensure_dir', ensure_dir_then_uninstall):
+            code, _, err = self.install(sha=SHA2)
+        self.assertEqual(calls, [self.m.ETC])
+        self.assertEqual(code, 1)
+        self.assertIn('just uninstalled the kit: run again', err)
+        # nothing written: only the guard's /etc folder (the uninstall's) is gone
+        self.assertEqual(set(self.snapshot()), {k for k in before if not k.startswith(self.m.ETC)})
+        code, _, err = self.install(sha=SHA2)                   # run again: it goes on
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.self_check()[0], 0)
+
     def test_leftovers_of_a_stopped_run_are_cleared(self):
+        self.turn_on()
         self.assertEqual(self.install()[0], 0)
         versions = self.path('/usr/local/libexec/model-guard/versions')
         os.makedirs(os.path.join(versions, '.tmp-aaaaaaaaaaaa-x', 'lib'))   # stopped while copying
         os.symlink('/elsewhere', self.path('/usr/local/libexec/model-guard/current.new-link-999999'))
-        self.assertEqual(self.install(sha=SHA2)[0], 0)
+        self.assertEqual(self.install(sha=SHA2, stop_after='record')[0], 'stopped after record (test)')
         self.assertEqual(sorted(os.listdir(versions)), [SHA1, SHA2])
         self.assertEqual(sorted(os.listdir(self.path('/usr/local/libexec/model-guard'))), ['current', 'versions'])
 
     def test_foreign_link_is_refused_before_anything_is_written(self):
+        self.turn_on()
         os.makedirs(self.path('/usr/local/bin'))
         os.symlink('/somewhere/else', self.path('/usr/local/bin/model-guard'))
         code, _, err = self.install()
@@ -208,6 +299,7 @@ class Install(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path('/etc/model-guard')))
 
     def test_current_that_is_not_a_link_is_refused(self):
+        self.turn_on()
         self.assertEqual(self.install()[0], 0)
         current = self.path('/usr/local/libexec/model-guard/current')
         os.unlink(current)
@@ -217,13 +309,22 @@ class Install(unittest.TestCase):
         self.assertIn('current exists and is not a link', err)
 
     def test_managed_settings_folder_that_is_not_ours_is_refused(self):
-        os.makedirs(self.path('/etc'))
+        self.turn_on(only_managed=False)
         os.symlink(self.path('/elsewhere'), self.path('/etc/claude-code'))
         code, _, err = self.install()
         self.assertEqual(code, 1)
         self.assertIn('/etc/claude-code exists and is not a root-owned folder', err)
         self.assertFalse(os.path.exists(self.path('/usr/local/libexec/model-guard')))
         os.unlink(self.path('/etc/claude-code'))
+        os.makedirs(self.path('/etc/claude-code/managed-settings.d'))
+        real_owner = self.m.owner_of
+        for folder in ('/etc/claude-code', '/etc/claude-code/managed-settings.d'):
+            with self.subTest(folder), mock.patch.object(self.m, 'owner_of',
+                                                         lambda r: 4242 if r == self.path(folder) else real_owner(r)):
+                code, _, err = self.install()                   # a folder root does not own
+                self.assertEqual(code, 1)
+                self.assertIn(f'{folder} exists and is not a root-owned folder', err)
+                self.assertFalse(os.path.exists(self.path('/usr/local/libexec/model-guard')))
         os.makedirs(self.path(DROP_IN))                         # a folder where the drop-in goes
         code, _, err = self.install()
         self.assertEqual(code, 1)
@@ -235,6 +336,7 @@ class Install(unittest.TestCase):
         for name, spoil in (('writable', lambda f: os.chmod(f, 0o666)),
                             ('link', lambda f: (shutil.copy(f, elsewhere), os.unlink(f), os.symlink(elsewhere, f)))):
             with self.subTest(name):
+                self.turn_on()
                 self.assertEqual(self.install()[0], 0)
                 guard = os.path.join(version, 'lib', 'model_guard.py')
                 spoil(guard)
@@ -244,9 +346,9 @@ class Install(unittest.TestCase):
                 self.assertEqual(os.lstat(guard).st_mode & 0o7777, 0o644)
 
     def test_self_check_reports_a_repointed_link(self):
-        self.assertEqual(self.install()[0], 0)
-        self.assertEqual(self.install(sha=SHA2)[0], 0)
         self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.install(sha=SHA2, stop_after='record')[0], 'stopped after record (test)')
         self.assertEqual(self.self_check()[0], 0)
         current = self.path('/usr/local/libexec/model-guard/current')
         os.unlink(current)
@@ -256,8 +358,8 @@ class Install(unittest.TestCase):
         self.assertIn('/usr/local/libexec/model-guard/current: differs from what was installed (link)', out)
 
     def test_self_check_reports_a_bad_record_row(self):
-        self.assertEqual(self.install()[0], 0)
         self.turn_on()
+        self.assertEqual(self.install()[0], 0)
         with open(self.path('/etc/model-guard/installed.tsv'), 'a') as f:
             f.write('just one field\n')
         code, out = self.self_check()
@@ -265,8 +367,8 @@ class Install(unittest.TestCase):
         self.assertIn("bad row ['just one field']", out)
 
     def test_changed_copy_is_reported_and_made_again(self):
-        self.assertEqual(self.install()[0], 0)
         self.turn_on()
+        self.assertEqual(self.install()[0], 0)
         with open(self.path(f'/usr/local/libexec/model-guard/versions/{SHA1}/lib/model_guard.py'), 'a') as f:
             f.write('# changed\n')
         code, out = self.self_check()
@@ -278,6 +380,7 @@ class Install(unittest.TestCase):
         self.assertEqual(self.self_check()[0], 0)
 
     def test_broken_new_copy_leaves_the_version_in_use(self):
+        self.turn_on()
         self.assertEqual(self.install()[0], 0)
         src = os.path.join(self.root, 'src', 'model-guard')
         shutil.copytree(KIT, src, ignore=shutil.ignore_patterns('__pycache__', 'tests'))
@@ -291,18 +394,107 @@ class Install(unittest.TestCase):
         self.assertEqual(os.readlink(self.path('/usr/local/libexec/model-guard/current')),
                          f'/usr/local/libexec/model-guard/versions/{SHA1}')
 
-    def test_upgrade_switches_and_keeps_the_old_version(self):
-        self.assertEqual(self.install()[0], 0)
-        self.assertEqual(self.install(sha=SHA2)[0], 0)
-        self.assertEqual(os.readlink(self.path('/usr/local/libexec/model-guard/current')),
-                         f'/usr/local/libexec/model-guard/versions/{SHA2}')
-        self.assertTrue(os.path.isdir(self.path(f'/usr/local/libexec/model-guard/versions/{SHA1}')))
+    def test_upgrade_switches_and_removes_old_versions(self):
         self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        versions = self.path('/usr/local/libexec/model-guard/versions')
+        # stopped before pruning: both versions stay, and running it again prunes
+        self.assertEqual(self.install(sha=SHA2, stop_after='record')[0], 'stopped after record (test)')
+        self.assertEqual(self.versions(), [SHA1, SHA2])
+        os.makedirs(self.path('/elsewhere/keep'))
+        os.symlink(self.path('/elsewhere'), os.path.join(versions, 'a-link'))   # removed, never followed
+        with open(os.path.join(versions, 'a-file'), 'w') as f:
+            f.write('stray\n')
+        code, out, err = self.install(sha=SHA2)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.current(), f'/usr/local/libexec/model-guard/versions/{SHA2}')
+        self.assertEqual(self.versions(), [SHA2])
+        self.assertIn(f'removed the old version folder /usr/local/libexec/model-guard/versions/{SHA1}', out)
+        self.assertTrue(os.path.isdir(self.path('/elsewhere/keep')))
+        self.assertEqual(self.self_check()[0], 0)
+        self.assertEqual(self.install(sha=SHA1)[0], 0)          # back to the first: the same, the other way
+        self.assertEqual(self.versions(), [SHA1])
         self.assertEqual(self.self_check()[0], 0)
 
-    def test_uninstall_removes_the_kit_and_runs_again(self):
-        self.assertEqual(self.install()[0], 0)
+    def test_a_first_install_without_a_valid_policy_writes_nothing(self):
+        """From the settings step on, the hook refuses every checked call while no policy loads: the first install
+        refuses before it writes anything, and the settings step checks again with the new version."""
+        cases = {
+            'no machine file': lambda: os.unlink(self.path('/etc/fork-kit/machine.json')),
+            'no policy file': lambda: os.unlink(self.path('/etc/fork-kit/model-policy.json')),
+            'a broken policy': lambda: self.write('/etc/fork-kit/model-policy.json', '{'),
+            'a newer policy': lambda: self.write('/etc/fork-kit/model-policy.json', {'version': 99}),
+        }
+        for name, spoil in cases.items():
+            with self.subTest(name):
+                self.fresh()
+                self.turn_on(only_managed=False)
+                spoil()
+                before = self.snapshot()
+                code, _, err = self.install()
+                self.assertEqual(code, 1)
+                self.assertIn('no valid model policy', err)
+                self.assertIn('nothing was written', err)
+                self.assertEqual(self.snapshot(), before)
+                self.turn_on(only_managed=False)
+                self.assertEqual(self.install()[0], 0, name)
+
+    def test_the_settings_step_checks_the_policy_again(self):
         self.turn_on()
+        real_self_test = self.m.self_test
+
+        def self_test_then_policy_goes(dest):             # the policy goes while the installer copies
+            os.unlink(self.path('/etc/fork-kit/model-policy.json'))
+            return real_self_test(dest)
+        with mock.patch.object(self.m, 'self_test', self_test_then_policy_goes):
+            code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn('the hook is not turned on yet', err)
+        self.assertFalse(os.path.lexists(self.path(DROP_IN)))
+        self.turn_on()
+        code, _, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.self_check()[0], 0)
+        os.unlink(self.path('/etc/fork-kit/model-policy.json'))   # the hook runs already: a rerun still repairs
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertIn('WARNING: this version is already in use and cannot use the model policy', out)
+
+    def test_an_upgrade_that_cannot_read_the_policy_warns(self):
+        """#589 review: when the hook already runs, the settings step still repairs, but says when the new version
+        cannot read the policy (say a kit that reads it otherwise), since the hook then refuses every checked call."""
+        self.turn_on()
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('WARNING', out)
+        self.write('/etc/fork-kit/model-policy.json', {'version': 99, 'mode': 'off', 'allow': []})
+        code, out, err = self.install(sha=SHA2)
+        self.assertEqual(code, 0, err)
+        self.assertIn('WARNING: this version is already in use and cannot use the model policy', out)
+        self.assertIn('update the kit', out)
+        self.assertIn('so the hook already refuses every checked call', out)   # printed after the switch
+        self.assertEqual(self.current(), f'/usr/local/libexec/model-guard/versions/{SHA2}')
+        self.turn_on()
+        code, out, err = self.install(sha=SHA2)                 # runs again with a policy it reads: no warning
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('WARNING', out)
+
+    def test_a_drop_in_someone_else_owns_is_written_again(self):
+        self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        drop_in = self.path(DROP_IN)
+        inode = os.lstat(drop_in).st_ino
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(os.lstat(drop_in).st_ino, inode)       # same text, mode and owner: left alone
+        real_owner = self.m.owner_of
+        with mock.patch.object(self.m, 'owner_of', lambda r: 4242 if r == drop_in else real_owner(r)):
+            self.assertEqual(self.install()[0], 0)
+        self.assertNotEqual(os.lstat(drop_in).st_ino, inode)    # the same text, but not root's: a new file
+
+    def test_uninstall_removes_the_kit_and_runs_again(self):
+        self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.install(sha=SHA2, stop_after='record')[0], 'stopped after record (test)')
         code, out, _ = self.run_main('uninstall')
         self.assertEqual(code, 0)
         self.assertIn('remove that PreToolUse entry', out)
@@ -312,6 +504,52 @@ class Install(unittest.TestCase):
         self.assertTrue(os.path.exists(self.path(MANAGED)))     # the owner's own settings stay
         self.assertTrue(os.path.exists(self.path('/etc/fork-kit/machine.json')))
         self.assertEqual(self.run_main('uninstall')[0], 0)
+        self.assertFalse(os.path.lexists(self.path('/etc/model-guard')))
+
+    def test_an_uninstall_stopped_after_each_step_is_finished_by_running_it_again(self):
+        steps = self.m.UNINSTALL_STEPS
+        for step in steps:
+            with self.subTest(step=step):
+                self.fresh()
+                self.turn_on()
+                self.assertEqual(self.install()[0], 0)
+                self.assertEqual(self.install(sha=SHA2, stop_after='record')[0], 'stopped after record (test)')
+                code, _, _ = self.run_main('uninstall', stop_after=step)
+                self.assertEqual(code, f'stopped after {step} (test)')
+                done = steps[:steps.index(step) + 1]
+                # the hook goes first: no session runs a half-removed kit
+                self.assertFalse(os.path.lexists(self.path(DROP_IN)))
+                # the short command stays while its version folder is there, so the owner can run it again
+                installer = self.path('/usr/local/sbin/model-guard-install')
+                self.assertEqual(os.path.lexists(installer), 'installer-link' not in done)
+                if 'installer-link' not in done:                  # and it still leads to a whole installer
+                    self.assertEqual(os.readlink(installer),
+                                     '/usr/local/libexec/model-guard/current/sbin/model-guard-install')
+                    self.assertTrue(os.path.isfile(self.path(self.current() + '/sbin/model-guard-install')))
+                self.assertEqual(os.path.isfile(self.path(f'/usr/local/libexec/model-guard/versions/{SHA2}/sbin/'
+                                                          'model-guard-install')), 'libexec' not in done)
+                self.assertEqual(os.path.exists(self.path('/etc/model-guard/install.lock')), 'lock' not in done)
+                if 'old-versions' in done and 'libexec' not in done:
+                    self.assertEqual(self.versions(), [SHA2])
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 0, err)
+                for path in ('/usr/local/bin/model-guard', '/usr/local/sbin/model-guard-install',
+                             '/usr/local/libexec/model-guard', '/etc/model-guard', DROP_IN):
+                    self.assertFalse(os.path.lexists(self.path(path)), path)
+                self.assertTrue(os.path.exists(self.path(MANAGED)))
+
+    def test_uninstall_leaves_a_drop_in_folder_alone(self):
+        self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        os.unlink(self.path(DROP_IN))
+        os.makedirs(self.path(DROP_IN + '/inside'))
+        code, out, err = self.run_main('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertIn('is not a plain file, so it was left alone: remove it by hand', out)
+        self.assertTrue(os.path.isdir(self.path(DROP_IN + '/inside')))
+        for path in ('/usr/local/bin/model-guard', '/usr/local/sbin/model-guard-install',
+                     '/usr/local/libexec/model-guard', '/etc/model-guard'):
+            self.assertFalse(os.path.lexists(self.path(path)), path)
 
     def test_bad_input_and_not_root_are_refused(self):
         self.assertEqual(self.install(sha='abc')[0], 1)
@@ -330,13 +568,13 @@ class Install(unittest.TestCase):
         self.assertIn('the kit is not installed', out)
 
     def test_self_check_reports_managed_settings_that_do_not_run_the_hook(self):
-        self.assertEqual(self.install()[0], 0)
         self.turn_on()
+        self.assertEqual(self.install()[0], 0)
         self.write(DROP_IN, {'hooks': {'PreToolUse': [dict(model_guard.hook_entry(), matcher='Agent')]}})
         code, out = self.self_check()
         self.assertEqual(code, 1)
         self.assertIn(f'{DROP_IN}: differs from what was installed (file)', out)
-        self.assertIn('entry 0 runs the guard but is not its entry: its matcher misses Task', out)
+        self.assertIn('entry 0 runs the guard but is not its entry: its matcher is not exactly', out)
         self.assertIn('no managed PreToolUse entry runs the guard', out)
         os.unlink(self.path(DROP_IN))
         code, out = self.self_check()
@@ -349,8 +587,8 @@ class Install(unittest.TestCase):
         self.assertIn('zz.json: not valid JSON', self.self_check()[1])
 
     def test_self_check_wants_only_managed_hooks_unless_the_machine_file_allows_others(self):
-        self.assertEqual(self.install()[0], 0)
         self.turn_on(only_managed=False)
+        self.assertEqual(self.install()[0], 0)
         code, out = self.self_check()
         self.assertEqual(code, 1)
         self.assertIn('allowManagedHooksOnly is not true', out)
@@ -360,16 +598,69 @@ class Install(unittest.TestCase):
         self.assertIn('allowOtherHooks', self.self_check()[1])
 
     def test_self_check_reports_a_managed_settings_file_others_can_write(self):
-        self.assertEqual(self.install()[0], 0)
         self.turn_on()
+        self.assertEqual(self.install()[0], 0)
         os.chmod(self.path(MANAGED), 0o666)
         code, out = self.self_check()
         self.assertEqual(code, 1)
         self.assertIn('writable by group or others', out)
 
-    def test_self_check_reports_no_policy(self):
+    def test_self_check_wants_claude_codes_model_keys_in_enforce(self):
+        self.turn_on(mode='enforce')
         self.assertEqual(self.install()[0], 0)
+        code, out = self.self_check()
+        self.assertEqual(code, 0, out)
+        self.turn_on(mode='enforce', model_keys=False)
+        code, out = self.self_check()
+        self.assertEqual(code, 1)
+        self.assertIn("managed settings miss Claude Code's own model limits", out)
+        self.assertIn('Put these keys', out)
+        self.assertIn('"availableModels"', out)
+        self.turn_on(mode='advise', model_keys=False)           # advise binds nothing, so it needs no keys
+        self.assertEqual(self.self_check()[0], 0)
+
+    def test_self_check_reports_a_stale_ultracode_option_row(self):
+        """#600: the example policy's "ultracodeOption": false row against T3's cached model list, end to end."""
         self.turn_on()
+        self.assertEqual(self.install()[0], 0)
+        self.assertEqual(self.self_check()[0], 0)
+        self.write(T3_CACHE, t3_cache(older_offers_ultracode=True))   # T3 reloaded its list: the model gained it
+        code, out = self.self_check()
+        self.assertEqual(code, 1)
+        self.assertIn("'example-older-0' has \"ultracodeOption\": false, but T3's model list", out)
+        self.assertIn('offers it the ultracode option', out)
+        os.unlink(self.path(T3_CACHE))                                 # no cache: said, never a silent pass
+        code, out = self.self_check()
+        self.assertEqual(code, 1)
+        self.assertIn('cannot be read', out)
+        self.turn_on(section={'t3ModelManifests': None})              # an old machine file names none
+        os.unlink(self.path(T3_CACHE))
+        self.assertIn('t3ModelManifests', self.self_check()[1])
+        self.turn_on(mode='off')                                       # off checks nothing, so it needs none
+        os.unlink(self.path(T3_CACHE))
+        self.assertEqual(self.self_check()[0], 0)
+
+    def test_self_check_reports_a_row_with_no_known_effort_id(self):
+        """#629: a row with efforts of a driver whose effort id the guard does not pin, without effortOptionIds:
+        every T3 pick of it is refused, so the self-check names it, the same each run, and not in mode off."""
+        cursor = {'driver': 'cursor', 'model': 'example-cursor-0', 'efforts': ['low']}
+        self.turn_on(rows=[cursor])
+        self.assertEqual(self.install()[0], 0)
+        code, out = self.self_check()
+        self.assertEqual(code, 1)
+        self.assertIn("cursor 'example-cursor-0' lists efforts, but the guard knows no option id", out)
+        self.assertIn('effortOptionIds', out)
+        self.assertEqual((code, out), self.self_check())
+        self.turn_on(rows=[dict(cursor, effortOptionIds=['reasoning'])])   # the id named: clean
+        self.assertEqual(self.self_check()[0], 0)
+        self.turn_on(rows=[{'driver': 'codex', 'model': 'example-codex-0', 'efforts': ['low']}])   # pinned: clean
+        self.assertEqual(self.self_check()[0], 0)
+        self.turn_on(mode='off', rows=[cursor])
+        self.assertEqual(self.self_check()[0], 0)
+
+    def test_self_check_reports_no_policy(self):
+        self.turn_on()
+        self.assertEqual(self.install()[0], 0)
         os.unlink(self.path('/etc/fork-kit/model-policy.json'))
         code, out = self.self_check()
         self.assertEqual(code, 1)
@@ -401,6 +692,39 @@ INSTALLER_MUTATIONS = {
                                       'test_managed_settings_folder_that_is_not_ours_is_refused'),
     'the drop-in is written': ('    write_file(drop_in, guard.drop_in_text())\n', '',
                                'test_fresh_install_links_record_and_self_check'),
+    'a first install needs a policy': ('        if not os.path.lexists(p(drop_in)):\n            raise Refused',
+                                       '        if False:\n            raise Refused',
+                                       'test_a_first_install_without_a_valid_policy_writes_nothing'),
+    'the settings step checks the policy again': ("    check_policy(guard, so='the hook is not turned on yet', warn=True)",
+                                                  '    pass', 'test_the_settings_step_checks_the_policy_again'),
+    'an upgrade that cannot read the policy warns': ('        if warn:', '        if False:',
+                                                     'test_an_upgrade_that_cannot_read_the_policy_warns'),
+    'a lock folder gone before the open is refused': (
+        "    except FileNotFoundError:\n        raise Refused('another model-guard-install just uninstalled",
+        "    except KeyError:\n        raise Refused('another model-guard-install just uninstalled",
+        'test_a_lock_folder_an_uninstall_removed_before_the_open_is_refused'),
+    'a file root does not own is written again': ('                    and owner_of(real) == ROOT_UID:',
+                                                  '                    :',
+                                                  'test_a_drop_in_someone_else_owns_is_written_again'),
+    'a managed folder root does not own is refused': ('                                      or owner_of(real) != ROOT_UID):',
+                                                      '                                      or False):',
+                                                      'test_managed_settings_folder_that_is_not_ours_is_refused'),
+    'old versions are removed': ("    prune_versions(a.sha)\n    done('prune')", "    done('prune')",
+                                 'test_upgrade_switches_and_removes_old_versions'),
+    'a pruned link is not followed': ('        if os.path.islink(path) or not os.path.isdir(path):',
+                                      '        if not os.path.isdir(path):',
+                                      'test_upgrade_switches_and_removes_old_versions'),
+    'a lock file an uninstall removed is refused': ('        if not same:', '        if False:',
+                                                    'test_a_lock_file_an_uninstall_removed_is_not_a_lock'),
+    'uninstall keeps the lock till last': ('                if path != p(LOCK):', '                if True:',
+                                           'test_an_uninstall_stopped_after_each_step_is_finished_by_running_it_again'),
+    'uninstall removes the old versions': ('            prune_versions(current)', '            pass',
+                                           'test_an_uninstall_stopped_after_each_step_is_finished_by_running_it_again'),
+    'uninstall keeps the short command till its folder goes': (
+        "        done('drop-in')\n", "        done('drop-in')\n        os.unlink(p(INSTALLER))\n",
+        'test_an_uninstall_stopped_after_each_step_is_finished_by_running_it_again'),
+    'uninstall leaves a drop-in folder alone': ('            if stat.S_ISREG(os.lstat(p(drop_in)).st_mode):',
+                                                '            if True:', 'test_uninstall_leaves_a_drop_in_folder_alone'),
     'uninstall removes the drop-in': ('            os.unlink(p(drop_in))   # first', '            pass   # first',
                                       'test_uninstall_removes_the_kit_and_runs_again'),
 }
@@ -420,6 +744,14 @@ GUARD_MUTATIONS = {
     'other hooks only when allowed': ("        allow_other_hooks = cfg['allowOtherHooks']",
                                       '        allow_other_hooks = True',
                                       'test_self_check_wants_only_managed_hooks_unless_the_machine_file_allows_others'),
+    "Claude Code's model keys are checked": ('            problems += model_settings_problems(usable, policy)',
+                                            '            pass', 'test_self_check_wants_claude_codes_model_keys_in_enforce'),
+    # #600
+    "T3's model lists are checked": ("        problems += ultracode_option_problems(policy, cfg['t3ModelManifests'])",
+                                     '        pass', 'test_self_check_reports_a_stale_ultracode_option_row'),
+    # #629
+    'rows with no known effort id are reported': ('        problems += effort_id_problems(policy)', '        pass',
+                                                  'test_self_check_reports_a_row_with_no_known_effort_id'),
 }
 
 

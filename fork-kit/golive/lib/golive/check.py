@@ -13,7 +13,7 @@ moves a damaged journal aside), so changing runs may start again. It writes only
 import argparse, hashlib, json, os, sys
 
 import machine_file
-from golive import config as config_mod, journal, live, osadapter
+from golive import config as config_mod, handoff, journal, live, osadapter
 
 MB = 1024 * 1024
 
@@ -125,6 +125,10 @@ def _checks(cfg, adapter, result, add, info, own_id):
     else:
         add('boot service', True, f'{osadapter.UNIT} serves this home')
 
+    holder = handoff.holder_seen(cfg.home, adapter.unit_active)
+    if holder is not None:  # #530: a W1 or switch left the home held on purpose
+        add('home holder', False, holder)
+
     server = None
     try:
         server = live.live_server(cfg.home, svc['mainPid'])
@@ -207,7 +211,8 @@ def _checks(cfg, adapter, result, add, info, own_id):
 
 
 STEADY = ('boot service', 'live server', 'no update in flight', 'no half switch', 'no markers')
-REPORT_ANSWERS = ('counts', 'pendingMigrations', 'providers')  # what _report takes from the report into the result
+# What _report takes from the report into the result.
+REPORT_ANSWERS = ('counts', 'pendingMigrations', 'providers', 'features')
 
 
 def server_changed(cfg, adapter, server):
@@ -259,11 +264,10 @@ def _report(cfg, report, result, add):
     version = report.get('version')
     add('report: target build', version == cfg.target_version, f'the staged build says it is {version}')
     fork = report.get('fork') if isinstance(report.get('fork'), dict) else {}
-    on = fork.get('featuresOn')
-    if not isinstance(on, list):
-        add('fork features off', False, 'the report has no fork.featuresOn list')
-    else:
-        add('fork features off', not on, f'switched on in settings: {live.features_on(fork)}' if on else 'all off')
+    state, said = features_answer(cfg, fork, result['live'])
+    if state is not None:  # the switch keeps them as they are: its re-read, `before` and verify require this
+        result['features'] = state
+    add('fork features', state is not None, said)
     problems = report.get('problems') if isinstance(report.get('problems'), list) else []
     named = '; '.join(f'{p.get("code")}: {p.get("message")}' for p in problems if isinstance(p, dict))
     readable = report.get('ok') is True
@@ -273,6 +277,42 @@ def _report(cfg, report, result, add):
     result['counts'] = db.get('counts')
     result['pendingMigrations'] = db.get('pendingMigrations')
     result['providers'] = providers_sum(report)  # switch's verify: the same after as before
+
+
+def features_answer(cfg, target_fork, server):
+    """(the fork features the switch keeps, what check says) or (None, why it refuses), from the staged target
+    build's report `target_fork` on the live home and, when the live build `server` is a fork build, its own report
+    (run beside the running T3, like the target's): a switch keeps the features as they are only when both builds
+    read the same values in the same places. A target that reads more (a new feature on by default, a key or a
+    policy default the old build read otherwise, `usagePacingGate` advise -> enforce) refuses before anything
+    stops. A live build that gives no report of its own (an older report version) passes only with all off."""
+    state, version = live.features_state(target_fork), server['version']
+    if state is None:
+        return None, 'the report has no fork.featuresOn list and fork.features map'
+    if not live.fork_build(version):
+        if state['on']:
+            return None, (f'switched on in settings while the live build {version} is not a fork build: the first '
+                          f'switch starts with all off ({live.features_on(target_fork)})')
+        return state, 'all off'
+    try:
+        own = live.fork_report(server['binary'], cfg.home)
+        was, why = live.features_state(own.get('fork')), 'it has no fork.featuresOn list and fork.features map'
+    except live.NotLive as e:
+        was, why = None, str(e)
+    if was is None:
+        if state['on']:
+            return None, (f'the live build {version} gives no report of its own fork features ({why}), so the kit '
+                          'cannot tell whether the target keeps them as they are, and the target reads some on '
+                          f'({live.features_on(target_fork)}): switch them off first, as for a first switch')
+        return state, f'all off (the live build {version} gives no report of its own: {why})'
+    differ = live.features_differ(was, state, f'in the live {version}', 'in the target')
+    if differ:
+        return None, (f'the target build reads other fork features than the live build: {differ}; the switch would '
+                      'go live with them changed: set them in settings so both builds read the same, or switch '
+                      'them off')
+    if state['on']:
+        return state, f'on, kept as they are (the live build reads the same): {live.features_on(target_fork)}'
+    return state, 'all off (the live build reads the same)'
 
 
 def providers_sum(report):
@@ -308,11 +348,15 @@ def _print(code, result, out):
 
 
 def _settle(cfg, reason, out, err):
+    stopped = []  # the owner says the home is right: a holder a W1 or switch left (#530) has nothing to keep
     try:
-        what, value = journal.settle(cfg.state_dir, reason)
+        what, value = journal.settle(cfg.state_dir, reason, then=lambda: stopped.append(handoff.stop_holder(cfg.home)))
     except (journal.Busy, journal.Newer, ValueError) as e:
         print(f't3-golive: {e}', file=err)
         return 1
+    if stopped and stopped[0] is not None:
+        print(f'stopped the kit\'s holder {handoff.holder_unit(cfg.home)} (pid {stopped[0]}): the home is not kept '
+              'owned any more, and T3 is left as it is', file=out)
     if what == 'settled':
         print(f'settled: {journal.describe(value)}; reason: {reason.strip()}', file=out)
     elif what == 'moved':
@@ -363,6 +407,8 @@ def main(argv, out=sys.stdout, err=sys.stderr):
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p = sub.add_parser('guard', help=argparse.SUPPRESS)
     p.add_argument('--run', required=True)
+    p = sub.add_parser('hold', help=argparse.SUPPRESS)  # the holder's unit (handoff.serve_holder)
+    p.add_argument('--home', required=True)
     p = sub.add_parser('switch', help='move the live T3 to the target build, verify it, go back on its own if not',
                        description='Needs a passed, fresh rehearsal of this staged build (its archive sha256) from '
                                    'the live build. Keeps the old runtime outside the home, then at a quiet point: '
@@ -386,6 +432,8 @@ def main(argv, out=sys.stdout, err=sys.stderr):
                    help="after a reboot, to let it run W1: the switch copy's time, as `t3-golive back` prints it")
     p.add_argument('--wait', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.command == 'hold':  # it only holds the lock of the home it was started for: no machine file needed
+        return handoff.serve_holder(args.home)
     try:
         cfg = config_mod.load()
     except machine_file.MachineFileError as e:

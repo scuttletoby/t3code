@@ -4,7 +4,7 @@ copy of `sleep` placed at the home's runtime path, so /proc shows it like the re
 SHA256SUMS, an archive and its extracted runtime (a stub `t3` that prints a report and records how it was run),
 and a machine file. Nothing here touches a real T3 home, a real unit or ~/.t3; PATH holds only the stubs.
 """
-import hashlib, io, json, os, shutil, signal, subprocess, sys, tarfile, tempfile
+import fcntl, hashlib, io, json, os, shutil, signal, subprocess, sys, tarfile, tempfile
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
@@ -13,10 +13,22 @@ sys.path[:0] = [os.path.join(KIT, 'lib'), COMMON]
 from golive import config, live, osadapter  # noqa: E402
 from golive import handoff  # noqa: E402
 
-# No fake launcher takes a serving lock unless a test makes one: the kit lets go of the owner lock at once.
+# A build that takes no serving lock: the kit lets go of the owner lock at once; one that does and never claims it (a
+# test's own model): it keeps it this long.
 handoff.HANDOVER_WAIT = 0.05
+# The fake boot service's launcher (this test process: the unit's MainPID) holds runtime/service-serving.lock while
+# its server runs a build that takes it (handoff.takes_serving_lock), as upstream's #claimServing does, so the kit's
+# look at the running launcher before a stop (handoff.launcher_unseen) passes as on a real host. gap.test.py models
+# the lock itself and turns this off.
+LAUNCHER_SERVES = True
 
 LIVE, TARGET = '0.1.9', '0.1.10-nightly.20261114.4682.fork.1'
+
+# The kit's holder (#530) as FakeAdapter.run_detached starts it: a real process, `hold --home <home>` at the end of
+# its command line as the real unit's, so the kit finds it in /proc/locks the same way. Machine.close stops them.
+HOLDER = (f'import sys; sys.path[:0] = {[os.path.join(KIT, "lib"), COMMON]!r}\n'
+          'from golive import handoff\nsys.exit(handoff.serve_holder(sys.argv[3]))')
+HOLDERS = []  # [(unit, Popen)]
 
 STUB_T3 = '''#!{python} -I
 import json, os, sys
@@ -26,6 +38,9 @@ with open(os.path.join(root, 'stub-t3-calls.jsonl'), 'a') as f:
 with open(os.path.join(root, 'stub-report.txt')) as f:
     sys.stdout.write(f.read())
 '''
+
+# The live build's own report (Machine.set_live_report): the live server is a copy of `sleep`, which has none.
+LIVE_STUB_T3 = STUB_T3.replace('stub-report.txt', 'stub-live-report.txt')
 
 STUB_SYSTEMCTL = '''#!{python} -I
 import json, os, sys
@@ -78,20 +93,36 @@ class Machine:
         self.backups = self.path('backups')
         self.bin = self.path('bin')
         self.server = None
+        self.serving = None  # the fd by which the fake launcher holds the serving lock (LAUNCHER_SERVES)
         self._saved = (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
-                       osadapter.CGROUP_FILE, os.environ.get('PATH'))
+                       osadapter.CGROUP_FILE, os.environ.get('PATH'), handoff.CGROUP_OF, live.fork_report)
         for d in (self.bin, self.backups, self.path('etc')):
             os.makedirs(d)
             os.chmod(d, 0o755)  # a umask of 002 would leave them group-writable, which the loader refuses
-        for name, text in (('systemctl', STUB_SYSTEMCTL), ('systemd-run', STUB_SYSTEMD_RUN)):
+        for name, text in (('systemctl', STUB_SYSTEMCTL), ('systemd-run', STUB_SYSTEMD_RUN),
+                           ('t3-live-stub', LIVE_STUB_T3)):
             self.write(f'bin/{name}', text.format(python=sys.executable, root=self.root), mode=0o755)
         os.environ['PATH'] = self.bin
+        live.fork_report = self._fork_report
         config.MACHINE_FILE, config.MACHINE_OWNER = self.path('etc/machine.json'), os.getuid()
         osadapter.SYSTEMCTL = os.path.join(self.bin, 'systemctl')
         osadapter.SYSTEMD_RUN = os.path.join(self.bin, 'systemd-run')
         # This test may itself run inside a T3 terminal: never let that decide what the kit sees.
         osadapter.CGROUP_FILE = self.write('cgroup', '0::/user.slice/user-1000.slice/user@1000.service/app.slice/'
                                                      'some-shell.scope\n')
+        # The fake boot service's main process is this test process: in t3code.service, as systemd runs the
+        # launcher (handoff.in_unit). A pid with no file here is not in this /proc.
+        handoff.CGROUP_OF = self.path('proc/{pid}/cgroup')
+        self.in_unit(os.getpid())
+
+    def in_unit(self, pid, unit=osadapter.UNIT):
+        """Process `pid` runs in `unit` as this /proc shows it (handoff.in_unit); unit None: not in this /proc."""
+        path = self.path(f'proc/{pid}/cgroup')
+        if unit is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        self.write(f'proc/{pid}/cgroup', f'0::/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}\n')
 
     def path(self, rel):
         return os.path.join(self.root, rel)
@@ -105,11 +136,26 @@ class Machine:
         return p
 
     def close(self):
+        self.launcher_stopped()
         if self.server is not None:
             kill(self.server)
             self.server = None
+        for held in [h for h in HOLDERS if h[1].args[-1].startswith(self.root + os.sep)]:
+            kill(held[1])
+            HOLDERS.remove(held)
+        for pid in [int(p) for p in os.listdir('/proc') if p.isdigit()]:  # holders a kit run in a subprocess left
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    argv = f.read().decode(errors='replace').split('\0')[:-1]
+            except OSError:
+                continue
+            if argv[-3:-1] == ['hold', '--home'] and argv[-1].startswith(self.root + os.sep):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
-         osadapter.CGROUP_FILE, path) = self._saved
+         osadapter.CGROUP_FILE, path, handoff.CGROUP_OF, live.fork_report) = self._saved
         os.environ['PATH'] = path or ''
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -149,6 +195,17 @@ class Machine:
         self.server = subprocess.Popen([runtime, '600'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL, start_new_session=True)
         self.runtime_file(pid=self.server.pid, serverVersion=version)
+        self.launcher_stopped()
+        if LAUNCHER_SERVES and handoff.takes_serving_lock(version):  # its launcher claimed the lock first
+            fd = os.open(self.path('home/runtime/service-serving.lock'), os.O_RDWR | os.O_CREAT, 0o644)
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a POSIX lock, as SQLite's
+            self.serving = fd
+
+    def launcher_stopped(self):
+        """The fake launcher lets go of the serving lock (the service stopped)."""
+        if self.serving is not None:
+            os.close(self.serving)
+            self.serving = None
 
     def runtime_file(self, **fields):
         self.write('home/userdata/server-runtime.json', json.dumps({
@@ -183,6 +240,21 @@ class Machine:
     def set_report(self, value, prefix=''):
         self.write('stub-report.txt', prefix + (json.dumps(value, indent=2) if isinstance(value, dict) else value))
 
+    def set_live_report(self, value):
+        """What the home's own runtime builds report (the live fork build's `__fork-report`); None: they have none
+        (a `sleep` copy fails, as an older build without this report version would)."""
+        if value is None:
+            os.remove(self.path('stub-live-report.txt'))
+        else:
+            self.write('stub-live-report.txt', json.dumps(value, indent=2) if isinstance(value, dict) else value)
+
+    def _fork_report(self, binary, home):
+        real = self._saved[-1]
+        runtimes = os.path.join(self.home, 'runtime', 'versions') + os.sep
+        if os.path.realpath(binary).startswith(runtimes) and os.path.exists(self.path('stub-live-report.txt')):
+            return real(self.path('bin/t3-live-stub'), home)
+        return real(binary, home)
+
     # --- what happened ---
     def calls(self, name):
         try:
@@ -213,6 +285,7 @@ class FakeAdapter(osadapter.SystemdUser):
     def __init__(self, root, machine=None, on=None):
         self.root, self.machine, self.on = root, machine, on or {}
         self.guard_up, self.guard_alive = True, True  # a detached guard logs that it waits, and keeps running
+        self.holder_up = True  # a detached holder (`hold`) really runs: False, as if systemd-run had failed
 
     def _svc(self, **props):
         path = os.path.join(self.root, 'service.json')
@@ -234,8 +307,10 @@ class FakeAdapter(osadapter.SystemdUser):
                 os.kill(json.load(f)['pid'], signal.SIGKILL)
         except (OSError, ValueError, KeyError):
             pass
-        if self.machine is not None and self.machine.server is not None:
-            self.machine.server.wait()
+        if self.machine is not None:
+            self.machine.launcher_stopped()
+            if self.machine.server is not None:
+                self.machine.server.wait()
         self._svc(ActiveState='inactive', MainPID=0)
         self._record('stop')
 
@@ -252,12 +327,22 @@ class FakeAdapter(osadapter.SystemdUser):
             raise osadapter.AdapterError(f'not a safe unit name: {unit!r}')
         self._record('run_detached', unit, argv, *([guard_after_seconds, guard_argv] if guard_argv else []),
                      *([list(properties)] if properties else []))
+        if argv[1:2] == ['hold']:  # the holder: one unit of a name at a time, as systemd-run
+            if any(u == unit and p.poll() is None for u, p in HOLDERS):
+                raise osadapter.AdapterError(f'systemd-run: Unit {unit}.service was already loaded or has a fragment')
+            if not self.holder_up:
+                raise osadapter.AdapterError('systemd-run: Failed to start transient service unit')
+            HOLDERS.append((unit, subprocess.Popen([sys.executable, '-I', '-c', HOLDER, *argv[1:]],
+                                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                   stderr=subprocess.DEVNULL, start_new_session=True)))
         if self.guard_up and argv[1:3] in (['guard', '--run'], ['switch-guard', '--run']):  # copy's guard; switch's
             from golive import coldcopy
             run_id = argv[argv.index('--run') + 1]
             coldcopy._guard_log(os.path.join(self.root, 'kit-state'), {'run': run_id, 'waiting': True})
 
     def unit_active(self, unit):
+        if unit.startswith('t3-golive-hold-'):
+            return any(u == unit and p.poll() is None for u, p in HOLDERS)
         return self.guard_alive
 
 

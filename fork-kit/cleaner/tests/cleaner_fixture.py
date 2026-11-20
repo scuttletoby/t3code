@@ -6,13 +6,13 @@ server command on this machine: to the cleaner it is a remote on another machine
 Nothing here reads or changes a real worktree, real Docker, the real process list or anything in the real temp
 folder but the test's own folder. Git reads only the test's own config.
 """
-import itertools, json, os, shutil, stat, subprocess, sys, tempfile, time, types, unittest
+import contextlib, itertools, json, os, shutil, stat, subprocess, sys, tempfile, time, types, unittest
 from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
 LIB = os.path.join(KIT, 'lib', 'cleaner')
-MODULES = ('config', 'facts', 'guard', 'compress', 'rules', 'engine', 'report', 'compare', 'daily')
+MODULES = ('config', 'facts', 'guard', 'compress', 'dedupe', 'rules', 'engine', 'report', 'compare', 'daily')
 if COMMON not in sys.path:
     sys.path.insert(0, COMMON)
 
@@ -117,6 +117,53 @@ exec sh -c "git ${last#git-}"
 '''
 
 
+_unmarked = []
+
+
+def private(st):
+    """A folder no other user can change what is in it: root's or this user's, and not writable by group or others
+    unless sticky (like /tmp). The machine file check (machine_file.py) asks this of every folder above the file,
+    and tests write their machine files in their own folder."""
+    return (st.st_uid in (0, os.getuid())
+            and not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not st.st_mode & stat.S_ISVTX))
+
+
+def first_unmarked(bases):
+    """The first folder of `bases` that can be written, has no KEEP entry or git folder in or above it, and is, with
+    every folder above it, `private`; None when there is none."""
+    for base in bases:
+        base = here = os.path.realpath(base)
+        while True:
+            try:
+                st = os.stat(here)
+            except OSError:
+                break
+            if (not private(st) or any(os.path.lexists(os.path.join(here, n)) for n in ('KEEP', '.git'))
+                    or all(os.path.lexists(os.path.join(here, n)) for n in ('HEAD', 'objects', 'refs'))):
+                break
+            if here == '/':
+                if os.path.isdir(base) and os.access(base, os.W_OK | os.X_OK):
+                    return base
+                break
+            here = os.path.dirname(here)
+    return None
+
+
+def unmarked_temp():
+    """The folder the tests make their own folders in: $TMPDIR (or the system's temp folder) when no folder in or
+    above it holds a KEEP entry or a git folder and each is `private`, else the first of /tmp, /var/tmp and
+    /dev/shm that is. compress-cold and dedupe rightly keep everything under such a marker, so a $TMPDIR inside a
+    git checkout would turn every test that expects them to work red; the machine file is rightly refused under a
+    folder others may write, so a group-writable $TMPDIR would turn the command tests red (#624)."""
+    if not _unmarked:
+        found = first_unmarked([tempfile.gettempdir(), '/tmp', '/var/tmp', '/dev/shm'])
+        if found is None:
+            raise RuntimeError('no temp folder without a KEEP entry or a git folder in or above it, that only this '
+                               'user or root may write (or sticky): set TMPDIR')
+        _unmarked.append(found)
+    return _unmarked[0]
+
+
 class Case(unittest.TestCase):
     """One temporary folder, a config over it, fake facts. Subclasses set `c` to the loaded kit."""
     c = None
@@ -124,7 +171,7 @@ class Case(unittest.TestCase):
     def setUp(self):
         umask = os.umask(0o022)
         self.addCleanup(os.umask, umask)
-        self.dir = os.path.realpath(tempfile.mkdtemp(prefix='cleaner-test-'))
+        self.dir = os.path.realpath(tempfile.mkdtemp(prefix='cleaner-test-', dir=unmarked_temp()))
         self.addCleanup(self.close)
         self.home, self.tmp, self.trees = (self.mkdir(n) for n in ('home', 'tmp', 'trees'))
         self.now = time.time()
@@ -147,7 +194,12 @@ class Case(unittest.TestCase):
         self.busy, self.unit_names, self.locks, self.texts = set(), set(), set(), []
         self.words, self.transcript_times = set(), {}     # process environments' words; {session id: time}
         self.mount_points = {'/'}
-        self.mount_lines, self.bind_sources = [], set()     # (point, device, root) and (device, root)
+        # (point, device, root) and (device, root). The one line: / shows the root of a filesystem no real stat has.
+        self.mount_lines, self.bind_sources = [('/', '0:0', '/')], set()
+        self.mount_whole = set()                            # (device, root) of whole btrfs subvolumes
+        self.mount_ids = None                               # (mount id, parent id) of each line; None: not known
+        self.mount_types = None                             # the filesystem type of each line; None: ext4 each
+        self.mount_own = False                              # the lines are the real ones of this namespace (#624)
         self.mount_options = {'/': ('rw', 'relatime')}       # {point: its per-mount options}
         self.fstab_points = set()                           # the mount points /etc/fstab names; None: unreadable
         # Tests set a file's age with its modification time. The kit also counts the inode change time, which no
@@ -178,6 +230,28 @@ class Case(unittest.TestCase):
     # --- files -------------------------------------------------------------------------------------------------
     def path(self, *parts):
         return os.path.join(self.dir, *parts)
+
+    def kernel(self, table, again=None):
+        """Patches what the kernel says: the mount id of an open folder is the id `table` ({point: id}, changed by
+        the test as it goes) gives its deepest point, and the mount list read again at the end of the walk
+        (guard._still_true) is the test's list as it is then, or what `again()` returns."""
+        def mount_id_of(fd):
+            at = os.readlink(f'/proc/self/fd/{fd}')
+            held = [p for p in table if p == '/' or at == p or at.startswith(p + '/')]
+            return table[max(held, key=len)]
+        patches = contextlib.ExitStack()
+        patches.enter_context(mock.patch.object(self.c.guard, 'mount_id_of', mount_id_of))
+        patches.enter_context(mock.patch.object(self.c.guard, 'own_mounts', again or self.mounts_now))
+        return patches
+
+    def mount_types_now(self):
+        """The filesystem type of each line: `mount_types`, or ext4 for each when the test names none."""
+        return ['ext4'] * len(self.mount_lines) if self.mount_types is None else self.mount_types
+
+    def mounts_now(self):
+        """The test's mount list as the kernel would give it read again (`own_mounts`): lines, ids, types."""
+        return self.c.facts.Mounts({p for p, _, _ in self.mount_lines}, self.mount_lines, ids=self.mount_ids,
+                                   types=self.mount_types_now(), own=True)
 
     def mkdir(self, *parts):
         os.makedirs(self.path(*parts), exist_ok=True)
@@ -231,7 +305,8 @@ class Case(unittest.TestCase):
                    'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
                    'dangling': lambda: [], 'now': self.now, 'transcripts': lambda: dict(self.transcript_times),
                    'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options,
-                                                         self.fstab_points)}
+                                                         self.fstab_points, self.mount_whole, self.mount_ids,
+                                                         self.mount_types_now(), self.mount_own)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):

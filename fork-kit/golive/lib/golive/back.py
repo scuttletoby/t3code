@@ -35,7 +35,7 @@ from golive.keptruntime import installed_t3
 UPDATE_TIMEOUT, HTTP_TIMEOUT, MB = 900, 5, 1024 * 1024
 T3_STUB = None  # tests only: a program run in place of any t3 the kit runs
 FOLLOWS = ('back', 'switch')
-_FORK = re.compile(r'\.fork\.\d+$')
+_FORK = live.FORK_BUILD
 
 
 def base_of(version):
@@ -268,6 +268,9 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
         raise journal.Refused(f'the copy cannot be restored: {e}; nothing was changed') from None
     # the backstop: W1 would restore under a server it cannot stop
     refuse_foreign(cfg, adapter, f'`t3-golive back --way w1 --lose-work-since {at}`')
+    why = _blind(cfg, adapter, old, at)  # before the runtime is put back and the pre hooks run (#580)
+    if why is not None:
+        raise journal.Refused(f'{why}; nothing was changed')
     with run.step('plan', way='w1', version=old, t3=t3, copy=copy_dir, at=at, automatic=automatic, kept=kept):
         pass
     with run.step('runtime', version=old) as facts:
@@ -277,19 +280,23 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
 
     def stop_restore_update():
         server = _server(cfg, adapter)
-        why = coldcopy.open_gap(cfg.home)  # before the stop and before saying so: T3 must not stop without the marker
+        # before the stop and before saying so: T3 must not stop without the marker, nor where the kit cannot tell
+        # the new launcher (handoff.handover_blind)
+        why = _blind(cfg, adapter, old, at, say) or coldcopy.open_gap(cfg.home)
         if why is not None:
             raise journal.Refused(f'{why}; T3 was not stopped')
         say('stopping T3 for W1: until this back ends ok, T3 stays stopped and is not started at boot, and background '
             'jobs stay paused (on purpose: the home may be half-restored); if it stops or fails, run the same back '
             'again')
         stopped.append(True)
-        with run.step('stop-service', pid=server and server['pid'], marker=handoff.marker_path(cfg.home)):
+        with run.step('stop-service', pid=server and server['pid'], marker=handoff.marker_path(cfg.home)) as facts:
             adapter.disable()  # first: from here T3 must not start at boot until the update enables it again
             adapter.stop()
             coldcopy._wait_stopped(adapter, server['pid'] if server else 0)
-            handoff.adopt(cfg.home, coldcopy.hold_owner_lock(os.path.join(cfg.home, 'userdata'),
-                                                             coldcopy.STOP_WAIT))  # kept until the update starts T3
+            # kept until the update starts T3; by the holder, so a failed or killed W1 leaves the home owned (#530)
+            lock, held = coldcopy.hold_home(adapter, cfg.home, coldcopy.STOP_WAIT)
+            handoff.adopt(cfg.home, lock)
+            facts.update(held)
         with run.step('restore', copy=copy_dir) as facts:
             facts.update(coldcopy.restore(run, copy_dir, cfg.home, from_home=cfg.home, version=old,
                                           floor_bytes=cfg.free_floor_mb * MB))
@@ -308,6 +315,39 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
             e.add_note('T3 was stopped for this W1: T3 stays stopped and is not started at boot (on purpose: the '
                        'home may be half-restored) until the same `t3-golive back --way w1` ends ok')
         raise
+
+
+def _blind(cfg, adapter, old, at, say=None):
+    """handoff.handover_blind for W1 (it starts `old` after the stop), or None when T3 is stopped already: a rerun
+    behind its own stop, or a T3 that is down. No stop is left to refuse then, and a refusal would leave the owner no
+    way back (#580): W1 goes on, and says (say) what the handover may cost. at: the copy's time (the remedy's
+    command)."""
+    try:
+        svc = adapter.service()
+    except osadapter.AdapterError as e:  # cannot tell whether T3 runs, nor look at its launcher: refused (a stop by
+        # hand is not offered: it would fail the same way, and the rerun would land here again)
+        return (f'the boot service cannot be read ({e}), so the kit cannot tell whether T3 runs, nor look at its '
+                'launcher; run the same W1 again once `systemctl --user show t3code.service` works')
+    if not svc.get('active'):
+        why = handoff.handover_blind(cfg.home, [old])
+        if why is not None and say is not None:
+            say(f'note: {why}; T3 is stopped already, so this W1 goes on: once its update starts T3, T3 may take '
+                'about a minute to come up, and as its update is a pending trial, that trial\'s database backup may be '
+                'lost')
+        return None
+    server = _server(cfg, adapter)
+    why = handoff.handover_blind(cfg.home, [old], server and server['version'], adapter.service)
+    if why is None:
+        return None
+    if why.service_unread:  # a stop by hand fails too, and a rerun counts the service as running again
+        return f'{why}; run the same W1 again once `systemctl --user show t3code.service` works'
+    # the running build is often the one W1 leaves: a restart would only start it again (#580). Stopped by hand,
+    # this W1 goes on (above). Until it runs, T3 is down with no marker and no owner lock: an SSH launch may start a
+    # server of its own on the home (the rerun then refuses, refuse_foreign), so at once.
+    return (f'{why}; to go back anyway, stop T3 (`systemctl --user stop t3code.service`), then at once run '
+            f'`t3-golive back --way w1 --lose-work-since {at}`: it then goes on, with that cost (until it runs, T3 is '
+            'stopped with no update marker and no owner lock, so a T3 desktop app connected over SSH may start a '
+            'server of its own on the home)')
 
 
 def refuse_foreign(cfg, adapter, again, stopped=None):
@@ -425,6 +465,10 @@ def _verify(run, cfg, adapter, version, old_pid, say):
     (_w1_scan). A kill between the failure and its mark reads as cut off: the safe side."""
     try:
         with run.step('verify') as facts:
+            # a holder a killed W1 left after its update restarted T3 (#530): the running T3 needs the home
+            let_go = handoff.find_holder(cfg.home) and handoff.holder_to_service(cfg.home, adapter.service())
+            if let_go:
+                facts['holderLetGo'] = let_go
             again = coldcopy._wait_started(cfg, adapter, version, old_pid)
             if live.service_state(cfg.home)[0] != version or not adapter.service()['enabled']:
                 raise RuntimeError(f't3 {version} runs, but the service state does not name it or {osadapter.UNIT} '
@@ -773,6 +817,11 @@ def _rerun_hint(runs):
     return f'W1 did not stop T3; run {again} again to finish it'
 
 
+NO_HOLDER = ('none, but a run that stopped and disabled T3 has not ended ok (a reboot ends the kit\'s holder): the '
+             'home is free, and a T3 desktop app connected over SSH may start its own server on it while it may be '
+             'half-restored; quit or disconnect that app until the same `t3-golive back` ends ok')
+
+
 def _status(cfg, adapter, add, notes, seen):
     """The checks; returns 'up', 'restarting', 'down' or 'unknown' (the live server goes in seen['server'])."""
     try:
@@ -782,6 +831,9 @@ def _status(cfg, adapter, add, notes, seen):
         return 'unknown'
     add('service', svc['loaded'] and svc['active'] and svc['enabled'] and check_mod._same_dir(svc['home'], cfg.home),
         f'{osadapter.UNIT} {svc.get("state")}, enabled: {svc["enabled"]}, serves {svc["home"]}')
+    holder = handoff.holder_seen(cfg.home, adapter.unit_active)
+    if holder is not None:  # #530
+        add('home holder', False, holder)
     try:
         runs = journal.read(cfg.state_dir)[0]
     except journal.Damaged as e:  # a journal from a newer kit included
@@ -789,6 +841,8 @@ def _status(cfg, adapter, add, notes, seen):
         add('journal', False, str(e))
     else:
         open_run = runs[-1] if runs and journal.needs_settling(runs[-1]) else None
+        if holder is None and open_run is not None and not svc['active'] and not svc['enabled']:
+            add('home holder', False, NO_HOLDER)  # a reboot ended the holder a W1 or switch left (#530)
         if open_run is None:
             add('journal', True, 'no golive run was left half-way')
         elif open_run['command'] in FOLLOWS:

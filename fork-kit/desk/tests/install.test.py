@@ -4,7 +4,7 @@ holds stubs of the fleet files. No root, no systemd, no network, no real user.
 
   python3 -I -B fork-kit/desk/tests/install.test.py
 """
-import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess
+import ast, contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, re, shutil, stat, subprocess
 import sys, tempfile, types, unittest, unittest.mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -348,6 +348,277 @@ class Desk(unittest.TestCase):
                 't3code-fleet-seed.service fork-fleet-desk-agent.service')
         self.assertLess(calls.index(stop), calls.index('systemctl restart fork-fleet-desk-agent.service'))
         self.assertEqual(json.loads(self.read('/etc/fork-fleet/desk-kit.json'))['sha'], SHA2)
+
+    def test_the_launcher_pin_goes_in_last_so_a_stopped_swap_never_pairs_a_new_pin_with_old_walls(self):
+        """Issue #408 item 1 (the #390 lenses): the walls pin the launcher in one file (PIN_HOLDER, the linux walls;
+        the wsl2 walls read that pin). A run stopped between any two renames of an upgrade never leaves the new pin
+        beside an older launcher, dispatcher or walls file (each would then be judged by a pin it was never checked
+        against), `check`'s install line fails meanwhile, the real walls refuse the mix (their manifest check, issue
+        #584 item 2), and the next run ends the swap. Also stopped before the first rename."""
+        self.assertEqual(self.install()[0], 0)
+        changed = {'.github/scripts/fork-fleet-launch.sh': STUBS['.github/scripts/fork-fleet-launch.sh'] + '# new\n',
+                   '.github/scripts/fork-fleet-walls.py': STUBS['.github/scripts/fork-fleet-walls.py'] + '# new\n',
+                   '.github/scripts/fork-fleet-walls/linux': '#!/bin/sh\n# new\n',
+                   '.github/scripts/fork-fleet-walls/wsl2': '#!/bin/sh\n# new\n'}
+        new = self.release('release2', changed)
+        news = {f'/opt/fork-fleet/{rel}': slurp(os.path.join(new, src)) for rel, src in
+                [*[(r, s) for r, s in self.m.FILES.items() if s in changed],
+                 *[(f'fork-fleet-walls/{n}', f'{self.m.WALLS}/{n}') for n in ('linux', 'wsl2')]]}
+        pin = '/opt/fork-fleet/' + self.m.PIN_HOLDER
+        self.assertIn(pin, news)
+        real, after = os.replace, []
+        walls = installed_walls(self.path('/opt/fork-fleet'))
+        walls.as_installed()
+
+        def stopped_after(n):
+            def spy(a, b, *k, **kw):
+                if '/.kit-stage-' in str(a):
+                    if len(after) == n:
+                        raise SystemExit(f'stopped after {n} renames')
+                    after.append(b)
+                return real(a, b, *k, **kw)
+            return spy
+        for n in range(len(news)):
+            with self.subTest(stopped_after=n):
+                after.clear()
+                with unittest.mock.patch.object(self.m.os, 'replace', stopped_after(n)):
+                    self.assertIn('stopped after', str(self.install(sha=SHA2, source=new)[0]))
+                self.assertEqual(len(after), n)
+                now = {path: self.read(path) == text for path, text in news.items()}
+                self.assertFalse(now[pin], f'the pin was renamed in while {[p for p, v in now.items() if not v]} '
+                                           'were still old')
+                self.assertTrue(self.m.installed_problems())   # check's install line fails meanwhile
+                if n:   # issue #584 item 2: the real walls refuse every mix of the stopped swap, the pin aside
+                    with self.assertRaisesRegex(walls.Broken, 'stopped half-way'):
+                        walls.as_installed()
+                else:   # stopped before the first rename: all old, as the old manifest records
+                    walls.as_installed()
+                code, _, err = self.install(sha=SHA2, source=new)   # runs again: ends the swap
+                self.assertEqual(code, 0, err)
+                self.assertEqual({path: self.read(path) for path in news}, news)
+                self.assertEqual(self.m.installed_problems(), [])
+                walls.as_installed()   # the new manifest: the walls run again
+                code, _, err = self.install()   # back to the old release for the next stop
+                self.assertEqual(code, 0, err)
+
+    def test_files_a_release_removes_are_gone_before_the_new_pin_goes_in(self):
+        """#579 lenses: a run stopped just before the pin holder's rename has already removed the files the new
+        release drops, so no old walls file is left beside the new pin; the next run ends the swap."""
+        self.assertEqual(self.install()[0], 0)
+        new = self.release('release2', {'.github/scripts/fork-fleet-walls/wsl2': None,
+                                        '.github/scripts/fork-fleet-walls/wsl2.fixture.json': None,
+                                        '.github/scripts/fork-fleet-walls/linux': '#!/bin/sh\n# new\n'})
+        gone = self.path('/opt/fork-fleet/fork-fleet-walls/wsl2')
+        self.assertTrue(os.path.exists(gone))
+        pin, real, seen = self.path('/opt/fork-fleet/' + self.m.PIN_HOLDER), os.replace, []
+
+        def spy(a, b, *k, **kw):
+            if str(b) == pin and '/.kit-stage-' in str(a):
+                seen.append(os.path.exists(gone))
+                raise SystemExit('stopped before the pin')
+            return real(a, b, *k, **kw)
+        with unittest.mock.patch.object(self.m.os, 'replace', spy):
+            self.assertIn('stopped before the pin', str(self.install(sha=SHA2, source=new)[0]))
+        self.assertEqual(seen, [False])
+        self.assertFalse(os.path.exists(gone))
+        code, _, err = self.install(sha=SHA2, source=new)   # runs again: ends the swap
+        self.assertEqual(code, 0, err)
+        self.assertIn('# new', self.read('/opt/fork-fleet/' + self.m.PIN_HOLDER))
+        self.assertFalse(os.path.exists(gone))
+        self.assertEqual(self.m.installed_problems(), [])
+
+    def test_a_file_the_kit_did_not_install_in_the_walls_folder_is_named_and_install_removes_it(self):
+        """Issue #584 item 2, old state: the walls refuse to run beside a walls-folder file their manifest does not
+        name (an editor's backup root left there, say); `check` names it with the fix, and installing again removes
+        it (the walls folder is the kit's own: the #597 lenses), after which the walls run again."""
+        self.assertEqual(self.install()[0], 0)
+        walls = installed_walls(self.path('/opt/fork-fleet'))
+        walls.as_installed()
+        stray = '/opt/fork-fleet/fork-fleet-walls/linux~'
+        self.write(self.path(stray), 'old\n')
+        with self.assertRaisesRegex(walls.Broken, r'linux~ is not in .*install the kit again \(desk-install removes'):
+            walls.as_installed()
+        self.assertEqual([x for x in self.m.installed_problems() if 'linux~' in x],
+                         [f'{stray}: not in the manifest, so the walls refuse to run: install again (it removes it)'])
+        code, out, err = self.install()   # runs again: removes it
+        self.assertEqual(code, 0, err)
+        self.assertIn(f'removing {stray}', out)
+        self.assertFalse(os.path.lexists(self.path(stray)))
+        self.assertEqual(self.m.installed_problems(), [])
+        walls.as_installed()
+        code, out, err = self.install()   # and again: nothing left to remove
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('removing', out)
+
+    def real_walls(self, name, extra=None):
+        """A release whose dispatcher is the repository's real fork-fleet-walls.py, with fixtures it accepts: its
+        `os` verb, which desk-install runs after the swap, holds the installed kit to its manifest (as_installed), as
+        the agent's walls run does before each job."""
+        fixture = json.dumps({'fail': {'os': [{}]}})
+        walls = '.github/scripts/fork-fleet-walls'
+        return self.release(name, {f'{walls}.py': slurp(os.path.join(REPO, f'{walls}.py')),
+                                   f'{walls}/linux.fixture.json': fixture, f'{walls}/wsl2.fixture.json': fixture,
+                                   **(extra or {})})
+
+    def walls_os(self):
+        """What the installed walls answer before a job: exit 0 is "runners start here"."""
+        return self.m.py(self.path('/opt/fork-fleet/fork-fleet-walls.py'), 'os')
+
+    def test_a_stopped_upgrade_then_another_release_ends_with_walls_that_run(self):
+        """The #597 lenses' major: an upgrade to a release that adds a walls file stops right after renaming it in,
+        so that release's manifest is never written. Installing another release next (a rollback to the old one, or
+        a skip ahead to a third) used to leave that file behind, since neither manifest names it: the walls refused
+        every job for good, while the install said "installed" and `check` said "install again". Now the install
+        removes it, the installed walls run (runners start), and a second run changes nothing. Also stopped half-way
+        through that removal: the walls refuse until the next run ends it."""
+        fixture = json.dumps({'fail': {'os': [{}]}})
+        old = self.real_walls('real1')
+        adds = self.real_walls('real2', {'.github/scripts/fork-fleet-walls/macos': '#!/bin/sh\n',
+                                         '.github/scripts/fork-fleet-walls/macos.fixture.json': fixture})
+        ahead = self.real_walls('real3', {'.github/scripts/fork-fleet-walls/linux': '#!/bin/sh\n# third\n'})
+        stray = self.path('/opt/fork-fleet/fork-fleet-walls/macos')
+        real_replace, real_unlink = os.replace, os.unlink
+
+        def stop_after_macos(a, b, *k, **kw):
+            real_replace(a, b, *k, **kw)
+            if str(b) == stray:
+                raise SystemExit('stopped after the new walls file')
+
+        def stop_at_its_removal(path, *k, **kw):
+            if str(path) == stray:
+                raise SystemExit('stopped before its removal')
+            return real_unlink(path, *k, **kw)
+        for case, (sha, source) in {'rollback': (SHA1, old), 'skip ahead': ('c' * 40, ahead)}.items():
+            with self.subTest(case):
+                code, _, err = self.install(source=old)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.walls_os().returncode, 0, self.walls_os().stderr)
+                with unittest.mock.patch.object(self.m.os, 'replace', stop_after_macos):
+                    self.assertIn('stopped after the new walls file', str(self.install(sha=SHA2, source=adds)[0]))
+                self.assertTrue(os.path.exists(stray))
+                r = self.walls_os()   # the stopped mix: refused, with a way out that works
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn('macos is not in', r.stderr)
+                self.assertIn('install the kit again (desk-install removes it)', r.stderr)
+                with unittest.mock.patch.object(self.m.os, 'unlink', stop_at_its_removal):
+                    self.assertIn('stopped before its removal', str(self.install(sha=sha, source=source)[0]))
+                self.assertEqual(self.walls_os().returncode, 2)   # stopped half-way: still refused
+                code, out, err = self.install(sha=sha, source=source)   # runs again: ends it
+                self.assertEqual(code, 0, err)
+                self.assertIn('removing /opt/fork-fleet/fork-fleet-walls/macos', out)
+                self.assertIn('(left by a stopped install, or a backup)', out)   # no manifest ever named it
+                self.assertFalse(os.path.lexists(stray))
+                self.assertFalse(os.path.lexists(stray + '.fixture.json'))
+                r = self.walls_os()
+                self.assertEqual((r.returncode, r.stderr), (0, ''))   # runners start
+                self.assertEqual(self.m.installed_problems(), [])
+                self.assertEqual(self.read('/opt/fork-fleet/SOURCE'), sha + '\n')
+                code, out, err = self.install(sha=sha, source=source)   # runs again: changes nothing
+                self.assertEqual(code, 0, err)
+                self.assertNotIn('removing', out)
+                self.assertEqual(self.walls_os().returncode, 0)
+
+    def test_a_link_fifo_or_folder_in_the_walls_folder_is_left_and_install_fails_loudly(self):
+        """The #597 lenses: install removes only plain root files from the walls folder and never follows a link.
+        A link (to a file outside, which stays as it is), a FIFO (never opened: no hang) or a folder there is left
+        for a person; the installed walls then refuse, so install exits non-zero and says to remove it by hand, and
+        `check` says the same. Once it is gone, the next install ends with walls that run."""
+        import signal
+        outside = os.path.join(self.tmp, 'outside')
+        self.write(outside, 'not the kit\'s\n')
+        walls = self.path('/opt/fork-fleet/fork-fleet-walls')
+        cases = {'link': lambda q: os.symlink(outside, q), 'fifo': lambda q: os.mkfifo(q, 0o644),
+                 'folder': lambda q: os.mkdir(q, 0o755)}
+
+        def hung(*_):
+            raise AssertionError('hung on a FIFO')
+        old = signal.signal(signal.SIGALRM, hung)
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        self.addCleanup(signal.alarm, 0)
+        source = self.real_walls('real1')
+        for case, put in cases.items():
+            with self.subTest(case):
+                code, _, err = self.install(source=source)
+                self.assertEqual(code, 0, err)
+                entry = os.path.join(walls, 'macos')
+                put(entry)
+                signal.alarm(60)
+                self.clear_calls()
+                code, out, err = self.install(source=source)
+                self.assertEqual(code, 1, out)
+                self.assertIn('the installed walls refuse to run', err)
+                # Issue #613 comment 5: the walls run before the agent is enabled, started or restarted.
+                self.assertEqual(self.agent_starts(), [])
+                self.assertIn('macos is not in', err)
+                self.assertIn('remove it by hand, then install the kit again', err)
+                self.assertTrue(os.path.lexists(entry))
+                self.assertEqual(slurp(outside), 'not the kit\'s\n')
+                self.assertEqual([x for x in self.m.installed_problems() if 'macos' in x],
+                                 ['/opt/fork-fleet/fork-fleet-walls/macos: not in the manifest, so the walls refuse to '
+                                  'run: not a plain file of root (a link, folder, FIFO or another owner\'s), so '
+                                  'install leaves it: remove it by hand, then install again'])
+                signal.alarm(0)
+                (os.rmdir if case == 'folder' else os.unlink)(entry)
+                code, _, err = self.install(source=source)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.walls_os().returncode, 0)
+
+    def agent_starts(self):
+        # the calls since clear_calls() that would enable, start or restart the desk agent
+        return [c for c in self.calls() if c.split()[:1] == ['systemctl'] and self.m.AGENT in c.split()
+                and set(c.split()) & {'enable', 'start', 'restart'}]
+
+    def test_a_plain_file_of_another_owner_in_the_walls_folder_is_left(self):
+        """Issue #613 comment 4: install removes only a plain file of root from the walls folder. One of another
+        owner (lstat says so; a test cannot chown) is left, `check` says to remove it by hand, the installed walls
+        refuse to run, and install exits non-zero before the agent is enabled or started. The dispatcher names it
+        the same way (its own uid check). Runs again: the same answer while it is there."""
+        source = self.real_walls('real1')
+        self.assertEqual(self.install(source=source)[0], 0)
+        opt = self.path('/opt/fork-fleet')
+        stray = os.path.join(opt, 'fork-fleet-walls', 'macos')
+        self.write(stray, '#!/bin/sh\n')
+        real_lstat = os.lstat
+
+        def other_owner(path, *a, **k):
+            st = real_lstat(path, *a, **k)
+            if os.fspath(path) != stray:
+                return st
+            f = list(st)[:10]
+            f[4] = st.st_uid + 1
+            return os.stat_result(f)
+        walls = installed_walls(opt)
+        with unittest.mock.patch('os.lstat', other_owner):
+            self.assertEqual([x for x in self.m.installed_problems() if 'macos' in x],
+                             [f'/opt/fork-fleet/fork-fleet-walls/macos: not in the manifest, so the walls refuse to '
+                              'run: not a plain file of root (a link, folder, FIFO or another owner\'s), so install '
+                              'leaves it: remove it by hand, then install again'])
+            with self.assertRaisesRegex(walls.Broken, r'macos is not in .* not a plain file of uid .*remove it by '
+                                                      r'hand'):
+                walls.as_installed()
+            for _ in range(2):   # runs again: the same
+                self.clear_calls()
+                code, out, err = self.install(source=source)
+                self.assertEqual(code, 1, out)
+                self.assertNotIn('removing', out)
+                self.assertIn('the installed walls refuse to run', err)
+                self.assertEqual(self.agent_starts(), [])
+                self.assertTrue(os.path.exists(stray))
+
+    def test_a_walls_file_the_last_release_had_and_this_one_drops_is_named_so(self):
+        """Issue #613 (#597 round 2, nit 4): a walls file of the last release that this one no longer ships is
+        removed and named as the last release's, not as a stopped install's leftover or a backup."""
+        fixture = json.dumps({'fail': {'os': [{}]}})
+        adds = self.real_walls('real2', {'.github/scripts/fork-fleet-walls/macos': '#!/bin/sh\n',
+                                         '.github/scripts/fork-fleet-walls/macos.fixture.json': fixture})
+        self.assertEqual(self.install(sha=SHA2, source=adds)[0], 0)
+        code, out, err = self.install(source=self.real_walls('real1'))
+        self.assertEqual(code, 0, err)
+        self.assertIn('removing /opt/fork-fleet/fork-fleet-walls/macos: in the kit\'s walls folder but not in this '
+                      'release (the last release\'s, which this one drops)', out)
+        self.assertNotIn('left by a stopped install', out)
+        self.assertFalse(os.path.lexists(self.path('/opt/fork-fleet/fork-fleet-walls/macos')))
+        self.assertEqual(self.walls_os().returncode, 0)
 
     def test_project_fleet_config_is_used_and_kept(self):
         project = os.path.join(self.tmp, 'project.json')
@@ -1083,12 +1354,97 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
 
+# A file that is not Python (a fixture): any `LAUNCHER_SHA256 ... =` that is not `==` counts, so a doubt fails loudly.
+PIN = re.compile(r'\bLAUNCHER_SHA256\b[^=\n]*=(?!=)')
+
+
+def sets_pin(text):
+    """True if text sets the launcher's pin (issue #584 item 4, #597 reviews): read as Python, every way to bind the
+    name or an attribute of that name, wherever it stands: plain, annotated, indented, chained (`a = LAUNCHER_SHA256 =
+    ...`), in a tuple or star target, augmented, a walrus, a for or with target, an import as, an attribute
+    (`LINUX.LAUNCHER_SHA256 = ...`), `globals()['LAUNCHER_SHA256'] = ...` or setattr(..., 'LAUNCHER_SHA256', ...).
+    Never a read, a comparison, a comment or a bare annotation. Text that is not Python falls back to PIN."""
+    name = 'LAUNCHER_SHA256'
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return bool(PIN.search(text))
+    bare = {id(n.target) for n in ast.walk(tree) if isinstance(n, ast.AnnAssign) and n.value is None}
+    for n in ast.walk(tree):
+        if id(n) in bare:
+            continue
+        if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store):
+            return True
+        if isinstance(n, ast.Attribute) and n.attr == name and isinstance(n.ctx, ast.Store):
+            return True
+        if (isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store) and isinstance(n.slice, ast.Constant)
+                and n.slice.value == name):
+            return True
+        if isinstance(n, ast.alias) and (n.asname or n.name.rpartition('.')[2]) == name:
+            return True
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == 'setattr' and len(n.args) > 1
+                and isinstance(n.args[1], ast.Constant) and n.args[1].value == name):
+            return True
+    return False
+
+
+def installed_walls(opt):
+    """The repository's real fork-fleet-walls.py as a module, as if installed in opt (its HERE): its as_installed()
+    holds opt's walls files to the MANIFEST.sha256 that desk-install wrote there."""
+    path = os.path.join(REPO, '.github', 'scripts', 'fork-fleet-walls.py')
+    spec = importlib.util.spec_from_file_location('fork_fleet_walls_installed', path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.HERE, m.WALLS = opt, os.path.join(opt, 'fork-fleet-walls')
+    m.LAUNCHER, m.MANIFEST = os.path.join(opt, 'fork-fleet-launch.sh'), os.path.join(opt, 'MANIFEST.sha256')
+    return m
+
+
 class Release(unittest.TestCase):
+    def test_the_kit_ships_every_file_the_launcher_reads_beside_itself(self):
+        # #597 round 2 nit 6: the walls hold LAUNCHER_INPUTS to the manifest; each must be a file the kit installs.
+        self.assertLessEqual(set(installed_walls('/nonexistent').LAUNCHER_INPUTS), set(load().FILES))
+
     def test_every_file_the_kit_installs_is_in_this_repository(self):
         m = load()
         for src in [*m.FILES.values(), *m.UNITS.values(), m.WALLS]:
             self.assertTrue(os.path.exists(os.path.join(REPO, src)), src)
         self.assertTrue(os.listdir(os.path.join(REPO, m.WALLS)))
+
+    def test_the_pin_holder_is_the_one_walls_file_that_pins_the_launcher(self):
+        """Issue #408 item 1: swap() renames PIN_HOLDER last; that only helps while it is the walls file that holds
+        the launcher's pin, and the only one."""
+        m = load()
+        folder = os.path.join(REPO, m.WALLS)
+        pins = [f'fork-fleet-walls/{n}' for n in sorted(os.listdir(folder))
+                if sets_pin(slurp(os.path.join(folder, n)))]
+        self.assertEqual(pins, [m.PIN_HOLDER])
+
+    def test_the_pin_pattern_finds_every_way_to_write_a_pin(self):
+        """Issue #584 item 4 (the #579 lens B nit) and the #597 reviews: a pin written with a type annotation, indented
+        (under an `if`, in a class), chained, in a tuple or on an attribute of another module is still a pin, so a
+        second pin holder cannot slip past the test above; a file that only reads or compares the pin holds none."""
+        for text in ('LAUNCHER_SHA256 = "ab"', 'LAUNCHER_SHA256="ab"', 'LAUNCHER_SHA256: str = "ab"',
+                     'LAUNCHER_SHA256 : Final[str]="ab"', '    LAUNCHER_SHA256 = "ab"', '\tLAUNCHER_SHA256: str = "ab"',
+                     'X = 1\nif True:\n    LAUNCHER_SHA256 = "ab"\n', 'LAUNCHER_SHA256 = (\n    "ab")',
+                     'LINUX.LAUNCHER_SHA256 = "ab"', 'import types\nLINUX = types\nLINUX.LAUNCHER_SHA256 = "ab"',
+                     'a = LAUNCHER_SHA256 = "ab"', 'LAUNCHER_SHA256 = a = "ab"', 'LAUNCHER_SHA256, b = "ab", 1',
+                     '(a, [LAUNCHER_SHA256]) = 1, ["ab"]', '*LAUNCHER_SHA256, = "ab"', 'x = 1; LAUNCHER_SHA256 = "ab"',
+                     'LAUNCHER_SHA256 += "ab"', '(LAUNCHER_SHA256 := "ab")', 'for LAUNCHER_SHA256 in ["ab"]: pass',
+                     'with open(p) as LAUNCHER_SHA256: pass', 'from pins import LAUNCHER_SHA256',
+                     'from pins import X as LAUNCHER_SHA256', 'globals()["LAUNCHER_SHA256"] = "ab"',
+                     'setattr(LINUX, "LAUNCHER_SHA256", "ab")', 'class W:\n    LAUNCHER_SHA256 = "ab"\n',
+                     'self.LAUNCHER_SHA256 = "ab"', '{"x": "LAUNCHER_SHA256 = ab"'):
+            with self.subTest(text):
+                self.assertTrue(sets_pin(text))
+        for text in ('', 'LINUX.LAUNCHER_SHA256', 'x = LINUX.LAUNCHER_SHA256', 'if got != LAUNCHER_SHA256:\n    pass',
+                     'LAUNCHER_SHA256 == got', 'if LAUNCHER_SHA256 == got:\n    pass', 'LAUNCHER_SHA256_OLD = "ab"',
+                     '# LAUNCHER_SHA256 = "ab"', 'OLD_LAUNCHER_SHA256 = "ab"', 'LAUNCHER_SHA256: str',
+                     '"""LAUNCHER_SHA256 = ab, a docstring"""', 'f(LAUNCHER_SHA256="ab")', 'x = {"LAUNCHER_SHA256": 1}',
+                     'x = d["LAUNCHER_SHA256"]', 'del LAUNCHER_SHA256', 'getattr(LINUX, "LAUNCHER_SHA256")',
+                     '{"x": "LAUNCHER_SHA256 == ab"'):
+            with self.subTest(text):
+                self.assertFalse(sets_pin(text))
 
     def test_bootstrap_checks_its_arguments_before_anything(self):
         boot = os.path.join(KIT, 'bootstrap.sh')

@@ -13,49 +13,59 @@ LAUNCHER = os.path.join(KIT, 'fork-fleet-launch.sh')
 LOCAL_FS = {'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'f2fs', 'jfs', 'reiserfs', 'zfs', 'bcachefs', 'nilfs2', 'overlay',
             'tmpfs', 'ramfs', 'rootfs', 'squashfs', 'erofs'}
 PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
-# Files in /etc that hold a password for a share: by name (smbcredentials, *.cred, ...), and the mount tables, whose
-# lines may name one (password=, pass=) or point at a file that does (credentials=, cred=): fstab, autofs maps and
-# systemd's mount and automount units with their drop-ins (Options=; the usual way to mount a share on a systemd host).
-SECRET_NAME = re.compile(r'(.*\.creds?|.*credentials?|\.?smbcred.*)', re.I)
-MOUNT_TABLES = ('/etc/fstab', '/etc/auto.*', '/etc/systemd/system/*.mount', '/etc/systemd/system/*.automount',
-                '/etc/systemd/system/*.mount.d/*.conf', '/etc/systemd/system/*.automount.d/*.conf')
-MOUNT_PASSWORD = re.compile(r'(^|[\s,=])(password|pass)=')
-MOUNT_CRED = re.compile(r'(?:^|[\s,=])(?:credentials|cred)=([^\s,]+)')
-# The files that set every login's or session's variables, and so every job may read (/etc is in its view): bash's,
-# zsh's, csh's and fish's start files, pam_env's (with the locale file it reads) and systemd's environment.d. None of
-# them can be made private: every login reads them. Each line is read for (1) a value shaped like a known token
-# (TOKEN_SHAPE: GitHub, GitLab, Slack, AWS, Google, npm, PyPI, Anthropic, OpenAI, a private key block), commented out
-# or not; (2) a password in a URL (scheme://user:password@, as an https_proxy line has it); (3) every NAME=value on it
-# (after export, declare -x, typeset -x, readonly, export -n, a guard `[ ... ] ||` or `&&`; csh's setenv NAME value;
-# fish's set [-gxU...] NAME value, not set -q/-e/-n/-S, which set nothing; pam_env's NAME DEFAULT=value;
-# ${NAME:=value}) that is a secret by its name and value (secret_assignment). The packages'
-# own login files are in /usr, which jobs see too: fish's vendor_conf.d and systemd's environment.d there. Not covered
-# (no shell is run, no full parser): a value built from parts (A=gh; B=${A}p_x), read from a file at login, an alias
-# or a function that sets one, or a secret with another name and no known shape.
-ENV_FILES = ('/etc/environment', '/etc/environment.d/*.conf', '/etc/security/pam_env.conf', '/etc/default/locale',
-             '/etc/profile', '/etc/profile.d/*', '/etc/bash.bashrc', '/etc/bashrc', '/etc/bash.bash_logout',
-             '/etc/zshenv', '/etc/zprofile', '/etc/zshrc', '/etc/zlogin', '/etc/zlogout', '/etc/zsh/*',
-             '/etc/csh.cshrc', '/etc/csh.login', '/etc/csh.logout', '/etc/fish/config.fish', '/etc/fish/conf.d/*.fish',
-             '/usr/share/fish/vendor_conf.d/*.fish', '/usr/local/share/fish/vendor_conf.d/*.fish',
-             '/usr/lib/environment.d/*.conf', '/usr/local/lib/environment.d/*.conf')
-# Files a service reads its variables from (by EnvironmentFile=, or by its init script): read as ENV_FILES are, but a
-# service reads them as root, so they may be made root's alone.
-SERVICE_FILES = ('/etc/default/*',)
-# Where systemd reads units and its own config from: /etc/systemd (the host's), and the packages' folders, whose units
-# (enabled, started by a timer or by hand: a unit's file is what jobs can read, whatever starts it) name an
-# EnvironmentFile= in /etc and may set a variable themselves. Jobs see /usr too.
-UNIT_DIRS = ('/etc/systemd', '/usr/lib/systemd/system', '/usr/lib/systemd/user', '/lib/systemd/system',
-             '/lib/systemd/user', '/usr/local/lib/systemd/system', '/usr/local/lib/systemd/user')
+# The /etc entries that hold this host's secrets, or are folders of them (mounts: none may be in a job's view, nor a
+# folder that holds one, nor any folder named private under /etc): passwords and keys, sudo's rules, ssh's host keys,
+# TLS private keys, every service's environment (/etc/default, /etc/sysconfig), the login and session files, cron,
+# systemd's units and credentials, the mount tables (a share's password), network and VPN secrets, this kit's own
+# conf, the usual backup and mail tools' folders, and the usual files that name this host's accounts or LAN hosts
+# (passwd, group and hosts, which a job has its own of, their backup copies, subuid/subgid, tcp wrappers' hosts.allow
+# and hosts.deny, networks and ethers; issues #594, #613). A lint of known names (ALLOW_PATHS is a project's explicit
+# choice), not every file a distro or tool may keep: etc_secrets reads what is left. SECRET_ELSEWHERE: the same
+# outside /etc (Debian's /var/backups holds passwd.bak and group.bak, mode 0644; /var/log the login records wtmp,
+# btmp and lastlog and auth.log; libnss-extrausers keeps its passwd in /var/lib/extrausers). A path of these, or a
+# folder of one, at another path (a bind mount or hard link: the same device and inode) is the same (secret_inodes).
+SECRET_ETC = ('/etc/shadow', '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/etc/sudoers', '/etc/sudoers.d',
+              '/etc/ssh', '/etc/ssl/private', '/etc/pki/tls/private', '/etc/pki/CA/private', '/etc/default',
+              '/etc/sysconfig', '/etc/environment', '/etc/environment.d', '/etc/profile', '/etc/profile.d',
+              '/etc/bash.bashrc', '/etc/bashrc', '/etc/zsh', '/etc/fish', '/etc/crontab', '/etc/cron.*',
+              '/etc/anacrontab', '/etc/credstore', '/etc/credstore.encrypted', '/etc/systemd', '/etc/fstab',
+              '/etc/auto.*', '/etc/security', '/etc/fork-fleet', '/etc/NetworkManager/system-connections',
+              '/etc/wpa_supplicant', '/etc/wireguard', '/etc/openvpn', '/etc/ipsec.secrets', '/etc/ipsec.d',
+              '/etc/ppp', '/etc/samba', '/etc/krb5.keytab', '/etc/letsencrypt', '/etc/docker', '/etc/containers',
+              '/etc/apt/auth.conf', '/etc/apt/auth.conf.d', '/etc/restic', '/etc/borgmatic', '/etc/msmtprc',
+              '/etc/netrc', '/etc/.git', '/etc/passwd', '/etc/passwd-', '/etc/group', '/etc/group-', '/etc/hosts',
+              '/etc/subuid', '/etc/subuid-', '/etc/subgid', '/etc/subgid-', '/etc/hosts.allow', '/etc/hosts.deny',
+              '/etc/networks', '/etc/ethers')
+SECRET_ELSEWHERE = ('/var/backups', '/var/log', '/var/lib/extrausers')
+# Those the launcher refuses itself (its never(); a test runs it on each and on every other entry above): only an
+# older launcher binds one, so the fix is to re-run the installer, whose launcher then names where the line is.
+LAUNCHER_REFUSES = ('/etc', '/etc/passwd', '/etc/group', '/etc/hosts', '/etc/passwd-', '/etc/group-', '/etc/subuid',
+                    '/etc/subuid-', '/etc/subgid', '/etc/subgid-', '/etc/hosts.allow', '/etc/hosts.deny',
+                    '/etc/networks', '/etc/ethers', '/var', '/var/log', '/var/log/*', '/var/backups', '/var/backups/*',
+                    '/var/lib', '/var/lib/extrausers', '/var/lib/extrausers/*')
+# What a job can still read that may hold a secret (etc_secrets_wall, issue #243 items 5 and 6), besides every file
+# of its /etc view: the host's own programs and settings in /usr/local (LOCAL_TOPS); the packages' units (UNIT_TOPS)
+# and environment files every login or user session reads (ENV_TOPS: systemd's environment.d, fish's vendor_conf.d);
+# systemd's credential stores in /usr (CREDSTORES: a file there is a secret by what it is, whatever its shape).
+LOCAL_TOPS = ('/usr/local/bin', '/usr/local/sbin', '/usr/local/etc')
+UNIT_TOPS = ('/usr/lib/systemd/system', '/usr/lib/systemd/user', '/lib/systemd/system', '/lib/systemd/user',
+             '/usr/local/lib/systemd/system', '/usr/local/lib/systemd/user')
+ENV_TOPS = ('/usr/lib/environment.d', '/usr/local/lib/environment.d', '/usr/share/fish/vendor_conf.d',
+            '/usr/local/share/fish/vendor_conf.d')
+CREDSTORES = ('/usr/local/lib/credstore', '/usr/lib/credstore')
 UNIT_FILE = re.compile(r'.*\.(service|socket|mount|automount|swap|timer|path|target|slice|scope|conf)')
 UNIT_ENV = ('Environment', 'DefaultEnvironment', 'ManagerEnvironment')
+# A secret's file by its name: a share's credentials (smbcredentials, *.cred), a private key or keystore, a netrc or
+# pgpass. Not one that plainly holds only public keys and certificates (public_only).
+SECRET_FILE = re.compile(r'.*\.creds?|.*credentials?|\.?smbcred.*|.*\.(?:key|p12|pfx|keytab)|'
+                         r'id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?|\.?netrc|\.?pgpass', re.I)
 # A secret's name (secret_kind), in any case, its words split on _: a word that holds SECRET, PASSW (password, passwd),
 # PASSPHRASE, CREDENTIAL, APIKEY or PRIVATEKEY (DJANGO_SECRETKEY, DBPASSWORD), ends in TOKEN or TOKENS (GH_TOKEN,
 # github_token; not TOKENIZERS_PARALLELISM), or is KEY(S), PASS, PAT or PW (OPENAI_API_KEY, api_key, db_pass, GH_PAT);
 # and no word after it that says the value is about the secret, not the secret (ABOUT: TOKEN_TTL, PASSWORD_MIN_LENGTH,
-# AWS_ACCESS_KEY_ID). Two of those words still say where the secret is, and the value is read as that: a file
-# (FILE_WORDS: DB_PASSWORD_FILE) others can read holds it, and a command (COMMAND_WORDS: RESTIC_PASSWORD_COMMAND)
-# may print it (an echo or printf of literal text) or hold it (--password=..., NAME=...). The value decides the rest
-# (secret_value).
+# AWS_ACCESS_KEY_ID). Two of those words still say where the secret is: a file (FILE_WORDS: DB_PASSWORD_FILE), read
+# as path_secret reads it, and a command (COMMAND_WORDS: RESTIC_PASSWORD_COMMAND), which fails closed (the walls run
+# no command). The value decides the rest (setting_secret).
 SECRET_WORD = re.compile(r'.*(SECRET|PASSW|PASSPHRASE|CREDENTIAL|APIKEY|PRIVATEKEY).*|.*TOKENS?|KEYS?|PASS|PAT|PW',
                          re.I)
 ABOUT = {'FILE', 'FILES', 'PATH', 'DIR', 'DIRECTORY', 'COMMAND', 'CMD', 'HELPER', 'PROMPT', 'TTL', 'LIFETIME',
@@ -85,55 +95,14 @@ SSH_PUBLIC = re.compile(r'(?:' + SSH_HOSTS + r')?((?:ssh-(?:ed25519|rsa|dss)|ecd
                         r'([A-Za-z0-9+/]+={0,2})((?:\s+[A-Za-z0-9._@+:-]+){0,4})')
 SSH_COMMENT = 64   # characters at most
 PUBLIC_MAX = 1 << 20   # a file larger than this is not read as public
-# A *_COMMAND's value, read as a command (command_secret): what a shell runs (SHELLS -c ...) is read again; the words
-# of WRAPPERS before a program are not it; a file an INTERPRETERS runs is its program, not its input; a file of LOCKED
-# needs a key to be read. A script in the command's own words (INLINE: python -c, perl -e, node -p, ...; awk and sed
-# take their script so) may read a file whose path it builds from parts: it gives a secret, as main before #213 had
-# every literal command (issue #226).
+# A shell script, by its #! (a_script): a shell's name, alone or after env.
 SHELLS = re.compile(r'(?:ba|da|z|k|mk|a)?sh')
-WRAPPERS = {'env', 'exec', 'command', 'nice', 'nohup'}
-INTERPRETERS = re.compile(r'(?:python|perl|ruby|node|php|lua|tclsh|(?:ba|da|z|k|mk|a)?sh)[\d.]*')
-INLINE = {'python': 'c', 'pypy': 'c', 'perl': 'eEM', 'ruby': 'e', 'node': 'ep', 'nodejs': 'ep', 'bun': 'ep',
-          'php': 'rRBEF', 'lua': 'e', 'Rscript': 'e', 'julia': 'e', 'expect': 'c'}
-INLINE_LONG = ('--eval', '--print', '--command', '--expression', '--source', '--exec')
-SCRIPTED = re.compile(r'g?awk|mawk|nawk|g?sed')
-# Where a path starts in a word of a command (word_paths): at a / that is not inside a relative path (backup/etc,
-# ../etc), so at the word's start, or after an option's letter (-p/etc/pw), an = (--file=/etc/pw), an @ (curl -d
-# @/etc/pw) or any other character a path has not. It ends at the word's end, or at any character of NOT_PLAIN_PATH
-# (\w is Unicode's: /etc/restic/pässwort), which a file's name may hold or not (/etc/restic/pass,word; /etc/pw,ro):
-# each end is read.
-PATH_START = re.compile(r'(?<![\w.+-])/')
-NOT_PLAIN_PATH = re.compile(r'[^\w.@+/-]')
-# What a word of a command may hold, all of it (an allow list, PR #240 round 3): letters and digits (any script's),
-# . / @ + : = , % ^ # ! ~ _ - and a blank, tab or line end (from quotes). Anything else means its file is not known
-# until a shell or systemd reads it: a variable or a command's output ($f, ${IFS}, $(...), `...`), a glob (* ? [), a
-# brace, a backslash (an escape: systemd reads \x77 and \s in a unit), a control character, U+FFFD (bytes that are no
-# UTF-8), any other sign. So does a tilde at a word's start or after = or : (HOME_TILDE: ~backup/pw, ~/pw: a service
-# user's home may be outside /home, where jobs see it). Such a word fails closed (Unsure). But a LOCKED file in the
-# home of who runs it (~/restic.gpg) needs a key all the same.
-PLAIN_WORD = re.compile(r'[\w./@+:=,%^#!~ \t\n-]*')
-HOME_TILDE = re.compile(r'(?:^|[=:])~')
-# But in a unit's command (only there can it be set) the folder of the unit's own credentials, which no job sees:
-# $CREDENTIALS_DIRECTORY and its specifier %d. One plain name in it (OWN_FILE, the advice's own form: cat
-# ${CREDENTIALS_DIRECTORY}/restic) is the unit's own credential: no file of this host. Any other use may be empty (a
-# unit with no credentials; a job that runs the command), so the rest of the word is read as a path from / (cat
-# $CREDENTIALS_DIRECTORY/etc/restic/pw reads /etc/restic/pw), and a .. in it fails closed (word_paths).
-_OWN = r'(?:\$(?:CREDENTIALS_DIRECTORY(?!\w)|\{CREDENTIALS_DIRECTORY\})|%d)'
-OWN_CREDENTIALS = re.compile(r'\$(?:CREDENTIALS_DIRECTORY(?!\w)|\{CREDENTIALS_DIRECTORY\})|%[%d]')
-OWN_FILE = re.compile(r'(^|=)' + _OWN + r'/(?!\.\.?$)[\w.@+-]+$')
-# Programs and options that change the folder a command runs in (cd /etc/restic && cat pw, env -C /etc/restic cat
-# pw): its relative words are then read from a folder the walls do not follow; it fails closed.
-CHDIR = {'cd', 'pushd', 'popd', 'chroot'}
-ENV_CHDIR = re.compile(r'-[^-]*C.*|--c.*')   # env -C, -iC, --chdir and its short forms (--ch)
-# A python run as `python -m module` (joined too: -mbase64) has no script: its first word is the module's input.
-PY_MODULE = re.compile(r'-[A-Za-z]*m.*')
-LOCKED = ('.gpg', '.age')
 TOKEN_SHAPE = re.compile(r'(?<![A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|'
                          r'glpat-[A-Za-z0-9_-]{20,}|xox[abeprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|'
                          r'AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{40,}|'
                          r'sk-(?:ant|proj)-[A-Za-z0-9_-]{20,})|-----BEGIN [A-Z ]*PRIVATE KEY-----')
 TOKEN_BYTES = re.compile(TOKEN_SHAPE.pattern.encode())
-SHAPE_MAX = 16 << 20   # a file of /etc larger than this is read for no token's shape (a database, a cache)
+SHAPE_MAX = 16 << 20   # a file larger than this is read for its name alone (a database, a cache, a program)
 URL_PASSWORD = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@\'"]*:(?![$`])[^/\s@\'"]+@')
 # Where a NAME= or setenv starts: the line's start or after a blank, ; & | ( { or ! (a guard, a subshell, a group).
 _AT = r'(?:^|(?<=[\s;&|({!]))'
@@ -145,41 +114,24 @@ FISH_ASKS = re.compile(r'-[A-Za-z]*[eqnS][A-Za-z]*|--(erase|query|names|show)') 
 PAM_ENV = re.compile(r'^\s*([A-Za-z_]\w*)\s+(?:DEFAULT|OVERRIDE)=' + _VALUE)
 DEFAULT = re.compile(r'\$\{[A-Za-z_]\w*:?[-=](.*)\}')
 SET_DEFAULT = re.compile(r'\$\{([A-Za-z_]\w*):?=([^}]*)\}')   # ${NAME:=value} sets NAME
-# A value that is no secret only when it truly is what it looks like (secret_value): a path that is there and that
-# others cannot read (one that is not there may be a password that starts with /; one others can read holds the
-# secret); a path in a home folder (~/..., which no job sees: ProtectHome=); in a unit only (systemd expands it there,
-# nowhere else) a specifier systemd knows (%d/db: $CREDENTIALS_DIRECTORY/db; %h/...); a yes/no, or 0 or 1. Any other
-# number may be a PIN: a name that means a count, a time or a length says so (ABOUT).
+# A value that is no secret only when it truly is what it looks like (setting_secret): a path that is there and that
+# no job can read (one that is not there may be a password that starts with /); a path in a home folder (~/..., which
+# no job sees: ProtectHome=); in a unit only (systemd expands it there, nowhere else) a specifier systemd knows (%d/db:
+# $CREDENTIALS_DIRECTORY/db; %h/...); a yes/no, or 0 or 1. Any other number may be a PIN: a name that means a count,
+# a time or a length says so (ABOUT).
 A_PATH = re.compile(r'(/[A-Za-z0-9._@+-]+)+/?')
 HOME_PATH = re.compile(r'~(/[A-Za-z0-9._@+-]+)+/?')
 A_SPECIFIER = re.compile(r'%[aAbBCdDEfgGhHiIjJlLmMnNopPqsStTuUvVwWyY](/[A-Za-z0-9._@+-]*)*')
 NOT_SECRET = {'true', 'false', 'yes', 'no', 'on', 'off', '0', '1'}
-# Where systemd looks for a credential by name (LoadCredential=NAME, ImportCredential=): a file there is a secret by
-# what it is, whatever its shape. The .encrypted ones need this host's own key (root's) or its TPM.
-CREDSTORES = ('/etc/credstore', '/run/credstore', '/usr/local/lib/credstore', '/usr/lib/credstore')
-# What to do about a secret, by the kind of file it is in (kind_of).
-ADVICE = {
-    'login': 'move it out: every login reads this file, so it cannot be made private',
-    'unit': 'move it into a file only root reads (a 0600 EnvironmentFile= or LoadCredential=)',
-    'mount': 'move it into a credentials= file only root reads (0600)',
-    'file': 'make the file readable by root alone (0600), or move it out',
-    'unsure': 'the walls cannot tell what it reads, so it fails closed: write it plainly (an absolute path of plain '
-              'names; no variable, glob, escape, cd or inline script)',
-}
-
-
 class Unsure(ValueError):
     """A value the walls cannot read for sure (a form they do not parse): it fails closed, with this reason, on the
     line that has it (PR #240 round 3: an allow list of plain forms, not a list of bad ones)."""
 
 
-# The specifiers systemd expands in a unit's path (systemd.unit(5), the system manager's), by what they give
-# (unit_paths): FIXED_SPECIFIERS one folder; ONE_NAME one name, never a / (an escaped unit name, an id, a host name, a
-# version; . or .. too: an instance may be either); %y and %Y the unit's own file and folder. Any other (%h, %s: a
-# home and a shell; %I %P %J %f: unescaped, with a / in it; %q: free text) may hold anything: Unsure.
+# The specifiers systemd expands to one fixed folder (systemd.unit(5), the system manager's): a unit's path that
+# starts with one is read from there (fixed_part); any other may hold anything.
 FIXED_SPECIFIERS = {'C': '/var/cache', 'D': '/usr/share', 'E': '/etc', 'L': '/var/log', 'S': '/var/lib', 't': '/run',
                     'T': '/tmp', 'V': '/var/tmp'}
-ONE_NAME = set('aAbBgGHijlmMnNopuUvwW')
 # Where systemd's manager reads a unit's drop-ins (systemd.unit(5): its unit search path, highest first; /lib for a
 # host whose /usr is not merged), and the drop-in folders of those that apply to a job's unit, fork-fleet-<name>.service
 # (fork-fleet-check-net too): service.d (every service), the prefix ones (fork-.service.d, fork-fleet-.service.d,
@@ -219,7 +171,7 @@ JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutA
 # The sha256 of the launcher (fork-fleet-launch.sh) these walls ship with, whose start() gives every job unit its own
 # stop timeouts (launcher_shipped). The kit's one pin: fork-fleet-walls/wsl2 reads it from here (issue #365 item 2).
 # A changed launcher must change it (fork-fleet-walls.test.py checks it against the launcher in the repo).
-LAUNCHER_SHA256 = 'f49311e147bfbd9d1cd36749b8d898dd42cd959fe95ac8212767b8532d5be61a'
+LAUNCHER_SHA256 = '9cab798d9521608a251952336777e73dc3a72606049a45d3dcb22646fe0b5e96'
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
 UNIT_BLANKS = ' \t\n\r'
@@ -386,6 +338,77 @@ def on_local_disk(table, p):
     return max(reversed(held), key=lambda m: len(m[0])) if held else ('', 'nothing')
 
 
+def but_resolv(view):
+    """The view but its last line when that is the launcher's own resolv.conf for jobs (`paths` prints it last), kept
+    in /etc/fork-fleet by default: no other file there (its conf) and no RESOLV_CONF the owner set elsewhere
+    is let off."""
+    return view[:-1] if view and list(view[-1]) == ['/etc/resolv.conf', '/etc/fork-fleet/resolv.conf'] else view
+
+
+def secret_etc(p):
+    """Whether p is an /etc entry of SECRET_ETC, is in one, or is a folder that holds one; or has a folder named
+    private in it (ssl/private and the like, wherever a tool keeps one). Outside /etc: whether p is a path of
+    SECRET_ELSEWHERE, in one, or a folder that holds one (/var)."""
+    if not p.startswith('/etc/'):
+        return any(p == s or p.startswith(s + '/') or s.startswith(p.rstrip('/') + '/') for s in SECRET_ELSEWHERE)
+    return 'private' in p.split('/') or any(
+        fnmatch.fnmatchcase(p, s) or fnmatch.fnmatchcase(p, s + '/*') or s.startswith(p + '/') for s in SECRET_ETC)
+
+
+def secret_inodes():
+    """{(device, inode): what} of each SECRET_ETC and SECRET_ELSEWHERE entry this host has ('the secret path'), and of
+    each folder above one ('a folder that holds the secret path', '/' too): a bind mount or hard link of one at
+    another path is the same device and inode (issue #613 item 7). One that is not there is skipped; one that cannot be
+    read: cannot tell (ValueError)."""
+    entries, holders = {}, {}
+    for pattern in SECRET_ETC + SECRET_ELSEWHERE:
+        for path in sorted(glob.glob(glob.escape(ROOT) + pattern)):
+            rel = path[len(ROOT):]
+            st = stat_or_none(rel)
+            if st is None:
+                continue
+            entries.setdefault((st.st_dev, st.st_ino), rel)
+            folder = rel
+            while folder != '/':
+                folder = os.path.dirname(folder)
+                st = stat_or_none(folder)
+                if st is not None:
+                    holders.setdefault((st.st_dev, st.st_ino), f'{folder}, a folder that holds {rel}')
+    return {**holders, **entries}   # an entry that also holds one is named as the entry
+
+
+def stat_or_none(path):
+    """os.stat of a path under ROOT, links followed: None when it is not there; any other error: cannot tell."""
+    try:
+        return os.stat(ROOT + path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        raise ValueError(f'cannot read {path} ({e.strerror})') from None
+
+
+def same_as_secret(real, inodes):
+    """What secret path real is by device and inode, or is inside (a folder above it is a secret entry itself, not
+    one that only holds one): None when neither. A single file inside a secret folder, bind-mounted or hard-linked on
+    its own elsewhere, is not found: the walls do not read every file of every secret folder (.github/fork-fleet.md)."""
+    st = stat_or_none(real)
+    if st is not None and (st.st_dev, st.st_ino) in inodes:
+        return inodes[(st.st_dev, st.st_ino)]
+    folder = real
+    while folder != '/':
+        folder = os.path.dirname(folder)
+        st = stat_or_none(folder)
+        what = inodes.get((st.st_dev, st.st_ino), '') if st is not None else ''
+        if what and ', a folder that holds ' not in what:
+            return f'{what}, a folder that holds it'
+    return None
+
+
+def launcher_refuses(p):
+    """Whether today's launcher refuses p itself (LAUNCHER_REFUSES)."""
+    return any(fnmatch.fnmatchcase(p, s) for s in LAUNCHER_REFUSES)
+
+
 def mounts_wall():
     """Every mount of this host but those that hold a path jobs see stays out of their units (an allow list, each path
     without its submounts): those few must be this host's own disks. A share, a data disk mounted anywhere (/srv,
@@ -399,6 +422,28 @@ def mounts_wall():
     if whole:
         return (f'jobs see all of /etc ({", ".join(whole[:3])}): an older kit\'s list; re-run the installer, whose '
                 'list names only the /etc entries builds need')
+    # Issue #370 item 1: nor an /etc entry that holds secrets, or a folder of one (ALLOW_PATHS=/etc/shadow, /etc/ssl);
+    # issue #594: nor one that names this host's accounts (/etc/passwd-, /etc/subuid, /var/backups).
+    # Issue #613 item 3: the way out names where the line is. One the launcher refuses itself: an older launcher's
+    # (re-run the installer); any other: the owner's ALLOW_PATHS or JOB_PATHS file (the installer's list has none).
+    named = [(dest, real) for dest, real in but_resolv(view) if secret_etc(dest) or secret_etc(real)]
+    secret = sorted({dest if dest == real else f'{dest} (that is {real})' for dest, real in named})
+    if secret:
+        older = any(launcher_refuses(dest) or launcher_refuses(real) for dest, real in named)
+        fix = ('bound by an older launcher, which does not refuse it itself: re-run the installer (its launcher then '
+               'refuses it and names where the line is)' if older else
+               'take it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names (the '
+               'installer\'s own list never has one), and allow only the files a build needs')
+        return (f'jobs see {", ".join(secret[:3])}: a path that holds this host\'s secrets or account names, or a '
+                f'folder of one; {fix}')
+    # Issue #613 item 7: nor one of those at another path (a bind mount, a hard link): the same device and inode.
+    inodes = secret_inodes()
+    same = sorted({f'{dest} (the same as {what})' for dest, real in but_resolv(view)
+                   for what in [same_as_secret(real, inodes)] if what})
+    if same:
+        return (f'jobs see {", ".join(same[:3])}: a bind mount or hard link of a path that holds this host\'s secrets '
+                'or account names; take it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names, and '
+                'allow only the files a build needs')
     for _, real in view:
         point, kind = on_local_disk(table, real)
         if kind not in LOCAL_FS:
@@ -554,7 +599,9 @@ def launcher_shipped():
     """Raises unless the installed launcher is the one these walls ship with, byte for byte (LAUNCHER_SHA256), read
     on one open file (O_NOFOLLOW; a FIFO does not block) that is as safe as launcher_safe wants it. Its start() gives
     every job unit -p TimeoutStopSec=90 -p TimeoutAbortSec=90 (fork-fleet.test.py's test_start runs it), so with it
-    systemd's defaults decide no job unit's stop timeouts. No reading of bash can tell what another launcher's
+    systemd's defaults decide no job unit's stop timeouts; and it then reads what systemd really applies (systemctl
+    show: drop-ins and defaults included) and kills a unit whose stop timeouts are over STOP_MAX, or cannot be read
+    (issue #365 item 1; the same STOP_MAX, a test keeps them one). No reading of bash can tell what another launcher's
     systemd-run gets (issue #316), so any other launcher, an older one too (a kit not installed whole): cannot tell."""
     fd = os.open(LAUNCHER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
     with os.fdopen(fd, 'rb') as f:
@@ -644,31 +691,6 @@ def real(path):
     return done or '/'
 
 
-def others_read(path, last=0o004):
-    """Whether a user with no claim on path (a job's runner user) can read it (last=0o001: enter the folder): every
-    folder above it searchable by others, and it readable by others. The folders above its real path (real) decide: a
-    link in a folder only root enters (/etc/restic/pw) to a file others reach another way (/etc/restic-real/pw) is
-    read through that other way (PR #240 round 3)."""
-    path = real(path)
-    if path is None:
-        return False
-    try:
-        parts = path.strip('/').split('/')
-        for i in range(len(parts)):
-            mode = os.stat(ROOT + '/' + '/'.join(parts[:i + 1])).st_mode
-            if not mode & (last if i == len(parts) - 1 else 0o001):
-                return False
-    except OSError:
-        return False
-    return True
-
-
-def readable(patterns):
-    """The files (no folders) these globs find under ROOT that others can read, sorted, each once."""
-    return sorted({p[len(ROOT):] for t in patterns for p in glob.glob(glob.escape(ROOT) + t)
-                   if os.path.isfile(p) and others_read(p[len(ROOT):])})
-
-
 def secret_kind(name):
     """What a variable's name says it holds: '' no secret (no word of it SECRET_WORD); 'value' a secret; 'file' a
     file that holds one, 'command' a command that gives one (only FILE_WORDS, or only COMMAND_WORDS, after the secret
@@ -694,243 +716,6 @@ def unquote(value):
         value = value[1:-1]
     m = DEFAULT.fullmatch(value)
     return unquote(m.group(1)) if m else value
-
-
-def secret_value(value, unit=False):
-    """Whether a value is a secret of its own: not empty, not a command ($(...), `...`, fish's (...)), not another
-    variable ($X, ${X}), not an array, and none of the shapes that are no secret only when they truly are that kind
-    (A_PATH's comment). unit: the value is a unit's (Environment=), where systemd expands a specifier."""
-    value = unquote(value)
-    if not value or value.startswith(('$', '`', '(')) or value.lower() in NOT_SECRET or HOME_PATH.fullmatch(value):
-        return False
-    if unit and A_SPECIFIER.fullmatch(value):
-        return False
-    if A_PATH.fullmatch(value) and os.path.exists(ROOT + value):
-        return bool(exposed(value))
-    return True
-
-
-def file_exposed(value, unit=False):
-    """Whether a *_FILE value names a file (a folder: a file in it) that is here and others can read: in a unit, its
-    specifiers read as unit_paths reads them (%d, the unit's own credentials, is none of this host's files); any name
-    in it, odd characters too (/etc/restic/pass,word); a relative one as word_paths reads it (from /, and in a unit
-    from its WorkingDirectory=). One with a .. in it may lead anywhere (%d/../../etc/pw), and one with U+FFFD in it
-    names bytes that are no UTF-8: Unsure."""
-    value = unquote(value)
-    if '..' in value.split('/'):
-        raise Unsure(f'{value[:60]!r} has a .. in it')
-    if '�' in value:
-        raise Unsure(f'{value[:60]!r} is not valid UTF-8')
-    if unit and '%' in value:
-        return not OWN_FILE.match(value) and not value.startswith('%d/') and any(
-            exposed(p) for p in unit_paths(value if value.startswith(('/', '%')) else '/' + value, unit))
-    if value.startswith('/'):
-        return bool(exposed(value))
-    if not value or value.startswith(('$', '`', '(', '~')):   # a variable, a command (secret_value), a home
-        return False
-    return any(exposed(p) for p in word_paths(value, unit))
-
-
-def literal(word):
-    """Whether a word of a command is text of its own: not a variable, a command or an option, nor printf's %s."""
-    return (not word.startswith(('$', '`', '-'))
-            and re.sub(r'%[-#0 +]*\d*(?:\.\d+)?[A-Za-z%]|\\.', '', word).strip() != '')
-
-
-def command_secret(value, unit=False, depth=0):
-    """Whether a *_COMMAND value gives a secret to whoever runs it, as a job could: it holds the secret as text, or
-    reads it from a file others can read. Each simple command of it (split at ; & | and brackets) is read: a secret's
-    NAME=value or --option=value (--password hunter2); an echo or printf of literal text, and a here-string of it
-    (<<<text); any file others can read that it names (an argument, an option's value or a redirect's: sed -n 1p
-    /etc/pw, --password-file=/etc/pw, cat</etc/pw) but its program (INTERPRETERS' script too; not python's -m module)
-    and a LOCKED file, each path in a word as word_paths reads it ("/etc/restic/my pw", etc/restic/pw from /); and
-    what a shell runs (sh -c '...'), or any word with a blank in it (eval '...', su -c '...'), read again. unit: the
-    unit's context (unit_context), for a command in its Environment=. What the walls cannot read for sure raises
-    Unsure (it fails closed; PR #240 round 3): a word that is not all PLAIN_WORD (in a unit, OWN_CREDENTIALS is none
-    of it), a path with .. in it, a here-document, a script in its words (INLINE, SCRIPTED), a change of folder
-    (CHDIR, env -C), a value it cannot split, or one nested deeper than 4."""
-    value = unquote(value)
-    if depth > 4:
-        raise Unsure('commands nested deeper than 4')
-    try:
-        lex = shlex.shlex(value, posix=True, punctuation_chars=';&|()<>')
-        lex.whitespace_split = True
-        lex.commenters = ''   # a # inside a word is no comment to a shell (cat /x#y); a real one is read too
-        words = list(lex)
-    except ValueError:
-        raise Unsure('its quotes do not close') from None
-    if unit:   # the unit's own credentials: one name in them is none of this host's files (OWN_FILE)
-        words = [OWN_CREDENTIALS.sub(lambda m: '%%' if m[0] == '%%' else '', OWN_FILE.sub(r'\1', w)) for w in words]
-    for w in words:
-        bare = w[1:] if w.startswith('~/') and w.endswith(LOCKED) else w
-        if bare.strip(';&|()<>') and (not PLAIN_WORD.fullmatch(bare) or HOME_TILDE.search(bare)):   # not < && ...
-            raise Unsure(f'{w[:40]!r} is not plain text (a variable, glob, brace, escape, ~ or other sign)')
-    commands = [[]]
-    for w in words:
-        if w and not w.strip(';&|()'):
-            commands.append([])
-        else:
-            commands[-1].append(w)
-    return any(simple_secret(c, unit, depth) for c in commands if c)
-
-
-def simple_secret(words, unit, depth):
-    """command_secret of one simple command: [word]."""
-    for i, word in enumerate(words):
-        name, eq, v = word.partition('=')
-        if eq and re.fullmatch(r'[A-Za-z_]\w*', name) and secret_assignment(name, v, unit):
-            return True
-        if word.startswith('--'):
-            name, eq, v = word[2:].partition('=')
-            if secret_kind(name.replace('-', '_')) == 'value' and secret_value(
-                    v if eq else (words[i + 1] if i + 1 < len(words) else ''), unit):
-                return True
-        if word.startswith('<<') and word != '<<<':
-            raise Unsure('a here-document')
-        if word == '<<<' and (i + 1 == len(words) or literal(words[i + 1])):
-            return True
-        if i and re.search(r'\s', word) and command_secret(word, unit, depth + 1):
-            return True
-        prog, rest = os.path.basename(word), words[i + 1:]
-        if SHELLS.fullmatch(prog):
-            script = next((rest[k + 1] for k, w in enumerate(rest[:-1]) if re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', w)),
-                          None)
-            if script is not None and not re.search(r'\s', script) and command_secret(script, unit, depth + 1):
-                return True
-        elif inline_script(prog, rest):
-            raise Unsure(f'{prog} runs a script given in its words')
-        elif prog in ('echo', 'printf') and any(literal(w) for w in rest):
-            return True
-    while words and (re.fullmatch(r'[A-Za-z_]\w*=.*', words[0]) or os.path.basename(words[0]) in WRAPPERS):
-        wrapper, words = os.path.basename(words[0]), words[1:]
-        while words and words[0].startswith('-'):   # the wrapper's options (env -i, nice -n 5: the 5 is no program)
-            if wrapper == 'env' and ENV_CHDIR.fullmatch(words[0]):
-                raise Unsure('env -C changes its folder')
-            words = words[1 + (words[0] in ('-n', '-u', '-a')):]
-    if not words:
-        return False
-    prog, args = os.path.basename(words[0]), words[1:]
-    if prog in CHDIR:
-        raise Unsure(f'{prog} changes its folder')
-    if INTERPRETERS.fullmatch(prog):   # its script is its program: the words before it and it are not its input
-        first = next((i for i, w in enumerate(args) if not w.startswith('-')), len(args))
-        if not (prog.startswith('python') and any(PY_MODULE.fullmatch(w) for w in args[:first])):
-            args = args[first + 1:]
-    return any(not p.endswith(LOCKED) and exposed(p) for w in args for p in word_paths(w, unit))
-
-
-def word_paths(word, unit=False):
-    """The files a word of a command (or a *_FILE value) may name (simple_secret): each path in it from where it
-    starts (PATH_START; in a -word also after its letters: curl -sK/etc/pw) to the word's end, and to each character
-    of NOT_PLAIN_PATH before that. A relative one (the word, what follows an = : or @ in it, or a -word's letters:
-    -Fetc/pw) read from where it is run: one with a / from / (etc/restic/pw: /etc/restic/pw; pass show
-    backup/restic: /backup/restic, not there), and in a unit from each folder its WorkingDirectory= may be
-    (unit_context: cat pw in /etc/restic), bare names too. In a unit, its specifiers as unit_paths reads them. A
-    path with .. in it, which leads anywhere from where it is run (../../etc/pw, x/../etc/pw), or a relative one in
-    a unit whose WorkingDirectory= the walls cannot read (~): Unsure."""
-    cwds = unit['cwds'] if unit else []
-    texts = [('', word[m.start():]) for m in PATH_START.finditer(word)]
-    rel = [word[i + 1:] for i, c in enumerate(word) if c in '=:@']
-    letters = re.match(r'-[A-Za-z0-9]+', word) if not word.startswith('--') else None
-    if letters:   # each place a short option's value may start: -sK/etc/pw, -Fetc/pw
-        rel += [word[i:] for i in range(2, letters.end() + 1)]
-    else:
-        rel.append(word)
-    for r in rel:
-        if not r or r.startswith('/'):
-            texts += [('', r)] if r else []
-            continue
-        if cwds is None:
-            raise Unsure(f'{word[:40]!r} is relative, and WorkingDirectory= is a folder the walls cannot read')
-        bases = (['/'] if '/' in r else []) + cwds
-        texts += [(b.rstrip('/') + '/', r) for b in bases]
-    out = set()
-    for base, t in texts:
-        for end in [m.start() for m in NOT_PLAIN_PATH.finditer(t)] + [len(t)]:
-            p = base + t[:end]
-            if '..' in p.split('/'):
-                raise Unsure(f'{word[:40]!r} has a .. in a path')
-            if p.strip('/'):
-                out.update(unit_paths(p, unit) if unit and '%' in p else [p])
-    return sorted(out)
-
-
-def inline_script(prog, args):
-    """Whether a program (a word of a command, args the words after it) runs a script given in those words: awk or
-    sed (SCRIPTED), or an interpreter with an option of INLINE (perl -ne, node --eval) before its script's file (the
-    first word that is a file here; an option's value may come before it)."""
-    if SCRIPTED.fullmatch(prog):
-        return True
-    flags = INLINE.get(re.sub(r'[\d.]+$', '', prog))
-    for w in args if flags else ():
-        if w.startswith('--') and w.partition('=')[0] in INLINE_LONG or re.fullmatch(f'-[^-]*[{flags}].*', w):
-            return True
-        if A_PATH.fullmatch(w) and os.path.isfile(ROOT + w):
-            return False
-    return False
-
-
-def secret_assignment(name, value, unit=False):
-    """Whether NAME=value sets a secret jobs can read: by the name's kind (secret_kind), its value read as that."""
-    kind = secret_kind(name)
-    if kind == 'value':
-        return secret_value(value, unit)
-    if kind == 'file':
-        return file_exposed(value, unit)
-    if kind == 'command':
-        return command_secret(value, unit)
-    return False
-
-
-def kind_of(path):
-    """What a file is to this host, for ADVICE: one every login reads, a unit, a mount table, or a file of its own."""
-    def under(globs):
-        return any(fnmatch.fnmatchcase(path, g) for g in globs)
-    if under(ENV_FILES):
-        return 'login'
-    if under(MOUNT_TABLES):
-        return 'mount'
-    if any(path.startswith(d + '/') for d in UNIT_DIRS):
-        return 'unit'
-    return 'file'
-
-
-def shaped(path, n, line):
-    """A known token's shape anywhere on the line (a comment too: the file still holds it), or a URL's password."""
-    out = []
-    if TOKEN_SHAPE.search(line):
-        out.append(f'{path} line {n} (a token)')
-    if not line.lstrip().startswith(('#', ';')) and URL_PASSWORD.search(line):
-        out.append(f'{path} line {n} (a password in a URL)')
-    return out
-
-
-def env_secrets(path, seen):
-    """What a login, session or service environment file (ENV_FILES, SERVICE_FILES, or a unit's EnvironmentFile=)
-    holds that is a secret, or that the walls cannot read for sure (Unsure): [(where, path[, advice])]."""
-    if path in seen:
-        return []
-    seen.add(path)
-    out = []
-    for n, line in enumerate((read(path) or '').splitlines(), 1):
-        out += shaped(path, n, line)
-        if line.lstrip().startswith('#'):
-            continue
-        sets = [m.groups() for r in (ASSIGN, PAM_ENV, SET_DEFAULT) for m in r.finditer(line)]
-        sets += [m.groups() for m in SETENV.finditer(line) if not m.group(2).startswith('#')]   # `#`: a comment
-        sets += [m.groups()[1:] for m in FISH_SET.finditer(line)
-                 if not m.group(3).startswith('#') and not any(FISH_ASKS.fullmatch(f) for f in m.group(1).split())]
-        names, unsure = set(), {}
-        for name, value in sets:
-            try:
-                if secret_assignment(name, value):
-                    names.add(name)
-            except Unsure as e:
-                unsure.setdefault(name, str(e))
-        out += [f'{path} line {n} ({name})' for name in sorted(names)]
-        out += [(f'{path} line {n} ({name}: {why})', path, ADVICE['unsure']) for name, why in sorted(unsure.items())
-                if name not in names]
-    return [where if isinstance(where, tuple) else (where, path) for where in out]
 
 
 def unit_lines(text, section=None):
@@ -970,18 +755,6 @@ def unit_lines(text, section=None):
     if buf is not None:
         keep(buf)
     return out
-
-
-def files_in(path):
-    """path if it is a file others can read; if a folder, each such file in it."""
-    full = ROOT + path
-    if os.path.isdir(full):
-        try:
-            return [p for p in (path.rstrip('/') + '/' + f for f in sorted(os.listdir(full)))
-                    if os.path.isfile(ROOT + p) and others_read(p)]
-        except OSError:
-            return []
-    return [path] if os.path.isfile(full) and others_read(path) else []
 
 
 def public_only(path):
@@ -1103,118 +876,127 @@ def ssh_public(line):
     return blob[4:4 + size] == m[1].encode() and len(blob) > 4 + size
 
 
-def exposed(path):
-    """files_in(path) that may hold a secret: those not public_only."""
-    return [f for f in files_in(path) if not public_only(f)]
+def may(full, st, bit):
+    """Whether a job's runner user may have bit (4 read, 1 enter) on the file or folder full, of mode st: the others
+    have it; or the group has it and that group is not root's (the runner may be in it), or an ACL is set (with one, the
+    group bits are its mask: some user or group it names may have it). Not the owner's bits: a runner user owns no file
+    of /etc or /usr (the installer makes it with none)."""
+    if st.st_mode & bit:
+        return True
+    if not st.st_mode & (bit << 3):
+        return False
+    if st.st_gid != 0:
+        return True
+    try:
+        os.getxattr(full, 'system.posix_acl_access', follow_symlinks=False)
+    except OSError:   # none (ENODATA), or a file system without ACLs
+        return False
+    return True
 
 
-def unit_paths(value, unit):
-    """The files a unit's path (value) may name, as systemd expands it on any instance (systemd.unit(5)):
-    FIXED_SPECIFIERS their folder; ONE_NAME any one name of what is there (a dot file too), or . or ..; %y and %Y the
-    unit's own file and folder (unit: unit_context; only a unit file's: a drop-in's unit may be anywhere); %% a %; a
-    wildcard (EnvironmentFile= takes one) any name too. Sorted, each there (a link too), under ROOT. One that does not
-    start at / once expanded, a specifier that may hold a / or anything (%h, %I, %f, %s, %q, ...), a brace (systemd's
-    glob reads one), a .. or U+FFFD: Unsure (PR #240 round 3)."""
-    if '{' in value or '\ufffd' in value or '..' in value.split('/'):
-        raise Unsure(f'{value[:60]!r} has a brace, a .. or bytes that are no UTF-8')
-    own = unit['path'] if unit and not unit['path'].rsplit('/', 2)[-2].endswith('.d') else None
+def job_reads(path, top):
+    """Whether a job may read path (a real host path, under top: a real path the launcher binds whole). The folders
+    from top down to it decide, and its own read bit (may); the launcher makes the folders above top itself."""
+    rest = path[len(top):].strip('/').split('/') if path != top else []
+    try:
+        at = top
+        for name in [''] + rest:
+            at = at + '/' + name if name else at
+            st = os.lstat(ROOT + at)
+            if not may(ROOT + at, st, 0o001 if stat.S_ISDIR(st.st_mode) and at != path else 0o004):
+                return False
+    except OSError:
+        return False
+    return True
 
-    def specifier(m):
-        c = m[1]
-        if c == '%':
-            return '%'
-        if c in FIXED_SPECIFIERS:
-            return FIXED_SPECIFIERS[c]
-        if c in ONE_NAME:
-            return '\0'
-        if c and c in 'yY' and own:
-            return own if c == 'y' else os.path.dirname(own)
-        raise Unsure(f'{value[:60]!r}: the walls do not expand %{c} (a home, a shell, a name with a / in it, a '
-                     'drop-in\'s own unit)')
-    path = re.sub(r'%(.?)', specifier, value, flags=re.S)
+
+def in_view(view, path):
+    """Where path is on this host if a job sees it ((real path, the top it is bound under) through the launcher's
+    `paths`), or None: none of its lines holds it."""
+    for dest, top in view:
+        if path == dest or path.startswith(dest.rstrip('/') + '/'):
+            return top + path[len(dest):], top
+    return None
+
+
+def view_secret(view, path):
+    """Why a path a setting names (a secret's file, an EnvironmentFile=, a LoadCredential=) gives a job a secret: it
+    sees the file (in_view; every link in it followed, as the kernel does, inside ROOT), may read it (job_reads) and it
+    is not plainly public (public_only). '' if not."""
+    host = in_view(view, path)
+    resolved = host and real(host[0])
+    host = resolved and in_view([(top, top) for _, top in view], resolved)
+    if not host or not os.path.isfile(ROOT + host[0]) or not job_reads(*host) or public_only(host[0]):
+        return ''
+    return f'{path}, which jobs can read'
+
+
+def fixed_part(path, unit):
+    """path up to its first name that is not known until systemd or a glob reads it (a specifier but FIXED_SPECIFIERS'
+    and %%, a * ? [ or brace): the folder it is in for sure. A path that starts with no / once %E and the like are
+    read, or one with a .. in it: Unsure."""
+    if '..' in path.split('/') or '�' in path:
+        raise Unsure(f'{path[:60]!r} has a .. or bytes that are no UTF-8')
+    if unit:
+        path = re.sub(r'^%([' + ''.join(FIXED_SPECIFIERS) + '])', lambda m: FIXED_SPECIFIERS[m[1]], path)
     if not path.startswith('/'):
-        raise Unsure(f'{value[:60]!r} is no absolute path')
-    found = ['']
-    for part in [p for p in path.split('/') if p]:
-        if '\0' not in part and not re.search(r'[*?[]', part):
-            found = [f + '/' + part for f in found]
-            continue
-        pattern, more = re.compile(fnmatch.translate(part.replace('\0', '*')), re.S), []
-        for f in found:
-            try:
-                names = os.listdir(ROOT + (f or '/'))
-            except OSError:
-                if os.path.isdir(ROOT + (f or '/')) and others_read(f or '/', 0o001):
-                    raise Unsure(f'cannot list {f or "/"}') from None
-                continue
-            more += [f + '/' + n for n in names + ['.', '..'] if pattern.fullmatch(n)]
-        found = more
-    return sorted({os.path.normpath(f) for f in found if os.path.lexists(ROOT + os.path.normpath(f))})
+        raise Unsure(f'{path[:60]!r} is no absolute path')
+    parts = path.split('/')
+    for i, part in enumerate(parts):
+        if re.search(r'[*?[{]', part) or (unit and re.search(r'%[^%]', part)):
+            return '/'.join(parts[:i]) or '/', False
+    return path, True
 
 
-def unit_context(path, workdirs):
-    """What a command in a unit's Environment= needs to know of it (word_paths, unit_paths): its file, and the folders
-    it may run in, cwds: every WorkingDirectory= of a unit file or drop-in for it (workdirs: [(unit, folders)], from
-    working_dirs), or None when one of them is a folder the walls cannot read (~, %h)."""
-    name, cwds = unit_name(path), []
-    for other, folders in workdirs:
-        if related(other, name):
-            if folders is None:
-                return {'path': path, 'cwds': None}
-            cwds += folders
-    return {'path': path, 'cwds': sorted(set(cwds))}
+def path_secret(view, value, unit):
+    """Why a path (a *_FILE's value, an EnvironmentFile=, a LoadCredential= source) gives a job a secret ('' if
+    not): the file it names (view_secret); a unit's own credentials (%d/..., $CREDENTIALS_DIRECTORY/...) and a home
+    (~, %h: no job sees one) are none. One whose name is not known for sure (fixed_part) fails closed when the folder
+    it is in for sure is in the job's view, or holds part of it."""
+    if HOME_PATH.fullmatch(value) or (unit and re.match(r'(%[dh]|\$\{?CREDENTIALS_DIRECTORY\}?)(/|$)', value)):
+        if '..' in value.split('/'):
+            raise Unsure(f'{value[:60]!r} has a .. in it')
+        return ''
+    fixed, whole = fixed_part(value, unit)
+    if whole:
+        return view_secret(view, fixed)
+    if in_view(view, fixed) or any(d == fixed or d.startswith(fixed.rstrip('/') + '/') for d, _ in view):
+        raise Unsure(f'{value[:60]!r} may name any file under {fixed}, which jobs see')
+    return ''
 
 
-def unit_name(path):
-    """The unit a unit file or drop-in is for: its name, or its drop-in folder's without .d (service: every service;
-    fork-.service: every fork-*.service; x@.service: every instance of x@)."""
-    folder, name = os.path.split(path)
-    folder = os.path.basename(folder)
-    return folder[:-2] if folder.endswith('.d') and name.endswith('.conf') else name
+def setting_secret(view, name, value, unit=False):
+    """Why NAME=value gives a job a secret ('' if not), by the name's kind (secret_kind): a value of its own (not
+    empty, a variable, a command's output, a yes/no or 0/1, a home path); a file (path_secret); a command, which
+    the walls do not run: Unsure. A value that is a path that is there is read as a file too (a password that starts
+    with / is not there)."""
+    kind = secret_kind(name)
+    value = unquote(value)
+    if kind in ('', 'about') or not value or value.startswith(('$', '`', '(')) or value.lower() in NOT_SECRET:
+        return ''
+    if kind == 'command':
+        raise Unsure('a command that gives a secret: the walls do not run it')
+    if kind == 'file' or (A_PATH.fullmatch(value) and os.path.lexists(ROOT + value)) or HOME_PATH.fullmatch(value) or (
+            unit and A_SPECIFIER.fullmatch(value)):
+        return path_secret(view, value, unit)
+    return 'a secret'
 
 
-def related(a, b):
-    """Whether what a's files set may apply to unit b, or the other way: the same unit, a type's drop-ins (service)
-    for one of that type, a prefix's (fork-.service) or a template's (x@.service) for one that starts so."""
-    def covers(g, n):
-        stem, dot, kind = g.rpartition('.')
-        n_stem, _, n_kind = n.rpartition('.')
-        if not dot:
-            return g == n_kind
-        return kind == n_kind and (g == n or (stem.endswith(('-', '@')) and n_stem.startswith(stem)))
-    return covers(a, b) or covers(b, a)
+def shell_sets(line):
+    """(NAME, value) of each variable a shell, csh, fish or pam_env line sets (ASSIGN, SETENV, FISH_SET, PAM_ENV,
+    SET_DEFAULT; not fish's set -q/-e/-n/-S, which set nothing)."""
+    sets = [m.groups() for r in (ASSIGN, PAM_ENV, SET_DEFAULT) for m in r.finditer(line)]
+    sets += [m.groups() for m in SETENV.finditer(line) if not m.group(2).startswith('#')]
+    sets += [m.groups()[1:] for m in FISH_SET.finditer(line)
+             if not m.group(3).startswith('#') and not any(FISH_ASKS.fullmatch(f) for f in m.group(1).split())]
+    return sets
 
 
-def working_dirs(units):
-    """Every WorkingDirectory= of these unit files and drop-ins: [(unit, [folder] or None)] (unit_context). One with
-    ~ (a home), a specifier the walls do not expand, or no absolute path: None. An empty one (a reset) adds none."""
+def unit_secrets(view, text):
+    """(line, why) of each secret a unit file, drop-in or systemd config gives a job: a secret in Environment=
+    (setting_secret; a backslash fails closed: systemd reads an escape there), any SetCredential= data, a
+    LoadCredential= or EnvironmentFile= file a job can read (path_secret; an EnvironmentFile= read as env_secrets)."""
     out = []
-    for path in units:
-        for _, key, value in unit_lines(read(path, strip=False) or ''):
-            value = value[1:] if value.startswith('-') else value
-            if key != 'WorkingDirectory' or not value:
-                continue
-            try:
-                if value.startswith('~') or not value.startswith(('/', '%')):
-                    raise Unsure('a home')
-                folders = unit_paths(value, {'path': path}) if '%' in value else [os.path.normpath(value)]
-            except Unsure:
-                folders = None
-            out.append((unit_name(path), folders))
-    return out
-
-
-def unit_secrets(path, seen, workdirs=()):
-    """A unit's, drop-in's or systemd config's secret: a variable with a secret's name and value in Environment=
-    (DefaultEnvironment=, ManagerEnvironment=), any SetCredential= value, a LoadCredential= or EnvironmentFile= that
-    others can read (one with a secret in it; a wildcard or a specifier in its path read as every file it may name:
-    unit_paths); and any line shaped like a token. A LoadCredential= by name alone reads CREDSTORES, read on their
-    own (credstores). What the walls cannot read for sure fails closed (Unsure, PR #240 round 3): a backslash in an
-    Environment= line (systemd reads C escapes there: p\\x77, \\s), a source path that is not absolute nor starts
-    with a specifier, one unit_paths cannot expand. [(where, path of the file[, advice])]"""
-    text = read(path, strip=False) or ''
-    unit = unit_context(path, workdirs)
-    out = [(where, path) for n, line in enumerate(text.splitlines(), 1) for where in shaped(path, n, line)]
     for n, key, value in unit_lines(text):
         try:
             if key in UNIT_ENV:
@@ -1224,143 +1006,143 @@ def unit_secrets(path, seen, workdirs=()):
                     items = shlex.split(value)
                 except ValueError:
                     raise Unsure('its quotes do not close') from None
-                names = set()
                 for k, eq, v in (x.partition('=') for x in items):
-                    try:
-                        if eq and secret_assignment(k, v, unit):
-                            names.add(k)
-                    except Unsure as e:
-                        out.append((f'{path} line {n} ({k}: {e})', path, ADVICE['unsure']))
-                out += [(f'{path} line {n} ({name})', path) for name in sorted(names)]
+                    why = eq and setting_secret(view, k, v, unit=True)
+                    out += [(n, f'{k}: {why}')] if why else []
             elif key == 'SetCredential':
                 cred, colon, data = value.partition(':')
-                if colon and data.strip():
-                    out.append((f'{path} line {n} (SetCredential={cred})', path))
-            elif key == 'LoadCredential':
-                cred, colon, source = value.partition(':')
-                if colon and source:
-                    out += [(f'{f} (LoadCredential={cred} of {path}; others can read it)', f)
-                            for found in source_paths(source, unit) for f in files_in(found)]
-            elif key == 'EnvironmentFile':
-                env = value[1:] if value.startswith('-') else value
-                for found in source_paths(env, unit) if env else ():
-                    if os.path.isfile(ROOT + found) and others_read(found):
-                        out += env_secrets(found, seen)
+                out += [(n, f'SetCredential={cred}: a secret')] if colon and data.strip() else []
+            elif key in ('LoadCredential', 'EnvironmentFile'):
+                source = value.partition(':')[2] if key == 'LoadCredential' else value.removeprefix('-')
+                if source and not source.startswith(('/', '%')):
+                    continue   # a credential's name: systemd looks in its credential stores (CREDSTORES)
+                why = source and path_secret(view, source, True)
+                if why and key == 'EnvironmentFile':   # a file a job reads in full: its own lines tell
+                    found = in_view(view, source)
+                    why = found and next((w for _, w in env_secrets(view, read(found[0], strip=False) or '')), '')
+                out += [(n, f'{key}: {why}')] if why else []
         except Unsure as e:
-            out.append((f'{path} line {n} ({key}: {e})', path, ADVICE['unsure']))
+            out.append((n, f'{key}: {e}'))
     return out
 
 
-def source_paths(source, unit):
-    """The files a LoadCredential= or EnvironmentFile= source may name (unit_paths). One that is no absolute path
-    and starts with no specifier (a credential's name to look up, a relative path): Unsure."""
-    if not source.startswith(('/', '%')):
-        raise Unsure(f'{source[:60]!r} is no absolute path')
-    return unit_paths(source, unit)
-
-
-def readable_under(top, name=None):
-    """Every file under top (and its folders) that others can read and whose name fits name (a regex), sorted."""
+def env_secrets(view, text):
+    """(line, why) of each secret a login, environment or shell file gives a job: a variable with a secret's name and
+    value (shell_sets, setting_secret) on a line that is no comment."""
     out = []
-    for folder, dirs, files in os.walk(ROOT + top):
-        dirs[:] = [d for d in dirs if others_read(os.path.join(folder, d)[len(ROOT):], 0o001)]
-        out += [p[len(ROOT):] for p in (os.path.join(folder, f) for f in files if not name or name.fullmatch(f))
-                if os.path.isfile(p) and others_read(p[len(ROOT):])]
-    return sorted(out)
-
-
-def unit_files():
-    """Every unit, drop-in and config file of UNIT_DIRS others can read, each once (a link to a packaged unit, or /lib
-    that is /usr/lib, read once: by the file it is)."""
-    out, seen = [], set()
-    for top in UNIT_DIRS:
-        for path in readable_under(top, None if top == '/etc/systemd' else UNIT_FILE):
+    for n, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith('#'):
+            continue
+        for name, value in shell_sets(line):
             try:
-                st = os.stat(ROOT + path)
-            except OSError:
-                continue
-            if (st.st_dev, st.st_ino) not in seen:
-                seen.add((st.st_dev, st.st_ino))
-                out.append(path)
+                why = setting_secret(view, name, value)
+            except Unsure as e:
+                why = str(e)
+            out += [(n, f'{name}: {why}')] if why else []
     return out
 
 
-def credstores():
-    """Every credential in CREDSTORES (not .encrypted) others can read: [(where, path)]."""
-    return [(f'{f} (a credential; others can read it)', f) for top in CREDSTORES for f in readable_under(top)]
+def a_script(head, name):
+    """Whether a program is a shell script (its #! names a shell of SHELLS, by itself or through env; or a .sh)."""
+    if name.endswith('.sh'):
+        return True
+    if not head.startswith(b'#!'):
+        return False
+    words = head[2:].split(b'\n', 1)[0].decode('utf-8', 'replace').split()
+    words = words[1:] if words and os.path.basename(words[0]) == 'env' else words
+    words = [w for w in words if not w.startswith('-')]
+    return bool(words) and SHELLS.fullmatch(os.path.basename(words[0])) is not None
 
 
-def token_file(path):
-    """Whether a file (a plain one, not a link) holds a known token's shape anywhere."""
+def file_secrets(view, path, how):
+    """(where, why) of what a file a job can read gives away: a secret's file name (SECRET_FILE; not a plainly public
+    one); anywhere in it, a known token's shape or a private key block (TOKEN_BYTES, a comment too: the file still holds
+    it); in a text file, a password in a URL (URL_PASSWORD) on a line that is no comment; and by how it is read (how):
+    a unit's settings ('unit'), a login, environment or shell file's variables ('env'; 'program': only a shell
+    script). A file larger than SHAPE_MAX is read for its name alone."""
+    out = []
+    if SECRET_FILE.fullmatch(os.path.basename(path)) and not public_only(path):
+        out.append((path, 'a secret\'s file name'))
     try:
         with open(ROOT + path, 'rb') as f:
             data = f.read(SHAPE_MAX + 1)
-    except OSError:
-        return False
-    return len(data) <= SHAPE_MAX and TOKEN_BYTES.search(data) is not None
+    except FileNotFoundError:   # gone since it was listed: nothing left to read
+        return out
+    except OSError as e:   # a job may read it (job_reads), the walls cannot: it fails closed
+        return out + [(path, f'cannot read it ({e.strerror})')]
+    if len(data) > SHAPE_MAX:
+        return out
+    if TOKEN_BYTES.search(data):
+        out.append((path, 'a token or private key'))
+    if b'\0' in data[:8192]:   # a program, a database: no lines to read
+        return out
+    text = data.decode('utf-8', 'replace')
+    out += [(f'{path} line {n}', 'a password in a URL') for n, line in enumerate(text.splitlines(), 1)
+            if not line.lstrip().startswith(('#', ';')) and URL_PASSWORD.search(line)]
+    if how == 'unit':
+        found = unit_secrets(view, text)
+    elif how == 'env' or (how == 'program' and a_script(data[:256], path)):
+        found = env_secrets(view, text)
+    else:
+        found = []
+    return out + [(f'{path} line {n}', why) for n, why in found]
+
+
+def view_files(view, tops):
+    """Every plain file (no link) under each of tops that a job sees and may read: (host path, top), each once (/lib
+    and /usr/lib on a host whose /usr is merged: once). A folder a job cannot enter is not walked."""
+    out, seen = [], set()
+    for top in tops:
+        found = in_view(view, top)
+        if found is None or not os.path.isdir(ROOT + found[0]) or os.path.islink(ROOT + found[0]):
+            if found and os.path.isfile(ROOT + found[0]) and not os.path.islink(ROOT + found[0]):
+                out += [found] if job_reads(*found) else []
+            continue
+        for folder, dirs, files in os.walk(ROOT + found[0]):
+            here = folder[len(ROOT):]
+            dirs[:] = sorted(d for d in dirs if job_reads(here + '/' + d, found[1]))
+            for name in sorted(files):
+                path = here + '/' + name
+                try:
+                    st = os.lstat(ROOT + path)
+                except FileNotFoundError:   # gone since the folder was listed
+                    continue
+                if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) not in seen and job_reads(path, found[1]):
+                    seen.add((st.st_dev, st.st_ino))
+                    out.append((path, found[1]))
+    return out
 
 
 def etc_secrets_wall():
-    """A lint, not a proof (PR #240 round 4): no secret found in the common places of /etc and /usr. It reads files
-    and guesses which hold a secret; it cannot prove that no file a job can read holds one (a *_COMMAND is a program;
-    which file it reads depends on bash and every program it calls). The real fix is in place: jobs see only an allow
-    list of /etc (issue #243: fork-fleet-job-paths.txt, refused whole by the launcher and by `mounts`, listed from
-    inside by check-net), so the open forms below in /etc are closed by that design, not by more parsing here. It still
-    reads all of /etc, so it can only fail more than needed, never less; trimming it to /usr and ALLOW_PATHS is the
-    rest of issue #243. What it finds: a credentials file (smbcredentials, *.cred, ...) readable by others; a
-    line of a mount table (MOUNT_TABLES: fstab, autofs maps, systemd mount and automount units and their drop-ins)
-    with password= or pass=, or with a credentials= or cred= file others can read; a secret in a login or session
-    environment file (ENV_FILES) or a service's (SERVICE_FILES: by name and value, by a token's shape, or a URL's
-    password); a secret in a systemd unit (UNIT_DIRS: Environment=, SetCredential=, or a LoadCredential= or
-    EnvironmentFile= others can read); a credential in systemd's credential stores (CREDSTORES) others can read; a
-    known token's shape in any other file of /etc. A file only its owner reads is fine. The advice fits the file
-    (ADVICE): a file every login reads cannot be made private, so its secret must move out.
-    Known open forms (each PASSes with a secret a job can read; see ENV_FILES' comment too):
-    - BORG_PASSCOMMAND="cat <readable file>" (PASSCOMMAND is one word, no secret word); a secret under a name with
-      no secret word; a readable password file nothing points at;
-    - a password in /etc/cron.d or /etc/crontab, in a script under /usr/local/bin, or on a unit's ExecStart= line;
-    - EnvironmentFile= and /etc/default files are read with shell regexes, not systemd's env-file parser (blanks
-      around =, unquoted blanks, escapes, quotes mid-value, continued lines);
-    - login files are read with regexes too: "pw" quoted mid-path, p\\w, a value continued with \\, a quoted value or
-      command over several lines, %xx (curl decodes file:///etc/restic/p%77), a newline in sh -c that hides a cd;
-    - unit settings that change the unit's view of files (BindPaths=, BindReadOnlyPaths=, RootDirectory=,
-      RootImage=, TemporaryFileSystem=, MountImages=); a % specifier inside an Environment= NAME;
-    - a folder read recursively (grep -r /etc/restic); a file the job reads through its group or an ACL
-      (others_read looks only at the other bits)."""
-    found, plain = [], []
-    for folder, dirs, files in os.walk(ROOT + '/etc'):
-        dirs[:] = [d for d in dirs if others_read(os.path.join(folder, d)[len(ROOT):], 0o001)]   # else no entry
-        for name in files:
-            path = os.path.join(folder, name)[len(ROOT):]
-            if not others_read(path):
-                continue
-            if SECRET_NAME.fullmatch(name):
-                found.append((f'{path} (others can read it)', path))
-            elif os.path.isfile(ROOT + path) and not os.path.islink(ROOT + path):
-                plain.append(path)
-    for table in readable(MOUNT_TABLES):
-        for n, line in enumerate((read(table) or '').splitlines(), 1):
-            if line.lstrip().startswith(('#', ';')):
-                continue
-            if MOUNT_PASSWORD.search(line):
-                found.append((f'{table} line {n} (a password)', table))
-            for cred in MOUNT_CRED.findall(line):
-                if cred.startswith('/') and others_read(cred):
-                    found.append((f'{table} line {n} ({cred}, which others can read)', cred))
-    seen = set()
-    for env in readable(ENV_FILES + SERVICE_FILES):
-        found += env_secrets(env, seen)
-    units = unit_files()
-    workdirs = working_dirs(units)
-    for unit in units:
-        found += unit_secrets(unit, seen, workdirs)
-    found += credstores()
-    read_whole = seen | set(units) | set(readable(MOUNT_TABLES))
-    found += [(f'{path} (a token)', path) for path in plain if path not in read_whole and token_file(path)]
+    """A lint, not a proof: no secret found in what jobs can still read of /etc and /usr (issue #243 items 5 and 6).
+    The fix is the view itself: jobs see only an allow list of /etc (fork-fleet-job-paths.txt and ALLOW_PATHS; the
+    known secret entries refused by `mounts`), so a login file, a unit, cron, /etc/default and a backup tool's folder
+    are not there to read. This reads, as a job could: every file of that /etc view (a key dropped into ssl/certs);
+    the host's own programs and settings in /usr/local (LOCAL_TOPS); the packages' units (UNIT_TOPS) and environment
+    files (ENV_TOPS); systemd's credential stores in /usr (CREDSTORES: any file there a job can read is a secret by
+    what it is). What it finds (file_secrets): a secret's file name, a token's shape or a private key, a password in
+    a URL, a variable with a secret's name and value in a unit, an environment file, a shell script or a file of the
+    /etc view. A file a job cannot read (job_reads: no other bit; no group bit, or root's group and no ACL) is fine.
+    Not read: the rest of /usr (the packages' own files: a toolchain's test keys are no secret of this host) and
+    ALLOW_PATHS outside /etc (a project's caches: each job reads them by the project's choice). Still open, as it is
+    a lint: a secret under a name with no secret word, in a form it does not parse (a Python program), or in a file
+    larger than SHAPE_MAX."""
+    view = but_resolv(job_view())
+    etc = [dest for dest, _ in view if dest.startswith('/etc/')]
+    found = []
+    for path, _ in view_files(view, etc + list(LOCAL_TOPS)):
+        found += file_secrets(view, path, 'env' if path.startswith('/etc/') or path.startswith('/usr/local/etc/')
+                              else 'program')
+    for path, _ in view_files(view, UNIT_TOPS):
+        found += file_secrets(view, path, 'unit' if UNIT_FILE.fullmatch(os.path.basename(path)) else 'program')
+    for path, _ in view_files(view, ENV_TOPS):
+        found += file_secrets(view, path, 'env')
+    found += [(path, 'a credential') for path, _ in view_files(view, CREDSTORES)]
     if found:
-        listed = '; '.join(f'{f[0]}: {f[2] if len(f) > 2 else ADVICE[kind_of(f[1])]}' for f in found[:3])
+        listed = '; '.join(f'{where} ({why})' for where, why in found[:3])
         more = f' (and {len(found) - 3} more)' if len(found) > 3 else ''
-        return f'jobs can read a secret on this host: {listed}{more}'
+        return (f'jobs can read a secret on this host: {listed}{more}: make the file readable by root alone (0600) '
+                'or move it out of what jobs see')
     return None
 
 
@@ -1373,12 +1155,12 @@ WALLS = [
     ('namespaces', 'the kernel has IPC, mount and network namespaces', namespaces_wall),
     ('seccomp', 'seccomp filters are available', seccomp_wall),
     ('container', 'not in a container', container_wall),
-    ('mounts', 'jobs see only the launcher\'s allow list of system paths, on this host\'s own disks; no other '
-               'mount', mounts_wall),
+    ('mounts', 'jobs see only the launcher\'s allow list of system paths, on this host\'s own disks, and no /etc '
+               'entry that holds secrets; no other mount', mounts_wall),
     ('job-units', 'no systemd drop-in nor launcher setting changes the job units the launcher asks for',
      job_units_wall),
-    ('etc-secrets', 'no secret found in the common places of /etc and /usr (a lint, not a proof; jobs see only an '
-                    'allow list of /etc: issue #243)', etc_secrets_wall),
+    ('etc-secrets', 'no secret found in what jobs see of /etc and /usr (a lint, not a proof; jobs see only an allow '
+                    'list of /etc: issue #243)', etc_secrets_wall),
 ]
 
 

@@ -246,10 +246,25 @@ class Mounts:
     mount namespace the cleaner may read, that shows one folder of a filesystem rather than all of it: the source of
     a bind mount (a container volume, a sandbox). `options`: {mount point: its per-mount options} (`noatime`,
     `relatime`, ...). `fstab`: the mount points /etc/fstab names, mounted now or not; None when it cannot be read.
-    A device is "major:minor" as mountinfo writes it."""
+    `whole`: (device, root) of each mount of the cleaner's own namespace that shows a whole btrfs subvolume (its
+    root is its `subvol=`). A device is "major:minor" as mountinfo writes it. `ids`: (mount id, parent mount id) of
+    each line of `lines`, in the same order, as mountinfo gives them; None when not known (then of several mounts on
+    one point the one listed last counts as on top). `types`: the filesystem type of each line (`ext4`, `btrfs`,
+    `overlay`, `fuse.bindfs`), in the same order; None when not known. `own`: the lines are this process's own
+    mount namespace as the kernel gave them (read_mounts of /proc/self/mountinfo), so a folder can be checked
+    against them: the mount the kernel finds it on now must be the one the list names (guard.above_refusal)."""
 
-    def __init__(self, points=('/',), lines=(), sources=(), options=None, fstab=()):
+    def __init__(self, points=('/',), lines=(), sources=(), options=None, fstab=(), whole=(), ids=None, types=None,
+                 own=False):
         self.points, self.lines, self.sources = set(points), list(lines), set(sources)
+        self.whole = set(whole)
+        self.ids = None if ids is None else list(ids)
+        if self.ids is not None and len(self.ids) != len(self.lines):
+            raise ValueError('a mount id for each mount line')
+        self.types = None if types is None else list(types)
+        if self.types is not None and len(self.types) != len(self.lines):
+            raise ValueError('a filesystem type for each mount line')
+        self.own = own
         self.fstab = None if fstab is None else {os.path.normpath(p) for p in fstab}
         self.options = {point: frozenset(opts) for point, opts in (options or {}).items()}
 
@@ -262,6 +277,92 @@ class Mounts:
                 if best is None or len(point) > len(best):
                     best = point
         return None if best is None else self.options[best]
+
+    def holding(self, path):
+        """The mount line (mount point, device, root) that `path` (a real path, no links in it) is on, or None when
+        no line holds it. With mount ids, the way the kernel finds it: from the mount on `/`, into the mount that
+        sits on the first mount point on the way to `path` (a mount on the same point sits on the one it hides),
+        and on from there. So a mount placed beneath another or moved onto a point is read where it really is, and
+        a mount on a point that a later mount above it hides is not used. When the ids do not give one answer (two
+        mounts on one point on the same mount, or none on `/`), None: not knowing is not knowing. Without ids, the
+        deepest mount point that is `path` or holds it, and of several on one point the last listed."""
+        index = self.held(path)
+        return None if index is None else self.lines[index]
+
+    def held(self, path):
+        """The index in `lines` of the line `holding` gives, or None."""
+        if self.ids is not None:
+            return self._holding_by_ids(path)
+        best = None
+        for i, line in enumerate(self.lines):
+            point = line[0]
+            if point == '/' or path == point or path.startswith(point + '/'):
+                if best is None or len(point) >= len(self.lines[best][0]):
+                    best = i
+        return best
+
+    def type_of(self, index):
+        """The filesystem type of the line at `index`; None when not known."""
+        return None if self.types is None else self.types[index]
+
+    def id_of(self, index):
+        """The mount id of the line at `index`; None when not known."""
+        return None if self.ids is None else self.ids[index][0]
+
+    def _holding_by_ids(self, path):
+        def holds(point):
+            return point == '/' or path == point or path.startswith(point + '/')
+        top, under, reached = self._tree()
+        # A line on the way to `path` that is not reached from the mount on `/` (its parent is not in the list, a
+        # loop of parent ids, one id twice): the list does not say where it sits, so what holds `path` is not known.
+        if top is None or any(holds(line[0]) and i not in reached for i, line in enumerate(self.lines)):
+            return None
+        current, passed = top, {top}
+        while True:
+            on = [i for i in under.get(self.ids[current][0], ()) if i not in passed and holds(self.lines[i][0])]
+            if not on:
+                return current
+            nearest = min(len(self.lines[i][0]) for i in on)
+            on = [i for i in on if len(self.lines[i][0]) == nearest]
+            if len(on) != 1:
+                return None                     # two mounts on one point sit on the same mount
+            current = on[0]
+            passed.add(current)
+
+    def _tree(self):
+        """(index of the mount on `/`, {parent id: indexes of the mounts on it}, indexes reached from the mount on
+        `/`); the first is None when there is not exactly one, or an id is listed twice. The mount on `/` is the
+        line on `/` whose parent is not in the list (or is itself)."""
+        if getattr(self, '_tree_cache', None) is None:
+            index = {mid: i for i, (mid, _) in enumerate(self.ids)}
+            under = {}
+            for i, (_, parent) in enumerate(self.ids):
+                under.setdefault(parent, []).append(i)
+            tops = [i for i, line in enumerate(self.lines)
+                    if line[0] == '/' and (self.ids[i][1] not in index or self.ids[i][1] == self.ids[i][0])]
+            top = tops[0] if len(tops) == 1 and len(index) == len(self.ids) else None
+            reached, stack = set(), [] if top is None else [top]
+            while stack:
+                i = stack.pop()
+                if i not in reached:
+                    reached.add(i)
+                    stack.extend(under.get(self.ids[i][0], ()))
+            self._tree_cache = (top, under, reached)
+        return self._tree_cache
+
+    def shown_at(self, device, folder):
+        """Every place in this mount namespace that shows the folder `folder` of the filesystem `device`: through a
+        mount of that filesystem whose root is that folder or holds it, and only where no other mount hides it."""
+        places = set()
+        for line in self.lines:
+            point, dev, root = line
+            if dev != device or not root.startswith('/'):
+                continue
+            if root == '/' or folder == root or folder.startswith(root + '/'):
+                place = os.path.normpath(os.path.join(point, os.path.relpath(folder, root)))
+                if self.holding(place) == line:
+                    places.add(place)
+        return sorted(places)
 
     def on_filesystem(self, path, dev):
         """Where `path` is on its own filesystem (the root of the deepest mount holding it, plus the rest), or None
@@ -288,9 +389,11 @@ class Mounts:
         return inside[0] if inside else None
 
 
-def _mount_lines(path, options=None):
+def _mount_lines(path, options=None, whole=None, ids=None, types=None):
     """[(mount point, device, root)] of one mountinfo file; `options`, a dict, gets {mount point: its per-mount
-    options}. Raises Unreadable when it cannot be read or a line is strange."""
+    options}; `whole`, a set, gets (device, root) of each mount that shows a whole btrfs subvolume; `ids`, a list,
+    gets (mount id, parent mount id) of each line; `types`, a list, the filesystem type of each line. Raises
+    Unreadable when it cannot be read or a line is strange."""
     try:
         with open(path, errors='surrogateescape') as f:
             lines = f.read().splitlines()
@@ -301,10 +404,24 @@ def _mount_lines(path, options=None):
         fields = line.split(' ')
         if len(fields) < 10 or '-' not in fields[6:] or not re.match(r'^\d+:\d+$', fields[2]):
             raise Unreadable(f'{path}: a line it cannot use: {line[:80]!r}')
-        point = os.path.normpath(_unescape(fields[4]))
-        out.append((point, fields[2], os.path.normpath(_unescape(fields[3]))))
+        if not (fields[0].isdigit() and fields[1].isdigit()):
+            raise Unreadable(f'{path}: a line without its mount ids: {line[:80]!r}')
+        point, root = os.path.normpath(_unescape(fields[4])), os.path.normpath(_unescape(fields[3]))
+        out.append((point, fields[2], root))
+        if ids is not None:
+            ids.append((int(fields[0]), int(fields[1])))
         if options is not None:
             options[point] = fields[5].split(',')      # a later mount on the same point hides the earlier one
+        rest = fields[fields.index('-', 6) + 1:]
+        if types is not None:
+            if not rest or not rest[0]:
+                raise Unreadable(f'{path}: a line without its filesystem type: {line[:80]!r}')
+            types.append(_unescape(rest[0]))
+        if whole is not None and rest[:1] == ['btrfs'] and len(rest) >= 3:
+            # The super options are split before they are unescaped: a comma in a name is written as \054.
+            subvol = [os.path.normpath(_unescape(o[len('subvol='):])) for o in rest[2].split(',') if o.startswith('subvol=')]
+            if subvol == [root]:
+                whole.add((fields[2], root))
     return out
 
 
@@ -326,13 +443,16 @@ def read_fstab(path='/etc/fstab'):
     return points
 
 
-def read_mounts(path='/proc/self/mountinfo', proc='/proc', fstab='/etc/fstab'):
+OWN_MOUNTINFO = '/proc/self/mountinfo'
+
+
+def read_mounts(path=OWN_MOUNTINFO, proc='/proc', fstab='/etc/fstab'):
     """Every mount point, bind mounts too: a bind mount of a folder on the same filesystem has the same device
     number, so only this list shows it. Also the bind mount sources of every other mount namespace the cleaner can
     read (its own user's processes): a folder a container or a sandbox shows. Raises Unreadable when its own list
     cannot be read or does not even hold /; another process's list that cannot be read is not seen."""
-    options = {}
-    lines = _mount_lines(path, options)
+    options, whole, ids, types = {}, set(), [], []
+    lines = _mount_lines(path, options, whole, ids, types)
     points = {point for point, _, _ in lines}
     if '/' not in points:
         raise Unreadable(f'{path} does not name /')
@@ -355,7 +475,30 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc', fstab='/etc/fstab'):
         except Unreadable:
             continue
         sources.update((device, root) for _, device, root in other if root != '/')
-    return Mounts(points, lines, sources, options, read_fstab(fstab))
+    return Mounts(points, lines, sources, options, read_fstab(fstab), whole, ids, types, own=path == OWN_MOUNTINFO)
+
+
+def own_mounts(path=OWN_MOUNTINFO):
+    """This process's own mount list, read now: its lines, mount ids and types only (no other namespace, no
+    fstab), for guard.above_refusal to see that the lines it used are still the kernel's. Raises Unreadable."""
+    ids, types = [], []
+    lines = _mount_lines(path, ids=ids, types=types)
+    return Mounts({point for point, _, _ in lines}, lines, ids=ids, types=types, own=True)
+
+
+def mount_id_of(fd, proc='/proc'):
+    """The mount id of the open file `fd` (`mnt_id` in /proc/self/fdinfo/<fd>: the id mountinfo gives each line).
+    Raises Unreadable when it cannot be read."""
+    where = os.path.join(proc, 'self', 'fdinfo', str(fd))
+    try:
+        with open(where) as f:
+            text = f.read()
+    except OSError as ex:
+        raise Unreadable(f'{where}: {ex.strerror}') from None
+    found = re.search(r'^mnt_id:\s*(\d+)\s*$', text, re.M)
+    if found is None:
+        raise Unreadable(f'{where} names no mount id')
+    return int(found.group(1))
 
 
 # --- systemd units ------------------------------------------------------------------------------------------------

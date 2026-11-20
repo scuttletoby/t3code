@@ -16,8 +16,72 @@ fork build), with a cold copy of the data first and a way back. It is built in s
 | `back`, `status`  | `lib/golive/back.py`        | the way back (W1-W3); read only: is T3 up and right?         |
 | kept runtime      | `lib/golive/keptruntime.py` | the old build's runtime, kept for W1 (upstream prunes it)    |
 | `switch`, verify  | `lib/golive/switch.py`      | the move itself, verify, the automatic way back, the guard   |
+| installer         | `sbin/t3-golive-install`    | the version folder, the links, the install record            |
 
-The owner's runbook is `docs/fork/go-live.md`. Install from `ci-release` comes later.
+The owner's runbook is `docs/fork/go-live.md`.
+
+## Install
+
+From a commit of the fork's protected release branch, as root, with the bootstrap every kit shares:
+
+```
+curl -fsSL --proto =https https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/fork-kit/common/bootstrap.sh -o fork-kit-bootstrap.sh
+sh fork-kit-bootstrap.sh --kit golive --repo FORK_OWNER/FORK --sha RELEASE_SHA
+```
+
+The bootstrap checks the commit is on `ci-release`, downloads exactly that commit and runs
+`sbin/t3-golive-install install`. That copies `bin/`, `sbin/`, `lib/golive/`, this page and
+`fork-kit/common/{machine_file,kit_install}.py` into `/usr/local/libexec/t3-golive/versions/<sha>/` (root-owned,
+with `MANIFEST.sha256`), imports every module and runs `t3-golive --help` and `t3-golive-install --help` as a
+self-test, switches
+`current` to it and links `/usr/local/bin/t3-golive` and `/usr/local/sbin/t3-golive-install`. It writes
+`/etc/t3-golive/installed.tsv`; `t3-golive-install self-check` reports drift from it. Safe to run again or to stop
+at any step; one installer at a time. The steps are the cleaner's (`fork-kit/common/kit_install.py`, see
+[common](../common/README.md#the-installer)); golive adds these rules:
+
+- **A copy made by hand.** A plain file at `/usr/local/bin/t3-golive` (a copy made before this installer) is kept
+  in `/usr/local/libexec/t3-golive/replaced/t3-golive.<sha256, 16>` (in the install record too) and the kit's link
+  replaces it in one step, so the command is never missing. `uninstall` puts back the copy kept last (by the order
+  in `replaced/order`, not by file times), with the mode and owner it had when it was kept, again in one step:
+  `t3-golive` is never missing during an uninstall either. (A copy kept by an installer from before the mode and
+  owner were kept comes back root-owned, `0755` or `0644`.) A link there that is not the kit's, or a folder, is
+  refused and left alone.
+- **A hand install in the kit's own layout.** Where `/usr/local/bin/t3-golive` already is the kit's link
+  (`/usr/local/libexec/t3-golive/current/bin/t3-golive`) and `current` a link into `versions/`, the install takes
+  it over: it switches `current` to the new release and leaves the hand version folder where it was (not in the
+  install record). There is no plain copy to keep, so `uninstall` then removes `t3-golive` entirely, with the hand
+  folder, like any install of the kit.
+- **No uninstall under a run, or while one needs settling.** A golive run, the holder that keeps T3 stopped and the
+  switch guard (and its timer) run the code of the version they started with (its real path), so an install keeps
+  old version folders (installing the same release over a changed copy swaps in the same code). `uninstall` takes
+  `<stateDir>/lock` (the machine file's `golive.stateDir`) and refuses while a run holds it, while the journal's
+  last run needs settling (a killed switch, a failed W1: T3 may be stopped and its home held), and while a process
+  or a transient systemd unit (the holder, a switch guard timer still pending) runs code from
+  `/usr/local/libexec/t3-golive` or through the kit's links. Settle first (`t3-golive status`, then `back` or
+  `settle`). A machine file it cannot read, a journal it cannot trust or over 64 MiB (golive writes a few KB a run),
+  and a lock or journal that is not a plain file, or has another filesystem mounted on it (the state folder is the
+  T3 user's), refuse too; the file looked at is the one opened (through `/proc/self/fd`), without waiting. Where no
+  golive run has made `<stateDir>/lock` yet, `uninstall` makes it first, as golive would (the file `0600`, the state
+  folder `0700`, folders above it as `os.makedirs` makes them) and as the owner of the last folder there (with that
+  user's own group, in a child that holds none of root's open files and is ended after 30 seconds or when
+  `uninstall` ends), never as root, and holds it: a first run cannot start during the uninstall. The way to the
+  state folder, and to the lock and journal already there, is opened one step at a time with no link followed. A
+  link of root's (`/home -> /var/home`) is gone along only where it sits in a folder of root's that no one else may
+  write in; any other link refuses (the T3 user could point it at another user's folder, or have moved a link of
+  root's into their own folder): make `stateDir` a path without it. Below the first folder that is not root's, every
+  folder must have that same owner (a folder of someone else's there may have been moved in). No folder on the way
+  may be on a FUSE filesystem (a user's own could show any owner) or on one whose type cannot be read from
+  `/proc/self/mountinfo`. Where the state folder is root's, nothing is made: a golive run as a user makes the lock
+  there only in a folder anyone may make folders in (a sticky one such as `/tmp`), an odd place for `stateDir` where
+  the gap stays. **Upgrade note (#617):** hosts whose `stateDir` goes through a link of the T3 user's (or through a
+  folder of root's below the T3 user's folders, a data disk mounted under their home, say) used to uninstall with
+  the lock already there, opened by its path; they now refuse, and the message says what to change. A run started by
+  a bare name from its own folder (`python3 t3-golive` in `/usr/local/bin`) is not seen by the process scan;
+  `./t3-golive`, `../bin/t3-golive` and doubled slashes are. Every golive run that changes anything holds the lock,
+  so it is covered there.
+- **Update through the bootstrap.** Run the bootstrap again with the newer release commit.
+
+The installer writes no machine file and nothing in a T3 home; `uninstall` leaves both, and the state folder.
 
 ## `t3-golive check`
 
@@ -32,13 +96,21 @@ found in `PATH`. It writes only the kit's own lock file. It refuses, with every 
   runtime holds exactly the archive's files;
 - free disk is at least 2 x database + floor (database + floor on each disk when backups are on another one);
 - the staged build's read-only report (`t3 __fork-report --base-dir <home>`, run with an empty HOME and a bare
-  PATH) is ok, is of the target version, and shows no fork feature switched on. It runs only beside a T3 that the
-  checks above found running steadily (service active, its own server live, no update pending, no marker): a
+  PATH) is ok, is of the target version, and says what the fork features are: each one's value (`fork.features`),
+  those switched on (`featuresOn`) and where (`featuresWhere`); a report without the list or the values refuses.
+  The switch keeps the features as they are (fork #529), so they go into the result (`features`: values, the
+  names on and their places, sorted). While the live build is upstream (no `.fork.N`: the first switch) every one
+  must be off. While it is a fork build, its own report (the live server's binary, run the same way beside it)
+  must read the same values in the same places: a target that reads one otherwise (a new feature on by default, a
+  key or policy default the old build read another way, `usagePacingGate` `advise` -> `enforce`) refuses, naming
+  each feature that differs, before anything stops; set it in settings so both builds read the same. A live fork
+  build that gives no report this kit reads (an older report version) passes only with all off. It runs only beside a
+  T3 that the checks above found running steadily (service active, its own server live, no update pending, no marker): a
   report reading the home while T3 stops keeps SQLite from tidying its WAL at the stop (nothing is lost, but the WAL
   with its frames and `-shm` stay, and a copy takes that WAL without its `-shm`). Otherwise it is not run, and says
   so. The live server is read again after it: if T3 stopped, restarted or began an update meanwhile (the owner or
   the auto-updater), the report's answer is not used and check refuses (`--json` then holds no `counts`,
-  `pendingMigrations` or `providers`);
+  `pendingMigrations`, `providers` or `features`);
 - the machine file section is complete, and no golive run needs settling (see below).
 
 Exit 0: ready (the plan is printed), or nothing to do, and only when no check failed: a refusal always wins.
@@ -224,7 +296,7 @@ only). From step 1 on, SIGINT, SIGTERM and SIGHUP are noted, never raised: the r
 stops at its next one (the verify at once) and puts T3 back as below; a signal before the stop refuses with the
 post hooks run. An interrupt that still gets through leaves no end line, as a kill does, so the guard acts on the
 run. Each `t3` the run starts runs in its own process group with a fixed environment and dies with the run. It
-refuses, with nothing changed, unless `check` passes (the fork-features-off check is part of it);
+refuses, with nothing changed, unless `check` passes (it gives the list of fork features on, which the switch keeps);
 the live report gives every count (an unknown count refuses: the verify could not tell what must be kept); the
 staged target archive is whole and its sha256 is the one the last `rehearse` run journalled (`targetSha256`: a
 rehearsal from before this field, or of another build, refuses with "rehearse again"); that rehearsal passed for
@@ -243,7 +315,10 @@ migrate plus ready, rounded up. Then, each a journalled step:
    refuses, T3 not stopped): a second transient unit runs `switch-guard --run <id> --wait` and its timer fires `switch-guard --run
    <id>` after the latest the run can end (`switch.guard_after`: every wait at its longest, the verify limit twice,
    the way back, plus 10 minutes). Not up: refused, T3 not stopped.
-2. `pre-hooks`, then quiet again; a failure runs the post hooks and refuses (T3 not stopped).
+2. `pre-hooks`, then quiet again, then the fork features read again by the staged build and the live fork build
+   (beside the running T3, with the server checked before and after, as check reads them); a failure, or other
+   features than check's (an owner switched one since), runs the post hooks and refuses (T3 not stopped). A rerun
+   reads them again.
 3. `stopping`: stop the service, wait until the server is gone and its ownership lock is free (held from here to
    the update), and see that nothing changed while it stopped. The step's facts name the copy folder, the old
    build and the time limit: the guard reads them.
@@ -259,8 +334,9 @@ migrate plus ready, rounded up. Then, each a journalled step:
    (`runtimeSha256`: every path, kind and content sum) for the verify.
 7. `before`: the stopped home's report, read now (nothing can write), by the target build just installed and
    checked (never the stage, which nothing checked since the prechecks): the counts the verify compares with, the
-   provider instances; it fails unless every count is known, the report is ok, fork features are off and the
-   pending migrations are those the rehearsal ran.
+   provider instances and the fork features; it fails unless every count is known, the report is ok, the fork
+   features (values, names on, places) are exactly those check read and the pending migrations are those the
+   rehearsal ran.
 8. `update` (the owner lock the kit holds goes to the new launcher once that holds its serving lock: see "The gap"
    below): `<home's target t3> update <target> --base-dir <home> --yes` with a fixed environment (no `T3CODE_RELEASE_BASE_URL` or other variable reaches it); the target is installed already,
    so it downloads nothing. A managed mirror policy (`/etc/t3code/policy.json`) is still asked whether the target is
@@ -271,9 +347,9 @@ migrate plus ready, rounded up. Then, each a journalled step:
    service active; the server is the target, from this home's runtime; service state names the target with no
    update pending; no markers; something answers HTTP on its port; the links point at the target; the target's
    report says no migration is pending, counts are not lower than in step 5, provider instances are the same
-   (compared by SHA256 only), fork features are all off and it is ok; and the runtime the server runs is still
-   byte for byte what step 6 recorded (checked first and when all else holds: a mismatch fails at once, it cannot
-   heal; a restaged archive does not matter any more).
+   (compared by SHA256 only), the fork features are those of step 7 and it is ok; and the runtime the server runs
+   is still byte for byte what step 6 recorded (checked first and when all else holds: a mismatch fails at once, it
+   cannot heal; a restaged archive does not matter any more).
 10. `post-hooks`. Exit 0: verified.
 
 A failure or a late verify goes back on its own. From step 8 on (its `update` started) that is #397's W1,
@@ -329,8 +405,61 @@ start: the new launcher then idled and verify waited for minutes.
   and the kit must not take that probe for the launcher (it would free the home in the middle of `t3 update`). A
   rule of "held on every poll for 100 ms" could not tell frequent probes from the launcher when load stretched the
   polls (#546). For an older build the kit lets go just before the start, as before (its server would meet the
-  kit's lock and idle). The verify step journals how the lock was let go (`handover`: `launcher`, `timeout`,
-  `start failed`, `before the start ...`) and any marker renewal that failed (`renewFailed`).
+  kit's lock and idle). The kit lets go at its first look (every 20 ms) after the launcher's claim, well inside
+  the 250 ms its server waits for the owner lock (#534). The look is a read of `/proc/locks` and nothing else:
+  the service (`systemctl show`, the adapter's usual timeout) is read by a thread of its own, about once a second
+  while it does not run, at once when a look finds the serving lock held, and no more once it runs: its MainPID
+  is kept while that process lives (#550, #580). A slow `systemctl` delays only the answer it brings, never a
+  look; but when the read that sees the unit run comes only after the claim (the usual order: the read before the
+  start saw it inactive), a `systemctl` that takes 2-3 s makes the handover that late (`handoverLate`). The 20 s
+  fallback is not harmless: the new server gives up after its 250 ms, its launcher idles, and T3
+  is down for about a minute (a pending update trial can lose its database backup). So before every stop that
+  may start a build that takes the serving lock (copy, switch, W1), the kit checks that it could tell the
+  launcher: where the running build takes the lock, its launcher must show now as the lock's holder under the
+  service's MainPID, the very look the handover makes; where it runs an older build, the kit must see a lock of
+  its own under its own pid. Where it cannot (`/proc/locks` unreadable, a `/proc` of another pid namespace, a
+  launcher that is not the service's main process or takes another kind of lock), the run refuses at plan time,
+  before its guard, hooks or any other change (`...; nothing was changed`), and checks again as the last look
+  before the stop (`...; T3 was not stopped`) (#550, #580). Another process holding the serving lock may be an SSH
+  launch's probe: the check looks once more 0.3 s later before it refuses. Nobody holding it is not enough to
+  refuse (upstream's launcher serves on without it when its 250 ms claim gave up, and the next one claims it
+  again), nor to go on: since Linux 4.12 `/proc/locks` leaves out the locks of processes outside the pid namespace
+  of that `/proc`, so a kit in a container with a `/proc` of its own sees nobody holding it while the launcher
+  does. So then the service's main process must be in this `/proc` and in `t3code.service` (its
+  `/proc/<pid>/cgroup`), and the kit must see its own lock. The copy and the switch count the build an update
+  caught at the stop may start as one that takes the lock, so on such a host they refuse even while an older
+  build runs. A W1 rerun behind its own stop (T3 is down already) goes on and says that T3 may take about a
+  minute to come up and that a pending trial's database backup may be lost. Where T3 runs and the check refuses,
+  W1 names the way out: stop T3 by hand, then at once run the same W1 (a restart would start the build W1 leaves
+  again; until the rerun, T3 is stopped with no marker and no owner lock). Where the service cannot be read, W1
+  refuses and says to run it again once `systemctl` works (a stop by hand would fail too).
+  The verify step
+  journals how the lock was let go (`handover`: `launcher`, `timeout`, `start failed`, `before the start ...`),
+  for `launcher` the measured delay (`handoverMs`: at most this many ms from the claim to the let-go; with
+  `handoverLate` when it reached 250 ms, so a server that idled on a very busy host is named), and any marker
+  renewal that failed (`renewFailed`).
+- **Root cause, a run that ends with T3 stopped (#530).** A W1 (and a switch) may end, fail or be killed with T3
+  stopped on purpose (the home may be half-restored). A lock held by the run's own process would be gone with it,
+  and the next SSH launch would start a server on that home. So right after the stop the kit starts a holder, a
+  transient unit of its own (`t3-golive-hold-<hash of the home>`, running `t3-golive hold --home <home>`), that
+  takes the owner lock and keeps it until it is stopped; the run adopts it as its own lock. Every start the kit makes
+  goes through the same handover, so the launcher gets the home from the holder. It goes only to a launcher that
+  holds its serving lock, or once the service runs: a failed start, a start that returns without T3 running (`t3
+  update` exits non-zero or times out, a build that never comes up), a failure before the start, or a kill leaves
+  the holder holding. The next run of the same `back` takes the holder over (no free moment, never a second one:
+  there is one unit name per home); a resumed verify stops one that is still there once the service runs T3.
+  `status` and `check` name the holder (do not start T3 by hand while it holds: its server would idle); `settle`
+  stops it (the owner says the home is right). It is found by its live process in `/proc/locks`, never by a file,
+  so nothing stale outlives it. Where `/proc/locks` cannot be read (the kit could never find the holder again) or
+  no transient unit can be started, the run holds the lock itself, as before, and the stop step says so (`holder:
+  null`, `holderError`); `status` and `check` name an active holder unit they cannot see there. A copy needs none:
+  its guard starts T3 again as soon as the copy run dies.
+- **Known gap: a reboot ends the holder.** The service stays disabled, so nothing starts T3 at boot, but a T3
+  desktop app connected over SSH that reconnects after the reboot finds the home free and may start its own server
+  on it while it may be half-restored. A holder that outlives a reboot would be an enabled unit on disk, state that
+  can outlive its reason (what finding the holder by its live process avoids), so the kit keeps the gap and says
+  it: `status` then fails `home holder` (none, but a run that stopped and disabled T3 has not ended ok) and says to
+  quit or disconnect that app until the same `back` ends ok.
 - **Backstop, a foreign server.** An SSH client older than 0.1.10 reads neither, and a server started by hand
   ignores both. When the runtime record names a live process that the boot service did not start and that itself
   holds `userdata/server-owner.sqlite` (a stale record whose pid was reused holds nothing and is never named), for
@@ -399,9 +528,12 @@ empty state?
 | `copy --here` from a T3 terminal                                                    | Refused: stopping T3 would kill it half-way                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | A desktop app's SSH launch while T3 is stopped (the gap)                            | It waits: the kit's marker is valid from before the stop until the new server is verified, and the kit holds the owner lock until the service's main process (the new launcher) holds its serving lock (an SSH launch's own probe of that lock, from another process, is not the launcher). No server of the old build takes the home (`tests/gap.test.py`, failing before the fix)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ... the marker cannot be written                                                    | Refused before T3 stops, and for W1 before it says it stops T3 (`the update marker ... cannot be written; T3 was not stopped`; W2/W3: `... not restarted`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ... the run is killed with T3 stopped                                               | Nothing renews the marker: it runs out within 60 s and launches go on as without it. The dead run holds no lock. A rerun is refused (`Unfinished`) as for any killed run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ... the run is killed with T3 stopped                                               | Nothing renews the marker: it runs out within 60 s. A dead copy holds no lock (its guard starts T3 at once). A W1 or switch that stopped T3 leaves the kit's holder (above): the home stays owned and launches keep waiting until the same `back` (or the switch guard) hands it to T3, `settle` stops it, or the machine reboots. A rerun is refused (`Unfinished`) as for any killed run; a W1's own rerun follows it and takes the holder over                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ... a newer marker (upstream's own update) is there at the end                      | Left alone: the kit removes only the bytes it wrote last (`marker: left: ...` in the verify step)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ... the target build takes no serving lock (an older build)                         | Older than `0.1.10-nightly.20261114.4695`: the kit lets go of the owner lock just before the start, as before; the marker still holds fresh launches                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ... the kit cannot tell the launcher by its locks                                   | Refused at plan time, before the guard, the hooks or any change (`...; nothing was changed`), and again as the last look before the stop (`...; T3 was not stopped`), no marker written: the kit could not tell the new launcher, would keep the owner lock 20 s after the start, and the new server would give up after 250 ms (T3 down about a minute). Where the running build takes the serving lock, its launcher must show as the holder now (it catches a `/proc` of another pid namespace, a launcher that is not the service's main process, another kind of lock); when nobody holds it (a claim that gave up), the service's main process must be in this `/proc` and in `t3code.service`, and the kit must see its own lock (a container's own `/proc` leaves the launcher's lock out); for an older build, the kit must see its own lock. W1's refusal names the way out: stop T3 by hand, then at once run the same W1 (`tests/gap.test.py`, #550, #580)                                                                   |
+| ... an older build runs on such a host                                              | The copy and the switch refuse too: an update caught at the stop may start a build that takes the lock. W1 to an older build goes on (`tests/gap.test.py`, #580)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ... a W1 rerun behind its own stop on such a host                                   | It goes on (T3 is stopped already: refusing would not bring it back) and says that T3 may take about a minute to come up and that a pending trial's database backup may be lost (`tests/gap.test.py` W1Gap, #580)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ... an SSH client older than 0.1.10, or a server started by hand, takes the home    | Backstop: verify stops within about 10 s and names the server (pid, command) and the remedy. The copy reports T3 did not come back. The switch's W1 refuses too, so nothing is put back: the switch ends failed, says that the target waits for the home unverified, and ends the remedy with `t3-golive back --way w1 --lose-work-since <time>` (`tests/gap.test.py` SwitchBackstop); the kit never stops it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | W1, W2 or W3 while a server the boot service did not start serves the home          | Refused before anything changes (`...; nothing was changed`). Behind a way back that stopped T3 (or with the service disabled) the remedy is: quit the desktop app, `kill <pid>`, the same back again, never start the service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
@@ -478,6 +610,14 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   only) is not checked by the removal, and the last `rmdir` goes by path (it only ever removes an empty folder).
 - **R1**: `__service-preflight` of the old build and of the fork build on the clone: both `ready`. The fork build's
   read-only report of the clone is the "before" report.
+- **Features off** (step `features-off`, fork #529): with a fork feature on (`waitFor`, `handoff`, ...) the R3
+  server could act on the clone: deliver waits or send messages. Each feature the before report says is on is
+  removed from the clone's `settings.json` (the server's value, a thread's entry in it, or a project override's;
+  a missing value reads as off), never from the home's or the copy's; the restore in R5 puts the copy's back. A
+  report again must say all off, and becomes the before report. The facts (and the result's `featuresOff`) name
+  the features, where they were on and what was removed. All off: the file is not touched. So a rehearsal never
+  runs the target with the features that go live (`waitFor` on against the migrated database, say): a passed
+  rehearsal says nothing about them, and the switch's verify on the live home is the first run with them on.
 - **R2**: `<fork t3> auth session list --json --base-dir <clone>`, with no server: a read-only command whose
   database layer migrates under the ownership lock. Timed: seconds, database growth, the migrations (the before
   report's `pendingMigrations`). A report after it must show exactly those applied and none pending (or it says no
@@ -491,10 +631,10 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   preflight on the migrated clone says `blocked` (`ready` when there were no migrations; its reason is journalled);
   `coldcopy.restore` puts the copy back into the clone and the old build's preflight says `ready`.
 
-The clone keeps `settings.json` as it is (R5 checks it is unchanged), so the R3 server reads the live provider
-settings: the provider program paths and homes (`binaryPath`, `homePath`) and any trace address. Its provider status
-checks may start those provider programs against the live provider homes (a login refresh, for example) and send
-traces to the same collector. No T3 data of the live home is reached.
+Apart from its fork features, the clone keeps `settings.json` as it is (R5 checks it is unchanged from then on),
+so the R3 server reads the live provider settings: the provider program paths and homes (`binaryPath`, `homePath`)
+and any trace address. Its provider status checks may start those provider programs against the live provider
+homes (a login refresh, for example) and send traces to the same collector. No T3 data of the live home is reached.
 
 The result (from and target version, copy, SHA256 of its manifest, migrations, seconds, growth, port) is the
 journal's last step, `result`, of a run that ended `ok`. A rehearsal is a **scratch run**
@@ -502,37 +642,43 @@ journal's last step, `result`, of a run that ended `ok`. A rehearsal is a **scra
 stopped needs no `settle` (`check` notes it); the next run throws the old clone away and makes a new one, never
 reusing one half-migrated. A run that needs settling still blocks it.
 
-| Situation                                               | What happens                                                                  |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Runs again after a good or failed rehearsal             | The old clone (it bears the mark) is removed and redone from the copy         |
-| Killed at any step (R0-R5, mid-restore)                 | The server dies with the run; nothing to settle; the next run redoes it       |
-| Killed while it removes the old folder                  | The mark goes last: the folder still bears it (or is empty); next run ends it |
-| A mount (or a swap to a link) after R0, before removal  | The guard runs again in the clone step: the run fails, nothing is removed     |
-| A swap (link, other folder) after that check            | The run fails; what is at the path now is never removed                       |
-| A mount point at or under the folder                    | Refused; never removed                                                        |
-| No mount list (not Linux, no `/proc`, an empty list)    | Refused before any step: rehearse cannot run there at all                     |
-| Reading the mount list failed this time                 | Refused before any step, naming the error; run again                          |
-| Mount tree cannot tell which mount is on top            | Refused before any step (a parent missing, a cycle, two on one point)         |
-| Python older than 3.11                                  | Refused before any step; an old rehearsal folder is kept                      |
-| `--copy` inside the rehearsal folder, or a link into it | Refused before any step: the clone step would remove it                       |
-| R2 left migrations pending                              | The run fails before R3: the server would migrate unmeasured                  |
-| A server still holds an old rehearsal home              | Refused before any step; stop it (its pid is in that home's runtime record)   |
-| `t3-rehearsal` without the mark, or a link              | Refused; never removed                                                        |
-| Live home by a link or bind path, or bound in a clone   | Refused (real path; file ids both ways and inside) before any removal         |
-| `backupDir` a bind of a folder inside the live home     | Refused before any step (mount list: the folder each is on its filesystem)    |
-| `backupDir` a bind from `userdata`'s own partition      | Refused before any step (and from a link's target, any mount under the home)  |
-| A live `userdata` link into or around the folder        | Refused before any step, any depth, dangling too; the old folder is kept      |
-| Such a link added after R0                              | The clone step's guard, or R0 on the clone, fails the run; nothing ran on it  |
-| A live `userdata` link that loops or cannot be followed | Refused before any step, naming the link; the old folder is kept              |
-| A live folder removed or made a file in a walk          | Refused (after R0: the run fails), saying run again; the run again passes     |
-| A link in the copy leads out of it                      | Left out of the clone and named (also one added after R0)                     |
-| The copy's `settings.json` or database a link out       | Refused before any step (`-wal`, `-journal`, any case): a file, a new copy    |
-| An old clone holding links out                          | Removed as any old clone: the removal never follows a link                    |
-| Copy with no manifest, not matching it, of another home | Refused (`--copy` or `t3-golive copy`)                                        |
-| Copy from another build than the live one               | Refused: take a new copy                                                      |
-| Port taken between the check and the start              | The server exits; R3 fails, the rerun passes once the port is free            |
-| Server never ready, or not saying work is held          | Stopped; the run fails                                                        |
-| Server dies during R4, or any R4 check fails            | The run fails naming every problem; the server is stopped                     |
+| Situation                                                 | What happens                                                                  |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Runs again after a good or failed rehearsal               | The old clone (it bears the mark) is removed and redone from the copy         |
+| Killed at any step (R0-R5, mid-restore)                   | The server dies with the run; nothing to settle; the next run redoes it       |
+| Killed while it removes the old folder                    | The mark goes last: the folder still bears it (or is empty); next run ends it |
+| A mount (or a swap to a link) after R0, before removal    | The guard runs again in the clone step: the run fails, nothing is removed     |
+| A swap (link, other folder) after that check              | The run fails; what is at the path now is never removed                       |
+| A mount point at or under the folder                      | Refused; never removed                                                        |
+| No mount list (not Linux, no `/proc`, an empty list)      | Refused before any step: rehearse cannot run there at all                     |
+| Reading the mount list failed this time                   | Refused before any step, naming the error; run again                          |
+| Mount tree cannot tell which mount is on top              | Refused before any step (a parent missing, a cycle, two on one point)         |
+| Python older than 3.11                                    | Refused before any step; an old rehearsal folder is kept                      |
+| `--copy` inside the rehearsal folder, or a link into it   | Refused before any step: the clone step would remove it                       |
+| R2 left migrations pending                                | The run fails before R3: the server would migrate unmeasured                  |
+| A fork feature on in the copy                             | Switched off in the clone's `settings.json` only, named in the facts          |
+| A feature still on after that (the machine's policy)      | The run fails before R2, naming where it is on: no server starts              |
+| Features on and the copy's `settings.json` not plain JSON | The run fails before R2: the kit cannot clear them; nothing ran on the clone  |
+| Killed while it clears them                               | Nothing to settle; the next run clones afresh and clears them again           |
+| A server still holds an old rehearsal home                | Refused before any step; stop it (its pid is in that home's runtime record)   |
+| `t3-rehearsal` without the mark, or a link                | Refused; never removed                                                        |
+| Live home by a link or bind path, or bound in a clone     | Refused (real path; file ids both ways and inside) before any removal         |
+| `backupDir` a bind of a folder inside the live home       | Refused before any step (mount list: the folder each is on its filesystem)    |
+| `backupDir` a bind from `userdata`'s own partition        | Refused before any step (and from a link's target, any mount under the home)  |
+| A live `userdata` link into or around the folder          | Refused before any step, any depth, dangling too; the old folder is kept      |
+| Such a link added after R0                                | The clone step's guard, or R0 on the clone, fails the run; nothing ran on it  |
+| A live `userdata` link that loops or cannot be followed   | Refused before any step, naming the link; the old folder is kept              |
+| A live folder removed or made a file in a walk            | Refused (after R0: the run fails), saying run again; the run again passes     |
+| A link in the copy leads out of it                        | Left out of the clone and named (also one added after R0)                     |
+| The copy's `settings.json` or database a link out         | Refused before any step (`-wal`, `-journal`, any case): a file, a new copy    |
+| An old clone holding links out                            | Removed as any old clone: the removal never follows a link                    |
+| Copy with no manifest, not matching it, of another home   | Refused (`--copy` or `t3-golive copy`)                                        |
+| Copy from another build than the live one                 | Refused: take a new copy                                                      |
+| Another program wants the port during the run             | It cannot: the port stays held from R0 until just before the start            |
+| The kernel handing that port out after its release        | It does not: a picked port lies outside `ip_local_port_range`                 |
+| A program binds that very port just before the start      | The server exits; R3 fails, the rerun passes once the port is free            |
+| Server never ready, or not saying work is held            | Stopped; the run fails                                                        |
+| Server dies during R4, or any R4 check fails              | The run fails naming every problem; the server is stopped                     |
 
 ## `t3-golive back [--way w1|w2|w3] [--lose-work-since <time>] [--here]`
 
@@ -731,6 +877,8 @@ python3 -I -B fork-kit/golive/tests/back.test.py       # back W1-W3 and status, 
 python3 -I -B fork-kit/golive/tests/rehearse.test.py   # rehearse R0-R5 with a stub t3 (old and fork build)
 python3 -I -B fork-kit/golive/tests/switch.test.py     # switch, verify, way back, guard on a fake machine
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
+python3 -I -B fork-kit/golive/tests/install.test.py    # the installer: a hand copy, no uninstall under a run
+python3 -I -B fork-kit/common/tests/kit_install.test.py
 python3 -I -B fork-kit/common/tests/machine_file.test.py
 ```
 

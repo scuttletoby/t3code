@@ -298,6 +298,154 @@ class PathSafety(GuardCase):
         with self.assertRaises(self.c.facts.Unreadable):
             self.c.facts.read_mounts(self.path('no-such-mountinfo'))
 
+    def test_whole_btrfs_subvolumes_are_read_from_the_mount_list(self):
+        """#604: a mount whose root is its own `subvol=` shows a whole btrfs subvolume; a part of one, a subvolume
+        of another filesystem kind, or a line without `subvol=` is not whole. A name with a space or a comma is
+        written escaped."""
+        info = self.file(self.path('mountinfo'), ''.join(line + '\n' for line in (
+            '22 1 0:31 /@ / rw,relatime shared:1 - btrfs /dev/sda2 rw,space_cache=v2,subvolid=256,subvol=/@',
+            '23 22 0:31 /@home /home rw,relatime shared:2 - btrfs /dev/sda2 rw,subvolid=257,subvol=/@home',
+            '24 22 0:31 /@home/u/src /srv/src rw,relatime shared:2 - btrfs /dev/sda2 rw,subvolid=257,subvol=/@home',
+            r'25 22 0:31 /@my\040data /data rw - btrfs /dev/sda2 rw,subvolid=258,subvol=/@my\040data',
+            r'26 22 0:31 /@a\054b /ab rw - btrfs /dev/sda2 rw,subvolid=259,subvol=/@a\054b',
+            '27 22 8:1 /srv /srv/old rw - ext4 /dev/sdb1 rw,subvol=/srv',
+            '28 22 0:32 /@x /x rw - btrfs /dev/sdc1 rw,subvolid=5')))
+        got = self.c.facts.read_mounts(info, proc=None)
+        self.assertEqual(got.whole, {('0:31', '/@'), ('0:31', '/@home'), ('0:31', '/@my data'), ('0:31', '/@a,b')})
+        self.assertEqual(self.c.facts.Mounts().whole, set())
+
+    def test_the_mount_holding_a_path_and_where_a_folder_of_a_filesystem_is_shown(self):
+        """#604: `holding` is the deepest mount, the last one on a mount point (it hides those before);
+        `shown_at` is every place a folder of a filesystem is seen, not where another mount hides it."""
+        mounts = self.c.facts.Mounts(lines=[
+            ('/', '8:1', '/'), ('/srv/view', '8:9', '/data'), ('/mnt/disk', '8:9', '/'),
+            ('/mnt/other', '8:9', '/data/deeper'), ('/mnt/hidden', '8:9', '/'), ('/mnt/hidden', '8:10', '/')])
+        self.assertEqual(mounts.holding('/srv/view/a'), ('/srv/view', '8:9', '/data'))
+        self.assertEqual(mounts.holding('/srv/viewer'), ('/', '8:1', '/'))
+        self.assertEqual(mounts.holding('/mnt/hidden/x'), ('/mnt/hidden', '8:10', '/'))
+        self.assertIsNone(self.c.facts.Mounts(lines=[('/srv', '8:1', '/')]).holding('/home'))
+        self.assertEqual(mounts.shown_at('8:9', '/'), ['/mnt/disk'])
+        self.assertEqual(mounts.shown_at('8:9', '/data'), ['/mnt/disk/data', '/srv/view'])
+        self.assertEqual(mounts.shown_at('8:9', '/data/deeper/x'),
+                         ['/mnt/disk/data/deeper/x', '/mnt/other/x', '/srv/view/deeper/x'])
+        self.assertEqual(mounts.shown_at('8:7', '/'), [])
+
+    def test_the_mount_on_top_is_found_by_mount_ids(self):
+        """#620: with mount ids, `holding` walks from the mount on `/` the way the kernel does. A mount placed
+        beneath another (listed later, sits under it) or one moved onto a point (listed early, sits on top) is read
+        where it really is; a mount on a deeper point that a later mount above it covers is not used; a list whose
+        ids do not give one answer gives None (not knowing). Without ids, the last listed on a point counts."""
+        lines = [('/', '8:1', '/'), ('/srv/a', '8:9', '/'), ('/srv/a', '8:10', '/'), ('/x/fs', '8:11', '/'),
+                 ('/x', '0:40', '/')]
+        old = self.c.facts.Mounts(lines=lines)
+        self.assertEqual(old.holding('/srv/a/f'), ('/srv/a', '8:10', '/'))
+        self.assertEqual(old.holding('/x/fs/f'), ('/x/fs', '8:11', '/'))
+        plain = self.c.facts.Mounts(lines=lines, ids=[(1, 0), (2, 1), (3, 2), (4, 1), (5, 1)])
+        self.assertEqual(plain.holding('/srv/a/f'), ('/srv/a', '8:10', '/'))
+        self.assertEqual(plain.holding('/x/fs/f'), ('/x', '0:40', '/'))         # /x covers the mount on /x/fs
+        self.assertEqual(plain.holding('/srv/b'), ('/', '8:1', '/'))
+        self.assertEqual(plain.shown_at('8:11', '/'), [])
+        beneath = self.c.facts.Mounts(lines=lines, ids=[(1, 0), (2, 3), (3, 1), (4, 1), (5, 1)])
+        self.assertEqual(beneath.holding('/srv/a/f'), ('/srv/a', '8:9', '/'))
+        self.assertEqual(beneath.shown_at('8:10', '/'), [])
+        self.assertEqual(beneath.shown_at('8:9', '/'), ['/srv/a'])
+        stacked_root = self.c.facts.Mounts(lines=[('/', '8:1', '/'), ('/', '8:2', '/')], ids=[(7, 7), (8, 7)])
+        self.assertEqual(stacked_root.holding('/a'), ('/', '8:2', '/'))
+        for name, ids in (('two on one point on one mount', [(1, 0), (2, 1), (3, 1), (4, 1), (5, 1)]),
+                          ('a loop', [(1, 0), (2, 3), (3, 2), (4, 1), (5, 1)]),
+                          ('a parent not in the list', [(1, 0), (2, 1), (3, 9), (4, 1), (5, 1)])):
+            with self.subTest(name=name):
+                mounts = self.c.facts.Mounts(lines=lines, ids=ids)
+                self.assertIsNone(mounts.holding('/srv/a/f'))
+                self.assertEqual(mounts.shown_at('8:9', '/'), [])
+                self.assertEqual(mounts.holding('/srv/b'), ('/', '8:1', '/'))        # not on the way: still known
+        two_tops = self.c.facts.Mounts(lines=[('/', '8:1', '/'), ('/', '8:2', '/')], ids=[(1, 0), (2, 0)])
+        twice = self.c.facts.Mounts(lines=lines, ids=[(1, 0), (2, 1), (2, 2), (4, 1), (5, 1)])
+        for mounts in (two_tops, twice):
+            self.assertIsNone(mounts.holding('/a'))
+        with self.assertRaises(ValueError):
+            self.c.facts.Mounts(lines=lines, ids=[(1, 0)])
+
+    def test_mount_ids_are_read_from_the_mount_list(self):
+        """#620: the mount id and the parent id of each line; a line without numbers there is not a list it can use."""
+        info = self.file(self.path('mountinfo'), ''.join(line + '\n' for line in (
+            '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw',
+            '90 22 8:9 / /srv/a rw - ext4 /dev/sdb1 rw',
+            '80 90 8:10 / /srv/a rw - ext4 /dev/sdc1 rw',
+            '91 80 0:50 / /srv/a rw - tmpfs tmpfs rw')))
+        got = self.c.facts.read_mounts(info, proc=None)
+        self.assertEqual(got.ids, [(22, 1), (90, 22), (80, 90), (91, 80)])
+        self.assertEqual(got.holding('/srv/a/x'), ('/srv/a', '0:50', '/'))
+        real = self.c.facts.read_mounts()
+        self.assertEqual(len(real.ids), len(real.lines))
+        self.assertEqual(real.holding('/'), self.c.facts.Mounts(lines=real.lines).holding('/'))   # this machine
+        with self.assertRaises(self.c.facts.Unreadable):
+            self.c.facts.read_mounts(self.file(self.path('mountinfo'), 'x 1 8:1 / / rw - ext4 /dev/sda1 rw\n'), proc=None)
+
+    def test_filesystem_types_are_read_from_the_mount_list(self):
+        """#624: the type of each line (after the "-"), unescaped; the cleaner's own list without a type on a line
+        is a list it cannot use. Only the real list is the cleaner's own: the mount check against the kernel is
+        made for that one only."""
+        info = self.file(self.path('mountinfo'), ''.join(line + '\n' for line in (
+            '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw',
+            '90 22 0:40 / /srv/a rw shared:2 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w',
+            r'91 22 0:41 / /srv/b rw - fuse.bind\040fs /src rw')))
+        got = self.c.facts.read_mounts(info, proc=None)
+        self.assertEqual(got.types, ['ext4', 'overlay', 'fuse.bind fs'])
+        self.assertFalse(got.own)
+        index = got.held('/srv/a/x')
+        self.assertEqual((got.type_of(index), got.id_of(index)), ('overlay', 90))
+        self.assertEqual(self.c.facts.Mounts(lines=got.lines).type_of(index), None)
+        with self.assertRaises(ValueError):
+            self.c.facts.Mounts(lines=got.lines, types=['ext4'])
+        real = self.c.facts.read_mounts()
+        self.assertTrue(real.own)
+        self.assertEqual(len(real.types), len(real.lines))
+        self.assertTrue(all(real.types))
+        with self.assertRaises(self.c.facts.Unreadable):
+            self.c.facts.read_mounts(self.file(self.path('mountinfo'),
+                                               '22 1 8:1 / / rw a:1 b:2 c:3 -\n'), proc=None)
+        with self.assertRaises(self.c.facts.Unreadable):
+            self.c.facts.read_mounts(self.file(self.path('mountinfo'), '22 1 8:1 / / rw a:1 b:2 -  x\n'), proc=None)
+
+    def test_the_mount_id_of_an_open_folder(self):
+        """#624: the kernel names the mount an open folder is on (mnt_id in fdinfo); no answer raises."""
+        fd = os.open(self.dir, os.O_PATH | os.O_DIRECTORY)
+        try:
+            got = self.c.facts.mount_id_of(fd)
+            real = self.c.facts.read_mounts()
+            self.assertIn(got, [one for one, _ in real.ids])
+            self.assertEqual(got, real.id_of(real.held(os.path.realpath(self.dir))))
+            proc = self.path('proc')
+            for text in (None, 'pos:\t0\nflags:\t010000000\n', 'mnt_id:\tx\n'):
+                with self.subTest(text=text), self.assertRaises(self.c.facts.Unreadable):
+                    if text is not None:
+                        self.file(os.path.join(proc, 'self', 'fdinfo', str(fd)), text)
+                    self.c.facts.mount_id_of(fd, proc)
+            self.file(os.path.join(proc, 'self', 'fdinfo', str(fd)), 'pos:\t0\nmnt_id:\t31\n')
+            self.assertEqual(self.c.facts.mount_id_of(fd, proc), 31)
+            # Only a whole line `mnt_id: <number>` counts: not a longer name that ends in it, not a number with
+            # more after it.
+            self.file(os.path.join(proc, 'self', 'fdinfo', str(fd)), 'pos:\t0\nino_mnt_id:\t7\nmnt_id:\t31\n')
+            self.assertEqual(self.c.facts.mount_id_of(fd, proc), 31)
+            self.file(os.path.join(proc, 'self', 'fdinfo', str(fd)), 'pos:\t0\nmnt_id:\t31x\n')
+            with self.assertRaises(self.c.facts.Unreadable):
+                self.c.facts.mount_id_of(fd, proc)
+        finally:
+            os.close(fd)
+
+    def test_the_mount_list_read_again(self):
+        """#624: `own_mounts` reads this process's own list again with its ids and types, as `read_mounts` does,
+        for the check at the end of the walk above a folder: the same lines for the same folders when nothing changed."""
+        real, again = self.c.facts.read_mounts(), self.c.facts.own_mounts()
+        self.assertTrue(again.own)
+        here = os.path.realpath(self.dir)
+        for of in ('/', here):      # the lines that hold them (other lines may come and go meanwhile)
+            i, j = again.held(of), real.held(of)
+            self.assertEqual((again.lines[i], again.ids[i], again.type_of(i)), (real.lines[j], real.ids[j], real.type_of(j)))
+        with self.assertRaises(self.c.facts.Unreadable):
+            self.c.facts.own_mounts(self.path('gone'))
+
     def test_another_owner(self):
         d = self.folder('tmp', 'job-1')
         inner = self.file(self.path('tmp', 'job-2', 'deep', 'theirs.bin'))
@@ -766,6 +914,20 @@ class GitFolders(GuardCase):
 
 
 MUTATIONS = {
+    'the top mount by mount ids': ('facts', 'if self.ids is not None:\n            return self._holding_by_ids(path)', 'if False:\n            pass',
+                                   PathSafety, 'test_the_mount_on_top_is_found_by_mount_ids'),
+    'a line on the way not reached is not known': ('facts', "if top is None or any(holds(line[0]) and i not in reached for i, line in enumerate(self.lines)):",
+                                                   'if top is None:', PathSafety, 'test_the_mount_on_top_is_found_by_mount_ids'),
+    'two mounts on one point on one mount': ('facts', "            if len(on) != 1:\n                return None                     # two mounts",
+                                             "            if False:\n                return None                     # two mounts",
+                                             PathSafety, 'test_the_mount_on_top_is_found_by_mount_ids'),
+    'mount ids read': ('facts', '            ids.append((int(fields[0]), int(fields[1])))', '            ids.append((0, 0))',
+                       PathSafety, 'test_mount_ids_are_read_from_the_mount_list'),
+    'a whole btrfs subvolume is its subvol=': ('facts', 'if subvol == [root]:', 'if subvol:', PathSafety,
+                                               'test_whole_btrfs_subvolumes_are_read_from_the_mount_list'),
+    'the last mount on a point hides the others': ('facts', 'if best is None or len(point) >= len(self.lines[best][0]):',
+                                                   'if best is None or len(point) > len(self.lines[best][0]):', PathSafety,
+                                                   'test_the_mount_holding_a_path_and_where_a_folder_of_a_filesystem_is_shown'),
     'must keep: the built-in paths': ('guard', 'kept = must_keep_match(cfg.must_keep, path)', 'kept = None',
                                       MustKeep, 'test_transcripts_sessions_and_t3_data_are_never_deleted'),
     'must keep: the agent homes whole': ('config', "'~/.claude*', '~/.codex*',\n", "'~/.claude*/projects', '~/.codex*/sessions',\n",
@@ -916,6 +1078,24 @@ MUTATIONS = {
     'git: no answer': ('guard', "return Refusal('could not read', f'git in {shown}: {ex}')", 'return None',
                        GitFolders, 'test_git_that_cannot_answer_means_keep'),
     'git: a folder inside is looked at': ('guard', 'gits.append((here, False))', 'pass', GitFolders, 'test_unpushed_commits'),
+    'the filesystem types are read': ('facts', 'types.append(_unescape(rest[0]))', "types.append('ext4')",
+                                      PathSafety, 'test_filesystem_types_are_read_from_the_mount_list'),
+    'only the real list is its own': ('facts', 'own=path == OWN_MOUNTINFO)', 'own=True)',
+                                      PathSafety, 'test_filesystem_types_are_read_from_the_mount_list'),
+    'a line without a type': ('facts', 'if not rest or not rest[0]:', 'if not rest:',
+                              PathSafety, 'test_filesystem_types_are_read_from_the_mount_list'),
+    'the mount id is read from fdinfo': ('facts', "found = re.search(r'^mnt_id:\\s*(\\d+)\\s*$', text, re.M)",
+                                         "found = re.search(r'^pos:\\s*(\\d+)\\s*$', text, re.M)",
+                                         PathSafety, 'test_the_mount_id_of_an_open_folder'),
+    'the mount id is a whole line (start)': ('facts', "found = re.search(r'^mnt_id:\\s*(\\d+)\\s*$', text, re.M)",
+                                             "found = re.search(r'mnt_id:\\s*(\\d+)\\s*$', text, re.M)",
+                                             PathSafety, 'test_the_mount_id_of_an_open_folder'),
+    'the mount id is a whole line (end)': ('facts', "found = re.search(r'^mnt_id:\\s*(\\d+)\\s*$', text, re.M)",
+                                           "found = re.search(r'^mnt_id:\\s*(\\d+)\\s*', text, re.M)",
+                                           PathSafety, 'test_the_mount_id_of_an_open_folder'),
+    'the list read again is its own': ('facts', 'return Mounts({point for point, _, _ in lines}, lines, ids=ids, types=types, own=True)',
+                                       'return Mounts({point for point, _, _ in lines}, lines, ids=ids, types=None, own=True)',
+                                       PathSafety, 'test_the_mount_list_read_again'),
 }
 
 

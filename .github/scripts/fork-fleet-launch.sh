@@ -140,8 +140,9 @@ PLAIN_PATH='(/[A-Za-z0-9._@+-]+)+'
 [[ $ALLOW_PATHS =~ ^($PLAIN_PATH(,$PLAIN_PATH)*)?$ ]] || die "$conf: ALLOW_PATHS is a comma-separated list of plain paths"
 # An absolute path (a relative one would be read from wherever this runs); on the fake machine, the fake one's.
 [[ $JOB_PATHS =~ ^($PLAIN_PATH)?$ ]] || die "$conf: JOB_PATHS is a plain absolute path"
+own_job_paths=0
 if [[ -n $JOB_PATHS ]]; then JOB_PATHS=$ROOT$JOB_PATHS; else
-  JOB_PATHS=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fork-fleet-job-paths.txt
+  JOB_PATHS=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fork-fleet-job-paths.txt own_job_paths=1
 fi
 [[ $CANARY_DIR =~ ^$PLAIN_PATH$ ]] || die "$conf: CANARY_DIR is a plain absolute path"
 [[ $FREE_COMMAND =~ ^($PLAIN_PATH)?$ && $FREE_CHECK =~ ^($PLAIN_PATH)?$ ]] ||
@@ -1019,14 +1020,31 @@ real_path() {
 }
 
 # A path no job ever sees of this host's: its own of these or none (/proc, /sys, /dev, /run, /tmp, /var/tmp), all of
-# /etc, or one that holds data (no_data). The rule of the list's and ALLOW_PATHS' lines.
+# /etc, or one that holds data (no_data). The rule of the list's and ALLOW_PATHS' lines; $3 says how to take the line
+# out where it came from (job_view: re-run the installer for its own list, else edit JOB_PATHS' file or launch.conf).
 never() {
   case $1/ in /proc/* | /sys/* | /dev/* | /run/* | /tmp/* | /var/tmp/*)
     die "$2: a job never sees it from this host (its own, none, or data): not a path to allow" ;;
   esac
   # All of /etc (issue #243): only the entries a build needs (the list's /etc lines), never the logins, units, cron,
   # /etc/default and backup tools' folders beside them. An older kit's list still names it: refused, no runner starts.
-  [[ $1 != /etc ]] || die "$2: all of /etc is never in a job's view (an older kit's list?): re-run the installer"
+  [[ $1 != /etc ]] || die "$2: all of /etc is never in a job's view (an older kit's list?): $3"
+  # The host's passwd, group and hosts (issue #370): job_fs writes a job's own; bound over them, the host's would be
+  # seen. An older kit's list still names them: refused, no runner starts.
+  case $1 in /etc/passwd | /etc/group | /etc/hosts)
+    die "$2: a job has the launcher's own, never this host's (an older kit's list?): $3" ;;
+  esac
+  # The other usual files that name this host's accounts or LAN hosts, and each folder that holds one (issue #613; the
+  # walls' SECRET_ETC and SECRET_ELSEWHERE name them too, for an older launcher, and a test keeps the two lists one):
+  # passwd's and group's backup copies, subuid and subgid, tcp wrappers' rules, the network and ethers name files, the
+  # logs and login records (/var/log: wtmp, btmp, lastlog, auth.log), Debian's /var/backups (passwd.bak) and
+  # libnss-extrausers' folder.
+  case $1 in
+    /etc/passwd- | /etc/group- | /etc/subuid | /etc/subuid- | /etc/subgid | /etc/subgid- | /etc/hosts.allow | \
+      /etc/hosts.deny | /etc/networks | /etc/ethers | /var | /var/log | /var/log/* | /var/backups | /var/backups/* | \
+      /var/lib | /var/lib/extrausers | /var/lib/extrausers/*)
+      die "$2: names this host's accounts or LAN hosts, or is a folder of such a file; a job never sees it: $3" ;;
+  esac
   no_data "$1" "$2"
 }
 
@@ -1058,7 +1076,7 @@ bound_real() {
 # share under /usr/lib/wsl, a disk under /etc stay out), and no mount the host makes later reaches the unit
 # (MountFlags=private). Sets view_ro (SOURCE:DEST) and view_links (DEST and its link's text).
 job_view() {
-  local line p real hook_dir=${HOOK%/*}
+  local line p real fix i n hook_dir=${HOOK%/*}
   local -a paths=() plain=()
   [[ $HOOK =~ ^$PLAIN_PATH$ && $WORK_ROOT =~ ^$PLAIN_PATH$ ]] || die "HOOK ($HOOK) and WORK_ROOT must be plain paths"
   owned_safe "$JOB_PATHS"
@@ -1066,17 +1084,28 @@ job_view() {
     [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
     paths+=("$line")
   done <"$JOB_PATHS"
+  n=${#paths[@]}
   # shellcheck disable=SC2206 # plain paths only, checked below
   paths+=(${ALLOW_PATHS//,/ })
   view_ro=() view_links=()
+  i=0
   for p in "${paths[@]}"; do
+    i=$((i + 1))
+    # Where the line came from, so a refusal names the way out (issue #594): the installer rewrites only its own list.
+    if ((i > n)); then
+      fix="take it out of ALLOW_PATHS in $conf"
+    elif ((own_job_paths)); then
+      fix='re-run the installer'
+    else
+      fix="take it out of $JOB_PATHS (JOB_PATHS in $conf)"
+    fi
     [[ $p =~ ^$PLAIN_PATH$ && /$p/ != */./* && /$p/ != */../* ]] || die "$JOB_PATHS or ALLOW_PATHS: not a plain path: $p"
-    never "$p" "$p"
+    never "$p" "$p" "$fix"
     if [[ -L $ROOT$p ]]; then
       view_links+=("$p" "$(readlink -- "$ROOT$p")")
     elif [[ -e $ROOT$p ]]; then
       real=$(real_path "$p")
-      never "$real" "$p (that is $real)"
+      never "$real" "$p (that is $real)" "$fix"
       view_ro+=("$real:$p")
       [[ $real != "$p" ]] || plain+=("$p")
     fi
@@ -1098,18 +1127,56 @@ job_view() {
   done
 }
 
-# job_view for a unit: its root ($1, root's), its copy ($2, read-write; already a real path, in WORK_ROOT's), and
-# the jobs' resolv.conf at $3. Sets props_fs and resolv_bind; seen, the mount points check-net's probe allows (its
-# own /proc, /sys, /dev and memory file systems are allowed there); from, each of them with the device and inode
-# its source has here, which the probe compares with what the unit has there (a link swapped in after job_view shows);
-# and linked, the links its root has (the list's, and /etc/resolv.conf when $3 is elsewhere: the probe allows them).
+# A job's own /etc/passwd, group and hosts in its root $1 (issue #370), for its user $2 with HOME $3: root, nobody and
+# that user, their groups, and localhost and this host's name on loopback. Never the host's: they name every account,
+# its GECOS (often a person's name) and home folder, and the LAN's host names. New files (noclobber) in a folder job_fs
+# just made, root's: nothing to lead a write astray. A job cannot change them (ProtectSystem=strict, and root's).
+job_etc() {
+  local root=$1 user=$2 home=${3:-/nonexistent} uid gid group name passwd groups hosts f
+  uid=$(id -u -- "$user") gid=$(id -g -- "$user") group=$(id -gn -- "$user")
+  [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $group =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "$user: no plain uid, gid or group name"
+  name=$(uname -n)
+  passwd='root:x:0:0:root:/root:/usr/sbin/nologin'$'\n'
+  ((uid == 65534)) || passwd+='nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin'$'\n'
+  passwd+="$user:x:$uid:$gid::$home:/bin/sh"$'\n'
+  groups='root:x:0:'$'\n'
+  ((gid == 65534)) || groups+='nogroup:x:65534:'$'\n'
+  groups+="$group:x:$gid:"$'\n'
+  hosts='127.0.0.1 localhost'$'\n''::1 localhost ip6-localhost ip6-loopback'$'\n'
+  # Its own name, as uname shows it to the job anyway (Java's getLocalHost and the like look it up); one with a _ too
+  # (issue #594), though no DNS name has one. A name with any other character (a blank, a #) gets no line.
+  [[ ! $name =~ ^[A-Za-z0-9_]([A-Za-z0-9._-]{0,252})$ || $name == localhost ]] || hosts+="127.0.1.1 $name"$'\n'
+  mkdir -p -m 0755 -- "$root/etc"
+  # One write a file, each checked: in a subshell left of ||, set -e is off, so a failed write would not stop the
+  # next (issue #594); the first that fails (a file already there, a full disk) stops them all and refuses the start.
+  (
+    set -o noclobber
+    umask 022
+    printf '%s' "$passwd" >"$root/etc/passwd" && printf '%s' "$groups" >"$root/etc/group" &&
+      printf '%s' "$hosts" >"$root/etc/hosts"
+  ) || die "could not write $root/etc's passwd, group and hosts as new files: refused"
+  # Each a plain file of its own now (issue #613 item 6): noclobber refuses only a regular file already there, so a link
+  # to /dev/null (or a FIFO) planted there would take the write and leave the job no passwd at all. Only root could
+  # plant one (the folder is root's, just made); refused all the same.
+  for f in passwd group hosts; do
+    [[ -f $root/etc/$f && ! -L $root/etc/$f && -s $root/etc/$f ]] || die "$root/etc/$f is not the plain file just written: refused"
+  done
+}
+
+# job_view for a unit: its root ($1, root's), its copy ($2, read-write; already a real path, in WORK_ROOT's), the
+# jobs' resolv.conf at $3 and its user $4. Sets props_fs and resolv_bind; seen, the mount points check-net's probe
+# allows (its own /proc, /sys, /dev and memory file systems are allowed there); from, each of them with the device
+# and inode its source has here, which the probe compares with what the unit has there (a link swapped in after
+# job_view shows); and linked, the entries its root has of job_fs's own (the list's links, /etc/resolv.conf when $3 is
+# elsewhere, and its own passwd, group and hosts: job_etc; the probe allows them).
 job_fs() {
-  local root=$1 rw=$2 resolv=$3 i b real
+  local root=$1 rw=$2 resolv=$3 user=$4 i b real
   local -a ro=() view_ro view_links
   job_view
   rm -rf --one-file-system -- "$root"
   mkdir -m 0755 -- "$root"
-  linked=''
+  job_etc "$root" "$user" "${rw:+$rw/home}"
+  linked=' /etc/passwd /etc/group /etc/hosts'
   for ((i = 0; i < ${#view_links[@]}; i += 2)); do
     mkdir -p -m 0755 -- "$root${view_links[i]%/*}"
     ln -s -- "${view_links[i + 1]}" "$root${view_links[i]}"
@@ -1166,7 +1233,7 @@ paths() {
 sandbox() {
   local user=$1 resolv=$2 own=$3 resolv_bind
   local -a props_fs
-  job_fs "$4" "$5" "$resolv"
+  job_fs "$4" "$5" "$resolv" "$user"
   props=(
     -p "NetworkNamespacePath=/run/netns/fork-fleet-$user"
     -p "IPAddressDeny=${PRIVATE4[*]} $own ::/0" -p IPAddressAllow=localhost
@@ -1260,6 +1327,58 @@ start() {
   "$SYSTEMD_RUN" --quiet --unit "fork-fleet-$name" --collect --uid "$user" --working-directory "$dir" \
     -p Type=exec -p KillMode=control-group -p "EnvironmentFile=$env_file" "${props[@]}" -p "ReadWritePaths=$dir" \
     -p "RuntimeMaxSec=$MAX_SECONDS" -p TimeoutStopSec=90 -p TimeoutAbortSec=90 -- "$dir/run.sh"
+  # What systemd really applies (issue #365 item 1), drop-ins and defaults included, not what was asked for: a unit
+  # whose stop timeouts are over STOP_MAX (or cannot be read) is killed at once, and the start refused.
+  bad=$(stops_over "fork-fleet-$name.service")
+  if [[ -n $bad ]]; then
+    "$SYSTEMCTL" kill --signal=KILL -- "fork-fleet-$name.service" || true
+    "$SYSTEMCTL" stop --no-block -- "fork-fleet-$name.service" || true
+    die "start: fork-fleet-$name.service $bad: a job that ignores the stop at RuntimeMaxSec would run on; killed and refused"
+  fi
+}
+
+# At most this long (seconds) may systemd wait for a job unit to stop before it kills it (the walls' STOP_MAX: a test
+# keeps the two one): at RuntimeMaxSec it asks the job to stop, and only kills it when that runs out.
+STOP_MAX=300
+
+# Why the stop timeouts systemd applies to unit $1 (`systemctl show`: TimeoutStopUSec, TimeoutAbortUSec) are not each
+# at most STOP_MAX, or nothing. Read as systemd prints them (format_timespan: words such as 1min, 30s, 500ms, 1.5s,
+# infinity; 0 is endless for a stop timeout); any other word, a key missing or twice, or a show that fails: not at
+# most (fail closed).
+stops_over() {
+  local out line key n frac unit ms word seen=' '
+  local -a words
+  out=$("$SYSTEMCTL" show -p TimeoutStopUSec -p TimeoutAbortUSec -- "$1" 2>/dev/null) || {
+    echo "has stop timeouts systemctl show cannot read"
+    return
+  }
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    [[ $line =~ ^(TimeoutStopUSec|TimeoutAbortUSec)=(.*)$ ]] || { echo "has a show line that is no stop timeout"; return; }
+    key=${BASH_REMATCH[1]}
+    [[ $seen != *" $key "* ]] || { echo "has $key twice"; return; }
+    seen+="$key "
+    read -ra words <<<"${BASH_REMATCH[2]}"
+    ((${#words[@]})) || { echo "has an empty $key"; return; }
+    [[ ${words[*]} != infinity && ${words[*]} != 0 ]] || { echo "has $key=${words[*]}: endless"; return; }
+    ms=0
+    for word in "${words[@]}"; do
+      [[ $word =~ ^([0-9]{1,9})(\.([0-9]{1,6}))?(us|ms|s|min|h|d|w|month|y)$ ]] ||
+        { echo "has $key=${words[*]}, not a time it can read"; return; }
+      n=$((10#${BASH_REMATCH[1]})) frac=${BASH_REMATCH[3]} unit=${BASH_REMATCH[4]}
+      # A fraction counts as one more of its unit (never less than systemd's).
+      [[ -z $frac ]] || n=$((n + 1))
+      case $unit in
+        us) ms=$((ms + (n + 999) / 1000)) ;;
+        ms) ms=$((ms + n)) ;;
+        s) ms=$((ms + n * 1000)) ;;
+        min) ms=$((ms + n * 60000)) ;;
+        *) ((n == 0)) || ms=$(((STOP_MAX + 1) * 1000)) ;;   # an hour or more: over, whatever the number
+      esac
+    done
+    ((ms > 0 && ms <= STOP_MAX * 1000)) || { echo "has $key=${words[*]}, over STOP_MAX ($STOP_MAX s) or endless"; return; }
+  done <<<"$out"
+  [[ $seen == *" TimeoutStopUSec "* && $seen == *" TimeoutAbortUSec "* ]] || echo "has stop timeouts systemctl show did not print"
 }
 
 # Runs in the sandbox as the runner user: $1 the URL that must answer, $2 this host's own public addresses, which the
@@ -1310,9 +1429,10 @@ EOF
 # bound point is the very file or folder job_fs checked (a link swapped in before systemd bound it would show);
 # entries in /mnt or /media; and sockets in the places a desktop keeps them (WSLg's X11 and PulseAudio). Other mount
 # points are read from mountinfo, never looked at: a share that hangs cannot stop the probe. Then /etc (issue #243),
-# checked by looking: every entry of the job's /etc is one the list (a mount point), a link of job_fs's (its fourth
+# checked by looking: every entry of the job's /etc is one the list (a mount point), an entry job_fs made (its fourth
 # argument) or the jobs' resolv.conf put there, and check-net's canaries (its fifth: files outside the list, one
-# others may read, one only the runner's group may) are not there nor readable.
+# others may read, one only the runner's group may) are not there nor readable. And the job's passwd, group and hosts
+# are job_etc's own (issue #370): root, nobody, its user and loopback only, never the host's accounts or LAN names.
 read -r -d '' WALLS <<'EOF' || true
 import ctypes, errno, mmap, os, re, signal, socket, stat, sys
 libc = ctypes.CDLL(None, use_errno=True)
@@ -1432,6 +1552,37 @@ def etc_extra():
         return None
     return extra
 etc = etc_extra()
+def not_own():
+    """Issue #370: what the job's passwd, group and hosts hold beyond job_fs's own (job_etc): an account or group but
+    root's, nobody's and this process's own, or a name on an address but loopback. The host's would name every account
+    (GECOS, home) and the LAN's hosts. A passwd or group with no line of this process's own (an empty one: issue #613
+    item 6) is not job_etc's either."""
+    out = []
+    for name, ids, mine in (('passwd', {0, 65534, os.getuid()}, os.getuid()),
+                            ('group', {0, 65534, os.getgid()}, os.getgid())):
+        try:
+            # Bytes beyond ASCII (an old Latin-1 GECOS on the host) as \x escapes: read, never a crash (issue #594).
+            with open(os.path.join(ETC, name), encoding='ascii', errors='backslashreplace') as f:
+                own = False
+                for x in f:
+                    w = x.rstrip('\n').split(':')
+                    if x.strip() and not (len(w) >= 4 and w[2].isdigit() and int(w[2]) in ids):
+                        out.append(f'{name} {w[0]}')
+                    own = own or (len(w) >= 4 and w[2].isdigit() and int(w[2]) == mine)
+                if not own:
+                    out.append(f'{name} (no line of its own)')
+        except OSError:
+            out.append(f'{name} (cannot read it)')
+    try:
+        with open(os.path.join(ETC, 'hosts'), encoding='ascii', errors='backslashreplace') as f:
+            for x in f:
+                w = x.split('#')[0].split()
+                if w and not (w[0] == '::1' or w[0].startswith('127.')):
+                    out.append(f'hosts {w[0]}')
+    except OSError:
+        out.append('hosts (cannot read it)')
+    return out
+own = not_own()
 canaries = sys.argv[5].split() if len(sys.argv) > 5 else []
 def there(p):
     try:
@@ -1457,6 +1608,7 @@ if sys.argv[1] == 'host':
                             'nothing beyond the list here either: the refusal inside shows nothing'))
     print(f'host: canaries: {len(seen_canaries)} of {len(canaries)} there' + (': the wall matters' if seen_canaries else
                                                                               ''))
+    print(f'host: passwd, group, hosts: {len(own)} entries a job\'s own leave out' + (': the wall matters' if own else ''))
     sys.exit(0)
 bad = 0
 def line(ok, text):
@@ -1482,6 +1634,8 @@ line(not receive, 'later mounts: ' + (f'the host\'s reach {few(receive)}' if rec
 line(not mnt, '/mnt and /media: ' + (f'hold {few(mnt)} inside' if mnt else 'nothing inside'))
 line(etc == [], '/etc: ' + ('cannot list it' if etc is None else
                             f'holds {few(etc)}, which no list line puts there' if etc else 'only the listed entries'))
+line(not own, 'passwd, group, hosts: ' + (f'hold {few(own)}, which are not the job\'s own' if own else
+                                         'only root, nobody, the job\'s own user and loopback'))
 line(bool(canaries) and not seen_canaries, 'canaries: ' + (
     f'{few(seen_canaries)} there inside' if seen_canaries else f'{len(canaries)} not there inside' if canaries else
     'none given'))

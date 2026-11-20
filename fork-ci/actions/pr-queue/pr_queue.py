@@ -83,8 +83,8 @@ GIT_AUTH = ('-c', 'credential.https://github.com.helper=',
 GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.commitGraph=false',
             '-c', 'core.attributesFile=/dev/null', '--no-replace-objects')
 # ... and no global or system config or attributes: on a self-hosted runner an earlier job may have written
-# ~/.gitconfig or ~/.config/git/attributes. The same
-# two as ../git-clean/git_clean.py's (git_clean.test.py pins GIT_SAFE and GIT_ENV to its).
+# ~/.gitconfig or ~/.config/git/attributes. GIT_SAFE and GIT_ENV are the same as ../git-clean/git_clean.py's
+# (git_clean.test.py pins them to its).
 GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ATTR_NOSYSTEM': '1'}
 # The tree git reads `.gitattributes` from, for every call git_env makes: the empty tree, so no attribute file of any
 # commit counts. Without it a bare repository's HEAD (git 2.43 to 2.45 read `HEAD:.gitattributes` there) or an
@@ -1481,7 +1481,9 @@ class Queue:
         text) is cleaned of them and of markdown; `advice`, the queue's own text from the config (a command in
         backticks, a `<sha>` placeholder), keeps its markdown unless it holds one (lens.no_lens_text). 0, or SILENT when
         the comment failed (the caller keeps STATE, so the next run says it)."""
-        why = lens.no_lens_text(why) + (' ' + lens.no_lens_text(advice, keep_markdown=True) if advice else '')
+        # One line: a multi-line gh error could start a line with `covered:`, `checks:` or a heading naming a lens.
+        why = lens.no_lens_text(' '.join(why.split()))
+        why += ' ' + lens.no_lens_text(advice, keep_markdown=True) if advice else ''
         print(f'#{n}: auto-merge left OFF: {why}')
         r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
                           f'pr_queue turned auto-merge OFF: {why}\nNeeds a lens read of any new commits, then '

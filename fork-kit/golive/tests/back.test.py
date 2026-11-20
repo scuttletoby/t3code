@@ -529,7 +529,8 @@ class W1(BackBase):
         self.assertEqual([s for s, _ in steps], ['plan', 'runtime', 'pre-hooks', 'stop-service', 'restore', 'update',
                                                  'verify', 'post-hooks'])
         self.assertEqual(steps[5][1]['t3'], self.m.path(f'home/runtime/versions/{fx.LIVE}/t3'))
-        self.assertEqual(self.calls()[-3:], ['disable', 'stop', 'start'])  # off at boot before the data moves
+        # off at boot before the data moves; the kit's holder keeps the home owned from the stop on (#530)
+        self.assertEqual(self.calls()[-4:], ['disable', 'stop', 'run_detached', 'start'])
         self.assertTrue(self.adapter.service()['enabled'])
         self.assertTrue(any('threads: 40 at the copy, 43 now' in line for line in self.said), self.said)
         self.assertEqual(self.last_run()['end']['result'], 'ok')
@@ -1056,6 +1057,8 @@ class FollowStuckW1(FollowBase):
         # stable's copy. The only fork build a switch names is the first one, whose base nightly is older than
         # that stable: W2 would run `--allow-downgrade` to it under data the stable wrote.
         ran, newer, later = '0.1.11', '0.1.12-nightly.20261201.7.fork.1', '0.1.12'
+        # 0.1.11 takes the serving lock: the fake launcher holds it while it runs (golive_fixture.LAUNCHER_SERVES), and
+        # the copy's look at the running launcher before its stop passes (#580)
         self.m.stage_release(ran)
         self.assertEqual(self.back('w3')['version'], ran)
         self.m.stage_release(newer)  # a copy is taken before a switch to a staged, newer target

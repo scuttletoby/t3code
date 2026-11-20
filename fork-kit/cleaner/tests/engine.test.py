@@ -629,7 +629,7 @@ class Engine(Case):
         with self.assertRaises(machine_file.MachineFileError):
             self.tmp_cfg(logFile='~/into-tmp/cleaner.log')
         # The lock and the journal next to the log are the cleaner's own files too: never in a must-keep path.
-        for own in ('cleaner.log.lock', 'cleaner.log.deleting', 'cleaner.log.reported'):
+        for own in ('cleaner.log.lock', 'cleaner.log.deleting', 'cleaner.log.reported', 'cleaner.log.dedupe', 'cleaner.log.dedupe-own'):
             with self.subTest(own=own), self.assertRaises(machine_file.MachineFileError):
                 self.cfg(mustKeep=[self.path('state', own)])
         self.cfg(mustKeep=[self.path('state', 'cleaner.log.other')])
@@ -795,10 +795,11 @@ class Config(Case):
             | {f'docker.{k}' for k in cf.DOCKER_SPEC} | {f'tmp.{k}' for k in cf.TMP_SPEC} \
             | {f'daily.{k}' for k in cf.DAILY_SPEC} | {f'compare.{k}' for k in cf.COMPARE_SPEC} \
             | {f'compressCold.{k}' for k in cf.COMPRESS_SPEC} | {f'folders.{k}' for k in cf.FOLDER_SPEC} \
-            | {f'agentScratch.{k}' for k in cf.SCRATCH_SPEC} | {f'keepFirst.{k}' for k in cf.KEEP_FIRST_SPEC}
+            | {f'agentScratch.{k}' for k in cf.SCRATCH_SPEC} | {f'keepFirst.{k}' for k in cf.KEEP_FIRST_SPEC} \
+            | {f'dedupe.{k}' for k in cf.DEDUPE_SPEC}
         self.assertEqual(set(cf.KEY_KINDS), keys)
         self.assertLessEqual(set(cf.KEY_KINDS.values()), {'own file', 'floor', 'keeps more', 'picks', 'loosens', 'compare only'})
-        self.assertEqual([k for k, v in cf.KEY_KINDS.items() if v == 'loosens'], ['repos.regenerable'])
+        self.assertEqual([k for k, v in cf.KEY_KINDS.items() if v == 'loosens'], ['repos.regenerable', 'folders.layered'])
 
     def test_the_launcher_runs(self):
         exe = os.path.join(fx.KIT, 'bin', 'fork-cleaner')
@@ -899,7 +900,7 @@ MUTATIONS = {
     'the log: its owner': ('engine', "if st.st_uid != os.getuid():", 'if False:', Engine, 'test_a_log_of_another_owner_is_not_the_cleaners'),
     'the log: its folder through links': ('config', 'os.path.join(os.path.realpath(os.path.dirname(log)), os.path.basename(log))', 'log',
                                           Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
-    'the log: lock and journal never in a must-keep path': ('config', 'for own in (self.log_file, self.lock_file, self.journal_file, self.report_file, self.report_lock_file):',
+    'the log: lock and journal never in a must-keep path': ('config', 'for own in (self.log_file, self.lock_file, self.journal_file, self.report_file, self.report_lock_file,\n                    self.dedupe_cache, self.dedupe_own):',
                                                             'for own in (self.log_file,):', Engine, 'test_the_log_is_never_in_a_must_keep_path_or_a_root'),
     'delete: the entry the last check judged': ('rules', 'if (st.st_dev, st.st_ino) != look.ident:  # ident', 'if False:',
                                                 Tmp, 'test_an_entry_swapped_after_the_last_check_is_never_followed'),

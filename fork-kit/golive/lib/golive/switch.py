@@ -226,8 +226,9 @@ def _installed_changed(cfg, version, build):
 
 def _look(cfg, adapter, version, before, binary, build=None):
     """What is wrong with the live T3 now ([] when nothing): design 4.5, for `version`. The migrations must all have
-    run, the counts must not shrink from the stopped home's before the update, the provider instances must be those,
-    and (build=install-target's record) the server must run the build install-target checked, byte for byte."""
+    run, the counts must not shrink from the stopped home's before the update, the provider instances and the fork
+    features on must be those, and (build=install-target's record) the server must run the build install-target
+    checked, byte for byte."""
     try:
         svc = adapter.service()
         if not svc['active']:
@@ -258,8 +259,9 @@ def _look(cfg, adapter, version, before, binary, build=None):
     said += [f'{k}: {before["counts"].get(k)} before, {counts.get(k)} now' for k in live.COUNTS
              if not (type(counts.get(k)) is int and counts[k] >= before['counts'][k])]
     fork = report.get('fork') if isinstance(report.get('fork'), dict) else {}
-    if fork.get('featuresOn') != []:
-        said.append(f'fork features on: {fork.get("featuresOn")}')
+    now = live.features_state(fork)
+    if now != before['features']:
+        said.append(f'fork features: {live.features_differ(before["features"], now, "before the switch", "now")}')
     if check_mod.providers_sum(report) != before['providers']:
         said.append('the provider instances differ from before the switch')
     if report.get('ok') is not True:
@@ -486,6 +488,13 @@ def stop_grace(cfg):
     return guard_after(cfg, MIN_LIMIT)
 
 
+def _blind(cfg, adapter, server):
+    """handoff.handover_blind for a switch: after the stop it starts the target, or the old build on its way back,
+    or, after an update caught at the stop, whatever build the service state names then (#580)."""
+    return handoff.handover_blind(cfg.home, [cfg.target_version, server['version'], handoff.ANY_BUILD],
+                                  server['version'], adapter.service)
+
+
 def _prechecks(cfg, adapter, owner_says_go, say, run):
     """Every refusal before the first step. Returns what the switch needs."""
     code, result = check_mod.run_check(cfg, adapter, own_run=run)
@@ -504,11 +513,16 @@ def _prechecks(cfg, adapter, owner_says_go, say, run):
         archive = live.staged_archive(cfg.stage_dir, cfg.target_version)[0]
     except live.NotLive as e:
         raise journal.Refused(f'{e}; nothing was changed') from None
+    if not isinstance(result.get('features'), dict):
+        raise journal.Refused('the check gave no list of the fork features: the switch cannot tell what it must '
+                              'keep; nothing was changed')
     rehearsal = passed_rehearsal(cfg, server['version'], sha)
     if result.get('pendingMigrations') != rehearsal['migrations']:
         raise journal.Refused(f'the target would run migrations {result.get("pendingMigrations")}, the '
                               f'rehearsal ran {rehearsal["migrations"]}: rehearse again')
-    why = coldcopy._home_problem(cfg)
+    # and whether the kit can tell the new launcher after the stop: before the wait, a kept runtime, the guard and the
+    # pre hooks, so a refusal touches nothing and waits for nothing (#580)
+    why = coldcopy._home_problem(cfg) or _blind(cfg, adapter, server)
     if why is not None:
         raise journal.Refused(f'{why}; nothing was changed')
     try:
@@ -522,28 +536,50 @@ def _prechecks(cfg, adapter, owner_says_go, say, run):
     if not owner_says_go:
         coldcopy.wait_quiet(cfg, server['version'], say)
         _disk(cfg, coldcopy._plan_total(cfg), keep_bytes, install_bytes)
-    why = check_mod.server_changed(cfg, adapter, server)
+    # the wait may have taken hours: again
+    why = check_mod.server_changed(cfg, adapter, server) or _blind(cfg, adapter, server)
     if why is not None:
         raise journal.Refused(f'{why}; nothing was changed')
     dest = os.path.join(cfg.backup_dir, f't3-switch-{coldcopy._stamp()}-{server["version"]}')
     if os.path.lexists(dest):
         raise journal.Refused(f'{dest} already exists; a copy never goes over another: try again in a second')
-    return {'server': server, 'binary': binary, 'archive': archive, 'sha': sha, 'rehearsal': rehearsal, 'dest': dest}
+    return {'server': server, 'binary': binary, 'archive': archive, 'sha': sha, 'rehearsal': rehearsal, 'dest': dest,
+            'features': result['features']}
 
 
-def _before(cfg, binary, migrations):
+def features_changed(cfg, binary, server, features):
+    """Why the fork features in the live home are not `features` (what check read), or None: read again just before
+    the stop, as check read them (by the staged build and the live fork build's own report), so a change since the
+    check refuses with T3 still running."""
+    try:
+        fork = live.fork_report(binary, cfg.home).get('fork')
+        differ = live.features_differ(features, live.features_state(fork), 'then', 'now')
+        if differ:
+            return f'the fork features changed since the check: {differ}'
+        now, why = check_mod.features_answer(cfg, fork, server)  # and the live build still reads the same
+    except live.NotLive as e:
+        return f'the fork features cannot be read again before the stop: {e}'
+    return None if now is not None else f'the fork features, read again before the stop: {why}'
+
+
+def _before(cfg, binary, migrations, features):
     """The stopped home's facts the verify compares with, read under the owner lock (nothing can write): raises
-    unless the report is whole and says what the rehearsal said."""
+    unless the report is whole and says what the rehearsal said, with the fork features `features` on (what the
+    check read: a switch keeps them as they are)."""
     report = _report(binary, cfg.home)
     db = report.get('database') if isinstance(report.get('database'), dict) else {}
     counts = db.get('counts') if isinstance(db.get('counts'), dict) else {}
     fork = report.get('fork') if isinstance(report.get('fork'), dict) else {}
     facts = {'reportCounts': {k: counts.get(k) for k in live.COUNTS}, 'providers': check_mod.providers_sum(report),
-             'pendingMigrations': db.get('pendingMigrations'), 'featuresOn': fork.get('featuresOn')}
+             'pendingMigrations': db.get('pendingMigrations'), 'features': live.features_state(fork)}
+    facts['featuresOn'] = facts['features']['on'] if facts['features'] else None
     if not all(type(counts.get(k)) is int for k in live.COUNTS):
         raise RuntimeError(f'the stopped home\'s report gave no counts ({counts})')
-    if report.get('ok') is not True or fork.get('featuresOn') != []:
-        raise RuntimeError(f'the stopped home\'s report is not ok or has fork features on ({fork.get("featuresOn")})')
+    if report.get('ok') is not True:
+        raise RuntimeError('the stopped home\'s report is not ok')
+    if facts['features'] != features:
+        raise RuntimeError(f'the stopped home\'s report has other fork features than the check read: '
+                           f'{live.features_differ(features, facts["features"], "at the check", "now")}')
     if db.get('pendingMigrations') != migrations:
         raise RuntimeError(f'the stopped home would run migrations {db.get("pendingMigrations")}, the rehearsal ran '
                            f'{migrations}')
@@ -606,12 +642,15 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
     if failed is None and not owner_says_go:
         ok, detail = coldcopy.quiet_now(cfg, old)
         failed = None if ok else f'not quiet any more: {detail}'
-    failed = failed or check_mod.server_changed(cfg, adapter, server) or coldcopy._home_problem(cfg)
+    failed = failed or check_mod.server_changed(cfg, adapter, server)
+    # Read beside the running T3 only, as check's (fork #180): the server is checked again after the read.
+    failed = (failed or features_changed(cfg, p['binary'], server, p['features'])
+              or check_mod.server_changed(cfg, adapter, server) or coldcopy._home_problem(cfg))
     if failed is None and not coldcopy._guard_alive(adapter, unit):
         failed = f'the guard {unit} is not running any more'
     if failed is None and stops.got:
         failed = f'stopped by {stops.names()}'
-    failed = failed or coldcopy.open_gap(cfg.home)
+    failed = failed or _blind(cfg, adapter, server) or coldcopy.open_gap(cfg.home)
     if failed is not None:
         again = coldcopy._hooks(run, 'post-hooks', cfg.post_hooks, cfg.home)
         if again:
@@ -620,10 +659,12 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
     say(f'stopping {osadapter.UNIT} (t3 {old}) to switch to {cfg.target_version}')
     error, lock, noted = None, None, 0
     try:
-        with run.step('stopping', **rec, marker=handoff.marker_path(cfg.home)):
+        with run.step('stopping', **rec, marker=handoff.marker_path(cfg.home)) as facts:
             adapter.stop()
             coldcopy._wait_stopped(adapter, server['pid'])
-            lock = coldcopy.hold_owner_lock(os.path.join(cfg.home, 'userdata'), coldcopy.STOP_WAIT)
+            # by the holder: a switch killed before its guard puts T3 back leaves the home owned (#530)
+            lock, held = coldcopy.hold_home(adapter, cfg.home, coldcopy.STOP_WAIT)
+            facts.update(held)
             if handoff.adopt(cfg.home, lock):  # held until the update's restart hands the home over
                 lock = None
             coldcopy._same_after_stop(cfg, server)
@@ -667,8 +708,9 @@ def _switch_on(run, cfg, adapter, owner_says_go, say, p, rec, unit, stops):
         # Read now, under the owner lock (nothing changed the home since the copy), with the target build just
         # installed and checked: never the stage, which nothing checked again since the prechecks.
         with run.step('before') as facts:
-            facts.update(_before(cfg, keptruntime.home_t3(cfg.home, cfg.target_version), rehearsal['migrations']))
-        before = {'counts': facts['reportCounts'], 'providers': facts['providers']}
+            facts.update(_before(cfg, keptruntime.home_t3(cfg.home, cfg.target_version), rehearsal['migrations'],
+                                 p['features']))
+        before = {'counts': facts['reportCounts'], 'providers': facts['providers'], 'features': facts['features']}
         stops.check()
         with run.step('update', version=cfg.target_version) as facts:
             _update(cfg, adapter, keptruntime.home_t3(cfg.home, cfg.target_version), cfg.target_version, limit)
@@ -762,10 +804,13 @@ def guard(cfg, adapter, run_id, wait, say=print, lose_work_since=None):
             except (journal.Damaged, OSError) as e:
                 runs = None
                 did.append(f'journal unreadable, so T3 is started if it is not active: {e}')
-                if not adapter.service()['active']:
+                svc = adapter.service()
+                if not svc['active'] and not svc['enabled']:  # the switch never disables it; its W1 does, on purpose
+                    did.append(f'{osadapter.UNIT} is not enabled: left stopped (a W1 that stopped may hold it)')
+                elif not svc['active']:
                     coldcopy.open_gap(cfg.home)  # left to run out: this guard does not wait for T3
-                    try:
-                        adapter.start()
+                    try:  # the killed run's holder (#530) lets go to the launcher
+                        handoff.starting(cfg.home, adapter.start, None, adapter.service)
                     finally:
                         handoff.close(cfg.home)
                     did.append(f'started {osadapter.UNIT}')
