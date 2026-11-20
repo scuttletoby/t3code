@@ -1,7 +1,8 @@
 /**
  * Fork (agent slots): `ActiveRunShells.read`, what the slot gate counts, over a real projection store.
  * A settled thread whose run goes on is still running. Checked against upstream's own shell read for
- * every run status, so drift turns a test red; the reader path runs once over a file database.
+ * every run status, so drift turns a test red; the reader path and the one read transaction run over
+ * a file database.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -18,13 +19,15 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as NodeSqlite from "node:sqlite";
+
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -32,6 +35,9 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ActiveRunShells from "./ActiveRunShells.ts";
+
+/** Upstream's index on runs by thread and status (migration 055), which upstream's shell read forces. */
+const RUN_STATUS_INDEX = "orchestration_v2_projection_runs_thread_status_idx";
 
 const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
 const old = DateTime.subtract(now, { days: 10 });
@@ -320,29 +326,61 @@ describe("ActiveRunShells.read", () => {
     }
   });
 
-  it.effect("upstream's run status index exists under the name the read uses", () =>
-    Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      const rows = yield* sql<{ readonly name: string }>`
-        SELECT name FROM sqlite_schema WHERE type = 'index' AND name = ${ActiveRunShells.RUN_STATUS_INDEX}
-      `;
-      // Red when upstream renames or drops it: update ActiveRunShells.ts (it reads on without it).
-      assert.lengthOf(rows, 1);
-    }).pipe(Effect.provide(layerSql)),
+  it.effect(
+    "SQLite reads the runs through upstream's index on its own, before and after ANALYZE",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const plan = Effect.gen(function* () {
+          const rows = yield* sql<{ readonly detail: string }>`
+          EXPLAIN QUERY PLAN ${ActiveRunShells.unfinishedRunThreadIds(sql)}
+        `;
+          return rows.map((row) => row.detail);
+        });
+        // Red when upstream renames or changes the index: the read still works (the next test), only
+        // slower, so point this at the new index, or say why a slower read is fine.
+        const indexed = `SCAN orchestration_v2_projection_runs USING COVERING INDEX ${RUN_STATUS_INDEX}`;
+        assert.include(yield* plan, indexed);
+        for (let thread = 0; thread < 40; thread++) {
+          const threadId = yield* createThread(`plan-${thread}`);
+          for (let ordinal = 1; ordinal <= 5; ordinal++) {
+            yield* createRun(
+              threadId,
+              ordinal === 5 && thread % 4 === 0 ? "running" : "completed",
+              ordinal,
+            );
+          }
+        }
+        yield* sql.unsafe("ANALYZE");
+        assert.include(yield* plan, indexed);
+      }).pipe(Effect.provide(layerSql)),
   );
 
-  it.effect("without the index it still counts every running agent, and logs an error once", () =>
+  /** What upstream may do to its index; the old read forced it by name and failed on a partial one. */
+  const indexChanges = {
+    dropped: `DROP INDEX ${RUN_STATUS_INDEX}`,
+    renamed: `DROP INDEX ${RUN_STATUS_INDEX};
+      CREATE INDEX orchestration_v2_projection_runs_renamed_idx
+        ON orchestration_v2_projection_runs(thread_id, status)`,
+    "made partial under the same name": `DROP INDEX ${RUN_STATUS_INDEX};
+      CREATE INDEX ${RUN_STATUS_INDEX} ON orchestration_v2_projection_runs(thread_id, status)
+        WHERE status IN ('preparing', 'starting', 'running', 'waiting')`,
+  };
+  it.effect.each(
+    Object.entries(indexChanges).map(([change, statements]) => ({ change, statements })),
+  )("with upstream's index $change, it still counts every running agent", ({ statements }) =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
       const sql = yield* SqlClient.SqlClient;
-      const busy = yield* createThread("unindexed-busy");
+      const busy = yield* createThread("reindexed-busy");
       yield* createRun(busy, "running");
-      const archived = yield* createThread("unindexed-archived", { archivedAt: old });
+      const archived = yield* createThread("reindexed-archived", { archivedAt: old });
       yield* createRun(archived, "starting");
-      yield* createRun(yield* createThread("unindexed-idle"), "completed");
-      // Upstream's shell read names the index too: read it before it goes, and serve that.
+      yield* createRun(yield* createThread("reindexed-idle"), "completed");
+      // Upstream's shell read forces the index by name today, so it would change with the index:
+      // read it before the change and serve that, so only the pre-select meets the new schema.
       const all = yield* store.getShellSnapshot();
-      yield* sql.unsafe(`DROP INDEX ${ActiveRunShells.RUN_STATUS_INDEX}`);
+      for (const statement of statements.split(";")) yield* sql.unsafe(statement);
       const only = (
         threads: OrchestrationV2ThreadShellSnapshot["threads"],
         wanted: ReadonlyArray<ThreadId>,
@@ -357,14 +395,10 @@ describe("ActiveRunShells.read", () => {
             }),
           ),
       } as unknown as ThreadManagementService.ThreadManagementService["Service"];
-      const errors: Array<string> = [];
-      const logger = Logger.make(({ logLevel, message }) => {
-        if (logLevel === "Error")
-          errors.push(String(Array.isArray(message) ? message[0] : message));
-      });
 
       yield* Effect.gen(function* () {
         const shells = yield* ActiveRunShells.ActiveRunShells;
+        // Read again too: nothing about the schema is kept between reads.
         for (let read = 0; read < 2; read++) {
           const snapshot = yield* shells.read;
           assert.deepStrictEqual(ids(snapshot.threads), [busy]);
@@ -372,25 +406,20 @@ describe("ActiveRunShells.read", () => {
         }
       }).pipe(
         Effect.provide(
-          Layer.mergeAll(
-            // Fresh: not the store-backed instance this test's own layer already built.
-            Layer.fresh(ActiveRunShells.layer).pipe(
-              Layer.provide(
-                Layer.succeed(ThreadManagementService.ThreadManagementService, threads),
-              ),
-              Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
-            ),
-            Logger.layer([logger], { mergeWithExisting: false }),
+          // Fresh: not the store-backed instance this test's own layer already built.
+          Layer.fresh(ActiveRunShells.layer).pipe(
+            Layer.provide(Layer.succeed(ThreadManagementService.ThreadManagementService, threads)),
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
           ),
         ),
       );
-      assert.deepStrictEqual(errors, [ActiveRunShells.MISSING_INDEX_MESSAGE]);
     }).pipe(Effect.provide(layerSql)),
   );
 });
 
 describe("ActiveRunShells.read over a file database", () => {
-  it.effect("reads on the reader while a write is half-way, and sees only what was committed", () =>
+  // Live: the timeout below needs real time, not the test clock.
+  it.live("reads on the reader while a write is half-way, and sees only what was committed", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -422,12 +451,97 @@ describe("ActiveRunShells.read over a file database", () => {
           ),
         );
         yield* Deferred.await(writerHeld);
-        // On the writer this read would wait for the transaction above, and the test would hang.
-        assert.deepStrictEqual(ids((yield* readActive).threads), [busy]);
+        // On the writer this read would wait for the transaction above, and that wait cannot be
+        // interrupted: wait for it apart (detached, it ends after the writer) and fail fast.
+        const reading = yield* Effect.forkDetach(readActive);
+        const during = yield* Fiber.join(reading).pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(10),
+            // Let the writer end first: the database cannot close while its transaction is open.
+            orElse: () =>
+              Deferred.succeed(releaseWriter, undefined).pipe(
+                Effect.andThen(Fiber.join(writer)),
+                Effect.andThen(
+                  Effect.die(
+                    new Error(
+                      "the read waited on the writer's open transaction: it must use the reader",
+                    ),
+                  ),
+                ),
+              ),
+          }),
+        );
+        assert.deepStrictEqual(ids(during.threads), [busy]);
         yield* Deferred.succeed(releaseWriter, undefined);
         yield* Fiber.join(writer);
         // Read again after the commit: the new run counts.
         assert.deepStrictEqual(ids((yield* readActive).threads), [busy, later].toSorted());
+      }).pipe(Effect.provide(layerFile));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect("reads the ids and the shells in one state, even when a write commits in between", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-active-runs-" });
+      const file = path.join(directory, "state.sqlite");
+      // Between the two reads, another connection hands the running agent over: one run ends and
+      // another thread's starts, in one commit. One agent runs before it and one after it.
+      let handOver: (() => void) | undefined;
+      const threadsBetween = Layer.effect(
+        ThreadManagementService.ThreadManagementService,
+        Effect.gen(function* () {
+          const store = yield* ProjectionStore.ProjectionStoreV2;
+          return {
+            readShellSnapshot: (options) =>
+              Effect.sync(() => {
+                handOver?.();
+                handOver = undefined;
+              }).pipe(
+                Effect.andThen(store.readShellSnapshot(options)),
+                Effect.map(Effect.orDie),
+                Effect.orDie,
+              ),
+          } as Pick<
+            ThreadManagementService.ThreadManagementService["Service"],
+            "readShellSnapshot"
+          > as ThreadManagementService.ThreadManagementService["Service"];
+        }),
+      );
+      const layerFile = ActiveRunShells.layer.pipe(
+        Layer.provideMerge(threadsBetween),
+        Layer.provideMerge(ProjectionStore.layer),
+        Layer.provideMerge(SqlitePersistence.layerFromPath(file)),
+        Layer.provide(NodeServices.layer),
+      );
+
+      yield* Effect.gen(function* () {
+        const first = yield* createThread("between-first");
+        const firstRun = yield* createRun(first, "running");
+        const second = yield* createThread("between-second");
+        const secondRun = yield* createRun(second, "completed");
+        handOver = () => {
+          const other = new NodeSqlite.DatabaseSync(file);
+          try {
+            other.exec("PRAGMA busy_timeout = 5000");
+            other.exec("BEGIN IMMEDIATE");
+            const setStatus = other.prepare(
+              "UPDATE orchestration_v2_projection_runs SET status = ? WHERE run_id = ?",
+            );
+            setStatus.run("completed", firstRun);
+            setStatus.run("running", secondRun);
+            other.exec("COMMIT");
+          } finally {
+            other.close();
+          }
+        };
+        const snapshot = yield* readActive;
+        assert.isUndefined(handOver, "the write ran between the two reads");
+        // The state before the commit. Two transactions would read the ids before it ([first]) and
+        // that shell after it (no active run): no agent at all, a count that never was.
+        assert.deepStrictEqual(ids(snapshot.threads), [first]);
+        // Read again: the commit is seen.
+        assert.deepStrictEqual(ids((yield* readActive).threads), [second]);
       }).pipe(Effect.provide(layerFile));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
