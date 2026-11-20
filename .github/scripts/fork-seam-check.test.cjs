@@ -14,6 +14,7 @@ const {
   findSpareSeamLines,
   findListedGone,
   findLostLines,
+  findPromotedNotFork,
   findStaleSeamLines,
   findUnlistedChanges,
   forkFileTest,
@@ -24,7 +25,10 @@ const {
   ownListProblem,
   parseConfig,
   parseRemoved,
+  promotedFiles,
   sameLines,
+  UPSTREAM_FILE,
+  UPSTREAM_REF,
 } = require("./fork-seam-check.cjs");
 
 const SCRIPT = path.join(__dirname, "fork-seam-check.cjs");
@@ -3103,4 +3107,313 @@ test("the command line: a spare seam copy fails fork-follow's run, is lowered af
       fs.rmSync(out, { force: true });
     }
   });
+});
+
+// A pull request that moves a "pending" file to "files" has its entry held to the fork lines
+// counted from upstream (--upstream or main's UPSTREAM_FILE, fetched read-only); without, as before.
+const WARNING = /^(?:Warning: |::warning::)/m;
+function withUpstream(body) {
+  withRepo(({ dir, git, commit, run }) => {
+    const upDir = `${dir}-upstream.git`;
+    const ref = () => {
+      try {
+        return git("rev-parse", "--verify", "--quiet", UPSTREAM_REF).trim();
+      } catch {
+        return undefined;
+      }
+    };
+    try {
+      const up = commit({ "p.ts": "a();\nb();\n" }, "upstream");
+      git("clone", "-q", "--bare", dir, upDir);
+      git("checkout", "-q", "-b", "fork");
+      const main = commit(
+        {
+          ...seams({ files: {}, pending: { "p.ts": 2 } }),
+          "p.ts": "a();\nforkA();\nb();\nforkB();\n",
+        },
+        "main",
+      );
+      const move = (added, from = main) => {
+        git("checkout", "-q", "-f", "-B", `pr-${added.join("-")}`, from);
+        return commit(seams({ files: { "p.ts": { why: "w", added } } }), "move p.ts to files");
+      };
+      body({ dir, git, commit, run, up, upDir, main, move, ref });
+    } finally {
+      fs.rmSync(upDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("--upstream: a promoted line upstream has is refused; the pull request's own count passes it", () => {
+  withUpstream(({ run, upDir, main, move }) => {
+    // `a();` is upstream's and `forkB();` is left out: the count (2) and "the file has it" pass.
+    const wrong = move(["a();", "forkA();"]);
+    const before = run("--config-ref", main, main, wrong);
+    assert.equal(before.status, 0, before.stderr);
+    assert.match(
+      before.stdout,
+      /^Note: this change moves p\.ts from "pending" to "files"; without --upstream/m,
+    );
+    const result = run("--config-ref", main, "--upstream", upDir, main, wrong);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(
+      result.stderr,
+      /- p\.ts: moved to "files" in this change's \.github\/fork-seams\.json, whose "added" lists `a\(\);`, but the fork adds no copy over upstream \([0-9a-f]{12}\): remove it from "added" \(a line upstream has is never a seam line\)\./,
+    );
+    assert.match(
+      result.stderr,
+      /- p\.ts: moved to "files" .*, whose "added" lists `forkB\(\);` not at all, but the fork adds it over upstream \([0-9a-f]{12}\): list it/,
+    );
+  });
+});
+
+test("--upstream: an entry listing exactly the fork lines passes, and runs again the same as upstream moves on", () => {
+  withUpstream(({ dir, git, run, up, upDir, main, move, ref }) => {
+    const right = move(["forkB();", "forkA();"]);
+    const wrong = move(["a();", "forkA();"]);
+    const judge = (pr) => run("--config-ref", main, "--upstream", upDir, main, pr);
+    const first = judge(right);
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(
+      first.stdout,
+      new RegExp(
+        `each entry lists exactly the fork lines counted from upstream \\(${up.slice(0, 12)}, `,
+      ),
+    );
+    assert.doesNotMatch(first.stdout, WARNING);
+    assert.equal(ref(), up);
+    // Runs again: the same verdicts, the ref fetched afresh.
+    assert.equal(judge(right).status, 0);
+    assert.equal(judge(wrong).status, 1);
+    // Upstream moved on past the fork's base (and took a fork line word for word): still judged
+    // from the commit main sits on, the merge-base, not upstream's newest head.
+    git("checkout", "-q", "-B", "upnext", up);
+    git("commit", "-q", "--allow-empty", "-m", "noop");
+    fs.writeFileSync(path.join(dir, "p.ts"), "a();\nforkA();\nb();\nc();\n");
+    git("commit", "-q", "-am", "upstream takes forkA");
+    const next = git("rev-parse", "HEAD").trim();
+    git(
+      "push",
+      "-q",
+      upDir,
+      `${next}:refs/heads/${git("-C", upDir, "symbolic-ref", "--short", "HEAD").trim()}`,
+    );
+    const again = judge(right);
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stdout, new RegExp(`\\(${up.slice(0, 12)}, `));
+    assert.equal(ref(), next);
+  });
+});
+
+test("--upstream: an unreachable or unrelated upstream is a warning and today's check, never an old fetch", () => {
+  withUpstream(({ dir, git, run, main, move, ref }) => {
+    const wrong = move(["a();", "forkA();"]);
+    const gone = `${dir}-no-such-upstream.git`;
+    // An earlier run's fetch (or one stopped half-way) left the ref: it is not judged by.
+    git("update-ref", UPSTREAM_REF, main);
+    const result = run("--config-ref", main, "--upstream", gone, main, wrong);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(
+      result.stdout,
+      new RegExp(
+        `${WARNING.source}this change moves p\\.ts from "pending" to "files", but could not fetch the default branch of ${gone.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} \\(twice\\): .*, so whether its "added" lists exactly the fork lines is not checked here`,
+        "m",
+      ),
+    );
+    assert.equal(ref(), undefined);
+    // An upstream with no commit in common with main: named, not taken for a base.
+    const other = `${dir}-unrelated.git`;
+    try {
+      execFileSync("git", ["init", "-q", "--bare", other]);
+      // An empty upstream (no default branch yet): it cannot be fetched.
+      const empty = run("--config-ref", main, "--upstream", other, main, wrong);
+      assert.equal(empty.status, 0, empty.stderr);
+      assert.match(
+        empty.stdout,
+        /could not fetch the default branch of .*-unrelated\.git \(twice\)/,
+      );
+      git("checkout", "-q", "--orphan", "lonely");
+      const lonely = (() => {
+        fs.writeFileSync(path.join(dir, "z.ts"), "z();\n");
+        git("add", "-A");
+        git("commit", "-q", "-m", "unrelated");
+        return git("rev-parse", "HEAD").trim();
+      })();
+      git("push", "-q", other, `${lonely}:refs/heads/main`);
+      execFileSync("git", ["-C", other, "symbolic-ref", "HEAD", "refs/heads/main"]);
+      const unrelated = run("--config-ref", main, "--upstream", other, main, wrong);
+      assert.equal(unrelated.status, 0, unrelated.stderr);
+      assert.match(
+        unrelated.stdout,
+        new RegExp(`, ${lonely.slice(0, 12)}\\) shares no commit with ${main}`),
+      );
+    } finally {
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+});
+
+test("--upstream: a change that moves no pending file fetches nothing", () => {
+  withUpstream(({ dir, git, commit, run, main, ref }) => {
+    git("checkout", "-q", "-B", "plain", main);
+    const plain = commit({ "q.ts": "fork();\n" }, "a fork file");
+    const result = run(
+      "--config-ref",
+      main,
+      "--upstream",
+      `${dir}-no-such-upstream.git`,
+      main,
+      plain,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, WARNING);
+    assert.equal(ref(), undefined);
+    // From upstream the base is upstream already: --upstream is a usage error there.
+    assert.equal(run("--from-upstream", "--upstream", dir, main, plain).status, 2);
+    assert.equal(run("--upstream", main, plain).status, 2);
+  });
+});
+
+test("--upstream in a partial clone (as fork-checks checks out): the verdict holds, and no remote is left", () => {
+  withUpstream(({ dir, git, upDir, main, move }) => {
+    const right = move(["forkA();", "forkB();"]);
+    const wrong = move(["a();", "forkA();"]);
+    git("config", "uploadpack.allowFilter", "true");
+    execFileSync("git", ["-C", upDir, "config", "uploadpack.allowFilter", "true"]);
+    const clone = `${dir}-partial`;
+    try {
+      execFileSync("git", ["init", "-q", clone]);
+      const cg = (...args) => execFileSync("git", ["-C", clone, ...args], { encoding: "utf8" });
+      cg("remote", "add", "origin", `file://${dir}`);
+      cg("fetch", "-q", "--no-tags", "--filter=blob:none", "origin", main, right, wrong);
+      cg("checkout", "-q", "--detach", main);
+      const judge = (pr) =>
+        spawnSync(
+          "node",
+          [SCRIPT, "--config-ref", main, "--upstream", `file://${upDir}`, main, pr],
+          {
+            cwd: clone,
+            encoding: "utf8",
+          },
+        );
+      const ok = judge(right);
+      assert.equal(ok.status, 0, ok.stderr);
+      assert.match(ok.stdout, /each entry lists exactly the fork lines/);
+      const bad = judge(wrong);
+      assert.equal(bad.status, 1, bad.stdout);
+      assert.match(bad.stderr, /lists `a\(\);`, but the fork adds no copy over upstream/);
+      // The fetch registered no remote: the next run starts from the same config.
+      assert.doesNotMatch(cg("config", "--list"), /fork-seam-upstream/);
+    } finally {
+      fs.rmSync(clone, { recursive: true, force: true });
+    }
+  });
+});
+
+test("findPromotedNotFork: exact copies, a file upstream lacks, and which files are promoted", () => {
+  const up = "a();\nb();\n";
+  const head = "a();\nforkA();\nforkA();\nb();\n";
+  const at = (text) => ({ atUpstream: () => text, atHead: () => head, name: "abc" });
+  assert.deepEqual(findPromotedNotFork(["p.ts"], promoted("forkA();", "forkA();"), at(up)), []);
+  assert.deepEqual(findPromotedNotFork(["p.ts"], promoted("forkA();"), at(up)), [
+    'p.ts: moved to "files" in this change\'s .github/fork-seams.json, whose "added" lists `forkA();`, but the fork adds it 2× over upstream (abc): list it 2× (every fork line the file holds is listed).',
+  ]);
+  assert.match(
+    findPromotedNotFork(["p.ts"], promoted("forkA();", "forkA();", "forkA();"), at(up))[0],
+    /lists `forkA\(\);` 3×, but the fork adds 2× over upstream \(abc\): list it 2×/,
+  );
+  assert.match(
+    findPromotedNotFork(["p.ts"], promoted("forkA();", "forkA();"), at(undefined))[0],
+    /upstream \(abc\) does not have it/,
+  );
+  assert.deepEqual(
+    promotedFiles(
+      { pending: { "p.ts": 1, "q.ts": 1, "r.ts": 1 } },
+      { "p.ts": {}, "q.ts": {} },
+      { "q.ts": 1 },
+    ),
+    ["p.ts"],
+  );
+  assert.deepEqual(promotedFiles({ pending: { "p.ts": 1 } }), []);
+});
+
+test("the list commit's upstream file: a wrong move is refused without --upstream; the pull request's own copy is never read", () => {
+  withUpstream(({ git, commit, run, upDir, main, move, ref }) => {
+    const named = JSON.stringify({ "//": "test", url: `file://${upDir}` });
+    // The pull request adds the file itself (main has none): main's list judges, and has no upstream.
+    git("checkout", "-q", "-f", "-B", "own-file", main);
+    const ownFile = commit(
+      {
+        ...seams({ files: { "p.ts": { why: "w", added: ["a();", "forkA();"] } } }),
+        [UPSTREAM_FILE]: named,
+      },
+      "move p.ts and name upstream itself",
+    );
+    const own = run("--config-ref", main, main, ownFile);
+    assert.equal(own.status, 0, own.stderr);
+    assert.match(
+      own.stdout,
+      /without --upstream \(and no \.github\/fork-upstream\.json at [0-9a-f]{12}\)/,
+    );
+    assert.equal(ref(), undefined);
+    // Main names upstream: the same wrong entry is refused with no flag, a right one passes, twice.
+    git("checkout", "-q", "-f", "-B", "main-named", main);
+    const mainNamed = commit({ [UPSTREAM_FILE]: named }, "name upstream");
+    const wrong = move(["a();", "forkA();"], mainNamed);
+    const right = move(["forkA();", "forkB();"], mainNamed);
+    for (let round = 0; round < 2; round++) {
+      const refused = run("--config-ref", mainNamed, mainNamed, wrong);
+      assert.equal(refused.status, 1, refused.stdout);
+      assert.match(refused.stderr, /lists `a\(\);`, but the fork adds no copy over upstream/);
+      const passed = run("--config-ref", mainNamed, mainNamed, right);
+      assert.equal(passed.status, 0, passed.stderr);
+      assert.match(
+        passed.stdout,
+        new RegExp(`and file://${upDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)`),
+      );
+    }
+    // --upstream, given, wins over the file (an unreachable one: a warning, not the file's verdict).
+    const flagged = run("--config-ref", mainNamed, "--upstream", `${upDir}-gone`, mainNamed, wrong);
+    assert.equal(flagged.status, 0, flagged.stderr);
+    assert.match(flagged.stdout, /could not fetch the default branch of .*-gone \(twice\)/);
+  });
+});
+
+test("a malformed upstream file on the list's commit refuses a move to files, and only a move", () => {
+  withUpstream(({ git, commit, run, upDir, main, move, ref }) => {
+    const bad = {
+      "": /is not JSON/,
+      "[]": /is not a JSON object/,
+      '{"url":"https://example.invalid/u.git","repo":"x"}': /unknown key "repo" \(known: url\)/,
+      '{"url":"--upload-pack=touch x"}': /"url" must be one https:\/\/ or file:\/\/ git URL/,
+      '{"url":"ext::sh -c x"}': /"url" must be one https:\/\/ or file:\/\/ git URL/,
+      [`{"url":"file://${upDir} x"}`]: /"url" must be one https:\/\/ or file:\/\/ git URL/,
+    };
+    for (const [text, why] of Object.entries(bad)) {
+      git("checkout", "-q", "-f", "-B", "main-bad", main);
+      const mainBad = commit({ [UPSTREAM_FILE]: text }, "a broken upstream file");
+      const result = run("--config-ref", mainBad, mainBad, move(["forkA();", "forkB();"], mainBad));
+      assert.equal(result.status, 1, `${text}: ${result.stdout}`);
+      assert.match(
+        result.stderr,
+        /p\.ts: moved to "files" in this change's \.github\/fork-seams\.json, but \.github\/fork-upstream\.json at [0-9a-f]{12}/,
+      );
+      assert.match(result.stderr, why);
+      assert.match(result.stderr, /fix that file with a pull request to main first/);
+      assert.equal(ref(), undefined);
+      // A change that moves no pending file (the fix itself, say) never reads it.
+      git("checkout", "-q", "-f", "-B", "plain-bad", mainBad);
+      const plain = commit({ "q.ts": "fork();\n" }, "a fork file");
+      assert.equal(run("--config-ref", mainBad, mainBad, plain).status, 0);
+    }
+  });
+});
+
+test("this repository's upstream file is well formed and names an https URL", () => {
+  const raw = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, UPSTREAM_FILE), "utf8"));
+  assert.match(raw.url, /^https:\/\/[^\s]+\.git$/);
+  assert.deepEqual(
+    Object.keys(raw).filter((key) => !key.startsWith("//")),
+    ["url"],
+  );
 });
