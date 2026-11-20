@@ -21,6 +21,8 @@ const ROW_ONE_LINE = /^ {2}\{.*\},?$/u;
 /** A line at the rows' own indent: inside a row, only its closing `},` may be there. */
 const ROW_INDENT = /^ {2}\S/u;
 const ROW_SCOPE_KEY = /\bscope:\s*(["'])(\w+)\1,\s*key:\s*(["'])([A-Za-z0-9]+)\3/gu;
+/** The same shape once strings are emptied, so the one read from `code` is the row's own and not a string's. */
+const ROW_SCOPE_KEY_BARE = /\bscope:\s*(""|''),\s*key:\s*(""|'')/gu;
 
 /**
  * A row's text without its comments (`code`), and also without the contents of its strings (`bare`), so neither a
@@ -103,7 +105,7 @@ function pinnedIds(text) {
     const { code, bare } = stripRow(row.text);
     if (bare.includes("...")) {
       throw new Error(
-        `${where(row.at)}a spread in a row (write each row's scope and key in the row itself)`,
+        `${where(row.at)}a spread in a row (no spreads anywhere in a row: write it all out)`,
       );
     }
     const objects = bare.trim().replace(/,$/u, "");
@@ -117,8 +119,9 @@ function pinnedIds(text) {
       }
     }
     const read = [...code.matchAll(ROW_SCOPE_KEY)];
-    const scopes = [...code.matchAll(/\bscope:/gu)].length;
-    if (read.length !== 1 || scopes !== 1) {
+    const scopes = [...bare.matchAll(/\bscope:/gu)].length;
+    const shaped = [...bare.matchAll(ROW_SCOPE_KEY_BARE)].length;
+    if (read.length !== 1 || scopes !== 1 || shaped !== 1) {
       throw new Error(
         `${where(row.at)}${scopes} "scope:" but ${read.length} read as ` +
           '`scope: "<scope>", key: "<key>"` (write each row that way)',

@@ -122,6 +122,19 @@ test("pinnedIds fails closed on a row whose scope and key could be read from the
       '  {\n    /* scope: "server", key: "a" */\n    key: "x",\n  },\n',
       /line 12: 0 "scope:" but 0 read/u,
     ],
+    // A string's "scope:" does not count, so a row whose own scope is not written as `scope:` is refused.
+    "shorthand scope, a string with a scope and key": [
+      `  { scope, key, note: "scope: 'server', key: 'fake'" },\n`,
+      /line 12: 0 "scope:" but 1 read/u,
+    ],
+    "quoted scope, a string with a scope and key": [
+      `  { "scope": "client", "key": "real", note: "scope: 'server', key: 'fake'" },\n`,
+      /line 12: 0 "scope:" but 1 read/u,
+    ],
+    "real scope and key, a string with another pair": [
+      `  { scope: "client", key: "real", note: "scope: 'server', key: 'fake'" },\n`,
+      /line 12: 1 "scope:" but 2 read/u,
+    ],
     // Two entries on one line read as one row, so the second would go unread.
     "two objects on one line": [
       '  { scope: "client", key: "b" }, { scope: "server", key: "c" },\n',
