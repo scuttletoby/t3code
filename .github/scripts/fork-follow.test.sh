@@ -693,6 +693,24 @@ plan
 check "plan: re-run of a rebase that lowered the list -> the same files, advance to the earlier release" \
   eval 'action_is advance && [[ "$(out candidate)" == "$released" ]] && grep -q "lowered the seam list" "$root/out"'
 
+# #432: upstream adds a file named like the fork's (upstream's own "fork" feature names files so).
+# A pull request's run would take it for the fork's own, so the run from upstream refused it and
+# every fork-follow stopped until a pull request excluded it. After the rebase the plan excludes
+# it itself, in the lowering commit, and the next run passes.
+new_upstream
+new_fork v0.1.10
+up_release v0.1.11 'echo up > fork-up.txt'
+plan
+check "plan: an upstream file named like a fork file is excluded in the lowered list, not a stop" \
+  eval 'action_is rebase && [[ ! -e "$root/refused" ]] \
+    && [[ "$(lowered_list | jq -c .forkFiles)" == "[\"!fork-up.txt\"]" ]] \
+    && grep -qx -- "- fork-up.txt: \"forkFiles\" \"!fork-up.txt\" added (upstream has it; a pull request'"'"'s run took it for a fork file)" <<< "$(git -C "$root/work" log -1 --format=%b "$(out candidate)")"'
+work git reset -q --hard "$(out candidate)"
+work git push -q --force origin HEAD:main
+plan
+check "plan: the next run from the new base passes the list with the exclusion" \
+  eval 'action_is release && [[ ! -e "$root/report.md" ]] && hasnt "lowered the seam list" "$root/out"'
+
 # The lowered list is checked again and must lower nothing more. A seam check that always lowers
 # (in the fork's series, which the plan runs) stops the plan: the report says what was lowered, and
 # the run's summary claims no commit, as nothing goes on from here.

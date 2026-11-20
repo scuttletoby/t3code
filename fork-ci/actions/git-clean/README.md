@@ -7,9 +7,21 @@ workspace, and an earlier job may have run pull request code there. That code ca
 of its own steps runs pull request code.
 
 - **Self-hosted runner:** it empties the workspace (`GITHUB_WORKSPACE`), so the checkout starts from nothing, as on a
-  GitHub-hosted runner. Symlinks are removed as links, never followed, and the workspace's real path must be its own
-  path below the runner's work folder (no symlink from `RUNNER_WORKSPACE` down): nothing outside the workspace is
-  touched. The walk keeps one folder open at a time, so a tree of any depth is removed.
+  GitHub-hosted runner. Symlinks are removed as links, never followed (a read-only folder is made writable without
+  following one either, also on glibc older than 2.32, where it needs `/proc`). The workspace's real path must be its
+  own path below the runner's work folder (no symlink from the work folder down), and the wipe then opens it from the
+  work folder one name at a time, never through a symlink, so a symlink swapped in after the check is refused, not
+  followed.
+  - **Mounts:** a mount point inside the workspace (any kind, a bind mount of a folder on the same disk too; read from
+    `/proc/self/mountinfo` on Linux) refuses the step before anything is removed. A folder on another device that
+    the walk meets anyway (a mount made during the wipe, or a btrfs subvolume, which has its own device but is not a
+    mount) is not entered: the step fails with its path. A subvolume stays until someone removes it by hand
+    (`btrfs subvolume delete`). A bind mount made during the wipe (that needs root) has the workspace's device: it is
+    entered and its source emptied before its `rmdir` fails.
+  - **Moves:** if another process moves a folder out of the workspace while the wipe is inside it, the wipe empties
+    that folder (it was the workspace's) and stops red there, before it removes anything where the folder now is.
+  - Apart from these, nothing outside the workspace is touched. The walk keeps one folder open at a time and lists
+    each folder once, so a tree of any depth or width is removed.
 - **GitHub-hosted runner:** each job starts on a fresh disk, so nothing is removed.
 - **Both:** it then refuses a `.git` at the checkout path whose config `actions/checkout` does not write (below).
 
@@ -56,10 +68,13 @@ No outputs. A refusal fails the step, so the checkout and every later step do no
 
 - `GITHUB_WORKSPACE` that is not an absolute folder, is a symlink, is not inside `RUNNER_WORKSPACE` (which a
   self-hosted runner always sets), has a real path other than its path below the runner's work folder (an earlier job
-  made `RUNNER_WORKSPACE` or a folder below it a symlink), or holds `HOME`, `RUNNER_TEMP`, `RUNNER_TOOL_CACHE` or the
-  action itself: nothing is removed.
-- A delete that fails (a file of another user, for example from a container): the step fails with the path. What is
-  left is removed by the next run once the file can be deleted.
+  made `RUNNER_WORKSPACE` or a folder below it a symlink), sits in a work folder (`_work`) that is a symlink (configure
+  the runner with the real path instead: `config.sh --work <real path>`), holds `HOME`, `RUNNER_TEMP`,
+  `RUNNER_TOOL_CACHE` or the action itself, or holds a mount point: nothing is removed.
+- A delete that fails (a file of another user, for example from a container), a folder on another device (a mount
+  made during the wipe, a btrfs subvolume), or a folder swapped for a symlink or moved out of the workspace during the
+  wipe: the step fails with the path. What is left is removed by the next run once the file can be deleted (or the
+  mount or subvolume is gone).
 - A checkout path that is absolute or leads outside the workspace.
 - `<path>/.git` that is a file or a symlink (a worktree or submodule: git would read another repository), or that holds
   `commondir`, `info/grafts`, `objects/info/alternates`, `objects/info/http-alternates` or `info/attributes` (they
@@ -83,7 +98,8 @@ The refusal says what to do either way: a key an earlier job left needs git-clea
 
 ## Runs again, stops half-way, old or empty state
 
-- **Runs again:** an empty workspace is emptied again (nothing to do) and passes.
+- **Runs again:** an empty workspace is emptied again (nothing to do) and passes. A refusal (a symlinked `_work`, a
+  mount, a subvolume) repeats on every run until a person fixes it; it never removes anything it refused.
 - **Stops half-way:** a delete that fails stops the step red, so no checkout runs on a half-empty workspace. The next
   run removes what is left, at any depth.
 - **Old workspace** (from before git-clean, or any earlier job): emptied like any other; a `.git` in it never reaches
@@ -95,4 +111,7 @@ The refusal says what to do either way: a key an earlier job left needs git-clea
 
 The runner user's own files outside the workspace (`~/.gitconfig`, the system git config) are not removed: the fork-ci
 git calls ignore them, `actions/checkout` does not. A runner that takes pull requests from people who are not trusted
-also needs a job home that does not outlive the job.
+also needs a job home that does not outlive the job. The folders above the work folder (`_work`), such as the
+runner's install folder, are trusted as they are: a symlink there is followed (the runner's own path may hold one),
+so the runner user must not be able to rename them from a job. A bind mount made inside the workspace while the wipe
+runs (root only) is entered (see Mounts above).

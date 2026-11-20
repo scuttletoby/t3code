@@ -39,6 +39,7 @@ import * as HoldWorkConnect from "./cloud/holdWorkConnect.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
+import * as WorkAdmission from "./workAdmission.ts";
 
 const BIN = NodeURL.fileURLToPath(new URL("./bin.ts", import.meta.url));
 const modelSelection = {
@@ -140,6 +141,53 @@ const heartbeats = (remote: FakeRemote) =>
     (request) => request.path === "/batch/" && request.body.includes('"server.boot.heartbeat"'),
   );
 
+/**
+ * What node itself may need to start on some machines (a shared-library path; Windows' system
+ * folder). The child gets these from this process and nothing else of its environment.
+ */
+const NODE_START_VARS = [
+  "LD_LIBRARY_PATH",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "SystemRoot",
+  "windir",
+] as const;
+
+/** The booted server's whole environment: a bare home on `root`, analytics and relay on `remoteUrl`. */
+const childEnv = (
+  root: string,
+  remoteUrl: string,
+  from: Readonly<Record<string, string | undefined>>,
+): Record<string, string> => ({
+  ...Object.fromEntries(
+    NODE_START_VARS.flatMap((name) => {
+      const value = from[name];
+      return value === undefined ? [] : [[name, value]];
+    }),
+  ),
+  // A bare home and PATH: no provider CLI, git, credentials or user config is reachable.
+  // Analytics is on, but sent only to the local fake server.
+  HOME: NodePath.join(root, "home"),
+  PATH: NodePath.dirname(process.execPath),
+  XDG_CACHE_HOME: NodePath.join(root, "cache"),
+  XDG_CONFIG_HOME: NodePath.join(root, "config"),
+  XDG_DATA_HOME: NodePath.join(root, "data"),
+  XDG_STATE_HOME: NodePath.join(root, "state"),
+  T3CODE_TELEMETRY_ENABLED: "true",
+  T3CODE_POSTHOG_HOST: remoteUrl,
+  // A build with T3 Connect: startup then also reconciles the stored desired link. The build's
+  // relay is the local fake server the stored link points at, so a held boot that reached it would
+  // show there.
+  T3CODE_RELAY_URL: remoteUrl,
+  NODE_EXTRA_CA_CERTS: REMOTE_CERT,
+  T3CODE_CLERK_PUBLISHABLE_KEY: "pk_test_hold_work",
+  T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: "client-hold-work",
+  NO_COLOR: "1",
+  // No managed policy, whatever this machine has (one that turns Connect off would hold the held
+  // phase's wait forever): a missing file means none. Source runs are the dev build, which reads it.
+  T3CODE_DEV_MANAGED_POLICY_PATH: NodePath.join(root, "no-policy.json"),
+});
+
 interface Boot {
   readonly child: NodeChildProcess.ChildProcess;
   readonly output: () => string;
@@ -171,28 +219,7 @@ const boot = async (
     ],
     {
       cwd: root,
-      // A bare home and PATH: no provider CLI, git, credentials or user config is reachable.
-      // Analytics is on, but sent only to the local fake server.
-      env: {
-        HOME: NodePath.join(root, "home"),
-        PATH: NodePath.dirname(process.execPath),
-        XDG_CACHE_HOME: NodePath.join(root, "cache"),
-        XDG_CONFIG_HOME: NodePath.join(root, "config"),
-        XDG_DATA_HOME: NodePath.join(root, "data"),
-        XDG_STATE_HOME: NodePath.join(root, "state"),
-        T3CODE_TELEMETRY_ENABLED: "true",
-        T3CODE_POSTHOG_HOST: remote.url,
-        // A build with T3 Connect: startup then also reconciles the stored desired link. The
-        // build's relay is the local fake server the stored link points at, so a held boot that
-        // reached it would show there.
-        T3CODE_RELAY_URL: remote.url,
-        NODE_EXTRA_CA_CERTS: REMOTE_CERT,
-        T3CODE_CLERK_PUBLISHABLE_KEY: "pk_test_hold_work",
-        T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: "client-hold-work",
-        NO_COLOR: "1",
-        // No managed policy, whatever this machine has: a missing file means none.
-        T3CODE_DEV_MANAGED_POLICY_PATH: NodePath.join(root, "no-policy.json"),
-      },
+      env: childEnv(root, remote.url, process.env),
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -329,6 +356,21 @@ const CONNECT_SPANS = [
 
 /** The spans that show a hold was not kept: each runs only when its part starts. */
 const HELD_SPANS = ["autoPullProjects", "RemoteDelegation.followOnce", ...CONNECT_SPANS];
+
+/**
+ * Spans only the fork's own server layers make while they are built (fork/forkLayers.ts): the read
+ * of the usage pacer and slot gate beside /mcp, the usage refresher, automatic updates. A server
+ * whose server.ts lost both `ForkLayers.layerRuntimeServices` and `ForkLayers.layerRoutes` (a sync
+ * that dropped them) still boots and keeps every hold, so only these show the gates are gone.
+ */
+const FORK_LAYER_SPANS = [
+  "ForkLayers.mcpGatesPresent",
+  "HeadlessUsageRefresher.make",
+  "cloud.auto_update.make",
+];
+
+const missingForkLayers = (spans: ReadonlySet<string>) =>
+  FORK_LAYER_SPANS.filter((name) => !spans.has(name));
 
 /** What a normal boot of a marked copy logs instead of starting Connect and agent activity. */
 const markedLines = (marker: string) =>
@@ -728,6 +770,31 @@ const snapshot = (paths: { stateDir: string; dbPath: string }): Snapshot => {
 };
 
 describe("serve --hold-work on a seeded home", () => {
+  it("starts the server with only what node needs from this machine's environment", () => {
+    const env = childEnv("/root-of-test", "https://127.0.0.1:1", {
+      LD_LIBRARY_PATH: "/opt/node/lib",
+      SystemRoot: "C:\\Windows",
+      HOME: "/home/someone",
+      PATH: "/usr/local/bin:/usr/bin",
+      GH_TOKEN: "token-from-this-machine",
+      T3CODE_HOME: "/home/someone/.t3",
+      T3CODE_DEV_MANAGED_POLICY_PATH: "/etc/somewhere/policy.json",
+    });
+    // A node that links a shared library from LD_LIBRARY_PATH still starts.
+    expect(env.LD_LIBRARY_PATH).toBe("/opt/node/lib");
+    expect(env.SystemRoot).toBe("C:\\Windows");
+    // Nothing else of this machine's: not its home, PATH, tokens, T3 home or policy.
+    expect(env.HOME).toBe(NodePath.join("/root-of-test", "home"));
+    expect(env.PATH).toBe(NodePath.dirname(process.execPath));
+    expect(env.GH_TOKEN).toBeUndefined();
+    expect(env.T3CODE_HOME).toBeUndefined();
+    expect(env.T3CODE_DEV_MANAGED_POLICY_PATH).toBe(
+      NodePath.join("/root-of-test", "no-policy.json"),
+    );
+    // A machine without them passes none on.
+    expect(Object.keys(childEnv("/r", "https://127.0.0.1:1", {}))).not.toContain("LD_LIBRARY_PATH");
+  });
+
   it("a held boot consumes no seeded work; a normal boot on the same home then runs it, Connect only once unmarked", async () => {
     const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-hold-work-boot-"));
     const remote = await fakeRemote();
@@ -783,6 +850,9 @@ describe("serve --hold-work on a seeded home", () => {
       const markerText = NodeFS.readFileSync(marker, "utf8");
       expect(markerText).toContain("--hold-work");
       const heldSpans = spansFrom(paths.stateDir, 0);
+      // The held boot says so in its log, and still builds every fork layer (gates included).
+      expect(held.output()).toContain(WorkAdmission.HOLD_WORK_BOOT_MESSAGE);
+      expect(missingForkLayers(heldSpans.names)).toEqual([]);
       // The publisher logs its state when it starts, before any held line: a held one never does.
       expect(held.output()).not.toMatch(PUBLISHER_STARTED);
 
@@ -854,6 +924,7 @@ describe("serve --hold-work on a seeded home", () => {
       );
       await stop(marked.child);
       const markedSpans = spansFrom(paths.stateDir, heldSpans.end);
+      expect(missingForkLayers(markedSpans.names)).toEqual([]);
       // No tunnel registered, started or released, and no agent activity sent.
       expect(tunnelReleases(remote)).toEqual([]);
       expect(activityPublishes(remote)).toEqual([]);
@@ -888,6 +959,7 @@ describe("serve --hold-work on a seeded home", () => {
       // tunnel at once: the relay has the release itself.
       const normalSpanCounts = spansFrom(paths.stateDir, markedSpans.end);
       const normalSpans = normalSpanCounts.names;
+      expect(missingForkLayers(normalSpans)).toEqual([]);
       expect(normalSpanCounts.counts.get("HoldWorkConnect.heldCopyMarker")).toBe(1);
       expect(normalSpans).toContain("environment.cloud.releaseManagedTunnelOnShutdown");
       expect(tunnelReleases(remote)).toHaveLength(1);

@@ -18,6 +18,7 @@ def load(name, file):
 
 
 A, desk = load('fork_fleet_desk_agent', 'fork-fleet-desk-agent.py'), load('fork_fleet_desk', 'fork-fleet-desk.py')
+Log = load('fork_fleet_desk_test', 'fork-fleet-desk.test.py').Log   # the agent's log: set once serve listens
 wire = A.wire
 POOL = 'desk'
 START_IN = 'ACTIONS_RUNNER_INPUT_JITCONFIG=abc+/=\nFORK_FLEET_RUN=7\nFORK_FLEET_ATTEMPT=1\n'
@@ -64,21 +65,6 @@ def gone(pid):
             return f.read().rsplit(')', 1)[1].split()[0] in ('Z', 'X')
     except FileNotFoundError:
         return True
-
-
-class Log(io.StringIO):
-    """The agent's log; `settled` is set once serve says 'session open' (relayed from ssh's stderr): it listens.
-    Its socket file alone is no sign: it appears at bind(), before listen(), and a connect in between is refused."""
-
-    def __init__(self):
-        super().__init__()
-        self.settled = threading.Event()
-
-    def write(self, s):
-        n = super().write(s)
-        if 'session open' in self.getvalue():
-            self.settled.set()
-        return n
 
 
 def until(cond, seconds=10):

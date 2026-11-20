@@ -122,9 +122,12 @@ watches; it changes nothing on the machine, and `0` turns it off.
   (the runbook below), regenerate the tree and commit it into the rebased series before pushing; a
   pull request that changes only the tree is judged line by line and refused. A pull request's run has no upstream commit,
   so it takes files named as the fork's (`fork`, `fork-*`, `forkName*`, `FORK_*`) and `forkFiles`
-  for the fork's own; from upstream, a pattern that matches an upstream file fails. Then remove the
-  entry (or exclude a fork-named path with `!path`): from then on a pull request's run judges the
-  file as upstream's, also before the rebase that brings upstream's copy. For the same
+  for the fork's own; from upstream, a pattern that matches an upstream file fails. Right after a
+  rebase it is not refused: fork-follow excludes the file itself in its lowering commit (the
+  file's own `forkFiles` entry goes; a fork-named path or one another pattern takes gets `!path`),
+  which only narrows what a pull request's run takes for the fork's own. Before a rebase (a list
+  on main that lets one through) it still fails: remove the entry or add the `!path` with a pull
+  request. Either way a pull request's run then judges the file as upstream's. For the same
   reason a pull request's run counts upstream's copies of a seam line against its allowance: a
   seam line upstream also has (`}`, `/**`) cannot be added by a pull request, only checked by
   fork-follow, so keep seam lines specific. A listed copy main's tip already has is spent too, not
