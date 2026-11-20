@@ -361,6 +361,11 @@ above `maxPerAccount` per provider account, or below `minFreeMemoryMb` of free m
 started in other ways are counted but never refused. With `waitFor` on, an agent can wait for a slot
 instead of retrying.
 
+A running agent is a thread whose shell shows an active run (settled or archived threads too), as
+upstream's own shell read decides (`apps/server/src/slots/ActiveRunShells.ts`); a test checks that
+for every run status. If upstream renames the index that read uses, the server logs an error naming
+that file once and goes on counting without the index.
+
 Switch on: **Settings → Fork**, section Agent slots, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is
 refused.
