@@ -572,8 +572,10 @@ def _same_holder(a, b):
 
 
 def _active(service):
+    """Read after a start that did not reach a launcher: not in a hurry, so the adapter's usual timeout, not the
+    short one (a slow systemctl would keep the home held behind a T3 that runs)."""
     try:
-        return bool(service(timeout=SERVICE_READ_TIMEOUT).get('active'))
+        return bool(service().get('active'))
     except Exception:  # noqa: BLE001  (cannot tell: the safe side keeps the home owned)
         return False
 

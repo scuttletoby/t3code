@@ -1251,6 +1251,20 @@ class Marker(unittest.TestCase):
         self.assertEqual(g.handover, 'launcher')
         self.assertEqual(len(reads), 2)
 
+    def test_a_slow_service_read_after_a_start_with_no_launcher_still_sees_t3_run(self):
+        """After a start that reached no launcher, the holder goes only when the service runs (#530). That read is not
+        in a hurry: it uses the adapter's usual timeout, so a systemctl slower than the short read during the start
+        (a busy machine) still sees T3 run, and the home is not kept held behind it."""
+        reads = []
+
+        def service(timeout=None):
+            reads.append(timeout)
+            if timeout is not None and timeout <= self.h.SERVICE_READ_TIMEOUT:
+                raise subprocess.TimeoutExpired(['systemctl', 'show'], timeout)
+            return {'active': True, 'mainPid': os.getpid()}
+        self.assertTrue(self.h._active(service))
+        self.assertEqual(reads, [None])
+
     def test_a_failed_renewal_is_journalled(self):
         with mock.patch.object(self.h, 'RENEW', 0.05):
             self.h.open_gap(self.m.home)
