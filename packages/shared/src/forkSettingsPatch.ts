@@ -40,9 +40,9 @@ const NULL_CLEARED_PROJECT_KEYS = Object.entries(FORK_PROJECT_KEYS_KEPT_WHEN_LEF
   .map(([key]) => key);
 
 /**
- * Splits a patch into its fork fields and the rest (upstream's). A project entry's `null` for a
- * {@link NULL_CLEARED_PROJECT_KEYS} key is left out of the rest: upstream would store it as the
- * project's own value. Left out, the key is removed, which is what the clear means.
+ * Splits off the fork fields, and drops a project's {@link NULL_CLEARED_PROJECT_KEYS} `null` from
+ * upstream's part, which upstream would store. Upstream's whole-entry merge then removes the key;
+ * the fork's server save keeps a left-out key, so it must get the unsplit patch to see the clear.
  */
 export function splitForkSettingsPatch<P extends ServerSettingsPatch>(
   patch: P,
@@ -163,6 +163,9 @@ export function keepLeftOutForkProjectKeys(
       if (!Object.hasOwn(entry, key)) {
         if (isSet(value)) kept[key] = value;
       } else if ((entry as Readonly<Record<string, unknown>>)[key] === CLEAR_VALUES[key]) {
+        // `""` (MCP keys): upstream stored it, so delete it. `null`: the split already kept it from
+        // upstream, so the delete is a no-op; it stays so a `next` that does hold a `null`
+        // (upstream's merge of an unsplit patch) still comes out without it.
         cleared.push(key);
       }
     }

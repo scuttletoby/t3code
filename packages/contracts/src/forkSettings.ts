@@ -218,19 +218,20 @@ export const FORK_PROJECT_SCOPED_KEYS = [
   "reviewRules",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
+/** Drops a `null`: it is a save's "clear", never a project's own value. */
+const dropNull = <A>(raw: Option.Option<A>): Option.Option<A> =>
+  Option.filter(raw, (entry): boolean => entry !== null);
+
 /**
- * A clear-by-`null` project key read from the file: a hand-written `null` reads as the key left out
- * (the server's value) and the next save drops it. `Schema.Null` comes first, as the lenient file
- * schemas take any value; the type keeps `null` for the patch, whose `null` the split drops.
+ * A clear-by-`null` project key in the file: a `null` reads as left out (the server's) and is never
+ * written. `Schema.Null` first, as the lenient file schemas take any value. The patch has its own
+ * schema (`ForkProjectOverridePatchFields`), so a client's clear still keeps its `null`.
  */
 const nullReadsAsUnset = <S extends Schema.Top>(value: S) =>
   Schema.optionalKey(Schema.Union([Schema.Null, value])).pipe(
     Schema.decodeTo(
       Schema.optionalKey(Schema.Union([Schema.Null, Schema.toType(value)])),
-      SchemaTransformation.transformOptional({
-        decode: (raw) => Option.filter(raw, (entry): boolean => entry !== null),
-        encode: (raw) => raw,
-      }),
+      SchemaTransformation.transformOptional({ decode: dropNull, encode: dropNull }),
     ),
   );
 
