@@ -61,18 +61,22 @@ Two choices to keep in mind when comparing before and after:
   first line, and `cache_write_failed` in `--json`) and a stop does not say to run again: the pages that failed were not saved, so it
   would ask for them again. Fix the cache folder first.
 - **Cache.** A jobs page is saved when the run and all its jobs are completed, keyed by run id and attempt (a re-run
-  is a new attempt, so a new page). A runs-list page is saved when every run in it is completed and the day ended
-  over an hour ago, and is reused for 12 hours (a later re-run changes it). Writes are a `.part-` file then a rename,
-  so a run killed mid-write leaves no half page under a name that is read. A file that is broken (bad JSON, nested
-  too deep, a bad date, a body that is not an object, or a field missing or of the wrong type, such as
-  `total_count` as text or a page without its runs or jobs; or a run or job in it that is not completed or lacks a
-  field the counting reads, such as a job without `started_at`, `completed_at` or `runner_name`), saved for another
-  page or in another cache format (an older or newer version of this tool) is fetched again: never a crash, and never
-  counted as no runs, no jobs or 0 seconds. A
-  date must be in the form GitHub writes, such as `2026-11-01T12:00:00Z`. A write that fails (a full disk, a
-  read-only folder) is reported once and the run goes on with the pages it can read (see above). `.part-` files
-  older than an hour are removed; one that cannot be removed (a read-only folder, a directory of that name) is
-  reported on its own line (and as `cache_cleanup_failed` in `--json`) and the run goes on.
+  is a new attempt, so a new page). A runs-list page is saved when every run in it is completed and the day ended over
+  an hour ago, and is reused for 12 hours (a later re-run changes it). One check decides both what is saved and what
+  is read back: a page that would be refused when read is never written, but fetched and counted live on each run,
+  like an unfinished page (GitHub has not been seen to send one). Writes are a `.part-` file then a rename, so a run
+  killed mid-write leaves no half page under a name that is read. A file that is broken (bad JSON, nested too deep, a
+  bad date, a body that is not an object, or a field missing or of the wrong type, such as `total_count` as text or a
+  page without its runs or jobs; a list emptied while `total_count` is above 0; or a run or job in it that is not
+  completed or lacks a field the counting reads: a job without `created_at`, `labels`, `runner_name`, `status` or
+  `conclusion`, a job without a `created_at` date, or a job that ran (reached a runner, not skipped) without both a
+  `started_at` and a `completed_at` date), saved for another page or in another cache format (an older or newer
+  version of this tool) is fetched again: never a crash, and never counted as no runs, no jobs, 0 seconds or no queue
+  wait. Pages GitHub sends always have these fields, so a cache from an older release is read as before. A date must
+  be in the form GitHub writes, such as `2026-11-01T12:00:00Z`. A write that fails (a full disk, a read-only folder)
+  is reported once and the run goes on with the pages it can read (see above). `.part-` files older than an hour are
+  removed; one that cannot be removed (a read-only folder, a directory of that name) is reported on its own line (and
+  as `cache_cleanup_failed` in `--json`) and the run goes on.
 - **Any OS.** It needs Python 3 and `gh`. Where the OS has user ids (Linux, macOS), a cache folder another user owns
   is refused and the folder is made 0700, also when it existed before; on Windows these checks are skipped. So on
   Linux or macOS the cache folder must allow private permissions: one on a filesystem where chmod has no effect (FAT
