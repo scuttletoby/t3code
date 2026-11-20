@@ -503,6 +503,29 @@ class Rehearse(Base):
             self.assertTrue(port < lo or port > hi, (port, lo, hi))
             self.assertNotEqual(port, rehearse.LIVE_DEFAULT_PORT)
 
+    def test_a_picked_port_comes_from_above_the_kernels_range_first(self):
+        """Review of #561: the ports just below the range hold common service defaults (a stopped or restarting
+        service would lose its port for the whole run), so a pick comes from above the range while one is free there,
+        and from below only when none above is."""
+        self.m.write('port-range', '32768 60999')
+        with mock.patch.object(rehearse, 'PORT_RANGE', self.m.path('port-range')):
+            for _ in range(20):
+                with rehearse._choose_port(config.load(), None) as held:
+                    self.assertGreater(held.getsockname()[1], 60999)
+            real = rehearse._hold
+            with mock.patch.object(rehearse, '_hold', side_effect=lambda n: None if n > 60999 else real(n)):
+                with rehearse._choose_port(config.load(), None) as held:
+                    self.assertLess(held.getsockname()[1], 32768)
+
+    def test_no_free_port_at_all_is_a_clean_refusal(self):
+        """Review of #561: with every port taken the run is refused with a message, not a traceback."""
+        class NoPort(socket.socket):
+            def bind(self, addr):
+                raise OSError(errno.EADDRINUSE, 'Address already in use')
+        with mock.patch.object(rehearse, '_hold', return_value=None), mock.patch.object(rehearse.socket, 'socket', NoPort):
+            with self.assertRaisesRegex(rehearse.journal.Refused, 'no free port'):
+                rehearse._choose_port(config.load(), None)
+
     def test_the_kernels_range_old_missing_or_garbled_falls_back_or_is_worked_around(self):
         for text, want in ((None, rehearse.EPHEMERAL_FALLBACK), ('nonsense', rehearse.EPHEMERAL_FALLBACK),
                            ('', rehearse.EPHEMERAL_FALLBACK), ('40000\t50000\n', (40000, 50000))):

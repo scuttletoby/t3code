@@ -213,16 +213,24 @@ def _ephemeral():
 def _pick(taken):
     """A held free port that the kernel never hands out on its own (outside its ephemeral range): released for the
     server's start, it can then be taken only by a program that binds that very port. Within the range only when
-    no port outside it is free."""
+    no port outside it is free. Above the range first: no service is assigned there (the ports just below it hold
+    common service defaults, such as 25565, 27017 or 30000-32767, whose service could be restarting), below only when
+    no port above is free."""
     lo, hi = _ephemeral()
-    pool = [n for n in (*range(max(PORT_MIN, lo - PORT_SPAN), lo), *range(hi + 1, min(65536, hi + 1 + PORT_SPAN)))
-            if n not in taken]
-    for n in random.sample(pool, min(len(pool), PICK_TRIES)):
-        held = _hold(n)
-        if held:
-            return held
+    above = [n for n in range(hi + 1, min(65536, hi + 1 + PORT_SPAN)) if n not in taken]
+    below = [n for n in range(max(PORT_MIN, lo - PORT_SPAN), lo) if n not in taken]
+    for pool in (above, below):
+        for n in random.sample(pool, min(len(pool), PICK_TRIES)):
+            held = _hold(n)
+            if held:
+                return held
     while True:
-        held = _hold(0)
+        try:
+            held = socket.socket()
+            held.bind(('127.0.0.1', 0))
+        except OSError as e:
+            held.close()
+            raise journal.Refused(f'no free port on 127.0.0.1 ({e.strerror}); nothing was changed') from None
         if held.getsockname()[1] not in taken:
             return held
         held.close()
