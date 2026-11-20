@@ -118,6 +118,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           code: "invalid_request",
           message: "The scheduled task was not found.",
         });
+      yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch
       const { task, threadId } = yield* scheduler
         .runNow({ id: input.taskId })
         .pipe(

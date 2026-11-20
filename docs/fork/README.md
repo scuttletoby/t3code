@@ -428,10 +428,12 @@ task's runs would start a new thread (not bound to the caller) whose profile in 
 is not within the caller's; a task bound to the caller runs in it and keeps its profile. A change
 to a task whose runs start new threads (also one made before this check), and unbinding a task from
 the caller, are refused the same way: delete the task, bind it to the caller
-(`bindToCurrentThread: true`), or ask the owner. A run itself is not checked, as a task does not
-record which thread made it. `t3_thread_transfer`'s fork is refused when the fork would get more
-than the caller's profile: a fork gets its source's profile cut to the source's, so forking the
-caller itself always goes through, and a fork of a thread whose parent cannot be read is refused.
+(`bindToCurrentThread: true`), or ask the owner. `run_scheduled_task_now` on such a task is refused
+too. A scheduled run itself is not checked, as a task does not record which thread made it.
+`t3_thread_transfer`'s fork is refused when the fork would get more than the caller's profile: a fork gets its source's profile cut to the source's, so forking the
+caller itself always goes through, and a fork of a thread whose parent cannot be read is refused. On
+another machine, a fork, a change to a scheduled task and `run_scheduled_task_now` are refused for
+such a thread, as a thread started there gets that machine's profile.
 
 Only Claude threads apply profiles. A Codex thread, or one on any other provider, would get every
 MCP server and every T3 tool whatever its profile says. So its turn is not started when its profile

@@ -12,6 +12,7 @@ import {
   EventId,
   type OrchestrationV2AppThread,
   type OrchestrationV2ThreadShell,
+  OrchestratorMcpFailure,
   type OrchestratorMcpScheduledTask,
   ProjectId,
   ProviderInstanceId,
@@ -52,6 +53,7 @@ const WIDE = ThreadId.make("thread:wide");
 const ORPHAN = ThreadId.make("thread:orphan");
 const INSTANCE = ProviderInstanceId.make("claudeAgent");
 const HERE = EnvironmentId.make("environment-here");
+const THERE = EnvironmentId.make("environment-there");
 const NOW = DateTime.makeUnsafe("2026-11-20T00:00:00.000Z");
 
 type Settings = Parameters<typeof ServerSettings.layerTest>[0];
@@ -165,12 +167,15 @@ interface Recorded {
   readonly scheduled: Array<unknown>;
   readonly updated: Array<unknown>;
   readonly dispatched: Array<{ readonly type: string }>;
+  readonly ran: Array<unknown>;
+  /** Calls sent to another machine, by tool. */
+  readonly forwarded: Array<string>;
 }
 
 /**
  * Runs `body` with upstream's orchestrator and thread toolkits over the settings given, a thread
  * caller (or the owner's own client with `caller: false`), a thread store holding THREADS, and
- * every scheduled task write and thread command recorded. `scheduledTasks: false` leaves the
+ * every scheduled task write, run, thread command and call sent to another machine recorded. `scheduledTasks: false` leaves the
  * scheduled task service out (it cannot be read).
  */
 const withToolkits = <A, E>(
@@ -178,11 +183,12 @@ const withToolkits = <A, E>(
   body: (input: {
     readonly recorded: Recorded;
     readonly schedule: (params: object) => Effect.Effect<string | undefined>;
-    readonly fork: (threadId: ThreadId) => Effect.Effect<string | undefined>;
+    readonly fork: (threadId: ThreadId, params?: object) => Effect.Effect<string | undefined>;
+    readonly runNow: (taskId: string, params?: object) => Effect.Effect<string | undefined>;
   }) => Effect.Effect<A, E>,
   options: { readonly caller?: boolean; readonly scheduledTasks?: boolean } = {},
 ) => {
-  const recorded: Recorded = { scheduled: [], updated: [], dispatched: [] };
+  const recorded: Recorded = { scheduled: [], updated: [], dispatched: [], ran: [], forwarded: [] };
   const threadCaller = options.caller !== false;
   const store = ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory));
   const dependencies = Layer.mergeAll(
@@ -227,13 +233,27 @@ const withToolkits = <A, E>(
         return Effect.succeed(summary(input.scheduledTaskId));
       },
     }),
-    options.scheduledTasks === false
+    // Left out, the toolkits still build: upstream's handlers read the service per call.
+    (options.scheduledTasks === false
       ? Layer.empty
       : Layer.mock(ScheduledTasks.ScheduledTaskService)({
           list: () => Effect.succeed({ tasks: Object.values(TASKS) }),
-        }),
+          runNow: (input) => {
+            recorded.ran.push(input);
+            const task = Object.values(TASKS).find((candidate) => candidate.id === input.id)!;
+            return Effect.succeed({ task, threadId: null });
+          },
+        })) as Layer.Layer<ScheduledTasks.ScheduledTaskService>,
     Layer.mock(ThreadMetadataMcpService.ThreadMetadataMcpService)({}),
-    Layer.mock(PeerForwarding.PeerForwarding)({}),
+    Layer.mock(PeerForwarding.PeerForwarding)({
+      call: (_scope, tool) => {
+        recorded.forwarded.push(tool.name);
+        // What the machine there answers does not matter here, only that the call went.
+        return Effect.fail(
+          new OrchestratorMcpFailure({ code: "orchestration_error", message: "sent there" }),
+        ) as never;
+      },
+    }),
     Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
     Layer.mock(PeerLinks.PeerLinks)({}),
     Layer.mock(RemoteDelegation.RemoteDelegation)({}),
@@ -286,9 +306,9 @@ const withToolkits = <A, E>(
             Effect.provide(context),
             Effect.orDie,
           );
-      const fork = (threadId: ThreadId) =>
+      const fork = (threadId: ThreadId, params: object = {}) =>
         threads
-          .handle("t3_thread_transfer", { action: "fork", threadId } as never)
+          .handle("t3_thread_transfer", { action: "fork", threadId, ...params } as never)
           .pipe(
             Stream.unwrap,
             Stream.runCollect,
@@ -296,7 +316,17 @@ const withToolkits = <A, E>(
             Effect.provide(context),
             Effect.orDie,
           );
-      return yield* body({ recorded, schedule, fork });
+      const runNow = (taskId: string, params: object = {}) =>
+        threads
+          .handle("run_scheduled_task_now", { taskId, ...params } as never)
+          .pipe(
+            Stream.unwrap,
+            Stream.runCollect,
+            Effect.map(refusal),
+            Effect.provide(context),
+            Effect.orDie,
+          );
+      return yield* body({ recorded, schedule, fork, runNow });
     }),
   ).pipe(Effect.orDie);
 };
@@ -438,7 +468,7 @@ it.effect("a change is refused when the scheduled task service cannot be read", 
     ({ recorded, schedule }) =>
       Effect.gen(function* () {
         expect(yield* schedule({ scheduledTaskId: TASKS.newThread.id, prompt: "New" })).toContain(
-          "cannot be read here, so it was not changed",
+          "cannot be read here, so the task was not changed",
         );
         expect(recorded.updated).toHaveLength(0);
       }),
@@ -526,4 +556,75 @@ it.effect("a thread on all, and the owner's own client, schedule and fork as bef
       { caller: false },
     );
   }),
+);
+
+it.effect("a narrowed thread cannot run a task now whose runs start a wider thread", () =>
+  withToolkits(
+    { ...NARROWED, ...projects({ [NARROW_PROJECT]: { mcpProfile: "docs" } }) },
+    ({ recorded, schedule, runNow }) =>
+      Effect.gen(function* () {
+        // The route the reviews found: change an old task, then run it. Both are refused.
+        expect(yield* schedule({ scheduledTaskId: TASKS.newThread.id, prompt: "New" })).toContain(
+          "capability_denied",
+        );
+        const message = yield* runNow(TASKS.newThread.id);
+        expect(message).toContain("capability_denied");
+        expect(message).toContain("The task was not run.");
+        // Runs again: refused each time, with nothing run.
+        expect(yield* runNow(TASKS.newThread.id)).toContain("capability_denied");
+        expect(recorded.ran).toHaveLength(0);
+        // A task bound to the caller runs in it; one in a project kept to `docs` keeps within it.
+        expect(yield* runNow(TASKS.bound.id)).toBeUndefined();
+        expect(yield* runNow(TASKS.narrow.id)).toBeUndefined();
+        expect(recorded.ran).toHaveLength(2);
+      }),
+  ),
+);
+
+it.effect("a run now by a caller whose profile cannot be worked out is refused", () =>
+  withToolkits(pickFor("deleted-profile"), ({ recorded, runNow }) =>
+    Effect.gen(function* () {
+      expect(yield* runNow(TASKS.newThread.id)).toContain("cannot be worked out");
+      expect(recorded.ran).toHaveLength(0);
+    }),
+  ),
+);
+
+it.effect("a narrowed thread cannot fork, change or run a task on another machine", () =>
+  withToolkits(NARROWED, ({ recorded, schedule, fork, runNow }) =>
+    Effect.gen(function* () {
+      // A thread started there gets that machine's profile, which this one cannot check.
+      const there = { environmentId: THERE };
+      const forked = yield* fork(WIDE, there);
+      expect(forked).toContain("capability_denied");
+      expect(forked).toContain("it was not forked");
+      // Its own fork too: there the fork gets that machine's profile, not this thread's.
+      expect(yield* fork(CALLER, there)).toContain("capability_denied");
+      expect(yield* schedule({ scheduledTaskId: TASKS.bound.id, ...there })).toContain(
+        "the task was not changed",
+      );
+      expect(yield* runNow(TASKS.bound.id, there)).toContain("the task was not run");
+      // Runs again: refused each time, and nothing is sent there.
+      expect(yield* fork(WIDE, there)).toContain("capability_denied");
+      expect(recorded.forwarded).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("a thread on all forks, changes and runs tasks on another machine as before", () =>
+  withToolkits({}, ({ recorded, schedule, fork, runNow }) =>
+    Effect.gen(function* () {
+      const there = { environmentId: THERE };
+      expect(yield* fork(WIDE, there)).toContain("sent there");
+      expect(yield* schedule({ scheduledTaskId: TASKS.bound.id, ...there })).toContain(
+        "sent there",
+      );
+      expect(yield* runNow(TASKS.bound.id, there)).toContain("sent there");
+      expect(recorded.forwarded).toEqual([
+        "t3_thread_transfer",
+        "schedule_task",
+        "run_scheduled_task_now",
+      ]);
+    }),
+  ),
 );

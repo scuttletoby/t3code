@@ -124,23 +124,23 @@ export const checkScheduleMcpProfile = Effect.fn("LaunchMcpProfile.schedule")(fu
 });
 
 /**
- * `schedule_task` changing a task here: refused when, after the change, its runs start a thread
- * wider than the caller's profile, whoever made it and whatever the change (unbind, rewrite,
- * re-enable). Deleting it or binding it to the caller is the way out; a missing task is the service's.
+ * A task here whose runs, after a change (`bindToCurrentThread` as the call gives it), start a
+ * thread wider than the caller's profile is refused, whoever made it; `done` ends the refusal.
  */
-export const checkScheduleEditMcpProfile = Effect.fn("LaunchMcpProfile.scheduleEdit")(function* (
+const checkTaskRuns = Effect.fn("LaunchMcpProfile.taskRuns")(function* (
   scheduledTaskId: ScheduledTaskId,
   bindToCurrentThread: boolean | undefined,
+  done: string,
 ) {
   const { caller } = yield* loadCaller();
   if (caller === undefined || bindToCurrentThread === true) return;
   // Upstream's orchestrator toolkit does not name this service; the server provides it to every
-  // toolkit, and without it the task cannot be read, so the change is refused.
+  // toolkit, and without it the task cannot be read, so the call is refused.
   const service = yield* Effect.serviceOption(ScheduledTasks.ScheduledTaskService);
   if (Option.isNone(service)) {
     return yield* new OrchestratorMcpFailure({
       code: "orchestration_error",
-      message: "The scheduled task cannot be read here, so it was not changed.",
+      message: `The scheduled task cannot be read here, so ${done}.`,
     });
   }
   const { tasks } = yield* service.value.list().pipe(
@@ -161,9 +161,22 @@ export const checkScheduleEditMcpProfile = Effect.fn("LaunchMcpProfile.scheduleE
     caller,
     scheduledRun(task.projectId),
     "a thread this task's runs start in its project",
-    (own) => `${SCHEDULE_INSTEAD(own)} delete_scheduled_task removes it. The task was not changed.`,
+    (own) => `${SCHEDULE_INSTEAD(own)} delete_scheduled_task removes it. The ${done.slice(4)}.`,
   );
 });
+
+/**
+ * `schedule_task` changing a task here (unbind, rewrite, re-enable, pause): refused by the rule
+ * above. Deleting it or binding it to the caller is the way out; a missing task is the service's.
+ */
+export const checkScheduleEditMcpProfile = (
+  scheduledTaskId: ScheduledTaskId,
+  bindToCurrentThread: boolean | undefined,
+) => checkTaskRuns(scheduledTaskId, bindToCurrentThread, "the task was not changed");
+
+/** `run_scheduled_task_now` here: the run starts the task's thread now, so the same rule holds. */
+export const checkScheduleRunMcpProfile = (scheduledTaskId: ScheduledTaskId) =>
+  checkTaskRuns(scheduledTaskId, undefined, "the task was not run");
 
 /**
  * `t3_thread_transfer` with `action: "fork"`: the fork is a thread whose parent is `source`, so
@@ -202,13 +215,14 @@ export const checkForkMcpProfile = Effect.fn("LaunchMcpProfile.fork")(function* 
  */
 const refuseLaunchElsewhere = Effect.fn("LaunchMcpProfile.elsewhere")(function* (
   launcher: OrchestrationV2ThreadShell | undefined,
+  done = "it was not started",
 ) {
   if (launcher === undefined) return;
   const own = yield* launcherProfile(yield* makeThreadMcpProfiles, launcher);
   if (isEveryMcpTool(own.profile)) return;
   return yield* new OrchestratorMcpFailure({
     code: "capability_denied",
-    message: `This thread's MCP profile is ${named(own)}, and a thread started on another machine gets that machine's profile, so it was not started. Use delegate_task with environmentId (the task keeps this thread's profile there), or start the thread on this machine.`,
+    message: `This thread's MCP profile is ${named(own)}, and a thread started on another machine gets that machine's profile, so ${done}. Use delegate_task with environmentId (the task keeps this thread's profile there), or start the thread on this machine.`,
   });
 });
 
@@ -229,3 +243,26 @@ export const startsHere = (caller: object): void => void startingHere.add(caller
 export const refuseUnlessHere = (caller: {
   readonly caller: OrchestrationV2ThreadShell | undefined;
 }) => (startingHere.has(caller) ? Effect.void : refuseLaunchElsewhere(caller.caller));
+
+/**
+ * A call forwarded to another machine that may start a thread there outside `startsThreads`: a
+ * fork, a change to a scheduled task, or running one now. A narrowed caller is refused, as the
+ * thread there would get that machine's profile; the call is not sent.
+ */
+export const checkForwarded = Effect.fn("LaunchMcpProfile.forwarded")(function* (
+  tool: string,
+  params: object,
+) {
+  const input = params as { readonly action?: unknown; readonly scheduledTaskId?: unknown };
+  const done =
+    tool === "t3_thread_transfer" && input.action === "fork"
+      ? "it was not forked"
+      : tool === "schedule_task" && input.scheduledTaskId !== undefined
+        ? "the task was not changed"
+        : tool === "run_scheduled_task_now"
+          ? "the task was not run"
+          : undefined;
+  if (done === undefined) return;
+  const { caller } = yield* loadCaller();
+  return yield* refuseLaunchElsewhere(caller, done);
+});
