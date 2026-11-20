@@ -338,13 +338,14 @@ it.effect("a narrowed thread cannot schedule a task on another machine either (#
     expect(narrow.forwarded).toHaveLength(0);
     // Here it goes on to the service, which the launch check of its runs covers.
     expect(refusal(yield* narrow.schedule({}))).toContain("scheduled here");
-    // An update starts no thread there, so it goes as before.
+    // An update there may make its runs start threads there, which get that machine's profile.
     const update = { environmentId: THERE, scheduledTaskId: "scheduled-task:1" };
-    expect(refusal(yield* narrow.schedule(update))).toContain("sent there");
-    expect(narrow.forwarded).toHaveLength(1);
+    expect(refusal(yield* narrow.schedule(update))).toContain("the task was not changed");
+    expect(narrow.forwarded).toHaveLength(0);
     const wide = harness({});
     expect(refusal(yield* wide.schedule({ environmentId: THERE }))).toContain("sent there");
-    expect(wide.forwarded).toHaveLength(1);
+    expect(refusal(yield* wide.schedule(update))).toContain("sent there");
+    expect(wide.forwarded).toHaveLength(2);
   }),
 );
 
