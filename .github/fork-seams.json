@@ -234,13 +234,14 @@
       ]
     },
     "apps/server/src/mcp/McpToolAccess.ts": {
-      "why": "A thread whose MCP profile is narrower than \"all\" cannot start a thread on another machine, which would get that machine's profile: the thread-starting tools' caller check goes through fork/launchMcpProfile.ts (#681).",
+      "why": "A thread whose MCP profile is narrower than \"all\" cannot start a thread on another machine, which would get that machine's profile (#681). Upstream's caller check stays as it is: startsThreads' own path marks its caller (startsHere), and working out the modes refuses a narrowed caller nothing marked (refuseUnlessHere), so its remote check refuses; the logic is in fork/launchMcpProfile.ts.",
       "added": [],
       "announced": {
         "since": "2026-11-20",
         "added": [
           "import * as LaunchMcpProfile from \"../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
-          "(params: P) => LaunchMcpProfile.checkedElsewhere(writingCaller, (c) => started(c, params)), // Fork: MCP profile launch"
+          "yield* LaunchMcpProfile.refuseUnlessHere(caller); // Fork: MCP profile launch",
+          "LaunchMcpProfile.startsHere(caller); // Fork: MCP profile launch"
         ]
       }
     },
