@@ -324,8 +324,10 @@ def _blind(cfg, adapter, old, at, say=None):
     command)."""
     try:
         svc = adapter.service()
-    except osadapter.AdapterError:
-        svc = {'active': True}  # cannot tell: the safe side, as if T3 ran (its stop fails on its own)
+    except osadapter.AdapterError as e:  # cannot tell whether T3 runs, nor look at its launcher: refused (a stop by
+        # hand is not offered: it would fail the same way, and the rerun would land here again)
+        return (f'the boot service cannot be read ({e}), so the kit cannot tell whether T3 runs, nor look at its '
+                'launcher; run the same W1 again once `systemctl --user show t3code.service` works')
     if not svc.get('active'):
         why = handoff.handover_blind(cfg.home, [old])
         if why is not None and say is not None:
@@ -337,10 +339,15 @@ def _blind(cfg, adapter, old, at, say=None):
     why = handoff.handover_blind(cfg.home, [old], server and server['version'], adapter.service)
     if why is None:
         return None
+    if why.service_unread:  # a stop by hand fails too, and a rerun counts the service as running again
+        return f'{why}; run the same W1 again once `systemctl --user show t3code.service` works'
     # the running build is often the one W1 leaves: a restart would only start it again (#580). Stopped by hand,
-    # this W1 goes on (above).
-    return (f'{why}; to go back anyway, stop T3 (`systemctl --user stop t3code.service`), then run `t3-golive back '
-            f'--way w1 --lose-work-since {at}`: it then goes on, with that cost')
+    # this W1 goes on (above). Until it runs, T3 is down with no marker and no owner lock: an SSH launch may start a
+    # server of its own on the home (the rerun then refuses, refuse_foreign), so at once.
+    return (f'{why}; to go back anyway, stop T3 (`systemctl --user stop t3code.service`), then at once run '
+            f'`t3-golive back --way w1 --lose-work-since {at}`: it then goes on, with that cost (until it runs, T3 is '
+            'stopped with no update marker and no owner lock, so a T3 desktop app connected over SSH may start a '
+            'server of its own on the home)')
 
 
 def refuse_foreign(cfg, adapter, again, stopped=None):

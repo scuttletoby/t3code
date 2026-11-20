@@ -95,7 +95,7 @@ class Machine:
         self.server = None
         self.serving = None  # the fd by which the fake launcher holds the serving lock (LAUNCHER_SERVES)
         self._saved = (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
-                       osadapter.CGROUP_FILE, os.environ.get('PATH'), live.fork_report)
+                       osadapter.CGROUP_FILE, os.environ.get('PATH'), handoff.CGROUP_OF, live.fork_report)
         for d in (self.bin, self.backups, self.path('etc')):
             os.makedirs(d)
             os.chmod(d, 0o755)  # a umask of 002 would leave them group-writable, which the loader refuses
@@ -110,6 +110,19 @@ class Machine:
         # This test may itself run inside a T3 terminal: never let that decide what the kit sees.
         osadapter.CGROUP_FILE = self.write('cgroup', '0::/user.slice/user-1000.slice/user@1000.service/app.slice/'
                                                      'some-shell.scope\n')
+        # The fake boot service's main process is this test process: in t3code.service, as systemd runs the
+        # launcher (handoff.in_unit). A pid with no file here is not in this /proc.
+        handoff.CGROUP_OF = self.path('proc/{pid}/cgroup')
+        self.in_unit(os.getpid())
+
+    def in_unit(self, pid, unit=osadapter.UNIT):
+        """Process `pid` runs in `unit` as this /proc shows it (handoff.in_unit); unit None: not in this /proc."""
+        path = self.path(f'proc/{pid}/cgroup')
+        if unit is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        self.write(f'proc/{pid}/cgroup', f'0::/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}\n')
 
     def path(self, rel):
         return os.path.join(self.root, rel)
@@ -142,7 +155,7 @@ class Machine:
                 except ProcessLookupError:
                     pass
         (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
-         osadapter.CGROUP_FILE, path, live.fork_report) = self._saved
+         osadapter.CGROUP_FILE, path, handoff.CGROUP_OF, live.fork_report) = self._saved
         os.environ['PATH'] = path or ''
         shutil.rmtree(self.root, ignore_errors=True)
 
