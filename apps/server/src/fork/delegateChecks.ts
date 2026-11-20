@@ -20,6 +20,7 @@ import type * as Scope from "effect/Scope";
 
 import { resolveRuntimeMode } from "../mcp/delegatedTaskModes.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
@@ -41,6 +42,14 @@ export interface DelegateChecksHost {
     readonly target: OrchestratorMcpTarget | undefined;
     readonly providers: ReadonlyArray<ServerProvider>;
   }) => Effect.Effect<DelegateTarget, OrchestratorMcpFailure>;
+  /**
+   * The service's folder scan for one instance (the project's own provider config), returning the
+   * registry after it. The target lookup scans only the requested instance.
+   */
+  readonly scanWorkspace: (
+    instanceId: ServerProvider["instanceId"],
+    cwd: string,
+  ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 }
 
 export interface BeforeWorkspaceInput {
@@ -50,10 +59,10 @@ export interface BeforeWorkspaceInput {
   readonly requested: OrchestratorMcpTarget | undefined;
   readonly runtimeMode: OrchestratorMcpDelegateTaskInput["runtimeMode"];
   /**
-   * The providers as the target lookup read them: after any refresh or folder scan it ran, with
-   * the models the project's own provider config adds (`withWorkspaceModels`).
+   * The parent's folder, as the target lookup reads it, or none. The checks read the providers
+   * themselves, after the lookup, with the models the folder's own provider config adds.
    */
-  readonly providers: ReadonlyArray<ServerProvider>;
+  readonly cwd: string | undefined;
   readonly target: DelegateTarget;
 }
 
@@ -113,6 +122,24 @@ const advertisedModel = (provider: ServerProvider, model: string) =>
     candidate.aliases?.some((alias) => alias.toLowerCase() === model.toLowerCase()),
   );
 
+/**
+ * The models a folder's own provider config adds, as the target lookup reads them: the same merge
+ * as `withWorkspaceModels` in `mcp/OrchestratorMcpService.ts`, which this module cannot import (that
+ * file imports this one).
+ */
+const withFolderModels = (
+  providers: ReadonlyArray<ServerProvider>,
+  cwd: string | undefined,
+): ReadonlyArray<ServerProvider> =>
+  cwd === undefined
+    ? providers
+    : providers.map((provider) => {
+        const models = provider.workspaceSnapshots?.find(
+          (snapshot) => snapshot.cwd === cwd,
+        )?.models;
+        return models === undefined ? provider : { ...provider, models };
+      });
+
 const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void };
 
 /**
@@ -123,6 +150,7 @@ const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void
 export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+  const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
   const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
 
@@ -139,17 +167,34 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
       return { target: input.target };
     }
     const { instanceId, model, options } = input.target.modelSelection;
-    const provider = input.providers.find((candidate) => candidate.instanceId === instanceId);
+    // Read after the target lookup, so any refresh or folder scan it ran is in the list.
+    const providers = withFolderModels(yield* providerRegistry.getProviders, input.cwd);
+    const provider = providers.find((candidate) => candidate.instanceId === instanceId);
     const parentMode = input.parent.thread.runtimeMode;
     const modeOn = (target: DelegateTarget) =>
       resolveRuntimeMode(parentMode, input.runtimeMode, target).pipe(Effect.option);
+    const sameTaskOn = (
+      candidate: ServerProvider["instanceId"],
+      list: ReadonlyArray<ServerProvider>,
+    ) =>
+      host
+        .resolveTarget({
+          parent: input.parent,
+          target: {
+            providerInstanceId: candidate,
+            model,
+            ...(options === undefined ? {} : { options }),
+          },
+          providers: withFolderModels(list, input.cwd),
+        })
+        .pipe(Effect.result);
     const outcome = yield* UsagePacingGate.decide({
       mode: settings.value.usagePacingGate,
       lowerEffort: settings.value.usagePacingLowerEffort,
       nowMs: yield* Clock.currentTimeMillis,
       instanceId,
       pinned: input.requested?.providerInstanceId !== undefined,
-      providers: input.providers,
+      providers,
       descriptors:
         provider === undefined
           ? undefined
@@ -160,29 +205,35 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
           onNone: () => Effect.undefined,
           onSome: (pacer) => pacer.paceOf(id).pipe(Effect.orElseSucceed(() => undefined)),
         }),
-      // The same model, options and runtime mode on an instance this project may use, or nothing.
+      // The same model, options and runtime mode on an instance this project may use, or why not.
       targetOn: Effect.fnUntraced(function* (candidate) {
         const enabled = yield* threadManagement.isProviderInstanceEnabledForProject({
           projectId: input.parent.thread.projectId,
           instanceId: candidate,
         });
-        if (!enabled) return undefined;
-        const resolved = yield* host
-          .resolveTarget({
-            parent: input.parent,
-            target: {
-              providerInstanceId: candidate,
-              model,
-              ...(options === undefined ? {} : { options }),
-            },
-            providers: input.providers,
-          })
-          .pipe(Effect.option);
-        if (Option.isNone(resolved)) return undefined;
-        const modes = yield* Effect.all([modeOn(input.target), modeOn(resolved.value)]);
+        if (!enabled) return { cannot: "this project turned it off" };
+        let resolved = yield* sameTaskOn(candidate, providers);
+        // The lookup scanned the folder for the requested instance only, and a fresh scan of one
+        // instance drops the others' snapshots of it: scan it for this one too, then look again.
+        if (
+          input.cwd !== undefined &&
+          resolved._tag === "Failure" &&
+          resolved.failure.code === "model_unavailable"
+        ) {
+          resolved = yield* sameTaskOn(candidate, yield* host.scanWorkspace(candidate, input.cwd));
+        }
+        if (resolved._tag === "Failure") {
+          return {
+            cannot:
+              resolved.failure.code === "model_unavailable"
+                ? `it does not list ${model}${input.cwd === undefined ? "" : " for this folder"}`
+                : `the task cannot run there (${resolved.failure.code})`,
+          };
+        }
+        const modes = yield* Effect.all([modeOn(input.target), modeOn(resolved.success)]);
         return Option.isSome(modes[1]) && Option.getOrNull(modes[0]) === modes[1].value
-          ? resolved.value
-          : undefined;
+          ? { target: resolved.success }
+          : { cannot: "it would run the task in another runtime mode" };
       }),
     });
     switch (outcome.action) {
