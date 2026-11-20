@@ -24,6 +24,7 @@ import * as Stream from "effect/Stream";
 
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
 import { forkParked } from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
@@ -37,7 +38,7 @@ import {
 import { handoffMessageText } from "./handoffMessage.ts";
 import { HANDOFF_SETTLE_CHECK_MS, HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 import { relayShowsFinish } from "./handoffRelayView.ts";
-import { threadHandoffSettings } from "./handoffOwner.ts";
+import { threadHandoff } from "./handoffOwner.ts";
 
 /** Part 3 reads the turn items of this many latest runs; the budget keeps the newest of them. */
 const TRANSCRIPT_RUNS = 20;
@@ -46,6 +47,7 @@ export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const adapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   // One per waiting thread; any event of that thread completes it, so the wait reads again.
   const wakes = new Map<ThreadId, Deferred.Deferred<void>>();
   // Completed by a request or run change of any thread (a child's request shows on its parent), so
@@ -60,9 +62,20 @@ export const make = Effect.gen(function* () {
   const readThread = Effect.fn("HandoffService.readThread")(function* (threadId: ThreadId) {
     const current = yield* serverSettings.getSettings;
     const thread = yield* projections.getThread(threadId);
-    const resolved = threadHandoffSettings(current, thread.projectId, threadId);
+    const { blocked, ...resolved } = yield* threadHandoff(current, thread).pipe(
+      Effect.provideService(ProviderAdapterRegistry.ProviderAdapterRegistryV2, adapters),
+    );
     // Off (the default) and `compact` read nothing more.
     if (resolved.mode !== "handoff") return null;
+    // Same rule as the compaction wrapper (handoffOwner.ts): a handoff that cannot run sends
+    // nothing, and idle compaction covers the thread instead. Read again at every step.
+    if (blocked !== null) {
+      yield* Effect.logWarning("handoff cannot run; idle compaction covers this thread", {
+        threadId,
+        ...blocked,
+      });
+      return null;
+    }
     return { ...resolved, records: yield* withStores(readHandoffRecords(threadId)) };
   });
 
@@ -342,4 +355,8 @@ export const make = Effect.gen(function* () {
 /** Started with the server's other workers, from `ForkLayers.layerRuntimeServices` (fork/forkLayers.ts). */
 export const layer = Layer.effectDiscard(
   make.pipe(Effect.flatMap((service) => service.start())),
-).pipe(Layer.provide(ProjectionStore.layer));
+).pipe(
+  Layer.provide(ProjectionStore.layer),
+  // Upstream's own lookup over the server's instance registry, as server.ts gives /mcp.
+  Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
+);
