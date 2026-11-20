@@ -97,8 +97,15 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<OrchestrationV2Run["status"]> = 
 ]);
 
 const ROLE_PREFIX = /^Act as the ([^\n]{1,60}?) sub-agent for this task\./u;
-const KIND_TAG = /\[run-kind:\s*([^\]\n]{1,80}?)\s*\]/iu;
-const ESTIMATE_TAG = /\[run-estimate:\s*([^\]\n]{1,80}?)\s*\]/iu;
+/** Longest kind or estimate text kept; a longer kind is cut, a longer estimate refused. */
+export const MAX_TAG_CHARS = 80;
+/** Up to the closing `]`, any length: one pass over the line, no backtracking. */
+const KIND_TAG = /\[run-kind:([^\]\n]*)\]/iu;
+/** An estimate tag without its `]` (on the same line) is read too, so that it is refused, not lost. */
+const ESTIMATE_TAG = /\[run-estimate:([^\]\n]*)(\]?)/iu;
+/** Cuts a long tag text to `MAX_TAG_CHARS`, marking the cut with `…`. */
+const capTagText = (text: string) =>
+  text.length > MAX_TAG_CHARS ? `${text.slice(0, MAX_TAG_CHARS)}…` : text;
 const DURATION_UNITS: Readonly<Record<string, number>> = {
   h: 3_600_000,
   hr: 3_600_000,
@@ -127,7 +134,9 @@ const TOKEN_SCALES: Readonly<Record<string, number>> = {
   b: 1e9,
   billion: 1e9,
 };
-const TOKEN_WORDS = new Set(["tok", "toks", "token", "tokens"]);
+const TOKEN_WORDS = ["tok", "toks", "token", "tokens"] as const;
+/** `2ktokens`, `2Mtokens`, `300ktok`: a scale written right before the word "tokens". */
+const tokenWordAtEnd = (unit: string) => TOKEN_WORDS.find((word) => unit.endsWith(word));
 /** Joins parts: spaces, commas, `;`, `+`, `~` (about) and the word "and". */
 const ESTIMATE_GAP = /(?:[\s,;+~]|and(?![a-z]))*/iuy;
 /** A number (`2`, `2.5`, `1e6`, `1,500,000`), its unit, and the word "tokens" if one follows. */
@@ -167,8 +176,15 @@ function readEstimateText(text: string): RunEstimate | null {
     const unit = part[2]!;
     const lower = unit.toLowerCase();
     if (!Number.isFinite(value)) return null;
-    if (part[3] !== undefined || TOKEN_WORDS.has(lower)) {
-      const scale = TOKEN_WORDS.has(lower) ? 1 : TOKEN_SCALES[lower];
+    const joinedWord = tokenWordAtEnd(lower);
+    if (part[3] !== undefined || joinedWord !== undefined) {
+      // `2M tokens` (the word apart) or `2Mtokens` (joined); never both, as in `2 tokens tokens`.
+      const scale =
+        part[3] !== undefined
+          ? joinedWord === undefined
+            ? TOKEN_SCALES[lower]
+            : undefined
+          : TOKEN_SCALES[lower.slice(0, lower.length - joinedWord!.length)];
       if (scale === undefined || tokens !== null) return null;
       tokens = value * scale;
     } else {
@@ -189,15 +205,26 @@ function readEstimateText(text: string): RunEstimate | null {
 
 /** `[run-estimate: 1h 30m 2.5M tokens]` in a text: null when there is no tag. */
 export function readEstimateTag(text: string): EstimateTag | null {
-  const tag = ESTIMATE_TAG.exec(text)?.[1];
-  if (tag === undefined) return null;
-  const estimate = readEstimateText(tag);
-  return estimate === null ? { estimate: null, refused: tag } : { estimate, refused: null };
+  const match = ESTIMATE_TAG.exec(text);
+  if (match === null) return null;
+  const tag = match[1]!.trim();
+  // Too long, or never closed: refused (kept cut short), so the summary counts it, never dropped.
+  const estimate =
+    tag.length > MAX_TAG_CHARS || match[2] !== "]" || tag === "" ? null : readEstimateText(tag);
+  return estimate === null
+    ? { estimate: null, refused: capTagText(tag) }
+    : { estimate, refused: null };
 }
 
 /** The estimate in a text, or null when there is none or it was refused. */
 export function parseEstimate(text: string): RunEstimate | null {
   return readEstimateTag(text)?.estimate ?? null;
+}
+
+/** `[run-kind: ...]` in a text, cut to `MAX_TAG_CHARS`; null when there is none or it is empty. */
+function readKindTag(text: string): string | null {
+  const kind = KIND_TAG.exec(text)?.[1]?.trim();
+  return kind === undefined || kind === "" ? null : capTagText(kind);
 }
 
 /** The labels a parent puts in a delegated task's text. */
@@ -212,7 +239,7 @@ export function parseTaskLabels(text: string | null): {
   const estimate = readEstimateTag(text);
   return {
     role: ROLE_PREFIX.exec(text.trimStart())?.[1]?.trim() ?? null,
-    kind: KIND_TAG.exec(text)?.[1] ?? null,
+    kind: readKindTag(text),
     estimate: estimate?.estimate ?? null,
     estimateRefused: estimate?.refused ?? null,
   };
