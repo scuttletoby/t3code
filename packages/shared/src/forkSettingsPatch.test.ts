@@ -7,7 +7,7 @@ import {
   PlaytestSettings,
   ProjectId,
   ProviderInstanceId,
-  type ServerSettings,
+  ServerSettings,
   ServerSettingsPatch,
   ThreadId,
 } from "@t3tools/contracts";
@@ -24,7 +24,7 @@ import {
   playtestProgramProblem,
   splitForkSettingsPatch,
 } from "./forkSettingsPatch.ts";
-import { clearProjectSettingsOverrides } from "./projectSettings.ts";
+import { clearProjectSettingsOverrides, resolveProjectSettings } from "./projectSettings.ts";
 import { applyServerSettingsPatch } from "./serverSettings.ts";
 // The source text, to pin the fork's lines in upstream's file.
 import SERVER_SETTINGS_SOURCE from "./serverSettings.ts?raw";
@@ -34,6 +34,11 @@ const codex = ProviderInstanceId.make("codex-b");
 
 const greenCheck = Schema.decodeSync(WaitCheck)({ argv: ["/bin/true"] });
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
+const encodeServerSettings = Schema.encodeSync(ServerSettings);
+const encodePatch = Schema.encodeUnknownSync(ServerSettingsPatch);
+/** Through JSON, as the wire carries it: fresh objects, never the ones the server holds. */
+const overWire = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
 const decodePlaytest = Schema.decodeUnknownSync(PlaytestSettings);
 const playtestAdapter = (program: string) => {
   const step = (name: string) => ({ argv: [program, name] });
@@ -358,6 +363,202 @@ describe("fork settings save check (MCP profile references)", () => {
     ],
   ] as const)("refuses %s, saying how to fix it", (_name, patch, message) => {
     expect(problemAfter(patch)).toMatch(message);
+  });
+});
+
+describe("fork settings save check (a project's kept reviewRules text)", () => {
+  const project = ProjectId.make("project-1");
+  const other = ProjectId.make("project-2");
+  const BAD = { preset: "strict", runner: { driver: "claudeAgent" } };
+  // As the file holds it: one project's bad hand edit, another project off.
+  const stored = decodeServerSettings({
+    projectSettingsOverrides: {
+      [project]: { reviewRules: BAD, defaultAutoPull: false },
+      [other]: { reviewRules: { preset: "off" } },
+    },
+  });
+  // A client resends a project's whole entry as it holds it: the server sends its settings as
+  // JSON, the client decodes them, and its save comes back as JSON. So the kept text the server
+  // compares is a fresh copy, never the stored object (a `===` compare would refuse every save).
+  const resend = (settings: ServerSettings, id: ProjectId, entry: Record<string, unknown>) => {
+    const held = decodeServerSettings(overWire(encodeServerSettings(settings)));
+    return decodePatch(
+      overWire(
+        encodePatch({
+          projectSettingsOverrides: { [id]: { ...held.projectSettingsOverrides[id], ...entry } },
+        }),
+      ),
+    );
+  };
+  const save = (settings: ServerSettings, patch: ServerSettingsPatch) => {
+    const next = applyServerSettingsPatch(settings, patch);
+    return { next, problem: forkSettingsWriteProblem(settings, next) };
+  };
+  const kept = (unreadable: unknown) => ({ reviewRules: { preset: "off", unreadable } });
+
+  it("takes the stored text back unchanged, and the same save again", () => {
+    const patch = resend(stored, project, { defaultAutoPull: true });
+    // The wire made a copy: equal text, another object.
+    const sent = patch.projectSettingsOverrides?.[project]?.reviewRules as
+      | { readonly unreadable?: unknown }
+      | undefined;
+    const held = stored.projectSettingsOverrides[project]?.reviewRules as
+      | { readonly unreadable?: unknown }
+      | undefined;
+    expect(sent?.unreadable).toEqual(held?.unreadable);
+    expect(sent?.unreadable).not.toBe(held?.unreadable);
+    const first = save(stored, patch);
+    expect(first.problem).toBeUndefined();
+    expect(first.next.projectSettingsOverrides[project]?.reviewRules).toEqual(
+      stored.projectSettingsOverrides[project]?.reviewRules,
+    );
+    // Runs again from what the first save left: still the same text, still accepted.
+    const again = save(first.next, resend(first.next, project, { defaultAutoPull: true }));
+    expect(again.problem).toBeUndefined();
+    expect(again.next).toEqual(first.next);
+  });
+
+  it.each([
+    ["other text than the stored one", project, kept({ preset: "recommended", lenses: ["x"] })],
+    ["text for a project that stores none", ProjectId.make("project-3"), kept(BAD)],
+    ["text for a project whose stored value reads well", other, kept(BAD)],
+    ["a large text nobody stored", project, kept("x".repeat(100_000))],
+  ])("refuses %s, so a save never brings text in", (_name, id, entry) => {
+    const problem = save(stored, resend(stored, id, entry)).problem;
+    expect(problem).toContain(`Project ${id}'s reviewRules`);
+  });
+
+  it("refuses a stale client's text after the person fixed the value elsewhere", () => {
+    const fixed = save(stored, resend(stored, project, { reviewRules: { preset: "recommended" } }));
+    expect(fixed.problem).toBeUndefined();
+    // The stale client still holds the old entry and resends it whole.
+    expect(save(fixed.next, resend(stored, project, { defaultAutoPull: true })).problem).toContain(
+      `Project ${project}'s reviewRules`,
+    );
+  });
+
+  it("lets a person replace or clear the kept text, and an older client leave it out", () => {
+    for (const reviewRules of [{ preset: "off" }, { preset: "recommended" }, null]) {
+      expect(
+        save(stored, resend(stored, project, { reviewRules })).problem,
+        JSON.stringify(reviewRules),
+      ).toBeUndefined();
+    }
+    expect(
+      save(
+        stored,
+        decodePatch({ projectSettingsOverrides: { [project]: { defaultAutoPull: true } } }),
+      ).problem,
+    ).toBeUndefined();
+    expect(save(stored, decodePatch({ enableAgentBrowserAccess: false })).problem).toBeUndefined();
+  });
+});
+
+describe("a project's null for playtest, handoff and reviewRules resolves to the server's value", () => {
+  const project = ProjectId.make("project-1");
+  // The server's values, each away from its default, so "the server's" differs from "off".
+  const SERVER_FILE = {
+    playtest: PLAYTEST_ADAPTER,
+    handoff: { mode: "handoff" },
+    reviewRules: { preset: "recommended" },
+  };
+  const KEYS = ["playtest", "handoff", "reviewRules"] as const;
+  /** The server's save (apps/server fork/serverSettingsPatch.ts): upstream's, then the kept keys. */
+  const serverSave = (current: ServerSettings, patch: ServerSettingsPatch) =>
+    keepLeftOutForkProjectKeys(current, patch, applyServerSettingsPatch(current, patch));
+  const serverValue = (settings: ServerSettings, key: (typeof KEYS)[number]) => settings[key];
+  /** What every reader gets: the resolved value and its source, and the project's raw override. */
+  const resolved = (settings: ServerSettings, key: (typeof KEYS)[number]) => {
+    const { settings: effective, sources, overrides } = resolveProjectSettings(settings, project);
+    return { value: effective[key], source: sources[key], has: Object.hasOwn(overrides, key) };
+  };
+  const expectServers = (settings: ServerSettings, key: (typeof KEYS)[number]) => {
+    const got = resolved(settings, key);
+    expect(got.value, key).not.toBeNull();
+    expect(got.value, key).toEqual(serverValue(settings, key));
+    expect(got.source, key).toBe("environment");
+    expect(got.has, key).toBe(false);
+  };
+
+  it.each(KEYS)("an old file's hand-written %s: null reads as the server's", (key) => {
+    const settings = decodeServerSettings({
+      ...SERVER_FILE,
+      projectSettingsOverrides: { [project]: { [key]: null, defaultAutoPull: false } },
+    });
+    expectServers(settings, key);
+    // A save of another key (runs again: twice) leaves it the server's, and the file without it.
+    let next = settings;
+    for (let run = 0; run < 2; run += 1) {
+      next = serverSave(next, decodePatch({ enableAgentBrowserAccess: run === 0 }));
+      expectServers(next, key);
+      expect(
+        encodeServerSettings(next).projectSettingsOverrides?.[project],
+        `${key} run ${run}`,
+      ).toEqual({ defaultAutoPull: false });
+    }
+  });
+
+  it.each(KEYS)("a project entry that holds only %s: null reads as empty", (key) => {
+    const settings = decodeServerSettings({
+      ...SERVER_FILE,
+      projectSettingsOverrides: { [project]: { [key]: null } },
+    });
+    expectServers(settings, key);
+  });
+
+  it.each(KEYS)("a client's clear of %s (null) resolves to the server's on both sides", (key) => {
+    const own = {
+      playtest: playtestAdapter("/opt/project/game"),
+      handoff: { mode: "compact" },
+      reviewRules: { preset: "off" },
+    }[key];
+    const stored = decodeServerSettings({
+      ...SERVER_FILE,
+      projectSettingsOverrides: { [project]: { [key]: own, defaultAutoPull: false } },
+    });
+    expect(resolved(stored, key).source, key).toBe("project");
+    const clear = decodePatch(
+      overWire({
+        projectSettingsOverrides: { [project]: { [key]: null, defaultAutoPull: false } },
+      }),
+    );
+    // The web shows a pending save with upstream's patch alone; the server adds the kept keys.
+    const pending = applyServerSettingsPatch(stored, clear);
+    expectServers(pending, key);
+    const saved = serverSave(stored, clear);
+    expectServers(saved, key);
+    expect(forkSettingsWriteProblem(stored, saved), key).toBeUndefined();
+    // Runs again: the same clear on the cleared settings changes nothing.
+    expect(serverSave(saved, clear), key).toEqual(saved);
+    // Two clients: an older one that holds the entry from before and leaves the key out does not
+    // bring the old value back, and one that resends the cleared entry keeps it cleared.
+    const older = decodePatch({
+      projectSettingsOverrides: { [project]: { defaultAutoPull: true } },
+    });
+    expectServers(serverSave(saved, older), key);
+    const fresh = decodePatch(
+      overWire({
+        projectSettingsOverrides: {
+          [project]: encodeServerSettings(saved).projectSettingsOverrides?.[project],
+        },
+      }),
+    );
+    expectServers(serverSave(saved, fresh), key);
+  });
+
+  it("empty or missing settings resolve every key to the server's default", () => {
+    for (const file of [
+      {},
+      { projectSettingsOverrides: {} },
+      { projectSettingsOverrides: { [project]: {} } },
+    ]) {
+      const settings = decodeServerSettings(file);
+      for (const key of KEYS) {
+        const got = resolved(settings, key);
+        expect(got.value, key).toEqual(DEFAULT_SERVER_SETTINGS[key]);
+        expect(got.source, key).toBe("environment");
+      }
+    }
   });
 });
 
