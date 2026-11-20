@@ -6,6 +6,7 @@
 import { MCP_CARRIED_PROFILES_REFUSE } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -19,31 +20,34 @@ import {
 } from "effect/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as ServerConfig from "../config.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ServerSettingsService from "../serverSettings.ts";
+import { makeMcpProfileSettings } from "./claudeMcpProfile.ts";
 
 export const FORK_FEATURES_PATH = "/api/fork/features";
 
 /**
  * The answer. A reader counts a feature only when it is `true`. `mcpProfileCarry: false` says this
- * version could, but its owner set `mcpCarriedProfiles` to `refuse`; absent, the version cannot.
+ * version could, but its owner set `mcpCarriedProfiles` to `refuse` (or its settings cannot be read
+ * now); absent, the version cannot.
  */
 export const ForkFeatures = Schema.Struct({ mcpProfileCarry: Schema.optionalKey(Schema.Boolean) });
 export type ForkFeatures = typeof ForkFeatures.Type;
 const decodeForkFeatures = Schema.decodeUnknownOption(ForkFeatures);
 
 /**
- * What this machine answers. Settings that cannot be read answer `true`, what this version does:
- * the answer is only advice, and each task's turn reads `mcpCarriedProfiles` again and refuses a
- * task it would not take (fork/mcpProfile.ts).
+ * What this machine answers, from the settings a Claude turn reads (fork/claudeMcpProfile.ts), so
+ * the route and the turn agree: `false` while `mcpCarriedProfiles` reads `refuse` (also for a
+ * settings.json that does not decode, which may say so) or the settings cannot be read at all.
+ * Each task's turn there reads it again and refuses a task it would not take (fork/mcpProfile.ts).
  */
-const thisMachine = (
-  settings: ServerSettingsService.ServerSettingsService["Service"],
-): Effect.Effect<ForkFeatures> =>
-  settings.getSettings.pipe(
-    Effect.map((read) => ({
+const thisMachine = (readSettings: Effect.Success<typeof makeMcpProfileSettings>) =>
+  readSettings.pipe(
+    Effect.map((read): ForkFeatures => ({
       mcpProfileCarry: read.mcpCarriedProfiles !== MCP_CARRIED_PROFILES_REFUSE,
     })),
-    Effect.orElseSucceed(() => ({ mcpProfileCarry: true })),
+    Effect.orElseSucceed((): ForkFeatures => ({ mcpProfileCarry: false })),
   );
 
 const notFound = () => HttpServerResponse.text("Not Found", { status: 404 });
@@ -51,13 +55,13 @@ const notFound = () => HttpServerResponse.text("Not Found", { status: 404 });
 /** The route's work with the server's auth passed in. A browser (it sends an Origin) is refused. */
 const handleForkFeatures = Effect.fn("fork.features.handle")(function* (
   auth: Pick<EnvironmentAuth.EnvironmentAuth["Service"], "authenticateMcpClient">,
-  settings: ServerSettingsService.ServerSettingsService["Service"],
+  readSettings: Effect.Success<typeof makeMcpProfileSettings>,
 ) {
   const request = yield* HttpServerRequest.HttpServerRequest;
   if (request.headers.origin !== undefined) return notFound();
   const client = yield* auth.authenticateMcpClient(request).pipe(Effect.option);
   if (Option.isNone(client) || !client.value.peerLink) return notFound();
-  return HttpServerResponse.jsonUnsafe(yield* thisMachine(settings), {
+  return HttpServerResponse.jsonUnsafe(yield* thisMachine(readSettings), {
     headers: { "cache-control": "no-store" },
   });
 });
@@ -66,8 +70,14 @@ const handleForkFeatures = Effect.fn("fork.features.handle")(function* (
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const auth = yield* EnvironmentAuth.EnvironmentAuth;
-    const settings = yield* ServerSettingsService.ServerSettingsService;
-    return HttpRouter.add("GET", FORK_FEATURES_PATH, handleForkFeatures(auth, settings));
+    // Asked for here, so a server wired without one is a type error, not a route that silently
+    // skips settings.json: the reader takes each only if it is there.
+    yield* ServerSettingsService.ServerSettingsService;
+    yield* ServerConfig.ServerConfig;
+    yield* FileSystem.FileSystem;
+    yield* ManagedPolicy.ManagedPolicy;
+    const readSettings = yield* makeMcpProfileSettings;
+    return HttpRouter.add("GET", FORK_FEATURES_PATH, handleForkFeatures(auth, readSettings));
   }),
 );
 

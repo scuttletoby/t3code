@@ -11,6 +11,7 @@ import {
   MCP_T3_TOOL_GROUPS,
   MCP_T3_UNGROUPED_TOOLS,
   type McpT3ToolGroup,
+  ProviderDriverKind,
   type ServerSettings,
   isBuiltInMcpProfileName,
   isDefinableMcpProfileName,
@@ -91,6 +92,11 @@ export interface McpProfileCannotApply {
   readonly threadId: string;
   /** One plain sentence on what is wrong and how to fix it, for the thread. */
   readonly message: string;
+  /**
+   * Where the fault starts: for `parent`, the message of the first thread up the lineage that is
+   * not refused for its parent's sake; for any other problem, `message` itself.
+   */
+  readonly cause: string;
 }
 
 export type McpProfileResolution = McpProfileResolved | McpProfileCannotApply;
@@ -168,6 +174,15 @@ const PROFILE_FIELDS: ReadonlySet<string> = new Set(["servers", "t3Tools"]);
 const CARRIED_FIELDS: ReadonlySet<string> = new Set(["name", ...PROFILE_FIELDS]);
 
 /** True when the profile is today's behaviour: every outside server and every T3 tool. */
+/**
+ * The drivers whose threads apply an MCP profile: Claude only (fork/claudeMcpProfile.ts). Any
+ * other provider gives a thread every MCP server and T3 tool, so a delegation refuses to send a
+ * narrower profile to one on another machine (fork/remoteMcpProfile.ts).
+ */
+export const MCP_PROFILE_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set([
+  ProviderDriverKind.make("claudeAgent"),
+]);
+
 export const isEveryMcpTool = (profile: McpProfileSet): boolean =>
   profile.servers === "all" && profile.t3Tools === "all";
 
@@ -372,13 +387,28 @@ function cannotApply(
               : FIX
           }.`
         : problem === "parent"
-          ? `The parent thread's MCP profile${name} cannot be applied, so this thread cannot start: ${FIX}.`
+          ? `The parent thread's MCP profile${name} cannot be applied, so this thread cannot start: ${FIX}. The reason up the chain: ${issue}`
           : problem === "carried"
             ? `The MCP profile${name} of the thread on another machine that delegated this one cannot be read by this version (${issue}), so this thread cannot start: update T3 here, or pick a profile for this thread in Settings.`
             : problem === "carried-refused"
-              ? `This thread is a task another machine delegated here with ${name === "" ? "an MCP profile this version cannot read" : `its MCP profile${name}`}, and this machine is set to refuse such tasks (mcpCarriedProfiles is "${MCP_CARRIED_PROFILES_REFUSE}"), so it cannot start: delegate the task on that machine, set mcpCarriedProfiles to "apply" here, or pick a profile for this thread in Settings.`
+              ? // `issue` is set only for a carried value this version cannot read, which `apply`
+                // refuses too, so setting it would not help.
+                `This thread is a task another machine delegated here with ${
+                  issue !== ""
+                    ? `an MCP profile${name} this version cannot read (${issue})`
+                    : `its MCP profile${name}`
+                }, and this machine is set to refuse such tasks (mcpCarriedProfiles is "${MCP_CARRIED_PROFILES_REFUSE}"), so it cannot start: delegate the task on that machine, ${
+                  issue !== "" ? "" : `set mcpCarriedProfiles to "apply" here, `
+                }or pick a profile for this thread in Settings.`
               : `This thread's parent threads ${issue}, so its MCP profile cannot be worked out: ${FIX}.`;
-  return { _tag: "CannotApply", problem, profileName, threadId: thread.threadId, message };
+  return {
+    _tag: "CannotApply",
+    problem,
+    profileName,
+    threadId: thread.threadId,
+    message,
+    cause: problem === "parent" ? issue : message,
+  };
 }
 
 function resolveAt(
@@ -413,14 +443,14 @@ function resolveAt(
       settings.mcpCarriedProfiles === MCP_CARRIED_PROFILES_REFUSE &&
       !(sent.ok && isEveryMcpTool(sent.profile))
     ) {
-      return cannotApply("carried-refused", thread, sent.name, "");
+      return cannotApply("carried-refused", thread, sent.name, sent.ok ? "" : sent.issue);
     }
     if (!sent.ok) return cannotApply("carried", thread, sent.name, sent.issue);
     parentProfile = sent.profile;
   } else {
     const parent = resolveAt(settings, lineage, index + 1, carried);
     if (parent._tag === "CannotApply") {
-      return cannotApply("parent", thread, parent.profileName, parent.message);
+      return cannotApply("parent", thread, parent.profileName, parent.cause);
     }
     parentProfile = parent.profile;
   }

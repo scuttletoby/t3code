@@ -173,18 +173,20 @@ export const McpCarriedProfiles = Schema.Literals([
 export type McpCarriedProfiles = typeof McpCarriedProfiles.Type;
 
 /**
- * `mcpCarriedProfiles` as the settings file holds it: `refuse` (any case, outer spaces ignored)
- * reads as `refuse`, anything else as `apply`, the default. Either value only narrows, so a bad one
- * widens nothing, and the rest of the file still loads. A save writes only the two values.
+ * `mcpCarriedProfiles` as the settings file holds it: `apply` (any case, outer spaces ignored) or
+ * `null` reads as `apply`, the default; anything else, `refuse` or a value it does not know (a typo,
+ * or a newer build's), as `refuse`, which only refuses: a bad value never opens up to `apply`, and
+ * the rest of the file still loads. A save writes only the two values.
  */
 export const McpCarriedProfilesFromSettingsFile = Schema.Unknown.pipe(
   Schema.decodeTo(
     McpCarriedProfiles,
     SchemaTransformation.transform<McpCarriedProfiles, unknown>({
       decode: (value) =>
-        typeof value === "string" && value.trim().toLowerCase() === MCP_CARRIED_PROFILES_REFUSE
-          ? MCP_CARRIED_PROFILES_REFUSE
-          : MCP_CARRIED_PROFILES_APPLY,
+        value === null ||
+        (typeof value === "string" && value.trim().toLowerCase() === MCP_CARRIED_PROFILES_APPLY)
+          ? MCP_CARRIED_PROFILES_APPLY
+          : MCP_CARRIED_PROFILES_REFUSE,
       encode: (value) => value,
     }),
   ),
