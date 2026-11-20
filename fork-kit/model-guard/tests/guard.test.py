@@ -6,6 +6,7 @@ fails.
   python3 -I -B fork-kit/model-guard/tests/guard.test.py
 """
 import io, json, os, re, shutil, subprocess, sys, tempfile, types, unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True   # the CI runner has no -B; keep the kit folder free of __pycache__
 
@@ -20,7 +21,9 @@ LARGE = {'driver': 'claudeAgent', 'model': 'example-large-1', 'efforts': ['mediu
 DEEP = {'driver': 'claudeAgent', 'model': 'example-deep-2', 'efforts': ['high'], 'aliases': ['deep']}
 PLAIN = {'driver': 'otherDriver', 'model': 'example-plain', 'aliases': ['plain']}
 POLICY = {'mode': 'enforce', 'allow': [LARGE, DEEP, PLAIN]}
-GOOD_TARGET = {'model': 'example-large-1', 'options': {'effort': 'high'}}
+# ultracode: false is named because T3 may turn ultracode on for a Claude model when the call leaves it out
+GOOD_TARGET = {'model': 'example-large-1', 'options': {'effort': 'high', 'ultracode': False}}
+NO_ULTRA = {'id': 'ultracode', 'value': False}
 
 
 def load(source=None):
@@ -44,6 +47,7 @@ class Guard(unittest.TestCase):
         self.policy_path = os.path.join(self.dir, 'policy.json')
         self.machine({'policyFile': self.policy_path})
         self.policy(POLICY)
+        self.records = []   # the owner's record (the system log outside tests)
 
     def close(self):
         os.umask(self.umask)
@@ -63,7 +67,8 @@ class Guard(unittest.TestCase):
         """The hook's printed answer (a dict), or None when it printed nothing."""
         out = io.StringIO()
         text = raw if raw is not None else json.dumps({'tool_name': tool, 'tool_input': tool_input or {}})
-        self.assertEqual(self.m.run_hook(io.StringIO(text), out, self.machine_path, os.getuid()), 0)
+        self.assertEqual(self.m.run_hook(io.StringIO(text), out, self.machine_path, os.getuid(),
+                                           record=self.records.append), 0)
         return json.loads(out.getvalue())['hookSpecificOutput'] if out.getvalue() else None
 
     def refused(self, tool, tool_input=None, *parts, raw=None):
@@ -96,8 +101,9 @@ class Guard(unittest.TestCase):
     def test_every_checked_tool_comes_from_the_one_list(self):
         for name in self.m.CHECKED_TOOLS:
             self.assertIsNotNone(self.m.tool_kind(name), name)
-            self.assertTrue(self.m._covers(self.m.HOOK_MATCHER, name), name)
-        for name in ('Workflow', 'mcp__t3-code__t3_thread_send', 'mcp__t3-code__t3_thread_transfer',
+            self.assertTrue(re.search(self.m.HOOK_MATCHER, name), name)
+        for name in ('Workflow', 'RemoteTrigger', 'mcp__t3-code__t3_project_create', 'mcp__t3-code__t3_project_update',
+                     'mcp__t3-code__t3_thread_send', 'mcp__t3-code__t3_thread_transfer',
                      'mcp__t3-code__t3_thread_send_attachments', 'mcp__t3-code__schedule_task'):
             self.assertIn(name, self.m.CHECKED_TOOLS)
 
@@ -199,7 +205,7 @@ class Guard(unittest.TestCase):
                      "effort 'max' is not allowed")
         self.refused(t, self.delegate({'model': 'example-large-1', 'options': [{'id': 'effort', 'value': 'high'},
                                                                               {'id': 'effort', 'value': 'low'}]}),
-                     "effort 'low'")
+                     "names 'effort' twice")
         self.refused(t, self.delegate({'model': 'example-deep-2', 'options': {'reasoningEffort': 'medium'}}),
                      "effort 'medium'")
 
@@ -216,8 +222,9 @@ class Guard(unittest.TestCase):
         t = 'mcp__t3-code__delegate_task'
         self.assertEqual(self.passed(t, self.delegate(GOOD_TARGET)), 'model-guard: example-large-1 is for most work.')
         self.passed(t, self.delegate({'model': ' example-large-1 ', 'providerInstanceId': 'any-account',
-                                      'options': [{'id': 'effort', 'value': 'medium'}]}))
-        self.passed(t, self.delegate({'model': 'example-deep-2', 'options': {'thinking_level': 'high'}}))
+                                      'options': [{'id': 'effort', 'value': 'medium'}, NO_ULTRA]}))
+        self.passed(t, self.delegate({'model': 'example-deep-2', 'options': {'thinking_level': 'high',
+                                                                             'ultracode': False}}))
         self.assertIsNone(self.hook(t, self.delegate({'model': 'example-plain', 'driverKind': 'otherDriver'})))
 
     def test_a_row_without_efforts_lets_no_effort_through(self):
@@ -235,17 +242,69 @@ class Guard(unittest.TestCase):
                                                           'efforts': ['medium']}]})
         self.refused(t, self.delegate(GOOD_TARGET), "effort 'high' is not allowed")
         self.passed(t, self.delegate(dict(GOOD_TARGET, driverKind='claudeAgent')))
-        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'medium'}}))
+        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'medium', 'ultracode': False}}))
+
+    def test_a_model_selection_never_trusts_driver_kind(self):
+        """#589 round 2: a ModelSelection (t3_thread_launch, t3_thread_configure, a project's default) has no
+        driverKind; T3 drops the key and runs the pick on the named instance. So a driverKind there is refused, and
+        the pick is checked against every row of its model, the ultracode rule included. Policy from both reviews:
+        one model in rows of two drivers that allow different efforts."""
+        two = {'mode': 'enforce', 'allow': [LARGE, DEEP, {'driver': 'otherDriver', 'model': 'example-large-1',
+                                                          'efforts': ['xhigh', 'max']}]}
+        self.policy(two)
+        paths = {'t3_thread_launch': lambda sel: {'title': 'x', 'modelSelection': sel},
+                 't3_thread_configure': lambda sel: {'threadId': 't', 'modelSelection': sel},
+                 't3_project_create': lambda sel: {'title': 'p', 'defaultModelSelection': sel},
+                 't3_project_update': lambda sel: {'projectId': 'p', 'defaultModelSelection': sel}}
+        for path, wrap in paths.items():
+            tool = 'mcp__t3-code__' + path
+            for driver in ('otherDriver', 'claudeAgent', None, '', 7):
+                for effort in ('max', 'high'):
+                    with self.subTest(path=path, driver=driver, effort=effort):
+                        # the reviews' call: Claude runs it at max, which its own row does not allow
+                        self.refused(tool, wrap({'instanceId': 'claudeAgent', 'model': 'example-large-1',
+                                                 'driverKind': driver,
+                                                 'options': {'effort': effort, 'ultracode': False}}),
+                                     'driverKind: T3 ignores it on a model selection')
+            for effort, why in (('max', "effort 'max' is not allowed"), ('high', "effort 'high' is not allowed"),
+                                ('xhigh', "effort 'xhigh' is not allowed")):
+                with self.subTest(path=path, effort=effort):     # no effort both rows allow
+                    self.refused(tool, wrap({'instanceId': 'claudeAgent', 'model': 'example-large-1',
+                                             'options': {'effort': effort, 'ultracode': False}}), why)
+        # rows that agree: the pick passes, and the Claude row's ultracode rule still holds
+        self.policy({'mode': 'enforce', 'allow': [LARGE, {'driver': 'otherDriver', 'model': 'example-large-1',
+                                                          'efforts': ['high', 'max']}]})
+        for path, wrap in paths.items():
+            tool = 'mcp__t3-code__' + path
+            with self.subTest(path=path, agree=True):
+                self.passed(tool, wrap({'instanceId': 'a', 'model': 'example-large-1',
+                                        'options': {'effort': 'high', 'ultracode': False}}))
+                self.refused(tool, wrap({'instanceId': 'a', 'model': 'example-large-1',
+                                         'options': {'effort': 'high'}}), 'must name ultracode')
+                self.refused(tool, wrap({'instanceId': 'a', 'model': 'example-large-1', 'driverKind': 'otherDriver',
+                                         'options': {'effort': 'high', 'ultracode': False}}), 'T3 ignores it')
+        # delegate_task and create_threads keep driverKind: T3 refuses an instance of another driver there
+        self.policy(two)
+        other = {'model': 'example-large-1', 'driverKind': 'otherDriver', 'options': {'effort': 'max'}}
+        claude = dict(GOOD_TARGET, driverKind='claudeAgent')
+        self.passed('mcp__t3-code__delegate_task', self.delegate(other))
+        self.passed('mcp__t3-code__delegate_task', self.delegate(claude))
+        self.passed('mcp__t3-code__create_threads', {'threads': [{'target': other}, {'target': claude}]})
+        self.refused('mcp__t3-code__delegate_task', self.delegate(dict(claude, options={'effort': 'max',
+                                                                                         'ultracode': False})),
+                     "effort 'max' is not allowed")
+        self.refused('mcp__t3-code__create_threads', {'threads': [{'target': dict(other, driverKind='claudeAgent')}]},
+                     "effort 'max' is not allowed")
 
     def test_ultracode_is_checked_as_the_effort_that_runs(self):
         t = 'mcp__t3-code__delegate_task'
         xhigh = {'mode': 'enforce', 'allow': [dict(LARGE, efforts=['high', 'xhigh'])]}
         self.policy(xhigh)
-        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'xhigh'}}))
+        self.passed(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'xhigh', 'ultracode': False}}))
         for options in ({'effort': 'xhigh', 'ultracode': True},
                         [{'id': 'effort', 'value': 'xhigh'}, {'id': 'ultracode', 'value': True}],
                         {'effort': 'ultracode'},                       # the old effort value: xhigh, ultracode on
-                        {'effort': 'high', 'ultracode': 'yes'}):
+                        {'effort': ' ultracode '}):                    # T3 trims the value
             with self.subTest(options=options):
                 self.refused(t, self.delegate({'model': 'example-large-1', 'options': options}),
                              "effort 'ultracode' is not allowed")
@@ -276,7 +335,7 @@ class Guard(unittest.TestCase):
         self.refused(t, {'title': 'x', 'modelSelection': {'instanceId': 'a', 'model': 'example-large-1'}},
                      'names no effort')
         self.passed(t, {'title': 'x', 'modelSelection': {'instanceId': 'a', 'model': 'example-large-1',
-                                                         'options': [{'id': 'effort', 'value': 'high'}]}})
+                                                         'options': [{'id': 'effort', 'value': 'high'}, NO_ULTRA]}})
 
     def test_thread_configure_is_checked_only_when_it_sets_a_model(self):
         t = 'mcp__t3-code__t3_thread_configure'
@@ -284,7 +343,7 @@ class Guard(unittest.TestCase):
         self.refused(t, {'modelSelection': None}, 'modelSelection is missing')
         self.refused(t, {'modelSelection': {'instanceId': 'a', 'model': 'other', 'options': {'effort': 'high'}}},
                      "model 'other'")
-        self.passed(t, {'modelSelection': {'provider': 'a', 'model': 'example-large-1', 'options': {'effort': 'high'}}})
+        self.passed(t, {'modelSelection': {'provider': 'a', 'model': 'example-large-1', 'options': GOOD_TARGET['options']}})
 
     # ---- the native Agent tool
 
@@ -380,6 +439,8 @@ const c = log("agent(") || items.map(i => i.agent)
             'escaped key': "agent('x', {'\\u006dodel': 'small', model: 'large', effort: 'high'})",
             'agent renamed': "const a = agent; a('x', {model: 'small', effort: 'high'})",
             'agent shorthand': "const o = {agent}; o.agent('x', {})",
+            'agent passed on': "const g = (f, p, o) => f(p, {model: 'small', effort: 'high'}); g(agent, 'p', {ok})"
+                               .replace('{ok}', ok),
             'three arguments': f"agent('x', {ok}, more)",
             'one argument': "agent('x')",
             'options plus more': f"agent('x', {ok} || other)",
@@ -434,6 +495,32 @@ const c = log("agent(") || items.map(i => i.agent)
                 with self.subTest(name):
                     self.refused('Workflow', self.workflow(script), why)
 
+    def test_workflow_of_and_keyword_properties_before_a_bracket(self):
+        """#329: "of" is the for-of keyword only in a for (...) header after the binding; elsewhere, and a keyword
+        after . or ?., is a name, so a [ after it is a member access (refused unless [number])."""
+        ok = "{model: 'large', effort: 'high'}"
+        for script in ("const of = {x: 1}; const y = of['x']",
+                       "const o = {return: [1]}; const y = o.return['a']",
+                       "const o = {of: {}}; const y = o.of['x']",
+                       "const o = {}; const y = o?.typeof['x']",
+                       "for (const of of [1]) { of['x'] }",
+                       "for (const x of y) { of['x'] }",
+                       "for (const x of of['x']) {}",
+                       "f(of['x'])"):
+            with self.subTest(script):
+                self.refused('Workflow', self.workflow(script), 'a computed member access other than [number]')
+        for script in (f"for (const m of ['a', 'b']) {{ await agent(m, {ok}) }}",
+                       f"for await (const m of ['a']) {{ agent(m, {ok}) }}",
+                       f"for (const [a, b] of [[1, 2]]) {{ agent('x', {ok}) }}",
+                       f"for (const {{a}} of [{{a: 1}}]) {{ agent('x', {ok}) }}",
+                       f"for (const of of ['a']) {{ agent(of, {ok}) }}",
+                       f"for (x.y of [1]) {{}} agent('x', {ok})",
+                       f"for (of[0] of [1]) {{}} agent('x', {ok})",
+                       f"for (const x of f(y)) {{ for (const z of ['a']) {{ agent(z, {ok}) }} }}",
+                       f"const t = typeof [1]; const s = `${{[1].length}}`; agent('x', {ok})"):
+            with self.subTest(script):
+                self.assertIn('is for most work', self.passed('Workflow', self.workflow(script)))
+
     def test_workflow_division_and_regular_expressions_are_refused(self):
         for script in ("const h = 4 / 2", "let h = 4; h /= 2", "const ok = /^a+$/.test(s)", "s.split(/,/)",
                        "x = {} / 2", "agent('x', {model: 'large', effort: 'high'}); const r = 1/2"):
@@ -449,6 +536,275 @@ const c = log("agent(") || items.map(i => i.agent)
                   "const s = \"a/b\" + 'c/d' + `/*`\r\n")
         self.assertIn('is for most work', self.passed('Workflow', self.workflow(script)))
         self.assertIn('is for most work', self.passed('Workflow', self.workflow(script.replace('\r\n', '\n'))))
+
+    # ---- RemoteTrigger and the project tools (#329)
+
+    def test_remote_trigger_may_only_read(self):
+        for action in ('list', 'get', 'list_runs', 'get_run_log'):
+            self.assertIsNone(self.hook('RemoteTrigger', {'action': action, 'trigger_id': 'x'}), action)
+        for args in ({'action': 'create', 'body': {'model': 'example-large-1'}}, {'action': 'update', 'trigger_id': 'x'},
+                     {'action': 'run', 'trigger_id': 'x'}, {'action': 'create_webhook_trigger'}, {'action': 'LIST'},
+                     {}, {'action': ['list']}):
+            with self.subTest(args):
+                self.refused('RemoteTrigger', args, 'cloud routine', '(only list, get, list_runs, get_run_log pass)')
+        self.refused(None, raw='{"tool_name": "RemoteTrigger", "tool_input": [1]}')
+        self.policy(dict(POLICY, mode='advise'))
+        self.assertIn('enforce would refuse', self.passed('RemoteTrigger', {'action': 'run'}))
+        self.policy(dict(POLICY, mode='off'))
+        self.assertIsNone(self.hook('RemoteTrigger', {'action': 'run'}))
+
+    def test_project_default_model_is_checked_when_given(self):
+        for name in ('t3_project_create', 't3_project_update'):
+            t = 'mcp__t3-code__' + name
+            with self.subTest(name):
+                self.assertIsNone(self.hook(t, {'title': 'p', 'workspaceRoot': '/w'}))       # left out: no model set
+                self.assertIsNone(self.hook(t, {'projectId': 'p', 'defaultModelSelection': None}))  # null: cleared
+                self.refused(t, {'projectId': 'p', 'defaultModelSelection': {'instanceId': 'a', 'model': 'other',
+                                                                           'options': {'effort': 'high'}}},
+                             "model 'other'", 'defaultModelSelection')
+                self.refused(t, {'defaultModelSelection': {'instanceId': 'a', 'model': 'example-large-1'}},
+                             'names no effort')
+                self.refused(t, {'defaultModelSelection': 'example-large-1'}, 'defaultModelSelection is missing')
+                self.passed(t, {'projectId': 'p', 'defaultModelSelection': dict(GOOD_TARGET, instanceId='a')})
+
+    def test_t3_picks_must_name_ultracode_unless_the_row_allows_it(self):
+        """T3 takes a Claude model's catalog default for ultracode when a call leaves it out (on, where the default
+        effort is ultracode), so a pick whose row does not allow ultracode says ultracode: false itself."""
+        t = 'mcp__t3-code__delegate_task'
+        plain = {'model': 'example-large-1', 'options': {'effort': 'high'}}
+        self.refused(t, self.delegate(plain), "options must name ultracode (false): without it 'example-large-1' can "
+                     'run ultracode (inherited from the parent thread', '"ultracodeOption": false')
+        self.refused(t, self.delegate(dict(plain, options=[{'id': 'effort', 'value': 'high'}])), 'must name ultracode')
+        self.refused(t, self.delegate(dict(plain, driverKind='claudeAgent')), 'must name ultracode')
+        self.passed(t, self.delegate(GOOD_TARGET))
+        self.passed(t, self.delegate(dict(plain, options=[{'id': 'effort', 'value': 'high'}, NO_ULTRA])))
+        self.refused(t, self.delegate(dict(plain, options={'effort': 'high', 'ultracode': True})), "effort 'ultracode'")
+        # another driver's model: T3's Claude default does not apply
+        self.assertIsNone(self.hook(t, self.delegate({'model': 'example-plain', 'driverKind': 'otherDriver'})))
+        self.assertIsNone(self.hook(t, self.delegate(dict(plain, model='example-plain', driverKind='otherDriver',
+                                                          options=None))))
+        self.policy({'mode': 'enforce', 'allow': [LARGE, {'driver': 'otherDriver', 'model': 'example-large-1'}]})
+        self.assertIsNone(self.hook(t, self.delegate({'model': 'example-large-1', 'driverKind': 'otherDriver'})))
+        self.policy(POLICY)
+        # every T3 tool that picks a model
+        for tool, args in (('create_threads', {'threads': [{'target': plain}]}),
+                           ('t3_thread_launch', {'modelSelection': plain}),
+                           ('t3_thread_configure', {'modelSelection': plain}),
+                           ('t3_project_update', {'defaultModelSelection': plain})):
+            with self.subTest(tool):
+                self.refused('mcp__t3-code__' + tool, args, 'must name ultracode')
+        # a row that allows ultracode needs no word on it; Claude Code's Agent tool has no ultracode option
+        self.passed('Agent', {'model': 'large', 'effort': 'high'})
+        self.policy({'mode': 'enforce', 'allow': [dict(LARGE, efforts=['high', 'ultracode'])]})
+        self.passed(t, self.delegate(plain))
+
+    def test_a_row_without_the_ultracode_option_needs_none(self):
+        """#589 review: T3 offers some Claude models no ultracode option and refuses one named for them ("Unknown
+        option ultracode"). Their row says "ultracodeOption": false, and a pick then need not, and cannot, name it."""
+        t = 'mcp__t3-code__delegate_task'
+        old = dict(DEEP, ultracodeOption=False)
+        self.policy({'mode': 'enforce', 'allow': [LARGE, old]})
+        plain = {'model': 'example-deep-2', 'options': {'effort': 'high'}}
+        for tool, args in (('delegate_task', self.delegate(plain)),
+                           ('delegate_task', self.delegate(dict(plain, driverKind='claudeAgent'))),
+                           ('create_threads', {'threads': [{'target': plain}]}),
+                           ('t3_thread_launch', {'modelSelection': plain}),
+                           ('t3_thread_configure', {'modelSelection': plain}),
+                           ('t3_project_create', {'defaultModelSelection': plain}),
+                           ('t3_project_update', {'defaultModelSelection': plain})):
+            with self.subTest(tool):
+                self.passed('mcp__t3-code__' + tool, args)
+        # it still runs only its own efforts: ultracode on (or the old effort value) is refused
+        for options in ({'effort': 'high', 'ultracode': True}, {'effort': 'ultracode'}, {'effort': 'xhigh'}):
+            with self.subTest(options=options):
+                self.refused(t, self.delegate(dict(plain, options=options)), 'is not allowed')
+        # the other rows keep the rule
+        self.refused(t, self.delegate({'model': 'example-large-1', 'options': {'effort': 'high'}}),
+                     'must name ultracode')
+        self.assertIn('no ultracode option', self.refused(t, self.delegate({'model': 'x'})))
+        # the key is checked: only Claude rows, never with the effort ultracode, true/false only
+        for row, why in ((dict(PLAIN, ultracodeOption=False), 'only claudeAgent rows have an ultracode option'),
+                         (dict(old, efforts=['high', 'ultracode']), 'cannot run the effort ultracode'),
+                         (dict(DEEP, ultracodeOption='no'), 'ultracodeOption: must be bool')):
+            with self.subTest(row=row):
+                self.policy({'mode': 'enforce', 'allow': [row]})
+                self.refused(t, self.delegate(plain), why)
+        self.policy({'mode': 'enforce', 'allow': [dict(DEEP, ultracodeOption=True)]})
+        self.refused(t, self.delegate(plain), 'must name ultracode')
+
+    def test_options_are_read_the_way_t3_reads_them(self):
+        """#589 review: T3 trims option ids and text values (packages/contracts/src/model.ts) and takes the first
+        entry of an id; it drops values that are neither text nor true/false and uses the default. The guard reads
+        them the same way, and refuses an id given twice after trimming and a value T3 would drop, on every path
+        that takes options."""
+        paths = {'delegate_task': lambda sel: self.delegate(sel),
+                 'create_threads': lambda sel: {'threads': [{'target': sel}]},
+                 't3_thread_launch': lambda sel: {'modelSelection': sel},
+                 't3_thread_configure': lambda sel: {'modelSelection': sel},
+                 't3_project_create': lambda sel: {'defaultModelSelection': sel},
+                 't3_project_update': lambda sel: {'defaultModelSelection': sel}}
+        refused = {
+            # lens B's two: max and ultracode past a check that compared ids exactly
+            'a spaced effort id first': ({' effort': 'max', 'effort': 'high', 'ultracode': False}, "names 'effort' twice"),
+            'a spaced ultracode id': ({'effort': 'high', ' ultracode': True, 'ultracode': False},
+                                      "names 'ultracode' twice"),
+            'a spaced id alone': ({'effort': 'high', '\tultracode\n': True}, "effort 'ultracode' is not allowed"),
+            'JavaScript trims U+FEFF': ({'\ufeffeffort': 'max', 'ultracode': False}, "effort 'max' is not allowed"),
+            'a list twice': ([{'id': 'effort', 'value': 'high'}, {'id': 'effort ', 'value': 'max'}, NO_ULTRA],
+                             "names 'effort' twice"),
+            'an empty id': ({'effort': 'high', ' ': 'x', 'ultracode': False}, 'not a non-empty text'),
+            'a list id that is not a text': ([{'id': 1, 'value': 'high'}], 'not a non-empty text'),
+            'ultracode null': ({'effort': 'high', 'ultracode': None}, 'ultracode must be true or false'),
+            'ultracode 0': ({'effort': 'high', 'ultracode': 0}, 'ultracode must be true or false'),
+            'ultracode as text': ({'effort': 'high', 'ultracode': 'false'}, 'ultracode must be true or false'),
+            'an effort T3 drops': ({'effort': None, 'ultracode': False}, 'is not a non-empty text or true/false'),
+            'an empty effort': ({'effort': '  ', 'ultracode': False}, 'is not a non-empty text or true/false'),
+        }
+        for path, wrap in paths.items():
+            for name, (options, why) in refused.items():
+                with self.subTest(path=path, case=name):
+                    self.refused('mcp__t3-code__' + path, wrap({'model': 'example-large-1', 'options': options}), why)
+            passing = ({' effort ': ' high ', ' ultracode': False},
+                       [{'id': ' effort', 'value': 'high\u00a0'}, {'id': '\u3000ultracode', 'value': False}])
+            for options in passing:
+                with self.subTest(path=path, options=options):
+                    self.passed('mcp__t3-code__' + path, wrap({'model': ' example-large-1\ufeff', 'options': options}))
+        # Python trims \x1c-\x1f, JavaScript does not: T3 sees another model, so the guard does too
+        self.refused('mcp__t3-code__delegate_task', self.delegate(dict(GOOD_TARGET, model='example-large-1\x1f')),
+                     'is not allowed')
+
+    def test_the_policy_may_not_live_in_the_guards_own_folder(self):
+        """An uninstall removes everything in the guard's /etc folder: a policy there would go with it."""
+        for where in ('/etc/model-guard/policy.json', '/etc/model-guard', '/etc/fork-kit/../model-guard/p.json'):
+            with self.subTest(where):
+                self.machine({'policyFile': where})
+                self.refused('Agent', {'model': 'large', 'effort': 'high'}, 'must not be in /etc/model-guard')
+        self.machine({'policyFile': self.policy_path})
+        self.passed('Agent', {'model': 'large', 'effort': 'high'})
+
+    def test_the_guards_folder_is_found_through_links(self):
+        """#589 round 2: /etc may be a link (/etc -> /private/etc on macOS), and so may a folder on the policy's
+        path; either way a policy that really lives in the guard's folder is refused."""
+        real = os.path.join(self.dir, 'private-etc', 'model-guard')
+        os.makedirs(real)
+        os.symlink(os.path.join(self.dir, 'private-etc'), os.path.join(self.dir, 'etc'))
+        os.symlink(real, os.path.join(self.dir, 'into-guard'))
+        # the folder there (an installed kit), then not made yet (before the first install: found by name alone)
+        for exists in (True, False):
+            if not exists:
+                os.rmdir(real)
+            for etc_dir in (real, os.path.join(self.dir, 'etc', 'model-guard')):
+                for where in (os.path.join(real, 'p.json'), os.path.join(self.dir, 'etc', 'model-guard', 'p.json'),
+                              os.path.join(self.dir, 'into-guard', 'p.json'), os.path.join(self.dir, 'into-guard')):
+                    with self.subTest(exists=exists, etc_dir=etc_dir, where=where), \
+                            mock.patch.object(self.m, 'ETC_DIR', etc_dir):
+                        self.machine({'policyFile': where})
+                        self.refused('Agent', {'model': 'large', 'effort': 'high'}, f'must not be in {etc_dir}')
+                with mock.patch.object(self.m, 'ETC_DIR', etc_dir):
+                    self.machine({'policyFile': self.policy_path})
+                    self.passed('Agent', {'model': 'large', 'effort': 'high'})
+        self.assertFalse(self.m.in_folder(os.path.join(self.dir, 'private-etc', 'model-guard-2', 'p.json'), real))
+
+    def test_the_guards_folder_is_found_by_identity(self):
+        """A case-insensitive file system spells one folder many ways (/etc/Model-Guard is /etc/model-guard on
+        macOS), so names alone miss it. Simulated here: a second folder that the file system reports as the same."""
+        guard_dir, other = os.path.join(self.dir, 'guard'), os.path.join(self.dir, 'Guard-Spelled')
+        os.makedirs(os.path.join(guard_dir, 'sub'))
+        os.makedirs(os.path.join(other, 'sub'))
+        real_stat = os.stat
+        def same(path, *a, **k):   # noqa: E306
+            return real_stat(guard_dir if os.path.normpath(path) == other else path, *a, **k)
+        self.assertFalse(self.m.in_folder(os.path.join(other, 'sub', 'p.json'), guard_dir))
+        with mock.patch('os.stat', same):
+            for where in (other, os.path.join(other, 'p.json'), os.path.join(other, 'sub', 'p.json')):
+                with self.subTest(where):
+                    self.assertTrue(self.m.in_folder(where, guard_dir))
+            self.assertFalse(self.m.in_folder(os.path.join(self.dir, 'elsewhere', 'p.json'), guard_dir))
+        # a folder that does not exist yet is checked by name only
+        self.assertFalse(self.m.in_folder(os.path.join(other, 'p.json'), os.path.join(self.dir, 'missing')))
+        self.assertTrue(self.m.in_folder(os.path.join(self.dir, 'missing', 'p.json'), os.path.join(self.dir, 'missing')))
+
+    # ---- the policy's version (#329)
+
+    def test_a_newer_policy_says_update_the_kit_in_every_mode(self):
+        for policy in (dict(POLICY, version=1), POLICY):
+            self.policy(policy)
+            self.passed('Agent', {'model': 'large', 'effort': 'high'})
+        for mode in ('off', 'advise', 'enforce'):
+            with self.subTest(mode):
+                self.policy(dict(POLICY, mode=mode, version=2))
+                self.refused('Agent', {'model': 'large', 'effort': 'high'}, self.policy_path,
+                             '.version: 2 is newer than this kit knows (1); update the kit')
+        # checked before the keys: a newer policy's new key names the version, not the key
+        self.policy({'version': 3, 'mode': 'enforce', 'allow': [dict(LARGE, driverKinds=['x'])], 'deny': []})
+        self.refused('Agent', {'model': 'large', 'effort': 'high'}, 'update the kit')
+        for version, why in ((0, 'must be 1 or more'), (-1, 'must be 1 or more'), (True, 'must be int'),
+                             ('2', 'must be int'), (1.0, 'must be int'), (None, 'must be int')):
+            with self.subTest(version=version):
+                self.policy(dict(POLICY, version=version))
+                self.refused('Agent', {'model': 'large', 'effort': 'high'}, '.version: ' + why)
+
+    # ---- the owner's record (#329)
+
+    def test_refusals_and_advise_notes_are_recorded(self):
+        bad = json.dumps({'tool_name': 'Agent', 'tool_input': {'model': 'small', 'effort': 'high'}, 'session_id': 's-1'})
+        self.refused(None, raw=bad)
+        self.assertEqual(len(self.records), 1, self.records)
+        self.assertTrue(self.records[0].startswith('session s-1: enforce: refused Agent: '), self.records)
+        self.assertIn("model 'small'", self.records[0])
+        self.passed('Agent', {'model': 'large', 'effort': 'high'})       # a passing call: nothing
+        self.assertIsNone(self.hook('Bash', {'model': 'small'}))         # an unchecked tool: nothing
+        self.assertEqual(len(self.records), 1)
+        self.policy(dict(POLICY, mode='advise'))
+        self.passed('Agent', {'model': 'small', 'effort': 'high'})
+        self.assertTrue(self.records[-1].startswith("advise: enforce would refuse Agent: the Agent call: model 'small'"),
+                        self.records)
+        self.policy(dict(POLICY, mode='off'))
+        self.assertIsNone(self.hook('Agent', {'model': 'small'}))
+        self.assertEqual(len(self.records), 2)
+        os.unlink(self.policy_path)
+        self.refused('Agent', {})
+        self.assertIn('the model policy cannot be used', self.records[-1])
+        self.assertIn(self.policy_path, self.records[-1])
+        self.refused(None, raw='[1]')
+        self.assertEqual(self.records[-1], 'model-guard refused: the hook input is not a JSON object')
+        self.policy(POLICY)
+        self.refused('Agent', {'model': 'x' * 10000, 'effort': 'high'})
+        self.assertEqual(len(self.records[-1]), self.m.RECORD_MAX)
+
+    def test_a_record_that_fails_never_changes_the_answer(self):
+        def broken(line):
+            raise OSError('the log is gone')
+        payload = json.dumps({'tool_name': 'Agent', 'tool_input': {'model': 'small', 'effort': 'high'}})
+        for mode, want in (('enforce', 'deny'), ('advise', None)):
+            with self.subTest(mode):
+                self.policy(dict(POLICY, mode=mode))
+                out = io.StringIO()
+                self.assertEqual(self.m.run_hook(io.StringIO(payload), out, self.machine_path, os.getuid(),
+                                                 record=broken), 0)
+                answer = json.loads(out.getvalue())['hookSpecificOutput']
+                self.assertEqual(answer.get('permissionDecision'), want, answer)
+
+    def test_the_default_record_is_the_system_log(self):
+        calls = []
+        fake = types.ModuleType('syslog')
+        fake.LOG_USER, fake.LOG_WARNING = 8, 4
+        fake.openlog = lambda ident, option, facility: calls.append(('open', ident, facility))
+        fake.syslog = lambda priority, text: calls.append(('log', priority, text))
+        payload = json.dumps({'tool_name': 'Agent', 'tool_input': {'model': 'small', 'effort': 'high'}})
+        with mock.patch.dict(sys.modules, {'syslog': fake}):
+            out = io.StringIO()
+            self.m.run_hook(io.StringIO(payload), out, self.machine_path, os.getuid())
+            self.assertEqual(calls[0], ('open', 'model-guard', 8))
+            self.assertEqual(calls[1][:2], ('log', 4))
+            self.assertIn('enforce: refused Agent', calls[1][2])
+
+            def gone(priority, text):
+                raise OSError('no log socket')
+            fake.syslog = gone
+            out = io.StringIO()
+            self.m.run_hook(io.StringIO(payload), out, self.machine_path, os.getuid())
+            self.assertEqual(json.loads(out.getvalue())['hookSpecificOutput']['permissionDecision'], 'deny')
 
     # ---- the hook's input
 
@@ -503,16 +859,14 @@ class ManagedSettings(unittest.TestCase):
         self.assertEqual(self.m.settings_problems([self.ONLY, ('d/model-guard.json', installed)], False), [])
         self.assertEqual(installed['hooks']['PreToolUse'], [self.m.hook_entry()])
         self.assertEqual(installed['hooks']['PreToolUse'][0]['hooks'][0]['onFailure'], 'block')
-        self.assertEqual(self.problems(self.entry(matcher='')), [])
-        self.assertEqual(self.problems(self.entry(matcher='*')), [])
-        self.assertEqual(self.problems(self.entry(matcher=','.join(self.m.CHECKED_TOOLS))), [])
+        self.assertEqual(self.problems(self.entry()), [])
 
     def test_the_security_lens_decoy_fails(self):
-        """A guard entry on Agent only, and an any-tool entry whose command only mentions the guard."""
+        """A guard entry on Agent only, and an entry with the full matcher whose command only mentions the guard."""
         p = self.problems(self.entry(matcher='Agent'),
-                          self.entry(matcher='*', command='true # ' + self.m.HOOK_LINK))
+                          self.entry(command='true # ' + self.m.HOOK_LINK))
         self.assertTrue(any('no managed PreToolUse entry runs the guard' in x for x in p), p)
-        self.assertTrue(any('entry 0 runs the guard but is not its entry: its matcher misses Task' in x for x in p), p)
+        self.assertTrue(any('entry 0 runs the guard but is not its entry: its matcher is not exactly' in x for x in p), p)
         self.assertTrue(any('entry 1 runs the guard but is not its entry: its hooks are not exactly' in x for x in p),
                         p)
 
@@ -521,7 +875,7 @@ class ManagedSettings(unittest.TestCase):
         p = self.problems(self.entry(command=self.m.HOOK_LINK), self.entry(matcher='Bash'))
         self.assertTrue(any('no managed PreToolUse entry runs the guard' in x for x in p), p)
         self.assertTrue(any('entry 0' in x and 'hooks are not exactly' in x for x in p), p)
-        self.assertTrue(any('entry 1' in x and 'matcher misses Agent' in x for x in p), p)
+        self.assertTrue(any('entry 1' in x and 'matcher is not exactly' in x for x in p), p)
 
     def test_an_entry_with_anything_more_fails(self):
         hook = dict(self.m.hook_entry()['hooks'][0])
@@ -540,20 +894,27 @@ class ManagedSettings(unittest.TestCase):
                 p = self.problems(entry)
                 self.assertTrue(any('no managed PreToolUse entry runs the guard' in x for x in p), p)
 
-    def test_a_matcher_that_misses_a_tool_fails(self):
-        for matcher, missed in (('Agent|Task', 'Workflow'), ('Agent|Task|Workflow|mcp__.*__delegate_task', 'create'),
-                                ('(', 'Agent'), (r'^(Agent|Task|mcp__.+__(delegate_task|create_threads))$', 'Workflow'),
-                                ('Agent,Task,Workflow', 'mcp__t3-code__t3_thread_send')):
+    def test_a_matcher_other_than_the_guards_fails(self):
+        """Only the exact matcher passes: no reading of Claude Code's (JavaScript) matcher rules, which a hand-written
+        matcher could get past (Python re vs JavaScript, one server name), and an older kit's matcher is reported."""
+        old_kit = self.m.HOOK_MATCHER.replace('|RemoteTrigger', '').replace('|t3_project_create|t3_project_update', '')
+        self.assertNotEqual(old_kit, self.m.HOOK_MATCHER)
+        for matcher in ('', '*', None, 'Agent|Task', ',', ','.join(self.m.CHECKED_TOOLS), '(', old_kit,
+                        self.m.HOOK_MATCHER.replace('mcp__.+__', 'mcp__t3-code__'), self.m.HOOK_MATCHER + ' ',
+                        '|'.join(self.m.CHECKED_TOOLS)):
             with self.subTest(matcher):
-                self.assertIn(missed, ' '.join(self.problems(self.entry(matcher=matcher))))
+                self.assertIn('its matcher is not exactly', ' '.join(self.problems(self.entry(matcher=matcher))))
 
     def test_the_matcher_covers_exactly_the_checked_tools(self):
-        cover = lambda name: self.m._covers(self.m.HOOK_MATCHER, name)  # noqa: E731
-        for name in ('Agent', 'Task', 'Workflow', 'mcp__t3-code__create_threads', 'mcp__t3__t3_thread_launch',
-                     'mcp__t3-code__t3_thread_send', 'mcp__t3-code__t3_thread_transfer'):
+        """The matcher is a regular expression that means the same in JavaScript and Python."""
+        cover = lambda name: re.search(self.m.HOOK_MATCHER, name) is not None  # noqa: E731
+        for name in ('Agent', 'Task', 'Workflow', 'RemoteTrigger', 'mcp__t3-code__create_threads',
+                     'mcp__t3__t3_thread_launch', 'mcp__t3-code__t3_thread_send', 'mcp__t3-code__t3_thread_transfer',
+                     'mcp__t3-code__t3_project_create', 'mcp__other__t3_project_update'):
             self.assertTrue(cover(name), name)
         for name in ('Bash', 'TaskStop', 'SubAgent', 'mcp__t3-code__task_status', 'mcp__t3-code__delegate_tasks',
-                     'mcp__t3-code__run_scheduled_task_now', 'Workflows'):
+                     'mcp__t3-code__run_scheduled_task_now', 'Workflows', 'RemoteTriggers', 'mcp__t3-code__t3_project_read',
+                     'mcp__t3-code__t3_project_delete'):
             self.assertFalse(cover(name), name)
 
     def test_hooks_switched_off_fail(self):
@@ -619,6 +980,77 @@ class ManagedSettings(unittest.TestCase):
         with self.assertRaises(self.m.PolicyError):
             self.m.managed_dir('plan9')
 
+    # ---- Claude Code's own model keys (#329, live-tested; README "Claude Code's model keys")
+
+    OPUS = {'driver': 'claudeAgent', 'model': 'example-opus-5', 'efforts': ['high', 'ultracode'], 'aliases': ['opus']}
+
+    def policy(self, mode='enforce', allow=None):
+        allow = [LARGE, DEEP, PLAIN, self.OPUS] if allow is None else allow
+        return self.m.parse_policy(json.dumps({'mode': mode, 'allow': allow}), 'policy.json')
+
+    def test_model_settings_come_from_the_claude_rows(self):
+        want = self.m.model_settings(self.policy())
+        self.assertEqual(want['availableModels'], ['example-deep-2', 'example-large-1', 'example-opus-5'])
+        self.assertIs(want['enforceAvailableModels'], True)
+        self.assertEqual(want['maxEffortLevel'], 'xhigh')   # ultracode runs at xhigh, above high
+        self.assertEqual(want['env'], {'CLAUDE_CODE_SUBAGENT_MODEL': '', 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE': '',
+                                       'CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL': '', 'CLAUDE_CODE_SUBAGENT_EFFORT': '',
+                                       'ANTHROPIC_DEFAULT_OPUS_MODEL': 'example-opus-5'})
+        self.assertEqual(self.m.model_settings(self.policy(allow=[dict(LARGE, efforts=['max', 'low'], defaultEffort='low')]))
+                         ['maxEffortLevel'], 'max')
+        for allow in ([dict(LARGE, efforts=['turbo'], defaultEffort='turbo')], [{'driver': 'claudeAgent', 'model': 'm'}]):
+            self.assertNotIn('maxEffortLevel', self.m.model_settings(self.policy(allow=allow)))
+
+    def test_every_claude_code_alias_is_pinned(self):
+        """#589 review: each of Claude Code's own aliases gets its pin, not only opus; other aliases get none."""
+        self.assertEqual(self.m.FAMILY_ALIASES, ('opus', 'sonnet', 'haiku', 'fable'))
+        for alias in ('opus', 'sonnet', 'haiku', 'fable'):
+            with self.subTest(alias):
+                env = self.m.model_settings(self.policy(allow=[dict(DEEP, aliases=[alias, 'mine'])]))['env']
+                self.assertEqual(env[f'ANTHROPIC_DEFAULT_{alias.upper()}_MODEL'], 'example-deep-2')
+                self.assertEqual(sorted(k for k in env if k.startswith('ANTHROPIC_')),
+                                 [f'ANTHROPIC_DEFAULT_{alias.upper()}_MODEL'])
+
+    def test_model_keys_missing_or_different_are_one_problem_with_the_keys_to_put(self):
+        policy = self.policy()
+        want = self.m.model_settings(policy)
+        p = self.m.model_settings_problems([('main', {'allowManagedHooksOnly': True})], policy)
+        self.assertEqual(len(p), 1, p)
+        for part in ("managed settings miss Claude Code's own model limits", 'availableModels is None',
+                     'enforceAvailableModels is not true', "maxEffortLevel is None, not the rows' highest effort 'xhigh'",
+                     "env CLAUDE_CODE_SUBAGENT_MODEL is None, not ''", "env ANTHROPIC_DEFAULT_OPUS_MODEL is None",
+                     'Put these keys in managed-settings.json: ' + json.dumps(want, sort_keys=True)):
+            self.assertIn(part, p[0])
+        main = {k: v for k, v in want.items() if k != 'env'}
+        good = [('main', dict(main, availableModels=list(reversed(want['availableModels'])))),
+                ('d/a.json', [1]), ('d/b.json', {'env': want['env']}), ('d/c.json', {'env': {'OTHER': '1'}})]
+        self.assertEqual(self.m.model_settings_problems(good, policy), [])
+        for name, later, why in (
+                ('a later file turns it off', {'enforceAvailableModels': False}, 'enforceAvailableModels is not true'),
+                ('one model more', {'availableModels': want['availableModels'] + ['x']}, 'availableModels is'),
+                ('higher effort', {'maxEffortLevel': 'max'}, "maxEffortLevel is 'max'"),
+                ('a sub-agent model', {'env': {'CLAUDE_CODE_SUBAGENT_MODEL': 'x'}},
+                 "env CLAUDE_CODE_SUBAGENT_MODEL is 'x'"),
+                ('an alias moved', {'env': {'ANTHROPIC_DEFAULT_OPUS_MODEL': 'y'}}, 'ANTHROPIC_DEFAULT_OPUS_MODEL is'),
+                ('not texts', {'availableModels': want['availableModels'] + [None]}, 'not a list of texts'),
+                ('not a list', {'availableModels': 'example-opus-5'}, 'not a list of texts')):
+            with self.subTest(name):
+                self.assertIn(why, ' '.join(self.m.model_settings_problems(good + [('d/z.json', later)], policy)))
+        # Claude Code may join the lists of all managed files: an earlier, wider list is reported too
+        wider = [('main', dict(main, availableModels=want['availableModels'] + ['x'])),
+                 ('d/b.json', {'env': want['env'], 'availableModels': want['availableModels']})]
+        self.assertIn("in all files", ' '.join(self.m.model_settings_problems(wider, policy)))
+        narrower = [('main', dict(main, availableModels=want['availableModels'][:1])),
+                    ('d/b.json', {'env': want['env'], 'availableModels': want['availableModels']})]
+        self.assertEqual(self.m.model_settings_problems(narrower, policy), [])
+
+    def test_model_keys_are_needed_only_in_enforce_with_claude_rows(self):
+        for mode in ('off', 'advise'):
+            self.assertEqual(self.m.model_settings_problems([], self.policy(mode)), [])
+        self.assertEqual(self.m.model_settings_problems([], self.policy(allow=[PLAIN])), [])
+        self.assertEqual(self.m.model_settings_problems([], self.policy(allow=[])), [])
+        self.assertNotEqual(self.m.model_settings_problems([], self.policy()), [])
+
 
 class Contract(unittest.TestCase):
     def test_effort_ids_match_the_servers_list(self):
@@ -679,14 +1111,14 @@ class Command(unittest.TestCase):
 
 # rule: (text in lib/model_guard.py, what it becomes, the test that must then fail)
 MUTATIONS = {
-    'broken policy fails closed': ("except PolicyError as e:\n        return _out('deny',",
-                                   "except PolicyError as e:\n        return _out(None,",
+    'broken policy fails closed': ("        _record(record, payload, reason)\n        return _out('deny', reason)",
+                                   "        _record(record, payload, reason)\n        return _out(None, reason)",
                                    'test_missing_policy_file_refuses_and_names_it'),
     'enforce refuses': ("if policy['mode'] == 'enforce':", "if False:",
                         'test_delegate_task_model_and_effort_must_be_in_a_row'),
     'model must be in a row': ('    if not found:\n', '    if False:\n',
                                'test_delegate_task_model_and_effort_must_be_in_a_row'),
-    'inherit is no model': (" or model == 'inherit':", ':', 'test_agent_must_name_an_allowed_model_and_effort'),
+    'inherit is no model': (" or js_trim(model) == 'inherit':", ':', 'test_agent_must_name_an_allowed_model_and_effort'),
     'effort must be named': ('        if not efforts:\n', '        if False:\n',
                              'test_delegate_task_must_name_model_and_effort'),
     'effort must be in the row': ('        if bad:\n', '        if False:\n',
@@ -720,8 +1152,7 @@ MUTATIONS = {
     'policy file is protected': ('machine_file.read_protected_text(cfg[\'policyFile\'], owner_uid)',
                                  "open(cfg['policyFile']).read()",
                                  'test_policy_file_others_can_write_or_a_link_refuses'),
-    'Workflow is checked': ("CLAUDE_TOOLS = {'Agent': 'agent', 'Task': 'agent', 'Workflow': 'workflow'}",
-                            "CLAUDE_TOOLS = {'Agent': 'agent', 'Task': 'agent'}",
+    'Workflow is checked': ("'Task': 'agent', 'Workflow': 'workflow',", "'Task': 'agent',",
                             'test_workflow_every_agent_call_is_checked'),
     'Workflow agent() calls checked': ('                check_pick(where, model,', '                (where, model,',
                                        'test_workflow_every_agent_call_is_checked'),
@@ -749,7 +1180,7 @@ MUTATIONS = {
                                         '            if False:', 'test_send_and_schedule_take_no_model'),
     'model fields found by name': ("re.compile(r'.*(model|effort|", "re.compile(r'(model|effort|",
                                    'test_send_and_schedule_take_no_model'),
-    'ultracode runs as ultracode': ('    if any(v not in (False, None) for v in ultracode):', '    if False:',
+    'ultracode runs as ultracode': ('    if True in ultracode:', '    if False:',
                                     'test_ultracode_is_checked_as_the_effort_that_runs'),
     'old ultracode effort is xhigh': ('    if ULTRACODE_EFFORT in efforts:', '    if False:',
                                       'test_ultracode_is_checked_as_the_effort_that_runs'),
@@ -758,12 +1189,101 @@ MUTATIONS = {
                                          'test_a_row_without_efforts_lets_no_effort_through'),
     'no driver: every row accepts': ('    for row in found:\n', '    for row in found[:1]:\n',
                                      'test_without_a_driver_every_row_of_the_model_must_accept_it'),
+    # #329
+    'RemoteTrigger is checked': (", 'RemoteTrigger': 'remote'}", '}', 'test_remote_trigger_may_only_read'),
+    'RemoteTrigger may only read': ('        if action not in REMOTE_READ_ACTIONS:', '        if False:',
+                                    'test_remote_trigger_may_only_read'),
+    'project tools are checked': ("'schedule_task', 't3_project_create',\n            't3_project_update')",
+                                  "'schedule_task')", 'test_project_default_model_is_checked_when_given'),
+    'project default model checked': ("    elif kind in ('t3_project_create', 't3_project_update') and",
+                                      '    elif False and', 'test_project_default_model_is_checked_when_given'),
+    'ultracode must be named': ('and ULTRACODE_OPTION_ID not in (key for key, _ in pairs)', 'and False',
+                                'test_t3_picks_must_name_ultracode_unless_the_row_allows_it'),
+    'only rows without ultracode': ("and ULTRACODE_EFFORT not in (r['efforts'] or ())", '',
+                                    'test_t3_picks_must_name_ultracode_unless_the_row_allows_it'),
+    'only Claude picks need ultracode': ('        if driver in (None, CLAUDE_DRIVER) and', '        if',
+                                         'test_t3_picks_must_name_ultracode_unless_the_row_allows_it'),
+    # #589 review: rows without T3's ultracode option, and options read the way T3 reads them
+    'a row without the ultracode option needs none': ("r['model'] == js_trim(model) and r['ultracodeOption']",
+                                                       "r['model'] == js_trim(model) and True",
+                                                       'test_a_row_without_the_ultracode_option_needs_none'),
+    'ultracodeOption only on Claude rows': ("        if not row['ultracodeOption'] and row['driver'] != CLAUDE_DRIVER:",
+                                            '        if False:', 'test_a_row_without_the_ultracode_option_needs_none'),
+    'ultracodeOption false cannot run ultracode': (
+        "        if not row['ultracodeOption'] and ULTRACODE_EFFORT in", '        if False and ULTRACODE_EFFORT in',
+        'test_a_row_without_the_ultracode_option_needs_none'),
+    'option ids are trimmed': ("        name = js_trim(key) if isinstance(key, str) else ''",
+                               "        name = key if isinstance(key, str) else ''",
+                               'test_options_are_read_the_way_t3_reads_them'),
+    'option values are trimmed': ('            value = js_trim(value)\n', '            pass\n',
+                                  'test_options_are_read_the_way_t3_reads_them'),
+    'an id twice is refused': ('        if name in seen:\n', '        if False:\n',
+                               'test_options_are_read_the_way_t3_reads_them'),
+    'an empty id is refused': ('        if not name:\n', '        if False:\n',
+                               'test_options_are_read_the_way_t3_reads_them'),
+    'a value T3 drops is refused': ('        elif not isinstance(value, bool):\n', '        elif False:\n',
+                                    'test_options_are_read_the_way_t3_reads_them'),
+    'ultracode must be true or false': ('        if name == ULTRACODE_OPTION_ID and not isinstance(value, bool):',
+                                        '        if False:', 'test_options_are_read_the_way_t3_reads_them'),
+    "JavaScript's trim": ('    return text.strip(JS_SPACE)', '    return text.strip()',
+                          'test_options_are_read_the_way_t3_reads_them'),
+    'the policy is not in the guard\'s /etc folder': (
+        "        if in_folder(v, ETC_DIR):", '        if False:',
+        'test_the_policy_may_not_live_in_the_guards_own_folder'),
+    'newer policy: update the kit': ("and data['version'] > POLICY_VERSION:", 'and False:',
+                                     'test_a_newer_policy_says_update_the_kit_in_every_mode'),
+    'policy version is 1 or more': ('None if v >= 1 else', 'None if True else',
+                                    'test_a_newer_policy_says_update_the_kit_in_every_mode'),
+    'enforce refusals recorded': ("        _record(record, payload, f'enforce: refused", "        (record, payload, f'",
+                                  'test_refusals_and_advise_notes_are_recorded'),
+    'advise notes recorded': ("    _record(record, payload, f'advise:", "    (record, payload, f'",
+                              'test_refusals_and_advise_notes_are_recorded'),
+    'policy errors recorded': ('        _record(record, payload, reason)\n', '        (record, payload, reason)\n',
+                               'test_refusals_and_advise_notes_are_recorded'),
+    'bad input recorded': ('        _record(record, None, reason)\n', '        (record, None, reason)\n',
+                           'test_refusals_and_advise_notes_are_recorded'),
+    'record is cut': ('        record(line[:RECORD_MAX])', '        record(line)',
+                      'test_refusals_and_advise_notes_are_recorded'),
+    'a failing record changes nothing': ('    except Exception:  # noqa: BLE001', '    except ZeroDivisionError:  # noqa: BLE001',
+                                         'test_a_record_that_fails_never_changes_the_answer'),
+    'the hook records to the system log': ('owner_uid=0, record=syslog_record)', 'owner_uid=0, record=None)',
+                                           'test_the_default_record_is_the_system_log'),
+    'Workflow: of[ is a member access': ("and (prev[1] != 'of' or k - 1 in of_words)", '',
+                                         'test_workflow_of_and_keyword_properties_before_a_bracket'),
+    'Workflow: a keyword after a dot is a name': ('in WF_EXPRESSION_WORDS \\\n                    and not dot_before(k - 1)',
+                                                  'in WF_EXPRESSION_WORDS \\\n                    and True',
+                                                  'test_workflow_of_and_keyword_properties_before_a_bracket'),
+    'Workflow: the for-of keyword': ('                of_words.add(k)\n', '                pass\n',
+                                     'test_workflow_of_and_keyword_properties_before_a_bracket'),
+    'Workflow: only the first of': ("and not heads[-1]['of'] and", 'and',
+                                    'test_workflow_of_and_keyword_properties_before_a_bracket'),
+    'Workflow: agent only as a direct call': ("                if k + 1 >= len(toks) or toks[k + 1][:2] != ['punct', '(']:",
+                                              '                if False:', 'test_workflow_that_cannot_be_read_is_refused'),
+    # #589 round 2
+    'a model selection refuses driverKind': ("        if selection and 'driverKind' in value:",
+                                             '        if False:', 'test_a_model_selection_never_trusts_driver_kind'),
+    'launch is a model selection': ("        target('modelSelection', args.get('modelSelection'), selection=True)\n"
+                                    "    elif kind == 't3_thread_configure'",
+                                    "        target('modelSelection', args.get('modelSelection'))\n"
+                                    "    elif kind == 't3_thread_configure'",
+                                    'test_a_model_selection_never_trusts_driver_kind'),
+    'configure is a model selection': ("the call only reads the thread\n        target('modelSelection', "
+                                       "args.get('modelSelection'), selection=True)",
+                                       "the call only reads the thread\n        target('modelSelection', "
+                                       "args.get('modelSelection'))", 'test_a_model_selection_never_trusts_driver_kind'),
+    'a project default is a model selection': ("args.get('defaultModelSelection'), selection=True)",
+                                               "args.get('defaultModelSelection'))",
+                                               'test_a_model_selection_never_trusts_driver_kind'),
+    'the guard folder resolved': ("    names = {os.path.normpath(folder), os.path.realpath(folder)}",
+                                  "    names = {os.path.normpath(folder)}", 'test_the_guards_folder_is_found_through_links'),
+    'the policy path resolved': ("    for name in (os.path.normpath(path), real):", "    for name in (os.path.normpath(path),):",
+                                 'test_the_guards_folder_is_found_through_links'),
+    'the guard folder by identity': ("            if os.path.samestat(os.stat(real), want):",
+                                     "            if False:", 'test_the_guards_folder_is_found_by_identity'),
 }
 SETTINGS_MUTATIONS = {
-    'matcher covers every tool': ('    if missed:\n', '    if False:\n', 'test_a_matcher_that_misses_a_tool_fails'),
-    'a bad regex covers nothing': ('    except re.error:\n        return False',
-                                   '    except re.error:\n        return True',
-                                   'test_a_matcher_that_misses_a_tool_fails'),
+    'the matcher is exactly the guard\'s': ("    if entry['matcher'] != HOOK_MATCHER:", '    if False:',
+                                          'test_a_matcher_other_than_the_guards_fails'),
     'exactly the guard command': ("    if entry['hooks'] != hook_entry()['hooks']:",
                                   '    if False:', 'test_the_state_lens_split_entries_fail'),
     'nothing more in the entry': ("set(entry) != {'matcher', 'hooks'}", "'hooks' not in entry",
@@ -784,6 +1304,32 @@ SETTINGS_MUTATIONS = {
     'managed files in order': ('for f in sorted(os.listdir(drop_ins))',
                                'for f in sorted(os.listdir(drop_ins), reverse=True)',
                                'test_managed_files_are_read_in_claude_codes_order_and_protected'),
+    # #329: Claude Code's own model keys
+    'model keys only in enforce': ("    if policy['mode'] != 'enforce':\n        return []",
+                                   "    if False:\n        return []",
+                                   'test_model_keys_are_needed_only_in_enforce_with_claude_rows'),
+    'availableModels checked': ("elif not lists or sorted(set(lists[-1])) != want['availableModels'] \\",
+                                "elif False and sorted(set(lists[-1])) != want['availableModels'] \\",
+                                'test_model_keys_missing_or_different_are_one_problem_with_the_keys_to_put'),
+    'no earlier file names more models': ("or not {m for v in lists for m in v} <= set(want['availableModels']):",
+                                          'or False:', 'test_model_keys_missing_or_different_are_one_problem_with_the_keys_to_put'),
+    'availableModels must hold texts': (
+        "    if any(not isinstance(v, list) or not all(isinstance(m, str) for m in v) for v in lists):",
+        '    if False:', 'test_model_keys_missing_or_different_are_one_problem_with_the_keys_to_put'),
+    'enforceAvailableModels checked': ("    if have.get('enforceAvailableModels') is not True:", '    if False:',
+                                       'test_model_keys_missing_or_different_are_one_problem_with_the_keys_to_put'),
+    'maxEffortLevel checked': ("have.get('maxEffortLevel') != want['maxEffortLevel']:", 'False:',
+                               'test_model_keys_missing_or_different_are_one_problem_with_the_keys_to_put'),
+    'env checked': ('        if env.get(name) != value:', '        if False:',
+                    'test_model_keys_missing_or_different_are_one_problem_with_the_keys_to_put'),
+    'later model keys win': ('                have[key] = data[key]', '                have.setdefault(key, data[key])',
+                             'test_model_keys_missing_or_different_are_one_problem_with_the_keys_to_put'),
+    'alias pins': ("                env[f'ANTHROPIC_DEFAULT_{alias.upper()}_MODEL'] = r['model']", '                pass',
+                   'test_model_settings_come_from_the_claude_rows'),
+    'neutral env': ("    env = {name: '' for name in NEUTRAL_ENV}", '    env = {}',
+                    'test_model_settings_come_from_the_claude_rows'),
+    'highest effort': ('max(known, key=EFFORT_ORDER.index)', 'min(known, key=EFFORT_ORDER.index)',
+                       'test_model_settings_come_from_the_claude_rows'),
 }
 
 
