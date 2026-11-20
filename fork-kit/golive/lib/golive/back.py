@@ -268,6 +268,9 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
         raise journal.Refused(f'the copy cannot be restored: {e}; nothing was changed') from None
     # the backstop: W1 would restore under a server it cannot stop
     refuse_foreign(cfg, adapter, f'`t3-golive back --way w1 --lose-work-since {at}`')
+    why = _blind(cfg, adapter, old)  # before the runtime is put back and the pre hooks run (#580)
+    if why is not None:
+        raise journal.Refused(f'{why}; nothing was changed')
     with run.step('plan', way='w1', version=old, t3=t3, copy=copy_dir, at=at, automatic=automatic, kept=kept):
         pass
     with run.step('runtime', version=old) as facts:
@@ -279,7 +282,7 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
         server = _server(cfg, adapter)
         # before the stop and before saying so: T3 must not stop without the marker, nor where the kit cannot tell
         # the new launcher (handoff.handover_blind)
-        why = handoff.handover_blind(cfg.home, [old]) or coldcopy.open_gap(cfg.home)
+        why = _blind(cfg, adapter, old, say) or coldcopy.open_gap(cfg.home)
         if why is not None:
             raise journal.Refused(f'{why}; T3 was not stopped')
         say('stopping T3 for W1: until this back ends ok, T3 stays stopped and is not started at boot, and background '
@@ -312,6 +315,24 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
             e.add_note('T3 was stopped for this W1: T3 stays stopped and is not started at boot (on purpose: the '
                        'home may be half-restored) until the same `t3-golive back --way w1` ends ok')
         raise
+
+
+def _blind(cfg, adapter, old, say=None):
+    """handoff.handover_blind for W1 (it starts `old` after the stop), or None when T3 is stopped already: a rerun
+    behind its own stop, or a T3 that is down. No stop is left to refuse then, and a refusal would leave the owner no
+    way back (#580): W1 goes on, and says (say) what the handover may cost."""
+    try:
+        svc = adapter.service()
+    except osadapter.AdapterError:
+        svc = {'active': True}  # cannot tell: the safe side, as if T3 ran (its stop fails on its own)
+    if not svc.get('active'):
+        why = handoff.handover_blind(cfg.home, [old])
+        if why is not None and say is not None:
+            say(f'note: {why}; T3 is stopped already, so this W1 goes on: once its update starts T3, T3 may take '
+                'about a minute to come up')
+        return None
+    server = _server(cfg, adapter)
+    return handoff.handover_blind(cfg.home, [old], server and server['version'], adapter.service)
 
 
 def refuse_foreign(cfg, adapter, again, stopped=None):

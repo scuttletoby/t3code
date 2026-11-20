@@ -1057,6 +1057,11 @@ class FollowStuckW1(FollowBase):
         # stable's copy. The only fork build a switch names is the first one, whose base nightly is older than
         # that stable: W2 would run `--allow-downgrade` to it under data the stable wrote.
         ran, newer, later = '0.1.11', '0.1.12-nightly.20261201.7.fork.1', '0.1.12'
+        # the fake launchers here take no serving lock (gap.test.py models it): count these builds as ones that take
+        # none, or the copy's look at the running launcher refuses before the stop (#580)
+        patcher = mock.patch('golive.handoff.SERVING_LOCK_SINCE', '0.1.13')
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.m.stage_release(ran)
         self.assertEqual(self.back('w3')['version'], ran)
         self.m.stage_release(newer)  # a copy is taken before a switch to a staged, newer target
