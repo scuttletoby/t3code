@@ -6,7 +6,7 @@ delete. `delete` is the only code in the kit that removes anything.
 """
 import calendar, errno, fnmatch, hashlib, json, os, re, shutil, stat, sys, time
 
-from . import compress, guard
+from . import compress, dedupe, guard
 from .config import matches, must_keep_match
 from .facts import (DELETED, Unreadable, Untouched, default_branch, elsewhere, git, git_code, local_branches, local_tags,
                     lonely, merged_seconds, origin_url, orphaned_worktree, present, reflog, remote_refs, remote_urls,
@@ -53,6 +53,8 @@ class Kept:
 class Plan:
     def __init__(self):
         self.items, self.kept = [], []
+        self.notes = []         # lines the plan and the run print before the items
+        self.after = []         # called after a real run; each returns a problem line or None
 
 
 def human(n):
@@ -1354,13 +1356,16 @@ def delete_branch(item):
 # The rules, by the name each one writes on what it plans: the one list of them. The disk report (report.py) needs
 # a class for each (config.CLASSES), and report.test.py fails for a rule here that has none.
 RULES = {'worktrees': plan_worktrees, 'docker': plan_docker, 'tmp': plan_tmp, SCRATCH: plan_scratch,
-         compress.RULE: compress.plan_compress}
-# Kinds whose step never leaves a path half gone (compress.py: the original or its checked copy is always there; a
-# branch: one git step on a ref, and its clone stays), so the journal of deletes in progress does not name them.
-# WORDS: what the engine says of them (plan, run, done) and NOUNS what it counts them as.
-UNJOURNALED = ('compress', 'part', 'branch')
-WORDS = {'compress': ('would compress', 'compressing', 'compressed')}
-NOUNS = {'compress': 'file', 'part': 'part file', 'branch': 'branch'}
+         compress.RULE: compress.plan_compress, dedupe.RULE: dedupe.plan_dedupe}
+# Kinds whose step never leaves a path half gone (compress.py: the original or its checked copy is always there;
+# dedupe.py: every name holds a whole file, one rename replaces a duplicate by its link, and a part is one more name
+# of a file; a branch: one git step on a ref, and its clone stays), so the journal of deletes in progress does not
+# name them. WORDS: what the engine says of them (plan, run, done) and NOUNS what it counts them as. KEEPS_CONTENT:
+# kinds that delete no content (they are not counted as deletes).
+UNJOURNALED = ('compress', 'part', 'branch', 'dedupe', 'link-part')
+WORDS = {'compress': ('would compress', 'compressing', 'compressed'), 'dedupe': ('would link', 'linking', 'linked')}
+NOUNS = {'compress': 'file', 'part': 'part file', 'branch': 'branch', 'dedupe': 'file', 'link-part': 'link part'}
+KEEPS_CONTENT = ('compress', 'dedupe')
 
 
 def plan(cfg, facts, measure=False):
@@ -1381,6 +1386,8 @@ def recheck(cfg, facts, item):
         return recheck_branch(cfg, facts, item)
     if item.kind in ('compress', 'part'):
         return compress.recheck(cfg, facts, item)
+    if item.kind in ('dedupe', 'link-part'):
+        return dedupe.recheck(cfg, facts, item)
     if item.kind == 'session':
         if not cfg.session_parent(os.path.dirname(item.path)):
             return Refusal('not a candidate', 'not a session folder of the agent-scratch root of the machine file')
@@ -1400,4 +1407,5 @@ def recheck(cfg, facts, item):
 
 def delete(item):
     {'path': delete_path, 'session': delete_path, 'worktree': delete_worktree, 'clone': delete_clone, 'branch': delete_branch,
-     'volume': lambda i: remove_volume(i.path), 'compress': compress.compress, 'part': compress.remove_part}[item.kind](item)
+     'volume': lambda i: remove_volume(i.path), 'compress': compress.compress, 'part': compress.remove_part,
+     'dedupe': dedupe.link, 'link-part': dedupe.remove_part}[item.kind](item)

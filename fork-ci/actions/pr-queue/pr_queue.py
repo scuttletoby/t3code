@@ -1481,7 +1481,9 @@ class Queue:
         text) is cleaned of them and of markdown; `advice`, the queue's own text from the config (a command in
         backticks, a `<sha>` placeholder), keeps its markdown unless it holds one (lens.no_lens_text). 0, or SILENT when
         the comment failed (the caller keeps STATE, so the next run says it)."""
-        why = lens.no_lens_text(why) + (' ' + lens.no_lens_text(advice, keep_markdown=True) if advice else '')
+        # One line: a multi-line gh error could start a line with `covered:`, `checks:` or a heading naming a lens.
+        why = lens.no_lens_text(' '.join(why.split()))
+        why += ' ' + lens.no_lens_text(advice, keep_markdown=True) if advice else ''
         print(f'#{n}: auto-merge left OFF: {why}')
         r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
                           f'pr_queue turned auto-merge OFF: {why}\nNeeds a lens read of any new commits, then '

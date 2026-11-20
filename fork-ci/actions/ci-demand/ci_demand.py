@@ -23,10 +23,12 @@ that failed were not saved.
 Cache (--cache, a folder the caller owns): a page is saved only when it cannot change any more: a job page when the
 run and all its jobs are completed (keyed by run id and attempt, so a re-run is a new page); a run-list page when
 every run in it is completed and its window ended over an hour ago, and then reused for LIST_MAX_AGE (a later re-run
-changes the run). Where the OS has user ids (not Windows), a folder another user owns is refused and the folder is
-made 0700 (a filesystem where chmod has no effect is refused). Writes are a `.part-` file then a rename. A file
-that is unreadable, half-written, damaged (also nested too deep, a page field missing or of the wrong type, or a run
-or job in it not completed or without a field the counting reads), saved for another page or in another FORMAT is
+changes the run). The same check (saved_ok) decides what is saved and what is read back, so a page it would refuse
+is never written: it is fetched and counted live, like an unfinished page. Where the OS has user ids (not Windows),
+a folder another user owns is refused and the folder is made 0700 (a filesystem where chmod has no effect is
+refused). Writes are a `.part-` file then a rename. A file that is unreadable, half-written, damaged (also nested
+too deep, a page field missing or of the wrong type, a run or job in it not completed or without a field the
+counting reads, or a list emptied while total_count is above 0), saved for another page or in another FORMAT is
 fetched again; a failed write only costs the cache; `.part-` files older than an hour go (one that cannot be removed
 is reported, also as `cache_cleanup_failed` in --json, and the run goes on).
 Exit: 0 complete, 2 bad arguments (a config file of the wrong shape too) or an API error (an answer with a field
@@ -254,15 +256,22 @@ def page_ok(body, kind):
 
 
 SAVED_FIELDS = {'workflow_runs': ('status', 'conclusion'),
-                'jobs': ('status', 'conclusion', 'runner_name', 'started_at', 'completed_at')}
+                'jobs': ('status', 'conclusion', 'runner_name', 'created_at', 'started_at', 'completed_at', 'labels')}
 
 
 def saved_ok(body, kind):
-    """A saved page (page_ok already) still meets the rule it was saved by: every run or job in it completed, with
-    every field the counting reads (the API always sends them, null where empty). A job that reached a runner needs
-    its start and end, else it would count as 0 seconds."""
+    """The rule a page is saved by, and checked again when it is read back (page_ok already): every run or job in it
+    completed, with every field the counting reads (the API always sends them, null where empty); a job's
+    `created_at` a date (else its queue wait is dropped) and, for a job that reached a runner and was not skipped, its
+    start and end (else it would count as 0 seconds); and a list that is empty only when `total_count` is 0 (the
+    paging never asks for a page past the end, so an emptied list would count as no runs or no jobs; should GitHub's
+    count ever run ahead of its list, that empty last page is fetched again each run: a request more, numbers right)."""
+    if not body[kind] and body['total_count'] > 0:
+        return False
     for x in body[kind]:
         if x.get('status') != 'completed' or not all(k in x for k in SAVED_FIELDS[kind]):
+            return False
+        if kind == 'jobs' and not is_date(x['created_at'], needed=True):
             return False
         if kind == 'jobs' and x['conclusion'] != 'skipped' and x['runner_name'] \
                 and not (is_date(x['started_at'], needed=True) and is_date(x['completed_at'], needed=True)):
@@ -280,7 +289,7 @@ def list_runs(api, repo, start, end, out):
         body = api.cached(ep, 'workflow_runs', LIST_MAX_AGE) if settled else None
         if body is None:
             body = api.get(ep, 'workflow_runs')
-            if settled and all(r.get('status') == 'completed' for r in body.get('workflow_runs', [])):
+            if settled and saved_ok(body, 'workflow_runs'):   # one rule for what is saved and what is read back
                 api.save(ep, body)
         total = body.get('total_count', 0)
         if total > SEARCH_CAP and end - start > dt.timedelta(seconds=1):
@@ -308,7 +317,7 @@ def run_jobs(api, repo, run):
         body = api.cached(key, 'jobs')
         if body is None:
             body = api.get(ep, 'jobs')
-            if run.get('status') == 'completed' and all(j.get('status') == 'completed' for j in body.get('jobs', [])):
+            if run.get('status') == 'completed' and saved_ok(body, 'jobs'):
                 api.save(key, body)
         jobs += body.get('jobs', [])
         api.check()

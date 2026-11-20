@@ -25,6 +25,10 @@ import re
 # that is indented 4+ spaces, quoted or a fence is never the header (lens_header), but its header line still counts as
 # one (lens_problem: fail closed).
 LENS_RE = re.compile(r'lens\s*:\s*(.*)', re.I)
+# A line that starts with a lens field in a form loose_header reads (`lens:`, `lens —`, `lens –`, and `lens=` with no
+# blank before the `=`): below the first line, one with a sha is a second lens's header (lens_problem; issue #303).
+# `LENS = '...'` is no field here: a report's test code assigns sample headers that way.
+FIELD_START_RE = re.compile(r'lens(?:\s*[:—–]|=)\s*(.*)', re.I)
 # The name ends at the first field: ` · reviewer:` or ` · read at:` (also `read at <hex>`; the separator may also be
 # `,` `—` or none). A bare `reviewer` or `read at` stays in the name (`data-integrity reviewer 1` and `... 2` are two
 # lenses).
@@ -38,7 +42,8 @@ NO_HEADER = 'comment without a first-line lens header'
 # leaves the old one; hiding the old one is not enough either.
 # The queue posts this text, so it never holds the lens marker with its colon (no_lens_text).
 NO_HEADER_WAY_OUT = ('delete that comment (hiding it is not enough), or edit it to start with `not a lens` and a colon '
-                     'and hold no lens header line, with any line that names the sha a lens read quoted with `>`, or')
+                     'and hold no lens header line and no sha on a line with a lens field, with any line that names '
+                     'the sha a lens read quoted with `>`, or')
 EDITED = 'edited after posting: post a new comment instead'
 # A review's edit and hidden flags, by review node id, as the caller read them with a query of its own (pr_queue
 # review_flags). gh pr view never fetches them for reviews but prints `includesCreatedEdit: false` anyway, so a review
@@ -205,18 +210,31 @@ def lens_header(body, narrow=False):
     return name, (at.group(1).lower() if at else None)
 
 
+# A fence as GitHub (GFM) reads one: an opening line is 3+ backticks or tildes after at most 3 spaces, and a backtick
+# fence's info string holds no backtick (```` ```x``` ```` is inline code, no fence). Only a line of the same character,
+# at least as long, with nothing but blanks after it closes the fence (```` ```js ```` inside an open fence is code). An
+# unclosed fence runs to the end of the comment. Issue #303: a line with an info string closed the fence, and a
+# backtick line with a backtick after it opened one, so lines GitHub shows as code were read as quotes or plain text,
+# and plain lines as code.
+FENCE_OPEN_RE = re.compile(r' {0,3}(?:(`{3,})[^`]*|(~{3,}).*)')
+FENCE_CLOSE_RE = re.compile(r' {0,3}(`{3,}|~{3,})[ \t]*')
+
+
+def fence_step(fence, line):
+    """(the fence open after this line or None, whether the line belongs to a fence), given the fence open before it."""
+    if fence:
+        m = FENCE_CLOSE_RE.fullmatch(line)
+        return (None if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) else fence), True
+    m = FENCE_OPEN_RE.fullmatch(line)
+    return (m.group(1) or m.group(2), True) if m else (None, False)
+
+
 def plain_lines(body):
-    """The comment's lines outside fenced blocks, 4-space/tab indented blocks and quotes."""
+    """The comment's lines outside fenced blocks (fence_step), 4-space/tab indented blocks and quotes."""
     out, fence = [], None
     for line in (body or '').splitlines():
-        m = re.match(r' {0,3}(`{3,}|~{3,})', line)
-        if fence:
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
-                fence = None
-            continue
-        if m:
-            fence = m.group(1)
-        elif line.strip() and not re.match(r' {4}|\t|[ ]{0,3}>', line):
+        fence, fenced = fence_step(fence, line)
+        if not fenced and line.strip() and not re.match(r' {4}|\t|[ ]{0,3}>', line):
             out.append(line)
     return out
 
@@ -226,13 +244,8 @@ def unquoted_lines(body):
     indented block is code, and the line stays."""
     out, fence = [], None
     for line in (body or '').splitlines():
-        m = re.match(r' {0,3}(`{3,}|~{3,})', line)
-        if fence:
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
-                fence = None
-        elif m:
-            fence = m.group(1)
-        elif re.match(r' {0,3}>', line):
+        fence, fenced = fence_step(fence, line)
+        if not fenced and re.match(r' {0,3}>', line):
             continue
         out.append(line)
     return out
@@ -256,13 +269,24 @@ def no_lens_text(text, keep_markdown=False):
     """Text that can never count as a lens read, name a lens or look like a lens report (lens_problem), for anything
     the queue quotes into a comment (gh errors): no `read at`, no lens field (`lens:`, `lens=`, `lens —`, `lens –`),
     no `safe to merge`. keep_markdown: the
-    queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown,
-    it holds none of these; otherwise it is cleaned like any other text."""
+    queue's own advice (a command in backticks, a `<sha>` placeholder) stays as written when, read without its markdown
+    either way (clean_inline narrow or not), it holds none of these; otherwise it is cleaned like any other text."""
     plain = clean_inline(text)
-    out = re.sub(r'\bread([\s-]*)at\b', r'read\1@', plain, flags=re.I)
+    if keep_markdown and _no_lens_forms(plain) == plain:   # the reader cleans the text as written once, either way
+        narrow = clean_inline(text, narrow=True)
+        if _no_lens_forms(narrow) == narrow:
+            return text
+    # Cleaned text is cleaned AGAIN by the reader, and nested markup (`lens<<a>b>=`, `lens[[](z)](w)=`) left by one
+    # pass would turn into a field on the second (issue #303). So the `<` `>` `[` `]` one pass left become blanks: with
+    # none of them, another pass (either way) changes nothing.
+    return _no_lens_forms(re.sub(r'[<>\[\]]', ' ', plain))
+
+
+def _no_lens_forms(text):
+    """The text with every lens form no_lens_text names rewritten."""
+    out = re.sub(r'\bread([\s-]*)at\b', r'read\1@', text, flags=re.I)
     out = re.sub(r'\bsafe(\s+)to(\s+)merge\b', r'safe\1to\2land', out, flags=re.I)
-    out = re.sub(r'\blens(\s*)[:=—–]', r'lens\1-', out, flags=re.I)   # every field form loose_header reads
-    return text if keep_markdown and out == plain else out
+    return re.sub(r'\blens(\s*)[:=—–]', r'lens\1-', out, flags=re.I)   # every field form loose_header reads
 
 
 def check_state(c):
@@ -355,9 +379,11 @@ class Review:
         first = next((line for line in lines if line.strip()), '')
         normed, start = [norm(line) for line in lines], f'starts with {first.strip()[:60]!r}'
         at = next((i for i, line in enumerate(lines) if line.strip()), 0)
-        # a header line, or (after the first line) a line starting `lens:` with a sha in any form (a second lens's
-        # loosely written read behind a valid header). Only at the line start: `lens:` in mid-line is often a mention.
-        headers = sum(header_line(line) or (i > at and bool((m := LENS_RE.match(line)) and HEX_RE.search(m.group(1))))
+        # a header line, or (after the first line) a line starting with a lens field in a form FIELD_START_RE reads and
+        # a sha in any form (a second lens's loosely written read behind a valid header). Only at the line start:
+        # `lens:` in mid-line is often a mention.
+        headers = sum(header_line(line)
+                      or (i > at and bool((m := FIELD_START_RE.match(line)) and HEX_RE.search(m.group(1))))
                       for i, line in enumerate(normed))
         if headers > 1:
             return f'{EMBEDDED} {headers} times (post one comment per lens), {start}'

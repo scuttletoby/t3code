@@ -38,6 +38,7 @@ CLASSES = (
     ('all docker volumes', 'rule:docker'),
     ('temp', 'rule:tmp'),
     ('cold folders', 'rule:compress-cold'),
+    ('dedupe folders', 'rule:dedupe'),
     ('agent scratch', 'rule:agent-scratch'),
     ('agent tool homes', AGENT_HOMES),
     ('T3 data', T3_DATA),
@@ -174,6 +175,7 @@ SPEC = {
     'agentScratch': (dict, {}, None),
     'daily': (dict, {}, None),
     'compressCold': (dict, {}, None),
+    'dedupe': (dict, {}, None),
 }
 WORKTREES_SPEC = {
     'repos': (list, (), None),
@@ -228,7 +230,12 @@ COMPRESS_SPEC = {
 }
 FOLDER_SPEC = {
     'path': (str, machine_file.REQUIRED, _path),        # the folder; files at any depth in it are looked at
-    'days': (int, machine_file.REQUIRED, _at_least(MIN_COLD_DAYS)),     # days without a change or a read
+    'days': (int, machine_file.REQUIRED, _at_least(MIN_COLD_DAYS)),     # days without a change (or a read: compressCold)
+}
+# `dedupe` (dedupe.py, #486): files with the same bytes in these folders, none changed for its folder's `days`,
+# become hard links of one of them. Each folder is a FOLDER_SPEC. Without folders the rule does nothing.
+DEDUPE_SPEC = {
+    'folders': (list, (), None),
 }
 COMPARE_SPEC = {
     'name': (str, machine_file.REQUIRED, None),
@@ -257,6 +264,9 @@ KEY_KINDS = {
     'compare.command': 'compare only', 'compare.pattern': 'compare only',
     'compressCold': 'picks', 'compressCold.folders': 'picks', 'compressCold.keepFreeGB': 'floor',
     'folders.path': 'picks', 'folders.days': 'floor',
+    # dedupe deletes no content either (every name keeps its bytes and metadata); its folders never are or hold a
+    # must-keep path, and every refusal holds in them (dedupe.py).
+    'dedupe': 'picks', 'dedupe.folders': 'picks',
     # agentScratch: on, its folder and its days pick what it looks at. keepFirst only adds a copy before a delete:
     # more patterns copy more; maxFileBytes has a floor; a session with more than maxSessionBytes to copy stays
     # whole, so the cap picks which sessions the rule may take at all (every refusal still holds for them). The
@@ -358,7 +368,10 @@ class Config:
         self.journal_file = self.log_file + '.deleting'     # deletes started and not ended (engine.py)
         self.report_file = self.log_file + '.reported'      # the last line of the log the last report counted
         self.report_lock_file = self.report_file + '.lock'  # one report at a time (report.py)
-        for own in (self.log_file, self.lock_file, self.journal_file, self.report_file, self.report_lock_file):
+        self.dedupe_cache = self.log_file + '.dedupe'           # what dedupe read and linked (dedupe.Cache)
+        self.dedupe_own = self.log_file + '.dedupe-own'         # its own links since that was written
+        for own in (self.log_file, self.lock_file, self.journal_file, self.report_file, self.report_lock_file,
+                    self.dedupe_cache, self.dedupe_own):
             kept = must_keep_match(self.must_keep, own)
             if kept is not None or any(fnmatch.fnmatchcase(part.lower(), glob) for part in own.split('/') for glob in MUST_KEEP_NAMES):
                 raise machine_file.MachineFileError(f'{where}.logFile: {values["logFile"]} is in a must-keep path, '
@@ -430,6 +443,8 @@ class Config:
         archive = (('agentScratch.keepFirst.archive', keep['archive'], self.keep_archive),) if self.scratch_enabled else ()
         self.cold_folders = self._cold(values['compressCold'], f'{where}.compressCold', values['logFile'], daily['outDir'],
                                        archive)
+        self.dedupe_folders = self._dedupe(values['dedupe'], f'{where}.dedupe', values['logFile'], daily['outDir'],
+                                           archive)
 
         for root in self.roots() | ({self.scratch_root} if self.scratch_enabled else set()):
             for key, text, own in (('logFile', values['logFile'], self.log_file),
@@ -466,20 +481,57 @@ class Config:
             if held:
                 raise machine_file.MachineFileError(f'{at}.path: {text} is or holds the must-keep path /{"/".join(held[0])}: '
                                                     'name a folder inside it (its settings and logins stay as they are)')
-            # `archive`: the keep-first archive of agent-scratch while that rule is on, also one of the cleaner's own files.
-            for key, own_text, own in (('logFile', log_text, self.log_file), ('daily.outDir', out_text, self.daily_dir)) + archive:
-                if _holds(path, own) or _holds(own, path):
-                    raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {key} {own_text}')
-            for root in self.roots() | ({self.scratch_root} if self.scratch_enabled else set()):
-                if _holds(path, root) or _holds(root, path):
-                    raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {root}, a folder '
-                                                        'another rule deletes from')
+            self._apart(path, text, at, log_text, out_text, archive)
             for other in folders:
                 if _holds(path, other.path) or _holds(other.path, path):
                     raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {other.path}, '
                                                         'another of its folders')
             folders.append(ColdFolder(path, folder['days']))
         return tuple(folders)
+
+    def _dedupe(self, section, where, log_text, out_text, archive=()):
+        """The folders of dedupe. Never the home folder or above it, never in, holding or reached through a link
+        to a must-keep path or name (the same guard as every rule: dedupe changes how files are stored), never in or
+        above the cleaner's own files, a folder another rule deletes from or compresses in, or another of its own."""
+        values = machine_file.fields(section, DEDUPE_SPEC, where)
+        folders = []
+        for i, entry in enumerate(values['folders']):
+            at = f'{where}.folders[{i}]'
+            folder = machine_file.fields(entry, FOLDER_SPEC, at)
+            path, text = self._expand(folder['path']), folder['path']
+            if _holds(path, self.home):
+                raise machine_file.MachineFileError(f'{at}.path: {text} is the home folder or holds it')
+            real = os.path.realpath(path)
+            for form in (path, real):
+                held = must_keep_match(self.must_keep, form)
+                if held is not None:
+                    raise machine_file.MachineFileError(f'{at}.path: {text} is in or holds the must-keep path '
+                                                        f'/{"/".join(held)}')
+                if any(matches(part.lower(), MUST_KEEP_NAMES) for part in form.split('/')):
+                    raise machine_file.MachineFileError(f'{at}.path: {text} is or is in a must-keep name '
+                                                        f'({", ".join(MUST_KEEP_NAMES)})')
+            self._apart(path, text, at, log_text, out_text, archive)
+            for other in self.cold_folders:
+                if _holds(path, other.path) or _holds(other.path, path):
+                    raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {other.path}, a '
+                                                        'folder of compressCold')
+            for other in folders:
+                if _holds(path, other.path) or _holds(other.path, path):
+                    raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {other.path}, '
+                                                        'another of its folders')
+            folders.append(ColdFolder(path, folder['days']))
+        return tuple(folders)
+
+    def _apart(self, path, text, at, log_text, out_text, archive):
+        """A folder of compress-cold or dedupe is never in or above the cleaner's own files (`archive`: the
+        keep-first archive of agent-scratch while that rule is on) or a folder another rule deletes from."""
+        for key, own_text, own in (('logFile', log_text, self.log_file), ('daily.outDir', out_text, self.daily_dir)) + archive:
+            if _holds(path, own) or _holds(own, path):
+                raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {key} {own_text}')
+        for root in self.roots() | ({self.scratch_root} if self.scratch_enabled else set()):
+            if _holds(path, root) or _holds(root, path):
+                raise machine_file.MachineFileError(f'{at}.path: {text} holds or is inside {root}, a folder '
+                                                    'another rule deletes from')
 
     def _never(self):
         """COMPRESS_NEVER as must-keep patterns: each as written, with its literal folder resolved, and where each

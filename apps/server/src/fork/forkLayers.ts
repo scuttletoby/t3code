@@ -16,6 +16,7 @@ import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
+import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
 
@@ -45,13 +46,25 @@ export const layerRuntimeServices = Layer.mergeAll(
   RunRecorder.layer,
 );
 
+/**
+ * Provided to the runtime's core dependencies (server.ts's `layerRuntimeCoreDependenciesBase`, first
+ * in its pipe, so only its own workers see it): upstream's orchestrator, except that idle compaction
+ * skips a thread whose handoff mode is `handoff`, which the handoff service alone owns.
+ */
+export const handoffThreadsSkipIdleCompaction = HandoffOwner.layer;
+
 /** In the routes, after upstream's follower of tasks in linked environments. */
 export const layerRoutes = Layer.mergeAll(
   // /mcp reads the usage pacer and the slot gate only if they are there (the usage pacing gate,
   // agentSlots). Asking for them beside /mcp makes a server wired without one a type error
-  // instead of a silent gate.
-  Layer.effectDiscard(UsagePacer.UsagePacer.pipe(Effect.asVoid)),
-  Layer.effectDiscard(SlotGate.SlotGate.pipe(Effect.asVoid)),
+  // instead of a silent gate. The span shows every boot found both (holdWork.boot.test.ts): a
+  // server.ts that lost this layer and layerRuntimeServices together still type-checks and boots.
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      yield* UsagePacer.UsagePacer;
+      yield* SlotGate.SlotGate;
+    }).pipe(Effect.withSpan("ForkLayers.mcpGatesPresent")),
+  ),
   // Off unless automaticUpdates is on; shares the Update button's ServerSelfUpdate in server.ts.
   ServerAutoUpdate.layer,
   // GET /api/fork/activity: 404 unless activityProbe is on; loopback programs only.

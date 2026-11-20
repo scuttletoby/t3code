@@ -277,7 +277,9 @@ def restore_and_downgrade(run, cfg, adapter, copy_dir, *, automatic, lose_work_s
 
     def stop_restore_update():
         server = _server(cfg, adapter)
-        why = coldcopy.open_gap(cfg.home)  # before the stop and before saying so: T3 must not stop without the marker
+        # before the stop and before saying so: T3 must not stop without the marker, nor where the kit cannot tell
+        # the new launcher (handoff.handover_blind)
+        why = handoff.handover_blind(cfg.home, [old]) or coldcopy.open_gap(cfg.home)
         if why is not None:
             raise journal.Refused(f'{why}; T3 was not stopped')
         say('stopping T3 for W1: until this back ends ok, T3 stays stopped and is not started at boot, and background '
