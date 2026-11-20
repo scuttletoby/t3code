@@ -69,15 +69,16 @@ watches; it changes nothing on the machine, and `0` turns it off.
   `added` lists exactly as many copies as are left, each one the file has, and its `announced`
   none the file has; the run from upstream then holds every one of them to that entry. Which
   lines are the fork's only upstream can tell, so for such a move the pull request's run
-  (`--upstream`, [#552](https://github.com/scuttletoby/t3code/issues/552)) fetches upstream's
-  default branch read-only (commits and trees only, into `refs/fork-seam-check/upstream`, deleted
-  before each fetch) and holds the entry's `added` to exactly the head's fork lines counted from
-  the merge-base of main and upstream's head: a line upstream has, or a fork line left out, is
-  refused. A change that moves no pending file fetches nothing. When upstream cannot be fetched
-  (twice) or shares no commit with main, the run warns, naming why, and checks as before; check
-  the entry by hand then with `node .github/scripts/fork-seam-check.cjs --from-upstream "$(git
-  merge-base origin/main upstream/main)" <pull request head>` (upstream's main fetched as
-  `upstream/main`). Left
+  fetches upstream's default branch from the URL in main's `.github/fork-upstream.json` (never
+  the pull request's copy; `--upstream <url>` by hand) read-only (commits and trees only, into
+  `refs/fork-seam-check/upstream`, deleted before each fetch) and holds the entry's `added` to
+  exactly the head's fork lines counted from the merge-base of main and upstream's head: a line
+  upstream has, or a fork line left out, is refused. A change that moves no pending file fetches
+  nothing; a malformed upstream file refuses only such a move. With no upstream file on main the
+  run notes that and checks as before; when upstream cannot be fetched (twice) or shares no
+  commit with main, it warns, naming why, and checks as before; check the entry by hand then with
+  `node .github/scripts/fork-seam-check.cjs --from-upstream "$(git merge-base origin/main
+  upstream/main)" <pull request head>` (upstream's main fetched as `upstream/main`). Left
   higher, the next run from upstream refuses main for the spare room; set lower or dropped, for
   the lines still there. Neither in `pending` nor moved may a change gain a fork line (an upstream
   line swapped for one is one more), whatever its list says. It reads its own list only to

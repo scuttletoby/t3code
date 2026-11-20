@@ -1,9 +1,7 @@
 // Usage: [--config-ref <rev>] [--upstream <url>] <base> <head> | --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>.
 // Refuses <head>'s upstream-file changes beyond .github/fork-seams.json: a PR uses <base>'s list (its own only for
-// "pending" ceilings it must lower); --from-upstream reads <head>'s. --after-rebase notes a too-high ceiling and
-// --lowered-list writes the lowered list. --upstream: a PR that moves a "pending" file to "files" has its entry
-// held to the fork lines counted from upstream (fetched read-only into one ref; unreachable: a warning). Reads git
-// objects only otherwise (and writes only that file).
+// "pending" ceilings it must lower), and holds a "pending" file it moves to "files" to the fork lines counted from
+// upstream (--upstream, else the list commit's .github/fork-upstream.json). Writes only --lowered-list's file.
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -13,6 +11,8 @@ const CONFIG = ".github/fork-seams.json";
 // fork-*.yml, which fork-follow makes the fork delete (that list cannot name them), the only upstream
 // files a change may delete.
 const REMOVED = ".github/fork-removed-workflows.txt";
+// Upstream's git URL, read from the list's commit (never the pull request's) only for a move to "files".
+const UPSTREAM_FILE = ".github/fork-upstream.json";
 const REMOVED_PATH = /^\.github\/workflows\/[^/,\s]+\.ya?ml$/;
 const FORK_WORKFLOW = /^\.github\/workflows\/fork-[^/]*\.ya?ml$/;
 // Generated upstream files: the folder each is generated from, and the fork test that proves the
@@ -648,6 +648,36 @@ function findPromotedNotFork(files, ownFiles, { atUpstream, atHead, name }) {
 // Where a pull request's run keeps upstream's default branch; deleted before each fetch, so a
 // failed fetch never leaves an earlier run's head to be judged by.
 const UPSTREAM_REF = "refs/fork-seam-check/upstream";
+
+/**
+ * The upstream git URL UPSTREAM_FILE names at `rev`: { url }, {} when `rev` has no such file, or
+ * { problem } when it is malformed (a plain https:// or file:// URL; never an option or transport).
+ */
+function upstreamNamedAt(rev) {
+  const text = textAt(rev, UPSTREAM_FILE);
+  if (text === undefined) return {};
+  const at = `${UPSTREAM_FILE} at ${rev.slice(0, 12)}`;
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch (error) {
+    return { problem: `${at} is not JSON (${error instanceof Error ? error.message : error})` };
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return { problem: `${at} is not a JSON object` };
+  }
+  const unknown = Object.keys(raw).find((key) => !key.startsWith("//") && key !== "url");
+  if (unknown !== undefined) {
+    return { problem: `${at} has an unknown key ${JSON.stringify(unknown)} (known: url)` };
+  }
+  if (
+    typeof raw.url !== "string" ||
+    !/^(?:https|file):\/\/[^\s\u0000-\u001f\u007f]+$/.test(raw.url)
+  ) {
+    return { problem: `${at}: "url" must be one https:// or file:// git URL` };
+  }
+  return { url: raw.url };
+}
 
 /**
  * Fetches upstream's default branch from `url` (read-only, into UPSTREAM_REF) and returns
@@ -1308,17 +1338,27 @@ function main(argv) {
     ownFiles,
     lowered,
   });
-  // A move to "files" lists lines main's list cannot tell from upstream's: only upstream can (#552).
+  // A move to "files" lists lines main's list cannot tell from upstream's: only upstream can.
   const promoted = upstream ? [] : promotedFiles(config, ownFiles, ownPending);
   const promotedCeilings = [];
   const warnings = [];
   if (promoted.length > 0) {
     const moves = `this change moves ${promoted.join(", ")} from "pending" to "files"`;
     const byHand = `whether its "added" lists exactly the fork lines is not checked here; fork-follow's next run refuses main if not (check it now: docs/fork/updates.md, "pending")`;
-    if (parsed.upstreamUrl === undefined) {
-      console.log(printable(`Note: ${moves}; without --upstream, ${byHand}.`));
+    const named =
+      parsed.upstreamUrl === undefined ? upstreamNamedAt(configRef) : { url: parsed.upstreamUrl };
+    if (named.problem !== undefined) {
+      promotedCeilings.push(
+        `${promoted.join(", ")}: moved to "files" in this change's ${CONFIG}, but ${named.problem}, so its fork lines cannot be counted: fix that file with a pull request to main first.`,
+      );
+    } else if (named.url === undefined) {
+      console.log(
+        printable(
+          `Note: ${moves}; without --upstream (and no ${UPSTREAM_FILE} at ${configRef.slice(0, 12)}), ${byHand}.`,
+        ),
+      );
     } else {
-      const found = upstreamBase(parsed.upstreamUrl, configRef, [configRef, head]);
+      const found = upstreamBase(named.url, configRef, [configRef, head]);
       if (found.problem !== undefined) {
         warnings.push(`${moves}, but ${found.problem}, so ${byHand}.`);
       } else if (!isAncestor(found.rev, head)) {
@@ -1337,7 +1377,7 @@ function main(argv) {
         if (promotedCeilings.length === 0) {
           console.log(
             printable(
-              `Note: ${moves}; each entry lists exactly the fork lines counted from upstream (${name}, the merge-base of ${configRef.slice(0, 12)} and ${parsed.upstreamUrl}).`,
+              `Note: ${moves}; each entry lists exactly the fork lines counted from upstream (${name}, the merge-base of ${configRef.slice(0, 12)} and ${named.url}).`,
             ),
           );
         }
@@ -1391,7 +1431,7 @@ function main(argv) {
     ...spare.notes,
   ];
   for (const note of notes) console.log(printable(`Note: ${note}`));
-  // In a workflow, an annotation on the run (the check still passes, as it did before #552).
+  // In a workflow, an annotation on the run (the check still passes, as without upstream).
   const warn = process.env.GITHUB_ACTIONS === "true" ? "::warning::" : "Warning: ";
   for (const warning of warnings) console.log(`${warn}${printable(warning)}`);
   if (editsList) {
@@ -1499,6 +1539,7 @@ module.exports = {
   parseRemoved,
   promotedFiles,
   sameLines,
+  UPSTREAM_FILE,
   UPSTREAM_REF,
 };
 
