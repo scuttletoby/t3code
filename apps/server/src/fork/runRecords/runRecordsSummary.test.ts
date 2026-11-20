@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - tests the plain node summary script against real files.
 /** Fork: the weekly run records summary and its command (issue 315). */
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
