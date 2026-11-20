@@ -1,13 +1,16 @@
 /**
- * Fork: a completed handoff run does not alert through the relay. The mark is stored with the run
- * (its `handoff:` message, sent by the server as an agent), so a restart keeps it; the relay sees
- * the run as upstream's stopped run (`latestRunStopRequested`). Every other run alerts as before.
+ * Fork: a completed handoff run does not alert through the relay, because the person's own turn
+ * already did. The mark is stored with the run (its `handoff:` message, sent by the server as an
+ * agent), so a restart keeps it; the relay sees the run as upstream's stopped run
+ * (`latestRunStopRequested`). Every other run alerts as before.
  */
 import {
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2Run,
+  RunId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -16,30 +19,50 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import { parseHandoffMessageId } from "./handoffFacts.ts";
 
+/**
+ * Upstream's relay holds a "finished" alert this long, because a run can end moments before its
+ * continuation starts; a run that starts in the hold drops it (`AgentAwarenessRelay.ts`).
+ */
+export const RELAY_COMPLETION_HOLD_MS = 5_000;
+
+/**
+ * The handoff service waits this long at a quiet thread before it sends (`HandoffService.ts`), so
+ * the person's alert for their own turn has gone out first; twice the hold, for a relay that lags.
+ */
+export const HANDOFF_SETTLE_MS = 2 * RELAY_COMPLETION_HOLD_MS;
+
 type QuietMessage = Pick<
   OrchestrationV2ConversationMessage,
   "id" | "runId" | "createdBy" | "creationSource"
 >;
 
 /**
- * Whether a completed run is a handoff run and nothing else: its message carries the handoff id
- * and was sent by the server as an agent (a person cannot send that), and the person steered no
- * message of their own into it (that makes the run theirs, as upstream does for background wakes).
- * A failed handoff run, or one whose message is missing, alerts as before.
+ * A completed first-send handoff run, sent by the server, no message of the person's in it, and
+ * requested at least the relay's hold after the person's run finished (so their alert went out).
+ * Anything else, a retry included, alerts as the turn's finish.
  */
 export function isQuietHandoffRun(
   threadId: ThreadId,
-  run: Pick<OrchestrationV2Run, "id" | "status" | "userMessageId">,
+  run: Pick<OrchestrationV2Run, "id" | "status" | "userMessageId" | "requestedAt">,
   messages: ReadonlyArray<QuietMessage>,
+  sourceRun: Pick<OrchestrationV2Run, "id" | "completedAt"> | undefined,
 ): boolean {
   if (run.status !== "completed") return false;
-  if (parseHandoffMessageId(threadId, run.userMessageId) === null) return false;
+  const handoff = parseHandoffMessageId(threadId, run.userMessageId);
+  if (handoff === null || handoff.retry) return false;
   const prompt = messages.find((message) => message.id === run.userMessageId);
   if (prompt?.createdBy !== "agent" || prompt.creationSource !== "server") return false;
-  return !messages.some((message) => message.runId === run.id && message.createdBy === "user");
+  if (messages.some((message) => message.runId === run.id && message.createdBy === "user")) {
+    return false;
+  }
+  if (sourceRun?.id !== handoff.runId || sourceRun.completedAt == null) return false;
+  return (
+    DateTime.toEpochMillis(run.requestedAt) - DateTime.toEpochMillis(sourceRun.completedAt) >=
+    RELAY_COMPLETION_HOLD_MS
+  );
 }
 
-/** Reads the thread's latest run and its messages, and says whether it is a quiet handoff run. */
+/** Reads the thread's latest run, its messages and source run; says whether it is a quiet handoff run. */
 const latestRunIsQuietHandoff = Effect.fn("HandoffQuiet.latestRunIsQuietHandoff")(function* (
   projections: ProjectionStore.ProjectionStoreV2["Service"],
   thread: AgentAwarenessThread,
@@ -50,18 +73,23 @@ const latestRunIsQuietHandoff = Effect.fn("HandoffQuiet.latestRunIsQuietHandoff"
     runIds: [latestRunId],
   });
   const run = runs.find((candidate) => candidate.id === latestRunId);
-  // Most runs stop here: only a handoff id costs the message reads.
-  if (run === undefined || parseHandoffMessageId(thread.id, run.userMessageId) === null) {
-    return false;
-  }
-  const [prompt, steered] = yield* Effect.all([
+  // Most runs stop here: only a first send's handoff id costs the other reads.
+  const handoff = run === undefined ? null : parseHandoffMessageId(thread.id, run.userMessageId);
+  if (run === undefined || handoff === null || handoff.retry) return false;
+  const [prompt, steered, source] = yield* Effect.all([
     projections.getThreadRecords(thread.id, ["messages"], { messageIds: [run.userMessageId] }),
     projections.getThreadRecords(thread.id, ["messages"], {
       messageRunIds: [run.id],
       messageRoles: ["user"],
     }),
+    projections.getThreadRecords(thread.id, ["runs"], { runIds: [RunId.make(handoff.runId)] }),
   ]);
-  return isQuietHandoffRun(thread.id, run, [...prompt.messages, ...steered.messages]);
+  return isQuietHandoffRun(
+    thread.id,
+    run,
+    [...prompt.messages, ...steered.messages],
+    source.runs.find((candidate) => candidate.id === handoff.runId),
+  );
 });
 
 /**

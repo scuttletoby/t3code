@@ -1,7 +1,8 @@
 /**
  * Fork: hands a long thread off to a fresh session in the same thread (design 4.4). At each turn end
- * it asks `handoffDecision`, sleeps to the idle window or waits for a busy thread to change, then
- * sends one fresh-context message through `dispatchHandoff`, which drops or cancels a late one.
+ * it asks `handoffDecision`, sleeps to the idle window or waits for a busy thread to change, settles
+ * (`HANDOFF_SETTLE_MS`), then sends one fresh-context message through `dispatchHandoff`, which drops
+ * or cancels a late one.
  */
 import {
   CommandId,
@@ -27,6 +28,7 @@ import { type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
 import { dispatchHandoff, readHandoffRecords } from "./handoffDispatch.ts";
 import { HANDOFF_RETRY_SUFFIX, handoffThreadFacts, parseHandoffMessageId } from "./handoffFacts.ts";
 import { handoffMessageText } from "./handoffMessage.ts";
+import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 import { threadHandoffSettings } from "./handoffOwner.ts";
 
 /** Part 3 reads the turn items of this many latest runs; the budget keeps the newest of them. */
@@ -103,6 +105,8 @@ export const make = Effect.gen(function* () {
     function* (threadId: ThreadId, sourceRunId: RunId) {
       let runId = sourceRunId;
       let trigger: HandoffTrigger = "turn-end";
+      // When a read first found the handoff due at a quiet thread; a sleep or a wait clears it.
+      let dueSinceMs: number | undefined;
       while (true) {
         // Set before the read, so a change between the read and the wait is not missed.
         const wake = yield* Deferred.make<void>();
@@ -115,6 +119,7 @@ export const make = Effect.gen(function* () {
         // timer that wakes to a newer run leaves it to that run's own turn end (`newer-run`).
         if (trigger === "turn-end" && latest?.state === "completed" && latest.id !== runId) {
           runId = latest.id as RunId;
+          dueSinceMs = undefined;
           continue;
         }
         const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
@@ -130,6 +135,7 @@ export const make = Effect.gen(function* () {
           nowMs,
         });
         if (decision.kind === "skip") return;
+        if (decision.kind !== "handoff") dueSinceMs = undefined;
         if (decision.kind === "sleep") {
           yield* Effect.sleep(Duration.millis(decision.untilMs - nowMs));
           trigger = "idle-timer";
@@ -139,6 +145,14 @@ export const make = Effect.gen(function* () {
           yield* Effect.logInfo("handoff waiting", { threadId, blockers: decision.blockers });
           // Read again when the thread changes: the work ending decides, not only the next turn.
           yield* Deferred.await(wake);
+          continue;
+        }
+        // Settle first: the relay holds a "finished" alert while a run may continue, so a handoff
+        // run that starts in that hold would drop the person's alert for their own turn. After the
+        // settle the alert went out, and the handoff run stays quiet (handoffQuiet.ts).
+        dueSinceMs ??= nowMs;
+        if (nowMs < dueSinceMs + HANDOFF_SETTLE_MS) {
+          yield* Effect.sleep(Duration.millis(dueSinceMs + HANDOFF_SETTLE_MS - nowMs));
           continue;
         }
         const run = read.records.runs.find((candidate) => candidate.id === runId);

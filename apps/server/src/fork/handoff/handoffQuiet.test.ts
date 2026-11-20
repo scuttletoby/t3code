@@ -37,7 +37,12 @@ import {
   threadId,
 } from "./handoff.testkit.ts";
 import { HANDOFF_RETRY_SUFFIX } from "./handoffFacts.ts";
-import { isQuietHandoffRun, quietHandoffAwareness } from "./handoffQuiet.ts";
+import {
+  HANDOFF_SETTLE_MS,
+  isQuietHandoffRun,
+  quietHandoffAwareness,
+  RELAY_COMPLETION_HOLD_MS,
+} from "./handoffQuiet.ts";
 
 const environmentId = EnvironmentId.make("environment");
 const base = projection({ usedTokens: 0 });
@@ -57,7 +62,15 @@ const handoffMessage = message({
   createdBy: "agent",
   creationSource: "server",
 });
-const handoffRun = run({ id: handoffRunId, ordinal: 2, userMessageId: handoffMessageId });
+/** Sent after the settle, as the service does: run-1's alert went out first. */
+const handoffRun = run({
+  id: handoffRunId,
+  ordinal: 2,
+  userMessageId: handoffMessageId,
+  requestedAt: at(HANDOFF_SETTLE_MS),
+  startedAt: at(HANDOFF_SETTLE_MS),
+  completedAt: at(MINUTE_MS),
+});
 
 const testDatabase = ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory));
 
@@ -220,7 +233,7 @@ describe("handoff run: no relay alert", () => {
     }).pipe(Effect.provide(testDatabase)),
   );
 
-  it.effect("its one retry is quiet too; a failed handoff run still alerts", () =>
+  it.effect("a failed handoff run alerts, and so does its retry that succeeds", () =>
     Effect.gen(function* () {
       const retryId = MessageId.make(`${handoffMessageId}${HANDOFF_RETRY_SUFFIX}`);
       const retryRunId = RunId.make("run-2-retry");
@@ -232,10 +245,19 @@ describe("handoff run: no relay alert", () => {
         "failed",
       );
       yield* seed({
-        runs: [run({ id: retryRunId, ordinal: 3, userMessageId: retryId })],
+        runs: [
+          run({
+            id: retryRunId,
+            ordinal: 3,
+            userMessageId: retryId,
+            requestedAt: at(MINUTE_MS),
+            completedAt: at(2 * MINUTE_MS),
+          }),
+        ],
         messages: [{ ...handoffMessage, id: retryId, runId: retryRunId }],
       });
-      expect(yield* publishOnce(awarenessThread(retryRunId))).toBeNull();
+      // The last alert said "failed": the work went on, so the retry's finish says so.
+      expect(yield* publishOnce(awarenessThread(retryRunId))).toBe("completed");
     }).pipe(Effect.provide(testDatabase)),
   );
 
@@ -294,6 +316,18 @@ describe("quietHandoffAwareness", () => {
     }),
   );
 
+  it.effect("a thread that is not completed costs no read", () =>
+    Effect.gen(function* () {
+      const reads = { count: 0 };
+      for (const status of ["running", "failed", "idle"] as const) {
+        const row = awarenessThread(handoffRunId, { status });
+        const threads = quietHandoffAwareness(threadsOf(row), storeOf(reads, false));
+        expect((yield* threads.getAgentAwarenessSnapshot(threadId)).threads[0]).toEqual(row);
+      }
+      expect(reads.count).toBe(0);
+    }),
+  );
+
   it.effect("an ordinary run costs one read; the catch-up list none", () =>
     Effect.gen(function* () {
       const reads = { count: 0 };
@@ -318,8 +352,20 @@ describe("isQuietHandoffRun", () => {
     const quiet = (
       patch: Partial<OrchestrationV2Run>,
       messages: ReadonlyArray<OrchestrationV2ConversationMessage> = [handoffMessage],
-    ) => isQuietHandoffRun(threadId, { ...handoffRun, ...patch }, messages);
+      source: OrchestrationV2Run | null = run(),
+    ) => isQuietHandoffRun(threadId, { ...handoffRun, ...patch }, messages, source ?? undefined);
     expect(quiet({})).toBe(true);
+    // Requested inside the relay's hold after the person's run: the person's alert was dropped.
+    expect(quiet({ requestedAt: at(RELAY_COMPLETION_HOLD_MS) })).toBe(true);
+    expect(quiet({ requestedAt: at(RELAY_COMPLETION_HOLD_MS - 1) })).toBe(false);
+    expect(quiet({ requestedAt: at() })).toBe(false);
+    // The source run is missing, is another run, or never finished.
+    expect(quiet({}, [handoffMessage], null)).toBe(false);
+    expect(quiet({}, [handoffMessage], run({ id: userRunId }))).toBe(false);
+    expect(quiet({}, [handoffMessage], run({ completedAt: null }))).toBe(false);
+    // The retry of a failed send: the last alert said it failed.
+    const retryId = MessageId.make(`${handoffMessageId}${HANDOFF_RETRY_SUFFIX}`);
+    expect(quiet({ userMessageId: retryId }, [{ ...handoffMessage, id: retryId }])).toBe(false);
     // An old run without the mark: an ordinary message id.
     expect(quiet({ userMessageId: MessageId.make("message-1") }, [userMessage])).toBe(false);
     // The handoff id, but not sent by the server as an agent.

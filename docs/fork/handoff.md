@@ -51,6 +51,10 @@ idle window it does not wait: the next turn end starts over.
 The service decides from what it read, but something else can land before the handoff does. So it
 checks twice more around the send:
 
+- **Settle.** Once the thread is quiet and the handoff is due, the service waits 10 s and reads
+  the thread again. The relay holds a "finished" alert for 5 s in case the run goes on; a handoff
+  run that started inside that hold would drop the person's alert for their own turn.
+  If the thread stops being quiet meanwhile, the settle starts over once it is quiet again.
 - **Right before.** The thread must still be quiet, and its latest run must still be the one the
   handoff was made from. Otherwise nothing is sent.
 - **Right after.** If something landed in between, the orchestrator has queued the handoff behind
@@ -86,15 +90,19 @@ written out in full. The message says when no effort is set.
 - **One retry.** A handoff run that fails is sent once more with the same text. If that also fails,
   the text stays in the thread and the server log says so; the next turn end decides again. A
   handoff the person stopped stays stopped: an interrupted handoff run is never sent again.
-- **No relay alert.** A completed handoff run does not alert through the relay (phone and other
-  devices): the relay sees it as upstream shows a stopped run. The mark is the run's own message
-  (its `handoff:` id, sent by the server as an agent), stored with the run, so a restart keeps it.
-  A failed handoff run, a run the person steered a message into, and the next real turn alert as
-  before (`fork/handoff/handoffQuiet.ts`).
+- **No second relay alert.** The person's turn alerts once through the relay (phone and other
+  devices). A completed handoff run then does not alert again: the relay sees it as upstream shows
+  a stopped run, so the phone's card for the thread is cleared, not shown as finished. It is quiet
+  only when it was requested at least 5 s after the person's run finished, that is after the
+  relay's hold, so their alert went out first. A handoff run requested sooner alerts when it
+  finishes, as the turn's finish. The mark is the run's own message (its `handoff:` id, sent by the
+  server as an agent) and the two runs' times, all stored, so a restart keeps it. A failed handoff
+  run, its retry (the last alert said "failed"), a run the person steered a message into, and the
+  next real turn alert as before (`fork/handoff/handoffQuiet.ts`).
 
 ## Limits
 
-- Timers and waits live in memory. After a server restart, the next turn end, or a late update of
+- Timers, waits and the settle live in memory. After a server restart, the next turn end, or a late update of
   an older run, decides again. A crash between the send and the cancel leaves a queued handoff
   queued; it runs after the newer run.
 - The browser notice still fires for a completed handoff run. The browser reads only the thread
