@@ -4,7 +4,7 @@ fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate a
 import ast, copy, datetime, glob, grp, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat
 import subprocess, sys, tempfile, textwrap, time
 import unittest, urllib.error, urllib.parse
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, suppress
 from functools import partial
 
 sys.dont_write_bytecode = True   # importing fork-fleet.py must not leave __pycache__ in the tree
@@ -1525,8 +1525,14 @@ class Launcher(unittest.TestCase):
                        'printf "%s\\n" "$user" > "$REC/user-$unit.service"; fi\nexit "$code"\n',
         'systemctl': '#!/usr/bin/env bash\n[[ ! -e $REC/systemctl-fails ]] || exit 1\n'
                      'case $1 in list-units) cat -- "$REC/units" 2>/dev/null; exit 0 ;; '
-                     'show) cat -- "$REC/user-${!#}" 2>/dev/null; exit 0 ;; '
+                     # start's look at the stop timeouts systemd applies: $REC/timeouts, else the launcher's own
+                     # 90 s; fails when $REC/show-fails exists. Any other show: the unit's user.
+                     'show) if [[ $2 == -p ]]; then printf "%s\\n" "$*" >> "$REC/shown"; '
+                     '[[ ! -e $REC/show-fails ]] || exit 1; if [[ -e $REC/timeouts ]]; then cat -- "$REC/timeouts"; '
+                     'else printf "TimeoutStopUSec=1min 30s\\nTimeoutAbortUSec=1min 30s\\n"; fi; exit 0; fi; '
+                     'cat -- "$REC/user-${!#}" 2>/dev/null; exit 0 ;; '
                      'stop) printf "%s\\n" "$*" >> "$REC/stopped" ;; '
+                     'kill) printf "%s\\n" "$*" >> "$REC/killed" ;; '
                      'set-property) printf "%s\\n" "$*" >> "$REC/set-property"; [[ ! -e $REC/set-property-fails ]] ;; '
                      '*) exit 2 ;; esac\n',
         'chown': '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$REC/chown"\n',
@@ -1710,6 +1716,74 @@ class Launcher(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(self.path('var/runners')).st_mode), 0o711)
         self.assertEqual(stat.S_IMODE(os.stat(run_dir).st_mode), 0o700)
         self.assertNotIn(self.JIT, got.stdout + got.stderr)
+        # Issue #365 item 1: it read the stop timeouts systemd applies to the unit, found them fine, stopped nothing.
+        self.assertEqual(self.rec_text('shown'), f'show -p TimeoutStopUSec -p TimeoutAbortUSec -- '
+                                                 f'fork-fleet-{self.NAME}.service\n')
+        self.assertIsNone(self.rec_text('killed'))
+        self.assertIsNone(self.rec_text('stopped'))
+
+    def test_start_kills_a_unit_whose_applied_stop_timeouts_are_over_stop_max(self):
+        """Issue #365 item 1: start reads what systemd really applies to the unit it just started (a drop-in or a
+        default can change what it asked for) and kills the unit, stops it and refuses the start when either stop
+        timeout is over STOP_MAX (300 s), endless (infinity, or 0), not a time it can read, missing or twice, or when
+        show fails: fail closed. At most STOP_MAX passes. State: each start is new (a name of its own); a refused one
+        leaves its copy for prune, as a start stopped half-way does."""
+        two = 'TimeoutStopUSec={}\nTimeoutAbortUSec={}\n'.format
+        cases = {
+            'endless stop': (two('infinity', '1min 30s'), 'TimeoutStopUSec=infinity: endless'),
+            'endless abort': (two('1min 30s', 'infinity'), 'TimeoutAbortUSec=infinity: endless'),
+            'zero': (two('0', '1min 30s'), 'TimeoutStopUSec=0: endless'),
+            'six minutes': (two('6min', '1min 30s'), 'TimeoutStopUSec=6min, over STOP_MAX'),
+            'just over': (two('1min 30s', '5min 1ms'), 'TimeoutAbortUSec=5min 1ms, over STOP_MAX'),
+            'an hour': (two('1h', '1min'), 'TimeoutStopUSec=1h, over STOP_MAX'),
+            'a word it cannot read': (two('1fortnight', '1min'), 'TimeoutStopUSec=1fortnight, not a time it can read'),
+            'a glob': (two('1min *', '1min'), 'not a time it can read'),
+            'empty': (two('', '1min'), 'an empty TimeoutStopUSec'),
+            'abort missing': ('TimeoutStopUSec=1min\n', 'systemctl show did not print'),
+            'nothing': ('', 'systemctl show did not print'),
+            'twice': (two('1min', '1min') + 'TimeoutStopUSec=infinity\n', 'TimeoutStopUSec twice'),
+            'another line': (two('1min', '1min') + 'User=root\n', 'a show line that is no stop timeout'),
+            'show fails': (None, 'systemctl show cannot read'),
+        }
+        for i, (case, (text, why)) in enumerate(cases.items()):
+            with self.subTest(case):
+                name = f'fleet-vm-t3code-{40 + i}'
+                for f in ('timeouts', 'show-fails', 'units', 'killed', 'stopped'):
+                    with suppress(FileNotFoundError):
+                        os.remove(os.path.join(self.rec, f))
+                if text is None:
+                    self.write('rec/show-fails', '', 0o644)
+                else:
+                    self.write('rec/timeouts', text, 0o644)
+                got = self.launch('start', name, stdin=self.INPUT)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn(f'start: fork-fleet-{name}.service has ', got.stderr)
+                self.assertIn(why, got.stderr)
+                self.assertIn('killed and refused', got.stderr)
+                self.assertEqual(self.rec_text('killed'), f'kill --signal=KILL -- fork-fleet-{name}.service\n')
+                self.assertEqual(self.rec_text('stopped'), f'stop --no-block -- fork-fleet-{name}.service\n')
+                self.assertFalse(os.path.exists(self.path(f'run/{name}.env')))
+        for i, text in enumerate((two('5min', '5min'), two('300s', '1min 30s'), two('4min 59.5s', '1s'),
+                                  two('0h 1min', '500ms 30us'), 'TimeoutAbortUSec=1min\n\nTimeoutStopUSec=2min\n')):
+            with self.subTest(text):
+                name = f'fleet-vm-t3code-{60 + i}'
+                for f in ('show-fails', 'units', 'killed', 'stopped'):
+                    with suppress(FileNotFoundError):
+                        os.remove(os.path.join(self.rec, f))
+                self.write('rec/timeouts', text, 0o644)
+                got = self.launch('start', name, stdin=self.INPUT)
+                self.assertEqual(got.returncode, 0, got.stderr)
+                self.assertIsNone(self.rec_text('killed'))
+                self.assertIsNone(self.rec_text('stopped'))
+
+    def test_start_stop_max_is_the_walls_own(self):
+        """Issue #365 item 1: start's STOP_MAX and the walls' are one number (each refuses what the other would)."""
+        with open(LAUNCH) as f:
+            ours = re.findall(r'^STOP_MAX=(\d+)$', f.read(), re.M)
+        with open(os.path.join(HERE, 'fork-fleet-walls', 'linux')) as f:
+            walls = re.findall(r'^STOP_MAX = (\d+)', f.read(), re.M)
+        self.assertEqual(len(ours), 1)
+        self.assertEqual(ours, walls)
 
     def test_the_dispatchers_host_drives_it(self):
         pool = dict(POOLS[WAITING], launch=['bash', LAUNCH])
@@ -3154,6 +3228,20 @@ class Launcher(unittest.TestCase):
                     for later in names[i + 1:]:
                         self.assertFalse(os.path.lexists(os.path.join(root, 'etc', later)), later)
 
+    def test_job_etc_refuses_a_link_where_its_files_go(self):
+        """Issue #613 item 6: noclobber refuses only a regular file already there; a link to /dev/null (only root could
+        plant one in the job's root) took the write and left the job an empty passwd. Each of the three must be the
+        plain file just written, or the start is refused. A fresh root still passes (test_job_etc_stops_at_*)."""
+        user = self.USERS[0]
+        for n in ('passwd', 'group', 'hosts'):
+            with self.subTest(n):
+                root = os.path.join(self.d, f'etc-null-{n}')
+                os.makedirs(os.path.join(root, 'etc'))
+                os.symlink('/dev/null', os.path.join(root, 'etc', n))
+                got = self.job_etc(root, user, 'build-host')
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn(f'{root}/etc/{n} is not the plain file just written: refused', got.stderr)
+
     def test_job_etc_puts_this_hosts_name_on_loopback_with_an_underscore_too(self):
         """Issue #594 item 5: a host name with _ (no DNS name, but a host may have one) gets its 127.0.1.1 line, so
         Java's getLocalHost works in the job. One with a blank or a # (it would add a name or cut the line) and
@@ -3201,6 +3289,12 @@ class Launcher(unittest.TestCase):
                          ['FAIL  passwd, group, hosts: hold passwd (cannot read it), which are not the job\'s own'])
         self.assertEqual(probe(own[0] + 'broken line\n', own[1], own[2]),
                          ['FAIL  passwd, group, hosts: hold passwd broken line, which are not the job\'s own'])
+        # Issue #613 item 6: an empty passwd (a link to /dev/null took job_etc's write), or one without the job's own
+        # user, is not job_etc's either.
+        self.assertEqual(probe('', own[1], own[2]),
+                         ['FAIL  passwd, group, hosts: hold passwd (no line of its own), which are not the job\'s own'])
+        self.assertEqual(probe(own[0], f'g:x:{65534 if gid == 0 else 0}:\n', own[2]),
+                         ['FAIL  passwd, group, hosts: hold group (no line of its own), which are not the job\'s own'])
         # Issue #594: a host's passwd, group or hosts with an old non-UTF-8 name (Latin-1 GECOS) is read, never a crash:
         # the host side prints its count (check-net goes on), and inside it is named with the bytes escaped.
         latin = f'jos\xe9:x:{me + 1}:{me + 1}:Jos\xe9 Example:/home/jose:/bin/bash\n'.encode('latin-1')
@@ -4102,6 +4196,24 @@ class LauncherAsRoot(unittest.TestCase):
         _, said = run('fleet-vm-t3code-32', drop='ProtectSystem=strict')
         self.assertIn('/', rw_mounts(said))
         self.launch('stop', 'fleet-vm-t3code-32')
+        # Issue #365 item 1, on the real systemd: a drop-in (root's, in /run) that makes the unit's stop timeout endless
+        # whatever start asked for. start reads what systemd applies, kills the unit and refuses.
+        name = 'fleet-vm-t3code-33'
+        unit = f'fork-fleet-{name}.service'
+        dropin = f'/run/systemd/system/{unit}.d'
+        self.assertFalse(os.path.lexists(dropin))
+        self.addCleanup(subprocess.run, ['systemctl', 'daemon-reload'], capture_output=True, timeout=120)
+        self.addCleanup(shutil.rmtree, dropin, True)
+        os.makedirs(dropin)
+        with open(os.path.join(dropin, '50-endless.conf'), 'w') as f:
+            f.write('[Service]\nTimeoutStopSec=infinity\n')
+        subprocess.run(['systemctl', 'daemon-reload'], check=True, capture_output=True, timeout=120)
+        Launcher.write(self, 'rec/drop', '', 0o644)
+        self.addCleanup(subprocess.run, ['systemctl', 'stop', unit], capture_output=True, timeout=120)
+        got = self.launch('start', name, stdin=self.INPUT)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn(f'{unit} has TimeoutStopUSec=infinity: endless', got.stderr)
+        self.assertNotEqual(subprocess.run(['systemctl', 'is-active', '--quiet', unit], timeout=60).returncode, 0)
 
 
 def rw_mounts(said):
@@ -4917,6 +5029,7 @@ class AnyRepository(unittest.TestCase):
 
 SKIPS = frozenset({'skip', 'skipIf', 'skipUnless'})   # unittest's skip decorators, by the name they are called by
 SKIP_TEST = 'SkipTest'   # what they raise: a decorator whose wrapper raises it skips the same way
+SKIP_CALL = 'skipTest'   # TestCase's own: a decorator whose wrapper calls x.skipTest() skips the same way
 
 
 def skip_misuse(source, name='<test file>'):
@@ -4929,8 +5042,9 @@ def skip_misuse(source, name='<test file>'):
     and `getattr(unittest, "skipIf")`), a name imported from unittest under its own name or another, a name or
     attribute assigned from a skip (`x = unittest.skipIf(..)`, `self.x = ...`, `x = partial(unittest.skip, ...)`: only
     the outermost target, so `self` is never one), and a decorator factory: a function whose body calls or returns a
-    skip, or raises unittest.SkipTest (a wrapper that skips its caller). A body that only names a word `skip` (a local
-    `skip = 0`, `opts.skip`) is no factory.
+    skip, raises unittest.SkipTest or calls `.skipTest(` on anything (`self.skipTest`, `args[0].skipTest`: a wrapper that
+    skips its caller; issue #613). A body that only names a word `skip` (a local `skip = 0`, `opts.skip`) is no
+    factory. A test method or helper that calls self.skipTest is one too, but only a skip where it decorates.
     A test class is a class with a base named *TestCase, a test class of this file, or a class from another module (as
     `fx.Case`: this file cannot tell, so it is taken as one); a mixin is a class with no base, `object`, or mixins of
     this file only. A test method is a `test*` function in a class's body (also under an `if` or `try` there; a
@@ -5015,7 +5129,8 @@ def skip_misuse(source, name='<test file>'):
             if skips(found):
                 names |= {x for k, x in targets if k == 'n'}
                 attrs |= {x for k, x in targets if k == 'a'}
-        names |= {f for f, found in functions.items() if skips(found)}
+        names |= {f for f, found in functions.items()
+                  if skips(found) or any(t[0] == 'a' and t[1] == SKIP_CALL for t in found)}
         cases |= {n.name for n in classes if any(last(b).endswith('TestCase') or last(b) in cases
                                                  or not (isinstance(b, ast.Name) and b.id in {*local, 'object'})
                                                  for b in n.bases)}
@@ -5129,6 +5244,14 @@ class SkipMisuse(unittest.TestCase):
             'module alias': ('import unittest as ut\n@ut.skip("x")\ndef probe(): pass\n', ['probe']),
             'attribute alias': ('class T(TestCase):\n    only = unittest.skip("x")\n'
                                 '    @only\n    def probe(self): pass\n', ['probe']),
+            # issue #613 (the #597 round-2 lenses): a wrapper that calls the test's own skipTest
+            'wrapper that calls self.skipTest': ('def only_root(f):\n    @functools.wraps(f)\n'
+                                                 '    def inner(self, *a):\n        self.skipTest("not root")\n'
+                                                 '    return inner\nclass T(TestCase):\n    @only_root\n'
+                                                 '    def probe(self): pass\n', ['probe']),
+            'wrapper that calls it on an argument': ('def only_root(f):\n    def inner(*a):\n'
+                                                     '        a[0].skipTest("not root")\n    return inner\n'
+                                                     '@only_root\ndef probe(t): pass\n', ['probe']),
         }
         for form, (body, want) in forms.items():
             with self.subTest(form):
@@ -5181,6 +5304,15 @@ class SkipMisuse(unittest.TestCase):
                 raise unittest.SkipTest("root only")   # a helper a test calls, as self.skipTest: fine
             class E(TestCase):
                 def test_f(self): need_root()
+            def need_systemd(t):
+                t.skipTest("no systemd")   # a helper a test calls: fine
+            def only_systemd(f):
+                def inner(self): self.skipTest("no systemd")
+                return inner
+            class F(TestCase):
+                def test_g(self): need_systemd(self)
+                @only_systemd
+                def test_h(self): pass
             '''
         self.assertEqual(self.misuse(ok), [])
 

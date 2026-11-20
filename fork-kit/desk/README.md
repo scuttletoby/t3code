@@ -163,11 +163,12 @@ parts run in the tests on a fake root.
   only after the last rename (and after the files a release drops are removed), so every mix of those files a stop
   leaves is refused, also after a reboot, until the next run ends the swap. (The kit's other files, such as the
   agent or the gate, are not held to the manifest by the walls; `check` compares them.) A file in
-  `fork-fleet-walls/` that the new manifest does not name (one a stopped install of another release left, or a
-  backup) is removed by the next install when it is a plain file of root; a link, folder, FIFO or a file of another
+  `fork-fleet-walls/` that the new manifest does not name (one the last release had and this one drops, one a stopped
+  install of another release left, or a backup; install says which) is removed by the next install when it is a plain file of root; a link, folder, FIFO or a file of another
   owner is never followed or removed: install names it and fails, and so does `check`, until it is removed by hand.
   After the swap, install runs the installed walls (`fork-fleet-walls.py os`) and fails (exit 1, before the agent
-  starts) if they refuse, naming why, so an install never says "installed" while runners cannot start. `SOURCE` is
+  is enabled, started or restarted; an agent that was already running stays up, but its walls refuse every job) if
+  they refuse, naming why, so an install never says "installed" while runners cannot start. `SOURCE` is
   written last, so `check` reports a half-done swap. Users are recorded in `/etc/fork-fleet/desk-kit.json` before they are
   made, so uninstall removes them even after a stop.
 - **Old record:** a record that names a project's fleet config while neither `/etc/fork-fleet/fleet-config.json`
