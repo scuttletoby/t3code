@@ -116,8 +116,11 @@ def above_refusal(path, mounts):
     shows one folder of a filesystem (a bind mount, a btrfs subvolume) hides the folders above that one, and git
     still sees the files there. Those are read where another mount of the same filesystem (`mounts.lines`) shows
     them. When no mount here shows them, it refuses ("could not read"), except above a whole btrfs subvolume
-    (`mounts.whole`): a btrfs root that is not mounted anywhere holds the subvolumes, not a user's files. A folder
-    above that cannot be read refuses too."""
+    (`mounts.whole`) that sits directly in the btrfs top folder (its path has one part: `/@`, `/@home`): that top
+    folder holds the subvolumes, not a user's files. A subvolume deeper down (`/@/home`, `/srv/repo/data`) has
+    ordinary folders above it, which are read like any other or refuse. A folder above that cannot be read refuses
+    too, and so does a place the mount list names that is not a folder now (the list is old, or another mount
+    covers it): its markers cannot be read there."""
     stack, seen = [(path, False)], set()
     while stack:
         here, look = stack.pop()
@@ -128,6 +131,10 @@ def above_refusal(path, mounts):
             return Refusal('could not read', f'more than {ABOVE_LIMIT} folders above {path} through its mounts')
         if look:
             try:
+                hst = os.lstat(here)
+                if not stat.S_ISDIR(hst.st_mode):
+                    return Refusal('could not read', f'{here} is a link or not a folder now, where '
+                                                     f'the mount list shows a folder above {path}')
                 found = marker(here)
             except OSError as ex:
                 return Refusal('could not read', f'{here}: {ex.strerror}')
@@ -145,7 +152,7 @@ def above_refusal(path, mounts):
                 return Refusal('could not read', f'{here} shows {root} of {device}, not a folder')
             up = os.path.dirname(root)
             places = mounts.shown_at(device, up)
-            if not places and (device, root) not in mounts.whole:
+            if not places and not ((device, root) in mounts.whole and up == '/'):
                 return Refusal('could not read', f'{here} shows the folder {root} of its filesystem ({device}), and no '
                                                  f'mount here shows the folder above it ({up}): a KEEP file or a git '
                                                  'folder there could not be seen')

@@ -182,6 +182,7 @@ class Case(unittest.TestCase):
         # (point, device, root) and (device, root). The one line: / shows the root of a filesystem no real stat has.
         self.mount_lines, self.bind_sources = [('/', '0:0', '/')], set()
         self.mount_whole = set()                            # (device, root) of whole btrfs subvolumes
+        self.mount_ids = None                               # (mount id, parent id) of each line; None: not known
         self.mount_options = {'/': ('rw', 'relatime')}       # {point: its per-mount options}
         self.fstab_points = set()                           # the mount points /etc/fstab names; None: unreadable
         # Tests set a file's age with its modification time. The kit also counts the inode change time, which no
@@ -265,7 +266,7 @@ class Case(unittest.TestCase):
                    'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
                    'dangling': lambda: [], 'now': self.now, 'transcripts': lambda: dict(self.transcript_times),
                    'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options,
-                                                         self.fstab_points, self.mount_whole)}
+                                                         self.fstab_points, self.mount_whole, self.mount_ids)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):

@@ -247,11 +247,16 @@ class Mounts:
     a bind mount (a container volume, a sandbox). `options`: {mount point: its per-mount options} (`noatime`,
     `relatime`, ...). `fstab`: the mount points /etc/fstab names, mounted now or not; None when it cannot be read.
     `whole`: (device, root) of each mount of the cleaner's own namespace that shows a whole btrfs subvolume (its
-    root is its `subvol=`). A device is "major:minor" as mountinfo writes it."""
+    root is its `subvol=`). A device is "major:minor" as mountinfo writes it. `ids`: (mount id, parent mount id) of
+    each line of `lines`, in the same order, as mountinfo gives them; None when not known (then of several mounts on
+    one point the one listed last counts as on top)."""
 
-    def __init__(self, points=('/',), lines=(), sources=(), options=None, fstab=(), whole=()):
+    def __init__(self, points=('/',), lines=(), sources=(), options=None, fstab=(), whole=(), ids=None):
         self.points, self.lines, self.sources = set(points), list(lines), set(sources)
         self.whole = set(whole)
+        self.ids = None if ids is None else list(ids)
+        if self.ids is not None and len(self.ids) != len(self.lines):
+            raise ValueError('a mount id for each mount line')
         self.fstab = None if fstab is None else {os.path.normpath(p) for p in fstab}
         self.options = {point: frozenset(opts) for point, opts in (options or {}).items()}
 
@@ -266,9 +271,15 @@ class Mounts:
         return None if best is None else self.options[best]
 
     def holding(self, path):
-        """The mount line (mount point, device, root) that `path` (a real path, no links in it) is on: the one of
-        the deepest mount point that is `path` or holds it; of several on one point the last, which hides the
-        others. None when no line holds it."""
+        """The mount line (mount point, device, root) that `path` (a real path, no links in it) is on, or None when
+        no line holds it. With mount ids, the way the kernel finds it: from the mount on `/`, into the mount that
+        sits on the first mount point on the way to `path` (a mount on the same point sits on the one it hides),
+        and on from there. So a mount placed beneath another or moved onto a point is read where it really is, and
+        a mount on a point that a later mount above it hides is not used. When the ids do not give one answer (two
+        mounts on one point on the same mount, or none on `/`), None: not knowing is not knowing. Without ids, the
+        deepest mount point that is `path` or holds it, and of several on one point the last listed."""
+        if self.ids is not None:
+            return self._holding_by_ids(path)
         best = None
         for line in self.lines:
             point = line[0]
@@ -276,6 +287,47 @@ class Mounts:
                 if best is None or len(point) >= len(best[0]):
                     best = line
         return best
+
+    def _holding_by_ids(self, path):
+        def holds(point):
+            return point == '/' or path == point or path.startswith(point + '/')
+        top, under, reached = self._tree()
+        # A line on the way to `path` that is not reached from the mount on `/` (its parent is not in the list, a
+        # loop of parent ids, one id twice): the list does not say where it sits, so what holds `path` is not known.
+        if top is None or any(holds(line[0]) and i not in reached for i, line in enumerate(self.lines)):
+            return None
+        current, passed = top, {top}
+        while True:
+            on = [i for i in under.get(self.ids[current][0], ()) if i not in passed and holds(self.lines[i][0])]
+            if not on:
+                return self.lines[current]
+            nearest = min(len(self.lines[i][0]) for i in on)
+            on = [i for i in on if len(self.lines[i][0]) == nearest]
+            if len(on) != 1:
+                return None                     # two mounts on one point sit on the same mount
+            current = on[0]
+            passed.add(current)
+
+    def _tree(self):
+        """(index of the mount on `/`, {parent id: indexes of the mounts on it}, indexes reached from the mount on
+        `/`); the first is None when there is not exactly one, or an id is listed twice. The mount on `/` is the
+        line on `/` whose parent is not in the list (or is itself)."""
+        if getattr(self, '_tree_cache', None) is None:
+            index = {mid: i for i, (mid, _) in enumerate(self.ids)}
+            under = {}
+            for i, (_, parent) in enumerate(self.ids):
+                under.setdefault(parent, []).append(i)
+            tops = [i for i, line in enumerate(self.lines)
+                    if line[0] == '/' and (self.ids[i][1] not in index or self.ids[i][1] == self.ids[i][0])]
+            top = tops[0] if len(tops) == 1 and len(index) == len(self.ids) else None
+            reached, stack = set(), [] if top is None else [top]
+            while stack:
+                i = stack.pop()
+                if i not in reached:
+                    reached.add(i)
+                    stack.extend(under.get(self.ids[i][0], ()))
+            self._tree_cache = (top, under, reached)
+        return self._tree_cache
 
     def shown_at(self, device, folder):
         """Every place in this mount namespace that shows the folder `folder` of the filesystem `device`: through a
@@ -316,10 +368,10 @@ class Mounts:
         return inside[0] if inside else None
 
 
-def _mount_lines(path, options=None, whole=None):
+def _mount_lines(path, options=None, whole=None, ids=None):
     """[(mount point, device, root)] of one mountinfo file; `options`, a dict, gets {mount point: its per-mount
-    options}; `whole`, a set, gets (device, root) of each mount that shows a whole btrfs subvolume. Raises
-    Unreadable when it cannot be read or a line is strange."""
+    options}; `whole`, a set, gets (device, root) of each mount that shows a whole btrfs subvolume; `ids`, a list,
+    gets (mount id, parent mount id) of each line. Raises Unreadable when it cannot be read or a line is strange."""
     try:
         with open(path, errors='surrogateescape') as f:
             lines = f.read().splitlines()
@@ -330,8 +382,12 @@ def _mount_lines(path, options=None, whole=None):
         fields = line.split(' ')
         if len(fields) < 10 or '-' not in fields[6:] or not re.match(r'^\d+:\d+$', fields[2]):
             raise Unreadable(f'{path}: a line it cannot use: {line[:80]!r}')
+        if not (fields[0].isdigit() and fields[1].isdigit()):
+            raise Unreadable(f'{path}: a line without its mount ids: {line[:80]!r}')
         point, root = os.path.normpath(_unescape(fields[4])), os.path.normpath(_unescape(fields[3]))
         out.append((point, fields[2], root))
+        if ids is not None:
+            ids.append((int(fields[0]), int(fields[1])))
         if options is not None:
             options[point] = fields[5].split(',')      # a later mount on the same point hides the earlier one
         rest = fields[fields.index('-', 6) + 1:]
@@ -366,8 +422,8 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc', fstab='/etc/fstab'):
     number, so only this list shows it. Also the bind mount sources of every other mount namespace the cleaner can
     read (its own user's processes): a folder a container or a sandbox shows. Raises Unreadable when its own list
     cannot be read or does not even hold /; another process's list that cannot be read is not seen."""
-    options, whole = {}, set()
-    lines = _mount_lines(path, options, whole)
+    options, whole, ids = {}, set(), []
+    lines = _mount_lines(path, options, whole, ids)
     points = {point for point, _, _ in lines}
     if '/' not in points:
         raise Unreadable(f'{path} does not name /')
@@ -390,7 +446,7 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc', fstab='/etc/fstab'):
         except Unreadable:
             continue
         sources.update((device, root) for _, device, root in other if root != '/')
-    return Mounts(points, lines, sources, options, read_fstab(fstab), whole)
+    return Mounts(points, lines, sources, options, read_fstab(fstab), whole, ids)
 
 
 # --- systemd units ------------------------------------------------------------------------------------------------

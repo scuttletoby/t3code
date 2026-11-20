@@ -1140,6 +1140,33 @@ class Gaps(Case):
         self.assertNotEqual(self.ino(a), self.ino(b), lines)
         self.assertEqual(self.read(b), body())
 
+    def test_a_marker_made_in_a_subfolder_at_the_last_check_stops_the_link(self):
+        """#620: the last check reads every folder from the configured folder down to the file's folder: a KEEP file
+        or a `.git` made between the plan and the link in `sub/mid`, with both files in `sub/mid/deeper`, leaves
+        both. Once it is gone, the next run links."""
+        for marker in ('KEEP', '.git'):
+            with self.subTest(marker=marker):
+                a = self.put(f'sub{marker}', 'mid', 'deeper', 'a.bin', days=50)
+                b = self.put(f'sub{marker}', 'mid', 'deeper', 'b.bin')
+                self.settle()
+                cfg = self.dd_cfg(folders=[{'path': os.path.join(self.dd, f'sub{marker}'), 'days': 30}])
+                at, real = os.path.join(self.dd, f'sub{marker}', 'mid', marker), self.c.dedupe.recheck
+
+                def recheck(cfg, facts, item):
+                    if not os.path.lexists(at):
+                        open(at, 'w').close()
+                        self.old(at, os.path.dirname(at))
+                    return real(cfg, facts, item)
+                with mock.patch.object(self.c.dedupe, 'recheck', recheck):
+                    code, lines = self.run_cleaner(cfg)
+                self.assertNotEqual(self.ino(a), self.ino(b), lines)
+                self.assertEqual((self.read(a), self.read(b)), (body(), body()))
+                self.assertTrue(any('KEEP file' in line or 'git folder' in line for line in lines), lines)
+                os.remove(at)
+                self.old(os.path.dirname(at))
+                code, lines = self.run_cleaner(cfg)
+                self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
+
     def test_a_keep_folder_above_keeps_it_as_one_below_does(self):
         """#604: a folder named KEEP counts the same above a configured folder and in it."""
         os.makedirs(os.path.join(self.dd, 'KEEP'))
@@ -1328,6 +1355,9 @@ MUTATIONS = {
     'the folders above, with the mount list': ('dedupe', 'refusal = guard.above_refusal(path, mounts)',
                                                "refusal = guard.above_refusal(path, type(mounts)(lines=[('/', '0:0', '/')]))",
                                                Gaps, 'test_a_git_folder_above_a_bind_mount_on_its_own_filesystem'),
+    'the last check reads down to the file': ('dedupe', "        refusal = _folder_refusal(cfg, facts, folder, here, hst, names)\n        if refusal is not None:\n            return refusal\n    try:\n        fst = os.lstat(path)",
+                                              "        refusal = _folder_refusal(cfg, facts, folder, here, hst, names) if part is None else None\n        if refusal is not None:\n            return refusal\n    try:\n        fst = os.lstat(path)",
+                                              Gaps, 'test_a_marker_made_in_a_subfolder_at_the_last_check_stops_the_link'),
     'the folders again after the comparison': ('dedupe', '                got = _recheck_path(cfg, facts, fdir.path, fpath)\n',
                                                '                got = None\n', Gaps, 'test_a_marker_made_while_the_bytes_are_compared_stops_the_link'),
     'mail boxes and partial downloads': ('dedupe', "'*.swap', 'mbox', '*.mbox', '*.part', '*.crdownload', '*.partial', '*.!qb')", "'*.swap')",

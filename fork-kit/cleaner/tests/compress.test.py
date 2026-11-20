@@ -1062,6 +1062,125 @@ class Above(Case):
         self.assertEqual((code, sorted(os.listdir(cold))), (0, ['linked.jsonl.zst', 'old.jsonl.zst']), lines)
         self.assertEqual(self.unpack(path + '.zst'), text())
 
+    def test_the_cold_folder_itself_a_bind_mount_point(self):
+        """#620: the cold folder is itself the mount point of a view of the folder /data of a disk (no folder
+        between it and the mount): the folder above /data is read as for a view higher up. A `.git` there keeps it,
+        as does a list with no view of it; with nothing there it compresses; a second run and a run after the
+        marker is gone behave the same."""
+        top = self.mkdir('point')
+        fs, cold = self.mkdir('point', 'fs'), self.mkdir('point', 'cold')
+        path = self.file(os.path.join(cold, 'old.jsonl'), text(), 40)
+        cfg = self.cfg(compressCold={'folders': [{'path': cold, 'days': 30}], 'keepFreeGB': 1})
+        self.mount_lines += [(cold, '8:9', '/data')]
+        self.assertKept(self.plan(cfg), cold, 'could not read', f'{cold} shows the folder /data of its filesystem')
+        self.mount_lines.insert(1, (fs, '8:9', '/'))
+        os.mkdir(os.path.join(fs, '.git'))
+        for _ in range(2):
+            self.assertKept(self.plan(cfg), cold, 'git folder', f'{fs}, above {cold}')
+            self.assertUntouched(cfg, path)
+        os.rmdir(os.path.join(fs, '.git'))
+        self.age(path, 40)
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, sorted(os.listdir(cold))), (0, ['old.jsonl.zst']), lines)
+        self.assertTrue(os.path.isdir(top))
+
+    def test_a_place_the_mount_list_shows_that_is_not_a_folder_now_keeps_it(self):
+        """#620: the mount list names a place that shows the folder above, but that place is not a folder now: it
+        was unmounted after the list was read (gone, or a link to a clean folder put there), or another mount covers
+        it (a list without mount ids cannot tell). Its markers cannot be read there: kept. Once the place shows the
+        folder again, the next run compresses."""
+        fs, cold, path, cfg = self.view('gone')
+        os.rmdir(fs)
+        self.assertKept(self.plan(cfg), cold, 'could not read', f'{fs}: No such file or directory')
+        self.assertUntouched(cfg, path)
+        clean = self.mkdir('gone', 'clean')
+        os.symlink(clean, fs)
+        self.assertKept(self.plan(cfg), cold, 'could not read', f'{fs} is a link or not a folder now')
+        self.assertUntouched(cfg, path)
+        os.remove(fs)
+        self.file(fs, 'a file where the folder was\n')
+        self.assertKept(self.plan(cfg), cold, 'could not read', f'{fs} is a link or not a folder now')
+        self.assertUntouched(cfg, path)
+        os.remove(fs)
+        os.mkdir(fs)
+        self.age(path, 40)
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual((code, sorted(os.listdir(cold))), (0, ['old.jsonl.zst']), lines)
+        # Covered: the only view of the whole disk is at x/fs, and later a mount goes over x. The list still names
+        # x/fs, but x/fs on disk is now a path in the mount over it, here not there.
+        x = self.mkdir('covered', 'x')
+        view = self.mkdir('covered', 'view')
+        self.mount_lines += [(os.path.join(x, 'fs'), '8:40', '/'), (view, '8:40', '/data'), (x, '8:41', '/')]
+        cold = self.mkdir('covered', 'view', 'cold')
+        path = self.file(os.path.join(cold, 'old.jsonl'), text(), 40)
+        cfg = self.cfg(compressCold={'folders': [{'path': cold, 'days': 30}], 'keepFreeGB': 1})
+        self.assertKept(self.plan(cfg), cold, 'could not read', f'{x}/fs: No such file or directory')
+        self.assertUntouched(cfg, path)
+
+    def test_a_nested_btrfs_subvolume_needs_its_folders_above(self):
+        """#620: only a subvolume directly in the btrfs top folder (`/@data`: one part) needs no view of the folder
+        above. A subvolume deeper down, mounted whole (`/projects/repo/data`, `/@/home`), has ordinary folders above
+        it that can hold a work tree: with no view of them it is kept; with a view they are read like any other."""
+        for n, root in enumerate(('/projects/repo/data', '/@/home')):
+            with self.subTest(root=root):
+                device = f'8:{50 + n}'
+                _, cold, path, cfg = self.view(f'nested{n}', root=root, whole=True, fs=False, device=device)
+                self.assertKept(self.plan(cfg), cold, 'could not read',
+                                f'no mount here shows the folder above it ({os.path.dirname(root)})')
+                self.assertUntouched(cfg, path)
+                fs = self.mkdir(f'nested{n}', 'fs')
+                above = self.mkdir(f'nested{n}', 'fs', *os.path.dirname(root).split('/')[1:])
+                self.mount_lines.append((fs, device, '/'))
+                os.mkdir(os.path.join(above, '.git'))
+                self.assertKept(self.plan(cfg), cold, 'git folder', f'{above}, above {cold}')
+                self.assertUntouched(cfg, path)
+                os.rmdir(os.path.join(above, '.git'))
+                self.age(path, 40)
+                code, lines = self.run_cleaner(cfg)
+                self.assertEqual((code, sorted(os.listdir(cold))), (0, ['old.jsonl.zst']), lines)
+
+    def test_a_marker_made_in_a_subfolder_at_the_last_check_stops_it(self):
+        """#620: the last check reads every folder from the cold folder down to the file's folder: a KEEP file or a
+        `.git` made between the plan and the run in `cold/sub`, with the file in `cold/sub/deeper`, stops it."""
+        for marker in ('KEEP', '.git'):
+            with self.subTest(marker=marker):
+                cold = self.mkdir(f'sub{marker}', 'cold')
+                path = self.file(os.path.join(cold, 'sub', 'deeper', 'old.jsonl'), text(), 40)
+                cfg = self.cfg(compressCold={'folders': [{'path': cold, 'days': 30}], 'keepFreeGB': 1})
+                at, real = os.path.join(cold, 'sub', marker), self.c.compress.recheck
+
+                def recheck(cfg, facts, item):
+                    if not os.path.lexists(at):
+                        self.file(at, 'made late\n')
+                    return real(cfg, facts, item)
+                with mock.patch.object(self.c.compress, 'recheck', recheck):
+                    code, lines = self.assertUntouched(cfg, path)
+                self.assertTrue(any(('KEEP file' in line or 'git folder' in line) and path in line for line in lines), lines)
+                os.remove(at)
+                self.age(path, 40)
+                code, lines = self.run_cleaner(cfg)
+                self.assertEqual((code, os.path.exists(path + '.zst')), (0, True), lines)
+
+    def test_a_view_under_a_mount_placed_beneath_is_not_used(self):
+        """#620: with mount ids the mount on top of a point is the one no other mount on that point sits on, not
+        the one listed last. Here the whole-disk view at `fs` is listed before another mount on `fs` but sits on it:
+        that one was placed beneath it (`move_mount` beneath) or the view was moved onto `fs` later. The view is on
+        top, so the KEEP file in it counts. When the ids say the later mount is on top, it hides the view."""
+        fs, cold, path, cfg = self.view('beneath')
+        self.file(os.path.join(fs, 'KEEP'), 'the whole disk\n')
+        # ids: / 1; the view of the whole disk at fs 10, sitting on 30; the cold folder's view 11; the other mount 30.
+        self.mount_lines.append((fs, '8:10', '/'))
+        self.mount_ids = [(1, 0), (10, 30), (11, 1), (30, 1)]
+        for _ in range(2):
+            self.assertKept(self.plan(cfg), cold, 'KEEP file', f'the whole disk ({fs}, above {cold})')
+            self.assertUntouched(cfg, path)
+        self.mount_ids = [(1, 0), (10, 1), (11, 1), (30, 10)]
+        self.assertKept(self.plan(cfg), cold, 'could not read', 'no mount here shows the folder above it (/)')
+        self.assertUntouched(cfg, path)
+        self.mount_ids = [(1, 0), (10, 30), (11, 1), (30, 10)]          # a loop: what holds fs is not known
+        self.assertKept(self.plan(cfg), cold, 'could not read', 'no mount here shows the folder above it (/)')
+        self.assertUntouched(cfg, path)
+
     def test_the_tests_make_their_folders_where_no_marker_is_above(self):
         """#604: a $TMPDIR inside a git checkout or under a KEEP file would make every test that expects a file
         compressed fail: the fixture takes the first temp folder with none above it."""
@@ -1243,11 +1362,24 @@ MUTATIONS = {
                                                     'refusal = _in_use(', Above, 'test_a_marker_made_while_the_copy_is_written_keeps_the_original'),
     'the folders above on its own filesystem': ('guard', 'stack.extend((place, True) for place in reversed(places))', 'pass',
                                                 Above, 'test_a_marker_above_a_bind_mount_on_its_own_filesystem_keeps_it'),
-    'no view of the folder above keeps it': ('guard', 'if not places and (device, root) not in mounts.whole:', 'if False:',
+    'no view of the folder above keeps it': ('guard', "if not places and not ((device, root) in mounts.whole and up == '/'):", 'if False:',
                                              Above, 'test_a_bind_mount_whose_folder_above_no_mount_shows_keeps_it'),
-    'a whole btrfs subvolume needs no view': ('guard', 'if not places and (device, root) not in mounts.whole:', 'if not places:',
+    'a whole btrfs subvolume needs no view': ('guard', "if not places and not ((device, root) in mounts.whole and up == '/'):", 'if not places:',
                                               Above, 'test_a_whole_btrfs_subvolume_needs_no_view_above'),
     'a view must not be hidden': ('facts', 'if self.holding(place) == line:', 'if True:', Above, 'test_a_view_another_mount_hides_is_not_used'),
+    'only a top btrfs subvolume needs no view': ('guard', "if not places and not ((device, root) in mounts.whole and up == '/'):",
+                                                 'if not places and (device, root) not in mounts.whole:',
+                                                 Above, 'test_a_nested_btrfs_subvolume_needs_its_folders_above'),
+    'a place shown must be a folder now': ('guard', 'hst = os.lstat(here)\n                if not stat.S_ISDIR(hst.st_mode):',
+                                           "hst = os.lstat('/')\n                if not stat.S_ISDIR(hst.st_mode):",
+                                           Above, 'test_a_place_the_mount_list_shows_that_is_not_a_folder_now_keeps_it'),
+    'the cold folder itself a mount point': ('guard', "if here == point and root != '/':", "if here == point and root != '/' and look:",
+                                             Above, 'test_the_cold_folder_itself_a_bind_mount_point'),
+    'the last check reads down to the file': ('compress', "    for part in [None] + ([] if rel == '.' else rel.split('/')):\n        if part is not None:\n            here = os.path.join(here, part)\n        try:\n            hst = os.lstat(here) if part is not None else hst\n            names = set(os.listdir(here)) if stat.S_ISDIR(hst.st_mode) and not stat.S_ISLNK(hst.st_mode) else set()\n        except OSError as ex:\n            return Refusal('could not read', f'{here}: {ex.strerror}')\n        refusal = _folder_refusal(cfg, facts, folder, here, hst, names)\n        if refusal is not None:\n            return refusal\n    return folder, names",
+                                              "    for part in [None] + ([] if rel == '.' else rel.split('/')):\n        if part is not None:\n            here = os.path.join(here, part)\n        try:\n            hst = os.lstat(here) if part is not None else hst\n            names = set(os.listdir(here)) if stat.S_ISDIR(hst.st_mode) and not stat.S_ISLNK(hst.st_mode) else set()\n        except OSError as ex:\n            return Refusal('could not read', f'{here}: {ex.strerror}')\n        refusal = _folder_refusal(cfg, facts, folder, here, hst, names) if part is None else None\n        if refusal is not None:\n            return refusal\n    return folder, names",
+                                              Above, 'test_a_marker_made_in_a_subfolder_at_the_last_check_stops_it'),
+    'the top mount by mount ids': ('facts', 'if self.ids is not None:\n            return self._holding_by_ids(path)', 'if False:\n            pass',
+                                   Above, 'test_a_view_under_a_mount_placed_beneath_is_not_used'),
     'views through a chain of mounts': ('guard', "if here == point and root != '/':", "if here == point and root != '/' and path.startswith(here + '/'):",
                                         Above, 'test_views_are_followed_through_a_chain_of_mounts'),
     'no mount line holds it': ('guard', "        if line is None:\n            return Refusal('could not read', f'no mount in the mount list holds {here}')\n",

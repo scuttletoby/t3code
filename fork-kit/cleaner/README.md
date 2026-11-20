@@ -537,8 +537,15 @@ rule is on), or a folder in or above another of its folders.
 filesystem (a bind mount, a btrfs subvolume) has folders above it there that the path up to `/` does not pass: a
 `.git` in one of them still makes it part of a work tree. Those folders are read where another mount of the same
 filesystem shows them (`/proc/self/mountinfo`), and so on up to that filesystem's top. When no mount here shows
-them, the folder is kept ("could not read"), except above a whole btrfs subvolume (its mount's root is its
-`subvol=`): the btrfs top folder holds the subvolumes, not files, so btrfs systems with `/@` on `/` still work.
+them, the folder is kept ("could not read"). One exception: a whole btrfs subvolume (its mount's root is its
+`subvol=`) that sits directly in the btrfs top folder, one level down (`/@`, `/@home`), needs no view of the top
+folder, which holds the subvolumes, not files; so btrfs systems with `/@` on `/` still work. A subvolume deeper
+down (`/@/home`, or `/projects/repo/data` made inside a work tree) has ordinary folders above it: they are read
+like any other, and when no mount shows them, it is kept. A place the mount list names must still be a folder (not
+a link) when it is read; when it is gone or is something else (the list is older than an unmount), it is kept.
+Which of several mounts on one point is on top comes from the mount ids in that list (the one no other mount on
+that point sits on), not from the order of the lines, so a mount placed beneath another or moved onto a point is
+read where it is; a mount that another mount higher up covers is not used.
 
 **The plan** says `would compress <file> (<size>, compress-cold: not changed or read for N days ...)` for each file,
 and per folder group how much it would free: one zstd run over the start of every file (64 KB each, 16 MB in all)
@@ -938,6 +945,12 @@ The installer writes no machine file: the `cleaner` section is the owner's, writ
 - Drives are known from `/proc/self/mountinfo` and `/etc/fstab` only: a drive that a systemd `.mount` or
   automount unit, `autofs` or a desktop mounts elsewhere than `/mnt`, `/media` or `/run/media`, when it is not
   mounted now, cannot be seen, and a worktree whose repository was on it can count as orphaned in the temp folder.
+- Overlay mounts (`overlayfs`, a container's root) and FUSE mounts that show another folder (`bindfs`) list `/`
+  as their root, so the check above reads only the folders on the path the cleaner sees, up to `/`. The folders
+  behind them (an overlay's `upperdir` and `lowerdir`, a `bindfs` source) and the folders above those are not
+  read, and the folder is **not** kept for that: a `.git` or `KEEP` above an `upperdir` or a `bindfs` source is
+  missed, and the files are compressed or linked. Do not name a folder reached through such a mount as a cold or
+  dedupe folder when what is behind it may sit in a work tree, or put a `KEEP` file in it.
 - A git folder kept somewhere else than in the work tree (`git --git-dir`, `GIT_DIR`, `core.worktree`, a bare
   dotfiles repository such as `~/.dotfiles` with the home as its work tree) leaves no `.git` in or above the work
   tree, so compress-cold and dedupe cannot see that git tracks the files there. Do not name such a work tree as a
