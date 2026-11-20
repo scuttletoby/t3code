@@ -47,7 +47,7 @@ import errno, fcntl, hashlib, json, os, re, secrets, signal, stat, struct, tempf
 from . import guard
 from .compress import CHUNK, FS_IOC_GETFLAGS, READ, _days, _in_use, _same, _stuck, human, xattrs
 from .facts import Unreadable, Untouched
-from .guard import CREDENTIAL_NAMES, KEEP_FILE, LOCK_NAMES, Refusal, matches
+from .guard import CREDENTIAL_NAMES, LOCK_NAMES, Refusal, matches
 
 RULE = 'dedupe'
 DAY = 86400
@@ -251,7 +251,7 @@ def _start(cfg, facts, folder):
     bound = mounts.bound(path, st.st_dev)
     if bound is not None:
         return None, Refusal('in use', f'a bind mount shows {bound} of its filesystem somewhere else (a container or a sandbox)')
-    refusal = guard.above_refusal(path)
+    refusal = guard.above_refusal(path, mounts)
     if refusal is not None:
         return None, refusal
     folder.dev = st.st_dev
@@ -283,9 +283,13 @@ def _folder_refusal(cfg, facts, folder, here, st, names):
         return Refusal('could not read', f'the mount list ({ex})')
     if here != folder.path and here in points:
         return Refusal('another filesystem', f'{here} is a mount point')
-    if KEEP_FILE in names:
-        return Refusal('KEEP file', f'{guard._keep_reason(os.path.join(here, KEEP_FILE))} ({here})')
-    if '.git' in names or {'HEAD', 'objects', 'refs'} <= set(names):
+    try:
+        found = guard.marker(here)
+    except OSError as ex:
+        return Refusal('could not read', f'{here}: {ex.strerror}')
+    if found is not None and found[0] == 'KEEP file':
+        return Refusal('KEEP file', f'{found[1]} ({here})')
+    if found is not None:
         return Refusal('git folder', f'{here}: git needs its files as they are')
     return _stuck(here)
 
@@ -801,7 +805,12 @@ def link(item):
         try:
             _compare(parent, name, kparent, kname, item)
             # Closed before the last look at the process list: the cleaner's own descriptors would count as uses.
+            # The folders of every name again too: a KEEP file or a git folder made while the bytes were compared.
             facts.forget()
+            for fpath, fdir in [(path, item.folder)] + sorted(knames.items()):
+                got = _recheck_path(cfg, facts, fdir.path, fpath)
+                if isinstance(got, Refusal):
+                    raise Untouched(f'{fpath}: {got.code}: {got.detail}: nothing changed')
             st = _stat_at(parent, name)
             if st is None:
                 raise Untouched(f'{path} is gone: nothing changed')
