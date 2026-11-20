@@ -351,8 +351,12 @@ function declarations(text, file = "") {
     const said = `${file}: "fork-ci:${match[1]}"`;
     if (words[0] === "may" || words[0] === "skips") {
       const ok = words.length === 3 && words[1] === "skip" && TEST_NAME.test(words[2]);
-      if (!ok) out.problems.push(`${said}: expected ${SKIP_FORM} (one test: Class.test_method, or an ok-lines name)`);
-      else if (out.skips.includes(words[2])) out.problems.push(`${said}: ${words[2]} is named twice`);
+      if (!ok)
+        out.problems.push(
+          `${said}: expected ${SKIP_FORM} (one test: Class.test_method, or an ok-lines name)`,
+        );
+      else if (out.skips.includes(words[2]))
+        out.problems.push(`${said}: ${words[2]} is named twice`);
       else out.skips.push(words[2]);
       continue;
     }
@@ -968,6 +972,7 @@ module.exports = {
   declarations,
   elsewhereAllowed,
   RUN_ELSEWHERE,
+  UNITTEST_SHIM,
   ownRuns,
   runKey,
   expectedKeys,

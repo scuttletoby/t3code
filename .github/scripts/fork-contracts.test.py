@@ -2137,6 +2137,33 @@ def check_script(run):
     return None if "\nCHECK\n" in body + "\n" or body.startswith("CHECK\n") else body + "\n"
 
 
+# The files the runner needs beside the tests (its list, itself, and the shim it runs each Python test through), so a
+# sparse checkout of a job that calls it must hold each (#664: a root job without the shim failed every Python test).
+RUNNER_FILES = [".github/fork-ci-tests.txt", RUNNER, ".github/scripts/fork-ci-unittest.py"]
+
+
+def checks_out(step, path):
+    """Whether a step's checkout (a non-cone sparse one: `/path`, `/dir/`, `/*`, `!...`) holds path; a step that is
+    no checkout of this repository, or checks out the whole tree, holds it."""
+    w = step.get("with") or {}
+    if "actions/checkout" not in str(step.get("uses", "")) or w.get("repository") or w.get("path"):
+        return True
+    lines = [line.strip() for line in str(w.get("sparse-checkout") or "").splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    def covers(pattern):
+        pattern = pattern.lstrip("/")
+        return pattern in ("*", "**") or pattern == path or (pattern.endswith("/") and path.startswith(pattern))
+    held = False
+    for line in lines:
+        if line.startswith("!"):
+            held = held and not covers(line[1:])
+        elif covers(line):
+            held = True
+    return held
+
+
 def record_problems(wf, record_jobs):
     """Why the jobs that call the runner do not each upload their records as pinned, or fork_ci_result does not check
     them all as pinned."""
@@ -2157,6 +2184,10 @@ def record_problems(wf, record_jobs):
                             f"pinned: {RECORD_UPLOAD}")
         elif uploads[0] < max(runner_steps):
             problems.append(f"fork-tests.yml/{j}: its records upload step comes before its last runner step")
+        missing = [f for f in RUNNER_FILES for st in job_steps if not checks_out(st, f)]
+        if missing:
+            problems.append(f"fork-tests.yml/{j}: calls the runner, but its checkout leaves out {sorted(set(missing))} "
+                            "(the runner's own files: its list, itself and fork-ci-unittest.py)")
     result = jobs.get("fork_ci_result") or {}
     steps = result.get("steps") or []
     downloads = [i for i, st in enumerate(steps) if st == RECORD_DOWNLOAD]
@@ -2257,6 +2288,11 @@ def upload_set(job, key, value):
 
 def without_step_uses(job, needle):
     return lambda jobs: jobs[job]["steps"].remove(upload_step(jobs, job))
+
+
+def sparse_edit(jobs, job, edit):
+    st = next(st for st in jobs[job]["steps"] if "actions/checkout" in str(st.get("uses", "")))
+    st["with"]["sparse-checkout"] = "\n".join(edit(st["with"]["sparse-checkout"].splitlines())) + "\n"
 
 
 def move_upload_before(jobs, job, needle):
@@ -2425,6 +2461,14 @@ QUIET_REFUSED = {
     "a records upload before the heavy test's own run": lambda jobs: move_upload_before(jobs, "kit_root_tests", HEAVY),
     "a second records upload in a job": lambda jobs: jobs["lint"]["steps"].append(copy.deepcopy(
         upload_step(jobs, "lint"))),
+    "the kit-as-root checkout without the unittest shim": lambda jobs: sparse_edit(
+        jobs, "kit_root_tests", lambda lines: [x for x in lines if "fork-ci-unittest" not in x]),
+    "the kit-as-root checkout without the runner": lambda jobs: sparse_edit(
+        jobs, "kit_root_tests", lambda lines: [x for x in lines if "fork-ci-tests.cjs" not in x]),
+    "a kit shard checkout that drops the scripts folder": lambda jobs: sparse_edit(
+        jobs, "kit_tests", lambda lines: lines + ["!/.github/scripts/"]),
+    "the lint checkout that drops the shim": lambda jobs: sparse_edit(
+        jobs, "lint", lambda lines: lines + ["!/.github/scripts/fork-ci-unittest.py"]),
     "a kit shard matrix with another key": lambda jobs: jobs["kit_tests"]["strategy"]["matrix"].__setitem__(
         "os", ["a", "b"]),
     "a fourth kit shard RECORD_JOBS does not know": lambda jobs: jobs["kit_tests"]["strategy"]["matrix"]["shard"]
@@ -2611,6 +2655,17 @@ RUN_ELSEWHERE = {".github/scripts/fork-secret-scan.test.sh": ".github/workflows/
 _ELSEWHERE = json.loads(subprocess.run(
     ["node", "-e", "const r = require(process.argv[1]); console.log(JSON.stringify(r.RUN_ELSEWHERE ?? null))",
      str(scripts_dir / "fork-ci-tests.cjs")], check=True, capture_output=True, text=True).stdout)
+_SHIM = json.loads(subprocess.run(
+    ["node", "-e", "const r = require(process.argv[1]); console.log(JSON.stringify(r.UNITTEST_SHIM ?? null))",
+     str(scripts_dir / "fork-ci-tests.cjs")], check=True, capture_output=True, text=True).stdout)
+check("records: the shim the runner runs Python tests through is the one each record job's checkout must hold",
+      _SHIM == RUNNER_FILES[2] and (root / RUNNER_FILES[2]).is_file(), json.dumps(_SHIM))
+check("records: checks_out reads sparse checkouts (a file, a folder, all, a negated path, none, another repository)",
+      [checks_out({"uses": "actions/checkout@x", "with": w}, ".github/scripts/fork-ci-unittest.py") for w in (
+          {"sparse-checkout": "/.github/scripts/fork-ci-unittest.py\n"}, {"sparse-checkout": "/.github/\n"},
+          {"sparse-checkout": "/*\n!/.repos/\n"}, {"sparse-checkout": "/*\n!/.github/scripts/\n"},
+          {"sparse-checkout": "/fork-kit/\n"}, {}, {"repository": "o/r", "sparse-checkout": "/x\n"})]
+      == [True, True, True, False, False, True, True])
 check("records: the fork tests another workflow runs are exactly the pinned one (RUN_ELSEWHERE)",
       _ELSEWHERE == RUN_ELSEWHERE, json.dumps(_ELSEWHERE))
 check("records: each fork test the list says another workflow runs is in RUN_ELSEWHERE, with that workflow",
