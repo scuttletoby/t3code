@@ -555,16 +555,20 @@ function findListedGone(config, { atBase, atHead }) {
 }
 
 /**
- * Upstream's files the head still has that a pull request's run would take for the fork's own (a
- * hole in that run). `upstreamFiles`: every path upstream has; `atHead`: a path's text in head.
+ * Upstream files in head that a pull request's run would take for the fork's own. Refused, except
+ * right after a rebase that writes a lowered list: there each goes to `lowered.hidden` and lowerList
+ * excludes it in "forkFiles", which only narrows what a pull request's run takes for the fork's own.
  */
-function findHiddenUpstreamFiles(upstreamFiles, isForkFile, atHead) {
-  return upstreamFiles
-    .filter((file) => isForkFile(file) && atHead(file) !== undefined)
-    .map(
-      (file) =>
-        `${file}: upstream has it, but a pull request's run takes it for a fork file (its name or "forkFiles"); exclude it with "!${file}".`,
-    );
+function findHiddenUpstreamFiles(upstreamFiles, isForkFile, atHead, lowered) {
+  const hidden = upstreamFiles.filter((file) => isForkFile(file) && atHead(file) !== undefined);
+  if (lowered !== undefined) {
+    for (const file of hidden) lowered.hidden.add(file);
+    return [];
+  }
+  return hidden.map(
+    (file) =>
+      `${file}: upstream has it, but a pull request's run takes it for a fork file (its name or "forkFiles"); exclude it with "!${file}".`,
+  );
 }
 
 /**
@@ -877,10 +881,10 @@ const MOVED_WHY =
   'Was "pending": fork-follow moved it here once it had no fork line left, as its "lost" entry still counts upstream lines it loses. No seam line: a fork line goes in a file of the fork\'s own.';
 
 /**
- * `text` with the counts in `lowered` ({ pending, lost }: Maps of file to count) lowered, as { text, changes },
- * or undefined when nothing changes. Only lowers; a count at 0 removes the entry. A "pending" file with no fork
- * line left that "lost" still names moves to "files" with no seam line (no fork line may come back, no line may
- * be lost). Two-space JSON, parsed again before it is returned, so a lowered list is never one the check refuses.
+ * `text` with `lowered` ({ pending, lost } Maps of counts, `hidden` Set of upstream files) applied, as
+ * { text, changes }, or undefined when nothing changes. Only lowers; a count at 0 removes the entry; a
+ * "pending" file with no fork line left moves to "files"; each hidden file stops being a fork file
+ * (its own "forkFiles" entry goes, or a `!` entry excludes it). Parsed again before it is returned.
  */
 function lowerList(text, lowered) {
   const raw = JSON.parse(text);
@@ -925,6 +929,21 @@ function lowerList(text, lowered) {
         changes.push(`${file}: "pending" ${ceiling} -> ${to}`);
         return [[file, to]];
       }),
+    );
+  }
+  for (const file of lowered.hidden ?? []) {
+    const patterns = raw.forkFiles ?? [];
+    const kept = patterns.filter((pattern) => pattern !== file);
+    const named = forkFileTest(kept)(file);
+    if (named) kept.push(`!${file}`);
+    raw.forkFiles = kept;
+    const what = !named
+      ? "entry removed"
+      : kept.length === patterns.length
+        ? `entry replaced by "!${file}"`
+        : `"!${file}" added`;
+    changes.push(
+      `${file}: "forkFiles" ${what} (upstream has it; a pull request's run took it for a fork file)`,
     );
   }
   // Appended through defineProperty: a file named `__proto__` stays an own key.
@@ -1038,7 +1057,9 @@ function main(argv) {
     }
   }
   const lowered =
-    parsed.loweredList === undefined ? undefined : { pending: new Map(), lost: new Map() };
+    parsed.loweredList === undefined
+      ? undefined
+      : { pending: new Map(), lost: new Map(), hidden: new Set() };
   const unlisted = findUnlistedChanges(config, {
     changed,
     atBase,
@@ -1087,6 +1108,7 @@ function main(argv) {
           git(["ls-tree", "-r", "-z", "--name-only", mergeBase]).split("\0").filter(Boolean),
           isForkFile,
           atHead,
+          lowered,
         )
       : []),
   ];
@@ -1127,7 +1149,18 @@ function main(argv) {
     if (listProblem !== undefined) return 1;
     if (lowered !== undefined) {
       // After a rebase only: fork-follow commits the lowered list into the rebased series.
-      const lower = lowerList(textAt(configRef, CONFIG), lowered);
+      const listText = textAt(configRef, CONFIG);
+      const lower = lowerList(listText, lowered);
+      const isStillFork = forkFileTest(parseConfig(lower?.text ?? listText).forkFiles);
+      const still = [...lowered.hidden].filter((file) => isStillFork(file));
+      if (still.length > 0) {
+        for (const file of still) {
+          console.error(
+            printable(`${file}: the lowered list still takes this upstream file for a fork file.`),
+          );
+        }
+        return 1;
+      }
       if (lower !== undefined) {
         fs.writeFileSync(parsed.loweredList, lower.text);
         for (const change of lower.changes) console.log(printable(`Lowered: ${change}`));
