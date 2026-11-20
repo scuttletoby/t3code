@@ -219,13 +219,21 @@ export interface GateInput<Target, R> {
   ) => Effect.Effect<InstancePace | undefined, never, R>;
   /**
    * The same task on another instance with room, or why it cannot run there. In `advise` it must
-   * change nothing (no folder scan), so advice only says what `enforce` would do.
+   * change nothing (no folder scan): `wouldScan` marks a refusal that `enforce` would check with a
+   * scan first, so the advice says what `enforce` would do.
    */
   readonly targetOn: (instanceId: ProviderInstanceId) => Effect.Effect<TargetOn<Target>, never, R>;
 }
 
-/** `cannot` finishes "<instance> has room, but …", e.g. "this project turned it off". */
-export type TargetOn<Target> = { readonly target: Target } | { readonly cannot: string };
+/**
+ * `cannot` finishes "<instance> has room, but …", e.g. "this project turned it off". `wouldScan`
+ * (advise only): the instance has no current scan of the folder, and `enforce` would run one first.
+ */
+export type TargetOn<Target> =
+  | { readonly target: Target }
+  | { readonly cannot: string; readonly wouldScan?: boolean };
+
+const HOLD = "hold this task";
 
 /**
  * The gate. `off` reads nothing. `advise` works out what `enforce` would do and only says it: its
@@ -259,6 +267,19 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
   let roomOn: ProviderInstanceId | undefined;
   // Accounts with room that cannot run this task, so the reply does not say none has room.
   const cannot: Array<string> = [];
+  // Advise only: accounts with room that `enforce` would scan the folder for before deciding.
+  const wouldScan: Array<ProviderInstanceId> = [];
+  /** "enforce would <then>", with the scan `enforce` would run first when advice ran none. */
+  const enforceWould = (then: string) => {
+    if (wouldScan.length === 0) return `"enforce" would ${then}.`;
+    const first = `"enforce" would first scan this folder for ${wouldScan.join(", ")}`;
+    if (input.pinned && then === HOLD) return `${first}, then ${HOLD} either way.`;
+    const one = wouldScan.length === 1;
+    const listed = input.pinned
+      ? HOLD
+      : `run this task on ${one ? wouldScan[0] : "the first that lists it"}`;
+    return `${first}: if ${one ? "it lists" : "one lists"} the model, it would ${listed}; if not, it would ${then}.`;
+  };
   if (current !== undefined) {
     const others = input.providers.filter(
       (provider) => provider.instanceId !== from && provider.driver === current.driver,
@@ -274,6 +295,7 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
       const on = yield* input.targetOn(candidate.instanceId);
       if ("cannot" in on) {
         cannot.push(`${candidate.instanceId} has room, but ${on.cannot}`);
+        if (advising && on.wouldScan === true) wouldScan.push(candidate.instanceId);
         continue;
       }
       const { target } = on;
@@ -282,7 +304,7 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
       return advising
         ? {
             action: "pass",
-            note: `${lead}: ${ahead}. ${roomOn} has room; "enforce" would run this task there.`,
+            note: `${lead}: ${ahead}. ${roomOn} has room; ${enforceWould(wouldScan.length === 0 ? "run this task there" : `run this task on ${roomOn}`)}`,
           }
         : {
             action: "switch",
@@ -308,7 +330,7 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
   if (step !== undefined && step.from === step.to) {
     return {
       action: "pass",
-      note: `${lead}: ${ahead} and ${noRoom}. The usagePacingLowerEffort setting lets ${step.optionId} ${step.from} run.`,
+      note: `${lead}: ${ahead} and ${noRoom}. The usagePacingLowerEffort setting lets ${step.optionId} ${step.from} run.${wouldScan.length === 0 ? "" : ` ${enforceWould("run it as asked")}`}`,
     };
   }
   if (step !== undefined) {
@@ -316,7 +338,7 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
     return advising
       ? {
           action: "pass",
-          note: `${lead}: ${ahead} and ${noRoom}. "enforce" would run this task at ${change}.`,
+          note: `${lead}: ${ahead} and ${noRoom}. ${enforceWould(`run this task at ${change}`)}`,
         }
       : {
           action: "lowerEffort",
@@ -340,7 +362,7 @@ export const decide = Effect.fn("UsagePacingGate.decide")(function* <Target, R>(
   return advising
     ? {
         action: "pass",
-        note: `${lead}: ${ahead}. ${elsewhere} "enforce" would hold this task. ${when}`,
+        note: `${lead}: ${ahead}. ${elsewhere} ${enforceWould(HOLD)} ${when}`,
       }
     : {
         action: "hold",

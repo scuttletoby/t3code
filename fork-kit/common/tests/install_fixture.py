@@ -111,8 +111,10 @@ class FakeHost(unittest.TestCase):
         return real is not None and os.path.isfile(real) and not os.path.islink(real)
 
     @contextlib.contextmanager
-    def no_hang(self, seconds=20):
-        """Fails the test (instead of hanging it) when the body waits longer than that, on a FIFO say."""
+    def no_hang(self, seconds=5):
+        """Fails the test (instead of hanging it) when the body waits longer than that, on a FIFO say. Each body
+        takes well under a second, so 5 s is a wide margin on a slow runner; a blocked open waits forever, so a
+        longer limit finds nothing more and only costs time (RedCheck's mutants that block wait it out each)."""
         def alarm(*_):
             raise AssertionError(f'still waiting after {seconds} s (it blocked)')
         old = signal.signal(signal.SIGALRM, alarm)

@@ -10,7 +10,8 @@ name: Fork tests
 # changes. The `workflows` job lints the fork workflows (actionlint) and fails
 # when upstream's ci.yml or release.yml test jobs change and this copy did not
 # follow (.github/scripts/fork-tests-drift.cjs). The fork's own script tests run
-# in three jobs side by side: `workflows`, `action_tests` and `kit_tests`.
+# side by side in `workflows`, `action_tests`, the `kit_tests` shards and
+# `kit_root_tests`.
 #
 # Require only `fork-ci-result` in a ruleset: it needs every other job, so jobs
 # can be added, split or resharded without touching the ruleset.
@@ -318,7 +319,8 @@ jobs:
       # docs/fork/: the fork's pages whose commands and links a test runs (fork-gate-trust-docs.test.py).
       # apps/, packages/: only the T3 source files the kits' contract tests pin
       # (fork-kit/golive/tests/contract.test.py; UsagePacingGate.ts: the effort option ids and
-      # model.ts: the ultracode mapping, in fork-kit/model-guard/tests/guard.test.py); keep the two lists in step.
+      # model.ts: the ultracode mapping, ModelManifest.ts and model-manifest.json: T3's model list and its
+      # cache, in fork-kit/model-guard/tests/guard.test.py); keep the lists in step.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -347,6 +349,8 @@ jobs:
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/persistence/Sqlite.ts
+            /apps/server/src/provider/ModelManifest.ts
+            /apps/server/src/provider/model-manifest.json
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
@@ -442,6 +446,8 @@ jobs:
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/persistence/Sqlite.ts
+            /apps/server/src/provider/ModelManifest.ts
+            /apps/server/src/provider/model-manifest.json
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
@@ -461,13 +467,21 @@ jobs:
           node .github/scripts/fork-ci-tests.cjs fork-ci/ .github/scripts/fork-fleet-walls
 
   # The host kits' tests (fork-kit/), split from `workflows` so the fork's script tests run
-  # side by side in three jobs: one job of all of them was the longest in the run.
+  # side by side: one job of all of them was the longest in the run. They are CPU-bound (every
+  # file at once on the runner's cores), so they are split again into shards of about equal
+  # weight (the ~Ns weights in .github/fork-ci-tests.txt; a weight far from a file's time fails
+  # the shard that ran it, so the split stays even). One job of them reached 8 to 9 minutes of
+  # its 10. More shards: add a number here; nothing else names them.
   kit_tests:
-    name: Fork kit tests
+    name: Fork kit tests ${{ matrix.shard }}
     if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       # The same files as in `workflows` (its comment says why each); the kits' tests read some.
       - name: Checkout
@@ -496,6 +510,8 @@ jobs:
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/persistence/Sqlite.ts
+            /apps/server/src/provider/ModelManifest.ts
+            /apps/server/src/provider/model-manifest.json
             /apps/server/src/serverOwnership.ts
             /apps/server/src/serverRuntimeState.ts
             /apps/server/src/serviceLauncher.ts
@@ -506,9 +522,30 @@ jobs:
             /packages/ssh/src/tunnel.ts
           sparse-checkout-cone-mode: false
 
-      # The tests under fork-kit, checked against .github/fork-ci-tests.txt as in `workflows`.
+      # This shard's share of the tests under fork-kit, checked against .github/fork-ci-tests.txt
+      # as in `workflows`.
       - name: Fork kit tests
+        env:
+          FORK_CI_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: node .github/scripts/fork-ci-tests.cjs fork-kit/
+
+  # The kits' tests that need root or a real systemd user manager, on their own runner: they
+  # change the machine (users, sudoers, linger), and beside the shards they add no time.
+  kit_root_tests:
+    name: Fork kit tests as root
+    if: ${{ (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Both tests read only their kits.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.changes.outputs.sha }}
+          sparse-checkout: |
+            /fork-kit/
+          sparse-checkout-cone-mode: false
 
       # The gh-apps host kit installed for real (fork-kit/gh-apps/README.md): real service
       # users, the real sudoers file and sudo, an agent user that tries to reach the keys,
@@ -1234,6 +1271,7 @@ jobs:
         workflows,
         action_tests,
         kit_tests,
+        kit_root_tests,
         secrets,
         lint,
         build,

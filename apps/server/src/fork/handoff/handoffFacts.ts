@@ -24,21 +24,28 @@ export type HandoffRecords = Pick<
   | "contextTransfers"
 >;
 
-/** A handoff message's id: `handoff:<thread>:<run>`, and `:retry1` for its one retry. */
+/**
+ * A handoff message's id: `handoff:<thread>:<run>`, then `:loud` when the run must alert (the
+ * relay may not have shown the person's finish, `handoffRelayView.ts`), and `:retry1` for its one
+ * retry.
+ */
 const HANDOFF_MESSAGE_PREFIX = "handoff:";
+export const HANDOFF_LOUD_SUFFIX = ":loud";
 export const HANDOFF_RETRY_SUFFIX = ":retry1";
 
-/** The source run a handoff message names, and whether it is the retry; null for any other id. */
+/** The source run a handoff message names, whether it alerts, and whether it is the retry; null for any other id. */
 export function parseHandoffMessageId(
   threadId: ThreadId,
   messageId: string,
-): { readonly runId: string; readonly retry: boolean } | null {
+): { readonly runId: string; readonly loud: boolean; readonly retry: boolean } | null {
   const prefix = `${HANDOFF_MESSAGE_PREFIX}${threadId}:`;
   if (!messageId.startsWith(prefix)) return null;
-  const rest = messageId.slice(prefix.length);
+  let rest = messageId.slice(prefix.length);
   const retry = rest.endsWith(HANDOFF_RETRY_SUFFIX);
-  const runId = retry ? rest.slice(0, -HANDOFF_RETRY_SUFFIX.length) : rest;
-  return runId === "" ? null : { runId, retry };
+  if (retry) rest = rest.slice(0, -HANDOFF_RETRY_SUFFIX.length);
+  const loud = rest.endsWith(HANDOFF_LOUD_SUFFIX);
+  const runId = loud ? rest.slice(0, -HANDOFF_LOUD_SUFFIX.length) : rest;
+  return runId === "" ? null : { runId, loud, retry };
 }
 
 /** The newest run that is part of the thread (a removed queued message leaves a cancelled one). */
@@ -155,7 +162,7 @@ export function handoffDispatchDropped(
   if (handoff.retry) {
     return (
       handoff.runId.endsWith(HANDOFF_RETRY_SUFFIX) ||
-      latest?.userMessageId !== `${HANDOFF_MESSAGE_PREFIX}${command.threadId}:${handoff.runId}` ||
+      latest?.userMessageId !== command.messageId.slice(0, -HANDOFF_RETRY_SUFFIX.length) ||
       latest.status !== "failed"
     );
   }

@@ -9,6 +9,7 @@ import * as ServerAutoUpdate from "../cloud/autoUpdate.ts";
 import type * as CloudLink from "../cloud/CloudLink.ts";
 import * as HoldWorkConnect from "../cloud/holdWorkConnect.ts";
 import type * as ServerConfig from "../config.ts";
+import type * as AgentAwarenessRelay from "../relay/AgentAwarenessRelay.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as HeadlessUsageRefresher from "../usage/HeadlessUsageRefresher.ts";
@@ -16,12 +17,20 @@ import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
+import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
+import * as HandoffQuiet from "./handoff/handoffQuiet.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
 
-/** Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. */
-export const holdWorkAgentActivity = HoldWorkConnect.agentActivityLayer;
+/**
+ * Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none, and a
+ * completed handoff run does not alert (fork/handoff/handoffQuiet.ts; only the relay's thread reads
+ * change, nothing else sees them).
+ */
+export const holdWorkAgentActivity = <E, R>(
+  relayLayer: Layer.Layer<AgentAwarenessRelay.AgentAwarenessRelay, E, R>,
+) => HoldWorkConnect.agentActivityLayer(relayLayer.pipe(Layer.provide(HandoffQuiet.layer)));
 
 /**
  * Upstream's Connect link with its reachability merged in, as server.ts had it, except that a held
@@ -36,7 +45,7 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
  * In the runtime's core dependencies (server.ts's `layerRuntimeCoreDependenciesBase`, not its local
  * `layerRuntimeServices`): usage pacer (and its history), slot gate, usage refresher, the handoff
  * service (fork/handoff), which upstream's own `mergeAll` builds concurrently beside its idle
- * compaction worker, and the run records follower (fork/runRecords).
+ * compaction worker, the run records follower (fork/runRecords) and the delegated result reminder.
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
@@ -44,6 +53,7 @@ export const layerRuntimeServices = Layer.mergeAll(
   HeadlessUsageRefresher.layer,
   HandoffService.layer,
   RunRecorder.layer,
+  DelegatedResultReminder.layer,
 );
 
 /**
