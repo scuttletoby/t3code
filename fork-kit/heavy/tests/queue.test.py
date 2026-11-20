@@ -9,7 +9,7 @@ reboot (empty folders), old-format or garbled tickets, two callers at the same i
 admission and clean-up rule in a copy of lib/heavy_queue.py and shows the test for that rule fails.
 """
 import contextlib, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, signal, subprocess, sys
-import tempfile, time, types, unittest
+import tempfile, threading, time, types, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUEUE = os.path.join(KIT, 'lib', 'heavy_queue.py')
@@ -133,6 +133,15 @@ sys.stdin.read()
 hq.release(q, t)
 '''
 
+# A real process that holds the queue lock (argv[1]) until its stdin closes; prints 'held' once it has it.
+HOLDER = r'''
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX)
+print('held', flush=True)
+sys.stdin.read()
+'''
+
 
 class QueueTests(unittest.TestCase):
     mod = None
@@ -170,8 +179,11 @@ class QueueTests(unittest.TestCase):
         return t
 
     def live(self):
-        with self.q:
-            return self.q.tickets()
+        """The live tickets, read under the queue lock. The lock wait runs on the real clock: a real caller process
+        holds the lock for real milliseconds, and self.q's fake clock would spend its whole lock wait in none."""
+        q = self.hq().Queue(self.host.box, self.cfg, out=self.lines.append)
+        with q:
+            return q.tickets()
 
     def decide(self, mb, keep=True, **cfg):
         q = self.queue(**cfg) if cfg else self.q
@@ -570,6 +582,33 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.live(), [])
         self.assertEqual(self.host.files(), [])
 
+    def test_a_look_waits_in_real_time_for_a_process_holding_the_lock(self):
+        """Fork #551: a real process holding the queue lock for a moment (a caller deciding) must not make the
+        test's own look give up. The holder takes the lock, then lets go 0.3 s later."""
+        p = self.lock_holder()
+        threading.Timer(0.3, p.stdin.close).start()
+        start = time.monotonic()
+        self.assertEqual(self.live(), [])
+        self.assertGreaterEqual(time.monotonic() - start, 0.2)  # it really waited for the holder
+        p.wait()
+
+    def test_a_lock_holder_killed_with_9_frees_the_lock_at_once(self):
+        """The state question for the lock itself: a process stopped half-way, killed while it holds the queue lock,
+        never keeps it (the kernel drops the flock with the process); the next look and a rerun take it at once."""
+        hq = self.hq()
+        p = self.lock_holder()
+        p.kill()
+        p.wait()
+        fd = os.open(os.path.join(self.host.box.queue_dir, 'lock'), os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # free: no wait at all
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.assertEqual(self.live(), [])
+        t = self.q.enter('gradle', 1000, 's.scope', 'x', 60)          # a rerun is admitted on its first look
+        self.assertEqual(t.state, 'admitted')
+        hq.release(self.q, t)
+        self.assertEqual(self.host.files(), [])
+
     def test_a_crashed_job_frees_its_reservation(self):
         p = self.caller('crash', 4000, wait=60)
         self.assertTrue(p.stdout.readline().startswith('admitted'))
@@ -661,6 +700,16 @@ class QueueTests(unittest.TestCase):
         p = subprocess.Popen([sys.executable, '-I', '-B', '-c', CALLER, json.dumps(args)], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, text=True)
         self.addCleanup(self.stop, p)
+        return p
+
+    def lock_holder(self):
+        """A real process holding the queue lock until its stdin closes; returns once it holds it."""
+        with self.q:
+            pass                                    # makes the folder and the lock file
+        p = subprocess.Popen([sys.executable, '-I', '-B', '-c', HOLDER, os.path.join(self.host.box.queue_dir, 'lock')],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop, p)
+        self.assertEqual(p.stdout.readline(), 'held\n')
         return p
 
     @staticmethod
