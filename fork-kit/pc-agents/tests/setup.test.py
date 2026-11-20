@@ -655,6 +655,7 @@ class RestartPending(Case):
         self.assertEqual(self.setup_run(SHA2)[0], 0)
         cli.put = real_put
         self.assertGreater(len(writes), 10)
+        whole = files()   # the upgrade run all the way: a rerun after any stop must leave the same files
         for stop in range(1, len(writes) + 1):
             self.restore(upgradable)
             before = files()
@@ -675,6 +676,7 @@ class RestartPending(Case):
             self.assertEqual(code, 0, f'stopped at write {stop}: {out}')
             code, out = self.check()
             self.assertEqual(code, 0, f'stopped at write {stop}: {out}')
+            self.assertEqual(files(), whole, f'stopped at write {stop} ({writes[stop - 1]})')
 
     def test_check_passes_on_its_own_restart_and_a_kill_while_watching_restarts_again(self):
         self.ready()
