@@ -263,7 +263,14 @@ describe("runSummaryCli", () => {
   it("ends the window after the --to day and takes --days", () => {
     const old = record("old", { endedAt: "2026-11-01T10:00:00.000Z" });
     const read = io({ "/home/someone/.t3/userdata/run-records/runs.jsonl": lines(old) });
-    assert.include(runSummaryCli(["--to", "2026-11-01", "--days", "1"], read), "1 recorded runs");
+    const oneDay = runSummaryCli(["--to", "2026-11-01", "--days", "1"], read);
+    assert.include(oneDay, "1 recorded runs");
+    // The header names the last day included, not the exclusive end.
+    assert.include(oneDay, "## Agent runs 2026-11-01 to 2026-11-01");
+    assert.include(
+      runSummaryCli(["--to", "2026-11-20"], read),
+      "## Agent runs 2026-11-14 to 2026-11-20",
+    );
     assert.include(runSummaryCli(["--to", "2026-10-31"], read), "0 recorded runs");
   });
 
@@ -313,11 +320,27 @@ describe("reading real files", () => {
     NodeFS.writeFileSync(file, `${lines(...many)}{"v":1,"runId":"torn","endedAt":"2026`);
     // Chunks far smaller than a line: every line and every multi-byte letter is split somewhere.
     const read = [...readFileLines(file, 7)!];
-    assert.strictEqual(read.length, 201);
-    assert.strictEqual(read[0], JSON.stringify(many[0]));
-    assert.strictEqual(read[199], JSON.stringify(many[199]));
-    assert.strictEqual(read[200], '{"v":1,"runId":"torn","endedAt":"2026');
+    // Every line, not a sample: a letter cut between two chunks lands in any of them.
+    assert.deepStrictEqual(read, [
+      ...many.map((entry) => JSON.stringify(entry)),
+      '{"v":1,"runId":"torn","endedAt":"2026',
+    ]);
     assert.strictEqual(readFileLines(NodePath.join(dir, "missing.jsonl")), null);
+  });
+
+  it("keeps a multi-byte letter whole at every place a chunk can cut it", () => {
+    const dir = tempDir();
+    const file = NodePath.join(dir, "runs.jsonl");
+    // 2-, 3- and 4-byte letters; chunk sizes 1 to 9 cut each of them at every byte.
+    const text = `ü€😀|${"ä✓🎉".repeat(5)}\nsecond ✓\n`;
+    NodeFS.writeFileSync(file, text);
+    for (let chunk = 1; chunk <= 9; chunk++) {
+      assert.deepStrictEqual(
+        [...readFileLines(file, chunk)!],
+        text.split("\n").slice(0, 2),
+        `${chunk}`,
+      );
+    }
   });
 
   it("skips a line too long to be a record and reads on", () => {
@@ -340,5 +363,45 @@ describe("reading real files", () => {
     NodeFS.rmSync(own);
     NodeFS.mkdirSync(own);
     assert.throws(() => runSummaryCli(["--state-dir", dir], real), /EISDIR/);
+  });
+
+  // Root reads any file, so the case cannot be set up there.
+  it.skipIf(process.getuid?.() === 0)(
+    "fails on a records file it has no permission to read, never prints 0 runs",
+    () => {
+      const dir = tempDir();
+      NodeFS.mkdirSync(NodePath.join(dir, "run-records"));
+      const own = NodePath.join(dir, "run-records", "runs.jsonl");
+      NodeFS.writeFileSync(own, lines(record("here")));
+      NodeFS.chmodSync(own, 0o000);
+      const real = { ...nodeSummaryIo(), nowMs: NOW_MS };
+      try {
+        assert.throws(() => runSummaryCli(["--state-dir", dir], real), /EACCES/);
+        // A file named on the command line too.
+        assert.throws(() => runSummaryCli(["--state-dir", tempDir(), own], real), /EACCES/);
+      } finally {
+        NodeFS.chmodSync(own, 0o600);
+      }
+    },
+  );
+
+  it("reads old record lines (no estimateRefused) beside new ones, and a run ended twice once", () => {
+    const dir = tempDir();
+    NodeFS.mkdirSync(NodePath.join(dir, "run-records"));
+    const old = record("old");
+    assert.notProperty(old, "estimateRefused");
+    const refused = record("refused", { estimateRefused: `${"x".repeat(80)}…` });
+    // The refused run ended again (a replay): the second line is the same run.
+    NodeFS.writeFileSync(
+      NodePath.join(dir, "run-records", "runs.jsonl"),
+      lines(old, refused, refused),
+    );
+    const output = runSummaryCli(["--state-dir", dir, "--json"], {
+      ...nodeSummaryIo(),
+      nowMs: NOW_MS,
+    });
+    const summary = JSON.parse(output) as { runs: number; refusedEstimates: number };
+    assert.strictEqual(summary.runs, 2);
+    assert.strictEqual(summary.refusedEstimates, 1);
   });
 });

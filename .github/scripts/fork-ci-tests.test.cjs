@@ -9,7 +9,10 @@ const {
   plan,
   readList,
   order,
+  shard,
+  readShard,
   inPart,
+  runSpeed,
   weightNote,
   findTests,
   presentTests,
@@ -113,6 +116,80 @@ test("the heaviest tests start first, tests without a weight before them, ties i
   assert.deepEqual(order(["d.test.sh", "a.test.sh"], entries), ["a.test.sh", "d.test.sh"]);
 });
 
+test("shards split the files by weight, heaviest first onto the lightest shard, each file in exactly one", () => {
+  const entries = readList(
+    "a.test.sh ~100s\nb.test.sh ~60s\nc.test.sh ~50s\nd.test.sh ~40s\ne.test.sh\nf.test.sh ~5s\n",
+  );
+  const files = entries.map((entry) => entry.file);
+  const shards = [1, 2, 3].map((index) => shard(files, entries, index, 3));
+  // a 100 | b 60 | c 50, then d 40 onto c (90), e (no weight: counts 10) onto b (70), f 5 onto b (75).
+  assert.deepEqual(shards, [
+    ["a.test.sh"],
+    ["b.test.sh", "e.test.sh", "f.test.sh"],
+    ["c.test.sh", "d.test.sh"],
+  ]);
+  assert.deepEqual(shards.flat().toSorted(), files.toSorted());
+  assert.deepEqual(shard(files, entries, 1, 1).toSorted(), files.toSorted());
+  // The same split from any order of the files: every shard of a run computes it on its own.
+  assert.deepEqual(
+    [1, 2, 3].map((index) => shard(files.toReversed(), entries, index, 3)),
+    shards,
+  );
+  // More shards than files: the extra ones get none (the run then fails: an empty part).
+  assert.deepEqual(shard(["a.test.sh"], entries, 2, 2), []);
+});
+
+// The kit shards in .github/workflows/fork-tests.yml: the matrix's shard numbers, and the env that hands this script
+// its shard. One job of the kit's tests reached 8 to 9 of its 10 minutes: sharded, each stays under half.
+test("the kit shards: a matrix of shards, each handed to this script, each well under the job's time limit", () => {
+  const root = path.resolve(__dirname, "../..");
+  const workflow = fs.readFileSync(path.join(root, ".github/workflows/fork-tests.yml"), "utf8");
+  const start = workflow.indexOf("\n  kit_tests:\n");
+  assert.notEqual(start, -1);
+  const rest = workflow.slice(start + 1);
+  const job = rest.slice(0, rest.slice(1).search(/\n {2}[a-z_]+:\n/) + 1);
+  const numbers = job.match(/\n {8}shard: \[([\d, ]+)\]\n/);
+  assert.ok(numbers, "kit_tests has no `shard: [1, 2, ...]` matrix");
+  const count = numbers[1].split(",").length;
+  assert.deepEqual(
+    numbers[1].split(",").map(Number),
+    Array.from({ length: count }, (_, i) => i + 1),
+  );
+  assert.ok(count >= 2, numbers[0]);
+  assert.match(
+    job,
+    /\n {10}FORK_CI_TEST_SHARD: \$\{\{ matrix\.shard \}\}\/\$\{\{ strategy\.job-total \}\}\n/,
+  );
+  const limit = Number(job.match(/\n {4}timeout-minutes: (\d+)\n/)[1]) * 60;
+
+  const entries = readList(fs.readFileSync(path.join(root, ".github/fork-ci-tests.txt"), "utf8"));
+  const kit = entries.filter((entry) => !entry.runBy && entry.file.startsWith("fork-kit/"));
+  const files = kit.map((entry) => entry.file);
+  const shards = Array.from({ length: count }, (_, i) => shard(files, kit, i + 1, count));
+  assert.deepEqual(shards.flat().toSorted(), files.toSorted());
+  const weight = (file) => kit.find((e) => e.file === file).weight ?? 10;
+  const sum = (list) => list.reduce((total, file) => total + weight(file), 0);
+  const loads = shards.map(sum);
+  // Balanced: no shard over the average by more than the heaviest test.
+  const heaviest = Math.max(...files.map(weight));
+  assert.ok(Math.max(...loads) <= sum(files) / count + heaviest, loads.join(" "));
+  // A weight is a file's time with the others running beside it on a usual runner's 4 cores, so a shard takes about
+  // its load over 4, and never less than its heaviest file. Half the limit leaves room for a slow runner.
+  const wall = shards.map((list) => Math.max(sum(list) / 4, ...list.map(weight)));
+  assert.ok(
+    Math.max(...wall) <= limit / 2,
+    `shards' expected seconds ${wall.map(Math.round).join(" ")}, limit ${limit}`,
+  );
+});
+
+test("FORK_CI_TEST_SHARD is <index>/<count>; unset or empty is the whole part; anything else throws", () => {
+  assert.deepEqual(readShard({}), { index: 1, count: 1 });
+  assert.deepEqual(readShard({ FORK_CI_TEST_SHARD: "" }), { index: 1, count: 1 });
+  assert.deepEqual(readShard({ FORK_CI_TEST_SHARD: "2/3" }), { index: 2, count: 3 });
+  for (const bad of ["0/3", "4/3", "1", "1/0", "a/b", "1/3 ", "-1/3", "/3"])
+    assert.throws(() => readShard({ FORK_CI_TEST_SHARD: bad }), /FORK_CI_TEST_SHARD/, bad);
+});
+
 test("a part is the files under its prefixes and under none of its `!` prefixes", () => {
   const files = ["fork-kit/a.test.py", "fork-kit/x/b.test.sh", ".github/scripts/c.test.cjs"];
   const pick = (...parts) => files.filter((file) => inPart(file, parts));
@@ -183,7 +260,7 @@ const callsByJob = (text) => {
 // The composite actions' and fleet walls' tests are about two thirds of the non-kit script tests' time: in a job
 // of their own, each of the three jobs stays well under its time limit. One call per job: two calls in one job run
 // one after the other.
-test("Fork tests run the script tests in three jobs: the kits, the actions with the walls, the rest", () => {
+test("Fork tests run the script tests in three jobs: the kits (sharded), the actions with the walls, the rest", () => {
   const root = path.resolve(__dirname, "../..");
   const calls = callsByJob(
     fs.readFileSync(path.join(root, ".github/workflows/fork-tests.yml"), "utf8"),
@@ -210,15 +287,45 @@ test("reads each job's runner calls", () => {
   assert.deepEqual(callsByJob(text), { one: [["x/"]] });
 });
 
-test("a long test without a weight, or one far from its weight, gets a note", () => {
+test("a long test without a weight, or one far from its weight, gets a note with the weight to write", () => {
   assert.equal(weightNote("a.test.sh", null, 20), null);
   assert.match(weightNote("a.test.sh", null, 45), /no weight: add "~45s"/);
   assert.equal(weightNote("a.test.sh", 100, 180), null); // load moves times this much
   assert.equal(weightNote("a.test.sh", 100, 60), null);
-  assert.match(weightNote("a.test.sh", 100, 230), /weight is ~100s: update it/);
+  assert.match(weightNote("a.test.sh", 100, 230), /weight is ~100s: make it "~230s"/);
   assert.equal(weightNote("a.test.sh", 10, 35), null);
-  assert.match(weightNote("a.test.sh", 10, 45), /update it/);
-  assert.match(weightNote("a.test.sh", 200, 20), /update it/);
+  assert.match(weightNote("a.test.sh", 10, 45), /make it "~45s"/);
+  assert.match(weightNote("a.test.sh", 200, 20), /make it "~20s"/);
+  // On a runner twice as slow as usual, times are read at half: a test that only took twice its weight is fine,
+  // and the weight to write is the usual time.
+  assert.equal(weightNote("a.test.sh", 100, 230, 2), null);
+  assert.equal(weightNote("a.test.sh", null, 50, 2), null);
+  assert.match(
+    weightNote("a.test.sh", 20, 200, 2),
+    /took 200 s \(~100s on a usual runner\), .* make it "~100s"/,
+  );
+});
+
+test("the runner's speed is the median of time over weight of the passed tests weighing 10 s or more", () => {
+  const weights = new Map([
+    ["a", 100],
+    ["b", 50],
+    ["c", 20],
+    ["d", 5],
+    ["e", null],
+    ["f", 40],
+  ]);
+  const run = (file, seconds, status = 0) => ({ file, seconds: String(seconds), status });
+  // a 2x, b 3x, c 1x; d (under 10 s), e (none) and the failed f do not count
+  assert.equal(
+    runSpeed(
+      [run("a", 200), run("b", 150), run("c", 20), run("d", 50), run("e", 9), run("f", 1, 1)],
+      weights,
+    ),
+    2,
+  );
+  assert.equal(runSpeed([run("a", 200), run("b", 150), run("c", 20), run("f", 160)], weights), 2.5);
+  assert.equal(runSpeed([run("a", 200), run("b", 150)], weights), 1); // too few to tell
 });
 
 test("finds every *.test.* file, subdirectories included", () => {
@@ -322,7 +429,7 @@ test("jobCount reads FORK_CI_TEST_JOBS, else the CPU count", () => {
 });
 
 // Runs the real script in a scratch tree whose list names `tests` ({ file: shell text }).
-function runScript(tests, jobs, args = [], list = Object.keys(tests).join("\n")) {
+function runScript(tests, jobs, args = [], list = Object.keys(tests).join("\n"), extra = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-tests-"));
   const write = (file, text) => {
     fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
@@ -339,7 +446,10 @@ function runScript(tests, jobs, args = [], list = Object.keys(tests).join("\n"))
     FORK_CI_TEST_JOBS: String(jobs),
     LEFT: path.join(root, "left.pid"),
     MARKS: root,
+    ...extra,
   };
+  delete env.FORK_CI_TEST_SHARD;
+  if (extra.FORK_CI_TEST_SHARD !== undefined) env.FORK_CI_TEST_SHARD = extra.FORK_CI_TEST_SHARD;
   delete env.GITHUB_STEP_SUMMARY;
   const run = childProcess.spawnSync("node", [".github/scripts/fork-ci-tests.cjs", ...args], {
     cwd: root,
@@ -395,20 +505,51 @@ test("one part runs only its files, heaviest first; an unlisted file fails only 
   const kit = runScript(tests, 1, ["fork-kit/"], list);
   const rest = runScript(tests, 1, ["!fork-kit/"], list);
   try {
-    assert.equal(kit.run.status, 0, kit.run.stdout + kit.run.stderr);
     const groups = (out) => [...out.matchAll(/::group::(\S+)/g)].map((m) => m[1]);
     assert.deepEqual(groups(kit.run.stdout), ["fork-kit/heavy.test.sh", "fork-kit/light.test.sh"]);
-    // heavy.test.sh ends at once, far from its ~60s: the log asks for a new weight.
+    // heavy.test.sh ends at once, far from its ~60s: a stale weight fails the run and names the one to write.
+    assert.equal(kit.run.status, 1, kit.run.stdout + kit.run.stderr);
     assert.match(
       kit.run.stdout,
-      /::notice file=fork-kit\/heavy\.test\.sh::fork-kit\/heavy\.test\.sh took \d+ s, its weight is ~60s: update it/,
+      /::error file=fork-kit\/heavy\.test\.sh::fork-kit\/heavy\.test\.sh took \d+ s, its weight is ~60s: make it "~1s" in \.github\/fork-ci-tests\.txt/,
     );
+    assert.doesNotMatch(kit.run.stdout, /::error file=fork-kit\/light/);
     assert.equal(rest.run.status, 1, rest.run.stdout + rest.run.stderr);
     assert.deepEqual(groups(rest.run.stdout), ["fork-ci/other.test.sh"]);
     assert.match(rest.run.stdout, /::error file=fork-ci\/unlisted\.test\.sh::.* is not in /);
   } finally {
     fs.rmSync(kit.root, { recursive: true, force: true });
     fs.rmSync(rest.root, { recursive: true, force: true });
+  }
+});
+
+test("FORK_CI_TEST_SHARD runs one shard of the part; the shards together run each test once", () => {
+  const tests = {
+    "fork-kit/a.test.sh": "echo a\n",
+    "fork-kit/b.test.sh": "echo b\n",
+    "fork-kit/c.test.sh": "echo c\n",
+    "fork-ci/d.test.sh": "echo d\n",
+  };
+  const list =
+    "fork-kit/a.test.sh ~3s\nfork-kit/b.test.sh ~2s\nfork-kit/c.test.sh ~2s\nfork-ci/d.test.sh\n";
+  const groups = (out) => [...out.matchAll(/::group::(\S+)/g)].map((m) => m[1]);
+  const runs = ["1/2", "2/2"].map((value) =>
+    runScript(tests, 1, ["fork-kit/"], list, { FORK_CI_TEST_SHARD: value }),
+  );
+  const bad = runScript(tests, 1, ["fork-kit/"], list, { FORK_CI_TEST_SHARD: "3/2" });
+  const empty = runScript(tests, 1, ["fork-kit/"], list, { FORK_CI_TEST_SHARD: "4/4" });
+  try {
+    for (const { run } of runs) assert.equal(run.status, 0, run.stdout + run.stderr);
+    assert.deepEqual(groups(runs[0].run.stdout), ["fork-kit/a.test.sh"]);
+    assert.deepEqual(groups(runs[1].run.stdout), ["fork-kit/b.test.sh", "fork-kit/c.test.sh"]);
+    assert.notEqual(bad.run.status, 0);
+    assert.match(bad.run.stderr, /FORK_CI_TEST_SHARD="3\/2"/);
+    assert.deepEqual(groups(bad.run.stdout), []);
+    // More shards than tests: the empty one fails instead of passing with nothing run.
+    assert.equal(empty.run.status, 1, empty.run.stdout + empty.run.stderr);
+    assert.match(empty.run.stdout, /::error::the part fork-kit\/ shard 4\/4 runs no test here/);
+  } finally {
+    for (const { root } of [...runs, bad, empty]) fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

@@ -215,6 +215,8 @@ function table(title: string, groups: ReadonlyArray<GroupSummary>): string {
   ].join("\n");
 }
 
+const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
 /** The summary as Markdown, for a terminal or an issue comment. */
 export function formatRunRecordsSummary(summary: RunRecordsSummary): string {
   const ratio = (value: number | null) => (value === null ? "-" : `${value.toFixed(2)}x`);
@@ -223,7 +225,8 @@ export function formatRunRecordsSummary(summary: RunRecordsSummary): string {
       `| ${(row.kind ?? NONE).replaceAll("|", "/")} | ${row.runs} | ${row.estimate.wallMs === undefined ? "-" : minutes(row.estimate.wallMs)} | ${minutes(row.actualWallMs)} | ${row.estimate.tokens === undefined ? "-" : tokens(row.estimate.tokens)} | ${tokens(row.actualTokens)} |`,
   );
   return [
-    `## Agent runs ${new Date(summary.fromMs).toISOString().slice(0, 10)} to ${new Date(summary.toMs).toISOString().slice(0, 10)}`,
+    // The window's end is exclusive: name the last day it includes (`--to 2026-11-20` ends 11-21 00:00).
+    `## Agent runs ${day(summary.fromMs)} to ${day(summary.toMs - 1)}`,
     "",
     `${summary.runs} recorded runs. Tokens are input (cache included) plus output, as providers report them.`,
     "List price = public per-token price, not what a plan bills.",
