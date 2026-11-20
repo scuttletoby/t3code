@@ -181,6 +181,12 @@ describe("fork delegation checks: the copied folder model merge", () => {
         ],
       },
       { instanceId: "empty", models: [model("a")], workspaceSnapshots: [snapshot("/work", [])] },
+      // Pending snapshots: a pending filter on one side only fails the check.
+      ...(["modelsPending", "slashCommandsPending"] as const).map((flag) => ({
+        instanceId: flag,
+        models: [model("a")],
+        workspaceSnapshots: [{ ...snapshot("/work", [model("a"), model("c")]), [flag]: true }],
+      })),
     ] as unknown as ReadonlyArray<ServerProvider>;
     for (const cwd of [undefined, "/work", "/elsewhere", "/missing"]) {
       assert.deepStrictEqual(

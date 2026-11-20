@@ -5,7 +5,7 @@ fails.
 
   python3 -I -B fork-kit/model-guard/tests/guard.test.py
 """
-import io, json, os, re, shutil, subprocess, sys, tempfile, types, unittest
+import contextlib, io, json, os, re, shutil, signal, subprocess, sys, tempfile, types, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True   # the CI runner has no -B; keep the kit folder free of __pycache__
@@ -24,6 +24,23 @@ POLICY = {'mode': 'enforce', 'allow': [LARGE, DEEP, PLAIN]}
 # ultracode: false is named because T3 may turn ultracode on for a Claude model when the call leaves it out
 GOOD_TARGET = {'model': 'example-large-1', 'options': {'effort': 'high', 'ultracode': False}}
 NO_ULTRA = {'id': 'ultracode', 'value': False}
+# an ACP agent: its reasoning control is its own option id (packages/provider-acp sessionConfig.ts, role "reasoning")
+AGENT = {'driver': 'acpDriver', 'model': 'example-agent', 'efforts': ['low', 'medium'],
+         'effortOptionIds': ['thought_level'], 'otherOptionIds': ['mode']}
+
+
+@contextlib.contextmanager
+def deadline(seconds):
+    """Fail with TimeoutError instead of hanging (a read that waits on a pipe, in a broken copy of the lib)."""
+    def stop(*_):
+        raise TimeoutError(f'still running after {seconds} seconds')
+    old = signal.signal(signal.SIGALRM, stop)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
 
 
 def load(source=None):
@@ -206,8 +223,8 @@ class Guard(unittest.TestCase):
         self.refused(t, self.delegate({'model': 'example-large-1', 'options': [{'id': 'effort', 'value': 'high'},
                                                                               {'id': 'effort', 'value': 'low'}]}),
                      "names 'effort' twice")
-        self.refused(t, self.delegate({'model': 'example-deep-2', 'options': {'reasoningEffort': 'medium'}}),
-                     "effort 'medium'")
+        self.refused(t, self.delegate({'model': 'example-deep-2', 'options': {
+            'effort': 'high', 'reasoningEffort': 'medium', 'ultracode': False}}), "effort 'medium'")
 
     def test_delegate_task_aliases_are_only_for_the_agent_tool(self):
         self.refused('mcp__t3-code__delegate_task', self.delegate({'model': 'large', 'options': {'effort': 'high'}}),
@@ -223,7 +240,7 @@ class Guard(unittest.TestCase):
         self.assertEqual(self.passed(t, self.delegate(GOOD_TARGET)), 'model-guard: example-large-1 is for most work.')
         self.passed(t, self.delegate({'model': ' example-large-1 ', 'providerInstanceId': 'any-account',
                                       'options': [{'id': 'effort', 'value': 'medium'}, NO_ULTRA]}))
-        self.passed(t, self.delegate({'model': 'example-deep-2', 'options': {'thinking_level': 'high',
+        self.passed(t, self.delegate({'model': 'example-deep-2', 'options': {'effort': 'high', 'thinking_level': 'high',
                                                                              'ultracode': False}}))
         self.assertIsNone(self.hook(t, self.delegate({'model': 'example-plain', 'driverKind': 'otherDriver'})))
 
@@ -673,6 +690,345 @@ const c = log("agent(") || items.map(i => i.agent)
         self.refused('mcp__t3-code__delegate_task', self.delegate(dict(GOOD_TARGET, model='example-large-1\x1f')),
                      'is not allowed')
 
+    def test_a_drivers_own_reasoning_option_is_read_or_refused(self):
+        """#601: an ACP driver names its reasoning control by its own option id. A row of a driver other than Claude
+        lists such ids in effortOptionIds (checked as efforts) or otherOptionIds (passed); any other id is refused,
+        so a pick cannot name an allowed effort and also raise the agent's own reasoning control."""
+        self.policy({'mode': 'enforce', 'allow': [LARGE, AGENT, PLAIN]})
+        paths = {'delegate_task': lambda sel: self.delegate(dict(sel, driverKind='acpDriver')),
+                 'delegate_task (no driver)': lambda sel: self.delegate(sel),
+                 'create_threads': lambda sel: {'threads': [{'target': sel}]},
+                 't3_thread_launch': lambda sel: {'modelSelection': sel},
+                 't3_thread_configure': lambda sel: {'modelSelection': sel},
+                 't3_project_create': lambda sel: {'defaultModelSelection': sel},
+                 't3_project_update': lambda sel: {'defaultModelSelection': sel}}
+        passing = ({'thought_level': 'medium'}, {'effort': 'low', 'thought_level': 'low', 'mode': 'plan'},
+                   [{'id': ' thought_level', 'value': 'low'}, {'id': 'mode ', 'value': 'ask'}],
+                   {'thought_level': 'low', 'ultracode': False})
+        refused = (({'thought_level': 'high'}, "effort 'high' is not allowed"),
+                   ({'effort': 'low', 'thought_level': 'high'}, "effort 'high' is not allowed"),
+                   ({' thought_level ': 'high'}, "effort 'high' is not allowed"),
+                   ({'thought_level': 'low', 'ultracode': True}, "effort 'ultracode' is not allowed"),
+                   ({'effort': 'low', 'reasoning_level': 'max'}, "option 'reasoning_level' is not one the guard can "
+                                                                 'read for acpDriver'),
+                   ({'mode': 'plan'}, 'names no effort'),
+                   # #618 review (both lenses): the driver never reads the shared id, so it ran its own default
+                   ({'effort': 'low', 'mode': 'plan'}, "names no effort for 'example-agent' under 'thought_level'"),
+                   ([{'id': 'effort', 'value': 'low'}, {'id': 'Thought_Level', 'value': 'max'}],
+                    "option 'Thought_Level' is not one"))
+        for path, wrap in paths.items():
+            tool = 'mcp__t3-code__' + path.split(' ')[0]
+            for options in passing:
+                with self.subTest(path=path, options=options):
+                    self.passed(tool, wrap({'model': 'example-agent', 'options': options}))
+            for options, why in refused:
+                with self.subTest(path=path, options=options):
+                    self.refused(tool, wrap({'model': 'example-agent', 'options': options}), why)
+            # a row that lists no ids reads only the shared effort ids: the old way through is closed
+            if path != 'delegate_task':
+                with self.subTest(path=path, row='plain'):
+                    self.refused(tool, wrap({'model': 'example-plain', 'options': {'thought_level': 'max'}}),
+                                 "option 'thought_level' is not one the guard can read", 'effortOptionIds')
+                    self.passed(tool, wrap({'model': 'example-plain'}))
+        # Claude rows are not touched: T3 checks their options against its own list
+        self.passed('mcp__t3-code__delegate_task',
+                    self.delegate(dict(GOOD_TARGET, options={'effort': 'high', 'ultracode': False, 'thinking': True})))
+        # the same model in a Claude row and an ACP row, no driver: each row reads the options its own way, and
+        # every row must accept them. The ACP row wants thought_level, the Claude row refuses it (#618 review), so
+        # no model selection passes; delegate_task with a driverKind picks one row.
+        claude = {'driver': 'claudeAgent', 'model': 'example-agent', 'efforts': ['high']}
+        self.policy({'mode': 'enforce', 'allow': [claude, dict(AGENT, efforts=['low', 'high'])]})
+        t = 'mcp__t3-code__t3_thread_launch'
+        self.refused(t, {'modelSelection': {'model': 'example-agent', 'options': {'effort': 'high', 'ultracode': False}}},
+                     "names no effort for 'example-agent' under 'thought_level'")
+        self.refused(t, {'modelSelection': {'model': 'example-agent', 'options': {
+            'effort': 'high', 'thought_level': 'high', 'ultracode': False}}}, "option 'thought_level' is not one T3's "
+                     'claudeAgent reads')
+        self.refused(t, {'modelSelection': {'model': 'example-agent', 'options': {
+            'effort': 'high', 'other': 'x', 'ultracode': False}}}, "option 'other' is not one")
+        d = 'mcp__t3-code__delegate_task'
+        self.passed(d, self.delegate({'model': 'example-agent', 'driverKind': 'claudeAgent',
+                                      'options': {'effort': 'high', 'ultracode': False}}))
+        self.passed(d, self.delegate({'model': 'example-agent', 'driverKind': 'acpDriver',
+                                      'options': {'effort': 'high', 'thought_level': 'high'}}))
+        self.refused(d, self.delegate({'model': 'example-agent', 'driverKind': 'acpDriver',
+                                       'options': {'thought_level': 'max'}}), "effort 'max' is not allowed")
+        # advise says it and refuses nothing
+        self.policy({'mode': 'advise', 'allow': [AGENT]})
+        note = self.passed(t, {'modelSelection': {'model': 'example-agent', 'options': {'thought_level': 'high'}}})
+        self.assertIn("effort 'high' is not allowed", note)
+
+    def test_option_id_keys_are_checked(self):
+        """#601: effortOptionIds and otherOptionIds are for rows of other drivers, never name ultracode, and an
+        effort id is never an "other" option. A broken row refuses every pick (fail closed)."""
+        t = 'mcp__t3-code__delegate_task'
+        for row, why in ((dict(LARGE, effortOptionIds=['thought_level']), 'only rows of other drivers take it'),
+                         (dict(LARGE, otherOptionIds=['mode']), 'only rows of other drivers take it'),
+                         (dict(AGENT, effortOptionIds=['ultracode']), 'ultracode is always read as the effort'),
+                         (dict(AGENT, otherOptionIds=['ultracode']), 'ultracode is always read as the effort'),
+                         (dict(AGENT, otherOptionIds=['thought_level']), "'thought_level' is an effort option id"),
+                         (dict(AGENT, otherOptionIds=['reasoning']), "'reasoning' is an effort option id"),
+                         (dict(AGENT, effortOptionIds=[' thought_level']), 'without spaces around them'),
+                         (dict(AGENT, effortOptionIds='thought_level'), 'effortOptionIds: must be list'),
+                         (dict(AGENT, otherOptionIds=[1]), 'otherOptionIds'),
+                         (dict(AGENT, effortOptionIds=[]), 'effortOptionIds'),
+                         # #618 review: a row with own effort ids but no efforts could pass no pick that names them
+                         ({k: v for k, v in AGENT.items() if k != 'efforts'}, 'the row lists no efforts'),
+                         # T3's session mode can repeat the reasoning levels (lens A)
+                         (dict(AGENT, otherOptionIds=['_t3/session-mode']), "'_t3/session-mode' is T3's session mode"),
+                         # a model or reasoning control is never an "other" option (lens B)
+                         (dict(AGENT, otherOptionIds=['mode', 'model']), "'model' names a model or reasoning"),
+                         (dict(AGENT, otherOptionIds=['configModelId']), "'configModelId' names a model"),
+                         (dict(AGENT, otherOptionIds=['reasoning_mode']), "'reasoning_mode' names a model"),
+                         (dict(AGENT, otherOptionIds=['ThoughtLevel']), "'ThoughtLevel' names a model"),
+                         (dict(AGENT, otherOptionIds=['thinkingBudget']), "'thinkingBudget' names a model"),
+                         (dict(AGENT, otherOptionIds=['effortHint']), "'effortHint' names a model")):
+            with self.subTest(row=row):
+                self.policy({'mode': 'advise', 'allow': [row]})
+                self.refused(t, self.delegate({'model': 'example-agent', 'options': {'thought_level': 'low'}}), why)
+        self.policy({'mode': 'enforce', 'allow': [AGENT]})
+        self.passed(t, self.delegate({'model': 'example-agent', 'options': {'thought_level': 'low'}}))
+        self.refused(t, self.delegate({'model': 'x'}), 'acpDriver example-agent (low|medium; effort option ids '
+                     'thought_level; other option ids mode)')
+        # an agent whose session mode is its reasoning: the mode is an effort id, checked and required
+        self.policy({'mode': 'enforce', 'allow': [dict(AGENT, effortOptionIds=['thought_level', '_t3/session-mode'])]})
+        self.passed(t, self.delegate({'model': 'example-agent', 'options': {'thought_level': 'low',
+                                                                            '_t3/session-mode': 'low'}}))
+        self.refused(t, self.delegate({'model': 'example-agent', 'options': {'thought_level': 'low',
+                                                                             '_t3/session-mode': 'max'}}),
+                     "effort 'max' is not allowed")
+        self.refused(t, self.delegate({'model': 'example-agent', 'options': {'thought_level': 'low'}}),
+                     "under '_t3/session-mode'")
+
+    def test_a_pick_names_its_effort_where_the_driver_reads_it(self):
+        """#618 review (both lenses, blocking): T3's ACP adapter applies only the ids the agent's session exposes, so
+        a pick that names an allowed effort under a shared id and leaves the row's own reasoning id out runs the
+        agent's default, or on delegate_task the parent's level (resolveTarget lays the given options over the
+        parent's). So a row with effortOptionIds wants each of them, and a Claude row wants "effort" (the one id T3's
+        Claude driver reads its effort from, claudeModelOptions.ts). On every path both lenses used."""
+        two = dict(AGENT, effortOptionIds=['thought_level', 'reasoning_mode'])
+        codex = {'driver': 'codexLike', 'model': 'example-coder', 'efforts': ['low'],
+                 'effortOptionIds': ['reasoningEffort']}
+        self.policy({'mode': 'enforce', 'allow': [LARGE, AGENT, codex,
+                                                   dict(two, model='example-agent-two')]})
+        paths = {'delegate_task': lambda sel, drv: self.delegate(dict(sel, driverKind=drv)),
+                 'delegate_task (no driver)': lambda sel, drv: self.delegate(sel),
+                 'create_threads': lambda sel, drv: {'threads': [{'target': sel}]},
+                 't3_thread_launch': lambda sel, drv: {'title': 'x', 'modelSelection': sel},
+                 't3_thread_configure': lambda sel, drv: {'threadId': 't', 'modelSelection': sel},
+                 't3_project_create': lambda sel, drv: {'title': 'p', 'defaultModelSelection': sel},
+                 't3_project_update': lambda sel, drv: {'projectId': 'p', 'defaultModelSelection': sel}}
+        cases = (
+            # (model, driver, options, None when it passes or the refusal's words)
+            ('example-agent', 'acpDriver', {'effort': 'low'}, "names no effort for 'example-agent' under "
+                                                               "'thought_level', the option acpDriver reads it from"),
+            ('example-agent', 'acpDriver', {'reasoning': 'low'}, "under 'thought_level'"),
+            ('example-agent', 'acpDriver', [{'id': 'effort', 'value': 'low'}, {'id': 'mode', 'value': 'plan'}],
+             "under 'thought_level'"),
+            ('example-agent', 'acpDriver', {'thought_level': 'low'}, None),
+            ('example-agent-two', 'acpDriver', {'thought_level': 'low'}, "under 'reasoning_mode'"),
+            ('example-agent-two', 'acpDriver', {'reasoning_mode': 'low', 'effort': 'low'}, "under 'thought_level'"),
+            ('example-agent-two', 'acpDriver', {'reasoning_mode': 'low', 'thought_level': 'low'}, None),
+            ('example-agent-two', 'acpDriver', {'reasoning_mode': 'max', 'thought_level': 'low'}, "effort 'max'"),
+            # a driver that reads one of the shared ids: list it, and only it counts
+            ('example-coder', 'codexLike', {'effort': 'low'}, "under 'reasoningEffort', the option codexLike"),
+            ('example-coder', 'codexLike', {'reasoningEffort': 'low'}, None),
+            ('example-coder', 'codexLike', {'reasoningEffort': 'low', 'effort': 'max'}, "effort 'max'"),
+            # Claude reads "effort" only
+            ('example-large-1', 'claudeAgent', {'thinking_level': 'high', 'ultracode': False},
+             "names no effort for 'example-large-1' under 'effort', the option claudeAgent reads it from"),
+            ('example-large-1', 'claudeAgent', {'reasoning': 'high', 'ultracode': False}, "under 'effort'"),
+            ('example-large-1', 'claudeAgent', {'effort': 'high', 'reasoning': 'high', 'ultracode': False}, None),
+            ('example-large-1', 'claudeAgent', {'effort': 'high', 'reasoning': 'max', 'ultracode': False},
+             "effort 'max'"),
+        )
+        for path, wrap in paths.items():
+            tool = 'mcp__t3-code__' + path.split(' ')[0]
+            for model, driver, options, why in cases:
+                with self.subTest(path=path, model=model, options=options):
+                    args = wrap({'model': model, 'options': options}, driver)
+                    if why is None:
+                        self.passed(tool, args)
+                    else:
+                        self.refused(tool, args, why)
+        # advise says it, refuses nothing; runs again with the same answer
+        self.policy({'mode': 'advise', 'allow': [AGENT]})
+        args = {'modelSelection': {'model': 'example-agent', 'options': {'effort': 'low'}}}
+        note = self.passed('mcp__t3-code__t3_thread_launch', args)
+        self.assertIn("under 'thought_level'", note)
+        self.assertEqual(note, self.passed('mcp__t3-code__t3_thread_launch', args))
+
+    def test_an_old_policy_this_round_refuses_fails_closed(self):
+        """State: a policy written for the first #601 round (a session mode as an "other" option, own effort ids on a
+        row without efforts) stays on the machine after the update. It refuses every pick, in advise mode too, says
+        which key to change, and does so every time it runs."""
+        t = 'mcp__t3-code__t3_thread_launch'
+        pick = {'modelSelection': {'model': 'example-large-1', 'options': {'effort': 'high', 'ultracode': False}}}
+        for row, why in ((dict(AGENT, otherOptionIds=['_t3/session-mode']), "'_t3/session-mode' is T3's session mode"),
+                         ({k: v for k, v in AGENT.items() if k != 'efforts'}, 'the row lists no efforts')):
+            with self.subTest(why=why):
+                self.policy({'mode': 'enforce', 'allow': [LARGE, row]})
+                first = self.refused(t, pick, why)
+                self.assertEqual(first, self.refused(t, pick, why))
+                self.policy({'mode': 'advise', 'allow': [LARGE, row]})
+                self.refused(t, pick, why, 'fails closed')
+
+    def test_claude_rows_refuse_ids_claude_does_not_read(self):
+        """#618 review (lens B major, lens A minor): a model selection has no driver, and T3 runs it on the named
+        instance. A model only in Claude rows, on another driver's instance offering the same slug, would read an id
+        such as thought_level as its reasoning, unchecked. So a Claude row takes only the ids T3's Claude driver reads
+        (and the shared effort ids, checked as efforts)."""
+        self.policy({'mode': 'enforce', 'allow': [LARGE, AGENT]})
+        paths = {'delegate_task': lambda sel: self.delegate(dict(sel, driverKind='claudeAgent')),
+                 'delegate_task (no driver)': lambda sel: self.delegate(sel),
+                 'create_threads': lambda sel: {'threads': [{'target': sel}]},
+                 't3_thread_launch': lambda sel: {'instanceId': 'any', 'modelSelection': sel},
+                 't3_thread_configure': lambda sel: {'modelSelection': sel},
+                 't3_project_create': lambda sel: {'defaultModelSelection': sel},
+                 't3_project_update': lambda sel: {'defaultModelSelection': sel}}
+        base = {'effort': 'high', 'ultracode': False}
+        for path, wrap in paths.items():
+            tool = 'mcp__t3-code__' + path.split(' ')[0]
+            for extra in ({'thought_level': 'max'}, {'mode': 'x'}, {'Effort': 'max'}, {'variant': 'max'}):
+                with self.subTest(path=path, extra=extra):
+                    self.refused(tool, wrap({'model': 'example-large-1', 'options': dict(base, **extra)}),
+                                 f"option {next(iter(extra))!r} is not one T3's claudeAgent reads")
+            for extra in ({}, {'thinking': True}, {'fastMode': False}, {'contextWindow': '1m'},
+                          {'reasoningEffort': 'medium'}):
+                with self.subTest(path=path, extra=extra):
+                    self.passed(tool, wrap({'model': 'example-large-1', 'options': dict(base, **extra)}))
+
+    # ---- #600: T3's model list against "ultracodeOption": false rows (a self-check report)
+
+    def t3_list(self, name, models, profiles=None, cache=True):
+        """Write a T3 model list: T3's cache ({fetchedAtMs, manifest}) or the manifest itself."""
+        def select(*choices):
+            return {'capabilities': {'optionDescriptors': [
+                {'id': 'effort', 'type': 'select', 'options': [{'id': c, 'label': c} for c in choices]}]}}
+        profiles = dict({'new': select('high', 'xhigh', 'ultracode'), 'old': select('high'),
+                         'toggle': {'capabilities': {'optionDescriptors': [select('high')['capabilities'][
+                             'optionDescriptors'][0], {'id': 'ultracode', 'type': 'boolean'}]}},
+                         'bare': {}, 'empty': {'capabilities': {}}, 'none': {'capabilities': {'optionDescriptors': []}}},
+                        **(profiles or {}))
+        manifest = {'version': 1, 'providers': {'claudeAgent': {'profiles': profiles, 'models': models}}}
+        path = os.path.join(self.dir, name)
+        self.write(path, {'fetchedAtMs': 1, 'manifest': manifest} if cache else manifest)
+        return path
+
+    def drift(self, paths, mode='enforce', rows=None):
+        policy = self.m.parse_policy(json.dumps({'mode': mode, 'allow': rows or [
+            LARGE, dict(DEEP, ultracodeOption=False)]}), 'p')
+        return self.m.ultracode_option_problems(policy, paths)
+
+    def test_t3_model_list_drift_is_reported(self):
+        """#600: T3 reloads its model list every hour. The self-check reads it and reports an "ultracodeOption":
+        false row whose model now has the ultracode option, has no option list (T3 then checks no options and keeps
+        an inherited ultracode), or is not in the list (a custom model); a list it cannot read is said, never a pass."""
+        deep = 'example-deep-2'
+        def one(models, **kw):
+            return self.drift([self.t3_list('t3.json', models, **kw)])
+        self.assertEqual(one([{'slug': deep, 'profile': 'old'}]), [])
+        self.assertEqual(one([{'slug': deep, 'profile': 'none'}]), [])
+        self.assertEqual(one([{'slug': deep, 'profile': 'old'}], cache=False), [])     # a manifest itself
+        self.assertEqual(one([{'slug': ' ' + deep, 'profile': ' old'}]), [])           # T3 trims
+        cases = {
+            'the effort ultracode': ([{'slug': deep, 'profile': 'new'}], 'offers it the ultracode option'),
+            'the ultracode toggle': ([{'slug': deep, 'profile': 'toggle'}], 'offers it the ultracode option'),
+            'by an alias': ([{'slug': 'example-deep-latest', 'aliases': ['EXAMPLE-DEEP-2'], 'profile': 'new'}],
+                            'offers it the ultracode option'),
+            'the worst entry': ([{'slug': deep, 'profile': 'bare'}, {'slug': deep, 'profile': 'new'}],
+                                'offers it the ultracode option'),
+            'the worst entry first': ([{'slug': deep, 'profile': 'new'}, {'slug': deep, 'profile': 'bare'}],
+                                      'offers it the ultracode option'),
+            'no capabilities': ([{'slug': deep, 'profile': 'bare'}], 'gives it no option list'),
+            'no option list': ([{'slug': deep, 'profile': 'empty'}], 'gives it no option list'),
+            'an unknown profile': ([{'slug': deep, 'profile': 'gone'}], 'gives it no option list'),
+            'no profile': ([{'slug': deep}], 'gives it no option list'),
+            'a custom model': ([{'slug': 'example-large-1', 'profile': 'new'}], "is not in T3's model list"),
+            'an empty list': ([], "is not in T3's model list"),
+        }
+        for name, (models, why) in cases.items():
+            with self.subTest(name):
+                problems = one(models)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(f"'{deep}' has \"ultracodeOption\": false", problems[0])
+                self.assertIn(why, problems[0])
+                self.assertIn('take "ultracodeOption": false out of its policy row', problems[0])
+        # runs again: the same answer, nothing stored
+        stale = self.t3_list('stale.json', [{'slug': deep, 'profile': 'new'}])
+        self.assertEqual(self.drift([stale]), self.drift([stale]))
+        # several lists: each is read, each says its own
+        good = self.t3_list('good.json', [{'slug': deep, 'profile': 'old'}])
+        problems = self.drift([good, stale, os.path.join(self.dir, 'gone.json')])
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn(stale, problems[0])
+        self.assertIn('gone.json cannot be read', problems[1])
+        # advise reports too (enforce would act on the row); off checks nothing; no false row needs no list
+        self.assertEqual(len(self.drift([stale], mode='advise')), 1)
+        self.assertEqual(self.drift([stale], mode='off'), [])
+        self.assertEqual(self.drift(None, rows=[LARGE]), [])
+        # an old machine file names no list: said, never a silent pass
+        problems = self.drift(None)
+        self.assertEqual(len(problems), 1)
+        self.assertIn('names no T3 model list ("t3ModelManifests")', problems[0])
+
+    def test_a_t3_model_list_that_cannot_be_used_is_said(self):
+        """#600: missing, a link, not a plain file, too large, half written (T3 stopped mid-write) or not a model
+        list: the self-check says so and names the rows it could not check."""
+        good = self.t3_list('good.json', [{'slug': 'example-deep-2', 'profile': 'old'}])
+        link = os.path.join(self.dir, 'link.json')
+        os.symlink(good, link)
+        fifo = os.path.join(self.dir, 'fifo')
+        os.mkfifo(fifo)
+        def raw(name, text):
+            path = os.path.join(self.dir, name)
+            self.write(path, text)
+            return path
+        with open(good, encoding='utf-8') as f:
+            whole = f.read()
+        cases = {
+            'missing': (os.path.join(self.dir, 'none.json'), 'cannot be read'),
+            'a link': (link, 'cannot be read'),
+            'a folder': (self.dir, 'is not a plain file'),
+            'a pipe': (fifo, 'is not a plain file'),
+            'half written': (raw('half.json', whole[:len(whole) // 2]), 'is not valid JSON'),
+            'empty': (raw('empty.json', ''), 'is not valid JSON'),
+            'version 2': (raw('v2.json', {'version': 2, 'providers': {}}), 'is not a T3 model manifest of version 1'),
+            'version true': (raw('vt.json', {'version': True, 'providers': {}}), 'is not a T3 model manifest'),
+            'a list': (raw('list.json', []), 'is not a T3 model manifest'),
+            'no claudeAgent': (raw('nc.json', {'version': 1, 'providers': {}}), 'has no claudeAgent model list'),
+            # a manifest key next to a version: read as a manifest of that version, never unwrapped as T3's cache
+            'a manifest with a version': (raw('mv.json', {'version': 2, 'manifest': json.loads(whole)['manifest']}),
+                                          'is not a T3 model manifest of version 1'),
+            'models not a list': (raw('nm.json', {'version': 1, 'providers': {'claudeAgent': {
+                'models': {}, 'profiles': {}}}}), 'has no claudeAgent model list'),
+            'no profiles': (raw('np.json', {'fetchedAtMs': 1, 'manifest': {'version': 1, 'providers': {
+                'claudeAgent': {'models': []}}}}), 'has no claudeAgent model list'),
+        }
+        for name, (path, why) in cases.items():
+            with self.subTest(name):
+                with deadline(10):   # a pipe with no writer: a read that waits would hang, not fail
+                    problems = self.drift([path])
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(f'T3 model list {path} {why}', problems[0])
+                self.assertIn("'example-deep-2' the ultracode option", problems[0])
+        with mock.patch.object(self.m, 'T3_MANIFEST_MAX', 10):
+            self.assertIn('is larger than 10 bytes', self.drift([good])[0])
+        self.assertEqual(self.drift([good]), [])
+
+    def test_t3_model_lists_in_the_machine_file_are_checked(self):
+        """#600: "t3ModelManifests" is a list of absolute paths, each once; anything else refuses every call, like
+        every bad machine file key. The lists are only read by the self-check: a call never depends on them."""
+        t = 'mcp__t3-code__delegate_task'
+        for value in ([], ['t3.json'], [1], ['/a', '/a'], '/a', None, {'a': 1}, ['/a\0b']):
+            with self.subTest(value=value):
+                self.machine({'policyFile': self.policy_path, 't3ModelManifests': value})
+                self.refused(t, self.delegate(GOOD_TARGET), 't3ModelManifests')
+        self.machine({'policyFile': self.policy_path + '\0'})   # a clear refusal, not a crash (lens A)
+        self.refused(t, self.delegate(GOOD_TARGET), 'policyFile: must be an absolute path')
+        self.machine({'policyFile': self.policy_path, 't3ModelManifests': [os.path.join(self.dir, 'none.json')]})
+        self.passed(t, self.delegate(GOOD_TARGET))
+
     def test_the_policy_may_not_live_in_the_guards_own_folder(self):
         """An uninstall removes everything in the guard's /etc folder: a policy there would go with it."""
         for where in ('/etc/model-guard/policy.json', '/etc/model-guard', '/etc/fork-kit/../model-guard/p.json'):
@@ -1078,6 +1434,37 @@ class Contract(unittest.TestCase):
         self.assertEqual(legacy.groups(), (model_guard.ULTRACODE_EFFORT, model_guard.ULTRACODE_RUNS_AT))
         self.assertEqual(option.groups(), (model_guard.ULTRACODE_OPTION_ID, model_guard.ULTRACODE_OPTION_ID))
 
+    def test_the_bundled_t3_model_list_reads_as_the_self_check_reads_it(self):
+        """#600: T3's own model list (the one it ships, and caches in <stateDir>/model-manifest.json as {fetchedAtMs,
+        manifest}) has the shape the self-check reads: a model with the effort ultracode and one without."""
+        with open(os.path.join(REPO, 'apps', 'server', 'src', 'provider', 'ModelManifest.ts'), encoding='utf-8') as f:
+            source = f.read()
+        self.assertIn('path.join(config.stateDir, "model-manifest.json")', source, 'the cache moved: update the README')
+        self.assertRegex(source, r'fetchedAtMs: Schema\.Number,\s*manifest:', 'the cache shape changed')
+        catalog, why = model_guard.read_t3_manifest(
+            os.path.join(REPO, 'apps', 'server', 'src', 'provider', 'model-manifest.json'))
+        self.assertIsNone(why)
+        self.assertEqual(model_guard.ultracode_option_in(catalog, 'claude-opus-5-5'), 'option')
+        self.assertEqual(model_guard.ultracode_option_in(catalog, 'claude-opus-4-7'), 'none')
+        self.assertEqual(model_guard.ultracode_option_in(catalog, 'example-custom'), 'missing')
+
+    def test_claude_rows_take_the_option_ids_t3_ships_for_claude(self):
+        """#618 review: a Claude row takes only the option ids T3's Claude models have (the select "effort", read as
+        the effort, and the others) plus ultracode, which T3 adds to the models whose efforts include it."""
+        with open(os.path.join(REPO, 'apps', 'server', 'src', 'provider', 'model-manifest.json'), encoding='utf-8') as f:
+            claude = json.load(f)['providers']['claudeAgent']
+        ids, selects = set(), set()
+        for profile in claude['profiles'].values():
+            for d in profile['capabilities']['optionDescriptors']:
+                ids.add(d['id'])
+                if d['id'] == 'effort':
+                    selects.add(d['type'])
+        self.assertEqual(ids | {model_guard.ULTRACODE_OPTION_ID}, set(model_guard.CLAUDE_OPTION_IDS),
+                         "T3's Claude option ids changed: update CLAUDE_OPTION_IDS and the README")
+        self.assertEqual(selects, {'select'})
+        self.assertEqual(model_guard.CLAUDE_EFFORT_ID, 'effort')
+        self.assertIn(model_guard.CLAUDE_EFFORT_ID, model_guard.EFFORT_OPTION_IDS)
+
     def test_the_example_policy_is_valid(self):
         with open(os.path.join(KIT, 'model-policy.example.json'), encoding='utf-8') as f:
             policy = model_guard.parse_policy(f.read(), 'model-policy.example.json')
@@ -1120,7 +1507,7 @@ MUTATIONS = {
                                'test_delegate_task_model_and_effort_must_be_in_a_row'),
     'inherit is no model': (" or js_trim(model) == 'inherit':", ':', 'test_agent_must_name_an_allowed_model_and_effort'),
     'effort must be named': ('        if not efforts:\n', '        if False:\n',
-                             'test_delegate_task_must_name_model_and_effort'),
+                             'test_agent_must_name_an_allowed_model_and_effort'),
     'effort must be in the row': ('        if bad:\n', '        if False:\n',
                                   'test_delegate_task_model_and_effort_must_be_in_a_row'),
     'driver must match': ("(driver is None or r['driver'] == driver)", 'True',
@@ -1280,6 +1667,77 @@ MUTATIONS = {
                                  'test_the_guards_folder_is_found_through_links'),
     'the guard folder by identity': ("            if os.path.samestat(os.stat(real), want):",
                                      "            if False:", 'test_the_guards_folder_is_found_by_identity'),
+    # #601: a driver's own option ids
+    'unread option ids refused': ('            if unread:\n', '            if False:\n',
+                                  'test_a_drivers_own_reasoning_option_is_read_or_refused'),
+    "a row's effort ids are read": ('effort_ids = EFFORT_OPTION_IDS + own', 'effort_ids = EFFORT_OPTION_IDS',
+                                    'test_a_drivers_own_reasoning_option_is_read_or_refused'),
+    "a row's effort ids must be named": ("            if missing and row['efforts'] is not None:",
+                                         '            if False:',
+                                         'test_a_pick_names_its_effort_where_the_driver_reads_it'),
+    'a Claude pick names effort': ('own, effort_ids = (CLAUDE_EFFORT_ID,), EFFORT_OPTION_IDS',
+                                   'own, effort_ids = (), EFFORT_OPTION_IDS',
+                                   'test_a_pick_names_its_effort_where_the_driver_reads_it'),
+    'Claude rows take only ids Claude reads': ("            if unread and row['driver'] == CLAUDE_DRIVER:",
+                                               '            if False:',
+                                               'test_claude_rows_refuse_ids_claude_does_not_read'),
+    'effort ids need efforts': ("        if effort_ids and row['efforts'] is None:", '        if False:',
+                                'test_option_id_keys_are_checked'),
+    'the session mode is not other': ('        if ACP_SESSION_MODE_ID in other_ids:', '        if False:',
+                                      'test_option_id_keys_are_checked'),
+    'other ids name no model or reasoning': ('        if named:\n', '        if False:\n',
+                                             'test_option_id_keys_are_checked'),
+    "a row's effort ids count as efforts": ('            efforts = _efforts_in(pairs, effort_ids)',
+                                            '            efforts = _efforts_in(pairs)',
+                                            'test_a_drivers_own_reasoning_option_is_read_or_refused'),
+    'option id keys only off Claude': ("            if ids and row['driver'] == CLAUDE_DRIVER:", '            if False:',
+                                       'test_option_id_keys_are_checked'),
+    'option id keys never ultracode': ('            if ULTRACODE_OPTION_ID in ids:', '            if False:',
+                                       'test_option_id_keys_are_checked'),
+    'an effort id is no other id': ('        if both:\n', '        if False:\n', 'test_option_id_keys_are_checked'),
+    'option ids are trimmed': ("    if problem is None and any(v != js_trim(v) for v in value):", '    if False:',
+                               'test_option_id_keys_are_checked'),
+    # #600: T3's model list against "ultracodeOption": false rows
+    'the option is reported': ("            if state == 'option':", '            if False:',
+                               'test_t3_model_list_drift_is_reported'),
+    'no option list is reported': ("            elif state == 'no list':", '            elif False:',
+                                   'test_t3_model_list_drift_is_reported'),
+    'a missing model is reported': ("            elif state == 'missing':", '            elif False:',
+                                    'test_t3_model_list_drift_is_reported'),
+    'no named list is reported': ('    if not manifest_paths:\n        return [', '    if not manifest_paths:\n'
+                                  '        return []\n        return [', 'test_t3_model_list_drift_is_reported'),
+    'an unusable list is reported': ("        if why:\n            problems.append(f'T3 model list",
+                                     "        if why:\n            continue\n            problems.append(f'T3 model list",
+                                     'test_a_t3_model_list_that_cannot_be_used_is_said'),
+    'the effort choice counts': ("any(isinstance(c, dict) and c.get('id') == ULTRACODE_EFFORT for c in choices)",
+                                 'False', 'test_t3_model_list_drift_is_reported'),
+    'aliases count': ("isinstance(a, str) and js_trim(a).lower() == model.lower() for a in aliases)",
+                      'False for a in aliases)', 'test_t3_model_list_drift_is_reported'),
+    'the worst entry wins': ("            found = 'no list'", "            return 'no list'",
+                             'test_t3_model_list_drift_is_reported'),
+    'no links': ("os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0)", 'os.O_RDONLY | os.O_NONBLOCK',
+                 'test_a_t3_model_list_that_cannot_be_used_is_said'),
+    'plain files only': ('        if not stat.S_ISREG(os.fstat(fd).st_mode):', '        if False:',
+                         'test_a_t3_model_list_that_cannot_be_used_is_said'),
+    'a size limit': ('    if len(raw) > T3_MANIFEST_MAX:', '    if False:',
+                     'test_a_t3_model_list_that_cannot_be_used_is_said'),
+    'version 1 only': ("data.get('version') != 1 or isinstance(data.get('version'), bool)", 'False',
+                       'test_a_t3_model_list_that_cannot_be_used_is_said'),
+    'off needs no list': ("    if not rows or policy['mode'] == 'off':", '    if not rows:',
+                          'test_t3_model_list_drift_is_reported'),
+    'the machine file paths are checked': (
+        "        if not v or any(not isinstance(p, str) or not os.path.isabs(p) or '\\0' in p for p in v):",
+        '        if False:', 'test_t3_model_lists_in_the_machine_file_are_checked'),
+    'no NUL in a machine file list': ("or not os.path.isabs(p) or '\\0' in p for p in v", 'or not os.path.isabs(p) for p in v',
+                                      'test_t3_model_lists_in_the_machine_file_are_checked'),
+    'no NUL in the policy path': ("        if not os.path.isabs(v) or '\\0' in v:", '        if not os.path.isabs(v):',
+                                  'test_t3_model_lists_in_the_machine_file_are_checked'),
+    'a pipe never blocks the read': ('os.O_RDONLY | os.O_NONBLOCK | ', 'os.O_RDONLY | ',
+                                     'test_a_t3_model_list_that_cannot_be_used_is_said'),
+    'the first entry with the option decides': ("            return 'option'\n", "            found = 'option'\n",
+                                                'test_t3_model_list_drift_is_reported'),
+    "only T3's own cache is unwrapped": ("'manifest' in data and 'version' not in data", "'manifest' in data",
+                                        'test_a_t3_model_list_that_cannot_be_used_is_said'),
 }
 SETTINGS_MUTATIONS = {
     'the matcher is exactly the guard\'s': ("    if entry['matcher'] != HOOK_MATCHER:", '    if False:',
