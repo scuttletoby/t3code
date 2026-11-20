@@ -1,8 +1,8 @@
 /**
- * Fork (issues 386, 625): backstop for upstream's completion wake. A parent's own events (a task
- * ending unread, a run ending) start one delayed check; an idle parent with results still unread
- * gets one queued message, ids from the task ids, so reruns and restarts never repeat it. At start,
- * every parent with a result unread from the last day is checked once. Off with `server.waitFor`.
+ * Fork (issues 386, 625): backstop for upstream's completion wake. A parent's own events start one
+ * delayed check; an idle parent with results unread is reminded once per task (message ids name the
+ * task keys). At start, parents with a result unread from the last day are checked once. Off with
+ * `server.waitFor`.
  */
 import type { OrchestrationV2Subagent, ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -27,7 +27,9 @@ import {
   parentBusy,
   REMINDER_MAX_AGE_MS,
   parentGone,
-  reminderIds,
+  REMINDER_ID_PREFIX,
+  reminderBatches,
+  reminderBatchIds,
   reminderText,
   resultDelivery,
 } from "./delegatedResults.ts";
@@ -99,38 +101,55 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
       watched.delete(parentThreadId);
       return { type: "none" } satisfies CheckOutcome;
     }
-    const ids = reminderIds(
-      parentThreadId,
-      owed.map((task) => task.id),
-    );
-    const result = yield* delivery.deliver({
-      threadId: parentThreadId,
-      messageId: ids.messageId,
-      commandId: ids.commandId,
-      text: reminderText(owed),
-    });
-    switch (result.type) {
-      case "delivered":
-        watched.delete(parentThreadId);
-        return { type: "sent", taskIds: owed.map((task) => task.id) } satisfies CheckOutcome;
-      case "gone":
-        watched.delete(parentThreadId);
-        return { type: "gone" } satisfies CheckOutcome;
-      case "stopped":
-        // A person stopped it: never restart it from here. Its next run end checks again.
-        watched.add(parentThreadId);
-        return { type: "held", detail: "stopped" } satisfies CheckOutcome;
-      case "rejected":
-        watched.delete(parentThreadId);
-        yield* Effect.logWarning("delegated result reminder refused", {
-          threadId: parentThreadId,
-          detail: result.detail,
-        });
-        return { type: "held", detail: result.detail } satisfies CheckOutcome;
-      case "retry":
-        watched.add(parentThreadId);
-        return { type: "unreadable" } satisfies CheckOutcome;
+    // What this parent was reminded of before, in either id format.
+    const sentIds = yield* store.sentIds(parentThreadId, REMINDER_ID_PREFIX);
+    if (sentIds === null) {
+      watched.add(parentThreadId);
+      return { type: "unreadable" } satisfies CheckOutcome;
     }
+    const batches = reminderBatches(parentThreadId, owed, sentIds);
+    if (batches.length === 0) {
+      watched.delete(parentThreadId);
+      return { type: "none" } satisfies CheckOutcome;
+    }
+    const sent: Array<string> = [];
+    for (const batch of batches) {
+      const ids = reminderBatchIds(
+        parentThreadId,
+        batch.map((task) => task.id),
+      );
+      const result = yield* delivery.deliver({
+        threadId: parentThreadId,
+        messageId: ids.messageId,
+        commandId: ids.commandId,
+        text: reminderText(batch),
+      });
+      switch (result.type) {
+        case "delivered":
+          sent.push(...batch.map((task) => task.id));
+          continue;
+        case "gone":
+          watched.delete(parentThreadId);
+          return { type: "gone" } satisfies CheckOutcome;
+        case "stopped":
+          // A person stopped it: never restart it from here. Its next run end checks again.
+          watched.add(parentThreadId);
+          return { type: "held", detail: "stopped" } satisfies CheckOutcome;
+        case "rejected":
+          watched.delete(parentThreadId);
+          yield* Effect.logWarning("delegated result reminder refused", {
+            threadId: parentThreadId,
+            detail: result.detail,
+          });
+          return { type: "held", detail: result.detail } satisfies CheckOutcome;
+        case "retry":
+          // The batches sent so far are recorded by their ids; the next try sends the rest.
+          watched.add(parentThreadId);
+          return { type: "unreadable" } satisfies CheckOutcome;
+      }
+    }
+    watched.delete(parentThreadId);
+    return { type: "sent", taskIds: sent } satisfies CheckOutcome;
   });
 
   /** One check after the delay; tries again a few times only while the parent cannot be read. */
