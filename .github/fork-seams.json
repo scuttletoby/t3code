@@ -236,11 +236,9 @@
     "apps/server/src/mcp/toolkits/environment/handlers.test.ts": 63,
     "apps/server/src/mcp/toolkits/project/handlers.test.ts": 48,
     "apps/server/src/orchestration-v2/EffectWorker.ts": 28,
-    "apps/server/src/orchestration-v2/ProjectionStore.ts": 7,
     "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": 127,
     "apps/server/src/orchestration-v2/ThreadLaunchService.test.ts": 84,
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": 13,
-    "apps/server/src/orchestration-v2/ThreadManagementService.ts": 1,
     "apps/server/src/orchestration-v2/runtimeLayer.test.ts": 259,
     "apps/server/src/orchestration-v2/runtimeLayer.ts": 28,
     "apps/server/src/processRunner.ts": 35,
@@ -299,7 +297,6 @@
     "apps/server/src/mcp/OrchestratorMcpService.slotGate.test.ts",
     "apps/server/src/mcp/OrchestratorMcpService.usageGate.test.ts",
     "apps/server/src/mcp/toolkits/waits/",
-    "apps/server/src/orchestration-v2/ProjectionStore.activeRunOnly.test.ts",
     "apps/server/src/playtest/",
     "apps/server/src/policy/managedSettings.forkKeys.test.ts",
     "apps/server/src/provider/ForkAgentContextBudget.test.ts",
@@ -372,10 +369,6 @@
       "lines": 2,
       "gone": 1
     },
-    "apps/server/src/orchestration-v2/ProjectionStore.ts": {
-      "lines": 1,
-      "gone": 1
-    },
     "apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts": {
       "lines": 1,
       "gone": 1
@@ -383,10 +376,6 @@
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": {
       "lines": 7,
       "gone": 3
-    },
-    "apps/server/src/orchestration-v2/ThreadManagementService.ts": {
-      "lines": 1,
-      "gone": 1
     },
     "apps/server/src/processRunner.ts": {
       "lines": 2,
