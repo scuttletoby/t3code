@@ -65,6 +65,11 @@ export type McpProfileProblem =
   | "broken"
   /** The parent thread's own profile cannot be applied, so the child's cannot be cut down. */
   | "parent"
+  /**
+   * The profile another machine sent with the task it delegated here cannot be read by this build
+   * (a newer build wrote fields this one does not know), so the task cannot be cut down to it.
+   */
+  | "carried"
   /** The lineage repeats a thread or is too deep. */
   | "lineage";
 
@@ -151,6 +156,7 @@ const BUILT_IN_PROFILES: Readonly<Record<string, McpProfileSet>> = {
 
 const KNOWN_GROUPS: ReadonlySet<string> = new Set(MCP_T3_TOOL_GROUPS);
 const PROFILE_FIELDS: ReadonlySet<string> = new Set(["servers", "t3Tools"]);
+const CARRIED_FIELDS: ReadonlySet<string> = new Set(["name", ...PROFILE_FIELDS]);
 
 /** True when the profile is today's behaviour: every outside server and every T3 tool. */
 export const isEveryMcpTool = (profile: McpProfileSet): boolean =>
@@ -237,6 +243,51 @@ function lookUp(settings: McpProfileSettings, name: string): Lookup {
   };
 }
 
+/**
+ * A delegating thread's resolved profile as another machine sends it with a task: its name and
+ * its `servers` and `t3Tools`. {@link resolveMcpProfile} cuts the task's own profile down to it.
+ */
+export type McpProfileCarried = {
+  readonly name: string;
+  readonly servers: McpProfileSet["servers"];
+  readonly t3Tools: McpProfileSet["t3Tools"];
+};
+
+/** A resolved profile as it is carried to another machine with a delegated task. */
+export const carryMcpProfile = (resolved: McpProfileResolved): McpProfileCarried => ({
+  name: resolved.name,
+  servers: resolved.profile.servers,
+  t3Tools: resolved.profile.t3Tools,
+});
+
+type CarriedLookup =
+  | { readonly ok: true; readonly name: string; readonly profile: McpProfileSet }
+  | { readonly ok: false; readonly name: string; readonly issue: string };
+
+/**
+ * A carried profile, checked as strictly as a settings entry: a field this build does not know
+ * could narrow the profile, so it refuses rather than being dropped. T3 tool groups it does not
+ * know keep nothing, which only narrows.
+ */
+function readCarried(value: unknown): CarriedLookup {
+  const name = isRecord(value) && typeof value.name === "string" ? value.name : "";
+  if (!isRecord(value)) return { ok: false, name, issue: "it is not an object" };
+  const extra = Object.keys(value).filter((field) => !CARRIED_FIELDS.has(field));
+  if (extra.length > 0) {
+    return {
+      ok: false,
+      name,
+      issue: `it has fields this version does not know (${extra.join(", ")})`,
+    };
+  }
+  if (name.trim() === "") return { ok: false, name, issue: "it has no name" };
+  const servers = parseServers(value.servers);
+  if (!servers.ok) return { ok: false, name, issue: servers.issue };
+  const t3Tools = parseT3Tools(value.t3Tools);
+  if (!t3Tools.ok) return { ok: false, name, issue: t3Tools.issue };
+  return { ok: true, name, profile: { servers: servers.value, t3Tools: t3Tools.value.groups } };
+}
+
 /** A set value; empty or absent means "not set". */
 const nonEmpty = (value: string | undefined): string | undefined => {
   const trimmed = value?.trim();
@@ -308,7 +359,9 @@ function cannotApply(
           }.`
         : problem === "parent"
           ? `The parent thread's MCP profile "${profileName}" cannot be applied, so this thread cannot start: ${FIX}.`
-          : `This thread's parent threads ${issue}, so its MCP profile cannot be worked out: ${FIX}.`;
+          : problem === "carried"
+            ? `The MCP profile "${profileName}" of the thread on another machine that delegated this one cannot be read by this version (${issue}), so this thread cannot start: update T3 here, or pick a profile for this thread in Settings.`
+            : `This thread's parent threads ${issue}, so its MCP profile cannot be worked out: ${FIX}.`;
   return { _tag: "CannotApply", problem, profileName, threadId: thread.threadId, message };
 }
 
@@ -316,6 +369,7 @@ function resolveAt(
   settings: McpProfileSettings,
   lineage: ReadonlyArray<McpProfileThread>,
   index: number,
+  carried: unknown,
 ): McpProfileResolution {
   const thread = lineage[index]!;
   const choice = ownChoice(settings, thread);
@@ -329,13 +383,24 @@ function resolveAt(
     narrowedByParent: false,
     unknownToolGroups: found.unknown,
   };
-  // The owner's pick is final; a thread without a parent has nothing to be cut to.
-  if (choice.source === "thread-pick" || index === lineage.length - 1) return own;
-  const parent = resolveAt(settings, lineage, index + 1);
-  if (parent._tag === "CannotApply") {
-    return cannotApply("parent", thread, parent.profileName, parent.message);
+  // The owner's pick is final; a thread without a parent, here or on the machine that delegated
+  // it, has nothing to be cut to.
+  if (choice.source === "thread-pick") return own;
+  const top = index === lineage.length - 1;
+  if (top && carried === undefined) return own;
+  let parentProfile: McpProfileSet;
+  if (top) {
+    const sent = readCarried(carried);
+    if (!sent.ok) return cannotApply("carried", thread, sent.name, sent.issue);
+    parentProfile = sent.profile;
+  } else {
+    const parent = resolveAt(settings, lineage, index + 1, carried);
+    if (parent._tag === "CannotApply") {
+      return cannotApply("parent", thread, parent.profileName, parent.message);
+    }
+    parentProfile = parent.profile;
   }
-  const profile = cutTo(own.profile, parent.profile);
+  const profile = cutTo(own.profile, parentProfile);
   return {
     ...own,
     profile,
@@ -347,12 +412,14 @@ function resolveAt(
 
 /**
  * The MCP profile of `lineage[0]`; `lineage` goes up through parents (a fork's source counts).
- * Order: the owner's pick is final; else the role default (`mcpSubagentProfile` for a delegated
- * child unless `inherit`, else `mcpProfile`; a project's override wins), cut down to the parent's.
+ * The owner's pick is final; else the role default (`mcpSubagentProfile` for a delegated child
+ * unless `inherit`, else `mcpProfile`; a project's override wins), cut down to the parent's, and
+ * the top thread's to `carried`, the profile another machine sent with it (if any).
  */
 export function resolveMcpProfile(
   settings: McpProfileSettings,
   lineage: ReadonlyArray<McpProfileThread>,
+  carried?: unknown,
 ): McpProfileResolution {
   const self = lineage[0];
   if (self === undefined) throw new Error("resolveMcpProfile needs the thread itself");
@@ -362,5 +429,5 @@ export function resolveMcpProfile(
   if (new Set(lineage.map((thread) => thread.threadId)).size !== lineage.length) {
     return cannotApply("lineage", self, "", "repeat a thread");
   }
-  return resolveAt(settings, lineage, 0);
+  return resolveAt(settings, lineage, 0, carried);
 }
