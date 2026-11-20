@@ -498,6 +498,59 @@ describe("WaitService slot waits", () => {
     }),
   );
 
+  it.effect(
+    "a store that cannot be loaded is not an empty one: no grant, used up later (#415)",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const world = newWorld();
+        const store = disk();
+        // A newer build's file: never read, so T1's held slot in it cannot be seen.
+        store.files.set(FILE, JSON.stringify({ version: 2, waits: [] }));
+        const send = fakeDelivery();
+        yield* Effect.gen(function* () {
+          const { gate, delegate } = yield* startService(store.fs, send.delivery);
+          // Nothing runs, but the held slots cannot be counted: never "free", no usage shown.
+          const unread = yield* gate.grant([{ key: "w_cccccccccc", threadId: T2 }]);
+          assert.deepStrictEqual(
+            unread.map((grant) => grant.type),
+            ["unread"],
+          );
+          assert.isNull(yield* gate.usage);
+          // T1 starts the agent its slot was held for, while the store still cannot be read.
+          const allowed = yield* gate.acquire({ callerThreadId: T1, targetInstanceId: MAIN });
+          assert.strictEqual(allowed.type, "allow");
+          // The store reads again, with T1's held slot in it; T1's dispatch ends with no child.
+          store.files.set(
+            FILE,
+            JSON.stringify({
+              version: 1,
+              waits: [
+                {
+                  id: "w_aaaaaaaaaa",
+                  threadId: T1,
+                  projectId: PROJECT,
+                  key: "000000000000000a", // gitleaks:allow (a fake test value, not a key)
+                  createdAt: "2026-11-14T11:00:00.000Z",
+                  deadlineAt: "2026-11-14T13:00:00.000Z",
+                  state: "delivered",
+                  endedAt: "2026-11-14T11:59:50.000Z",
+                  attempt: 0,
+                  kind: "slot",
+                  spec: {},
+                  result: { outcome: "free", detail: "", at: "2026-11-14T11:59:50.000Z" },
+                  reservedUntil: "2026-11-14T12:00:50.000Z",
+                },
+              ],
+            }),
+          );
+          yield* gate.release(allowed.type === "allow" ? allowed.token : null);
+          // T1's start used its slot up: the slot is free for another thread, not held twice.
+          assert.strictEqual(yield* delegate(OUTSIDER), "allow");
+        }).pipe(Effect.provide(serverLayer(world, slotsOn(1))));
+      }),
+  );
+
   it.effect("waits off (the default): no store read or written, its held slots do not count", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(NOW);
