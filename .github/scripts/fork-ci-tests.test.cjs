@@ -14,6 +14,9 @@ const {
   inPart,
   runSpeed,
   weightNote,
+  judge,
+  expectedSeconds,
+  slowNote,
   findTests,
   presentTests,
   runAll,
@@ -296,6 +299,15 @@ test("a long test without a weight, or one far from its weight, gets a note with
   assert.equal(weightNote("a.test.sh", 10, 35), null);
   assert.match(weightNote("a.test.sh", 10, 45), /make it "~45s"/);
   assert.match(weightNote("a.test.sh", 200, 20), /make it "~20s"/);
+  // The edges: over 30 s (no weight), over 30 s off and over double or under half.
+  assert.equal(weightNote("a.test.sh", null, 30), null);
+  assert.match(weightNote("a.test.sh", null, 31), /add "~31s"/);
+  assert.equal(weightNote("a.test.sh", 10, 40), null);
+  assert.match(weightNote("a.test.sh", 10, 41), /make it "~41s"/);
+  assert.equal(weightNote("a.test.sh", 100, 200), null);
+  assert.match(weightNote("a.test.sh", 100, 201), /make it "~201s"/);
+  assert.equal(weightNote("a.test.sh", 200, 100), null);
+  assert.match(weightNote("a.test.sh", 200, 99), /make it "~99s"/);
   // On a runner twice as slow as usual, times are read at half: a test that only took twice its weight is fine,
   // and the weight to write is the usual time.
   assert.equal(weightNote("a.test.sh", 100, 230, 2), null);
@@ -304,6 +316,81 @@ test("a long test without a weight, or one far from its weight, gets a note with
     weightNote("a.test.sh", 20, 200, 2),
     /took 200 s \(~100s on a usual runner\), .* make it "~100s"/,
   );
+});
+
+test("a weight note names the usual time only when the runner's speed is not 1", () => {
+  assert.equal(
+    weightNote("a.test.sh", 100, 230),
+    'a.test.sh took 230 s, its weight is ~100s: make it "~230s"',
+  );
+  assert.equal(
+    weightNote("a.test.sh", null, 45),
+    'a.test.sh took 45 s and has no weight: add "~45s"',
+  );
+  assert.equal(
+    weightNote("a.test.sh", 20, 200, 2),
+    'a.test.sh took 200 s (~100s on a usual runner), its weight is ~20s: make it "~100s"',
+  );
+});
+
+test("a shard's results: its failed tests, and a weight note only for a passed test far from its weight", () => {
+  const weights = new Map([
+    ["far", 100],
+    ["near", 100],
+    ["broke", 100],
+    ["new", null],
+  ]);
+  const run = (file, seconds, status = 0) => ({ file, seconds: String(seconds), status });
+  // `broke` failed after 300 s, far from its ~100s: a failure, but its time says nothing about its weight.
+  const { failed, stale, speed } = judge(
+    [run("far", 300), run("near", 100), run("broke", 300, 1), run("new", 5, null)],
+    weights,
+  );
+  assert.deepEqual(failed, ["broke", "new"]);
+  assert.deepEqual(stale, [{ file: "far", note: weightNote("far", 100, 300) }]);
+  assert.equal(speed, 1); // two passed weighted tests are too few to tell
+  // At a speed read from enough tests, notes use it; nothing passed, nothing to judge.
+  const many = new Map([...weights, ["b", 50], ["c", 50]]);
+  const slow = judge([run("near", 200), run("b", 100), run("c", 100), run("far", 900)], many);
+  assert.equal(slow.speed, 2);
+  assert.deepEqual(slow.stale, [{ file: "far", note: weightNote("far", 100, 900, 2) }]);
+  assert.deepEqual(judge([], weights), { failed: [], stale: [], speed: 1 });
+});
+
+// A slowdown all of a shard's tests share moves the speed, not any one test against it: no weight note shows it, so
+// the shard's own time against its weights does, as a warning.
+test("a shard over twice its expected time, and by over a minute, gets a warning; the weights alone do not", () => {
+  const weights = new Map([
+    ["a", 100],
+    ["b", 60],
+    ["c", 60],
+    ["d", 20],
+    ["e", null],
+  ]);
+  const files = ["a", "b", "c", "d", "e"];
+  // 250 s of weight on 4 slots is 62.5 s, but never less than the heaviest test.
+  assert.equal(expectedSeconds(files, weights, 4), 100);
+  assert.equal(expectedSeconds(files, weights, 1), 250);
+  assert.equal(expectedSeconds(["e"], weights, 4), 10);
+  assert.equal(expectedSeconds([], weights, 4), 0);
+  assert.equal(slowNote(files, weights, 4, 200), null); // twice, not more
+  assert.equal(slowNote(files, weights, 4, 120), null);
+  assert.equal(
+    slowNote(files, weights, 4, 201),
+    "the tests here took 201 s in all, ~100s expected from their weights (4 at once): a slowdown all of them " +
+      "share, which no weight shows; the job's time limit is next",
+  );
+  assert.equal(slowNote(["e"], weights, 4, 65), null); // over twice, but under a minute more
+  assert.match(slowNote(["e"], weights, 4, 71), /took 71 s in all, ~10s expected/);
+  assert.match(slowNote(files, weights, 1, 600), /~250s expected .*\(1 at once\)/);
+  // Every test 2.5 times its weight: the speed takes it all, no weight is stale, only the shard's time shows it.
+  const runs = files.map((file) => ({
+    file,
+    seconds: String(2.5 * (weights.get(file) ?? 10)),
+    status: 0,
+  }));
+  assert.deepEqual(judge(runs, weights).stale, []);
+  assert.notEqual(slowNote(files, weights, 4, 250), null);
 });
 
 test("the runner's speed is the median of time over weight of the passed tests weighing 10 s or more", () => {

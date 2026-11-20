@@ -17,6 +17,7 @@ import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
+import * as DelegatedOrphanScan from "./delegatedResults/DelegatedOrphanScan.ts";
 import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
 import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
@@ -82,6 +83,8 @@ export const layerRoutes = Layer.mergeAll(
   ActivityProbe.layer,
   // GET /api/fork/features: what this version does for a linked machine; its token only.
   ForkFeatures.layer,
+  // Linked threads a parent here launched but whose task the last stop lost: one reminder each.
+  DelegatedOrphanScan.layer,
 );
 
 /**
