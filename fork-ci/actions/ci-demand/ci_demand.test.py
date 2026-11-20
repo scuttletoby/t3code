@@ -16,7 +16,7 @@ R = 'repos/acme/widgets/actions/runs'
 DAY1 = f'{R}?created=2026-11-01T00:00:00Z..2026-11-01T23:59:59Z&per_page=100&page=1'
 DAY2 = f'{R}?created=2026-11-02T00:00:00Z..2026-11-02T23:59:59Z&per_page=100&page=1'
 DAY4 = f'{R}?created=2026-11-04T00:00:00Z..2026-11-04T23:59:59Z&per_page=100&page=1'   # "today" at NOW
-J101, J201 = (f'{R}/{n}/jobs?filter=all&per_page=100&page=1' for n in (101, 201))
+J101, J102, J201 = (f'{R}/{n}/jobs?filter=all&per_page=100&page=1' for n in (101, 102, 201))
 NOW = 1793793600.0   # 2026-11-04T12:00:00Z
 with open(os.path.join(HERE, 'testdata', 'two-days.json')) as f:
     PAGES = json.load(f)['pages']
@@ -361,6 +361,15 @@ class State(Case):
             ('job without conclusion', 'jobs', lambda b: [j.pop('conclusion') for j in b['jobs']]),
             ('run without status', 'workflow_runs', lambda b: [r.pop('status') for r in b['workflow_runs']]),
             ('run without conclusion', 'workflow_runs', lambda b: [r.pop('conclusion') for r in b['workflow_runs']]),
+            # A job that ran with no start (was counted as 0 seconds); a list emptied with its total_count kept (was
+            # counted as no runs or no jobs); a job without created_at or labels (its queue wait was dropped or filed
+            # under "(none)"). The skipped and never-started jobs in the test data already have null dates.
+            ('job started_at empty', 'jobs', lambda b: [j.update(started_at=None) for j in b['jobs']]),
+            ('jobs emptied, total_count kept', 'jobs', lambda b: b.update(jobs=[])),
+            ('runs emptied, total_count kept', 'workflow_runs', lambda b: b.update(workflow_runs=[])),
+            ('job without created_at', 'jobs', lambda b: [j.pop('created_at') for j in b['jobs']]),
+            ('job created_at empty', 'jobs', lambda b: [j.update(created_at=None) for j in b['jobs']]),
+            ('job without labels', 'jobs', lambda b: [j.pop('labels') for j in b['jobs']]),
         ]
         self.assertEqual(self.numbers()[0], 0)
         for what, kind, change in damage:
@@ -377,6 +386,64 @@ class State(Case):
             self.assertEqual((code, doc['requests'], doc['cached']), (0, fetched, 6 - fetched), (what, self.err))
             self.assertEqual(doc['days']['total']['ci_hours'], 3.25, what)
             self.assertEqual(self.numbers()[1]['requests'], 0, what)   # the pages fetched again were saved again
+
+    def test_a_page_the_read_back_would_refuse_is_never_saved(self):
+        # One rule for saving and reading back: an answer that would be refused when read is not written, so a run again
+        # asks for it once (counted live, like an unfinished page) and never rewrites the cache with it.
+        def no_start(p):
+            p[J101]['jobs'][0]['started_at'] = None   # completed, reached a runner, no start: 0 seconds if saved
+
+        def emptied(p):
+            p[J102]['jobs'] = []   # total_count still 2
+
+        def no_created(p):
+            p[J201]['jobs'][0]['created_at'] = None
+
+        def run_no_conclusion(p):
+            p[DAY2]['workflow_runs'][0].pop('conclusion')
+
+        for what, ep, change in (('runner job without start', J101, no_start), ('jobs emptied', J102, emptied),
+                                 ('job without created_at', J201, no_created),
+                                 ('run without conclusion', DAY2, run_no_conclusion)):
+            shutil.rmtree(self.cache, True)
+            p = copy.deepcopy(PAGES)
+            change(p)
+            self.serve({k: [ok(v)] for k, v in p.items()})
+            for n in range(3):
+                before = len(self.calls())
+                code, doc = self.numbers()
+                asked = [c[-1] for c in self.calls()[before:]]
+                self.assertEqual(code, 0, (what, self.err))
+                if n:
+                    self.assertEqual(asked, [ep], what)   # the other pages are read from the cache
+                self.assertNotIn(ep, self.saved_keys(), what)
+
+    def test_a_skipped_job_or_one_that_never_reached_a_runner_stays_cached_without_dates(self):
+        # As GitHub sends them: null dates. Neither counts toward CI hours or waits, so a good page is not refused (a
+        # refused page would be asked for on every run). A skipped job counts nowhere whatever its runner says.
+        for what, change in (('skipped, runner named', dict(conclusion='skipped', runner_name='runner-1')),
+                             ('skipped, runner empty', dict(conclusion='skipped', runner_name='')),
+                             ('cancelled in the queue', dict(conclusion='cancelled', runner_name=None))):
+            shutil.rmtree(self.cache, True)
+            p = copy.deepcopy(PAGES)
+            p[J201]['jobs'].append({**p[J201]['jobs'][0], 'name': 'extra', 'started_at': None, 'completed_at': None,
+                                    **change})
+            p[J201]['total_count'] = 2
+            self.serve({k: [ok(v)] for k, v in p.items()})
+            code, doc = self.numbers()
+            self.assertEqual((code, doc['days']['total']['ci_hours']), (0, 3.25), (what, self.err))
+            self.assertIn(J201, self.saved_keys(), what)
+            code, doc = self.numbers()
+            self.assertEqual((code, doc['requests'], doc['cached'], doc['days']['total']['ci_hours']), (0, 0, 6, 3.25),
+                             what)
+
+    def saved_keys(self):
+        keys = []
+        for name in os.listdir(self.cache) if os.path.isdir(self.cache) else []:
+            if not name.startswith('.part-'):
+                with open(os.path.join(self.cache, name)) as f:
+                    keys.append(json.load(f)['key'].split('#')[0])
+        return keys
 
     def test_read_only_cache_folder_with_an_old_part_file_goes_on(self):
         # The start-up clean-up cannot remove an old .part- file: reported on its own line, not an exit; a page it then
@@ -566,7 +633,7 @@ class State(Case):
         self.assertIn(': 2 requests, 0 cached pages', out)
         self.assertTrue(os.path.isdir(self.cache))
         code, doc = self.numbers()
-        self.assertEqual((code, doc['days']), (0, {}))
+        self.assertEqual((code, doc['days'], doc['requests'], doc['cached']), (0, {}, 0, 2))   # empty and total 0: saved
 
 
 class Answers(Case):

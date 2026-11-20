@@ -57,11 +57,16 @@
           "root": "~/worktrees",
           "github": "example-owner/example-repo",
           "regenerable": ["dist"],
-          "branches": ["work/*"]
+          "branches": ["work/*"],
+          "mergedBranches": true
         }
       ]
     },
     "tmp": { "root": "/tmp", "patterns": { "example-build-*": 7 } },
+    "docker": { "enabled": true, "days": 7 },
+    "agentScratch": { "enabled": true, "days": 3 },
+    "compressCold": { "folders": [{ "path": "~/.codex/sessions", "days": 30 }] },
+    "dedupe": { "folders": [{ "path": "~/mirrors", "days": 30 }] },
     "daily": {
       "mode": "compare",
       "oldTimers": ["example-retention.timer"],
