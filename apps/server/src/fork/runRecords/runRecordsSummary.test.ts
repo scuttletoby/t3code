@@ -159,6 +159,22 @@ describe("summarizeRunRecords", () => {
     );
   });
 
+  it("counts an empty refused tag: refused text can be empty, and still counts", () => {
+    const summary = summarizeRunRecords(
+      [
+        record("empty", { estimateRefused: "" }),
+        record("plain"),
+        record("none", { estimateRefused: null }),
+      ],
+      { toMs: NOW_MS },
+    );
+    assert.strictEqual(summary.refusedEstimates, 1);
+    assert.include(
+      formatRunRecordsSummary(summary),
+      "1 runs had an estimate tag that could not be read",
+    );
+  });
+
   it("counts only runs that ended in the window, each run once", () => {
     const summary = summarizeRunRecords(
       [
@@ -294,6 +310,23 @@ describe("runSummaryCli", () => {
     assert.throws(() => runSummaryCli(["--weeks", "2"], io({})), /unknown option/);
     assert.throws(() => runSummaryCli(["--days", "0"], io({})), /positive/);
     assert.throws(() => runSummaryCli(["--to", "soon"], io({})), /date/);
+    // Only a real day written YYYY-MM-DD: no rolling over, no month alone, no local-time forms.
+    for (const bad of [
+      "2026-02-30",
+      "2026-02-29",
+      "2026-13-01",
+      "2026-11-31",
+      "2026-11-00",
+      "2026-11",
+      "2026/11/20",
+      "2026-11-20T12:00:00Z",
+      " 2026-11-20",
+      "0099-01-01",
+    ]) {
+      assert.throws(() => runSummaryCli(["--to", bad], io({})), /real date/, bad);
+    }
+    assert.include(runSummaryCli(["--to", "2028-02-29"], io({})), "to 2028-02-29");
+    assert.include(runSummaryCli(["--to", "2026-12-31"], io({})), "2026-12-25 to 2026-12-31");
     assert.throws(() => runSummaryCli(["--days"], io({})), /needs a value/);
   });
 });

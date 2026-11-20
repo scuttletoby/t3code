@@ -39,7 +39,7 @@ or ended without a final answer. Its usage is whatever its provider reported unt
 Put these anywhere in the `delegate_task` task text:
 
 - `[run-kind: lens: data]`: a free-text kind, grouped by in the summary. A kind over 80 characters is
-  cut to 80 and ends in `…`.
+  cut to 80 and ends in `…`. The first closed tag is used.
 - `[run-estimate: 40m 2M tokens]`: the parent's guess, a time, a token count, or both.
   - Times: `1h30m`, `1h 30m`, `1.5h`, `90 min`, `45s` (`h`, `hr`, `hour(s)`, `m`, `min`, `minute(s)`,
     `s`, `sec`, `second(s)`; any case).
@@ -49,9 +49,13 @@ Put these anywhere in the `delegate_task` task text:
   - Parts may be joined by spaces, `,`, `;`, `+`, `~` or "and".
   - Anything else refuses the whole tag, and nothing is guessed: a range (`30-40m`), a lone `2M`
     (minutes or a million?), `300k` without "tokens", words like "about", a time unit twice, or two
-    token counts. A tag over 80 characters, or one with no closing `]` on its line, is refused too.
-    A refused tag is kept in `estimateRefused` (cut to 80 characters plus `…`), logged as a warning,
-    and counted in the summary.
+    token counts. A tag over 80 characters, or one with no closing `]` on its line (or before the
+    next `[`), is refused too. A refused tag is kept in `estimateRefused` (cut to 80 characters
+    plus `…`), logged as a warning, and counted in the summary.
+  - The first tag that reads is used, so a brief may mention the tag (`see the [run-estimate:
+    format below`) before its real one. Only when no tag reads is the first one refused.
+- Characters are what a person sees: an emoji or a letter with its accent counts as one, and a cut
+  never splits one.
 
 ## The weekly summary
 
@@ -68,8 +72,9 @@ the model the provider reported running when it reported one, else at the model 
 whose model has no rate are left out of the price and counted (`+2 unpriced`); `-` means none had
 a rate.
 
-The header names the window's first and last day: `--to 2026-11-20` (the end of that day) prints
-`2026-11-14 to 2026-11-20`.
+The header names the window's first and last day: `--to 2026-11-20` (the end of that day, UTC)
+prints `2026-11-14 to 2026-11-20`. `--to` takes only a real day written `YYYY-MM-DD`: `2026-02-30`,
+`2026-11` and `2026/11/20` are refused with a non-zero exit.
 
 It reads the files line by line and keeps only the window's records, so a file of any size works
 (a whole string would stop past about 512 MB). A records file it cannot read (other than the state

@@ -172,6 +172,63 @@ describe("parseTaskLabels", () => {
     });
   });
 
+  it("reads the first tag that reads: an earlier mention of the tag never hides it", () => {
+    const real = "[run-estimate: 40m]";
+    for (const mention of [
+      "see the [run-estimate: format below\n",
+      "see the [run-estimate: format below\r\n",
+      `[run-estimate: 40m ${"x".repeat(MAX_TAG_CHARS)}]\n`,
+      "[run-estimate: ] ",
+      "[run-estimate: 30-40m] ",
+      // On the same line: the next `[` ends the unclosed mention.
+      "see [run-estimate: ",
+    ]) {
+      assert.deepStrictEqual(
+        readEstimateTag(`${mention}${real}`),
+        { estimate: { wallMs: 40 * MINUTE_MS }, refused: null },
+        JSON.stringify(mention),
+      );
+    }
+    // With no tag that reads, the first one is refused, not a later one.
+    assert.deepStrictEqual(readEstimateTag("[run-estimate: soon] [run-estimate: 1-2h]"), {
+      estimate: null,
+      refused: "soon",
+    });
+    assert.deepStrictEqual(readEstimateTag("see [run-estimate: \n[run-estimate: 1-2h]"), {
+      estimate: null,
+      refused: "",
+    });
+    // Many unclosed openers before the real tag: each is passed over, the real one still read.
+    const openers = "[run-estimate: ".repeat(200_000);
+    assert.deepStrictEqual(readEstimateTag(`${openers}${real}`)?.estimate, {
+      wallMs: 40 * MINUTE_MS,
+    });
+    // The kind tag behaves the same way.
+    assert.strictEqual(parseTaskLabels("see [run-kind: format [run-kind: fix]").kind, "fix");
+    assert.strictEqual(parseTaskLabels("see the [run-kind: format\n[run-kind: fix]").kind, "fix");
+  });
+
+  it("counts and cuts whole characters, never half an emoji or a letter's accent", () => {
+    const emoji = "\u{1F600}"; // two UTF-16 units
+    const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"; // one character, eight units
+    const accent = "e\u0301"; // e and a combining accent: one character
+    for (const char of [emoji, family, accent]) {
+      // 80 characters fit even though they are more than 80 units.
+      const atLimit = char.repeat(MAX_TAG_CHARS);
+      assert.strictEqual(parseTaskLabels(`[run-kind: ${atLimit}]`).kind, atLimit);
+      const refused = readEstimateTag(`[run-estimate: ${atLimit}]`)?.refused;
+      assert.strictEqual(refused, atLimit, "refused as unreadable, not as too long");
+      // One more is cut back to 80 whole characters.
+      const over = `${"a".repeat(MAX_TAG_CHARS - 1)}${char.repeat(2)}`;
+      const cut = `${"a".repeat(MAX_TAG_CHARS - 1)}${char}…`;
+      assert.strictEqual(readEstimateTag(`[run-estimate: ${over}]`)?.refused, cut);
+      assert.strictEqual(parseTaskLabels(`[run-kind: ${over}]`).kind, cut);
+      // The cut text survives a record line unchanged: no lone surrogate.
+      assert.strictEqual(JSON.parse(JSON.stringify(cut)), cut);
+      assert.isTrue(cut.isWellFormed());
+    }
+  });
+
   it("cuts a long kind tag rather than dropping it", () => {
     const long = `lens: ${"data ".repeat(30)}`.trim();
     assert.strictEqual(parseTaskLabels(`[run-kind: ${long}]`).kind, `${long.slice(0, 80)}…`);

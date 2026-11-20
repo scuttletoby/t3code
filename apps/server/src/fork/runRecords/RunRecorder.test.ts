@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
@@ -534,6 +535,62 @@ it.layer(NodeServices.layer)("RunRecorder", (it) => {
       assert.strictEqual(record?.estimateRefused, "2M");
     }),
   );
+
+  it.effect("an empty estimate tag is recorded, logged and counted as refused", () => {
+    const refusedTags: Array<unknown> = [];
+    const logger = Logger.make(({ logLevel, message }) => {
+      const [text, fields] = Array.isArray(message) ? message : [message];
+      if (logLevel === "Warn" && String(text).startsWith("run estimate tag refused")) {
+        refusedTags.push((fields as { tag?: unknown } | undefined)?.tag);
+      }
+    });
+    return Effect.gen(function* () {
+      const { world, start, records } = yield* harness;
+      world.subagents[0] = task(
+        "parent",
+        "child",
+        "Act as the writer sub-agent for this task.\n\n[run-estimate: ]\nFix it.",
+        "Fix the cursor",
+      );
+      endRun(world, run("child", "run-1"), { answer: "Done." });
+      yield* start;
+      // Runs again (a restart replays the end): still one line, logged once.
+      storeUpdate(world, run("child", "run-1"));
+      yield* start;
+      const all = yield* records;
+      assert.deepStrictEqual(
+        all.map((record) => [record.runId, record.estimate, record.estimateRefused]),
+        [["run-1", null, ""]],
+      );
+      assert.deepStrictEqual(refusedTags, [""]);
+      assert.strictEqual(summarizeRunRecords(all, { toMs: NOW_MS + 1 }).refusedEstimates, 1);
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
+
+  it.effect("an earlier mention of the tag does not hide the real one, and is not logged", () => {
+    const refusedTags: Array<unknown> = [];
+    const logger = Logger.make(({ logLevel, message }) => {
+      const [text, fields] = Array.isArray(message) ? message : [message];
+      if (logLevel === "Warn" && String(text).startsWith("run estimate tag refused")) {
+        refusedTags.push((fields as { tag?: unknown } | undefined)?.tag);
+      }
+    });
+    return Effect.gen(function* () {
+      const { world, start, records } = yield* harness;
+      world.subagents[0] = task(
+        "parent",
+        "child",
+        "Act as the writer sub-agent for this task.\n\nSee the [run-estimate: format below.\n[run-estimate: 40m]\nFix it.",
+        "Fix the cursor",
+      );
+      endRun(world, run("child", "run-1"), { answer: "Done." });
+      yield* start;
+      const [record] = yield* records;
+      assert.deepStrictEqual(record?.estimate, { wallMs: 40 * 60_000 });
+      assert.strictEqual(record?.estimateRefused, null);
+      assert.deepStrictEqual(refusedTags, []);
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
 
   it.effect("a too-long estimate tag is refused once, even when its run ends again or stops", () =>
     Effect.gen(function* () {

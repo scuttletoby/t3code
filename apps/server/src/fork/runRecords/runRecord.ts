@@ -97,15 +97,42 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<OrchestrationV2Run["status"]> = 
 ]);
 
 const ROLE_PREFIX = /^Act as the ([^\n]{1,60}?) sub-agent for this task\./u;
-/** Longest kind or estimate text kept; a longer kind is cut, a longer estimate refused. */
+/**
+ * Longest kind or estimate text kept, in characters a person sees (graphemes); a longer kind is cut,
+ * a longer estimate refused.
+ */
 export const MAX_TAG_CHARS = 80;
-/** Up to the closing `]`, any length: one pass over the line, no backtracking. */
-const KIND_TAG = /\[run-kind:([^\]\n]*)\]/iu;
-/** An estimate tag without its `]` (on the same line) is read too, so that it is refused, not lost. */
-const ESTIMATE_TAG = /\[run-estimate:([^\]\n]*)(\]?)/iu;
-/** Cuts a long tag text to `MAX_TAG_CHARS`, marking the cut with `…`. */
-const capTagText = (text: string) =>
-  text.length > MAX_TAG_CHARS ? `${text.slice(0, MAX_TAG_CHARS)}…` : text;
+/**
+ * Up to the closing `]`, any length: one pass over the line, no backtracking. A `[` ends a tag, so
+ * an unclosed mention (`see the [run-kind: format`) never swallows a later tag on its line.
+ */
+const KIND_TAG = /\[run-kind:([^\][\n]*)\]/iu;
+/**
+ * Every estimate tag in a text. One without its `]` (on the same line, before the next `[`) is read
+ * too, so that it is refused, not lost; the next `[` ends it, so it never swallows a later tag.
+ */
+const ESTIMATE_TAGS = /\[run-estimate:([^\][\n]*)(\]?)/giu;
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/**
+ * The text's first `MAX_TAG_CHARS` characters, or null when it has no more than that. Characters
+ * are what a person sees (an emoji, a letter with its accent), never half of one.
+ */
+const overTagLimit = (text: string): string | null => {
+  // Never more characters than UTF-16 units: a short text needs no segmenting.
+  if (text.length <= MAX_TAG_CHARS) return null;
+  let count = 0;
+  // Stops at the first character past the limit, so a long text costs no more than a short one.
+  for (const { index } of GRAPHEMES.segment(text)) {
+    if (count === MAX_TAG_CHARS) return text.slice(0, index);
+    count += 1;
+  }
+  return null;
+};
+/** Cuts a long tag text to `MAX_TAG_CHARS` characters, marking the cut with `…`. */
+const capTagText = (text: string) => {
+  const cut = overTagLimit(text);
+  return cut === null ? text : `${cut}…`;
+};
 const DURATION_UNITS: Readonly<Record<string, number>> = {
   h: 3_600_000,
   hr: 3_600_000,
@@ -203,17 +230,21 @@ function readEstimateText(text: string): RunEstimate | null {
   return safe && Object.keys(estimate).length > 0 ? estimate : null;
 }
 
-/** `[run-estimate: 1h 30m 2.5M tokens]` in a text: null when there is no tag. */
+/**
+ * `[run-estimate: 1h 30m 2.5M tokens]` in a text, null when there is none. The first tag that reads
+ * wins, so an earlier mention of the tag never hides the real one. With none that reads, the first
+ * is refused (too long, unclosed, empty or unreadable) and kept cut short, so the summary counts it.
+ */
 export function readEstimateTag(text: string): EstimateTag | null {
-  const match = ESTIMATE_TAG.exec(text);
-  if (match === null) return null;
-  const tag = match[1]!.trim();
-  // Too long, or never closed: refused (kept cut short), so the summary counts it, never dropped.
-  const estimate =
-    tag.length > MAX_TAG_CHARS || match[2] !== "]" || tag === "" ? null : readEstimateText(tag);
-  return estimate === null
-    ? { estimate: null, refused: capTagText(tag) }
-    : { estimate, refused: null };
+  let refused: string | null = null;
+  for (const match of text.matchAll(ESTIMATE_TAGS)) {
+    const tag = match[1]!.trim();
+    const estimate =
+      match[2] !== "]" || tag === "" || overTagLimit(tag) !== null ? null : readEstimateText(tag);
+    if (estimate !== null) return { estimate, refused: null };
+    refused ??= capTagText(tag);
+  }
+  return refused === null ? null : { estimate: null, refused };
 }
 
 /** The estimate in a text, or null when there is none or it was refused. */
