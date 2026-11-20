@@ -22,11 +22,18 @@ import * as Stream from "effect/Stream";
 import * as ServerConfig from "../config.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../mcp/McpToolAccess.ts";
+import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
+import * as OrchestratorHandlers from "../mcp/toolkits/orchestrator/handlers.ts";
+import { OrchestratorToolkit } from "../mcp/toolkits/orchestrator/tools.ts";
+import * as ThreadMetadataMcpService from "../mcp/ThreadMetadataMcpService.ts";
 import * as ProjectHandlers from "../mcp/toolkits/project/handlers.ts";
 import { ProjectToolkit } from "../mcp/toolkits/project/tools.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
+import * as PeerLinkRequests from "../peer/PeerLinkRequests.ts";
+import * as PeerLinks from "../peer/PeerLinks.ts";
+import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as Project from "../project/ProjectService.ts";
 import * as DocumentText from "../provider/DocumentText.ts";
@@ -189,13 +196,56 @@ const harness = (settings: Settings, options: { readonly caller?: boolean } = {}
         } as never)
         .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
     });
-  return { launched, forwarded, launch };
+  const scheduled: Array<unknown> = [];
+  /** Upstream's real `schedule_task` handler, the other tool that starts threads. */
+  const schedule = (input: {
+    readonly environmentId?: EnvironmentId;
+    readonly scheduledTaskId?: string;
+  }) =>
+    Effect.gen(function* () {
+      const service = Layer.mergeAll(
+        Layer.mock(OrchestratorMcpService.OrchestratorMcpService)({
+          scheduleTask: (_scope, task) => {
+            scheduled.push(task);
+            return Effect.fail(
+              new OrchestratorMcpFailure({
+                code: "orchestration_error",
+                message: "scheduled here",
+              }),
+            ) as never;
+          },
+          updateScheduledTask: (_scope, task) => {
+            scheduled.push(task);
+            return Effect.fail(
+              new OrchestratorMcpFailure({ code: "orchestration_error", message: "updated here" }),
+            ) as never;
+          },
+        }),
+        Layer.mock(ThreadMetadataMcpService.ThreadMetadataMcpService)({}),
+        Layer.mock(PeerLinks.PeerLinks)({}),
+        Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
+        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+      ).pipe(Layer.provideMerge(dependencies));
+      const toolkit = yield* OrchestratorToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(OrchestratorHandlers.layer).pipe(
+            Layer.provide(service),
+          ),
+        ),
+      );
+      return yield* toolkit
+        .handle("schedule_task", {
+          prompt: "Do the work",
+          schedule: { type: "interval", everyMs: 3_600_000 },
+          ...input,
+        } as never)
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(service));
+    });
+  return { launched, forwarded, scheduled, launch, schedule };
 };
 
-/** `code: message` of a refused launch, or `undefined` for one that went through. */
-const refusal = (
-  chunks: Effect.Success<ReturnType<ReturnType<typeof harness>["launch"]>>,
-): string | undefined => {
+/** `code: message` of a refused call, or `undefined` for one that went through. */
+const refusal = (chunks: Iterable<unknown>): string | undefined => {
   const last = [...chunks].at(-1) as
     | { readonly isFailure: boolean; readonly result: { code?: string; message?: string } }
     | undefined;
@@ -277,4 +327,46 @@ it.effect("a narrowed thread cannot launch on another machine; an all thread can
     expect(refusal(yield* wide.launch({ environmentId: THERE }))).toContain("sent there");
     expect(wide.forwarded).toHaveLength(1);
   }),
+);
+
+it.effect("a narrowed thread cannot schedule a task on another machine either (#681)", () =>
+  Effect.gen(function* () {
+    const narrow = harness({ ...DOCS_ONLY, ...pickFor("docs") } as Settings);
+    expect(refusal(yield* narrow.schedule({ environmentId: THERE }))).toContain(
+      "another machine gets that machine's profile",
+    );
+    expect(narrow.forwarded).toHaveLength(0);
+    // Here it goes on to the service, which the launch check of its runs covers.
+    expect(refusal(yield* narrow.schedule({}))).toContain("scheduled here");
+    // An update starts no thread there, so it goes as before.
+    const update = { environmentId: THERE, scheduledTaskId: "scheduled-task:1" };
+    expect(refusal(yield* narrow.schedule(update))).toContain("sent there");
+    expect(narrow.forwarded).toHaveLength(1);
+    const wide = harness({});
+    expect(refusal(yield* wide.schedule({ environmentId: THERE }))).toContain("sent there");
+    expect(wide.forwarded).toHaveLength(1);
+  }),
+);
+
+it.effect(
+  "a narrowed thread's launch here, then there, then here again: each call is its own (#681)",
+  () =>
+    Effect.gen(function* () {
+      // Runs again: a launch here marks only its own caller, so the next call there is refused.
+      const narrow = harness({
+        ...DOCS_ONLY,
+        ...pickFor("docs"),
+        projectSettingsFolded: true,
+        mcpProfile: "t3-only",
+      } as Settings);
+      expect(refusal(yield* narrow.launch({ projectId: NARROW_PROJECT }))).toBeUndefined();
+      expect(refusal(yield* narrow.launch({ environmentId: THERE }))).toContain(
+        "another machine gets that machine's profile",
+      );
+      expect(
+        refusal(yield* narrow.launch({ projectId: NARROW_PROJECT, clientRequestId: "again" })),
+      ).toBeUndefined();
+      expect(narrow.forwarded).toHaveLength(0);
+      expect(narrow.launched).toHaveLength(2);
+    }),
 );
