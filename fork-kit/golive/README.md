@@ -42,8 +42,10 @@ at any step; one installer at a time. The steps are the cleaner's (`fork-kit/com
 - **A copy made by hand.** A plain file at `/usr/local/bin/t3-golive` (a copy made before this installer) is kept
   in `/usr/local/libexec/t3-golive/replaced/t3-golive.<sha256, 16>` (in the install record too) and the kit's link
   replaces it in one step, so the command is never missing. `uninstall` puts back the copy kept last (by the order
-  in `replaced/order`, not by file times). A link there that is not the kit's, or a folder, is refused and left
-  alone.
+  in `replaced/order`, not by file times), with the mode and owner it had when it was kept, again in one step:
+  `t3-golive` is never missing during an uninstall either. (A copy kept by an installer from before the mode and
+  owner were kept comes back root-owned, `0755` or `0644`.) A link there that is not the kit's, or a folder, is
+  refused and left alone.
 - **A hand install in the kit's own layout.** Where `/usr/local/bin/t3-golive` already is the kit's link
   (`/usr/local/libexec/t3-golive/current/bin/t3-golive`) and `current` a link into `versions/`, the install takes
   it over: it switches `current` to the new release and leaves the hand version folder where it was (not in the
@@ -57,7 +59,12 @@ at any step; one installer at a time. The steps are the cleaner's (`fork-kit/com
   a process or a transient systemd unit (the holder, a switch guard timer still pending) runs code from
   `/usr/local/libexec/t3-golive` or through the kit's links. Settle first (`t3-golive status`, then `back` or
   `settle`). A machine file it cannot read, a journal it cannot trust, and a lock or journal that is not a plain
-  file (the state folder is the T3 user's) refuse too.
+  file (the state folder is the T3 user's) refuse too. Where no golive run has made `<stateDir>/lock` yet,
+  `uninstall` makes it first, as golive would (the file `0600`, a missing folder `0700`) and as the state folder's
+  owner, never as root, and holds it: a first run cannot start during the uninstall. In a folder of root's no run
+  as a user could make the lock either, so nothing is made there. A run started by a bare name from its own folder
+  (`python3 t3-golive` in `/usr/local/bin`) is not seen by the process scan; `./t3-golive`, `../bin/t3-golive`
+  and doubled slashes are. Every golive run that changes anything holds the lock, so it is covered there.
 - **Update through the bootstrap.** Run the bootstrap again with the newer release commit.
 
 The installer writes no machine file and nothing in a T3 home; `uninstall` leaves both, and the state folder.

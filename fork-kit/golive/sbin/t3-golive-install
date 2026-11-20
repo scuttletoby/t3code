@@ -10,12 +10,14 @@ fork-kit/common/{machine_file,kit_install}.py of one release into /usr/local/lib
 MANIFEST.sha256), checks the copy (every module imports, `t3-golive --help`), switches the link `current` to it and
 links /usr/local/bin/t3-golive and /usr/local/sbin/t3-golive-install to it. An old /usr/local/bin/t3-golive that is
 a plain file (a hand copy from before this installer) is kept in /usr/local/libexec/t3-golive/replaced/ and put back
-by uninstall. Old version folders stay: the detached units of a run (its guard, the switch guard's timer) run the
-version that started them. uninstall is refused while a golive run holds the kit's lock (golive.stateDir of the
-machine file), while the journal there has a run that needs settling (a killed switch, a failed W1: T3 may be
-stopped and its home held), and while a process or a transient unit (the holder, a switch guard's pending timer)
-runs code from /usr/local/libexec/t3-golive. Safe to run again, and to stop at any step; one installer at a time. The steps every kit shares are
-in fork-kit/common/kit_install.py.
+by uninstall, in one step and with the mode and owner it had. Old version folders stay: the detached units of a run
+(its guard, the switch guard's timer) run the version that started them. uninstall is refused while a golive run
+holds the kit's lock (golive.stateDir of the machine file), while the journal there has a run that needs settling (a
+killed switch, a failed W1: T3 may be stopped and its home held), and while a process or a transient unit (the
+holder, a switch guard's pending timer) runs code from /usr/local/libexec/t3-golive. Where no golive run has made
+the lock yet, uninstall makes it first (as the state folder's owner, never as root) and holds it, so no first run
+starts under it. Safe to run again, and to stop at any step; one installer at a time. The steps every kit shares
+are in fork-kit/common/kit_install.py.
 """
 import contextlib, fcntl, os, stat, sys, tempfile
 _kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -35,6 +37,7 @@ COMMAND = '/usr/local/bin/t3-golive'
 
 class GoliveInstaller(kit_install.Installer):
     PROG = 't3-golive-install'
+    PROGRAM = __file__
     KIT = 'golive'
     ETC = '/etc/t3-golive'
     LIBEXEC = '/usr/local/libexec/t3-golive'
@@ -47,6 +50,7 @@ class GoliveInstaller(kit_install.Installer):
     MODULES = ('__init__', 'back', 'check', 'coldcopy', 'config', 'handoff', 'journal', 'keptruntime', 'live',
                'osadapter', 'rehearse', 'switch')
     HELP = ('bin/t3-golive', 'switch-guard')
+    SYSTEM_UID = 0          # tests only: the owner (root) of a folder no golive run as a user can make its lock in
 
     def state_dir(self):
         """golive.stateDir of the machine file, or None where no golive section is set (no run ever here)."""
@@ -61,7 +65,8 @@ class GoliveInstaller(kit_install.Installer):
     @contextlib.contextmanager
     def uninstall_guard(self):
         """A run holds <stateDir>/lock: removing the code under it would leave its guard nothing to run. Held for
-        the whole uninstall, so no run starts in between. Under it, a run the journal says needs settling refuses
+        the whole uninstall, so no run starts in between; where there is no lock file yet (no run here ever), it is
+        made first (make_lock), so a first run cannot start in between either. Under it, a run the journal says needs settling refuses
         too: such a run has ended, but what it left (T3 stopped, the holder, a pending guard) still needs this
         kit's code (`t3-golive status`, `settle`, `back`). The lock and the journal are opened without following a
         link and without waiting: anything but a plain file there refuses (the state folder is the T3 user's)."""
@@ -70,7 +75,9 @@ class GoliveInstaller(kit_install.Installer):
             yield
             return
         fd = self.open_state_file(state, 'lock')
-        if fd is None:              # no golive run has ever taken the lock here; its journal is read all the same
+        if fd is None:              # no golive run has ever taken the lock here: make it, as a first run would
+            fd = self.make_lock(state)
+        if fd is None:              # in a folder of root's, which no golive run as a user can make it in either
             self.refuse_unsettled(state)
             yield
             return
@@ -84,6 +91,61 @@ class GoliveInstaller(kit_install.Installer):
             yield
         finally:
             os.close(fd)
+
+    def make_lock(self, state):
+        """<stateDir>/lock where there is none yet (no golive run has ever been here), made the way golive's first
+        run makes it (journal.lock: the folder 0700, the file 0600) and as the user who would run it: the owner of
+        the state folder, or of the folder it would be made in. So the lock covers that first run too: one that
+        starts during this uninstall finds it held. It is made in a child process with that user's rights, never
+        root's, so a link in the T3 user's folders leads nowhere that user could not write. None, with nothing
+        made, when that owner is root: no golive run as a user can make the lock there either."""
+        lock, where = os.path.join(state, 'lock'), state
+        while not os.path.lexists(self.p(where)) and where != '/':
+            where = os.path.dirname(where)
+        try:
+            st = os.stat(self.p(where))
+        except OSError as e:
+            raise self.Refused(f'{where} cannot be read ({e.strerror}): uninstall cannot make {lock}, which keeps a '
+                               'first golive run from starting under it') from None
+        if st.st_uid == self.SYSTEM_UID:
+            return None
+
+        def make():
+            os.makedirs(self.p(state), mode=0o700, exist_ok=True)
+            os.close(os.open(self.p(lock), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+        self.run_as(st.st_uid, st.st_gid, make, f'make {lock} as uid {st.st_uid}')
+        self.say(f'made {lock} (as uid {st.st_uid}), the lock a golive run takes, and holds it while it uninstalls')
+        fd = self.open_state_file(state, 'lock')
+        if fd is None:
+            raise self.Refused(f'{lock} is gone again: run uninstall again')
+        return fd
+
+    def run_as(self, uid, gid, fn, what):
+        """fn() in a child process with that user's rights (no groups but gid), not root's. Refused when it fails."""
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:                # the child: never back into the caller's code
+            code = 1
+            try:
+                os.close(r)
+                if uid != os.geteuid():
+                    os.setgroups([])
+                    os.setgid(gid)
+                    os.setuid(uid)
+                fn()
+                code = 0
+            except BaseException as e:      # noqa: B036 -- reported to the parent, then the child exits
+                with contextlib.suppress(OSError):
+                    os.write(w, str(e).encode('utf-8', 'replace')[:500])
+            finally:
+                os._exit(code)
+        os.close(w)
+        with os.fdopen(r, 'rb') as f:
+            why = f.read().decode('utf-8', 'replace')
+        _, status = os.waitpid(pid, 0)
+        if os.waitstatus_to_exitcode(status) != 0:
+            raise self.Refused(f'cannot {what} ({why or "it failed"}): uninstall takes that lock so that no golive '
+                               'run starts under it; look at the state folder and run again')
 
     def open_state_file(self, state, name):
         """A plain file of the state folder, opened read-only with no link followed and no wait; None when there

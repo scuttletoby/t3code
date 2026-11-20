@@ -5,7 +5,7 @@ and shows its test then fails.
 
   python3 -I -B fork-kit/common/tests/kit_install.test.py
 """
-import contextlib, fcntl, os, shutil, subprocess, sys, unittest
+import contextlib, errno, fcntl, os, shutil, subprocess, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -252,6 +252,7 @@ class Contract:
         text = fx.source_of(installer, ('    import kit_install', '    import kit_install_gone'))
         with open(installer, 'w') as f:
             f.write(text)
+        self.m.check_same_installer = lambda source: None     # the release's own installer, as the bootstrap runs it
         code, _, err = self.install(source=src)
         self.assertEqual(code, 1)
         self.assertIn(f'sbin/{self.m.PROG} --help failed', err)
@@ -319,6 +320,173 @@ class Contract:
         self.assertEqual(code, 1)
         self.assertIn('cannot be read', err)
         self.assertTrue(os.path.isdir(self.version()))
+
+    def test_a_release_whose_installer_differs_is_refused(self):
+        """An installed installer given a newer release would copy its own file list, not the release's (and could
+        leave out a file the release needs): refused before anything is written, naming the bootstrap. A copy of
+        the same release elsewhere is fine."""
+        for rel in (f'sbin/{self.m.PROG}', 'common/kit_install.py'):
+            with self.subTest(rel=rel):
+                shutil.rmtree(self.root)
+                os.makedirs(self.root)
+                src = self.copy_kit()
+                with open(os.path.join(src if rel.startswith('sbin/') else self.root, rel), 'a') as f:
+                    f.write('# as a newer release has it\n')
+                code, _, err = self.install(source=src)
+                self.assertEqual(code, 1)
+                self.assertIn(f'its {rel} differs from the installer that runs', err)
+                self.assertIn('bootstrap', err)
+                self.assertFalse(os.path.exists(self.path(self.m.ETC)))
+                self.assertFalse(os.path.exists(self.path(self.m.LIBEXEC)))
+        shutil.rmtree(self.root)
+        os.makedirs(self.root)
+        self.assertEqual(self.install(source=self.copy_kit())[0], 0)
+
+    def test_a_run_that_names_the_real_path_of_the_kit_holds_uninstall(self):
+        """Where /usr/local/libexec is a link (to a bigger disk, say), the kit's runs name the real path of their
+        version: a process or a transient unit naming it holds uninstall too."""
+        real = '/var/usrlocal/libexec'
+        os.makedirs(self.path(real))
+        os.makedirs(self.path('/usr/local'))
+        os.symlink(self.path(real), self.path('/usr/local/libexec'))
+        code_file = f'{real}/{os.path.basename(self.m.LIBEXEC)}/versions/{SHA1}/{self.m.HELP[0]}'
+        units = os.path.join(self.m.RUN, 'systemd', 'transient')
+        cases = {
+            'a process': lambda: self.process(4270, '/usr/bin/python3', '-IB', code_file, 'hold'),
+            'a transient unit': lambda: self.transient(units, 'run-r9.service',
+                                                       f'[Service]\nExecStart="/usr/bin/python3" "{code_file}"\n'),
+        }
+        for what, make in cases.items():
+            with self.subTest(what=what):
+                self.assertEqual(self.install()[0], 0)
+                made = make()
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1, err)
+                self.assertIn('code of this kit is in use', err)
+                self.assertTrue(os.path.isdir(self.version()))
+                if made:
+                    os.unlink(made)
+                else:
+                    shutil.rmtree(os.path.join(self.m.PROC, '4270'))
+                self.assertEqual(self.run_main('uninstall')[0], 0)
+
+    def test_a_run_named_by_another_spelling_of_the_path_holds_uninstall(self):
+        """`./t3-golive` from its folder, `../bin/t3-golive`, `/usr/local//bin/t3-golive` all run the kit's code."""
+        link = self.first_link()
+        folder, name = os.path.split(link)
+        code_file = f'{self.m.LIBEXEC}/versions/{SHA1}/{self.m.HELP[0]}'
+        cases = {
+            './name from its folder': (f'./{name}', folder),
+            '../folder/name': (f'../{os.path.basename(folder)}/{name}', folder),
+            'a doubled slash in the link': (link.replace('/local/', '/local//'), None),
+            'a doubled slash in the version path': (code_file.replace('/libexec/', '/libexec//'), None),
+            'a relative version path': (os.path.relpath(code_file, '/usr/local'), '/usr/local'),
+        }
+        for what, (arg, cwd) in cases.items():
+            with self.subTest(what=what):
+                self.assertEqual(self.install()[0], 0)
+                self.process(4280, '/usr/bin/python3', '-IB', arg, 'run', cwd=cwd)
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1, err)
+                self.assertIn('code of this kit is in use', err)
+                shutil.rmtree(os.path.join(self.m.PROC, '4280'))
+                self.assertEqual(self.run_main('uninstall')[0], 0)
+
+    def test_a_planted_unit_folder_refuses_cleanly_and_never_blocks(self):
+        """<run>/user/<uid> is that user's: a link (to /proc/self, or to another folder), a FIFO or a file where
+        systemd keeps their transient units refuses with a message, never a traceback, a wait, or a read of where
+        the link points."""
+        user = os.path.join(self.m.RUN, 'user', '1000')
+        elsewhere = os.path.join(self.host, 'elsewhere')
+
+        def link_to(target, at):
+            def plant():
+                os.makedirs(os.path.dirname(at), exist_ok=True)
+                os.symlink(target, at)
+            return plant
+
+        def other_folder():
+            os.makedirs(elsewhere, exist_ok=True)
+            self.transient(elsewhere, 'kit.service', f'[Service]\nExecStart="{self.first_link()}"\n')
+            link_to(elsewhere, os.path.join(user, 'systemd', 'transient'))()
+
+        cases = {
+            'transient: a link to /proc/self': link_to('/proc/self', os.path.join(user, 'systemd', 'transient')),
+            'systemd: a link to /proc/self': link_to('/proc/self', os.path.join(user, 'systemd')),
+            'transient: a link to a folder of units': other_folder,
+            'transient: a FIFO': lambda: (os.makedirs(os.path.join(user, 'systemd')),
+                                          os.mkfifo(os.path.join(user, 'systemd', 'transient'))),
+            'transient: a file': lambda: self.transient(os.path.join(user, 'systemd'), 'transient', 'x'),
+        }
+        for what, plant in cases.items():
+            with self.subTest(what=what):
+                self.assertEqual(self.install()[0], 0)
+                shutil.rmtree(os.path.join(self.m.RUN, 'user'), ignore_errors=True)
+                os.makedirs(user)
+                plant()
+                with self.no_hang():
+                    code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 1, err)
+                self.assertIn('cannot see whether a transient unit runs code of this kit', err)
+                self.assertTrue(os.path.isdir(self.version()))
+        shutil.rmtree(os.path.join(self.m.RUN, 'user'))
+        self.assertEqual(self.run_main('uninstall')[0], 0)
+
+    def test_a_unit_folder_of_another_owner_or_filesystem_or_unreadable_unit_refuses(self):
+        """Every step down to a unit folder must be root's (or, below <run>/user/<uid>, that user's) and on one
+        filesystem (no mount of a user's own there); a unit file that cannot be read (EIO, as /proc/self/mem gives)
+        refuses."""
+        units = os.path.join(self.m.RUN, 'user', '1000', 'systemd', 'transient')
+        os.makedirs(units)
+        root = self.m.ROOT_UID
+        self.m.ROOT_UID = root + 1                      # <run>/user is then not root's
+        with self.assertRaisesRegex(self.mod.kit_install.Refused, 'belongs to uid'):
+            self.m.unit_folders()
+        self.m.ROOT_UID = root
+        fstat = os.fstat
+
+        def other_mount(fd):
+            st = fstat(fd)
+            if os.readlink(f'/proc/self/fd/{fd}') == units:
+                return os.stat_result(st[:2] + (st.st_dev + 1,) + st[3:])
+            return st
+        with mock.patch.object(os, 'fstat', other_mount):
+            with self.assertRaisesRegex(self.mod.kit_install.Refused, 'a mount of its own'):
+                self.m.unit_folders()
+        for fd in [fd for _, fd in self.m.unit_folders()]:   # as it is: opens, no refusal
+            os.close(fd)
+        self.assertEqual(self.install()[0], 0)
+        self.transient(units, 'run-u1.service', '[Service]\nExecStart=/bin/true\n')
+        with mock.patch.object(os, 'read', side_effect=OSError(errno.EIO, 'Input/output error')):
+            code, _, err = self.run_main('uninstall')
+        self.assertEqual(code, 1, err)
+        self.assertIn('run-u1.service cannot be read', err)
+        self.assertTrue(os.path.isdir(self.version()))
+
+    def test_uninstall_stopped_anywhere_then_run_again_finishes(self):
+        """Stopped right after any one change it makes (a kill), uninstall run again finishes and leaves nothing.
+        The installer's own link goes last: while the version it runs is still there, the link is too, so the run
+        again can be made with it."""
+        own = [p for p, rel in self.m.LINKS.items() if rel == f'sbin/{self.m.PROG}'][0]
+        for n in range(1, 500):             # no subTest: a failure must end the loop, not go on to n + 1
+            with self.stop_context(n):
+                shutil.rmtree(self.root)
+                os.makedirs(self.root)
+                self.assertEqual(self.install()[0], 0)
+                code, _, err, stopped = self.uninstall_stopped_after(n)
+                if not stopped:
+                    self.assertEqual(code, 0, err)
+                    break
+                self.assertEqual(code, 'stopped (test)')
+                if os.path.isfile(self.version(rel=f'sbin/{self.m.PROG}')):
+                    self.assertTrue(self.is_file(own), 'the installer link went before its code')
+                code, _, err = self.run_main('uninstall')
+                self.assertEqual(code, 0, err)
+                for gone in (self.m.LIBEXEC, self.m.ETC, *self.m.LINKS):
+                    self.assertFalse(os.path.lexists(self.path(gone)), gone)
+        else:
+            self.fail('uninstall made more than 500 changes')
+        self.assertGreater(n, 5)
 
     def test_a_replaced_folder_that_is_not_a_folder_is_refused_before_anything_is_written(self):
         os.makedirs(self.path(self.m.LIBEXEC))
@@ -510,8 +678,35 @@ MUTATIONS = {
         'engine', '            if int(name) in mine:', '            if int(name) == os.getpid():',
         'test_what_is_not_the_kit_never_holds_uninstall'),
     'uninstall: a FIFO among the units is never waited on': (
-        'engine', 'fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)',
-        'fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)', 'test_what_is_not_the_kit_never_holds_uninstall'),
+        'engine', 'ufd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)',
+        'ufd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)',
+        'test_what_is_not_the_kit_never_holds_uninstall'),
+    'uninstall: the real path of <libexec> counts': (
+        'engine', '            roots.add(real[len(self.PREFIX):])', '            pass',
+        'test_a_run_that_names_the_real_path_of_the_kit_holds_uninstall'),
+    'uninstall: another spelling of the path counts': (
+        'engine', 'for arg in (a, self._norm(a, cwd))', 'for arg in (a,)',
+        'test_a_run_named_by_another_spelling_of_the_path_holds_uninstall'),
+    'uninstall: a unit folder is opened without following a link': (
+        'engine', 'fd = os.open(name, DIR_FLAGS | os.O_NONBLOCK, dir_fd=parent)',
+        'fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)',
+        'test_a_planted_unit_folder_refuses_cleanly_and_never_blocks'),
+    "uninstall: a unit folder must be root's or its user's": (
+        'engine', 'if st.st_uid not in owners or (dev is not None', 'if (dev is not None',
+        'test_a_unit_folder_of_another_owner_or_filesystem_or_unreadable_unit_refuses'),
+    'uninstall: a unit folder on another filesystem refuses': (
+        'engine', ' or (dev is not None and st.st_dev != dev):', ':',
+        'test_a_unit_folder_of_another_owner_or_filesystem_or_unreadable_unit_refuses'),
+    'uninstall: a unit it cannot read refuses': (
+        'engine', '            return os.read(ufd, limit)\n        except OSError as e:\n',
+        '            return os.read(ufd, limit)\n        except OSError as e:\n            return None\n',
+        'test_a_unit_folder_of_another_owner_or_filesystem_or_unreadable_unit_refuses'),
+    "uninstall: the installer's own link goes last": (
+        'engine', '            if path in own:\n                continue\n', '',
+        'test_uninstall_stopped_anywhere_then_run_again_finishes'),
+    "install: the release's installer is the one that runs": (
+        'engine', '            if not same:\n', '            if False:\n',
+        'test_a_release_whose_installer_differs_is_refused'),
     'uninstall: no process list refuses': (
         'engine', "            raise Refused(f'{self.PROC} cannot be read", "            return []\n"
         "            raise Refused(f'{self.PROC} cannot be read", 'test_what_is_not_the_kit_never_holds_uninstall'),

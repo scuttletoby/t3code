@@ -4,6 +4,7 @@ PREFIX and the current user as root, with a fake process list and runtime folder
 no systemd, no network. A link the installer writes names a host path: resolve() follows it inside the fake host
 only, never onto the real machine."""
 import contextlib, importlib.util, io, os, shutil, signal, subprocess, sys, tempfile, unittest
+from unittest import mock
 
 FORK_KIT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 COMMON = os.path.join(FORK_KIT, 'common')
@@ -122,11 +123,13 @@ class FakeHost(unittest.TestCase):
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old)
 
-    def process(self, pid, *argv):
-        """A fake process with that command line in the fake process list."""
+    def process(self, pid, *argv, cwd=None):
+        """A fake process with that command line (and that folder, cwd) in the fake process list."""
         os.makedirs(os.path.join(self.m.PROC, str(pid)), exist_ok=True)
         with open(os.path.join(self.m.PROC, str(pid), 'cmdline'), 'wb') as f:
             f.write(b'\0'.join(os.fsencode(a) for a in argv) + b'\0')
+        if cwd is not None:
+            os.symlink(cwd, os.path.join(self.m.PROC, str(pid), 'cwd'))
         self.addCleanup(shutil.rmtree, os.path.join(self.m.PROC, str(pid)), True)
 
     def run_main(self, *argv, stop_after=None):
@@ -137,6 +140,37 @@ class FakeHost(unittest.TestCase):
             except SystemExit as e:
                 code = str(e)
         return code, out.getvalue(), err.getvalue()
+
+    @contextlib.contextmanager
+    def stop_context(self, n):
+        """Names the stop (n) in a failure, without going on to the next one as subTest would."""
+        try:
+            yield
+        except AssertionError as e:
+            raise AssertionError(f'stopped after change {n}: {e}') from e
+
+    CHANGES = ('unlink', 'rename', 'replace', 'rmdir', 'chmod', 'chown')
+
+    def uninstall_stopped_after(self, n, check=None):
+        """uninstall, stopped (as by a kill) right after its n-th change to the files (each of CHANGES, inside
+        rmtree too); check() runs after every change. (code, out, err, whether it stopped)."""
+        count, real = [0], {name: getattr(os, name) for name in self.CHANGES}
+
+        def wrap(name):
+            def change(*args, **kwargs):
+                result = real[name](*args, **kwargs)
+                count[0] += 1
+                if check is not None:
+                    check()
+                if count[0] == n:
+                    raise SystemExit('stopped (test)')
+                return result
+            return change
+        with contextlib.ExitStack() as stack:
+            for name in self.CHANGES:
+                stack.enter_context(mock.patch.object(os, name, wrap(name)))
+            code, out, err = self.run_main('uninstall')
+        return code, out, err, count[0] >= n
 
     def install(self, *extra, sha=SHA1, stop_after=None, source=None):
         return self.run_main('install', '--source', source or self.KIT_DIR, '--sha', sha, *extra,
@@ -179,4 +213,5 @@ def red_check(case, mutations):
             mutant(test).run(result)
             case.assertEqual(result.testsRun, 1)
             case.assertFalse(result.wasSuccessful(), f'{test} still passes with {rule!r} broken')
-            case.assertFalse([e for e in result.errors if 'exactly once' in e[1]], f'{rule}: text not found')
+            case.assertFalse([e for e in result.errors + result.failures if 'exactly once' in e[1]],
+                             f'{rule}: text not found')         # an AssertionError in setUp is a failure

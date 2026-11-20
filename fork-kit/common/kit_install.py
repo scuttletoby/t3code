@@ -7,11 +7,14 @@ self-test, and adds what only that kit does (an option, a unit file, a check). E
   and unchanged is used as it is, any other is made again beside it, self-tested, and swapped in whole;
 - switch the link <libexec>/current to it in one step, then the command links;
 - keep a plain old command found where a link goes (a hand copy from before the kit) in <libexec>/replaced/, and
-  put the last one kept back on uninstall (replaced/order lists them in the order they were kept);
+  put the last one kept back on uninstall, with its mode and owner, over the link in one step (replaced/order lists
+  them in the order they were kept);
 - write <etc>/installed.tsv, which `self-check` reads to report drift;
 - one installer (or uninstall) at a time; safe to run again and to stop at any step. Old version folders stay:
   a timer or a detached run may name one. uninstall refuses while a process or a transient systemd unit (a timer
-  still pending) runs code from <libexec>.
+  still pending) runs code from <libexec>;
+- install only the release whose installer runs: an installed installer given a newer release refuses (its file
+  list is not the release's), and the bootstrap runs the release's own.
 
 Plain Python 3 standard library. Paths are read under PREFIX and owners compared with ROOT_UID; PROC and RUN name
 the process list and the runtime folder (tests only, all four).
@@ -19,6 +22,7 @@ the process list and the runtime folder (tests only, all four).
 import argparse, contextlib, ctypes, errno, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
 SHA_RE = re.compile(r'^[0-9a-f]{40}\Z')
+ENGINE = os.path.abspath(__file__)      # this file: install compares it with the release's common/kit_install.py
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 AT_FDCWD, RENAME_EXCHANGE = -100, 2
 
@@ -70,6 +74,7 @@ class Installer:
     HELP = None             # ('bin/fork-cleaner', 'fork-cleaner daily'): its --help must print that text
     HAS_CONFIG = False      # write <etc>/config.json from config()
     KIT_STEPS = ()          # the kit's own steps, after `links`
+    PROGRAM = None          # the kit's installer file (its __file__): install refuses a release whose one differs
 
     PREFIX = ''             # tests only: every fixed path is read under this folder
     ROOT_UID = 0            # tests only: who must run the installer and own the installed files
@@ -389,12 +394,32 @@ class Installer:
             raise Refused('--sha must be the full 40-character release commit')
         for rel in self.source_files():
             self.read_source(os.path.realpath(a.source or ''), rel)
+        self.check_same_installer(os.path.realpath(a.source))
         self.check_kit(a)
 
+    def check_same_installer(self, source):
+        """The release's installer must be the one that runs: its file list (SOURCE_FILES, MODULES), self-test and
+        steps are the ones this run uses. An installed installer given a newer release would copy its own list, not
+        the release's, and could leave out a file the newer release needs and still report OK. The bootstrap runs
+        the release's own installer, so it always passes here."""
+        for rel, running in ((f'sbin/{self.PROG}', self.PROGRAM), ('common/kit_install.py', ENGINE)):
+            try:
+                with open(running, 'rb') as f:
+                    same = f.read() == self.read_source(source, rel)
+            except (OSError, TypeError) as e:
+                raise Refused(f'cannot read the installer that runs ({running}: {e}): install with the bootstrap, as '
+                              f'root (fork-kit/{self.KIT}/README.md, Install)') from None
+            if not same:
+                raise Refused(f'--source {source}: its {rel} differs from the installer that runs ({running}), so this '
+                              'installer would copy its own file list, not the release\'s. Install that release with '
+                              f'the bootstrap, as root (fork-kit/{self.KIT}/README.md, Install): it runs the '
+                              'release\'s own installer. Nothing was changed')
+
     def keep_old(self, path):
-        """A plain old file at a link path goes to REPLACED (named by its hash, so a second run copies nothing) and
-        its name to the end of REPLACED/order (the last one kept is the one uninstall puts back); the link then
-        replaces it in one step, so the path is never missing."""
+        """A plain old file at a link path goes to REPLACED (named by its hash, so a second run copies nothing;
+        root-owned, 0755 or 0644, whatever it was) and its name, mode and owner to the end of REPLACED/order (the
+        last one kept is the one uninstall puts back, with that mode and owner); the link then replaces it in one
+        step, so the path is never missing."""
         real = self.p(path)
         if not self.plain_file(real):
             return
@@ -404,25 +429,41 @@ class Installer:
             if name.endswith('.tmp'):
                 os.unlink(os.path.join(folder, name))
         digest = sha256_file(real)
+        st = os.lstat(real)
         name = f'{os.path.basename(path)}.{digest[:16]}'
         dest = os.path.join(folder, name)
         if not os.path.exists(dest):
             tmp = dest + '.tmp'
             shutil.copyfile(real, tmp)
-            os.chmod(tmp, 0o755 if os.stat(real).st_mode & 0o111 else 0o644)
+            os.chmod(tmp, 0o755 if st.st_mode & 0o111 else 0o644)
             os.replace(tmp, dest)
-        order = [n for n in self.kept_order() if n != name] + [name]
-        self.write_file(self.ORDER, ''.join(n + '\n' for n in order))
+        meta = (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+        rows = [r for r in self.order_rows() if r[0] != name] + [(name, meta)]
+        self.write_file(self.ORDER, ''.join(n + (f'\t{m[0]:o}\t{m[1]}\t{m[2]}' if m else '') + '\n'
+                                            for n, m in rows))
         self.say(f'the old {path} (sha256 {digest[:16]}) is kept as {self.REPLACED}/{name}; '
                  'uninstall puts it back')
 
-    def kept_order(self):
-        """The names in REPLACED/order, first kept first (none when there is no such file)."""
+    def order_rows(self):
+        """REPLACED/order, first kept first: (name, (mode, uid, gid) of the old file, or None in an order from
+        before the mode and owner were kept: it comes back as the kept copy is, root-owned). None when there is no
+        such file."""
         try:
             with open(self.p(self.ORDER), encoding='utf-8') as f:
-                return [line.strip() for line in f if line.strip()]
+                lines = [line.strip().split('\t') for line in f if line.strip()]
         except FileNotFoundError:
             return []
+        rows = []
+        for f in lines:
+            meta = None
+            if len(f) == 4 and re.fullmatch(r'[0-7]{1,4}', f[1]) and f[2].isdigit() and f[3].isdigit():
+                meta = (int(f[1], 8), int(f[2]), int(f[3]))
+            rows.append((f[0], meta))
+        return rows
+
+    def kept_order(self):
+        """The names in REPLACED/order, first kept first (none when there is no such file)."""
+        return [name for name, _ in self.order_rows()]
 
     def replaced(self):
         """The kept old files: [(link path, kept path)], in the order they were kept (REPLACED/order), the last
@@ -482,6 +523,7 @@ class Installer:
         done('switch')
         for path, target in self.links().items():
             if path in self.KEEP_OLD:
+                self.drop_restore_leftover(path)
                 self.keep_old(path)
             self.switch_link(path, target)
         done('links')
@@ -513,35 +555,133 @@ class Installer:
             return self._remove()
 
     def code_paths(self):
-        """The paths a command line or a unit names when it runs this kit's code: <libexec>/ (and its real path),
-        and the kit's links."""
+        """The paths a command line or a unit names when it runs this kit's code: <libexec>/ (and its real path, where
+        /usr/local or a folder in it is a link: the kit's runs name the real path of their version), and the kit's
+        links."""
         roots = {self.LIBEXEC}
         real = os.path.realpath(self.p(self.LIBEXEC))
         if real.startswith(self.PREFIX + '/'):
             roots.add(real[len(self.PREFIX):])
         return tuple(os.fsencode(r + '/') for r in sorted(roots)), {os.fsencode(p) for p in self.LINKS}
 
-    def _names_code(self, args, roots, links):
-        return any(arg.startswith(roots) or arg in links for arg in args)
+    @staticmethod
+    def _norm(arg, cwd):
+        """A command-line word as the absolute path it names: `/usr/local/bin//t3-golive`, `./t3-golive` and
+        `../bin/t3-golive` (against the process's folder) all name the link. A bare word (`python3 t3-golive`, run
+        from /usr/local/bin) is not taken as a path, so such a run is not seen; that is harmless today, as every
+        golive run that changes anything holds the kit's lock, which uninstall takes first."""
+        if not arg.startswith(b'/'):
+            if b'/' not in arg or cwd is None:
+                return arg
+            arg = cwd + b'/' + arg
+        return b'/' + os.path.normpath(arg).lstrip(b'/')
+
+    def _names_code(self, args, roots, links, cwd=None):
+        return any(arg.startswith(roots) or arg in links for a in args if a for arg in (a, self._norm(a, cwd)))
+
+    def _open_folder(self, parent, name, owners, dev, shown):
+        """The folder `name` under the open folder `parent`, opened with no link followed and never waited on; None
+        when there is none. Refused when it is anything else, owned by someone not in owners, or (dev) on another
+        filesystem than that: uninstall cannot see what runs from there."""
+        why = 'uninstall cannot see whether a transient unit runs code of this kit; look at it and run again'
+        try:
+            fd = os.open(name, DIR_FLAGS | os.O_NONBLOCK, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise Refused(f'{shown} cannot be opened as a folder without following a link ({e.strerror}): {why}') \
+                from None
+        st = os.fstat(fd)
+        if st.st_uid not in owners or (dev is not None and st.st_dev != dev):
+            os.close(fd)
+            raise Refused(f'{shown} belongs to uid {st.st_uid} or is a mount of its own: {why}')
+        return fd
+
+    def _open_chain(self, top, parts, owners, shown):
+        """parts below the open folder top, each by _open_folder, all on the first one's filesystem."""
+        fd, dev, here = None, None, shown
+        try:
+            for part in parts:
+                here += '/' + part
+                new = self._open_folder(top if fd is None else fd, part, owners, dev, here)
+                if fd is not None:
+                    os.close(fd)
+                fd = new
+                if fd is None:
+                    return None
+                dev = os.fstat(fd).st_dev if dev is None else dev
+            return fd
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            raise
+
+    def unit_folders(self):
+        """The folders systemd keeps transient units in, open: [(shown path, fd)]. <run>/systemd/transient is
+        root's. <run>/user/<uid>/systemd/transient is that user's, who could put a link (to /proc/self, say), a FIFO,
+        another folder or a mount there: each step is opened with no link followed and never waited on, must be
+        owned by root or that user, and must be on the filesystem of <run>/user/<uid>. Refused when one cannot be
+        opened like that, so root's uninstall never reads where a user points it."""
+        try:
+            run = os.open(self.RUN, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            raise Refused(f'{self.RUN} cannot be read ({e.strerror}): uninstall cannot see whether a transient unit '
+                          'runs code of this kit') from None
+        out, users = [], None
+        try:
+            chains = [(run, ('systemd', 'transient'), {self.ROOT_UID})]
+            users = self._open_chain(run, ('user',), {self.ROOT_UID}, self.RUN)
+            if users is not None:
+                try:
+                    names = sorted(os.listdir(users))
+                except OSError as e:
+                    raise Refused(f'{self.RUN}/user cannot be read ({e.strerror}): uninstall cannot see whether a '
+                                  'transient unit runs code of this kit') from None
+                chains += [(users, (n, 'systemd', 'transient'), {self.ROOT_UID, int(n)}) for n in names if n.isdigit()]
+            for top, parts, owners in chains:
+                shown = self.RUN + ('/user' if top == users else '')
+                fd = self._open_chain(top, parts, owners, shown)
+                if fd is not None:
+                    out.append((shown + '/' + '/'.join(parts), fd))
+        except BaseException:
+            for _, fd in out:
+                os.close(fd)
+            raise
+        finally:
+            if users is not None:
+                os.close(users)
+            os.close(run)
+        return out
 
     @staticmethod
-    def _read_small(path, limit=1 << 20):
-        """A regular file's first bytes, or None for anything else (a FIFO, a link, a device: never waited on)."""
+    def _read_unit(folder, fd, name, limit=1 << 20):
+        """A transient unit file's first bytes, opened in its folder with no link followed and never waited on; None
+        for anything but a regular file (a FIFO, a link: systemd writes neither) or one that is gone. Refused when
+        it cannot be read."""
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-        except OSError:
-            return None
+            ufd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ELOOP):
+                return None                 # gone (the unit ended), or a link
+            raise Refused(f'{folder}/{name} cannot be read ({e.strerror}): uninstall cannot see whether it runs code '
+                          'of this kit; look at it and run again') from None
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            if not stat.S_ISREG(os.fstat(ufd).st_mode):
                 return None
-            return os.read(fd, limit)
+            return os.read(ufd, limit)
+        except OSError as e:
+            raise Refused(f'{folder}/{name} cannot be read ({e.strerror}): uninstall cannot see whether it runs code '
+                          'of this kit; look at it and run again') from None
         finally:
-            os.close(fd)
+            os.close(ufd)
 
     def in_use(self):
         """What runs this kit's code now, one line each: a process whose command line names it (but this one and
         the ones that started it), and a transient systemd unit (systemd-run's: a detached run, or the service of a
-        timer still pending) whose unit file names it. Refused when the process list cannot be read."""
+        timer still pending) whose unit file names it. Refused when the process list or a unit folder cannot be
+        read."""
         roots, links = self.code_paths()
         found, mine, pid = [], set(), os.getpid()
         while pid > 1 and pid not in mine:  # this uninstall and what started it (sudo, a shell) name the links
@@ -564,42 +704,76 @@ class Installer:
                     args = f.read().split(b'\0')
             except OSError:
                 continue                    # it ended
-            if self._names_code(args, roots, links):
+            try:
+                cwd = os.readlink(os.fsencode(f'{self.PROC}/{name}/cwd'))
+            except OSError:
+                cwd = None
+            if self._names_code(args, roots, links, cwd):
                 shown = b' '.join(a for a in args if a).decode('utf-8', 'replace')
                 found.append(f'process {name}: {shown[:200]}')
-        folders = [f'{self.RUN}/systemd/transient']
-        with contextlib.suppress(OSError):
-            folders += [f'{self.RUN}/user/{u}/systemd/transient' for u in sorted(os.listdir(f'{self.RUN}/user'))]
-        for folder in folders:
-            try:
-                names = sorted(os.listdir(folder))
-            except OSError:
-                continue                    # no such folder: no transient unit there
-            for name in names:
-                text = self._read_small(os.path.join(folder, name))
-                if text is None:
-                    continue
-                if any(r in text for r in roots) or any(re.search(rb'(?:^|[\s="\'@!+:-])' + re.escape(link)
-                                                                    + rb'(?:[\s"\']|$)', text) for link in links):
-                    found.append(f'transient unit {name} ({folder}): a detached run, or a timer still pending')
+        folders = self.unit_folders()
+        try:
+            for folder, fd in folders:
+                for name in sorted(os.listdir(fd)):
+                    text = self._read_unit(folder, fd, name)
+                    if text is None:
+                        continue
+                    if any(r in text for r in roots) or any(re.search(rb'(?:^|[\s="\'@!+:-])' + re.escape(link)
+                                                                        + rb'(?:[\s"\']|$)', text) for link in links):
+                        found.append(f'transient unit {name} ({folder}): a detached run, or a timer still pending')
+        finally:
+            for _, fd in folders:
+                os.close(fd)
         return found
 
+    def drop_restore_leftover(self, path):
+        """<path>.restore, left by an uninstall that stopped while putting an old file back."""
+        tmp = self.p(path) + '.restore'
+        if os.path.lexists(tmp) and not os.path.isdir(tmp):
+            os.unlink(tmp)
+
+    def put_back(self, path, kept, meta):
+        """The kept old file at path, with its mode and owner (meta), in one step: the link (or nothing) there is
+        replaced by the whole file, so the command is never missing."""
+        real = self.p(path)
+        self.drop_restore_leftover(path)
+        tmp = real + '.restore'
+        shutil.copyfile(kept, tmp)
+        if meta is None:                    # an order from before the mode and owner were kept
+            os.chmod(tmp, stat.S_IMODE(os.stat(kept).st_mode))
+        else:
+            mode, uid, gid = meta
+            os.chown(tmp, uid, gid)
+            os.chmod(tmp, mode)             # after chown, which clears a set-id bit
+        os.replace(tmp, real)
+        self.say(f'put the old {path} back')
+
     def _remove(self):
-        kept = self.replaced()
-        for path, target in self.links().items():
-            if self.ours(path, target):
-                os.unlink(self.p(path))
+        """In an order that a stop at any point, then a run again, finishes: each kept old file over its link in one
+        step, the other command links, the kit's own files, <libexec>, then the installer's own link, then <etc>. A
+        stop before <libexec> goes is run again with the installer's link; one while it goes leaves the link to a
+        half-removed version: install again with the bootstrap, then uninstall (the README says so)."""
+        kept, meta, last = self.replaced(), dict(self.order_rows()), {}
         for path, src in reversed(kept):    # the newest kept copy of each path
-            real = self.p(path)
-            if not os.path.lexists(real):
-                tmp = real + '.restore'
-                shutil.copy2(src, tmp)
-                os.replace(tmp, real)
-                self.say(f'put the old {path} back')
+            last.setdefault(path, src)
+        own = {path for path, rel in self.LINKS.items() if rel == f'sbin/{self.PROG}'}
+        for path, target in self.links().items():
+            if path in own:
+                continue
+            if path in last and (self.ours(path, target) or not os.path.lexists(self.p(path))):
+                self.put_back(path, last[path], meta.get(os.path.basename(last[path])))
+            elif self.ours(path, target):
+                os.unlink(self.p(path))
+            if path in self.KEEP_OLD:
+                self.drop_restore_leftover(path)
         self.kit_uninstall()
-        for path in (self.LIBEXEC, self.ETC):
-            if os.path.isdir(self.p(path)) and not os.path.islink(self.p(path)):
-                shutil.rmtree(self.p(path))
+        if os.path.isdir(self.p(self.LIBEXEC)) and not os.path.islink(self.p(self.LIBEXEC)):
+            shutil.rmtree(self.p(self.LIBEXEC))
+        for path, target in self.links().items():
+            if path in own and self.ours(path, target):
+                os.unlink(self.p(path))
+        if os.path.isdir(self.p(self.ETC)) and not os.path.islink(self.p(self.ETC)):
+            shutil.rmtree(self.p(self.ETC))
         self.say(f'uninstalled (the machine file and what the {self.KIT} kit wrote elsewhere stay)')
         return 0
 
