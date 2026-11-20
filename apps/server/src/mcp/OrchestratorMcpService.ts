@@ -2999,7 +2999,7 @@ const make = Effect.gen(function* () {
         parent,
         requested: input.target,
         runtimeMode: input.runtimeMode,
-        providers,
+        providers: withWorkspaceModels(yield* loadProviders, yield* parentWorkspaceCwd(parent)),
         target,
       });
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
