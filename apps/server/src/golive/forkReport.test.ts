@@ -47,6 +47,8 @@ import {
 const afterCheck = vi.hoisted(() => ({ path: "", run: () => {} }));
 /** A stat of this path finds nothing and a look at the path itself (lstat) fails with EACCES. */
 const lstatFails = vi.hoisted(() => ({ path: "" }));
+/** The next stat of this path finds nothing, as when a first start creates it just after the stat. */
+const statMissesOnce = vi.hoisted(() => ({ path: "" }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeFS>();
   const existsSync: typeof actual.existsSync = (path) => {
@@ -66,7 +68,9 @@ vi.mock("node:fs", async (importOriginal) => {
     return (actual.lstatSync as (...args: Array<unknown>) => unknown)(path, ...rest);
   }) as typeof actual.lstatSync;
   const statSync = ((path: NodeFS.PathLike, ...rest: Array<unknown>) => {
-    if (path === lstatFails.path) {
+    const missOnce = path === statMissesOnce.path;
+    if (missOnce) statMissesOnce.path = "";
+    if (missOnce || path === lstatFails.path) {
       throw Object.assign(new Error(`ENOENT: no such file or directory, stat '${String(path)}'`), {
         code: "ENOENT",
       });
@@ -97,6 +101,7 @@ const children: Array<NodeChildProcess.ChildProcess> = [];
 afterEach(() => {
   openFails.remaining = 0;
   lstatFails.path = "";
+  statMissesOnce.path = "";
   for (const child of children.splice(0)) child.kill("SIGKILL");
   for (const home of homes.splice(0)) NodeFS.rmSync(home, { recursive: true, force: true });
 });
@@ -404,8 +409,15 @@ describe("__fork-report writes nothing", () => {
   // is this test's own, a live one, as a stopping server's is until it has released the home.
   it("names the live server of a home whose open fails twice, so the report can be run again", () => {
     const home = makeHome();
+    leaveCrashedWal(home);
     const runtimePath = NodePath.join(home, "userdata", "server-runtime.json");
     NodeFS.writeFileSync(runtimePath, JSON.stringify({ version: 1, pid: process.pid, port: 1 }));
+    // The server stops between the WAL checks and the open: it deletes its -wal and -shm.
+    afterCheck.path = `${dbPathOf(home)}-shm`;
+    afterCheck.run = () => {
+      NodeFS.rmSync(`${dbPathOf(home)}-wal`);
+      NodeFS.rmSync(`${dbPathOf(home)}-shm`);
+    };
     openFails.remaining = 2;
 
     const report = readForkReport(home);
@@ -418,8 +430,39 @@ describe("__fork-report writes nothing", () => {
     ]);
     // A record whose process has exited is no server: the message stays as it was.
     NodeFS.writeFileSync(runtimePath, JSON.stringify({ version: 1, pid: 2 ** 31 - 1, port: 1 }));
+    leaveCrashedWal(home);
+    afterCheck.path = `${dbPathOf(home)}-shm`;
     openFails.remaining = 2;
     expect(readForkReport(home).problems[0]!.message).toBe(
+      "Could not open the database: unable to open database file",
+    );
+  });
+
+  // A server running steadily keeps the same -wal and -shm open: a read that fails beside it fails
+  // for the database's own reason, which running the report again would not change.
+  it("does not ask for a run again beside a server whose WAL files stayed the same", async () => {
+    const home = makeHome();
+    await startWriter(home);
+    const runtimePath = NodePath.join(home, "userdata", "server-runtime.json");
+    NodeFS.writeFileSync(runtimePath, JSON.stringify({ version: 1, pid: process.pid, port: 1 }));
+    openFails.remaining = 2;
+
+    const report = readForkReport(home);
+
+    expect(report.problems).toEqual([
+      {
+        code: "database-unreadable",
+        message: "Could not open the database: unable to open database file",
+      },
+    ]);
+    // Nor beside a home whose database has no WAL files at all.
+    const plain = makeHome();
+    NodeFS.writeFileSync(
+      NodePath.join(plain, "userdata", "server-runtime.json"),
+      JSON.stringify({ version: 1, pid: process.pid, port: 1 }),
+    );
+    openFails.remaining = 2;
+    expect(readForkReport(plain).problems[0]!.message).toBe(
       "Could not open the database: unable to open database file",
     );
   });
@@ -603,6 +646,35 @@ describe("__fork-report on old, newer and empty state", () => {
       },
     ]);
   });
+
+  // Root bypasses file permissions, so chmod cannot force EACCES.
+  it.skipIf(process.getuid?.() === 0)(
+    "reports a V1 database it may not read as one a start could not import, writing nothing",
+    () => {
+      const home = tempDir();
+      NodeFS.mkdirSync(NodePath.join(home, "userdata"));
+      const v1 = NodePath.join(home, "userdata", "state.sqlite");
+      new NodeSqlite.DatabaseSync(v1).close();
+      const before = snapshot(home);
+      NodeFS.chmodSync(v1, 0o000);
+      try {
+        const report = readForkReport(home);
+
+        expect(report.database.state).toBe("missing");
+        expect(report.database.v1Import).toBeNull();
+        expect(report.problems.map((problem) => problem.code)).toEqual(["database-unreadable"]);
+        const { message } = report.problems[0]!;
+        expect(message.startsWith(`${v1} cannot be read (EACCES`)).toBe(true);
+        expect(
+          message.endsWith("); a start would try to import it as the V1 database and fail."),
+        ).toBe(true);
+        expect(report.ok).toBe(false);
+      } finally {
+        NodeFS.chmodSync(v1, 0o644);
+      }
+      expect(snapshot(home)).toEqual(before);
+    },
+  );
 
   it("reads an empty home as no database and every fork feature off", () => {
     const home = tempDir();
@@ -814,6 +886,71 @@ describe("__fork-report on a home a start could not write", () => {
       } finally {
         NodeFS.chmodSync(home, 0o755);
       }
+    },
+  );
+
+  // Root bypasses directory permissions, so chmod cannot force EACCES.
+  it.skipIf(process.getuid?.() === 0).each([
+    ["worktrees nor caches", [], "worktrees and caches"],
+    ["caches", ["worktrees"], "caches"],
+    ["worktrees", ["caches"], "worktrees"],
+  ] as const)(
+    "names a home with userdata but no %s that a start could not create them in",
+    (_, present, missing) => {
+      const home = makeHome();
+      for (const name of present) NodeFS.mkdirSync(NodePath.join(home, name));
+      const before = snapshot(home);
+      NodeFS.chmodSync(home, 0o500);
+      try {
+        const report = readForkReport(home);
+
+        expect(report.database.state).toBe("present");
+        expect(report.problems.map((problem) => problem.code)).toEqual(["home-missing"]);
+        const { message } = report.problems[0]!;
+        expect(message.startsWith(`${home} cannot be written (EACCES`)).toBe(true);
+        expect(message.endsWith(`); a start could not create ${missing} in it.`)).toBe(true);
+        expect(report.ok).toBe(false);
+      } finally {
+        NodeFS.chmodSync(home, 0o755);
+      }
+      expect(snapshot(home)).toEqual(before);
+    },
+  );
+
+  // Root bypasses directory permissions, so chmod cannot force EACCES.
+  it.skipIf(process.getuid?.() === 0)(
+    "reads a home a start already set up as ready even when the home itself is not writable",
+    () => {
+      const home = makeHome();
+      NodeFS.mkdirSync(NodePath.join(home, "worktrees"));
+      NodeFS.mkdirSync(NodePath.join(home, "caches"));
+      NodeFS.chmodSync(home, 0o500);
+      try {
+        const report = readForkReport(home);
+
+        expect(report.problems).toEqual([]);
+        expect(report.ok).toBe(true);
+      } finally {
+        NodeFS.chmodSync(home, 0o755);
+      }
+    },
+  );
+
+  it.each([
+    ["the home", (home: string) => home],
+    ["its userdata", (home: string) => NodePath.join(home, "userdata")],
+  ] as const)(
+    "reads %s that a first start creates just after the stat as it is now, not as a race",
+    (_, pathOf) => {
+      const home = makeHome();
+      statMissesOnce.path = pathOf(home);
+
+      const report = readForkReport(home);
+
+      expect(statMissesOnce.path).toBe("");
+      expect(report.home.exists).toBe(true);
+      expect(report.problems).toEqual([]);
+      expect(report.ok).toBe(true);
     },
   );
 
