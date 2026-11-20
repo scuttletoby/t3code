@@ -124,7 +124,7 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     off: true,
     reason:
       "No review lens is listed, changed or checked until a person sets the preset; the repo's CI gate stays the guarantee.",
-    decidedIn: "#99",
+    decidedIn: "#291",
   },
   {
     scope: "server",
@@ -186,6 +186,15 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     decidedIn: "#145",
   },
   {
+    scope: "server",
+    key: "mcpCarriedProfiles",
+    default: "apply",
+    off: true,
+    reason:
+      "A task a linked machine delegates here is cut down to the profile it carries, which with no profiles set anywhere is `all`: nothing changes.",
+    decidedIn: "#640",
+  },
+  {
     scope: "projectOverride",
     key: "mcpProfile",
     default: undefined,
@@ -231,7 +240,7 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     default: undefined,
     off: true,
     reason: "A project without its own review rules uses the server's.",
-    decidedIn: "#99",
+    decidedIn: "#291",
   },
 ];
 

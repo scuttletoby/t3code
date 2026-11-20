@@ -348,19 +348,26 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
           const notListed = { cannot: `it does not list ${model} for this folder` };
           // A current model list is an answer, whoever published it (another path may have, during
           // a back-off): the reply gives it, not "no result".
-          const answered = folderScan(providers, candidate, cwd, nowMs).models;
+          const before = folderScan(providers, candidate, cwd, nowMs);
           const key = `${candidate}\u0000${cwd}`;
           const noAnswer = (retryAtMs: number) => ({
             cannot: `it does not list ${model} and its scan of this folder gave no result (scanned again after ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))})`,
           });
           const retryAtMs = (yield* Ref.get(failedScans)).get(key);
-          if (answered && (!mayScan || backingOff(retryAtMs, nowMs))) return notListed;
+          // `enforce` scans unless a back-off holds, and the registry runs a probe for any snapshot
+          // that is not settled (slash commands still loading too). So the advice answers from the
+          // list only where `enforce` would: during a back-off, or from a settled list.
+          if (before.models && (backingOff(retryAtMs, nowMs) || (!mayScan && before.settled))) {
+            return notListed;
+          }
           // A back-off that `enforce` recorded holds in `advise` too: `enforce` would not scan now,
           // so the advice must not say it would.
           if (backingOff(retryAtMs, nowMs)) return noAnswer(retryAtMs);
           if (!mayScan) {
             return {
-              cannot: `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
+              cannot: before.models
+                ? `it does not list ${model} for this folder in a scan that is still loading its slash commands (advice only, so it was not scanned again)`
+                : `it does not list ${model} and has no current scan of this folder (advice only, so none was run)`,
               wouldScan: true,
             };
           }

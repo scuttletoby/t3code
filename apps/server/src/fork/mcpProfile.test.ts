@@ -5,6 +5,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   MCP_PROFILE_MAX_LINEAGE,
   type McpProfileResolution,
+  type McpProfileSettings,
   type McpProfileThread,
   isEveryMcpTool,
   resolveMcpProfile,
@@ -454,5 +455,106 @@ describe("MCP profile resolver: a profile another machine carried with its task 
     const first = resolveMcpProfile(fromFile({}), [child("task")], value);
     expect(resolveMcpProfile(fromFile({}), [child("task")], value)).toEqual(first);
     expect(value).toEqual(carried(["docs"]));
+  });
+});
+
+describe("MCP profile resolver: a machine set to refuse carried profiles (#640)", () => {
+  const carried = (servers: unknown, t3Tools: unknown = "all", name = "remote") => ({
+    name,
+    servers,
+    t3Tools,
+  });
+  const REFUSE = { mcpCarriedProfiles: "refuse" };
+
+  it("refuses a task that carries a narrower profile, and its sub-agents with it", () => {
+    const settings = fromFile(REFUSE);
+    const task = refused(resolveMcpProfile(settings, [child("task")], carried([])));
+    expect(task.problem).toBe("carried-refused");
+    expect(task.message).toContain('"remote"');
+    expect(task.message).toContain('set mcpCarriedProfiles to "apply" here');
+    const sub = refused(resolveMcpProfile(settings, [child("sub"), child("task")], carried([])));
+    expect(sub.problem).toBe("parent");
+    // A T3-tool cut alone is narrower too.
+    const tools = refused(
+      resolveMcpProfile(settings, [child("task")], carried("all", ["threads"])),
+    );
+    expect(tools.problem).toBe("carried-refused");
+  });
+
+  it("refuses a carried profile it cannot read, never giving the task all", () => {
+    const settings = fromFile(REFUSE);
+    for (const value of [{ ...carried([]), resources: [] }, "t3-only", carried("none")]) {
+      expect(refused(resolveMcpProfile(settings, [child("task")], value)).problem).toBe(
+        "carried-refused",
+      );
+    }
+  });
+
+  it("names no empty profile in a refusal: it says the profile cannot be read (#653)", () => {
+    // Not an object, or no name: the carried value has no name to show.
+    for (const value of [
+      "t3-only",
+      7,
+      null,
+      { servers: [], t3Tools: "all" },
+      carried([], "all", " "),
+    ]) {
+      for (const file of [REFUSE, {}]) {
+        const settings = fromFile(file);
+        const task = refused(resolveMcpProfile(settings, [child("task")], value));
+        const sub = refused(resolveMcpProfile(settings, [child("sub"), child("task")], value));
+        for (const message of [task.message, sub.message]) {
+          expect(message).not.toMatch(/profile\s*"\s*"/);
+          expect(message).not.toContain('""');
+        }
+        expect(sub.message).toContain("The parent thread's MCP profile cannot be applied");
+        if (file === REFUSE) {
+          expect(task.message).toContain(
+            "delegated here with an MCP profile this version cannot read, and",
+          );
+        } else {
+          expect(task.message).toMatch(/^The MCP profile of the thread on another machine/);
+        }
+      }
+    }
+    // A carried name is still shown.
+    const named = refused(resolveMcpProfile(fromFile(REFUSE), [child("task")], carried([])));
+    expect(named.message).toContain('with its MCP profile "remote", and');
+  });
+
+  it("makes every caller say what this machine does with a carried profile (#653)", () => {
+    const { mcpCarriedProfiles, ...rest } = fromFile(REFUSE);
+    expect(mcpCarriedProfiles).toBe("refuse");
+    // Typecheck: settings without the key are not resolver settings, so no caller gets apply by
+    // leaving it out.
+    // @ts-expect-error mcpCarriedProfiles is required
+    const partial: McpProfileSettings = rest;
+    expect(partial).not.toHaveProperty("mcpCarriedProfiles");
+  });
+
+  it("takes a task that carries all, which cuts nothing, as apply would", () => {
+    const value = carried("all", "all", "all");
+    const refuse = resolved(resolveMcpProfile(fromFile(REFUSE), [child("task")], value));
+    const apply = resolved(resolveMcpProfile(fromFile({}), [child("task")], value));
+    expect(refuse).toEqual(apply);
+    expect(isEveryMcpTool(refuse.profile)).toBe(true);
+  });
+
+  it("leaves the owner's pick for the task, and tasks with nothing carried, as before", () => {
+    const picked = fromFile({ ...REFUSE, mcpThreadProfiles: { task: "t3-only" } });
+    expect(resolved(resolveMcpProfile(picked, [child("task")], carried(["docs"]))).name).toBe(
+      "t3-only",
+    );
+    const settings = fromFile({ ...REFUSE, mcpSubagentProfile: "t3-only" });
+    expect(resolved(resolveMcpProfile(settings, [child("task")])).name).toBe("t3-only");
+    expect(resolved(resolveMcpProfile(fromFile(REFUSE), [top("local")])).name).toBe("all");
+  });
+
+  it("follows the setting on each run: refuse, then apply, then refuse again", () => {
+    const value = carried(["docs"]);
+    const runs = [REFUSE, {}, { mcpCarriedProfiles: "apply" }, REFUSE].map(
+      (file) => resolveMcpProfile(fromFile(file), [child("task")], value)._tag,
+    );
+    expect(runs).toEqual(["CannotApply", "Resolved", "Resolved", "CannotApply"]);
   });
 });

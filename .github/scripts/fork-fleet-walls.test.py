@@ -1406,7 +1406,16 @@ class EveryWallsFile(WallsRunner):
                     '/var/backups/passwd.bak': {'var/backups/passwd.bak': 'alice:x:1000:1000::/home/alice:/bin/sh\n'},
                     '/var/log/wtmp': {'var/log/wtmp': 'alice\n'},
                     '/var/lib/extrausers': {'var/lib/extrausers/passwd': 'alice:x:1000:1000::/home/alice:/bin/sh\n'},
-                    '/var': {'var/backups/group.bak': 'sudo:x:27:alice\n'}}   # a folder that holds it
+                    '/var': {'var/backups/group.bak': 'sudo:x:27:alice\n'},   # a folder that holds it
+                    # Issue #636: more of the usual places.
+                    '/etc/passwd.dpkg-old': {'etc/passwd.dpkg-old': 'alice:x:1000:1000::/home/alice:/bin/sh\n'},
+                    '/etc/group.OLD': {'etc/group.OLD': 'sudo:x:27:alice\n'},
+                    '/etc/hosts.equiv': {'etc/hosts.equiv': 'build-host alice\n'},
+                    '/var/mail': {'var/mail/alice': ''},
+                    '/var/spool/mail/alice': {'var/spool/mail/alice': ''},
+                    '/var/lib/sss/mc': {'var/lib/sss/mc/passwd': 'alice\n'},
+                    '/var/lib/dhcp': {'var/lib/dhcp/dhclient.leases': 'lease { option host-name "nas"; }\n'},
+                    '/var/lib/misc': {'var/lib/misc/dnsmasq.leases': '1 aa:bb:cc:dd:ee:ff 192.0.2.9 nas *\n'}}
         for allow, files in accounts.items():
             with self.subTest(allow):
                 p = run([os.path.join(self.folder, 'linux'), 'check'],
@@ -1485,6 +1494,13 @@ class EveryWallsFile(WallsRunner):
                 self.assertIn('FAIL  mounts  ', got)
                 self.assertIn(want, got)
                 self.assertNotIn(owner if want == older else older, got)
+        # Issue #636: both kinds at once name both ways out in one run (it took a run each).
+        for line in ('/etc/passwd /etc/passwd\\n/etc/shadow /etc/shadow', '/etc/ssh /etc/ssh\\n/opt/l /var/log'):
+            with self.subTest(line):
+                got = self.fake_paths(line, self.root(LINUX))
+                self.assertIn('FAIL  mounts  ', got)
+                self.assertIn('an older launcher binds some: re-run the installer; take the rest out of ALLOW_PATHS or '
+                              'JOB_PATHS\n', got)
 
     def test_linux_mounts_finds_a_secret_at_another_path_by_its_inode(self):
         """Issue #613 item 7: a bind mount or hard link of a secret entry at another path is the same device and
@@ -1509,13 +1525,25 @@ class EveryWallsFile(WallsRunner):
         real_stat = os.stat
         for other, want in (('opt/keys', '/etc/ssl/private'),
                             ('opt/keys/k.key', '/etc/ssl/private, a folder that holds it'),
-                            ('opt/e', '/etc, a folder that holds ')):
+                            ('opt/e', '/etc, a folder that holds '),
+                            # Issue #636: any folder named private under /etc, as secret_etc has it, not only the
+                            # listed ones.
+                            ('opt/app', '/etc/myapp/private'),
+                            ('opt/app/k.key', '/etc/myapp/private, a folder that holds it'),
+                            ('opt/deep', '/etc/a/b/c/private')):
             with self.subTest(other):
                 root = root_with()
+                os.makedirs(os.path.join(root, 'etc/myapp/private'))
+                write(os.path.join(root, 'etc/myapp/private/k.key'), 'k\n')
+                os.makedirs(os.path.join(root, 'etc/a/b/c/private'))
+                os.makedirs(os.path.join(root, 'opt/app'))
+                write(os.path.join(root, 'opt/app/k.key'), 'k\n')
                 m = fw_linux()
                 m.ROOT = root
                 bound = {os.path.join(root, 'opt/keys'): os.path.join(root, 'etc/ssl/private'),
-                         os.path.join(root, 'opt/e'): os.path.join(root, 'etc')}
+                         os.path.join(root, 'opt/e'): os.path.join(root, 'etc'),
+                         os.path.join(root, 'opt/app'): os.path.join(root, 'etc/myapp/private'),
+                         os.path.join(root, 'opt/deep'): os.path.join(root, 'etc/a/b/c/private')}
 
                 def fake_stat(p, *a, **k):
                     return real_stat(bound.get(p, p), *a, **k)
@@ -1530,6 +1558,16 @@ class EveryWallsFile(WallsRunner):
         with mock.patch.object(m.os, 'stat', side_effect=PermissionError(13, 'Permission denied')):
             with self.assertRaisesRegex(ValueError, 'cannot read /etc/shadow'):
                 m.secret_inodes()
+        # Issue #636: a folder of /etc that cannot be listed may hold a private one: cannot tell. No /etc: none.
+        locked = os.path.join(m.ROOT, 'etc/locked')
+        os.makedirs(locked)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o755)
+        if os.geteuid() != 0:
+            with self.assertRaisesRegex(ValueError, 'cannot list /etc/locked'):
+                m.secret_inodes()
+        m.ROOT = self.root({'usr/': ''})
+        self.assertEqual(m.private_folders(), [])
         # Runs again: the same answer.
         root = root_with([('etc/shadow', 'opt/s')])
         self.assertEqual(self.fake_paths('/opt/s /opt/s', root), self.fake_paths('/opt/s /opt/s', root))
@@ -1543,7 +1581,11 @@ class EveryWallsFile(WallsRunner):
         launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
         conf = 'etc/fork-fleet/launch.conf'
         each = {p.replace('*', 'x') for p in (*m.SECRET_ETC, *m.SECRET_ELSEWHERE, *m.LAUNCHER_REFUSES)}
-        each |= {'/var/log/wtmp', '/var/lib/extrausers/passwd', '/var/backups/group.bak', '/etc/ssl', '/var/cache'}
+        each |= {'/var/log/wtmp', '/var/lib/extrausers/passwd', '/var/backups/group.bak', '/etc/ssl', '/var/cache',
+                 # Issue #636: more of the usual places, and their neighbours that are not.
+                 '/etc/passwd.bak', '/etc/hosts.equiv', '/var/mail/alice', '/var/spool/mail/alice',
+                 '/var/lib/sss/mc/passwd', '/var/lib/sss/db', '/var/lib/dhcp/dhclient.leases', '/etc/hostname',
+                 '/etc/host.conf', '/etc/groff', '/var/lib/misc/other', '/var/lib/apt'}
         for p in sorted(each):
             with self.subTest(p):
                 got = run([launcher, 'paths'], self.root(overlay(LINUX, {conf: f'ALLOW_PATHS={p}\n'})))
@@ -1555,6 +1597,16 @@ class EveryWallsFile(WallsRunner):
                     self.assertIn('take it out of ALLOW_PATHS', got.stderr)
                 if p != '/etc' and m.launcher_refuses(p):
                     self.assertTrue(m.secret_etc(p), p)
+        # Issue #636 item 4: and the other way: every pattern never() refuses (but its own-or-none and data roots) is
+        # one of LAUNCHER_REFUSES. A refusal added to the launcher alone stayed green before, and the walls then took
+        # an older launcher's line for the owner's.
+        with open(launcher) as f:
+            body = re.search(r'^never\(\) \{\n(.*?)^\}\n', f.read(), re.M | re.S).group(1)
+        theirs = set(re.findall(r'\[\[ \$1 != (/\S+) \]\]', body))
+        for block in re.findall(r'case \$1 in\s*(.*?)\)\s*die', body, re.S):
+            theirs |= {x.strip() for x in block.replace('\\\n', ' ').split('|')}
+        self.assertIn('/var/lib/dhcp/*', theirs)   # the parse found the whole list
+        self.assertEqual(theirs, set(m.LAUNCHER_REFUSES))
 
     def test_linux_etc_secrets_reads_only_what_jobs_see(self):
         """Issue #243 items 5 and 6: jobs see an allow list of /etc, so a secret in a login file, a unit or
