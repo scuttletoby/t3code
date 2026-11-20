@@ -2929,7 +2929,7 @@ test("--lowered-list writes the lowered list after a rebase only, and only when 
   });
 });
 
-// #311: a listed "added" copy the fork no longer adds (a generic `};` or `settings = {` left from
+// A listed "added" copy the fork no longer adds (a generic `};` or `settings = {` left from
 // an older change) was room for a line nobody announced, and neither run noticed.
 const spare = (files, base, head, options = {}) =>
   findSpareSeamLines(files, {
@@ -3067,7 +3067,7 @@ test("the command line: a spare seam copy fails fork-follow's run, is lowered af
     assert.equal(refused.status, 1, refused.stdout);
     assert.match(refused.stderr, /- a\.ts: this change drops `\.\.\.fork,`, which main's list has/);
     assert.match(refused.stderr, /drop each spare "added" copy/);
-    // Merged as it is (as before #311), the next run from upstream refuses main.
+    // Merged as it is, the next run from upstream refuses main.
     const nightly = fromUpstream(upstream, kept);
     assert.equal(nightly.status, 1, nightly.stdout);
     assert.match(nightly.stderr, /- a\.ts: "added" lists `\.\.\.fork,`, but the fork adds no copy/);

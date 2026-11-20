@@ -541,12 +541,9 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false, 
 }
 
 /**
- * Listed "added" copies the fork does not use: room for a line nobody announced (a generic `}` the
- * fork no longer adds is one more `}` a later change may add). From upstream each listed line allows
- * no more copies than the head has over the base: more is a `ceilings` refusal, or right after a
- * rebase (upstream may take a fork line word for word) a note, and `lowered.added` gets the copies in
- * use. On a pull request, a change that drops copies of a listed line lists exactly main's copies less
- * those in its own `ownFiles` entry (the own list only refuses: too few fails the run from upstream).
+ * Spare listed "added" copies: room for a line nobody announced. From upstream, a copy the head does
+ * not add over the base is refused (after a rebase: a note, and `lowered.added` keeps the copies in
+ * use). A pull request that drops copies lists exactly main's copies less those in `ownFiles`.
  */
 function findSpareSeamLines(
   files,
@@ -938,11 +935,9 @@ const MOVED_WHY =
   'Was "pending": fork-follow moved it here once it had no fork line left, as its "lost" entry still counts upstream lines it loses. No seam line: a fork line goes in a file of the fork\'s own.';
 
 /**
- * `text` with `lowered` ({ pending, lost } Maps of counts, `added` Map of each file's copies in use,
- * `hidden` Set of upstream files) applied, as { text, changes }, or undefined when nothing changes.
- * Only lowers; a count at 0 removes the entry; a spare "added" copy goes; a
- * "pending" file with no fork line left moves to "files"; each hidden file stops being a fork file
- * (its own "forkFiles" entry goes, or a `!` entry excludes it). Parsed again before it is returned.
+ * `text` with `lowered` (pending/lost/added Maps, `hidden` Set) applied, as { text, changes }, or
+ * undefined. Only lowers: a 0 count or spare "added" copy goes, an emptied "pending" file moves to
+ * "files", a hidden file stops being a fork file ("forkFiles" entry or `!`). Parsed again after.
  */
 function lowerList(text, lowered) {
   const raw = JSON.parse(text);
