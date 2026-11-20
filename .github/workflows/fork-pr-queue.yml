@@ -89,6 +89,9 @@ jobs:
       - name: Remove an earlier run's caller and toolkit folders
         shell: bash
         run: rm -rf -- "${GITHUB_WORKSPACE:?}/caller" "${GITHUB_WORKSPACE:?}/toolkit"
+      # Both checkouts keep the default persist-credentials: `false` makes checkout's cleanup run `git submodule
+      # foreach`, which fails (exit 128) on a repository with gitlinks and no .gitmodules, as this one has. The next
+      # step drops the token instead.
       - name: Check out the caller's config
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -102,6 +105,34 @@ jobs:
           ref: ${{ steps.toolkit.outputs.sha }}
           path: toolkit
           sparse-checkout: fork-ci/actions/pr-queue
+      # Neither checkout keeps the job's token, which notify_command (the project's own code) could read in the
+      # workspace or RUNNER_TEMP. Checkout v6 keeps it in $RUNNER_TEMP/git-credentials-*.config, which .git/config
+      # includes (includeIf.<gitdir>.path); an older one keeps http.<url>.extraheader in .git/config. All of it goes,
+      # and the step fails unless no extraheader is left in any config git reads there. The queue needs none: it reads
+      # its config from the local checkout and fetches with its own login. Nothing to remove (a re-run) passes.
+      # Same steps as .github/actions/drop-checkout-credentials, inline: a caller's workspace has no copy of that
+      # action. Test: .github/scripts/fork-pr-queue-workflow.test.py.
+      - name: Drop the checkouts' token
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in "${GITHUB_WORKSPACE:?}/caller" "${GITHUB_WORKSPACE:?}/toolkit"; do
+            { git -C "$dir" config --local --name-only --get-regexp '^(includeif\..*\.path|http\..*\.extraheader)$' || true; } |
+              sort -u | while IFS= read -r key; do git -C "$dir" config --local --unset-all "$key"; done
+          done
+          rm -f -- "${RUNNER_TEMP:?}"/git-credentials-*.config
+          for dir in "${GITHUB_WORKSPACE:?}/caller" "${GITHUB_WORKSPACE:?}/toolkit"; do
+            rc=0
+            git -C "$dir" config --get-regexp '\.extraheader$' > /dev/null || rc=$?
+            if [[ "$rc" != 1 ]]; then
+              echo "::error::pr-queue: the checkout's token is still in $dir's git config (or the config cannot be read), so notify_command could read it" >&2
+              exit 2
+            fi
+          done
+          if compgen -G "${RUNNER_TEMP}/git-credentials-*.config" > /dev/null; then
+            echo "::error::pr-queue: a checkout credentials file is still in RUNNER_TEMP" >&2
+            exit 2
+          fi
       - name: Run the queue
         uses: ./toolkit/fork-ci/actions/pr-queue
         with:

@@ -25,7 +25,7 @@ git config --global user.name test
 git config --global user.email test@example.invalid
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
-unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML OLD_HEADS SCANNED_GONE PUSH_REF
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML OLD_HEADS SCANNED_GONE OLD_HEADS_FILE SCANNED_GONE_FILE PUSH_REF
 export CONFIG_BRANCH=main
 
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
@@ -711,6 +711,38 @@ for bad in "--all" "$zeros" "${gone4:0:12}" ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEF
     check "daily sweep: a word in SCANNED_GONE that is not a commit id fails ($bad)" 2 \
     "::error::Secret scan: '.*' in SCANNED_GONE is not a commit id"
 done
+# #637: the lists in files (OLD_HEADS_FILE, SCANNED_GONE_FILE), read instead of the variables. The
+# sweep's list outgrew the 128 KiB the kernel allows one environment string, so the workflow hands
+# it over in a file; this one is that size (each id many times, as the activity record has them).
+big_list="$root/old-heads-big"
+main_tip="$(git rev-parse main)"
+for ((n = 0; n < 1800; n++)); do printf '%s\n%s\n' "$vanished" "$main_tip"; done > "$big_list"
+[[ $(wc -c < "$big_list") -gt 131072 ]] || { echo "FAIL the list in a file is not over 128 KiB"; failures=$((failures + 1)); }
+OLD_HEADS="" OLD_HEADS_FILE="$big_list" EVENT_NAME=schedule \
+  check "daily sweep: a list over 128 KiB in OLD_HEADS_FILE is read (a deleted branch's key found)" 1 \
+  "1 tip\\(s\\) no ref holds" "" "leaks found: [1-9]"
+# The state question: the same run again reads the same list the same way.
+OLD_HEADS="" OLD_HEADS_FILE="$big_list" EVENT_NAME=schedule \
+  check "daily sweep: the same run again (the list in a file) finds the same key" 1 "1 tip\\(s\\) no ref holds"
+printf '%s\n' "$vanished" > "$root/old-heads-one"
+OLD_HEADS="" OLD_HEADS_FILE="$root/old-heads-one" EVENT_NAME=schedule \
+  check "daily sweep: OLD_HEADS_FILE is read instead of an empty OLD_HEADS" 1 "1 tip\\(s\\) no ref holds"
+: > "$root/old-heads-empty"
+OLD_HEADS="$vanished" OLD_HEADS_FILE="$root/old-heads-empty" EVENT_NAME=schedule \
+  check "daily sweep: an empty OLD_HEADS_FILE is an empty list (read instead of the variable)" 0 "" "no ref holds"
+printf '%s\n' "$gone4" > "$root/gone-four"
+SCANNED_GONE="" SCANNED_GONE_FILE="$root/gone-four" OLD_HEADS="" OLD_HEADS_FILE="$root/gone-four" EVENT_NAME=schedule \
+  check "daily sweep: a gone tip SCANNED_GONE_FILE names (a scan read it) warns, and passes" 0 \
+  "$gone_scanned_warning.*444444444444" "::error"
+OLD_HEADS="$vanished" OLD_HEADS_FILE="$root/no-such-list" EVENT_NAME=schedule \
+  check "daily sweep: an OLD_HEADS_FILE that cannot be read fails the job (not an empty list)" 2 \
+  "::error::Secret scan: cannot read OLD_HEADS_FILE"
+SCANNED_GONE="$gone4" SCANNED_GONE_FILE="$root/no-such-list" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: a SCANNED_GONE_FILE that cannot be read fails the job" 2 \
+  "::error::Secret scan: cannot read SCANNED_GONE_FILE"
+OLD_HEADS="" OLD_HEADS_FILE="$root/no-such-list" EVENT_NAME=pull_request BEFORE="" HEAD_SHA="$main_tip" \
+  check "pull request: an OLD_HEADS_FILE that cannot be read fails the job too" 2 \
+  "::error::Secret scan: cannot read OLD_HEADS_FILE"
 set_gone_list "$gone3 checked by hand: GitHub serves it nowhere (test)" # the list as the tests below expect it
 
 # #317 item 2: "one batch fetch first, then one by one" from a fresh blob-less clone, which holds

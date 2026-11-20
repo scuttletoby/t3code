@@ -23,13 +23,18 @@ export const FINISHED_RUN_STATUSES = OrchestrationV2RunStatus.literals.filter(
   ThreadManagementService.isTerminalRunStatus,
 );
 
-/** Upstream's index on runs by thread and status, which upstream's own shell read names too. */
-export const RUN_STATUS_INDEX = "orchestration_v2_projection_runs_thread_status_idx";
-
-/** Logged when the index is gone: the read goes on without it, so the gate still counts. */
-export const MISSING_INDEX_MESSAGE =
-  `agent slots: index ${RUN_STATUS_INDEX} is missing; reading running agents without it ` +
-  "(slower). Upstream renamed or dropped it: update apps/server/src/slots/ActiveRunShells.ts";
+/**
+ * The threads with a run in a status other than a finished one. It names no index: SQLite picks
+ * upstream's `(thread_id, status)` index on its own (a test checks the plan), and an index that is
+ * renamed, dropped or made partial only makes the read slower, never fails it. Exported for that test.
+ */
+export const unfinishedRunThreadIds = (sql: SqlClient.SqlClient) => sql<{
+  readonly thread_id: string;
+}>`
+  SELECT DISTINCT thread_id
+  FROM orchestration_v2_projection_runs
+  WHERE status NOT IN ${sql.in(FINISHED_RUN_STATUSES)}
+`;
 
 export class ActiveRunShells extends Context.Service<
   ActiveRunShells,
@@ -47,36 +52,12 @@ const hasActiveRun = (thread: { readonly activeRunId: unknown }) => thread.activ
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
-  /** Logged once per server: the gate reads often, and the message names the fix. */
-  let missingIndexLogged = false;
-  const unfinishedRunThreadIds = Effect.gen(function* () {
-    // A missing index would fail `INDEXED BY` and leave the gate with no counts, so ask first.
-    const index = yield* sql`
-      SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ${RUN_STATUS_INDEX}
-    `;
-    if (index.length > 0) {
-      return yield* sql<{ readonly thread_id: string }>`
-        SELECT DISTINCT thread_id
-        FROM orchestration_v2_projection_runs
-          INDEXED BY ${sql.literal(RUN_STATUS_INDEX)}
-        WHERE status NOT IN ${sql.in(FINISHED_RUN_STATUSES)}
-      `;
-    }
-    if (!missingIndexLogged) {
-      missingIndexLogged = true;
-      yield* Effect.logError(MISSING_INDEX_MESSAGE);
-    }
-    return yield* sql<{ readonly thread_id: string }>`
-      SELECT DISTINCT thread_id
-      FROM orchestration_v2_projection_runs
-      WHERE status NOT IN ${sql.in(FINISHED_RUN_STATUSES)}
-    `;
-  });
   const read = Effect.gen(function* () {
     const decode = yield* sql
       .withTransaction(
+        // One read transaction: the shells come from the same state of the store as the ids.
         Effect.gen(function* () {
-          const rows = yield* unfinishedRunThreadIds;
+          const rows = yield* unfinishedRunThreadIds(sql);
           return yield* threadManagement.readShellSnapshot({
             threadIds: rows.map((row) => ThreadId.make(row.thread_id)),
           });
