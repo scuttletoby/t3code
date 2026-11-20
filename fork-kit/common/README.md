@@ -70,7 +70,34 @@ under the same file-safety rules (root owner, no link, plain file, 1 MiB, UTF-8)
 in the defaults. All three raise `MachineFileError` with a message that names the file and the key. Plain Python 3
 standard library.
 
+## The installer
+
+`kit_install.py` is the installer of the cleaner and golive kits; each kit's `sbin/<kit>-install` is a small
+subclass that names its paths, links, files and modules, and adds its own steps. `install --source FOLDER --sha
+SHA`, as root:
+
+1. **check**: refuses, before writing anything, a link path that is not the kit's (a kit may keep a plain old
+   file there instead: `KEEP_OLD`), a folder that is a file or a link, a bad `--sha`, a source file that is
+   missing or reached through a link;
+2. **copy**: the files into `.tmp-*` beside `versions/<sha>/`, read with no link followed, root-owned, with
+   `MANIFEST.sha256`; **self-test**: every module imported and the help run from the copy; then the copy is
+   swapped in, in one step (`renameat2` exchange; two renames where the filesystem has none). A version folder
+   that is whole and matches is kept as it is; one that differs (a stop half-way, an older installer) is made
+   again beside it;
+3. **switch**: `current` to it in one step; **links**: each of the kit's links in one step; the kit's own steps;
+4. **record**: `installed.tsv`, what `self-check` compares.
+
+Safe to run again (nothing changes), and to stop at any step (the next run finishes it); one installer at a time
+(`<etc>/install.lock`, `uninstall` too). Old version folders stay: a run of the kit may still be using one.
+`uninstall` removes the links, the libexec and etc folders and puts back what `KEEP_OLD` kept.
+
+`bootstrap.sh --kit cleaner|golive --repo OWNER/REPO --sha SHA [kit options]` checks the commit is on the protected
+release branch, downloads exactly that commit and runs the kit's installer; it passes on only the kit's own options.
+
 ## Tests
 
+`python3 -I -B fork-kit/common/tests/kit_install.test.py` runs the installer contract for every kit that uses
+`kit_install.py`, and the bootstrap's options (a fake host in a temporary folder, no root); its red check breaks each
+rule in a copy of the engine or the bootstrap and shows its test then fails.
 `python3 -I -B fork-kit/common/tests/machine_file.test.py` (temporary files only, no root). Its red check breaks
 each file-safety rule in a copy of the loader and shows the test for that rule then fails.

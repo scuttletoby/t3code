@@ -16,8 +16,39 @@ fork build), with a cold copy of the data first and a way back. It is built in s
 | `back`, `status`  | `lib/golive/back.py`        | the way back (W1-W3); read only: is T3 up and right?         |
 | kept runtime      | `lib/golive/keptruntime.py` | the old build's runtime, kept for W1 (upstream prunes it)    |
 | `switch`, verify  | `lib/golive/switch.py`      | the move itself, verify, the automatic way back, the guard   |
+| installer         | `sbin/t3-golive-install`    | the version folder, the links, the install record            |
 
-The owner's runbook is `docs/fork/go-live.md`. Install from `ci-release` comes later.
+The owner's runbook is `docs/fork/go-live.md`.
+
+## Install
+
+From a commit of the fork's protected release branch, as root, with the bootstrap every kit shares:
+
+```
+curl -fsSL --proto =https https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/fork-kit/common/bootstrap.sh -o fork-kit-bootstrap.sh
+sh fork-kit-bootstrap.sh --kit golive --repo FORK_OWNER/FORK --sha RELEASE_SHA
+```
+
+The bootstrap checks the commit is on `ci-release`, downloads exactly that commit and runs
+`sbin/t3-golive-install install`. That copies `bin/`, `sbin/`, `lib/golive/`, this page and
+`fork-kit/common/{machine_file,kit_install}.py` into `/usr/local/libexec/t3-golive/versions/<sha>/` (root-owned,
+with `MANIFEST.sha256`), imports every module and runs `t3-golive switch-guard --help` as a self-test, switches
+`current` to it and links `/usr/local/bin/t3-golive` and `/usr/local/sbin/t3-golive-install`. It writes
+`/etc/t3-golive/installed.tsv`; `t3-golive-install self-check` reports drift from it. Safe to run again or to stop
+at any step; one installer at a time. The steps are the cleaner's (`fork-kit/common/kit_install.py`, see
+[common](../common/README.md#the-installer)); golive adds two rules:
+
+- **A copy made by hand.** A plain file at `/usr/local/bin/t3-golive` (a copy made before this installer) is kept
+  in `/usr/local/libexec/t3-golive/replaced/t3-golive.<sha256, 16>` (in the install record too) and the kit's link
+  replaces it in one step, so the command is never missing. `uninstall` puts the newest kept copy back. A link
+  there that is not the kit's, or a folder, is refused and left alone.
+- **No uninstall under a run.** A golive run, and the guard that keeps T3 stopped, run the code of the version
+  they started with (its real path), so an install never takes the code from under them: old version folders
+  stay. `uninstall` takes `<stateDir>/lock` (the machine file's `golive.stateDir`) and refuses while a run holds
+  it; a machine file it cannot read refuses too. It cannot see a switch guard timer still pending in a user's
+  systemd: run `t3-golive status` first.
+
+The installer writes no machine file and nothing in a T3 home; `uninstall` leaves both, and the state folder.
 
 ## `t3-golive check`
 
@@ -780,6 +811,8 @@ python3 -I -B fork-kit/golive/tests/back.test.py       # back W1-W3 and status, 
 python3 -I -B fork-kit/golive/tests/rehearse.test.py   # rehearse R0-R5 with a stub t3 (old and fork build)
 python3 -I -B fork-kit/golive/tests/switch.test.py     # switch, verify, way back, guard on a fake machine
 python3 -I -B fork-kit/golive/tests/contract.test.py   # upstream names the kit reads still exist
+python3 -I -B fork-kit/golive/tests/install.test.py    # the installer: a hand copy, no uninstall under a run
+python3 -I -B fork-kit/common/tests/kit_install.test.py
 python3 -I -B fork-kit/common/tests/machine_file.test.py
 ```
 

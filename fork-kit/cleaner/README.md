@@ -23,7 +23,7 @@ delete with what they would, and deletes nothing.
 | `report`     | `lib/cleaner/report.py`                                 | one line: GB per class, and what runs freed                   |
 | `compare`    | `lib/cleaner/compare.py`                                | its plan next to the dry runs of the tools it replaces        |
 | `daily`      | `lib/cleaner/daily.py`                                  | what the timer runs: compare mode or run mode                 |
-| installer    | `sbin/fork-cleaner-install`, `bootstrap.sh`, `systemd/` | the version folder, the links, the timer                      |
+| installer    | `sbin/fork-cleaner-install`, `systemd/`                 | the version folder, the links, the timer                      |
 
 ## Commands
 
@@ -703,10 +703,11 @@ makes the compare `incomplete` (exit 1, which wins over 3); what it printed stil
 
 ## Install
 
-From a commit of the fork's protected release branch, as root:
+From a commit of the fork's protected release branch, as root, with the bootstrap every kit shares
+(`fork-kit/common/bootstrap.sh`):
 
 ```
-sh bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
+sh fork-kit-bootstrap.sh --kit cleaner --repo FORK_OWNER/FORK --sha RELEASE_SHA --timer
 ```
 
 The bootstrap checks the commit is on `ci-release`, downloads exactly that commit and runs
@@ -725,7 +726,8 @@ that is a link is refused, never copied), so a link to a file only root may read
 world-readable copy. A copy of the same release that changed is made again beside it, self-tested, and only then
 swapped in, in one step (`renameat2` exchange; two renames where the filesystem has none): a copy that stops half
 way or fails its self-test leaves the copy in use as it was. The bootstrap passes only `--timer` or `--no-timer`
-on to the installer; any other option is refused.
+on to the installer; any other option is refused. The steps every kit shares are in
+`fork-kit/common/kit_install.py` ([common](../common/README.md#the-installer)).
 
 The installer writes no machine file: the `cleaner` section is the owner's, written by hand.
 
