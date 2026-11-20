@@ -68,19 +68,29 @@ test("a test run elsewhere must be named by its runner, which is not an upstream
       "      # x/commented.test.cjs\n" +
       "      - run: |\n" +
       "          # x/commented.test.cjs\n" +
-      "          cd x && node --test commented.test.cjs\n",
+      "          cd x && node --test commented.test.cjs\n" +
+      "      - run: true # x/trailing.test.cjs\n",
     ".github/workflows/ci.yml": "run: node --test x/upstream.test.cjs",
-    "scripts/smoke.ts": '// x/commented-ts.test.cjs\nrun(["--test", "x/named-ts.test.cjs"]);\n',
+    "scripts/smoke.ts":
+      '// x/commented-ts.test.cjs\nrun(["--test", "x/named-ts.test.cjs"]);\n' +
+      "run([]); // x/trailing-ts.test.cjs\n" +
+      "/* x/block-ts.test.cjs\n   x/block-ts.test.cjs */ run([]);\n" +
+      'fetch("https://example.invalid/x/url-ts.test.cjs");\n',
   };
   const entries = [
     { file: "x/named.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
     { file: "x/unnamed.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
     { file: "x/upstream.test.cjs", runBy: ".github/workflows/ci.yml" },
     { file: "x/nowhere.test.cjs", runBy: "scripts/missing.ts" },
-    // Named only in a YAML or shell comment (the run goes there by `cd`): not run (#646).
+    // Named only in a YAML or shell comment (the run goes there by `cd`): not run.
     { file: "x/commented.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
     { file: "x/commented-ts.test.cjs", runBy: "scripts/smoke.ts" },
     { file: "x/named-ts.test.cjs", runBy: "scripts/smoke.ts" },
+    // A comment after code, or a /* */ block over lines, names nothing either; a URL's // is not a comment.
+    { file: "x/trailing.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
+    { file: "x/trailing-ts.test.cjs", runBy: "scripts/smoke.ts" },
+    { file: "x/block-ts.test.cjs", runBy: "scripts/smoke.ts" },
+    { file: "x/url-ts.test.cjs", runBy: "scripts/smoke.ts" },
   ];
   const result = plan(
     entries,
@@ -92,6 +102,7 @@ test("a test run elsewhere must be named by its runner, which is not an upstream
   assert.deepEqual(result.elsewhere, [
     { file: "x/named.test.cjs", runBy: ".github/workflows/fork-tests.yml" },
     { file: "x/named-ts.test.cjs", runBy: "scripts/smoke.ts" },
+    { file: "x/url-ts.test.cjs", runBy: "scripts/smoke.ts" },
   ]);
   assert.deepEqual(
     result.notRun.map((n) => n.file),
@@ -101,6 +112,9 @@ test("a test run elsewhere must be named by its runner, which is not an upstream
       "x/nowhere.test.cjs",
       "x/commented.test.cjs",
       "x/commented-ts.test.cjs",
+      "x/trailing.test.cjs",
+      "x/trailing-ts.test.cjs",
+      "x/block-ts.test.cjs",
     ],
   );
   assert.match(result.notRun[1].why, /upstream workflow/);
@@ -118,6 +132,13 @@ test("the list ignores comments and blank lines and reads `run by` and weights",
       { file: "b.test.py", runBy: "c.yml", weight: null },
       { file: "d.test.cjs", runBy: null, weight: 120 },
     ],
+  );
+  // One spelling of a runner's path, so `./a/b` and `a//b` compare equal to `a/b` wherever the list is read.
+  assert.deepEqual(
+    readList(
+      "e.test.py run by ./.github/workflows/x.yml\nf.test.py run by .github//workflows/x.yml\n",
+    ).map((e) => e.runBy),
+    [".github/workflows/x.yml", ".github/workflows/x.yml"],
   );
   for (const bad of [
     "a.test.sh run c.yml",
@@ -402,7 +423,7 @@ test("a shard over twice its expected time, and by over a minute, gets a warning
       "share, which no weight shows; the job's time limit is next",
   );
   assert.equal(slowNote(["e"], weights, 4, 65), null); // over twice, but under a minute more
-  assert.equal(slowNote(["e"], weights, 4, 70), null); // a minute more exactly is not over a minute (#646)
+  assert.equal(slowNote(["e"], weights, 4, 70), null); // a minute more exactly is not over a minute
   assert.notEqual(slowNote(["e"], weights, 4, 70.5), null);
   assert.match(slowNote(["e"], weights, 4, 71), /took 71 s in all, ~10s expected/);
   assert.match(slowNote(files, weights, 1, 600), /~250s expected .*\(1 at once\)/);
@@ -722,7 +743,7 @@ async function mainTaking(seconds, list) {
   }
 }
 
-// #646: main() itself prints the warning and the summary's Slow line, and neither fails the run.
+// main() itself prints the warning and the summary's Slow line, and neither fails the run.
 test("a shard over twice its expected time and by over a minute warns in the log and the summary, and passes", async () => {
   const list = ["fork-ci/a.test.sh ~5s", "fork-ci/b.test.sh ~5s"]; // 10 s on one slot
   const slow = await mainTaking(71, list);

@@ -213,7 +213,7 @@ class Case(unittest.TestCase):
         a setup run here) are looked at once for real, and every later look gets that answer: for a test that runs
         setup hundreds of times for its writes. A write a rerun leaves out still fails such a test, in one of two
         ways: setup.test.py's stopped-half-way and killed-upgrade tests compare the fake root file by file
-        (same_files(): kind, mode, owner, content) with a whole run's; update.test.py's tests have the kit's own walls
+        (same_files(): kind, mode, owner, group, content) with a whole run's; update.test.py's tests have the kit's own walls
         (check, whose file:* walls are not cached) say so. A wsl2 wall added later that reads a file the kit writes
         gets the cached answer too: in update.test.py, a write only that wall would catch goes unseen. The walls' own
         answers have their tests (check.test.py, the fleet walls' tests)."""
@@ -324,7 +324,7 @@ class Case(unittest.TestCase):
 
     def snapshot(self):
         """Every path under the fake root but the fake tools' logs and the running system (/proc, /sys: processes):
-        kind, mode, owner, mtime, inode, link, content."""
+        kind, mode, owner, group, mtime, inode, link, content."""
         out = {}
         for top, dirs, names in os.walk(self.root):
             for n in dirs + names:
@@ -335,12 +335,12 @@ class Case(unittest.TestCase):
                 st = os.lstat(full)
                 body = os.readlink(full) if stat.S_ISLNK(st.st_mode) else \
                     blob(full) if stat.S_ISREG(st.st_mode) else None
-                out[rel] = (st.st_mode, st.st_uid, st.st_mtime_ns, st.st_ino, body)
+                out[rel] = (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns, st.st_ino, body)
         return out
 
     def same_files(self, skip=()):
-        """snapshot() as two runs that end the same must leave it: each path's kind and mode, owner and content (not
-        its mtime or inode), but the paths in skip."""
-        return {p: (v[0], v[1], v[4]) for p, v in self.snapshot().items() if p not in skip}
+        """snapshot() as two runs that end the same must leave it: each path's kind and mode, owner, group and content
+        (not its mtime or inode), but the paths in skip."""
+        return {p: (v[0], v[1], v[2], v[5]) for p, v in self.snapshot().items() if p not in skip}
 
 

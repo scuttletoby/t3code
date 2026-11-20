@@ -656,13 +656,21 @@ class RestartPending(Case):
         cli.put = real_put
         self.assertGreater(len(writes), 10)
         whole = files()   # the upgrade run all the way: a rerun after any stop must leave the same files
-        # Compared by mode and owner too, not content alone (#646): a rerun that left one file with another mode
-        # differs. (Owner: every file here is the test's own, and only root could chown one.)
+        # Compared by mode, owner and group too, not content alone: a rerun that left one file with another mode or
+        # group differs. (Owner: every file here is the test's own, and only root could chown one. Group: the test's
+        # user can move a file to another group it is in, when it is in one.)
         some = next(p for p, v in sorted(whole.items()) if stat.S_ISREG(v[0]))
         os.chmod(self.path(some), stat.S_IMODE(whole[some][0]) ^ 0o044)
         self.assertNotEqual(files(), whole, some)
         os.chmod(self.path(some), stat.S_IMODE(whole[some][0]))
         self.assertEqual(files(), whole)
+        gid = os.lstat(self.path(some)).st_gid
+        other = next((g for g in os.getgroups() if g != gid), None)
+        if other is not None:
+            os.chown(self.path(some), -1, other)
+            self.assertNotEqual(files(), whole, some)
+            os.chown(self.path(some), -1, gid)
+            self.assertEqual(files(), whole)
         for stop in range(1, len(writes) + 1):
             self.restore(upgradable)
             before = files()

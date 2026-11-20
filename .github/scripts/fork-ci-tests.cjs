@@ -20,9 +20,17 @@ const RUNNER = {
 };
 const UPSTREAM_WORKFLOW = /^\.github\/workflows\/(?!fork-)[^/]+\.ya?ml$/;
 
-// A runner file's lines but its comment lines (`#` or `//` first), so a path kept only in a comment names nothing.
-function codeLines(text) {
-  return text.split("\n").filter((line) => !/^\s*(?:#|\/\/)/.test(line));
+// A runner file's lines with its comments removed, so a path kept only in a comment names nothing. A JavaScript or
+// TypeScript file loses `/* ... */` and `//` to the line's end (not `://`, a URL); any other file (YAML, shell,
+// Python) loses `#` to the line's end where `#` starts the line or follows a space. Where this errs (a `#` or `//`
+// inside a string) it removes code, so the test counts as not run: the safe side.
+function codeLines(text, file = "") {
+  if (/\.[cm]?[jt]sx?$/.test(file))
+    return text
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .map((line) => line.replace(/(^|[^:])\/\/.*/, "$1"));
+  return text.split("\n").map((line) => line.replace(/(^|\s)#.*/, "$1"));
 }
 
 // `entries`: [{ file, runBy, weight }]; `present`: test files in the tree;
@@ -48,7 +56,7 @@ function plan(entries, present, ever, read = () => null) {
     else {
       const text = read(runBy);
       if (text === null) why = `${runBy} does not exist`;
-      else if (!codeLines(text).some((line) => line.includes(file)))
+      else if (!codeLines(text, runBy).some((line) => line.includes(file)))
         why = `${runBy} does not name ${file} (a comment does not count)`;
     }
     if (why) notRun.push({ file, why });
@@ -78,7 +86,8 @@ function readList(text) {
         );
       return {
         file: match[1],
-        runBy: match[3] ?? null,
+        // `./a/b` and `a//b` name the same file as `a/b`, so every reader compares one spelling.
+        runBy: match[3] ? path.posix.normalize(match[3]) : null,
         weight: match[2] ? Number(match[2]) : null,
       };
     });

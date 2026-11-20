@@ -43,13 +43,15 @@ copies that must fail (so a check that stops seeing its problem goes red too):
   result       fork-tests.yml's fork_ci_result, the one check a ruleset requires, needs every other job
                of that workflow except the ones in RESULT_OPTIONAL (none today), so no job's failure
                can merge.
-  quiet        nothing in fork-tests.yml may fail quietly: no continue-on-error on a job or a step, and a
-               step that runs the fork's own tests (fork-ci-tests.cjs, fork-kit/, fork-ci/,
-               .github/scripts/fork-* test files) has no if:, no working-directory, no shell: but bash,
-               no cd, pushd, trap, set +e or set +o, no pipe, || or background &, and no ;, ! or && after
-               the test on its line, so its exit status is the test's. Every test .github/fork-ci-tests.txt
-               lists as run by fork-tests.yml is run by a step's own command (python3, node or bash with the
-               test's path as an argument, not in a comment or an echo); a fork test by such a step (#646).
+  quiet        nothing in fork-tests.yml may fail quietly: no continue-on-error on a job or a step. A step whose
+               run names a fork test, fork-kit, fork-ci or a test file is held to an allowlist, so its exit
+               status is its tests': its run is only lines of the allowed test forms (python3 with -I/-B/-u,
+               node with the runner or --test, or bash, then a listed test; set VAR=value switches only; an
+               optional 2>&1), its keys, env and if: are from a fixed set (no working-directory, shell only
+               bash, an if: only on upstream's tests), its job has no defaults, env or container, a fixed if:
+               and no step naming GITHUB_ENV, GITHUB_PATH or BASH_ENV, and the workflow has no defaults or
+               env. Every test .github/fork-ci-tests.txt lists as run by fork-tests.yml is run whole by such
+               a line, with the variable that switches it on. Anything else is refused with the allowed form.
   policies     every workflow with a pull_request_target trigger is listed in
                .github/fork-actions-policies.json (#401): allowed (the fork workflows the repository's
                Actions policy allows; each there, with that trigger and no other) or upstream_blocked;
@@ -1750,126 +1752,235 @@ for label, mutate in {
 
 # --- quiet ---------------------------------------------------------------------------------------
 # fork_ci_result trusts each job's result, so nothing in fork-tests.yml may fail quietly: no continue-on-error on a
-# job or a step (any value: an expression can turn it on for one matrix shard), and a step that runs the fork's own
-# tests (fork-ci-tests.cjs, or a test file under fork-kit/, fork-ci/ or .github/scripts/fork-*) has no if:, which
-# could skip it in one shard or on one event and leave the job green. Upstream's test steps keep theirs (the `test`
-# job runs some only in its first shard).
-FORK_TEST_RUN = re.compile(r"\.github/scripts/fork-ci-tests\.cjs|(?:fork-kit/|fork-ci/|\.github/scripts/fork-)\S*\.test\.\w+")
+# job or a step (any value: an expression can turn it on for one matrix shard). A step that runs tests the fork
+# relies on is held to an allowlist, not a blocklist: a blocklist of shell tricks keeps missing one (`sh -c '... ||
+# true'`, `set -n`, a function named node, `python3 -m py_compile <test>`). The allowlist:
+#   - its run is only lines (backslash continuations joined, whole comment lines skipped) of one TEST_FORMS shape;
+#   - the step has only STEP_KEYS: shell only `bash`, env only STEP_ENV, an if: only STEP_IFS and only on a step that
+#     runs upstream's tests alone (the `test` job runs those in its first shard); no working-directory;
+#   - its job has only JOB_KEYS (no defaults, env, container or services), its if: is one of JOB_IFS, and no run step
+#     of the job names GITHUB_ENV, GITHUB_PATH or BASH_ENV (each changes what a later step's command runs);
+#   - the workflow has no defaults or env.
+# Every test .github/fork-ci-tests.txt lists as run by fork-tests.yml must be run whole by such a line, with the
+# variable that switches it on (REQUIRED_VARS). Anything else is refused with the allowed form in the message.
 
-
-# The fork's own tests among the list's `run by` ones (upstream's keep their if:, as in ci.yml).
-FORK_OWN_TEST = re.compile(r"(?:fork-kit/|fork-ci/|\.github/scripts/fork-)\S*\.test\.\w+")
-# The tests .github/fork-ci-tests.txt lists as run by fork-tests.yml, read by fork-ci-tests.cjs's own readList.
-RUN_BY_HERE = [e["file"] for e in json.loads(subprocess.run(
+# The tests .github/fork-ci-tests.txt lists, read by fork-ci-tests.cjs's own readList (which spells each `run by`
+# path one way: `./a/b` is `a/b`), and those it says this file runs.
+LISTED = json.loads(subprocess.run(
     ["node", "-e", "const fs = require('fs'); const { readList } = require(process.argv[1]); "
      "console.log(JSON.stringify(readList(fs.readFileSync(process.argv[2], 'utf8'))))",
      str(scripts_dir / "fork-ci-tests.cjs"), str(root / ".github/fork-ci-tests.txt")],
-    check=True, capture_output=True, text=True).stdout) if e["runBy"] == ".github/workflows/fork-tests.yml"]
+    check=True, capture_output=True, text=True).stdout)
+RUN_BY_HERE = [e["file"] for e in LISTED if e["runBy"] == ".github/workflows/fork-tests.yml"]
+LISTED_FILES = {e["file"] for e in LISTED}
+# The fork's own tests among them (upstream's keep their if:, as in ci.yml).
+FORK_OWN_TEST = re.compile(r"(?:fork-kit/|fork-ci/|\.github/scripts/fork-)\S*\.test\.\w+")
+# A step whose run names any of these is a test step and must have the allowed shape. It is wide on purpose (a
+# folder name alone, any test extension the fork uses): a step that runs a test by another spelling still names one.
+TEST_MENTION = re.compile(r"fork-ci-tests|fork-kit|fork-ci/|\.test\.(?:py|sh|cjs|mjs|js)\b")
+RUNNER = ".github/scripts/fork-ci-tests.cjs"
+
+# The VAR=value words a test line may start with (each at most once), exactly as written: the switches that turn the
+# root and heavy tests on, and the two values sudo or a new step would otherwise lose.
+ALLOWED_VARS = {"GH_APPS_ROOT_TESTS=1", "HEAVY_REAL_TESTS=1", "FORK_FLEET_ROOT_TESTS=1",
+                'GITHUB_ACTIONS="$GITHUB_ACTIONS"', 'XDG_RUNTIME_DIR="/run/user/$(id -u)"'}
+# A test run on its own line needs its switch (and sudo where it tests as root): without it the test skips and
+# passes.
+REQUIRED_VARS = {"fork-kit/gh-apps/tests/root.test.py": (True, "GH_APPS_ROOT_TESTS=1"),
+                 "fork-kit/heavy/tests/heavy.test.py": (False, "HEAVY_REAL_TESTS=1"),
+                 ".github/scripts/fork-fleet.test.py": (True, "FORK_FLEET_ROOT_TESTS=1")}
+PY_FLAGS = {"-I", "-B", "-u"}
+STEP_KEYS = {"name", "id", "run", "env", "if", "shell", "timeout-minutes"}
+STEP_ENV = {"FORK_CI_TEST_SHARD": "${{ matrix.shard }}/${{ strategy.job-total }}"}
+STEP_IFS = {"matrix.shard == 1"}
+JOB_KEYS = {"name", "if", "needs", "runs-on", "timeout-minutes", "strategy", "permissions", "steps"}
+JOB_IFS = {"${{ " + PR_GUARD + " }}",
+           "${{ " + PR_GUARD + " && (!cancelled() && needs.changes.outputs.test != 'false') }}"}
+TEST_FORMS = (
+    "a fork test step's run is only lines of these forms, each optionally ending in 2>&1: "
+    "`[sudo env] [VAR=value ...] python3 [-I] [-B] [-u] <listed .py test> [-v <TestClass>]` (no arguments after a "
+    "test the list says fork-tests.yml runs: it runs whole), "
+    f"`node {RUNNER} [<path prefix> | '!<path prefix>' ...]`, `node --test <listed .cjs/.mjs/.js test> ...` or "
+    "`bash <listed .sh test>`, a test path written as listed (or with ./), VAR=value one of "
+    + ", ".join(sorted(ALLOWED_VARS)))
+
+TOKEN = re.compile(r"""(?:[^\s'"]+|'[^']*'|"(?:[^"\\]|\\.)*")+""")
+PLAIN = re.compile(r"""'([\w./!+-]+)'|"([\w./!+-]+)"|([\w./!+-]+)""")
 
 
-def unquoted(line):
-    """A shell line with each quoted word that is a plain word or path unquoted, and every other quoted string (a
-    glob, spaces, $, !, ;) emptied: those are text, not commands."""
-    def word(m):
-        text = m.group(1) if m.group(1) is not None else m.group(2)
-        return text if re.fullmatch(r"[\w./@%+=:,-]+", text) else "''"
-    return re.sub(r"'([^']*)'|\"([^\"]*)\"", word, line).strip()
+def words(line):
+    """A shell line's words as written (quotes kept), or None if a quote is not closed."""
+    rest, out = line.strip(), []
+    while rest:
+        m = TOKEN.match(rest)
+        if not m:
+            return None
+        out.append(m.group(0))
+        rest = rest[m.end():].lstrip()
+    return out
 
 
-# A line that is only a test's command: python3, node or bash (after `sudo [env]` and VAR=value words) and its
-# arguments, with nothing that could run something after it or change its status (| ; & # !).
-TEST_COMMAND = r"(?:sudo\s+(?:env\s+)?)?(?:[A-Za-z_]\w*=\S*\s+)*(?:python3|node|bash)\s"
+def plain(word):
+    """A word's text if it is a plain path or name, quoted whole or not; None for anything a shell would expand,
+    split or treat as an operator."""
+    m = PLAIN.fullmatch(word)
+    return next((g for g in m.groups() if g is not None), None) if m else None
 
 
-def runs_test(line, test):
-    """Whether a shell line (comments and continuations already handled) is a command that runs test (its path one
-    of the arguments)."""
-    return re.fullmatch(TEST_COMMAND + r"(?:[^|;&#!]*\s)?" + re.escape(test) + r"(?:\s[^|;&#!]*)?",
-                        unquoted(line)) is not None
+def test_path(word):
+    text = plain(word)
+    return text[2:] if text and text.startswith("./") else text
+
+
+def test_line(line):
+    """The tests one shell line runs whole, as {"tests": [...], "partial": [...]} (partial: run with arguments that
+    pick some of them), or a string saying why the line is not one of the allowed forms."""
+    w = words(line)
+    if not w:
+        return "a quote that is not closed"
+    if w[-1] == "2>&1":
+        w = w[:-1]
+    sudo = w[:2] == ["sudo", "env"]
+    if sudo:
+        w = w[2:]
+    env = []
+    while w and re.match(r"[A-Za-z_]\w*=", w[0]):
+        if w[0] not in ALLOWED_VARS or w[0] in env:
+            return f"{w[0]} is not an allowed VAR=value (or comes twice)"
+        env.append(w.pop(0))
+    if not w:
+        return "no command"
+    cmd, args = w[0], w[1:]
+    if cmd == "python3":
+        while args and args[0] in PY_FLAGS and args[0] not in args[1:]:
+            args = args[1:]
+        path = test_path(args[0]) if args else None
+        if path not in LISTED_FILES or not path.endswith(".py"):
+            return "python3 takes only -I, -B and -u, then a listed .py test"
+        rest = args[1:]
+        if rest and not (len(rest) == 2 and rest[0] == "-v" and re.fullmatch(r"[A-Z]\w*", rest[1] or "")):
+            return f"after {path} only -v <TestClass>"
+        found = {"tests": [path], "partial": []}
+        if rest:
+            found = {"tests": [], "partial": [path]}
+    elif cmd == "node" and args and test_path(args[0]) == RUNNER:
+        for a in args[1:]:
+            text = plain(a)
+            if text is None or not re.fullmatch(r"!?[\w.][\w./-]*", text):
+                return f"{RUNNER} takes only path prefixes (`fork-kit/`, '!fork-kit/')"
+        found = {"tests": [RUNNER], "partial": []}
+    elif cmd == "node" and args[:1] == ["--test"] and len(args) > 1:
+        paths = [test_path(a) for a in args[1:]]
+        if not all(p in LISTED_FILES and re.search(r"\.[cm]?js$", p) for p in paths):
+            return "node --test takes only listed .cjs, .mjs or .js tests"
+        found = {"tests": paths, "partial": []}
+    elif cmd == "bash" and len(args) == 1 and (test_path(args[0]) or "").endswith(".sh") \
+            and test_path(args[0]) in LISTED_FILES:
+        found = {"tests": [test_path(args[0])], "partial": []}
+    else:
+        return f"`{cmd}` with these arguments is not a test command"
+    for t in found["tests"] + found["partial"]:
+        need_sudo, var = REQUIRED_VARS.get(t, (sudo, None))
+        if var and var not in env:
+            return f"{t} needs {var} (without it the test skips and passes)"
+        if need_sudo != sudo:
+            return f"{t} runs {'only' if need_sudo else 'never'} under sudo env"
+    return found
 
 
 def step_runs(step):
     return joined_lines(str(step.get("run", "")))
 
 
-def own_tests(tests):
-    return [t for t in tests if FORK_OWN_TEST.fullmatch(t)]
+def is_test_step(step):
+    return bool(TEST_MENTION.search(str(step.get("run", ""))))
 
 
-def fork_test_step(step, tests=RUN_BY_HERE):
-    """Whether a step runs fork tests: it names fork-ci-tests.cjs or a fork test file anywhere in its run (comments
-    too), or runs a fork test that the list says this file runs."""
-    return bool(FORK_TEST_RUN.search(str(step.get("run", "")))) or any(
-        runs_test(line, t) for _, line in step_runs(step) for t in own_tests(tests))
-
-
-def exit_status_problems(step, tests=RUN_BY_HERE):
-    """Why the step's exit status may not be its fork tests' (empty: it is). The default shell is bash -e (`bash`
-    adds pipefail), so a step of plain lines fails at its first failing one; a line that names a fork test is only
-    that test's command."""
-    problems = []
-    if "working-directory" in step:
-        problems.append("a working-directory (the test it names may be another one)")
-    if step.get("shell", "bash") != "bash":
-        problems.append(f"shell: {step['shell']} (only bash keeps -e)")
-    for n, line in step_runs(step):
-        code = unquoted(line)
-        for bad, why in ((r"(?:^|[\s;&|(])(?:cd|pushd)\s", "a cd or pushd (the test it names may be another one)"),
-                         (r"(?:^|[\s;&|(])trap\s", "a trap"),
-                         (r"(?:^|[\s;&|(])set\s+\+[a-z]*[eo]", "set +e or set +o"),
-                         (r"\|", "a pipe or ||"),
-                         (r"(?<![&>])&(?![&>])", "a command run in the background")):
-            if re.search(bad, code):
-                problems.append(f"line {n}: {why}")
-        names = FORK_TEST_RUN.search(code) or any(t in code for t in own_tests(tests))
-        if names and not re.fullmatch(TEST_COMMAND + r"[^|;&#!]*", code):
-            problems.append(f"line {n}: names a fork test but is not only its command (python3, node or bash and its "
-                            "arguments): an if, !, ; or && around it may change its status")
-    return problems
+def test_step_problems(step):
+    """Why a test step is not of the allowed shape (empty: it is), and the tests it runs whole."""
+    problems, ran = [], []
+    for key in sorted(set(step) - STEP_KEYS):
+        problems.append(f"{key}: is not allowed on a test step (only {', '.join(sorted(STEP_KEYS))})")
+    if "shell" in step and step["shell"] != "bash":
+        problems.append(f"shell: {step['shell']} (only bash, which keeps -e)")
+    for k, v in (step.get("env") or {}).items():
+        if STEP_ENV.get(k) != v:
+            problems.append(f"env {k}: is not allowed on a test step (only {STEP_ENV})")
+    lines = [(n, line) for n, line in step_runs(step) if line.strip()]
+    if not lines:
+        problems.append("names a test but runs none")
+    for n, line in lines:
+        found = test_line(line)
+        if isinstance(found, str):
+            problems.append(f"line {n}: {found}; {TEST_FORMS}")
+        else:
+            ran += found["tests"]
+    if "if" in step:
+        own = [t for t in ran if t == RUNNER or FORK_OWN_TEST.fullmatch(t)]
+        if own or not ran or str(step["if"]) not in STEP_IFS:
+            problems.append(f"if: {step['if']} (a step of the fork's own tests has none; upstream's may have only "
+                            f"{', '.join(sorted(STEP_IFS))})")
+    return problems, ran
 
 
 def quiet_problems(wf, tests=RUN_BY_HERE):
-    problems = []
+    problems, ran = [], set()
+    for key in ("defaults", "env"):
+        if key in wf:
+            problems.append(f"fork-tests.yml: workflow-level {key}: is not allowed (it reaches every test step)")
     for j, job in (wf.get("jobs") or {}).items():
         if "continue-on-error" in job:
             problems.append(f"fork-tests.yml/{j}: continue-on-error on the job (its failure would pass)")
-        for i, step in enumerate(job.get("steps") or []):
-            where = f"fork-tests.yml/{j} step {i + 1} ({step.get('name', 'unnamed')})"
+        job_steps = job.get("steps") or []
+        for i, step in enumerate(job_steps):
             if "continue-on-error" in step:
+                where = f"fork-tests.yml/{j} step {i + 1} ({step.get('name', 'unnamed')})"
                 problems.append(f"{where}: continue-on-error (its failure would pass)")
-            if not fork_test_step(step, tests):
-                continue
-            if "if" in step:
-                problems.append(f"{where}: runs fork tests under an if: (it could skip them and pass)")
-            problems += [f"{where}: {why}" for why in exit_status_problems(step, tests)]
-    # #646: each test the list says this file runs is run by a step's own command, not only named somewhere.
-    every = [st for job in (wf.get("jobs") or {}).values() for st in job.get("steps") or []]
+        if not any(is_test_step(st) for st in job_steps):
+            continue
+        for key in sorted(set(job) - JOB_KEYS):
+            problems.append(f"fork-tests.yml/{j}: {key}: is not allowed on a job with test steps (only "
+                            f"{', '.join(sorted(JOB_KEYS))})")
+        if job.get("if") not in JOB_IFS:
+            problems.append(f"fork-tests.yml/{j}: if: {job.get('if')} (a job with test steps has one of "
+                            f"{' or '.join(sorted(JOB_IFS))})")
+        for i, step in enumerate(job_steps):
+            where = f"fork-tests.yml/{j} step {i + 1} ({step.get('name', 'unnamed')})"
+            if re.search(r"GITHUB_ENV|GITHUB_PATH|BASH_ENV", str(step.get("run", ""))):
+                problems.append(f"{where}: names GITHUB_ENV, GITHUB_PATH or BASH_ENV in a job with test steps (it "
+                                "changes what a later step's command runs)")
+            if is_test_step(step):
+                found, step_ran = test_step_problems(step)
+                problems += [f"{where}: {why}" for why in found]
+                if not found:
+                    ran.update(step_ran)
     for t in tests:
-        if not any(runs_test(line, t) for st in every for _, line in step_runs(st)):
-            problems.append(f"{t}: .github/fork-ci-tests.txt says fork-tests.yml runs it, but no step's command does "
-                            "(python3, node or bash with its path)")
+        if t not in ran:
+            problems.append(f"{t}: .github/fork-ci-tests.txt says fork-tests.yml runs it, but no test step runs it "
+                            f"whole; {TEST_FORMS}")
     return problems
 
 
-check("quiet: no job or step of fork-tests.yml may fail quietly, no step running fork tests has an if: or can hide "
-      "its tests' status, and each test listed as run by fork-tests.yml is run by a step",
+check("quiet: no job or step of fork-tests.yml may fail quietly, every test step has the allowed shape, and each "
+      "test listed as run by fork-tests.yml is run whole by one",
       not quiet_problems(fork_tests), "; ".join(quiet_problems(fork_tests)))
-check("quiet: the check sees the fork's test steps (kit shards, kit as root, script tests)",
+check("quiet: the check sees the fork's test steps (script tests, actions, kit shards, kit as root, lint) and upstream's",
       {j for j, job in fork_tests["jobs"].items() for st in job.get("steps") or []
-       if fork_test_step(st)} >= {"workflows", "action_tests", "kit_tests", "kit_root_tests", "lint"})
+       if is_test_step(st)} >= {"workflows", "action_tests", "kit_tests", "kit_root_tests", "lint", "test"})
 check("quiet: the list's run-by-fork-tests.yml entries are read (the kit-as-root ones, the owned-reads one, "
       "upstream's release checks)",
       {"fork-kit/gh-apps/tests/root.test.py", "fork-kit/heavy/tests/heavy.test.py",
        ".github/scripts/fork-owned-reads.test.py", ".github/scripts/test-delta.test.cjs"} <= set(RUN_BY_HERE))
 
-
-def quiet_mutant(mutate):
+def quiet_mutant(mutate, whole=None):
     wf = copy.deepcopy(fork_tests)
-    mutate(wf["jobs"])
+    (whole or (lambda w: mutate(w["jobs"])))(wf)
     return quiet_problems(wf)
 
 
 HEAVY = "fork-kit/heavy/tests/heavy.test.py"
+ROOT_TEST = "fork-kit/gh-apps/tests/root.test.py"
+KIT = f"node {RUNNER} fork-kit/"
 
 
 def heavy_step(jobs):
@@ -1889,25 +2000,39 @@ def test_step(jobs, job, needle):
     return next(st for st in jobs[job]["steps"] if needle in str(st.get("run", "")))
 
 
-for label, mutate in {
-    "a kit shard's test step skipped in one shard": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs")
+def kit_run(run):
+    return lambda jobs: test_step(jobs, "kit_tests", RUNNER).__setitem__("run", run)
+
+
+def heavy_run(run):
+    return lambda jobs: with_heavy(jobs, run=run)
+
+
+def job_set(job, key, value):
+    return lambda jobs: jobs[job].__setitem__(key, value)
+
+
+HEAVY_LINE = next(line for _, line in step_runs(heavy_step(fork_tests["jobs"])) if HEAVY in line)
+ROOT_LINE = next(line for _, line in step_runs(test_step(fork_tests["jobs"], "kit_root_tests", ROOT_TEST)))
+QUIET_REFUSED = {
+    "a kit shard's test step skipped in one shard": lambda jobs: test_step(jobs, "kit_tests", RUNNER)
         .__setitem__("if", "matrix.shard != 3"),
-    "the kit tests' job with continue-on-error": lambda jobs: jobs["kit_tests"].__setitem__("continue-on-error", True),
-    "one kit shard with continue-on-error": lambda jobs: jobs["kit_tests"].__setitem__(
-        "continue-on-error", "${{ matrix.shard == 3 }}"),
-    "the kit tests as root with continue-on-error": lambda jobs: jobs["kit_root_tests"].__setitem__(
-        "continue-on-error", True),
-    "a root kit test step with continue-on-error": lambda jobs: test_step(jobs, "kit_root_tests", "root.test.py")
+    "the kit tests' job with continue-on-error": job_set("kit_tests", "continue-on-error", True),
+    "one kit shard with continue-on-error": job_set("kit_tests", "continue-on-error", "${{ matrix.shard == 3 }}"),
+    "the kit tests as root with continue-on-error": job_set("kit_root_tests", "continue-on-error", True),
+    "a root kit test step with continue-on-error": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST)
         .__setitem__("continue-on-error", True),
-    "a root kit test step under an if:": lambda jobs: test_step(jobs, "kit_root_tests", "root.test.py")
+    "a root kit test step under an if:": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST)
         .__setitem__("if", "github.event_name == 'push'"),
-    "the script tests' step under an if:": lambda jobs: test_step(jobs, "workflows", "fork-ci-tests.cjs")
+    "the script tests' step under an if:": lambda jobs: test_step(jobs, "workflows", RUNNER)
+        .__setitem__("if", "always()"),
+    "an upstream test step under another if:": lambda jobs: test_step(jobs, "test", "stage-preview-bundle.test.py")
         .__setitem__("if", "always()"),
     "a step with continue-on-error: false (any value)": lambda jobs: jobs["lint"]["steps"][0].__setitem__(
         "continue-on-error", False),
     "a non-test step of the build job with continue-on-error": lambda jobs: jobs["build"]["steps"][0].__setitem__(
         "continue-on-error", True),
-    # #646 point 1: the review's dodge, the test run from its folder under an if:, its path only in a comment.
+    # The first review's dodge: the test run from its folder under an if:, its path only in a comment.
     "the heavy test run after a cd, under an if:, its path in a comment": lambda jobs: with_heavy(
         jobs, run=lambda line: f"# {HEAVY}\ncd fork-kit/heavy && HEAVY_REAL_TESTS=1 python3 -I -B tests/heavy.test.py",
         **{"if": "github.event_name == 'push'"}),
@@ -1917,59 +2042,134 @@ for label, mutate in {
     "the heavy test run after a cd, under an if:, its path only in a YAML comment (gone once parsed)":
         lambda jobs: with_heavy(jobs, run=lambda line: "cd fork-kit/heavy\nHEAVY_REAL_TESTS=1 python3 -I -B "
                                 "tests/heavy.test.py", **{"if": "github.event_name == 'push'"}),
-    "the heavy test run after a cd (no if:)": lambda jobs: with_heavy(
-        jobs, run=lambda line: "cd fork-kit/heavy\nHEAVY_REAL_TESTS=1 python3 -I -B tests/heavy.test.py"),
-    "the heavy test's path only echoed": lambda jobs: with_heavy(jobs, run=lambda line: f"echo {HEAVY}"),
+    "the heavy test run after a cd (no if:)": heavy_run(
+        lambda line: "cd fork-kit/heavy\nHEAVY_REAL_TESTS=1 python3 -I -B tests/heavy.test.py"),
+    "a cd /tmp, then the heavy test by its full path": heavy_run(lambda line: "cd /tmp\n" + line),
+    "a pushd, then the heavy test by its full path": heavy_run(lambda line: "pushd /tmp\n" + line),
+    "the heavy test's path only echoed": heavy_run(lambda line: f"echo {HEAVY}"),
     "the heavy test with a working-directory and its full path": lambda jobs: with_heavy(
         jobs, **{"working-directory": "."}),
-    "a listed root kit test no step runs": lambda jobs: test_step(jobs, "kit_root_tests", "root.test.py").__setitem__(
-        "run", "echo fork-kit/gh-apps/tests/root.test.py"),
+    "a listed root kit test no step runs": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
+        "run", f"echo {ROOT_TEST}"),
     "an upstream test the list says this file runs, run by no step": lambda jobs: test_step(
         jobs, "test", "stage-preview-bundle.test.py").__setitem__("run", "true"),
-    # #646 point 2: a status hidden after the test.
-    "a kit shard's tests || true": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs").__setitem__(
-        "run", "node .github/scripts/fork-ci-tests.cjs fork-kit/ || true"),
-    "a kit shard's tests || exit 0 on a continued line": lambda jobs: test_step(
-        jobs, "kit_tests", "fork-ci-tests.cjs").__setitem__(
-        "run", "node .github/scripts/fork-ci-tests.cjs \\\n  fork-kit/ \\\n  || exit 0\n"),
-    "a kit shard's tests under shell: bash {0}, then true": lambda jobs: test_step(
-        jobs, "kit_tests", "fork-ci-tests.cjs").update(
-        shell="bash {0}", run="node .github/scripts/fork-ci-tests.cjs fork-kit/\ntrue\n"),
-    "a kit shard's tests under shell: sh": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs").update(
-        shell="sh"),
-    "a kit shard's tests; true": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs").__setitem__(
-        "run", "node .github/scripts/fork-ci-tests.cjs fork-kit/; true"),
-    "a kit shard's tests && true": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs").__setitem__(
-        "run", "node .github/scripts/fork-ci-tests.cjs fork-kit/ && true"),
-    "a kit shard's tests as an if: condition": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs")
-        .__setitem__("run", "if node .github/scripts/fork-ci-tests.cjs fork-kit/; then :; fi"),
-    "the heavy test's quoted path; true": lambda jobs: with_heavy(
-        jobs, run=lambda line: line.replace(HEAVY, f'"{HEAVY}"') + "; true"),
-    "a kit shard's tests negated with !": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs").__setitem__(
-        "run", "! node .github/scripts/fork-ci-tests.cjs fork-kit/"),
-    "a kit shard's tests piped into tee": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs").__setitem__(
-        "run", "node .github/scripts/fork-ci-tests.cjs fork-kit/ | tee log"),
-    "a kit shard's tests in the background, then wait": lambda jobs: test_step(
-        jobs, "kit_tests", "fork-ci-tests.cjs").__setitem__(
-        "run", "node .github/scripts/fork-ci-tests.cjs fork-kit/ &\nwait\n"),
-    "a heavy step with set +e before its test": lambda jobs: with_heavy(jobs, run=lambda line: "set +e\n" + line),
-    "a heavy step with set +o errexit before its test": lambda jobs: with_heavy(
-        jobs, run=lambda line: "set +o errexit\n" + line),
-    "a heavy step with a trap that exits 0": lambda jobs: with_heavy(
-        jobs, run=lambda line: "trap 'exit 0' EXIT\n" + line),
-    "the heavy test || true": lambda jobs: with_heavy(
-        jobs, run=lambda line: line + " || true"),
-    "the root kit test under shell: bash {0}": lambda jobs: test_step(
-        jobs, "kit_root_tests", "root.test.py").__setitem__("shell", "bash {0}"),
-}.items():
-    check(f"quiet: {label} fails", bool(quiet_mutant(mutate)))
-check("quiet: the heavy test as its step runs it today is seen as run, and its step as a fork test step",
-      any(runs_test(line, HEAVY) for st in fork_tests["jobs"]["kit_root_tests"]["steps"] for _, line in step_runs(st))
-      and fork_test_step(heavy_step(fork_tests["jobs"])))
-check("quiet: shell: bash, a test line split by \\ and quoted test paths pass",
-      not quiet_mutant(lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs").update(
-          shell="bash", run="node .github/scripts/fork-ci-tests.cjs \\\n  'fork-kit/'\n"))
-      and not quiet_mutant(lambda jobs: with_heavy(jobs, run=lambda line: line.replace(HEAVY, f'"{HEAVY}"'))))
+    # A status hidden after the test, or the test not reached.
+    "a kit shard's tests || true": kit_run(f"{KIT} || true"),
+    "a kit shard's tests || exit 0 on a continued line": kit_run(f"node {RUNNER} \\\n  fork-kit/ \\\n  || exit 0\n"),
+    "a kit shard's tests under shell: bash {0}, then true": lambda jobs: test_step(jobs, "kit_tests", RUNNER).update(
+        shell="bash {0}", run=f"{KIT}\ntrue\n"),
+    "a kit shard's tests under shell: sh": lambda jobs: test_step(jobs, "kit_tests", RUNNER).update(shell="sh"),
+    "a kit shard's tests; true": kit_run(f"{KIT}; true"),
+    "a kit shard's tests;true (no space)": kit_run(f"{KIT};true"),
+    "a kit shard's tests && true": kit_run(f"{KIT} && true"),
+    "a kit shard's tests as an if: condition": kit_run(f"if {KIT}; then :; fi"),
+    "the heavy test's quoted path; true": heavy_run(lambda line: line.replace(HEAVY, f'"{HEAVY}"') + "; true"),
+    "a kit shard's tests negated with !": kit_run(f"! {KIT}"),
+    "a kit shard's tests piped into tee": kit_run(f"{KIT} | tee log"),
+    "a kit shard's tests in the background, then wait": kit_run(f"{KIT} &\nwait\n"),
+    "a heavy step with set +e before its test": heavy_run(lambda line: "set +e\n" + line),
+    "a heavy step with set +o errexit before its test": heavy_run(lambda line: "set +o errexit\n" + line),
+    "a heavy step with a trap that exits 0": heavy_run(lambda line: "trap 'exit 0' EXIT\n" + line),
+    "the heavy test || true": heavy_run(lambda line: line + " || true"),
+    "the root kit test under shell: bash {0}": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST)
+        .__setitem__("shell", "bash {0}"),
+    # The second round's dodges (both reviews of the blocklist): the test inside a quoted string,
+    "sh -c '<kit tests> || true'": kit_run(f"sh -c '{KIT} || true'"),
+    "bash -c '<kit tests> || true'": kit_run(f"bash -c '{KIT} || true'"),
+    "eval \"<kit tests> || true\"": kit_run(f'eval "{KIT} || true"'),
+    # the shell or folder set for the job or the whole workflow,
+    "job-level defaults.run.shell: bash {0}, then true": lambda jobs: (
+        jobs["kit_tests"].__setitem__("defaults", {"run": {"shell": "bash {0}"}}),
+        kit_run(f"{KIT}\ntrue")(jobs)),
+    "job-level defaults.run.working-directory": job_set("kit_root_tests", "defaults",
+                                                        {"run": {"working-directory": "fork-kit/heavy"}}),
+    "job-level env: NODE_OPTIONS": job_set("kit_tests", "env", {"NODE_OPTIONS": "--require=/tmp/x.js"}),
+    "a container for the job": job_set("kit_tests", "container", "ubuntu:24.04"),
+    "a job-level if: that skips the job": job_set("kit_root_tests", "if", "${{ false }}"),
+    # lines around the test that stop it running or hide its status,
+    "exit 0 before the test": heavy_run(lambda line: "exit 0\n" + line),
+    "set -n before the test (reads the rest, runs none of it)": heavy_run(lambda line: "set -n\n" + line),
+    "the test inside if false; then ... fi": heavy_run(lambda line: f"if false; then\n{line}\nfi"),
+    "the test inside while false; do ... done": heavy_run(lambda line: f"while false; do\n{line}\ndone"),
+    "the test inside a case that never matches": heavy_run(lambda line: f"case x in\ny) {line} ;;\nesac"),
+    "the test in a heredoc to :": heavy_run(lambda line: f": <<'EOF'\n{line}\nEOF"),
+    "set -x +e before the test": heavy_run(lambda line: "set -x +e\n" + line),
+    "shopt -uo errexit before the test, true after": heavy_run(lambda line: f"shopt -uo errexit\n{line}\ntrue"),
+    "a function named python3 before the test": heavy_run(lambda line: "python3() { :; }\n" + line),
+    "an alias node=true before the kit tests": kit_run(f"shopt -s expand_aliases\nalias node=true\n{KIT}"),
+    # arguments that run nothing,
+    "python3 -c pass <heavy test>": heavy_run(lambda line: line.replace("python3 -I -B", "python3 -c pass")),
+    "python3 -c 'import sys; sys.exit(0)' <heavy test>": heavy_run(
+        lambda line: line.replace("python3 -I -B", "python3 -c 'import sys; sys.exit(0)'")),
+    "python3 -m py_compile <heavy test>": heavy_run(lambda line: line.replace("python3 -I -B", "python3 -m py_compile")),
+    "<heavy test> --help": heavy_run(lambda line: line + " --help"),
+    "<heavy test> with one test class picked": heavy_run(lambda line: line + " -v SomeClass"),
+    "node --check <runner> fork-kit/": kit_run(f"node --check {RUNNER} fork-kit/"),
+    "node -e 0 <runner> fork-kit/": kit_run(f"node -e 0 {RUNNER} fork-kit/"),
+    "the runner with --help": kit_run(f"{KIT} --help"),
+    "node --test <upstream test> --test-only": lambda jobs: test_step(jobs, "test", "test-delta.test.cjs")
+        .__setitem__("run", "node --test .github/scripts/test-delta.test.cjs --test-only"),
+    # what the command runs changed through its environment,
+    "NODE_OPTIONS=--require=... before the kit tests": kit_run(f"NODE_OPTIONS=--require=/tmp/x.js {KIT}"),
+    "PATH=/tmp/f:$PATH before the heavy test": heavy_run(lambda line: "PATH=/tmp/f:$PATH " + line),
+    "step env: BASH_ENV": lambda jobs: heavy_step(jobs).__setitem__("env", {"BASH_ENV": "/tmp/x"}),
+    "step env: NODE_OPTIONS": lambda jobs: test_step(jobs, "kit_tests", RUNNER)["env"].__setitem__(
+        "NODE_OPTIONS", "--require=/tmp/x.js"),
+    "step env: another FORK_CI_TEST_SHARD": lambda jobs: test_step(jobs, "kit_tests", RUNNER)["env"].__setitem__(
+        "FORK_CI_TEST_SHARD", "1/1"),
+    "an earlier step that writes NODE_OPTIONS to GITHUB_ENV": lambda jobs: jobs["kit_tests"]["steps"].insert(
+        1, {"run": 'echo "NODE_OPTIONS=--require=/tmp/x.js" >> "$GITHUB_ENV"'}),
+    "an earlier step that puts a folder on GITHUB_PATH": lambda jobs: jobs["kit_root_tests"]["steps"].insert(
+        1, {"run": 'echo /tmp/f >> "$GITHUB_PATH"'}),
+    "sudo -E (the whole environment to root)": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
+        "run", ROOT_LINE.replace("sudo env", "sudo -E env")),
+    # and the switch that turns a test on dropped.
+    "the heavy test without HEAVY_REAL_TESTS=1": heavy_run(lambda line: line.replace("HEAVY_REAL_TESTS=1 ", "")),
+    "the root test without GH_APPS_ROOT_TESTS=1": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST)
+        .__setitem__("run", ROOT_LINE.replace("GH_APPS_ROOT_TESTS=1 ", "")),
+    "the root test without sudo": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
+        "run", ROOT_LINE.replace("sudo env ", "")),
+    "the fleet launcher as root without FORK_FLEET_ROOT_TESTS=1": lambda jobs: test_step(
+        jobs, "workflows", "LauncherAsRoot").__setitem__(
+        "run", "sudo env python3 -B .github/scripts/fork-fleet.test.py -v LauncherAsRoot"),
+    "a test path with a glob": heavy_run(lambda line: line.replace(HEAVY, "fork-kit/heavy/tests/*.test.py")),
+    "a quote left open": heavy_run(lambda line: line + " '"),
+    "a runner part that starts with -": kit_run(f"node {RUNNER} --x"),
+    "a test line written to a log, not shown": heavy_run(lambda line: line + " > log 2>&1"),
+}
+QUIET_WHOLE_REFUSED = {
+    "workflow-level defaults.run.shell: bash {0}": lambda wf: wf.__setitem__("defaults", {"run": {"shell": "bash {0}"}}),
+    "workflow-level defaults.run.working-directory": lambda wf: wf.__setitem__(
+        "defaults", {"run": {"working-directory": "fork-kit/heavy"}}),
+    "workflow-level env: PATH": lambda wf: wf.__setitem__("env", {"PATH": "/tmp/f:/usr/bin"}),
+}
+for label, mutate in QUIET_REFUSED.items():
+    check(f"quiet: {label} fails", bool(quiet_mutant(mutate)), "")
+for label, mutate in QUIET_WHOLE_REFUSED.items():
+    check(f"quiet: {label} fails", bool(quiet_mutant(None, whole=mutate)))
+# A refused line says what is allowed (the form), so the fix is plain from the message alone.
+check("quiet: a refused test line names the allowed forms",
+      any(TEST_FORMS in p for p in quiet_mutant(QUIET_REFUSED["sh -c '<kit tests> || true'"])))
+check("quiet: the heavy test as its step runs it today is seen as run whole, and its step as a test step",
+      test_line(HEAVY_LINE) == {"tests": [HEAVY], "partial": []} and is_test_step(heavy_step(fork_tests["jobs"])))
+QUIET_ACCEPTED = {
+    "shell: bash and a runner line split by \\ with a quoted part": lambda jobs: test_step(
+        jobs, "kit_tests", RUNNER).update(shell="bash", run=f"node {RUNNER} \\\n  'fork-kit/'\n"),
+    "the heavy test's path quoted": heavy_run(lambda line: line.replace(HEAVY, f'"{HEAVY}"')),
+    "the heavy test's path with ./": heavy_run(lambda line: line.replace(HEAVY, f"./{HEAVY}")),
+    "the runner with ./ and 2>&1": kit_run(f"node ./{RUNNER} fork-kit/ 2>&1"),
+    "the heavy test with 2>&1 and -u": heavy_run(lambda line: line.replace("-I -B", "-I -B -u") + " 2>&1"),
+    "a whole comment line before the test": heavy_run(lambda line: "# the heavy kit\n" + line),
+    "the switch variables in another order": heavy_run(
+        lambda line: line.replace(f'XDG_RUNTIME_DIR="/run/user/$(id -u)" HEAVY_REAL_TESTS=1',
+                                  f'HEAVY_REAL_TESTS=1 XDG_RUNTIME_DIR="/run/user/$(id -u)"')),
+    "two test lines in one step": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
+        "run", f"{ROOT_LINE}\n{HEAVY_LINE}\n"),
+    "a listed .sh test run by bash": kit_run(f"{KIT}\nbash .github/scripts/fork-follow.test.sh"),
+    "a step timeout and id": lambda jobs: heavy_step(jobs).update({"timeout-minutes": 5, "id": "heavy"}),
+}
+for label, mutate in QUIET_ACCEPTED.items():
+    check(f"quiet: {label} passes", not quiet_mutant(mutate), "; ".join(quiet_mutant(mutate)))
 check("quiet: upstream's test steps under if: matrix.shard == 1 pass",
       not quiet_mutant(lambda jobs: None) and any(
           "if" in st and ".test." in str(st.get("run", "")) for st in fork_tests["jobs"]["test"]["steps"]))
