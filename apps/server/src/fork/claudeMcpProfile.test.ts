@@ -271,13 +271,26 @@ describe("claudeMcpProfileForThread", () => {
       Effect.match({ onFailure: (refusal) => refusal.message, onSuccess: (plan) => plan.servers }),
     );
 
-  it.effect("with no profile set, a child whose parent is gone still gets all", () =>
-    Effect.gen(function* () {
-      // Parents are read now (one may carry a profile from another machine), but with nothing
-      // set here a missing one refuses nothing, as before.
-      assert.strictEqual(yield* forThread({}, thread("child", "gone"), store([])), "all");
-      assert.strictEqual(yield* forThread({}, thread("top"), noReads), "all");
-    }),
+  it.effect(
+    "with no profile set, a child whose parent cannot be read is refused, not given all",
+    () =>
+      Effect.gen(function* () {
+        // Any parent may be a task another machine delegated with a narrower profile, so a parent
+        // that cannot be read refuses the child even with nothing set here.
+        const gone = yield* forThread({}, thread("child", "gone"), store([]));
+        assert.include(String(gone), "parent thread cannot be read");
+        assert.strictEqual(yield* forThread({}, thread("top"), noReads), "all");
+        // With no store wired at all (the adapter built alone; the server always wires one),
+        // nothing here can carry a profile, so with nothing set the child keeps all, as before.
+        assert.strictEqual(yield* forThread({}, thread("child", "gone")), "all");
+        // The owner's pick for that very thread is final without its parents.
+        const picked = yield* forThread(
+          { mcpThreadProfiles: { child: "all" } },
+          thread("child", "gone"),
+          store([]),
+        );
+        assert.strictEqual(picked, "all");
+      }),
   );
 
   it.effect("an inheriting child is cut to its parent's pick, read from the store", () =>
@@ -365,6 +378,22 @@ describe("a task another machine delegated here (#532)", () => {
       const task = remoteTask("task", T3_ONLY);
       const { servers } = yield* planned({}, thread("sub", "task"), [task]);
       assert.deepStrictEqual(servers, []);
+    }),
+  );
+
+  it.effect("refuses a sub-agent whose task cannot be read here, never giving it all", () =>
+    Effect.gen(function* () {
+      // The task's row fails to read or decode (the store's read turns both into null), so its
+      // carried t3-only is unknown: refused with nothing set here, with a sub-agent rule of all
+      // and at any depth; only the owner's pick for the sub-agent itself stands.
+      const sub = thread("sub", "task");
+      assert.include(String((yield* planned({}, sub)).servers), "parent thread cannot be read");
+      const rule = yield* planned({ mcpSubagentProfile: "all" }, sub);
+      assert.include(String(rule.servers), "parent thread cannot be read");
+      const deep = yield* planned({}, thread("deep", "sub"), [sub]);
+      assert.include(String(deep.servers), "parent thread cannot be read");
+      const picked = yield* planned({ mcpThreadProfiles: { sub: "t3-only" } }, sub);
+      assert.deepStrictEqual(picked.servers, []);
     }),
   );
 

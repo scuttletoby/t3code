@@ -9,7 +9,13 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Scope from "effect/Scope";
-import { HttpClient, HttpClientRequest, HttpRouter, HttpServerRequest } from "effect/http";
+import {
+  HttpClient,
+  HttpClientRequest,
+  HttpRouter,
+  HttpServerRequest,
+  HttpServerResponse,
+} from "effect/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
@@ -27,17 +33,24 @@ const layerFakeAuth = Layer.succeed(EnvironmentAuth.EnvironmentAuth, {
   },
 } as unknown as EnvironmentAuth.EnvironmentAuth["Service"]);
 
-/** A server with upstream's static app page, plus this route when `withRoute` (this version). */
-const serve = (withRoute: boolean) =>
+/**
+ * A server with upstream's static app page, plus this route when `withRoute` (this version), or
+ * another answer at the features path (a proxy or a machine that is not this version).
+ */
+const serve = (withRoute: boolean | Layer.Layer<never, never, HttpRouter.HttpRouter>) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const config = yield* ServerConfig.ServerConfig;
     const staticDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-fork-features-" });
     yield* fs.writeFileString(path.join(staticDir, "index.html"), "<!doctype html><p>app");
-    const layerApp = withRoute
-      ? Layer.merge(ForkFeatures.layer, ServerHttp.layerStaticAndDevRoute)
-      : ServerHttp.layerStaticAndDevRoute;
+    const layerApp =
+      withRoute === false
+        ? ServerHttp.layerStaticAndDevRoute
+        : Layer.merge(
+            withRoute === true ? ForkFeatures.layer : withRoute,
+            ServerHttp.layerStaticAndDevRoute,
+          );
     const services = yield* Layer.build(
       HttpRouter.serve(layerApp, { disableListenLog: true, disableLogger: true }).pipe(
         Layer.provideMerge(layerFakeAuth),
@@ -110,6 +123,46 @@ describe("fork features route in the server's router", () => {
         expect(yield* response.text).toBe("Not Found");
       }),
     ),
+  );
+
+  it.effect("a redirect is not followed, even to an address that answers yes", () =>
+    provided(
+      Effect.gen(function* () {
+        const moved = "/moved/features";
+        const server = yield* serve(
+          Layer.mergeAll(
+            HttpRouter.add(
+              "GET",
+              ForkFeatures.FORK_FEATURES_PATH,
+              HttpServerResponse.redirect(moved, { status: 302 }),
+            ),
+            HttpRouter.add("GET", moved, HttpServerResponse.jsonUnsafe({ mcpProfileCarry: true })),
+          ),
+        );
+        // A plain fetch follows it to the yes, so only the reader's own setting refuses it.
+        const followed = yield* server.get({ authorization: "Bearer link-token" });
+        expect(yield* followed.json).toEqual({ mcpProfileCarry: true });
+        expect(yield* server.read("link-token")).toEqual({});
+      }),
+    ),
+  );
+
+  it.effect.each([500, 404, 201])(
+    "this route's JSON with status %s reads as no features",
+    (status) =>
+      provided(
+        Effect.gen(function* () {
+          const server = yield* serve(
+            HttpRouter.add(
+              "GET",
+              ForkFeatures.FORK_FEATURES_PATH,
+              HttpServerResponse.jsonUnsafe({ mcpProfileCarry: true }, { status }),
+            ),
+          );
+          expect((yield* server.get({ authorization: "Bearer link-token" })).status).toBe(status);
+          expect(yield* server.read("link-token")).toEqual({});
+        }),
+      ),
   );
 
   it.effect("an older server answers with its app page, which reads as no features", () =>

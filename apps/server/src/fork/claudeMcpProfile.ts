@@ -222,7 +222,19 @@ export function claudeMcpServersOutsidePlan(
     .map((server) => server.name);
 }
 
-/** With no thread picks, project values or sub-agent rule, every thread in a lineage gets `mcpProfile`. */
+const profileThread = (settings: ServerSettings, thread: LineageThread): McpProfileThread => {
+  const project = settings.projectSettingsOverrides[thread.projectId];
+  return {
+    threadId: thread.id,
+    delegated: isDelegatedAppThread(thread),
+    project: { mcpProfile: project?.mcpProfile, mcpSubagentProfile: project?.mcpSubagentProfile },
+  };
+};
+
+/**
+ * With no thread picks, project values or sub-agent rule, every thread in a lineage gets
+ * `mcpProfile`. Only used where no thread store is wired (see `mcpProfileForThread`).
+ */
 const needsLineage = (settings: ServerSettings) =>
   Object.keys(settings.mcpThreadProfiles).length > 0 ||
   !(
@@ -232,15 +244,6 @@ const needsLineage = (settings: ServerSettings) =>
   Object.values(settings.projectSettingsOverrides).some(
     (project) => !blank(project.mcpProfile) || !blank(project.mcpSubagentProfile),
   );
-
-const profileThread = (settings: ServerSettings, thread: LineageThread): McpProfileThread => {
-  const project = settings.projectSettingsOverrides[thread.projectId];
-  return {
-    threadId: thread.id,
-    delegated: isDelegatedAppThread(thread),
-    project: { mcpProfile: project?.mcpProfile, mcpSubagentProfile: project?.mcpSubagentProfile },
-  };
-};
 
 type FindThread = ((threadId: ThreadId) => Effect.Effect<LineageThread | null>) | undefined;
 
@@ -286,9 +289,12 @@ const mcpProfileForThread = Effect.fn("ClaudeMcpProfile.profileForThread")(funct
   if (resolved._tag === "CannotApply") {
     return yield* new ClaudeMcpProfileError({ reason: resolved.message });
   }
-  // A local parent that is gone cannot cut the profile down, so the thread refuses, when any
-  // setting here makes a parent count. With none, the thread gets `mcpProfile`, as before.
-  if (parentMissing && needsLineage(settings) && resolved.source !== "thread-pick") {
+  // A parent the store cannot give may be a task another machine delegated with a narrower
+  // profile, so the thread refuses whatever the settings; only the owner's pick for it stands.
+  // With no store wired (the adapter built alone; the server always wires one), nothing here can
+  // carry a profile, so only settings that make a parent count refuse.
+  const refuses = findThread === undefined ? needsLineage(settings) : true;
+  if (parentMissing && refuses && resolved.source !== "thread-pick") {
     return yield* new ClaudeMcpProfileError({
       reason: `This thread's parent thread cannot be read, so its MCP profile cannot be worked out: ${FIX}.`,
     });
@@ -365,6 +371,11 @@ export const makeThreadMcpProfiles = Effect.gen(function* () {
     );
   }
   const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
+  if (Option.isNone(sql)) {
+    yield* Effect.logWarning(
+      "MCP profiles: no thread store here, so parent threads are not read; a child thread is refused only when a setting here makes its parent count",
+    );
+  }
   const store = Option.isSome(sql)
     ? yield* ProjectionStore.ProjectionStoreV2.pipe(
         Effect.provide(ProjectionStore.layer),

@@ -83,7 +83,8 @@ const input = {
 /**
  * The linked machine: on this version ("carries"), an older one whose server answers the features
  * path with its app page ("older"), one that answers 404 ("refuses"), not linked or resolvable
- * ("unlinked"), unreachable ("down"), never answering ("never"), or answering once `hold` is done.
+ * ("unlinked"), unreachable ("down"), never answering ("never"), sending 200 headers and then
+ * never the end of the body ("stalls"), or answering once `hold` is done.
  */
 type Box =
   | "carries"
@@ -92,6 +93,7 @@ type Box =
   | "unlinked"
   | "down"
   | "never"
+  | "stalls"
   | { readonly hold: Deferred.Deferred<void> };
 
 /** How `box` answers `request`, as its server would. */
@@ -111,6 +113,12 @@ const answer = (peer: Box, request: HttpClientRequest.HttpClientRequest) => {
       );
     case "refuses":
       return respond(new Response("Not Found", { status: 404 }));
+    case "stalls":
+      return respond(
+        new Response(new ReadableStream({ start() {} }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
     case "never":
       return Effect.never;
     default:
@@ -300,11 +308,17 @@ it.effect("refuses a narrower profile when the machine cannot be reached", () =>
   ),
 );
 
-it.effect("refuses a narrower profile when the machine does not answer in time", () =>
+it.effect.each<readonly [string, Box]>([
+  ["does not answer in time", "never"],
+  // One deadline covers the whole answer: headers in time do not leave the body unbounded.
+  ["sends its headers and then stalls the body", "stalls"],
+])("refuses a narrower profile when the machine %s", ([, peer]) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const harness = yield* makeHarness(T3_ONLY, "never");
+      const harness = yield* makeHarness(T3_ONLY, peer);
       const call = yield* harness.delegate.pipe(Effect.exit, Effect.forkChild);
+      // The box has been asked (and a stalling one has sent its headers) before time moves on.
+      yield* harness.asked;
       yield* Effect.yieldNow;
       yield* TestClock.adjust(PeerLinks.probeTimeout("https://box.test"));
       const exit = yield* Fiber.join(call);

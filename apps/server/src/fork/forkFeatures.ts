@@ -1,7 +1,8 @@
 /**
  * Fork: `GET /api/fork/features`, what this fork version does for a linked machine, and the reader a
  * linked machine asks it with. Answered only to a linked machine's own token; any other caller gets
- * upstream's plain 404, so it learns nothing, not even that this is the fork.
+ * a plain 404, so it learns no feature. (That 404, where upstream answers its app page, does show
+ * the server is the fork, as `/api/fork/activity` already does; the fork is public.)
  */
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -68,18 +69,20 @@ export const readForkFeatures = Effect.fn("fork.features.read")(function* (
   const noRedirects = HttpClient.transform(http, (response) =>
     Effect.provideService(response, FetchHttpClient.RequestInit, { redirect: "manual" }),
   );
-  const response = yield* noRedirects
-    .execute(
+  // One deadline for the whole answer, its body too: a machine that sends the headers and then
+  // stalls must not hold the delegation open.
+  return yield* Effect.gen(function* () {
+    const response = yield* noRedirects.execute(
       HttpClientRequest.get(`${peer.url}${FORK_FEATURES_PATH}`).pipe(
         HttpClientRequest.bearerToken(peer.token),
         HttpClientRequest.acceptJson,
       ),
-    )
-    .pipe(
-      Effect.timeout(peer.timeout),
-      Effect.mapError(() => new ForkFeaturesUnanswered({ message: `${peer.url} did not answer.` })),
     );
-  if (response.status !== 200) return {} satisfies ForkFeatures;
-  const body = yield* response.json.pipe(Effect.option);
-  return Option.getOrElse(Option.flatMap(body, decodeForkFeatures), () => ({}) as ForkFeatures);
+    if (response.status !== 200) return {} satisfies ForkFeatures;
+    const body = yield* response.json.pipe(Effect.option);
+    return Option.getOrElse(Option.flatMap(body, decodeForkFeatures), () => ({}) as ForkFeatures);
+  }).pipe(
+    Effect.timeout(peer.timeout),
+    Effect.mapError(() => new ForkFeaturesUnanswered({ message: `${peer.url} did not answer.` })),
+  );
 });
