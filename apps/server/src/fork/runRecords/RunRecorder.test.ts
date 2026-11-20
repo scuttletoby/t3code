@@ -535,6 +535,42 @@ it.layer(NodeServices.layer)("RunRecorder", (it) => {
     }),
   );
 
+  it.effect("a too-long estimate tag is refused once, even when its run ends again or stops", () =>
+    Effect.gen(function* () {
+      const { world, start, records, lines } = yield* harness;
+      const long = `40m ${"x".repeat(100)}`;
+      world.subagents[0] = task(
+        "parent",
+        "child",
+        `Act as the writer sub-agent for this task.\n\n[run-estimate: ${long}]\nFix it.`,
+        "Fix the cursor",
+      );
+      endRun(world, run("child", "done"), { answer: "Done." });
+      // Stopped half-way, then the same end stored again after a restart.
+      endRun(world, run("child", "stopped", { status: "interrupted" }));
+      yield* start;
+      storeUpdate(world, run("child", "done"));
+      storeUpdate(world, run("child", "stopped", { status: "interrupted" }));
+      yield* start;
+      assert.strictEqual((yield* lines).length, 2);
+      const refused = `${long.slice(0, 80)}…`;
+      assert.deepStrictEqual(
+        (yield* records).map((record) => [
+          record.runId,
+          record.endStatus,
+          record.estimate,
+          record.estimateRefused,
+        ]),
+        [
+          ["done", "completed", null, refused],
+          ["stopped", "cut_off", null, refused],
+        ],
+      );
+      const summary = summarizeRunRecords(yield* records, { toMs: NOW_MS + 1 });
+      assert.strictEqual(summary.refusedEstimates, 2);
+    }),
+  );
+
   it.effect("records a top-level run (an orchestrator) without a parent or labels", () =>
     Effect.gen(function* () {
       const { world, start, records } = yield* harness;

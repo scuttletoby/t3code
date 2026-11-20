@@ -4,6 +4,7 @@ import * as DateTime from "effect/DateTime";
 
 import {
   buildRunRecord,
+  MAX_TAG_CHARS,
   parseEstimate,
   parseRunRecordLines,
   parseTaskLabels,
@@ -145,6 +146,59 @@ describe("parseTaskLabels", () => {
       estimate: null,
       estimateRefused: "2M",
     });
+  });
+
+  it("refuses an estimate tag that is too long or never closed, keeping its text cut short", () => {
+    const long = `40m ${"x".repeat(MAX_TAG_CHARS)}`;
+    assert.deepStrictEqual(readEstimateTag(`[run-estimate: ${long}]`), {
+      estimate: null,
+      refused: `${long.slice(0, MAX_TAG_CHARS)}…`,
+    });
+    // Readable in every part, but longer than a tag may be: refused all the same.
+    const wordy = `1 hour${" and".repeat(20)} 30 minutes`;
+    assert.isAbove(wordy.length, MAX_TAG_CHARS);
+    assert.strictEqual(readEstimateTag(`[run-estimate: ${wordy}]`)?.refused?.length, 81);
+    assert.deepStrictEqual(readEstimateTag("[run-estimate: 40m\nDo it. ]"), {
+      estimate: null,
+      refused: "40m",
+    });
+    assert.deepStrictEqual(readEstimateTag("[run-estimate: ]"), { estimate: null, refused: "" });
+    // Exactly the limit is still read.
+    const atLimit = `40m${" ".repeat(MAX_TAG_CHARS - 12)}2M tokens`;
+    assert.strictEqual(atLimit.length, MAX_TAG_CHARS);
+    assert.deepStrictEqual(parseEstimate(`[run-estimate: ${atLimit}]`), {
+      wallMs: 40 * MINUTE_MS,
+      tokens: 2_000_000,
+    });
+  });
+
+  it("cuts a long kind tag rather than dropping it", () => {
+    const long = `lens: ${"data ".repeat(30)}`.trim();
+    assert.strictEqual(parseTaskLabels(`[run-kind: ${long}]`).kind, `${long.slice(0, 80)}…`);
+    assert.strictEqual(parseTaskLabels("[run-kind:  lens: data ]").kind, "lens: data");
+    assert.strictEqual(parseTaskLabels("[run-kind: ]").kind, null);
+  });
+
+  it("reads a token scale written right before the word tokens", () => {
+    const cases: ReadonlyArray<readonly [string, { wallMs?: number; tokens?: number }]> = [
+      ["2ktokens", { tokens: 2000 }],
+      ["2Mtokens", { tokens: 2_000_000 }],
+      ["300ktok", { tokens: 300_000 }],
+      ["2.5mtokens", { tokens: 2_500_000 }],
+      ["2 milliontokens", { tokens: 2_000_000 }],
+      ["1e6tokens", { tokens: 1_000_000 }],
+      ["5000tok", { tokens: 5000 }],
+      ["40m 2Mtokens", { wallMs: 40 * MINUTE_MS, tokens: 2_000_000 }],
+    ];
+    for (const [tag, expected] of cases) {
+      assert.deepStrictEqual(parseEstimate(`[run-estimate: ${tag}]`), expected, tag);
+    }
+    for (const tag of ["2xtokens", "2 tokens tokens", "2Mtokens tokens", "2etokens"]) {
+      assert.deepStrictEqual(readEstimateTag(`[run-estimate: ${tag}]`), {
+        estimate: null,
+        refused: tag,
+      });
+    }
   });
 });
 
