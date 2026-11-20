@@ -1,13 +1,16 @@
 #!/bin/sh
-# fork-cleaner bootstrap: installs the cleaner kit of one release of this fork. Run as root:
+# fork-kit bootstrap: installs one kit of one release of this fork, for the kits that share
+# fork-kit/common/kit_install.py. Run as root:
 #
-#   sh fork-cleaner-bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA [--timer | --no-timer]
+#   sh fork-kit-bootstrap.sh --kit KIT --repo FORK_OWNER/FORK --sha RELEASE_SHA [kit options]
 #
-# --timer writes the daily user units fork-cleaner.service and fork-cleaner.timer to /etc/systemd/user (each user
-# enables the timer), --no-timer removes them (fork-kit/cleaner/sbin/fork-cleaner-install).
+# KIT and its options (each kit's sbin/*-install says what they do):
+#   cleaner   fork-kit/cleaner/sbin/fork-cleaner-install   [--timer | --no-timer]
+#   golive    fork-kit/golive/sbin/t3-golive-install       (none)
 #
 # It refuses a sha that is not a commit on the fork's protected release branch (ci-release), downloads exactly
-# that commit, prints the sha and the hash of what it downloaded, and runs its installer (safe to run again).
+# that commit, prints the sha and the hash of what it downloaded, and runs the kit's installer (safe to run again).
+# Only the options listed for the kit reach its installer: never a second --sha or --source.
 # Needs: curl, tar, python3. Linux with systemd only.
 set -eu
 umask 022
@@ -15,24 +18,30 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset TMPDIR CURL_HOME SSL_CERT_FILE SSL_CERT_DIR || true
 
-die() { echo "fork-cleaner-bootstrap: $*" >&2; exit 1; }
+die() { echo "fork-kit-bootstrap: $*" >&2; exit 1; }
 
-repo='' sha='' timer='' branch='ci-release' api='https://api.github.com' codeload='https://codeload.github.com'
+kit='' repo='' sha='' opt='' branch='ci-release' api='https://api.github.com' codeload='https://codeload.github.com'
 while [ $# -gt 0 ]; do
   case "$1" in
+    --kit) [ $# -ge 2 ] || die "--kit needs a value"; kit="$2"; shift 2 ;;
     --repo) [ $# -ge 2 ] || die "--repo needs a value"; repo="$2"; shift 2 ;;
     --sha) [ $# -ge 2 ] || die "--sha needs a value"; sha="$2"; shift 2 ;;
     --release-branch) [ $# -ge 2 ] || die "--release-branch needs a value"; branch="$2"; shift 2 ;;
-    --timer|--no-timer) timer="$1"; shift ;;   # only these reach the installer: never a second --sha or --source
+    --timer|--no-timer) opt="$1"; shift ;;
     *) die "unknown option $1 (see the top of this file)" ;;
   esac
 done
+case "$kit" in
+  cleaner) installer='sbin/fork-cleaner-install' ;;
+  golive) installer='sbin/t3-golive-install'; [ -z "$opt" ] || die "$opt is not an option of --kit golive" ;;
+  *) die "--kit must be one of: cleaner golive" ;;
+esac
 printf '%s\n' "$repo" | grep -Eqx '[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}' || die "--repo must be OWNER/NAME"
 printf '%s\n' "$sha" | grep -Eqx '[0-9a-f]{40}' || die "--sha must be the full 40-character release commit"
 printf '%s\n' "$branch" | grep -Eqx '[A-Za-z0-9._/-]{1,100}' || die "bad --release-branch"
 [ "$(id -u)" = 0 ] || die "run this as root"
 
-work="$(mktemp -d /tmp/fork-cleaner-bootstrap.XXXXXXXX)"
+work="$(mktemp -d /tmp/fork-kit-bootstrap.XXXXXXXX)"
 trap 'rm -rf "${work:?}"' EXIT
 trap 'exit 1' INT TERM HUP
 fetch() { curl -fsSL --proto '=https' --tlsv1.2 --max-redirs 0 -H 'Accept: application/vnd.github+json' -o "$2" "$1"; }
@@ -55,7 +64,7 @@ mkdir "$work/src"
 tar -xzf "$work/kit.tar.gz" -C "$work/src" --no-same-owner --no-same-permissions
 top="$(find "$work/src" -mindepth 1 -maxdepth 1 -type d)"
 [ "$(printf '%s\n' "$top" | wc -l)" = 1 ] && [ -n "$top" ] || die "the download does not have one top folder"
-kit="$top/fork-kit/cleaner"
-[ -f "$kit/sbin/fork-cleaner-install" ] || die "release $sha has no fork-kit/cleaner installer (is it a release with the kit?)"
-echo "fork-cleaner-bootstrap: release $sha of $repo, download sha256 $(sha256sum "$work/kit.tar.gz" | cut -d' ' -f1)"
-python3 -I -B "$kit/sbin/fork-cleaner-install" install --source "$kit" --sha "$sha" ${timer:+"$timer"}
+dir="$top/fork-kit/$kit"
+[ -f "$dir/$installer" ] || die "release $sha has no fork-kit/$kit installer (is it a release with the kit's installer?)"
+echo "fork-kit-bootstrap: $kit kit, release $sha of $repo, download sha256 $(sha256sum "$work/kit.tar.gz" | cut -d' ' -f1)"
+python3 -I -B "$dir/$installer" install --source "$dir" --sha "$sha" ${opt:+"$opt"}
