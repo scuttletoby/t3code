@@ -513,7 +513,11 @@ any read when the stored time is more than a day old. `days` is 7 or more, so a 
 seen.
 
 **Never taken**, on top of what the config refuses: links (never followed, folders neither), folders with a `KEEP`
-file, git folders, other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
+entry (a file, or a folder named `KEEP`) and git folders (`.git` of any kind, or a bare repository: `HEAD`, `objects`
+and `refs`), in a cold folder or in a folder above it up to `/` and on its own filesystem (see below; read at the plan,
+again before each file and once more after its copy is written, before the original goes; each name is looked up, so
+on a folder that folds case `keep` counts too; a `~/.git` of dotfiles keeps every folder under the home; a name that
+cannot be looked up keeps it too), other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
 files, credential and lock names, a database with a `-wal`, `-shm` or `-journal` beside it (and those files),
 hard-linked files, files already compressed (`.zst`, `.gz`, `.xz`, `.zip`, ...), files under 16 KB, a file whose
 `.zst` name is taken by something else, and a folder named like `*log-archive*` (#468 keeps log archives as they
@@ -528,6 +532,20 @@ above `~/.claude*` or the folder a `~/.claude*` link leads to (Claude Code reads
 folder named like `*log-archive*` or inside one, the cleaner's own log or daily folder (and, while `agent-scratch`
 is on, its keep-first archive), a folder another rule deletes from (the `agent-scratch` root among them while that
 rule is on), or a folder in or above another of its folders.
+
+**Above, on its own filesystem.** A cold or dedupe folder reached through a mount that shows only one folder of its
+filesystem (a bind mount, a btrfs subvolume) has folders above it there that the path up to `/` does not pass: a
+`.git` in one of them still makes it part of a work tree. Those folders are read where another mount of the same
+filesystem shows them (`/proc/self/mountinfo`), and so on up to that filesystem's top. When no mount here shows
+them, the folder is kept ("could not read"). One exception: a whole btrfs subvolume (its mount's root is its
+`subvol=`) that sits directly in the btrfs top folder, one level down (`/@`, `/@home`), needs no view of the top
+folder, which holds the subvolumes, not files; so btrfs systems with `/@` on `/` still work. A subvolume deeper
+down (`/@/home`, or `/projects/repo/data` made inside a work tree) has ordinary folders above it: they are read
+like any other, and when no mount shows them, it is kept. A place the mount list names must still be a folder (not
+a link) when it is read; when it is gone or is something else (the list is older than an unmount), it is kept.
+Which of several mounts on one point is on top comes from the mount ids in that list (the one no other mount on
+that point sits on), not from the order of the lines, so a mount placed beneath another or moved onto a point is
+read where it is; a mount that another mount higher up covers is not used.
 
 **The plan** says `would compress <file> (<size>, compress-cold: not changed or read for N days ...)` for each file,
 and per folder group how much it would free: one zstd run over the start of every file (64 KB each, 16 MB in all)
@@ -641,8 +659,10 @@ another version, a link or someone else's: an empty cache (files are read again,
 as new as their inode time until their `days` pass).
 
 **Never taken**, on top of what the config refuses: links (never followed, folders neither), folders with a `KEEP`
-file and git folders (`.git`, or a bare repository), in a configured folder or in a folder above it up to `/` (read
-at the plan and again before each link; a `~/.git` of dotfiles keeps every folder under the home), other filesystems
+entry (a file, or a folder named `KEEP`) and git folders (`.git` of any kind, or a bare repository), in a configured
+folder or in a folder above it up to `/` and on its own filesystem (as compress-cold; read at the plan, again before
+each link and once more after the bytes are compared, for every name of both files; a `~/.git` of dotfiles keeps
+every folder under the home; a name that cannot be looked up keeps it too), other filesystems
 and mount points, a folder shown somewhere else by a bind mount, other owners' files, credential and lock names,
 must-keep names, the in-place kinds above, files under 64 KB, files with more
 than one name (unless all of them are in the folders and taken by the rule, as after an earlier run: then it is the
@@ -855,7 +875,9 @@ way or fails its self-test leaves the copy in use as it was. The bootstrap passe
 on to the installer; any other option is refused. The steps every kit shares are in
 `fork-kit/common/kit_install.py` ([common](../common/README.md#the-installer)).
 
-Update only through the bootstrap, with the newer release commit. An installed `fork-cleaner-install` from
+Update only through the bootstrap, with the newer release commit. The installed `fork-cleaner-install` refuses a
+`--source` whose `sbin/fork-cleaner-install` or `common/kit_install.py` differs from its own (it would copy its own
+file list, not the newer release's) and names the bootstrap, which runs the release's own installer. One from
 before the shared installer (`fork-kit/common/kit_install.py`) copies no `common/kit_install.py`, so the installer
 it leaves cannot load: it then refuses and says to run the bootstrap, which makes the copy whole again. The
 self-test now runs the copied installer's `--help` too, so a copy like that is refused from here on. `uninstall`
@@ -925,6 +947,16 @@ The installer writes no machine file: the `cleaner` section is the owner's, writ
 - Drives are known from `/proc/self/mountinfo` and `/etc/fstab` only: a drive that a systemd `.mount` or
   automount unit, `autofs` or a desktop mounts elsewhere than `/mnt`, `/media` or `/run/media`, when it is not
   mounted now, cannot be seen, and a worktree whose repository was on it can count as orphaned in the temp folder.
+- Overlay mounts (`overlayfs`, a container's root) and FUSE mounts that show another folder (`bindfs`) list `/`
+  as their root, so the check above reads only the folders on the path the cleaner sees, up to `/`. The folders
+  behind them (an overlay's `upperdir` and `lowerdir`, a `bindfs` source) and the folders above those are not
+  read, and the folder is **not** kept for that: a `.git` or `KEEP` above an `upperdir` or a `bindfs` source is
+  missed, and the files are compressed or linked. Do not name a folder reached through such a mount as a cold or
+  dedupe folder when what is behind it may sit in a work tree, or put a `KEEP` file in it.
+- A git folder kept somewhere else than in the work tree (`git --git-dir`, `GIT_DIR`, `core.worktree`, a bare
+  dotfiles repository such as `~/.dotfiles` with the home as its work tree) leaves no `.git` in or above the work
+  tree, so compress-cold and dedupe cannot see that git tracks the files there. Do not name such a work tree as a
+  cold or dedupe folder, or put a `KEEP` file in it.
 - Linux only so far (`/proc`, systemd unit folders).
 
 ## Tests

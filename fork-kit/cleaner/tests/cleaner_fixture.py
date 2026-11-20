@@ -117,6 +117,38 @@ exec sh -c "git ${last#git-}"
 '''
 
 
+_unmarked = []
+
+
+def first_unmarked(bases):
+    """The first folder of `bases` that can be written and has no KEEP entry or git folder in or above it, or None."""
+    for base in bases:
+        base = here = os.path.realpath(base)
+        while True:
+            if (any(os.path.lexists(os.path.join(here, n)) for n in ('KEEP', '.git'))
+                    or all(os.path.lexists(os.path.join(here, n)) for n in ('HEAD', 'objects', 'refs'))):
+                break
+            if here == '/':
+                if os.path.isdir(base) and os.access(base, os.W_OK | os.X_OK):
+                    return base
+                break
+            here = os.path.dirname(here)
+    return None
+
+
+def unmarked_temp():
+    """The folder the tests make their own folders in: $TMPDIR (or the system's temp folder) when no folder in or
+    above it holds a KEEP entry or a git folder, else the first of /tmp, /var/tmp and /dev/shm that has none.
+    compress-cold and dedupe rightly keep everything under such a marker, so a $TMPDIR inside a git checkout would
+    turn every test that expects them to work red."""
+    if not _unmarked:
+        found = first_unmarked([tempfile.gettempdir(), '/tmp', '/var/tmp', '/dev/shm'])
+        if found is None:
+            raise RuntimeError('no temp folder without a KEEP entry or a git folder in or above it: set TMPDIR')
+        _unmarked.append(found)
+    return _unmarked[0]
+
+
 class Case(unittest.TestCase):
     """One temporary folder, a config over it, fake facts. Subclasses set `c` to the loaded kit."""
     c = None
@@ -124,7 +156,7 @@ class Case(unittest.TestCase):
     def setUp(self):
         umask = os.umask(0o022)
         self.addCleanup(os.umask, umask)
-        self.dir = os.path.realpath(tempfile.mkdtemp(prefix='cleaner-test-'))
+        self.dir = os.path.realpath(tempfile.mkdtemp(prefix='cleaner-test-', dir=unmarked_temp()))
         self.addCleanup(self.close)
         self.home, self.tmp, self.trees = (self.mkdir(n) for n in ('home', 'tmp', 'trees'))
         self.now = time.time()
@@ -147,7 +179,10 @@ class Case(unittest.TestCase):
         self.busy, self.unit_names, self.locks, self.texts = set(), set(), set(), []
         self.words, self.transcript_times = set(), {}     # process environments' words; {session id: time}
         self.mount_points = {'/'}
-        self.mount_lines, self.bind_sources = [], set()     # (point, device, root) and (device, root)
+        # (point, device, root) and (device, root). The one line: / shows the root of a filesystem no real stat has.
+        self.mount_lines, self.bind_sources = [('/', '0:0', '/')], set()
+        self.mount_whole = set()                            # (device, root) of whole btrfs subvolumes
+        self.mount_ids = None                               # (mount id, parent id) of each line; None: not known
         self.mount_options = {'/': ('rw', 'relatime')}       # {point: its per-mount options}
         self.fstab_points = set()                           # the mount points /etc/fstab names; None: unreadable
         # Tests set a file's age with its modification time. The kit also counts the inode change time, which no
@@ -231,7 +266,7 @@ class Case(unittest.TestCase):
                    'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
                    'dangling': lambda: [], 'now': self.now, 'transcripts': lambda: dict(self.transcript_times),
                    'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options,
-                                                         self.fstab_points)}
+                                                         self.fstab_points, self.mount_whole, self.mount_ids)}
         return self.c.facts.Facts(cfg, **{**readers, **over})
 
     def plan(self, cfg, **over):

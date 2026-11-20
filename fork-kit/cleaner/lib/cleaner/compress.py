@@ -13,7 +13,9 @@ removed after that. So at every moment the original or a checked copy is there, 
 - a file that is in use, changed, or opened at any point is kept as it was; a disk too full for a whole copy
   plus `keepFreeGB` is refused before anything is written; zstd missing keeps everything ("could not read").
 
-What it never takes, in a configured folder: links (never followed), folders with a KEEP file, git folders, other
+What it never takes, in a configured folder: links (never followed), folders with a KEEP file, git folders (also a
+KEEP file or a git folder in a folder above the configured folder, up to `/` and on its own filesystem:
+guard.above_refusal; read at the plan, at the last check and once more after the copy is written), other
 filesystems and mount points, other owners' files, credential and lock names, databases with a journal beside them,
 hard-linked files, files already compressed, and files under MIN_BYTES. It also skips, with a line in the plan, what
 it could not finish: a file its owner may not read, an immutable or append-only file or folder, a file whose group,
@@ -26,7 +28,7 @@ import errno, fcntl, hashlib, os, re, secrets, shutil, stat, struct, subprocess,
 from . import guard
 from .config import COMPRESS_NEVER_NAMES, matches
 from .facts import Unreadable, Untouched
-from .guard import CREDENTIAL_NAMES, LOCK_NAMES, KEEP_FILE, Refusal
+from .guard import CREDENTIAL_NAMES, LOCK_NAMES, Refusal
 
 RULE = 'compress-cold'
 DAY = 86400
@@ -142,9 +144,13 @@ def _folder_refusal(cfg, facts, folder, here, st, names):
         return Refusal('could not read', f'the mount list ({ex})')
     if here != folder.path and here in points:
         return Refusal('another filesystem', f'{here} is a mount point')
-    if KEEP_FILE in names:
-        return Refusal('KEEP file', f'{guard._keep_reason(os.path.join(here, KEEP_FILE))} ({here})')
-    if '.git' in names or {'HEAD', 'objects', 'refs'} <= set(names):
+    try:
+        found = guard.marker(here)
+    except OSError as ex:
+        return Refusal('could not read', f'{here}: {ex.strerror}')
+    if found is not None and found[0] == 'KEEP file':
+        return Refusal('KEEP file', f'{found[1]} ({here})')
+    if found is not None:
         return Refusal('git folder', f'{here}: git keeps its own objects compressed, and git needs its files as they are')
     return _stuck(here)
 
@@ -342,6 +348,9 @@ def _start(cfg, facts, folder):
     bound = mounts.bound(path, st.st_dev)
     if bound is not None:
         return None, Refusal('in use', f'a bind mount shows {bound} of its filesystem somewhere else (a container or a sandbox)')
+    refusal = guard.above_refusal(path, mounts)
+    if refusal is not None:
+        return None, refusal
     # relatime (the usual default) updates the access time at the first read after a change, and at least once a
     # day: with days >= 7 (config.MIN_COLD_DAYS) a file read in that time always looks read. noatime never does.
     options = mounts.options_of(path)
@@ -441,9 +450,9 @@ def estimate(items):
 
 
 # --- the last check -----------------------------------------------------------------------------------------------
-def recheck(cfg, facts, item):
-    """Everything about one item read again: the folders from the cold folder down, the file, the room on the disk.
-    None when it may still be done."""
+def _folders(cfg, facts, item):
+    """(folder, names in the file's folder) when the cold folder, every folder above it and every folder from it
+    down to the file's folder may still be taken; a Refusal when not."""
     folder = next((f for f in cfg.cold_folders if f.path == item.folder.path), None)
     if folder is None:
         return Refusal('not a candidate', 'its folder is no longer in compressCold.folders')
@@ -467,6 +476,16 @@ def recheck(cfg, facts, item):
         refusal = _folder_refusal(cfg, facts, folder, here, hst, names)
         if refusal is not None:
             return refusal
+    return folder, names
+
+
+def recheck(cfg, facts, item):
+    """Everything about one item read again: the folders from the cold folder down, the file, the room on the disk.
+    None when it may still be done."""
+    got = _folders(cfg, facts, item)
+    if isinstance(got, Refusal):
+        return got
+    folder, names = got
     try:
         fst = os.lstat(item.path)
     except FileNotFoundError:
@@ -647,8 +666,10 @@ def compress(item):
         # are still the files this run checked (read just before the removal: an editor's atomic save onto either
         # name is seen). What is left is the time between these reads and the unlink, microseconds; a read lease
         # (F_SETLEASE) would close it only while the cleaner holds the file open, which the process list counts.
+        # The folders again too: a KEEP file or a git folder made above or in them while the copy was written.
         facts.forget()
-        refusal = _in_use(facts, item.folder, path, st)
+        refusal = _folders(cfg, facts, item)
+        refusal = refusal if isinstance(refusal, Refusal) else _in_use(facts, item.folder, path, st)
         try:
             now = os.stat(name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:

@@ -1140,13 +1140,104 @@ class Gaps(Case):
         self.assertNotEqual(self.ino(a), self.ino(b), lines)
         self.assertEqual(self.read(b), body())
 
-    def test_a_keep_folder_above_is_not_a_keep_file(self):
+    def test_a_marker_made_in_a_subfolder_at_the_last_check_stops_the_link(self):
+        """#620: the last check reads every folder from the configured folder down to the file's folder: a KEEP file
+        or a `.git` made between the plan and the link in `sub/mid`, with both files in `sub/mid/deeper`, leaves
+        both. Once it is gone, the next run links."""
+        for marker in ('KEEP', '.git'):
+            with self.subTest(marker=marker):
+                a = self.put(f'sub{marker}', 'mid', 'deeper', 'a.bin', days=50)
+                b = self.put(f'sub{marker}', 'mid', 'deeper', 'b.bin')
+                self.settle()
+                cfg = self.dd_cfg(folders=[{'path': os.path.join(self.dd, f'sub{marker}'), 'days': 30}])
+                at, real = os.path.join(self.dd, f'sub{marker}', 'mid', marker), self.c.dedupe.recheck
+
+                def recheck(cfg, facts, item):
+                    if not os.path.lexists(at):
+                        open(at, 'w').close()
+                        self.old(at, os.path.dirname(at))
+                    return real(cfg, facts, item)
+                with mock.patch.object(self.c.dedupe, 'recheck', recheck):
+                    code, lines = self.run_cleaner(cfg)
+                self.assertNotEqual(self.ino(a), self.ino(b), lines)
+                self.assertEqual((self.read(a), self.read(b)), (body(), body()))
+                self.assertTrue(any('KEEP file' in line or 'git folder' in line for line in lines), lines)
+                os.remove(at)
+                self.old(os.path.dirname(at))
+                code, lines = self.run_cleaner(cfg)
+                self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
+
+    def test_a_keep_folder_above_keeps_it_as_one_below_does(self):
+        """#604: a folder named KEEP counts the same above a configured folder and in it."""
         os.makedirs(os.path.join(self.dd, 'KEEP'))
         a = self.put('KEEP', 'a.bin', days=50)
         b = self.put('KEEP', 'b.bin')
         cfg = self.dd_cfg(folders=[{'path': os.path.join(self.dd, 'KEEP'), 'days': 30}])
         code, lines = self.run_cleaner(cfg)
+        self.assertNotEqual(self.ino(a), self.ino(b), lines)
+        self.assertTrue(any('(dedupe: KEEP file: a folder named KEEP' in line for line in lines), lines)
+
+    def test_a_marker_above_that_cannot_be_read_keeps_it(self):
+        """#604: a `.git` or a KEEP above that cannot be looked up is not "not there"."""
+        for name in ('.git', 'KEEP'):
+            with self.subTest(name=name):
+                a = self.put(f'no{name}', 'in', 'a.bin', days=50)
+                b = self.put(f'no{name}', 'in', 'b.bin')
+                target, real = os.path.join(self.dd, f'no{name}', name), os.lstat
+
+                def lstat(at, *args, **kwargs):
+                    if at == target:
+                        raise PermissionError(errno.EACCES, 'Permission denied', at)
+                    return real(at, *args, **kwargs)
+                cfg = self.dd_cfg(folders=[{'path': os.path.dirname(a), 'days': 30}])
+                with mock.patch.object(os, 'lstat', lstat):
+                    code, lines = self.run_cleaner(cfg)
+                self.assertNotEqual(self.ino(a), self.ino(b), lines)
+                self.assertTrue(any('(dedupe: could not read' in line for line in lines), lines)
+
+    def test_a_git_folder_above_a_bind_mount_on_its_own_filesystem(self):
+        """#604: the configured folder is reached through a mount that shows the folder /data of a disk; a second
+        mount shows the whole disk, with a `.git` in its top folder. A second run still leaves it; once the `.git`
+        is gone the next run links."""
+        fs, view = self.mkdir('dd', 'fs'), self.mkdir('dd', 'view')
+        self.mount_lines += [(fs, '8:9', '/'), (view, '8:9', '/data')]
+        os.mkdir(os.path.join(fs, '.git'))
+        a = self.put('view', 'in', 'a.bin', days=50)
+        b = self.put('view', 'in', 'b.bin')
+        cfg = self.dd_cfg(folders=[{'path': os.path.dirname(a), 'days': 30}])
+        for _ in range(2):
+            code, lines = self.run_cleaner(cfg)
+            self.assertNotEqual(self.ino(a), self.ino(b), lines)
+            self.assertTrue(any(f'(dedupe: git folder: {fs}, above {os.path.dirname(a)}' in line for line in lines), lines)
+        os.rmdir(os.path.join(fs, '.git'))
+        code, lines = self.run_cleaner(cfg)
         self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
+        self.assertEqual(self.read(b), body())
+
+    def test_a_marker_made_while_the_bytes_are_compared_stops_the_link(self):
+        """#604: every name's folders are read once more after the comparison: a KEEP file made then above the
+        duplicate's folder or above the kept file's folder leaves both. Once it is gone, the next run links."""
+        for n, side in enumerate(('one', 'two')):
+            with self.subTest(side=side):
+                one, two = self.mkdir('dd', f'pair{n}', 'one', 'in'), self.mkdir('dd', f'pair{n}', 'two', 'in')
+                a = self.put(f'pair{n}', 'one', 'in', 'a.bin', days=50)
+                b = self.put(f'pair{n}', 'two', 'in', 'b.bin')
+                self.settle()               # made after the first subtest's plan: as old as their times say
+                cfg = self.dd_cfg(folders=[{'path': one, 'days': 30}, {'path': two, 'days': 30}])
+                at, real = os.path.join(self.dd, f'pair{n}', side, 'KEEP'), self.c.dedupe._compare
+
+                def compare(*args):
+                    got = real(*args)
+                    open(at, 'w').close()
+                    return got
+                with mock.patch.object(self.c.dedupe, '_compare', compare):
+                    code, lines = self.run_cleaner(cfg)
+                self.assertNotEqual(self.ino(a), self.ino(b), lines)
+                self.assertEqual((self.read(a), self.read(b)), (body(), body()))
+                self.assertTrue(any('KEEP file' in line and 'nothing changed' in line for line in lines), lines)
+                os.remove(at)
+                code, lines = self.run_cleaner(cfg)
+                self.assertEqual((code, self.ino(a)), (0, self.ino(b)), lines)
 
     # minors
     def test_dax_and_verity_flags_are_compared(self):
@@ -1228,7 +1319,7 @@ MUTATIONS = {
     'the plan warns': ('dedupe', '        plan.notes.append(WARNING)', '        pass', Writes, 'test_the_readme_and_the_plan_say_so'),
     'the cache needs an unchanged stamp': ('dedupe', 'if cached is not None and tuple(cached[:3]) == stamp:', 'if cached is not None:',
                                            Cached, 'test_a_changed_file_is_read_again'),
-    'git folders': ('dedupe', "if '.git' in names or", "if False or", Refused, 'test_what_it_never_takes'),
+    'markers in the folder and under it': ('dedupe', 'found = guard.marker(here)', 'found = None', Refused, 'test_what_it_never_takes'),
     'another owner': ('dedupe', "    if guard.owner(st) != os.getuid():\n        return Refusal('another owner', f'uid {guard.owner(st)}')\n    if not st.st_mode",
                       "    if not st.st_mode", Refused, 'test_another_owners_file_stays'),
     'the same metadata': ('dedupe', 'by_meta.setdefault(entry[4], []).append(entry)', 'by_meta.setdefault(0, []).append(entry)',
@@ -1250,10 +1341,25 @@ MUTATIONS = {
                                                     Gaps, 'test_kept_file_written_during_the_link_without_leases'),
     'the inode time before the rename': ('dedupe', "or pst.st_ctime_ns != run.ctime.get(kident)):", "):",
                                          Gaps, 'test_kept_file_written_with_its_time_set_back_after_the_link_without_leases'),
-    'a KEEP file above': ('dedupe', 'if keep is not None and not stat.S_ISDIR(keep.st_mode):', 'if False:',
-                          Gaps, 'test_folder_under_a_keep_file'),
-    'a git folder above': ('dedupe', "if os.path.lexists(os.path.join(here, '.git')) or all(", "if False or all(",
+    'a KEEP entry above': ('guard', "    if st is not None:\n        return 'KEEP file',", "    if False:\n        return 'KEEP file',",
+                           Gaps, 'test_folder_under_a_keep_file'),
+    'a KEEP folder counts': ('guard', "    if st is not None:\n        return 'KEEP file',",
+                             "    if st is not None and not stat.S_ISDIR(st.st_mode):\n        return 'KEEP file',",
+                             Gaps, 'test_a_keep_folder_above_keeps_it_as_one_below_does'),
+    'a git folder above': ('guard', "if _lstat_or_none(os.path.join(here, '.git')) is not None:", 'if False:',
                            Gaps, 'test_folder_inside_a_git_work_tree'),
+    'a .git that cannot be read': ('guard', "if _lstat_or_none(os.path.join(here, '.git')) is not None:",
+                                   "if os.path.lexists(os.path.join(here, '.git')):", Gaps, 'test_a_marker_above_that_cannot_be_read_keeps_it'),
+    'the folders above on its own filesystem': ('guard', 'stack.extend((place, True) for place in reversed(places))', 'pass',
+                                                Gaps, 'test_a_git_folder_above_a_bind_mount_on_its_own_filesystem'),
+    'the folders above, with the mount list': ('dedupe', 'refusal = guard.above_refusal(path, mounts)',
+                                               "refusal = guard.above_refusal(path, type(mounts)(lines=[('/', '0:0', '/')]))",
+                                               Gaps, 'test_a_git_folder_above_a_bind_mount_on_its_own_filesystem'),
+    'the last check reads down to the file': ('dedupe', "        refusal = _folder_refusal(cfg, facts, folder, here, hst, names)\n        if refusal is not None:\n            return refusal\n    try:\n        fst = os.lstat(path)",
+                                              "        refusal = _folder_refusal(cfg, facts, folder, here, hst, names) if part is None else None\n        if refusal is not None:\n            return refusal\n    try:\n        fst = os.lstat(path)",
+                                              Gaps, 'test_a_marker_made_in_a_subfolder_at_the_last_check_stops_the_link'),
+    'the folders again after the comparison': ('dedupe', '                got = _recheck_path(cfg, facts, fdir.path, fpath)\n',
+                                               '                got = None\n', Gaps, 'test_a_marker_made_while_the_bytes_are_compared_stops_the_link'),
     'mail boxes and partial downloads': ('dedupe', "'*.swap', 'mbox', '*.mbox', '*.part', '*.crdownload', '*.partial', '*.!qb')", "'*.swap')",
                                          Gaps, 'test_mail_boxes_and_partial_downloads_are_written_in_place'),
     'verity and DAX flags': ('dedupe', ' | FS_VERITY_FL | FS_DAX_FL', '', Gaps, 'test_dax_and_verity_flags_are_compared'),

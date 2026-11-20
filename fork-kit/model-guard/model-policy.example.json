@@ -18,6 +18,13 @@
       "useFor": "design options and root causes others missed; it costs more, so not routine work"
     },
     {
+      "driver": "claudeAgent",
+      "model": "example-older-0",
+      "efforts": ["high"],
+      "ultracodeOption": false,
+      "useFor": "an older model T3 offers no ultracode option"
+    },
+    {
       "driver": "exampleDriver",
       "model": "example-plain-1",
       "useFor": "a model with no effort control"

@@ -177,6 +177,13 @@ woken with the result. `wait_list` and `wait_cancel` list and end them. While of
 judged nor delivered; listing and cancelling still work. Other fields set deadlines, limits per
 thread and how often each kind is checked.
 
+The same switch turns on the delegated result reminder: when a `delegate_task` child ends and its
+result has still not reached the idle parent a couple of minutes later (upstream's own wake did not
+land), the parent gets one queued message naming those tasks. It is sent once per set of owed tasks,
+also across restarts, never to a busy, stopped or archived thread, and never for results older than
+a day. `task_list` (always there, read only) lists a thread's tasks with an unread result and how
+many of its children run now per place, from their live status.
+
 Switch on: **Settings → Fork**, section Waits (shown while a server is connected), "Let agents wait for events", or in `settings.json`:
 `"waitFor": { "enabled": true }`.
 
@@ -539,6 +546,8 @@ switch.
 - [host-tools.md](host-tools.md): design for agents on a person's own computer (no code yet).
 - [playtest.md](playtest.md): the playtest adapter contract (steps, environment, exit codes).
 - [handoff.md](handoff.md): handoff instead of compaction (when, the quiet rule, the message).
+- [run-records.md](run-records.md): one record per agent run (usage, time, labels) and the weekly
+  summary.
 - [`.github/fork-fleet.md`](../../.github/fork-fleet.md): the fleet runners and `CI_RUNNERS`.
 - [`fork-ci/README.md`](../../fork-ci/README.md) and [`fork-kit/README.md`](../../fork-kit/README.md):
   CI actions and host kits.
