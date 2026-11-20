@@ -1,7 +1,8 @@
 /**
- * Fork (issue 386): the reminder of delegated results that never reached their parent. The state
- * question: it runs again (no second message), the server restarted (a fresh service finds the
- * message it sent), the parent is busy or was stopped, and old rows from before delivery records.
+ * Fork (issues 386, 625): the reminder of delegated results that never reached their parent. The
+ * state question: it runs again (no second message), the server restarted (a fresh service finds
+ * the message it sent, and the table finds a parent with no wake reserved), the parent is busy or
+ * was stopped, and rows with no delivery state (old ones, or a wait that never acknowledged).
  */
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -11,6 +12,7 @@ import {
   type OrchestrationV2ThreadShell,
   ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -28,6 +30,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { REMINDER_MAX_AGE_MS } from "./delegatedResults.ts";
 import { at, delegatedTask, NOW, PARENT } from "./delegatedResults.testkit.ts";
 import * as DelegatedResultReminder from "./DelegatedResultReminder.ts";
+import * as DelegatedResultsStore from "./DelegatedResultsStore.ts";
 
 const OPTIONS: DelegatedResultReminder.ReminderOptions = {
   delay: Duration.minutes(2),
@@ -61,10 +64,15 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   const sent: Array<Sent> = [];
   const receipts = new Map<string, ThreadId>();
   let failSends = 0;
+  // Parents whose wake upstream reserved (null: every parent with tasks), and those the table names.
+  const recovery: { ids: ReadonlyArray<ThreadId> | null } = { ids: null };
+  const unread: { ids: ReadonlyArray<ThreadId>; since: Array<string> } = { ids: [], since: [] };
   return {
     shells,
     tasks,
     sent,
+    recovery,
+    unread,
     failNextSends: (count: number) => {
       failSends = count;
     },
@@ -113,7 +121,14 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
             ),
         }),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
-          getRecoveryThreadIds: () => Effect.succeed([...tasks.keys()]),
+          getRecoveryThreadIds: () => Effect.succeed(recovery.ids ?? [...tasks.keys()]),
+        }),
+        Layer.mock(DelegatedResultsStore.DelegatedResultsStore)({
+          parentsWithUnreadResults: (sinceIso) =>
+            Effect.sync(() => {
+              unread.since.push(sinceIso);
+              return unread.ids;
+            }),
         }),
       ),
   };
@@ -212,12 +227,47 @@ describe("DelegatedResultReminder.check", () => {
       yield* setClock;
       const world = makeWorld();
       world.tasks.set(PARENT, [
-        delegatedTask({ completionDelivery: undefined }),
+        delegatedTask({
+          completionDelivery: undefined,
+          completedAt: at(NOW - REMINDER_MAX_AGE_MS - 1),
+        }),
         delegatedTask({ id: "task-2", completedAt: at(NOW - REMINDER_MAX_AGE_MS - 1) }),
         delegatedTask({ id: "task-3", origin: "provider_native" }),
       ]);
       expect(yield* (yield* service(world)).check(PARENT)).toEqual({ type: "none" });
       expect(world.sent).toHaveLength(0);
+    }),
+  );
+
+  it.effect("reminds a wait task whose acknowledgement failed (no delivery state)", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const task = delegatedTask({ completionDelivery: undefined });
+      world.tasks.set(PARENT, [task]);
+      const reminder = yield* service(world);
+      expect(reminder.triggers({ type: "subagent.updated", threadId: PARENT, payload: task })).toBe(
+        true,
+      );
+      expect(yield* reminder.check(PARENT)).toEqual({ type: "sent", taskIds: ["task-1"] });
+      // The same task read later with an acknowledgement is settled: nothing more.
+      world.tasks.set(PARENT, [
+        delegatedTask({ completionDelivery: { state: "acknowledged", observedByRunId: null } }),
+      ]);
+      expect(yield* reminder.check(PARENT)).toEqual({ type: "none" });
+      expect(world.sent).toHaveLength(1);
+    }),
+  );
+
+  it.effect("reminds a parent that left background work running (no run end may come)", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.shells.set(
+        PARENT,
+        idleShell(PARENT, { pendingBackgroundTasks: [{ id: "monitor" } as never] }),
+      );
+      expect(yield* (yield* service(world)).check(PARENT)).toMatchObject({ type: "sent" });
     }),
   );
 
@@ -243,6 +293,15 @@ describe("DelegatedResultReminder.check", () => {
       world.shells.set(PARENT, idleShell(PARENT));
       expect(yield* reminder.check(PARENT)).toMatchObject({ type: "sent" });
       expect(reminder.watched.has(PARENT)).toBe(false);
+      // A run update that is no end is no trigger, even for a watched parent.
+      reminder.watched.add(PARENT);
+      for (const status of ["queued", "running", "waiting"]) {
+        expect(
+          reminder.triggers({ type: "run.updated", threadId: PARENT, payload: { status } }),
+        ).toBe(false);
+      }
+      expect(reminder.triggers({ type: "run.updated", threadId: PARENT, payload: {} })).toBe(false);
+      reminder.watched.delete(PARENT);
       // A run end of a parent with nothing owed is no trigger.
       expect(
         reminder.triggers({
@@ -261,6 +320,15 @@ describe("DelegatedResultReminder.check", () => {
       world.shells.set(PARENT, idleShell(PARENT, { status: "interrupted" }));
       const reminder = yield* service(world);
       expect(yield* reminder.check(PARENT)).toEqual({ type: "held", detail: "stopped" });
+      // Not restarted, but its next run end (a person sends it on) checks again.
+      expect(reminder.watched.has(PARENT)).toBe(true);
+      expect(
+        reminder.triggers({
+          type: "run.updated",
+          threadId: PARENT,
+          payload: { status: "completed" },
+        }),
+      ).toBe(true);
       world.shells.set(PARENT, idleShell(PARENT, { archivedAt: at(NOW) }));
       expect(yield* reminder.check(PARENT)).toEqual({ type: "gone" });
       world.shells.delete(PARENT);
@@ -334,6 +402,57 @@ describe("DelegatedResultReminder.start", () => {
       yield* settle;
       expect(world.sent).toHaveLength(1);
       yield* Fiber.interrupt(second);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("after a restart, finds a parent whose result had no wake reserved", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.recovery.ids = [];
+      world.unread.ids = [PARENT];
+      const reminder = yield* service(world);
+      const fiber = yield* reminder.start().pipe(Effect.andThen(Effect.never), Effect.forkScoped);
+      yield* settle;
+      // It asks for results from the last day only.
+      expect(world.unread.since).toEqual([DateTime.formatIso(at(NOW - REMINDER_MAX_AGE_MS))]);
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      expect(world.sent).toHaveLength(1);
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("the startup scan leaves a parent to the check an event already moved later", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const pubsub = yield* PubSub.unbounded<Event>();
+      const reminder = yield* service(world, Stream.fromPubSub(pubsub));
+      const fiber = yield* reminder.start().pipe(Effect.andThen(Effect.never), Effect.forkScoped);
+      yield* settle;
+      // The parent works again just before the scan's delay ends: its run end comes later.
+      yield* TestClock.adjust(Duration.minutes(1));
+      yield* PubSub.publish(pubsub, {
+        type: "subagent.updated",
+        threadId: PARENT,
+        payload: delegatedTask(),
+      });
+      yield* settle;
+      world.shells.set(
+        PARENT,
+        idleShell(PARENT, { status: "running", activityRunStatus: "running" }),
+      );
+      yield* TestClock.adjust(Duration.minutes(1));
+      yield* settle;
+      // The scan skipped it: the parent was not marked busy (watched) by a scan of its own.
+      expect(world.sent).toHaveLength(0);
+      expect(reminder.watched.has(PARENT)).toBe(false);
+      world.shells.set(PARENT, idleShell(PARENT));
+      yield* TestClock.adjust(Duration.minutes(1));
+      yield* settle;
+      expect(world.sent).toHaveLength(1);
+      yield* Fiber.interrupt(fiber);
     }).pipe(Effect.scoped),
   );
 
