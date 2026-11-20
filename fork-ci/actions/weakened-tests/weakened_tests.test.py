@@ -514,6 +514,14 @@ class Refused(unittest.TestCase):
         self.assertNotIn('old list', gh.ours()[0]['body'])
         self.assertIn('git-clean refused', c.summary)
 
+    def test_a_refusal_on_the_head_of_the_earlier_report_does_not_call_it_another_head(self):   # a re-run
+        gh = FakeGh(comments=[{'id': 3, 'login': BOT, 'body': MARK + f'\nHead `{self.repo.base[:12]}`: a list'}])
+        self.run_refused(gh, self.repo.base)
+        body = gh.ours()[0]['body']
+        self.assertIn('git-clean refused', body)
+        self.assertNotIn('another head', body)
+        self.assertIn('replaces any earlier report', body)
+
     def test_no_comment_yet_posts_none_and_again_edits_nothing(self):
         gh = FakeGh()
         self.run_refused(gh)
