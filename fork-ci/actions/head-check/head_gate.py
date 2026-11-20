@@ -326,8 +326,11 @@ def review_run_pr(repo, run, gh, out):
         return [], None
     if not (pr_queue.SHA.fullmatch(sha) and pr_queue.REPO_RE.fullmatch(head_repo) and 0 < len(branch) <= BRANCH_MAX
             and branch.isprintable()):
-        out("nothing to judge: the run does not name a head (head sha, head repository, head branch); dispatch the "
-            'gate with the pull request number')
+        # A warning, not a log line: a review run always has these fields (GitHub's, of a pull request event), so a
+        # run without them means GitHub's fields are not what this lookup expects, and no review would ever re-run the
+        # gate while every run stays green. The annotation makes that seen (the live check after setup looks for it).
+        out("::warning::head gate: nothing to judge: the review trigger's run does not name a head (head sha, head "
+            'repository, head branch); dispatch the gate with the pull request number')
         return [], None
     owner = urllib.parse.quote(head_repo.split('/')[0], safe='')
     query = (f'repos/{repo}/pulls?state=open&per_page=100&head={owner}:'
