@@ -485,11 +485,12 @@ back).
 }
 ```
 
-| Key                           | Default  | Meaning                                                                                      |
-| ----------------------------- | -------- | -------------------------------------------------------------------------------------------- |
-| `compressCold.folders[].path` | required | a folder; files at any depth in it are looked at                                             |
-| `compressCold.folders[].days` | required | days without a change or a read (7 or more)                                                  |
-| `compressCold.keepFreeGB`     | 5        | GB the disk keeps free with a whole copy written (1 or more): a file that does not fit stays |
+| Key                              | Default  | Meaning                                                                                      |
+| -------------------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `compressCold.folders[].path`    | required | a folder; files at any depth in it are looked at                                             |
+| `compressCold.folders[].days`    | required | days without a change or a read (7 or more)                                                  |
+| `compressCold.folders[].layered` | false    | the folder may be on a filesystem that is not local (overlay, FUSE, a share; see below)      |
+| `compressCold.keepFreeGB`        | 5        | GB the disk keeps free with a whole copy written (1 or more): a file that does not fit stays |
 
 **The order, for each file.** The copy is written under a hidden part name in the same folder
 (`.<name>.zst.<8 hex>.cleaner-part`), synced, tested with `zstd -t`, and decompressed again: the sha256 and length
@@ -547,6 +548,29 @@ Which of several mounts on one point is on top comes from the mount ids in that 
 that point sits on), not from the order of the lines, so a mount placed beneath another or moved onto a point is
 read where it is; a mount that another mount higher up covers is not used.
 
+**The mount list must still be true.** The list is read once, and a mount can be taken away or put on a folder
+after that. So each folder the check passes, on the way up from the cold or dedupe folder, is opened and the
+kernel says which mount it is on now (`mnt_id` in `/proc/self/fdinfo`): it must be the mount the list names for
+it, and its device must be that mount's device (not compared on btrfs, bcachefs and overlay, whose folders have
+other device numbers than the list names). Its markers are looked up in that open folder, and the mount is read
+again by its path after them; a folder that is on another mount, or that changed while it was read, is kept, and
+so is one whose mount cannot be read. Mount ids are given out again once freed, so a new mount on a point can
+have the old one's id: after the walk the list is read once more, and each folder must still be held by the
+same line (mount point, device, root, type, id and parent id), or it is kept.
+
+**Only local filesystems pass.** The check above trusts a mount's root only on a local filesystem whose root says
+all there is to see: `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`, `bcachefs`, `f2fs`, `zfs`, `jfs`, `nilfs2`, `tmpfs`,
+`devtmpfs` (`/dev`), `ramfs`, `vfat`, `msdos`, `exfat`, `ntfs`, `ntfs3`, `hfsplus` and `fuseblk` (`LOCAL` in `guard.py`). Every other
+type lists `/` as its root or a root of another machine: an overlay (`overlay`, `aufs`, `fuse-overlayfs`, a
+container's root), a FUSE mount that shows another folder (`bindfs`, `mergerfs`, `unionfs`, `portal`), an
+encrypting one (`ecryptfs`, `gocryptfs`), a network or VM share (`nfs`, `cifs`, `smb3`, `9p`, `virtiofs`,
+`sshfs`, `rclone`, `ceph`), an automount point that is not mounted (`autofs`) and any type not named here. The
+folders behind it (an overlay's `upperdir` and `lowerdir`, a `bindfs` source, the folders above a share's export
+on the far side) cannot be read here, so a `.git` or `KEEP` there would be missed. A cold or dedupe folder that is
+on such a mount, or has a folder above it on one, is kept (`could not read`), unless its entry in the machine file
+says `"layered": true`: say that only once you have checked that nothing behind the mount sits in a work tree.
+Even then, a `.git` or `KEEP` that is seen on the way up still keeps it.
+
 **The plan** says `would compress <file> (<size>, compress-cold: not changed or read for N days ...)` for each file,
 and per folder group how much it would free: one zstd run over the start of every file (64 KB each, 16 MB in all)
 gives the estimate. A run says `compressed <file> (<freed>, ...; now <file>.zst, <size>, read back and checked)`.
@@ -589,10 +613,11 @@ stays, each reads the same bytes as before, and the disk holds them once. Withou
 }
 ```
 
-| Key                     | Default  | Meaning                                                          |
-| ----------------------- | -------- | ---------------------------------------------------------------- |
-| `dedupe.folders[].path` | required | a folder; files at any depth in it are looked at                 |
-| `dedupe.folders[].days` | required | days without a change (7 or more): newer files are not looked at |
+| Key                        | Default  | Meaning                                                                |
+| -------------------------- | -------- | ---------------------------------------------------------------------- |
+| `dedupe.folders[].path`    | required | a folder; files at any depth in it are looked at                       |
+| `dedupe.folders[].days`    | required | days without a change (7 or more): newer files are not looked at       |
+| `dedupe.folders[].layered` | false    | the folder may be on a filesystem that is not local (as compress-cold) |
 
 **The risk it takes: read this before you name a folder.** Names of one hard-linked file are one file, so any
 write **into** one name changes every name, and the other names' old bytes are gone. Most ways of writing a file do
@@ -784,7 +809,8 @@ floor, a root folder that is `/`, the home folder or a folder above it: the comm
 exits 2 and does nothing.
 
 Every key can only pick what a rule looks at, raise a floor, or keep more (`KEY_KINDS` in `config.py`; a test
-fails for a key that is not placed there). The one key that frees more, `regenerable`, takes plain folder names
+fails for a key that is not placed there). Two keys free more. `layered` (a cold or dedupe folder may be on a
+filesystem that is not local: an overlay, FUSE or a share) is a yes or no, false by default. `regenerable` takes plain folder names
 only: no `/` and no wildcard, so `["*"]` is refused and can never take the `ignored files` refusal away. A name
 frees an ignored folder of that name (and what is in it), never a file, and never a credential-looking name.
 
@@ -947,12 +973,14 @@ The installer writes no machine file: the `cleaner` section is the owner's, writ
 - Drives are known from `/proc/self/mountinfo` and `/etc/fstab` only: a drive that a systemd `.mount` or
   automount unit, `autofs` or a desktop mounts elsewhere than `/mnt`, `/media` or `/run/media`, when it is not
   mounted now, cannot be seen, and a worktree whose repository was on it can count as orphaned in the temp folder.
-- Overlay mounts (`overlayfs`, a container's root) and FUSE mounts that show another folder (`bindfs`) list `/`
-  as their root, so the check above reads only the folders on the path the cleaner sees, up to `/`. The folders
-  behind them (an overlay's `upperdir` and `lowerdir`, a `bindfs` source) and the folders above those are not
-  read, and the folder is **not** kept for that: a `.git` or `KEEP` above an `upperdir` or a `bindfs` source is
-  missed, and the files are compressed or linked. Do not name a folder reached through such a mount as a cold or
-  dedupe folder when what is behind it may sit in a work tree, or put a `KEEP` file in it.
+- A folder named with `"layered": true` is read only on the path the cleaner sees, up to `/`: a `.git` or `KEEP`
+  behind the overlay, FUSE mount or share (above an `upperdir`, a `bindfs` source or a share's export) is missed,
+  and the files are compressed or linked. Without that key such a folder is kept.
+- A folder below an automount point that is not mounted is kept (`autofs` is not local). Once the share is
+  mounted, its own type counts, and a network share is kept too unless the folder says `"layered": true`.
+- The mount list is read again after the walk, and each folder's mount before and after its markers; a mount
+  put in place and taken away again between those reads, or after the last one, is not seen. The compress or
+  link runs the check again just before it.
 - A git folder kept somewhere else than in the work tree (`git --git-dir`, `GIT_DIR`, `core.worktree`, a bare
   dotfiles repository such as `~/.dotfiles` with the home as its work tree) leaves no `.git` in or above the work
   tree, so compress-cold and dedupe cannot see that git tracks the files there. Do not name such a work tree as a
