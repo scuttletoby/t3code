@@ -7,6 +7,7 @@ const test = require("node:test");
 
 const {
   plan,
+  jsCode,
   readList,
   order,
   shard,
@@ -122,6 +123,66 @@ test("a test run elsewhere must be named by its runner, which is not an upstream
     result.notRun[3].why,
     /does not name x\/commented\.test\.cjs \(a comment does not count\)/,
   );
+});
+
+// Upstream's scripts/release-smoke.ts has `'**/*'` in a template literal: a comment marker inside a string, a
+// template literal or a regular expression starts no comment, so a later `/** ... */` removes nothing before it.
+test("a JS or TS runner's comment markers inside strings, templates and regular expressions are not comments", () => {
+  const files = {
+    "scripts/smoke.ts": [
+      "const yaml = `",
+      "  paths:",
+      "    - '**/*'",
+      "`;",
+      'const url = "//x"; run(["--test", "x/after-string.test.cjs"]);',
+      "const glob = `${dir}/**/*${ext ? `/*${ext}` : ''}`; run(['x/after-template.test.cjs']);",
+      'const re = /\\/\\*|[/*]/g; run(["x/after-regex.test.cjs"]); // x/comment.test.cjs',
+      "const half = total / 2; run(['x/after-division.test.cjs']); // x/after-division-comment.test.cjs",
+      "/** A doc block after them all. */",
+      "export const later = 1;",
+    ].join("\n"),
+  };
+  const entries = [
+    "x/after-string.test.cjs",
+    "x/after-template.test.cjs",
+    "x/after-regex.test.cjs",
+    "x/after-division.test.cjs",
+    "x/comment.test.cjs",
+    "x/after-division-comment.test.cjs",
+  ].map((file) => ({ file, runBy: "scripts/smoke.ts" }));
+  const result = plan(
+    entries,
+    entries.map((e) => e.file),
+    never,
+    (file) => files[file] ?? null,
+  );
+  assert.deepEqual(
+    result.elsewhere.map((e) => e.file),
+    entries.slice(0, 4).map((e) => e.file),
+  );
+  assert.deepEqual(
+    result.notRun.map((n) => n.file),
+    ["x/comment.test.cjs", "x/after-division-comment.test.cjs"],
+  );
+  // Comments are blanked, not cut: the lines and their numbers stay.
+  const text = files["scripts/smoke.ts"];
+  assert.equal(jsCode(text).split("\n").length, text.split("\n").length);
+  assert.match(jsCode(text).split("\n")[8], /^ +$/);
+});
+
+test("the real release-smoke.ts names its listed test outside a comment", () => {
+  const root = path.resolve(__dirname, "../..");
+  const text = fs.readFileSync(path.join(root, "scripts/release-smoke.ts"), "utf8");
+  assert.ok(text.includes("'**/*'"), "the shape this guards against is still there");
+  // A doc block after the whole file, as upstream could add: the test is still named.
+  const later = `${text}\n/** a later doc block */\n`;
+  const result = plan(
+    [{ file: ".github/scripts/relay-state-output.test.cjs", runBy: "scripts/release-smoke.ts" }],
+    [".github/scripts/relay-state-output.test.cjs"],
+    never,
+    () => later,
+  );
+  assert.deepEqual(result.notRun, []);
 });
 
 test("the list ignores comments and blank lines and reads `run by` and weights", () => {
@@ -242,94 +303,6 @@ test("a part is the files under its prefixes and under none of its `!` prefixes"
   assert.deepEqual(pick("fork-kit/"), files.slice(0, 2));
   assert.deepEqual(pick("!fork-kit/"), files.slice(2));
   assert.deepEqual(pick("fork-kit/", "!fork-kit/x/"), files.slice(0, 1));
-});
-
-// The arguments of each `node .github/scripts/fork-ci-tests.cjs ...` call in a workflow's text.
-const runnerCalls = (text) =>
-  text
-    .split("\n")
-    .filter((line) => !/^\s*#/.test(line))
-    .flatMap((line) => [
-      ...line.matchAll(/\bnode\s+\.github\/scripts\/fork-ci-tests\.cjs((?:[ \t]+[^\s#;&|]+)*)/g),
-    ])
-    .map((match) =>
-      [...match[1].matchAll(/'([^']*)'|"([^"]*)"|(\S+)/g)].map((a) => a[1] ?? a[2] ?? a[3]),
-    );
-
-test("reads a workflow's runner calls, quotes removed, comment lines skipped", () => {
-  const text = [
-    "      # node .github/scripts/fork-ci-tests.cjs commented/",
-    "        run: node .github/scripts/fork-ci-tests.cjs fork-kit/",
-    "          node .github/scripts/fork-ci-tests.cjs '!fork-kit/' \"!x/\" # a note",
-    "          node .github/scripts/fork-ci-tests.cjs",
-  ].join("\n");
-  assert.deepEqual(runnerCalls(text), [["fork-kit/"], ["!fork-kit/", "!x/"], []]);
-});
-
-test("Fork tests' runner calls split every listed and present test into exactly one part", () => {
-  const root = path.resolve(__dirname, "../..");
-  const calls = runnerCalls(
-    fs.readFileSync(path.join(root, ".github/workflows/fork-tests.yml"), "utf8"),
-  );
-  assert.ok(calls.length > 0, "fork-tests.yml calls fork-ci-tests.cjs");
-  const listed = readList(fs.readFileSync(path.join(root, ".github/fork-ci-tests.txt"), "utf8"));
-  const files = [...new Set([...listed.map(({ file }) => file), ...presentTests(root)])];
-  const wrong = files
-    .map((file) => [file, calls.filter((parts) => inPart(file, parts))])
-    .filter(([, parts]) => parts.length !== 1)
-    .map(
-      ([file, parts]) =>
-        `${file}: in ${parts.length} parts (${parts.map((p) => p.join(" ") || "all").join("; ")})`,
-    );
-  assert.deepEqual(wrong, []);
-});
-
-// The runner calls of each job in a workflow's text: a job starts at a two-space `name:` line under `jobs:`.
-const callsByJob = (text) => {
-  const jobs = {};
-  let job = null;
-  let inJobs = false;
-  for (const line of text.split("\n")) {
-    if (/^\S/.test(line)) inJobs = line.startsWith("jobs:");
-    const head = inJobs && line.match(/^ {2}([A-Za-z_][\w-]*):\s*$/);
-    if (head) job = jobs[head[1]] = [];
-    else if (job) job.push(line);
-  }
-  return Object.fromEntries(
-    Object.entries(jobs)
-      .map(([name, lines]) => [name, runnerCalls(lines.join("\n"))])
-      .filter(([, calls]) => calls.length > 0),
-  );
-};
-
-// The composite actions' and fleet walls' tests are about two thirds of the non-kit script tests' time: in a job
-// of their own, each of the three jobs stays well under its time limit. One call per job: two calls in one job run
-// one after the other.
-test("Fork tests run the script tests in three jobs: the kits (sharded), the actions with the walls, the rest", () => {
-  const root = path.resolve(__dirname, "../..");
-  const calls = callsByJob(
-    fs.readFileSync(path.join(root, ".github/workflows/fork-tests.yml"), "utf8"),
-  );
-  assert.deepEqual(calls, {
-    workflows: [["!fork-kit/", "!fork-ci/", "!.github/scripts/fork-fleet-walls"]],
-    action_tests: [["fork-ci/", ".github/scripts/fork-fleet-walls"]],
-    kit_tests: [["fork-kit/"]],
-  });
-});
-
-test("reads each job's runner calls", () => {
-  const text = [
-    "on: push",
-    "  a:",
-    "jobs:",
-    "  one:",
-    "    steps:",
-    "      - run: node .github/scripts/fork-ci-tests.cjs x/",
-    "  two:",
-    "    steps:",
-    "      - run: echo",
-  ].join("\n");
-  assert.deepEqual(callsByJob(text), { one: [["x/"]] });
 });
 
 test("a long test without a weight, or one far from its weight, gets a note with the weight to write", () => {

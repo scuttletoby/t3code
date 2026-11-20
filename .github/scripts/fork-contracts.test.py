@@ -44,14 +44,21 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                of that workflow except the ones in RESULT_OPTIONAL (none today), so no job's failure
                can merge.
   quiet        nothing in fork-tests.yml may fail quietly: no continue-on-error on a job or a step. A step whose
-               run names a fork test, fork-kit, fork-ci or a test file is held to an allowlist, so its exit
-               status is its tests': its run is only lines of the allowed test forms (python3 with -I/-B/-u,
-               node with the runner or --test, or bash, then a listed test; set VAR=value switches only; an
-               optional 2>&1), its keys, env and if: are from a fixed set (no working-directory, shell only
-               bash, an if: only on upstream's tests), its job has no defaults, env or container, a fixed if:
-               and no step naming GITHUB_ENV, GITHUB_PATH or BASH_ENV, and the workflow has no defaults or
-               env. Every test .github/fork-ci-tests.txt lists as run by fork-tests.yml is run whole by such
-               a line, with the variable that switches it on. Anything else is refused with the allowed form.
+               run's code lines (not its comment lines) name a fork test, fork-kit, fork-ci or a test file is a
+               test step, held to an allowlist, so its exit status is its tests': its run is only lines of the
+               allowed test forms (python3 with -I/-B/-u, then a listed .py test, optionally -v <TestClass>;
+               node with the runner and path prefixes, or node --test; or bash; then listed tests), each
+               optionally after VAR=value words from a fixed set (the switches that turn tests on, and two
+               values a new step or sudo would lose) and optionally ending in 2>&1; `sudo env` only before
+               python3 and only for a test REQUIRED_VARS marks as testing as root (and always for those). Its
+               keys, env and if: are from a fixed set (no working-directory, shell only bash, an if: only on
+               upstream's tests), its job has no defaults, env or container, a fixed if: and no step naming
+               GITHUB_ENV, GITHUB_PATH or BASH_ENV, and the workflow has no defaults or env. Every test
+               .github/fork-ci-tests.txt lists as run by fork-tests.yml is run whole by such a line, with the
+               variable that switches it on (a new test that skips without a switch must be added to
+               REQUIRED_VARS). The runner calls read from those same accepted lines, job by job, are the three
+               pinned ones (RUNNER_PARTS), and put each listed or present test in exactly one part, by the
+               runner's own inPart. Anything else is refused with the allowed form.
   policies     every workflow with a pull_request_target trigger is listed in
                .github/fork-actions-policies.json (#401): allowed (the fork workflows the repository's
                Actions policy allows; each there, with that trigger and no other) or upstream_blocked;
@@ -1762,7 +1769,11 @@ for label, mutate in {
 #     of the job names GITHUB_ENV, GITHUB_PATH or BASH_ENV (each changes what a later step's command runs);
 #   - the workflow has no defaults or env.
 # Every test .github/fork-ci-tests.txt lists as run by fork-tests.yml must be run whole by such a line, with the
-# variable that switches it on (REQUIRED_VARS). Anything else is refused with the allowed form in the message.
+# variable that switches it on (REQUIRED_VARS). The runner's parts are read from the same accepted lines (YAML parsed,
+# quotes removed as bash removes them), never from the file's text, so a call kept in a YAML comment or a step name
+# counts for nothing. Anything else is refused with the allowed form in the message.
+# Not checked here (#664): what a step that is not a test step does to the next one's interpreter or files (beyond
+# GITHUB_ENV, GITHUB_PATH and BASH_ENV), and a gated test missing from REQUIRED_VARS.
 
 # The tests .github/fork-ci-tests.txt lists, read by fork-ci-tests.cjs's own readList (which spells each `run by`
 # path one way: `./a/b` is `a/b`), and those it says this file runs.
@@ -1775,8 +1786,10 @@ RUN_BY_HERE = [e["file"] for e in LISTED if e["runBy"] == ".github/workflows/for
 LISTED_FILES = {e["file"] for e in LISTED}
 # The fork's own tests among them (upstream's keep their if:, as in ci.yml).
 FORK_OWN_TEST = re.compile(r"(?:fork-kit/|fork-ci/|\.github/scripts/fork-)\S*\.test\.\w+")
-# A step whose run names any of these is a test step and must have the allowed shape. It is wide on purpose (a
-# folder name alone, any test extension the fork uses): a step that runs a test by another spelling still names one.
+# A step whose run's code lines (comment lines skipped, as bash skips them) name any of these is a test step and must
+# have the allowed shape. It is wide on purpose (a folder name alone, any test extension the fork uses): a step that
+# runs a test by another spelling still names one. A name kept only in a comment line runs nothing, so it does not make
+# a step a test step; a listed test named only there is still caught, as no test step runs it.
 TEST_MENTION = re.compile(r"fork-ci-tests|fork-kit|fork-ci/|\.test\.(?:py|sh|cjs|mjs|js)\b")
 RUNNER = ".github/scripts/fork-ci-tests.cjs"
 
@@ -1785,7 +1798,8 @@ RUNNER = ".github/scripts/fork-ci-tests.cjs"
 ALLOWED_VARS = {"GH_APPS_ROOT_TESTS=1", "HEAVY_REAL_TESTS=1", "FORK_FLEET_ROOT_TESTS=1",
                 'GITHUB_ACTIONS="$GITHUB_ACTIONS"', 'XDG_RUNTIME_DIR="/run/user/$(id -u)"'}
 # A test run on its own line needs its switch (and sudo where it tests as root): without it the test skips and
-# passes.
+# passes. Only these run under `sudo env`: as root a test that skips for root (skipIf(geteuid() == 0)) passes, and sudo
+# drops FORK_CI_TEST_SHARD. A new test that skips without a switch must be added here (#664 reads it from the test).
 REQUIRED_VARS = {"fork-kit/gh-apps/tests/root.test.py": (True, "GH_APPS_ROOT_TESTS=1"),
                  "fork-kit/heavy/tests/heavy.test.py": (False, "HEAVY_REAL_TESTS=1"),
                  ".github/scripts/fork-fleet.test.py": (True, "FORK_FLEET_ROOT_TESTS=1")}
@@ -1797,11 +1811,13 @@ JOB_KEYS = {"name", "if", "needs", "runs-on", "timeout-minutes", "strategy", "pe
 JOB_IFS = {"${{ " + PR_GUARD + " }}",
            "${{ " + PR_GUARD + " && (!cancelled() && needs.changes.outputs.test != 'false') }}"}
 TEST_FORMS = (
-    "a fork test step's run is only lines of these forms, each optionally ending in 2>&1: "
+    "a fork test step's run is only lines of these forms, each optionally ending in 2>&1, with no trailing # comment: "
     "`[sudo env] [VAR=value ...] python3 [-I] [-B] [-u] <listed .py test> [-v <TestClass>]` (no arguments after a "
-    "test the list says fork-tests.yml runs: it runs whole), "
-    f"`node {RUNNER} [<path prefix> | '!<path prefix>' ...]`, `node --test <listed .cjs/.mjs/.js test> ...` or "
-    "`bash <listed .sh test>`, a test path written as listed (or with ./), VAR=value one of "
+    "test the list says fork-tests.yml runs: it runs whole; `sudo env` only, and always, for "
+    + ", ".join(sorted(t for t, (root_, _) in REQUIRED_VARS.items() if root_)) + "), "
+    f"`[VAR=value ...] node {RUNNER} [<path prefix> | '!<path prefix>' ...]`, "
+    "`[VAR=value ...] node --test <listed .cjs/.mjs/.js test> ...` or "
+    "`[VAR=value ...] bash <listed .sh test>`, a test path written as listed (or with ./), VAR=value one of "
     + ", ".join(sorted(ALLOWED_VARS)))
 
 TOKEN = re.compile(r"""(?:[^\s'"]+|'[^']*'|"(?:[^"\\]|\\.)*")+""")
@@ -1833,11 +1849,16 @@ def test_path(word):
 
 
 def test_line(line):
-    """The tests one shell line runs whole, as {"tests": [...], "partial": [...]} (partial: run with arguments that
-    pick some of them), or a string saying why the line is not one of the allowed forms."""
+    """The tests one shell line runs whole, as {"tests": [...], "partial": [...], "parts": [...]} (partial: run with
+    arguments that pick some of them; parts: the runner's arguments as bash hands them to it, or None when the line
+    does not call the runner), or a string saying why the line is not one of the allowed forms."""
     w = words(line)
     if not w:
         return "a quote that is not closed"
+    comment = next((i for i, word in enumerate(w) if word.startswith("#")), None)
+    if comment is not None:
+        return f"a trailing comment ({' '.join(w[comment:])}) is not allowed on a test line (a comment goes on a line " \
+               "of its own)"
     if w[-1] == "2>&1":
         w = w[:-1]
     sudo = w[:2] == ["sudo", "env"]
@@ -1851,6 +1872,9 @@ def test_line(line):
     if not w:
         return "no command"
     cmd, args = w[0], w[1:]
+    if sudo and cmd != "python3":
+        return f"`sudo env` comes only before python3 (and a test that tests as root), not before `{cmd}`"
+    parts = None
     if cmd == "python3":
         while args and args[0] in PY_FLAGS and args[0] not in args[1:]:
             args = args[1:]
@@ -1869,6 +1893,7 @@ def test_line(line):
             if text is None or not re.fullmatch(r"!?[\w.][\w./-]*", text):
                 return f"{RUNNER} takes only path prefixes (`fork-kit/`, '!fork-kit/')"
         found = {"tests": [RUNNER], "partial": []}
+        parts = [plain(a) for a in args[1:]]
     elif cmd == "node" and args[:1] == ["--test"] and len(args) > 1:
         paths = [test_path(a) for a in args[1:]]
         if not all(p in LISTED_FILES and re.search(r"\.[cm]?js$", p) for p in paths):
@@ -1880,25 +1905,31 @@ def test_line(line):
     else:
         return f"`{cmd}` with these arguments is not a test command"
     for t in found["tests"] + found["partial"]:
-        need_sudo, var = REQUIRED_VARS.get(t, (sudo, None))
+        need_sudo, var = REQUIRED_VARS.get(t, (False, None))
         if var and var not in env:
             return f"{t} needs {var} (without it the test skips and passes)"
         if need_sudo != sudo:
             return f"{t} runs {'only' if need_sudo else 'never'} under sudo env"
-    return found
+    return {**found, "parts": parts}
 
 
 def step_runs(step):
     return joined_lines(str(step.get("run", "")))
 
 
+def test_mention(step):
+    """What in a step's run code lines (not its comment lines) makes it a test step, or None."""
+    m = TEST_MENTION.search("\n".join(line for _, line in step_runs(step)))
+    return m.group(0) if m else None
+
+
 def is_test_step(step):
-    return bool(TEST_MENTION.search(str(step.get("run", ""))))
+    return test_mention(step) is not None
 
 
 def test_step_problems(step):
-    """Why a test step is not of the allowed shape (empty: it is), and the tests it runs whole."""
-    problems, ran = [], []
+    """Why a test step is not of the allowed shape (empty: it is), the tests it runs whole and its runner calls."""
+    problems, ran, calls = [], [], []
     for key in sorted(set(step) - STEP_KEYS):
         problems.append(f"{key}: is not allowed on a test step (only {', '.join(sorted(STEP_KEYS))})")
     if "shell" in step and step["shell"] != "bash":
@@ -1908,23 +1939,57 @@ def test_step_problems(step):
             problems.append(f"env {k}: is not allowed on a test step (only {STEP_ENV})")
     lines = [(n, line) for n, line in step_runs(step) if line.strip()]
     if not lines:
-        problems.append("names a test but runs none")
+        problems.append(f"names a test but runs none; {TEST_FORMS}")
     for n, line in lines:
         found = test_line(line)
         if isinstance(found, str):
             problems.append(f"line {n}: {found}; {TEST_FORMS}")
         else:
             ran += found["tests"]
+            if found["parts"] is not None:
+                calls.append(found["parts"])
     if "if" in step:
         own = [t for t in ran if t == RUNNER or FORK_OWN_TEST.fullmatch(t)]
         if own or not ran or str(step["if"]) not in STEP_IFS:
             problems.append(f"if: {step['if']} (a step of the fork's own tests has none; upstream's may have only "
                             f"{', '.join(sorted(STEP_IFS))})")
-    return problems, ran
+    return problems, ran, calls
+
+
+# The runner calls each job makes, as read from its accepted test lines: one call per job (two in one job run one after
+# the other). The kits sharded, the composite actions with the fleet walls (about two thirds of the non-kit script
+# tests' time), the rest: each of the three jobs stays well under its time limit.
+RUNNER_PARTS = {
+    "workflows": [["!fork-kit/", "!fork-ci/", "!.github/scripts/fork-fleet-walls"]],
+    "action_tests": [["fork-ci/", ".github/scripts/fork-fleet-walls"]],
+    "kit_tests": [["fork-kit/"]],
+}
+
+
+def part_problems(calls_by_job):
+    """Why the runner calls are not the pinned ones, or leave a listed or present test in no part or in two, by the
+    runner's own inPart and presentTests."""
+    problems = []
+    if calls_by_job != RUNNER_PARTS:
+        problems.append(f"fork-tests.yml: the runner calls by job are {calls_by_job}, not {RUNNER_PARTS}")
+    calls = [parts for job_calls in calls_by_job.values() for parts in job_calls]
+    wrong = json.loads(subprocess.run(
+        ["node", "-e", "const fs = require('fs'); const r = require(process.argv[1]); "
+         "const calls = JSON.parse(process.argv[3]); "
+         "const listed = r.readList(fs.readFileSync(process.argv[2], 'utf8')).map((e) => e.file); "
+         "const files = [...new Set([...listed, ...r.presentTests()])]; "
+         "console.log(JSON.stringify(files.map((f) => [f, calls.filter((parts) => r.inPart(f, parts))])"
+         ".filter(([, parts]) => parts.length !== 1)))",
+         str(scripts_dir / "fork-ci-tests.cjs"), str(root / ".github/fork-ci-tests.txt"), json.dumps(calls)],
+        check=True, capture_output=True, text=True).stdout)
+    for file, parts in wrong:
+        where = "; ".join(" ".join(p) or "all" for p in parts)
+        problems.append(f"{file}: in {len(parts)} runner parts ({where}), not exactly one")
+    return problems
 
 
 def quiet_problems(wf, tests=RUN_BY_HERE):
-    problems, ran = [], set()
+    problems, ran, calls_by_job = [], set(), {}
     for key in ("defaults", "env"):
         if key in wf:
             problems.append(f"fork-tests.yml: workflow-level {key}: is not allowed (it reaches every test step)")
@@ -1949,11 +2014,15 @@ def quiet_problems(wf, tests=RUN_BY_HERE):
             if re.search(r"GITHUB_ENV|GITHUB_PATH|BASH_ENV", str(step.get("run", ""))):
                 problems.append(f"{where}: names GITHUB_ENV, GITHUB_PATH or BASH_ENV in a job with test steps (it "
                                 "changes what a later step's command runs)")
-            if is_test_step(step):
-                found, step_ran = test_step_problems(step)
-                problems += [f"{where}: {why}" for why in found]
+            mention = test_mention(step)
+            if mention:
+                found, step_ran, calls = test_step_problems(step)
+                problems += [f"{where}, a test step (its run names `{mention}`): {why}" for why in found]
                 if not found:
                     ran.update(step_ran)
+                    calls_by_job.setdefault(j, []).extend(calls)
+    calls_by_job = {j: calls for j, calls in calls_by_job.items() if calls}
+    problems += part_problems(calls_by_job)
     for t in tests:
         if t not in ran:
             problems.append(f"{t}: .github/fork-ci-tests.txt says fork-tests.yml runs it, but no test step runs it "
@@ -2121,6 +2190,15 @@ QUIET_REFUSED = {
         1, {"run": 'echo "NODE_OPTIONS=--require=/tmp/x.js" >> "$GITHUB_ENV"'}),
     "an earlier step that puts a folder on GITHUB_PATH": lambda jobs: jobs["kit_root_tests"]["steps"].insert(
         1, {"run": 'echo /tmp/f >> "$GITHUB_PATH"'}),
+    # sudo env before anything but python3 and a test that tests as root: as root a test that skips for root passes,
+    # and FORK_CI_TEST_SHARD is lost.
+    "sudo env before the kit runner": kit_run(f"sudo env {KIT}"),
+    "sudo env before a listed .sh test run by bash": kit_run(f"{KIT}\nsudo env bash .github/scripts/fork-follow.test.sh"),
+    "sudo env before node --test <upstream tests>": lambda jobs: (lambda st: st.__setitem__(
+        "run", "sudo env " + st["run"]))(test_step(jobs, "test", "test-delta.test.cjs")),
+    "sudo env before a .py test that does not test as root": lambda jobs: test_step(
+        jobs, "lint", "fork-owned-reads.test.py").__setitem__(
+        "run", "sudo env python3 -I -B .github/scripts/fork-owned-reads.test.py"),
     "sudo -E (the whole environment to root)": lambda jobs: test_step(jobs, "kit_root_tests", ROOT_TEST).__setitem__(
         "run", ROOT_LINE.replace("sudo env", "sudo -E env")),
     # and the switch that turns a test on dropped.
@@ -2136,6 +2214,12 @@ QUIET_REFUSED = {
     "a quote left open": heavy_run(lambda line: line + " '"),
     "a runner part that starts with -": kit_run(f"node {RUNNER} --x"),
     "a test line written to a log, not shown": heavy_run(lambda line: line + " > log 2>&1"),
+    # The runner's parts read from the accepted lines: the kit cut to one folder (the shards still each get a file).
+    "the kit runner with ./, cut to fork-kit/pc-agents/": kit_run(f"node ./{RUNNER} fork-kit/pc-agents/"),
+    "the kit runner quoted, cut to fork-kit/pc-agents/": kit_run(f"node '{RUNNER}' 'fork-kit/pc-agents/'"),
+    "a second runner call in the kit job": kit_run(f"{KIT}\n{KIT}"),
+    "the script tests' runner without its !fork-ci/ part (the action tests run twice)": lambda jobs: test_step(
+        jobs, "workflows", RUNNER).__setitem__("run", f"node {RUNNER} '!fork-kit/' '!.github/scripts/fork-fleet-walls'"),
 }
 QUIET_WHOLE_REFUSED = {
     "workflow-level defaults.run.shell: bash {0}": lambda wf: wf.__setitem__("defaults", {"run": {"shell": "bash {0}"}}),
@@ -2150,8 +2234,50 @@ for label, mutate in QUIET_WHOLE_REFUSED.items():
 # A refused line says what is allowed (the form), so the fix is plain from the message alone.
 check("quiet: a refused test line names the allowed forms",
       any(TEST_FORMS in p for p in quiet_mutant(QUIET_REFUSED["sh -c '<kit tests> || true'"])))
+# The same cut kit call with the whole call kept where a raw-text reader would see it but YAML and bash do not: in a
+# YAML comment after the run value, or in the step's name. Made on the workflow's text and parsed, as Actions reads it.
+fork_tests_text = (workflows_dir / "fork-tests.yml").read_text()
+KIT_TEXT = f"        run: {KIT}\n"
+QUIET_TEXT_REFUSED = {
+    "the kit runner with ./ cut to fork-kit/pc-agents/, the whole call in a YAML comment": (
+        KIT_TEXT, f"        run: node ./{RUNNER} fork-kit/pc-agents/ # {KIT}\n"),
+    "the kit runner with ./ cut to fork-kit/pc-agents/, the whole call in the step's name": (
+        f"      - name: Fork kit tests\n", f"      - name: Fork kit tests {KIT}\n",
+        KIT_TEXT, f"        run: node ./{RUNNER} fork-kit/pc-agents/\n"),
+    "the kit runner cut to fork-kit/pc-agents/, the whole call on a comment line of the run": (
+        KIT_TEXT, f"        run: |\n          # {KIT}\n          node {RUNNER} fork-kit/pc-agents/\n"),
+}
+check("quiet: the kit step's text is as the text mutants expect", fork_tests_text.count(KIT_TEXT) == 1
+      and fork_tests_text.count("      - name: Fork kit tests\n") == 1)
+for label, pairs in QUIET_TEXT_REFUSED.items():
+    text = fork_tests_text
+    for old, new in zip(pairs[::2], pairs[1::2]):
+        text = text.replace(old, new)
+    found = quiet_problems(yaml.safe_load(text))
+    check(f"quiet: {label} fails", text != fork_tests_text and any("runner parts" in p for p in found),
+          "; ".join(found))
+check("quiet: the real runner calls are the pinned ones, read from the accepted lines",
+      not part_problems(RUNNER_PARTS) and any(st.get("run", "").strip() == KIT
+                                              for st in fork_tests["jobs"]["kit_tests"]["steps"]))
+# A refusal names the right reason.
+REASONS = {
+    "a trailing # comment on the kit runner line": (
+        kit_run(f"{KIT}  # shard"), "a trailing comment (# shard) is not allowed"),
+    "sudo env before the kit runner": (QUIET_REFUSED["sudo env before the kit runner"],
+                                       "`sudo env` comes only before python3"),
+    "a set-up step named a test step by its code": (
+        lambda jobs: jobs["kit_root_tests"]["steps"].insert(1, {"run": "cp fork-kit/heavy/x /tmp/x"}),
+        "a test step (its run names `fork-kit`)"),
+    "a test step that runs nothing": (kit_run(f"echo {KIT}"), "`echo` with these arguments is not a test command"),
+}
+for label, (mutate, reason) in REASONS.items():
+    found = quiet_mutant(mutate)
+    check(f"quiet: {label} is refused, saying why", any(reason in p and TEST_FORMS in p for p in found),
+          "; ".join(found))
+check("quiet: a step that runs nothing but names a test is refused with the allowed forms",
+      any("names a test but runs none; " + TEST_FORMS in p for p in test_step_problems({"run": "# x\n\n"})[0]))
 check("quiet: the heavy test as its step runs it today is seen as run whole, and its step as a test step",
-      test_line(HEAVY_LINE) == {"tests": [HEAVY], "partial": []} and is_test_step(heavy_step(fork_tests["jobs"])))
+      test_line(HEAVY_LINE) == {"tests": [HEAVY], "partial": [], "parts": None} and is_test_step(heavy_step(fork_tests["jobs"])))
 QUIET_ACCEPTED = {
     "shell: bash and a runner line split by \\ with a quoted part": lambda jobs: test_step(
         jobs, "kit_tests", RUNNER).update(shell="bash", run=f"node {RUNNER} \\\n  'fork-kit/'\n"),
@@ -2167,6 +2293,12 @@ QUIET_ACCEPTED = {
         "run", f"{ROOT_LINE}\n{HEAVY_LINE}\n"),
     "a listed .sh test run by bash": kit_run(f"{KIT}\nbash .github/scripts/fork-follow.test.sh"),
     "a step timeout and id": lambda jobs: heavy_step(jobs).update({"timeout-minutes": 5, "id": "heavy"}),
+    # A kit path in a set-up step's comment line only: the step runs no test, so it is not a test step.
+    "a set-up step with a kit path in a comment line": lambda jobs: next(
+        st for st in jobs["kit_root_tests"]["steps"] if "loginctl" in str(st.get("run", ""))).__setitem__(
+        "run", "# slice as in fork-kit/heavy/README.md\n" + next(
+            st for st in jobs["kit_root_tests"]["steps"] if "loginctl" in str(st.get("run", "")))["run"]),
+    "the kit runner quoted and with ./": kit_run(f"node './{RUNNER}' \"fork-kit/\""),
 }
 for label, mutate in QUIET_ACCEPTED.items():
     check(f"quiet: {label} passes", not quiet_mutant(mutate), "; ".join(quiet_mutant(mutate)))

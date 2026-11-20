@@ -666,7 +666,10 @@ class RestartPending(Case):
         self.assertEqual(files(), whole)
         gid = os.lstat(self.path(some)).st_gid
         other = next((g for g in os.getgroups() if g != gid), None)
-        if other is not None:
+        if other is None:   # said, so a run where this part did not happen shows it
+            print('setup.test.py: the group part of the killed-upgrade self-check is skipped: the test user is in '
+                  'one group only', file=sys.stderr)
+        else:
             os.chown(self.path(some), -1, other)
             self.assertNotEqual(files(), whole, some)
             os.chown(self.path(some), -1, gid)

@@ -20,16 +20,106 @@ const RUNNER = {
 };
 const UPSTREAM_WORKFLOW = /^\.github\/workflows\/(?!fork-)[^/]+\.ya?ml$/;
 
+// Words after which a `/` starts a regular expression, not a division.
+const BEFORE_REGEX = new Set(
+  "return typeof instanceof in of new delete void throw case do else yield await".split(" "),
+);
+
+// A JavaScript or TypeScript file's text with its comments blanked (newlines kept), read by a small tokeniser: a
+// string ('...' or "..."), a template literal (its `${...}` read as code, nested to any depth) or a regular
+// expression is kept whole, so a `//` or `/*` inside one (upstream's `'**/*'`) starts no comment. A `/` is a regular
+// expression where a value cannot end before it (after an operator, `(`, `,`, a keyword such as `return`, or at the
+// start), else a division. Checked against TypeScript's parser on every JS/TS file of the tree: the same comments,
+// but for JSX text, where a `//` blanks the rest of its line (removed code: the test counts as not run, the safe side).
+function jsCode(text) {
+  let out = "";
+  let i = 0;
+  let valueEnds = false; // the last token can end a value: a `/` after it divides
+  const nest = []; // for each open `{`: "code", or "template" for a `${` inside a template literal
+  const blank = (part) => part.replace(/[^\n]/g, " ");
+  const template = () => {
+    // From just after a backtick or a `}` that closes a `${`: to the closing backtick, or into the next `${`.
+    const start = i;
+    while (i < text.length && text[i] !== "`" && !(text[i] === "$" && text[i + 1] === "{"))
+      i += text[i] === "\\" ? 2 : 1;
+    if (text[i] === "`") {
+      i += 1;
+      valueEnds = true;
+    } else if (i < text.length) {
+      i += 2;
+      nest.push("template");
+      valueEnds = false;
+    }
+    out += text.slice(start, i);
+  };
+  while (i < text.length) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (c === "/" && next === "/") {
+      const end = text.indexOf("\n", i);
+      const stop = end === -1 ? text.length : end;
+      out += blank(text.slice(i, stop));
+      i = stop;
+    } else if (c === "/" && next === "*") {
+      const end = text.indexOf("*/", i + 2);
+      const stop = end === -1 ? text.length : end + 2;
+      out += blank(text.slice(i, stop));
+      i = stop;
+    } else if (c === "'" || c === '"') {
+      const start = i;
+      i += 1;
+      while (i < text.length && text[i] !== c && text[i] !== "\n") i += text[i] === "\\" ? 2 : 1;
+      i += 1;
+      out += text.slice(start, i);
+      valueEnds = true;
+    } else if (c === "`") {
+      out += c;
+      i += 1;
+      template();
+    } else if (c === "/" && !valueEnds) {
+      const start = i;
+      let inClass = false;
+      i += 1;
+      while (i < text.length && text[i] !== "\n" && (inClass || text[i] !== "/")) {
+        if (text[i] === "\\") i += 1;
+        else if (text[i] === "[") inClass = true;
+        else if (text[i] === "]") inClass = false;
+        i += 1;
+      }
+      i += 1;
+      while (i < text.length && /\w/.test(text[i])) i += 1;
+      out += text.slice(start, i);
+      valueEnds = true;
+    } else if (c === "{") {
+      nest.push("code");
+      out += c;
+      i += 1;
+      valueEnds = false;
+    } else if (c === "}") {
+      i += 1;
+      out += c;
+      if (nest.pop() === "template") template();
+      else valueEnds = true;
+    } else if (/[\w$]/.test(c)) {
+      const word = text.slice(i).match(/^[\w$]+/)[0];
+      out += word;
+      i += word.length;
+      valueEnds = !BEFORE_REGEX.has(word);
+    } else {
+      out += c;
+      i += 1;
+      if (!/\s/.test(c)) valueEnds = c === ")" || c === "]";
+    }
+  }
+  return out;
+}
+
 // A runner file's lines with its comments removed, so a path kept only in a comment names nothing. A JavaScript or
-// TypeScript file loses `/* ... */` and `//` to the line's end (not `://`, a URL); any other file (YAML, shell,
-// Python) loses `#` to the line's end where `#` starts the line or follows a space. Where this errs (a `#` or `//`
+// TypeScript file goes through jsCode(), so a comment marker inside a string is not a comment. Any other file (YAML,
+// shell, Python) loses `#` to the line's end where `#` starts the line or follows a space; where that errs (a ` #`
 // inside a string) it removes code, so the test counts as not run: the safe side.
 function codeLines(text, file = "") {
-  if (/\.[cm]?[jt]sx?$/.test(file))
-    return text
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .split("\n")
-      .map((line) => line.replace(/(^|[^:])\/\/.*/, "$1"));
+  if (/\.[cm]?[jt]sx?$/.test(file)) return jsCode(text).split("\n");
   return text.split("\n").map((line) => line.replace(/(^|\s)#.*/, "$1"));
 }
 
@@ -397,6 +487,7 @@ async function main(
 
 module.exports = {
   plan,
+  jsCode,
   readList,
   order,
   shard,
