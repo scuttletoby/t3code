@@ -1415,6 +1415,10 @@ class EveryWallsFile(WallsRunner):
                     '/var/spool/mail/alice': {'var/spool/mail/alice': ''},
                     '/var/lib/sss/mc': {'var/lib/sss/mc/passwd': 'alice\n'},
                     '/var/lib/dhcp': {'var/lib/dhcp/dhclient.leases': 'lease { option host-name "nas"; }\n'},
+                    # Issue #656: the other DHCP clients' leases.
+                    '/var/lib/dhclient': {'var/lib/dhclient/dhclient.leases': 'lease { option host-name "nas"; }\n'},
+                    '/var/lib/dhcpcd': {'var/lib/dhcpcd/eth0.lease': 'nas\n'},
+                    '/var/lib/NetworkManager': {'var/lib/NetworkManager/internal-x.lease': 'HOSTNAME=nas\n'},
                     '/var/lib/misc': {'var/lib/misc/dnsmasq.leases': '1 aa:bb:cc:dd:ee:ff 192.0.2.9 nas *\n'}}
         for allow, files in accounts.items():
             with self.subTest(allow):
@@ -1500,7 +1504,17 @@ class EveryWallsFile(WallsRunner):
                 got = self.fake_paths(line, self.root(LINUX))
                 self.assertIn('FAIL  mounts  ', got)
                 self.assertIn('an older launcher binds some: re-run the installer; take the rest out of ALLOW_PATHS or '
-                              'JOB_PATHS\n', got)
+                              'JOB_PATHS; the paths: ', got)
+        # Issue #656: the ways out come before the paths, so long paths that fill the line's 400-character cap never
+        # cut the owner's half off (it was after three of them).
+        long = '/opt/' + 'v' * 150
+        for line in (f'/etc/passwd /etc/passwd\\n{long}/a /etc/shadow\\n{long}/b /etc/ssh',
+                     f'{long}/a /etc/shadow\\n{long}/b /etc/ssh\\n{long}/c /etc/passwd'):
+            with self.subTest('long paths'):
+                got = self.fake_paths(line, self.root(LINUX))
+                said = next(x for x in got.splitlines() if x.startswith('FAIL  mounts  '))
+                self.assertGreater(len(said), 390, said)   # the cap did cut it
+                self.assertIn('re-run the installer; take the rest out of ALLOW_PATHS or JOB_PATHS', said)
 
     def test_linux_mounts_finds_a_secret_at_another_path_by_its_inode(self):
         """Issue #613 item 7: a bind mount or hard link of a secret entry at another path is the same device and
@@ -1516,7 +1530,8 @@ class EveryWallsFile(WallsRunner):
                 os.link(os.path.join(root, target), os.path.join(root, link))
             return root
         got = self.fake_paths('/opt/s /opt/s', root_with([('etc/shadow', 'opt/s')]))
-        self.assertRegex(got, r'FAIL  mounts  .*jobs see /opt/s \(the same as /etc/shadow\): a bind mount or hard link')
+        self.assertRegex(got, r'FAIL  mounts  .*: jobs see a bind mount or hard link .*: take it out of '
+                              r'ALLOW_PATHS.*; the paths: /opt/s \(the same as /etc/shadow\)')
         got = self.fake_paths('/opt/c /opt/c', root_with([('etc/ssl/certs/ca.pem', 'opt/c')]))   # not a secret
         self.assertNotIn('FAIL  mounts', got)
         got = self.fake_paths('/opt/certs /etc/ssl/certs', root_with())
@@ -1567,7 +1582,19 @@ class EveryWallsFile(WallsRunner):
             with self.assertRaisesRegex(ValueError, 'cannot list /etc/locked'):
                 m.secret_inodes()
         m.ROOT = self.root({'usr/': ''})
-        self.assertEqual(m.private_folders(), [])
+        self.assertEqual(m.private_entries(), [])
+        # Issue #656: a file named private under /etc is one too; a link named private is not followed (its target,
+        # here /usr/share, is no secret: the link's own path is, by name, in secret_etc).
+        m.ROOT = self.root({'etc/app/private': 'k\n', 'usr/share/doc/': ''})
+        os.symlink('../../usr/share', os.path.join(m.ROOT, 'etc/private'))
+        os.makedirs(os.path.join(m.ROOT, 'etc/b'))
+        os.symlink('/usr/share/doc', os.path.join(m.ROOT, 'etc/b/private'))
+        self.assertEqual(m.private_entries(), [os.path.join(m.ROOT, 'etc/app/private')])
+        inodes = m.secret_inodes()
+        self.assertIsNone(m.same_as_secret('/usr/share/doc', inodes))
+        self.assertIsNone(m.same_as_secret('/usr/share', inodes))
+        self.assertIn('/etc/app/private', m.same_as_secret('/etc/app/private', inodes) or '')
+        self.assertTrue(m.secret_etc('/etc/private') and m.secret_etc('/etc/b/private'))
         # Runs again: the same answer.
         root = root_with([('etc/shadow', 'opt/s')])
         self.assertEqual(self.fake_paths('/opt/s /opt/s', root), self.fake_paths('/opt/s /opt/s', root))
@@ -1585,7 +1612,10 @@ class EveryWallsFile(WallsRunner):
                  # Issue #636: more of the usual places, and their neighbours that are not.
                  '/etc/passwd.bak', '/etc/hosts.equiv', '/var/mail/alice', '/var/spool/mail/alice',
                  '/var/lib/sss/mc/passwd', '/var/lib/sss/db', '/var/lib/dhcp/dhclient.leases', '/etc/hostname',
-                 '/etc/host.conf', '/etc/groff', '/var/lib/misc/other', '/var/lib/apt'}
+                 '/etc/host.conf', '/etc/groff', '/var/lib/misc/other', '/var/lib/apt',
+                 # Issue #656: the other DHCP clients' leases, and a neighbour that is not one.
+                 '/var/lib/dhclient/dhclient.leases', '/var/lib/dhcpcd/eth0.lease',
+                 '/var/lib/NetworkManager/internal-x.lease', '/var/lib/NetworkManager', '/var/lib/dpkg'}
         for p in sorted(each):
             with self.subTest(p):
                 got = run([launcher, 'paths'], self.root(overlay(LINUX, {conf: f'ALLOW_PATHS={p}\n'})))
@@ -1603,10 +1633,21 @@ class EveryWallsFile(WallsRunner):
         with open(launcher) as f:
             body = re.search(r'^never\(\) \{\n(.*?)^\}\n', f.read(), re.M | re.S).group(1)
         theirs = set(re.findall(r'\[\[ \$1 != (/\S+) \]\]', body))
-        for block in re.findall(r'case \$1 in\s*(.*?)\)\s*die', body, re.S):
+        blocks = re.findall(r'case \$1 in\s*(.*?)\)\s*die', body, re.S)
+        for block in blocks:
             theirs |= {x.strip() for x in block.replace('\\\n', ' ').split('|')}
-        self.assertIn('/var/lib/dhcp/*', theirs)   # the parse found the whole list
+        self.assertIn('/var/lib/NetworkManager/*', theirs)   # the parse found the whole list
         self.assertEqual(theirs, set(m.LAUNCHER_REFUSES))
+        # Issue #656: and nothing the parse skips. A refusal in another shape (an `if`, a `[[ $1 == ...`) stayed green:
+        # every line that reads $1 is one of the shapes above (or the data roots' no_data), and each die is one of
+        # theirs, or the own-or-none roots' one.
+        own = re.findall(r'case \$1/ in', body)
+        self.assertEqual(body.count('die '), len(re.findall(r'\[\[ \$1 != /\S+ \]\] \|\| die ', body)) + len(blocks) +
+                         len(own), body)
+        for line in body.splitlines():
+            if '$1' in line:
+                self.assertRegex(line.strip(), r'^(\[\[ \$1 != /\S+ \]\] \|\| die |case \$1/? in( |$)|'
+                                 r'no_data "\$1" "\$2"$)', line)
 
     def test_linux_etc_secrets_reads_only_what_jobs_see(self):
         """Issue #243 items 5 and 6: jobs see an allow list of /etc, so a secret in a login file, a unit or
