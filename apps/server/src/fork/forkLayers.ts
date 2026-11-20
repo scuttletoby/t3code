@@ -16,6 +16,7 @@ import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
+import * as DelegatedResultReminder from "./delegatedResults/DelegatedResultReminder.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
@@ -36,7 +37,7 @@ export const holdWorkCloudLink = <E, R, ROut2, E2, R2>(
  * In the runtime's core dependencies (server.ts's `layerRuntimeCoreDependenciesBase`, not its local
  * `layerRuntimeServices`): usage pacer (and its history), slot gate, usage refresher, the handoff
  * service (fork/handoff), which upstream's own `mergeAll` builds concurrently beside its idle
- * compaction worker, and the run records follower (fork/runRecords).
+ * compaction worker, the run records follower (fork/runRecords) and the delegated result reminder.
  */
 export const layerRuntimeServices = Layer.mergeAll(
   UsagePacer.layer.pipe(Layer.provideMerge(UsageReadingsHistory.layer)),
@@ -44,6 +45,7 @@ export const layerRuntimeServices = Layer.mergeAll(
   HeadlessUsageRefresher.layer,
   HandoffService.layer,
   RunRecorder.layer,
+  DelegatedResultReminder.layer,
 );
 
 /**
