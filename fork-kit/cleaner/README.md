@@ -513,7 +513,9 @@ any read when the stored time is more than a day old. `days` is 7 or more, so a 
 seen.
 
 **Never taken**, on top of what the config refuses: links (never followed, folders neither), folders with a `KEEP`
-file, git folders, other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
+file and git folders (`.git`, or a bare repository), in a cold folder or in a folder above it up to `/` (read at the
+plan and again before each file; a `~/.git` of dotfiles keeps every folder under the home; a folder above that cannot
+be read keeps it too), other filesystems and mount points, a folder shown somewhere else by a bind mount, other owners'
 files, credential and lock names, a database with a `-wal`, `-shm` or `-journal` beside it (and those files),
 hard-linked files, files already compressed (`.zst`, `.gz`, `.xz`, `.zip`, ...), files under 16 KB, a file whose
 `.zst` name is taken by something else, and a folder named like `*log-archive*` (#468 keeps log archives as they
