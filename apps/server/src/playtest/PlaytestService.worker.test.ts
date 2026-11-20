@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 
+import * as ProcessRunner from "../processRunner.ts";
 import * as PlaytestService from "./PlaytestService.ts";
 import {
   adapter,
@@ -27,6 +28,7 @@ import {
   OTHER_THREAD,
   ran,
   removeFile,
+  runnerControl,
   setFile,
   settingsWith,
   stepProcesses,
@@ -212,6 +214,7 @@ const serviceIn = (
       notice: PlaytestService.PlaytestNotice,
     ) => Effect.Effect<PlaytestService.PlaytestNoticeResult>;
     readonly overrides?: Record<string, unknown>;
+    readonly runner?: ProcessRunner.ProcessRunner["Service"];
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -220,6 +223,7 @@ const serviceIn = (
       yield* settingsWith(adapter(w.fx, w.dir, options.overrides ?? {})),
       {
         onChange: w.signal.onChange,
+        ...(options.runner === undefined ? {} : { runner: options.runner }),
         ...(options.threadGone === undefined ? {} : { threadGone: options.threadGone }),
         ...(options.notify === undefined ? {} : { notify: options.notify }),
       },
@@ -258,6 +262,18 @@ const status = (service: PlaytestService.PlaytestService, threadId: ThreadId = T
     return session!;
   });
 
+/**
+ * Whether the thread's stored `renewedAt` is set and is not `before`. A renew writes its
+ * `finished|renew` line before the service stores its answer, so a test that then reads the
+ * session waits on this, not on the line.
+ */
+const renewedSince = (
+  service: PlaytestService.PlaytestService,
+  before?: string,
+  threadId: ThreadId = THREAD,
+) =>
+  Effect.map(status(service, threadId), (s) => s.renewedAt !== undefined && s.renewedAt !== before);
+
 describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestService sweep", () => {
   it.live("after a restart the sweep renews at once, then only when renewMinutes passed", () =>
     live(
@@ -281,10 +297,12 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
           assert.isAtLeast(again.nextDueAt, time.nowMs() + 9 * MINUTE);
           assert.isAtMost(again.nextDueAt, time.nowMs() + 10 * MINUTE);
 
+          const firstAt = (yield* status(service)).renewedAt;
           yield* time.advance(10 * MINUTE);
           yield* service.runDue();
-          yield* signal.until(Effect.map(finished(dir, "renew"), (count) => count === 2));
+          yield* signal.until(renewedSince(service, firstAt));
           assert.strictEqual(yield* starts(dir, "renew"), 2);
+          assert.strictEqual(yield* finished(dir, "renew"), 2);
           assert.strictEqual((yield* status(service)).state, "active");
         }),
       ),
@@ -316,8 +334,9 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
           assert.isAbove(a.nextDueAt, time.nowMs());
           assert.isAbove(b.nextDueAt, time.nowMs());
           yield* openGate(dir, "renew");
-          yield* signal.until(Effect.map(finished(dir, "renew"), (count) => count === 1));
+          yield* signal.until(renewedSince(service));
           assert.strictEqual(yield* starts(dir, "renew"), 1);
+          assert.strictEqual(yield* finished(dir, "renew"), 1);
         }),
       ),
     ),
@@ -711,9 +730,13 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
               },
             );
             yield* within10s(service.runDue());
-            yield* signal.until(Effect.map(finished(dir, "renew"), (count) => count === 2));
-            assert.isDefined((yield* status(service, OTHER_THREAD)).renewedAt);
-            assert.isDefined((yield* status(service)).renewedAt);
+            yield* signal.until(
+              Effect.map(
+                Effect.all([renewedSince(service), renewedSince(service, undefined, OTHER_THREAD)]),
+                ([a, b]) => a && b,
+              ),
+            );
+            assert.strictEqual(yield* finished(dir, "renew"), 2);
 
             // The next sweep runs too, and does not start a second read of the stuck thread.
             yield* within10s(service.runDue());
@@ -735,6 +758,43 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
               "the stuck thread read again",
             );
             assert.strictEqual((yield* status(service)).state, "active");
+          }),
+        ),
+      ),
+  );
+
+  it.live(
+    "renew's finished line comes before its stored renewedAt; a stop in between keeps no renew",
+    () =>
+      live(
+        withTime(({ fx, dir, time, signal }) =>
+          Effect.gen(function* () {
+            yield* writeStore(fx, [freshSession(fx, dir, time)]);
+            const runs = yield* runnerControl;
+            const service = yield* serviceIn({ fx, dir, signal }, { runner: runs.runner });
+            const answer = yield* runs.holdNextReturn;
+            yield* service.runDue();
+            yield* answer.reached;
+
+            // The renew process has exited and logged its end, but its answer is not stored yet:
+            // a wait on the `finished|renew` line returns here, and reading renewedAt then fails.
+            assert.strictEqual(yield* finished(dir, "renew"), 1);
+            assert.isUndefined((yield* status(service)).renewedAt);
+            assert.isFalse(yield* renewedSince(service));
+            // A sweep meanwhile starts no second renew.
+            yield* service.runDue();
+            assert.strictEqual(yield* starts(dir, "renew"), 1);
+            // T3 stopped here: the store has no renewedAt either, so a new T3 counts no renew.
+            const cut = yield* serviceIn({ fx, dir, signal });
+            assert.isUndefined((yield* status(cut)).renewedAt);
+
+            yield* answer.release;
+            yield* signal.until(renewedSince(service));
+            assert.strictEqual(yield* starts(dir, "renew"), 1);
+            // A T3 started after the answer was stored reads the same renewedAt.
+            const renewedAt = (yield* status(service)).renewedAt;
+            const next = yield* serviceIn({ fx, dir, signal });
+            assert.strictEqual((yield* status(next)).renewedAt, renewedAt);
           }),
         ),
       ),
@@ -805,9 +865,11 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
           assert.isAtLeast(next.nextDueAt, time.nowMs() + 9 * MINUTE);
           assert.strictEqual(yield* starts(dir, "renew"), 1);
 
+          const firstAt = (yield* status(service)).renewedAt;
           yield* time.advance(10 * MINUTE);
           yield* service.runDue();
-          yield* signal.until(Effect.map(finished(dir, "renew"), (count) => count === 2));
+          yield* signal.until(renewedSince(service, firstAt));
+          assert.strictEqual(yield* finished(dir, "renew"), 2);
           assert.strictEqual((yield* status(service)).state, "active");
         }),
       ),
@@ -859,18 +921,25 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("PlaytestServic
               (yield* service.start({ threadId: THREAD, target: "dev-1" })).outcome,
               "started",
             );
-            yield* setFile(dir, "renew.code", "3");
-            // One failed renew a minute (a sweep again after each change, until the renew ran).
+            // One failed renew a minute (a sweep again after each change, until the renew's answer
+            // is stored: its `finished|renew` line comes before that). Each fails with its own code,
+            // so the stored problem tells the two apart.
             for (const count of [1, 2]) {
+              yield* setFile(dir, "renew.code", `${2 + count}`);
               yield* time.advance(MINUTE);
               yield* signal.until(
                 Effect.andThen(
                   service.runDue(),
-                  Effect.map(finished(dir, "renew"), (done) => done === count),
+                  Effect.map(
+                    status(service),
+                    (s) => s.problem?.includes(`Exit code ${2 + count}.`) ?? false,
+                  ),
                 ),
               );
+              assert.strictEqual(yield* finished(dir, "renew"), count);
               assert.strictEqual((yield* status(service)).state, "active");
             }
+            yield* setFile(dir, "renew.code", "3");
             yield* time.advance(MINUTE);
             yield* signal.until(
               Effect.andThen(
