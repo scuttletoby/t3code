@@ -4,7 +4,7 @@ It checks every call that can start an agent or change an agent's model: Claude 
 versions) and Workflow tool, and T3's MCP tools in T3_TOOLS. CHECKED_TOOLS below is the one list: the hook's
 matcher, tool_kind() and the self-check are all made from it. Every other tool passes untouched.
 
-The policy is a JSON file {"mode": "off" | "advise" | "enforce", "allow": [rows]}; the machine file
+The policy is a JSON file {"mode": "off" | "advise" | "enforce", "allow": [rows], "version": 1}; the machine file
 (fork-kit/common) names it in its "model-guard" section. Rules (README.md next to this folder):
 
 - every checked call names its model and its effort, and both are in one row; else enforce refuses and lists
@@ -13,6 +13,8 @@ The policy is a JSON file {"mode": "off" | "advise" | "enforce", "allow": [rows]
   field on a tool that has none) is refused in enforce;
 - the policy file or the machine file missing, unreadable or invalid: refused, naming the file (fail closed);
 - mode off: every call passes; advise: every call passes and the agent is told what enforce would do;
+- every advise note and every refusal is also written to the system log (tag model-guard), so the machine owner
+  has a record (`journalctl -t model-guard`); a log that cannot be written never changes the answer;
 - a passing call gets the row's "useFor" note, so the agent sees what the model is for.
 
 Plain Python 3 standard library. No state: the files are read again on every call.
@@ -42,9 +44,15 @@ ULTRACODE_RUNS_AT = 'xhigh'
 
 # Every tool the hook checks, and how. The one list: HOOK_MATCHER, tool_kind() and the self-check come from it.
 # Claude Code's own tools by name; T3's under any MCP server name (mcp__<server>__<tool>).
-CLAUDE_TOOLS = {'Agent': 'agent', 'Task': 'agent', 'Workflow': 'workflow'}
+# RemoteTrigger creates, changes and fires cloud routines that run on a model the guard cannot see.
+CLAUDE_TOOLS = {'Agent': 'agent', 'Task': 'agent', 'Workflow': 'workflow', 'RemoteTrigger': 'remote'}
 T3_TOOLS = ('delegate_task', 'create_threads', 't3_thread_launch', 't3_thread_configure', 't3_thread_transfer',
-            't3_thread_send', 't3_thread_send_attachments', 'schedule_task')
+            't3_thread_send', 't3_thread_send_attachments', 'schedule_task', 't3_project_create',
+            't3_project_update')
+# RemoteTrigger actions that only read
+REMOTE_READ_ACTIONS = ('list', 'get', 'list_runs', 'get_run_log')
+# the policy versions this kit reads
+POLICY_VERSION = 1
 MCP_TOOL = re.compile(r'^mcp__.+__(' + '|'.join(T3_TOOLS) + r')$')
 # what the self-check tests the matcher with (T3's own server name; the matcher takes any)
 CHECKED_TOOLS = tuple(CLAUDE_TOOLS) + tuple(f'mcp__t3-code__{t}' for t in T3_TOOLS)
@@ -118,9 +126,13 @@ def _text(value):
     return None if value.strip() else 'must not be empty'
 
 
+# "ultracodeOption": false says T3 offers this Claude model no ultracode option (its effort list has no ultracode,
+# ClaudeModelCatalog.ts withUltracodeToggle), so a T3 pick of it need not name ultracode, and T3 refuses one that does
 ROW = {'driver': (str, machine_file.REQUIRED, _text), 'model': (str, machine_file.REQUIRED, _text),
        'efforts': (list, None, _words), 'defaultEffort': (str, None, _text), 'aliases': (list, None, _words),
-       'useFor': (str, None, None)}
+       'useFor': (str, None, None), 'ultracodeOption': (bool, True, None)}
+# the guard's own /etc folder: an uninstall removes everything in it, so the policy may not live there
+ETC_DIR = os.path.dirname(INSTALLED)
 
 
 def parse_policy(text, path):
@@ -129,8 +141,15 @@ def parse_policy(text, path):
         data = json.loads(text, object_pairs_hook=_no_duplicates)
     except (ValueError, RecursionError) as e:
         raise PolicyError(f'{path}: not valid JSON ({e})') from None
+    if isinstance(data, dict) and isinstance(data.get('version'), int) and not isinstance(data['version'], bool) \
+            and data['version'] > POLICY_VERSION:
+        # checked first: a newer policy may use keys or rules this kit does not know
+        raise PolicyError(f'{path}.version: {data["version"]} is newer than this kit knows ({POLICY_VERSION}); '
+                          f'update the kit')
+    positive = lambda v: None if v >= 1 else 'must be 1 or more'  # noqa: E731
     policy = machine_file.fields(data, {'mode': (str, machine_file.REQUIRED, None),
-                                        'allow': (list, machine_file.REQUIRED, None)}, path)
+                                        'allow': (list, machine_file.REQUIRED, None),
+                                        'version': (int, 1, positive)}, path)
     if policy['mode'] not in MODES:
         raise PolicyError(f'{path}.mode: must be one of {", ".join(MODES)} (it is {policy["mode"]!r})')
     rows, names = [], {}
@@ -139,20 +158,55 @@ def parse_policy(text, path):
         row = machine_file.fields(raw, ROW, where)
         if row['defaultEffort'] is not None and row['defaultEffort'] not in (row['efforts'] or ()):
             raise PolicyError(f'{where}.defaultEffort: {row["defaultEffort"]!r} is not one of its efforts')
+        if not row['ultracodeOption'] and row['driver'] != CLAUDE_DRIVER:
+            raise PolicyError(f'{where}.ultracodeOption: only {CLAUDE_DRIVER} rows have an ultracode option')
+        if not row['ultracodeOption'] and ULTRACODE_EFFORT in (row['efforts'] or ()):
+            raise PolicyError(f'{where}.ultracodeOption: false, so the model cannot run the effort ultracode')
         for name in [row['model']] + (row['aliases'] or []):
             # a name (model or alias) means one row of a driver, never two
             if (row['driver'], name) in names:
                 raise PolicyError(f'{where}: {row["driver"]} {name!r} is also in allow[{names[row["driver"], name]}]')
             names[row['driver'], name] = i
         rows.append(row)
-    return {'mode': policy['mode'], 'allow': rows}
+    return {'mode': policy['mode'], 'allow': rows, 'version': policy['version']}
+
+
+def in_folder(path, folder):
+    """True when path is folder or inside it: by name, as written and resolved (links followed) on both sides, so
+    /private/etc/x is in /etc/x where /etc links to /private/etc; and, while the folder exists, by being the same
+    folder as one of path's resolved parents, which also catches another spelling on a case-insensitive file system
+    (/etc/Model-Guard on macOS)."""
+    names = {os.path.normpath(folder), os.path.realpath(folder)}
+    real = os.path.realpath(path)
+    for name in (os.path.normpath(path), real):
+        if any(name == n or name.startswith(n.rstrip(os.sep) + os.sep) for n in names):
+            return True
+    try:
+        want = os.stat(folder)
+    except OSError:
+        return False
+    while True:
+        try:
+            if os.path.samestat(os.stat(real), want):
+                return True
+        except OSError:
+            pass
+        parent = os.path.dirname(real)
+        if parent == real:
+            return False
+        real = parent
 
 
 def load_policy(machine_path=None, owner_uid=0):
     """(the machine section, the policy). Both files root-owned (owner_uid in tests); raises PolicyError."""
     machine_path = machine_path or machine_file.default_path()
     section = machine_file.read_section(KIT, machine_path, owner_uid)
-    absolute = lambda v: None if os.path.isabs(v) else 'must be an absolute path'  # noqa: E731
+    def absolute(v):
+        if not os.path.isabs(v):
+            return 'must be an absolute path'
+        if in_folder(v, ETC_DIR):
+            return f'must not be in {ETC_DIR}, which an uninstall removes'
+        return None
     cfg = machine_file.fields(section, {
         'policyFile': (str, machine_file.REQUIRED, absolute),
         'allowOtherHooks': (bool, False, None),
@@ -166,6 +220,8 @@ def describe(row):
     extra = [f'default {row["defaultEffort"]}'] if row['defaultEffort'] else []
     if row['aliases']:
         extra.append('Agent tool: ' + ' or '.join(repr(a) for a in row['aliases']))
+    if not row['ultracodeOption']:
+        extra.append('no ultracode option')
     text = f'{row["driver"]} {row["model"]} ({efforts}' + ''.join(f'; {e}' for e in extra) + ')'
     return text + (f': use for {row["useFor"]}' if row['useFor'] else '')
 
@@ -173,24 +229,62 @@ def describe(row):
 # ---------- one call
 
 
-def _efforts_in(options, where, problems):
-    """The efforts an options value ({id: value} or [{id, value}]) runs, as T3 runs them: ultracode on means the
-    effort "ultracode" (it runs at xhigh, so that xhigh is not named again)."""
+# JavaScript's String.prototype.trim: its WhiteSpace and LineTerminator characters (not Python's str.strip, which
+# trims \x1c-\x1f and keeps U+FEFF)
+JS_SPACE = '\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029' \
+           '\u202f\u205f\u3000\ufeff'
+
+
+def js_trim(text):
+    return text.strip(JS_SPACE)
+
+
+def _option_pairs(options, where, problems):
+    """The (id, value) pairs of an options value ({id: value} or [{id, value}]) as T3 reads them
+    (packages/contracts/src/model.ts ProviderOptionSelections): ids and text values trimmed. T3 drops a value that is
+    not a text or a boolean, or an empty id or text, and then uses the default; its lookups take the first entry of
+    an id. So such a value is refused, and so is an id given twice after trimming. None when refused."""
     if options is None:
         return []
     if isinstance(options, dict):
-        pairs = list(options.items())
+        raw = list(options.items())
     elif isinstance(options, list) and all(isinstance(o, dict) for o in options):
-        pairs = [(o.get('id'), o.get('value')) for o in options]
+        raw = [(o.get('id'), o.get('value')) for o in options]
     else:
         problems.append(f'{where}.options is neither an object nor a list of {{id, value}}')
-        return []
+        return None
+    pairs, seen = [], set()
+    for key, value in raw:
+        name = js_trim(key) if isinstance(key, str) else ''
+        if not name:
+            problems.append(f'{where}.options has an option id {key!r} that is not a non-empty text')
+            return None
+        if name in seen:
+            problems.append(f'{where}.options names {name!r} twice (T3 trims option ids, so {key!r} is {name!r})')
+            return None
+        seen.add(name)
+        if name == ULTRACODE_OPTION_ID and not isinstance(value, bool):
+            problems.append(f'{where}.options.ultracode must be true or false (T3 uses the default for {value!r})')
+            return None
+        if isinstance(value, str) and js_trim(value):
+            value = js_trim(value)
+        elif not isinstance(value, bool):
+            problems.append(f'{where}.options.{name}: {value!r} is not a non-empty text or true/false (T3 drops it '
+                            f'and uses the default)')
+            return None
+        pairs.append((name, value))
+    return pairs
+
+
+def _efforts_in(pairs):
+    """The efforts option pairs run, as T3 runs them: ultracode on means the effort "ultracode" (it runs at xhigh,
+    so that xhigh is not named again)."""
     efforts = [value for key, value in pairs if key in EFFORT_OPTION_IDS]
     ultracode = [value for key, value in pairs if key == ULTRACODE_OPTION_ID]
     if ULTRACODE_EFFORT in efforts:       # the old effort value: xhigh, with the option on unless it is given
         efforts = [ULTRACODE_RUNS_AT if e == ULTRACODE_EFFORT else e for e in efforts]
         ultracode = ultracode or [True]
-    if any(v not in (False, None) for v in ultracode):
+    if True in ultracode:
         efforts = [e for e in efforts if e != ULTRACODE_RUNS_AT] + [ULTRACODE_EFFORT]
     return efforts
 
@@ -198,10 +292,10 @@ def _efforts_in(options, where, problems):
 def check_pick(where, model, efforts, driver, rows, agent, problems, matched):
     """One model pick against the rows; adds problems, or the rows it matched. Without a driver every row naming
     the model must accept the pick. A row without "efforts" accepts only a pick that names no effort."""
-    if not isinstance(model, str) or not model.strip() or model == 'inherit':
+    if not isinstance(model, str) or not js_trim(model) or js_trim(model) == 'inherit':
         problems.append(f'{where} names no model (every call must name one; the guard cannot see the parent\'s)')
         return
-    model = model.strip()  # T3 trims it too
+    model = js_trim(model)  # T3 trims it too
     if driver is not None and not isinstance(driver, str):
         problems.append(f'{where} has a driver that is not a text')
         return
@@ -244,7 +338,8 @@ WF_FORBIDDEN = frozenset((
     'Reflect', 'Proxy', 'with', '__proto__', 'prototype', 'getPrototypeOf', 'setPrototypeOf', 'defineProperty',
     'defineProperties', 'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'arguments', 'setTimeout',
     'setInterval'))
-# after these words a [ starts an array (not a member access)
+# after these words a [ starts an array (not a member access), unless the word is a property name (after . or ?.);
+# "of" is the word only as the first of directly inside a for (...) header, after the binding; elsewhere it is a name
 WF_EXPRESSION_WORDS = frozenset((
     'return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'new', 'delete', 'void', 'throw', 'instanceof', 'yield',
     'await', 'const', 'let', 'var', 'export'))
@@ -461,10 +556,21 @@ def workflow_problems(args, rows, problems, matched):
         return
     try:
         toks = _js_tokens(script)
-        calls, opens = 0, []
+        calls, opens, heads, of_words = 0, [], [], set()
+
+        def dot_before(j):
+            return j >= 1 and toks[j - 1][0] == 'punct' and toks[j - 1][1] in ('.', '?.')
+
         for k, (kind, text, line, _) in enumerate(toks):
             prev = toks[k - 1] if k else None
-            after_dot = prev is not None and prev[0] == 'punct' and prev[1] in ('.', '?.')
+            after_dot = dot_before(k)
+            if kind == 'name' and text == 'of' and not after_dot and opens and opens[-1] == '(' and heads[-1] \
+                    and not heads[-1]['of'] and prev is not None \
+                    and (prev[0] == 'name' and (prev[1] not in WF_EXPRESSION_WORDS or prev[1] == 'of'
+                                                or dot_before(k - 1))
+                         or prev[0] == 'punct' and prev[1] in (']', '}', ')')):
+                heads[-1]['of'] = True   # the for-of keyword; any other "of" is a name
+                of_words.add(k)
             if kind == 'name' and text in WF_FORBIDDEN:
                 raise ScriptError(f'line {line}: uses {text!r}, which the guard cannot follow')
             if kind == 'name' and text == 'workflow' and not after_dot:
@@ -481,8 +587,10 @@ def workflow_problems(args, rows, problems, matched):
             if kind != 'punct':
                 continue
             if text == '[':
+                word = prev is not None and prev[0] == 'name' and prev[1] in WF_EXPRESSION_WORDS \
+                    and not dot_before(k - 1) and (prev[1] != 'of' or k - 1 in of_words)
                 if prev is not None and (prev[0] in ('num', 'str')
-                                         or prev[0] == 'name' and prev[1] not in WF_EXPRESSION_WORDS
+                                         or prev[0] == 'name' and not word
                                          or prev[0] == 'punct' and prev[1] in (')', ']', '}', '}`', '?.')):
                     if toks[k + 1][0] != 'num' or toks[k + 2][:2] != ['punct', ']']:
                         raise ScriptError(f'line {line}: a computed member access other than [number]')
@@ -491,12 +599,17 @@ def workflow_problems(args, rows, problems, matched):
                     raise ScriptError(f'line {line}: a computed key')
             if text in _OPEN:
                 opens.append(text)
+                for_head = text == '(' and prev is not None and prev[0] == 'name' and not after_dot and (
+                    prev[1] == 'for' or prev[1] == 'await' and k >= 2 and toks[k - 2][:2] == ['name', 'for'])
+                heads.append({'of': False} if for_head else None)
             elif text in ('}', ')', ']', '}`', '}${'):
                 if not opens or _OPEN[opens[-1]] != text[0]:
                     raise ScriptError(f'line {line}: brackets do not match')
                 opens.pop()
+                heads.pop()
                 if text == '}${':
                     opens.append('`${')
+                    heads.append(None)
     except ScriptError as e:
         problems.append(f'the Workflow script cannot be checked ({e}); write each agent() call as agent(prompt, '
                         f'{{model: "...", effort: "...", ...}}) with no tricks')
@@ -516,13 +629,46 @@ def check_call(kind, args, rows):
     if kind == 'workflow':
         workflow_problems(args, rows, problems, matched)
         return problems, matched
+    if kind == 'remote':
+        action = args.get('action')
+        if action not in REMOTE_READ_ACTIONS:
+            problems.append(f'RemoteTrigger {action!r} creates, changes or fires a cloud routine, which runs on a '
+                            f'model the guard cannot see (only {", ".join(REMOTE_READ_ACTIONS)} pass)')
+        return problems, matched
 
-    def target(where, value):
+    def target(where, value, selection=False):
         if not isinstance(value, dict):
             problems.append(f'{where} is missing: name its model and options.effort (nothing is inherited)')
             return
-        efforts = _efforts_in(value.get('options'), where, problems)
-        check_pick(where, value.get('model'), efforts, value.get('driverKind'), rows, False, problems, matched)
+        if selection and 'driverKind' in value:
+            # A ModelSelection (t3_thread_launch, t3_thread_configure, a project's default) has only instanceId or
+            # provider, model and options; T3 drops any other key (packages/contracts/src/modelSelection.ts) and
+            # runs the pick on the instance, whatever driver this names. So the guard never reads it there: such a
+            # pick is checked against every row of its model, and a driverKind is refused so it cannot mislead.
+            problems.append(f'{where}.driverKind: T3 ignores it on a model selection (it runs the pick on the named '
+                            f'instance), so the guard cannot use it: leave it out, and every row of the model must '
+                            f'allow the pick')
+            return
+        pairs = _option_pairs(value.get('options'), where, problems)
+        if pairs is None:
+            return
+        # only a delegate_task or create_threads target has a real driverKind: T3 refuses an instance of another
+        # driver there (OrchestratorMcpService.ts resolveTarget). On a model selection it is refused above.
+        model, driver = value.get('model'), value.get('driverKind')
+        check_pick(where, model, _efforts_in(pairs), driver, rows, False, problems, matched)
+        # A Claude pick that leaves ultracode out can still run it: delegate_task with the parent's model and instance
+        # starts from the parent's options and lays the given ones over them (OrchestratorMcpService.ts resolveTarget,
+        # "Given values override inherited"), so under a parent running ultracode the child runs it too; and T3 takes
+        # the catalog's default where the default effort is ultracode (ClaudeModelCatalog.ts ultracodeByDefault).
+        # So a pick whose row does not allow ultracode must say ultracode: false itself, unless the row says the
+        # model has no ultracode option (T3 refuses the option there, and nothing can turn it on).
+        if driver in (None, CLAUDE_DRIVER) and isinstance(model, str) \
+                and ULTRACODE_OPTION_ID not in (key for key, _ in pairs) \
+                and any(r['driver'] == CLAUDE_DRIVER and r['model'] == js_trim(model) and r['ultracodeOption']
+                        and ULTRACODE_EFFORT not in (r['efforts'] or ()) for r in rows):
+            problems.append(f'{where}: options must name ultracode (false): without it {js_trim(model)!r} can run '
+                            f'ultracode (inherited from the parent thread, or the model\'s default). If T3 offers '
+                            f'this model no ultracode option, the policy row says "ultracodeOption": false')
 
     if kind in NO_MODEL_TOOLS:
         for key in args:
@@ -541,9 +687,14 @@ def check_call(kind, args, rows):
         for i, thread in enumerate(threads if isinstance(threads, list) else []):
             target(f'threads[{i}].target', thread.get('target') if isinstance(thread, dict) else None)
     elif kind == 't3_thread_launch':
-        target('modelSelection', args.get('modelSelection'))
-    elif kind == 't3_thread_configure' and 'modelSelection' in args:
-        target('modelSelection', args.get('modelSelection'))  # without it the call only reads the thread
+        target('modelSelection', args.get('modelSelection'), selection=True)
+    elif kind == 't3_thread_configure' and 'modelSelection' in args:   # without it the call only reads the thread
+        target('modelSelection', args.get('modelSelection'), selection=True)
+    elif kind in ('t3_project_create', 't3_project_update') and args.get('defaultModelSelection') is not None:
+        # the project's default model: schedule_task and other callers that name none run on it. Left out or null,
+        # the call sets no model (the project falls back to a default this call does not set), so only a given
+        # selection is checked.
+        target('defaultModelSelection', args.get('defaultModelSelection'), selection=True)
     return problems, matched
 
 
@@ -556,10 +707,34 @@ def _out(decision=None, reason=None, context=None):
     return {'hookSpecificOutput': out}
 
 
-def decide(payload, load):
+SYSLOG_IDENT = KIT
+RECORD_MAX = 4000
+
+
+def syslog_record(text):
+    """Write one line to the system log under SYSLOG_IDENT (journalctl -t model-guard; /var/log/syslog or
+    auth.log elsewhere)."""
+    import syslog
+    syslog.openlog(SYSLOG_IDENT, 0, syslog.LOG_USER)
+    syslog.syslog(syslog.LOG_WARNING, text)
+
+
+def _record(record, payload, text):
+    """Hand the owner's record one line; a recorder that fails never changes the hook's answer."""
+    if record is None:
+        return
+    session = payload.get('session_id') if isinstance(payload, dict) else None
+    line = (f'session {session}: ' if isinstance(session, str) else '') + text
+    try:
+        record(line[:RECORD_MAX])
+    except Exception:  # noqa: BLE001 - the record is best effort; the answer stands
+        pass
+
+
+def decide(payload, load, record=None):
     """The hook's answer (a dict to print) or None (no output: the call goes on as without the hook).
     `load()` returns (machine section, policy) or raises PolicyError. Never returns 'allow': a passing call still
-    goes through the session's own permission rules."""
+    goes through the session's own permission rules. `record(line)` gets every refusal and every advise note."""
     tool = payload.get('tool_name') if isinstance(payload, dict) else None
     kind = tool_kind(tool)
     if kind is None:
@@ -567,8 +742,10 @@ def decide(payload, load):
     try:
         cfg, policy = load()
     except PolicyError as e:
-        return _out('deny', f'model-guard refused {tool}: the model policy cannot be used ({e}). The guard fails '
-                            f'closed. Do not work around it: tell the person who runs this machine.')
+        reason = (f'model-guard refused {tool}: the model policy cannot be used ({e}). The guard fails closed. Do '
+                  f'not work around it: tell the person who runs this machine.')
+        _record(record, payload, reason)
+        return _out('deny', reason)
     if policy['mode'] == 'off':
         return None
     problems, matched = check_call(kind, payload.get('tool_input'), policy['allow'])
@@ -579,11 +756,13 @@ def decide(payload, load):
     why = (f'{"; ".join(problems)}. Name an allowed model and its effort on every such call. '
            f'Allowed rows: {rows}. The policy ({cfg["policyFile"]}) is the machine owner\'s; do not edit it.')
     if policy['mode'] == 'enforce':
+        _record(record, payload, f'enforce: refused {tool}: {"; ".join(problems)}')
         return _out('deny', f'model-guard refused {tool}: {why}')
+    _record(record, payload, f'advise: enforce would refuse {tool}: {"; ".join(problems)}')
     return _out(context=f'model-guard (advise mode, nothing refused): enforce would refuse this {tool} call: {why}')
 
 
-def run_hook(stdin, stdout, machine_path=None, owner_uid=0):
+def run_hook(stdin, stdout, machine_path=None, owner_uid=0, record=syslog_record):
     try:
         payload = json.loads(stdin.read())
     except ValueError as e:
@@ -592,9 +771,10 @@ def run_hook(stdin, stdout, machine_path=None, owner_uid=0):
     else:
         reason = 'model-guard refused: the hook input is not a JSON object'
     if not isinstance(payload, dict):
+        _record(record, None, reason)
         out = _out('deny', reason)
     else:
-        out = decide(payload, lambda: load_policy(machine_path, owner_uid))
+        out = decide(payload, lambda: load_policy(machine_path, owner_uid), record)
     if out:
         stdout.write(json.dumps(out) + '\n')
     return 0
@@ -603,29 +783,14 @@ def run_hook(stdin, stdout, machine_path=None, owner_uid=0):
 # ---------- drift: does Claude Code's managed settings run the hook?
 
 
-def _covers(matcher, name):
-    """Claude Code's matcher rule: empty or '*' is every tool; only letters, digits, _, -, spaces, | and , is a
-    list of exact names; anything else is a JavaScript regular expression searched in the name."""
-    if matcher in (None, '', '*'):
-        return True
-    if not isinstance(matcher, str):
-        return False
-    if re.fullmatch(r'[\w\- |,]+', matcher, re.A):
-        return name in [w.strip() for w in re.split(r'[|,]', matcher)]
-    try:
-        return re.search(matcher, name) is not None
-    except re.error:
-        return False
-
-
 def entry_problems(entry):
-    """Why one PreToolUse entry is not the guard's (None when it is): its matcher covers every checked tool and its
-    only hook runs exactly HOOK_COMMAND, synchronously, with Claude Code's default timeout, and blocks on failure."""
+    """Why one PreToolUse entry is not the guard's (None when it is): it is exactly hook_entry(). The matcher must be
+    exactly HOOK_MATCHER: the self-check does not try to follow Claude Code's matcher rules, which may change, and
+    an entry from an older kit (whose matcher misses a tool added since) is reported until the installer runs."""
     if not isinstance(entry, dict) or set(entry) != {'matcher', 'hooks'}:
         return 'it is not exactly {"matcher", "hooks"}'
-    missed = [n for n in CHECKED_TOOLS if not _covers(entry['matcher'], n)]
-    if missed:
-        return f'its matcher misses {", ".join(missed)}'
+    if entry['matcher'] != HOOK_MATCHER:
+        return f'its matcher is not exactly {HOOK_MATCHER!r} (run model-guard-install install to rewrite it)'
     if entry['hooks'] != hook_entry()['hooks']:
         return (f'its hooks are not exactly one command {HOOK_COMMAND!r} with onFailure "block" '
                 '(no async, no timeout, nothing else)')
@@ -660,6 +825,77 @@ def settings_problems(files, allow_other_hooks):
         problems.append('allowManagedHooksOnly is not true, so a user or project hook can change a checked call '
                         'after the guard has seen it (set it in managed-settings.json, or "allowOtherHooks": true '
                         f'in the machine file\'s "{KIT}" section to accept that)')
+    return problems
+
+
+# Claude Code's own model limits (live-tested with Claude Code 2.1.325, see README "Claude Code's model keys"): they
+# bind the main session, Agent sub-agents and Workflow agents, whatever the call names, so in enforce mode the
+# managed settings must carry them, made from the policy's claudeAgent rows.
+EFFORT_ORDER = ('low', 'medium', 'high', 'xhigh', 'max')
+# Claude Code's model aliases: the env variable that maps each to a model (an update of Claude Code moves the map)
+FAMILY_ALIASES = ('opus', 'sonnet', 'haiku', 'fable')
+# variables that make a sub-agent or Workflow agent run on another model or effort than the call the guard saw;
+# empty is the neutral value (Claude Code ignores an empty one), and managed env wins over every other source
+NEUTRAL_ENV = ('CLAUDE_CODE_SUBAGENT_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE', 'CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL',
+               'CLAUDE_CODE_SUBAGENT_EFFORT')
+
+
+def model_settings(policy):
+    """The managed settings keys enforce mode needs, made from the policy's claudeAgent rows: {key: value}."""
+    rows = [r for r in policy['allow'] if r['driver'] == CLAUDE_DRIVER]
+    env = {name: '' for name in NEUTRAL_ENV}
+    for r in rows:
+        for alias in r['aliases'] or ():
+            if alias in FAMILY_ALIASES:
+                env[f'ANTHROPIC_DEFAULT_{alias.upper()}_MODEL'] = r['model']
+    out = {'availableModels': sorted({r['model'] for r in rows}), 'enforceAvailableModels': True}
+    efforts = [ULTRACODE_RUNS_AT if e == ULTRACODE_EFFORT else e for r in rows for e in (r['efforts'] or ())]
+    known = [e for e in efforts if e in EFFORT_ORDER]
+    if known:
+        out['maxEffortLevel'] = max(known, key=EFFORT_ORDER.index)
+    out['env'] = env
+    return out
+
+
+def model_settings_problems(files, policy):
+    """Where the merged managed settings ([(path, data)], later files win, env merged by name) miss or differ from
+    model_settings(policy). Only enforce mode needs them: they bind in every mode, so advise and off do not."""
+    if policy['mode'] != 'enforce':
+        return []
+    want = model_settings(policy)
+    if not want['availableModels']:
+        return []  # no claudeAgent row: the guard refuses every Claude pick, and availableModels cannot say "none"
+    have, env, lists = {}, {}, []
+    for _, data in files:
+        if not isinstance(data, dict):
+            continue
+        for key in ('availableModels', 'enforceAvailableModels', 'maxEffortLevel'):
+            if key in data:
+                have[key] = data[key]
+        if 'availableModels' in data:
+            lists.append(data['availableModels'])
+        if isinstance(data.get('env'), dict):
+            env.update(data['env'])
+    problems = []
+    if any(not isinstance(v, list) or not all(isinstance(m, str) for m in v) for v in lists):
+        problems.append(f'availableModels is not a list of texts in every file ({lists!r})')
+    # the last file's list must be the rows' models, and no earlier one may name more: the check holds whether
+    # Claude Code takes the last list or joins the lists of all managed files
+    elif not lists or sorted(set(lists[-1])) != want['availableModels'] \
+            or not {m for v in lists for m in v} <= set(want['availableModels']):
+        problems.append(f'availableModels is {have.get("availableModels")!r} (in all files {lists!r}), not the '
+                        f'claudeAgent rows\' models {want["availableModels"]!r}')
+    if have.get('enforceAvailableModels') is not True:
+        problems.append('enforceAvailableModels is not true')
+    if 'maxEffortLevel' in want and have.get('maxEffortLevel') != want['maxEffortLevel']:
+        problems.append(f'maxEffortLevel is {have.get("maxEffortLevel")!r}, not the rows\' highest effort '
+                        f'{want["maxEffortLevel"]!r}')
+    for name, value in want['env'].items():
+        if env.get(name) != value:
+            problems.append(f'env {name} is {env.get(name)!r}, not {value!r}')
+    if problems:
+        problems = ['managed settings miss Claude Code\'s own model limits (' + '; '.join(problems) + '). Put these '
+                    'keys in managed-settings.json: ' + json.dumps(want, sort_keys=True)]
     return problems
 
 
@@ -713,7 +949,7 @@ def self_check(machine_path=None, owner_uid=0, prefix=''):
             ok = False
         if not ok:
             problems.append(f'{path}: differs from what was installed ({kind})')
-    allow_other_hooks = False
+    allow_other_hooks, policy = False, None
     try:
         cfg, policy = load_policy(machine_path, owner_uid)
     except PolicyError as e:
@@ -727,7 +963,10 @@ def self_check(machine_path=None, owner_uid=0, prefix=''):
         problems.append(str(e))
     else:
         problems += [f'{path}: {error}' for path, _, error in files if error]
-        problems += settings_problems([(path, data) for path, data, error in files if not error], allow_other_hooks)
+        usable = [(path, data) for path, data, error in files if not error]
+        problems += settings_problems(usable, allow_other_hooks)
+        if policy is not None:
+            problems += model_settings_problems(usable, policy)
     for p in problems:
         print(f'PROBLEM: {p}')
     print('self-check: ' + ('OK' if not problems else f'{len(problems)} problems'))
