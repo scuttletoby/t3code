@@ -329,8 +329,11 @@ start: the new launcher then idled and verify waited for minutes.
   and the kit must not take that probe for the launcher (it would free the home in the middle of `t3 update`). A
   rule of "held on every poll for 100 ms" could not tell frequent probes from the launcher when load stretched the
   polls (#546). For an older build the kit lets go just before the start, as before (its server would meet the
-  kit's lock and idle). The verify step journals how the lock was let go (`handover`: `launcher`, `timeout`,
-  `start failed`, `before the start ...`) and any marker renewal that failed (`renewFailed`).
+  kit's lock and idle). The kit lets go at its first look (every 20 ms) after the launcher's claim, well inside
+  the 250 ms its server waits for the owner lock (#534). The verify step journals how the lock was let go
+  (`handover`: `launcher`, `timeout`, `start failed`, `before the start ...`), for `launcher` the measured delay
+  (`handoverMs`: at most this many ms from the claim to the let-go; with `handoverLate` when it reached 250 ms, so
+  a server that idled on a very busy host is named), and any marker renewal that failed (`renewFailed`).
 - **Backstop, a foreign server.** An SSH client older than 0.1.10 reads neither, and a server started by hand
   ignores both. When the runtime record names a live process that the boot service did not start and that itself
   holds `userdata/server-owner.sqlite` (a stale record whose pid was reused holds nothing and is never named), for
