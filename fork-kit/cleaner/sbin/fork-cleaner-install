@@ -35,6 +35,7 @@ DISABLE = 'systemctl --user disable --now fork-cleaner.timer'
 
 class CleanerInstaller(kit_install.Installer):
     PROG = 'fork-cleaner-install'
+    PROGRAM = __file__
     KIT = 'cleaner'
     ETC = '/etc/fork-cleaner'
     LIBEXEC = '/usr/local/libexec/fork-cleaner'
