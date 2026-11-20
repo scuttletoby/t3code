@@ -298,6 +298,38 @@ class PathSafety(GuardCase):
         with self.assertRaises(self.c.facts.Unreadable):
             self.c.facts.read_mounts(self.path('no-such-mountinfo'))
 
+    def test_whole_btrfs_subvolumes_are_read_from_the_mount_list(self):
+        """#604: a mount whose root is its own `subvol=` shows a whole btrfs subvolume; a part of one, a subvolume
+        of another filesystem kind, or a line without `subvol=` is not whole. A name with a space or a comma is
+        written escaped."""
+        info = self.file(self.path('mountinfo'), ''.join(line + '\n' for line in (
+            '22 1 0:31 /@ / rw,relatime shared:1 - btrfs /dev/sda2 rw,space_cache=v2,subvolid=256,subvol=/@',
+            '23 22 0:31 /@home /home rw,relatime shared:2 - btrfs /dev/sda2 rw,subvolid=257,subvol=/@home',
+            '24 22 0:31 /@home/u/src /srv/src rw,relatime shared:2 - btrfs /dev/sda2 rw,subvolid=257,subvol=/@home',
+            r'25 22 0:31 /@my\040data /data rw - btrfs /dev/sda2 rw,subvolid=258,subvol=/@my\040data',
+            r'26 22 0:31 /@a\054b /ab rw - btrfs /dev/sda2 rw,subvolid=259,subvol=/@a\054b',
+            '27 22 8:1 /srv /srv/old rw - ext4 /dev/sdb1 rw,subvol=/srv',
+            '28 22 0:32 /@x /x rw - btrfs /dev/sdc1 rw,subvolid=5')))
+        got = self.c.facts.read_mounts(info, proc=None)
+        self.assertEqual(got.whole, {('0:31', '/@'), ('0:31', '/@home'), ('0:31', '/@my data'), ('0:31', '/@a,b')})
+        self.assertEqual(self.c.facts.Mounts().whole, set())
+
+    def test_the_mount_holding_a_path_and_where_a_folder_of_a_filesystem_is_shown(self):
+        """#604: `holding` is the deepest mount, the last one on a mount point (it hides those before);
+        `shown_at` is every place a folder of a filesystem is seen, not where another mount hides it."""
+        mounts = self.c.facts.Mounts(lines=[
+            ('/', '8:1', '/'), ('/srv/view', '8:9', '/data'), ('/mnt/disk', '8:9', '/'),
+            ('/mnt/other', '8:9', '/data/deeper'), ('/mnt/hidden', '8:9', '/'), ('/mnt/hidden', '8:10', '/')])
+        self.assertEqual(mounts.holding('/srv/view/a'), ('/srv/view', '8:9', '/data'))
+        self.assertEqual(mounts.holding('/srv/viewer'), ('/', '8:1', '/'))
+        self.assertEqual(mounts.holding('/mnt/hidden/x'), ('/mnt/hidden', '8:10', '/'))
+        self.assertIsNone(self.c.facts.Mounts(lines=[('/srv', '8:1', '/')]).holding('/home'))
+        self.assertEqual(mounts.shown_at('8:9', '/'), ['/mnt/disk'])
+        self.assertEqual(mounts.shown_at('8:9', '/data'), ['/mnt/disk/data', '/srv/view'])
+        self.assertEqual(mounts.shown_at('8:9', '/data/deeper/x'),
+                         ['/mnt/disk/data/deeper/x', '/mnt/other/x', '/srv/view/deeper/x'])
+        self.assertEqual(mounts.shown_at('8:7', '/'), [])
+
     def test_another_owner(self):
         d = self.folder('tmp', 'job-1')
         inner = self.file(self.path('tmp', 'job-2', 'deep', 'theirs.bin'))
@@ -766,6 +798,11 @@ class GitFolders(GuardCase):
 
 
 MUTATIONS = {
+    'a whole btrfs subvolume is its subvol=': ('facts', 'if subvol == [root]:', 'if subvol:', PathSafety,
+                                               'test_whole_btrfs_subvolumes_are_read_from_the_mount_list'),
+    'the last mount on a point hides the others': ('facts', 'if best is None or len(point) >= len(best[0]):',
+                                                   'if best is None or len(point) > len(best[0]):', PathSafety,
+                                                   'test_the_mount_holding_a_path_and_where_a_folder_of_a_filesystem_is_shown'),
     'must keep: the built-in paths': ('guard', 'kept = must_keep_match(cfg.must_keep, path)', 'kept = None',
                                       MustKeep, 'test_transcripts_sessions_and_t3_data_are_never_deleted'),
     'must keep: the agent homes whole': ('config', "'~/.claude*', '~/.codex*',\n", "'~/.claude*/projects', '~/.codex*/sessions',\n",

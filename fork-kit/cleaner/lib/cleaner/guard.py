@@ -84,27 +84,75 @@ def _keep_reason(keep):
     return line[0].strip() if line and line[0].strip() else 'no reason given'
 
 
-def above_refusal(path):
-    """A KEEP file or a git folder (`.git`, or `HEAD`, `objects` and `refs`) in a folder above the configured folder
-    `path`, up to `/`: everything under it is kept, as below it (a work tree's files are git's; a KEEP file keeps its
-    whole folder). None when there is none. A folder above that cannot be read refuses. The rules that only look
-    from a configured folder down (compress-cold, dedupe) ask this at the plan and again at their last check."""
-    here = os.path.dirname(path)
-    while True:
-        try:
-            keep = _lstat_or_none(os.path.join(here, KEEP_FILE))
-            in_git = _lstat_or_none(os.path.join(here, '.git')) is not None or all(
-                _lstat_or_none(os.path.join(here, n)) is not None for n in ('HEAD', 'objects', 'refs'))
-        except OSError as ex:
-            return Refusal('could not read', f'{here}: {ex.strerror}')
-        if keep is not None and not stat.S_ISDIR(keep.st_mode):
-            return Refusal('KEEP file', f'{_keep_reason(os.path.join(here, KEEP_FILE))} ({here}, above {path})')
-        if in_git:
-            return Refusal('git folder', f'{here}, above {path}: git needs its files as they are')
-        up = os.path.dirname(here)
-        if up == here:
-            return None
-        here = up
+BARE = ('HEAD', 'objects', 'refs')     # a bare repository: all three in one folder
+ABOVE_LIMIT = 1000                   # folders the walk above may read; more (a loop of mounts?) refuses
+
+
+def marker(here):
+    """What marks the folder `here` as one compress-cold and dedupe leave whole, with everything under it: ('KEEP
+    file', its reason) for an entry named KEEP of any kind (a file, a link, a folder), ('git folder', None) for a
+    `.git` of any kind (a folder; a file of a linked worktree or a submodule) or a bare repository (`HEAD`, `objects`
+    and `refs`), None for neither. One check, the same in the folders above a configured folder and in and under
+    it: each name is looked up (lstat, never followed), so on a folder that folds case `keep` counts too. Raises
+    OSError when a name cannot be looked up: that is not "not there"."""
+    keep = os.path.join(here, KEEP_FILE)
+    st = _lstat_or_none(keep)
+    if st is not None:
+        return 'KEEP file', ('a folder named KEEP' if stat.S_ISDIR(st.st_mode) else _keep_reason(keep))
+    if _lstat_or_none(os.path.join(here, '.git')) is not None:
+        return 'git folder', None
+    if all(_lstat_or_none(os.path.join(here, n)) is not None for n in BARE):
+        return 'git folder', None
+    return None
+
+
+def above_refusal(path, mounts):
+    """A KEEP file or a git folder (`marker`) in a folder above the configured folder `path`: everything under it is
+    kept, as below it (a work tree's files are git's; a KEEP file keeps its whole folder). None when there is none.
+    The rules that only look from a configured folder down (compress-cold, dedupe) ask this at the plan and again
+    at their last checks.
+
+    "Above" is every folder above it up to `/`, and also every folder above it on its own filesystem: a mount that
+    shows one folder of a filesystem (a bind mount, a btrfs subvolume) hides the folders above that one, and git
+    still sees the files there. Those are read where another mount of the same filesystem (`mounts.lines`) shows
+    them. When no mount here shows them, it refuses ("could not read"), except above a whole btrfs subvolume
+    (`mounts.whole`): a btrfs root that is not mounted anywhere holds the subvolumes, not a user's files. A folder
+    above that cannot be read refuses too."""
+    stack, seen = [(path, False)], set()
+    while stack:
+        here, look = stack.pop()
+        if (here, look) in seen:
+            continue
+        seen.add((here, look))
+        if len(seen) > ABOVE_LIMIT:
+            return Refusal('could not read', f'more than {ABOVE_LIMIT} folders above {path} through its mounts')
+        if look:
+            try:
+                found = marker(here)
+            except OSError as ex:
+                return Refusal('could not read', f'{here}: {ex.strerror}')
+            if found is not None and found[0] == 'KEEP file':
+                return Refusal('KEEP file', f'{found[1]} ({here}, above {path})')
+            if found is not None:
+                return Refusal('git folder', f'{here}, above {path}: git needs its files as they are')
+        line = mounts.holding(here)
+        if line is None:
+            return Refusal('could not read', f'no mount in the mount list holds {here}')
+        point, device, root = line
+        if here == point and root != '/':
+            # `here` shows the folder `root` of its filesystem: the folder above that one is above it too.
+            if not root.startswith('/'):
+                return Refusal('could not read', f'{here} shows {root} of {device}, not a folder')
+            up = os.path.dirname(root)
+            places = mounts.shown_at(device, up)
+            if not places and (device, root) not in mounts.whole:
+                return Refusal('could not read', f'{here} shows the folder {root} of its filesystem ({device}), and no '
+                                                 f'mount here shows the folder above it ({up}): a KEEP file or a git '
+                                                 'folder there could not be seen')
+            stack.extend((place, True) for place in reversed(places))
+        if here != '/':
+            stack.append((os.path.dirname(here), True))
+    return None
 
 
 def _lstat_or_none(path):

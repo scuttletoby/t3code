@@ -246,10 +246,12 @@ class Mounts:
     mount namespace the cleaner may read, that shows one folder of a filesystem rather than all of it: the source of
     a bind mount (a container volume, a sandbox). `options`: {mount point: its per-mount options} (`noatime`,
     `relatime`, ...). `fstab`: the mount points /etc/fstab names, mounted now or not; None when it cannot be read.
-    A device is "major:minor" as mountinfo writes it."""
+    `whole`: (device, root) of each mount of the cleaner's own namespace that shows a whole btrfs subvolume (its
+    root is its `subvol=`). A device is "major:minor" as mountinfo writes it."""
 
-    def __init__(self, points=('/',), lines=(), sources=(), options=None, fstab=()):
+    def __init__(self, points=('/',), lines=(), sources=(), options=None, fstab=(), whole=()):
         self.points, self.lines, self.sources = set(points), list(lines), set(sources)
+        self.whole = set(whole)
         self.fstab = None if fstab is None else {os.path.normpath(p) for p in fstab}
         self.options = {point: frozenset(opts) for point, opts in (options or {}).items()}
 
@@ -262,6 +264,32 @@ class Mounts:
                 if best is None or len(point) > len(best):
                     best = point
         return None if best is None else self.options[best]
+
+    def holding(self, path):
+        """The mount line (mount point, device, root) that `path` (a real path, no links in it) is on: the one of
+        the deepest mount point that is `path` or holds it; of several on one point the last, which hides the
+        others. None when no line holds it."""
+        best = None
+        for line in self.lines:
+            point = line[0]
+            if point == '/' or path == point or path.startswith(point + '/'):
+                if best is None or len(point) >= len(best[0]):
+                    best = line
+        return best
+
+    def shown_at(self, device, folder):
+        """Every place in this mount namespace that shows the folder `folder` of the filesystem `device`: through a
+        mount of that filesystem whose root is that folder or holds it, and only where no other mount hides it."""
+        places = set()
+        for line in self.lines:
+            point, dev, root = line
+            if dev != device or not root.startswith('/'):
+                continue
+            if root == '/' or folder == root or folder.startswith(root + '/'):
+                place = os.path.normpath(os.path.join(point, os.path.relpath(folder, root)))
+                if self.holding(place) == line:
+                    places.add(place)
+        return sorted(places)
 
     def on_filesystem(self, path, dev):
         """Where `path` is on its own filesystem (the root of the deepest mount holding it, plus the rest), or None
@@ -288,9 +316,10 @@ class Mounts:
         return inside[0] if inside else None
 
 
-def _mount_lines(path, options=None):
+def _mount_lines(path, options=None, whole=None):
     """[(mount point, device, root)] of one mountinfo file; `options`, a dict, gets {mount point: its per-mount
-    options}. Raises Unreadable when it cannot be read or a line is strange."""
+    options}; `whole`, a set, gets (device, root) of each mount that shows a whole btrfs subvolume. Raises
+    Unreadable when it cannot be read or a line is strange."""
     try:
         with open(path, errors='surrogateescape') as f:
             lines = f.read().splitlines()
@@ -301,10 +330,16 @@ def _mount_lines(path, options=None):
         fields = line.split(' ')
         if len(fields) < 10 or '-' not in fields[6:] or not re.match(r'^\d+:\d+$', fields[2]):
             raise Unreadable(f'{path}: a line it cannot use: {line[:80]!r}')
-        point = os.path.normpath(_unescape(fields[4]))
-        out.append((point, fields[2], os.path.normpath(_unescape(fields[3]))))
+        point, root = os.path.normpath(_unescape(fields[4])), os.path.normpath(_unescape(fields[3]))
+        out.append((point, fields[2], root))
         if options is not None:
             options[point] = fields[5].split(',')      # a later mount on the same point hides the earlier one
+        rest = fields[fields.index('-', 6) + 1:]
+        if whole is not None and rest[:1] == ['btrfs'] and len(rest) >= 3:
+            # The super options are split before they are unescaped: a comma in a name is written as \054.
+            subvol = [os.path.normpath(_unescape(o[len('subvol='):])) for o in rest[2].split(',') if o.startswith('subvol=')]
+            if subvol == [root]:
+                whole.add((fields[2], root))
     return out
 
 
@@ -331,8 +366,8 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc', fstab='/etc/fstab'):
     number, so only this list shows it. Also the bind mount sources of every other mount namespace the cleaner can
     read (its own user's processes): a folder a container or a sandbox shows. Raises Unreadable when its own list
     cannot be read or does not even hold /; another process's list that cannot be read is not seen."""
-    options = {}
-    lines = _mount_lines(path, options)
+    options, whole = {}, set()
+    lines = _mount_lines(path, options, whole)
     points = {point for point, _, _ in lines}
     if '/' not in points:
         raise Unreadable(f'{path} does not name /')
@@ -355,7 +390,7 @@ def read_mounts(path='/proc/self/mountinfo', proc='/proc', fstab='/etc/fstab'):
         except Unreadable:
             continue
         sources.update((device, root) for _, device, root in other if root != '/')
-    return Mounts(points, lines, sources, options, read_fstab(fstab))
+    return Mounts(points, lines, sources, options, read_fstab(fstab), whole)
 
 
 # --- systemd units ------------------------------------------------------------------------------------------------
