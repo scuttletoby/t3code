@@ -1170,17 +1170,27 @@ class EveryWallsFile(WallsRunner):
                  '/etc/systemd/system': {'etc/systemd/system/': ''},
                  '/etc/auto.master': {'etc/auto.master': '/net -hosts\n'},
                  '/etc/myapp/private': {'etc/myapp/private/': ''},
+                 # Issue #594: what names this host's accounts (a job has its own passwd, group and hosts; the
+                 # launcher refuses those three itself: an older one's, below).
+                 '/etc/passwd-': {'etc/passwd-': 'alice:x:1000:1000:Alice Example:/home/alice:/bin/bash\n'},
+                 '/etc/group-': {'etc/group-': 'sudo:x:27:alice\n'},
+                 '/etc/subuid': {'etc/subuid': 'alice:100000:65536\n'},
+                 '/etc/subgid': {'etc/subgid': 'alice:100000:65536\n'},
+                 '/var/backups': {'var/backups/passwd.bak': 'alice:x:1000:1000:Alice:/home/alice:/bin/bash\n'},
+                 '/var': {'var/backups/group.bak': 'sudo:x:27:alice\n'},   # a folder that holds it
                  '/etc/nsswitch.conf,/etc/fstab': {}}   # a harmless entry beside one that is not
         for allow, files in fails.items():
             with self.subTest(allow):
                 p = run([os.path.join(self.folder, 'linux'), 'check'],
                         self.root(overlay(LINUX, {**files, conf: f'ALLOW_PATHS={allow}\n'})))
-                self.assertRegex(p.stdout, r'FAIL  mounts  .*an /etc entry that holds this host\'s secrets')
+                self.assertRegex(p.stdout, r'FAIL  mounts  .*a path that holds this host\'s secrets or account names')
                 self.assertIn(allow.split(',')[-1], p.stdout)
-        for allow in ('', '/etc/myapp', '/etc/java-17-openjdk', '/etc/ssl/certs', '/etc/shadow', '/etc/ssh'):
+        for allow in ('', '/etc/myapp', '/etc/java-17-openjdk', '/etc/ssl/certs', '/var/cache', '/etc/host.conf',
+                      '/etc/shadow', '/etc/ssh'):
             with self.subTest(allow or 'none'):   # the last two are not on this host: nothing bound
                 root = self.root(overlay(LINUX, {conf: f'ALLOW_PATHS={allow}\n', 'etc/myapp/app.conf': 'A=1\n',
-                                                 'etc/java-17-openjdk/': '', 'etc/ssl/certs/': ''}))
+                                                 'etc/java-17-openjdk/': '', 'etc/ssl/certs/': '',
+                                                 'var/cache/apt/': '', 'etc/host.conf': 'multi on\n'}))
                 for _ in range(2):
                     self.assertNotIn('mounts', self.walls('linux', 'check', root)[1])
         root = self.root(overlay(LINUX, {conf: None}))   # no launch.conf at all
@@ -1197,7 +1207,12 @@ class EveryWallsFile(WallsRunner):
                            (resolv + '/usr /usr\\n', True),   # not last: not the launcher's own
                            ('/usr /usr\\n/etc/resolv.conf /etc/ssl/private/r\\n', True),
                            ('/usr /usr\\n/etc/resolv.conf /etc/fork-fleet/launch.conf\\n', True),
-                           ('/usr /usr\\n/etc/resolv.conf /etc/dns/resolv.conf\\n', False)):   # RESOLV_CONF set
+                           ('/usr /usr\\n/etc/resolv.conf /etc/dns/resolv.conf\\n', False),   # RESOLV_CONF set
+                           # Issue #594: an older launcher that binds the host's own passwd, group or hosts, or a
+                           # backup of them through a link.
+                           ('/usr /usr\\n/etc/passwd /etc/passwd\\n' + resolv, True),
+                           ('/usr /usr\\n/etc/hosts /etc/hosts\\n' + resolv, True),
+                           ('/usr /usr\\n/opt/b /var/backups\\n' + resolv, True)):
             with self.subTest(lines):
                 write(launcher, f'#!/bin/sh\ncase $1 in paths) printf "{lines}" ;; *) exit 1 ;; esac\n')
                 os.chmod(launcher, 0o755)
@@ -1369,7 +1384,7 @@ class EveryWallsFile(WallsRunner):
         (fork-fleet-walls.py check), with what to do: re-run the installer. Its listed entries pass."""
         launcher = os.path.join(os.path.dirname(self.folder), 'fork-fleet-launch.sh')
         for lines, bad in (('/usr /usr\\n/etc /etc\\n', True), ('/usr /usr\\n/etc/x /etc\\n', True),
-                           ('/usr /usr\\n/etc/passwd /etc/passwd\\n/etc/ssl/certs /etc/ssl/certs\\n', False)):
+                           ('/usr /usr\\n/etc/nsswitch.conf /etc/nsswitch.conf\\n/etc/ssl/certs /etc/ssl/certs\\n', False)):
             with self.subTest(lines):
                 write(launcher, f'#!/bin/sh\ncase $1 in paths) printf "{lines}" ;; *) exit 1 ;; esac\n')
                 os.chmod(launcher, 0o755)
