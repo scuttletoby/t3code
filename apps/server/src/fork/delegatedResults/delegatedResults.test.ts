@@ -4,7 +4,11 @@ import { EnvironmentId, NodeId, ThreadId } from "@t3tools/contracts";
 import {
   countByPlace,
   isRemindable,
+  type LinkedThread,
   localActivity,
+  orphanReminderIds,
+  orphanReminderText,
+  orphansOf,
   parentBusy,
   REMINDER_MAX_AGE_MS,
   reminderIds,
@@ -32,7 +36,7 @@ describe("resultDelivery", () => {
       ).toBe("settled");
     }
   });
-  it("says none for an old row with no delivery record", () => {
+  it("says none for an old row, or a wait task, with no delivery record", () => {
     expect(resultDelivery(delegatedTask({ completionDelivery: undefined }))).toBe("none");
   });
 });
@@ -50,8 +54,15 @@ describe("isRemindable", () => {
     });
     expect(isRemindable(remote, NOW)).toBe(true);
   });
-  it("never reminds an old row from before delivery records", () => {
-    expect(isRemindable(delegatedTask({ completionDelivery: undefined }), NOW)).toBe(false);
+  it("reminds a recent result with no delivery record: a wait whose acknowledgement failed", () => {
+    expect(isRemindable(delegatedTask({ completionDelivery: undefined }), NOW)).toBe(true);
+  });
+  it("never reminds an old row from before delivery records (older than a day)", () => {
+    const old = delegatedTask({
+      completionDelivery: undefined,
+      completedAt: at(NOW - REMINDER_MAX_AGE_MS - 1),
+    });
+    expect(isRemindable(old, NOW)).toBe(false);
   });
   it("never reminds a result older than a day (an abandoned thread)", () => {
     const old = delegatedTask({ completedAt: at(NOW - REMINDER_MAX_AGE_MS - 1) });
@@ -129,6 +140,18 @@ describe("activity and slots", () => {
     } as const;
     expect(parentBusy(idle)).toBe(false);
     expect(parentBusy({ ...idle, status: "queued" })).toBe(true);
+    expect(parentBusy({ ...idle, pendingRuntimeRequest: {} as never })).toBe(true);
+  });
+  it("does not treat background work the parent left running as busy", () => {
+    const idle = {
+      activityRunStatus: null,
+      status: "idle",
+      pendingRuntimeRequest: null,
+      pendingBackgroundTasks: [{} as never],
+    } as const;
+    // Upstream counts it as a live child shell; no run end may come for hours.
+    expect(localActivity(idle as never)).toBe("live");
+    expect(parentBusy(idle)).toBe(false);
   });
 });
 
@@ -138,5 +161,65 @@ describe("reminderText", () => {
     expect(text).toContain("2 delegated tasks");
     expect(text.indexOf("t-1")).toBeLessThan(text.indexOf("t-2"));
     expect(text).toContain("task_status");
+    // Upstream's wake may land just before it.
+    expect(text).toContain("may not have reached");
+  });
+});
+
+const HERE = EnvironmentId.make("env-here");
+const THERE = EnvironmentId.make("env-b");
+const linked = (
+  threadId: string,
+  from: { environmentId?: EnvironmentId; threadId?: ThreadId } = {},
+  environmentId = THERE,
+): LinkedThread => ({
+  environmentId,
+  threadId: ThreadId.make(threadId),
+  title: `title ${threadId}`,
+  delegatedFrom: {
+    environmentId: from.environmentId ?? HERE,
+    threadId: from.threadId ?? PARENT,
+  },
+});
+
+describe("orphansOf", () => {
+  it("keeps a thread there launched from this parent that no task follows", () => {
+    const listed = [linked("r-1"), linked("r-2")];
+    const followed = [{ environmentId: THERE, threadId: ThreadId.make("r-1") }];
+    expect(orphansOf(listed, HERE, PARENT, followed).map((t) => t.threadId)).toEqual(["r-2"]);
+  });
+  it("never counts a thread launched from another environment's thread of the same id", () => {
+    const listed = [linked("r-1", { environmentId: EnvironmentId.make("env-c") })];
+    expect(orphansOf(listed, HERE, PARENT, [])).toEqual([]);
+  });
+  it("never counts another parent's thread, or one followed in another environment's name", () => {
+    expect(
+      orphansOf([linked("r-1", { threadId: ThreadId.make("other") })], HERE, PARENT, []),
+    ).toEqual([]);
+    // Same thread id, but the task follows it in another environment: still an orphan here.
+    const followedElsewhere = [
+      { environmentId: EnvironmentId.make("env-c"), threadId: ThreadId.make("r-1") },
+    ];
+    expect(orphansOf([linked("r-1")], HERE, PARENT, followedElsewhere)).toHaveLength(1);
+  });
+});
+
+describe("orphan reminder", () => {
+  it("has the same ids for the same orphans in any order, other ids than a task reminder", () => {
+    const a = orphanReminderIds(PARENT, [linked("r-1"), linked("r-2")]);
+    const b = orphanReminderIds(PARENT, [linked("r-2"), linked("r-1")]);
+    expect(a).toEqual(b);
+    expect(orphanReminderIds(PARENT, [linked("r-1")])).not.toEqual(a);
+    expect(a.messageId).not.toEqual(
+      reminderIds(PARENT, [NodeId.make("r-1"), NodeId.make("r-2")]).messageId,
+    );
+  });
+  it("names each orphan with its environment and the tools that read and stop it", () => {
+    const text = orphanReminderText([linked("r-2"), linked("r-1")]);
+    expect(text).toContain("2 threads");
+    expect(text.indexOf("r-1")).toBeLessThan(text.indexOf("r-2"));
+    expect(text).toContain(`in ${THERE}`);
+    expect(text).toContain("t3_thread_read");
+    expect(text).toContain("t3_thread_interrupt");
   });
 });

@@ -1,10 +1,12 @@
 /**
- * Fork (issue 386): backstop for upstream's completion wake. A parent's own events (a task ending
- * owed, a run ending) start one delayed check; an idle parent with results still owed gets one queued
- * message, ids from the task ids, so reruns and restarts never repeat it. Off with `server.waitFor`.
+ * Fork (issues 386, 625): backstop for upstream's completion wake. A parent's own events (a task
+ * ending unread, a run ending) start one delayed check; an idle parent with results still unread
+ * gets one queued message, ids from the task ids, so reruns and restarts never repeat it. At start,
+ * every parent with a result unread from the last day is checked once. Off with `server.waitFor`.
  */
 import type { OrchestrationV2Subagent, ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FiberMap from "effect/FiberMap";
@@ -17,11 +19,13 @@ import * as ThreadManagement from "../../orchestration-v2/ThreadManagementServic
 import { forkParked } from "../../serverActivation.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as WaitDelivery from "../../waits/WaitDelivery.ts";
+import * as DelegatedResultsStore from "./DelegatedResultsStore.ts";
 import {
   isDelegatedTask,
   isEndedTask,
   isRemindable,
   parentBusy,
+  REMINDER_MAX_AGE_MS,
   parentGone,
   reminderIds,
   reminderText,
@@ -62,6 +66,7 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
   const delivery = yield* WaitDelivery.make();
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const settings = yield* ServerSettingsService;
+  const store = yield* DelegatedResultsStore.DelegatedResultsStore;
   // Parents that were busy (or could not be reached) while a result was owed: their next run end
   // checks again. In memory; a restart rebuilds it from the startup scan.
   const watched = new Set<ThreadId>();
@@ -149,7 +154,10 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
       ),
   );
 
-  /** A task that ended with its result owed, or a run end of a watched parent. */
+  /**
+   * A task that ended with its result owed or with no delivery state (a wait that may not
+   * acknowledge it), or a run end of a watched parent.
+   */
   const triggers = (event: {
     readonly type: string;
     readonly threadId: ThreadId;
@@ -157,7 +165,10 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
   }): boolean => {
     if (event.type === "subagent.updated") {
       const task = event.payload as OrchestrationV2Subagent;
-      return isDelegatedTask(task) && isEndedTask(task) && resultDelivery(task) === "owed";
+      const delivery = resultDelivery(task);
+      return (
+        isDelegatedTask(task) && isEndedTask(task) && (delivery === "owed" || delivery === "none")
+      );
     }
     if (event.type === "run.updated" && watched.has(event.threadId)) {
       const run = event.payload as { readonly status?: string };
@@ -176,15 +187,20 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
           : Effect.void,
       ),
     );
-    // Results owed when the server stopped: upstream offers their wakes again at start; a parent
-    // that still has one owed after the delay gets its reminder. One parent at a time.
+    // Results unread when the server stopped: upstream offers the wakes it had reserved again at
+    // start; the table also names parents whose result had no wake reserved yet. A parent that
+    // still has one unread after the delay gets its reminder. One parent at a time.
     yield* forkParked(
       Effect.gen(function* () {
-        const parents = yield* projections
+        const recovering = yield* projections
           .getRecoveryThreadIds("delegated-completions")
           .pipe(Effect.orElseSucceed((): ReadonlyArray<ThreadId> => []));
+        const sinceMs = (yield* Clock.currentTimeMillis) - REMINDER_MAX_AGE_MS;
+        const unread = yield* store.parentsWithUnreadResults(
+          DateTime.formatIso(DateTime.makeUnsafe(sinceMs)),
+        );
         yield* Effect.sleep(options.delay);
-        for (const parentThreadId of new Set(parents)) {
+        for (const parentThreadId of new Set([...recovering, ...unread])) {
           // An event already moved this parent's check later.
           if (yield* FiberMap.has(timers, parentThreadId)) continue;
           yield* check(parentThreadId).pipe(
@@ -208,6 +224,10 @@ export const layer = Layer.effectDiscard(
   make().pipe(Effect.flatMap((service) => service.start())),
 ).pipe(
   Layer.provide(
-    Layer.merge(ProjectionStore.layer, CommandReceiptStore.layerFromApplicationReceipts),
+    Layer.mergeAll(
+      ProjectionStore.layer,
+      CommandReceiptStore.layerFromApplicationReceipts,
+      DelegatedResultsStore.layer,
+    ),
   ),
 );
