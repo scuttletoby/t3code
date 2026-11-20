@@ -43,6 +43,9 @@ copies that must fail (so a check that stops seeing its problem goes red too):
   result       fork-tests.yml's fork_ci_result, the one check a ruleset requires, needs every other job
                of that workflow except the ones in RESULT_OPTIONAL (none today), so no job's failure
                can merge.
+  quiet        nothing in fork-tests.yml may fail quietly: no continue-on-error on a job or a step, and no
+               if: on a step that runs the fork's own tests (fork-ci-tests.cjs, fork-kit/, fork-ci/,
+               .github/scripts/fork-* test files), so no shard or job can skip them and stay green.
   policies     every workflow with a pull_request_target trigger is listed in
                .github/fork-actions-policies.json (#401): allowed (the fork workflows the repository's
                Actions policy allows; each there, with that trigger and no other) or upstream_blocked;
@@ -1740,6 +1743,70 @@ for label, mutate in {
     "no fork_ci_result job": lambda jobs: jobs.pop("fork_ci_result"),
 }.items():
     check(f"result: {label} fails", bool(result_mutant(mutate)))
+
+# --- quiet ---------------------------------------------------------------------------------------
+# fork_ci_result trusts each job's result, so nothing in fork-tests.yml may fail quietly: no continue-on-error on a
+# job or a step (any value: an expression can turn it on for one matrix shard), and a step that runs the fork's own
+# tests (fork-ci-tests.cjs, or a test file under fork-kit/, fork-ci/ or .github/scripts/fork-*) has no if:, which
+# could skip it in one shard or on one event and leave the job green. Upstream's test steps keep theirs (the `test`
+# job runs some only in its first shard).
+FORK_TEST_RUN = re.compile(r"\.github/scripts/fork-ci-tests\.cjs|(?:fork-kit/|fork-ci/|\.github/scripts/fork-)\S*\.test\.\w+")
+
+
+def quiet_problems(wf):
+    problems = []
+    for j, job in (wf.get("jobs") or {}).items():
+        if "continue-on-error" in job:
+            problems.append(f"fork-tests.yml/{j}: continue-on-error on the job (its failure would pass)")
+        for i, step in enumerate(job.get("steps") or []):
+            where = f"fork-tests.yml/{j} step {i + 1} ({step.get('name', 'unnamed')})"
+            if "continue-on-error" in step:
+                problems.append(f"{where}: continue-on-error (its failure would pass)")
+            if "if" in step and FORK_TEST_RUN.search(str(step.get("run", ""))):
+                problems.append(f"{where}: runs fork tests under an if: (it could skip them and pass)")
+    return problems
+
+
+check("quiet: no job or step of fork-tests.yml may fail quietly, and no step running fork tests has an if:",
+      not quiet_problems(fork_tests), "; ".join(quiet_problems(fork_tests)))
+check("quiet: the check sees the fork's test steps (kit shards, kit as root, script tests)",
+      {j for j, job in fork_tests["jobs"].items() for st in job.get("steps") or []
+       if FORK_TEST_RUN.search(str(st.get("run", "")))} >= {"workflows", "action_tests", "kit_tests", "kit_root_tests"})
+
+
+def quiet_mutant(mutate):
+    wf = copy.deepcopy(fork_tests)
+    mutate(wf["jobs"])
+    return quiet_problems(wf)
+
+
+def test_step(jobs, job, needle):
+    return next(st for st in jobs[job]["steps"] if needle in str(st.get("run", "")))
+
+
+for label, mutate in {
+    "a kit shard's test step skipped in one shard": lambda jobs: test_step(jobs, "kit_tests", "fork-ci-tests.cjs")
+        .__setitem__("if", "matrix.shard != 3"),
+    "the kit tests' job with continue-on-error": lambda jobs: jobs["kit_tests"].__setitem__("continue-on-error", True),
+    "one kit shard with continue-on-error": lambda jobs: jobs["kit_tests"].__setitem__(
+        "continue-on-error", "${{ matrix.shard == 3 }}"),
+    "the kit tests as root with continue-on-error": lambda jobs: jobs["kit_root_tests"].__setitem__(
+        "continue-on-error", True),
+    "a root kit test step with continue-on-error": lambda jobs: test_step(jobs, "kit_root_tests", "root.test.py")
+        .__setitem__("continue-on-error", True),
+    "a root kit test step under an if:": lambda jobs: test_step(jobs, "kit_root_tests", "root.test.py")
+        .__setitem__("if", "github.event_name == 'push'"),
+    "the script tests' step under an if:": lambda jobs: test_step(jobs, "workflows", "fork-ci-tests.cjs")
+        .__setitem__("if", "always()"),
+    "a step with continue-on-error: false (any value)": lambda jobs: jobs["lint"]["steps"][0].__setitem__(
+        "continue-on-error", False),
+    "a non-test step of the build job with continue-on-error": lambda jobs: jobs["build"]["steps"][0].__setitem__(
+        "continue-on-error", True),
+}.items():
+    check(f"quiet: {label} fails", bool(quiet_mutant(mutate)))
+check("quiet: upstream's test steps under if: matrix.shard == 1 pass",
+      not quiet_mutant(lambda jobs: None) and any(
+          "if" in st and ".test." in str(st.get("run", "")) for st in fork_tests["jobs"]["test"]["steps"]))
 
 # --- policies ----------------------------------------------------------------------------------
 # GitHub blocks pull_request_target (from 2026-12-02) unless a repository Actions policy allows it
