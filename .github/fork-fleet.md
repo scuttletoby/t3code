@@ -199,7 +199,12 @@ Two more things limit what a job can do:
   write it or any folder above it, and no link may lead to it, or check-net
   refuses). An older kit whose list still names `/etc` whole is
   refused by the launcher and fails `mounts`: re-run the installer. A
-  project that needs another `/etc` entry adds it to `ALLOW_PATHS`. The per-OS walls ask
+  project that needs another `/etc` entry adds it to `ALLOW_PATHS`, the file
+  alone; an entry that holds this host's secrets, is in one, or is a folder
+  that holds one (`shadow`, `sudoers`, `ssh`, `ssl` (it holds `ssl/private`),
+  `/etc/default`, cron, `systemd`, `fstab`, this kit's own folder, any folder
+  named `private`, ...) fails `mounts`, as written and where it really leads
+  (issue #370). The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`, and `tools` for the
   `systemd-run` and `systemctl` it runs) instead of keeping a list of their
   own. A systemd drop-in that changes the job units (`service.d`,
@@ -258,8 +263,13 @@ Two more things limit what a job can do:
 
 Fleet jobs read no secrets (a test checks this). The fleet's GitHub token lives
 only on the fleet host, readable by root. A host's own secrets stay out of jobs
-because a job's `/etc` is an allow list (above); the walls' `etc-secrets` is a
-lint for the common places, not a proof.
+because a job's `/etc` is an allow list (above). The walls' `etc-secrets`
+reads what jobs do see: the `/etc` entries of the list and of `ALLOW_PATHS`,
+`/usr/local`'s programs and settings, the packages' units and environment
+files in `/usr`, and systemd's credential stores there. A secret a job's user
+may read there (others may, or a group that is not root's, or an ACL) fails it:
+make the file 0600 or move it out. A unit's path systemd fills in fails closed
+when it may lead into what jobs see. It is a lint, not a proof.
 
 ### Why the gate kills the worker (actions/runner, `main`, read 2026-11-12)
 
@@ -523,6 +533,7 @@ chmod 600 /etc/fork-fleet/launch.conf
 # reuses the last answer for that long (0: it looks up on every pass).
 # ALLOW_PATHS (empty): more paths jobs see read-only, comma-separated (a tool cache); never one that holds data
 # (/home, /root, /mnt, /media, /srv are refused, also through a symlink), never under a folder others (its group or all) may write.
+# Never an /etc entry that holds secrets, nor a folder of one (the walls' mounts fails: issue #370).
 # JOB_PATHS (fork-fleet-job-paths.txt beside the launcher): the system paths every job sees; leave it.
 
 # 5. The dispatcher, for the vm pool only.
