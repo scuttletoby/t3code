@@ -341,6 +341,53 @@ def compare_counts(before, after):
     return said
 
 
+FORK_BUILD = re.compile(r'\.fork\.\d+$')  # a fork build's version: its upstream nightly's, then `.fork.N`
+
+
+def fork_build(version):
+    """Whether `version` names a fork build (it has a fork report and fork features), not an upstream one."""
+    return isinstance(version, str) and FORK_BUILD.search(version) is not None
+
+
+def features_list(fork):
+    """The report's `featuresOn` when it is a list of names, else None (a report without it says nothing)."""
+    on = fork.get('featuresOn') if isinstance(fork, dict) else None
+    return list(on) if isinstance(on, list) and all(isinstance(n, str) for n in on) else None
+
+
+def features_state(fork):
+    """What a report's `fork` says the fork features are, in a form that compares whole and in any order:
+    {'values': every feature's value (`usagePacingGate: advise` and `enforce` both count as on, so the names alone
+    do not say which), 'on': the names on, sorted, 'where': each feature's places (server, project:<id>,
+    thread:<id>, policy), sorted}. None when the report has no `featuresOn` list or no `features` map."""
+    on = features_list(fork)
+    values = fork.get('features') if isinstance(fork, dict) else None
+    if on is None or not isinstance(values, dict):
+        return None
+    where = fork.get('featuresWhere') if isinstance(fork.get('featuresWhere'), dict) else {}
+    return {'values': {str(k): values[k] for k in sorted(values, key=str)}, 'on': sorted(on),
+            'where': {str(k): sorted(map(str, where[k])) for k in sorted(where, key=str)
+                      if isinstance(where[k], list) and where[k]}}
+
+
+def features_differ(was, now, was_said='before', now_said='now'):
+    """How two features_state()s differ, feature by feature ('' when they are the same)."""
+    if was is None or now is None:
+        return '' if was == now else f'no fork feature list {was_said if was is None else now_said}'
+    said = []
+    for name in sorted(set(was['values']) | set(now['values']) | set(was['on']) | set(now['on'])):
+        a, b = (json.dumps(s['values'].get(name)) if name in s['values'] else 'not in its report' for s in (was, now))
+        if a != b:
+            said.append(f'{name}: {a} {was_said}, {b} {now_said}')
+        elif (name in was['on']) != (name in now['on']):
+            said.append(f'{name}: {"on" if name in was["on"] else "off"} {was_said}, '
+                        f'{"on" if name in now["on"] else "off"} {now_said}')
+        elif was['where'].get(name, []) != now['where'].get(name, []):
+            said.append(f'{name}: on in {", ".join(was["where"].get(name, [])) or "no place"} {was_said}, '
+                        f'in {", ".join(now["where"].get(name, [])) or "no place"} {now_said}')
+    return '; '.join(said)
+
+
 def features_on(fork):
     """The report's fork features that are on, each with where (`handoff (project:p1, thread:t1)`), so an operator
     knows which project override or thread entry to clear. A report without `featuresWhere` names the features only."""

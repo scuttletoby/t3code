@@ -474,6 +474,73 @@ def _r4(cfg, before, after):
     return said
 
 
+def _off_in(settings, fork):
+    """Removes from the settings file's object `settings` every value the report `fork` says switches a feature on
+    (a missing value reads as off): the server's own (a `thread:<id>` entry is in it) and a project override's.
+    A place the machine's policy locks (`policy`) is left: no edit of settings.json switches it off. Returns what
+    went, as `key` or `project:<id>/key`."""
+    where = fork.get('featuresWhere') if isinstance(fork.get('featuresWhere'), dict) else {}
+    overrides = settings.get('projectSettingsOverrides')
+    removed = []
+    for name in live.features_list(fork) or []:
+        for place in where.get(name) if isinstance(where.get(name), list) else []:
+            place = str(place)
+            if place == 'server' or place.startswith('thread:'):
+                if name in settings:
+                    del settings[name]
+                    removed.append(name)
+            elif place.startswith('project:'):
+                project = place[len('project:'):].split('/thread:')[0]
+                override = overrides.get(project) if isinstance(overrides, dict) else None
+                if isinstance(override, dict) and name in override:
+                    del override[name]
+                    removed.append(f'project:{project}/{name}')
+    return removed
+
+
+def _features_off(p, before):
+    """R3 runs a server on the clone: with a fork feature on (waitFor, handoff, ...) it could act, deliver waits or
+    send messages. So every feature on in the clone is switched off in the clone's settings.json (never the home's;
+    the restore puts the copy's back), and a report must then read them all off. Returns (facts, the report)."""
+    fork = before.get('fork') if isinstance(before.get('fork'), dict) else {}
+    on = live.features_list(fork)
+    if on is None:
+        raise Failed('R3: the report on the clone has no fork.featuresOn list: the rehearsal cannot tell whether '
+                     'its server would act; nothing ran on it')
+    facts = {'featuresOn': on, 'where': live.features_on(fork), 'removed': []}
+    if not on:
+        return facts, before
+    path = os.path.join(p['home'], 'userdata', 'settings.json')
+    if os.path.islink(path):
+        raise Failed(f'R3: fork features are on in the clone ({facts["where"]}) and {path} is a link: the kit '
+                     'writes no settings through a link; nothing ran on it')
+    try:
+        with open(path, encoding='utf-8') as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        settings = None  # on by the machine's policy alone: the report below names it
+    except (OSError, ValueError) as e:
+        raise Failed(f'R3: fork features are on in the clone ({facts["where"]}) and its settings.json does not read '
+                     f'as plain JSON ({e}), so the kit cannot switch them off; switch them off by hand in the copy '
+                     'or rehearse after they are off; nothing ran on it') from None
+    if isinstance(settings, dict):
+        facts['removed'] = _off_in(settings, fork)
+        tmp = f'{path}.golive-features-off'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    after = _report(p)
+    still = live.features_list(after.get('fork') if isinstance(after.get('fork'), dict) else {})
+    if still != []:
+        raise Failed(f'R3: fork features stay on in the clone after the kit cleared its settings.json '
+                     f'({live.features_on(after.get("fork") or {}) or still}): a policy or a value the kit cannot '
+                     'clear switches them on, and the rehearsal server could act on them; nothing ran on it')
+    return facts, after
+
+
 def _serve(p, empty):
     log = open(os.path.join(p['root'], 'server.log'), 'wb')
     try:
@@ -529,13 +596,19 @@ def run_rehearse(cfg, copy_dir=None, port=None, say=print):
         for line in result['leftOut']:
             say(f'left out of the clone: {line}')
         _r0_clone(cfg, p)
-        settings = coldcopy._file_sum(os.path.join(p['home'], 'userdata', 'settings.json'))
         with run.step('preflight') as facts:
             for name, binary, version in (('old', p['old'], p['from']), ('fork', p['fork'], cfg.target_version)):
                 facts[name], why = _preflight(binary, p['home'], p['protocol'], version)
                 if facts[name] != 'ready':
                     raise Failed(f'R1: the preflight of t3 {version} on the clone says {facts[name]}: {why}')
             before = _report(p)
+        with run.step('features-off') as facts:  # the clone's own settings only; the restore puts the copy's back
+            off, before = _features_off(p, before)
+            facts.update(off)
+        result['featuresOff'] = off
+        if off['featuresOn']:
+            say(f'R3: the fork features on in the copy ({off["where"]}) are switched off in the clone only')
+        settings = coldcopy._file_sum(os.path.join(p['home'], 'userdata', 'settings.json'))
         result['migrations'] = list(_db(before).get('pendingMigrations') or [])
         with run.step('migrate') as facts:
             size, t0 = live.database_bytes(p['home']), time.monotonic()
