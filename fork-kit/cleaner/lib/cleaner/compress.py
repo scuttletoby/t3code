@@ -13,7 +13,8 @@ removed after that. So at every moment the original or a checked copy is there, 
 - a file that is in use, changed, or opened at any point is kept as it was; a disk too full for a whole copy
   plus `keepFreeGB` is refused before anything is written; zstd missing keeps everything ("could not read").
 
-What it never takes, in a configured folder: links (never followed), folders with a KEEP file, git folders, other
+What it never takes, in a configured folder: links (never followed), folders with a KEEP file, git folders (also a
+KEEP file or a git folder in a folder above the configured folder, up to `/`: guard.above_refusal), other
 filesystems and mount points, other owners' files, credential and lock names, databases with a journal beside them,
 hard-linked files, files already compressed, and files under MIN_BYTES. It also skips, with a line in the plan, what
 it could not finish: a file its owner may not read, an immutable or append-only file or folder, a file whose group,
@@ -342,6 +343,9 @@ def _start(cfg, facts, folder):
     bound = mounts.bound(path, st.st_dev)
     if bound is not None:
         return None, Refusal('in use', f'a bind mount shows {bound} of its filesystem somewhere else (a container or a sandbox)')
+    refusal = guard.above_refusal(path)
+    if refusal is not None:
+        return None, refusal
     # relatime (the usual default) updates the access time at the first read after a change, and at least once a
     # day: with days >= 7 (config.MIN_COLD_DAYS) a file read in that time always looks read. noatime never does.
     options = mounts.options_of(path)
