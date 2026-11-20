@@ -4,7 +4,7 @@ copy of `sleep` placed at the home's runtime path, so /proc shows it like the re
 SHA256SUMS, an archive and its extracted runtime (a stub `t3` that prints a report and records how it was run),
 and a machine file. Nothing here touches a real T3 home, a real unit or ~/.t3; PATH holds only the stubs.
 """
-import hashlib, io, json, os, shutil, signal, subprocess, sys, tarfile, tempfile
+import fcntl, hashlib, io, json, os, shutil, signal, subprocess, sys, tarfile, tempfile
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMMON = os.path.join(os.path.dirname(KIT), 'common')
@@ -13,8 +13,14 @@ sys.path[:0] = [os.path.join(KIT, 'lib'), COMMON]
 from golive import config, live, osadapter  # noqa: E402
 from golive import handoff  # noqa: E402
 
-# No fake launcher takes a serving lock unless a test makes one: the kit lets go of the owner lock at once.
+# A build that takes no serving lock: the kit lets go of the owner lock at once; one that does and never claims it (a
+# test's own model): it keeps it this long.
 handoff.HANDOVER_WAIT = 0.05
+# The fake boot service's launcher (this test process: the unit's MainPID) holds runtime/service-serving.lock while
+# its server runs a build that takes it (handoff.takes_serving_lock), as upstream's #claimServing does, so the kit's
+# look at the running launcher before a stop (handoff.launcher_unseen) passes as on a real host. gap.test.py models
+# the lock itself and turns this off.
+LAUNCHER_SERVES = True
 
 LIVE, TARGET = '0.1.9', '0.1.10-nightly.20261114.4682.fork.1'
 
@@ -87,6 +93,7 @@ class Machine:
         self.backups = self.path('backups')
         self.bin = self.path('bin')
         self.server = None
+        self.serving = None  # the fd by which the fake launcher holds the serving lock (LAUNCHER_SERVES)
         self._saved = (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
                        osadapter.CGROUP_FILE, os.environ.get('PATH'), live.fork_report)
         for d in (self.bin, self.backups, self.path('etc')):
@@ -116,6 +123,7 @@ class Machine:
         return p
 
     def close(self):
+        self.launcher_stopped()
         if self.server is not None:
             kill(self.server)
             self.server = None
@@ -174,6 +182,17 @@ class Machine:
         self.server = subprocess.Popen([runtime, '600'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL, start_new_session=True)
         self.runtime_file(pid=self.server.pid, serverVersion=version)
+        self.launcher_stopped()
+        if LAUNCHER_SERVES and handoff.takes_serving_lock(version):  # its launcher claimed the lock first
+            fd = os.open(self.path('home/runtime/service-serving.lock'), os.O_RDWR | os.O_CREAT, 0o644)
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a POSIX lock, as SQLite's
+            self.serving = fd
+
+    def launcher_stopped(self):
+        """The fake launcher lets go of the serving lock (the service stopped)."""
+        if self.serving is not None:
+            os.close(self.serving)
+            self.serving = None
 
     def runtime_file(self, **fields):
         self.write('home/userdata/server-runtime.json', json.dumps({
@@ -275,8 +294,10 @@ class FakeAdapter(osadapter.SystemdUser):
                 os.kill(json.load(f)['pid'], signal.SIGKILL)
         except (OSError, ValueError, KeyError):
             pass
-        if self.machine is not None and self.machine.server is not None:
-            self.machine.server.wait()
+        if self.machine is not None:
+            self.machine.launcher_stopped()
+            if self.machine.server is not None:
+                self.machine.server.wait()
         self._svc(ActiveState='inactive', MainPID=0)
         self._record('stop')
 

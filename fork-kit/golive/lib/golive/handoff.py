@@ -212,7 +212,11 @@ def sees_own_lock(home):
 
 def launcher_unseen(home, service):
     """None when the boot service's launcher holds the serving lock now as the handover will look for it
-    (launcher_serving); else why not. service: reads the boot service (adapter.service)."""
+    (launcher_serving); else why not. service: reads the boot service (adapter.service).
+    Nobody holding it is no verdict on the launcher: upstream's launcher waits 250 ms for the lock and then serves
+    without it (serviceLauncher.ts #claimServing: an SSH probe held it at that moment), and the launcher the kit
+    starts after the stop claims it again from the start. Then the kit's own lock decides, as for an older build
+    (sees_own_lock: it also catches a /proc/locks that names the file under another inode, which reads as nobody)."""
     try:
         svc = service()
     except Exception as e:  # noqa: BLE001  (the stop needs systemctl too: refuse with what it said)
@@ -222,14 +226,14 @@ def launcher_unseen(home, service):
         return None
     if holders is None:
         return '/proc/locks cannot be read'
+    if not holders:
+        return sees_own_lock(home)
     pid = svc.get('mainPid') if svc.get('active') else None
     if not pid:
         return 'the boot service has no running main process'
-    seen = f'pid {", ".join(map(str, sorted(holders)))}' if holders else 'no process'
-    return (f'/proc/locks lists {seen} as the holder of runtime/{SERVING_LOCK}, not the boot service\'s main process '
-            f'(pid {pid}): a /proc of another pid namespace, a launcher that is not the service\'s main process or '
-            'takes another kind of lock, or a launcher whose claim of that lock gave up (`systemctl --user restart '
-            't3code.service` has it claim the lock again)')
+    return (f'/proc/locks lists pid {", ".join(map(str, sorted(holders)))} as the holder of runtime/{SERVING_LOCK}, '
+            f'not the boot service\'s main process (pid {pid}): a /proc of another pid namespace, or a launcher that '
+            'is not the service\'s main process or takes another kind of lock')
 
 
 def handover_blind(home, versions, running=None, service=None):
@@ -239,8 +243,8 @@ def handover_blind(home, versions, running=None, service=None):
     build T3 runs now, service: reads the boot service (adapter.service). When the running build takes the serving
     lock, its launcher must show as serving now (launcher_unseen, #580): the look the handover depends on, made on
     the real launcher, so a kit in another pid namespace, a launcher that is not the service's main process, or a
-    lock of another kind refuse here. Otherwise (an older running build, or none named) the kit must see a lock of
-    its own (sees_own_lock, #550)."""
+    lock of another kind refuse here. Otherwise (an older running build, none named, or nobody holding the serving
+    lock: a claim that gave up) the kit must see a lock of its own (sees_own_lock, #550)."""
     if not any(takes_serving_lock(v) for v in versions):
         return None
     if running is not None and service is not None and takes_serving_lock(running):
@@ -335,10 +339,15 @@ class Gap:
         svc, kick, ended = [{}], threading.Event(), threading.Event()  # svc[0]: the service as last read
 
         def reader():  # the looks never wait for systemctl: a slow read delays only the answer it brings (#580)
-            while not ended.is_set():
+            while True:
                 kick.clear()
-                if not _runs(svc[0]):  # kept while its main process runs (#550)
-                    svc[0] = _read(service)
+                if ended.is_set():  # after the clear: an end set just before it is not missed
+                    return
+                try:
+                    if not _runs(svc[0]):  # kept while its main process runs (#550)
+                        svc[0] = _read(service)
+                except Exception:  # noqa: BLE001  (an error of its own must not end the reads: the kit would keep
+                    pass           # the owner lock HANDOVER_WAIT; the next pass reads again)
                 kick.wait(SERVICE_REREAD)
 
         def watch():  # HANDOVER_WAIT counts from fn's return (`t3 update` installs first, then restarts T3)
