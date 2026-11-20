@@ -157,11 +157,6 @@ describe("makeClaudeMcpProfiles", () => {
     operation: "read-secret",
     cause: new Error("secret store unreadable"),
   });
-  /**
-   * A fresh start (a server restart or a Claude adapter rebuild) that plans a thread once per
-   * entry: the settings, or a failed read (it reads provider secrets too). `file` is what
-   * settings.json holds: its text, `undefined` for no file, or "unreadable".
-   */
   /** A task another machine delegated here, carrying t3-only. */
   const carriedTask: LineageThread = {
     ...thread("task"),
@@ -172,6 +167,11 @@ describe("makeClaudeMcpProfiles", () => {
       mcpProfile: { name: "t3-only", servers: [], t3Tools: "all" },
     },
   };
+  /**
+   * A fresh start (a server restart or a Claude adapter rebuild) that plans a thread once per
+   * entry: the settings, or a failed read (it reads provider secrets too). `file` is what
+   * settings.json holds: its text, `undefined` for no file, or "unreadable".
+   */
   const plansFor = (
     reads: ReadonlyArray<Record<string, unknown> | "fails">,
     file: string | undefined | "unreadable" = undefined,

@@ -305,24 +305,45 @@ const ready = async (root: string, started: Boot) => {
   return read() ?? {};
 };
 
-/** The names of the spans the server wrote to its trace file, from byte `from` on, and how often each. */
+/**
+ * The names of the spans the server wrote to its trace file, from byte `from` on, how often each,
+ * and the names of the spans each ran inside (a child ends, and so is written, before its parent).
+ */
 const spansFrom = (stateDir: string, from: number) => {
   const tracePath = NodePath.join(stateDir, "logs", "server.trace.ndjson");
   const text = NodeFS.existsSync(tracePath) ? NodeFS.readFileSync(tracePath) : Buffer.alloc(0);
   const names = new Set<string>();
   const counts = new Map<string, number>();
+  const nameById = new Map<string, string>();
+  const parentIds: Array<readonly [name: string, parentSpanId: string]> = [];
   for (const line of text.subarray(from).toString("utf8").split("\n")) {
     try {
-      const name = (JSON.parse(line) as { readonly name?: unknown }).name;
+      const span = JSON.parse(line) as {
+        readonly name?: unknown;
+        readonly spanId?: unknown;
+        readonly parentSpanId?: unknown;
+      };
+      const name = span.name;
       if (typeof name === "string") {
         names.add(name);
         counts.set(name, (counts.get(name) ?? 0) + 1);
+        if (typeof span.spanId === "string") nameById.set(span.spanId, name);
+        if (typeof span.parentSpanId === "string") parentIds.push([name, span.parentSpanId]);
       }
     } catch {
       // A blank or partial line.
     }
   }
-  return { names, counts, end: text.length };
+  const parents = new Map<string, Set<string>>();
+  for (const [name, parentSpanId] of parentIds) {
+    const parent = nameById.get(parentSpanId);
+    if (parent === undefined) continue;
+    const known = parents.get(name) ?? new Set<string>();
+    known.add(parent);
+    parents.set(name, known);
+  }
+  const parentsOf = (name: string) => [...(parents.get(name) ?? [])].toSorted();
+  return { names, counts, parentsOf, end: text.length };
 };
 
 /** What each hold outside the work gate logs instead of starting. */
@@ -358,19 +379,27 @@ const CONNECT_SPANS = [
 const HELD_SPANS = ["autoPullProjects", "RemoteDelegation.followOnce", ...CONNECT_SPANS];
 
 /**
- * Spans only the fork's own server layers make while they are built (fork/forkLayers.ts): the read
- * of the usage pacer and slot gate beside /mcp, the usage refresher, automatic updates. A server
- * whose server.ts lost both `ForkLayers.layerRuntimeServices` and `ForkLayers.layerRoutes` (a sync
- * that dropped them) still boots and keeps every hold, so only these show the gates are gone.
+ * Spans only the fork's own server layers make while built (fork/forkLayers.ts). A server.ts that
+ * lost `ForkLayers.layerRuntimeServices` and `layerRoutes`, or `ForkLayers.mcpProfileTurnCheck`,
+ * still boots and keeps every hold, so only these show the gates are gone.
  */
 const FORK_LAYER_SPANS = [
   "ForkLayers.mcpGatesPresent",
   "HeadlessUsageRefresher.make",
   "cloud.auto_update.make",
+  "McpProfileTurnCheck.make",
 ];
 
 const missingForkLayers = (spans: ReadonlySet<string>) =>
   FORK_LAYER_SPANS.filter((name) => !spans.has(name));
+
+/**
+ * Where `ForkLayers.mcpProfileTurnCheck` sits: the orchestration layer's adapter registry and its
+ * runtime policy read each instance from it (its span runs inside theirs). Moved above
+ * `layerOrchestrationApplication` in server.ts, it would still be built and still emit its make
+ * span, but both would read upstream's registry, so a turn would not be checked.
+ */
+const TURN_CHECK_READERS = ["ProviderAdapterRegistryV2.get", "RuntimePolicyV2.resolve"];
 
 /** What a normal boot of a marked copy logs instead of starting Connect and agent activity. */
 const markedLines = (marker: string) =>
@@ -916,6 +945,9 @@ describe("serve --hold-work on a seeded home", () => {
             ) &&
             heartbeats(remote).length > 0 &&
             spans.has("RemoteDelegation.followOnce") &&
+            // The seeded turns asked the orchestration layer for their adapter (each such span
+            // ends after the instance read inside it), so the check below has its spans.
+            TURN_CHECK_READERS.every((name) => spans.has(name)) &&
             markedLines(marker).every((line) => marked.output().includes(line)) &&
             // Past the random wait before registration, and past the desired-link reconcile.
             HELD_CONNECT_STEPS.every((name) => spans.has(name))
@@ -925,6 +957,9 @@ describe("serve --hold-work on a seeded home", () => {
       await stop(marked.child);
       const markedSpans = spansFrom(paths.stateDir, heldSpans.end);
       expect(missingForkLayers(markedSpans.names)).toEqual([]);
+      expect(markedSpans.parentsOf("McpProfileTurnCheck.getInstance")).toEqual(
+        expect.arrayContaining(TURN_CHECK_READERS),
+      );
       // No tunnel registered, started or released, and no agent activity sent.
       expect(tunnelReleases(remote)).toEqual([]);
       expect(activityPublishes(remote)).toEqual([]);
