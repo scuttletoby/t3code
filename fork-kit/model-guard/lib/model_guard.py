@@ -12,8 +12,10 @@ The policy is a JSON file {"mode": "off" | "advise" | "enforce", "allow": [rows]
 - a T3 pick names only option ids the guard can read: on a Claude row the ids T3's Claude driver reads and the
   shared effort ids; on a row of another driver the shared effort ids, ultracode, and the row's effortOptionIds
   (read as efforts) and otherOptionIds (#601);
-- a T3 pick names its effort under each id the row's driver reads it from (Claude: effort; another driver: each of
-  its row's effortOptionIds), so the driver never runs a default or inherited level under an effort it ignores;
+- a T3 pick names its effort under each id the row's driver reads it from (DRIVER_EFFORT_IDS for T3's built-in
+  drivers, Claude's among them, and each of the row's effortOptionIds), so the driver never runs a default or
+  inherited level under an effort it ignores; a row with efforts whose driver reads no id the guard knows refuses
+  every T3 pick (#629);
 - a call that would run a model the hook cannot see (a thread fork, a Workflow script it cannot read, a model
   field on a tool that has none) is refused in enforce;
 - the policy file or the machine file missing, unreadable or invalid: refused, naming the file (fail closed);
@@ -51,7 +53,32 @@ ULTRACODE_RUNS_AT = 'xhigh'
 # them in step) and the one it reads the effort from. A Claude row refuses any other id in a T3 pick: T3 has no
 # driver on a model selection, so the same model on another driver's instance could read it as its reasoning.
 CLAUDE_OPTION_IDS = ('effort', ULTRACODE_OPTION_ID, 'contextWindow', 'fastMode', 'thinking')
-CLAUDE_EFFORT_ID = 'effort'
+# the Claude ids T3 reads only as true/false (claudeModelOptions.ts getModelSelectionBooleanOptionValue); another
+# driver may read the same id as its reasoning level (Mistral Vibe's ACP "thinking", Pi's "thinking"), so a text
+# value is refused (#629)
+CLAUDE_BOOLEAN_IDS = ('fastMode', 'thinking')
+# The option id each of T3's built-in drivers reads its reasoning level from, as the guard already knew it for Claude
+# (#629; a test reads each one from T3's code and keeps the list of built-in drivers in step). A pick of such a row
+# must name its effort there: under another id the driver ignores, it runs its default or the parent's level.
+DRIVER_EFFORT_IDS = {
+    CLAUDE_DRIVER: 'effort',          # apps/server/src/claudeModelOptions.ts
+    'codex': 'reasoningEffort',       # apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
+    'fx': 'effort',                   # packages/provider-fx/src/server/acpSupport.ts FX_EFFORT_CONFIG_ID
+    'grok': 'reasoningEffort',        # packages/provider-grok/src/server/adapter.ts GROK_REASONING_EFFORT_OPTION_ID
+    'kiro': 'reasoningEffort',        # packages/provider-kiro/src/server/adapter.ts applyKiroEffort
+    'muse': 'reasoningEffort',        # packages/provider-muse/src/server/adapter.ts selectionEffort
+    'opencode': 'variant',            # packages/provider-opencode/src/server/adapter.ts and v2/adapter.ts
+    'pi': 'thinking',                 # packages/provider-pi/src/server/adapter.ts applySelection
+}
+# T3's built-in drivers with no fixed reasoning id: the agent or the model names it (an ACP agent's config option,
+# a Cursor model's parameter). Their rows, like those of any driver not known here, list it in effortOptionIds; a
+# row with efforts and no such id refuses every T3 pick (fail closed).
+AGENT_NAMED_EFFORT_DRIVERS = ('acpRegistry', 'antigravity', 'cursor')
+# Option ids of a built-in driver that pick what runs other than as a model or reasoning id would say: an OpenCode
+# "agent" (packages/provider-opencode/src/server/adapter.ts turnPromptOptions) may set its own model and variant, so
+# it is never an option that changes neither (#629)
+DRIVER_MODEL_OPTION_IDS = {'opencode': ('agent',)}
+CLAUDE_EFFORT_ID = DRIVER_EFFORT_IDS[CLAUDE_DRIVER]
 # T3's option id for an ACP agent's session mode (packages/provider-acp/src/server/sessionConfig.ts
 # ACP_SESSION_MODE_OPTION_ID). Some agents repeat their reasoning levels as modes; T3 then hides the control but still
 # applies a pick of it (adapter.ts setMode), so it is never an option that "changes no reasoning".
@@ -200,14 +227,15 @@ def parse_policy(text, path):
                                   f'T3\'s own)')
             if ULTRACODE_OPTION_ID in ids:
                 raise PolicyError(f'{where}.{key}: ultracode is always read as the effort ultracode')
-        both = [i for i in other_ids if i in effort_ids or i in EFFORT_OPTION_IDS]
+        both = [i for i in other_ids if i in effort_ids or i in EFFORT_OPTION_IDS
+                or i == DRIVER_EFFORT_IDS.get(row['driver'])]
         if both:
             raise PolicyError(f'{where}.otherOptionIds: {both[0]!r} is an effort option id, so it cannot be an option '
                               f'that changes no reasoning')
         if ACP_SESSION_MODE_ID in other_ids:
             raise PolicyError(f'{where}.otherOptionIds: {ACP_SESSION_MODE_ID!r} is T3\'s session mode, which some '
                               f'agents use as a second reasoning control (list it in effortOptionIds if it is one)')
-        named = [i for i in other_ids if NOT_OTHER.search(i)]
+        named = [i for i in other_ids if NOT_OTHER.search(i) or i in DRIVER_MODEL_OPTION_IDS.get(row['driver'], ())]
         if named:
             raise PolicyError(f'{where}.otherOptionIds: {named[0]!r} names a model or reasoning control, so it cannot '
                               f'be an option that changes neither')
@@ -267,6 +295,13 @@ def load_policy(machine_path=None, owner_uid=0):
     }, f'{machine_path}: {KIT}')
     text = machine_file.read_protected_text(cfg['policyFile'], owner_uid)
     return cfg, parse_policy(text, cfg['policyFile'])
+
+
+def row_effort_ids(row):
+    """The option ids a row's driver reads its effort from (each must be named in a T3 pick): the one the guard
+    knows for a built-in driver, and the row's effortOptionIds. Empty for a driver the guard knows no id for."""
+    known = DRIVER_EFFORT_IDS.get(row['driver'])
+    return tuple(dict.fromkeys(((known,) if known else ()) + tuple(row['effortOptionIds'] or ())))
 
 
 def describe(row):
@@ -351,8 +386,8 @@ def check_pick(where, model, efforts, driver, rows, agent, problems, matched, pa
     """One model pick against the rows; adds problems, or the rows it matched. Without a driver every row naming
     the model must accept the pick. A row without "efforts" accepts only a pick that names no effort. A T3 pick
     gives its option pairs instead of efforts: each row reads them with its own effort option ids, refuses an option
-    id it cannot read (#601), and wants the effort under each id its driver reads it from (Claude: effort; another
-    driver: its effortOptionIds)."""
+    id it cannot read (#601), and wants the effort under each id its driver reads it from (row_effort_ids; with none
+    known, a row with efforts refuses the pick, #629)."""
     if not isinstance(model, str) or not js_trim(model) or js_trim(model) == 'inherit':
         problems.append(f'{where} names no model (every call must name one; the guard cannot see the parent\'s)')
         return
@@ -371,7 +406,12 @@ def check_pick(where, model, efforts, driver, rows, agent, problems, matched, pa
                 own, effort_ids = (CLAUDE_EFFORT_ID,), EFFORT_OPTION_IDS
                 read = set(EFFORT_OPTION_IDS) | set(CLAUDE_OPTION_IDS)
             else:
-                own = tuple(row['effortOptionIds'] or ())
+                own = row_effort_ids(row)
+                if not own and row['efforts'] is not None:
+                    problems.append(f'{where}: the guard does not know which option id {row["driver"]} reads the '
+                                    f'effort of {model!r} from, so it cannot tell what level would run: the policy row '
+                                    f'must list it in effortOptionIds')
+                    return
                 effort_ids = EFFORT_OPTION_IDS + own
                 read = set(effort_ids) | {ULTRACODE_OPTION_ID} | set(row['otherOptionIds'] or ())
             keys = [key for key, _ in pairs]
@@ -380,6 +420,12 @@ def check_pick(where, model, efforts, driver, rows, agent, problems, matched, pa
                 problems.append(f'{where}: option {unread[0]!r} is not one T3\'s {CLAUDE_DRIVER} reads '
                                 f'({", ".join(CLAUDE_OPTION_IDS)}): T3 runs a model selection on the named '
                                 f'instance, and on another driver\'s instance {model!r} could read it as its '
+                                f'reasoning, unchecked')
+                return
+            text = [key for key, value in pairs if key in CLAUDE_BOOLEAN_IDS and not isinstance(value, bool)]
+            if text and row['driver'] == CLAUDE_DRIVER:
+                problems.append(f'{where}.options.{text[0]} must be true or false: T3\'s {CLAUDE_DRIVER} reads it '
+                                f'only so, and on another driver\'s instance {model!r} could read a text as its '
                                 f'reasoning, unchecked')
                 return
             if unread:
@@ -1104,6 +1150,16 @@ def ultracode_option_problems(policy, manifest_paths):
     return problems
 
 
+def effort_id_problems(policy):
+    """Rows whose every T3 pick is refused because the guard knows no option id their driver reads the effort from
+    (#629): said by the self-check, so the owner adds effortOptionIds before enforce refuses the picks."""
+    if policy['mode'] == 'off':
+        return []
+    return [f'{row["driver"]} {row["model"]!r} lists efforts, but the guard knows no option id {row["driver"]} reads '
+            f'the effort from, so every T3 pick of it is refused: list that id in the row\'s effortOptionIds'
+            for row in policy['allow'] if row['efforts'] is not None and not row_effort_ids(row)]
+
+
 def managed_files(folder, owner_uid=0):
     """[(path, data, error)] of Claude Code's managed settings files in its order (managed-settings.json, then
     managed-settings.d/*.json by name); each must be root-owned and not writable by others, like the machine file.
@@ -1163,6 +1219,7 @@ def self_check(machine_path=None, owner_uid=0, prefix=''):
         allow_other_hooks = cfg['allowOtherHooks']
         print(f'policy {cfg["policyFile"]}: mode {policy["mode"]}, {len(policy["allow"])} rows')
         problems += ultracode_option_problems(policy, cfg['t3ModelManifests'])
+        problems += effort_id_problems(policy)
     try:
         files = managed_files(prefix + managed_dir(), owner_uid)
     except PolicyError as e:

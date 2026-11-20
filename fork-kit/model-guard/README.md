@@ -62,9 +62,33 @@ Where the effort is read:
   `reasoning_effort`, `reasoning`, `thinking_level` (the same list T3's usage pacing gate uses; a test keeps them in
   step), and on a row of another driver than Claude also the row's own `effortOptionIds` (see **Options of other
   drivers**). Every effort named must be allowed, and the effort must be named under the id the row's driver reads
-  it from: `effort` on a `claudeAgent` row (T3's Claude driver reads no other, `apps/server/src/claudeModelOptions.ts`),
-  each of the row's `effortOptionIds` on another driver's row. So `{"thinking_level": "high"}` alone is refused for
-  a Claude model: Claude would run its default or inherited effort.
+  it from: for T3's built-in drivers the guard knows that id (below), and on a row of another driver than Claude
+  also each of the row's `effortOptionIds`. So `{"thinking_level": "high"}` alone is refused for a Claude model, and
+  `{"effort": "low"}` for a Codex model: the driver would run its default or inherited effort.
+- **The effort id of each built-in driver** (#629). The guard pins the option id each of T3's built-in drivers
+  reads its reasoning level from, and a test reads every one of them, and the list of built-in drivers, from T3's
+  code, so a driver T3 adds or changes fails the test until the guard is updated:
+
+  | Driver kind   | Effort id         | Read in                                                             |
+  | ------------- | ----------------- | ------------------------------------------------------------------- |
+  | `claudeAgent` | `effort`          | `apps/server/src/claudeModelOptions.ts`                             |
+  | `codex`       | `reasoningEffort` | `apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts`       |
+  | `fx`          | `effort`          | `packages/provider-fx/src/server/acpSupport.ts`                     |
+  | `grok`        | `reasoningEffort` | `packages/provider-grok/src/server/adapter.ts`                      |
+  | `kiro`        | `reasoningEffort` | `packages/provider-kiro/src/server/adapter.ts`                      |
+  | `muse`        | `reasoningEffort` | `packages/provider-muse/src/server/adapter.ts`                      |
+  | `opencode`    | `variant`         | `packages/provider-opencode/src/server/adapter.ts`, `v2/adapter.ts` |
+  | `pi`          | `thinking`        | `packages/provider-pi/src/server/adapter.ts`                        |
+
+  `cursor`, `antigravity` and `acpRegistry` have no fixed id: the model (a Cursor model's parameter) or the agent
+  (an ACP agent's `thought_level` config option) names it. A row of one of them, or of any driver not built into
+  T3, that lists `efforts` must list the id in `effortOptionIds`; without it the guard cannot tell which level would
+  run, so **every T3 pick of the row is refused** (fail closed; advise notes it), and `--self-check` names the row.
+  `effortOptionIds` on a built-in driver's row adds ids to the pinned one: a pick must name both.
+
+- **OpenCode agents.** T3's OpenCode driver also reads `agent` (`turnPromptOptions` in its `adapter.ts`): an
+  OpenCode agent can set its own model and variant, which the guard cannot see. So an `opencode` row refuses
+  `agent` in `otherOptionIds`, and a pick that names it is refused as an id the guard cannot read.
 - **Options are read the way T3 reads them** (`packages/contracts/src/model.ts`, `ProviderOptionSelections`): T3
   trims option ids and text values (JavaScript's `trim`, which the hook copies) and takes the first entry of an id.
   So `{" effort": "max", "effort": "high"}` runs `max`. The hook trims the same way and refuses an id given twice
@@ -87,12 +111,20 @@ Where the effort is read:
     `effortOptionIds`. The policy refuses T3's session mode `_t3/session-mode` here, and any id that contains
     `model`, `effort`, `reason`, `think`, `thought`, `ultracode`, `provider`, `driver` or `instance` (any case).
 
+  A built-in driver's own effort id (the table above) is an effort id, never an `otherOptionIds` entry.
+  Listing `_t3/session-mode` in `effortOptionIds` keeps a row's `delegate_task` picks from passing T3 for
+  agents whose modes mirror their thought levels. T3 hides that descriptor for them, so its `delegate_task`
+  check (`invalidOptionSelections`) refuses the id as "Unknown option". That fails closed, but such a row can
+  then be picked only through `t3_thread_launch`, `t3_thread_configure` or a project's default.
+
   Any other id is refused, and the refusal names the two keys. A `claudeAgent` row takes only the ids T3's Claude
   driver reads (`effort`, `ultracode`, `contextWindow`, `fastMode`, `thinking`; a test keeps them in step with T3's
   bundled model list) and the five shared effort ids: a model selection has no driver and T3 runs it on the named
   instance, so on another driver's instance that offers the same model name an id such as `thought_level` would set
-  the reasoning, unchecked. When one model name is in a Claude row and a row of another driver, a pick with no
-  driver must suit both, which none can if the other row has `effortOptionIds`; use `delegate_task` with
+  the reasoning, unchecked. For the same reason `fastMode` and `thinking` must be `true` or `false` there (T3's
+  Claude driver reads them only so, a test keeps the two in step): Pi, and some ACP agents such as Mistral Vibe,
+  read `thinking` as their reasoning level, so a text value would set it unchecked. When one model name is in a
+  Claude row and a row of another driver, a pick with no driver must suit both, which none can if the other row has `effortOptionIds`; use `delegate_task` with
   `driverKind` for that model.
 
 - **Ultracode** is checked as what the server runs. The option `ultracode` (only `true` or `false`; any other value
@@ -149,8 +181,8 @@ What v0 does not check:
   model of the session that makes the call. So a model only in Claude rows that another driver's instance also
   offers runs there with that agent's default reasoning: `effort` passes the check, and the agent may ignore it
   (the guard only keeps such a pick from naming the agent's own reasoning id).
-- whether a row's driver reads the shared effort id a pick names, on a row of another driver without
-  `effortOptionIds`: a driver that ignores `effort` runs its default. List the id it reads in `effortOptionIds`.
+- that a row's `effortOptionIds` are the ids its driver really reads, for a driver whose id the guard does not
+  pin (Cursor, Antigravity, the ACP registry, drivers not built into T3): the owner vouches for them by listing them.
 - what an `otherOptionIds` option does: the owner vouches for it by listing it.
 - between two self-checks, a T3 model list that changed under an `"ultracodeOption": false` row.
 
@@ -248,8 +280,9 @@ What v0 does not check:
 
 Rules of the file: JSON with no key given twice and no unknown key; lists not empty and without repeats; texts not
 empty. Option ids have no spaces around them (T3 trims them) and are never `ultracode`, and an effort id (one of
-the five or the row's own) is never an `otherOptionIds` id. `effortOptionIds` needs `efforts`; `otherOptionIds` never
-holds `_t3/session-mode` or an id naming a model or reasoning control (see **Options of other drivers**). The file must be owned by root, not writable by group or others, and not a link (the same rules as the
+the five, the row's own, or its built-in driver's) is never an `otherOptionIds` id. `effortOptionIds` needs
+`efforts`; `otherOptionIds` never holds `_t3/session-mode`, an id naming a model or reasoning control, or an
+`opencode` row's `agent` (see **Options of other drivers**). The file must be owned by root, not writable by group or others, and not a link (the same rules as the
 machine file), so an agent cannot widen its own policy.
 
 ## Turn it on (owner, as root)
@@ -445,6 +478,8 @@ exits 1:
 - a policy row with `"ultracodeOption": false` whose model T3's model list (`t3ModelManifests`) now offers the
   ultracode option, gives no option list, or does not list; a named list that cannot be read (missing, a link, not a
   plain file, over 16 MiB, not JSON or not a version 1 model list); or no list named (not in mode `off`);
+- a policy row with `efforts` whose driver reads its effort from an id the guard does not pin and that lists no
+  `effortOptionIds` (#629; not in mode `off`): every T3 pick of it is refused until the id is listed;
 - in `enforce`: Claude Code's model keys are missing or differ from the policy (see
   [Claude Code's model keys](#claude-codes-model-keys)); the line holds the JSON to put in `managed-settings.json`.
 
@@ -497,7 +532,19 @@ once the kit is gone: take that entry out too.
   policy has a `false` row; an older kit given a machine file with the key refuses every checked call.
 - **Old policy files** stay valid. Since #601, a T3 pick of a row of another driver than Claude that names an option
   id other than the five effort ids and `ultracode` is refused in `enforce` (noted in `advise`); the refusal names
-  `effortOptionIds` and `otherOptionIds`.
+  `effortOptionIds` and `otherOptionIds`. Since #629 an old policy still parses, but some picks it passed are
+  refused, each time the same, naming the key or option to add (advise notes it; the self-check names the rows):
+  - a row of `codex`, `opencode`, `pi`, `grok`, `kiro`, `muse` or `fx` wants the effort under its driver's id (the
+    table above): `{"effort": "low"}` for a Codex row, which Codex ignores, is refused; name `reasoningEffort`. A
+    row that already lists that id in `effortOptionIds` (the old advice for Codex) works as before;
+  - a row with `efforts` of `cursor`, `antigravity`, `acpRegistry` or a driver not built into T3, without
+    `effortOptionIds`, refuses every T3 pick: list the id its driver reads;
+  - an `opencode` row with `agent`, or its driver's effort id, in `otherOptionIds` makes the policy invalid
+    (every checked call refused, naming the key);
+  - on a `claudeAgent` row: `thinking` or `fastMode` with a text value is refused. Since #618, three old
+    Claude pick shapes are refused too, because none names `effort`, the one id T3's Claude driver reads:
+    `{"ultracode": true}` alone (it passed before #618 on a row allowing `ultracode`), and an effort named only
+    under `thinking_level` or only under `reasoningEffort`. Name `"effort"` next to them.
 - **The installer runs again:** every step checks what is there and only fixes what differs; a second run changes
   nothing. Two installers at once: the second is refused (a lock on `/etc/model-guard/install.lock`). An installer
   that opened the lock file just before an uninstall removed it is refused too ("run again").
@@ -526,10 +573,13 @@ once the kit is gone: take that entry out too.
 
 `python3 -I -B fork-kit/model-guard/tests/guard.test.py`: every rule above with temporary files (the current user
 stands in for root). Its red check breaks each refuse rule and each self-check rule in a copy of
-`lib/model_guard.py` and shows the test for that rule then fails. Three tests read the server's code: the effort
-option ids from `apps/server/src/usage/UsagePacingGate.ts`, the ultracode mapping from
-`packages/shared/src/model.ts`, and T3's bundled model list (`apps/server/src/provider/model-manifest.json`, one model
-with the effort `ultracode` and one without) with its cache path and shape in `ModelManifest.ts`.
+`lib/model_guard.py` and shows the test for that rule then fails. The `Contract` tests read the server's code: the
+effort option ids from `apps/server/src/usage/UsagePacingGate.ts`, the ultracode mapping from
+`packages/shared/src/model.ts`, T3's bundled model list (`apps/server/src/provider/model-manifest.json`, one model
+with the effort `ultracode` and one without) with its cache path and shape in `ModelManifest.ts`, Claude's effort and
+true/false ids in `apps/server/src/claudeModelOptions.ts`, and each built-in driver (`builtInDrivers.ts`), its kind
+and the file where it reads its effort (#629). The fork's CI checks out only the T3 files these tests read; the
+`workflows` job's three sparse lists in `.github/workflows/fork-tests.yml` name them.
 
 `python3 -I -B fork-kit/model-guard/tests/install.test.py`: the installer and the self-check on a fake host in a
 temporary folder, no root: a fresh install and an upgrade stopped after each step, a first install without a
