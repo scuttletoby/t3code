@@ -166,6 +166,7 @@ describe("makeClaudeMcpProfiles", () => {
     reads: ReadonlyArray<Record<string, unknown> | "fails">,
     file: string | undefined | "unreadable" = undefined,
     policy?: unknown,
+    self: LineageThread = thread("t"),
   ) =>
     Effect.gen(function* () {
       const { settingsPath } = yield* ServerConfig.ServerConfig;
@@ -187,10 +188,14 @@ describe("makeClaudeMcpProfiles", () => {
       const outcomes: Array<string> = [];
       for (const _ of reads) {
         outcomes.push(
-          yield* plan(thread("t"), {}).pipe(
+          yield* plan(self, {}).pipe(
             Effect.match({
               onFailure: (refusal) => refusal.message,
-              onSuccess: (result) => result.name,
+              // A carried profile cuts an `all` thread without renaming it.
+              onSuccess: (result) =>
+                result.name === "all" && result.servers !== "all"
+                  ? `all cut to ${JSON.stringify(result.servers)}`
+                  : result.name,
             }),
           ),
         );
@@ -234,6 +239,43 @@ describe("makeClaudeMcpProfiles", () => {
       };
       assert.deepStrictEqual(yield* plansFor(["fails"], "{}", policy), ["t3-only"]);
     }),
+  );
+
+  it.effect(
+    "a failed read with a settings.json that does not decode refuses a narrower carried task (#653)",
+    () =>
+      Effect.gen(function* () {
+        // The file may say mcpCarriedProfiles "refuse", so it is not read as the default apply.
+        const task: LineageThread = {
+          ...thread("task"),
+          delegatedFrom: {
+            environmentId: "environment-there" as never,
+            threadId: ThreadId.make("thread-there"),
+            title: "Parent there",
+            mcpProfile: { name: "t3-only", servers: [], t3Tools: "all" },
+          },
+        };
+        const broken = "{ not json";
+        const runs = yield* plansFor(["fails", "fails"], broken, undefined, task);
+        assert.strictEqual(runs.length, 2);
+        for (const run of runs) assert.include(run, "set to refuse such tasks");
+        // Settings read in full, a file that decodes, or no file: the default apply cuts it.
+        const cut = ["all cut to []"];
+        assert.deepStrictEqual(yield* plansFor([{}], broken, undefined, task), cut);
+        assert.deepStrictEqual(yield* plansFor(["fails"], "{}", undefined, task), cut);
+        assert.deepStrictEqual(yield* plansFor(["fails"], undefined, undefined, task), cut);
+        // A task carrying all cuts nothing, so it is taken; a thread of this machine's own gets
+        // the defaults, as before.
+        const all: LineageThread = {
+          ...task,
+          delegatedFrom: {
+            ...task.delegatedFrom!,
+            mcpProfile: { name: "all", servers: "all", t3Tools: "all" },
+          },
+        };
+        assert.deepStrictEqual(yield* plansFor(["fails"], broken, undefined, all), ["all"]);
+        assert.deepStrictEqual(yield* plansFor(["fails"], broken), ["all"]);
+      }),
   );
 
   it.effect("refuses when settings.json cannot be read either, even after a read with none", () =>
