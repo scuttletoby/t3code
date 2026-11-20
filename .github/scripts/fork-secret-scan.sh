@@ -19,9 +19,11 @@
 #                with the job's token; whitespace-separated commit ids; may be empty. See "sweep,
 #                gone tips"
 #   DELETED_TIPS the sweep: those OLD_HEADS GitHub's API has no commit for at all that origin did
-#                not serve either (the workflow asked both, or asked git on an earlier day: its
-#                record, #691), SCANNED_GONE among them; whitespace-separated commit ids; may be
-#                empty. Given only as DELETED_TIPS_FILE. See "sweep, deleted tips"
+#                not serve either (the workflow asked both; or its record, #691, has the tip as read
+#                by a scan on an earlier day, so git is not asked again), SCANNED_GONE among them;
+#                whitespace-separated commit ids; may be empty. The workflow gives it as
+#                DELETED_TIPS_FILE only (the list can outgrow the environment); the variable is read
+#                when no file is set, as for the others. See "sweep, deleted tips"
 #   OLD_HEADS_FILE, SCANNED_GONE_FILE, DELETED_TIPS_FILE  a file holding that list, read instead of
 #                the variable when set (#637: the kernel caps one environment string at 128 KiB,
 #                and the sweep's list outgrew it); a file that cannot be read fails the job
