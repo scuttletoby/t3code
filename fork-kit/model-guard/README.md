@@ -91,7 +91,12 @@ Where the effort is read:
   and settings, which the guard cannot see (T3 still sends the model, and the effort when the pick names it, so the
   agent cannot change those through the pick; it is refused anyway, fail closed). So an `opencode` row refuses
   `agent`, and a `kiro` row `mode`, in `otherOptionIds` and in `effortOptionIds` (#638 review), and a pick that
-  names it is refused as an id the guard cannot read.
+  names it is refused as an id the guard cannot read. On `delegate_task` and `create_threads`, T3 lays the parent's
+  options under a pick when the instance and model are the same; the fork's delegation checks
+  (`apps/server/src/fork/delegateChecks.ts`, `AGENT_OPTION_IDS`) drop an inherited `agent` (OpenCode) or `mode`
+  (Kiro) when the pick names its model, so the child runs the model the guard checked, not the parent's agent
+  (#643). A pick with no model keeps the parent's options, as before (the guard refuses such a T3 pick). A test
+  keeps `AGENT_OPTION_IDS` and the guard's list in step.
 - **Driver kinds are exact.** A row whose `driver` is one of T3's built-in kinds in another case or with spaces
   around it (`Codex`, `" codex"`) makes the policy invalid: a pick with no driver could run on that driver's
   instance, which reads other option ids than the row says (#638 review).
@@ -189,12 +194,13 @@ What v0 does not check:
   (`effort` for a Claude or Fx row, `variant` for an OpenCode row), and the other driver may ignore it (the guard
   only keeps such a pick from naming an id the row's driver does not read). Pi and OpenCode share the
   `provider/model` form of model names, so this can happen between them.
-- on `delegate_task`, what the child takes over from its parent: T3 lays the parent's options under the given ones
-  when the instance and model are the same, so the child of an OpenCode parent that runs an agent keeps that agent,
-  although the guard refuses a pick that names one.
-- that the model offers each allowed level: Kiro, Grok and OpenCode v2 skip a level the model does not list and run
-  their default. `delegate_task` is safe (T3 refuses such a value); launch, configure and a project's default are
-  not. List in `efforts` only the levels the model offers.
+- on a T3 older than #643, what the child takes over from its parent: such a T3 keeps an OpenCode parent's `agent`
+  (or Kiro's `mode`) on a child whose pick names the same instance and model. Since #643 T3 drops it (see **Agent
+  options**).
+- that the model offers each allowed level, for rows of drivers other than Claude: Kiro, Grok and OpenCode v2 skip
+  a level the model does not list and run their default. `delegate_task` is safe (T3 refuses such a value);
+  launch, configure and a project's default are not. List in `efforts` only the levels the model offers. T3's
+  model list has option lists only for Claude models, so the self-check compares only `claudeAgent` rows (#643).
 - that a row's `effortOptionIds` are the ids its driver really reads, for a driver whose id the guard does not
   pin (Cursor, Antigravity, the ACP registry, drivers not built into T3): the owner vouches for them by listing them.
 - what an `otherOptionIds` option does: the owner vouches for it by listing it.
@@ -495,6 +501,12 @@ exits 1:
   plain file, over 16 MiB, not JSON or not a version 1 model list); or no list named (not in mode `off`);
 - a policy row with `efforts` whose driver reads its effort from an id the guard does not pin and that lists no
   `effortOptionIds` (#629; not in mode `off`): every T3 pick of it is refused until the id is listed;
+- a `claudeAgent` row whose `efforts` hold a level its model does not offer in T3's model list (`t3ModelManifests`;
+  the choices of the `effort` option, and `ultracode` when the model has the ultracode option), or whose model the
+  list gives no option list (#643; not in mode `off`): outside `delegate_task` such a level runs the model's
+  default. With several lists, a level must be offered in each. A row with `efforts` and no list named, or a named
+  list that cannot be read, is reported too. A model that is not in the list (a custom model) is a `note:` line,
+  not a problem;
 - in `enforce`: Claude Code's model keys are missing or differ from the policy (see
   [Claude Code's model keys](#claude-codes-model-keys)); the line holds the JSON to put in `managed-settings.json`.
 
@@ -544,7 +556,8 @@ once the kit is gone: take that entry out too.
 - **T3's model list changes, vanishes or is half-written** (#600): the self-check reads each named list again on
   every run and keeps nothing. A missing list, one being rewritten at that moment (invalid JSON), or one of another
   shape is reported, never taken as clean. An old machine file without `t3ModelManifests` is reported when the
-  policy has a `false` row; an older kit given a machine file with the key refuses every checked call.
+  policy has a `false` row or, since #643, a `claudeAgent` row with `efforts`; an older kit given a machine file
+  with the key refuses every checked call. A model that loses a level in a reload is reported on the next run.
 - **Old policy files** stay valid. Since #601, a T3 pick of a row of another driver than Claude that names an option
   id other than the five effort ids and `ultracode` is refused in `enforce` (noted in `advise`); the refusal names
   `effortOptionIds` and `otherOptionIds`. Since #629 an old policy still parses, but some picks it passed are
@@ -598,7 +611,8 @@ effort option ids from `apps/server/src/usage/UsagePacingGate.ts`, the ultracode
 with the effort `ultracode` and one without) with its cache path and shape in `ModelManifest.ts`, Claude's effort and
 true/false ids in `apps/server/src/claudeModelOptions.ts`, and each built-in driver (`builtInDrivers.ts`), its kind
 and the file where it reads its effort (#629), failing on any entry of the list it cannot read (a spread, a call),
-and the agent options of OpenCode and Kiro. The fork's CI checks out only the T3 files these tests read; three jobs
+the agent options of OpenCode and Kiro, which must match `AGENT_OPTION_IDS` in `apps/server/src/fork/delegateChecks.ts`
+(#643), and that T3's bundled list has option lists only for Claude models. The fork's CI checks out only the T3 files these tests read; three jobs
 of `.github/workflows/fork-tests.yml` (`workflows`, `action_tests` and `kit_tests`) each have a sparse list that
 names them.
 
@@ -606,5 +620,5 @@ names them.
 temporary folder, no root: a fresh install and an upgrade stopped after each step, a first install without a
 policy, run again, leftovers, a second installer and a removed lock file, old state (a link, a folder or file root
 does not own), pruning, an uninstall stopped after each step, Claude Code's model keys and a stale
-`"ultracodeOption": false` row (#600) in the self-check. Its
+`"ultracodeOption": false` row (#600) and a level a model does not offer (#643) in the self-check. Its
 red check breaks the installer's and the self-check's rules.

@@ -22,15 +22,15 @@ MANAGED = '/etc/claude-code/managed-settings.json'
 T3_CACHE = '/var/lib/t3/model-manifest.json'
 
 
-def t3_cache(older_offers_ultracode=False):
+def t3_cache(older_offers_ultracode=False, new_levels=('medium', 'high', 'xhigh')):
     """T3's cached model list ({fetchedAtMs, manifest}) for the example policy's Claude models: example-older-0 has
-    an effort list without ultracode, unless asked."""
+    an effort list without ultracode, unless asked; the others offer new_levels and ultracode."""
     def profile(*efforts):
         return {'capabilities': {'optionDescriptors': [
             {'id': 'effort', 'label': 'Reasoning', 'type': 'select',
              'options': [{'id': e, 'label': e} for e in efforts]}]}}
     return {'fetchedAtMs': 1, 'manifest': {'version': 1, 'currentModels': {}, 'providers': {'claudeAgent': {
-        'profiles': {'new': profile('medium', 'high', 'xhigh', 'ultracode'),
+        'profiles': {'new': profile(*new_levels, 'ultracode'),
                      'old': profile('high', *(['ultracode'] if older_offers_ultracode else []))},
         'models': [{'slug': m, 'name': m, 'status': 'current', 'profile': p}
                    for m, p in (('example-large-1-0', 'new'), ('example-deep-2-0', 'new'),
@@ -619,6 +619,25 @@ class Install(unittest.TestCase):
         self.turn_on(mode='advise', model_keys=False)           # advise binds nothing, so it needs no keys
         self.assertEqual(self.self_check()[0], 0)
 
+    def test_self_check_reports_a_level_the_model_does_not_offer(self):
+        """#643: the example policy's Claude rows' levels against T3's cached model list, end to end: a level T3 no
+        longer offers is a problem, the same each run; a custom model is a note; mode off checks nothing."""
+        self.turn_on(rows=({'driver': 'claudeAgent', 'model': 'example-custom-0', 'efforts': ['high']},))
+        self.assertEqual(self.install()[0], 0)
+        code, out = self.self_check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("note: 'example-custom-0' is not in T3's model list", out)
+        self.write(T3_CACHE, t3_cache(new_levels=('medium', 'high')))   # T3 reloaded its list: xhigh is gone
+        for _ in range(2):                                              # runs again: the same answer
+            code, out = self.self_check()
+            self.assertEqual(code, 1)
+            self.assertIn("'example-large-1-0' allows xhigh, but T3's model list", out)
+            self.assertIn("'example-deep-2-0' allows xhigh", out)
+            self.assertIn('self-check: 2 problems', out)
+        self.turn_on(mode='off')
+        self.write(T3_CACHE, t3_cache(new_levels=('medium', 'high')))
+        self.assertEqual(self.self_check()[0], 0)
+
     def test_self_check_reports_a_stale_ultracode_option_row(self):
         """#600: the example policy's "ultracodeOption": false row against T3's cached model list, end to end."""
         self.turn_on()
@@ -752,6 +771,11 @@ GUARD_MUTATIONS = {
     # #629
     'rows with no known effort id are reported': ('        problems += effort_id_problems(policy)', '        pass',
                                                   'test_self_check_reports_a_row_with_no_known_effort_id'),
+    # #643
+    "Claude rows' levels are compared": ('        problems += offer_problems', '        pass',
+                                         'test_self_check_reports_a_level_the_model_does_not_offer'),
+    'notes are printed': ("            print(f'note: {note}')", '            pass',
+                          'test_self_check_reports_a_level_the_model_does_not_offer'),
 }
 
 

@@ -2,7 +2,8 @@
 /**
  * Fork: the delegation checks' seam. The upstream `OrchestratorMcpService.ts` keeps only the seat
  * calls; this file fails if a fork check is inlined there again. What the checks do is tested in
- * `OrchestratorMcpService.usageGate.test.ts` and `OrchestratorMcpService.slotGate.test.ts`.
+ * `OrchestratorMcpService.usageGate.test.ts` and `OrchestratorMcpService.slotGate.test.ts`; the
+ * inherited agent option here and in `OrchestratorMcpService.test.ts`.
  */
 import * as NodeFS from "node:fs";
 
@@ -140,19 +141,189 @@ describe("fork delegation checks: runs again", () => {
     }).pipe(Effect.scoped, Effect.provide(untouched)),
   );
 
-  it.effect("create_threads' seat checks nothing yet and keeps the target, retry or not", () =>
+  it.effect("create_threads' seat on a retry reads nothing and keeps the target", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
       for (const isRetry of [false, true]) {
+        // A target without an agent option reads nothing, retry or not.
         const result = yield* checks.beforeCreateThread({
           isRetry,
           callerThreadId,
           parent,
+          requested: { model: "gpt-5.4" },
           target,
         });
         assert.deepStrictEqual(result, { target });
       }
+      // A retry keeps even an inherited agent option: it starts no work (the receipt holds the
+      // target it was first dispatched with).
+      const withAgent = agentTarget([{ id: "agent", value: "build" }]);
+      const retry = yield* checks.beforeCreateThread({
+        isRetry: true,
+        callerThreadId,
+        parent,
+        requested: { model: "big-pickle" },
+        target: withAgent,
+      });
+      assert.deepStrictEqual(retry, { target: withAgent });
+      const before = yield* checks.beforeWorkspace({
+        isRetry: true,
+        parent,
+        requested: { model: "big-pickle" },
+        runtimeMode: undefined,
+        cwd: undefined,
+        target: withAgent,
+      });
+      assert.deepStrictEqual(before, { target: withAgent });
     }).pipe(Effect.provide(untouched)),
+  );
+});
+
+const opencodeId = ProviderInstanceId.make("opencode-work");
+const kiroId = ProviderInstanceId.make("kiro-work");
+const agentTarget = (
+  options: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>,
+  instanceId = opencodeId,
+): DelegateChecks.DelegateTarget => ({
+  modelSelection: { instanceId, model: "big-pickle", options },
+  supportedRuntimeModes: undefined,
+});
+/** Pacing off, and a provider list with each driver: the drop runs with the gate off as well. */
+const providersWith = Layer.mergeAll(
+  Layer.mock(ServerSettings.ServerSettingsService)({
+    getSettings: Effect.succeed({ usagePacingGate: "off" } as never),
+  }),
+  Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+  Layer.mock(ProviderRegistry.ProviderRegistry)({
+    getProviders: Effect.succeed([
+      { instanceId: opencodeId, driver: "opencode", models: [] },
+      { instanceId: kiroId, driver: "kiro", models: [] },
+      { instanceId: ProviderInstanceId.make("codex"), driver: "codex", models: [] },
+    ] as unknown as ReadonlyArray<ServerProvider>),
+  }),
+);
+
+describe("fork delegation checks: an inherited agent option (#643)", () => {
+  const effort = { id: "variant", value: "high" } as const;
+  const agent = { id: "agent", value: "build" } as const;
+
+  it("a call that names its model drops the agent option it did not name", () => {
+    const cases = [
+      {
+        name: "opencode, model named, agent inherited",
+        driver: "opencode",
+        requested: { model: "big-pickle" },
+        options: [effort, agent],
+        kept: [effort],
+      },
+      {
+        name: "opencode, model and options named, agent inherited",
+        driver: "opencode",
+        requested: { model: "big-pickle", options: [effort] },
+        options: [effort, agent],
+        kept: [effort],
+      },
+      {
+        name: "kiro, model named, mode inherited",
+        driver: "kiro",
+        requested: { model: "big-pickle" },
+        options: [{ id: "mode", value: "planner" }],
+        kept: [],
+      },
+      {
+        name: "an instance not in the list drops every agent id",
+        driver: undefined,
+        requested: { model: "big-pickle" },
+        options: [agent, { id: "mode", value: "planner" }, effort],
+        kept: [effort],
+      },
+      {
+        name: "the call names the agent itself",
+        driver: "opencode",
+        requested: { model: "big-pickle", options: [agent] },
+        options: [effort, agent],
+        kept: [effort, agent],
+      },
+      {
+        name: "no model named: the parent's options stay, as upstream",
+        driver: "opencode",
+        requested: undefined,
+        options: [effort, agent],
+        kept: [effort, agent],
+      },
+      {
+        name: "no model named, options named: upstream merge stays",
+        driver: "opencode",
+        requested: { options: [effort] },
+        options: [effort, agent],
+        kept: [effort, agent],
+      },
+      {
+        name: "another driver's id is no agent option",
+        driver: "codex",
+        requested: { model: "big-pickle" },
+        options: [agent, { id: "mode", value: "x" }],
+        kept: [agent, { id: "mode", value: "x" }],
+      },
+      {
+        name: "opencode keeps an option named mode",
+        driver: "opencode",
+        requested: { model: "big-pickle" },
+        options: [{ id: "mode", value: "x" }],
+        kept: [{ id: "mode", value: "x" }],
+      },
+    ] as const;
+    for (const testCase of cases) {
+      const given = agentTarget(testCase.options);
+      const result = DelegateChecks.withoutInheritedAgent(
+        given,
+        testCase.requested,
+        testCase.driver,
+      );
+      assert.deepStrictEqual(result.modelSelection.options, testCase.kept, testCase.name);
+      assert.deepStrictEqual(result.modelSelection.model, given.modelSelection.model);
+      // Runs again: the result of a drop is a fixed point.
+      assert.deepStrictEqual(
+        DelegateChecks.withoutInheritedAgent(result, testCase.requested, testCase.driver),
+        result,
+        `${testCase.name} (again)`,
+      );
+    }
+    // No options at all (a child on another model): nothing to drop, same object back.
+    assert.strictEqual(
+      DelegateChecks.withoutInheritedAgent(target, { model: "gpt-5.4" }, "opencode"),
+      target,
+    );
+  });
+
+  it.effect("both seats drop it on the final target, by the target instance's driver", () =>
+    Effect.gen(function* () {
+      const checks = yield* DelegateChecks.make(host);
+      for (const [instanceId, option] of [
+        [opencodeId, agent],
+        [kiroId, { id: "mode", value: "planner" }],
+      ] as const) {
+        const given = agentTarget([effort, option], instanceId);
+        const expected = agentTarget([effort], instanceId);
+        const created = yield* checks.beforeCreateThread({
+          isRetry: false,
+          callerThreadId,
+          parent,
+          requested: { model: "big-pickle" },
+          target: given,
+        });
+        assert.deepStrictEqual(created, { target: expected }, `create_threads ${instanceId}`);
+        const before = yield* checks.beforeWorkspace({
+          isRetry: false,
+          parent,
+          requested: { model: "big-pickle" },
+          runtimeMode: undefined,
+          cwd: undefined,
+          target: given,
+        });
+        assert.deepStrictEqual(before, { target: expected }, `delegate_task ${instanceId}`);
+      }
+    }).pipe(Effect.provide(providersWith)),
   );
 });
 

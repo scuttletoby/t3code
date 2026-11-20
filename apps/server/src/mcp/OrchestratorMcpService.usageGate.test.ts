@@ -130,15 +130,19 @@ const scope: McpInvocationScope = {
   issuedAt: 1,
 };
 
-const parentProjection = (subagents: ReadonlyArray<unknown>): OrchestrationV2ThreadProjection =>
-  ({
+const parentProjection = (
+  subagents: ReadonlyArray<unknown>,
+  options?: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>,
+): OrchestrationV2ThreadProjection => {
+  const modelSelection = { instanceId: MAIN, model: MODEL, ...(options ? { options } : {}) };
+  return {
     thread: {
       id: parentThreadId,
       projectId,
       title: "Parent",
       createdBy: "user",
       creationSource: "web",
-      modelSelection: { instanceId: MAIN, model: MODEL },
+      modelSelection,
       runtimeMode: "full-access",
       interactionMode: "default",
     },
@@ -149,12 +153,13 @@ const parentProjection = (subagents: ReadonlyArray<unknown>): OrchestrationV2Thr
         status: "running",
         rootNodeId: NodeId.make("node:usage-gate-root"),
         providerInstanceId: MAIN,
-        modelSelection: { instanceId: MAIN, model: MODEL },
+        modelSelection,
       },
     ],
     contextTransfers: [],
     subagents,
-  }) as unknown as OrchestrationV2ThreadProjection;
+  } as unknown as OrchestrationV2ThreadProjection;
+};
 
 const childProjection = {
   thread: { id: childThreadId, title: "Child" },
@@ -189,6 +194,8 @@ const delegate = (input: {
   readonly target?: OrchestratorMcpTarget;
   readonly disabledForProject?: ReadonlyArray<ProviderInstanceId>;
   readonly retryOfAccepted?: boolean;
+  /** The options the parent thread runs with (none by default). */
+  readonly parentOptions?: ReadonlyArray<{ readonly id: string; readonly value: string }>;
   readonly runtimeMode?: RuntimeMode;
   readonly settingsUnreadable?: boolean;
   /** The parent project's folder; without it the project is not found. */
@@ -268,7 +275,7 @@ const delegate = (input: {
         getThreadRecords: (threadId) =>
           Effect.succeed(
             threadId === parentThreadId
-              ? parentProjection(dispatched.length > 0 ? [task] : [])
+              ? parentProjection(dispatched.length > 0 ? [task] : [], input.parentOptions)
               : childProjection,
           ),
         isProviderInstanceEnabledForProject: ({ instanceId }) =>
@@ -494,6 +501,49 @@ describe("OrchestratorMcpService usage pacing gate", () => {
         providers: [main(60), second(10)],
         target: { options: [{ id: "reasoningEffort", value: "low" }] },
       });
+      assert.deepStrictEqual(dispatched[0]?.modelSelection, {
+        instanceId: SECOND,
+        model: MODEL,
+        options: [{ id: "reasoningEffort", value: "low" }],
+      });
+    }),
+  );
+
+  it.effect("enforce, ahead: a moved pick does not take the parent's OpenCode agent (#643)", () =>
+    Effect.gen(function* () {
+      // An OpenCode parent that runs an agent; the call names the model, so the agent stays out,
+      // on the account the pacer moves the task to as well.
+      const opencode = (base: ServerProvider): ServerProvider => ({
+        ...base,
+        driver: ProviderDriverKind.make("opencode"),
+        models: base.models.map((model) => ({
+          ...model,
+          capabilities: {
+            optionDescriptors: [
+              ...(model.capabilities?.optionDescriptors ?? []),
+              {
+                id: "agent",
+                label: "Agent",
+                type: "select",
+                options: [
+                  { id: "build", label: "Build" },
+                  { id: "plan", label: "Plan" },
+                ],
+              },
+            ],
+          },
+        })),
+      });
+      const { result, dispatched } = yield* delegate({
+        settings: enforce,
+        providers: [opencode(main(60)), opencode(second(10))],
+        parentOptions: [
+          { id: "reasoningEffort", value: "low" },
+          { id: "agent", value: "plan" },
+        ],
+        target: { model: MODEL },
+      });
+      assert.include(textOf(result), "runs on codex-second");
       assert.deepStrictEqual(dispatched[0]?.modelSelection, {
         instanceId: SECOND,
         model: MODEL,

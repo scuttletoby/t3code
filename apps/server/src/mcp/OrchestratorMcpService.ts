@@ -3208,6 +3208,7 @@ const make = Effect.gen(function* () {
                 isRetry: isRetryOfAcceptedCreation,
                 callerThreadId: scope.thread.threadId,
                 parent,
+                requested: request.target,
                 target: resolvedTarget,
               });
               const runtimeMode = yield* resolveRuntimeMode(

@@ -322,7 +322,8 @@ jobs:
       # model.ts: the ultracode mapping, ModelManifest.ts and model-manifest.json: T3's model list and its
       # cache, builtInDrivers.ts, the drivers' kind files and the files where each reads its effort
       # (claudeModelOptions.ts, the adapters) and Kiro's agent id (acpSupport.ts): the effort id of each
-      # built-in driver, in fork-kit/model-guard/tests/guard.test.py); keep the lists in step.
+      # built-in driver, and delegateChecks.ts: the agent option ids T3 drops when a pick names its model,
+      # in fork-kit/model-guard/tests/guard.test.py); keep the lists in step.
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -350,6 +351,7 @@ jobs:
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
+            /apps/server/src/fork/delegateChecks.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts
@@ -469,6 +471,7 @@ jobs:
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
+            /apps/server/src/fork/delegateChecks.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts
@@ -555,6 +558,7 @@ jobs:
             /apps/server/src/cloud/serviceProtocol.ts
             /apps/server/src/config.ts
             /apps/server/src/desktopUpdate/DesktopUpdateMarker.ts
+            /apps/server/src/fork/delegateChecks.ts
             /apps/server/src/golive/forkReport.ts
             /apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
             /apps/server/src/persistence/Sqlite.ts

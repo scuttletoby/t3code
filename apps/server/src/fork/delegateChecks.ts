@@ -95,6 +95,8 @@ export interface BeforeCreateThreadInput {
   readonly isRetry: boolean;
   readonly callerThreadId: ThreadId;
   readonly parent: Parent;
+  /** The target the caller asked for, before the parent's options were laid under it. */
+  readonly requested: OrchestratorMcpTarget | undefined;
   readonly target: DelegateTarget;
 }
 
@@ -179,6 +181,38 @@ const FAILED_SCAN_BACKOFF_MS = PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS;
  */
 const backingOff = (retryAtMs: number | undefined, nowMs: number): retryAtMs is number =>
   retryAtMs !== undefined && retryAtMs > nowMs && retryAtMs - nowMs <= FAILED_SCAN_BACKOFF_MS;
+
+/**
+ * Options that pick the agent a driver runs (OpenCode's `agent`, Kiro's `mode`), which bring their
+ * own prompt, tools and settings. The model guard (`fork-kit/model-guard`) refuses these ids in a
+ * call and pins this list in a contract test.
+ */
+const AGENT_OPTION_IDS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  kiro: ["mode"],
+  opencode: ["agent"],
+};
+
+const ANY_AGENT_OPTION_ID = new Set(Object.values(AGENT_OPTION_IDS).flat());
+
+/**
+ * A call that names its model drops the parent's inherited agent option, which the model guard
+ * cannot see; an agent option the call names itself stays, and a call without a model keeps all.
+ * `driver` undefined (an unknown instance) drops every agent id.
+ */
+export const withoutInheritedAgent = (
+  target: DelegateTarget,
+  requested: OrchestratorMcpTarget | undefined,
+  driver: string | undefined,
+): DelegateTarget => {
+  const options = target.modelSelection.options;
+  if (requested?.model === undefined || options === undefined) return target;
+  const ids = driver === undefined ? ANY_AGENT_OPTION_ID : new Set(AGENT_OPTION_IDS[driver] ?? []);
+  const named = new Set((requested.options ?? []).map((option) => option.id));
+  const kept = options.filter((option) => !ids.has(option.id) || named.has(option.id));
+  return kept.length === options.length
+    ? target
+    : { ...target, modelSelection: { ...target.modelSelection, options: kept } };
+};
 
 const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void };
 
@@ -373,15 +407,48 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
       })),
     );
 
+  /**
+   * `withoutInheritedAgent` on the final target. The providers are read only when the target holds
+   * an agent option id, so a target without one reads nothing.
+   */
+  const dropInheritedAgent = Effect.fnUntraced(function* (
+    target: DelegateTarget,
+    requested: OrchestratorMcpTarget | undefined,
+  ) {
+    const options = target.modelSelection.options ?? [];
+    if (requested?.model === undefined || !options.some((o) => ANY_AGENT_OPTION_ID.has(o.id))) {
+      return target;
+    }
+    const providers = yield* providerRegistry.getProviders;
+    const driver = providers.find(
+      (provider) => provider.instanceId === target.modelSelection.instanceId,
+    )?.driver;
+    return withoutInheritedAgent(target, requested, driver);
+  });
+
   const checks: DelegateChecks = {
+    // After the pacer: a target it moves to is looked up with the options as resolved.
     beforeWorkspace: (input) =>
-      input.isRetry ? Effect.succeed({ target: input.target }) : paceTarget(input),
+      input.isRetry
+        ? Effect.succeed({ target: input.target })
+        : paceTarget(input).pipe(
+            Effect.flatMap((result) =>
+              dropInheritedAgent(result.target, input.requested).pipe(
+                Effect.map((target) => ({ ...result, target })),
+              ),
+            ),
+          ),
     afterWorkspace: (input) =>
       input.isRetry || Option.isNone(slotGate)
         ? Effect.succeed(NO_HOLD)
         : acquireSlot(slotGate.value, input),
-    // No fork check on created threads yet; model policy (M3) and placement (P1) add theirs here.
-    beforeCreateThread: (input) => Effect.succeed({ target: input.target }),
+    // Placement (P1) adds its check here.
+    beforeCreateThread: (input) =>
+      input.isRetry
+        ? Effect.succeed({ target: input.target })
+        : dropInheritedAgent(input.target, input.requested).pipe(
+            Effect.map((target) => ({ target })),
+          ),
   };
   return checks;
 });

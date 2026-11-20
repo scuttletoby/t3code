@@ -4522,6 +4522,142 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
   );
 
+  it.effect("a pick that names its model does not inherit the parent's OpenCode agent (#643)", () =>
+    Effect.gen(function* () {
+      // The model guard checks only the call, so an agent the parent runs must not reach a child
+      // through the inherited options. A call without a model keeps upstream inheritance.
+      const opencodeId = ProviderInstanceId.make("opencode");
+      const inherited = {
+        instanceId: opencodeId,
+        model: "big-pickle",
+        options: [
+          { id: "variant", value: "high" },
+          { id: "agent", value: "plan" },
+        ],
+      } as const;
+      const cases = [
+        { name: "model named", target: { model: "big-pickle" }, options: [inherited.options[0]] },
+        {
+          name: "model and effort named",
+          target: { model: "big-pickle", options: { variant: "low" } },
+          options: [{ id: "variant", value: "low" }],
+        },
+        {
+          name: "agent named by the call",
+          target: { model: "big-pickle", options: { agent: "build" } },
+          options: [inherited.options[0], { id: "agent", value: "build" }],
+        },
+        { name: "no model named", target: {}, options: inherited.options },
+      ] as const;
+      for (const testCase of cases) {
+        for (const tool of ["delegate_task", "create_threads"] as const) {
+          const commands: Array<{ readonly type: string; readonly modelSelection?: unknown }> = [];
+          const task = {
+            id: taskId,
+            threadId: parentThreadId,
+            origin: "app_owned",
+            childThreadId,
+            providerInstanceId: opencodeId,
+            model: inherited.model,
+            status: "running",
+            result: null,
+          };
+          const dependencies = Layer.mergeAll(
+            NodeServices.layer,
+            NodeCrypto.layer,
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              hasReceipt: () => Effect.succeed(false),
+              assertProviderInstanceEnabled: () => Effect.void,
+              getThreadRecords: (threadId) =>
+                Effect.succeed(
+                  threadId === parentThreadId
+                    ? parentProjection(commands.length > 0 ? [task] : [], inherited)
+                    : ({
+                        ...childProjection,
+                        thread: { ...childProjection.thread, modelSelection: inherited },
+                      } as unknown as OrchestrationV2ThreadProjection),
+                ),
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  commands.push(command as never);
+                  return {
+                    sequence: 1,
+                    storedEvents: [{ event: { type: "subagent.updated", payload: task } }],
+                  } as never;
+                }),
+            }),
+            ServerSettings.layerTest(),
+            providerRegistryLayer([
+              {
+                ...providerSnapshot({
+                  instanceId: opencodeId,
+                  driver: ProviderDriverKind.make("opencode"),
+                }),
+                models: [
+                  {
+                    slug: inherited.model,
+                    name: inherited.model,
+                    isCustom: false,
+                    capabilities: {
+                      optionDescriptors: [
+                        {
+                          id: "variant",
+                          label: "Variant",
+                          type: "select",
+                          options: [
+                            { id: "low", label: "Low" },
+                            { id: "high", label: "High" },
+                          ],
+                        },
+                        {
+                          id: "agent",
+                          label: "Agent",
+                          type: "select",
+                          options: [
+                            { id: "build", label: "Build" },
+                            { id: "plan", label: "Plan" },
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            ]),
+            adapterRegistryLayer([opencodeId]),
+            Layer.mock(ProjectService.ProjectService)({ getById: () => Effect.succeedNone }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          );
+          yield* Effect.gen(function* () {
+            const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+            const target = yield* decodeTarget(testCase.target);
+            if (tool === "delegate_task") {
+              yield* service.delegateTask(scope, {
+                task: "Review the change.",
+                target,
+                mode: "async",
+                clientRequestId: `agent-${testCase.name}`,
+              });
+            } else {
+              yield* service.createThreads(scope, {
+                threads: [{ target }],
+                clientRequestId: `agent-${testCase.name}`,
+              });
+            }
+            const created = commands.find((command) => command.modelSelection !== undefined);
+            assert.deepEqual(
+              created?.modelSelection,
+              { ...inherited, options: testCase.options },
+              `${tool}: ${testCase.name}`,
+            );
+          }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+        }
+      }
+    }),
+  );
+
   it.effect("accepts the inherited options it reports back as a delegate target", () =>
     Effect.gen(function* () {
       // t3_thread_launch keeps a model selection as given, so a thread can hold an option its model lacks.

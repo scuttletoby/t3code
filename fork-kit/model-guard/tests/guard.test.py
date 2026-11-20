@@ -1302,6 +1302,103 @@ const c = log("agent(") || items.map(i => i.agent)
             self.assertIn('is larger than 10 bytes', self.drift([good])[0])
         self.assertEqual(self.drift([good]), [])
 
+    # ---- #643: the levels a Claude row allows against the levels T3's model list offers (a self-check report)
+
+    def offers(self, paths, rows, mode='enforce'):
+        return self.m.effort_offer_problems(
+            self.m.parse_policy(json.dumps({'mode': mode, 'allow': rows}), 'p'), paths)
+
+    def test_t3_model_list_levels_are_compared(self):
+        """#643: a level a Claude row allows that its model does not offer: T3's delegate_task refuses a pick of it,
+        but a launch, a configure or a project default starts the model with no level, so it runs its default. The
+        self-check reports each such level; a model T3 gives no option list is reported, one not in the list is a
+        note (nothing to compare)."""
+        large = 'example-large-1'
+        def row(efforts, model=large, **kw):
+            return dict({'driver': 'claudeAgent', 'model': model, 'efforts': efforts}, **kw)
+        other = {'capabilities': {'optionDescriptors': [   # xhigh only as a choice of another select
+            {'id': 'effort', 'type': 'select', 'options': [{'id': 'high', 'label': 'high'}]},
+            {'id': 'contextWindow', 'type': 'select', 'options': [{'id': 'xhigh', 'label': 'xhigh'}]}]}}
+        def one(models, rows, **kw):
+            return self.offers([self.t3_list('t3.json', models, profiles={'other': other}, **kw)], rows)
+        new = [{'slug': large, 'profile': 'new'}]     # high, xhigh and ultracode
+        # every allowed level offered: nothing to say
+        for rows in ([row(['high', 'xhigh'])], [row(['high', 'ultracode'])], [row(['high'])]):
+            with self.subTest(rows=rows):
+                self.assertEqual(one(new, rows), ([], []))
+        self.assertEqual(one([{'slug': large, 'profile': 'toggle'}], [row(['high', 'ultracode'])]), ([], []))
+        self.assertEqual(one([{'slug': ' ' + large, 'profile': ' new'}], [row(['high'])]), ([], []))   # T3 trims
+        self.assertEqual(one(new, [row(['high'])], cache=False), ([], []))                           # a manifest itself
+        cases = {
+            'one level': (new, row(['medium', 'high']), 'allows medium', 'take it out'),
+            'two levels': (new, row(['low', 'medium', 'high']), 'allows low, medium', 'take them out'),
+            'the default': (new, row(['medium', 'high'], defaultEffort='medium'), 'allows medium',
+                            "efforts and defaultEffort"),
+            'ultracode without the option': ([{'slug': large, 'profile': 'old'}], row(['high', 'ultracode']),
+                                             'allows ultracode', 'take it out'),
+            'by an alias': ([{'slug': 'example-large-latest', 'aliases': ['EXAMPLE-LARGE-1'], 'profile': 'old'}],
+                            row(['high', 'xhigh']), 'allows xhigh', 'take it out'),
+            'the worst entry': ([{'slug': large, 'profile': 'new'}, {'slug': large, 'profile': 'old'}],
+                                row(['high', 'xhigh']), 'allows xhigh', 'take it out'),
+            'the worst entry first': ([{'slug': large, 'profile': 'old'}, {'slug': large, 'profile': 'new'}],
+                                      row(['high', 'xhigh']), 'allows xhigh', 'take it out'),
+            'an empty option list': ([{'slug': large, 'profile': 'none'}], row(['high']), 'allows high',
+                                     'take it out'),
+            'a level of another select': ([{'slug': large, 'profile': 'other'}], row(['high', 'xhigh']),
+                                          'allows xhigh', 'take it out'),
+            'no capabilities': ([{'slug': large, 'profile': 'bare'}], row(['high']), 'gives it no option list',
+                                'T3 checks no level'),
+            'no option list': ([{'slug': large, 'profile': 'empty'}], row(['high']), 'gives it no option list',
+                               'T3 checks no level'),
+            'an unknown profile': ([{'slug': large, 'profile': 'gone'}], row(['high']), 'gives it no option list',
+                                   'T3 checks no level'),
+        }
+        for name, (models, given, why, fix) in cases.items():
+            with self.subTest(name):
+                problems, notes = one(models, [given])
+                self.assertEqual(len(problems), 1, problems)
+                self.assertEqual(notes, [])
+                self.assertIn(f"'{large}' ", problems[0])
+                self.assertIn(why, problems[0])
+                self.assertIn(fix, problems[0])
+        # a model not in the list (a custom model): a note, no problem
+        problems, notes = one([{'slug': 'example-other', 'profile': 'new'}], [row(['high'])])
+        self.assertEqual(problems, [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn(f"'{large}' is not in T3's model list", notes[0])
+        # rows without efforts and rows of other drivers are not compared (T3's model list has option lists for
+        # Claude models only); a policy with none of them needs no list
+        others = [PLAIN, AGENT, {'driver': 'codex', 'model': 'example-codex', 'efforts': ['low']},
+                  {'driver': 'claudeAgent', 'model': 'example-plain-claude'}]
+        self.assertEqual(one([], others), ([], []))
+        self.assertEqual(self.offers(None, others), ([], []))
+        # runs again: the same answer, nothing stored
+        stale = self.t3_list('stale.json', new)
+        self.assertEqual(self.offers([stale], [row(['medium', 'high'])]), self.offers([stale], [row(['medium', 'high'])]))
+        # several lists: each is read, each says its own; one that cannot be read is said, never a pass
+        good = self.t3_list('good.json', [{'slug': large, 'profile': 'old'}])
+        problems, _ = self.offers([good, stale, os.path.join(self.dir, 'gone.json')], [row(['high', 'xhigh'])])
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn(good, problems[0])
+        self.assertIn('gone.json cannot be read', problems[1])
+        self.assertIn(f"'{large}' offer the levels their rows allow", problems[1])
+        # stopped half-way: T3 was writing its list
+        half = os.path.join(self.dir, 'half.json')
+        with open(stale, encoding='utf-8') as f:
+            self.write(half, f.read()[:40])
+        problems, _ = self.offers([half], [row(['high'])])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(f'T3 model list {half} is not valid JSON', problems[0])
+        # advise reports too; off checks nothing
+        self.assertEqual(len(self.offers([stale], [row(['medium', 'high'])], mode='advise')[0]), 1)
+        self.assertEqual(self.offers([stale], [row(['medium', 'high'])], mode='off'), ([], []))
+        self.assertEqual(self.offers(None, [row(['medium', 'high'])], mode='off'), ([], []))
+        # an old machine file names no list: said, never a silent pass
+        problems, _ = self.offers(None, [row(['high'])])
+        self.assertEqual(len(problems), 1)
+        self.assertIn('names no T3 model list ("t3ModelManifests")', problems[0])
+        self.assertIn(f"'{large}'", problems[0])
+
     def test_t3_model_lists_in_the_machine_file_are_checked(self):
         """#600: "t3ModelManifests" is a list of absolute paths, each once; anything else refuses every call, like
         every bad machine file key. The lists are only read by the self-check: a call never depends on them."""
@@ -1733,6 +1830,39 @@ class Contract(unittest.TestCase):
         self.assertEqual(model_guard.ultracode_option_in(catalog, 'claude-opus-5-5'), 'option')
         self.assertEqual(model_guard.ultracode_option_in(catalog, 'claude-opus-4-7'), 'none')
         self.assertEqual(model_guard.ultracode_option_in(catalog, 'example-custom'), 'missing')
+        # #643: the levels each Claude model offers read from the same list
+        levels, why = model_guard.efforts_offered_in(catalog, 'claude-opus-5-5')
+        self.assertIsNone(why)
+        self.assertLessEqual({'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'}, levels)
+        levels, _ = model_guard.efforts_offered_in(catalog, 'claude-opus-4-5')
+        self.assertIn('high', levels)
+        self.assertNotIn('xhigh', levels)
+        self.assertEqual(model_guard.efforts_offered_in(catalog, 'opus')[0],
+                         model_guard.efforts_offered_in(catalog, 'claude-opus-5-5')[0])     # by an alias
+        self.assertEqual(model_guard.efforts_offered_in(catalog, 'example-custom'), (None, 'missing'))
+
+    def test_t3_model_list_has_option_lists_for_claude_models_only(self):
+        """#643: the self-check compares only Claude rows' levels because T3's model list gives option lists only to
+        Claude models (the others' come from the provider while T3 runs). If another driver gains them, compare its
+        rows too and update the README ("list only the levels the model offers")."""
+        with open(os.path.join(REPO, 'apps', 'server', 'src', 'provider', 'model-manifest.json'), encoding='utf-8') as f:
+            providers = json.load(f)['providers']
+        with_lists = sorted(driver for driver, catalog in providers.items()
+                            if any((p.get('capabilities') or {}).get('optionDescriptors')
+                                   for p in (catalog.get('profiles') or {}).values()))
+        self.assertEqual(with_lists, [model_guard.CLAUDE_DRIVER])
+
+    def test_agent_option_ids_match_the_servers_list(self):
+        """#643: T3's delegation checks drop an agent option a child would inherit from its parent when the call
+        names its model (apps/server/src/fork/delegateChecks.ts AGENT_OPTION_IDS), so the guard, which sees only the
+        call, refuses the same ids in a pick (DRIVER_MODEL_OPTION_IDS)."""
+        path = os.path.join(REPO, 'apps', 'server', 'src', 'fork', 'delegateChecks.ts')
+        with open(path, encoding='utf-8') as f:
+            block = re.search(r'const AGENT_OPTION_IDS[^=]*= \{(.*?)\};', f.read(), re.S)
+        self.assertIsNotNone(block, f'AGENT_OPTION_IDS not found in {path}: keep the guard\'s list in step')
+        server = {driver: tuple(re.findall(r'"([^"]+)"', ids))
+                  for driver, ids in re.findall(r'(\w+): \[([^\]]*)\]', block.group(1))}
+        self.assertEqual(server, model_guard.DRIVER_MODEL_OPTION_IDS)
 
     def test_claude_rows_take_the_option_ids_t3_ships_for_claude(self):
         """#618 review: a Claude row takes only the option ids T3's Claude models have (the select "effort", read as
@@ -2100,6 +2230,28 @@ MUTATIONS = {
                        'test_a_t3_model_list_that_cannot_be_used_is_said'),
     'off needs no list': ("    if not rows or policy['mode'] == 'off':", '    if not rows:',
                           'test_t3_model_list_drift_is_reported'),
+    # #643: the levels a Claude row allows against T3's model list
+    'unoffered levels are reported': ('                missing = [e for e in row[\'efforts\'] if e not in offered]',
+                                      '                missing = []', 'test_t3_model_list_levels_are_compared'),
+    'a level is offered only by each entry': ('        offered = levels if offered is None else offered & levels',
+                                              '        offered = levels if offered is None else offered | levels',
+                                              'test_t3_model_list_levels_are_compared'),
+    'only the effort select offers levels': ("d.get('id') == CLAUDE_EFFORT_ID\n", "True\n",
+                                             'test_t3_model_list_levels_are_compared'),
+    'ultracode by its option': ('            levels.add(ULTRACODE_EFFORT)', '            pass',
+                                'test_t3_model_list_levels_are_compared'),
+    'a model without options is reported': ('    if None in entries:\n        return None, \'no list\'',
+                                            '    if None in entries:\n        return frozenset(), None',
+                                            'test_t3_model_list_levels_are_compared'),
+    'levels: no named list is reported': ('    if not manifest_paths:\n        return ([f\'',
+                                          '    if not manifest_paths:\n        return [], []\n        return ([f\'',
+                                          'test_t3_model_list_levels_are_compared'),
+    'levels: an unusable list is reported': ('        if why is not None:', '        if False:',
+                                             'test_t3_model_list_levels_are_compared'),
+    'levels: off needs no list': ("    if policy['mode'] == 'off' or not rows:", '    if not rows:',
+                                  'test_t3_model_list_levels_are_compared'),
+    'levels: Claude rows only': ("r['driver'] == CLAUDE_DRIVER and r['efforts']]", "r['efforts']]",
+                                 'test_t3_model_list_levels_are_compared'),
     'the machine file paths are checked': (
         "        if not v or any(not isinstance(p, str) or not os.path.isabs(p) or '\\0' in p for p in v):",
         '        if False:', 'test_t3_model_lists_in_the_machine_file_are_checked'),
