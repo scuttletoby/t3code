@@ -18,12 +18,14 @@ PLAIN = re.compile(r'(/[A-Za-z0-9._@+-]+)+')
 # TLS private keys, every service's environment (/etc/default, /etc/sysconfig), the login and session files, cron,
 # systemd's units and credentials, the mount tables (a share's password), network and VPN secrets, this kit's own
 # conf, the usual backup and mail tools' folders, and the usual files that name this host's accounts or LAN hosts
-# (passwd, group and hosts, which a job has its own of, their backup copies, subuid/subgid, tcp wrappers' hosts.allow
-# and hosts.deny, networks and ethers; issues #594, #613). A lint of known names (ALLOW_PATHS is a project's explicit
-# choice), not every file a distro or tool may keep: etc_secrets reads what is left. SECRET_ELSEWHERE: the same
-# outside /etc (Debian's /var/backups holds passwd.bak and group.bak, mode 0644; /var/log the login records wtmp,
-# btmp and lastlog and auth.log; libnss-extrausers keeps its passwd in /var/lib/extrausers). A path of these, or a
-# folder of one, at another path (a bind mount or hard link: the same device and inode) is the same (secret_inodes).
+# (passwd, group and hosts, which a job has its own of, and their backup copies: passwd-, passwd~, passwd.bak;
+# subuid/subgid, tcp wrappers' hosts.allow and hosts.deny, hosts.equiv, networks and ethers; issues #594, #613, #636).
+# A lint of known names (ALLOW_PATHS is a project's explicit choice), not every file a distro or tool may keep:
+# etc_secrets reads what is left. SECRET_ELSEWHERE: the same outside /etc (Debian's /var/backups holds passwd.bak and
+# group.bak, mode 0644; /var/log the login records wtmp, btmp and lastlog and auth.log; libnss-extrausers keeps its
+# passwd in /var/lib/extrausers; the mail spools have a file per user name; SSSD's cache holds passwd and group, its
+# mc readable by all; the DHCP leases name the LAN's hosts). A path of these, of a folder named private under /etc, or
+# a folder of one, at another path (a bind mount or hard link: the same device and inode) is the same (secret_inodes).
 SECRET_ETC = ('/etc/shadow', '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/etc/sudoers', '/etc/sudoers.d',
               '/etc/ssh', '/etc/ssl/private', '/etc/pki/tls/private', '/etc/pki/CA/private', '/etc/default',
               '/etc/sysconfig', '/etc/environment', '/etc/environment.d', '/etc/profile', '/etc/profile.d',
@@ -33,16 +35,19 @@ SECRET_ETC = ('/etc/shadow', '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/
               '/etc/wpa_supplicant', '/etc/wireguard', '/etc/openvpn', '/etc/ipsec.secrets', '/etc/ipsec.d',
               '/etc/ppp', '/etc/samba', '/etc/krb5.keytab', '/etc/letsencrypt', '/etc/docker', '/etc/containers',
               '/etc/apt/auth.conf', '/etc/apt/auth.conf.d', '/etc/restic', '/etc/borgmatic', '/etc/msmtprc',
-              '/etc/netrc', '/etc/.git', '/etc/passwd', '/etc/passwd-', '/etc/group', '/etc/group-', '/etc/hosts',
-              '/etc/subuid', '/etc/subuid-', '/etc/subgid', '/etc/subgid-', '/etc/hosts.allow', '/etc/hosts.deny',
+              '/etc/netrc', '/etc/.git', '/etc/passwd*', '/etc/group*', '/etc/hosts*', '/etc/subuid*', '/etc/subgid*',
               '/etc/networks', '/etc/ethers')
-SECRET_ELSEWHERE = ('/var/backups', '/var/log', '/var/lib/extrausers')
-# Those the launcher refuses itself (its never(); a test runs it on each and on every other entry above): only an
-# older launcher binds one, so the fix is to re-run the installer, whose launcher then names where the line is.
-LAUNCHER_REFUSES = ('/etc', '/etc/passwd', '/etc/group', '/etc/hosts', '/etc/passwd-', '/etc/group-', '/etc/subuid',
-                    '/etc/subuid-', '/etc/subgid', '/etc/subgid-', '/etc/hosts.allow', '/etc/hosts.deny',
-                    '/etc/networks', '/etc/ethers', '/var', '/var/log', '/var/log/*', '/var/backups', '/var/backups/*',
-                    '/var/lib', '/var/lib/extrausers', '/var/lib/extrausers/*')
+SECRET_ELSEWHERE = ('/var/backups', '/var/log', '/var/lib/extrausers', '/var/mail', '/var/spool/mail', '/var/lib/sss',
+                    '/var/lib/misc/dnsmasq.leases', '/var/lib/dhcp')
+# Those the launcher refuses itself, as its never() writes them (a test reads never()'s patterns and keeps the two
+# sets one, both ways, and runs the launcher on each and on every other entry above): only an older launcher binds
+# one, so the fix is to re-run the installer, whose launcher then names where the line is.
+LAUNCHER_REFUSES = ('/etc', '/etc/passwd', '/etc/group', '/etc/hosts', '/etc/passwd*', '/etc/group*', '/etc/hosts*',
+                    '/etc/subuid*', '/etc/subgid*', '/etc/networks', '/etc/ethers', '/var', '/var/log', '/var/log/*',
+                    '/var/backups', '/var/backups/*', '/var/lib', '/var/lib/extrausers', '/var/lib/extrausers/*',
+                    '/var/mail', '/var/mail/*', '/var/spool', '/var/spool/mail', '/var/spool/mail/*', '/var/lib/sss',
+                    '/var/lib/sss/*', '/var/lib/misc', '/var/lib/misc/dnsmasq.leases', '/var/lib/dhcp',
+                    '/var/lib/dhcp/*')
 # What a job can still read that may hold a secret (etc_secrets_wall, issue #243 items 5 and 6), besides every file
 # of its /etc view: the host's own programs and settings in /usr/local (LOCAL_TOPS); the packages' units (UNIT_TOPS)
 # and environment files every login or user session reads (ENV_TOPS: systemd's environment.d, fish's vendor_conf.d);
@@ -171,7 +176,7 @@ JOB_STOP_TIMEOUTS = {'DefaultTimeoutStopSec': 'TimeoutStopSec', 'DefaultTimeoutA
 # The sha256 of the launcher (fork-fleet-launch.sh) these walls ship with, whose start() gives every job unit its own
 # stop timeouts (launcher_shipped). The kit's one pin: fork-fleet-walls/wsl2 reads it from here (issue #365 item 2).
 # A changed launcher must change it (fork-fleet-walls.test.py checks it against the launcher in the repo).
-LAUNCHER_SHA256 = '9cab798d9521608a251952336777e73dc3a72606049a45d3dcb22646fe0b5e96'
+LAUNCHER_SHA256 = '5dfa2a8d5499e55f510281ccab3f342a38ccdd41bf072be85e2b5addd7413806'
 # Where systemd ends a line of a unit file, and what it strips as blank (its WHITESPACE; issue #226).
 UNIT_LINE_END = re.compile(r'\r\n|[\n\r\0]')
 UNIT_BLANKS = ' \t\n\r'
@@ -356,25 +361,38 @@ def secret_etc(p):
 
 
 def secret_inodes():
-    """{(device, inode): what} of each SECRET_ETC and SECRET_ELSEWHERE entry this host has ('the secret path'), and of
-    each folder above one ('a folder that holds the secret path', '/' too): a bind mount or hard link of one at
-    another path is the same device and inode (issue #613 item 7). One that is not there is skipped; one that cannot be
-    read: cannot tell (ValueError)."""
+    """{(device, inode): what} of each SECRET_ETC and SECRET_ELSEWHERE entry this host has and each folder named
+    private under /etc (secret_etc's own rule, issue #636) ('the secret path'), and of each folder above one ('a folder
+    that holds the secret path', '/' too): a bind mount or hard link of one at another path is the same device and
+    inode (issue #613 item 7). One that is not there is skipped; one that cannot be read: cannot tell (ValueError)."""
     entries, holders = {}, {}
-    for pattern in SECRET_ETC + SECRET_ELSEWHERE:
-        for path in sorted(glob.glob(glob.escape(ROOT) + pattern)):
-            rel = path[len(ROOT):]
-            st = stat_or_none(rel)
-            if st is None:
-                continue
-            entries.setdefault((st.st_dev, st.st_ino), rel)
-            folder = rel
-            while folder != '/':
-                folder = os.path.dirname(folder)
-                st = stat_or_none(folder)
-                if st is not None:
-                    holders.setdefault((st.st_dev, st.st_ino), f'{folder}, a folder that holds {rel}')
+    found = [path for pattern in SECRET_ETC + SECRET_ELSEWHERE
+             for path in sorted(glob.glob(glob.escape(ROOT) + pattern))]
+    for path in found + private_folders():
+        rel = path[len(ROOT):]
+        st = stat_or_none(rel)
+        if st is None:
+            continue
+        entries.setdefault((st.st_dev, st.st_ino), rel)
+        folder = rel
+        while folder != '/':
+            folder = os.path.dirname(folder)
+            st = stat_or_none(folder)
+            if st is not None:
+                holders.setdefault((st.st_dev, st.st_ino), f'{folder}, a folder that holds {rel}')
     return {**holders, **entries}   # an entry that also holds one is named as the entry
+
+
+def private_folders():
+    """Every folder named private under /etc (links not followed below /etc), as paths under ROOT, sorted: [] when
+    there is no /etc. One that cannot be listed: cannot tell (ValueError)."""
+    def failed(e):
+        if not isinstance(e, (FileNotFoundError, NotADirectoryError)):   # gone while walked: nothing there
+            raise ValueError(f'cannot list {(e.filename or "?")[len(ROOT):]} ({e.strerror})')
+    if not os.path.isdir(ROOT + '/etc'):
+        return []
+    return sorted(os.path.join(top, d) for top, dirs, _ in os.walk(ROOT + '/etc', onerror=failed)
+                  for d in dirs if d == 'private')
 
 
 def stat_or_none(path):
@@ -389,8 +407,10 @@ def stat_or_none(path):
 
 def same_as_secret(real, inodes):
     """What secret path real is by device and inode, or is inside (a folder above it is a secret entry itself, not
-    one that only holds one): None when neither. A single file inside a secret folder, bind-mounted or hard-linked on
-    its own elsewhere, is not found: the walls do not read every file of every secret folder (.github/fork-fleet.md)."""
+    one that only holds one): None when neither. Not found, as the walls stat only real and the folders above it,
+    never what is in real or in a secret folder (.github/fork-fleet.md): a single file or sub-folder of a secret folder
+    bind-mounted or hard-linked on its own elsewhere, and a hard link of a secret file inside an allowed folder (a
+    bind there is not seen by jobs: norbind). Only root can make either."""
     st = stat_or_none(real)
     if st is not None and (st.st_dev, st.st_ino) in inodes:
         return inodes[(st.st_dev, st.st_ino)]
@@ -429,11 +449,16 @@ def mounts_wall():
     named = [(dest, real) for dest, real in but_resolv(view) if secret_etc(dest) or secret_etc(real)]
     secret = sorted({dest if dest == real else f'{dest} (that is {real})' for dest, real in named})
     if secret:
-        older = any(launcher_refuses(dest) or launcher_refuses(real) for dest, real in named)
-        fix = ('bound by an older launcher, which does not refuse it itself: re-run the installer (its launcher then '
-               'refuses it and names where the line is)' if older else
-               'take it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names (the '
-               'installer\'s own list never has one), and allow only the files a build needs')
+        # Issue #636: both ways out when both kinds are there (an older launcher's line and the owner's), not one a run.
+        older = [launcher_refuses(dest) or launcher_refuses(real) for dest, real in named]
+        if all(older):
+            fix = ('bound by an older launcher, which does not refuse it itself: re-run the installer (its launcher '
+                   'then refuses it and names where the line is)')
+        elif any(older):   # both at once: short, so the line's 400-character cap keeps both ways out
+            fix = 'an older launcher binds some: re-run the installer; take the rest out of ALLOW_PATHS or JOB_PATHS'
+        else:
+            fix = ('take it out of ALLOW_PATHS, or of the JOB_PATHS file the launcher\'s conf names (the installer\'s '
+                   'own list never has one), and allow only the files a build needs')
         return (f'jobs see {", ".join(secret[:3])}: a path that holds this host\'s secrets or account names, or a '
                 f'folder of one; {fix}')
     # Issue #613 item 7: nor one of those at another path (a bind mount, a hard link): the same device and inode.
