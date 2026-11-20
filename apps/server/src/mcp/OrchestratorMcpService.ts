@@ -1745,7 +1745,7 @@ const make = Effect.gen(function* () {
   });
 
   // Fork: the fork's delegation checks (usage pacing, agent slots), called at their seats.
-  const delegateChecks = yield* DelegateChecks.make({ resolveTarget });
+  const delegateChecks = yield* DelegateChecks.make({ resolveTarget, scanWorkspace });
 
   const requestKey = (clientRequestId: string | undefined): Effect.Effect<string> =>
     clientRequestId === undefined ? random.uuidV4() : Effect.succeed(clientRequestId);
@@ -2823,7 +2823,7 @@ const make = Effect.gen(function* () {
         parent,
         requested: input.target,
         runtimeMode: input.runtimeMode,
-        providers: withWorkspaceModels(yield* loadProviders, yield* parentWorkspaceCwd(parent)),
+        cwd: yield* parentWorkspaceCwd(parent),
         target,
       });
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
