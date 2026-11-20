@@ -1,8 +1,7 @@
 /**
  * Fork: the model policy, which models (and efforts) agents may pick, per provider driver. Only the
- * setting lives here; the server reads only whether it is on (a delegated child then keeps only the
- * options its call names, `apps/server/src/fork/delegateChecks.ts`). Wired into the server settings
- * only through forkSettings.ts.
+ * setting lives here; nothing reads it yet. Wired into the server settings only through
+ * forkSettings.ts.
  */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
