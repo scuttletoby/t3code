@@ -262,10 +262,14 @@ describe("makeClaudeMcpProfiles", () => {
             mcpProfile: { name: "t3-only", servers: [], t3Tools: "all" },
           },
         };
-        const broken = "{ not json";
+        // A setting the decode refuses; its text says no MCP profile key.
+        const broken = JSON.stringify({ defaultRuntimeMode: 5 });
         const runs = yield* plansFor(["fails", "fails"], broken, undefined, task);
         assert.strictEqual(runs.length, 2);
         for (const run of runs) assert.include(run, "set to refuse such tasks");
+        // Text that cannot say, on a fresh start: refused too, before the carried profile counts.
+        for (const run of yield* plansFor(["fails"], "{ not json", undefined, task))
+          assert.include(run, "has not read its MCP profiles since it started");
         // A file that decodes, or no file: the default apply cuts it.
         const cut = ["all cut to []"];
         assert.deepStrictEqual(yield* plansFor(["fails"], "{}", undefined, task), cut);
@@ -290,12 +294,25 @@ describe("makeClaudeMcpProfiles", () => {
       Effect.gen(function* () {
         // Upstream's load gives every setting its default (apply) for a file that does not decode;
         // the file is checked on each read, so it reads as refuse here too.
-        for (const broken of ["{ not json", "", JSON.stringify({ providers: 5 })]) {
-          const runs = yield* plansFor([{}, {}], broken, undefined, carriedTask);
-          assert.strictEqual(runs.length, 2);
-          for (const run of runs) assert.include(run, "set to refuse such tasks");
-          // This machine's own threads still start, with what the read gave.
-          assert.deepStrictEqual(yield* plansFor([{ mcpProfile: "t3-only" }], broken), ["t3-only"]);
+        const legacy = JSON.stringify({ providers: 5 });
+        const runs = yield* plansFor([{}, {}], legacy, undefined, carriedTask);
+        assert.strictEqual(runs.length, 2);
+        for (const run of runs) assert.include(run, "set to refuse such tasks");
+        // This machine's own threads start with the MCP profile keys the file's text sets (none
+        // here), whatever the read gave: the file counts, the read may be an earlier load's.
+        assert.deepStrictEqual(yield* plansFor([{ mcpProfile: "t3-only" }], legacy), ["all"]);
+        // Text that cannot say (cut off, empty), on a fresh start: every thread refuses.
+        for (const broken of ["{ not json", ""]) {
+          for (const self of [carriedTask, thread("t")]) {
+            const refused = yield* plansFor(
+              [{}, { mcpProfile: "t3-only" }],
+              broken,
+              undefined,
+              self,
+            );
+            assert.strictEqual(refused.length, 2);
+            for (const run of refused) assert.include(run, "since it started");
+          }
         }
         // Fixed (or removed) again, the next read takes the task as before.
         assert.deepStrictEqual(yield* plansFor([{}], "{}", undefined, carriedTask), [
@@ -327,8 +344,9 @@ describe("makeClaudeMcpProfiles", () => {
         organization: "Example Corp",
         settings: { mcpProfile: { value: "t3-only", locked: true } },
       };
-      // A failed read and a broken file: still the locked t3-only, never the defaults' all.
-      assert.deepStrictEqual(yield* plansFor(["fails", "fails"], "{ not json", lockProfile), [
+      // A failed read and a file that does not decode: still the locked t3-only, never all.
+      const broken = JSON.stringify({ defaultRuntimeMode: 5 });
+      assert.deepStrictEqual(yield* plansFor(["fails", "fails"], broken, lockProfile), [
         "t3-only",
         "t3-only",
       ]);
@@ -340,7 +358,7 @@ describe("makeClaudeMcpProfiles", () => {
         settings: { mcpCarriedProfiles: { value: "apply", locked: true } },
       };
       for (const reads of [["fails"], [{}]] as const) {
-        assert.deepStrictEqual(yield* plansFor(reads, "{ not json", lockApply, carriedTask), [
+        assert.deepStrictEqual(yield* plansFor(reads, broken, lockApply, carriedTask), [
           "all cut to []",
         ]);
       }
@@ -462,6 +480,136 @@ describe("makeClaudeMcpProfiles", () => {
           ).pipe(Layer.provideMerge(NodeServices.layer)),
         ),
       ),
+  );
+});
+
+describe("makeClaudeMcpProfiles: settings.json broken before its MCP profile keys (#681)", () => {
+  /**
+   * Upstream's load as the server runs it: the file's settings, or every default for a file that
+   * does not parse (`serverSettings.ts`' reload replaces the cache the same way).
+   */
+  const asUpstreamLoads = Effect.gen(function* () {
+    const { settingsPath } = yield* ServerConfig.ServerConfig;
+    const fs = yield* FileSystem.FileSystem;
+    const service = yield* ServerSettingsService.ServerSettingsService;
+    const getSettings = fs.readFileString(settingsPath).pipe(
+      Effect.map((raw) => {
+        try {
+          return fromFile(JSON.parse(raw));
+        } catch {
+          return fromFile({});
+        }
+      }),
+      Effect.orElseSucceed(() => fromFile({})),
+    );
+    /** A server start: a new settings service, so nothing read before it is remembered. */
+    const start = () =>
+      makeClaudeMcpProfiles.pipe(
+        Effect.provideService(ServerSettingsService.ServerSettingsService, {
+          ...service,
+          getSettings,
+        }),
+        Effect.map(
+          (plan) => () =>
+            plan(thread("t"), {}).pipe(
+              Effect.match({ onFailure: (refusal) => refusal.message, onSuccess: (r) => r.name }),
+            ),
+        ),
+      );
+    const write = (text: string) => fs.writeFileString(settingsPath, text);
+    return { start, write };
+  });
+  const files = Layer.mergeAll(
+    ServerSettingsService.ServerSettingsService.layerTest(),
+    ManagedPolicy.layerTest(),
+    Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+  ).pipe(Layer.provideMerge(NodeServices.layer));
+  const NARROWED = JSON.stringify({ theme: "dark", mcpProfile: "t3-only" });
+  /** Cut off before the key, empty, cut off in a value, garbage, a list: none can say. */
+  const CANNOT_SAY = ['{ "theme": "dark", ', "", '{ "theme": "da', "\u0000\u0001 zz", "[1, 2]"];
+
+  it.effect("narrowed, then cut off, empty or garbage: the profile last read stays", () =>
+    Effect.gen(function* () {
+      const { start, write } = yield* asUpstreamLoads;
+      const run = yield* start();
+      yield* write(NARROWED);
+      assert.strictEqual(yield* run(), "t3-only");
+      for (const broken of CANNOT_SAY) {
+        yield* write(broken);
+        // Runs again: each turn reads the file again and keeps the last profile.
+        for (const _ of [1, 2]) assert.strictEqual(yield* run(), "t3-only", JSON.stringify(broken));
+      }
+      // A file that names a key but is cut off after it still refuses: it may set a new one.
+      yield* write('{ "mcpProfile": "all", "theme": ');
+      assert.include(yield* run(), "sets MCP profiles but cannot be read");
+      // Fixed: the next turn reads it. A valid file that names no key sets none, so all, and
+      // that is the profile kept when it breaks again.
+      yield* write(JSON.stringify({ theme: "light", mcpProfile: "t3-only" }));
+      assert.strictEqual(yield* run(), "t3-only");
+      yield* write(JSON.stringify({ theme: "light" }));
+      assert.strictEqual(yield* run(), "all");
+      yield* write("");
+      assert.strictEqual(yield* run(), "all");
+      // Text a full decode refuses but whose keys read: those keys are the last read too.
+      yield* write(JSON.stringify({ defaultRuntimeMode: 5, mcpProfile: "t3-only" }));
+      assert.strictEqual(yield* run(), "t3-only");
+      yield* write('{ "theme": ');
+      assert.strictEqual(yield* run(), "t3-only");
+    }).pipe(Effect.provide(files)),
+  );
+
+  it.effect("a server started on a file that cannot say refuses until it is fixed", () =>
+    Effect.gen(function* () {
+      const { start, write } = yield* asUpstreamLoads;
+      const before = yield* start();
+      yield* write(NARROWED);
+      assert.strictEqual(yield* before(), "t3-only");
+      yield* write('{ "theme": "dark", ');
+      assert.strictEqual(yield* before(), "t3-only");
+      // Restart with the file still broken: nothing read since the start, so refused, never all.
+      const after = yield* start();
+      for (const broken of CANNOT_SAY) {
+        yield* write(broken);
+        for (const _ of [1, 2]) {
+          const refused = yield* after();
+          assert.include(refused, "has not read its MCP profiles since it started");
+          assert.include(refused, "fix settings.json");
+        }
+      }
+      // The server from before the restart still holds what it read.
+      assert.strictEqual(yield* before(), "t3-only");
+      // Fixed: read; broken again: kept.
+      yield* write(NARROWED);
+      assert.strictEqual(yield* after(), "t3-only");
+      yield* write("");
+      assert.strictEqual(yield* after(), "t3-only");
+      // No file at all is a fresh install: all, and kept as the last read.
+      const fresh = yield* start();
+      const { settingsPath } = yield* ServerConfig.ServerConfig;
+      yield* (yield* FileSystem.FileSystem).remove(settingsPath);
+      assert.strictEqual(yield* fresh(), "all");
+      yield* write("");
+      assert.strictEqual(yield* fresh(), "all");
+    }).pipe(Effect.provide(files)),
+  );
+
+  it.effect(
+    "a file fixed before the service reloads it counts at once, not the stale defaults",
+    () =>
+      Effect.gen(function* () {
+        const { settingsPath } = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const service = yield* ServerSettingsService.ServerSettingsService;
+        // The service still holds the defaults a broken load gave (its watcher has not reloaded).
+        const plan = yield* makeClaudeMcpProfiles.pipe(
+          Effect.provideService(ServerSettingsService.ServerSettingsService, {
+            ...service,
+            getSettings: Effect.succeed(fromFile({})),
+          }),
+        );
+        yield* fs.writeFileString(settingsPath, NARROWED);
+        for (const _ of [1, 2]) assert.strictEqual((yield* plan(thread("t"), {})).name, "t3-only");
+      }).pipe(Effect.provide(files)),
   );
 });
 

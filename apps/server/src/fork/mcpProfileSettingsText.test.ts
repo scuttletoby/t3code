@@ -1,40 +1,73 @@
 import { DEFAULT_SERVER_SETTINGS, ProjectId, type ServerSettings } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
-import { readMcpProfileKeysFromText, withMcpProfileFileKeys } from "./mcpProfileSettingsText.ts";
+import {
+  mcpProfileFileKeysOf,
+  readMcpProfileKeysFromText,
+  withMcpProfileFileKeys,
+} from "./mcpProfileSettingsText.ts";
 
 const asIs = (persisted: unknown) => persisted;
 const read = (raw: string, withDefaults: (persisted: unknown) => unknown = asIs) =>
   readMcpProfileKeysFromText(raw, withDefaults);
 const keysOf = (raw: string) => {
   const result = read(raw);
-  if (!result.ok) throw new Error(`unreadable: ${result.issue}`);
+  if (result._tag !== "keys") throw new Error(`${result._tag}: ${result.issue}`);
   return result.keys;
 };
 
 describe("readMcpProfileKeysFromText (#681)", () => {
-  it("text that names no MCP profile key sets none, however broken it is", () => {
-    // An empty file, one cut off half-way through a write, a list: none can hold a profile.
-    for (const raw of ["", "{ not json", '{ "theme": "dark", ', "[1, 2]", "null", "5"]) {
-      expect(read(raw)).toEqual({ ok: true, keys: undefined });
-    }
+  it("text that is not a JSON object and names no key cannot say, so it is not read as none", () => {
+    // An empty file, one cut off half-way through a write (before its keys), garbage, a list:
+    // each may have held a profile, so the caller keeps the keys it last read (or refuses).
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ["", "it is empty"],
+      ["  \n", "it is empty"],
+      ["{ not json", "it is not valid JSON"],
+      ['{ "theme": "dark", ', "it is not valid JSON"],
+      ['{ "theme": "da', "it is not valid JSON"],
+      ["\u0000\u0001 zz", "it is not valid JSON"],
+      ["[1, 2]", "it holds a list, not an object"],
+      ["null", "it holds null, not an object"],
+      ["5", "it holds number, not an object"],
+    ];
+    for (const [raw, issue] of cases) expect(read(raw)).toEqual({ _tag: "unknown", issue });
+  });
+
+  it("a JSON object that names no key sets none: the defaults, as a full decode reads it", () => {
+    const keys = keysOf('{ "theme": "dark" }');
+    expect(keys).toMatchObject({ mcpProfiles: {}, mcpThreadProfiles: {} });
+    expect(keys.mcpProfile ?? "all").toBe("all");
+    expect(keys.projectSettingsOverrides).toEqual({});
+    // The managed policy's defaults still apply to it.
+    const withDefaults = (persisted: unknown) => ({
+      mcpProfile: "t3-only",
+      ...(persisted as object),
+    });
+    expect(read("{}", withDefaults)).toMatchObject({
+      _tag: "keys",
+      keys: { mcpProfile: "t3-only" },
+    });
   });
 
   it("refuses text that names a profile key but cannot be read, never reading it as all", () => {
     const halfWritten = '{ "mcpProfile": "t3-only", "theme": ';
-    expect(read(halfWritten)).toEqual({ ok: false, issue: "it is not valid JSON" });
-    expect(read('["mcpProfile"]')).toEqual({ ok: false, issue: "it holds a list, not an object" });
+    expect(read(halfWritten)).toEqual({ _tag: "unreadable", issue: "it is not valid JSON" });
+    expect(read('["mcpProfile"]')).toEqual({
+      _tag: "unreadable",
+      issue: "it holds a list, not an object",
+    });
     expect(read('"mcpThreadProfiles"')).toEqual({
-      ok: false,
+      _tag: "unreadable",
       issue: "it holds string, not an object",
     });
     expect(read('{ "mcpProfile": "docs", "projectSettingsOverrides": 5 }')).toEqual({
-      ok: false,
+      _tag: "unreadable",
       issue: "its projectSettingsOverrides holds number, not a map",
     });
     // A key spelled with an escape counts as named.
     expect(read('{ "\\u006dcpProfile": "t3-only", ')).toEqual({
-      ok: false,
+      _tag: "unreadable",
       issue: "it is not valid JSON",
     });
   });
@@ -91,7 +124,7 @@ describe("readMcpProfileKeysFromText (#681)", () => {
       ...(persisted as object),
     });
     expect(read('{ "mcpThreadProfiles": {} }', withDefaults)).toMatchObject({
-      ok: true,
+      _tag: "keys",
       keys: { mcpProfile: "t3-only" },
     });
   });
@@ -112,7 +145,7 @@ describe("withMcpProfileFileKeys (#681)", () => {
         mcpProfile: "t3-only",
         projectSettingsOverrides: { "project:a": { mcpProfile: "t3-only" } },
       }),
-    )!;
+    );
     const laid = withMcpProfileFileKeys(base, keys);
     expect(laid.mcpProfile).toBe("t3-only");
     expect(laid.projectSettingsOverrides[ProjectId.make("project:a")]).toEqual({
@@ -125,5 +158,31 @@ describe("withMcpProfileFileKeys (#681)", () => {
     ).toBeUndefined();
     // Pure: the service's settings are left as they were.
     expect(base.mcpProfile).toBe("all");
+  });
+});
+
+describe("mcpProfileFileKeysOf (#681)", () => {
+  it("gives a decoded file's keys as its text gives them, so either can stand for the other", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      mcpProfile: "t3-only",
+      mcpThreadProfiles: { "thread:a": "all" },
+      projectSettingsOverrides: {
+        [ProjectId.make("project:a")]: { mcpSubagentProfile: "t3-only", autoPull: true },
+        [ProjectId.make("project:b")]: { autoPull: true },
+      },
+    } as unknown as ServerSettings;
+    const keys = mcpProfileFileKeysOf(settings);
+    expect(keys).toMatchObject({ mcpProfile: "t3-only", mcpThreadProfiles: { "thread:a": "all" } });
+    // Only a project's MCP keys; a project with none is left out, as the text reader leaves none.
+    expect(keys.projectSettingsOverrides).toEqual({
+      "project:a": { mcpSubagentProfile: "t3-only" },
+    });
+    // Laid over settings that lost them (a broken load's defaults), they come back.
+    const laid = withMcpProfileFileKeys(DEFAULT_SERVER_SETTINGS, keys);
+    expect(laid.mcpProfile).toBe("t3-only");
+    expect(laid.projectSettingsOverrides[ProjectId.make("project:a")]?.mcpSubagentProfile).toBe(
+      "t3-only",
+    );
   });
 });

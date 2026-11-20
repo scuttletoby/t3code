@@ -413,14 +413,25 @@ still shows a server the profile leaves out, or does not list its servers within
 managed Claude policy on the machine or `--mcp-config` in the Claude launch arguments can make
 Claude load a server T3's list leaves out.
 
-A thread whose profile is narrower than `all` cannot start a thread that gets more than its own
-profile ([#681](https://github.com/scuttletoby/t3code/issues/681)). `t3_thread_launch` from it is
-refused, before anything is made, when the new thread's profile in the target project (the project's
-`mcpProfile`, else the server's) is not within the launcher's: a profile is within another when its
-servers and T3 tools are a part of the other's. A launch on another machine, and a new `schedule_task` there,
-are refused for such a thread too, as that machine gives the thread its own profile; `delegate_task` carries the
-launcher's profile instead. A launcher whose profile cannot be worked out is refused, never taken
-as `all`. A thread on `all`, and the owner's own client, launch as before.
+A thread whose profile is narrower than `all` cannot start a top-level thread on this machine that
+gets more than its own profile ([#681](https://github.com/scuttletoby/t3code/issues/681)).
+`t3_thread_launch` and `create_threads` from it are refused, before any thread is made, when the new
+thread's profile (its project's `mcpProfile`, else the server's; `create_threads` makes its thread in
+the caller's own project) is not within the launcher's: a profile is within another when its servers
+and T3 tools are a part of the other's. Both profiles come from one settings read. A launcher, or a
+new thread, whose profile cannot be worked out (a project that names a profile no setting defines)
+is refused, never taken as `all`. Each call is checked: a retry of a `t3_thread_launch` that was
+accepted before is checked again, so it is refused when the profiles no longer allow it, though its
+thread exists; a retry of an accepted `create_threads` call is left as it resolves, as its thread is
+already made. `t3_thread_launch` with `scratch: true` makes the (empty) scratch project before the
+check, so a refused launch can leave that project behind; it makes no thread. A launch on another
+machine, and a new `schedule_task` there, are refused for such a thread too, as that machine gives
+the thread its own profile; `delegate_task` carries the launcher's profile instead. That refusal is
+made by the sending machine: a T3 from before this check sends a narrowed thread's launch to a
+machine of this version unchecked, and there it arrives with no calling thread and gets that
+machine's profile. Editing or running a scheduled task on another machine, and moving a thread
+there (`t3_thread_transfer`), are not checked yet. A thread on `all`, and the owner's own client,
+launch as before.
 
 Only Claude threads apply profiles. A Codex thread, or one on any other provider, would get every
 MCP server and every T3 tool whatever its profile says. So its turn is not started when its profile
@@ -534,16 +545,19 @@ check of its own thread's profile, and for the features route's answer. When it 
 (also when it already did not decode when the server loaded it, which gives every setting its
 default), this setting reads as `refuse`, as the file may say so: a narrower carried task is
 refused, and the route answers `false`. A managed policy that locks this setting wins over that.
-This machine's own threads never get a wider profile from a broken file
-([#681](https://github.com/scuttletoby/t3code/issues/681)): the MCP profile keys (`mcpProfiles`,
+This machine's own threads do not get a wider profile from a broken file
+([#681](https://github.com/scuttletoby/t3code/issues/681)). The MCP profile keys (`mcpProfiles`,
 `mcpProfile`, `mcpSubagentProfile`, `mcpThreadProfiles` and each project's `mcpProfile` and
-`mcpSubagentProfile`) are read from the file's text the way a full decode reads them, so a typo in
-another setting leaves every thread's profile as the file sets it. A file whose text names none of
-those keys sets no profile, so its threads keep the settings the server has (also the thread that
-fixes the file). A file that names one but cannot be read as a JSON object (cut off half-way
-through a write, a list, a project map that is not a map), or that cannot be read from disk at all,
-refuses every turn, delegation and launch it decides, saying why, until it is fixed: the next turn
-reads it again. When the settings cannot be read in full (they read provider secrets too), the MCP
+`mcpSubagentProfile`) are read from the file on each read, over the settings the server holds
+(which can still be an earlier load's, such as a broken file's defaults until it reloads). A file
+that is a JSON object but does not decode (a typo in another setting) gives the keys its text holds,
+read the way a full decode reads them; a valid file that names none of them sets none, so `all`.
+Text that is not a JSON object and names none of them (empty, cut off before its MCP keys, garbage)
+cannot say, so the server keeps the MCP profile keys it last read in this run; a server started on
+such a file has none, and refuses every turn, delegation and launch until the file is fixed. Text
+that names one of them but cannot be read as a JSON object (cut off half-way through a write, a
+list, a project map that is not a map), or a file that cannot be read from disk at all, refuses
+the same way, saying why. The next turn reads the file again. When the settings cannot be read in full (they read provider secrets too), the MCP
 profile settings come from `settings.json` alone; when that cannot be read either, a turn or a
 delegation is refused and the route answers `false`, never anything wider. Only the person can
 change it; agents cannot.

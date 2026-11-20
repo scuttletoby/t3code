@@ -1,7 +1,7 @@
 /**
- * Fork: the MCP profile keys of a settings.json that does not decode as a whole (upstream's load
- * then gives defaults, so `all`), read from its text as a full decode reads them. Text that names a
- * key but cannot be read as an object refuses, never `all` on a guess; text naming none sets none.
+ * Fork: the MCP profile keys of a settings.json that does not decode (upstream's load then gives
+ * defaults, so `all`), read from its text. Text naming a key but not an object is unreadable; text
+ * that is not an object and names no key (empty, cut off, garbage) is unknown: the caller decides.
  */
 import {
   ForkProjectOverrideFields,
@@ -25,13 +25,19 @@ export type McpProfileFileKeys = Pick<
 };
 
 export type McpProfileFileKeysRead =
-  /** `keys` is `undefined` when the text names no MCP profile key, so it sets none. */
-  | { readonly ok: true; readonly keys: McpProfileFileKeys | undefined }
-  | { readonly ok: false; readonly issue: string };
+  /** A JSON object: the keys it sets (none named: the defaults, so a valid file sets none). */
+  | { readonly _tag: "keys"; readonly keys: McpProfileFileKeys }
+  /**
+   * Not a JSON object, naming no key: empty, cut off before its keys, or garbage. It may have
+   * held a profile, so it says nothing either way; `issue` says what it is.
+   */
+  | { readonly _tag: "unknown"; readonly issue: string }
+  /** Names a key but cannot be read: refuse, never `all` on a guess. */
+  | { readonly _tag: "unreadable"; readonly issue: string };
 
 /**
- * Text that names none of these keys sets no profile, whatever else is wrong with it. JSON can
- * spell a key's letters only as themselves or as a `\u` escape, so text with an escape counts.
+ * Whether text that cannot be read names a profile key. JSON can spell a key's letters only as
+ * themselves or as a `\u` escape, so text with an escape counts.
  */
 const NAMES_A_PROFILE_KEY = /mcpProfile|mcpSubagentProfile|mcpThreadProfiles|\\u/;
 
@@ -70,19 +76,31 @@ export function readMcpProfileKeysFromText(
   raw: string,
   withDefaults: (persisted: unknown) => unknown,
 ): McpProfileFileKeysRead {
-  if (!NAMES_A_PROFILE_KEY.test(raw)) return { ok: true, keys: undefined };
   const parsed = parseSettingsFileText(raw);
-  if (Exit.isFailure(parsed)) return { ok: false, issue: "it is not valid JSON" };
-  if (!isRecord(parsed.value)) {
-    return { ok: false, issue: `it holds ${kind(parsed.value)}, not an object` };
+  if (Exit.isFailure(parsed) || !isRecord(parsed.value)) {
+    const issue = Exit.isSuccess(parsed)
+      ? `it holds ${kind(parsed.value)}, not an object`
+      : raw.trim() === ""
+        ? "it is empty"
+        : "it is not valid JSON";
+    return NAMES_A_PROFILE_KEY.test(raw)
+      ? { _tag: "unreadable", issue }
+      : { _tag: "unknown", issue };
   }
   const filled = withDefaults(parsed.value);
-  if (!isRecord(filled)) return { ok: false, issue: "the managed policy's defaults do not apply" };
+  if (!isRecord(filled)) {
+    return { _tag: "unreadable", issue: "the managed policy's defaults do not apply" };
+  }
   const server = decodeServerKeys(filled);
-  if (Exit.isFailure(server)) return { ok: false, issue: "its MCP profile keys do not read" };
+  if (Exit.isFailure(server)) {
+    return { _tag: "unreadable", issue: "its MCP profile keys do not read" };
+  }
   const projects: unknown = filled.projectSettingsOverrides;
   if (projects !== undefined && projects !== null && !isRecord(projects)) {
-    return { ok: false, issue: `its projectSettingsOverrides holds ${kind(projects)}, not a map` };
+    return {
+      _tag: "unreadable",
+      issue: `its projectSettingsOverrides holds ${kind(projects)}, not a map`,
+    };
   }
   const projectSettingsOverrides: Record<
     string,
@@ -98,7 +116,30 @@ export function readMcpProfileKeysFromText(
       ? decoded.value
       : unreadableProject(entry);
   }
-  return { ok: true, keys: { ...server.value, projectSettingsOverrides } };
+  return { _tag: "keys", keys: { ...server.value, projectSettingsOverrides } };
+}
+
+/** The MCP profile keys of settings a load decoded, as {@link readMcpProfileKeysFromText} gives. */
+export function mcpProfileFileKeysOf(settings: ServerSettings): McpProfileFileKeys {
+  const projectSettingsOverrides: Record<
+    string,
+    { readonly mcpProfile?: string; readonly mcpSubagentProfile?: string }
+  > = {};
+  for (const [projectId, override] of Object.entries(settings.projectSettingsOverrides)) {
+    const { mcpProfile, mcpSubagentProfile } = override ?? {};
+    if (mcpProfile === undefined && mcpSubagentProfile === undefined) continue;
+    projectSettingsOverrides[projectId] = {
+      ...(mcpProfile === undefined ? {} : { mcpProfile }),
+      ...(mcpSubagentProfile === undefined ? {} : { mcpSubagentProfile }),
+    };
+  }
+  return {
+    mcpProfiles: settings.mcpProfiles,
+    mcpProfile: settings.mcpProfile,
+    mcpSubagentProfile: settings.mcpSubagentProfile,
+    mcpThreadProfiles: settings.mcpThreadProfiles,
+    projectSettingsOverrides,
+  };
 }
 
 /**
