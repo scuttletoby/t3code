@@ -51,30 +51,34 @@ at any step; one installer at a time. The steps are the cleaner's (`fork-kit/com
   it over: it switches `current` to the new release and leaves the hand version folder where it was (not in the
   install record). There is no plain copy to keep, so `uninstall` then removes `t3-golive` entirely, with the hand
   folder, like any install of the kit.
-- **No uninstall under a run, or while one needs settling.** A golive run, the holder that keeps T3 stopped and
-  the switch guard (and its timer) run the code of the version they started with (its real path), so an install
-  keeps old version folders (installing the same release over a changed copy swaps in the same code). `uninstall`
-  takes `<stateDir>/lock` (the machine file's `golive.stateDir`) and refuses while a run holds it, while the
-  journal's last run needs settling (a killed switch, a failed W1: T3 may be stopped and its home held), and while
-  a process or a transient systemd unit (the holder, a switch guard timer still pending) runs code from
+- **No uninstall under a run, or while one needs settling.** A golive run, the holder that keeps T3 stopped and the
+  switch guard (and its timer) run the code of the version they started with (its real path), so an install keeps
+  old version folders (installing the same release over a changed copy swaps in the same code). `uninstall` takes
+  `<stateDir>/lock` (the machine file's `golive.stateDir`) and refuses while a run holds it, while the journal's
+  last run needs settling (a killed switch, a failed W1: T3 may be stopped and its home held), and while a process
+  or a transient systemd unit (the holder, a switch guard timer still pending) runs code from
   `/usr/local/libexec/t3-golive` or through the kit's links. Settle first (`t3-golive status`, then `back` or
-  `settle`). A machine file it cannot read, a journal it cannot trust, and a lock or journal that is not a plain
-  file (the state folder is the T3 user's) refuse too. Where no golive run has made `<stateDir>/lock` yet,
-  `uninstall` makes it first, as golive would (the file `0600`, the state folder `0700`, folders above it as
-  `os.makedirs` makes them) and as the owner of the last folder there (with that user's own group, in a child
-  that holds none of root's open files and is ended after 30 seconds or when `uninstall` ends), never as root,
-  and holds it: a first run cannot start during the uninstall. The way to the state folder, and to the lock and
-  journal already there, is opened one step at a time with no link followed. A link of root's
-  (`/home -> /var/home`) is gone along only where it sits in a folder of root's that no one else may write in;
-  any other link refuses (the T3 user could point it at another user's folder, or have moved a link of root's
-  into their own folder): make `stateDir` a path without it. Below the first folder that is not root's, every
-  folder must have that same owner (a folder of someone else's there may have been moved in). No folder on the
-  way may be on a FUSE filesystem (a user's own could show any owner) or on one whose type cannot be read from
-  `/proc/self/mountinfo`. Where the state folder is root's, nothing is made: a golive run as a user makes the
-  lock there only in a folder anyone may make folders in (a sticky one such as `/tmp`), an odd place for
-  `stateDir` where the gap stays. A run started by a bare name from its own folder
-  (`python3 t3-golive` in `/usr/local/bin`) is not seen by the process scan; `./t3-golive`, `../bin/t3-golive`
-  and doubled slashes are. Every golive run that changes anything holds the lock, so it is covered there.
+  `settle`). A machine file it cannot read, a journal it cannot trust or over 64 MiB (golive writes a few KB a run),
+  and a lock or journal that is not a plain file, or has another filesystem mounted on it (the state folder is the
+  T3 user's), refuse too; the file looked at is the one opened (through `/proc/self/fd`), without waiting. Where no
+  golive run has made `<stateDir>/lock` yet, `uninstall` makes it first, as golive would (the file `0600`, the state
+  folder `0700`, folders above it as `os.makedirs` makes them) and as the owner of the last folder there (with that
+  user's own group, in a child that holds none of root's open files and is ended after 30 seconds or when
+  `uninstall` ends), never as root, and holds it: a first run cannot start during the uninstall. The way to the
+  state folder, and to the lock and journal already there, is opened one step at a time with no link followed. A
+  link of root's (`/home -> /var/home`) is gone along only where it sits in a folder of root's that no one else may
+  write in; any other link refuses (the T3 user could point it at another user's folder, or have moved a link of
+  root's into their own folder): make `stateDir` a path without it. Below the first folder that is not root's, every
+  folder must have that same owner (a folder of someone else's there may have been moved in). No folder on the way
+  may be on a FUSE filesystem (a user's own could show any owner) or on one whose type cannot be read from
+  `/proc/self/mountinfo`. Where the state folder is root's, nothing is made: a golive run as a user makes the lock
+  there only in a folder anyone may make folders in (a sticky one such as `/tmp`), an odd place for `stateDir` where
+  the gap stays. **Upgrade note (#617):** hosts whose `stateDir` goes through a link of the T3 user's (or through a
+  folder of root's below the T3 user's folders, a data disk mounted under their home, say) used to uninstall with
+  the lock already there, opened by its path; they now refuse, and the message says what to change. A run started by
+  a bare name from its own folder (`python3 t3-golive` in `/usr/local/bin`) is not seen by the process scan;
+  `./t3-golive`, `../bin/t3-golive` and doubled slashes are. Every golive run that changes anything holds the lock,
+  so it is covered there.
 - **Update through the bootstrap.** Run the bootstrap again with the newer release commit.
 
 The installer writes no machine file and nothing in a T3 home; `uninstall` leaves both, and the state folder.
