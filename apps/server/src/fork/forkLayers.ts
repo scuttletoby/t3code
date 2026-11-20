@@ -16,6 +16,7 @@ import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsageReadingsHistory from "../usage/UsageReadingsHistory.ts";
 import * as WorkAdmission from "../workAdmission.ts";
 import * as ActivityProbe from "./activityProbe.ts";
+import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 
 /** Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. */
@@ -42,6 +43,13 @@ export const layerRuntimeServices = Layer.mergeAll(
   HeadlessUsageRefresher.layer,
   HandoffService.layer,
 );
+
+/**
+ * Provided to the runtime's core dependencies (server.ts's `layerRuntimeCoreDependenciesBase`, first
+ * in its pipe, so only its own workers see it): upstream's orchestrator, except that idle compaction
+ * skips a thread whose handoff mode is `handoff`, which the handoff service alone owns.
+ */
+export const handoffThreadsSkipIdleCompaction = HandoffOwner.layer;
 
 /** In the routes, after upstream's follower of tasks in linked environments. */
 export const layerRoutes = Layer.mergeAll(
