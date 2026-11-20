@@ -27,6 +27,9 @@ with open(os.path.join(root, 'stub-report.txt')) as f:
     sys.stdout.write(f.read())
 '''
 
+# The live build's own report (Machine.set_live_report): the live server is a copy of `sleep`, which has none.
+LIVE_STUB_T3 = STUB_T3.replace('stub-report.txt', 'stub-live-report.txt')
+
 STUB_SYSTEMCTL = '''#!{python} -I
 import json, os, sys
 root = {root!r}
@@ -79,13 +82,15 @@ class Machine:
         self.bin = self.path('bin')
         self.server = None
         self._saved = (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
-                       osadapter.CGROUP_FILE, os.environ.get('PATH'))
+                       osadapter.CGROUP_FILE, os.environ.get('PATH'), live.fork_report)
         for d in (self.bin, self.backups, self.path('etc')):
             os.makedirs(d)
             os.chmod(d, 0o755)  # a umask of 002 would leave them group-writable, which the loader refuses
-        for name, text in (('systemctl', STUB_SYSTEMCTL), ('systemd-run', STUB_SYSTEMD_RUN)):
+        for name, text in (('systemctl', STUB_SYSTEMCTL), ('systemd-run', STUB_SYSTEMD_RUN),
+                           ('t3-live-stub', LIVE_STUB_T3)):
             self.write(f'bin/{name}', text.format(python=sys.executable, root=self.root), mode=0o755)
         os.environ['PATH'] = self.bin
+        live.fork_report = self._fork_report
         config.MACHINE_FILE, config.MACHINE_OWNER = self.path('etc/machine.json'), os.getuid()
         osadapter.SYSTEMCTL = os.path.join(self.bin, 'systemctl')
         osadapter.SYSTEMD_RUN = os.path.join(self.bin, 'systemd-run')
@@ -109,7 +114,7 @@ class Machine:
             kill(self.server)
             self.server = None
         (config.MACHINE_FILE, config.MACHINE_OWNER, osadapter.SYSTEMCTL, osadapter.SYSTEMD_RUN,
-         osadapter.CGROUP_FILE, path) = self._saved
+         osadapter.CGROUP_FILE, path, live.fork_report) = self._saved
         os.environ['PATH'] = path or ''
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -182,6 +187,21 @@ class Machine:
 
     def set_report(self, value, prefix=''):
         self.write('stub-report.txt', prefix + (json.dumps(value, indent=2) if isinstance(value, dict) else value))
+
+    def set_live_report(self, value):
+        """What the home's own runtime builds report (the live fork build's `__fork-report`); None: they have none
+        (a `sleep` copy fails, as an older build without this report version would)."""
+        if value is None:
+            os.remove(self.path('stub-live-report.txt'))
+        else:
+            self.write('stub-live-report.txt', json.dumps(value, indent=2) if isinstance(value, dict) else value)
+
+    def _fork_report(self, binary, home):
+        real = self._saved[-1]
+        runtimes = os.path.join(self.home, 'runtime', 'versions') + os.sep
+        if os.path.realpath(binary).startswith(runtimes) and os.path.exists(self.path('stub-live-report.txt')):
+            return real(self.path('bin/t3-live-stub'), home)
+        return real(binary, home)
 
     # --- what happened ---
     def calls(self, name):

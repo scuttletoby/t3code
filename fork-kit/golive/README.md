@@ -32,15 +32,21 @@ found in `PATH`. It writes only the kit's own lock file. It refuses, with every 
   runtime holds exactly the archive's files;
 - free disk is at least 2 x database + floor (database + floor on each disk when backups are on another one);
 - the staged build's read-only report (`t3 __fork-report --base-dir <home>`, run with an empty HOME and a bare
-  PATH) is ok, is of the target version, and lists the fork features switched on (`featuresOn`; a report without
-  that list refuses). That list goes into the result: the switch keeps the features as they are (fork #529).
-  While the live build is upstream (no `.fork.N`: the first switch) every one must be off. It runs only beside a
+  PATH) is ok, is of the target version, and says what the fork features are: each one's value (`fork.features`),
+  those switched on (`featuresOn`) and where (`featuresWhere`); a report without the list or the values refuses.
+  The switch keeps the features as they are (fork #529), so they go into the result (`features`: values, the
+  names on and their places, sorted). While the live build is upstream (no `.fork.N`: the first switch) every one
+  must be off. While it is a fork build, its own report (the live server's binary, run the same way beside it)
+  must read the same values in the same places: a target that reads one otherwise (a new feature on by default, a
+  key or policy default the old build read another way, `usagePacingGate` `advise` -> `enforce`) refuses, naming
+  each feature that differs, before anything stops; set it in settings so both builds read the same. A live fork
+  build that gives no report this kit reads (an older report version) passes only with all off. It runs only beside a
   T3 that the checks above found running steadily (service active, its own server live, no update pending, no marker): a
   report reading the home while T3 stops keeps SQLite from tidying its WAL at the stop (nothing is lost, but the WAL
   with its frames and `-shm` stay, and a copy takes that WAL without its `-shm`). Otherwise it is not run, and says
   so. The live server is read again after it: if T3 stopped, restarted or began an update meanwhile (the owner or
   the auto-updater), the report's answer is not used and check refuses (`--json` then holds no `counts`,
-  `pendingMigrations`, `providers` or `featuresOn`);
+  `pendingMigrations`, `providers` or `features`);
 - the machine file section is complete, and no golive run needs settling (see below).
 
 Exit 0: ready (the plan is printed), or nothing to do, and only when no check failed: a refusal always wins.
@@ -245,9 +251,10 @@ migrate plus ready, rounded up. Then, each a journalled step:
    refuses, T3 not stopped): a second transient unit runs `switch-guard --run <id> --wait` and its timer fires `switch-guard --run
    <id>` after the latest the run can end (`switch.guard_after`: every wait at its longest, the verify limit twice,
    the way back, plus 10 minutes). Not up: refused, T3 not stopped.
-2. `pre-hooks`, then quiet again, then the fork features on read again by the staged build (beside the running T3,
-   with the server checked before and after, as check reads them); a failure, or another list than check's (an
-   owner switched a feature since), runs the post hooks and refuses (T3 not stopped). A rerun reads the new list.
+2. `pre-hooks`, then quiet again, then the fork features read again by the staged build and the live fork build
+   (beside the running T3, with the server checked before and after, as check reads them); a failure, or other
+   features than check's (an owner switched one since), runs the post hooks and refuses (T3 not stopped). A rerun
+   reads them again.
 3. `stopping`: stop the service, wait until the server is gone and its ownership lock is free (held from here to
    the update), and see that nothing changed while it stopped. The step's facts name the copy folder, the old
    build and the time limit: the guard reads them.
@@ -263,8 +270,9 @@ migrate plus ready, rounded up. Then, each a journalled step:
    (`runtimeSha256`: every path, kind and content sum) for the verify.
 7. `before`: the stopped home's report, read now (nothing can write), by the target build just installed and
    checked (never the stage, which nothing checked since the prechecks): the counts the verify compares with, the
-   provider instances and the fork features on; it fails unless every count is known, the report is ok, the fork
-   features on are exactly those check read and the pending migrations are those the rehearsal ran.
+   provider instances and the fork features; it fails unless every count is known, the report is ok, the fork
+   features (values, names on, places) are exactly those check read and the pending migrations are those the
+   rehearsal ran.
 8. `update` (the owner lock the kit holds goes to the new launcher once that holds its serving lock: see "The gap"
    below): `<home's target t3> update <target> --base-dir <home> --yes` with a fixed environment (no `T3CODE_RELEASE_BASE_URL` or other variable reaches it); the target is installed already,
    so it downloads nothing. A managed mirror policy (`/etc/t3code/policy.json`) is still asked whether the target is
@@ -275,7 +283,7 @@ migrate plus ready, rounded up. Then, each a journalled step:
    service active; the server is the target, from this home's runtime; service state names the target with no
    update pending; no markers; something answers HTTP on its port; the links point at the target; the target's
    report says no migration is pending, counts are not lower than in step 5, provider instances are the same
-   (compared by SHA256 only), the fork features on are those of step 7 and it is ok; and the runtime the server runs
+   (compared by SHA256 only), the fork features are those of step 7 and it is ok; and the runtime the server runs
    is still byte for byte what step 6 recorded (checked first and when all else holds: a mismatch fails at once, it
    cannot heal; a restaged archive does not matter any more).
 10. `post-hooks`. Exit 0: verified.
@@ -490,7 +498,9 @@ and nothing else from the environment, and dies with the run (`PR_SET_PDEATHSIG`
   removed from the clone's `settings.json` (the server's value, a thread's entry in it, or a project override's;
   a missing value reads as off), never from the home's or the copy's; the restore in R5 puts the copy's back. A
   report again must say all off, and becomes the before report. The facts (and the result's `featuresOff`) name
-  the features, where they were on and what was removed. All off: the file is not touched.
+  the features, where they were on and what was removed. All off: the file is not touched. So a rehearsal never
+  runs the target with the features that go live (`waitFor` on against the migrated database, say): a passed
+  rehearsal says nothing about them, and the switch's verify on the live home is the first run with them on.
 - **R2**: `<fork t3> auth session list --json --base-dir <clone>`, with no server: a read-only command whose
   database layer migrates under the ownership lock. Timed: seconds, database growth, the migrations (the before
   report's `pendingMigrations`). A report after it must show exactly those applied and none pending (or it says no
