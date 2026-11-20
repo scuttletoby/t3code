@@ -49,6 +49,10 @@ export interface BeforeWorkspaceInput {
   readonly parent: Parent;
   readonly requested: OrchestratorMcpTarget | undefined;
   readonly runtimeMode: OrchestratorMcpDelegateTaskInput["runtimeMode"];
+  /**
+   * The providers as the target lookup read them: after any refresh or folder scan it ran, with
+   * the models the project's own provider config adds (`withWorkspaceModels`).
+   */
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly target: DelegateTarget;
 }

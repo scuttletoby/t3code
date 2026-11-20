@@ -122,6 +122,9 @@ def home_owned(home, hold=0.0):
 
 PROBE_HOLD = 0.004  # an SSH probe's hold, made long enough that the kit's 20 ms poll meets one every few polls
 PROBES = 40  # how many probes a probing phase lasts: a count, not a time (under load each probe takes longer)
+# and how many more it makes after the kit first met one (#550): a kit that took that probe for the launcher let go
+# right then, and only a later probe finds the home free (ending at the meeting, the race tests often missed it)
+PROBES_AFTER_MET = 10
 PROBING_LIMIT = 300  # seconds: a probing phase that has not ended by then fails its test instead of hanging it
 
 
@@ -131,9 +134,9 @@ def kit_looks_for_the_launcher(test):
     from golive import handoff
     looks, real = [], handoff.launcher_serving
 
-    def spy(home, svc):
+    def spy(home, svc, holders=None):
         began = time.monotonic()
-        found = real(home, svc)
+        found = real(home, svc, holders)
         looks.append((began, found))
         return found
     patcher = mock.patch.object(handoff, 'launcher_serving', spy)
@@ -162,7 +165,8 @@ def kit_meets_probes(test):
 class Prober:
     """SSH launches waiting in the launch script's `home_owned` loop (tunnel.ts), probing the serving lock, many
     times faster than upstream's once a second, at random intervals. A launch that finds the home free starts a
-    hand server (race.launch). wait() returns after PROBES probes once the kit met one (met: kit_meets_probes)."""
+    hand server (race.launch). wait() returns after PROBES probes, and PROBES_AFTER_MET after the kit first met one
+    (met: kit_meets_probes)."""
 
     def __init__(self, race, met):
         self.race, self.met, self.stop, self.probes = race, met, threading.Event(), 0
@@ -170,7 +174,7 @@ class Prober:
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self):
-        home = self.race.m.home
+        home, last = self.race.m.home, None  # last: the probe count this phase ends at (once the kit met one)
         serving = os.path.join(home, 'runtime', 'service-serving.lock')
         if not os.path.exists(serving):  # a launcher of this home ran before (upstream creates it then)
             sqlite3.connect(serving).close()
@@ -180,7 +184,9 @@ class Prober:
                 if not home_owned(home, PROBE_HOLD):
                     self.race.launch('old')  # it looked already: it starts its own server now
                     return
-                if self.probes >= PROBES and self.met.is_set():
+                if last is None and self.met.is_set():
+                    last = max(PROBES, self.probes + PROBES_AFTER_MET)
+                if last is not None and self.probes >= last:
                     return
         finally:
             self.done.set()
@@ -304,6 +310,21 @@ def marker_since(test, version):
     test.addCleanup(patcher.stop)
 
 
+def kit_cannot_see_its_own_lock(test):
+    """/proc/locks lists the kit's own lock under no pid it knows (a /proc of another pid namespace), so it could
+    not see the launcher's either (#550). Every other lock reads as before."""
+    real = handoff.lock_holders
+
+    def blind(path):
+        return set() if path.startswith('/proc/self/fd/') else real(path)
+    patcher = mock.patch.object(handoff, 'lock_holders', blind)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
+BLIND = "the kit cannot tell the boot service's launcher by its locks here"
+
+
 class CopyRace(copy_t.CopyBase):
     def setUp(self):
         super().setUp()
@@ -389,6 +410,24 @@ class CopyRace(copy_t.CopyBase):
             self.copy()
         self.assertNotIn('stop', self.calls())
 
+    def test_a_kit_that_cannot_see_its_own_lock_refuses_before_the_stop(self):
+        """#550: it could not tell the launcher after the start, and would keep the owner lock until the new server
+        gave up: T3 down for a minute. Refused before the marker, so no SSH launch waits on one; run again, it
+        refuses the same; an old build (no serving lock to see) still copies."""
+        kit_cannot_see_its_own_lock(self)
+        for _ in range(2):
+            with self.assertRaisesRegex(journal.Refused, f"{BLIND} .*T3 would stay down.*; T3 was not stopped"):
+                self.copy()
+            self.assertNotIn('stop', self.calls())
+            self.assertFalse(os.path.exists(self.m.path('home/runtime/desktop-update-in-progress')))
+            self.assertEqual([n for n in os.listdir(self.m.path('home/runtime')) if 'probe' in n or 'tmp' in n], [])
+        marker_since(self, NEW)
+        self.adapter.claims_serving = False
+        self.adapter.before_start = ['fresh']  # as in test_an_old_launcher_without_the_serving_lock_still_starts
+        old = self.m.server.pid
+        self.copy()
+        self.assert_t3_runs_again(old)
+
 
 class CopyBackstop(copy_t.CopyBase):
     """An SSH client older than 0.1.10 honours neither the marker nor the locks: the hand server it starts in the
@@ -467,6 +506,18 @@ class SwitchRace(switch_t.SwitchBase):
             self.assertIsNotNone(ms, when)
         self.assertFalse(os.path.exists(self.m.path('home/runtime/desktop-update-in-progress')))
         self.assertEqual(self.last_run()['end']['result'], 'ok')
+
+    def test_a_kit_that_cannot_see_its_own_lock_refuses_before_the_stop(self):
+        """#550: the target and the way back (the old build) take the serving lock: the switch refuses before the
+        stop where the kit could not tell their launcher."""
+        marker_since(self, fx.LIVE)
+        kit_cannot_see_its_own_lock(self)
+        self.rehearsed()
+        with self.assertRaisesRegex(journal.Refused, f'{BLIND} .*; T3 was not stopped'):
+            self.switch()
+        self.assertNotIn('stopping', [s['step'] for s in self.last_run()['steps']])
+        self.assertEqual(self.server()['version'], fx.LIVE)
+        self.assertFalse(os.path.exists(self.m.path('home/runtime/desktop-update-in-progress')))
 
     def test_ssh_launches_probing_through_the_update_never_free_the_home(self):
         marker_since(self, fx.TARGET)
@@ -601,6 +652,18 @@ class W1Gap(back_t.BackBase):
         self.assertNotIn('stop', self.calls()[calls:])
         self.assertFalse(any('stopping T3' in s for s in self.said), self.said)
         self.assertTrue(self.adapter.service()['active'])
+
+    def test_a_w1_where_the_kit_cannot_see_its_own_lock_refuses_before_saying_it_stops_t3(self):
+        """#550: W1's update starts the old build, which takes the serving lock here."""
+        marker_since(self, fx.LIVE)
+        kit_cannot_see_its_own_lock(self)
+        calls = len(self.calls())
+        with self.assertRaisesRegex(journal.Refused, f'{BLIND} .*; T3 was not stopped'):
+            self.back('w1', lose_work_since=self.at)
+        self.assertNotIn('stop', self.calls()[calls:])
+        self.assertFalse(any('stopping T3' in s for s in self.said), self.said)
+        self.assertTrue(self.adapter.service()['active'])
+        self.assertTrue(self.adapter.service()['enabled'])
 
 
 class Holder(back_t.BackBase):
@@ -956,7 +1019,7 @@ class Marker(unittest.TestCase):
         self.assertFalse(held(owner))
         self.assertLess(time.monotonic() - began, 5)
 
-    def service(self):
+    def service(self, timeout=None):
         """The boot service as adapter.service() reads it: this process stands in for its launcher."""
         return {'active': True, 'mainPid': os.getpid()}
 
@@ -976,10 +1039,13 @@ class Marker(unittest.TestCase):
         stop, probing, probes, free, claimed = threading.Event(), threading.Event(), [], [], []
 
         def ssh_probes():
+            last = None  # the probe count this phase ends at, once the kit met one (Prober)
             try:
                 while not stop.wait(random.uniform(0.006, 0.03)):
                     probes.append(probe(PROBE_HOLD, serving))
-                    if len(probes) >= PROBES and met.is_set():
+                    if last is None and met.is_set():
+                        last = max(PROBES, len(probes) + PROBES_AFTER_MET)
+                    if last is not None and len(probes) >= last:
                         return
             finally:
                 probing.set()
@@ -1032,8 +1098,8 @@ class Marker(unittest.TestCase):
         for slow, wait, late in ((0.0, 10**9, False), (0.3, self.h.SERVER_LOCK_WAIT_MS, True)):
             real = self.h.launcher_serving
 
-            def seen(home, svc, slow=slow, real=real):  # a look stretched by load, after the claim
-                found = real(home, svc)
+            def seen(home, svc, holders=None, slow=slow, real=real):  # a look stretched by load, after the claim
+                found = real(home, svc, holders)
                 if found:
                     time.sleep(slow)
                 return found
@@ -1094,13 +1160,110 @@ class Marker(unittest.TestCase):
             g.starting(lambda: None, NEW, self.service)  # held all along, by a process that is not the service's
         self.assertEqual(g.handover, 'timeout')
         g.adopt(coldcopy.hold_owner_lock(userdata, 0))
-        g.starting(lambda: None, NEW, lambda: {'active': True, 'mainPid': holder.pid})
+        g.starting(lambda: None, NEW, lambda **_: {'active': True, 'mainPid': holder.pid})
         self.assertEqual(g.handover, 'launcher')
         g.adopt(coldcopy.hold_owner_lock(userdata, 0))
         with mock.patch.object(self.h, 'HANDOVER_WAIT', 0.3):
-            g.starting(lambda: None, NEW, lambda: {'active': False, 'mainPid': holder.pid})  # a stopped service
+            g.starting(lambda: None, NEW, lambda **_: {'active': False, 'mainPid': holder.pid})  # a stopped service
         self.assertEqual(g.handover, 'timeout')
         holder.stdout.close()
+
+    def test_the_kit_sees_its_own_lock_and_leaves_nothing_behind(self):
+        """#550: the check before the stop. Here (Linux, one pid namespace) it sees its lock; where /proc/locks
+        cannot be read or lists it under no pid it knows, it says why; a build that takes no serving lock needs no
+        such look. Run again, it says the same: it keeps nothing (the file it locks has no name)."""
+        runtime = self.m.path('home/runtime')
+        for _ in range(2):
+            self.assertIsNone(self.h.sees_own_lock(self.m.home))
+            self.assertIsNone(self.h.handover_blind(self.m.home, [NEW]))
+            self.assertEqual(os.listdir(runtime), [])
+        with mock.patch.object(self.h, 'lock_holders', return_value=None):
+            self.assertEqual(self.h.sees_own_lock(self.m.home), '/proc/locks cannot be read')
+            why = self.h.handover_blind(self.m.home, ['0.1.9', NEW])
+            self.assertIn("cannot tell the boot service's launcher by its locks here (/proc/locks cannot be read)", why)
+            self.assertIn(f'keep the home\'s owner lock {self.h.HANDOVER_WAIT:g} s', why)
+            self.assertIsNone(self.h.handover_blind(self.m.home, ['0.1.9']))  # it lets go before the start
+        with mock.patch.object(self.h, 'lock_holders', return_value={1}):
+            self.assertIn(f'does not list this process (pid {os.getpid()})', self.h.sees_own_lock(self.m.home))
+        self.assertEqual(os.listdir(runtime), [])
+        os.rmdir(runtime)  # a missing runtime folder: the marker's write refuses (open_gap), not this look
+        self.assertIsNone(self.h.sees_own_lock(self.m.home))
+
+    def test_the_service_is_read_until_it_runs_then_its_main_pid_is_kept(self):
+        """#550: each look that met an SSH probe ran `systemctl show` (timeout 30 s) inside the 250 ms the new
+        server waits. Now the service is read with a short timeout, and once it runs its MainPID is kept: probes
+        all through the start cost no read, and the look after the claim is a read of /proc/locks alone."""
+        userdata, runtime = self.m.path('home/userdata'), self.m.path('home/runtime')
+        os.makedirs(userdata)
+        serving = os.path.join(runtime, 'service-serving.lock')
+        sqlite3.connect(serving).close()
+        owner = os.path.join(userdata, 'server-owner.sqlite')
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        met = kit_meets_probes(self)
+        reads = []
+
+        def service(timeout=None):
+            reads.append(timeout)
+            return {'active': True, 'mainPid': os.getpid()}
+
+        def start():  # SSH launches probe until the kit met PROBES_AFTER_MET more, then the launcher claims
+            n = 0
+            while n < PROBES_AFTER_MET:
+                probe(PROBE_HOLD, serving)
+                n += met.is_set()
+            launcher = sqlite3.connect(serving, isolation_level=None, timeout=1)
+            launcher.execute('BEGIN EXCLUSIVE')
+            end = time.monotonic() + PROBING_LIMIT
+            while held(owner) and time.monotonic() < end:
+                time.sleep(0.005)
+            launcher.close()
+        g.starting(start, NEW, service)
+        self.assertEqual(g.handover, 'launcher')
+        self.assertEqual(len(reads), 1, f'the service was read {len(reads)} times')
+        self.assertEqual(reads, [self.h.SERVICE_READ_TIMEOUT])
+
+    def test_a_main_process_that_is_gone_is_read_again(self):
+        """Old state: the service read gave a MainPID that has exited since (Restart=always started a new launcher):
+        the kit reads the service again and hands the home to the new one."""
+        userdata = self.m.path('home/userdata')
+        os.makedirs(userdata)
+        serving = self.m.path('home/runtime/service-serving.lock')
+        owner = os.path.join(userdata, 'server-owner.sqlite')
+        gone = subprocess.Popen([sys.executable, '-I', '-c', 'pass'])
+        gone.wait()
+        reads = []
+
+        def service(timeout=None):
+            reads.append(timeout)
+            return {'active': True, 'mainPid': gone.pid if len(reads) == 1 else os.getpid()}
+
+        def start():
+            launcher = sqlite3.connect(serving, isolation_level=None)
+            launcher.execute('BEGIN EXCLUSIVE')
+            end = time.monotonic() + PROBING_LIMIT
+            while held(owner) and time.monotonic() < end:
+                time.sleep(0.005)
+            launcher.close()
+        g = self.h.Gap(self.m.home)
+        g.adopt(coldcopy.hold_owner_lock(userdata, 0))
+        g.starting(start, NEW, service)
+        self.assertEqual(g.handover, 'launcher')
+        self.assertEqual(len(reads), 2)
+
+    def test_a_slow_service_read_after_a_start_with_no_launcher_still_sees_t3_run(self):
+        """After a start that reached no launcher, the holder goes only when the service runs (#530). That read is not
+        in a hurry: it uses the adapter's usual timeout, so a systemctl slower than the short read during the start
+        (a busy machine) still sees T3 run, and the home is not kept held behind it."""
+        reads = []
+
+        def service(timeout=None):
+            reads.append(timeout)
+            if timeout is not None and timeout <= self.h.SERVICE_READ_TIMEOUT:
+                raise subprocess.TimeoutExpired(['systemctl', 'show'], timeout)
+            return {'active': True, 'mainPid': os.getpid()}
+        self.assertTrue(self.h._active(service))
+        self.assertEqual(reads, [None])
 
     def test_a_failed_renewal_is_journalled(self):
         with mock.patch.object(self.h, 'RENEW', 0.05):

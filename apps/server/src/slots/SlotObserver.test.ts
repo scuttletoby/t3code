@@ -11,12 +11,12 @@ import {
   type ServerSettings as ServerSettingsValue,
   ThreadId,
 } from "@t3tools/contracts";
-import type { SlotRuleStatus } from "@t3tools/contracts/waitFor";
+import { type SlotRuleStatus, WaitToolFailure } from "@t3tools/contracts/waitFor";
 import { AgentScope, type AgentScopeShape } from "@t3tools/shared/AgentScope";
 import type { CapacityFileRead, CapacityHost } from "@t3tools/shared/capacityReadings";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import type { DeepPartial } from "@t3tools/shared/Struct";
-import { DISPATCH_SAFETY_MS } from "@t3tools/shared/agentSlots";
+import { DISPATCH_SAFETY_MS, type SlotReservation } from "@t3tools/shared/agentSlots";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -176,17 +176,24 @@ const acquireAndRelease = Effect.tap(acquire, release).pipe(Effect.map((answer) 
 /** Lets forked observations and the fake host's promises finish (scheduler turns, no real wait). */
 const settle = Effect.forEach(Array.from({ length: 20 }), () => Effect.yieldNow, { discard: true });
 
-/** The status once `observed + skipped` reached `count`. */
-const statusAfter = (count: number) =>
+/** `status` once `observed + skipped` reached `count` (scheduler turns only, at most 200). */
+const counted = <S extends { readonly observed: number; readonly skipped: number }>(
+  status: Effect.Effect<S | null>,
+  count: number,
+  name = "",
+) =>
   Effect.gen(function* () {
-    const gate = yield* SlotGate.SlotGate;
     for (let turn = 0; turn < 200; turn += 1) {
-      const status = yield* gate.observed;
-      if (status !== null && status.observed + status.skipped >= count) return status;
+      const current = yield* status;
+      if (current !== null && current.observed + current.skipped >= count) return current;
       yield* settle;
     }
-    return yield* Effect.die(new Error(`fewer than ${count} observations`));
+    return yield* Effect.die(new Error(`${name}fewer than ${count} observations`));
   });
+
+/** The gate's status once `observed + skipped` reached `count`. */
+const statusAfter = (count: number) =>
+  SlotGate.SlotGate.pipe(Effect.flatMap((gate) => counted(gate.observed, count)));
 
 const observe = (patch: Record<string, unknown> = {}) => ({
   agentSlots: { mode: "observe", ...patch },
@@ -827,15 +834,7 @@ describe("SlotGate observe mode", () => {
             gateRecords: false,
             ...patch,
           });
-        const done = (count: number) =>
-          Effect.gen(function* () {
-            for (let turn = 0; turn < 200; turn += 1) {
-              const status = yield* observer.status;
-              if (status.observed + status.skipped >= count) return status;
-              yield* settle;
-            }
-            return yield* Effect.die(new Error(`${name}: fewer than ${count} observations`));
-          });
+        const done = (count: number) => counted(observer.status, count, `${name}: `);
         let decisions = 0;
         if (entry.own === "skipped") {
           // Other threads' observations fill the queue; the first one's store read takes 1 s.
@@ -973,10 +972,7 @@ describe("SlotGate observe mode", () => {
             ...input,
           });
           decided += 1;
-          for (let turn = 0; (yield* observer.status).observed < decided; turn += 1) {
-            if (turn === 200) return yield* Effect.die(new Error("not observed"));
-            yield* settle;
-          }
+          yield* counted(observer.status, decided);
         });
       // Slots off: the holder starts (a dispatch that never ends: a lost release).
       yield* decide({
@@ -1038,10 +1034,7 @@ describe("SlotGate observe mode", () => {
           slowDecided += 1;
           yield* settle;
           yield* TestClock.adjust(OBSERVE_READ_TIMEOUT);
-          for (let turn = 0; (yield* slow.status).observed < slowDecided; turn += 1) {
-            if (turn === 200) return yield* Effect.die(new Error("not observed"));
-            yield* settle;
-          }
+          yield* counted(slow.status, slowDecided);
         });
       const startAt = (atMs: number, token: number) => ({
         atMs,
@@ -1055,6 +1048,128 @@ describe("SlotGate observe mode", () => {
       yield* decideSlow(startAt(DISPATCH_SAFETY_MS + 1, 2));
       yield* decideSlow({ atMs: DISPATCH_SAFETY_MS + 2, gateRecords: true });
       assert.deepStrictEqual(yield* slow.kept, { starts: 0, usedHolds: 0, notes: 0 }, "slots on");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("a wait store that cannot be read is no good read: the start's note stays (#415)", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const HOLD = { key: "w_held", threadId: caller, untilMs: 100_000 };
+      let failing = true;
+      const statuses = yield* run(
+        world,
+        { ...observe(), waitFor: { enabled: true } },
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          yield* gate.attachReservations({
+            read: Effect.suspend(() =>
+              failing
+                ? Effect.fail(
+                    new WaitToolFailure({ code: "store_unavailable", message: "newer version" }),
+                  )
+                : Effect.succeed([HOLD]),
+            ),
+            used: () => Effect.void,
+          });
+          // The holder starts while the store cannot be read; its dispatch keeps running.
+          assert.strictEqual((yield* acquire).type, "allow");
+          const unread = yield* statusAfter(1);
+          failing = false;
+          // Another thread's decision: the start counts once, its hold is used up (not both).
+          yield* gate.acquire({ callerThreadId: ThreadId.make("other"), targetInstanceId: MAIN });
+          return [unread, yield* statusAfter(2)] as const;
+        }),
+      );
+      assert.deepInclude(statuses[0].last, { readings: "failed", pieces: null });
+      assert.deepInclude(statuses[1].last, { readings: "ok", pieces: 1 });
+    }),
+  );
+
+  it.effect(
+    "a decision outside observe mode drops the notes: a later hold still counts (#415)",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        let hang = true;
+        let inStore: ReadonlyArray<SlotReservation> = [];
+        const status = yield* run(
+          world,
+          { ...observe(), waitFor: { enabled: true } },
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            const settings = yield* ServerSettings.ServerSettingsService;
+            yield* gate.attachReservations({
+              read: Effect.suspend(() => (hang ? Effect.never : Effect.succeed(inStore))),
+              used: () => Effect.void,
+            });
+            // Slots off: the caller starts (a note), its store read hangs so no read takes the
+            // note, and its dispatch ends with no child.
+            yield* release(yield* acquire);
+            yield* settle;
+            yield* TestClock.adjust(OBSERVE_READ_TIMEOUT);
+            yield* statusAfter(1);
+            // Fixed mode with a limit: the same thread is granted a new hold, which is written.
+            hang = false;
+            yield* settings.updateSettings({
+              agentSlots: { mode: "fixed", enabled: true, maxPerMachine: 5 },
+            });
+            const grants = yield* gate.grant([{ key: "w_new", threadId: caller }]);
+            assert.deepStrictEqual(
+              grants.map((grant) => grant.type),
+              ["granted"],
+            );
+            yield* gate.keep(["w_new"]);
+            inStore = [
+              {
+                key: "w_new",
+                threadId: caller,
+                untilMs: (grants[0] as { untilMs: number }).untilMs,
+              },
+            ];
+            // Back to observe with slots off, well inside the note's 10 minutes.
+            yield* settings.updateSettings({ agentSlots: { mode: "observe", enabled: false } });
+            yield* gate.acquire({ callerThreadId: ThreadId.make("other"), targetInstanceId: MAIN });
+            return yield* statusAfter(2);
+          }),
+        );
+        // The new hold was granted after the start: it counts.
+        assert.deepInclude(status.last, { readings: "ok", pieces: 1 });
+      }),
+  );
+
+  it.effect("a second start of the same thread renews its note's time (#415)", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const slow = yield* observerFor(world);
+      let decided = 0;
+      const decideSlow = (input: Partial<SlotObserveInput> & { atMs: number }) =>
+        Effect.gen(function* () {
+          yield* slow.observe({
+            today: ["allow"],
+            starting: [],
+            held: Effect.never,
+            startGraceMs: 30_000,
+            gateRecords: false,
+            ...input,
+          });
+          decided += 1;
+          yield* settle;
+          yield* TestClock.adjust(OBSERVE_READ_TIMEOUT);
+          yield* counted(slow.status, decided);
+        });
+      const startAt = (atMs: number, token: number) => ({
+        atMs,
+        callerThreadId: "waiter",
+        ownStart: { token, instanceId: MAIN, atMs },
+      });
+      // A hold may outlive the note's limit (`reserveSeconds` over 600): the later start's note
+      // must still take it.
+      yield* decideSlow(startAt(0, 1));
+      yield* decideSlow(startAt(DISPATCH_SAFETY_MS / 2, 2));
+      yield* decideSlow({ atMs: DISPATCH_SAFETY_MS });
+      assert.strictEqual((yield* slow.kept).notes, 1, "renewed");
+      yield* decideSlow({ atMs: DISPATCH_SAFETY_MS * 1.5 });
+      assert.strictEqual((yield* slow.kept).notes, 0, "ended");
     }).pipe(Effect.scoped),
   );
 

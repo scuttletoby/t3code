@@ -195,7 +195,8 @@ schema_check "$base" "The series"
 # is a fork with a list of its own). After a rebase (--after-rebase), a "pending" ceiling or "lost"
 # count above the file's lines is only a note: upstream taking a fork line drops it in the rebase,
 # and the next run (from the new base) would refuse it. So the series gets a commit that lowers each
-# one (#325); a count that rose is still refused, as raising one is the owner's review.
+# one (#325), and excludes in "forkFiles" each upstream file a pull request's run would take for the
+# fork's own (#432); a count that rose is still refused, as raising one is the owner's review.
 seam_refusal="Fork changes to upstream files must stay within the seam lines"
 # What a lowering commit changed, for the run's summary: written only once the plan has finished,
 # as a later check can still stop it and then nothing is pushed.
@@ -218,7 +219,7 @@ seam_check() { # seam_check BASE WHAT [--after-rebase]
     as_fork commit -q -m "fork seams: lower counts after the rebase onto $target_tag" -m "$lowered"
     printf '%s\n' "$2 lowered the seam list (.github/fork-seams.json) in a commit of its own:" "$lowered" >&2
     lowered_summary=("### Seam list lowered: $2" "" "$lowered" "" \
-      "Committed on top of the rebased series (the candidate); the fork lines or upstream lines these counted are gone." "")
+      "Committed on top of the rebased series (the candidate); the fork lines or upstream lines these counted are gone, and each excluded file is upstream's." "")
     # The lowered list is judged again: it must pass and lower nothing more.
     status=0
     seam_run "$1" ${3:+"$3"} || status=$?

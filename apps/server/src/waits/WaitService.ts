@@ -672,15 +672,16 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
       : slotJudgement(grant, settings, true);
   });
 
-  /** The slots delivered slot waits still hold, for the gate (it reads them only while waits are on). */
+  /**
+   * The slots delivered slot waits still hold, for the gate (it reads them only while waits are on).
+   * Fails when the store or the settings cannot be read: never an empty store then.
+   */
   const heldInStore = lock.withPermits(1)(
     Effect.gen(function* () {
-      const loaded = yield* ensureLoaded(true);
-      if (!loaded.ok) return [];
-      const settings = yield* readSettingsOrNull;
-      if (settings === null) return [];
+      const contents = yield* loadedOrFail(true);
+      const settings = yield* readSettings;
       const now = yield* Clock.currentTimeMillis;
-      return loaded.contents.waits.flatMap((wait) =>
+      return contents.waits.flatMap((wait) =>
         storedReservation(wait, now, settings.agentSlots.reserveSeconds),
       );
     }),
