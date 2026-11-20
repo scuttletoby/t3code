@@ -193,6 +193,10 @@ const delegate = (input: {
   readonly workspaceRoot?: string;
   /** What the registry holds once the folder is scanned (the folder's own provider config). */
   readonly scanned?: ReadonlyArray<ServerProvider>;
+  /** A scan that fails: the registry recovers to the list as it was, as the real one does. */
+  readonly scanFails?: (instanceId: ProviderInstanceId, nthScan: number) => boolean;
+  /** One call per entry, at that many ms after NOW_MS, on the same service. Default: one call. */
+  readonly calls?: ReadonlyArray<number>;
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
@@ -278,16 +282,18 @@ const delegate = (input: {
         // Like the real registry: a scan reads one account's folder config, not every account's.
         refreshWorkspaceSnapshot: ({ instanceId, cwd }) =>
           Effect.sync(() => scans.push({ instanceId, cwd })).pipe(
-            Effect.andThen(
-              Ref.updateAndGet(registry, (current) =>
-                current.map((provider) =>
-                  provider.instanceId === instanceId
-                    ? ((input.scanned ?? input.providers).find(
-                        (entry) => entry.instanceId === instanceId,
-                      ) ?? provider)
-                    : provider,
-                ),
-              ),
+            Effect.flatMap((nthScan) =>
+              input.scanFails?.(instanceId, nthScan) === true
+                ? Ref.get(registry)
+                : Ref.updateAndGet(registry, (current) =>
+                    current.map((provider) =>
+                      provider.instanceId === instanceId
+                        ? ((input.scanned ?? input.providers).find(
+                            (entry) => entry.instanceId === instanceId,
+                          ) ?? provider)
+                        : provider,
+                    ),
+                  ),
             ),
           ),
       }),
@@ -322,19 +328,24 @@ const delegate = (input: {
         : ServerSettings.layerTest(input.settings ?? {}),
       layerPacer,
     );
-    const result = yield* Effect.gen(function* () {
+    const results = yield* Effect.gen(function* () {
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-      return yield* service
-        .delegateTask(scope, {
-          task: "Review the change.",
-          ...(input.target === undefined ? {} : { target: input.target }),
-          ...(input.runtimeMode === undefined ? {} : { runtimeMode: input.runtimeMode }),
-          mode: "async",
-          clientRequestId: "usage-gate-1",
-        })
-        .pipe(Effect.result);
+      return yield* Effect.forEach(input.calls ?? [0], (offsetMs, index) =>
+        TestClock.setTime(NOW_MS + offsetMs).pipe(
+          Effect.andThen(
+            service.delegateTask(scope, {
+              task: "Review the change.",
+              ...(input.target === undefined ? {} : { target: input.target }),
+              ...(input.runtimeMode === undefined ? {} : { runtimeMode: input.runtimeMode }),
+              mode: "async",
+              clientRequestId: `usage-gate-${index + 1}`,
+            }),
+          ),
+          Effect.result,
+        ),
+      );
     }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
-    return { result, dispatched, scans };
+    return { result: results.at(-1)!, results, dispatched, scans };
   });
 
 const enforce = { usagePacingGate: "enforce" } as const;
@@ -654,6 +665,158 @@ describe("OrchestratorMcpService usage pacing gate", () => {
           options: [{ id: "reasoningEffort", value: "medium" }],
         });
       }),
+  );
+
+  it.effect("enforce, ahead: a candidate refused for another reason is not scanned (#596)", () =>
+    Effect.gen(function* () {
+      // The other account is unhealthy: its folder could not change that, so it is not scanned.
+      const { result, dispatched, scans } = yield* delegate({
+        settings: enforce,
+        providers: [inFolder(main(60)), { ...second(10), status: "error" }],
+        scanned: [inFolder(main(60)), inFolder(second(10))],
+        workspaceRoot: ROOT,
+        target: { model: LOCAL },
+      });
+      assert.isTrue(result._tag === "Failure");
+      if (result._tag !== "Failure") return;
+      assert.include(
+        result.failure.message,
+        "(codex-second has room, but the task cannot run there (provider_unavailable)).",
+      );
+      assert.deepStrictEqual(dispatched, []);
+      assert.deepStrictEqual(scans, []);
+    }),
+  );
+
+  it.effect(
+    "enforce, ahead: a failed folder scan says so and is not run on every call (#596)",
+    () =>
+      Effect.gen(function* () {
+        const scanned = [inFolder(main(60)), inFolder(second(10))];
+        const failedText = (retry: string) =>
+          `(codex-second has room, but it does not list ${LOCAL} and its scan of this folder gave no result (scanned again after ${retry})).`;
+        // The first two scans fail, the third works. Calls: now, a minute later (backing off), just
+        // before the back-off ends, once it ends (scans and fails again), and after that (works).
+        const { results, dispatched, scans } = yield* delegate({
+          settings: enforce,
+          providers: [inFolder(main(60)), second(10)],
+          scanned,
+          scanFails: (instanceId, nthScan) => instanceId === SECOND && nthScan <= 2,
+          workspaceRoot: ROOT,
+          target: { model: LOCAL },
+          calls: [0, MINUTE, 5 * MINUTE - 1, 5 * MINUTE, 10 * MINUTE],
+        });
+        const messages = results.map((result) =>
+          result._tag === "Failure" ? result.failure.message : "",
+        );
+        for (const message of messages.slice(0, 3)) {
+          assert.include(message, failedText("2026-11-13T12:05:00.000Z"));
+          assert.notInclude(message, "for this folder");
+        }
+        assert.include(messages[3]!, failedText("2026-11-13T12:10:00.000Z"));
+        // Scanned at the first call, at the end of the back-off and after the second one: 3 scans.
+        assert.deepStrictEqual(
+          scans,
+          [SECOND, SECOND, SECOND].map((instanceId) => ({ instanceId, cwd: ROOT })),
+        );
+        // The scan that worked moves the task; nothing ran before it.
+        const last = results[4]!;
+        assert.isTrue(last._tag === "Success");
+        if (last._tag !== "Success") return;
+        assert.include(last.success.usagePacingNote ?? "", "runs on codex-second");
+        assert.deepStrictEqual(
+          dispatched.map((entry) => entry.modelSelection),
+          [{ instanceId: SECOND, model: LOCAL }],
+        );
+      }),
+  );
+
+  it.effect(
+    "enforce, ahead: an old snapshot and a failed scan are not read as an answer (#596)",
+    () =>
+      Effect.gen(function* () {
+        // The other account scanned this folder long ago (before its config added the model).
+        const old: ServerProvider = {
+          ...second(10),
+          workspaceSnapshots: [
+            {
+              cwd: ROOT,
+              checkedAt: at(-DAY),
+              slashCommands: [],
+              skills: [],
+              models: second(10).models,
+            },
+          ],
+        };
+        for (const [fails, text] of [
+          [true, `it does not list ${LOCAL} and its scan of this folder gave no result`],
+          [false, "runs on codex-second"],
+        ] as const) {
+          const { result, scans } = yield* delegate({
+            settings: enforce,
+            providers: [inFolder(main(60)), old],
+            scanned: [inFolder(main(60)), inFolder(second(10))],
+            scanFails: () => fails,
+            workspaceRoot: ROOT,
+            target: { model: LOCAL },
+          });
+          const text_ =
+            result._tag === "Failure"
+              ? result.failure.message
+              : (result.success.usagePacingNote ?? "");
+          assert.include(text_, text);
+          assert.deepStrictEqual(scans, [{ instanceId: SECOND, cwd: ROOT }]);
+        }
+      }),
+  );
+
+  it.effect("advise scans no folder; a named instance in enforce still does (#596)", () =>
+    Effect.gen(function* () {
+      const advise = { usagePacingGate: "advise" } as const;
+      const scanned = [inFolder(main(60)), inFolder(second(10))];
+      // advise, the other account has not scanned the folder: the note says it is not known.
+      const unscanned = yield* delegate({
+        settings: advise,
+        providers: [inFolder(main(60)), second(10)],
+        scanned,
+        workspaceRoot: ROOT,
+        target: { model: LOCAL },
+      });
+      assert.isTrue(unscanned.result._tag === "Success");
+      if (unscanned.result._tag !== "Success") return;
+      assert.include(
+        unscanned.result.success.usagePacingNote ?? "",
+        `codex-second has room, but it does not list ${LOCAL} and has no current scan of this folder (advice only, so none was run)`,
+      );
+      assert.deepStrictEqual(unscanned.scans, []);
+      assert.deepStrictEqual(unscanned.dispatched[0]?.modelSelection, {
+        instanceId: MAIN,
+        model: LOCAL,
+      });
+      // advise, both scanned before: the advice is read from the snapshots, still without a scan.
+      const known = yield* delegate({
+        settings: advise,
+        providers: scanned,
+        workspaceRoot: ROOT,
+        target: { model: LOCAL },
+      });
+      assert.isTrue(known.result._tag === "Success");
+      if (known.result._tag !== "Success") return;
+      assert.include(known.result.success.usagePacingNote ?? "", "would run this task there");
+      assert.deepStrictEqual(known.scans, []);
+      // enforce with the instance named: the scan decides between a hold and a lower effort.
+      const pinned = yield* delegate({
+        settings: { ...enforce, usagePacingLowerEffort: { high: "medium" } },
+        providers: [inFolder(main(60)), second(10)],
+        scanned,
+        workspaceRoot: ROOT,
+        target: { providerInstanceId: MAIN, model: LOCAL },
+      });
+      assert.isTrue(pinned.result._tag === "Failure");
+      if (pinned.result._tag !== "Failure") return;
+      assert.include(pinned.result.failure.message, "codex-second has room: pass it as");
+      assert.deepStrictEqual(pinned.scans, [{ instanceId: SECOND, cwd: ROOT }]);
+    }),
   );
 
   it.effect("enforce, over the even pace: lowers the effort of a project config model (#559)", () =>
