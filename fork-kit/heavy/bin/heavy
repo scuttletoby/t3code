@@ -5,8 +5,11 @@
   HEAVY_KEEP=1 heavy <command>    the same, but processes the command leaves running are kept (a daemon)
   heavy --self-check              check the config, the slice and the installed files; exit 1 on a problem
   heavy sweep [--dry-run|--json]  stop or report what commands left behind outside heavy (lib/heavy_sweep.py)
-  heavy docker-label [--value]    the owner label for a container a test starts, so the sweep can remove it
-                                  (--owner-pid PID: the long-lived test process that uses it; README)
+  heavy leftovers [--older-than AGE] [--json]
+                                  look only: what is left behind (processes, heavy scopes, containers) older
+                                  than AGE (seconds, 30m, 2h, 1d), each with its owner and age; needs no settings
+  heavy docker-label [--value]    the owner label for a container a test starts, so heavy (when its command ends)
+                                  and the sweep can remove it (--owner-pid PID: the long-lived test process; README)
   heavy --kind <name> [--mb N] [--wait S] [--] <command> [args...]
                                   the same, but first wait in the memory queue until the job's memory fits
                                   (lib/heavy_queue.py; exit 76 after --wait seconds, default 7200, with the
@@ -14,7 +17,7 @@
                                   has no such line)
   heavy queue [--json]            what the memory queue runs and holds, and the figures behind it
   heavy waits [--days N] [--json] minutes waited for memory per day
-  heavy -- <command> [args...]    run a command that is named sweep, docker-label, queue or waits
+  heavy -- <command> [args...]    run a command that is named sweep, leftovers, docker-label, queue or waits
 
 The command runs with the same folder, environment, stdin, stdout, stderr and open files, and heavy exits with
 its exit code (or dies of the same signal). When the command ends, every process it left in its scope is stopped
@@ -22,9 +25,15 @@ its exit code (or dies of the same signal). When the command ends, every process
 
   heavy: stopped N leftover processes (<names>)
 
-Nothing is printed when nothing was left. When heavy itself gets INT, TERM, HUP or QUIT, the command gets the
-signal too (from heavy when someone sent it to heavy alone; a terminal's Ctrl-C reaches both); after the grace
-time, or at a second signal, the whole scope is stopped.
+Docker containers labelled with the scope (heavy docker-label) are removed then too:
+
+  heavy: removed N leftover containers (<names>)
+
+Nothing is printed when nothing was left. If heavy itself dies without cleaning up (kill -9, a crash), its guard
+(a small process of its own, outside the scope, named scope-guard) stops the scope and removes those containers.
+When heavy itself gets INT, TERM, HUP or QUIT, the command gets the signal too (from heavy when someone sent it
+to heavy alone; a terminal's Ctrl-C reaches both); after the grace time, or at a second signal, the whole scope
+is stopped.
 
 heavy never runs a command uncapped: it refuses (exit 1) when the systemd user manager cannot be reached, or the
 slice has no unit or no memory limit. Inside another heavy command it runs the command in the outer scope, which
@@ -35,7 +44,8 @@ heavy-keep-<name>-<random>.scope, all others heavy-<name>-<random>.scope (never 
 
 Settings: /etc/heavy/config.json ({"slice": "heavy.slice", "grace_seconds": 30}), or the file HEAVY_CONFIG names;
 HEAVY_SLICE and HEAVY_GRACE override single values (HEAVY_SYSTEMCTL: another systemctl, HEAVY_QUEUE_ROOT: another
-folder for the memory queue's state; both for tests). Standard library only; Linux with systemd and cgroup v2.
+folder for the memory queue's state, HEAVY_DOCKER: another docker; all for tests). Standard library only; Linux
+with systemd and cgroup v2.
 """
 import hashlib, json, os, re, secrets, signal, subprocess, sys, time
 
@@ -53,6 +63,10 @@ RERAISE = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGKILL, signal.
 PR_SET_PDEATHSIG = 1
 PR_SET_NAME = 15
 PROBE_NAME = b'grp-sigprobe'   # no 'heavy' in it: `pkill heavy` / `killall heavy` must not signal the probe too
+GUARD_NAME = b'scope-guard'    # the same for the guard: `pkill -9 heavy` must leave it to clean up after heavy
+LABEL = 'fork-kit.heavy.owner'  # the container owner label (lib/heavy_sweep.py writes and reads it too)
+DOCKER_SOCKET = '/var/run/docker.sock'
+DOCKER_TIMEOUT = 20
 MAX_NAMES = 5
 # Python sets these to SIG_IGN at startup, and SIG_IGN survives exec: put them back before the command starts
 # (subprocess does the same for its children)
@@ -273,6 +287,156 @@ def stop_scope(systemctl, unit, cg, grace):
     return left
 
 
+def docker_tool():
+    """The docker program, or None when this user has no Docker to clean up: not installed, or no DOCKER_HOST and a
+    default socket this user cannot use (such a user could not have started a container through it either)."""
+    if os.environ.get('HEAVY_DOCKER'):          # tests: a fake docker
+        path = os.environ['HEAVY_DOCKER']
+        return path if os.path.isabs(path) and os.access(path, os.X_OK) else None
+    path = next((os.path.join(d, 'docker') for d in ('/usr/bin', '/bin', '/usr/local/bin')
+                 if os.access(os.path.join(d, 'docker'), os.X_OK)), None)
+    if (path and not os.environ.get('DOCKER_HOST') and not os.environ.get('DOCKER_CONTEXT')
+            and not os.access(DOCKER_SOCKET, os.R_OK | os.W_OK)):
+        return None
+    return path
+
+
+def owner_value(unit):
+    """The owner label value `heavy docker-label` gives a container started in this scope (lib/heavy_sweep.py)."""
+    return f'uid={os.getuid()},scope={unit}'
+
+
+def short_name(name):
+    name = name.lstrip('/') or '?'
+    return name if len(name) <= 40 else name[:37] + '...'
+
+
+def remove_containers(docker, unit):
+    """Remove (with their anonymous volumes) the containers labelled as started in this scope, by full id. Returns
+    (names removed, problem text or ''). Only an exact label match is touched: never another scope's, another user's
+    or an unlabelled container."""
+    if not docker:
+        return [], ''
+    value = owner_value(unit)
+    try:
+        r = subprocess.run([docker, 'ps', '-a', '-q', '--no-trunc', '--filter', f'label={LABEL}={value}'],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=DOCKER_TIMEOUT)
+        if r.returncode != 0:
+            return [], (r.stderr.strip() or f'docker ps: exit {r.returncode}').splitlines()[-1]
+        ids = [i for i in r.stdout.split() if re.fullmatch(r'[0-9a-f]{64}', i)]
+        if not ids:
+            return [], ''
+        r = subprocess.run([docker, 'inspect', '--type', 'container', *ids], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=DOCKER_TIMEOUT)
+        found = json.loads(r.stdout or '[]')      # one gone since `ps` is left out (exit 1, the rest printed)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        return [], f'docker: {e}'
+    mine = {}
+    for c in found if isinstance(found, list) else []:
+        try:
+            if ((c.get('Config') or {}).get('Labels') or {}).get(LABEL) == value and c['Id'] in ids:
+                mine[c['Id']] = short_name(c.get('Name') or '')
+        except (AttributeError, KeyError, TypeError):
+            continue
+    if not mine:
+        return [], ''
+    try:
+        r = subprocess.run([docker, 'rm', '-f', '-v', '--', *mine], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=DOCKER_TIMEOUT * 6)
+    except (OSError, subprocess.SubprocessError) as e:
+        return [], f'docker rm: {e}'
+    done = set(r.stdout.split())
+    removed = [name for cid, name in mine.items() if cid in done]
+    failed = [line for line in r.stderr.splitlines() if line.strip() and 'No such container' not in line]
+    return removed, (failed[-1] if failed else '')
+
+
+def say_containers(why, unit, removed, problem):
+    if removed:
+        shown = ', '.join(removed[:MAX_NAMES]) + (', ...' if len(removed) > MAX_NAMES else '')
+        say(f'{why}removed {len(removed)} leftover {"container" if len(removed) == 1 else "containers"} ({shown})')
+    if problem:
+        say(f'{why}could not remove the containers of {unit} ({problem}); the leftover sweep looks again')
+
+
+class ScopeGuard:
+    """heavy's guard: a child in a session of its own, outside the scope, that cleans up when heavy cannot. heavy
+    tells it "done" once heavy itself has cleaned up; when heavy goes away without that (kill -9, a crash), the guard
+    stops the scope (every process in it, double-forked ones too) and removes its containers, as heavy would have.
+    It ignores the signals heavy forwards or handles (a terminal's, a service stop's TERM): it waits for heavy. It
+    holds no open file of heavy's but stderr, and keeps nothing of the scope: a queued job's ticket ends with it."""
+
+    def __init__(self, systemctl, docker, unit, grace):
+        self.pid = self.w = None
+        try:
+            r, w = os.pipe()
+            pid = os.fork()
+        except OSError:
+            return              # no guard: heavy still cleans up after itself; the sweep is the fallback
+        if pid == 0:
+            try:
+                os.close(w)
+                os.setsid()     # a group kill of heavy's group (kill -9 -PGID) never reaches it
+                for sig in WATCH + FORWARD:
+                    signal.signal(sig, signal.SIG_IGN)
+                signal.pthread_sigmask(signal.SIG_SETMASK, [])
+                null = os.open('/dev/null', os.O_RDWR)
+                os.dup2(null, 0)
+                os.dup2(null, 1)
+                for fd in [int(x) for x in os.listdir('/proc/self/fd')]:
+                    if fd > 2 and fd != r:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                prctl = load_prctl()
+                if prctl is not None:
+                    prctl(PR_SET_NAME, GUARD_NAME, 0, 0, 0)
+                word = b''
+                while True:
+                    try:
+                        word = os.read(r, 1)
+                        break
+                    except InterruptedError:
+                        continue
+                if word != b'd':
+                    self.clean(systemctl, docker, unit, grace)
+            except BaseException:
+                pass
+            finally:
+                os._exit(0)
+        os.close(r)
+        self.pid, self.w = pid, w
+
+    @staticmethod
+    def clean(systemctl, docker, unit, grace):
+        cg, pids = scope_state(systemctl, unit)
+        text = describe(pids) if pids else ''
+        left = stop_scope(systemctl, unit, cg, grace) if cg else []
+        removed, problem = remove_containers(docker, unit)
+        why = 'heavy was killed: '
+        if text:
+            say(f'{why}stopped {text}')
+        if left:
+            say(f'{why}{len(left)} processes are still running in {unit}: {", ".join(map(str, left[:10]))}')
+        say_containers(why, unit, removed, problem)
+
+    def done(self):
+        """heavy has cleaned up: the guard ends without doing anything."""
+        if self.w is None:
+            return
+        try:
+            os.write(self.w, b'd')
+            os.close(self.w)
+        except OSError:
+            pass
+        self.w = None
+        try:
+            os.waitpid(self.pid, 0)
+        except OSError:
+            pass
+
+
 def load_prctl():
     try:   # loaded before a fork: the child only calls it
         import ctypes
@@ -370,6 +534,7 @@ def same_group(pid):
 
 def child_setup(restore_ignored, mask):
     prctl = load_prctl()
+    parent = os.getpid()
 
     def setup():
         for sig in restore_ignored:
@@ -377,6 +542,8 @@ def child_setup(restore_ignored, mask):
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         if prctl is not None:   # heavy killed with -9: the command dies too, as when heavy and it were one process
             prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+            if os.getppid() != parent:      # heavy died before that took hold: never start the command alone
+                os._exit(127)
     return setup
 
 
@@ -502,18 +669,26 @@ def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler
     restore = ignored + ([signal.SIGCHLD] if chld_ignored else [])
     cmd = [systemd_run, '--user', '--scope', '--quiet', '--collect', f'--slice={cfg["slice"]}', f'--unit={unit}',
            '-p', f'TimeoutStopSec={grace:g}s', '--', *argv]
+    docker = docker_tool()
+    # a kept scope outlives heavy on purpose: no guard for it (the command still dies with heavy)
+    guard = None if keep else ScopeGuard(systemctl, docker, unit, grace)
     probe = GroupProbe(list(WATCH + FORWARD))
     try:
         child = subprocess.Popen(cmd, close_fds=False, env=env,
                                  preexec_fn=child_setup(restore, old_mask if child_mask is None else child_mask))
     except OSError as e:
         probe.close()
+        if guard is not None:
+            guard.done()
         say(f'cannot start systemd-run: {e}')
         return 1
     try:
-        return wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler)
+        return wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler, docker, guard)
     finally:
         probe.close()
+        if guard is not None and guard.w is not None:   # an error on the way: heavy cleaned up nothing, the guard does
+            os.close(guard.w)
+            guard.w = None
 
 
 def unchecked(why, unit):
@@ -521,7 +696,7 @@ def unchecked(why, unit):
         f'look with: systemctl --user status {unit}')
 
 
-def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler=None):
+def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler=None, docker=None, guard=None):
 
     # The first INT/TERM/HUP/QUIT reaches the command (heavy passes it on when it was sent to heavy alone); heavy
     # gives the command the grace time to end, then stops the whole scope. A second one stops the scope at once.
@@ -595,6 +770,9 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, s
             say(f'{name}: stopped {text}')
         if left:
             say(f'{name}: {len(left)} processes are still running in {unit}: {", ".join(map(str, left[:10]))}')
+        say_containers(f'{name}: ', unit, *remove_containers(docker, unit))
+        if guard is not None:
+            guard.done()
         return finish(status, got)
 
     why = f'{signal.Signals(got).name}: ' if got is not None else ''   # the command ended after a signal to heavy
@@ -617,6 +795,10 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, s
             say(f'{why}stopped {text}')
             if left:
                 say(f'{len(left)} processes are still running in {unit}: {", ".join(map(str, left[:10]))}')
+    if not (keep and got is None):      # what the command left in Docker: kept with the scope, else removed
+        say_containers(why, unit, *remove_containers(docker, unit))
+    if guard is not None:
+        guard.done()
     return finish(status, got)
 
 
@@ -735,13 +917,14 @@ def queue_verb(verb, args):
 def main(argv):
     if argv[:1] == ['--self-check']:
         return self_check()
-    if argv[:1] in (['sweep'], ['docker-label']):
+    if argv[:1] in (['sweep'], ['leftovers'], ['docker-label']):
         try:
             mod = kit_module('heavy_sweep')
         except (OSError, ImportError, SyntaxError) as e:
             say(f'{argv[0]}: cannot load the sweep ({e})')
             return 1
-        return (mod.sweep_main if argv[0] == 'sweep' else mod.label_main)(argv[1:])
+        return {'sweep': mod.sweep_main, 'leftovers': mod.leftovers_main,
+                'docker-label': mod.label_main}[argv[0]](argv[1:])
     if argv[:1] in (['queue'], ['waits']):
         return queue_verb(argv[0], argv[1:])
     job, argv = job_options(argv)
