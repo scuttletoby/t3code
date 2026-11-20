@@ -136,6 +136,9 @@ describe("agent turn start paths stay behind the work gate", () => {
   it("only the turn services mention startTurn outside the adapters", () => {
     expect(filesMatching(/\bstartTurn\b/, { skipAdapters: true })).toEqual(
       byName([
+        // Fork: wraps each session's startTurn with the MCP profile check and calls it only from
+        // that wrap, so the turn still starts only through the gated turn services below.
+        "fork/mcpProfileTurnCheck.ts",
         "orchestration-v2/ProviderSessionManager.ts",
         "orchestration-v2/ProviderTurnStartService.ts",
         "orchestration-v2/RunExecutionService.ts",

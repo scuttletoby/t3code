@@ -8,6 +8,7 @@ import {
   OrchestratorMcpCapabilitiesInput,
   OrchestratorMcpCapabilitiesResult,
   OrchestratorMcpFailure,
+  type ProviderDriverKind,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -44,7 +45,15 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
   return Effect.fn("RemoteMcpProfile.carry")(function* (
     parent: LineageThread,
     scope: McpInvocationContext.McpThreadInvocationScope,
-    target: { readonly environmentId: EnvironmentId },
+    /**
+     * With `driverKind` and no `providerInstanceId`, peer/RemoteDelegation.ts picked the instance
+     * there from the instances it lists for that driver.
+     */
+    target: {
+      readonly environmentId: EnvironmentId;
+      readonly driverKind?: ProviderDriverKind | undefined;
+      readonly providerInstanceId?: ProviderInstanceId | undefined;
+    },
     /** The provider instance there the launch names: where the task would run. */
     instanceId: ProviderInstanceId,
   ) {
@@ -95,12 +104,15 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
         message: `${peer.link.label} runs a T3 Code version that does not apply this thread's MCP profile ("${resolved.name}") to a task, so the task was not sent: there it would get every MCP server that machine's own profile allows. Update T3 Code on ${peer.link.label}, or delegate the task on this machine.`,
       });
     }
-    // Only a Claude thread applies a profile there; any other provider runs the task with every
-    // MCP server and T3 tool, whatever it carries. Asked for each task, like the route.
-    const { providers } = yield* forwarding.call(scope, RemoteCapabilitiesTool, environmentId, {});
-    const driverKind = providers.find(
-      (provider) => provider.providerInstanceId === instanceId,
-    )?.driverKind;
+    // Only Claude applies a profile there. With no instance named, upstream picked one from that
+    // machine's list by this driver, so the list is not asked twice. A named instance is passed on
+    // even when unlisted, so it is looked up here. Its turn is checked again there as it starts.
+    const pickedByDriver = target.providerInstanceId === undefined ? target.driverKind : undefined;
+    const driverKind =
+      pickedByDriver ??
+      (yield* forwarding.call(scope, RemoteCapabilitiesTool, environmentId, {})).providers.find(
+        (provider) => provider.providerInstanceId === instanceId,
+      )?.driverKind;
     if (driverKind === undefined || !MCP_PROFILE_DRIVERS.has(driverKind)) {
       return yield* new OrchestratorMcpFailure({
         code: "capability_denied",
