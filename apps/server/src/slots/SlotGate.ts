@@ -177,6 +177,15 @@ const make = Effect.gen(function* () {
    * so none comes in between; an uncounted one may, and counts against nothing.
    */
   const unreadStarts = new Set<string>();
+  /**
+   * Stored holds that a good read used up for `unreadStarts`, not yet cleared in the store. Cleared
+   * outside the semaphore by the next acquire, grant or usage (`clearUsedLater`), as `acquire`
+   * clears its own; a key leaves only after its write was tried, so a call cut off half-way leaves
+   * it for the next one (clearing twice changes nothing). Lost on a restart, like `unreadStarts`.
+   */
+  const usedLater = new Set<string>();
+  /** Why the store last could not be read; warned once until the reason changes or a read works. */
+  let storeProblem: string | null = null;
 
   /**
    * Threads with an active run, settled or not (settling a thread does not stop its run), nobody
@@ -236,6 +245,7 @@ const make = Effect.gen(function* () {
     if (!waitsOn) {
       // Stored holds do not count while waits are off; a start then never uses them up either.
       unreadStarts.clear();
+      storeProblem = null;
       return Effect.succeed<HeldRead>({ held: [], whole: true });
     }
     const skipped = new Set([...usedKeys.keys(), ...hiddenKeys()]);
@@ -248,16 +258,22 @@ const make = Effect.gen(function* () {
         for (const reservation of fromStore) {
           if (!unreadStarts.has(reservation.threadId)) continue;
           usedKeys.set(reservation.key, reservation.untilMs);
+          usedLater.add(reservation.key);
           skipped.add(reservation.key);
         }
         unreadStarts.clear();
+        storeProblem = null;
         return { held: live([...memory, ...fromStore]), whole: true };
       }),
-      Effect.catch((cause) =>
-        Effect.logWarning("agent slots: the slots held in the wait store cannot be read", {
+      Effect.catch((cause) => {
+        const unread = Effect.succeed<HeldRead>({ held: live(memory), whole: false });
+        // Every decision and observation reads the store: one warning per reason, not per read.
+        if (cause.message === storeProblem) return unread;
+        storeProblem = cause.message;
+        return Effect.logWarning("agent slots: the slots held in the wait store cannot be read", {
           cause,
-        }).pipe(Effect.as<HeldRead>({ held: live(memory), whole: false })),
-      ),
+        }).pipe(Effect.andThen(unread));
+      }),
     );
   });
 
@@ -394,6 +410,21 @@ const make = Effect.gen(function* () {
           ),
         );
 
+  /**
+   * Clears the stored holds a later good read used up (`usedLater`), outside the semaphore. Each
+   * key leaves the set once its write was tried (a failed write is logged; its copy ends by itself).
+   */
+  const clearUsedLater = Effect.suspend(() => {
+    const keys = [...usedLater];
+    return clearStored(keys).pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          for (const key of keys) usedLater.delete(key);
+        }),
+      ),
+    );
+  });
+
   /** A decision and the caller's held slots it used up (typed whole, for `observeBeside`). */
   const asDecided = (outcome: SlotAcquire, used: ReadonlyArray<string>) => ({ outcome, used });
 
@@ -466,10 +497,11 @@ const make = Effect.gen(function* () {
     // Cleared in the store after the decision, outside the semaphore; a failed write only means
     // the stored copy ends by itself (it no longer counts here either way).
     yield* clearStored(used);
+    yield* clearUsedLater;
     return outcome;
   });
 
-  const grant = Effect.fn("SlotGate.grant")(
+  const grantLocked = Effect.fn("SlotGate.grantLocked")(
     function* (requests: ReadonlyArray<SlotRequest>) {
       const settings = yield* readSettings;
       const limits = Option.isNone(settings)
@@ -581,6 +613,12 @@ const make = Effect.gen(function* () {
     semaphore.withPermits(1),
   );
 
+  const grant = Effect.fn("SlotGate.grant")(function* (requests: ReadonlyArray<SlotRequest>) {
+    const grants = yield* grantLocked(requests);
+    yield* clearUsedLater;
+    return grants;
+  });
+
   const keepLocked = Effect.fn("SlotGate.keepLocked")(function* (keys: ReadonlyArray<string>) {
     const replaced: Array<string> = [];
     for (const key of keys) {
@@ -605,6 +643,8 @@ const make = Effect.gen(function* () {
         ? []
         : liveStarting(yield* Ref.get(entries), read.visible, nowMs, limits.startGraceMs);
     const heldRead = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
+    // Not under the semaphore: a hold this read used up is cleared in the store here.
+    yield* clearUsedLater;
     if (!heldRead.whole) return null;
     const reservations = onePerThread(heldRead.held);
     // Holds hidden by a re-ask not kept yet: on their own account only, as `decide` counts them.

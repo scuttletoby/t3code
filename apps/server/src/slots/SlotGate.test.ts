@@ -12,12 +12,14 @@ import {
   ServerSettingsError,
   ThreadId,
 } from "@t3tools/contracts";
-import type { AgentSlotsSettings } from "@t3tools/contracts/waitFor";
+import { type AgentSlotsSettings, WaitToolFailure } from "@t3tools/contracts/waitFor";
 import type { DeepPartial } from "@t3tools/shared/Struct";
 import { DISPATCH_SAFETY_MS, type SlotReservation } from "@t3tools/shared/agentSlots";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import { TestClock } from "effect/testing";
 
 import * as OrchestratorV2 from "../orchestration-v2/Orchestrator.ts";
@@ -771,6 +773,172 @@ describe("SlotGate", () => {
             }),
           );
         }),
+    );
+
+    /** A store whose read fails with `problem` while it is set; `used` clears a hold in it. */
+    const flakyStore = (holds: ReadonlyArray<SlotReservation>) => {
+      const store = {
+        problem: null as string | null,
+        holds,
+        used: [] as Array<string>,
+        /** Set: the next `used` call completes it, then hangs (a call cut off half-way). */
+        hangNext: null as Deferred.Deferred<void> | null,
+        reads: 0,
+      };
+      const attach = (gate: SlotGate.SlotGate["Service"]) =>
+        gate.attachReservations({
+          read: Effect.suspend(() => {
+            store.reads += 1;
+            return store.problem === null
+              ? Effect.succeed(store.holds)
+              : Effect.fail(
+                  new WaitToolFailure({ code: "store_unavailable", message: store.problem }),
+                );
+          }),
+          used: (key) =>
+            Effect.suspend(() => {
+              const hang = store.hangNext;
+              if (hang !== null) {
+                store.hangNext = null;
+                return Deferred.succeed(hang, undefined).pipe(Effect.andThen(Effect.never));
+              }
+              store.used.push(key);
+              store.holds = store.holds.filter((entry) => entry.key !== key);
+              return Effect.void;
+            }),
+        });
+      return { store, attach };
+    };
+
+    it.effect(
+      "a start while the store cannot be read: the next good read clears its hold in the store (#574)",
+      () =>
+        Effect.gen(function* () {
+          // Fixed mode: no observation reads the store beside the decisions.
+          const settings = waitsOn({ mode: "fixed", maxPerMachine: 2 });
+          for (const path of ["acquire", "grant", "usage"] as const) {
+            const world = newWorld();
+            const { store, attach } = flakyStore([
+              { key: "stored", threadId: holder, untilMs: 90_000 },
+            ]);
+            yield* run(
+              world,
+              settings,
+              Effect.gen(function* () {
+                const gate = yield* SlotGate.SlotGate;
+                yield* attach(gate);
+                store.problem = "a newer file";
+                const start = yield* acquireAs(holder);
+                assert.strictEqual(start.type, "allow");
+                // Its dispatch ends with no child: nothing of it is left starting.
+                yield* gate.release(start.type === "allow" ? start.token : null);
+                assert.deepStrictEqual(store.used, []);
+                store.problem = null;
+                // The next good read, on any path, uses the hold up and clears it in the store.
+                if (path === "acquire") assert.strictEqual((yield* acquireAs(other)).type, "allow");
+                if (path === "grant") {
+                  assert.deepStrictEqual(types(yield* grant({ key: "w-other", threadId: other })), [
+                    "granted",
+                  ]);
+                }
+                if (path === "usage") {
+                  assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 0, max: 2 });
+                }
+                assert.deepStrictEqual(store.used, ["stored"], path);
+                // Runs again: it is not cleared twice (another start clears only its own hold).
+                yield* gate.usage;
+                yield* acquireAs(other);
+                assert.deepStrictEqual(
+                  store.used.filter((key) => key === "stored"),
+                  ["stored"],
+                  path,
+                );
+              }),
+            );
+            // A restart (a new gate on the same store): the used hold does not count again.
+            yield* run(
+              world,
+              settings,
+              Effect.gen(function* () {
+                const gate = yield* SlotGate.SlotGate;
+                yield* attach(gate);
+                assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 0, max: 2 }, path);
+              }),
+            );
+          }
+        }),
+    );
+
+    it.effect("a clear cut off half-way is tried again by the next call (#574)", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        const { store, attach } = flakyStore([
+          { key: "stored", threadId: holder, untilMs: 90_000 },
+        ]);
+        yield* run(
+          world,
+          waitsOn({ mode: "fixed", maxPerMachine: 2 }),
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* attach(gate);
+            store.problem = "a newer file";
+            assert.strictEqual((yield* acquireAs(holder)).type, "allow");
+            store.problem = null;
+            const clearing = yield* Deferred.make<void>();
+            store.hangNext = clearing;
+            // The good read uses the hold up; its clear hangs and the call is cut off.
+            const fiber = yield* Effect.forkChild(gate.usage);
+            yield* Deferred.await(clearing);
+            yield* Fiber.interrupt(fiber);
+            assert.deepStrictEqual(store.used, []);
+            // Hidden in memory meanwhile, and cleared by the next call.
+            assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 2 });
+            assert.deepStrictEqual(store.used, ["stored"]);
+            assert.deepStrictEqual(store.holds, []);
+          }),
+        );
+      }),
+    );
+
+    it.effect("a store that cannot be read is warned about once per reason (#574)", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        const warnings: Array<string> = [];
+        const logger = Logger.make(({ logLevel, message }) => {
+          const text = String(Array.isArray(message) ? message[0] : message);
+          if (logLevel === "Warn") warnings.push(text);
+        });
+        const storeWarnings = () =>
+          warnings.filter((text) => text.includes("held in the wait store cannot be read")).length;
+        const { store, attach } = flakyStore([]);
+        yield* run(
+          world,
+          waitsOn({ mode: "fixed", maxPerMachine: 2 }),
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* attach(gate);
+            store.problem = "a newer file";
+            yield* acquireAs(other);
+            yield* grant({ key: "w1", threadId: holder });
+            assert.isNull(yield* gate.usage);
+            yield* acquireAs(other);
+            assert.strictEqual(storeWarnings(), 1);
+            // Another reason: warned again.
+            store.problem = "a damaged file";
+            yield* acquireAs(other);
+            yield* acquireAs(other);
+            assert.strictEqual(storeWarnings(), 2);
+            // Read again, then the same reason as before: a new spell of failures, warned again.
+            store.problem = null;
+            yield* gate.usage;
+            store.problem = "a damaged file";
+            yield* gate.usage;
+            yield* gate.usage;
+            assert.strictEqual(storeWarnings(), 3);
+            assert.isAbove(store.reads, 7);
+          }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false }))),
+        );
+      }),
     );
 
     it.effect("usage: null while slots are off; counts running, starting and held", () =>
