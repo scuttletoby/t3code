@@ -64,12 +64,12 @@ export interface SlotObserveInput {
   readonly atMs: number;
   readonly starting: ReadonlyArray<StartingEntry>;
   /**
-   * The live held slots as the gate counts them: memory as of the decision, the wait store as of
-   * when the observation runs (read in the observer's fiber, so a slow store never delays the
-   * decision). An observation that waits behind others can miss a hold a later decision used up
-   * meanwhile, or count one granted after its decision: one agent off, for a few seconds.
+   * The live held slots as the gate counts them: memory as of the decision, the wait store when the
+   * observation runs (off the decision path). A queued observation can be one agent off for a few
+   * seconds (a hold used up or granted meanwhile). `undefined`: the store could not be read, which
+   * is never a good read.
    */
-  readonly held: Effect.Effect<ReadonlyArray<SlotReservation>>;
+  readonly held: Effect.Effect<ReadonlyArray<SlotReservation> | undefined>;
   /** `acquire`'s caller: its own held slot is used up by the start it asks for (counted once). */
   readonly callerThreadId?: string | undefined;
   readonly startGraceMs: number;
@@ -135,7 +135,8 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
   /**
    * Slots off: threads allowed a start, noted at the decision (before any skip). The next good store
    * read uses their holds up, whatever became of the start meanwhile, and drops the notes. Slots on
-   * drops them all; a note no read took goes after `DISPATCH_SAFETY_MS`.
+   * drops them all, as does any decision outside observe mode (`outside`: it may grant a hold the
+   * note must not take); a note no read took goes `DISPATCH_SAFETY_MS` after the thread's last start.
    */
   const startedThreads = new Map<string, number>();
 
@@ -197,8 +198,10 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
       running === undefined
         ? Option.none()
         : yield* Effect.timeoutOption(input.held, OBSERVE_READ_TIMEOUT);
+    // A store that could not be read is not an empty one: the pieces are unknown, the notes stay.
+    const storeFailed = Option.isSome(heldRead) && heldRead.value === undefined;
     let pieces: ReadonlyArray<OwnPiece> | null = null;
-    if (running !== undefined && Option.isSome(heldRead)) {
+    if (running !== undefined && Option.isSome(heldRead) && heldRead.value !== undefined) {
       // The starts of before the decision as they are now, read with the runs of now: a child
       // named or a dispatch ended while this waited is seen (else a child that shows its run
       // meanwhile would count twice).
@@ -242,7 +245,7 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
       pieces === null
         ? {
             facts: null,
-            readings: (running === undefined ? "failed" : "slow") as SlotReadings,
+            readings: (running === undefined || storeFailed ? "failed" : "slow") as SlotReadings,
           }
         : yield* readings(pieces);
     const { decisions, pressure: next } = observeSlotAnswers(CAPACITY_RULE, {
@@ -339,6 +342,10 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
         );
       }),
     status: Ref.get(status),
+    /** The gate decided outside observe mode (fixed, or settings unread): the notes go. */
+    outside: Effect.sync(() => {
+      startedThreads.clear();
+    }),
     /** What the rule keeps in memory (for tests: nothing past the point it stops counting). */
     kept: Effect.sync(() => ({
       starts: ownStarts.length,
