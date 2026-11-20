@@ -221,23 +221,35 @@ Two more things limit what a job can do:
   `/etc/default`, cron, `systemd`, `fstab`, this kit's own folder, any folder
   named `private`, ...) fails `mounts`, as written and where it really leads
   (issue #370). The files that name this host's accounts or LAN hosts, and
-  each folder that holds one, the launcher refuses itself (issues #594, #613):
-  `passwd`, `group` and `hosts`, the backups `passwd-` and `group-`, `subuid`
-  and `subgid` and their backups, `hosts.allow`, `hosts.deny`, `networks`,
-  `ethers`, and outside `/etc` `/var/backups`, `/var/log` (`wtmp`, `btmp`,
-  `lastlog`, `auth.log`), `/var/lib/extrausers`, and `/var` and `/var/lib`
-  that hold them; it names the line's file (`ALLOW_PATHS`, a `JOB_PATHS` file,
+  each folder that holds one, the launcher refuses itself (issues #594, #613,
+  #636): `passwd`, `group` and `hosts` and every name that starts with one of
+  them (the backups `passwd-`, `passwd~`, `passwd.bak`, `hosts.allow`,
+  `hosts.deny`, `hosts.equiv`), `subuid` and `subgid` and their backups,
+  `networks`, `ethers`, and outside `/etc` `/var/backups`, `/var/log` (`wtmp`,
+  `btmp`, `lastlog`, `auth.log`), `/var/lib/extrausers`, the mail spools
+  (`/var/mail`, `/var/spool/mail`: a file per user name), SSSD's cache
+  (`/var/lib/sss`), the DHCP leases (`/var/lib/dhcp`,
+  `/var/lib/misc/dnsmasq.leases`), and `/var`, `/var/lib`, `/var/spool` and
+  `/var/lib/misc` that hold them; it names the line's file (`ALLOW_PATHS`, a `JOB_PATHS` file,
   or "re-run the installer" for its own list). `mounts` fails on each too, for
   an older launcher that does not refuse it: re-run the installer. These are
   the usual places, not every file that could name a user (a project's own
   files are the project's to keep out). `mounts` also fails on a path jobs see
   that is the same file or folder (device and inode) as one of these secret
   entries or a folder that holds one, whatever its name: a bind mount or hard
-  link of `/etc/shadow` or `/etc/ssl/private` at `/opt/keys`, or of `/etc`
-  itself (issue #613). It cannot see a single file inside a secret folder
-  bind-mounted or hard-linked on its own somewhere else (a hard link of
-  `/var/log/auth.log` at `/opt/log`): the walls would have to read every file
-  in those folders. The per-OS walls ask
+  link of `/etc/shadow` or `/etc/ssl/private` at `/opt/keys` (or of any other
+  folder named `private` under `/etc`), or of `/etc` itself (issues #613,
+  #636). The walls look only at the path jobs see and the folders above it,
+  never inside it or inside a secret folder, so three things are not found,
+  each of which only root can make: a single file or a sub-folder of a secret
+  folder bind-mounted or hard-linked on its own somewhere else (a hard link of
+  `/var/log/auth.log` at `/opt/log`, a bind of `/var/log/journal`); and a hard
+  link of a secret file placed inside an allowed folder (`/etc/passwd-` linked
+  as `/opt/tools/p` with `ALLOW_PATHS=/opt/tools`). It covers a hard link of
+  `/etc/shadow` only when the link is the allowed path itself. A bind mount
+  inside an allowed folder is not seen by jobs at all (the launcher binds
+  without submounts). Finding the rest would mean reading every file of those
+  folders and of every allowed one. The per-OS walls ask
   the launcher (`fork-fleet-launch.sh paths`, and `tools` for the
   `systemd-run` and `systemctl` it runs) instead of keeping a list of their
   own. A systemd drop-in that changes the job units (`service.d`,
@@ -255,12 +267,23 @@ Two more things limit what a job can do:
   drop-in, or as systemd's own default (`system.conf`: the first of `/etc`,
   `/run`, `/usr/local/lib` and `/usr/lib`, and every `system.conf.d`) while a
   job unit an older launcher started is still loaded (an endless one of a
-  unit's own fails too). The launcher checks the outcome as well (issue #365):
-  right after `systemd-run` it reads the unit's applied `TimeoutStopUSec` and
-  `TimeoutAbortUSec` (`systemctl show`), and when either is endless, over 5
-  minutes, missing or not a time it can read, it kills and stops the unit and
-  refuses the start, so a drop-in made after the walls ran still cannot give a
-  job an endless stop; and a
+  unit's own fails too). The launcher checks the outcome as well (issues #365,
+  #636): right after `systemd-run` it reads what systemd applies to the unit
+  (`systemctl show`): `TimeoutStopUSec` and `TimeoutAbortUSec` at most 5
+  minutes, `RuntimeMaxUSec` at most `MAX_SECONDS`, `RuntimeRandomizedExtraUSec`
+  0 (where systemd has it), `KillMode=control-group`, `SendSIGKILL=yes` and
+  `FinalKillSignal=9`. When one is not, or is missing or cannot be read, it
+  kills and stops the unit and refuses the start; it says "killed" only once
+  systemd shows the unit inactive, failed or gone, and otherwise "could not
+  kill it" with the command to do it by hand. A unit that already ended and
+  was collected (systemd no longer has it, and `show` prints the manager's
+  defaults) has nothing to check. So a drop-in made after the walls ran (only
+  root can) cannot give a job an endless stop or run through these settings;
+  other settings it could change (a `Restart=`, say) only the walls'
+  `job-units` check sees, when they run. Nor is anything checked when the
+  launcher itself is killed between `systemd-run` and that read (the agent's
+  `start` time limit, say): the unit then runs unchecked, which needs such a
+  drop-in as well, so two faults at once; and a
   launcher setting that runs another program than systemd's own. A list counts
   only in the section systemd reads it in (`[Service]`, `[Slice]`), as systemd
   drops it anywhere else. The walls know the launcher they ship with: its
