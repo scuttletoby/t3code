@@ -106,6 +106,38 @@ describe("fork settings seam", () => {
     }
   });
 
+  it("never writes a project's null to the file, while a patch's null (the clear) goes over the wire", () => {
+    const encodePatch = Schema.encodeSync(ServerSettingsPatch);
+    for (const key of ["playtest", "handoff", "reviewRules"] as const) {
+      // No path puts a `null` in memory today; if one ever did, the save drops it (the same
+      // meaning: the server's value), so it never reaches the file to be read back.
+      const inMemory = (entry: Record<string, unknown>) =>
+        ({
+          ...decodeServerSettings({}),
+          projectSettingsOverrides: { [PROJECT]: entry },
+        }) as unknown as ServerSettings;
+      const written = encodeServerSettings(inMemory({ [key]: null, defaultAutoPull: false }))
+        .projectSettingsOverrides?.[PROJECT];
+      expect(written, key).toEqual({ defaultAutoPull: false });
+      expect(
+        encodeServerSettings(inMemory({ [key]: null })).projectSettingsOverrides?.[PROJECT],
+        key,
+      ).toEqual({});
+      // The written file reads back the same, and writes the same again (runs again).
+      const reread = decodeServerSettings(
+        JSON.parse(JSON.stringify({ projectSettingsOverrides: { [PROJECT]: written } })),
+      );
+      expect(encodeServerSettings(reread).projectSettingsOverrides?.[PROJECT], key).toEqual(
+        written,
+      );
+      // The patch has its own schema for these keys: a client's clear keeps its `null` both ways.
+      const clear = { projectSettingsOverrides: { [PROJECT]: { [key]: null } } };
+      const sent = JSON.parse(JSON.stringify(encodePatch(decodePatch(clear))));
+      expect(sent, key).toEqual(clear);
+      expect(decodePatch(sent).projectSettingsOverrides?.[PROJECT], key).toEqual({ [key]: null });
+    }
+  });
+
   it("gives every fork setting a patch field and a patch rule", () => {
     const keys = Object.keys(ForkServerSettingsFields).toSorted();
     expect(Object.keys(ForkServerSettingsPatchFields).toSorted()).toEqual(keys);
