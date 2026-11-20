@@ -1,7 +1,7 @@
 /**
- * Fork: a thread started by a narrower thread (`t3_thread_launch`, a `schedule_task` whose runs
- * start new threads, a `t3_thread_transfer` fork) is refused unless its profile is within the
- * starter's; `delegate_task` cuts a child to its parent as before.
+ * Fork: a thread started by a narrower thread (`t3_thread_launch`, `create_threads`, a
+ * `schedule_task` whose runs start new threads, a `t3_thread_transfer` fork) is refused unless its
+ * profile is within the starter's; `delegate_task` cuts a child to its parent as before.
  */
 import {
   OrchestratorMcpFailure,
@@ -16,28 +16,89 @@ import * as Option from "effect/Option";
 import { loadCaller } from "../mcp/threadAccess.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 
-import { type LineageThread, makeThreadMcpProfiles } from "./claudeMcpProfile.ts";
+import {
+  type LineageThread,
+  makeThreadMcpProfileReads,
+  makeThreadMcpProfiles,
+} from "./claudeMcpProfile.ts";
 import { isEveryMcpTool, isWithinMcpProfile, type McpProfileResolved } from "./mcpProfile.ts";
 
-type ProfileFor = Effect.Success<typeof makeThreadMcpProfiles>;
+type Refusal = { readonly reason: string };
 
-/** The launcher's profile, or a refusal when it cannot be worked out: never `all` on a guess. */
-const launcherProfile = (profileFor: ProfileFor, launcher: LineageThread) =>
-  profileFor(launcher).pipe(
-    Effect.mapError(
-      (refusal) =>
-        new OrchestratorMcpFailure({
-          code: "invalid_request",
-          message: `This thread's MCP profile cannot be worked out, so it cannot start another thread. ${refusal.reason}`,
-        }),
-    ),
-  );
+/** The launcher's profile cannot be worked out: a refusal, never `all` on a guess. */
+const launcherUnknown = (refusal: Refusal) =>
+  new OrchestratorMcpFailure({
+    code: "invalid_request",
+    message: `This thread's MCP profile cannot be worked out, so it cannot start another thread. ${refusal.reason}`,
+  });
 
 const named = (resolved: McpProfileResolved) => `"${resolved.name}"`;
 
 /**
+ * Stands in for a new thread whose id is not known before its dispatch (`create_threads`): it has
+ * no pick of its own, so its project's or the server's profile applies.
+ */
+const UNNAMED_NEW_THREAD = ThreadId.make("(new thread)");
+
+/** A thread that launches another, and where: its route words the refusal. */
+export interface Launched {
+  /** The new thread's id, when known before its dispatch. */
+  readonly threadId?: ThreadId | undefined;
+  readonly projectId: ProjectId;
+  /** `create_threads` starts the thread in the caller's own project. */
+  readonly route?: "t3_thread_launch" | "create_threads";
+}
+
+/**
+ * Refuses a launch whose new top-level thread in `projectId` would get anything the launcher's
+ * profile does not keep (both from one settings read). No calling thread (the owner's client, a
+ * task delegated here) is not checked. A retry checks again.
+ */
+export const makeLaunchMcpProfileCheck = Effect.gen(function* () {
+  const reads = yield* makeThreadMcpProfileReads;
+  return Effect.fn("LaunchMcpProfile.check")(function* (
+    launcher: LineageThread | undefined,
+    launched: Launched,
+  ) {
+    if (launcher === undefined) return;
+    const profileFor = yield* Effect.mapError(reads, launcherUnknown);
+    const own = yield* Effect.mapError(profileFor(launcher), launcherUnknown);
+    if (isEveryMcpTool(own.profile)) return;
+    const threadId = launched.threadId ?? UNNAMED_NEW_THREAD;
+    const theirs = yield* profileFor({
+      id: threadId,
+      projectId: launched.projectId,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+    }).pipe(
+      Effect.mapError(
+        (refusal) =>
+          new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: `The new thread's MCP profile cannot be worked out, so it was not started. ${refusal.reason}`,
+          }),
+      ),
+    );
+    if (isWithinMcpProfile(theirs.profile, own.profile)) return;
+    const instead =
+      launched.route === "create_threads"
+        ? `Use delegate_task (its sub-agent keeps this thread's profile), or ask the owner to start it.`
+        : `Use delegate_task (its sub-agent keeps this thread's profile), start the thread in a project whose MCP profile is within ${named(own)}, or ask the owner to start it.`;
+    return yield* new OrchestratorMcpFailure({
+      code: "capability_denied",
+      message: `This thread's MCP profile is ${named(own)}, and a thread it starts in that project would get ${named(theirs)}, which keeps MCP servers or T3 tools ${named(own)} does not, so it was not started. ${instead}`,
+    });
+  });
+});
+
+/** {@link makeLaunchMcpProfileCheck} for one `t3_thread_launch`, in the handler's services. */
+export const checkLaunchMcpProfile = (
+  launcher: OrchestrationV2ThreadShell | undefined,
+  launched: Launched,
+) => Effect.flatMap(makeLaunchMcpProfileCheck, (check) => check(launcher, launched));
+
+/**
  * Refuses a thread `launcher` starts when `started`, as it would be made, would get anything the
- * launcher's profile does not keep. `what` names the new thread in the refusal ("a thread it
+ * launcher's profile does not keep (both from one settings read). `what` names the new thread in the refusal ("a thread it
  * starts in that project"); `instead` says how to go on. A launcher on `all` is not checked.
  */
 const checkStarted = Effect.fn("LaunchMcpProfile.checkStarted")(function* (
@@ -46,8 +107,8 @@ const checkStarted = Effect.fn("LaunchMcpProfile.checkStarted")(function* (
   what: string,
   instead: (own: string) => string,
 ) {
-  const profileFor = yield* makeThreadMcpProfiles;
-  const own = yield* launcherProfile(profileFor, launcher);
+  const profileFor = yield* Effect.mapError(yield* makeThreadMcpProfileReads, launcherUnknown);
+  const own = yield* Effect.mapError(profileFor(launcher), launcherUnknown);
   if (isEveryMcpTool(own.profile)) return;
   const theirs = yield* profileFor(started).pipe(
     Effect.mapError(
@@ -70,26 +131,6 @@ const topLevel = (threadId: ThreadId, projectId: ProjectId): LineageThread => ({
   id: threadId,
   projectId,
   lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-});
-
-/**
- * Refuses a launch from a thread with a narrower profile than `all` when the new thread, a
- * top-level thread in `projectId`, would get anything the launcher's profile does not keep. A
- * call with no calling thread (the owner's own client, or a task another machine delegated, which
- * carries its profile) is not checked here. A retry checks again, against the settings it reads.
- */
-export const checkLaunchMcpProfile = Effect.fn("LaunchMcpProfile.check")(function* (
-  launcher: OrchestrationV2ThreadShell | undefined,
-  launched: { readonly threadId: ThreadId; readonly projectId: ProjectId },
-) {
-  if (launcher === undefined) return;
-  return yield* checkStarted(
-    launcher,
-    topLevel(launched.threadId, launched.projectId),
-    "a thread it starts in that project",
-    (own) =>
-      `Use delegate_task (its sub-agent keeps this thread's profile), start the thread in a project whose MCP profile is within ${own}, or ask the owner to start it.`,
-  );
 });
 
 /** The thread a scheduled run starts has no id until it runs, and no pick can name it. */
@@ -218,7 +259,7 @@ const refuseLaunchElsewhere = Effect.fn("LaunchMcpProfile.elsewhere")(function* 
   done = "it was not started",
 ) {
   if (launcher === undefined) return;
-  const own = yield* launcherProfile(yield* makeThreadMcpProfiles, launcher);
+  const own = yield* Effect.mapError((yield* makeThreadMcpProfiles)(launcher), launcherUnknown);
   if (isEveryMcpTool(own.profile)) return;
   return yield* new OrchestratorMcpFailure({
     code: "capability_denied",

@@ -315,6 +315,28 @@ it.effect("a launcher whose profile cannot be worked out is refused, never taken
   }),
 );
 
+it.effect("a launch whose new thread's profile cannot be worked out is refused (#681)", () =>
+  Effect.gen(function* () {
+    // The project names a profile no setting defines (an old or deleted one): never taken as all.
+    const { launched, launch } = harness({
+      ...DOCS_ONLY,
+      ...pickFor("docs"),
+      projectSettingsFolded: true,
+      projectSettingsOverrides: { [NARROW_PROJECT]: { mcpProfile: "deleted-profile" } },
+    } as Settings);
+    for (const clientRequestId of [undefined, "retry-1", "retry-1", "retry-2"]) {
+      const message = refusal(yield* launch({ projectId: NARROW_PROJECT, clientRequestId }));
+      expect(message).toContain(
+        "invalid_request: The new thread's MCP profile cannot be worked out",
+      );
+    }
+    expect(launched).toHaveLength(0);
+    // A project on all is refused for being wider, a different refusal.
+    expect(refusal(yield* launch({ projectId: PROJECT }))).toContain("capability_denied");
+    expect(launched).toHaveLength(0);
+  }),
+);
+
 it.effect("a narrowed thread cannot launch on another machine; an all thread can (#681)", () =>
   Effect.gen(function* () {
     const narrow = harness({ ...DOCS_ONLY, ...pickFor("docs") } as Settings);

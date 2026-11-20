@@ -38,7 +38,12 @@ import {
   type McpProfileThread,
   resolveMcpProfile,
 } from "./mcpProfile.ts";
-import { readMcpProfileKeysFromText, withMcpProfileFileKeys } from "./mcpProfileSettingsText.ts";
+import {
+  type McpProfileFileKeys,
+  mcpProfileFileKeysOf,
+  readMcpProfileKeysFromText,
+  withMcpProfileFileKeys,
+} from "./mcpProfileSettingsText.ts";
 
 export class ClaudeMcpProfileError extends Schema.TaggedError<ClaudeMcpProfileError>()(
   "ClaudeMcpProfileError",
@@ -239,20 +244,30 @@ export type FindThread = (threadId: ThreadId) => Effect.Effect<LineageThread | n
  * unreadable parent refuses; `findThread` is `undefined` only with no store and no settings
  * service (upstream's adapter tests), where the defaults give `all` and nothing can be carried.
  */
+/** The schema requires a lineage; a hand-made record without one is read as a root thread. */
+const withLineage = (thread: LineageThread): LineageThread =>
+  (thread.lineage as LineageThread["lineage"] | undefined) === undefined
+    ? {
+        ...thread,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: thread.id },
+      }
+    : thread;
+
 const mcpProfileForThread = Effect.fn("ClaudeMcpProfile.profileForThread")(function* (
   settings: ServerSettings,
   thread: LineageThread,
   findThread: FindThread | undefined,
 ) {
-  const lineage: Array<LineageThread> = [thread];
+  const lineage: Array<LineageThread> = [withLineage(thread)];
   let parentMissing = false;
   // Parents are read even with no profile set here: one of them may be a task another machine
   // delegated, which carries the profile of its thread there.
-  let parentId = thread.lineage.parentThreadId;
+  let parentId = lineage[0]!.lineage.parentThreadId;
   // One past the limit, or a repeat, is kept so the resolver refuses it.
   while (parentId !== null && lineage.length <= MCP_PROFILE_MAX_LINEAGE) {
     const repeated = lineage.find((entry) => entry.id === parentId);
-    const parent = repeated ?? (findThread === undefined ? null : yield* findThread(parentId));
+    const found = repeated ?? (findThread === undefined ? null : yield* findThread(parentId));
+    const parent = found === null ? null : withLineage(found);
     parentMissing = parent === null;
     if (parent === null) break;
     lineage.push(parent);
@@ -313,25 +328,18 @@ export const planKeyFor = (mcpOverrides: object): string | undefined =>
 const planKey = (plan: ClaudeMcpProfilePlan): string | undefined =>
   plan.servers === "all" ? undefined : ["mcp", ...plan.servers].join("\u0000");
 
-/** settings.json as a load decodes it, with the policy's locks laid over. */
+/** settings.json as this read found it. */
 type SettingsFileRead =
-  | {
-      readonly readable: true;
-      /** The file's settings; no file gives the defaults. */
-      readonly settings: ServerSettings;
-    }
-  | {
-      /** A file that does not decode (also an empty one) or whose legacy keys do not. */
-      readonly readable: false;
-      /**
-       * `base` with the MCP profile keys of the file's text (none when it names none: `base`'s
-       * stand) and `mcpCarriedProfiles` `refuse` (the file may say so), the policy's locks laid
-       * over; why not, when the text names a key but cannot be read.
-       */
-      readonly over: (base: ServerSettings) => ServerSettings | { readonly unreadable: string };
-      /** The policy's defaults, a base for {@link over} when the settings service cannot read. */
-      readonly defaults: ServerSettings;
-    };
+  /** No file: the policy's defaults, its locks laid over. */
+  | { readonly kind: "missing"; readonly settings: ServerSettings }
+  /** A file that decodes: its settings, the policy's locks laid over. */
+  | { readonly kind: "decoded"; readonly settings: ServerSettings }
+  /** A file that does not decode (or whose legacy keys do not): the MCP profile keys its text sets. */
+  | { readonly kind: "text"; readonly keys: McpProfileFileKeys }
+  /** Not a JSON object and naming no key (empty, cut off before its keys): it cannot say. */
+  | { readonly kind: "unknown"; readonly issue: string }
+  /** Names a key but cannot be read. */
+  | { readonly kind: "unreadable"; readonly issue: string };
 
 /**
  * settings.json as a load decodes it (no provider secrets: MCP keys hold none); `undefined` with no
@@ -349,29 +357,42 @@ const settingsFileReader = Effect.gen(function* () {
   const { settingsPath } = config.value;
   const fs = fileSystem.value;
   const managed = policy.value.settings;
-  return Effect.gen(function* () {
+  const read = Effect.gen(function* () {
     if (!(yield* fs.exists(settingsPath))) {
-      return { readable: true, settings: managed.applyLocks(managed.defaults) };
+      return { kind: "missing", settings: managed.applyLocks(managed.defaults) };
     }
     const raw = yield* fs.readFileString(settingsPath);
     const decoded = ServerSettingsService.decodeSettingsFileText(raw, managed.withDefaults);
     if (Exit.isSuccess(decoded) && !ServerSettingsService.settingsFileLegacyKeysUnreadable(raw)) {
-      return { readable: true, settings: managed.applyLocks(decoded.value) };
+      return { kind: "decoded", settings: managed.applyLocks(decoded.value) };
     }
-    const keys = readMcpProfileKeysFromText(raw, managed.withDefaults);
-    return {
-      readable: false,
-      over: (base) =>
-        keys.ok
-          ? managed.applyLocks({
-              ...(keys.keys === undefined ? base : withMcpProfileFileKeys(base, keys.keys)),
-              mcpCarriedProfiles: MCP_CARRIED_PROFILES_REFUSE,
-            })
-          : { unreadable: keys.issue },
-      defaults: managed.defaults,
-    };
+    const text = readMcpProfileKeysFromText(raw, managed.withDefaults);
+    return text._tag === "keys"
+      ? { kind: "text", keys: text.keys }
+      : { kind: text._tag, issue: text.issue };
   }) satisfies Effect.Effect<SettingsFileRead, unknown>;
+  return {
+    read,
+    /**
+     * `base` with MCP profile keys a file that does not decode stands for, and
+     * `mcpCarriedProfiles` `refuse` (the file may say so), the policy's locks laid over.
+     */
+    layOver: (base: ServerSettings, keys: McpProfileFileKeys): ServerSettings =>
+      managed.applyLocks({
+        ...withMcpProfileFileKeys(base, keys),
+        mcpCarriedProfiles: MCP_CARRIED_PROFILES_REFUSE,
+      }),
+    /** The policy's defaults, a base when the settings service cannot read. */
+    defaults: managed.defaults,
+  };
 });
+
+/**
+ * The MCP profile keys settings.json last gave (a file that decodes, text that reads, or no file),
+ * per settings service, so per server process. Memory only: a server that starts with a file that
+ * cannot say has none, and refuses until the file is fixed.
+ */
+const LAST_READ_KEYS = new WeakMap<object, McpProfileFileKeys>();
 
 const cannotReadSettings = () =>
   new ClaudeMcpProfileError({
@@ -384,11 +405,16 @@ const unreadableSettingsFile = (issue: string) =>
     reason: `T3's settings.json sets MCP profiles but cannot be read (${issue}), so this thread's MCP profile cannot be worked out and it cannot start: fix settings.json (the server log says what is wrong); the next turn reads it again.`,
   });
 
+/** The refusal for a settings.json that cannot say, with no keys read since the server started. */
+const noReadSettingsFile = (issue: string) =>
+  new ClaudeMcpProfileError({
+    reason: `T3's settings.json cannot be read (${issue}), and this server has not read its MCP profiles since it started, so this thread's MCP profile cannot be worked out and it cannot start: fix settings.json (the server log says what is wrong); the next turn reads it again.`,
+  });
+
 /**
- * The settings MCP profiles read (Claude turns, delegations, launches, the features route), or a
- * refusal. A failed read falls back to settings.json alone, else refuses. A settings.json that
- * does not decode, also one broken at load, gives the MCP profile keys its text holds, and
- * `mcpCarriedProfiles` reads as `refuse`, as it may say so; text that cannot say refuses.
+ * The settings MCP profiles read, or a refusal. settings.json's own MCP keys win on every read (the
+ * service may still hold a broken load's defaults). Undecodable text gives its keys and carried
+ * `refuse`; text that cannot say keeps the keys last read, refusing with none since start.
  */
 export const makeMcpProfileSettings = Effect.gen(function* () {
   const settingsService = yield* Effect.serviceOption(ServerSettingsService.ServerSettingsService);
@@ -399,17 +425,17 @@ export const makeMcpProfileSettings = Effect.gen(function* () {
     return Effect.succeed(DEFAULT_SERVER_SETTINGS);
   }
   const service = settingsService.value;
-  const readSettingsFile = yield* settingsFileReader;
+  const reader = yield* settingsFileReader;
   return Effect.gen(function* () {
     const read = yield* service.getSettings.pipe(Effect.result);
-    if (readSettingsFile === undefined) {
+    if (reader === undefined) {
       if (read._tag === "Success") return read.success;
       yield* Effect.logWarning("MCP profiles: the settings could not be read", {
         cause: read.failure,
       });
       return yield* cannotReadSettings();
     }
-    const fileRead = yield* readSettingsFile.pipe(Effect.result);
+    const fileRead = yield* reader.read.pipe(Effect.result);
     if (fileRead._tag === "Failure") {
       // The service's settings may be a broken file's defaults from an earlier load, so they do
       // not count while the file cannot be read: never `all` on a guess.
@@ -419,39 +445,66 @@ export const makeMcpProfileSettings = Effect.gen(function* () {
       return yield* cannotReadSettings();
     }
     const file = fileRead.success;
-    if (file.readable) {
-      if (read._tag === "Success") return read.success;
-      yield* Effect.logWarning(
-        "MCP profiles: settings could not be read in full, so the MCP profile settings come from settings.json alone",
-        { cause: read.failure },
-      );
-      return file.settings;
+    const base = read._tag === "Success" ? read.success : reader.defaults;
+    switch (file.kind) {
+      case "missing":
+      case "decoded": {
+        LAST_READ_KEYS.set(service, mcpProfileFileKeysOf(file.settings));
+        if (read._tag === "Failure") {
+          yield* Effect.logWarning(
+            "MCP profiles: settings could not be read in full, so the MCP profile settings come from settings.json alone",
+            { cause: read.failure },
+          );
+          return file.settings;
+        }
+        // No file: the service's settings stand. A file that decodes: its MCP profile keys count
+        // over the service's, which may still be an earlier broken load's defaults.
+        if (file.kind === "missing") return read.success;
+        return {
+          ...withMcpProfileFileKeys(read.success, mcpProfileFileKeysOf(file.settings)),
+          mcpCarriedProfiles: file.settings.mcpCarriedProfiles,
+        };
+      }
+      case "text":
+        LAST_READ_KEYS.set(service, file.keys);
+        yield* Effect.logWarning(
+          "MCP profiles: settings.json does not decode, so the MCP profile settings come from its text, and carried MCP profiles read as refuse",
+        );
+        return reader.layOver(base, file.keys);
+      case "unreadable":
+        yield* Effect.logWarning(
+          "MCP profiles: settings.json does not decode and its text cannot say which MCP profile a thread has, so threads are refused until it is fixed",
+          { issue: file.issue },
+        );
+        return yield* unreadableSettingsFile(file.issue);
+      case "unknown": {
+        const kept = LAST_READ_KEYS.get(service);
+        if (kept === undefined) {
+          yield* Effect.logWarning(
+            "MCP profiles: settings.json cannot be read and no MCP profile settings were read since the server started, so threads are refused until it is fixed",
+            { issue: file.issue },
+          );
+          return yield* noReadSettingsFile(file.issue);
+        }
+        yield* Effect.logWarning(
+          "MCP profiles: settings.json cannot be read, so the MCP profile settings last read stand, and carried MCP profiles read as refuse",
+          { issue: file.issue },
+        );
+        return reader.layOver(base, kept);
+      }
     }
-    // The service gave every setting its default for this file (or still holds the last load's);
-    // the MCP profile keys the text holds replace the service's, never widened to `all`.
-    const settings = file.over(read._tag === "Success" ? read.success : file.defaults);
-    if ("unreadable" in settings) {
-      yield* Effect.logWarning(
-        "MCP profiles: settings.json does not decode and its text cannot say which MCP profile a thread has, so threads are refused until it is fixed",
-        { issue: settings.unreadable },
-      );
-      return yield* unreadableSettingsFile(settings.unreadable);
-    }
-    yield* Effect.logWarning(
-      "MCP profiles: settings.json does not decode, so the MCP profile settings come from its text, and carried MCP profiles read as refuse",
-    );
-    return settings;
   }).pipe(Effect.withSpan("ClaudeMcpProfile.readSettings"));
 });
 
 type McpOverrides = { readonly mcpServers?: Readonly<Record<string, unknown>> | undefined };
 
 /**
- * A thread's resolved profile, or a refusal, from the settings {@link makeMcpProfileSettings}
- * reads; without the settings service (tests), the default settings' (`all`, cut to a profile
- * another machine carried).
+ * One settings read, or a refusal, then threads' resolved profiles (or refusals) from it: two
+ * threads compared against one file. Settings as {@link makeMcpProfileSettings} reads them; without
+ * the settings service (tests), the default settings' (`all`, cut to a profile another machine
+ * carried).
  */
-export const makeThreadMcpProfiles = Effect.gen(function* () {
+export const makeThreadMcpProfileReads = Effect.gen(function* () {
   const settingsService = yield* Effect.serviceOption(ServerSettingsService.ServerSettingsService);
   const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
   // The adapter built alone (upstream's adapter tests): default settings and no store, so nothing
@@ -477,8 +530,20 @@ export const makeThreadMcpProfiles = Effect.gen(function* () {
       ? undefined
       : () => Effect.succeed(null);
   const readSettings = yield* makeMcpProfileSettings;
+  return Effect.map(
+    readSettings,
+    (settings) => (thread: LineageThread) => mcpProfileForThread(settings, thread, findThread),
+  );
+});
+
+/**
+ * A thread's resolved profile, or a refusal, from the settings {@link makeMcpProfileSettings}
+ * reads on each call; see {@link makeThreadMcpProfileReads}.
+ */
+export const makeThreadMcpProfiles = Effect.gen(function* () {
+  const reads = yield* makeThreadMcpProfileReads;
   return Effect.fn("ClaudeMcpProfile.profileFor")(function* (thread: LineageThread) {
-    return yield* mcpProfileForThread(yield* readSettings, thread, findThread);
+    return yield* (yield* reads)(thread);
   });
 });
 
