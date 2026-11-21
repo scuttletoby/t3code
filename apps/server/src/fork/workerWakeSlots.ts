@@ -11,6 +11,7 @@ import {
   type RuntimeRequestId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -18,6 +19,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 
 import { ServerConfig } from "../config.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
@@ -98,7 +100,24 @@ export const makeWorkerWakeSlots = Effect.fn("WorkerWakeSlots.make")(function* <
     return { orchestrator, retry: Effect.void, held: (): ReadonlyArray<MessageDispatch> => [] };
   const held = new Map<CommandId, MessageDispatch>();
   for (const wake of yield* input.store.load) held.set(wake.commandId, wake);
-  const save = Effect.suspend(() => input.store.save([...held.values()]));
+  if (held.size > 0)
+    yield* Effect.logInfo("held delegated task questions loaded: sent when a slot frees", {
+      count: held.size,
+    });
+  const saving = yield* Semaphore.make(1);
+  // One save at a time, its snapshot taken under the lock: the last write is what is held now.
+  const save = saving.withPermits(1)(Effect.suspend(() => input.store.save([...held.values()])));
+  /** Held wakes whose parent or question could not be read: logged once. */
+  const unreadLogged = new Set<CommandId>();
+  const unread = Effect.fn("WorkerWakeSlots.unread")(function* (command: MessageDispatch) {
+    if (unreadLogged.has(command.commandId)) return false;
+    unreadLogged.add(command.commandId);
+    yield* Effect.logWarning(
+      "held delegated task question waits: its parent or question could not be read",
+      { threadId: command.threadId },
+    );
+    return false;
+  });
 
   /** `null`: it may start now; else why it waits. */
   const slotFor = Effect.fn("WorkerWakeSlots.slotFor")(function* (command: MessageDispatch) {
@@ -143,12 +162,12 @@ export const makeWorkerWakeSlots = Effect.fn("WorkerWakeSlots.make")(function* <
   /** One held wake: `true` when it leaves the file (sent, or no longer owed). */
   const retryOne = Effect.fn("WorkerWakeSlots.retryOne")(function* (command: MessageDispatch) {
     const thread = yield* input.threadOf(command.threadId).pipe(Effect.option);
-    if (Option.isNone(thread)) return false;
+    if (Option.isNone(thread)) return yield* unread(command);
     if (thread.value === null) return true;
     const asked = questionOf(command);
     if (asked !== null) {
       const open = yield* input.questionOpen(command.threadId, asked).pipe(Effect.option);
-      if (Option.isNone(open)) return false;
+      if (Option.isNone(open)) return yield* unread(command);
       if (!open.value) return true;
     }
     if ((yield* slotFor(command)) !== null) return false;
@@ -168,6 +187,7 @@ export const makeWorkerWakeSlots = Effect.fn("WorkerWakeSlots.make")(function* <
     for (const command of held.values()) {
       if (!(yield* retryOne(command))) continue;
       held.delete(command.commandId);
+      unreadLogged.delete(command.commandId);
       changed = true;
     }
     if (changed) yield* save;
@@ -190,7 +210,8 @@ export const makeWorkerWakeSlots = Effect.fn("WorkerWakeSlots.make")(function* <
 
 /**
  * The held wakes in `filePath`. Missing is none. A file or entry that cannot be read is logged and
- * left out: the next save writes what is held then.
+ * left out: the next save writes what is held then. A file that cannot be read is first moved to
+ * `<file>.corrupt-<ms>`, so nothing is written over it.
  */
 const fileStore = Effect.fn("WorkerWakeSlots.fileStore")(function* (filePath: string) {
   const fs = yield* FileSystem.FileSystem;
@@ -199,7 +220,15 @@ const fileStore = Effect.fn("WorkerWakeSlots.fileStore")(function* (filePath: st
     const text = yield* fs.readFileString(filePath).pipe(Effect.option);
     const file = Option.flatMap(text, decodeFile);
     if (Option.isNone(file)) {
-      yield* Effect.logWarning("held wakes file unreadable; its wakes are not sent", { filePath });
+      const keptAs = `${filePath}.corrupt-${yield* Clock.currentTimeMillis}`;
+      const kept = yield* fs.rename(filePath, keptAs).pipe(
+        Effect.as(keptAs),
+        Effect.orElseSucceed(() => null),
+      );
+      yield* Effect.logWarning("held wakes file unreadable; its wakes are not sent", {
+        filePath,
+        keptAs: kept,
+      });
       return [];
     }
     const wakes = file.value.wakes.flatMap((entry) => {
@@ -215,6 +244,7 @@ const fileStore = Effect.fn("WorkerWakeSlots.fileStore")(function* (filePath: st
       });
     return wakes;
   });
+  // Called one at a time (`makeWorkerWakeSlots` holds a lock), so one temp name is enough.
   const save = Effect.fn("WorkerWakeSlots.save")(
     function* (wakes: ReadonlyArray<MessageDispatch>) {
       const temporary = `${filePath}.tmp`;

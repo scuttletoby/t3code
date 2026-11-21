@@ -9,6 +9,8 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
+  MessageId,
+  RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -245,6 +247,39 @@ describe("provider continuations take an agent slot", () => {
         assert.strictEqual(yield* Queue.size(dispatched), 0);
       }).pipe(Effect.provide(server(world, dispatched)), Effect.scoped);
     }),
+  );
+
+  it.effect("a delegated result is upstream's at once: no slot asked, even with none free", () =>
+    Effect.gen(function* () {
+      const world = newWorld(0);
+      const inner =
+        yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+      const gated = ContinuationSlot.gateContinuations(
+        {
+          offer: (value) => Queue.offer(inner, value).pipe(Effect.asVoid),
+          take: Queue.take(inner),
+        },
+        Option.some(yield* SlotGate.SlotGate.pipe(Effect.provide(gateOf(world)))),
+        () => Effect.succeed({ instanceId: INSTANCE }),
+        yield* Effect.scope,
+      );
+      const delegated = request(A, {
+        delegatedCompletion: {
+          parentRunId: RunId.make("run:continuation-a"),
+          generation: 1,
+          messageId: MessageId.make("message:continuation-a"),
+        },
+      });
+      yield* gated.offer(delegated);
+      const taken: Array<ProviderContinuationRequests.ProviderContinuationRequest> = [];
+      yield* gated.take.pipe(
+        Effect.tap((value) => Effect.sync(() => taken.push(value))),
+        Effect.forkScoped,
+      );
+      yield* TestClock.adjust("1 minute");
+      assert.deepStrictEqual(taken, [delegated]);
+      assert.deepStrictEqual(world.asks, []);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("stopped while one waits: nothing is sent later, half-way or twice", () =>

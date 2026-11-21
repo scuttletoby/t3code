@@ -17,6 +17,7 @@ import {
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -285,6 +286,10 @@ describe("a delegated task's question to an idle parent takes an agent slot", ()
           Effect.scoped,
         );
         assert.lengthOf(wakes(world), 1);
+        assert.lengthOf(
+          world.logs.filter((log) => log.includes("held delegated task questions loaded")),
+          1,
+        );
         world.free = 5;
         yield* TestClock.adjust("1 minute").pipe(Effect.provide(server(world, dir)), Effect.scoped);
         assert.lengthOf(wakes(world), 1);
@@ -353,6 +358,11 @@ describe("a delegated task's question to an idle parent takes an agent slot", ()
         yield* TestClock.adjust("30 seconds");
         assert.deepStrictEqual(wakes(world), []);
         assert.deepStrictEqual(yield* heldIds(dir), [WAKE_COMMAND]);
+        // Asked every 5 s, logged once.
+        assert.lengthOf(
+          world.logs.filter((log) => log.includes("its parent or question could not be read")),
+          1,
+        );
         world.parent = "idle";
         yield* TestClock.adjust("5 seconds");
         assert.lengthOf(wakes(world), 1);
@@ -360,23 +370,130 @@ describe("a delegated task's question to an idle parent takes an agent slot", ()
     }).pipe(Effect.scoped),
   );
 
-  it.effect("old, empty, broken or missing file: nothing sent from it; a new hold writes it", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem.pipe(Effect.provide(NodeServices.layer));
-      for (const contents of [null, "", '{"version":1,"wakes":[]}', "{not json", '{"version":9}']) {
-        const dir = yield* tempDir;
-        const world = newWorld(0);
-        const file = yield* heldFile(dir);
-        if (contents !== null)
-          yield* fs.writeFileString(file, contents).pipe(Effect.provide(NodeServices.layer));
-        yield* Effect.gen(function* () {
-          yield* TestClock.adjust("10 seconds");
-          assert.deepStrictEqual(world.sent, []);
-          yield* ask;
-          assert.deepStrictEqual(yield* heldIds(dir), [WAKE_COMMAND]);
-        }).pipe(Effect.provide(server(world, dir)), Effect.scoped);
-      }
-    }).pipe(Effect.scoped),
+  it.effect(
+    "old, empty, broken or missing file: nothing sent from it; a bad one is kept; a new hold writes it",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem.pipe(Effect.provide(NodeServices.layer));
+        const path = yield* Path.Path.pipe(Effect.provide(NodeServices.layer));
+        for (const contents of [
+          null,
+          "",
+          '{"version":1,"wakes":[]}',
+          "{not json",
+          '{"version":9}',
+        ]) {
+          const dir = yield* tempDir;
+          const world = newWorld(0);
+          const file = yield* heldFile(dir);
+          if (contents !== null)
+            yield* fs.writeFileString(file, contents).pipe(Effect.provide(NodeServices.layer));
+          yield* Effect.gen(function* () {
+            yield* TestClock.adjust("10 seconds");
+            assert.deepStrictEqual(world.sent, []);
+            yield* ask;
+            assert.deepStrictEqual(yield* heldIds(dir), [WAKE_COMMAND]);
+          }).pipe(Effect.provide(server(world, dir)), Effect.scoped);
+          // A file that could not be read is kept beside the new one, and named in the log.
+          const kept = (yield* fs
+            .readDirectory(path.dirname(file))
+            .pipe(Effect.provide(NodeServices.layer))).filter((name) =>
+            name.startsWith(`${WorkerWakeSlots.HELD_WAKES_FILE}.corrupt-`),
+          );
+          if (contents === null || contents.startsWith('{"version":1')) {
+            assert.deepStrictEqual(kept, []);
+            continue;
+          }
+          assert.lengthOf(kept, 1);
+          const keptAs = path.join(path.dirname(file), kept[0]!);
+          assert.strictEqual(
+            yield* fs.readFileString(keptAs).pipe(Effect.provide(NodeServices.layer)),
+            contents,
+          );
+          assert.isTrue(
+            world.logs.some(
+              (log) => log.includes("held wakes file unreadable") && log.includes(kept[0]!),
+            ),
+          );
+        }
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a send's save and a new hold's save run one at a time: the file ends with what is held",
+    () =>
+      Effect.gen(function* () {
+        // Review B's case: one slot, W1 held. The retry sends W1 and starts a slow save of [].
+        // Meanwhile W3 is refused and held. The file must end [W3], as memory does.
+        const world = newWorld(1);
+        const wake = (name: string) =>
+          ({
+            type: "message.dispatch",
+            commandId: `server:delegated-task-question:${PARENT}:${name}`,
+            messageId: `message:${name}`,
+            threadId: PARENT,
+          }) as never as Extract<OrchestrationV2ServerCommand, { type: "message.dispatch" }>;
+        const [w1, w3] = [wake("w1"), wake("w3")];
+        let file: ReadonlyArray<string> = [w1.commandId];
+        let saves = 0;
+        const firstSaveStarted = yield* Deferred.make<void>();
+        const firstSaveMayEnd = yield* Deferred.make<void>();
+        const refused = yield* Deferred.make<void>();
+        const gate = yield* SlotGate.SlotGate.pipe(Effect.provide(gateOf(world)));
+        const slots = yield* WorkerWakeSlots.makeWorkerWakeSlots({
+          orchestrator: {
+            dispatch: (command: OrchestrationV2ServerCommand) =>
+              Effect.sync(() => {
+                world.sent.push(command);
+                return { sequence: world.sent.length, storedEvents: [] };
+              }),
+          } as never,
+          gate: Option.some({
+            ...gate,
+            acquire: (input) =>
+              gate
+                .acquire(input)
+                .pipe(
+                  Effect.tap((slot) =>
+                    slot.type === "refuse" ? Deferred.succeed(refused, undefined) : Effect.void,
+                  ),
+                ),
+          }),
+          threadOf: () => Effect.succeed({ instanceId: ProviderInstanceId.make("claudeAgent") }),
+          questionOpen: () => Effect.succeed(true),
+          store: {
+            load: Effect.succeed([w1]),
+            save: (held) =>
+              Effect.gen(function* () {
+                saves += 1;
+                if (saves === 1) {
+                  yield* Deferred.succeed(firstSaveStarted, undefined);
+                  yield* Deferred.await(firstSaveMayEnd);
+                }
+                file = held.map((command) => command.commandId);
+              }),
+          },
+        });
+        const retrying = yield* Effect.forkChild(slots.retry);
+        yield* Deferred.await(firstSaveStarted);
+        assert.deepStrictEqual(
+          world.sent.map((command) => command.commandId),
+          [w1.commandId],
+        );
+        const holding = yield* Effect.forkChild(slots.orchestrator.dispatch(w3));
+        // Refused, then held (one yield): its save runs now, or waits for the first (the lock).
+        yield* Deferred.await(refused);
+        yield* Effect.yieldNow;
+        assert.isTrue(slots.held().some((command) => command.commandId === w3.commandId));
+        yield* Deferred.succeed(firstSaveMayEnd, undefined);
+        yield* Fiber.join(retrying);
+        yield* Fiber.join(holding);
+        assert.deepStrictEqual(
+          slots.held().map((command) => command.commandId),
+          [w3.commandId],
+        );
+        assert.deepStrictEqual(file, [w3.commandId]);
+      }),
   );
 
   it.effect("an unreadable entry is left out; the readable one beside it is sent", () =>

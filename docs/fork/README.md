@@ -479,7 +479,9 @@ only queues: no slot.
   (`apps/server/src/fork/handoff/handoffDispatch.ts`, after its busy check). Refused, nothing is
   sent: it asks again every 5 s or at the thread's next event (logged once), deciding again each
   time without a new settle, and a thread that moved on drops it. Like every handoff timer it is
-  memory only: a restart drops a waiting handoff, and the thread's next turn end decides again.
+  memory only: a restart drops a waiting handoff, and the thread's next turn end decides again. A
+  waiting resend of a failed handoff run is dropped too, with no log: the failed run's text stays
+  in the thread, and the next turn end decides again.
 - Upstream's provider continuation ("Background task completed": an agent that ended its turn
   while its own background work ran starts again when that work ends;
   `apps/server/src/fork/continuationSlot.ts`). The slot is asked when upstream's worker takes the
@@ -494,12 +496,20 @@ only queues: no slot.
   `fork-held-wakes.json` in the server's state folder and asked again every 5 s (logged once). It
   leaves the file once sent, or when the question is answered, its task ends or the parent is
   archived or deleted. A restart reads the file and sends it once; upstream's fixed command id
-  keeps a send cut off before the file write from making a second message. A file or an entry that
-  cannot be read is logged and left out.
+  keeps a send cut off before the file write from making a second message. Saves run one at a
+  time, each writing what is held then. A file that cannot be read is moved to
+  `fork-held-wakes.json.corrupt-<ms>` beside it and logged, so the next save does not write over
+  it; an entry that cannot be read is logged and left out. A held wake whose parent or question
+  cannot be read waits, logged once.
 - Upstream's idle compaction (same file), after the handoff owner's check. Refused, it is skipped
   (logged), not held: it only pays off while the prompt cache is warm, minutes before it expires,
   and a late one costs a full uncached read. The next completed run arms a new one, as after a
-  restart.
+  restart. It is asked once: a thread whose window always falls while the slots are full does not
+  compact.
+
+Like the wake-ups above, the handoff, the continuation and the question wake hold no place in
+line: each asks again on its own 5 s timer, so under steady load a slot that frees between two
+asks can go to another start, and one can wait without limit. Nothing is lost or sent twice.
 
 The calling thread is left out of the count (it waits on its child). A start no thread on this
 machine asks for (a scheduled run, the owner's client, a call from another machine) has no caller, so
