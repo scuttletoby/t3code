@@ -247,6 +247,11 @@ export type SlotDecision =
       /** The limit (count rules) or the floor in MB (memory). */
       readonly max: number;
       readonly instanceId: string;
+      /**
+       * Of `used`, the starts waiting in the gate's line ahead of this one (count rules): they are
+       * not running yet, so `wait_list` does not show them.
+       */
+      readonly inLine?: number | undefined;
     };
 
 export interface SlotDecisionInput {
@@ -325,15 +330,29 @@ export function slotDecision(input: SlotDecisionInput): SlotDecision {
   return { type: "allow" };
 }
 
+/**
+ * "N agents are running{where}", and the starts waiting in line ahead of this one apart
+ * (`inLine`), so the count matches `wait_list`.
+ */
+export function slotRunningText(
+  decision: Extract<SlotDecision, { readonly type: "refuse" }>,
+  where: string,
+): string {
+  const agents = (count: number) => (count === 1 ? "1 agent is" : `${count} agents are`);
+  const inLine = decision.inLine ?? 0;
+  if (inLine === 0) return `${agents(decision.used)} running${where}`;
+  const starts = inLine === 1 ? "1 start is" : `${inLine} starts are`;
+  return `${agents(decision.used - inLine)} running${where} and ${starts} waiting in line ahead of this one`;
+}
+
 /** Why a slot is not free, without a full stop (held slots count as running agents). */
 export function slotRefusalReason(
   decision: Extract<SlotDecision, { readonly type: "refuse" }>,
 ): string {
-  const agents = (count: number) => (count === 1 ? "1 agent is" : `${count} agents are`);
   return decision.rule === "machine"
-    ? `${agents(decision.used)} running on this machine, and the limit is ${decision.max}`
+    ? `${slotRunningText(decision, " on this machine")}, and the limit is ${decision.max}`
     : decision.rule === "account"
-      ? `${agents(decision.used)} running on account ${decision.instanceId}, and the limit is ${decision.max}`
+      ? `${slotRunningText(decision, ` on account ${decision.instanceId}`)}, and the limit is ${decision.max}`
       : `only ${decision.used} MB of memory is free, and a new agent needs at least ${decision.max} MB`;
 }
 

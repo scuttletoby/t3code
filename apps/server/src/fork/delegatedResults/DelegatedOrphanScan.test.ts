@@ -80,6 +80,8 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   /** Answers its first page only. */
   const cutShort = new Set<EnvironmentId>();
   const linksOff = { value: false };
+  /** Every send fails as a store that cannot be read now does (tried again, same id). */
+  const sendFails = { value: false };
   const pageReads: Array<{ environmentId: EnvironmentId; cursor: number }> = [];
   const sent: Array<{ threadId: ThreadId; messageId: string; text: string }> = [];
   const receipts = new Map<string, ThreadId>();
@@ -113,6 +115,7 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
     silent,
     cutShort,
     linksOff,
+    sendFails,
     pageReads,
     sent,
     receipts,
@@ -137,24 +140,32 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
             ),
           ),
         sendToThread: (input) =>
-          refusing.has(input.commandId)
-            ? Effect.sync(() => refused.add(input.commandId)).pipe(
-                Effect.andThen(
-                  Effect.fail({
-                    _tag: "ThreadManagementCommandInvariantError",
-                    message: "refused",
-                  } as never),
-                ),
-              )
-            : Effect.sync(() => {
-                sent.push({
+          sendFails.value
+            ? Effect.fail(
+                new ThreadManagement.ThreadManagementProjectionLoadError({
+                  projectId: input.projectId,
                   threadId: input.threadId,
-                  messageId: input.messageId!,
-                  text: input.text,
-                });
-                receipts.set(input.commandId, input.threadId);
-                return {} as never;
-              }),
+                  cause: new Error("store busy"),
+                }),
+              )
+            : refusing.has(input.commandId)
+              ? Effect.sync(() => refused.add(input.commandId)).pipe(
+                  Effect.andThen(
+                    Effect.fail({
+                      _tag: "ThreadManagementCommandInvariantError",
+                      message: "refused",
+                    } as never),
+                  ),
+                )
+              : Effect.sync(() => {
+                  sent.push({
+                    threadId: input.threadId,
+                    messageId: input.messageId!,
+                    text: input.text,
+                  });
+                  receipts.set(input.commandId, input.threadId);
+                  return {} as never;
+                }),
       }),
       Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
         getByCommandId: (commandId: CommandId) =>
@@ -775,6 +786,8 @@ describe("DelegatedOrphanScan and agent slots", () => {
           callerThreadId: PARENT,
           intoThreadId: PARENT,
           keepsHeld: true,
+          // Asked again every 5 s through the wait service's delivery, in one place in line.
+          place: { key: expect.stringMatching(/^wait-delivery:/) },
         }),
       ]);
     }),
@@ -926,6 +939,79 @@ describe("DelegatedOrphanScan and agent slots", () => {
         yield* settle;
         yield* Fiber.join(again);
         expect(world.sent).toHaveLength(1);
+      }),
+  );
+
+  it.effect("a send that keeps failing is logged as a failed send, not an unreadable parent", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.slots.state.all = true;
+      const warnings: Array<string> = [];
+      const logger = Logger.make(({ message, logLevel }) => {
+        if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+      });
+      const fiber = yield* (yield* service(world))
+        .run()
+        .pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          Effect.forkChild,
+        );
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      // A slot frees, but every send fails.
+      world.slots.state.all = false;
+      world.sendFails.value = true;
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      for (let step = 0; step < OPTIONS.attempts; step++) {
+        yield* TestClock.adjust(OPTIONS.retryDelay);
+        yield* settle;
+      }
+      expect(fiber.pollUnsafe()).toBeDefined();
+      expect(warnings.filter((warning) => warning.includes("its send failed"))).toHaveLength(1);
+      expect(warnings.filter((warning) => warning.includes("cannot be read"))).toHaveLength(0);
+      expect(
+        warnings.filter((warning) => warning.includes("left to the next start: its send kept")),
+      ).toHaveLength(1);
+      expect(world.sent).toHaveLength(0);
+    }),
+  );
+
+  it.effect(
+    "the give-up warning lists a parent whose send kept failing apart from unread ones",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        // A slot is free, but every send to the parent fails: each scan tries it again.
+        world.sendFails.value = true;
+        const warnings: Array<string> = [];
+        const logger = Logger.make(({ message, logLevel }) => {
+          if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+        });
+        const fiber = yield* (yield* service(world))
+          .run()
+          .pipe(
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+            Effect.forkChild,
+          );
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        for (let attempt = 1; attempt <= OPTIONS.attempts; attempt += 1) {
+          yield* settle;
+          if (attempt < OPTIONS.attempts) yield* TestClock.adjust(OPTIONS.retryDelay);
+        }
+        yield* Fiber.join(fiber);
+        const left = warnings.filter((warning) => warning.includes("work unchecked"));
+        expect(left).toHaveLength(1);
+        const fields = (JSON.parse(left[0]!) as Array<unknown>).find(
+          (part): part is Record<string, unknown> => typeof part === "object" && part !== null,
+        );
+        expect(fields?.failedSendParentThreadIds).toEqual([PARENT]);
+        expect(fields?.unreadableParentThreadIds).toEqual([]);
+        expect(world.sent).toHaveLength(0);
       }),
   );
 
