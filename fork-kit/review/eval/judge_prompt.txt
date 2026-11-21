@@ -1,0 +1,19 @@
+You are the blind judge in a controlled code-review experiment, case {case}.
+
+Inputs (read-only):
+- {workdir}/judge/{case}/truth.json: the confirmed bugs for this diff: `blocker_major`, `minor`, and `known_other_lens` (real issues found earlier by other means). Only you see this.
+- {workdir}/judge/{case}/review-NN.md: independent reviews of the same diff by different reviewers. You do not know who wrote which; do not guess.
+- {workdir}/cases/{case}/diff.patch, diff.stat, brief.md and the source tree {workdir}/cases/{case}/src/: to check claims.
+
+Do not open anything else (nothing else under {workdir}, no agent settings, no git, GitHub, web, tool servers or sub-agents, no builds or servers). Small offline python3 or sh checks in {workdir}/scratch/judge-{case}/ are fine. Delete only literal paths; never kill processes by pattern.
+
+Task, for every finding in every review:
+1. Match it against truth.json. It matches an item only if it names the same root defect (same code path and the same failure mechanism); different wording or severity is fine. Right place but wrong mechanism = `partial` (no credit). One finding can match at most one item; if a review reports the same defect twice, credit it once.
+2. If it matches nothing, decide yourself by checking the code in src/: `real` (a true defect; give your own severity blocker/major/minor/nit with a one-line trace), `fp` (false positive; one-line reason with file:line), or `unsure` (one line why).
+Be strict and consistent across reviews; judge each finding on its own merits, not by how confident or long the review is.
+
+Write {workdir}/judge/{case}/scores.json exactly in this shape:
+{"reviews": {"review-01.md": {"found": ["<truth id>", "..."], "findings": [{"n": 1, "claimed": "major", "match": "<truth id>" or null, "verdict": "match|partial|real|fp|unsure", "severity": "blocker|major|minor|nit", "note": "one line"}]}, ...},
+ "new_real": [{"key": "short-slug", "severity": "...", "where": "file:line", "what": "one line", "reviews": ["review-03.md"]}]}
+`found` lists every truth id (blocker_major, minor and known_other_lens ids) the review matched. `new_real` merges the same real new defect across reviews under one key.
+Then write {workdir}/judge/{case}/JUDGE.md: a short table per review (finding n, match/verdict, severity) and a list of new real bugs. Your final message is one line: `judged {case} <number of reviews>`.
