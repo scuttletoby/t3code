@@ -169,13 +169,14 @@ describe("agent turn start paths stay behind the work gate", () => {
   });
 
   // Every timed source (scheduled tasks, webhook coalescing, waits, usage-limit recovery, usage
-  // refresh, the playtest sweep) registers with the shared scheduler, which runs none of them when held from boot.
+  // refresh, the playtest sweep, the agent slot note cleanup) registers with the shared scheduler, which runs none of them when held from boot.
   it("timed sources run only through the shared scheduler, which the held gate pauses", () => {
     const scheduler = read("scheduling/Scheduler.ts");
     expect(scheduler).toMatch(/admission\.register\("scheduler"\)/);
     expect(scheduler).toMatch(/if \(admission\.heldFromBoot\)/);
     expect(filesMatching(/\bscheduler\.register\(/i).toSorted()).toEqual(
       [
+        "fork/agentSlotRoutes.ts",
         "orchestration-v2/UsageLimitRecoveryWorker.ts",
         "playtest/PlaytestLayer.ts",
         "scheduledTasks/ScheduledTaskService.ts",

@@ -1,5 +1,6 @@
 /**
- * Fork: the agent slot gate on `delegate_task` (`agentSlots`). Off and `fixed`: reads only the
+ * Fork: the agent slot gate on `delegate_task` (`agentSlots`), and on every other route that starts
+ * an agent (`fork/agentSlotRoutes.ts`). Off and `fixed`: reads only the
  * settings. `observe`: the capacity rule runs beside each decision (`SlotObserver.ts`). Its own state
  * is memory only; slots held by delivered slot waits come from the wait store (`attachReservations`).
  */
@@ -53,7 +54,23 @@ export type SlotAcquire =
    * capacity rule beside it keeps the start itself (`observe` mode).
    */
   | { readonly type: "allow"; readonly token: SlotToken | null }
-  | { readonly type: "refuse"; readonly message: string };
+  /** `message` is the text for an agent that asked (`slots_full`); `refusal` says why, for other routes. */
+  | { readonly type: "refuse"; readonly message: string; readonly refusal: SlotRefusal };
+
+/** Why `acquire` refused. */
+export type SlotRefusal =
+  /**
+   * A limit is reached. `batch`: the call asked for more than one start (`alsoNeeds`); `free` of
+   * the `needed` slots are free. `waitsOn`: a slot wait can be registered.
+   */
+  | {
+      readonly type: "full";
+      readonly decision: Extract<SlotDecision, { readonly type: "refuse" }>;
+      readonly waitsOn: boolean;
+      readonly batch?: { readonly needed: number; readonly free: number } | undefined;
+    }
+  /** The running agents could not be counted. */
+  | { readonly type: "unread"; readonly problem: CountReadProblem };
 
 /** Slots held by delivered slot waits, as the wait store keeps them (`reservedUntil`). */
 export interface StoredReservations {
@@ -107,17 +124,26 @@ export interface SlotUsage {
   readonly freeMemoryMb: number | null;
 }
 
+export interface SlotAcquireInput {
+  readonly callerThreadId: ThreadId | null;
+  readonly targetInstanceId: ProviderInstanceId;
+  /**
+   * More starts the caller makes right after this one (their instances, one entry each): allowed
+   * only when all of them would be too. Only this start is taken; the others take their own later.
+   */
+  readonly alsoNeeds?: ReadonlyArray<ProviderInstanceId> | undefined;
+}
+
 export class SlotGate extends Context.Service<
   SlotGate,
   {
     /**
-     * Allow or refuse one new delegated agent on `targetInstanceId`. An allowed call counts as
-     * running at once, so concurrent callers never get more slots than are free.
+     * Allow or refuse one new agent on `targetInstanceId`. An allowed call counts as running at
+     * once, so concurrent callers never get more slots than are free. `callerThreadId` is the
+     * thread that starts it (its own run is not counted, and its held slot is used up), or `null`
+     * for a start no thread asks for (a scheduled run, the owner's client, a linked machine).
      */
-    readonly acquire: (input: {
-      readonly callerThreadId: ThreadId;
-      readonly targetInstanceId: ProviderInstanceId;
-    }) => Effect.Effect<SlotAcquire>;
+    readonly acquire: (input: SlotAcquireInput) => Effect.Effect<SlotAcquire>;
     /** The dispatch named the child: its entry ends as soon as the child shows a run. */
     readonly started: (token: SlotToken | null, childThreadId: ThreadId) => Effect.Effect<void>;
     /**
@@ -257,6 +283,23 @@ const make = Effect.gen(function* () {
    * acquire. A caller cut off while it waits leaves the read to the others; the mask keeps it from
    * being cut off between the fork and the marker (a read the next caller could not see).
    */
+  /**
+   * The problem last logged while the count stays unreadable, so a count unreadable for hours logs
+   * once (and once more when its problem changes or it reads again), not on every read.
+   */
+  let unreadLogged: "timeout" | "error" | "crash" | null = null;
+  const logUnread = (problem: "timeout" | "error" | "crash", log: Effect.Effect<void>) =>
+    Effect.suspend(() => {
+      if (unreadLogged === problem) return Effect.void;
+      unreadLogged = problem;
+      return log;
+    });
+  const logReadAgain = Effect.suspend(() => {
+    if (unreadLogged === null) return Effect.void;
+    unreadLogged = null;
+    return Effect.logInfo("agent slots: running agents can be counted again");
+  });
+
   const readCount: Effect.Effect<CountRead> = Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
       const flight = yield* sharedRead;
@@ -279,12 +322,16 @@ const make = Effect.gen(function* () {
         (yield* Clock.currentTimeMillis) - flight.startedAtMs >
           Duration.toMillis(COUNT_READ_TIMEOUT);
       if (exit === null || late) {
-        yield* Effect.logWarning("agent slots: running agents could not be counted", {
-          problem: "timeout",
-        });
+        yield* logUnread(
+          "timeout",
+          Effect.logWarning("agent slots: running agents could not be counted", {
+            problem: "timeout",
+          }),
+        );
         return { type: "unread", problem: "timeout" } satisfies CountRead;
       }
       if (Exit.isSuccess(exit)) {
+        yield* logReadAgain;
         const threads = [...exit.value.threads, ...exit.value.archivedThreads];
         return {
           type: "read",
@@ -298,11 +345,19 @@ const make = Effect.gen(function* () {
         Cause.hasInterruptsOnly(exit.cause) && flight.stopped ? "timeout" : "error";
       // A bug in the count read (a defect, not a failure) is a failed read too.
       yield* Cause.hasDies(exit.cause)
-        ? Effect.logWarning("agent slots: counting running agents crashed", { cause: exit.cause })
-        : Effect.logWarning("agent slots: running agents could not be counted", {
+        ? logUnread(
+            "crash",
+            Effect.logWarning("agent slots: counting running agents crashed", {
+              cause: exit.cause,
+            }),
+          )
+        : logUnread(
             problem,
-            cause: exit.cause,
-          });
+            Effect.logWarning("agent slots: running agents could not be counted", {
+              problem,
+              cause: exit.cause,
+            }),
+          );
       return { type: "unread", problem } satisfies CountRead;
     }),
   );
@@ -421,7 +476,7 @@ const make = Effect.gen(function* () {
      * rule's own, so `started` and `release` reach the rule's record of that start.
      */
     caller?: {
-      readonly threadId: string;
+      readonly threadId: string | undefined;
       readonly instanceId: string;
       readonly untracked: (result: A) => boolean;
       readonly withToken: (result: A, token: SlotToken) => A;
@@ -529,10 +584,7 @@ const make = Effect.gen(function* () {
    * caller's own held slots never count against it; they are not a pass past a limit either.
    */
   const decide = Effect.fn("SlotGate.decide")(
-    function* (input: {
-      readonly callerThreadId: ThreadId;
-      readonly targetInstanceId: ProviderInstanceId;
-    }) {
+    function* (input: SlotAcquireInput) {
       const settings = yield* readSettings;
       const limits = Option.isNone(settings)
         ? null
@@ -547,7 +599,14 @@ const make = Effect.gen(function* () {
       // Fails closed: a count it needs but cannot read refuses before anything is
       // recorded, so the refused call starts nothing, uses no held slot and writes nothing.
       if (count?.type === "unread") {
-        return asDecided({ type: "refuse", message: countUnreadRefusalText(count.problem) }, []);
+        return asDecided(
+          {
+            type: "refuse",
+            message: countUnreadRefusalText(count.problem),
+            refusal: { type: "unread", problem: count.problem },
+          },
+          [],
+        );
       }
       const read = count;
       const running = read?.running.filter((agent) => agent.threadId !== input.callerThreadId);
@@ -556,20 +615,48 @@ const make = Effect.gen(function* () {
       // holds are used up at the next good read.
       const heldRead = yield* liveHeld(waitsOn, nowMs);
       const reservations = heldRead.held;
-      const decision = slotDecision({
-        // Read only when a count limit applies (`counted`), so no count means none to check.
-        limits,
-        running: running ?? [],
-        starting: kept,
-        reservations: onePerThread(
-          reservations.filter((reservation) => reservation.threadId !== input.callerThreadId),
-        ),
-        accountOnly: hiddenHeld(waitsOn, nowMs, input.callerThreadId),
-        targetInstanceId: input.targetInstanceId,
-        freeMemoryBytes: yield* freeMemoryBytes(limits),
+      const memoryBytes = yield* freeMemoryBytes(limits);
+      const decisionWith = (
+        targetInstanceId: ProviderInstanceId,
+        starting: ReadonlyArray<StartingEntry>,
+      ) =>
+        slotDecision({
+          // Read only when a count limit applies (`counted`), so no count means none to check.
+          limits,
+          running: running ?? [],
+          starting,
+          reservations: onePerThread(
+            reservations.filter((reservation) => reservation.threadId !== input.callerThreadId),
+          ),
+          accountOnly: hiddenHeld(waitsOn, nowMs, input.callerThreadId ?? ""),
+          targetInstanceId,
+          freeMemoryBytes: memoryBytes,
+        });
+      const decision = decisionWith(input.targetInstanceId, kept);
+      const alsoNeeds = input.alsoNeeds ?? [];
+      const full = (
+        refused: Extract<SlotDecision, { readonly type: "refuse" }>,
+        free: number,
+      ): SlotAcquire => ({
+        type: "refuse",
+        message: slotRefusalText(refused, waitsOn),
+        refusal: {
+          type: "full",
+          decision: refused,
+          waitsOn,
+          ...(alsoNeeds.length === 0 ? {} : { batch: { needed: alsoNeeds.length + 1, free } }),
+        },
       });
-      if (decision.type === "refuse") {
-        return asDecided({ type: "refuse", message: slotRefusalText(decision, waitsOn) }, []);
+      if (decision.type === "refuse") return asDecided(full(decision, 0), []);
+      // The later starts of the batch, counted as starting one after another (nothing recorded).
+      const starting: Array<StartingEntry> = [
+        ...kept,
+        { token: -1, instanceId: input.targetInstanceId, atMs: nowMs },
+      ];
+      for (const [index, instanceId] of alsoNeeds.entries()) {
+        const next = decisionWith(instanceId, starting);
+        if (next.type === "refuse") return asDecided(full(next, index + 1), []);
+        starting.push({ token: -2 - index, instanceId, atMs: nowMs });
       }
       const token = yield* Ref.getAndUpdate(nextToken, (value) => value + 1);
       yield* Ref.update(entries, (current) => [
@@ -577,13 +664,15 @@ const make = Effect.gen(function* () {
         { token, instanceId: input.targetInstanceId, atMs: nowMs },
       ]);
       // The agent it held a slot for starts now: its held slot is used up, with every older copy.
-      const used = yield* useUp(reservations, input.callerThreadId);
-      if (!heldRead.whole) unreadStarts.add(input.callerThreadId);
+      // A start no thread asks for holds no slot: it uses none up.
+      const caller = input.callerThreadId;
+      const used = caller === null ? [] : yield* useUp(reservations, caller);
+      if (!heldRead.whole && caller !== null) unreadStarts.add(caller);
       return asDecided({ type: "allow", token }, used);
     },
     (decided, input) =>
       observeBeside(decided, (result) => [result.outcome.type], {
-        threadId: input.callerThreadId,
+        threadId: input.callerThreadId ?? undefined,
         instanceId: input.targetInstanceId,
         untracked: (result) => result.outcome.type === "allow" && result.outcome.token === null,
         withToken: (result, token) => asDecided({ type: "allow", token }, result.used),
@@ -592,10 +681,7 @@ const make = Effect.gen(function* () {
     semaphore.withPermits(1),
   );
 
-  const acquire = Effect.fn("SlotGate.acquire")(function* (input: {
-    readonly callerThreadId: ThreadId;
-    readonly targetInstanceId: ProviderInstanceId;
-  }) {
+  const acquire = Effect.fn("SlotGate.acquire")(function* (input: SlotAcquireInput) {
     const { outcome, used } = yield* decide(input);
     // Cleared in the store after the decision, outside the semaphore; a failed write only means
     // the stored copy ends by itself (it no longer counts here either way).
