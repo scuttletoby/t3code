@@ -1,5 +1,5 @@
 """gh-apps parity with the older per-user gh-as, and the state cases: the call forms it took (gh-as NAME -- gh ...,
---repo=, --app=, --help), a GH_REPO for another repository refused, a cache that is expired, half-written or left
+--repo=, --app=, --help), a GH_REPO for another repository or a GH_HOST other than github.com refused, a cache that is expired, half-written or left
 over from a killed run, config missing or empty, two agents minting at once, token values never in messages, and the
 modes of the cache. python3 -I -B fork-kit/gh-apps/tests/parity.test.py"""
 import contextlib, http.server, io, json, os, stat, sys, tempfile, threading, time, unittest
@@ -22,12 +22,13 @@ class Calls(unittest.TestCase):
         self.work = tempfile.mkdtemp(dir=self.host.path('/home/agent'))
         self.launched = []
         kf.patch(wrapper, launch=lambda cmd, fd: self.launched.append(cmd))
-        self.env = os.environ.pop('GH_REPO', None)
+        self.env = {k: os.environ.pop(k, None) for k in ('GH_REPO', 'GH_HOST')}
 
     def tearDown(self):
-        os.environ.pop('GH_REPO', None)
-        if self.env is not None:
-            os.environ['GH_REPO'] = self.env
+        for k, v in self.env.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
         self.host.close()
 
     def call(self, *args):
@@ -92,6 +93,32 @@ class Calls(unittest.TestCase):
             os.environ['GH_REPO'] = named
             code, _, err = self.call('demo', '--', 'gh', 'pr', 'list')
             self.assertEqual((code, self.launched), (0, [self.want()]), (named, err))
+
+    def test_gh_repo_is_masked_before_it_is_cut(self):
+        """Lens B: the refusal quotes at most 120 characters; a token that the cut would split is masked first, so
+        not even its start is echoed."""
+        for pad in (110, 116, 0):
+            os.environ['GH_REPO'] = 'x' * pad + NEW
+            code, _, err = self.call('--app', 'demo', 'gh', 'pr', 'list')
+            self.assertEqual((code, self.launched), (1, []), pad)
+            self.assertNotIn('ghs_', err)
+            self.assertNotIn('nnnn', err)
+            self.assertIn('[red', err)
+
+    def test_gh_host_other_than_github_com_is_refused(self):
+        for host in ('ghe.example', 'api.github.com', 'github.com.evil', ' github.com', 'x' * 116 + NEW):
+            os.environ['GH_HOST'] = host
+            code, _, err = self.call('demo', '--', 'gh', 'pr', 'list')
+            self.assertEqual((code, self.launched), (1, []), host)
+            self.assertIn('GH_HOST=', err)
+            self.assertNotIn('ghs_', err)
+
+    def test_gh_host_github_com_or_empty_is_fine(self):
+        for host in ('github.com', 'GitHub.com', ''):
+            self.launched.clear()
+            os.environ['GH_HOST'] = host
+            code, _, err = self.call('demo', '--', 'gh', 'pr', 'list')
+            self.assertEqual((code, self.launched), (0, [self.want()]), (host, err))
 
     def test_gh_repo_never_picks_the_app(self):
         """GH_REPO is checked against the app the call picked; it never picks one itself (no --repo and no origin:

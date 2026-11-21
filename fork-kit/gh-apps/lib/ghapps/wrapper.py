@@ -9,8 +9,9 @@ starts the privileged gh-as through sudo, which checks everything again.
   gh-as --self-check    checks the installed files against the install record
   gh-as --help          this text
 
---repo=OWNER/NAME and --app=NAME work too. A GH_REPO in the caller's environment never reaches gh (gh always gets
-the app's repository), so one that names another repository is refused rather than silently ignored.
+--repo=OWNER/NAME and --app=NAME work too. A GH_REPO or GH_HOST in the caller's environment never reaches gh (gh
+always gets the app's repository on github.com), so one that names another repository or host is refused rather than
+silently ignored.
 """
 import os, stat, subprocess, sys
 
@@ -131,13 +132,23 @@ def split_selector(args):
     return repo, app, args[1:]
 
 
-def check_env_repo(app):
-    """gh-as gives gh the app's repository as GH_REPO. A caller's own GH_REPO that names another one means the
-    caller expects gh to work there: refused, never silently swapped (an empty one counts as unset, as in gh)."""
+def shown(value):
+    """A caller's value as a message may quote it: anything secret-looking is masked first, then the text is cut
+    (cutting first could leave the start of a token that no longer looks like one)."""
+    return repr(c.redact(value)[:120])
+
+
+def check_env(app):
+    """gh-as gives gh the app's repository as GH_REPO and github.com as GH_HOST. A caller's own GH_REPO or GH_HOST
+    that names another one means the caller expects gh to work there: refused, never silently swapped (an empty one
+    counts as unset, as in gh)."""
     named = os.environ.get('GH_REPO', '')
     if named and (c.norm_repo(named) or '').lower() != app['repo'].lower():
-        raise Refused(f'GH_REPO={named[:120]!r} is not {app["repo"]}, the only repository app {app["name"]} may use: '
+        raise Refused(f'GH_REPO={shown(named)} is not {app["repo"]}, the only repository app {app["name"]} may use: '
                       'unset GH_REPO or pick its app with --repo')
+    host = os.environ.get('GH_HOST', '')
+    if host and host.lower() != 'github.com':
+        raise Refused(f'GH_HOST={shown(host)} is not github.com, the only host gh-as works with: unset GH_HOST')
 
 
 def main(argv):
@@ -160,7 +171,7 @@ def main(argv):
             app = c.load_app(app_name)
         else:
             app = c.app_for_repo(repo or origin_repo(os.getcwd()))
-        check_env_repo(app)
+        check_env(app)
         c.require_only_app(app)   # gh-as checks it again; refused here first, with the same words
         parsed = policy.parse(args, app['repo'], 'wrapper')
         fd = None
