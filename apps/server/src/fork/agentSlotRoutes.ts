@@ -27,6 +27,7 @@ import { encodePendingTask } from "../scheduledTasks/webhookDedupe.ts";
 import type { WebhookRequest } from "../scheduledTasks/webhookTemplate.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
+import { makeScheduledTaskMcpProfiles } from "./scheduledTaskMcpProfile.ts";
 
 type Refused = Extract<SlotGate.SlotAcquire, { readonly type: "refuse" }>;
 type FullDecision = Extract<SlotDecision, { readonly type: "refuse" }>;
@@ -387,6 +388,9 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   // The production wiring gives scheduled runs the gate; a boot test looks for this span.
   if (Option.isSome(gate))
     yield* Effect.void.pipe(Effect.withSpan("AgentSlotRoutes.scheduledRunsGated"));
+  // Who saved each task, and the run check on it: built here, where the service's one fork
+  // line already builds the slots, so the service needs no second build line.
+  const profiles = yield* makeScheduledTaskMcpProfiles(threads);
 
   /**
    * The slot each running task holds until its dispatch ends (one run per task at a time), so
@@ -545,6 +549,10 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       yield* Effect.sleep(WEBHOOK_SLOT_RETRY);
       const gone = yield* webhookGone(task).pipe(Effect.orElseSucceed(() => null));
       if (gone !== null) return yield* Effect.fail(new WebhookSkipped({ reason: gone }));
+      // Checked again as it would start: the owner may have widened the project meanwhile.
+      const refused = task.threadId === null ? yield* profiles.runRefusal(task) : null;
+      if (refused !== null) return yield* Effect.fail(new WebhookSkipped({ reason: refused }));
+      // A bound thread that shows a run only queues: the gate lets it pass (`intoThreadId`).
       const slot = yield* take(yield* targetOf(task));
       if (slot.type === "allow") return allowed(task, slot.end);
     }
@@ -559,14 +567,36 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
     task: ScheduledTask,
     trigger: "scheduled" | "manual" | "webhook",
     now: DateTime.DateTime,
-    // The missed-run rescheduler: a run that waits is not rescheduled.
-    _reschedule: (
+    // The missed-run rescheduler: a run that waits is not rescheduled; a refused one is.
+    reschedule: (
       task: ScheduledTask,
       now: DateTime.DateTime,
       reason: string,
       runError: string,
     ) => Effect.Effect<void, E, R>,
   ) {
+    // A new thread wider than the profile the task was saved with starts nothing: on its schedule
+    // a failed run with the reason (moved to its next time), "run now" fails, a webhook skips.
+    const profileRefusal = task.threadId === null ? yield* profiles.runRefusal(task) : null;
+    if (profileRefusal !== null) {
+      if (trigger === "manual") {
+        return yield* new ScheduledTaskError({ message: profileRefusal, taskId: task.id });
+      }
+      if (trigger === "webhook")
+        return yield* Effect.fail(new WebhookSkipped({ reason: profileRefusal }));
+      yield* reschedule(task, now, "MCP profile", profileRefusal).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Could not record a scheduled run refused for its MCP profile", {
+            taskId: task.id,
+            cause,
+          }),
+        ),
+      );
+      return {
+        skipped: { task, threadId: null, dispatchFailed: false },
+        end: () => Effect.void,
+      } as ScheduledSlot;
+    }
     if (Option.isNone(gate)) return { skipped: null, end: () => Effect.void } as ScheduledSlot;
     const slot = yield* take(yield* targetOf(task));
     if (slot.type === "allow") return allowed(task, slot.end);
@@ -625,5 +655,11 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   });
   yield* scheduler.register("agent-slot-notes", clearStaleNotes);
 
-  return { admit: admitRun, ended, directDelivery };
+  return {
+    admit: admitRun,
+    ended,
+    directDelivery,
+    /** `ScheduledTaskService.upsert`, last before it writes the row (`scheduledTaskMcpProfile.ts`). */
+    saving: profiles.saving,
+  };
 });
