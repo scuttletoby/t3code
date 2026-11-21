@@ -23,10 +23,12 @@ import {
   type SlotReservation,
   type StartingEntry,
 } from "@t3tools/shared/agentSlots";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -148,8 +150,34 @@ export class SlotGate extends Context.Service<
   }
 >()("t3/slots/SlotGate") {}
 
-/** The longest the count read may take; after it the gate lets the call through, as unread. */
+/**
+ * The longest the count read may take; after it the read counts as failed (a delegation that needs
+ * the count is refused). A normal read takes well under 1 s, even with about 1M stored runs.
+ */
 export const COUNT_READ_TIMEOUT = Duration.seconds(5);
+
+/** Why the running agents could not be counted: the read failed (or crashed), or took too long. */
+export type CountReadProblem = "error" | "timeout";
+
+/**
+ * A delegation that needs the count while it cannot be read is refused, never let through on the
+ * memory floor alone. Sent with the gate's other refusals (`slots_full`).
+ */
+export const countUnreadRefusalText = (problem: CountReadProblem): string =>
+  "No agent was started: the slot gate could not read the thread list " +
+  (problem === "timeout"
+    ? `(the read took longer than ${Duration.toSeconds(COUNT_READ_TIMEOUT)} seconds)`
+    : "(the read failed with an error)") +
+  ", so it cannot count the running agents. Try again in a moment, or do the work yourself.";
+
+/** One count read: the running agents and the threads that show a run, or why it failed. */
+type CountRead =
+  | {
+      readonly type: "read";
+      readonly running: ReadonlyArray<RunningAgent>;
+      readonly visible: ReadonlySet<string>;
+    }
+  | { readonly type: "unread"; readonly problem: CountReadProblem };
 
 const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -188,32 +216,43 @@ const make = Effect.gen(function* () {
   let storeProblem: string | null = null;
 
   /**
-   * Threads with an active run, settled or not (settling a thread does not stop its run), nobody
-   * left out. `undefined` when they cannot be read in time: counts never stop a delegation (the
-   * memory floor still applies) and never make a slot wait "free". Interruptible on its own, so
-   * the timeout works inside the caller's uninterruptible acquire.
+   * Threads with an active run (settled ones too), or why they cannot be read in time; an empty list
+   * is a good read. Its own fiber, stopped but not awaited at the timeout, so a read that cannot
+   * stop at once holds neither the caller nor the semaphore. The interruptible wait lets the
+   * timeout work inside the caller's uninterruptible acquire.
    */
-  const readRunning = Effect.interruptible(activeRunShells.read).pipe(
-    // A timeout fails with a TimeoutError, which the catch below logs like any other read failure.
-    Effect.timeout(COUNT_READ_TIMEOUT),
-    Effect.map((snapshot) => {
-      const threads = [...snapshot.threads, ...snapshot.archivedThreads];
-      return {
-        running: runningAgents(threads, null),
-        visible: visibleRunThreadIds(threads),
-      } satisfies { running: ReadonlyArray<RunningAgent>; visible: ReadonlySet<string> };
-    }),
-    Effect.catch((cause) =>
-      Effect.logWarning("agent slots: running agents could not be counted", { cause }).pipe(
-        Effect.as(undefined),
+  const readCount: Effect.Effect<CountRead> = Effect.gen(function* () {
+    const reading = yield* Effect.forkDetach(Effect.interruptible(activeRunShells.read));
+    return yield* Effect.interruptible(Fiber.join(reading)).pipe(
+      Effect.timeout(COUNT_READ_TIMEOUT),
+      Effect.map((snapshot): CountRead => {
+        const threads = [...snapshot.threads, ...snapshot.archivedThreads];
+        return {
+          type: "read",
+          running: runningAgents(threads, null),
+          visible: visibleRunThreadIds(threads),
+        };
+      }),
+      Effect.catch((cause) => {
+        const problem: CountReadProblem = Cause.isTimeoutError(cause) ? "timeout" : "error";
+        return Effect.logWarning("agent slots: running agents could not be counted", {
+          problem,
+          cause,
+        }).pipe(Effect.as<CountRead>({ type: "unread", problem }));
+      }),
+      // A bug in the count read (a defect, not a failure) is a failed read too.
+      Effect.catchDefect((defect) =>
+        Effect.logWarning("agent slots: counting running agents crashed", { defect }).pipe(
+          Effect.as<CountRead>({ type: "unread", problem: "error" }),
+        ),
       ),
-    ),
-    // A bug in the count read (a defect, not a failure) must not refuse every delegation either.
-    Effect.catchDefect((defect) =>
-      Effect.logWarning("agent slots: counting running agents crashed", { defect }).pipe(
-        Effect.as(undefined),
-      ),
-    ),
+      Effect.ensuring(Effect.sync(() => reading.interruptUnsafe())),
+    );
+  });
+
+  /** The count, or `undefined` when it cannot be read (slot waits and `wait_list`: never "free"). */
+  const readRunning = readCount.pipe(
+    Effect.map((read) => (read.type === "read" ? read : undefined)),
   );
 
   const observer = yield* makeSlotObserver(readRunning);
@@ -447,11 +486,17 @@ const make = Effect.gen(function* () {
       const waitsOn = settings.value.waitFor.enabled;
       const nowMs = yield* Clock.currentTimeMillis;
       const counted = limitsCount(limits, input.targetInstanceId);
-      const read = counted ? yield* readRunning : undefined;
+      const count = counted ? yield* readCount : undefined;
+      // Fails closed: a count it needs but cannot read refuses before anything is
+      // recorded, so the refused call starts nothing, uses no held slot and writes nothing.
+      if (count?.type === "unread") {
+        return asDecided({ type: "refuse", message: countUnreadRefusalText(count.problem) }, []);
+      }
+      const read = count;
       const running = read?.running.filter((agent) => agent.threadId !== input.callerThreadId);
       const kept = yield* keepStarting(read?.visible, nowMs, limits);
-      // A store that cannot be read: its holds go uncounted (memory only), as unread counts never
-      // stop a delegation; the caller's stored holds are used up at the next good read.
+      // A store that cannot be read: its holds go uncounted (memory only); the caller's stored
+      // holds are used up at the next good read.
       const heldRead = yield* liveHeld(waitsOn, nowMs);
       const reservations = heldRead.held;
       const decision = slotDecision({

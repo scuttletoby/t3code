@@ -30,6 +30,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import { TestClock } from "effect/testing";
 
+import * as OrchestratorV2 from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -150,6 +151,8 @@ interface World {
   readonly tasks: Array<{ readonly id: NodeId; readonly childThreadId: ThreadId }>;
   readonly dispatched: Array<{ readonly instanceId: string }>;
   snapshotReads: number;
+  /** The count read fails (the thread list cannot be read). */
+  snapshotFails: boolean;
   memoryReads: number;
   freeMemoryBytes: number;
   /** The next dispatches fail (a rejected command). */
@@ -169,6 +172,7 @@ const newWorld = (): World => ({
   tasks: [],
   dispatched: [],
   snapshotReads: 0,
+  snapshotFails: false,
   memoryReads: 0,
   freeMemoryBytes: 16_000 * MB,
   failDispatches: 0,
@@ -287,6 +291,11 @@ const serverLayer = (
       read: Effect.gen(function* () {
         world.snapshotReads += 1;
         yield* Effect.yieldNow;
+        if (world.snapshotFails) {
+          return yield* new OrchestratorV2.OrchestratorProjectionError({
+            threadId: parentThreadId,
+          });
+        }
         return {
           schemaVersion: 1,
           snapshotSequence: 1,
@@ -422,6 +431,30 @@ describe("OrchestratorMcpService agent slot gate", () => {
         assert.deepStrictEqual(world.dispatched, []);
       }
     }),
+  );
+
+  it.effect(
+    "a thread list that cannot be read refuses with slots_full; nothing is dispatched (#684)",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotFails = true;
+        yield* Effect.gen(function* () {
+          const failure = failureOf(yield* delegate("slot-unread"));
+          assert.strictEqual(failure.code, "slots_full");
+          assert.strictEqual(
+            failure.message,
+            "No agent was started: the slot gate could not read the thread list (the read failed " +
+              "with an error), so it cannot count the running agents. Try again in a moment, or do " +
+              "the work yourself.",
+          );
+          assert.deepStrictEqual(world.dispatched, []);
+          // Runs again: once the list reads, the same request starts its child.
+          world.snapshotFails = false;
+          assert.strictEqual((yield* delegate("slot-unread"))._tag, "Success");
+          assert.deepStrictEqual(world.dispatched, [{ instanceId: MAIN }]);
+        }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 2 }), roomy)));
+      }),
   );
 
   it.effect("below the limits the child starts", () =>

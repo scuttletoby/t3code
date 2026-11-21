@@ -366,8 +366,11 @@ A running agent is a thread whose shell shows an active run (settled or archived
 upstream's own shell read decides (`apps/server/src/slots/ActiveRunShells.ts`); a test checks that
 for every run status. The fork's part of that read names no index, so a renamed, dropped or partial
 index only makes it slower (a test checks that SQLite still uses upstream's index). Upstream's own
-shell read does name the index; if that read fails, the gate cannot count running agents and does
-not refuse because of them (the free-memory floor still applies), as for any failed count.
+shell read does name the index. When the running agents cannot be counted (that read fails, crashes
+or takes longer than 5 s), a delegation that needs the count is refused with `slots_full` and a
+message saying the thread list could not be read and nothing was started; the caller can try again
+in a moment. An empty thread list is a good read, not a failure. A slot wait is never woken while
+the count cannot be read.
 
 Switch on: **Settings → Fork**, section Agent slots, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is

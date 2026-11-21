@@ -43,6 +43,10 @@ interface World {
   snapshotHangs: boolean;
   /** The count read dies (a bug in the read, not a failure). */
   snapshotDies?: boolean;
+  /** Set: the count read waits on it and cannot be interrupted (a busy reader). */
+  snapshotStuck?: Deferred.Deferred<void> | undefined;
+  /** Hung reads the gate stopped. */
+  readsStopped: number;
   freeMemoryBytes: number;
 }
 
@@ -52,6 +56,7 @@ const newWorld = (): World => ({
   memoryReads: 0,
   snapshotFails: false,
   snapshotHangs: false,
+  readsStopped: 0,
   freeMemoryBytes: 16_000 * MB,
 });
 
@@ -89,7 +94,17 @@ const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue> | "un
         Layer.mock(ActiveRunShells.ActiveRunShells)({
           read: Effect.gen(function* () {
             world.snapshotReads += 1;
-            if (world.snapshotHangs) return yield* Effect.never;
+            if (world.snapshotHangs) {
+              return yield* Effect.never.pipe(
+                Effect.onInterrupt(() =>
+                  Effect.sync(() => {
+                    world.readsStopped += 1;
+                  }),
+                ),
+              );
+            }
+            const stuck = world.snapshotStuck;
+            if (stuck !== undefined) yield* Effect.uninterruptible(Deferred.await(stuck));
             if (world.snapshotDies) return yield* Effect.die(new Error("corrupt row"));
             // Lets concurrent callers interleave here, the slow part of a real acquire.
             yield* Effect.yieldNow;
@@ -398,55 +413,137 @@ describe("SlotGate", () => {
       }),
   );
 
-  it.effect(
-    "a hung count read lets the call through after the timeout, even inside an uninterruptible acquire",
-    () =>
-      Effect.gen(function* () {
-        const world = newWorld();
-        world.snapshotHangs = true;
-        world.threads = [{ id: "a", instanceId: MAIN }];
-        const outcome = yield* run(
-          world,
-          on({ maxPerMachine: 1 }),
-          Effect.gen(function* () {
-            const fiber = yield* Effect.forkChild(Effect.uninterruptible(acquire()));
-            yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
-            return yield* Fiber.join(fiber);
-          }),
-        );
-        assert.strictEqual(outcome.type, "allow");
-      }),
-  );
+  describe("a count read that fails refuses: the gate fails closed (#684)", () => {
+    const refusal = (outcome: SlotGate.SlotAcquire) =>
+      outcome.type === "refuse"
+        ? outcome.message
+        : assert.fail(`expected refuse, got ${outcome.type}`);
+    // The memory floor is met: only the unread count can refuse.
+    const settings = on({ maxPerMachine: 1, minFreeMemoryMb: 100 });
 
-  it.effect(
-    "a projection that cannot be read lets the delegation through; memory still applies",
-    () =>
+    it.effect("a read error refuses in plain words; nothing is sticky, the retry allows", () =>
       Effect.gen(function* () {
         const world = newWorld();
         world.snapshotFails = true;
-        world.threads = [{ id: "a", instanceId: MAIN }];
-        const allowed = yield* run(world, on({ maxPerMachine: 1 }), acquire());
-        assert.strictEqual(allowed.type, "allow");
-        world.freeMemoryBytes = 10 * MB;
-        const refused = yield* run(
+        yield* run(
           world,
-          on({ maxPerMachine: 1, minFreeMemoryMb: 100 }),
-          acquire(),
+          settings,
+          Effect.gen(function* () {
+            assert.strictEqual(
+              refusal(yield* acquire()),
+              "No agent was started: the slot gate could not read the thread list (the read " +
+                "failed with an error), so it cannot count the running agents. Try again in a " +
+                "moment, or do the work yourself.",
+            );
+            // Runs again: the read works now, and the store is empty (no failure).
+            world.snapshotFails = false;
+            assert.strictEqual((yield* acquire()).type, "allow");
+          }),
         );
-        assert.strictEqual(refused.type, "refuse");
-        if (refused.type === "refuse") assert.include(refused.message, "memory");
       }),
-  );
+    );
 
-  it.effect("a count read that dies (a bug, not a failure) lets the call through", () =>
-    Effect.gen(function* () {
-      const world = newWorld();
-      world.snapshotDies = true;
-      world.threads = [{ id: "a", instanceId: MAIN }];
-      const outcome = yield* run(world, on({ maxPerMachine: 1 }), acquire());
-      assert.strictEqual(outcome.type, "allow");
-    }),
-  );
+    it.effect("a read that dies (a bug, not a failure) refuses as an error", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotDies = true;
+        const message = refusal(yield* run(world, settings, acquire()));
+        assert.include(message, "could not read the thread list (the read failed with an error)");
+      }),
+    );
+
+    it.effect(
+      "a hung read refuses at the timeout, even inside an uninterruptible acquire, and is stopped",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          world.snapshotHangs = true;
+          yield* run(
+            world,
+            settings,
+            Effect.gen(function* () {
+              const fiber = yield* Effect.forkChild(Effect.uninterruptible(acquire()));
+              yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
+              const message = refusal(yield* Fiber.join(fiber));
+              assert.include(
+                message,
+                "could not read the thread list (the read took longer than 5 seconds)",
+              );
+              assert.strictEqual(message, SlotGate.countUnreadRefusalText("timeout"));
+              assert.strictEqual(world.readsStopped, 1, "the hung read was stopped");
+              // The gate is free and keeps nothing: the next call reads again and is allowed.
+              world.snapshotHangs = false;
+              assert.strictEqual((yield* acquire()).type, "allow");
+              assert.strictEqual(world.snapshotReads, 2);
+            }),
+          );
+        }),
+    );
+
+    it.effect(
+      "a read that cannot be stopped holds neither the call nor the gate after the timeout",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          const stuck = yield* Deferred.make<void>();
+          world.snapshotStuck = stuck;
+          yield* run(
+            world,
+            settings,
+            Effect.gen(function* () {
+              const fiber = yield* Effect.forkChild(acquire());
+              yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
+              for (let step = 0; step < 20; step += 1) yield* Effect.yieldNow;
+              const exit = fiber.pollUnsafe();
+              if (exit === undefined) {
+                yield* Deferred.succeed(stuck, undefined);
+                return assert.fail("the refused call still waits on the read it gave up on");
+              }
+              assert.include(
+                refusal(yield* Fiber.join(fiber)),
+                "the read took longer than 5 seconds",
+              );
+              // The old read is still pending: the next call is not blocked by it.
+              world.snapshotStuck = undefined;
+              assert.strictEqual((yield* acquire()).type, "allow");
+              // Its late answer changes nothing: the agent just allowed still holds the one slot.
+              yield* Deferred.succeed(stuck, undefined);
+              yield* Effect.yieldNow;
+              assert.strictEqual((yield* acquire()).type, "refuse");
+            }),
+          );
+        }),
+    );
+
+    it.effect("an empty thread list is a good read, not a failure: allowed and counted", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [];
+        yield* run(
+          world,
+          settings,
+          Effect.gen(function* () {
+            assert.strictEqual((yield* acquire()).type, "allow");
+            // The count works: the agent just allowed fills the one slot.
+            const message = refusal(yield* acquire());
+            assert.include(message, "No free agent slot");
+          }),
+        );
+      }),
+    );
+
+    it.effect(
+      "no counted limit for the target: nothing is read, so a broken read refuses nothing",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          world.snapshotFails = true;
+          const outcome = yield* run(world, on({ maxPerAccount: { [SECOND]: 1 } }), acquire(MAIN));
+          assert.strictEqual(outcome.type, "allow");
+          assert.strictEqual(world.snapshotReads, 0);
+        }),
+    );
+  });
 
   it.effect("settings changed while running: off to on takes effect at the next call", () =>
     Effect.gen(function* () {
@@ -690,6 +787,42 @@ describe("SlotGate", () => {
           }),
         );
       }),
+    );
+
+    it.effect(
+      "a refusal for an unread count writes nothing: no start, the held slot kept, nothing cleared (#684)",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          const used: Array<string> = [];
+          let inStore: ReadonlyArray<SlotReservation> = [
+            { key: "stored", threadId: holder, untilMs: 90_000 },
+          ];
+          yield* run(
+            world,
+            waitsOn({ mode: "fixed", maxPerMachine: 2 }),
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              yield* gate.attachReservations({
+                read: Effect.sync(() => inStore),
+                used: (key) =>
+                  Effect.sync(() => {
+                    used.push(key);
+                    inStore = inStore.filter((entry) => entry.key !== key);
+                  }),
+              });
+              world.snapshotFails = true;
+              assert.strictEqual((yield* acquireAs(holder)).type, "refuse");
+              assert.deepStrictEqual(used, []);
+              // Read again: the hold still counts and no starting entry was added.
+              world.snapshotFails = false;
+              assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 2 });
+              // The retry starts the agent the slot was held for: used up once, now.
+              assert.strictEqual((yield* acquireAs(holder)).type, "allow");
+              assert.deepStrictEqual(used, ["stored"]);
+            }),
+          );
+        }),
     );
 
     it.effect("slots held in the wait store: read only while waits are on; used up once", () =>
