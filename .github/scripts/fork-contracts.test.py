@@ -2575,7 +2575,8 @@ READ_CASES = {
 read_code = (read_step(real) or {}).get("run", "exit 99\n")  # (no read step: every case red)
 
 
-def read_results(code, names=None):
+def read_results(code, names=None, first_red=False):
+    """Each case's (ok, run); with first_red, stops at the first red one (a mutant needs only one)."""
     out = {}
     for name, (setup, ok) in READ_CASES.items():
         if names is not None and name not in names:
@@ -2584,6 +2585,8 @@ def read_results(code, names=None):
         s = read_record(code, setup.pop("runs", None), setup.pop("artifacts", None), setup.pop("zips", None),
                         setup.pop("compare", None), before=setup.pop("before", None), **setup)
         out[name] = (bool(ok(s)), s)
+        if first_red and not out[name][0]:
+            break
     return out
 
 
@@ -2624,7 +2627,7 @@ for what, old, new in (
     ("the fresh folder", 'rm -rf -- "$dir" "$zip"\n', ""),
 ):
     mutated = read_code.replace(old, new)
-    results = read_results(mutated) if mutated != read_code else {}
+    results = read_results(mutated, first_red=True) if mutated != read_code else {}
     check(f"secret-scan e2e (#701): the record's read step without {what}: a case above goes red",
           mutated != read_code and not all(ok for ok, _ in results.values()),
           "unchanged" if mutated == read_code else "every case still green")
