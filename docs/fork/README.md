@@ -373,8 +373,11 @@ in a moment. An empty thread list is a good read, not a failure. A slot wait is 
 the count cannot be read. A refused call writes nothing of its own; it may still clear, in the wait
 store, a held slot that an earlier allowed call used up. At most one count read runs at a time: a
 caller that needs the count while a read runs joins that read, so a slow store never piles up reads.
-Delegations go through the gate one at a time, so with a stuck store queued callers wait about 5 s
-each in turn (the third one about 15 s) and are then refused.
+An answer that comes more than 5 s after its read started is not used, so no count is older than
+that. While a read never ends, delegations that need the count are refused even if other database
+readers are free, until it ends or the server restarts. Delegations go through the gate one at a
+time, so with a stuck store queued callers wait about 5 s each in turn (the third one about 15 s)
+and are then refused.
 
 Switch on: **Settings → Fork**, section Agent slots, "Limit running agents", or in `settings.json`:
 `"agentSlots": { "enabled": true, "maxPerMachine": 4 }`. With `enabled` and no limits set, nothing is

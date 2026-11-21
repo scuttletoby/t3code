@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Scheduler from "effect/Scheduler";
 import { TestClock } from "effect/testing";
 
 import * as OrchestratorV2 from "../orchestration-v2/Orchestrator.ts";
@@ -47,6 +48,8 @@ interface World {
   snapshotStuck?: Deferred.Deferred<void> | undefined;
   /** The count read interrupts itself (a reader pool that shuts down). */
   snapshotInterrupts?: boolean;
+  /** Set: the count read takes its snapshot, then waits on it (interruptibly) before it answers. */
+  snapshotLate?: Deferred.Deferred<void> | undefined;
   /** Hung reads the gate stopped. */
   readsStopped: number;
   /** Count reads running now, and the most that ever ran at once. */
@@ -116,6 +119,12 @@ const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue> | "un
             const stuck = world.snapshotStuck;
             if (stuck !== undefined) yield* Effect.uninterruptible(Deferred.await(stuck));
             if (world.snapshotDies) return yield* Effect.die(new Error("corrupt row"));
+            const late = world.snapshotLate;
+            if (late !== undefined) {
+              const taken = snapshotOf(world);
+              yield* Deferred.await(late);
+              return taken;
+            }
             // Lets concurrent callers interleave here, the slow part of a real acquire.
             yield* Effect.yieldNow;
             if (world.snapshotFails) {
@@ -654,6 +663,102 @@ describe("SlotGate", () => {
             assert.strictEqual(world.snapshotReads, 1);
           }),
         );
+      }),
+    );
+
+    it.effect(
+      "a joined answer older than the read limit refuses: a cut-off starter leaves no old count",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          const late = yield* Deferred.make<void>();
+          world.snapshotLate = late;
+          yield* run(
+            world,
+            settings,
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              // wait_list starts the read (nothing running yet) and is cut off: nobody stops it.
+              const usage = yield* Effect.forkChild(gate.usage);
+              yield* settle;
+              usage.interruptUnsafe();
+              yield* settle;
+              // A thread starts outside the gate (create_threads, a scheduled run).
+              yield* TestClock.adjust("1 second");
+              world.threads = [{ id: "thread:other", instanceId: MAIN }];
+              // A delegation joins the old read at 40 s, and it answers at 41 s.
+              yield* TestClock.adjust("39 seconds");
+              const joiner = yield* Effect.forkChild(acquire());
+              yield* settle;
+              yield* TestClock.adjust("1 second");
+              yield* Deferred.succeed(late, undefined);
+              yield* settle;
+              assert.strictEqual(
+                refusal(yield* Fiber.join(joiner)),
+                SlotGate.countUnreadRefusalText("timeout"),
+                "an answer from 41 s ago is not a count",
+              );
+              assert.strictEqual(world.snapshotReads, 1, "the delegation joined the old read");
+              // Runs again: a fresh read counts the other thread, and the one slot is taken.
+              world.snapshotLate = undefined;
+              assert.include(refusal(yield* acquire()), "No free agent slot");
+              assert.strictEqual(world.snapshotReads, 2);
+            }),
+          );
+        }),
+    );
+
+    it.effect("callers that yield between every step still start only one read", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotHangs = true;
+        yield* run(
+          world,
+          settings,
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            const callers = yield* Effect.forkChild(
+              Effect.all([gate.usage, gate.usage, gate.usage, gate.usage], {
+                concurrency: "unbounded",
+              }).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 1)),
+            );
+            // Every step yields, so the callers need many more turns to reach the read.
+            for (let turn = 0; turn < 20; turn += 1) yield* settle;
+            assert.strictEqual(world.maxReadsInFlight, 1, "one read for four callers");
+            yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
+            assert.deepStrictEqual(yield* Fiber.join(callers), [null, null, null, null]);
+            assert.strictEqual(world.snapshotReads, 1);
+          }),
+        );
+      }),
+    );
+
+    it.effect("a caller cut off at any step leaves no read without its marker", () =>
+      Effect.gen(function* () {
+        // Each step of the first caller in turn: wherever it is cut off, the second caller finds
+        // the read it started (or none), never a read running with no marker beside a second one.
+        for (let steps = 0; steps < 40; steps += 1) {
+          const world = newWorld();
+          world.snapshotHangs = true;
+          yield* run(
+            world,
+            settings,
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              const first = yield* Effect.forkChild(
+                gate.usage.pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 1)),
+              );
+              for (let step = 0; step < steps; step += 1) yield* Effect.yieldNow;
+              first.interruptUnsafe();
+              for (let turn = 0; turn < 20; turn += 1) yield* settle;
+              const second = yield* Effect.forkChild(gate.usage);
+              yield* settle;
+              assert.isAtMost(world.maxReadsInFlight, 1, `cut off after ${steps} steps`);
+              yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
+              assert.strictEqual(yield* Fiber.join(second), null);
+            }),
+          );
+        }
       }),
     );
 

@@ -221,35 +221,41 @@ const make = Effect.gen(function* () {
   let storeProblem: string | null = null;
 
   /**
-   * The one count read in flight: callers that need the count while it runs join it, so a slow
-   * store never has two. `stopped`: stopped at a caller's timeout. Cleared when the read ends, any
-   * way (a late answer too), so an ended read never refuses anyone.
+   * The one count read in flight, joined by every caller that needs the count while it runs.
+   * `startedAtMs`: an answer later than COUNT_READ_TIMEOUT after it is no count. `stopped`: stopped
+   * at a caller's timeout. Cleared when the read ends, any way, so an ended read refuses no one.
    */
   let inFlight: {
     readonly fiber: Fiber.Fiber<OrchestrationV2ThreadShellSnapshot, unknown>;
+    readonly startedAtMs: number;
     stopped: boolean;
   } | null = null;
+  /** Check and set of the marker as one step: a scheduler yield in between starts no second read. */
+  const startLock = yield* Semaphore.make(1);
 
   /** The read in flight, or a new one; no interruption in between, so one is never lost. */
-  const sharedRead = Effect.suspend(() => {
-    if (inFlight !== null) return Effect.succeed(inFlight);
-    return Effect.forkDetach(activeRunShells.read).pipe(
-      Effect.map((fiber) => {
-        const flight = { fiber, stopped: false };
+  const sharedRead = startLock.withPermits(1)(
+    Effect.suspend(() => {
+      if (inFlight !== null) return Effect.succeed(inFlight);
+      return Effect.gen(function* () {
+        const startedAtMs = yield* Clock.currentTimeMillis;
+        const fiber = yield* Effect.forkDetach(activeRunShells.read);
+        const flight = { fiber, startedAtMs, stopped: false };
         inFlight = flight;
         // Called at once if the read already ended.
         fiber.addObserver(() => {
           if (inFlight === flight) inFlight = null;
         });
         return flight;
-      }),
-    );
-  });
+      });
+    }),
+  );
 
   /**
    * Threads with an active run, or why they cannot be read in time (an empty list is a good read).
-   * The shared read's fiber starts interruptible, so the timeout stops it even inside an
-   * uninterruptible acquire, without awaiting it. A caller cut off leaves the read to the others.
+   * The read's fiber starts interruptible, so the timeout stops it even in an uninterruptible
+   * acquire. A caller cut off while it waits leaves the read to the others; the mask keeps it from
+   * being cut off between the fork and the marker (a read the next caller could not see).
    */
   const readCount: Effect.Effect<CountRead> = Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
@@ -265,7 +271,14 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
-      if (exit === null) {
+      // An answer later than the limit after the read started (joined from a read whose starter
+      // was cut off) is as old as a timed-out one: never a count.
+      const late =
+        exit !== null &&
+        Exit.isSuccess(exit) &&
+        (yield* Clock.currentTimeMillis) - flight.startedAtMs >
+          Duration.toMillis(COUNT_READ_TIMEOUT);
+      if (exit === null || late) {
         yield* Effect.logWarning("agent slots: running agents could not be counted", {
           problem: "timeout",
         });
