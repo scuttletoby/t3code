@@ -19,7 +19,13 @@ it would refuse every head after it.
 The config's optional `review` block (../pr-queue/README.md, "Review rules") names lenses by changed path: the paths
 are `git diff --name-status -M` from the merge base to the head (changed_paths), judged by review_judge.judge. In
 `enforce` its lenses are required too; in `shadow` the summary only says what they would have been. A change it cannot
-judge (no merge base, a failed diff) is refused, never passed. Without the block nothing of this runs.
+judge (no merge base, a failed diff) is refused, never passed. The same block judges the review itself
+(review_judge.judge_rounds, review_rounds): in `enforce` a lens's newest report with a blocker or major finding that
+no later round or person cleared fails the head (`findings: true`), and so does a report with no findings section;
+the approach lens is required from round `rounds.approach_at`; a round past `rounds.max` fails the head until a
+person's override comment for it (a login in `override_authors`; none listed: no override is a person's, issue #78)
+lets it through. A round is a read of a different own change (own_change), so a queue update adds none. In `shadow`
+the summary only says so. Without the block nothing of this runs.
 
 Pass: every lens read the head (or a newer override vouches for it), and every required lens is there; a pull
 request with no lens comments and no required lens (nothing to compare); a draft, with --pass-drafts only. Fail,
@@ -38,7 +44,7 @@ for a check that runs where nothing of the pull request is ever checked out (for
 head come from differs (Checkout).
 `--required-lenses` takes one lens name per line (a name may hold a comma: `data-integrity (DI-1, DI-2)`).
 """
-import argparse, json, os, re, subprocess, sys, tempfile, time, unicodedata
+import argparse, hashlib, json, os, re, subprocess, sys, tempfile, time, unicodedata
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'pr-queue'))
@@ -49,6 +55,7 @@ import review_config  # noqa: E402
 import review_judge  # noqa: E402
 
 ATTEMPTS, RETRY_SECONDS = 3, 10
+FETCH_SECONDS = 120   # a fetch of a read commit that takes longer counts as failed (the job has 15 minutes in all)
 FIELDS = 'isDraft,headRefOid,comments,reviews'
 SHA = pr_queue.SHA
 REFUSED = pr_queue.REFUSED
@@ -119,10 +126,14 @@ class Checkout:
 
     def fetch(self, sha):
         """A read commit no ref of the repository reaches (a force-push dropped it; GitHub keeps it), from origin with the
-        credentials the checkout stored or the gate's environment gives (none: a private repository then fails)."""
-        return self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha,
-                        fetch=True).returncode == 0 \
-            and self.has(sha)
+        credentials the checkout stored or the gate's environment gives (none: a private repository then fails). A fetch
+        that takes over FETCH_SECONDS failed."""
+        try:
+            done = self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha, fetch=True,
+                            timeout=FETCH_SECONDS).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+        return done and self.has(sha)
 
 
 def required_names(text):
@@ -344,10 +355,113 @@ def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out
         return 1, False, f'could not read the pull request from GitHub after {ATTEMPTS} tries: {why}', []
     review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association, cfg.lens_author_associations,
                          log=lambda text: out(escape(text)))
+    rounds = None
+    if paths is not None and not (pr['isDraft'] and pass_drafts):
+        rounds, why = review_rounds(cfg.review, review, pr, checkout, cfg.override_prefix)
+        if rounds is None:   # fail closed, in shadow as in enforce, as for the path rules
+            return 1, False, f'the review rounds and findings cannot be judged, so the head is not passed: {why}', [row]
+        if enforced and rounds.approach:
+            required.setdefault(lens.lens_key(cfg.review.rounds.approach_lens), cfg.review.rounds.approach_lens)
     ok, reason, rows = verdict(pr, review, checkout, required, pass_drafts, enforced)
+    if rounds is not None:
+        mode = cfg.review.mode
+        rows = [(f'findings and rounds ({mode})', not (enforced and rounds.problems),
+                 ('' if enforced else 'they would have said: ') + rounds.text(cfg.review))] + rows
+        out(f'findings and rounds ({mode}): {escape(rows[0][2])}')
+        if enforced and rounds.problems:
+            reason = '; '.join(rounds.problems) + ('' if ok else f'; and: {reason}')
+            ok = False
     if paths is not None:
         rows = [row] + rows
     return (0 if ok else 1), ok, reason, rows
+
+
+def own_change(checkout, base):
+    """change_of for review_judge.review_round: what the pull request itself changes at a read commit, so two reads of
+    the same change are one round. The key is a hash of `git diff -U0` from the commit's merge base with `base` to it,
+    hunk line numbers dropped: a head that only merges the base in (a queue or branch update) has the same own change
+    as the head it updates, and is no new round. The `index <blob>..<blob>` lines and the whole hunk header (line
+    numbers, and the function name git shows) are dropped too: they move when the base edits other lines of a file the
+    pull request changes; --binary keeps a binary file's content in the key. A short sha is resolved when it names one
+    commit. A commit that is not in the repository and cannot be fetched, more than one merge base or a failed diff: a
+    round of its own (unknown counts more rounds, never fewer)."""
+    cache = {}
+
+    def of(sha):
+        if sha not in cache:
+            cache[sha] = diff_key(checkout, base, sha) or ('unknown', sha)
+        return cache[sha]
+    return of
+
+
+def diff_key(checkout, base, sha):
+    if lens.FULL_SHA.fullmatch(sha):
+        if not (checkout.has(sha) or checkout.fetch(sha)):
+            return None
+        full = sha
+    else:
+        r = checkout.git('rev-parse', '-q', '--verify', '--end-of-options', sha + '^{commit}')
+        full = r.stdout.strip() if r.returncode == 0 else ''
+        if not SHA.fullmatch(full):
+            return None
+    r = checkout.git('merge-base', '--all', base, full)
+    bases = r.stdout.split() if r.returncode == 0 else []
+    if len(bases) != 1 or not SHA.fullmatch(bases[0]):
+        return None
+    d = checkout.git('diff', '--no-ext-diff', '--no-textconv', '--no-relative', '--ignore-submodules=none',
+                     '--no-color', '--no-renames', '--binary', '-U0', bases[0], full, '--',
+                     errors='surrogateescape')
+    if d.returncode != 0:
+        return None
+    text = re.sub(r'^index .*\n', '', re.sub(r'^@@ .*', '@@', d.stdout, flags=re.M), flags=re.M)
+    return ('change', hashlib.sha256(text.encode('utf-8', 'surrogateescape')).hexdigest())
+
+
+def review_rounds(rules, review, pr, checkout, prefix):
+    """(review_judge.Rounds, None) of the pull request's lens comments under the base's `review` rules, or (None, why).
+    The round counts every lens header the check reads now (lens_scan's history: old, edited and hidden ones too;
+    a deleted comment is gone from GitHub, so only the round marker of a later header keeps it counted), each read
+    change once (own_change). Each lens's newest entry is judged as review_judge says (REPORT ...): a person's override
+    (an override comment by a login in review.override_authors that vouches for this head: its sha or that change
+    merged with the base) newer than the entry clears it; any other override clears no finding. Any error is a why,
+    never a pass."""
+    try:
+        head = str(pr.get('headRefOid') or '').lower()
+        parents = checkout.merge_parents()
+        if not parents:
+            return None, "HEAD is not GitHub's two-parent merge commit, so the rounds are unknown"
+        entries, history = review.lens_scan(pr)
+        people = {a.lower() for a in rules.override_authors}
+        for _, _, post in review.lens_posts(pr):   # listed, but GitHub records another association: it never counts
+            login = (post.get('author') or {}).get('login') or ''
+            if login.lower() in people and review.override_re.match(post.get('body') or '') \
+                    and post.get('authorAssociation') != review.override_association:
+                review.log(f'warning: the override comment by {login} does not count: GitHub records its author '
+                           f'association as {post.get("authorAssociation") or "none"}, and an override counts only '
+                           f'with {review.override_association} (override.author_association); being listed in '
+                           f'review.override_authors does not change that')
+        overrides = [((when, i), sha, post) for when, i, post in review.lens_posts(pr)
+                     for sha in [review.override_sha(post)] if sha]
+        newest = max((at for at, _, _ in overrides), default=None)
+        person = max((at for at, sha, post in overrides
+                      if ((post.get('author') or {}).get('login') or '').lower() in people
+                      and (sha == head or same_change(checkout, head, sha)[0])), default=None)
+        reports = {}
+        for key, (at, sha, _, post) in entries.items():
+            if person is not None and at < person:
+                how = review_judge.CLEARED
+            elif key.startswith(lens.NO_HEADER):
+                how = review_judge.LOOSE if newest is not None and at < newest else review_judge.NOT_JUDGED
+            elif lens.FULL_SHA.fullmatch(sha or ''):
+                how = review_judge.REPORT
+            else:
+                how = review_judge.UNREAD if newest is not None and at < newest else review_judge.NOT_JUDGED
+            reports[key] = (how, post.get('body') or '')
+        decided = person is not None and all(at < person for at, _, _, _ in entries.values())
+        return review_judge.judge_rounds(rules, history, reports, decided, own_change(checkout, parents[0]),
+                                         prefix), None
+    except Exception as e:   # noqa: BLE001 - unknown never passes
+        return None, f'{type(e).__name__}: {review_judge.shown(str(e))[:300]}'
 
 
 def argument_problems(repo, n, required_text):
