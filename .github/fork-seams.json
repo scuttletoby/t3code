@@ -298,6 +298,28 @@
         "import * as ModelPolicyCheck from \"../../../fork/modelPolicyCheck.ts\"; // Fork: model policy",
         "yield* ModelPolicyCheck.checkConfigure(modelSelection); // Fork: model policy"
       ]
+    },
+    "apps/server/src/mcp/toolkits/environment/handlers.ts": {
+      "why": "t3_environment_read returns this machine's facts beside upstream's fields, for an agent choosing a machine (placement design row P3, facts out): hostResources (CPU, cores, memory; the result field of upstream PR #34293, closed there unmerged) and the fork's placement (declared labels, and running agents, slots free and the memory floor read from the agent slot gate's status, or available false with a reason when the gate cannot be read), all from fork/environmentFacts.ts. A linked machine's read is forwarded as before and returns that machine's facts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as EnvironmentFacts from \"../../../fork/environmentFacts.ts\"; // Fork (P3): facts out",
+          "...(yield* EnvironmentFacts.read), // Fork (P3): facts out"
+        ]
+      }
+    },
+    "apps/server/src/mcp/toolkits/environment/tools.ts": {
+      "why": "t3_environment_read's result schema takes the two optional fork fields hostResources and placement (fork/environmentFacts.ts, placement design row P3), so a linked machine's facts decode here and a machine on an older T3 that leaves them out still decodes (no facts). Result fields are not in the advertised tool list the context budget measures, so the budget is unchanged.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as EnvironmentFacts from \"../../../fork/environmentFacts.ts\"; // Fork (P3): facts out",
+          "...EnvironmentFacts.ResultFields, // Fork (P3): facts out"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
