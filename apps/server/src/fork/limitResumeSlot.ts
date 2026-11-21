@@ -67,6 +67,8 @@ export const gateLimitResumes = <E>(
           threadId: command.threadId,
           instanceId,
           keepsHeld: true,
+          // Asked again every tick (5 s) while refused: it keeps its place in the line.
+          place: { key: `limit-resume:${command.commandId}` },
         });
         if (slot.type === "refuse")
           return yield* skipped(command.commandId, command.threadId, reasonHere(slot.refusal));

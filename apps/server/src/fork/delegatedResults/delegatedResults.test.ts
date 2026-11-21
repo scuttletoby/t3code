@@ -17,6 +17,7 @@ import {
   legacyReminderKeys,
   legacyReminderMessageIds,
   legacyReminderSetId,
+  makeRefusalLog,
   REMINDER_MAX_AGE_MS,
   reminderBatches,
   reminderBatchIds,
@@ -229,6 +230,38 @@ describe("reminder ids", () => {
     expect(
       legacyReminderKeys(PARENT, old.messageId, old.text.replace(/\n- t-09 [^\n]*/, "")),
     ).toEqual([]);
+    // Over ten there is no digest to match (it covers the unnamed rest too), so only this
+    // parent's own first-format id counts: another parent's, or a per-task id, gives nothing.
+    expect(legacyReminderKeys(ThreadId.make("other"), old.messageId, old.text)).toEqual([]);
+    const perTask = reminderBatchIds(PARENT, ids("t-00"));
+    expect(legacyReminderKeys(PARENT, perTask.messageId, old.text)).toEqual([]);
+  });
+
+  it("logs a refusal once per command id and process, and forgets it after a day", () => {
+    const newRefusal = makeRefusalLog();
+    expect(newRefusal("command-a", NOW)).toBe(true);
+    // Each later check finds its refused receipt again: not logged again.
+    expect(newRefusal("command-a", NOW + 60_000)).toBe(false);
+    // Another batch (new ids) is logged.
+    expect(newRefusal("command-b", NOW + 60_000)).toBe(true);
+    // A restart is a new log: a batch still refused is logged once more.
+    expect(makeRefusalLog()("command-a", NOW + 60_000)).toBe(true);
+    // Kept for the reminder age; past it its tasks are no longer reminded, so it is dropped
+    // (command-b, logged a minute later, is still kept).
+    expect(newRefusal("command-a", NOW + REMINDER_MAX_AGE_MS)).toBe(false);
+    expect(newRefusal("command-c", NOW + REMINDER_MAX_AGE_MS + 1)).toBe(true);
+    expect(newRefusal("command-a", NOW + REMINDER_MAX_AGE_MS + 1)).toBe(true);
+    expect(newRefusal("command-b", NOW + REMINDER_MAX_AGE_MS + 1)).toBe(false);
+  });
+
+  it("keeps a refusal for the whole process when told never to forget (the orphan scan)", () => {
+    const newRefusal = makeRefusalLog(null);
+    expect(newRefusal("command-a", NOW)).toBe(true);
+    // An orphan batch's ids do not age: a slot wait finds its refused receipt days later too.
+    expect(newRefusal("command-a", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(false);
+    expect(newRefusal("command-b", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(true);
+    // A restart is still a new log.
+    expect(makeRefusalLog(null)("command-a", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(true);
   });
 
   it("finds this parent's first-format ids, from messages and receipts", () => {
