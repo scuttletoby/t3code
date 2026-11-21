@@ -472,6 +472,35 @@ it.effect(
     }).pipe(Effect.provide(layerOneSlot())),
 );
 
+it.effect(
+  "#711: a woken slot waiter is woken as itself: its own held slot does not refuse its wake-up",
+  () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread:wake-holder");
+      yield* createThread(threadId);
+      const world = slotWorld();
+      const gate = yield* SlotGate.SlotGate.pipe(Effect.provide(slotGateOver(world, instanceId)));
+      // Its slot wait is met (2 slots, none running) and its slot held.
+      const grants = yield* gate.grant([{ key: "w_holderaaaa", threadId }]);
+      assert.deepStrictEqual(
+        grants.map((grant) => grant.type),
+        ["granted"],
+      );
+      yield* gate.keep(["w_holderaaaa"]);
+      const delivery = yield* WaitDelivery.make(Option.some(gate));
+      // Asked as the woken thread, its own hold is left out: the wake-up is sent. Asked as no one
+      // (or another thread), its hold and its own wake-up would fill both slots: never sent.
+      assert.deepStrictEqual(yield* delivery.deliver(wake(threadId, "wait:w_holderaaaa")), {
+        type: "delivered",
+      });
+      assert.strictEqual(yield* copies(threadId, "wait:w_holderaaaa"), 1);
+    }).pipe(
+      Effect.provide(
+        layerOneSlot({ agentSlots: { enabled: true, maxPerMachine: 2, reserveSeconds: 60 } }),
+      ),
+    ),
+);
+
 it.effect("#711: a wake-up of a thread that shows a run only queues: sent when full", () =>
   Effect.gen(function* () {
     const threadId = ThreadId.make("thread:wake-busy");
@@ -619,4 +648,21 @@ it.effect(
       yield* empty.runDue();
       assert.deepStrictEqual(yield* sentCopies, [1, 1]);
     }).pipe(Effect.scoped, Effect.provide(layerOneSlot())),
+);
+
+it.effect("#711: the server's wait worker sends wake-ups through the server's one slot gate", () =>
+  Effect.gen(function* () {
+    // Built only in the running server (its services are many): its source says what it uses.
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const worker = yield* fs.readFileString(
+      yield* path.fromFileUrl(new URL("./WaitWorker.ts", import.meta.url)),
+    );
+    assert.include(
+      worker,
+      "delivery: yield* WaitDelivery.make(Option.some(yield* SlotGate.SlotGate)),",
+    );
+    assert.include(worker, "slots: yield* SlotGate.SlotGate,");
+    assert.strictEqual(worker.split("WaitDelivery.make(").length, 2);
+  }).pipe(Effect.provide(NodeServices.layer)),
 );

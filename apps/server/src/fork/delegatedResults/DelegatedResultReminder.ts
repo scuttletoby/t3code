@@ -1,8 +1,7 @@
 /**
- * Fork (issues 386, 625): backstop for upstream's completion wake. A parent's own events start one
- * delayed check; an idle parent with results unread is reminded once per task (message ids name the
- * task keys). At start, parents with a result unread from the last day are checked once. Off with
- * `server.waitFor`.
+ * Fork: backstop for upstream's completion wake. An idle parent with results unread is reminded once
+ * per task (message ids name the task keys); at start, the last day's are checked once. Off with
+ * `server.waitFor`. A reminder takes an agent slot; refused, it is asked again and never given up.
  */
 import type { OrchestrationV2Subagent, ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -16,9 +15,11 @@ import * as Stream from "effect/Stream";
 import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
+import * as SlotGate from "../../slots/SlotGate.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as WaitDelivery from "../../waits/WaitDelivery.ts";
+import { WAKE_SLOT_RETRY_MS } from "../../waits/WaitService.ts";
 import * as DelegatedResultsStore from "./DelegatedResultsStore.ts";
 import {
   isDelegatedTask,
@@ -41,6 +42,12 @@ export interface ReminderOptions {
   readonly retryDelay: Duration.Input;
   /** Tries of one check before it waits for the parent's next event. */
   readonly attempts: number;
+  /**
+   * Between tries while the agent slot gate refuses (the wait service's `WAKE_SLOT_RETRY_MS` by
+   * default). Not counted in `attempts`: an idle parent sends no next event, so a reminder that
+   * waits for a slot is never given up.
+   */
+  readonly slotRetryDelay?: Duration.Input;
 }
 
 const DEFAULT_OPTIONS: ReminderOptions = {
@@ -56,6 +63,8 @@ export type CheckOutcome =
   | { readonly type: "off" }
   | { readonly type: "gone" }
   | { readonly type: "unreadable" }
+  /** The agent slot gate refused: asked again after `slotRetryDelay`. */
+  | { readonly type: "waitsForSlot"; readonly detail: string }
   | { readonly type: "sent"; readonly taskIds: ReadonlyArray<string> }
   | { readonly type: "held"; readonly detail: string };
 
@@ -65,7 +74,9 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
   options: ReminderOptions = DEFAULT_OPTIONS,
 ) {
   const threads = yield* ThreadManagement.ThreadManagementService;
-  const delivery = yield* WaitDelivery.make();
+  // The server's one gate (`SlotGate.layer` memoizes): none in a test that gives none.
+  const delivery = yield* WaitDelivery.make(yield* Effect.serviceOption(SlotGate.SlotGate));
+  const slotRetryDelay = options.slotRetryDelay ?? Duration.millis(WAKE_SLOT_RETRY_MS);
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const settings = yield* ServerSettingsService;
   const store = yield* DelegatedResultsStore.DelegatedResultsStore;
@@ -142,8 +153,10 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
             detail: result.detail,
           });
           return { type: "held", detail: result.detail } satisfies CheckOutcome;
-        // Not given a gate (`WaitDelivery.make`): never answered here.
         case "waitsForSlot":
+          // Nothing of this batch was sent; the ones before it are recorded by their ids.
+          watched.add(parentThreadId);
+          return { type: "waitsForSlot", detail: result.detail } satisfies CheckOutcome;
         case "retry":
           // The batches sent so far are recorded by their ids; the next try sends the rest.
           watched.add(parentThreadId);
@@ -154,15 +167,44 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
     return { type: "sent", taskIds: sent } satisfies CheckOutcome;
   });
 
-  /** One check after the delay; tries again a few times only while the parent cannot be read. */
+  /**
+   * Checks until done: a few more tries only while the parent cannot be read, and every
+   * `slotRetryDelay` while the slot gate refuses, for as long as it refuses (logged once).
+   */
+  const checkUntilDone = Effect.fnUntraced(function* (parentThreadId: ThreadId) {
+    let waitLogged = false;
+    for (let attempt = 1; attempt <= options.attempts;) {
+      const outcome = yield* check(parentThreadId);
+      if (outcome.type === "waitsForSlot") {
+        if (!waitLogged) {
+          waitLogged = true;
+          yield* Effect.logInfo("delegated result reminder waits for an agent slot", {
+            threadId: parentThreadId,
+            detail: outcome.detail,
+          });
+        }
+        yield* Effect.sleep(slotRetryDelay);
+        continue;
+      }
+      if (outcome.type !== "unreadable") return;
+      yield* Effect.sleep(options.retryDelay);
+      attempt += 1;
+    }
+  });
+
+  const logFailure = (parentThreadId: ThreadId) =>
+    Effect.catchCause((cause) =>
+      Effect.logWarning("delegated result reminder check failed", {
+        threadId: parentThreadId,
+        cause,
+      }),
+    );
+
+  /** One check after the delay, then `checkUntilDone`. */
   const checkLater = Effect.fn("DelegatedResultReminder.checkLater")(
     function* (parentThreadId: ThreadId) {
       yield* Effect.sleep(options.delay);
-      for (let attempt = 1; attempt <= options.attempts; attempt += 1) {
-        const outcome = yield* check(parentThreadId);
-        if (outcome.type !== "unreadable") return;
-        yield* Effect.sleep(options.retryDelay);
-      }
+      yield* checkUntilDone(parentThreadId);
     },
     (effect, parentThreadId) =>
       effect.pipe(
@@ -224,14 +266,23 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
         for (const parentThreadId of new Set([...recovering, ...unread])) {
           // An event already moved this parent's check later.
           if (yield* FiberMap.has(timers, parentThreadId)) continue;
-          yield* check(parentThreadId).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("delegated result reminder check failed", {
-                threadId: parentThreadId,
-                cause,
-              }),
-            ),
+          const outcome = yield* check(parentThreadId).pipe(
+            Effect.map((done): CheckOutcome | undefined => done),
+            logFailure(parentThreadId),
           );
+          // Refused a slot: asked again in its own timer, so the next parents are not held up.
+          // An event meanwhile moves it later, as for any timer.
+          if (outcome?.type === "waitsForSlot") {
+            yield* FiberMap.run(
+              timers,
+              parentThreadId,
+              Effect.sleep(slotRetryDelay).pipe(
+                Effect.andThen(checkUntilDone(parentThreadId)),
+                logFailure(parentThreadId),
+              ),
+              { onlyIfMissing: true },
+            );
+          }
         }
       }),
     );
@@ -240,12 +291,16 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
   return { check, start, triggers, watched };
 });
 
-/** Started with the server's other workers, from `ForkLayers.layerRuntimeServices` (fork/forkLayers.ts). */
+/**
+ * Started with the server's other workers, from `ForkLayers.layerRuntimeServices`
+ * (fork/forkLayers.ts). Its slot gate is the server's one gate: layers memoize by reference.
+ */
 export const layer = Layer.effectDiscard(
   make().pipe(Effect.flatMap((service) => service.start())),
 ).pipe(
   Layer.provide(
     Layer.mergeAll(
+      SlotGate.layer,
       ProjectionStore.layer,
       CommandReceiptStore.layerFromApplicationReceipts,
       DelegatedResultsStore.layer,

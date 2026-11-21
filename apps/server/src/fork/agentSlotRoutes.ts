@@ -217,7 +217,7 @@ export const checkSendSlot = Effect.fn("AgentSlotRoutes.checkSendSlot")(function
       (error) =>
         new OrchestratorMcpFailure({
           code: "orchestration_error",
-          message: `Nothing was sent to thread ${threadId}: it could not be read to check for a free agent slot (${error.message}).`,
+          message: `This call sent nothing to thread ${threadId}: it could not be read to check for a free agent slot (${error.message}).`,
         }),
     ),
   );
@@ -229,7 +229,9 @@ export const checkSendSlot = Effect.fn("AgentSlotRoutes.checkSendSlot")(function
     instanceId: shell.modelSelection.instanceId,
   });
   if (slot.type === "refuse") {
-    return yield* slotsFull(`Nothing was sent to thread ${threadId}. ${refusalFor(caller, slot)}`);
+    return yield* slotsFull(
+      `This call sent nothing to thread ${threadId}. ${refusalFor(caller, slot)}`,
+    );
   }
 });
 

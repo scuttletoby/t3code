@@ -202,7 +202,7 @@ describe.each(TOOLS)("%s through the agent slot gate (#711)", (tool) => {
       const { sent, send } = harness({ slots: slotWorld([BUSY]) });
       const message = refusal(yield* send(tool));
       expect(message).toBe(
-        "slots_full: Nothing was sent to thread thread:receiver. No free agent slot: 1 agent is " +
+        "slots_full: This call sent nothing to thread thread:receiver. No free agent slot: 1 agent is " +
           "running on this machine, and the limit is 1. Try again later. Or do the work yourself.",
       );
       expect(sent).toEqual([]);
@@ -222,10 +222,10 @@ describe.each(TOOLS)("%s through the agent slot gate (#711)", (tool) => {
       expect(refusal(yield* send(tool))).toBeUndefined();
       expect(sent).toEqual([TARGET]);
       // Its run shows no run yet: a start into another idle thread finds no slot.
-      expect(refusal(yield* send(tool, OTHER))).toMatch(/^slots_full: Nothing was sent/);
+      expect(refusal(yield* send(tool, OTHER))).toMatch(/^slots_full: This call sent nothing/);
       // It shows now: counted once, as running.
       world.running = [TARGET];
-      expect(refusal(yield* send(tool, OTHER))).toMatch(/^slots_full: Nothing was sent/);
+      expect(refusal(yield* send(tool, OTHER))).toMatch(/^slots_full: This call sent nothing/);
       expect(sent).toEqual([TARGET]);
     }),
   );
@@ -278,7 +278,7 @@ describe.each(TOOLS)("%s through the agent slot gate (#711)", (tool) => {
       const { sent, send } = harness({ slots: world });
       // Fails closed even for a thread that runs: running or not cannot be told.
       expect(refusal(yield* send(tool))).toMatch(
-        /^slots_full: Nothing was sent to thread thread:receiver\. No agent was started: the slot gate could not read the thread list/,
+        /^slots_full: This call sent nothing to thread thread:receiver\. No agent was started: the slot gate could not read the thread list/,
       );
       expect(sent).toEqual([]);
       // Readable again: the retry goes through, once.
@@ -292,7 +292,7 @@ describe.each(TOOLS)("%s through the agent slot gate (#711)", (tool) => {
     Effect.gen(function* () {
       const { sent, send } = harness({ caller: false, slots: slotWorld([BUSY]) });
       expect(refusal(yield* send(tool))).toBe(
-        "slots_full: Nothing was sent to thread thread:receiver. No agent was started: the " +
+        "slots_full: This call sent nothing to thread thread:receiver. No agent was started: the " +
           "machine asked to start it has no free agent slot (1 agent is running there, and the limit is 1).",
       );
       expect(sent).toEqual([]);
@@ -347,7 +347,7 @@ describe("checkSendSlot: a receiver the gate cannot judge (#711)", () => {
         Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId: TARGET })),
       );
       expect(message).toMatch(
-        /^orchestration_error: Nothing was sent to thread thread:receiver: it could not be read to check for a free agent slot \(Failed to load orchestration projection for thread thread:receiver\.\)\.$/,
+        /^orchestration_error: This call sent nothing to thread thread:receiver: it could not be read to check for a free agent slot \(Failed to load orchestration projection for thread thread:receiver\.\)\.$/,
       );
       expect(world.reads).toBe(0);
     }),

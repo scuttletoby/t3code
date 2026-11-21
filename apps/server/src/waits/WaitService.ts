@@ -671,7 +671,10 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     if (queued && effectiveSlotLimits(settings.agentSlots) !== null) {
       return { type: "notYet", detail: "Older slot waits go first." } satisfies Judgement;
     }
-    const [grant] = yield* gate.grant([{ key: waitId, threadId, account: spec.account }]);
+    // Asked from the thread's own run and answered at once: no wake-up to count.
+    const [grant] = yield* gate.grant([
+      { key: waitId, threadId, account: spec.account, awake: true },
+    ]);
     // Met at once, nothing to write: the slot the thread held before moves to this answer now.
     if (grant?.type === "granted") yield* gate.keep([waitId]);
     return grant === undefined

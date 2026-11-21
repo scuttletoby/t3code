@@ -14,10 +14,13 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 
@@ -27,7 +30,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { legacyReminderSetId, REMINDER_MAX_AGE_MS } from "./delegatedResults.ts";
-import { at, delegatedTask, NOW, PARENT } from "./delegatedResults.testkit.ts";
+import { at, delegatedTask, makeSlots, NOW, PARENT } from "./delegatedResults.testkit.ts";
 import * as DelegatedResultReminder from "./DelegatedResultReminder.ts";
 import * as DelegatedResultsStore from "./DelegatedResultsStore.ts";
 
@@ -69,8 +72,11 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   // Parents whose wake upstream reserved (null: every parent with tasks), and those the table names.
   const recovery: { ids: ReadonlyArray<ThreadId> | null } = { ids: null };
   const unread: { ids: ReadonlyArray<ThreadId>; since: Array<string> } = { ids: [], since: [] };
+  // The agent slot gate, which lets every reminder through unless a test fills it.
+  const slots = makeSlots();
   return {
     shells,
+    slots,
     tasks,
     sent,
     recovery,
@@ -85,6 +91,7 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
     layer: (events: Stream.Stream<{ type: string; threadId: ThreadId; payload: unknown }>) =>
       Layer.mergeAll(
         ServerSettingsService.layerTest({ waitFor }),
+        slots.layer,
         Layer.mock(ThreadManagement.ThreadManagementService)({
           getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
           getThreadRecords: ((threadId: ThreadId) =>
@@ -576,4 +583,163 @@ describe("DelegatedResultReminder.start", () => {
       ).toBe(false);
     });
   });
+});
+
+/**
+ * Fork (issue 711): a reminder starts a run in an idle parent, so it asks the agent slot gate. One
+ * refused waits for a slot: asked again every few seconds for as long as it takes, sent once a
+ * slot frees, never twice, and found again by the startup scan after a restart.
+ */
+describe("DelegatedResultReminder and agent slots", () => {
+  const SLOT_RETRY = Duration.seconds(5);
+  const infoLogs = (into: Array<string>) =>
+    Logger.layer(
+      [
+        Logger.make(({ message, logLevel }) => {
+          if (logLevel === "Info") into.push(JSON.stringify(message));
+        }),
+      ],
+      { mergeWithExisting: false },
+    );
+
+  it.effect("asks the gate as a wake-up of the parent, and sends nothing while it refuses", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.slots.state.all = true;
+      const reminder = yield* service(world);
+      expect(yield* reminder.check(PARENT)).toMatchObject({ type: "waitsForSlot" });
+      expect(world.sent).toHaveLength(0);
+      // The parent's own held slot stays held for the run this reminder wakes up.
+      expect(world.slots.asks).toEqual([
+        expect.objectContaining({
+          callerThreadId: PARENT,
+          intoThreadId: PARENT,
+          keepsHeld: true,
+        }),
+      ]);
+      // A refusal is no reason to drop the parent: its next run end checks too.
+      expect(reminder.watched.has(PARENT)).toBe(true);
+      world.slots.state.all = false;
+      expect(yield* reminder.check(PARENT)).toMatchObject({ type: "sent" });
+      // Runs again: the same result is never reminded twice.
+      expect(yield* reminder.check(PARENT)).toEqual({ type: "none" });
+      expect(world.sent).toHaveLength(1);
+    }),
+  );
+
+  it.effect("waits for a slot past every attempt, logs it once, and sends once a slot frees", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.tasks.set(PARENT, []);
+      world.slots.state.all = true;
+      const logs: Array<string> = [];
+      const pubsub = yield* PubSub.unbounded<Event>();
+      const reminder = yield* service(world, Stream.fromPubSub(pubsub));
+      const fiber = yield* reminder
+        .start()
+        .pipe(Effect.andThen(Effect.never), Effect.provide(infoLogs(logs)), Effect.forkScoped);
+      yield* settle;
+      const ended = delegatedTask();
+      world.tasks.set(PARENT, [ended]);
+      yield* PubSub.publish(pubsub, { type: "subagent.updated", threadId: PARENT, payload: ended });
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      expect(world.slots.asks).toHaveLength(1);
+      // Far more tries than `attempts` (3), every 5 seconds: a refusal is never given up.
+      for (let step = 0; step < 24; step++) {
+        yield* TestClock.adjust(SLOT_RETRY);
+        yield* settle;
+      }
+      expect(world.slots.asks).toHaveLength(25);
+      expect(world.sent).toHaveLength(0);
+      expect(logs.filter((log) => log.includes("waits for an agent slot"))).toHaveLength(1);
+      world.slots.state.all = false;
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      expect(world.sent).toHaveLength(1);
+      // Done: no more asks, and never a second message.
+      yield* TestClock.adjust(Duration.minutes(10));
+      yield* settle;
+      expect(world.slots.asks).toHaveLength(26);
+      expect(world.sent).toHaveLength(1);
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a restart while one waits loses nothing: the startup scan waits and sends it once",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        world.slots.state.all = true;
+        // The first server lives in its own scope: a restart closes all of it, timers too.
+        const firstServer = yield* Scope.make();
+        const first = yield* service(world).pipe(Scope.provide(firstServer));
+        yield* first
+          .start()
+          .pipe(
+            Effect.andThen(Effect.never),
+            Scope.provide(firstServer),
+            Effect.forkIn(firstServer),
+          );
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        yield* settle;
+        yield* TestClock.adjust(SLOT_RETRY);
+        yield* settle;
+        expect(world.slots.asks).toHaveLength(2);
+        // Stopped half-way through its wait.
+        yield* Scope.close(firstServer, Exit.void);
+        const asked = world.slots.asks.length;
+        yield* TestClock.adjust(Duration.minutes(5));
+        yield* settle;
+        expect(world.slots.asks).toHaveLength(asked);
+
+        // The next start: the scan finds the result still owed, and its timer waits for a slot.
+        const again = yield* service(world);
+        const after = yield* again.start().pipe(Effect.andThen(Effect.never), Effect.forkScoped);
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        yield* settle;
+        yield* TestClock.adjust(SLOT_RETRY);
+        yield* settle;
+        expect(world.slots.asks).toHaveLength(asked + 2);
+        expect(world.sent).toHaveLength(0);
+        world.slots.state.all = false;
+        yield* TestClock.adjust(SLOT_RETRY);
+        yield* settle;
+        expect(world.sent).toHaveLength(1);
+        yield* TestClock.adjust(Duration.minutes(10));
+        yield* settle;
+        expect(world.sent).toHaveLength(1);
+        yield* Fiber.interrupt(after);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("the startup scan does not hold the next parent up while one waits for a slot", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const other = ThreadId.make("thread-other");
+      world.shells.set(other, idleShell(other));
+      world.tasks.set(other, [delegatedTask({ threadId: other })]);
+      world.recovery.ids = [PARENT, other];
+      world.slots.full.add(PARENT);
+      const reminder = yield* service(world);
+      const fiber = yield* reminder.start().pipe(Effect.andThen(Effect.never), Effect.forkScoped);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      expect(world.sent.map((message) => message.threadId)).toEqual([other]);
+      world.slots.full.delete(PARENT);
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      expect(world.sent.map((message) => message.threadId)).toEqual([other, PARENT]);
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.scoped),
+  );
 });

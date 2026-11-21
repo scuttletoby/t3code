@@ -141,15 +141,23 @@ export function liveStarting<Entry extends StartingEntry>(
 
 /**
  * The live entries that count now: a message queued into a thread (`queuedInto`) counts only
- * while that thread shows no run (else its run is counted, once).
+ * while that thread shows no run (else its run is counted, once). Entries that name one thread
+ * (queued into it, or a start in it) count once: a thread runs one run at a time, so more
+ * messages into it, or a delivery tried again, start no second agent there.
  */
 export function countedStarting<Entry extends StartingEntry>(
   entries: ReadonlyArray<Entry>,
   visibleRunIds: ReadonlySet<string>,
 ): ReadonlyArray<Entry> {
-  return entries.filter(
-    (entry) => entry.queuedInto === undefined || !visibleRunIds.has(entry.queuedInto),
-  );
+  const named = new Set<string>();
+  return entries.filter((entry) => {
+    if (entry.queuedInto !== undefined && visibleRunIds.has(entry.queuedInto)) return false;
+    const thread = entry.queuedInto ?? entry.childThreadId;
+    if (thread === undefined) return true;
+    if (named.has(thread)) return false;
+    named.add(thread);
+    return true;
+  });
 }
 
 /**
@@ -199,6 +207,32 @@ export function onePerThread(
     }
   }
   return reservations.filter((reservation) => byThread.get(reservation.threadId) === reservation);
+}
+
+/**
+ * Wake-ups still to start for held slots (the woken run is an agent too): one per held thread that
+ * shows no run, is not woken yet (`woken`: delivered wait keys) and has no live entry naming it.
+ * Machine only (`instanceId` ""); its account is checked when the wake-up starts. Never recorded.
+ */
+export function pendingWakes(
+  reservations: ReadonlyArray<SlotReservation>,
+  visibleRunIds: ReadonlySet<string>,
+  starting: ReadonlyArray<StartingEntry>,
+  woken: ReadonlySet<string>,
+): ReadonlyArray<StartingEntry> {
+  const named = new Set(
+    starting.flatMap((entry) => [
+      ...(entry.childThreadId === undefined ? [] : [entry.childThreadId]),
+      ...(entry.queuedInto === undefined ? [] : [entry.queuedInto]),
+    ]),
+  );
+  const threads = new Set<string>();
+  for (const reservation of reservations) {
+    if (woken.has(reservation.key) || visibleRunIds.has(reservation.threadId)) continue;
+    if (named.has(reservation.threadId)) continue;
+    threads.add(reservation.threadId);
+  }
+  return [...threads].map((_, index) => ({ token: -1_000 - index, instanceId: "", atMs: 0 }));
 }
 
 export type SlotRule = "machine" | "account" | "memory";
