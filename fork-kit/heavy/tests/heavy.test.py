@@ -667,7 +667,7 @@ class Heavy(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         records = self.measured(state)
         self.assertEqual([(x['kind'], x['end']) for x in records], [('heavy-test', 'exited')], r.stderr)
-        self.assertGreaterEqual(records[0]['peakMb'], 120)         # the kernel's peak, read after the scope went
+        self.assertGreaterEqual(records[0]['peakMb'], 120)         # the kernel's high-water mark, seen every second
         self.assertGreaterEqual(records[0]['usedMb'], 100)
         self.assertLess(records[0]['usedMb'], 1024)
 

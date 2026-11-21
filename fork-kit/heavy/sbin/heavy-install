@@ -35,7 +35,8 @@ UNIT_DIR = '/etc/systemd/user'
 LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-install'}
 
 SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'lib/heavy_queue.py',
-                'lib/heavy_measure.py', 'common/machine_file.py', 'systemd/heavy-sweep.service', 'systemd/heavy-sweep.timer')
+                'lib/heavy_measure.py', 'common/machine_file.py', 'systemd/heavy-sweep.service',
+                'systemd/heavy-sweep.timer')
 SWEEP_UNITS = ('heavy-sweep.service', 'heavy-sweep.timer')
 UNIT_HEADER = '# heavy kit: written by heavy-install.'
 EXECUTABLE = {'bin/heavy', 'sbin/heavy-install'}

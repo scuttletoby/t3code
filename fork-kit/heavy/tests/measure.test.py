@@ -79,6 +79,10 @@ class Base(unittest.TestCase):
         return subprocess.run([sys.executable, '-I', '-B', HEAVY, 'capacity', '--kinds', kinds or self.kinds,
                                '--check', self.check, *args], capture_output=True, text=True, env=e, timeout=60)
 
+    def read_bytes(self):
+        with open(self.history, 'rb') as f:
+            return f.read()
+
     def calls_made(self):
         try:
             with open(self.calls) as f:
@@ -415,17 +419,23 @@ class Recording(Base):
         self.assertEqual([(r['kind'], r['usedMb'], r['peakMb'], r['end']) for r in records],
                          [('node-tests', 400, 450, 'exited')])
 
-    def test_the_peak_file_opened_while_the_scope_lived_is_read_after_it_is_gone(self):
+    def test_the_peak_seen_while_the_scope_lived_is_kept_after_it_is_gone(self):
         m = self.measurer()
         folder = self.scope(100, 300)
         m.sample()
-        with open(os.path.join(folder, 'memory.peak'), 'w') as f:     # grew after the last sample
-            f.write(f'{900 * MB}\n')
-        shutil.rmtree(folder)                                  # the scope is gone when heavy records
+        with open(os.path.join(folder, 'memory.peak'), 'w') as f:     # a spike between two looks: the kernel's
+            f.write(f'{900 * MB}\n')                                  # high-water mark keeps it
+        with open(os.path.join(folder, 'used'), 'w') as f:
+            f.write(str(150 * MB))
+        m.sample()
+        shutil.rmtree(folder)                   # the scope is gone when heavy records: its files fail (ENODEV)
+        real = self.m._read_int
+        self.m._read_int = lambda fd: None
+        self.addCleanup(setattr, self.m, '_read_int', real)
         m.sample()
         m.record()
         records, _ = self.m.read_history(self.state)
-        self.assertEqual([(r['usedMb'], r['peakMb']) for r in records], [(100, 900)])
+        self.assertEqual([(r['usedMb'], r['peakMb']) for r in records], [(150, 900)])
 
     def test_a_stopped_run_is_recorded_as_stopped_and_not_counted(self):
         m = self.measurer()
@@ -444,7 +454,7 @@ class Recording(Base):
 
     def test_a_job_killed_before_it_records_leaves_the_history_as_it_was(self):
         self.add(*[rec('node-tests', 500)] * 5)
-        before = open(self.history, 'rb').read()
+        before = self.read_bytes()
         folder = self.scope(800, 900)
         code = (f'import importlib.machinery, importlib.util, os, signal\n'
                 f'l = importlib.machinery.SourceFileLoader("hm", {MEASURE!r})\n'
@@ -454,7 +464,7 @@ class Recording(Base):
                 f'x.sample()\nos.kill(os.getpid(), signal.SIGKILL)\n')
         p = subprocess.run([sys.executable, '-I', '-c', code], timeout=30)
         self.assertEqual(p.returncode, -signal.SIGKILL)
-        self.assertEqual(open(self.history, 'rb').read(), before)
+        self.assertEqual(self.read_bytes(), before)
         self.assertEqual(self.m.amount('node-tests', self.m.load_kinds(self.kinds),
                                        self.m.read_history(self.state)[0])[0], 640)
 
@@ -472,7 +482,7 @@ class Recording(Base):
         m = self.measurer(inner)
         self.scope(100, 100)
         m.sample()
-        self.assertEqual(m.interval, 3)
+        self.assertEqual(m.interval, self.m.SAMPLE_SECONDS)
         m.record()
         self.assertEqual(inner.calls, ['sample', 'record'])
         inner2 = FakeInner()

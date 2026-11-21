@@ -52,8 +52,7 @@ heavy-keep-<name>-<random>.scope, all others heavy-<name>-<random>.scope (never 
 Settings: /etc/heavy/config.json ({"slice": "heavy.slice", "grace_seconds": 30}), or the file HEAVY_CONFIG names;
 HEAVY_SLICE and HEAVY_GRACE override single values (HEAVY_SYSTEMCTL: another systemctl, HEAVY_QUEUE_ROOT: another
 folder for the memory queue's state, HEAVY_STATE_DIR: another folder for the measured history, HEAVY_DOCKER:
-another docker; all for tests). Standard library only; Linux
-with systemd and cgroup v2.
+another docker; all for tests). Standard library only; Linux with systemd and cgroup v2.
 """
 import hashlib, json, os, re, secrets, signal, subprocess, sys, time
 
@@ -908,7 +907,10 @@ def job_options(argv):
         return 'usage', argv
     if not 64 <= mb <= 1 << 20 or not 0 <= wait <= 7 * 86400:
         return 'usage', argv
-    return {'kind': opts.get('--kind'), 'mb': mb, 'wait': wait, 'measure': opts.get('--measure')}, rest
+    job = {'kind': opts.get('--kind'), 'mb': mb, 'wait': wait}
+    if '--measure' in opts:
+        job['measure'] = opts['--measure']
+    return job, rest
 
 
 def queue_module():

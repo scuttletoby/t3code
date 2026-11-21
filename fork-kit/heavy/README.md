@@ -82,7 +82,7 @@ when that fits; the others wait in order. Without `--kind` heavy runs at once, a
 their real use is in the slice's figures).
 
 - **What a job reserves:** `--mb` (the project's start value for the kind), else 3072 MB, raised by what the kind
-  has used. While a queued job runs, heavy samples its scope's memory every 3 s and once more when the command
+  has used. While a queued job runs, heavy samples its scope's memory every second and once more when the command
   ends; the highest sample of every run goes into the kind's history (`peaks.json`, last 20 runs), failed and
   OOM-killed runs too (they often peak highest). The reservation is the highest of those peaks x 1.15, rounded up
   to 128 MB, never below the start value, at most 4x it, and a learned value at most the budget minus `vmReserveMb`.
@@ -92,7 +92,7 @@ their real use is in the slice's figures).
   reservation can be below a real peak; the slice's `memory.high`/`memory.max` still catch a real overrun. A start
   value above the budget stays as set. Kinds and start values are project facts: they live in the project's config,
   which passes them as `--kind`/`--mb`.
-- **Sampling limits:** a spike shorter than 3 s can be missed, and a job that is killed for memory is seen at its
+- **Sampling limits:** a spike shorter than a second can be missed, and a job that is killed for memory is seen at its
   last sample, not at the moment it was killed. That is why the reservation keeps a margin and never drops under
   the start value: set the start value from a real peak, not a typical run.
 - **When it fits:** reservation <= budget - used - owed, and <= MemAvailable - `vmReserveMb` - owed, the slice is
@@ -206,10 +206,11 @@ each run really used, and `heavy capacity` turns a kind name into the amount its
 asks for what the job needs, not a guess.
 
 **Recording.** `heavy --measure <kind> <command>` (and `heavy --kind <kind> ...`, which queues; `--measure` there
-names another kind for the record) looks at the job's scope while it runs: `memory.peak` (the kernel's exact
-high-water mark; heavy opens it while the scope lives and reads it after the command ended, when the scope is
-already gone) and `used` (what the queue counts: `memory.current` less file cache the kernel can drop, at least the
-anon memory, plus swap; sampled every 3 s, at first every 0.2 s until the scope is seen). When the command ends one
+names another kind for the record) looks at the job's scope every second while it runs (every 0.2 s until the
+scope is seen): `memory.peak` (the kernel's high-water mark since the scope began, so a spike between two looks
+still counts) and `used` (what the queue counts: `memory.current` less file cache the kernel can drop, at least the
+anon memory, plus swap). The scope and its files are gone as soon as its last process ends, so the record holds the
+last look: only growth in the last second of a job is missed. When the command ends one
 line is appended to `~/.local/state/heavy/measured.jsonl` (`HEAVY_STATE_DIR` names another absolute folder):
 
 ```

@@ -5,9 +5,11 @@
   heavy capacity --kinds FILE --show [--json] [<kind>...]
 
 Recording: a job run with --measure (or queued with --kind, unless --measure names another kind) has its scope's
-memory looked at while it runs: memory.peak (the kernel's exact high-water mark, read from a file opened while the
-scope lives, so it holds after the scope is gone) and `used` (memory.current less file cache the kernel can drop,
-at least its anon, plus its swap; sampled every few seconds). When the command ends, one JSON line goes to
+memory looked at every second while it runs: memory.peak (the kernel's high-water mark since the scope began, so a
+spike between two looks still counts) and `used` (memory.current less file cache the kernel can drop, at least its
+anon, plus its swap). The scope is gone as soon as its last process ends, and its files with it (reads then fail
+with ENODEV): the record holds the last look, so only growth in the last second is missed. When the command ends,
+one JSON line goes to
 ~/.local/state/heavy/measured.jsonl (HEAVY_STATE_DIR names another folder): the kind, both figures in MB, how long
 it ran and how it ended. Lines are appended with one write each (two jobs that end together keep both lines) and
 the file is rotated to measured.jsonl.1 past 256 KiB (at most two files are kept). A nested heavy (inside another
@@ -44,7 +46,7 @@ LOCK = 'measured.lock'
 MAX_BYTES = 256 << 10           # rotate past this; at most this file and one rotated file are kept
 READ_MAX = 1 << 20              # a reader reads at most the last MiB of each file
 MAX_LINE = 4000                 # one record is far smaller; one write of it is never split by another writer
-SAMPLE_SECONDS = 3              # the `used` sample interval while the job runs
+SAMPLE_SECONDS = 1              # look at the scope this often while the job runs (two small reads)
 FIRST_LOOK = 0.2                # until the scope's memory.peak is open, look this often (a short job is caught)
 FIRST_TRIES = 50                # ... at most this many times (10 s), then every SAMPLE_SECONDS
 CORRUPT_SHARE = 10              # more than one bad line and more than 1 in this many: the history is not trusted
@@ -339,7 +341,7 @@ class Measurer:
                  out=say):
         self.box, self.scope, self.kind, self.folder, self.used_of = box, scope, kind, folder, used_of
         self.inner, self.now, self.monotonic, self.out = inner, now, monotonic, out
-        self.peak_fd, self.used, self.tries, self.done = None, 0, 0, False
+        self.peak_fd, self.peak, self.used, self.tries, self.done = None, 0, 0, 0, False
         self.start = monotonic()
 
     @property
@@ -364,6 +366,8 @@ class Measurer:
                     self.peak_fd = os.open(os.path.join(cg, 'memory.peak'), os.O_RDONLY | os.O_CLOEXEC)
                 except OSError:
                     pass                # no scope yet, or a kernel without memory.peak: `used` alone
+            if self.peak_fd is not None:
+                self.peak = max(self.peak, _read_int(self.peak_fd) or 0)    # None once the scope is gone
             used = self.used_of(cg)
             if used:
                 self.used = max(self.used, used)
@@ -384,11 +388,11 @@ class Measurer:
         if self.done:
             return
         self.done = True
-        peak = None
         if self.peak_fd is not None:
-            peak = _read_int(self.peak_fd)      # the file of a scope that is gone still reads its last peak
+            self.peak = max(self.peak, _read_int(self.peak_fd) or 0)    # a scope with leftovers still answers
             os.close(self.peak_fd)
             self.peak_fd = None
+        peak = self.peak
         rec = {'v': VERSION, 'at': _iso(self.now()), 'kind': self.kind, 'end': end,
                'seconds': round(self.monotonic() - self.start, 1),
                'usedMb': int(math.ceil(self.used / MB)) if self.used else None,
