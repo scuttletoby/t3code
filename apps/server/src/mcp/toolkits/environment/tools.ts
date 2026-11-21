@@ -10,6 +10,7 @@ import {
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/ai";
 import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
+import * as EnvironmentFacts from "../../../fork/environmentFacts.ts"; // Fork (P3): facts out
 import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as Settings from "../../../serverSettings.ts";
@@ -49,6 +50,7 @@ const EnvironmentReadTool = Tool.make("t3_environment_read", {
     serverVersion: Schema.String,
     platform: ExecutionEnvironmentDescriptor.fields.platform,
     preferences: Schema.Struct(PreferenceFields),
+    ...EnvironmentFacts.ResultFields, // Fork (P3): facts out
   }),
 })
   .annotate(Tool.Readonly, true)

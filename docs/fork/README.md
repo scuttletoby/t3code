@@ -1011,6 +1011,35 @@ An early draft had a client setting for one "anchor machine" for new work. It wa
 shipped: upstream's load balancing does the same. Settings saved with it still load. See
 [anchor-machine.md](anchor-machine.md).
 
+## Machine facts on `t3_environment_read`
+
+Placement design row P3 ("facts out"). `t3_environment_read` returns two optional fields beside
+upstream's, for this machine and for a linked one (the read is forwarded there as before):
+
+- `hostResources`: CPU load, cores and memory, the snapshot the app's load balancing already
+  samples. This is the result field of upstream PR #34293, which was closed upstream without
+  merging; the fork carries the field (same name and schema) from its own file,
+  `apps/server/src/fork/environmentFacts.ts`. Not carried as it was: its export in
+  `McpHttpServer.ts`, its test lines in upstream's test files and its new tool description, since
+  the fork adds no lines to those files (its tests are in fork test files instead), and the tool's
+  dependency on the sampler (the fork's file finds it, and the slot gate, without one, so no
+  upstream test needs a new mock).
+- `placement`: `labels` (facts typed once in that machine's Settings, such as owner logins; no
+  setting holds them yet, so they are empty until placement row P2 adds it), `available` and
+  `reason`, and, from the agent slot gate's own status read (the one `wait_list` shows):
+  `runningAgents` (running, starting or holding a slot), `slotsFree` (`null`: no machine limit),
+  `memoryFloorMb` (`agentSlots.minFreeMemoryMb`, `null`: none) and `freeMemoryMb`. `factsAt` is
+  when they were read. `available` is `false` when every machine slot is in use or free memory is
+  below the floor. With `agentSlots` off it is `true`, with a reason and no counts: the machine sets
+  no limit and does not count its agents.
+
+When the slot gate cannot be read (its count read fails or takes longer than its own limit, the
+gate is not running, or the settings cannot be read), `placement` says `available: false` with a
+reason and gives no count, so an agent never sees a guessed "slots free". A linked machine on an
+older T3 leaves both fields out, which means "no facts", never a failed read. Nothing is stored:
+each read measures again. The fields are part of the tool's result, not of the tool list an agent
+loads, so the tool context budget is unchanged.
+
 ## Install the fork today
 
 There is no one-line installer for the fork yet: `t3.codes/install.sh` and upstream's docs install
