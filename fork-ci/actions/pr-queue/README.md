@@ -148,8 +148,11 @@ whole). Then (`review_judge.py`, `review_glob.py`):
   each one count together: more paths, never fewer.
 
 `review.vectors.json` holds the shared cases (globs, rule sets, changed paths with
-their status, and the expected weight and lenses); the Python tests read it, and
-T3 tests its own matcher on the same file.
+their status, and the expected weight and lenses; lens report bodies and the
+findings read in them; lens comment scans; review rounds). The Python tests and
+T3's pure copy of these rules (`apps/server/src/fork/reviewRules/`) both replay
+every vector, and each side fails on a section or field it does not run. A rule
+change updates both sides and the vectors in one pull request.
 
 Notes for T3's matcher and its GitHub reader (no change in the gate):
 

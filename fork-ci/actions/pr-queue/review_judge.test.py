@@ -1,7 +1,8 @@
 """Tests of review_judge.py (run: python3 fork-ci/actions/pr-queue/review_judge.test.py).
 
-Which lens reads a change needs by the `review` block's path rules. The shared vectors (review.vectors.json, `cases`)
-are the contract both sides test; the rest here: reading git's name-status output, and that a rule set the parser
+Which lens reads a change needs by the `review` block's path rules, the findings a lens report says, and the rounds.
+The shared vectors (review.vectors.json: `cases`, `findings`, `scans`, `rounds`) are the contract both sides test; the
+rest here: reading git's name-status output, and that a rule set the parser
 would refuse, or a diff line nobody knows, never judges.
 """
 import dataclasses, json, os, sys, time, unittest
@@ -11,6 +12,7 @@ sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import config  # noqa: E402
+import lens  # noqa: E402
 import review_config as rc  # noqa: E402
 import review_judge as rj  # noqa: E402
 
@@ -178,139 +180,50 @@ def rounds(history, reports, decided=False, review=BASIC, change_of=None):
 
 
 # Findings as the fork's lens reports write them (pull requests #720-#739) and as reviews A and B of #740 showed they
-# can be written: each must count as a blocker or major finding.
-FINDING = [
-    ('heading, numbered item', '### Blocking\n\n1. **The lock is gone.** Two writers race on the row.'),
-    ('heading, bold item', '### Major\n**B1. The retry loops forever.**'),
-    ('heading with a note', '### Blocking (merge, not safety)\n1. The queue merges an unread head.'),
-    ('heading with a long note', '### Major (older than this PR; a follow-up issue is fine)\n- the cache never expires'),
-    ('bold inline', '**Blocking:** the lock is gone.'),
-    ('bold bare, item under it', '**Major**\n- two writers race'),
-    ('plain', 'Blocking: x'),
-    ('findings word', 'Major findings: x'),
-    ('findings word, list under it', 'Major findings:\n1. x'),
-    ('dash list', '- major — x'),
-    ('en dash', 'major – x'),
-    ('hyphen', 'major - x'),
-    ('emoji', '🔴 Major: x'),
-    ('emoji, bold', '⚠️ **Blocker**: x'),
-    ('numbered label', 'major 2: a retry loops'),
-    ('plural with a note', 'Majors (state): stopped half-way leaves a row'),
-    ('brackets', '[major] x'),
-    ('second label of a line', 'Blocker: none, major: two writers race'),
-    ('after a semicolon', 'blocker: none; major: x'),
-    ('after and', 'blocker: none and major: x'),
-    ('table row', '| severity | finding |\n|---|---|\n| major | x |'),
-    ('table row, bold', '| **Blocker** | the lock is gone |'),
-    ('table column', '| blocker | major |\n| --- | --- |\n| none | two writers race |'),
-    ('fullwidth M (NFKC)', '\uff2dajor: x'),
-    ('zero-width space', 'maj\u200bor: x'),
-    ('zero-width joiner in heading', '### Bl\u200docking\n1. x'),
-    ('soft hyphen', 'ma\u00adjor: x'),
-    ('Cyrillic o', 'maj\u043er: x'),
-    ('Cyrillic M', '\u041cajor: x'),
-    ('Greek omicron', 'bl\u03bfcker: x'),
-    ('digit zero for o', 'maj0r: x'),
-    ('heading, code under it', '### Major\n```\nthe race is in x\n```'),
-    ('heading, nothing under it', '### Major'),
-    ('heading, next heading under it', '### Major\n### Minor\n- a typo'),
-    ('bare label, nothing under it', 'major:'),
-    ('a none that is not one', 'major: none of the retries stop'),
-    ('a no that is not one', 'major: no lock on the write path'),
-    ('a dash that is not one', 'major: - x'),
-    ('see below', 'blocker: see below'),
-    ('quoted (read: fail closed)', '> major: quoted from round 1'),
-    ('indented (read: fail closed)', '    major: in an indented block'),
-    ('HTML tag', '<b>major</b>: x'),
-    ('link', '[major](http://e/x): y'),
-    ('summary tag', '<details><summary>major: x</summary>'),
-    ('narrow read only', 'major (see <b ): x <i>'),   # the wide tag eats the colon
-    ('NOT SAFE header', '## Review lens A, head 0123abc: **NOT SAFE**\nblocker: none\nmajor: none'),
-    ('NOT SAFE verdict', 'verdict: NOT SAFE\nblocker: none\nmajor: none'),
-    ('finding line', 'finding: major src/a.py:3 loses data'),   # another project's lens format
-    ('finding line, blocker', '- finding: blocker the lock is gone'),
-    ('finding line after blocker: none', 'blocker: none\nfinding: major src/a.py:3 loses data'),
-    ('finding line after findings: none', 'findings: none\nfinding: major x'),
-    ('recap of a fixed major', NONE + '\n- Major 1 (cap): fixed at the root.'),   # labelled: read as open
-    ('recap of a fixed blocker', NONE + '\n**Blocking 1:** fixed.'),
-    ('HTML entity', NONE + '\nma&#106;or: x'),
-    ('Markdown escape', NONE + '\nmajor\\: x'),
-    ('ratio sign for a colon', NONE + '\nmajor\u2236 x'),
-    ('a dash glued to none', 'major: none-critical race'),
-]
-# Lines a clean report writes: no finding, and a findings section.
-CLEAN = [
-    ('both on one line', 'Blocker: none, major: none'),
-    ('none found', 'Major: none found'),
-    ('none with a note', 'major: none (only minors)'),
-    ('none!', 'major: none!'),
-    ('heading, none under it', '### Major\nnone'),
-    ('headings, None.', '### Blocking\nNone.\n\n### Major\nNone.'),
-    ('bold inline', '**Blocking:** none.\n**Major:** none.'),
-    ('a rule between', '### Major\n\n---\n\nNone.'),
-    ('table columns', '| blocker | major |\n|---|---|\n| none | none |'),
-    ('table columns, blanks round the rule', '| blocker | major |\n  |---|---|  \n| none | none |'),
-    ('table row', '| severity | finding |\n|---|---|\n| major | none |'),
-    ('n/a', 'major: n/a'), ('zero', 'major: 0'), ('em dash', 'major: —'), ('list', '- majors: none'),
-    ('bold no', '**blockers:** no'), ('nothing', 'blocker: nothing'), ('NA', 'major: NA'),
-    ('minors do not block', 'major: none\n### Minor\n- a typo\nminor: x\nnit: y'),
-    ('code block', 'major: none\n```\nmajor: in code\n### Blocking\n1. x\n```'),
-    ('tilde fence', 'blocker: none\n~~~\nblocker: x\n~~~'),
-    ('longer fence holds a shorter one', 'major: none\n````\n```\nmajor: x\n```\n````'),
-    ('findings: none', 'findings: none'),
-    ('Unicode none', '\u041cajor: n\u043ene'),
-    ('both, full stops', 'Blocker: none. Major: none.'),
-    ('nothing found', 'major: nothing found'),
-    ('a minor after it', 'major: none; minor: x'),
-    ('prose that says not safe', 'major: none\nThe old code was not safe to run twice; this fixes it.'),
-    ('none, a dash, a note', 'major: none — two minors below'),
-    ('none, a hyphen, a note', 'major: none - two minors below'),
-    ('none in parentheses', 'Major: (none)'),
-    ('none and an emoji', 'major: None \u2705'),
-    ('only minor finding lines', 'finding: minor src/a.py:3 a typo\nfinding: nit y'),
-    ('a recap without a label', NONE + '\nround 1, fixed: the race'),
-]
-# Each makes a findings section on its own: a blocker and a major label, `findings: none` or `finding:` lines.
-SECTION = ['Blocker: none, major: none', '### Blocking\nNone.\n\n### Major\nNone.',
-           '**Blocking:** none.\n**Major:** none.', '| blocker | major |\n|---|---|\n| none | none |', 'findings: none',
-           'Blocker: none. Major: none.',
-           'finding: minor a typo', NONE, '| severity | finding |\n|---|---|\n| blocker | none |\n| major | none |']
-# Review A and B of #740 round 2: `blocker: none` kept from the prompt, the major written in a form not read as a label.
-# With one label kind only there is no findings section, so each fails closed (no section), never clean.
-ONE_KIND = ['F1 (major): x', '1. **Retry drops rows** (major): x', '- F1. Severity: major. x',
-            '- F1 — **Severity:** Major — x', '- F1 — major: x', 'F1: major: x', 'One major: x', 'Major 1. x',
-            'minor: typo. Also major: x']
-ONE_LABEL = ['major: none', 'blocker: none', '### Major\nNone.', '| severity | finding |\n|---|---|\n| major | none |']
-# Lines that only mention a label: no finding, and no findings section either.
-MENTION = ['fixed: the major of round 1', 'no major found', 'majority: x', 'Major version: 2', 'blockerx: y',
-           'major 12345: too long a number', 'the blocking call in x']
+# can be written are shared vectors (review.vectors.json `findings`), so the TypeScript side reads the same lines;
+# `group` says which rule each shows. Review A and B of #740 round 2: `blocker: none` kept from the prompt, the major
+# written in a form not read as a label (`one-kind`): with one label kind only there is no findings section, so each
+# fails closed, never clean.
+FINDINGS = VECTORS['findings']
+
+
+def group(name):
+    return [v for v in FINDINGS if v['group'] == name]
 
 
 class Findings(unittest.TestCase):
+    def test_every_shared_findings_vector(self):
+        for v in FINDINGS:
+            with self.subTest(v['name']):
+                said, section = rj.read_findings(v['body'])
+                self.assertEqual([list(f) for f in said], v['findings'])
+                self.assertEqual(section, v['section'])
+
+    def test_each_rule_keeps_its_vectors(self):   # a vector dropped from the file is a rule no longer shown
+        sizes = {g: len(group(g)) for g in ('finding', 'clean', 'section', 'one-kind', 'one-label', 'mention')}
+        self.assertEqual(sizes, {'finding': 57, 'clean': 36, 'section': 9, 'one-kind': 9, 'one-label': 4,
+                                 'mention': 8})
+
     def test_each_real_finding_format_counts(self):
-        for what, body in FINDING:
-            with self.subTest(what):
-                said, section = rj.read_findings(HEAD + body)
-                self.assertTrue(said, body)
-                self.assertTrue(said[0][0] in ('blocker', 'major'))
+        for v in group('finding'):
+            with self.subTest(v['name']):
+                self.assertTrue(v['findings'] and v['findings'][0][0] in ('blocker', 'major'))
 
     def test_each_clean_format_is_no_finding(self):
-        for what, body in CLEAN:
-            with self.subTest(what):
-                self.assertEqual(rj.read_findings(HEAD + body)[0], [], body)
-                self.assertEqual(rj.read_findings(HEAD + NONE + '\n\n' + body), ([], True), body)
+        for v in group('clean'):
+            with self.subTest(v['name']):
+                self.assertEqual(v['findings'], [])
+                if v['body'].startswith(HEAD):
+                    self.assertEqual(rj.read_findings(HEAD + NONE + '\n\n' + v['body'][len(HEAD):]), ([], True))
 
     def test_a_section_needs_a_blocker_and_a_major_label(self):   # #740 round 2, A major 1
-        for body in SECTION:
-            with self.subTest(body):
-                self.assertEqual(rj.read_findings(HEAD + body), ([], True))
-        for body in ONE_LABEL:
-            with self.subTest(body):
-                self.assertEqual(rj.read_findings(HEAD + body), ([], False))
-        for body in ONE_KIND:
-            with self.subTest(body):
-                self.assertEqual(rj.read_findings(HEAD + 'blocker: none\n' + body), ([], False))
-                r = rounds([('code', H1)], {'code': HEAD + 'blocker: none\n' + body})
+        for v in group('section'):
+            self.assertEqual((v['findings'], v['section']), ([], True), v['name'])
+        for v in group('one-label') + group('one-kind') + group('mention'):
+            self.assertEqual((v['findings'], v['section']), ([], False), v['name'])
+        for v in group('one-kind'):
+            with self.subTest(v['name']):
+                r = rounds([('code', H1)], {'code': v['body']})
                 self.assertEqual(len(r.problems), 1)
                 self.assertIn('lens code: its newest report has no findings section', r.problems[0])
 
@@ -328,20 +241,6 @@ class Findings(unittest.TestCase):
         table = '| blocker | major |\n|---|---|\n| none | none |\n'
         self.assertEqual(rj.read_findings(table + '```\ncode\n```\n| a | b |'), ([], True))
         self.assertEqual(len(rj.findings(table + '| a | b |')), 1)   # without the fence: a row of the table
-
-    def test_a_line_that_only_mentions_a_label_is_neither(self):
-        for line in MENTION:
-            with self.subTest(line):
-                self.assertEqual(rj.read_findings(HEAD + line), ([], False))
-
-    def test_the_kind_and_line_are_named(self):
-        self.assertEqual(rj.findings('blocker: the lock is gone\n- **Major:** two writers race\nminor: a typo'),
-                         [('blocker', 'blocker: the lock is gone'), ('major', 'Major: two writers race')])
-        self.assertEqual(rj.findings('### Major\n- race')[0], ('major', 'Major race'))
-        self.assertEqual(rj.findings('### Major')[0], ('major', 'Major (nothing under it)'))
-
-    def test_an_unclosed_fence_runs_to_the_end(self):   # GitHub shows the rest as code
-        self.assertEqual(rj.read_findings(NONE + '\n```\nmajor: x'), ([], True))
 
     def test_fold(self):
         self.assertEqual(rj.fold('\uff2da\u200bj\u043er'), 'Major')
@@ -447,6 +346,58 @@ class Rounds(unittest.TestCase):
     def test_the_same_comments_give_the_same_verdict(self):   # runs again: pure
         args = ([('code', H1), ('code r2', H2)], {'code': 'major: x'})
         self.assertEqual(rounds(*args), rounds(*args))
+
+
+# Every section of review.vectors.json, replayed whole: the TypeScript side (apps/server/src/reviewRules) runs the same
+# sections, and each side fails on a section or a vector field it does not run, so neither can skip one quietly.
+SECTIONS = {'about', 'config_path', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds'}
+FIELDS = {'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
+          'findings': {'name', 'group', 'body', 'findings', 'section'},
+          'scans': {'name', 'posts', 'history', 'entries'},
+          'rounds': {'name', 'config', 'history', 'reports', 'decided', 'changes', 'override_authors', 'findings',
+                     'expect'}}
+SCAN = lens.Review((), 'override for head', 'OWNER', ('OWNER',))
+
+
+def scan(posts):
+    comments = [{'body': p['body'], 'author': {'login': 'someone'}, 'authorAssociation': 'OWNER',
+                 'createdAt': f'2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z',
+                 'includesCreatedEdit': p.get('edited', False), 'isMinimized': p.get('hidden', False)}
+                for i, p in enumerate(posts)]
+    found, history = SCAN.lens_scan({'comments': comments, 'reviews': []})
+    return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}
+
+
+def replay_round(v):
+    review = dataclasses.replace(CONFIGS[v['config']], override_authors=tuple(v.get('override_authors', ())),
+                                 findings=v.get('findings', True))
+    changes = v.get('changes')
+    r = rj.judge_rounds(review, [tuple(h) for h in v['history']], {k: tuple(e) for k, e in v['reports'].items()},
+                        v.get('decided', False), (lambda s: changes.get(s, s)) if changes else None)
+    return {'round': r.round, 'approach': r.approach, 'over_cap': r.over_cap,
+            'findings': [list(f) for f in r.findings], 'problems': list(r.problems), 'text': r.text(review)}
+
+
+class SharedVectors(unittest.TestCase):
+    def test_this_side_runs_every_section_and_field(self):
+        self.assertEqual(set(VECTORS), SECTIONS)
+        for section, fields in FIELDS.items():
+            names = [v['name'] for v in VECTORS[section]]
+            self.assertEqual(len(names), len(set(names)), f'{section}: two vectors share a name')
+            for v in VECTORS[section]:
+                self.assertLessEqual(set(v), fields, f'{section}: {v["name"]}')
+
+    def test_every_scan(self):   # same comment twice, edited, hidden, old forms, no comment at all
+        self.assertGreaterEqual(len(VECTORS['scans']), 13)
+        for v in VECTORS['scans']:
+            with self.subTest(v['name']):
+                self.assertEqual(scan(v['posts']), (v['history'], v['entries']))
+
+    def test_every_round(self):
+        self.assertGreaterEqual(len(VECTORS['rounds']), 28)
+        for v in VECTORS['rounds']:
+            with self.subTest(v['name']):
+                self.assertEqual(replay_round(v), v['expect'])
 
 
 class OverrideAuthors(unittest.TestCase):
