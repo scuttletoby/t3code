@@ -77,11 +77,18 @@ interface Harness {
   readonly sql: SqlClient.SqlClient;
   /** Every thread launched and every message sent to a bound thread. */
   readonly started: Array<string>;
+  /** What each of those was started with, in the same order (a send has no title). */
+  readonly prompts: Array<Prompt>;
   /** One pass of the due-task poll, as the scheduler runs it. */
   readonly poll: Effect.Effect<void>;
   readonly webhookWorker: Effect.Effect<void>;
   /** One pass of the fork's waiting-note cleanup. */
   readonly notesWorker: Effect.Effect<void>;
+}
+
+interface Prompt {
+  readonly text: string;
+  readonly title?: string | undefined;
 }
 
 interface Options {
@@ -90,6 +97,7 @@ interface Options {
   readonly bound?: BoundThread;
   /** Shared across boots, so a restart test sees what the first boot started. */
   readonly started?: Array<string>;
+  readonly prompts?: Array<Prompt>;
 }
 
 /**
@@ -100,6 +108,7 @@ interface Options {
 const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Options = {}) =>
   Effect.gen(function* () {
     const started: Array<string> = options.started ?? [];
+    const prompts: Array<Prompt> = options.prompts ?? [];
     const bound = options.bound ?? { instanceId: INSTANCE, running: false };
     const workers = new Map<string, Effect.Effect<void>>();
     const base = Layer.mergeAll(
@@ -118,6 +127,7 @@ const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Op
         launch: (input) =>
           Effect.sync(() => {
             started.push(`launch:${input.commandId}`);
+            prompts.push({ text: input.initialMessage?.text ?? "", title: input.title });
             return { threadId: STARTED, resumed: false } as never;
           }),
         isNonGitProject: () => Effect.succeed(false),
@@ -139,6 +149,7 @@ const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Op
         sendToThread: (input) =>
           Effect.sync(() => {
             started.push(`send:${input.threadId}`);
+            prompts.push({ text: input.text });
             return {} as never;
           }),
       }),
@@ -169,6 +180,7 @@ const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Op
         service,
         sql,
         started,
+        prompts,
         poll: Effect.suspend(() => workers.get("scheduled-tasks")!),
         webhookWorker: Effect.suspend(() => workers.get("webhook-coalescing")!),
         notesWorker: Effect.suspend(() => workers.get("agent-slot-notes")!),
@@ -850,6 +862,193 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
         { slots },
       );
     },
+  );
+
+  /** The delivery as its log shows it. */
+  const deliveryOf = (service: Harness["service"], id: string, deliveryId: string) =>
+    service
+      .getWebhookDelivery({ id, deliveryId } as never)
+      .pipe(Effect.map(({ delivery }) => delivery));
+
+  /** A webhook task, delivered once now with the slot full: the worker holds it in its wait. */
+  const waitingDelivery = (harness: Harness, overrides: Record<string, unknown> = {}) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(START);
+      const input = yield* taskInput({ schedule: { type: "webhook" }, ...overrides });
+      const { task } = yield* harness.service.upsert(input);
+      const accepted = yield* harness.service.triggerWebhook(webhookRequest(task));
+      if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+      // Stored; one worker pass with the clock still at START takes it into its slot wait.
+      yield* settle;
+      yield* harness.webhookWorker;
+      yield* settle;
+      assert.deepEqual(harness.started, []);
+      const save = (patch: Record<string, unknown>) =>
+        Effect.flatMap(taskInput({ ...input, id: task.id, ...patch }), (next) =>
+          harness.service.upsert(next),
+        );
+      return { task, deliveryId: accepted.deliveryId, save };
+    });
+
+  const SAVED_WHILE_WAITING = [
+    { name: "a task that starts a thread", overrides: {}, kind: "launch:" },
+    { name: "a task bound to an idle thread", overrides: { threadId: BOUND }, kind: "send:" },
+  ] as const;
+  it.effect.each(SAVED_WHILE_WAITING)(
+    "$name: a webhook delivery saved while it waits runs once, on the task as saved (#719)",
+    ({ overrides, kind }) => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        (harness) =>
+          Effect.gen(function* () {
+            const { service, sql, started, prompts, webhookWorker } = harness;
+            const { task, deliveryId, save } = yield* waitingDelivery(harness, overrides);
+            // Saved twice while it waits: first in the same millisecond as the copy it holds
+            // (same `updated_at`, only the prompt differs), then in its next wait.
+            for (const [step, prompt] of [
+              "Read the new issues.",
+              "Close the stale issues.",
+            ].entries()) {
+              if (step > 0) yield* TestClock.adjust("1 minute");
+              yield* save({ prompt });
+              yield* workerRounds(webhookWorker, 3);
+              // Not run on the copy from before the save, not dropped: still stored, and its log
+              // shows the prompt rendered again from the task as saved.
+              assert.deepEqual(started, []);
+              assert.deepEqual(yield* pendingStates(sql, task.id), [
+                { delivery_id: deliveryId, state: "dispatching" },
+              ]);
+              const waiting = yield* deliveryOf(service, task.id, deliveryId);
+              assert.equal(waiting.outcome, "accepted");
+              assert.include(waiting.renderedPrompt ?? "", prompt);
+            }
+            slots.running = [];
+            yield* until(() => started.length === 1, "the delivery started");
+            assert.isTrue(started[0]!.startsWith(kind));
+            assert.include(prompts[0]!.text, "Close the stale issues.");
+            assert.notInclude(prompts[0]!.text, "Review the open pull requests.");
+            assert.notInclude(prompts[0]!.text, "Read the new issues.");
+            // Runs again: more rounds start nothing more, and the delivery is done, not failed.
+            yield* workerRounds(webhookWorker, 4);
+            assert.equal(started.length, 1);
+            assert.equal((yield* rowOf(sql, task.id)).run_count, 1);
+            assert.deepEqual(yield* pendingStates(sql, task.id), []);
+            assert.equal((yield* deliveryOf(service, task.id, deliveryId)).outcome, "accepted");
+          }),
+        { slots },
+      );
+    },
+  );
+
+  it.effect("a save while it waits that keeps the prompt is seen too: it runs as saved", () => {
+    const slots = slotWorld([BUSY]);
+    return withService(
+      (harness) =>
+        Effect.gen(function* () {
+          const { save } = yield* waitingDelivery(harness);
+          yield* TestClock.adjust("1 minute");
+          yield* save({ title: "Morning review" });
+          yield* workerRounds(harness.webhookWorker, 2);
+          slots.running = [];
+          yield* until(() => harness.started.length === 1, "the delivery started");
+          assert.equal(harness.prompts[0]!.title, "Morning review");
+        }),
+      { slots },
+    );
+  });
+
+  it.effect.each([
+    { name: "stored then", storable: true },
+    { name: "still not storable", storable: false },
+  ])(
+    "a direct delivery waiting in memory (its store failed) whose task is saved: $name",
+    ({ storable }) => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        ({ service, sql, started, prompts, webhookWorker }) =>
+          Effect.gen(function* () {
+            yield* TestClock.setTime(START);
+            const input = yield* taskInput({ schedule: { type: "webhook" } });
+            const { task } = yield* service.upsert(input);
+            yield* sql`CREATE TRIGGER no_store BEFORE INSERT ON scheduled_task_webhook_pending
+              BEGIN SELECT RAISE(ABORT, 'store refused'); END`;
+            const accepted = yield* service.triggerWebhook(webhookRequest(task));
+            if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+            yield* settle;
+            // Not stored: it waits in memory.
+            assert.deepEqual(yield* pendingStates(sql, task.id), []);
+            yield* TestClock.adjust("1 minute");
+            yield* service.upsert(yield* taskInput({ ...input, id: task.id, prompt: "Triage." }));
+            if (storable) yield* sql`DROP TRIGGER no_store`;
+            yield* TestClock.adjust(AgentSlotRoutes.WEBHOOK_SLOT_RETRY);
+            yield* settle;
+            if (storable) {
+              // Stored now, for the worker, which runs it on the task as saved, once.
+              assert.deepEqual(yield* pendingStates(sql, task.id), [
+                { delivery_id: accepted.deliveryId, state: "dispatching" },
+              ]);
+              yield* workerRounds(webhookWorker, 2);
+              assert.deepEqual(started, []);
+              slots.running = [];
+              yield* workerRounds(webhookWorker, 4);
+              assert.equal(started.length, 1);
+              assert.include(prompts[0]!.text, "Triage.");
+              return;
+            }
+            // Its prompt is the old one and it cannot be handed on: not run, and it says why.
+            const { delivery } = yield* service.getWebhookDelivery({
+              id: task.id,
+              deliveryId: accepted.deliveryId,
+            });
+            assert.equal(delivery.outcome, "dispatch_failed");
+            assert.equal(delivery.error, AgentSlotRoutes.SAVED_WHILE_WAITING_NOT_STORED);
+            slots.running = [];
+            yield* TestClock.adjust(AgentSlotRoutes.WEBHOOK_SLOT_RETRY);
+            yield* workerRounds(webhookWorker, 3);
+            assert.deepEqual(started, []);
+          }),
+        { slots },
+      );
+    },
+  );
+
+  it.effect(
+    "a delivery saved while it waits, then a restart: the new server runs it as saved",
+    () =>
+      Effect.gen(function* () {
+        const started: Array<string> = [];
+        const prompts: Array<Prompt> = [];
+        const ids = yield* boot(
+          (harness) =>
+            Effect.gen(function* () {
+              const { task, deliveryId, save } = yield* waitingDelivery(harness);
+              yield* TestClock.adjust("1 minute");
+              yield* save({ prompt: "Read the new issues." });
+              // Stops before or after its wait saw the save: the row is still stored either way.
+              yield* workerRounds(harness.webhookWorker, 1);
+              return { taskId: task.id, deliveryId };
+            }),
+          { slots: slotWorld([BUSY]), started, prompts },
+        );
+        assert.deepEqual(started, []);
+        yield* boot(
+          ({ sql, service, webhookWorker }) =>
+            Effect.gen(function* () {
+              yield* webhookWorker;
+              yield* until(() => started.length === 1, "the delivery started after the restart");
+              yield* workerRounds(webhookWorker, 4);
+              assert.equal(started.length, 1);
+              assert.include(prompts[0]!.text, "Read the new issues.");
+              assert.deepEqual(yield* pendingStates(sql, ids.taskId), []);
+              const { delivery } = yield* service.getWebhookDelivery({
+                id: ids.taskId,
+                deliveryId: ids.deliveryId,
+              });
+              assert.equal(delivery.outcome, "accepted");
+            }),
+          { slots: slotWorld(), started, prompts },
+        );
+      }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
   );
 
   it.effect("a coalesced webhook delivery waiting at a restart runs on the new server, once", () =>
