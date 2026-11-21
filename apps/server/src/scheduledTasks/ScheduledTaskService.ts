@@ -1612,6 +1612,7 @@ export const layer = Layer.effect(
         lastRunError: existingTask?.lastRunError ?? null,
         runCount: existingTask?.runCount ?? 0,
       };
+      yield* runSlots.saving(task, existingTask); // Fork: the saving thread's MCP profile
       yield* saveTask(
         task,
         input.requireExisting === true,
