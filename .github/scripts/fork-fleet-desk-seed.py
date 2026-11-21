@@ -39,9 +39,11 @@ Each run (one at a time: a lock) meets this state:
                                                24 hours (TornLog; the hourly timer's RandomizedDelaySec and a 5 min
                                                margin make each wait up to an hour longer); another copy on the host
                                                skips the wait once per back-off step (the try still counts, so a
-                                               host that remakes it hourly still backs off, but it never moves the
-                                               step's end: the wait runs from the last try that waited), so a fix
-                                               made right after another new copy waits for the step (up to 24 h);
+                                               host that remakes it hourly still backs off: the next wait doubles,
+                                               but runs from the last try that waited, not from the early try, so
+                                               it ends at most one step later, never past 24 h after that try), so a
+                                               fix made right after another new copy waits for that doubled wait
+                                               (up to 24 h);
                                                torn on every try for over TORN_DAY: exit 1
   .torn.json cannot be written (a full disk)   the run goes on, counts its tries in memory, and exits 1
   a fetch that kills the run (MemoryMax, TimeoutStartSec)
@@ -414,24 +416,42 @@ class Tar(tarfile.TarFile):
         raise Torn(f'{tarinfo.name[:80]!r} is a link that cannot be made here (its target is not copied instead)')
 
 
+def probe(form):
+    """The small tar sparse_read reads for FORM: a pax sparse form (SPARSE), an old-GNU sparse member ('old GNU', its
+    refusal is in Info._proc_member) or an extended header over HEADER_MOST ('headers': only its header, as Info
+    refuses it before its data is read)."""
+    info = tarfile.TarInfo('s')
+    if form == 'headers':
+        info.type, info.size = tarfile.XHDTYPE, HEADER_MOST + 1
+        return info.tobuf(tarfile.USTAR_FORMAT, 'utf-8', 'surrogateescape')
+    info.size = 512
+    if form == 'old GNU':
+        info.type, fmt = tarfile.GNUTYPE_SPARSE, tarfile.GNU_FORMAT
+    else:
+        info.pax_headers, fmt = SPARSE[form], tarfile.PAX_FORMAT
+    return info.tobuf(fmt, 'utf-8', 'surrogateescape') + b'0\n'.ljust(512, b'\0') + bytes(1024)   # 1.0: its map
+
+
+PROBES = {**{form: 'is a sparse member' for form in SPARSE}, 'old GNU': 'is a sparse member',
+          'headers': 'headers hold more than'}   # each probe's form: the refusal it must be torn by
+
+
 def sparse_read():
-    """The pax sparse forms (SPARSE) that Info reads into a sparse member on this Python: none while tarfile still
-    calls the handlers Info refuses them in (PRIVATE proves only that they are there). A tarfile that does not know
-    a form, or refuses it, reads none."""
+    """The probes (PROBES) this Python's tarfile reads past Info's limits: none while tarfile still calls the
+    handlers and the _proc_member Info refuses them in (PRIVATE proves only that they are there). Each probe must be
+    torn by its own refusal; anything else is named (alone: read as a sparse member; with why: read whole, torn by
+    another limit, another error, or the probe could not even be made), as it is not proven refused."""
     read = []
-    for form, pax in SPARSE.items():
-        buf, info = io.BytesIO(), tarfile.TarInfo('s')
-        info.size, info.pax_headers = 512, pax
-        with tarfile.open(fileobj=buf, mode='w', format=tarfile.PAX_FORMAT) as t:
-            t.addfile(info, io.BytesIO(b'0\n'.ljust(512, b'\0')))   # 1.0: its map (no part) is the data's start
+    for form, refusal in PROBES.items():
         try:
-            with Tar.open(fileobj=io.BytesIO(buf.getvalue()), mode='r|', tarinfo=Info) as t:
-                if any(m.sparse is not None for m in iter(t.next, None)):
-                    read.append(form)
-        except (Torn, tarfile.TarError):
-            pass
-        except Exception:   # what this code did not foresee: not known to be refused
-            read.append(form)
+            with Tar.open(fileobj=io.BytesIO(probe(form)), mode='r|', tarinfo=Info) as t:
+                got = list(iter(t.next, None))
+            read.append(form if any(m.sparse is not None for m in got) else f'{form}: read whole')
+        except Torn as e:
+            if refusal not in str(e):   # torn, but not by the refusal this form proves
+                read.append(f'{form}: {str(e)[:80]}')
+        except Exception as e:   # tarfile's own error, or one this code did not foresee: not known to be refused
+            read.append(f'{form}: {e.__class__.__name__}: {str(e)[:80]}')
     return read
 
 
@@ -646,9 +666,9 @@ def own_seeds(conf, config):
 def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
     """One run (the module's docstring). A seed that fails in any way, a deep tree included, is said and the run
     goes on with the next; old versions are pruned in every run. When it may fetch nothing (no data filter or no
-    private tarfile part in PRIVATE, a sparse form read past Info, its own fleet config broken or without its
-    pool) it still drops each seed past
-    its age, by its label's max_age_hours, and then says why (agent.Bad: exit 2, the unit's last result shows it)."""
+    private tarfile part in PRIVATE, a probe of sparse_read not torn by its own refusal, its own fleet config broken or
+    without its pool) it still drops each seed past its age, by its label's max_age_hours, and then says why
+    (agent.Bad: exit 2, the unit's last result shows it)."""
     cannot, own = None, None
     if not hasattr(tarfile, 'data_filter'):   # releases with known filter bypasses pass this: settle() checks again
         cannot = 'this Python has no tarfile data filter (3.12, or 3.8.17 and later)'
@@ -656,7 +676,8 @@ def run(agent, conf, root=SEEDS, now=time.time, say=print, config=CONFIG):
                                                              else tarfile.TarInfo, k, None))]:
         cannot = f'this Python\'s tarfile has no {", ".join(gone)} (the limits of Info and Tar need them)'
     elif read := sparse_read():
-        cannot = f'this Python\'s tarfile reads pax sparse members ({", ".join(read)}) past Info\'s refusal'
+        cannot = (f'this Python\'s tarfile is not proven to refuse sparse members and long headers '
+                  f'({"; ".join(read)})')
     try:
         own = own_seeds(conf, config)
     except Torn as e:
@@ -712,9 +733,10 @@ class TornLog:
     and cleared when the seed is fetched or the same as the host's. A seed torn TRIES times in a row is tried again
     only min(2 ** (TRIES - 1), 24) hours after the last try (a link too slow for it, a host that cuts it: not every
     hour), or at once when the host offers another copy (`copy`: its [bytes, made] when last tried), but that only
-    once per back-off step (`early`: the last try was such a one), so a fix made right after another new copy waits
-    for the step (up to 24 h). Such a try counts (the next wait doubles) but keeps `last`, the try the step runs
-    from: it never moves the next try later. One torn on every try since more than TORN_DAY is `late`. Only seeds
+    once per back-off step (`early`: the last try was such a one). Such a try counts (the next wait doubles) but
+    keeps `last`, the try the wait runs from: the next normal try comes at most one step later than it would have
+    (h 5, not 3, after an early try at h 1.5), and only at the 24 h cap not at all; never from the early try. So a
+    fix made right after another new copy waits for that doubled wait (up to 24 h). One torn on every try since more than TORN_DAY is `late`. Only seeds
     in the host's list are kept, and only in a run that read the list. A missing or unreadable file is an empty
     record; one that cannot be written (a full disk) is kept in memory for this run and said in `unsaved`."""
 
@@ -752,7 +774,8 @@ class TornLog:
 
     def trying(self, name, item=None):
         """Counted as torn before the fetch, saved: `why` says so until the fetch ends; `early` when it is tried
-        before its back-off is over (a new copy): its `last` stays, so the step still ends when it would have."""
+        before its back-off is over (a new copy): its `last` stays, so the next wait, doubled, runs from the last
+        try that waited, not from this one (it ends one step later than it would have, but for the 24 h cap)."""
         early = self.left(name) is not None
         r = self.seeds.get(name) or {'first': int(self.now()), 'tries': 0}
         self.seeds[name] = {**r, 'last': r['last'] if early else int(self.now()), 'tries': r['tries'] + 1,

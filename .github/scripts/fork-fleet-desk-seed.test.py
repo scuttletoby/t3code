@@ -3,7 +3,7 @@
 offer in-process, the desktop's run end to end through a fake ssh that runs the host's side, and the forced command's
 divert in fork-fleet-desk.py. Temp folders only; no root, no ssh, no network. Run: python3 -I -B <this>. Linux only."""
 import contextlib, fcntl, hashlib, importlib.util, io, json, os, shutil, stat, subprocess, sys, tarfile, tempfile, threading
-import errno, signal, time, unittest
+import errno, re, signal, time, unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -1090,11 +1090,46 @@ class Desktop(Base):
         self.assertEqual(seed.sparse_read(), [])
         for k, form in (('_proc_gnusparse_00', '0.0'), ('_proc_gnusparse_01', '0.1'), ('_proc_gnusparse_10', '1.0')):
             with self.subTest(form), mock.patch.object(seed.Info, k, getattr(tarfile.TarInfo, k)):
-                with self.assertRaisesRegex(agent.Bad, f'sparse members \\({form}\\)'):
+                with self.assertRaisesRegex(agent.Bad, f'long headers \\({form}\\)'):
                     self.run_seed()
                 self.assertEqual(self.fetches(), [])
         self.assertEqual(self.run_seed(), 0)
         self.assertEqual(self.files('m2'), {'a': b'one'})
+
+    def test_only_its_own_refusal_proves_a_probe(self):   # PR #729 lens A minors 1, 3 and lens B minor 3
+        def raises(e):
+            return mock.Mock(side_effect=e)
+        cases = {   # before: the first two counted as refused, and no probe needed _proc_member to be called
+            '0.0: another limit': (seed.Info, '_proc_gnusparse_00', raises(seed.Torn('another limit'))),
+            '0.1: ReadError: refused by tarfile': (seed.Info, '_proc_gnusparse_01', raises(tarfile.ReadError(
+                'refused by tarfile'))),
+            'old GNU; headers: ': (seed.Info, '_proc_member', tarfile.TarInfo._proc_member),   # a later tarfile that
+        }                                                                       # stops calling it: Info's limits go
+        self.make('m2', {'a': b'one'})
+        for want, (owner, k, new) in cases.items():
+            with self.subTest(want), mock.patch.object(owner, k, new):
+                self.assertIn(want.split('; ')[0], seed.sparse_read())
+                with self.assertRaisesRegex(agent.Bad, re.escape(want)):
+                    self.run_seed()
+                self.assertEqual(self.fetches(), [])
+        self.assertEqual(seed.sparse_read(), [])
+        self.assertEqual(self.run_seed(), 0)
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+
+    def test_a_probe_that_cannot_be_made_still_drops_an_old_seed_and_is_exit_2(self):   # PR #729 lens A 2, B 2
+        self.make('m2', {'a': b'one'})
+        self.run_seed()
+        fetched = len(self.fetches())
+        with mock.patch.object(tarfile.TarInfo, 'tobuf', mock.Mock(side_effect=ValueError('no GNU.sparse keys'))):
+            self.assertEqual(len(seed.sparse_read()), len(seed.PROBES))   # each named, none raised
+            with self.assertRaisesRegex(agent.Bad, 'ValueError: no GNU.sparse keys.*no seeds fetched'):
+                self.run_seed(now=lambda: time.time() + 999 * 3600)   # before: the ValueError itself, exit 1
+            self.assertEqual(self.files('m2'), {'a': b'one'})   # under its max_age_hours: kept
+            with self.assertRaises(agent.Bad):
+                self.run_seed(now=lambda: time.time() + 1001 * 3600)
+        self.assertIsNone(self.files('m2'))   # past it: dropped, as the docs say
+        self.assertTrue(any('older than 1000 h' in x for x in self.said), self.said)
+        self.assertEqual(len(self.fetches()), fetched)
 
     def test_only_a_block_of_zeros_ends_the_tar_and_only_zeros_follow(self):   # #258 item 4 (lens237sr5 nit 3)
         bad = bytearray(tarfile.TarInfo('b').tobuf(format=tarfile.GNU_FORMAT))
@@ -1121,7 +1156,8 @@ class Desktop(Base):
                 self.run_seed(now=lambda i=i: time.time() + i * 7 * 3600)
                 self.assertEqual(self.files('m2'), {'a': b'one'})
                 self.assertTrue(any('m2: keeps the old one' in x and ('bad tar header' in x or 'after the tar' in x
-                                                                     or 'below 0' in x) for x in self.said), self.said)
+                                                                     or 'below 0' in x or 'the size -1' in x)
+                                    for x in self.said), self.said)   # 'the size -1': guarded, on 3.13.5
                 with contextlib.suppress(FileNotFoundError):   # each case tried at once, not after a wait
                     os.unlink(os.path.join(self.root, '.torn.json'))
         self.raw('m2', first, b'\0' * 30000)   # end blocks and any zero padding: a whole tar
@@ -1146,7 +1182,7 @@ class Desktop(Base):
         self.assertEqual([int(x.split('tried again in about ')[1].split(' h')[0]) for x in fails], [1, 2, 3, 8, 15])
         self.assertEqual(['at once if' in x for x in fails], [True, True, False, True, False])
 
-    def test_an_early_try_never_moves_the_next_try_later(self):   # #258 item 2 (lens237cr5 nit 2)
+    def test_an_early_try_keeps_the_wait_running_from_the_last_try_that_waited(self):   # #258 item 2 (lens237cr5 nit 2)
         start, tried, saved, said = int(time.time()) - 12 * 3600, [], [], {}
 
         def torn(agent_, conf, item, root, now, **kw):
@@ -1163,6 +1199,14 @@ class Desktop(Base):
         self.assertEqual([(r['last'] - start, r['tries'], r['early']) for r in saved],
                          [(0, 1, False), (3600, 2, False), (3600, 3, True), (5 * 3600, 4, False)])
         self.assertTrue(any('torn 3 times' in x and 'about 3 h' in x for x in said[2]), said[2])   # before: 4 h
+        # the early try at h 1.5 still doubled the wait: the next normal try is at h 5 (h 1 + 4), not h 3; at the
+        # 24 h cap an early try moves nothing
+        log = seed.TornLog(None, lambda: 10 * 3600)
+        log.seeds['m2'] = {'first': 0, 'last': 0, 'tries': 6, 'copy': [1, 1]}
+        before = log.left('m2')
+        self.assertIsNone(log.due('m2', {'bytes': 2, 'made': 2}))   # another copy: tried early
+        log.trying('m2', {'bytes': 2, 'made': 2})
+        self.assertEqual((log.seeds['m2']['last'], log.seeds['m2']['tries'], log.left('m2')), (0, 7, before))
 
     def test_an_old_record_whose_early_try_moved_last_still_waits(self):   # #258: a record #237 wrote
         start, tried = int(time.time()) - 12 * 3600, []
