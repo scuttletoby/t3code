@@ -379,11 +379,16 @@ These routes start a new agent run and go through the same gate, with the same c
   minutes while it waits, upstream's missed-run rule applies. "Run now" fails with `Not run, no agent slot: ` and the reason and changes
   nothing; over MCP `run_scheduled_task_now` answers `slots_full`. A webhook delivery waits the
   same way and starts once when a slot is free; it ends without a run only if its task is paused,
-  deleted, replaced or its trigger changed while it waits (other edits are not seen: it runs with
-  the task as it was when it began to wait). Every waiting delivery is in the store, so a restart
-  keeps it and it runs once: a direct one (no coalescing window) is moved there when it is first
-  refused. A scheduled run or a webhook takes a slot only when no agent that waits for one holds
-  it; there is no order between routes, so on a host kept full it can wait long.
+  deleted, replaced or its trigger changed while it waits. A save while it waits (any other edit)
+  is seen at its next retry: it is never run on the task as it was before the save, and not
+  dropped. It stays stored, and the stored-delivery worker reads the task again, renders the
+  prompt again and waits again if no slot is free
+  ([#719](https://github.com/scuttletoby/t3code/issues/719)). Every waiting delivery is in the
+  store, so a restart keeps it and it runs once: a direct one (no coalescing window) is moved there
+  when it is first refused. If that store fails, the delivery waits in memory; a save then stores
+  it, and if the store fails again it ends without a run, saying why. A scheduled run or a webhook
+  takes a slot only when no agent that waits for one holds it; there is no order between routes,
+  so on a host kept full it can wait long.
 - A task bound to a thread whose run is active only queues its prompt there: no new run, so no slot
   and no wait. A bound thread that is idle starts a run and is gated, counted on the thread's
   current provider.
@@ -592,13 +597,14 @@ get more than the recorded profile, for example after the owner widened the proj
 is also refused when the task was saved from another machine, and when an agent made it and it has no
 entry (saved before this record, or the file was lost or an older copy put back). The owner saves
 the task once in the app to allow it; a task the owner made with no entry runs as before. A
-webhook delivery that waited for an agent slot is checked again as it starts; if the task was saved
-again while it waited, the delivery is not run (it was asked for the task as it was) and is lost,
-not run again on the new task ([#719](https://github.com/scuttletoby/t3code/issues/719)); the next
-delivery uses the task as it is now. A scheduled run or `run_scheduled_task_now` whose read a save
-overtook is refused the same way. A refused scheduled run is recorded as failed with the reason and
-moves on to its next time; a one-time task then has no next time, so after the owner's save it is
-run now or given a new time (the reason says so). A task whose row changed after its record (a save
+webhook delivery that waited for an agent slot is checked again as it starts. If the task was saved
+again while it waited, it is read again and checked on the task as saved
+([#719](https://github.com/scuttletoby/t3code/issues/719)): a save the record allows runs it, once,
+with the new prompt. A scheduled run or `run_scheduled_task_now` whose read a save overtook (a
+short window as it starts) is refused, saying so; the next run uses the task as it is now. A
+refused scheduled run is recorded as failed with the reason and moves on to its next time; a
+one-time task then has no next time, so after the owner's save it is run now or given a new time
+(the reason says so). A task whose row changed after its record (a save
 stopped half-way) is refused until it is saved again, and a record file that cannot be read refuses
 saves and runs that start a new thread until it is fixed or removed (the server log warns once while
 it stays so, and again if it breaks again after a good read). Runs into a bound thread keep that
@@ -612,6 +618,8 @@ made, or another thread binding the task to itself) is kept by that save and not
 it ([#719](https://github.com/scuttletoby/t3code/issues/719)): the first run's thread gets the
 project's profile the save was checked on, and a thread that binds the task to itself is one a
 narrowed thread can already send words to (`t3_thread_send`, as T3's own tools cannot be cut yet).
+A change that lets profiles cut T3's own tools (today `claudeMcpProfile.ts` refuses `t3Tools`
+other than `all`) must revisit this: then such a bind is a way to a wider run.
 An owner-made task that a narrowed thread changed runs as the owner's again if its entry is dropped
 from the file, which takes owner-level access to the state folder. Entries of deleted tasks are
 dropped at each start.
