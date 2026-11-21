@@ -83,6 +83,9 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   const pageReads: Array<{ environmentId: EnvironmentId; cursor: number }> = [];
   const sent: Array<{ threadId: ThreadId; messageId: string; text: string }> = [];
   const receipts = new Map<string, ThreadId>();
+  // Commands the thread refuses, and their refused receipts (never counted as sent).
+  const refusing = new Set<string>();
+  const refused = new Set<string>();
   // The agent slot gate, which lets every reminder through unless a test fills it.
   const slots = makeSlots();
   const page = (environmentId: EnvironmentId, cursor: number) => {
@@ -113,6 +116,8 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
     pageReads,
     sent,
     receipts,
+    refusing,
+    refused,
     slots,
     layer: Layer.mergeAll(
       ServerSettingsService.layerTest({ waitFor }),
@@ -132,18 +137,33 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
             ),
           ),
         sendToThread: (input) =>
-          Effect.sync(() => {
-            sent.push({ threadId: input.threadId, messageId: input.messageId!, text: input.text });
-            receipts.set(input.commandId, input.threadId);
-            return {} as never;
-          }),
+          refusing.has(input.commandId)
+            ? Effect.sync(() => refused.add(input.commandId)).pipe(
+                Effect.andThen(
+                  Effect.fail({
+                    _tag: "ThreadManagementCommandInvariantError",
+                    message: "refused",
+                  } as never),
+                ),
+              )
+            : Effect.sync(() => {
+                sent.push({
+                  threadId: input.threadId,
+                  messageId: input.messageId!,
+                  text: input.text,
+                });
+                receipts.set(input.commandId, input.threadId);
+                return {} as never;
+              }),
       }),
       Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
         getByCommandId: (commandId: CommandId) =>
           Effect.succeed(
             receipts.has(commandId)
               ? Option.some({ status: "accepted", threadId: receipts.get(commandId)! } as never)
-              : Option.none(),
+              : refused.has(commandId)
+                ? Option.some({ status: "rejected", threadId: PARENT, error: "refused" } as never)
+                : Option.none(),
           ),
       }),
       Layer.mock(DelegatedResultsStore.DelegatedResultsStore)({
@@ -210,6 +230,16 @@ const service = (world: ReturnType<typeof makeWorld>, options: Partial<typeof OP
   DelegatedOrphanScan.make({ ...OPTIONS, ...options }).pipe(Effect.provide(world.layer));
 
 const setClock = TestClock.setTime(NOW);
+
+const warningLogs = (into: Array<string>) =>
+  Logger.layer(
+    [
+      Logger.make(({ message, logLevel }) => {
+        if (logLevel === "Warn") into.push(JSON.stringify(message));
+      }),
+    ],
+    { mergeWithExisting: false },
+  );
 
 /** Lets forked fibers reach their next sleep (or finish) before the clock moves. */
 const settle = Effect.repeat(Effect.yieldNow, { times: 30 });
@@ -445,6 +475,32 @@ describe("DelegatedOrphanScan.scan", () => {
         (yield* scanned((yield* service(world, allPages)).scan())).parents.get(PARENT),
       ).toEqual({ type: "none" });
       expect(world.sent).toHaveLength(1);
+    }),
+  );
+
+  it.effect("warns of a refused message once, not on every pass; a new one warns again", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const warnings: Array<string> = [];
+      const lost1 = [{ environmentId: ENV_B, threadId: ThreadId.make("lost-1") }];
+      world.refusing.add(orphanBatchIds(PARENT, lost1).commandId);
+      const scan = yield* service(world);
+      const refusedOutcome = { type: "held", detail: "refused" };
+      const once = scanned(scan.scan()).pipe(Effect.provide(warningLogs(warnings)));
+      expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
+      // Runs again, and after a restart: answered from its refused receipt, no new warning.
+      expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
+      yield* scanned((yield* service(world)).scan()).pipe(Effect.provide(warningLogs(warnings)));
+      const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
+      expect(refusals()).toHaveLength(1);
+      expect(world.sent).toHaveLength(0);
+      // Another orphan there: a new message (new ids), refused too, warns once more.
+      world.there.set(ENV_B, [{ threadId: "lost-2" }, { threadId: "known-1" }]);
+      const lost2 = [{ environmentId: ENV_B, threadId: ThreadId.make("lost-2") }];
+      world.refusing.add(orphanBatchIds(PARENT, lost2).commandId);
+      expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
+      expect(refusals()).toHaveLength(2);
     }),
   );
 
