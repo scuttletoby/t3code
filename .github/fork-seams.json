@@ -252,7 +252,7 @@
       ]
     },
     "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
-      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706).",
+      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706). A save records the MCP profile of the thread that made it, and refuses a narrower thread's change that would let the task's runs get more than its own profile; a run that starts a new thread is refused when that thread would get more than the recorded profile (fork/scheduledTaskMcpProfile.ts, #699).",
       "added": [
         "import { makeScheduledRunSlots } from \"../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
         "const runSlots = yield* makeScheduledRunSlots(WebhookDeliverySkipped); // Fork: agent slots",
@@ -261,7 +261,13 @@
         "yield* slot.end(threadId); // Fork: the slot names the run's thread",
         "Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot",
         "runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "yield* runSlots.saving(task, existingTask); // Fork: the saving thread's MCP profile"
+        ]
+      }
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693).",
