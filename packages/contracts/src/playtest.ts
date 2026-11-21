@@ -31,8 +31,11 @@ export const isPlaytestProgramFullyQualified = (program: string, platform: strin
     ? /^[A-Za-z]:[\\/]/u.test(program) || /^[\\/]{2}/u.test(program)
     : program.startsWith("/");
 
-/** A full path on some OS. The settings do not know the server's OS; the server's save checks it. */
-const isAbsoluteProgram = (program: string): boolean =>
+/**
+ * A full path on some OS. The settings do not know the server's OS; the server's save checks it
+ * ({@link isPlaytestProgramFullyQualified}). Placement's `factsCommand` uses it too.
+ */
+export const isAbsoluteProgram = (program: string): boolean =>
   isPlaytestProgramFullyQualified(program, "linux") ||
   isPlaytestProgramFullyQualified(program, "win32");
 
