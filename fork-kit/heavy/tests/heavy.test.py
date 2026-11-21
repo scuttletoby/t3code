@@ -75,6 +75,19 @@ def read_line(p, timeout=60.0):
     return got[0]
 
 
+def wait_pid(pid, timeout=60.0):
+    """os.waitpid for a forked child with a time limit: its exit code, or (after KILL) a failure after the timeout."""
+    end = time.monotonic() + timeout
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return os.waitstatus_to_exitcode(status)
+        if time.monotonic() >= end:
+            os.kill(pid, signal.SIGKILL)
+            raise AssertionError(f'pid {pid} still running after {timeout:g} s')
+        time.sleep(0.01)
+
+
 def wait_for(cond, timeout=15.0, what='condition'):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -1043,6 +1056,25 @@ class Parts(unittest.TestCase):
         self.assertEqual(left, [c.pid])
         self.assertIsNone(c.poll())
 
+    def test_processes_that_end_a_moment_later_are_not_named_still_running(self):
+        # #767 nit: without pidfds and cgroup.kill heavy sends nothing itself, but systemd's failed stop may already
+        # have signalled the processes: heavy still looks for a moment (SETTLE), not the whole grace time
+        from unittest import mock
+        cg = '/heavy-test-0a1b2c3d.scope'
+        os.makedirs(self.dir + cg)                      # no cgroup.kill
+        self.mod.CGROUP_ROOTS = (self.dir,)
+        first = []
+
+        def pids(_cg):                                  # the process ends 0.2 s after heavy first looked
+            first.append(first[0] if first else time.monotonic())
+            return [] if time.monotonic() - first[0] >= 0.2 else [4194304]
+
+        start = time.monotonic()
+        with mock.patch.object(os, 'pidfd_open', None), mock.patch.object(self.mod, 'cgroup_pids', pids):
+            left = self.mod.stop_scope(shutil.which('false'), 'heavy-test-0a1b2c3d.scope', cg, 30)
+        self.assertEqual(left, [])
+        self.assertLess(time.monotonic() - start, 10)
+
     def foreign_folder(self):
         """A folder another user owns: '/' for a user that is not root; as root (CI) a temporary one given away."""
         if os.geteuid() != 0:
@@ -1068,9 +1100,19 @@ class Parts(unittest.TestCase):
         self.addCleanup(os.chdir, here)
         os.chdir(work)
 
-        def state(home, pw, euid=None):
+        me = os.getuid()
+
+        def as_root(real):
+            """os.stat or os.lstat as root sees this test's folders: this user's files read as root's."""
+            def look(path, *args, **kwargs):
+                st = real(path, *args, **kwargs)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0 if st.st_uid == me else
+                                       st.st_uid, st.st_gid, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            return look
+
+        def state(home, pw, euid=None, root=False):
             """(heavy's state notes folder, docker-label's base, heavy's base) for HOME=home (None: unset), a passwd
-            home pw (None: no entry) and maybe another effective uid."""
+            home pw (None: no entry) and maybe another effective uid, or root (mocked: nothing runs as root)."""
             env = {k: v for k, v in os.environ.items() if k != 'HOME'}
             if home is not None:
                 env['HOME'] = home
@@ -1079,8 +1121,11 @@ class Parts(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
                 stack.enter_context(mock.patch.object(pwd, 'getpwuid', **entry))
-                if euid is not None:
-                    stack.enter_context(mock.patch.multiple(os, getuid=lambda: euid, geteuid=lambda: euid))
+                if euid is not None or root:
+                    stack.enter_context(mock.patch.multiple(os, getuid=lambda: 0 if root else euid,
+                                                            geteuid=lambda: 0 if root else euid))
+                if root:
+                    stack.enter_context(mock.patch.multiple(os, stat=as_root(os.stat), lstat=as_root(os.lstat)))
                 return self.mod.state_marks_dir(), sweep.state_base(), self.mod.state_base()
 
         def labelled(home):
@@ -1115,6 +1160,27 @@ class Parts(unittest.TestCase):
                 self.assertEqual(state(home, None), ('', '', ''))
         self.assertEqual((os.listdir(work), os.listdir(os.path.join(work, 'rel'))), (['rel'], []),
                          'a folder was made in the working folder')
+        # #767 item 1: a home others can write is not used (this user's own, made 1777)
+        os.chmod(mine, 0o1777)
+        self.assertEqual(state(mine, pw_home)[:2], (labelled(pw_home), os.path.join(pw_home, '.local', 'state')))
+        self.assertFalse(os.path.exists(os.path.join(mine, '.local')))
+        os.chmod(mine, 0o700)
+        # as root: HOME=/tmp (root's, anyone can write it), where another user planted .local -> their own folder,
+        # and HOME=/: root's own home from the passwd database instead, and nothing made in the planted folder
+        tmp, victim, roots = (os.path.join(self.dir, n) for n in ('tmp', 'victim', 'root-home'))
+        for d in (tmp, victim, roots):
+            os.mkdir(d, 0o700)
+        os.chmod(tmp, 0o1777)
+        os.symlink(victim, os.path.join(tmp, '.local'))
+        for home in (tmp, '/'):
+            with self.subTest(root_HOME=home):
+                got = state(home, roots, root=True)
+                self.assertEqual(got, (labelled(roots),) + (os.path.join(roots, '.local', 'state'),) * 2)
+        # a home only root can write, with .local planted as a link: never followed, so no second folder
+        shutil.rmtree(os.path.join(roots, '.local'))
+        os.symlink(victim, os.path.join(roots, '.local'))
+        self.assertEqual(state(roots, None, root=True)[0], '')
+        self.assertEqual(os.listdir(victim), [], 'root made folders through a planted .local link')
         # docker-label with no such home: one reason, no note anywhere
         sweep.RUNTIME_ROOT = os.path.join(self.dir, 'no-run')
         with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != 'HOME'}, clear=True), \
@@ -1140,13 +1206,13 @@ class Parts(unittest.TestCase):
                                 setup()
                             finally:
                                 os._exit(0)
-                        code = os.waitstatus_to_exitcode(os.waitpid(g, 0)[1]) & 0xff
+                        code = wait_pid(g) & 0xff
                     else:
                         setup()
                         code = 0
                 finally:
                     os._exit(code)
-            return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+            return wait_pid(pid)
 
         self.assertEqual(run(grandchild=False), 0)
         self.assertEqual(run(grandchild=True), 127)
@@ -1183,6 +1249,7 @@ class Parts(unittest.TestCase):
         base = os.path.join(root, str(os.getuid()))
         os.makedirs(base, 0o700)
         state_root = os.path.join(self.dir, 'home', '.local', 'state')           # missing: heavy makes it
+        os.mkdir(os.path.join(self.dir, 'home'), 0o700)                          # (in a home that is there)
         self.mod.RUNTIME_ROOT = sweep.RUNTIME_ROOT = root
         self.mod.STATE_ROOT = sweep.STATE_ROOT = state_root
         unit = 'heavy-sh-0a1b2c3d.scope'
@@ -1231,25 +1298,40 @@ class Parts(unittest.TestCase):
 
 
 UNTIMED_CALLS = ('run', 'check_output', 'check_call', 'call')
+NEVER_TIMED = ('getoutput', 'getstatusoutput')          # subprocess calls that take no timeout at all
 PIPES = ('stdout', 'stderr')
+READS = ('read', 'readline', 'readlines')
+# calls that read a pipe they are given to its end (or until a line comes)
+DRAINS = ('list', 'tuple', 'set', 'frozenset', 'sorted', 'iter', 'next', 'enumerate', 'zip', 'map', 'filter',
+          'dict', 'any', 'all', 'sum', 'min', 'max')
 
 
 def untimed(source, name):
-    """Every wait for a test process in source that has no time limit (#744 item 7, #761 item 3): subprocess.run and
-    friends without timeout= (also passed on uncalled, as to addCleanup, or imported bare), wait() without a time,
-    communicate() without timeout= (its first positional argument is the input, not the time), and any read of or
-    loop over a process's stdout or stderr outside read_line."""
+    """The waits for a test process in source that have no time limit (#744 item 7, #761 item 3, #767 item 2), in
+    the forms Hygiene.test_the_check_finds_each_listed_form lists (a form it does not list may get through):
+    subprocess.run and friends without timeout= (also passed on uncalled, as to addCleanup, imported bare, or through
+    `import subprocess as sp`), getoutput and getstatusoutput (no timeout at all), wait() without a time,
+    communicate() without timeout= (its first positional argument is the input, not the time), a bound wait or
+    communicate passed on uncalled without timeout=, os.waitpid or os.wait4 without WNOHANG, and outside read_line
+    any read of a process's stdout or stderr (called, or passed on uncalled as to iter), a loop over one, or one
+    given to list/next/enumerate/map/join and the like."""
     import ast
     tree = ast.parse(source)
     helpers = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'read_line']
     inside = {id(x) for h in helpers for x in ast.walk(h)}
+    modules = {'subprocess'} | {a.asname for n in ast.walk(tree) if isinstance(n, ast.Import)
+                                for a in n.names if a.name == 'subprocess' and a.asname}
 
     def is_pipe(n):
         return isinstance(n, ast.Attribute) and n.attr in PIPES
 
-    def is_untimed_fn(n):
-        return (isinstance(n, ast.Attribute) and n.attr in UNTIMED_CALLS and isinstance(n.value, ast.Name)
-                and n.value.id == 'subprocess')
+    def of_subprocess(n, names):
+        return (isinstance(n, ast.Attribute) and n.attr in names and isinstance(n.value, ast.Name)
+                and n.value.id in modules)
+
+    def names_wnohang(n):
+        return any(isinstance(x, (ast.Name, ast.Attribute)) and getattr(x, 'id', getattr(x, 'attr', '')) == 'WNOHANG'
+                   for x in ast.walk(n))
 
     found = []
     for n in ast.walk(tree):
@@ -1257,29 +1339,38 @@ def untimed(source, name):
             continue
         if isinstance(n, ast.ImportFrom) and n.module == 'subprocess':
             found += [f'{name}:{n.lineno} from subprocess import {a.name}' for a in n.names
-                      if a.name in UNTIMED_CALLS]
+                      if a.name in UNTIMED_CALLS + NEVER_TIMED]
         elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)) and is_pipe(n.iter):
             found.append(f'{name}:{getattr(n, "lineno", n.iter.lineno)} loop over .{n.iter.attr} (use read_line)')
+        elif isinstance(n, ast.Attribute) and n.attr in READS and is_pipe(n.value):
+            found.append(f'{name}:{n.lineno} {n.value.attr}.{n.attr} (use read_line)')     # called or passed on
         if not isinstance(n, ast.Call):
             continue
         timed = any(k.arg == 'timeout' for k in n.keywords)
-        for arg in n.args:          # addCleanup(subprocess.run, ...): the call happens later, with these keywords
-            if is_untimed_fn(arg) and not timed:
+        for i, arg in enumerate(n.args):    # addCleanup(subprocess.run, ...): called later with the rest
+            rest = len(n.args) - i - 1
+            if of_subprocess(arg, NEVER_TIMED) or (of_subprocess(arg, UNTIMED_CALLS) and not timed):
                 found.append(f'{name}:{n.lineno} subprocess.{arg.attr} passed on without a timeout')
-        if isinstance(n.func, ast.Name) and n.func.id in ('list', 'tuple', 'set', 'sorted', 'iter', 'next') and \
-                n.args and is_pipe(n.args[0]):
-            found.append(f'{name}:{n.lineno} {n.func.id}(.{n.args[0].attr}) (use read_line)')
+            elif (isinstance(arg, ast.Attribute) and not timed
+                  and ((arg.attr == 'wait' and rest < 1) or (arg.attr == 'communicate' and rest < 2))):
+                found.append(f'{name}:{n.lineno} .{arg.attr} passed on without a timeout')
+        drains = ((isinstance(n.func, ast.Name) and n.func.id in DRAINS)
+                  or (isinstance(n.func, ast.Attribute) and n.func.attr == 'join'))
+        if drains and any(is_pipe(a) for a in n.args):
+            what = n.func.id if isinstance(n.func, ast.Name) else 'join'
+            found.append(f'{name}:{n.lineno} {what}() over a pipe (use read_line)')
         if not isinstance(n.func, ast.Attribute):
             continue
-        a, base = n.func.attr, n.func.value
-        if is_untimed_fn(n.func) and not timed:
+        a = n.func.attr
+        if of_subprocess(n.func, NEVER_TIMED) or (of_subprocess(n.func, UNTIMED_CALLS) and not timed):
             found.append(f'{name}:{n.lineno} subprocess.{a}')
         elif a == 'wait' and not n.args and not timed:
             found.append(f'{name}:{n.lineno} wait()')
         elif a == 'communicate' and len(n.args) < 2 and not timed:
             found.append(f'{name}:{n.lineno} communicate() without timeout=')
-        elif a in ('read', 'readline', 'readlines') and is_pipe(base):
-            found.append(f'{name}:{n.lineno} {base.attr}.{a}() (use read_line)')
+        elif (a in ('waitpid', 'wait4') and isinstance(n.func.value, ast.Name) and n.func.value.id == 'os'
+              and not (len(n.args) > 1 and names_wnohang(n.args[1]))):
+            found.append(f'{name}:{n.lineno} os.{a} without WNOHANG (use wait_pid)')
     return found
 
 
@@ -1296,8 +1387,9 @@ class Hygiene(unittest.TestCase):
                 found += untimed(f.read(), name)
         self.assertEqual(found, [])
 
-    def test_the_check_finds_every_form(self):
-        # #761 item 3: each of these hangs on a silent process; each timed form passes
+    def test_the_check_finds_each_listed_form(self):
+        # #761 item 3, #767 item 2: each of these hangs on a silent process; each timed form passes. The check
+        # promises these forms only (untimed's docstring), not every way Python can wait
         cases = {
             'p.wait()': 1, 'p.wait(5)': 0, 'p.wait(timeout=5)': 0,
             'p.communicate()': 1, "p.communicate('x')": 1, "p.communicate('x', 5)": 0, 'p.communicate(timeout=5)': 0,
@@ -1310,6 +1402,16 @@ class Hygiene(unittest.TestCase):
             'for line in p.stdout: pass': 1, 'for line in p.stderr: pass': 1, '[x for x in p.stdout]': 1,
             'list(p.stderr)': 1, 'next(p.stdout)': 1,
             'p.stdout.close()': 0, 'f.read()': 0,
+            "for line in iter(p.stdout.readline, ''): pass": 1, 'enumerate(p.stdout)': 1,
+            'list(map(str.strip, p.stdout))': 1, 'zip(p.stdout, x)': 1, 'filter(None, p.stderr)': 1,
+            "''.join(p.stdout)": 1, "'-'.join(x)": 0,
+            "import subprocess as sp\nsp.run(['x'])": 1, "import subprocess as sp\nsp.run(['x'], timeout=5)": 0,
+            "subprocess.getoutput('x')": 1, "subprocess.getstatusoutput('x')": 1, 'from subprocess import getoutput': 1,
+            "self.addCleanup(subprocess.getoutput, 'x')": 1,
+            'os.waitpid(pid, 0)': 1, 'os.wait4(pid, 0)': 1, 'os.waitpid(pid, os.WNOHANG)': 0,
+            'self.addCleanup(p.wait)': 1, 'self.addCleanup(p.communicate)': 1, 'self.addCleanup(p.wait, 5)': 0,
+            'self.addCleanup(p.wait, timeout=5)': 0, 'self.addCleanup(p.communicate, None, 5)': 0,
+            'self.addCleanup(p.stdout.close)': 0,
             'def read_line(p):\n    return p.stdout.readline()': 0,
         }
         for text, want in cases.items():
