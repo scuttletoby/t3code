@@ -20,8 +20,10 @@ agent user                 ghrun (sudo, one fixed command)           ghkeys (sud
                             the token out of the output
 ```
 
-- **The agent** runs `gh-as [--repo OWNER/NAME | --app NAME] gh <command>`. Without `--repo` the wrapper reads
-  the `origin` remote with `/usr/bin/git` (never a `git` found in `PATH`). A file flag (`-F body.md`,
+- **The agent** runs `gh-as [--repo OWNER/NAME | --app NAME] gh <command>` (also `--repo=…`, `--app=…`, and
+  `gh-as NAME -- gh <command>`, the form of the older per-user gh-as; `gh-as --help`). Without `--repo` the wrapper
+  reads the `origin` remote with `/usr/bin/git` (never a `git` found in `PATH`). gh always gets the App's own
+  repository; a `GH_REPO` in the agent's environment that names another one is refused, not silently replaced. A file flag (`-F body.md`,
   `--body-file`, `--input`, `-F key=@file`) is opened by the wrapper **as the agent**, so only files the agent
   could read anyway can be sent; gh then reads them from stdin.
 - **ghrun** runs the privileged `gh-as` and `gh`. It refuses every file path (only stdin), every command that is

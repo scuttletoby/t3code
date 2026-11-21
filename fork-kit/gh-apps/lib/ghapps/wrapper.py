@@ -4,8 +4,13 @@ PATH), picks the app set up for it, and reads any file a gh flag names (as the a
 starts the privileged gh-as through sudo, which checks everything again.
 
   gh-as [--repo OWNER/NAME | --app NAME] [--] gh <command> ...
+  gh-as NAME -- gh <command> ...      the same as --app NAME (the form of the older per-user gh-as)
   gh-as --list          the apps set up on this machine
   gh-as --self-check    checks the installed files against the install record
+  gh-as --help          this text
+
+--repo=OWNER/NAME and --app=NAME work too. A GH_REPO in the caller's environment never reaches gh (gh always gets
+the app's repository), so one that names another repository is refused rather than silently ignored.
 """
 import os, stat, subprocess, sys
 
@@ -14,7 +19,8 @@ from .common import Refused
 
 FILE_LIMIT = 25 * 1024 * 1024
 USAGE = ('usage: gh-as [--repo OWNER/NAME | --app NAME] [--] gh <command> ...\n'
-         '       gh-as --list | --self-check')
+         '       gh-as NAME -- gh <command> ...\n'
+         '       gh-as --list | --self-check | --help')
 
 
 def note(msg):
@@ -91,6 +97,49 @@ def list_apps():
     return 0
 
 
+class Usage(Exception):
+    pass
+
+
+def split_selector(args):
+    """The words before the gh command -> (repo, app name, the rest starting at gh). Raises Usage.
+    --repo X, --repo=X, --app X, --app=X, or a bare app name followed by -- (gh-as NAME -- gh ...); each at most once,
+    and never --repo and an app together."""
+    repo = app = None
+    args = list(args)
+    while args:
+        a = args[0]
+        if a in ('--repo', '--app') and len(args) > 1:
+            flag, value, args = a, args[1], args[2:]
+        elif a.startswith(('--repo=', '--app=')):
+            flag, _, value = a.partition('=')
+            args = args[1:]
+        elif a not in ('gh', '--') and not a.startswith('-') and args[1:2] == ['--']:
+            flag, value, args = '--app', a, args[1:]
+        else:
+            break
+        if not value or (repo if flag == '--repo' else app) is not None:
+            raise Usage()
+        if flag == '--repo':
+            repo = value
+        else:
+            app = value
+    if args[:1] == ['--']:
+        args = args[1:]
+    if not args or args[0] != 'gh' or (repo and app):
+        raise Usage()
+    return repo, app, args[1:]
+
+
+def check_env_repo(app):
+    """gh-as gives gh the app's repository as GH_REPO. A caller's own GH_REPO that names another one means the
+    caller expects gh to work there: refused, never silently swapped (an empty one counts as unset, as in gh)."""
+    named = os.environ.get('GH_REPO', '')
+    if named and (c.norm_repo(named) or '').lower() != app['repo'].lower():
+        raise Refused(f'GH_REPO={named[:120]!r} is not {app["repo"]}, the only repository app {app["name"]} may use: '
+                      'unset GH_REPO or pick its app with --repo')
+
+
 def main(argv):
     args = list(argv)
     if args in (['--list'], ['--self-check']):
@@ -98,26 +147,20 @@ def main(argv):
             return list_apps()
         from . import install
         return install.self_check_main()
-    repo = app_name = None
+    if args in (['--help'], ['-h']):
+        print(__doc__.strip() + '\n\n' + USAGE)
+        return 0
     try:
-        while args and args[0] in ('--repo', '--app'):
-            if len(args) < 2:
-                break
-            if args[0] == '--repo':
-                repo = args[1]
-            else:
-                app_name = args[1]
-            args = args[2:]
-        if args[:1] == ['--']:
-            args = args[1:]
-        if not args or args[0] != 'gh' or (repo and app_name):
+        try:
+            repo, app_name, args = split_selector(args)
+        except Usage:
             print(USAGE, file=sys.stderr)
             return 2
-        args = args[1:]
         if app_name:
             app = c.load_app(app_name)
         else:
             app = c.app_for_repo(repo or origin_repo(os.getcwd()))
+        check_env_repo(app)
         c.require_only_app(app)   # gh-as checks it again; refused here first, with the same words
         parsed = policy.parse(args, app['repo'], 'wrapper')
         fd = None
