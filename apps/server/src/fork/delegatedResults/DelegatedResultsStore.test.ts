@@ -1,19 +1,25 @@
 /**
  * Fork (issue 625): the reminder's own reads over the real schema. The state question: rows from
  * before delivery states (no state), settled and running rows, rows older than the window, a
- * provider's own subagent, an empty table, and a send whose message row is missing but whose
- * receipt was kept (or the other way round).
+ * provider's own subagent, an empty table, a send whose message row is missing but whose
+ * receipt was kept (or the other way round), and old or broken message rows (issue 741).
  */
 import { assert, it } from "@effect/vitest";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, NodeId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import { legacyReminderKeys, reminderKey } from "./delegatedResults.ts";
+import { firstFormatReminder, reminderMessageEvent } from "./delegatedResults.testkit.ts";
 import * as DelegatedResultsStore from "./DelegatedResultsStore.ts";
 
-const layer = DelegatedResultsStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory));
+// Upstream's projection writes the message rows, as on a server.
+const layer = Layer.mergeAll(DelegatedResultsStore.layer, ProjectionStore.layer).pipe(
+  Layer.provideMerge(SqlitePersistence.layerMemory),
+);
 
 const SINCE = "2026-11-19T12:00:00.000Z";
 const RECENT = "2026-11-20T11:59:00.000Z";
@@ -147,6 +153,48 @@ it.layer(layer)("DelegatedResultsStore", (it) => {
         "delegated-orphan:p-sent:aaaaaaaaaaaa:0",
         "delegated-orphan:p-sent:bbbbbbbbbbbb:0",
       ]);
+    }),
+  );
+
+  it.effect("reads a first-format reminder's text back from the real message table", () =>
+    Effect.gen(function* () {
+      const parent = ThreadId.make("p-texts");
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* DelegatedResultsStore.DelegatedResultsStore;
+      // Written by upstream's projection, as the old server's send wrote it.
+      const old = firstFormatReminder(parent, ["a", "b"]);
+      yield* projections.apply(reminderMessageEvent(parent, old.messageId, old.text));
+      // Rows whose payload has no text string: an old payload, a text not a string. (A payload
+      // that is not JSON never gets in: the table's search triggers refuse it.)
+      const raw = (id: string, payload: string) => sql`
+        INSERT INTO orchestration_v2_projection_messages (
+          message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json
+        ) VALUES (${id}, ${parent}, NULL, NULL, 'user', 0, ${RECENT}, ${RECENT}, ${payload})
+      `;
+      yield* raw("m-obsolete", '{"obsolete":"transcript"}');
+      yield* raw("m-number", '{"text":42}');
+      // Another thread's message is never read under this thread.
+      const elsewhere = firstFormatReminder(ThreadId.make("p-elsewhere"), ["c"]);
+      yield* projections.apply(
+        reminderMessageEvent(ThreadId.make("p-elsewhere"), elsewhere.messageId, elsewhere.text),
+      );
+      const texts = yield* store.messageTexts(parent, [
+        old.messageId,
+        old.messageId,
+        "m-obsolete",
+        "m-number",
+        elsewhere.messageId,
+        "m-missing",
+      ]);
+      // Each row alone: the broken ones are left out, the readable one still counts.
+      assert.deepStrictEqual(texts, new Map([[old.messageId, old.text]]));
+      // The text upstream wrote reads back exactly, so it splits into its tasks.
+      assert.deepStrictEqual(
+        legacyReminderKeys(parent, old.messageId, texts!.get(old.messageId)!),
+        [reminderKey(NodeId.make("a")), reminderKey(NodeId.make("b"))],
+      );
+      assert.deepStrictEqual(yield* store.messageTexts(parent, []), new Map());
     }),
   );
 });
