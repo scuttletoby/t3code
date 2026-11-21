@@ -38,6 +38,15 @@ const methodBody = (source: string, method: string) => {
 
 const count = (text: string, needle: string) => text.split(needle).length - 1;
 
+/** The remote task read, a `const` beside the methods: to the next one. */
+const remoteReadBody = (source: string) => {
+  const start = source.indexOf(
+    'const readRemoteTask = Effect.fn("OrchestratorMcpService.readRemoteTask")',
+  );
+  assert.isAtLeast(start, 0, "readRemoteTask not found in OrchestratorMcpService.ts");
+  return source.slice(start, source.indexOf("Effect.fn(", start + 40));
+};
+
 describe("fork delegation checks: upstream seat calls", () => {
   const source = NodeFS.readFileSync(UPSTREAM_FILE, "utf8");
 
@@ -46,7 +55,7 @@ describe("fork delegation checks: upstream seat calls", () => {
     assert.strictEqual(count(source, "DelegateChecks.make("), 1);
   });
 
-  it("delegate_task calls seat 1 and seat 2 once each, and create_threads its seat once", () => {
+  it("delegate_task calls seat 1 and seat 2 once each, create_threads its seat, the remote read its own", () => {
     const delegateTask = methodBody(source, "delegateTask");
     const createThreads = methodBody(source, "createThreads");
     const seats = {
@@ -55,6 +64,8 @@ describe("fork delegation checks: upstream seat calls", () => {
       beforeCreateThread: [createThreads, 1],
       // The remote path has no seat: it takes its target's own options through the same rule.
       remoteTarget: [delegateTask, 1],
+      // A remote task's status reads its prompts there, over upstream's fixed false/null.
+      remotePrompts: [remoteReadBody(source), 1],
     } as const;
     for (const [seat, [body, expected]] of Object.entries(seats)) {
       assert.strictEqual(count(body, `delegateChecks.${seat}(`), expected, `seat ${seat}`);
@@ -92,8 +103,9 @@ describe("fork delegation checks: upstream seat calls", () => {
 
   it("the fork lines in the upstream file stay pinned", () => {
     // A new fork line here goes through fork/delegateChecks.ts. If one truly must sit in the
-    // upstream file, raise this number and say why in the PR.
-    assert.strictEqual(count(source, "// Fork:"), 6);
+    // upstream file, raise this number and say why in the PR. 7: the remote read's spread line
+    // (fork/remoteTaskPrompts.ts) carries its marker on the same line, so no line was added.
+    assert.strictEqual(count(source, "// Fork:"), 7);
   });
 });
 
