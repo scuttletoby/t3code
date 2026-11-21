@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  aliasModelPolicyRows,
   modelPolicyAllowText,
   modelPolicyEditorText,
   modelPolicyStartsFromStartRows,
@@ -95,6 +96,41 @@ describe("unknownModelPolicyDrivers", () => {
 
   it("flags nothing when no provider is known (a disconnected environment)", () => {
     expect(unknownModelPolicyDrivers(rows, new Set())).toEqual([]);
+  });
+});
+
+describe("aliasModelPolicyRows (#127)", () => {
+  const rows = fromFile({
+    modelPolicy: {
+      mode: "enforce",
+      allow: [
+        { driver: "claudeAgent", model: "opus", efforts: ["high"] },
+        { driver: "claudeAgent", model: "claude-opus-5-5", efforts: ["high"] },
+        { driver: "codex", model: "opus" },
+        { driver: "claudeAgent", model: "Fable" },
+      ],
+    },
+  }).modelPolicy.allow;
+  const claude = {
+    driver: "claudeAgent",
+    models: [{ slug: "claude-opus-5-5", aliases: ["opus"] }],
+    // A folder's own list counts too.
+    workspaceSnapshots: [{ models: [{ slug: "claude-fable-5-2", aliases: ["fable"] }] }],
+  };
+
+  it("names each row whose model is an alias in its own driver's lists, with the model", () => {
+    expect(aliasModelPolicyRows(rows, [claude, { driver: "codex", models: [] }])).toEqual([
+      { row: rows[0], aliasOf: ["claude-opus-5-5"] },
+      { row: rows[3], aliasOf: ["claude-fable-5-2"] },
+    ]);
+    // Runs again: the same answer.
+    expect(aliasModelPolicyRows(rows, [claude])).toEqual(aliasModelPolicyRows(rows, [claude]));
+  });
+
+  it("flags nothing for a full id, or with no provider of the driver known", () => {
+    expect(aliasModelPolicyRows([rows[1]!], [claude])).toEqual([]);
+    expect(aliasModelPolicyRows(rows, [])).toEqual([]);
+    expect(aliasModelPolicyRows(rows, [{ driver: "claudeAgent" }])).toEqual([]);
   });
 });
 

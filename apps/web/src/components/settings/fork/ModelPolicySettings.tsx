@@ -32,6 +32,7 @@ import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
 import { ForkRow, useSelectedProviders } from "./ForkRow";
 import {
+  aliasModelPolicyRows,
   MODEL_POLICY_MODE_OPTIONS,
   modelPolicyEditorText,
   modelPolicyRowLine,
@@ -240,6 +241,9 @@ export function ModelPolicySettings() {
   const unknownDrivers = new Set(
     unknownModelPolicyDrivers(shown.allow, new Set(providers.map((provider) => provider.driver))),
   );
+  const aliasRows = new Map(
+    aliasModelPolicyRows(shown.allow, providers).map(({ row, aliasOf }) => [row, aliasOf]),
+  );
   const marks = personModelPickMarks(shown, picks, providers);
   const byDriver = new Map<string, Array<ModelPolicy["allow"][number]>>();
   for (const row of shown.allow)
@@ -315,9 +319,21 @@ export function ModelPolicySettings() {
                       picks are refused.
                     </span>
                   ) : null}
-                  {rows.map((row) => (
-                    <code key={JSON.stringify(row)}>{modelPolicyRowLine(row)}</code>
-                  ))}
+                  {rows.map((row) => {
+                    const aliasOf = aliasRows.get(row);
+                    return (
+                      <span key={JSON.stringify(row)} className="grid gap-0.5">
+                        <code>{modelPolicyRowLine(row)}</code>
+                        {aliasOf === undefined ? null : (
+                          <span role="note" className="text-destructive-foreground">
+                            {row.model} is an alias of {aliasOf.join(" or ")}; name the full id. A
+                            row naming an alias follows it when a provider moves it to a new model,
+                            and does not allow a pick of the full id.
+                          </span>
+                        )}
+                      </span>
+                    );
+                  })}
                 </dd>
               </div>
             ))}

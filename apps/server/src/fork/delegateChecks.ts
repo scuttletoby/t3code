@@ -590,9 +590,15 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         : Effect.map(ownOptionsOn, (on) => (on ? remoteTarget(target) : target))
       ).pipe(
         // The linked machine's driver is not known here (a driverKind the call names is the agent's
-        // claim, not read): every row naming the model must allow it.
+        // claim, not read): every row naming the model must allow it. This machine's catalog names
+        // the model's own reasoning control, when it has the model.
         Effect.tap((sent) =>
-          checkPick("delegate_task", Effect.succeed(ModelPolicyCheck.pickOfRemoteTarget(sent))),
+          checkPick(
+            "delegate_task",
+            Effect.map(providerRegistry.getProviders, (providers) =>
+              ModelPolicyCheck.pickOfRemoteTarget(providers, sent),
+            ),
+          ),
         ),
       ),
   };

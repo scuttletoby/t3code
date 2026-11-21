@@ -4,6 +4,8 @@ import {
   checkModelPolicyPick,
   MODEL_POLICY_START_ROWS,
   type ModelPolicy,
+  modelPolicyAliasTargets,
+  type ModelPolicyListedModel,
   type ModelPolicyMode,
   ModelPolicyPatch,
   type ModelPolicyRow,
@@ -92,6 +94,41 @@ export function unknownModelPolicyDrivers(
 ): ReadonlyArray<string> {
   if (knownDrivers.size === 0) return [];
   return [...new Set(rows.map((row) => row.driver))].filter((driver) => !knownDrivers.has(driver));
+}
+
+/** A provider as the alias check reads it: its driver and the model lists it has. */
+export interface ModelPolicyAliasProvider {
+  readonly driver: string;
+  readonly models?: ReadonlyArray<ModelPolicyListedModel> | undefined;
+  readonly workspaceSnapshots?:
+    | ReadonlyArray<{ readonly models?: ReadonlyArray<ModelPolicyListedModel> | undefined }>
+    | undefined;
+}
+
+/**
+ * Each row whose model is an alias in its driver's model lists here, with the models the alias
+ * names (`opus` for `claude-opus-5-5`). The driver resolves an alias through the catalog, so such a
+ * row follows the alias when a provider moves it to a new model; the server reads a pick as named,
+ * so the row also misses a pick of the full id. Empty when no provider of the driver is known.
+ */
+export function aliasModelPolicyRows(
+  rows: ReadonlyArray<ModelPolicyRow>,
+  providers: ReadonlyArray<ModelPolicyAliasProvider>,
+): ReadonlyArray<{ readonly row: ModelPolicyRow; readonly aliasOf: ReadonlyArray<string> }> {
+  return rows.flatMap((row) => {
+    const lists = providers.flatMap((provider) =>
+      provider.driver !== row.driver
+        ? []
+        : [
+            provider.models ?? [],
+            ...(provider.workspaceSnapshots ?? []).flatMap((snapshot) =>
+              snapshot.models === undefined ? [] : [snapshot.models],
+            ),
+          ],
+    );
+    const aliasOf = modelPolicyAliasTargets(lists, row.model);
+    return aliasOf.length === 0 ? [] : [{ row, aliasOf }];
+  });
 }
 
 /** One allowed row as one line. */
