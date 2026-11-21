@@ -55,6 +55,8 @@ jobs:
       config: .github/pr-queue.json
       check-name: CHECK_NAME
       # In shadow (or with no review block) these names decide. In enforce the config's path rules name the lenses and
-      # these are required as well; empty this only after the base's config is in enforce.
+      # these are required as well; empty this only after the base's config is in enforce. Empty, it is no floor: a
+      # change only zero-lens rules match (`**/*.md` in review.recommended.json, AGENTS.md too) merges with no lens
+      # (the guide, step 5).
       required-lenses: | # one lens name per line; none = the gate refuses, unless the config's review block is in enforce
         LENS_NAME
