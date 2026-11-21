@@ -20,7 +20,7 @@ import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
 import { type LineageThread, makeThreadMcpProfiles } from "./claudeMcpProfile.ts";
 import { readForkFeatures } from "./forkFeatures.ts";
-import { MCP_PROFILE_DRIVERS, carryMcpProfile, isEveryMcpTool } from "./mcpProfile.ts";
+import { MCP_PROFILE_REMOTE_DRIVERS, carryMcpProfile, isEveryMcpTool } from "./mcpProfile.ts";
 
 /** `orchestrator_capabilities` there, as peer/RemoteDelegation.ts describes it: its providers. */
 const RemoteCapabilitiesTool = Tool.make("orchestrator_capabilities", {
@@ -113,7 +113,7 @@ export const makeCarry = Effect.fn("RemoteMcpProfile.makeCarry")(function* (
       (yield* forwarding.call(scope, RemoteCapabilitiesTool, environmentId, {})).providers.find(
         (provider) => provider.providerInstanceId === instanceId,
       )?.driverKind;
-    if (driverKind === undefined || !MCP_PROFILE_DRIVERS.has(driverKind)) {
+    if (driverKind === undefined || !MCP_PROFILE_REMOTE_DRIVERS.has(driverKind)) {
       return yield* new OrchestratorMcpFailure({
         code: "capability_denied",
         message: `${

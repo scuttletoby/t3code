@@ -174,12 +174,22 @@ const PROFILE_FIELDS: ReadonlySet<string> = new Set(["servers", "t3Tools"]);
 const CARRIED_FIELDS: ReadonlySet<string> = new Set(["name", ...PROFILE_FIELDS]);
 
 /**
- * The drivers whose threads apply an MCP profile: Claude only (fork/claudeMcpProfile.ts). Any
- * other provider would give a thread every MCP server and T3 tool, so a turn there whose profile
- * is narrower than `all` is refused as it starts (fork/mcpProfileTurnCheck.ts), and a delegation
- * refuses to send a narrower profile to one on another machine (fork/remoteMcpProfile.ts).
+ * The drivers whose threads apply an MCP profile: Claude (fork/claudeMcpProfile.ts) and Codex
+ * (fork/codexMcpProfile.ts). Any other provider would give a thread every MCP server and T3 tool,
+ * so a turn there whose profile is narrower than `all` is refused as it starts
+ * (fork/mcpProfileTurnCheck.ts).
  */
 export const MCP_PROFILE_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set([
+  ProviderDriverKind.make("claudeAgent"),
+  ProviderDriverKind.make("codex"),
+]);
+
+/**
+ * The drivers a delegation sends a narrower profile to on another machine
+ * (fork/remoteMcpProfile.ts): Claude only, since a machine that carries profiles may run a T3
+ * from before Codex applied them.
+ */
+export const MCP_PROFILE_REMOTE_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set([
   ProviderDriverKind.make("claudeAgent"),
 ]);
 
