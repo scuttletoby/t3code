@@ -184,6 +184,13 @@ land), the parent gets one queued message naming those tasks. A result counts as
 owed, and also when it has no delivery state at all: an old row, or a `mode: "wait"` task whose
 acknowledgement failed. Each task is reminded once, also across restarts and when another result
 becomes owed later (the later message names only the new task); a message names at most ten tasks.
+A message the thread refuses holds back only its own tasks (until the set changes); the other
+messages of that check are still sent. The refusal is logged once, when it happens, not on each
+later check. A reminder sent before per-task ids (one id for the whole set) is split into its tasks
+from its text, so after an upgrade a task it named is not reminded again; only tasks past the first
+ten of such a message, which it never named, may be reminded once more. Such a message whose text
+cannot be read is left out alone: its tasks may be reminded once more, and the parent's other
+reminders still go. The check at start and a check after an event never run at once for one parent.
 It never goes to a stopped or archived thread, and never for results older than a day. A parent is busy, and
 waits for its own run end, while a run of it goes or a question of it is open (an open question
 holds the reminder until that run ends); background work it left running does not hold it. At
@@ -419,12 +426,18 @@ These routes start a new agent run and go through the same gate, with the same c
   (`wait_cancel` stops `waiting` waits only), so a wake-up that waits for a slot is sent once a
   slot frees. A wake-up keeps the thread's own held slot (from a `slot` wait) for the agent it
   wakes up to start, and every other thread's held slot whose wake-up is still to come counts that
-  wake-up as an agent of its own, so slot waits met in one sweep are each woken.
+  wake-up as an agent of its own, so slot waits met in one sweep are each woken. That held slot
+  lives in the gate's memory only: a wake-up that itself waits for a slot keeps it for
+  `reserveSeconds` at most, and a restart drops it, so that wake-up then asks like any other start
+  (late, never over the limit). A receiver found stopped frees its held slot at once.
 - The fork's delegated-result reminder and its orphan scan (a parent that is idle and still owed a
   child's result is sent one reminder) take a slot the same way. Refused, nothing is sent: the
   reminder is asked again every 5 s, however long it takes, and a refusal is not counted as a
   failed try (logged once). Its message and command ids are fixed per result, so a restart's
-  startup scan finds the result still owed, waits again and sends it once.
+  startup scan finds the result still owed, waits again and sends it once. An orphan scan parent
+  that cannot be read is asked again every 10 minutes, logged once, at most as many times in a row
+  as the scan's own attempts, then left to the next start. Once a waiting parent's reminder goes,
+  its linked threads are listed again, so an orphan that showed meanwhile is named too.
 - Upstream's pull request watch wake-ups (checks passed or failed, a review, merged or closed,
   "stopped watching") into a thread that shows no run take a slot the same way
   (`apps/server/src/fork/pullRequestWatchSlot.ts`). Refused, the update fails and nothing is
@@ -432,7 +445,11 @@ These routes start a new agent run and go through the same gate, with the same c
   2 minutes), finds the same news against the stored watch and sends it then, once. A restart
   finds it again from the stored watch. A watch that ends because its pull request cannot be read
   keeps its "stopped watching" wake-up the same way, and is not ended without it. Into a thread
-  that shows a run a wake-up only queues: no slot.
+  that shows a run a wake-up only queues: no slot. While a wake-up waits, upstream's reactor logs a
+  warning and reads the pull request in full (its details and activity) on every sweep, so a host
+  kept full with several watched pull requests spends GitHub API calls and log lines every 2
+  minutes per watch until a slot frees. A watch that no refusal renews for 10 minutes (removed, or
+  its thread gone) is forgotten by the gate's wrapper.
 - Upstream's usage-limit resume ("Continue where you left off." into each thread that failed on a
   limit, at its reset) takes a slot the same way (`apps/server/src/fork/limitResumeSlot.ts`), so a
   reset does not start every failed thread at once. Refused, nothing is sent: the thread stays
@@ -466,15 +483,45 @@ These are not gated, on purpose:
   gives back. Restart recovery resumes runs that were running when the server stopped.
   `t3_worktree_handoff` continues the same agent's work after its own turn.
 
-These four are not gated yet. Each can **start a run in an idle thread with no slot**, so a full
-host can go over its limit through them. Gating them is follow-up #724:
+These start a run in an idle thread on their own, and take a slot the same way
+([#724](https://github.com/scuttletoby/t3code/issues/724)). Into a thread that shows a run each
+only queues: no slot.
 
-- The fork's context handoff (`apps/server/src/fork/handoff/HandoffService.ts`): the idle-timer
-  trigger starts a run with fresh context after the thread's turn ended. It is off by default.
-- Upstream's provider continuation ("Background task completed"): an agent that ended its turn
-  while its own background work ran starts again when that work ends.
-- Upstream's delegated question replies: a child's question answered back into an idle parent.
-- Upstream's idle compaction: a compaction run started in an idle thread.
+- The fork's context handoff, and its one resend of a failed handoff run
+  (`apps/server/src/fork/handoff/handoffDispatch.ts`, after its busy check). Refused, nothing is
+  sent: it asks again every 5 s or at the thread's next event (logged once), deciding again each
+  time without a new settle, and a thread that moved on drops it. Like every handoff timer it is
+  memory only: a restart drops a waiting handoff, and the thread's next turn end decides again. A
+  waiting resend of a failed handoff run is dropped too, with no log: the failed run's text stays
+  in the thread, and the next turn end decides again.
+- Upstream's provider continuation ("Background task completed": an agent that ended its turn
+  while its own background work ran starts again when that work ends;
+  `apps/server/src/fork/continuationSlot.ts`). The slot is asked when upstream's worker takes the
+  request from its queue, never inside an adapter's `dispatchIfCurrent`, which holds the
+  adapter's own lock. Refused, the request goes back on the queue and is asked again every 5 s
+  (logged once); the adapter offers no second one meanwhile, and other threads' continuations
+  pass. A delegated result is left as above. It waits in memory, as upstream's queue does: a
+  restart loses it, as the restart ends the provider session whose background work it reports
+  (Claude's buffered output lives in that process).
+- A delegated task's question to its idle parent (upstream's question reactor;
+  `apps/server/src/fork/workerWakeSlots.ts`). Refused, nothing is sent: the wake is kept in
+  `fork-held-wakes.json` in the server's state folder and asked again every 5 s (logged once). It
+  leaves the file once sent, or when the question is answered, its task ends or the parent is
+  archived or deleted. A restart reads the file and sends it once; upstream's fixed command id
+  keeps a send cut off before the file write from making a second message. Saves run one at a
+  time, each writing what is held then. A file that cannot be read is moved to
+  `fork-held-wakes.json.corrupt-<ms>` beside it and logged, so the next save does not write over
+  it; an entry that cannot be read is logged and left out. A held wake whose parent or question
+  cannot be read waits, logged once.
+- Upstream's idle compaction (same file), after the handoff owner's check. Refused, it is skipped
+  (logged), not held: it only pays off while the prompt cache is warm, minutes before it expires,
+  and a late one costs a full uncached read. The next completed run arms a new one, as after a
+  restart. It is asked once: a thread whose window always falls while the slots are full does not
+  compact.
+
+Like the wake-ups above, the handoff, the continuation and the question wake hold no place in
+line: each asks again on its own 5 s timer, so under steady load a slot that frees between two
+asks can go to another start, and one can wait without limit. Nothing is lost or sent twice.
 
 The calling thread is left out of the count (it waits on its child). A start no thread on this
 machine asks for (a scheduled run, the owner's client, a call from another machine) has no caller, so

@@ -1,5 +1,15 @@
 /** Fork (issue 386): delegated task rows for the tests of `task_list` and the reminder. */
-import { NodeId, type OrchestrationV2Subagent, ThreadId } from "@t3tools/contracts";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Rebuilds the first reminder format's digest.
+import * as NodeCrypto from "node:crypto";
+
+import {
+  EventId,
+  MessageId,
+  NodeId,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2Subagent,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -52,3 +62,57 @@ export const makeSlots = () => {
   });
   return { full, state, asks, layer };
 };
+
+/**
+ * Fork (issue 695): a reminder as the first format sent it, before each task had its own key: one
+ * id for the whole set (sha256 of the sorted ids, 16 hex digits), and a text listing the first ten
+ * tasks (`delegatedTask` rows). "never" is the very first wording, "may" the one after it.
+ */
+export const firstFormatReminder = (
+  parentThreadId: ThreadId,
+  taskIds: ReadonlyArray<string>,
+  wording: "never" | "may" = "may",
+) => {
+  const sorted = [...new Set(taskIds)].toSorted();
+  const digest = NodeCrypto.createHash("sha256").update(sorted.join("\n")).digest("hex");
+  const messageId = `delegated-reminder:${parentThreadId}:${digest.slice(0, 16)}`;
+  const count = sorted.length === 1 ? "1 delegated task" : `${sorted.length} delegated tasks`;
+  const reached =
+    wording === "never" ? "never reached this thread" : "may not have reached this thread";
+  const text = [
+    `[delegated results] ${count} ended, but the result ${reached}:`,
+    ...sorted.slice(0, 10).map((id) => `- ${id} "a task" (completed)`),
+    ...(sorted.length > 10 ? [`- and ${sorted.length - 10} more`] : []),
+    "Read each with task_status (that marks it read). task_list lists every task with an unread result.",
+  ].join("\n");
+  return { messageId, commandId: `${messageId}:0`, text };
+};
+
+/**
+ * Fork (issue 741): the event that projects a message the reminder sent into the real message
+ * table, as upstream writes it (its own encoding of the row's payload).
+ */
+export const reminderMessageEvent = (
+  threadId: ThreadId,
+  messageId: string,
+  text: string,
+): OrchestrationV2DomainEvent => ({
+  id: EventId.make(`event:${messageId}`),
+  threadId,
+  occurredAt: at(NOW - 30_000),
+  type: "message.updated",
+  payload: {
+    id: MessageId.make(messageId),
+    threadId,
+    runId: null,
+    nodeId: null,
+    role: "user",
+    text,
+    attachments: [],
+    streaming: false,
+    createdBy: "agent",
+    creationSource: "mcp",
+    createdAt: at(NOW - 30_000),
+    updatedAt: at(NOW - 30_000),
+  },
+});
