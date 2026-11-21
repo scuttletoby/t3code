@@ -1,9 +1,7 @@
 /**
- * Fork (waits): sends a wait's message through the thread tools' send, at most once. A retry
- * first looks for its message in the thread, then reads its command's receipt, and only then
- * sends; so a send that was accepted but whose answer was lost is never sent a second time.
- * Given the slot gate, a message that would wake a thread showing no run first takes a slot
- * (`fork/agentSlotRoutes.ts`); refused, nothing is sent and the message waits for one.
+ * Fork (waits): sends a wait's message at most once: a retry looks for its message, then its
+ * command's receipt, and only then sends. With the slot gate, a message that would wake a thread
+ * showing no run first takes a slot; refused, nothing is sent and it waits for one.
  */
 import {
   CommandId,

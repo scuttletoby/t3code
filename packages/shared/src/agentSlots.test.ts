@@ -171,7 +171,11 @@ describe("countedStarting (#711)", () => {
   });
 
   it("counts a message queued into a thread only while that thread shows no run", () => {
-    const entries = [queued(1, "busy"), queued(2, "ended"), { token: 3, instanceId: MAIN, atMs: 0 }];
+    const entries = [
+      queued(1, "busy"),
+      queued(2, "ended"),
+      { token: 3, instanceId: MAIN, atMs: 0 },
+    ];
     // "busy" still runs: its run is counted, not its queued message too.
     expect(countedStarting(entries, new Set(["busy"])).map((e) => e.token)).toEqual([2, 3]);
     expect(countedStarting(entries, new Set()).map((e) => e.token)).toEqual([1, 2, 3]);

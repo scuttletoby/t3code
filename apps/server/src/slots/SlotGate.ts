@@ -134,11 +134,9 @@ export interface SlotAcquireInput {
    */
   readonly alsoNeeds?: ReadonlyArray<ProviderInstanceId> | undefined;
   /**
-   * The start is a message into this existing thread. While the count shows it with a run, the
-   * message only queues: allowed whatever the limits, and recorded so that it counts only while
-   * the thread shows no run (its run ended before the message landed; see `queuedInto`). Idle,
-   * it is a start like any other. The count is read for it even when no count limit applies;
-   * unread, it refuses only where a count limit applies.
+   * A message into this existing thread. Shown with a run, it only queues: allowed, and counted
+   * only while the thread shows no run (its run ended first; `queuedInto`). Idle, it is a start.
+   * Unread, it refuses only where a count limit applies.
    */
   readonly intoThreadId?: ThreadId | undefined;
   /**

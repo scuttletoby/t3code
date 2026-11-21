@@ -183,12 +183,9 @@ export interface SendSlot {
 }
 
 /**
- * A message into an existing thread: into a thread that shows a run it only queues (allowed, no
- * slot; it counts only if that run ends before the message lands, for the start grace), into one
- * that shows none it starts a run and takes a slot like `delegate_task`. Asked last before the
- * send; the slot is named for the thread at once, so there is nothing to end afterwards. The
- * count decides both in one step (`SlotGate.acquire`'s `intoThreadId`), so a run that ends
- * between the check and the send never starts one without a slot.
+ * A message into an existing thread: into one that shows a run it only queues; into one that
+ * shows none it takes a slot like `delegate_task`. One gate step decides both, so a run that
+ * ends between the check and the send never starts one without a slot. Asked last before the send.
  */
 export const admitSend = (
   gate: Option.Option<SlotGate.SlotGate["Service"]>,

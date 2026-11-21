@@ -1,5 +1,5 @@
 /**
- * Fork (#711): `t3_thread_send` and `t3_thread_send_attachments` through the agent slot gate, on
+ * Fork: `t3_thread_send` and `t3_thread_send_attachments` through the agent slot gate, on
  * upstream's real handlers and access rules and the server's real gate (`slotWorld.testkit.ts`).
  * An agent's message into a thread that shows no run starts one, so it takes a slot like
  * `delegate_task`; into a thread that shows a run it only queues. Refused, nothing is sent.
@@ -258,7 +258,10 @@ describe.each(TOOLS)("%s through the agent slot gate (#711)", (tool) => {
   it.effect("off, or a host that runs no gate: sent as upstream, nothing read", () =>
     Effect.gen(function* () {
       const world = slotWorld([BUSY]);
-      const off = harness({ settings: { agentSlots: { mode: "fixed" } } as Settings, slots: world });
+      const off = harness({
+        settings: { agentSlots: { mode: "fixed" } } as Settings,
+        slots: world,
+      });
       expect(refusal(yield* off.send(tool))).toBeUndefined();
       expect(off.sent).toEqual([TARGET]);
       expect(world.reads).toBe(0);
@@ -320,18 +323,20 @@ const check = (
   );
 
 describe("checkSendSlot: a receiver the gate cannot judge (#711)", () => {
-  it.effect("gone, deleted or archived: left to the send, which refuses it with its own error", () =>
-    Effect.gen(function* () {
-      const world = slotWorld([BUSY]);
-      const idle = liveThreadShell(TARGET, { activeRunId: null });
-      const at = DateTime.makeUnsafe("2026-01-02T00:00:00.000Z");
-      expect(yield* check(world, Effect.succeed(null))).toBeUndefined();
-      expect(yield* check(world, Effect.succeed({ ...idle, deletedAt: at }))).toBeUndefined();
-      expect(yield* check(world, Effect.succeed({ ...idle, archivedAt: at }))).toBeUndefined();
-      expect(world.reads).toBe(0);
-      // A live one is judged: full refuses.
-      expect(yield* check(world, Effect.succeed(idle))).toMatch(/^slots_full: /);
-    }),
+  it.effect(
+    "gone, deleted or archived: left to the send, which refuses it with its own error",
+    () =>
+      Effect.gen(function* () {
+        const world = slotWorld([BUSY]);
+        const idle = liveThreadShell(TARGET, { activeRunId: null });
+        const at = DateTime.makeUnsafe("2026-01-02T00:00:00.000Z");
+        expect(yield* check(world, Effect.succeed(null))).toBeUndefined();
+        expect(yield* check(world, Effect.succeed({ ...idle, deletedAt: at }))).toBeUndefined();
+        expect(yield* check(world, Effect.succeed({ ...idle, archivedAt: at }))).toBeUndefined();
+        expect(world.reads).toBe(0);
+        // A live one is judged: full refuses.
+        expect(yield* check(world, Effect.succeed(idle))).toMatch(/^slots_full: /);
+      }),
   );
 
   it.effect("unreadable: refused, nothing sent, the gate not asked", () =>

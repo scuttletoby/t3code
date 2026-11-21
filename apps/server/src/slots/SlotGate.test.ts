@@ -1842,24 +1842,26 @@ describe("a message into an existing thread (`intoThreadId`, #711)", () => {
       }),
   );
 
-  it.effect("into a thread that shows no run it is a start: full refuses, free takes the slot", () =>
-    Effect.gen(function* () {
-      const world = newWorld();
-      world.threads = [{ id: other, instanceId: MAIN }];
-      yield* run(
-        world,
-        on({ maxPerMachine: 1, startGraceSeconds: 30 }),
-        Effect.gen(function* () {
-          assert.strictEqual(yield* send(bound), "refuse");
-          world.threads = [];
-          assert.strictEqual(yield* send(bound), "allow");
-          // Sent, its run not shown yet: the slot is its own.
-          assert.deepStrictEqual(yield* types(1), ["refuse"]);
-          world.threads = [{ id: bound, instanceId: MAIN }];
-          assert.deepStrictEqual(yield* types(1), ["refuse"]);
-        }),
-      );
-    }),
+  it.effect(
+    "into a thread that shows no run it is a start: full refuses, free takes the slot",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [{ id: other, instanceId: MAIN }];
+        yield* run(
+          world,
+          on({ maxPerMachine: 1, startGraceSeconds: 30 }),
+          Effect.gen(function* () {
+            assert.strictEqual(yield* send(bound), "refuse");
+            world.threads = [];
+            assert.strictEqual(yield* send(bound), "allow");
+            // Sent, its run not shown yet: the slot is its own.
+            assert.deepStrictEqual(yield* types(1), ["refuse"]);
+            world.threads = [{ id: bound, instanceId: MAIN }];
+            assert.deepStrictEqual(yield* types(1), ["refuse"]);
+          }),
+        );
+      }),
   );
 
   it.effect(

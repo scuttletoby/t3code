@@ -414,7 +414,7 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(layerWaitsOn)),
 );
 
-/** Waits on and one agent slot per machine (#711), over the real send path. */
+/** Waits on and one agent slot per machine, over the real send path. */
 const layerOneSlot = (settings: object = { agentSlots: { enabled: true, maxPerMachine: 1 } }) =>
   ThreadManagementService.layer.pipe(
     Layer.provideMerge(
