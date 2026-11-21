@@ -187,17 +187,18 @@ becomes owed later (the later message names only the new task); a message names 
 A message the thread refuses holds back only its own tasks (until the set changes); the other
 messages of that check are still sent. Each refused message is logged once per server run, not on
 each later check (also when another thread holds its id); after a restart a message still refused
-is logged once more, so a refusal whose log line a stop cut off is still logged. A reminder sent before per-task ids (one id for the whole set) is split into its tasks
-from its text, so after an upgrade a task it named is not reminded again; only tasks past the first
-ten of such a message, which it never named, may be reminded once more. Such a message whose text
-cannot be read is left out alone: its tasks may be reminded once more, and the parent's other
-reminders still go. The check at start and a check after an event never run at once for one parent.
-It never goes to a stopped or archived thread, and never for results older than a day. A parent is busy, and
-waits for its own run end, while a run of it goes or a question of it is open (an open question
-holds the reminder until that run ends); background work it left running does not hold it. At
-start, every parent with a result unread from the last day is checked once, also when upstream had
-reserved no wake for it. Upstream's wake can land just before the reminder, so the message says the
-result _may_ not have arrived.
+is logged once more, so a refusal whose log line a stop cut off is still logged. A reminder sent
+before per-task ids (one id for the whole set) is split into its tasks from its text, so after an
+upgrade a task it named is not reminded again; only tasks past the first ten of such a message,
+which it never named, may be reminded once more. Such a message whose text cannot be read is left
+out alone: its tasks may be reminded once more, and the parent's other reminders still go. The check
+at start and a check after an event never run at once for one parent. It never goes to a stopped or
+archived thread, and never for results older than a day. A parent is busy, and waits for its own run
+end, while a run of it goes or a question of it is open (an open question holds the reminder until
+that run ends); background work it left running does not hold it. At start, every parent with a
+result unread from the last day is checked once, also when upstream had reserved no wake for it.
+Upstream's wake can land just before the reminder, so the message says the result _may_ not have
+arrived.
 
 The server makes a thread in a linked environment before it records the task here, so a server that
 stops in between leaves a thread there that no task here follows. At start (a few minutes after,
