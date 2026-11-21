@@ -457,10 +457,19 @@ These are not gated, on purpose:
 - `t3_thread_transfer`: a fork copies context into a new thread and runs no turn; merge_back
   leaves the context for the target's next run. The first message into the fork is a
   `t3_thread_send`, gated as above.
-- Upstream's other wake-ups and continuations: a delegated task's result delivered to its parent,
-  monitor wake-ups (queued behind the active run), and the internal continuations (restart
-  recovery, idle compaction, provider continuation, delegated question replies, worktree
-  handoff). Most of these continue a run that already holds a slot or queue behind one.
+- A delegated task's result delivered to its parent: this mostly takes the slot the finished child
+  gives back. Restart recovery resumes runs that were running when the server stopped.
+  `t3_worktree_handoff` continues the same agent's work after its own turn.
+
+These four are not gated yet. Each can **start a run in an idle thread with no slot**, so a full
+host can go over its limit through them. Gating them is follow-up #724:
+
+- The fork's context handoff (`apps/server/src/fork/handoff/HandoffService.ts`): the idle-timer
+  trigger starts a run with fresh context after the thread's turn ended. It is off by default.
+- Upstream's provider continuation ("Background task completed"): an agent that ended its turn
+  while its own background work ran starts again when that work ends.
+- Upstream's delegated question replies: a child's question answered back into an idle parent.
+- Upstream's idle compaction: a compaction run started in an idle thread.
 
 The calling thread is left out of the count (it waits on its child). A start no thread on this
 machine asks for (a scheduled run, the owner's client, a call from another machine) has no caller, so
