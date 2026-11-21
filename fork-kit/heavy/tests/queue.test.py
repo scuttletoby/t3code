@@ -33,6 +33,19 @@ def load_module(name, path, source=None):
     return mod
 
 
+def read_line(p, timeout=60.0):
+    """The next line of p's stdout, or a failure after the timeout (p is killed then): a caller that hangs fails the
+    test instead of hanging it (as tests/heavy.test.py read_line)."""
+    got = []
+    reader = threading.Thread(target=lambda: got.append(p.stdout.readline()), daemon=True)
+    reader.start()
+    reader.join(timeout)
+    if reader.is_alive():
+        p.kill()
+        raise AssertionError(f'no line from pid {p.pid} in {timeout:g} s')
+    return got[0]
+
+
 class FakeHost:
     """A temporary cgroup tree for the slice and its scopes, a meminfo file, a queue root and a state folder."""
 
@@ -578,7 +591,7 @@ class QueueTests(unittest.TestCase):
         p = self.caller('dies', 1000, wait=60)
         self.wait_for(lambda: len(self.live()) == 1)
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
         self.assertEqual(self.live(), [])
         self.assertEqual(self.host.files(), [])
 
@@ -590,7 +603,7 @@ class QueueTests(unittest.TestCase):
         start = time.monotonic()
         self.assertEqual(self.live(), [])
         self.assertGreaterEqual(time.monotonic() - start, 0.2)  # it really waited for the holder
-        p.wait()
+        p.wait(timeout=60)
 
     def test_a_lock_holder_killed_with_9_frees_the_lock_at_once(self):
         """The state question for the lock itself: a process stopped half-way, killed while it holds the queue lock,
@@ -598,7 +611,7 @@ class QueueTests(unittest.TestCase):
         hq = self.hq()
         p = self.lock_holder()
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
         fd = os.open(os.path.join(self.host.box.queue_dir, 'lock'), os.O_RDWR)
         self.addCleanup(os.close, fd)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # free: no wait at all
@@ -611,10 +624,10 @@ class QueueTests(unittest.TestCase):
 
     def test_a_crashed_job_frees_its_reservation(self):
         p = self.caller('crash', 4000, wait=60)
-        self.assertTrue(p.stdout.readline().startswith('admitted'))
+        self.assertTrue(read_line(p).startswith('admitted'))
         self.assertFalse(self.decide(1000)[0])      # the crashed job's 4000 MB is still held
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
         self.assertTrue(self.decide(1000)[0])       # gone with its process; nothing to clean by hand
         self.assertNotIn('crash', [t.kind for t in self.live()])
 
@@ -680,15 +693,15 @@ class QueueTests(unittest.TestCase):
         first = self.first_line(p1, p2)
         self.assertIsNotNone(first)
         winner, loser = first
-        self.assertTrue(winner.stdout.readline().startswith('admitted'))
+        self.assertTrue(read_line(winner).startswith('admitted'))
         seqs = sorted(t.seq for t in self.live())
         self.assertEqual(seqs, [1, 2])              # one lock: two different places, never the same one
         self.assertEqual(sorted(t.state for t in self.live()), ['admitted', 'waiting'])
         winner.stdin.close()
-        winner.wait()
-        self.assertTrue(loser.stdout.readline().startswith('admitted'))
+        winner.wait(timeout=60)
+        self.assertTrue(read_line(loser).startswith('admitted'))
         loser.stdin.close()
-        loser.wait()
+        loser.wait(timeout=60)
         self.assertEqual(self.live(), [])
 
     # helpers for real processes
@@ -709,14 +722,14 @@ class QueueTests(unittest.TestCase):
         p = subprocess.Popen([sys.executable, '-I', '-B', '-c', HOLDER, os.path.join(self.host.box.queue_dir, 'lock')],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.addCleanup(self.stop, p)
-        self.assertEqual(p.stdout.readline(), 'held\n')
+        self.assertEqual(read_line(p), 'held\n')
         return p
 
     @staticmethod
     def stop(p):
         if p.poll() is None:
             p.kill()
-        p.wait()
+        p.wait(timeout=60)
         for f in (p.stdin, p.stdout):
             if f:
                 f.close()
@@ -881,7 +894,7 @@ class QueueTests(unittest.TestCase):
         hq = self.hq()
         os.makedirs(self.host.state)
         p = subprocess.Popen(['true'])
-        p.wait()                                    # a pid that is gone
+        p.wait(timeout=60)                          # a pid that is gone
         dead = os.path.join(self.host.state, f'peaks.json.{p.pid}.tmp')
         alive = os.path.join(self.host.state, f'waits.log.{os.getppid()}.tmp')
         for path in (dead, alive):
@@ -970,12 +983,14 @@ class CommandLine(unittest.TestCase):
                 self.assertEqual(jo(bad)[0], 'usage')
 
     def test_usage_errors_exit_2_before_anything_runs(self):
-        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, '--kind', 'x'], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, '--kind', 'x'], capture_output=True, text=True,
+                           timeout=60)
         self.assertEqual(r.returncode, 2)
         self.assertIn('usage: heavy --kind', r.stderr)
 
     def test_queue_help(self):
-        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'queue', '--help'], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'queue', '--help'], capture_output=True, text=True,
+                           timeout=60)
         self.assertEqual(r.returncode, 0)
         self.assertIn('heavy waits', r.stdout)
 
