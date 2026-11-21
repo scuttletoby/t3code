@@ -13,6 +13,8 @@ temporary folder in the command line, scopes by those processes.
 import json, os, re, shutil, signal, subprocess, sys, tempfile, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FAKE_TOOLS = os.path.join(KIT, 'tests', 'fake_tools.py')
+LABEL = 'fork-kit.heavy.owner'
 HEAVY = os.environ.get('HEAVY_TEST_BIN') or os.path.join(KIT, 'bin', 'heavy')
 OLD = os.path.join(KIT, 'tests', 'old-heavy.sh')
 WRAPPERS = {os.path.realpath(HEAVY), os.path.realpath(OLD)}
@@ -34,7 +36,21 @@ def manager_problem():
     return None
 
 
-PROBLEM = manager_problem()
+def nested_problem():
+    """Run inside a heavy scope (`heavy python3 heavy.test.py`), the heavy under test would run nested (no scope of
+    its own) and the cleanup would stop the outer scope, this test run with it. Each command the tests run gets a
+    heavy scope of its own: run the file itself without heavy."""
+    try:
+        with open('/proc/self/cgroup') as f:
+            leaf = f.read().strip().rpartition('/')[2]
+    except OSError:
+        return None
+    if leaf.startswith('heavy-') and leaf.endswith('.scope'):
+        return f'runs inside the heavy scope {leaf}: run this file without heavy (every command it runs gets its own)'
+    return None
+
+
+PROBLEM = nested_problem() or manager_problem()
 
 
 def comm(pid):
@@ -72,9 +88,36 @@ class Heavy(unittest.TestCase):
         self.stubborn = self.script('stubborn', quiet + f"trap '' TERM INT HUP\nwhile :; do {self.dir}/sleeper 0.1; done")
         # a private memory queue: never the user's live one (a test job must not wait behind real builds)
         self.queue_root = os.path.join(self.dir, 'queue')
+        # a fake docker (tests/fake_tools.py) on a state file of this test: never the machine's own containers
+        self.docker_state = os.path.join(self.dir, 'docker.json')
+        with open(self.docker_state, 'w') as f:
+            json.dump({'containers': []}, f)
+        self.docker = self.script('docker', f'exec "{sys.executable}" -I -B "{FAKE_TOOLS}" "{self.docker_state}" '
+                                            f'docker "$@"')
         self.env = dict(os.environ, HEAVY_SLICE=SLICE, HEAVY_CONFIG=os.path.join(self.dir, 'no-config.json'),
-                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root)
+                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root, HEAVY_DOCKER=self.docker)
         self.env.pop('HEAVY_KEEP', None)
+
+    def containers(self):
+        with open(self.docker_state) as f:
+            return {c['Name'].lstrip('/'): (c['Config']['Labels'] or {}).get(LABEL) for c in json.load(f)['containers']}
+
+    def add_container(self, name, owner):
+        with open(self.docker_state) as f:
+            state = json.load(f)
+        state['containers'].append({'Id': os.urandom(32).hex(), 'Name': '/' + name, 'Created': '2026-01-01T00:00:00Z',
+                                    'State': {'Running': True},
+                                    'Config': {'Labels': {LABEL: owner} if owner else {}, 'Image': 'img'}})
+        with open(self.docker_state, 'w') as f:
+            json.dump(state, f)
+
+    def db_up(self, name='test-db'):
+        """Shell text for a command that starts a container the way a test should: labelled with heavy's scope."""
+        return f'"$HEAVY_DOCKER" run -d --label "$("{HEAVY}" docker-label)" --name {name} mariadb >/dev/null || exit 9'
+
+    def double_fork(self):
+        """Shell text that starts a sleeper which leaves its parent and its session (a daemon's double fork)."""
+        return f'(setsid {self.sleeper} &)'
 
     def script(self, name, body):
         path = os.path.join(self.dir, name)
@@ -206,6 +249,77 @@ class Heavy(unittest.TestCase):
         self.assertRegex(leaf, r'^heavy-keep_-[0-9a-f]{8}\.scope$')
         self.assertFalse(leaf.startswith('heavy-keep-'), leaf)
 
+    def test_a_double_forked_child_is_stopped_too(self):
+        r = self.heavy('sh', '-c', f'{self.double_fork()}; {self.sleeper} & exit 0')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ours(), [])
+        self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 2 leftover processes (sleeper)'])
+
+    def test_a_container_the_command_started_is_removed_and_no_other(self):
+        uid = os.getuid()
+        self.add_container('unlabelled', None)
+        self.add_container('other-scope', f'uid={uid},scope=heavy-other-0a1b2c3d.scope')
+        self.add_container('other-user', f'uid={uid + 1},scope=heavy-sh-0a1b2c3d.scope')
+        r = self.heavy('sh', '-c', f'{self.db_up()}; exit 4')
+        self.assertEqual(r.returncode, 4, r.stderr)                 # the command's own exit code, as always
+        self.assertEqual(self.heavy_lines(r.stderr), ['heavy: removed 1 leftover container (test-db)'])
+        self.assertEqual(self.containers(), {'unlabelled': None,
+                                             'other-scope': f'uid={uid},scope=heavy-other-0a1b2c3d.scope',
+                                             'other-user': f'uid={uid + 1},scope=heavy-sh-0a1b2c3d.scope'})
+
+    def test_a_container_and_a_double_forked_child_go_when_heavy_is_killed_with_9(self):
+        # kill -9 leaves heavy no chance to clean up: its guard does it (the command itself dies with heavy)
+        p = self.start('sh', '-c', f'{self.db_up()}; {self.double_fork()}; {self.sleeper} & exec {self.sleeper}')
+        wait_for(lambda: [comm(pid) for pid in self.ours()].count('sleeper') == 3 and 'test-db' in self.containers(),
+                 what='the command, its children and its container')
+        p.kill()
+        _, err = p.communicate(timeout=60)       # stderr ends when the guard is done with it
+        wait_for(lambda: not self.ours(), what='the leftovers of a killed heavy to stop')
+        self.assertEqual(self.containers(), {})
+        lines = self.heavy_lines(err)
+        self.assertEqual(len(lines), 2, err)
+        # the command itself dies with heavy, maybe just before the guard looks, maybe just after
+        self.assertRegex(lines[0], r'^heavy: heavy was killed: stopped (2|3) leftover processes \(sleeper\)$')
+        self.assertEqual(lines[1], 'heavy: heavy was killed: removed 1 leftover container (test-db)')
+        self.assertEqual(self.scopes(), [])
+
+    def test_a_rerun_after_a_killed_heavy_starts_clean(self):
+        # the same test again (the same container name, as a test suite has): the first run left nothing behind
+        cmd = f'{self.db_up()}; echo up; exec {self.sleeper}'
+        p = self.start('sh', '-c', cmd)
+        self.assertEqual(p.stdout.readline(), 'up\n')
+        p.kill()
+        p.communicate(timeout=60)
+        wait_for(lambda: not self.ours(), what='the first run to be cleaned up')
+        r = self.heavy('sh', '-c', f'{self.db_up()}; echo ran')
+        self.assertEqual((r.returncode, r.stdout), (0, 'ran\n'), r.stderr)
+        self.assertEqual(self.heavy_lines(r.stderr), ['heavy: removed 1 leftover container (test-db)'])
+        r = self.heavy('sh', '-c', 'echo again')               # and a run with nothing to clean says nothing
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, 'again\n', ''))
+        self.assertEqual(self.containers(), {})
+
+    def test_a_kept_scope_keeps_its_container(self):
+        env = dict(self.env, HEAVY_KEEP='1')
+        r = self.heavy('sh', '-c', f'{self.db_up()}; exit 0', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.heavy_lines(r.stderr), [])
+        [(name, owner)] = self.containers().items()
+        self.assertRegex(owner, r'scope=heavy-keep-sh-[0-9a-f]{8}\.scope$')
+
+    def test_docker_missing_or_down_never_changes_the_run(self):
+        r = self.heavy('sh', '-c', f'{self.sleeper} & exit 3',
+                       env=dict(self.env, HEAVY_DOCKER=os.path.join(self.dir, 'no-docker')))
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 1 leftover process (sleeper)'])
+        with open(self.docker_state, 'w') as f:
+            json.dump({'containers': [], 'dockerDown': True}, f)
+        r = self.heavy('sh', '-c', 'exit 3')
+        self.assertEqual(r.returncode, 3)
+        lines = self.heavy_lines(r.stderr)
+        self.assertEqual(len(lines), 1, r.stderr)
+        self.assertRegex(lines[0], r'^heavy: could not remove the containers of heavy-sh-[0-9a-f]{8}\.scope '
+                                   r'\(Cannot connect to the Docker daemon')
+
     def test_leftovers_that_cannot_be_checked_are_reported(self):
         # the last systemctl query fails (an overloaded host: bus error or timeout): heavy says so, never silent
         self.leaves_on_purpose = True
@@ -247,7 +361,7 @@ class Heavy(unittest.TestCase):
     def test_environment_is_the_callers_in_a_c_locale_too(self):
         # Python's C-locale coercion (PEP 538) adds LC_CTYPE=C.UTF-8 to heavy's own environment: not to the command's
         env = {k: v for k, v in self.env.items() if k in ('PATH', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
-                                                          'HEAVY_SLICE', 'HEAVY_CONFIG', 'HEAVY_GRACE')}
+                                                          'HEAVY_SLICE', 'HEAVY_CONFIG', 'HEAVY_GRACE', 'HEAVY_DOCKER')}
         env['LANG'] = 'C'
         r = self.heavy('env', '-0', env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -301,6 +415,15 @@ class Heavy(unittest.TestCase):
         self.assertEqual(p.returncode, -signal.SIGTERM)
         self.assertEqual(self.ours(), [])
         self.assertIn('heavy: SIGTERM: stopped', err)
+
+    def test_term_to_heavy_removes_the_commands_container(self):
+        p = self.start('sh', '-c', f'{self.db_up()}; echo up; exec {self.sleeper}')
+        self.assertEqual(p.stdout.readline(), 'up\n')
+        p.send_signal(signal.SIGTERM)
+        _, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, -signal.SIGTERM)
+        self.assertEqual(self.containers(), {})
+        self.assertIn('heavy: SIGTERM: removed 1 leftover container (test-db)', err)
 
     def test_int_to_heavy_and_a_command_that_ignores_it(self):
         p = self.start('sh', '-c', f'{self.sleeper} & exec {self.stubborn}')
@@ -383,6 +506,7 @@ class Heavy(unittest.TestCase):
         p.send_signal(signal.SIGINT)
         out, err = p.communicate(timeout=60)
         self.assertIn('grp-sigprobe', names, err)
+        self.assertIn('scope-guard', names, err)       # `pkill -9 heavy` must leave the guard to clean up
         self.assertEqual([n for n in names if n and 'heavy' in n], [], err)
 
     @staticmethod
@@ -405,8 +529,10 @@ class Heavy(unittest.TestCase):
         # the command itself, not systemd-run still making the scope (its arguments name the folder too)
         wait_for(lambda: [comm(pid) for pid in self.ours()] == ['sleeper'], what='the command')
         p.kill()
-        p.wait(timeout=30)
+        _, err = p.communicate(timeout=60)      # and heavy's guard is done (it holds heavy's stderr till then)
         wait_for(lambda: not self.ours(), what='the command to die with heavy')
+        # the command dies with heavy; the guard may look just before that and stop it itself
+        self.assertIn(self.heavy_lines(err), ([], ['heavy: heavy was killed: stopped 1 leftover process (sleeper)']))
 
     # --- refusals: never run uncapped ----------------------------------------------------------------------------
 
@@ -482,19 +608,28 @@ class Heavy(unittest.TestCase):
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertGreater(len(self.peaks()['heavy-test']), 0)      # a failed or OOM-killed run often peaks highest
 
-    def test_a_queued_heavy_killed_with_9_keeps_the_reservation_while_its_command_runs(self):
+    def test_a_queued_heavy_killed_with_9_frees_its_reservation_once_its_guard_stops_the_scope(self):
         env = dict(self.env, HOME=self.dir)
         p = self.start('--kind', 'heavy-test', '--mb', '64', '--wait', '60', '--', 'sh', '-c',
                        f'{self.sleeper} & exec {self.sleeper}', env=env)
         wait_for(lambda: len(self.ours()) == 2, what='both processes')
-        p.kill()
-        p.communicate(timeout=30)
         jobs = self.queue_jobs(env)
         self.assertEqual([(j['kind'], j['state']) for j in jobs], [('heavy-test', 'admitted')])
-        units = self.scopes()
-        subprocess.run(['systemctl', '--user', 'kill', '-s', 'KILL', *units], capture_output=True, timeout=60)
-        wait_for(lambda: not self.ours(), what='the command to end')
-        subprocess.run(['systemctl', '--user', 'stop', *units], capture_output=True, timeout=60)
+        # the guard holds no file of the queue: the reservation ends with the job's processes, never later
+        guards = [int(n) for n in os.listdir('/proc') if n.isdigit() and self.ppid(int(n)) == p.pid
+                  and comm(int(n)) == 'scope-guard']
+        self.assertEqual(len(guards), 1)
+        held = []
+        for fd in os.listdir(f'/proc/{guards[0]}/fd'):
+            try:
+                held.append(os.readlink(f'/proc/{guards[0]}/fd/{fd}'))
+            except OSError:
+                pass
+        self.assertEqual([h for h in held if h.startswith(self.queue_root)], [], held)
+        p.kill()
+        _, err = p.communicate(timeout=60)
+        wait_for(lambda: not self.ours(), what='the guard to stop the scope')
+        self.assertRegex(err, r'heavy: heavy was killed: stopped (1 leftover process|2 leftover processes) \(sleeper\)')
         self.assertEqual(self.queue_jobs(env), [])
 
     def test_a_queued_job_that_never_fits_gives_up_with_76(self):

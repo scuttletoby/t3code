@@ -108,9 +108,10 @@ by_name = {s.get("name"): s for s in steps}
 clean = by_name.get("Remove an earlier run's caller and toolkit folders") or {}
 caller = by_name.get("Check out the caller's config") or {}
 toolkit = by_name.get("Check out the queue at this workflow's own commit") or {}
+drop = by_name.get("Drop the checkouts' token") or {}
 queue = by_name.get("Run the queue") or {}
-check("steps: refuse, remove the old folders, the caller's config, the toolkit, the queue, in that order",
-      steps == [first, clean, caller, toolkit, queue], ", ".join(str(s.get("name")) for s in steps))
+check("steps: refuse, remove the old folders, the caller's config, the toolkit, drop their token, the queue, in that "
+      "order", steps == [first, clean, caller, toolkit, drop, queue], ", ".join(str(s.get("name")) for s in steps))
 
 # The runner is self-hosted and its workspace is reused: an earlier run's caller/ or toolkit/ (a symlink, a
 # planted .git, files checkout would keep) never reaches this run's checkouts.
@@ -161,6 +162,130 @@ check("the caller's checkout holds only the config, in its own folder",
 check("the toolkit is checked out at this workflow's own repository and commit, not the caller's",
       tw.get("repository") == "${{ steps.toolkit.outputs.repo }}" and tw.get("ref") == "${{ steps.toolkit.outputs.sha }}"
       and set(tw) == {"repository", "ref", "path", "sparse-checkout"}, str(tw))
+# #675: no checkout leaves the job's token where notify_command (the project's own code) can read it. Not with
+# persist-credentials: false, whose cleanup fails on a repository with gitlinks and no .gitmodules (this one; the
+# contract test .github/scripts/fork-contracts.test.py forbids it), but a step that drops it after both checkouts.
+check("no checkout sets persist-credentials (its `false` fails on this repository's gitlinks)",
+      not any("persist-credentials" in (s.get("with") or {}) for s in steps), f"{cw} {tw}")
+check("the token drop is one bash step that cannot be skipped or fail quietly, with no expression in its script",
+      set(drop) == {"name", "shell", "run"} and drop.get("shell") == "bash" and "${{" not in str(drop.get("run")),
+      str(sorted(drop)))
+
+HEADER = "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46ZmFrZQ=="
+
+
+def git(cwd, *a, env=None, ok=True):
+    r = subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True,
+                       env={**GIT_ENV, **(env or {})})
+    if ok and r.returncode != 0:
+        raise RuntimeError(f"git {a}: {r.stderr}")
+    return r
+
+
+GIT_ENV = {"PATH": os.environ["PATH"], "HOME": tempfile.mkdtemp(prefix="fork-pr-queue-home-"),
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+
+
+def drop_e2e(run):
+    """Runs the token drop as Actions runs it in a workspace whose caller/ and toolkit/ are laid out as
+    actions/checkout leaves them; returns what went wrong."""
+    problems = []
+    top = pathlib.Path(tempfile.mkdtemp(prefix="fork-pr-queue-drop-"))
+    ws, tmp = top / "ws", top / "runner-temp"
+    tmp.mkdir()
+
+    def checkout(name):
+        dest = ws / name
+        git(top, "init", "-q", str(dest))
+        git(dest, "remote", "add", "origin", f"https://github.com/owner/{name}")
+        return dest
+
+    def step(**env):
+        return bash(run, {**GIT_ENV, "GITHUB_WORKSPACE": str(ws), "RUNNER_TEMP": str(tmp), **env})
+
+    def headers(dest, **env):
+        return git(dest, "config", "--get-regexp", r"\.extraheader$", env=env, ok=False).returncode
+
+    def lay_out():
+        shutil.rmtree(ws, ignore_errors=True)
+        caller_dir, toolkit_dir = checkout("caller"), checkout("toolkit")
+        # checkout v6: the header in a file of its own under RUNNER_TEMP that the repository's config includes for
+        # its git dir (one entry for the runner's path, one for a container's), a file per checkout.
+        for i, dest in enumerate((caller_dir, toolkit_dir)):
+            creds = tmp / f"git-credentials-{i}.config"
+            creds.write_text(f'[http "https://github.com/"]\n\textraheader = {HEADER}\n')
+            git(dest, "config", "--local", f"includeIf.gitdir:{dest}/.git.path", str(creds))
+            git(dest, "config", "--local", f"includeIf.gitdir:/github/workspace/{dest.name}/.git.path",
+                f"/github/runner_temp/{creds.name}")
+        # an older checkout: the header in the repository's own config, twice
+        git(toolkit_dir, "config", "--local", "http.https://github.com/.extraheader", HEADER)
+        git(toolkit_dir, "config", "--local", "--add", "http.https://github.com/.extraheader", HEADER)
+        return caller_dir, toolkit_dir
+
+    caller_dir, toolkit_dir = lay_out()
+    if headers(caller_dir) != 0 or headers(toolkit_dir) != 0:
+        problems.append("fixture: the headers are not seen")
+    r = step()
+    for dest in (caller_dir, toolkit_dir):
+        if r.returncode != 0 or headers(dest) != 1 or \
+                git(dest, "config", "--local", "--get-regexp", "^includeif", ok=False).returncode != 1:
+            problems.append(f"{dest.name}: the token is not removed with exit 0 (exit {r.returncode}: {r.stderr.strip()})")
+        if git(dest, "config", "remote.origin.url").stdout.strip() != f"https://github.com/owner/{dest.name}":
+            problems.append(f"{dest.name}: the step changed more than the token (origin's URL)")
+    if list(tmp.glob("git-credentials-*.config")):
+        problems.append("a credentials file under RUNNER_TEMP is left")
+    # Runs again (a re-run, or the step after a half-way stop): nothing left to remove passes quietly.
+    r = step()
+    if r.returncode != 0 or r.stderr.strip():
+        problems.append(f"re-run: nothing to remove does not pass quietly (exit {r.returncode}: {r.stderr.strip()})")
+    # A header the step cannot remove (another config file): the closing check fails the step.
+    lay_out()
+    elsewhere = top / "global-with-header"
+    elsewhere.write_text(f'[http "https://github.com/"]\n\textraheader = {HEADER}\n')
+    r = step(GIT_CONFIG_GLOBAL=str(elsewhere))
+    if r.returncode == 0 or "::error::" not in r.stderr:
+        problems.append(f"a header left in another config: the step passes (exit {r.returncode})")
+    # A config git cannot read: no proof the header is gone.
+    lay_out()
+    broken = top / "global-broken"
+    broken.write_text("[http\n")
+    r = step(GIT_CONFIG_GLOBAL=str(broken))
+    if r.returncode == 0 or "::error::" not in r.stderr:
+        problems.append(f"an unreadable config: the step passes (exit {r.returncode})")
+    # A checkout that is not there (empty or old state): nothing proves it has no token.
+    lay_out()
+    shutil.rmtree(ws / "toolkit")
+    r = step()
+    if r.returncode == 0:
+        problems.append("a missing toolkit checkout: the step passes")
+    # A credentials file the step cannot remove: it fails.
+    lay_out()
+    (tmp / "git-credentials-stuck.config").mkdir()
+    r = step()
+    if r.returncode == 0:
+        problems.append("a credentials path it cannot remove: the step passes")
+    shutil.rmtree(tmp / "git-credentials-stuck.config")
+    shutil.rmtree(top, ignore_errors=True)
+    return problems
+
+
+drop_run = str(drop.get("run", "exit 97"))
+problems = drop_e2e(drop_run)
+check("token drop e2e: removes checkout v6's includes and files and an older checkout's headers in caller/ and "
+      "toolkit/, keeps the rest, passes quietly on a re-run, fails on a header it cannot remove, an unreadable "
+      "config, a missing checkout or a file it cannot remove", not problems, "; ".join(problems))
+# Broken forms, run: the e2e must see each (a check that stops seeing its problem goes red).
+for label, broken_run in {
+    "no `|| true` (nothing to remove ends the step)": drop_run.replace(" || true; }", "; }"),
+    "no closing check": drop_run[:drop_run.find("rm -f --")] + 'rm -f -- "${RUNNER_TEMP:?}"/git-credentials-*.config\n',
+    "a closing check that ignores read errors": drop_run.replace('"$rc" != 1', '"$rc" == 0'),
+    "the include kept": drop_run.replace("includeif\\..*\\.path|", ""),
+    "the old header kept": drop_run.replace("|http\\..*\\.extraheader", ""),
+    "no dedup (a header set twice)": drop_run.replace("sort -u | while", "while"),
+    "the credentials file kept": drop_run.replace('rm -f -- "${RUNNER_TEMP:?}"/git-credentials-*.config\n', ""),
+    "only the caller's checkout": drop_run.replace(' "${GITHUB_WORKSPACE:?}/toolkit"', ""),
+}.items():
+    check(f"token drop e2e: a drop with {label} fails", broken_run != drop_run and bool(drop_e2e(broken_run)))
 action_dir = str(tw.get("sparse-checkout"))
 check("the queue step runs the action from that checkout",
       queue.get("uses") == f"./{tw.get('path')}/{action_dir}" and (root / action_dir / "action.yml").is_file(),
