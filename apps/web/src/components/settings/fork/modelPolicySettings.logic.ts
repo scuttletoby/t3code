@@ -1,10 +1,15 @@
 /** Fork: the pure parts of the model policy panel (`modelPolicy`, server only). */
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
 import {
+  checkModelPolicyPick,
+  MODEL_POLICY_START_ROWS,
   type ModelPolicy,
   type ModelPolicyMode,
   ModelPolicyPatch,
   type ModelPolicyRow,
+  modelPolicyPickEfforts,
+  modelPolicyStance,
+  type ModelSelection,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -19,12 +24,12 @@ export const MODEL_POLICY_MODE_OPTIONS: ReadonlyArray<{
   {
     value: "advise",
     label: "Advise",
-    description: "Agents are told which models they may pick; a pick off the list still runs.",
+    description: "An agent is told when its pick is off the list; the pick still runs.",
   },
   {
     value: "enforce",
     label: "Enforce",
-    description: "A pick off the list is refused.",
+    description: "An agent's pick off the list, or one that names no model, is refused.",
   },
 ];
 
@@ -53,11 +58,21 @@ function unreadableFields(policy: ModelPolicy): Readonly<Record<string, unknown>
  * the fail-closed `[]` would throw the text away without saying so.
  */
 export function modelPolicyEditorText(policy: ModelPolicy): string {
+  if (modelPolicyStartsFromStartRows(policy))
+    return JSON.stringify(MODEL_POLICY_START_ROWS, null, 2);
   if (!("unreadable" in policy)) return modelPolicyAllowText(policy);
   const raw = Array.isArray(policy.unreadable)
     ? policy.unreadable
     : unreadableFields(policy)?.allow;
   return JSON.stringify(Array.isArray(raw) ? raw : [], null, 2);
+}
+
+/**
+ * The editor offers the fork's start rows while a readable policy has no rows saved: the
+ * owner saves them as they are or changes them first. Nothing is saved until they do.
+ */
+export function modelPolicyStartsFromStartRows(policy: ModelPolicy): boolean {
+  return !("unreadable" in policy) && policy.allow.length === 0;
 }
 
 /** The mode an unreadable value names, when it names one of the three; never the fail-closed one. */
@@ -111,4 +126,59 @@ export function withModelPolicyAllow(
     error:
       "The rows cannot be saved: each needs driver and model; efforts is a non-empty list, defaultEffort one of them, useFor a short note. Any other key is refused.",
   };
+}
+
+/** The person's own model picks in the server settings that Settings checks against the rows. */
+const PERSON_MODEL_PICKS = [
+  { key: "defaultModelSelection", label: "Default model for new threads" },
+  { key: "fallbackModelSelection", label: "Fallback model" },
+  { key: "textGenerationModelSelection", label: "Text generation model" },
+  { key: "sourceControlWriterModelSelection", label: "Commit and pull request writer" },
+  { key: "reviewGuideModelSelection", label: "Review guide model" },
+  { key: "speechPostProcessingModelSelection", label: "Transcript cleanup model" },
+] as const;
+
+export type PersonModelPickKey = (typeof PERSON_MODEL_PICKS)[number]["key"];
+
+export interface PersonModelPickMark {
+  readonly key: PersonModelPickKey;
+  readonly label: string;
+  /** The pick as one line: model and effort. */
+  readonly pick: string;
+  /** Why it is outside the rows; `null` when it is inside. */
+  readonly outside: string | null;
+}
+
+/**
+ * The person's own picks, each marked inside or outside the rows. Agents only: these picks
+ * are never refused; the mark only shows which ones an agent could not make. Empty while the policy
+ * is off or cannot be read (its warning says so). A pick on an instance no selected environment
+ * has reads without a driver, so every row naming its model must allow it.
+ */
+export function personModelPickMarks(
+  policy: ModelPolicy,
+  picks: Partial<Record<PersonModelPickKey, ModelSelection | null | undefined>>,
+  providers: ReadonlyArray<{ readonly instanceId: string; readonly driver: string }>,
+): ReadonlyArray<PersonModelPickMark> {
+  const stance = modelPolicyStance(policy);
+  if (stance.mode === "off" || stance.unreadable) return [];
+  return PERSON_MODEL_PICKS.flatMap(({ key, label }) => {
+    const selection = picks[key];
+    if (selection === null || selection === undefined) return [];
+    const pick = {
+      driver: providers.find((provider) => provider.instanceId === selection.instanceId)?.driver,
+      model: selection.model,
+      options: selection.options,
+    };
+    const efforts = modelPolicyPickEfforts(pick);
+    const verdict = checkModelPolicyPick(stance.allow, pick);
+    return [
+      {
+        key,
+        label,
+        pick: `${selection.model}${efforts.length === 0 ? "" : `, effort ${efforts.join(" + ")}`}`,
+        outside: verdict.inside ? null : verdict.why,
+      },
+    ];
+  });
 }

@@ -1,10 +1,12 @@
-import { ServerSettings } from "@t3tools/contracts";
+import { MODEL_POLICY_START_ROWS, ServerSettings } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   modelPolicyAllowText,
   modelPolicyEditorText,
+  modelPolicyStartsFromStartRows,
+  personModelPickMarks,
   unknownModelPolicyDrivers,
   unreadableModelPolicyMode,
   unreadableModelPolicyText,
@@ -93,5 +95,89 @@ describe("unknownModelPolicyDrivers", () => {
 
   it("flags nothing when no provider is known (a disconnected environment)", () => {
     expect(unknownModelPolicyDrivers(rows, new Set())).toEqual([]);
+  });
+});
+
+describe("the editor's start rows (#126)", () => {
+  it("offers the fork's start rows while a readable policy has none saved", () => {
+    for (const value of [{}, { mode: "advise" }, { mode: "enforce", allow: [] }]) {
+      const policy = fromFile({ modelPolicy: value }).modelPolicy;
+      expect(modelPolicyStartsFromStartRows(policy)).toBe(true);
+      expect(JSON.parse(modelPolicyEditorText(policy))).toEqual(MODEL_POLICY_START_ROWS);
+      // Saved as offered, they read back the same.
+      expect(withModelPolicyAllow("advise", modelPolicyEditorText(policy))).toEqual({
+        value: { mode: "advise", allow: MODEL_POLICY_START_ROWS },
+      });
+    }
+  });
+
+  it("never replaces saved rows or an unreadable value's own text", () => {
+    const stored = fromFile({ modelPolicy: { mode: "off", allow: [ROW] } }).modelPolicy;
+    expect(modelPolicyStartsFromStartRows(stored)).toBe(false);
+    const bad = fromFile({ modelPolicy: { mode: "on" } }).modelPolicy;
+    expect(modelPolicyStartsFromStartRows(bad)).toBe(false);
+    expect(modelPolicyEditorText(bad)).toBe("[]");
+  });
+});
+
+describe("personModelPickMarks: the outside policy mark (#125)", () => {
+  const providers = [
+    { instanceId: "claudeAgent", driver: "claudeAgent" },
+    { instanceId: "codex", driver: "codex" },
+  ];
+  const policy = (mode: string, allow: unknown = MODEL_POLICY_START_ROWS) =>
+    fromFile({ modelPolicy: { mode, allow } }).modelPolicy;
+  const picks = {
+    defaultModelSelection: {
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "high" }],
+    },
+    textGenerationModelSelection: { instanceId: "codex", model: "gpt-mini" },
+    reviewGuideModelSelection: {
+      instanceId: "claudeAgent",
+      model: "claude-fable-5-2",
+      options: [{ id: "effort", value: "max" }],
+    },
+    sourceControlWriterModelSelection: null,
+  } as never;
+
+  it("marks each set pick inside or outside the rows, in the settings' order", () => {
+    expect(personModelPickMarks(policy("enforce"), picks, providers)).toEqual([
+      {
+        key: "defaultModelSelection",
+        label: "Default model for new threads",
+        pick: "claude-opus-5-5, effort high",
+        outside: null,
+      },
+      {
+        key: "textGenerationModelSelection",
+        label: "Text generation model",
+        pick: "gpt-mini",
+        outside: "gpt-mini (codex) is in no row",
+      },
+      {
+        key: "reviewGuideModelSelection",
+        label: "Review guide model",
+        pick: "claude-fable-5-2, effort max",
+        outside: "claude-fable-5-2 does not allow effort max",
+      },
+    ]);
+    // Advise marks the same.
+    expect(personModelPickMarks(policy("advise"), picks, providers)).toEqual(
+      personModelPickMarks(policy("enforce"), picks, providers),
+    );
+  });
+
+  it("marks nothing while the policy is off or cannot be read; empty rows mark every pick", () => {
+    expect(personModelPickMarks(policy("off"), picks, providers)).toEqual([]);
+    expect(
+      personModelPickMarks(fromFile({ modelPolicy: { mode: "x" } }).modelPolicy, picks, providers),
+    ).toEqual([]);
+    expect(
+      personModelPickMarks(policy("enforce", []), picks, providers).every(
+        (mark) => mark.outside !== null,
+      ),
+    ).toBe(true);
   });
 });

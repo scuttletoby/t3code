@@ -25,6 +25,7 @@ import {
   makeThreadMcpProfileReads,
   makeThreadMcpProfiles,
 } from "./claudeMcpProfile.ts";
+import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
 import { isEveryMcpTool, isWithinMcpProfile, type McpProfileResolved } from "./mcpProfile.ts";
 import { boundToWiderRefusal } from "./scheduledTaskMcpProfile.ts";
 
@@ -340,14 +341,15 @@ const FORK_ACTION = "fork" satisfies ForkParams[typeof ACTION];
 const TASK_ID = "scheduledTaskId" satisfies keyof ScheduleParams;
 
 /**
- * A call forwarded to another machine that may start a thread there outside `startsThreads`: a
- * fork, a change to a scheduled task, or running one now. A narrowed caller is refused, as the
- * thread there would get that machine's profile; the call is not sent. Tools are matched by name.
+ * A call forwarded to another machine, checked before it is sent (the machine there sees no calling
+ * thread): the model policy first ({@link ModelPolicyCheck.checkForwarded}), then a narrowed caller's
+ * call that may start a thread there (a fork, a scheduled task change or run). A refusal sends nothing.
  */
 export const checkForwarded = Effect.fn("LaunchMcpProfile.forwarded")(function* (
   tool: string,
   params: object,
 ) {
+  yield* ModelPolicyCheck.checkForwarded(tool, params);
   const input = params as { readonly [ACTION]?: unknown; readonly [TASK_ID]?: unknown };
   const done =
     tool === FORK_TOOL && input[ACTION] === FORK_ACTION
