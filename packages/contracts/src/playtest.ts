@@ -345,3 +345,73 @@ export class PlaytestFailure extends Schema.TaggedError<PlaytestFailure>()("Play
   code: PlaytestFailureCode,
   message: Schema.String,
 }) {}
+
+/** What the `playtest` tool does: claim a target, run one round, show the session, release it. */
+export const PlaytestToolAction = Schema.Literals(["start", "push", "status", "end"]);
+export type PlaytestToolAction = typeof PlaytestToolAction.Type;
+
+/**
+ * The `playtest` tool's input. Flat on purpose (provider tool schemas must be one object). No
+ * thread and no setting: the thread is the caller's own, from its MCP credential, and the steps
+ * are the person's settings. `target` and `note` belong to `start` only; the service checks them.
+ */
+export const PlaytestToolInput = Schema.Struct({
+  action: PlaytestToolAction,
+  target: Schema.optionalKey(
+    Schema.String.annotate({
+      description: "start only: the test target to claim.",
+    }),
+  ),
+  note: Schema.optionalKey(
+    Schema.String.annotate({ description: "start only: why, in one line." }),
+  ),
+}).check(
+  Schema.makeFilter((input) =>
+    input.action === "start"
+      ? input.target === undefined
+        ? "start needs a target."
+        : undefined
+      : input.target !== undefined || input.note !== undefined
+        ? `${input.action} takes no target or note: it acts on this thread's session.`
+        : undefined,
+  ),
+);
+export type PlaytestToolInput = typeof PlaytestToolInput.Type;
+
+const { adapter: _adapter, ...sessionViewFields } = PlaytestSessionRecord.fields;
+/** A session as the tool shows it: without the adapter's steps, with the step kind running now. */
+export const PlaytestSessionView = Schema.Struct({
+  ...sessionViewFields,
+  running: Schema.optionalKey(Schema.Literals(["claim", "round", "release"])),
+});
+export type PlaytestSessionView = typeof PlaytestSessionView.Type;
+
+/**
+ * What the service answered. start: `started`, `already-on` (this thread's session for that target
+ * was on), `refused` (the claim said no), `failed`, `stopped` (ended while claiming). push: `done`,
+ * `refused`, `failed`, `stopped`. status: `on`, `ended` (the last one), `none`. end: `ended`,
+ * `nothing-to-end`, `release-failed` (still ending; T3 tries again).
+ */
+export const PlaytestToolOutcome = Schema.Literals([
+  "started",
+  "already-on",
+  "refused",
+  "failed",
+  "stopped",
+  "done",
+  "on",
+  "ended",
+  "none",
+  "nothing-to-end",
+  "release-failed",
+]);
+export type PlaytestToolOutcome = typeof PlaytestToolOutcome.Type;
+
+export const PlaytestToolResult = Schema.Struct({
+  action: PlaytestToolAction,
+  outcome: PlaytestToolOutcome,
+  /** One plain sentence or two: what happened and what to do next. */
+  message: Schema.String,
+  session: Schema.NullOr(PlaytestSessionView),
+});
+export type PlaytestToolResult = typeof PlaytestToolResult.Type;
