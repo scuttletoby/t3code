@@ -245,13 +245,14 @@
       ]
     },
     "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
-      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule is recorded as skipped with the reason and its next time, run now fails, a webhook delivery is marked failed (fork/agentSlotRoutes.ts, #706).",
+      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot; a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706).",
       "added": [
         "import { makeScheduledRunSlots } from \"../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
         "const runSlots = yield* makeScheduledRunSlots(WebhookDeliverySkipped); // Fork: agent slots",
         "const slot = yield* runSlots.admit(active, trigger, startedAt, rescheduleMissedRun); // Fork: agent slots",
         "if (slot.skipped !== null) return slot.skipped; // Fork: a skipped run is recorded",
-        "yield* slot.end(threadId); // Fork: the slot names the run's thread"
+        "yield* slot.end(threadId); // Fork: the slot names the run's thread",
+        "Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot"
       ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
@@ -263,11 +264,14 @@
       ]
     },
     "apps/server/src/mcp/toolkits/thread/handlers.ts": {
-      "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693).",
+      "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693); run_scheduled_task_now refused by the agent slot gate answers slots_full (fork/agentSlotRoutes.ts, #706; the prettier-ignore keeps upstream's run_scheduled_task_now lines as they are, since a second pipe step would make the formatter reflow them).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch",
-        "yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch"
+        "yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch",
+        "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+        "// prettier-ignore",
+        "Effect.mapError(AgentSlotRoutes.runNowSlotRefusal), // Fork: agent slots"
       ]
     }
   },

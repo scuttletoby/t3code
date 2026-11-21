@@ -303,6 +303,7 @@ describe("SlotGate observe mode", () => {
         assert.deepStrictEqual(refused, {
           type: "refuse",
           message: SlotGate.countUnreadRefusalText("error"),
+          refusal: { type: "unread", problem: "error" },
         });
         // The rule beside it got today's refusal and could not read the pieces either.
         assert.deepInclude(first.last, { today: "refuse", readings: "failed", pieces: null });

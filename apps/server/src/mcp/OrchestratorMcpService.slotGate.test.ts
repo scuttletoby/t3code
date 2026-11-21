@@ -131,14 +131,14 @@ const parentProjection = (subagents: ReadonlyArray<unknown>): OrchestrationV2Thr
     subagents,
   }) as unknown as OrchestrationV2ThreadProjection;
 
-const childProjection = (childThreadId: ThreadId) =>
+const childProjection = (childThreadId: ThreadId, hasRun = false) =>
   ({
     thread: {
       id: childThreadId,
       title: "Child",
       modelSelection: { instanceId: MAIN, model: MODEL },
     },
-    runs: [],
+    runs: hasRun ? [{ id: RunId.make(`run:${childThreadId}`), status: "running" }] : [],
     contextTransfers: [],
     messages: [],
     subagents: [],
@@ -173,6 +173,8 @@ interface World {
   readonly accepted: Set<string>;
   /** Threads `create_threads` dispatched (`thread.create`), and whether each started a run. */
   readonly created: Array<{ readonly threadId: ThreadId; readonly startsRun: boolean }>;
+  /** Runs after each `thread.create` (another caller takes a slot mid-batch, say). */
+  afterCreate: (() => void) | undefined;
 }
 
 const newWorld = (): World => ({
@@ -189,6 +191,7 @@ const newWorld = (): World => ({
   dispatchBegun: Deferred.makeUnsafe<void>(),
   accepted: new Set(),
   created: [],
+  afterCreate: undefined,
 });
 
 /** The server's layers for one test: the gate and /mcp share one settings service and world. */
@@ -222,7 +225,10 @@ const serverLayer = (
         Effect.succeed(
           threadId === parentThreadId
             ? parentProjection(world.tasks.map(taskOf))
-            : childProjection(threadId),
+            : childProjection(
+                threadId,
+                world.created.some((entry) => entry.threadId === threadId && entry.startsRun),
+              ),
         ),
       isProviderInstanceEnabledForProject: () => Effect.succeed(true),
       assertProviderInstanceEnabled: () => Effect.void,
@@ -235,6 +241,7 @@ const serverLayer = (
             const startsRun = command.initialMessage !== undefined;
             world.created.push({ threadId: command.threadId, startsRun });
             world.accepted.add(command.commandId);
+            world.afterCreate?.();
             return {
               sequence: world.created.length,
               storedEvents: startsRun ? [{ event: { type: "run.created" } }] : [],
@@ -731,7 +738,7 @@ describe("create_threads through the agent slot gate", () => {
       assert.strictEqual(failure.code, "slots_full");
       assert.strictEqual(
         failure.message,
-        "No free agent slot: 1 agent is running on this machine, and the limit is 1. Try again later. Or do the work yourself.",
+        "No thread was created. No free agent slot: 1 agent is running on this machine, and the limit is 1. Try again later. Or do the work yourself.",
       );
       assert.deepStrictEqual(world.created, []);
       assert.strictEqual(world.accepted.size, 0);
@@ -769,14 +776,114 @@ describe("create_threads through the agent slot gate", () => {
     }),
   );
 
-  it.effect("one call counts its own threads: one free slot creates the first only", () =>
+  it.effect("the whole batch is checked first: 2 prompts, 1 free slot, none created", () =>
     Effect.gen(function* () {
       const world = newWorld();
       const result = yield* createThreads("create-two", ["First.", "Second."]).pipe(
         Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)),
       );
+      const failure = failureOf(result);
+      assert.strictEqual(failure.code, "slots_full");
+      assert.isTrue(
+        failure.message.startsWith(
+          "No thread was created: the 2 threads with a prompt need 2 free agent slots, and 1 is free.",
+        ),
+        failure.message,
+      );
+      assert.deepStrictEqual(world.created, []);
+      assert.strictEqual(world.accepted.size, 0);
+    }),
+  );
+
+  it.effect("a batch that starts with a thread without a prompt is checked first too", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.running = [{ id: "busy", instanceId: MAIN }];
+      const result = yield* createThreads("create-idle-first", [undefined, "Work on it."]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)),
+      );
       assert.strictEqual(failureOf(result).code, "slots_full");
+      assert.deepStrictEqual(world.created, []);
+    }),
+  );
+
+  it.effect("enough slots for the batch: every thread is created and started", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const result = yield* createThreads("create-batch", [undefined, "First.", "Second."]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 2 }), roomy)),
+      );
+      assert.strictEqual(result._tag, "Success");
+      assert.deepStrictEqual(
+        world.created.map((entry) => entry.startsRun),
+        [false, true, true],
+      );
+    }),
+  );
+
+  it.effect("stops half-way: a slot taken mid-batch names the threads already created", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      // Another caller starts an agent once the first thread exists.
+      world.afterCreate = () => {
+        world.running = [{ id: "other", instanceId: MAIN }];
+      };
+      const result = yield* createThreads("create-race", ["First.", "Second."]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 2 }), roomy)),
+      );
+      const failure = failureOf(result);
+      assert.strictEqual(failure.code, "slots_full");
       assert.strictEqual(world.created.length, 1);
+      assert.isTrue(
+        failure.message.startsWith(
+          `Thread 2 was not created. Created before it in this call: ${world.created[0]!.threadId}.`,
+        ),
+        failure.message,
+      );
+    }),
+  );
+
+  it.effect("runs again after a stop: the created thread is kept, the rest are created", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.afterCreate = () => {
+        world.running = [{ id: "other", instanceId: MAIN }];
+      };
+      yield* Effect.gen(function* () {
+        assert.strictEqual(
+          failureOf(yield* createThreads("create-resume", ["First.", "Second."])).code,
+          "slots_full",
+        );
+        world.afterCreate = undefined;
+        world.running = [];
+        // The first thread's run counts (its grace and its run); one slot is left, for the second.
+        assert.strictEqual(
+          (yield* createThreads("create-resume", ["First.", "Second."]))._tag,
+          "Success",
+        );
+        // The first thread's command is sent again (the store keeps one); two threads in all.
+        assert.strictEqual(new Set(world.created.map((entry) => entry.threadId)).size, 2);
+        assert.isTrue(world.created.every((entry) => entry.startsRun));
+      }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 2 }), roomy)));
+    }),
+  );
+
+  it.effect("runs again: a created thread whose run never started is counted again", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.running = [{ id: "busy", instanceId: MAIN }];
+      // An older call created the thread, then stopped before its run (receipt, no run).
+      const created = yield* Effect.gen(function* () {
+        world.running = [];
+        assert.strictEqual((yield* createThreads("create-norun", [undefined]))._tag, "Success");
+        return world.created[0]!.threadId;
+      }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)));
+      assert.isDefined(created);
+      world.running = [{ id: "busy", instanceId: MAIN }];
+      const result = yield* createThreads("create-norun", ["Work on it."]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)),
+      );
+      assert.strictEqual(failureOf(result).code, "slots_full");
     }),
   );
 

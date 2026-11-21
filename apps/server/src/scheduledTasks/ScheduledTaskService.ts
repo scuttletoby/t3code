@@ -1234,6 +1234,7 @@ export const layer = Layer.effect(
         Effect.onError((cause) =>
           releaseStuckRun(task, startedAtIso, errorMessage(cause), webhook?.deliveryId),
         ),
+        Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot
       );
 
       // Reserve and release as one bracket so an interrupt cannot leave the task marked busy.

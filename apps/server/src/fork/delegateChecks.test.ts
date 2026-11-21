@@ -102,12 +102,13 @@ const callerThreadId = ThreadId.make("thread:seam-parent");
  * A new thread without a prompt, as create_threads passes it: it starts no run, so it takes no
  * agent slot (`OrchestratorMcpService.slotGate.test.ts` checks one that does).
  */
-const child = { threadId: ThreadId.make("thread:seam-child"), startsRun: false };
+const child = { threadId: ThreadId.make("thread:seam-child"), index: 0, batch: [{}] };
 const parent = {
   thread: {
     id: callerThreadId,
     projectId: ProjectId.make("project:seam"),
     runtimeMode: "full-access",
+    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
     lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: callerThreadId },
   },
 } as unknown as Pick<OrchestrationV2ThreadProjection, "thread">;

@@ -9,6 +9,7 @@ import {
   type ModelSelection,
   type OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpFailure,
+  type OrchestratorMcpCreateThreadRequest,
   type OrchestratorMcpTarget,
   PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
   type OrchestrationV2ThreadProjection,
@@ -97,10 +98,14 @@ export interface DelegateHold {
 export interface BeforeCreateThreadInput {
   readonly isRetry: boolean;
   /**
-   * The thread to be created, and whether its creation starts a run (a prompt): only then does it
-   * take an agent slot. The caller is the parent.
+   * The thread to be created: its place in the call's batch. A thread with a prompt starts a run
+   * and takes an agent slot; the first one checks the whole batch fits. The caller is the parent.
    */
-  readonly child: { readonly threadId: ThreadId; readonly startsRun: boolean };
+  readonly child: {
+    readonly threadId: ThreadId;
+    readonly index: number;
+    readonly batch: ReadonlyArray<OrchestratorMcpCreateThreadRequest>;
+  };
   readonly parent: Parent;
   /** The target the caller asked for, before the parent's options were laid under it. */
   readonly requested: OrchestratorMcpTarget | undefined;
@@ -484,25 +489,35 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         : acquireSlot(slotGate.value, input),
     // Placement (P1) adds its check here. The MCP profile check is first: a refusal starts nothing.
     // The slot is last, on the final target; a retry of an accepted creation starts nothing new.
-    beforeCreateThread: (input) =>
-      input.isRetry
-        ? Effect.succeed({ target: input.target })
+    beforeCreateThread: (input) => {
+      const slot = (target: DelegateTarget, retry: AgentSlotRoutes.CreateThreadSlot["retry"]) =>
+        AgentSlotRoutes.admitCreateThread(slotGate, {
+          callerThreadId: input.parent.thread.id,
+          threadId: input.child.threadId,
+          index: input.child.index,
+          batch: input.child.batch,
+          targetInstanceId: target.modelSelection.instanceId,
+          defaultInstanceId: input.parent.thread.modelSelection.instanceId,
+          retry,
+        });
+      // A retry starts the run its first try did not (the dispatch after the creation failed).
+      const hasRun = Effect.suspend(() =>
+        threadManagement.getThreadRecords(input.child.threadId, ["runs"]),
+      ).pipe(
+        Effect.map((records) => records.runs.length > 0),
+        Effect.orElseSucceed(() => false),
+      );
+      return input.isRetry
+        ? slot(input.target, { hasRun }).pipe(Effect.as({ target: input.target }))
         : launchMcpProfile(input.parent.thread, {
             projectId: input.parent.thread.projectId,
             route: "create_threads",
           }).pipe(
             Effect.andThen(ownTarget(input.target, input.requested)),
-            Effect.tap((target) =>
-              input.child.startsRun
-                ? AgentSlotRoutes.admitNamed(slotGate, {
-                    callerThreadId: input.parent.thread.id,
-                    targetInstanceId: target.modelSelection.instanceId,
-                    childThreadId: input.child.threadId,
-                  })
-                : Effect.void,
-            ),
+            Effect.tap((target) => slot(target, null)),
             Effect.map((target) => ({ target })),
-          ),
+          );
+    },
     remoteTarget: (target) =>
       remoteTarget(target) === target
         ? Effect.succeed(target)

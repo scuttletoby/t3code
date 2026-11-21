@@ -3204,7 +3204,7 @@ const make = Effect.gen(function* () {
               });
               const { target } = yield* delegateChecks.beforeCreateThread({
                 isRetry: isRetryOfAcceptedCreation,
-                child: { threadId, startsRun: request.prompt !== undefined },
+                child: { threadId, index, batch: input.threads },
                 parent,
                 requested: request.target,
                 target: resolvedTarget,
