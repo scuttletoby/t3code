@@ -1,0 +1,61 @@
+name: Fork CI re-run
+
+# Fork only. A failed Fork tests run gets ONE automatic "re-run failed jobs"
+# (GitHub's own), only when every failed job shows a known infrastructure sign:
+# its runner lost communication, its box was full (OOM kills, memory.max hits,
+# memory.high throttling while stalled), or it ran past its time limit while the
+# machine was stalled. Never for a test failure (no sign: left red, fail closed)
+# and never twice: the re-run is triggered by github-actions, and a run with an
+# attempt by anyone but CONFIG's actors is left red. Every rule, and the numbers
+# that decide it, are in .github/scripts/fork-ci-rerun.py and
+# .github/fork-ci-rerun.json; each job's numbers come from its own
+# fork-ci-pressure.py steps (fork-tests.yml). Each re-run is a warning
+# annotation with its signs and numbers and a row in this job's summary, and
+# every pass counts the automatic re-runs of the last 24 hours.
+# On a schedule, not on workflow_run (fork-contracts.test.py refuses events a
+# pull request from another fork can cause): nothing is kept between passes,
+# each reads the runs of the last hour from GitHub, so a pass that stopped
+# half-way is finished by the next. Offset from fork-fleet.yml's sweep, which
+# re-runs a lost fleet runner's run too: whichever comes first re-runs it, the
+# other finds an attempt by github-actions and leaves it. Runbook:
+# .github/fork-ci-rerun.md.
+on:
+  schedule:
+    - cron: "5-55/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Only this Fork tests run (its id; empty for every run of the last hour)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: fork-ci-rerun
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      checks: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: |
+            /.github/fork-ci-rerun.json
+            /.github/scripts/fork-ci-rerun.py
+          sparse-checkout-cone-mode: false
+
+      - name: Re-run a run that failed for infrastructure only, once
+        env:
+          CI_RUNNERS: ${{ vars.CI_RUNNERS }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: python3 -I .github/scripts/fork-ci-rerun.py sweep ${RUN_ID:+--run-id "$RUN_ID"}
