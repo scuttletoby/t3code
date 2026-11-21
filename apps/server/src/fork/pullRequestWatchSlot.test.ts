@@ -60,6 +60,7 @@ import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { makeSlots } from "./delegatedResults/delegatedResults.testkit.ts";
 import {
+  FORGET_WATCH_KEY_MS,
   gatePullRequestWatchWakes,
   layerOver,
   PullRequestWatchWakeWaitsForSlot,
@@ -252,6 +253,31 @@ describe("pull request watch wake-ups take an agent slot", () => {
     }),
   );
 
+  const forgetLogs: Array<string> = [];
+  it.effect(
+    "a watch no refusal renews for 10 minutes (removed, its thread gone) is forgotten",
+    () =>
+      Effect.gen(function* () {
+        const { sent, slots, wrapped } = yield* makeWrapped(() => Effect.succeed(INSTANCE));
+        slots.state.all = true;
+        yield* Effect.exit(wrapped.dispatch(watchSync({ id: "f1", wake: true, ends: true })));
+        yield* Effect.exit(wrapped.dispatch(watchSync({ id: "f2", wake: true, number: 2 })));
+        // Retried each sweep (2 min): still known.
+        yield* TestClock.adjust(FORGET_WATCH_KEY_MS - 60_000);
+        yield* Effect.exit(wrapped.dispatch(watchSync({ id: "f3", wake: true, number: 2 })));
+        yield* TestClock.adjust(FORGET_WATCH_KEY_MS + 1);
+        // The ending watch's key is gone: its silent end is no longer held back.
+        const end = watchSync({ id: "f4", wake: false, ends: true });
+        yield* wrapped.dispatch(end);
+        expect(sent).toEqual([end]);
+        // The waiting watch's key too: a new wait of it is logged again.
+        yield* Effect.exit(wrapped.dispatch(watchSync({ id: "f5", wake: true, number: 2 })));
+        expect(
+          forgetLogs.filter((log) => log.includes("wake-up waits for an agent slot")),
+        ).toHaveLength(3);
+      }).pipe(Effect.provide(infoLogs(forgetLogs))),
+  );
+
   it.effect("a thread that cannot be read waits; one that is gone is upstream's to refuse", () =>
     Effect.gen(function* () {
       const unreadable = yield* makeWrapped(() => Effect.fail("unreadable"));
@@ -294,7 +320,13 @@ describe("pull request watch wake-ups take an agent slot", () => {
         );
         const forkLayers = yield* read("./forkLayers.ts");
         expect(forkLayers).toMatch(
-          /export const handoffThreadsSkipIdleCompaction = PullRequestWatchSlot\.layer\.pipe\(\s*Layer\.provide\(HandoffOwner\.layer\),\s*\);/,
+          /export const handoffThreadsSkipIdleCompaction = PullRequestWatchSlot\.layer\.pipe\(\s*Layer\.provide\(HandoffOwner\.layer\),\s*Layer\.provide\(WorkerWakeSlots\.layer\),\s*\);/,
+        );
+        expect(yield* read("./workerWakeSlots.ts")).toMatch(
+          /export const layer = layerOver\.pipe\(\s*Layer\.provide\(Layer\.merge\(SlotGate\.layer, ProjectionStore\.layer\)\),\s*\);/,
+        );
+        expect(yield* read("./handoff/HandoffService.ts")).toContain(
+          "  Layer.provide(SlotGate.layer),\n);",
         );
         const own = yield* read("./pullRequestWatchSlot.ts");
         expect(own).toMatch(

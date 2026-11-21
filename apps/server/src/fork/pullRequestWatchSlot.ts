@@ -9,6 +9,7 @@ import type {
   ThreadId,
   ThreadPullRequestKey,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -33,6 +34,9 @@ export class PullRequestWatchWakeWaitsForSlot extends Schema.TaggedError<PullReq
     return `The pull request watch wake-up waits for an agent slot: ${this.detail}.`;
   }
 }
+
+/** A key no refusal renewed this long is a watch that ended or whose thread went (sweeps: 2 min). */
+export const FORGET_WATCH_KEY_MS = 10 * 60_000;
 
 const watchKey = (
   threadId: ThreadId,
@@ -60,9 +64,15 @@ export const gatePullRequestWatchWakes = <E>(
    * watch with no wake, which would lose it; that next silent end is refused once, so the reactor
    * keeps the watch and gives up again, with its wake, on its next failed read.
    */
-  const endingRefused = new Set<string>();
+  const endingRefused = new Map<string, number>();
   /** Watches whose wake waits, logged once until one lands. */
-  const waiting = new Set<string>();
+  const waiting = new Map<string, number>();
+  const forgetOld = Effect.fn("PullRequestWatchSlot.forgetOld")(function* () {
+    const nowMs = yield* Clock.currentTimeMillis;
+    for (const keys of [endingRefused, waiting])
+      for (const [key, atMs] of keys) if (nowMs - atMs > FORGET_WATCH_KEY_MS) keys.delete(key);
+    return nowMs;
+  });
 
   const waitsForSlot = (command: WatchSync, detail: string) =>
     Effect.fail(
@@ -91,14 +101,15 @@ export const gatePullRequestWatchWakes = <E>(
     const keys = watchesOf(command).map((watch) => watchKey(command.threadId, watch));
     if (slot.type === "refuse") {
       const detail = reasonHere(slot.refusal);
+      const nowMs = yield* forgetOld();
       for (const watch of watchesOf(command))
-        if (watch.watch === null) endingRefused.add(watchKey(command.threadId, watch));
+        if (watch.watch === null) endingRefused.set(watchKey(command.threadId, watch), nowMs);
       if (keys.some((key) => !waiting.has(key)))
         yield* Effect.logInfo("pull request watch wake-up waits for an agent slot", {
           threadId: command.threadId,
           detail,
         });
-      for (const key of keys) waiting.add(key);
+      for (const key of keys) waiting.set(key, nowMs);
       return yield* waitsForSlot(command, detail);
     }
     for (const key of keys) {
@@ -114,6 +125,7 @@ export const gatePullRequestWatchWakes = <E>(
       if (command.type !== "thread.pull-request-watch.sync")
         return yield* orchestrator.dispatch(command);
       if (command.wake !== undefined) return yield* dispatchWake(command);
+      yield* forgetOld();
       const silentEnds = watchesOf(command)
         .filter((watch) => watch.watch === null)
         .map((watch) => watchKey(command.threadId, watch))
