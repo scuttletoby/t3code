@@ -485,7 +485,10 @@ the thread its own profile; `delegate_task` carries the launcher's profile inste
 made by the sending machine: a T3 from before this check sends a narrowed thread's launch to a
 machine of this version unchecked, and there it arrives with no calling thread and gets that
 machine's profile. Editing or running a scheduled task on another machine, and a fork there, are
-covered below. A thread on `all`, and the owner's own client, launch as before.
+covered below; a T3 from before those checks sends them unchecked too, and each arrives here with
+no calling thread: a fork gets its project's profile cut to its source's, a change to a task is
+recorded as saved from another machine, and a run now is checked against the task's record (both
+below). A thread on `all`, and the owner's own client, launch as before.
 
 The same rule holds for the other ways such a thread starts a thread on this machine
 ([#693](https://github.com/scuttletoby/t3code/issues/693)). `schedule_task` is refused when the
@@ -494,9 +497,14 @@ is not within the caller's; a task bound to the caller runs in it and keeps its 
 to a task whose runs start new threads (also one made before this check), and unbinding a task from
 the caller, are refused the same way: delete the task, bind it to the caller
 (`bindToCurrentThread: true`), or ask the owner. `run_scheduled_task_now` on such a task is refused
-too. These refusals are checked again by the scheduled task service on the task it reads as it
-saves, so a change another caller makes in between is seen
-([#699](https://github.com/scuttletoby/t3code/issues/699)). Such a thread also cannot change the
+too. A retry of a `schedule_task` create that was accepted before is checked again, so it is
+refused when the profiles no longer allow it, though the task exists. These refusals are checked
+again by the scheduled task service on the task it reads as it saves, so a change another caller
+makes in between is seen ([#699](https://github.com/scuttletoby/t3code/issues/699)). A change that
+lands while the owner moves the task's thread to another project (which moves the task with it) is
+refused, so it cannot put the task back in its old project without its thread; the task stays as
+the move left it, and is read and changed again
+([#704](https://github.com/scuttletoby/t3code/issues/704)). Such a thread also cannot change the
 prompt, project or thread of a task bound to another thread whose profile is not within its own
 (that thread would run its words); reading, renaming, pausing it and changing its schedule still
 work. The `schedule_task` handler checks that before the service is called, so a refused change
@@ -511,19 +519,29 @@ get more than the recorded profile, for example after the owner widened the proj
 is also refused when the task was saved from another machine, and when an agent made it and it has no
 entry (saved before this record, or the file was lost or an older copy put back). The owner saves
 the task once in the app to allow it; a task the owner made with no entry runs as before. A
-webhook delivery that waited for an agent slot is checked again as it starts. A refused scheduled run
+webhook delivery that waited for an agent slot is checked again as it starts; if the task was saved
+again while it waited, the delivery is not run (it was asked for the task as it was), and the next
+delivery uses the task as it is now. A refused scheduled run
 is recorded as failed with the reason and moves on to its next time; a one-time task then has no
 next time, so after the owner's save it is run now or given a new time (the reason says so). A task
 whose row changed after its record (a save stopped half-way) is refused until it is saved again, and
 a record file that cannot be read refuses saves and runs that start a new thread until it is fixed
-or removed. Runs into a bound thread keep that thread's profile and are not held up. That includes
+or removed (the server log warns once while it stays so). Runs into a bound thread keep that thread's profile and are not held up. That includes
 a task with `threadMode: "continue"` that has no thread yet: its first run is checked, later runs go
 into the thread that run made, and if the owner widens the project, that thread and those runs widen
 with it. A change saved from another machine is not checked against the thread a task is bound to
 here: a current sender refuses a narrowed thread's change first, but a T3 from before that check
-forwards it. Entries of deleted tasks are dropped at each start.
+forwards it. A thread bound while a save is being made (the task's first run binding the thread it
+made, or another thread binding the task to itself) is kept by that save and not checked against
+it ([#719](https://github.com/scuttletoby/t3code/issues/719)): the first run's thread gets the
+project's profile the save was checked on, and a thread that binds the task to itself is one a
+narrowed thread can already send words to (`t3_thread_send`, as T3's own tools cannot be cut yet).
+An owner-made task that a narrowed thread changed runs as the owner's again if its entry is dropped
+from the file, which takes owner-level access to the state folder. Entries of deleted tasks are
+dropped at each start.
 `t3_thread_transfer`'s fork is refused when the fork would get more than the caller's profile: a
-fork gets its source's profile cut to the source's, so forking the caller itself always goes through, and a fork of a thread whose parent cannot be read is refused. On
+fork gets its project's profile cut to its source's, so forking the caller itself always goes
+through, and a fork of a thread whose parent cannot be read is refused. On
 another machine, a fork, a change to a scheduled task and `run_scheduled_task_now` are refused for
 such a thread, as a thread started there gets that machine's profile.
 

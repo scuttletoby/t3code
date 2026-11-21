@@ -15,6 +15,8 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import { loadCaller } from "../mcp/threadAccess.ts";
+import type { OrchestratorToolkit } from "../mcp/toolkits/orchestrator/tools.ts";
+import type { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 
 import {
@@ -180,8 +182,10 @@ const checkTaskRuns = Effect.fn("LaunchMcpProfile.taskRuns")(function* (
   const { caller, threads } = yield* loadCaller();
   if (caller === undefined) return;
   const changesBound = prompt !== undefined || bindToCurrentThread !== undefined;
-  // Upstream's orchestrator toolkit does not name this service; the server provides it to every
-  // toolkit, and without it the task cannot be read, so the call is refused.
+  // Upstream's orchestrator toolkit does not name this service (`schedule_task` declares only its
+  // own services). The server hands every toolkit call the whole context it was built with
+  // (McpHttpServer's `provideRegistrationServices`), which holds it; a test through that wiring
+  // pins it (scheduleForkMcpProfile.test.ts). Without it the task cannot be read: refused.
   const service = yield* Effect.serviceOption(ScheduledTasks.ScheduledTaskService);
   if (Option.isNone(service)) {
     return yield* new OrchestratorMcpFailure({
@@ -199,6 +203,8 @@ const checkTaskRuns = Effect.fn("LaunchMcpProfile.taskRuns")(function* (
     ),
   );
   const task = tasks.find((candidate) => candidate.id === scheduledTaskId);
+  // Missing here: left to the service's "not found". A task made between this read and the
+  // service's own is checked there, on the row it writes.
   if (task === undefined) return;
   // Bound to another thread: the service's rule (scheduledTaskMcpProfile.ts), here too so a refused
   // change does not use up the webhook secretRef it carries (the service consumes it first).
@@ -320,9 +326,17 @@ export const refuseUnlessHere = (caller: {
 }) => (startingHere.has(caller) ? Effect.void : refuseLaunchElsewhere(caller.caller));
 
 /**
+ * The tools `checkForwarded` matches by name, typed against upstream's toolkits: a rename there
+ * fails the typecheck here instead of dropping the check without a word.
+ */
+const FORK_TOOL = "t3_thread_transfer" satisfies keyof (typeof ThreadToolkit)["tools"];
+const SCHEDULE_TOOL = "schedule_task" satisfies keyof (typeof OrchestratorToolkit)["tools"];
+const RUN_NOW_TOOL = "run_scheduled_task_now" satisfies keyof (typeof ThreadToolkit)["tools"];
+
+/**
  * A call forwarded to another machine that may start a thread there outside `startsThreads`: a
  * fork, a change to a scheduled task, or running one now. A narrowed caller is refused, as the
- * thread there would get that machine's profile; the call is not sent.
+ * thread there would get that machine's profile; the call is not sent. Tools are matched by name.
  */
 export const checkForwarded = Effect.fn("LaunchMcpProfile.forwarded")(function* (
   tool: string,
@@ -330,11 +344,11 @@ export const checkForwarded = Effect.fn("LaunchMcpProfile.forwarded")(function* 
 ) {
   const input = params as { readonly action?: unknown; readonly scheduledTaskId?: unknown };
   const done =
-    tool === "t3_thread_transfer" && input.action === "fork"
+    tool === FORK_TOOL && input.action === "fork"
       ? "it was not forked"
-      : tool === "schedule_task" && input.scheduledTaskId !== undefined
+      : tool === SCHEDULE_TOOL && input.scheduledTaskId !== undefined
         ? "the task was not changed"
-        : tool === "run_scheduled_task_now"
+        : tool === RUN_NOW_TOOL
           ? "the task was not run"
           : undefined;
   if (done === undefined) return;
