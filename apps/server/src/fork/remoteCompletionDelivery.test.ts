@@ -21,7 +21,6 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
-import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
@@ -277,14 +276,8 @@ const makeParentServer = (database: Context.Context<SqlClient.SqlClient>, there:
       ProviderReplayHarness.layerWithRegistry(
         { name: "remote-completion-delivery" },
         ProviderAdapterRegistry.layerFromAdapters([adapter]),
-        { databaseLayer: layerDatabase, runEffectWorker: false },
-      ),
-    ).pipe(
-      Layer.provide(
-        Layer.succeed(ProviderContinuationRequests.ProviderContinuationRequests, {
-          offer: () => Effect.void,
-          take: Effect.never,
-        }),
+        // Upstream's continuation worker takes each wake offered and writes its message.
+        { databaseLayer: layerDatabase, runEffectWorker: false, runContinuationWorker: true },
       ),
     );
     const layerThreads = ThreadManagement.layer.pipe(
@@ -435,9 +428,9 @@ const seedParent = (server: ParentServer) =>
   });
 
 /**
- * What the parent holds for the task: its result, and the wake upstream reserved for it on the
- * parent's run (its message id, generation, and the generations handed out on that run). Its
- * message is written when the wake is taken, which no worker does here.
+ * What the parent holds for the task: its result, the wake upstream reserved for it on the
+ * parent's run (its message id, generation, and the generations handed out on that run), and the
+ * wake messages naming it, which upstream's continuation worker writes when it takes the wake.
  */
 const parentView = (server: ParentServer, taskId: NodeId) =>
   server.orchestrator.getThreadProjection(parentThreadId).pipe(
@@ -451,33 +444,52 @@ const parentView = (server: ParentServer, taskId: NodeId) =>
           generation: cohort?.delivery?.generation,
           generations: (cohort?.nextGeneration ?? 1) - 1,
           taskIds: cohort?.delivery?.taskIds ?? [],
-          messages: projection.messages.filter(
-            (message) => message.delegatedCompletion?.taskIds.includes(taskId) === true,
-          ).length,
+          messages: projection.messages
+            .filter((message) => message.delegatedCompletion?.taskIds.includes(taskId) === true)
+            .map((message) => message.id),
         },
       };
     }),
   );
 
-/** Waits for the task's end to be recorded here with its wake claimed, then reads the parent. */
+/**
+ * Waits for the task's end to be recorded here with its wake claimed, and for the wake's message
+ * to be written, then reads the parent.
+ */
 const awaitResult = (server: ParentServer, taskId: NodeId) =>
-  server.orchestrator
-    .streamStoredEventsFrom({
-      threadId: parentThreadId,
-      afterSequence: 0,
-      eventType: "subagent.updated",
-    })
-    .pipe(
-      Stream.filter(
-        ({ event }) =>
-          event.type === "subagent.updated" &&
-          event.payload.id === taskId &&
-          event.payload.result !== null &&
-          event.payload.completionDelivery?.state === "claimed",
-      ),
-      Stream.runHead,
-      Effect.andThen(parentView(server, taskId)),
-    );
+  Effect.gen(function* () {
+    yield* server.orchestrator
+      .streamStoredEventsFrom({
+        threadId: parentThreadId,
+        afterSequence: 0,
+        eventType: "subagent.updated",
+      })
+      .pipe(
+        Stream.filter(
+          ({ event }) =>
+            event.type === "subagent.updated" &&
+            event.payload.id === taskId &&
+            event.payload.result !== null &&
+            event.payload.completionDelivery?.state === "claimed",
+        ),
+        Stream.runHead,
+      );
+    yield* server.orchestrator
+      .streamStoredEventsFrom({
+        threadId: parentThreadId,
+        afterSequence: 0,
+        eventType: "message.updated",
+      })
+      .pipe(
+        Stream.filter(
+          ({ event }) =>
+            event.type === "message.updated" &&
+            event.payload.delegatedCompletion?.taskIds.includes(taskId) === true,
+        ),
+        Stream.runHead,
+      );
+    return yield* parentView(server, taskId);
+  });
 
 /** Nothing left for a start to follow: no open task, and its thread there is stopped. */
 const expectNothingToFollow = (server: ParentServer) =>
@@ -498,7 +510,8 @@ const expectDeliveredOnce = (
   });
   expect(view.task?.remoteChild?.stoppedThere).toBe(true);
   expect(view.wake).toMatchObject({ generation: 1, generations: 1, taskIds: [taskId] });
-  expect(view.wake.messages).toBeLessThanOrEqual(1);
+  // The worker took the wake: exactly one message names the task, the reserved one.
+  expect(view.wake.messages).toEqual([view.wake.messageId]);
   return view.wake;
 };
 
