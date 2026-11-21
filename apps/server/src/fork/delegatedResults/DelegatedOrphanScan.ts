@@ -178,10 +178,13 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
           // A person stopped it: never restart it from here.
           return { type: "held", detail: "stopped" } satisfies ParentOutcome;
         case "rejected":
-          yield* Effect.logWarning("delegated orphan reminder refused", {
-            threadId: parentThreadId,
-            detail: result.detail,
-          });
+          // Logged when refused, not on each later pass that finds its refused receipt.
+          if (result.earlier !== true) {
+            yield* Effect.logWarning("delegated orphan reminder refused", {
+              threadId: parentThreadId,
+              detail: result.detail,
+            });
+          }
           refused = result.detail;
           break;
         case "retry":

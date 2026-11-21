@@ -23,12 +23,14 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 import { TestClock } from "effect/testing";
 
 import * as McpToolAccessTestkit from "../../mcp/McpToolAccess.testkit.ts";
 import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
+import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { legacyReminderSetId, REMINDER_MAX_AGE_MS, reminderBatchIds } from "./delegatedResults.ts";
 import {
@@ -38,6 +40,7 @@ import {
   makeSlots,
   NOW,
   PARENT,
+  reminderMessageEvent,
 } from "./delegatedResults.testkit.ts";
 import * as DelegatedResultReminder from "./DelegatedResultReminder.ts";
 import * as DelegatedResultsStore from "./DelegatedResultsStore.ts";
@@ -86,6 +89,10 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   let failSends = 0;
   // The record of earlier reminders cannot be read while this is set.
   const record = { unreadable: false, messagesUnreadable: false };
+  // Set: the thread's messages are read from the real projection, not from `sent`.
+  const realMessages: {
+    read: ThreadManagement.ThreadManagementService["Service"]["getMessagesById"] | null;
+  } = { read: null };
   // Parents whose wake upstream reserved (null: every parent with tasks), and those the table names.
   const recovery: { ids: ReadonlyArray<ThreadId> | null } = { ids: null };
   const unread: { ids: ReadonlyArray<ThreadId>; since: Array<string> } = { ids: [], since: [] };
@@ -103,6 +110,7 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
     refusing,
     refused,
     sends,
+    realMessages,
     /** The next `count` sends fail, after `after` more succeed. */
     failNextSends: (count: number, after = 0) => {
       okSends = after;
@@ -117,19 +125,21 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
           getThreadRecords: ((threadId: ThreadId) =>
             Effect.succeed({ subagents: tasks.get(threadId) ?? [] })) as never,
           getMessagesById: (threadId, ids) =>
-            record.messagesUnreadable
-              ? Effect.fail({ _tag: "OrchestratorProjectionError", message: "busy" } as never)
-              : Effect.succeed(
-                  new Map(
-                    sent
-                      .filter((message) => message.threadId === threadId)
-                      .filter((message) => ids.includes(MessageId.make(message.messageId)))
-                      .map((message) => [
-                        MessageId.make(message.messageId),
-                        { text: message.text } as never,
-                      ]),
+            realMessages.read !== null
+              ? realMessages.read(threadId, ids)
+              : record.messagesUnreadable
+                ? Effect.fail({ _tag: "OrchestratorProjectionError", message: "busy" } as never)
+                : Effect.succeed(
+                    new Map(
+                      sent
+                        .filter((message) => message.threadId === threadId)
+                        .filter((message) => ids.includes(MessageId.make(message.messageId)))
+                        .map((message) => [
+                          MessageId.make(message.messageId),
+                          { text: message.text } as never,
+                        ]),
+                    ),
                   ),
-                ),
           sendToThread: (input) =>
             Effect.gen(function* () {
               if (refusing.commandIds.includes(input.commandId)) {
@@ -203,6 +213,18 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
                       .map(([commandId]) => commandId),
                   ].filter((id) => id.startsWith(prefix)),
             ),
+          // As the real read: the text of each of the thread's messages asked for.
+          messageTexts: (threadId, ids) =>
+            Effect.sync(() =>
+              record.messagesUnreadable
+                ? null
+                : new Map(
+                    sent
+                      .filter((message) => message.threadId === threadId)
+                      .filter((message) => ids.includes(message.messageId))
+                      .map((message) => [message.messageId, message.text]),
+                  ),
+            ),
         }),
       ),
   };
@@ -223,6 +245,21 @@ const reminderIdsOf = (tasks: ReadonlyArray<OrchestrationV2Subagent>) =>
     PARENT,
     tasks.map((task) => task.id),
   );
+
+const warningLogs = (into: Array<string>) =>
+  Logger.layer(
+    [
+      Logger.make(({ message, logLevel }) => {
+        if (logLevel === "Warn") into.push(JSON.stringify(message));
+      }),
+    ],
+    { mergeWithExisting: false },
+  );
+
+// Upstream's projection and the reminder's own reads, over one real database.
+const realStores = Layer.mergeAll(DelegatedResultsStore.layer, ProjectionStore.layer).pipe(
+  Layer.provideMerge(SqlitePersistence.layerMemory),
+);
 
 /** Lets forked fibers reach their next sleep (or finish) before the clock moves or a check. */
 const settle = Effect.repeat(Effect.yieldNow, { times: 20 });
@@ -420,6 +457,86 @@ describe("DelegatedResultReminder.check", () => {
       expect(world.sent).toHaveLength(2);
       expect(world.refused.size).toBe(1);
     }),
+  );
+
+  it.effect("warns of a refused batch once, not on every check; a new batch warns again", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const many = Array.from({ length: 12 }, (_, index) =>
+        delegatedTask({ id: `task-${String(index).padStart(2, "0")}` }),
+      );
+      world.tasks.set(PARENT, many);
+      const first = reminderIdsOf(many.slice(0, 10));
+      world.refusing.commandIds = [first.commandId];
+      const warnings: Array<string> = [];
+      const refusals = () => warnings.filter((log) => log.includes("reminder refused"));
+      const reminder = yield* service(world);
+      const check = reminder.check(PARENT).pipe(Effect.provide(warningLogs(warnings)));
+      expect(yield* check).toMatchObject({ type: "held", taskIds: ["task-10", "task-11"] });
+      // Runs again, and after a restart: answered from its refused receipt, no new warning.
+      expect(yield* check).toMatchObject({ type: "held", taskIds: [] });
+      yield* (yield* service(world)).check(PARENT).pipe(Effect.provide(warningLogs(warnings)));
+      expect(refusals()).toHaveLength(1);
+      // A task that sorts first ends: the refused tasks go in a new batch (new ids), refused too.
+      const extra = delegatedTask({ id: "task-0" });
+      world.tasks.set(PARENT, [extra, ...many]);
+      const next = reminderIdsOf([extra, ...many.slice(0, 9)]);
+      world.refusing.commandIds = [first.commandId, next.commandId];
+      expect(yield* check).toEqual({ type: "held", detail: "refused", taskIds: ["task-09"] });
+      expect(refusals()).toHaveLength(2);
+      expect(yield* check).toEqual({ type: "held", detail: "refused", taskIds: [] });
+      expect(refusals()).toHaveLength(2);
+    }),
+  );
+
+  it.effect(
+    "a first-format reminder that cannot be decoded is left out alone (real message table)",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const store = yield* DelegatedResultsStore.DelegatedResultsStore;
+        const sql = yield* SqlClient.SqlClient;
+        // Every message read goes to the real table (upstream's decode included).
+        world.realMessages.read = projections.getMessagesById as never;
+        // Before the upgrade: tasks 1 and 2 told in one message, written by upstream's projection.
+        const good = firstFormatReminder(PARENT, ["task-1", "task-2"]);
+        yield* projections.apply(reminderMessageEvent(PARENT, good.messageId, good.text));
+        // Tasks 3 and 4 told in another, whose stored payload upstream can no longer decode.
+        const broken = firstFormatReminder(PARENT, ["task-3", "task-4"]);
+        yield* sql`
+          INSERT INTO orchestration_v2_projection_messages (
+            message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at,
+            payload_json
+          ) VALUES (
+            ${broken.messageId}, ${PARENT}, NULL, NULL, 'user', 0, '2026-11-20T11:59:00.000Z',
+            '2026-11-20T11:59:00.000Z', '{"obsolete":"transcript"}'
+          )
+        `;
+        world.tasks.set(
+          PARENT,
+          ["task-1", "task-2", "task-3", "task-4", "task-5"].map((id) => delegatedTask({ id })),
+        );
+        const reminder = yield* DelegatedResultReminder.make(OPTIONS).pipe(
+          Effect.provideService(DelegatedResultsStore.DelegatedResultsStore, store),
+          Effect.provide(world.layer(Stream.empty)),
+        );
+        // Tasks 1 and 2 are split from the readable text; 3 and 4 fall back to their receipt's
+        // rule (not the owed set, not one task), so they are reminded once more.
+        expect(yield* reminder.check(PARENT)).toEqual({
+          type: "sent",
+          taskIds: ["task-3", "task-4", "task-5"],
+        });
+        expect(world.sent).toHaveLength(1);
+        // Runs again, once the projection has its message: nothing more.
+        yield* projections.apply(
+          reminderMessageEvent(PARENT, world.sent[0]!.messageId, world.sent[0]!.text),
+        );
+        expect(yield* reminder.check(PARENT)).toEqual({ type: "none" });
+        expect(world.sent).toHaveLength(1);
+      }).pipe(Effect.provide(realStores)),
   );
 
   it.effect("many owed results go in batches; one stopped half-way sends only the rest", () =>
