@@ -648,6 +648,61 @@ class Heavy(unittest.TestCase):
         self.assertEqual(r.returncode, 76, r.stderr)
         self.assertIn('gave up after waiting', r.stderr)
 
+    # --- measured need (lib/heavy_measure.py; the history and the capacity front are in measure.test.py) ----------
+
+    def measured(self, state):
+        try:
+            with open(os.path.join(state, 'measured.jsonl')) as f:
+                return [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def grow(self, mb, seconds):
+        """A command that holds mb MB of written memory for a while (the test folder is in its command line)."""
+        return [sys.executable, '-I', '-c', f'import time; b = b"x" * ({mb} << 20); time.sleep({seconds})  # {self.dir}']
+
+    def test_a_measured_job_records_its_memory_under_its_kind(self):
+        state = os.path.join(self.dir, 'state')
+        r = self.heavy('--measure', 'heavy-test', '--', *self.grow(120, 2), env=dict(self.env, HEAVY_STATE_DIR=state))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        records = self.measured(state)
+        self.assertEqual([(x['kind'], x['end']) for x in records], [('heavy-test', 'exited')], r.stderr)
+        self.assertGreaterEqual(records[0]['peakMb'], 120)         # the kernel's peak, read after the scope went
+        self.assertGreaterEqual(records[0]['usedMb'], 100)
+        self.assertLess(records[0]['usedMb'], 1024)
+
+    def test_a_queued_job_records_under_its_queue_kind(self):
+        state = os.path.join(self.dir, 'state')
+        r = self.heavy('--kind', 'heavy-test', '--mb', '256', '--wait', '60', '--', *self.grow(80, 1),
+                       env=dict(self.env, HOME=self.dir, HEAVY_STATE_DIR=state))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([x['kind'] for x in self.measured(state)], ['heavy-test'])
+
+    def test_a_nested_heavy_records_nothing_of_its_own(self):
+        state = os.path.join(self.dir, 'state')
+        inner = ' '.join(f"'{a}'" for a in self.grow(60, 1))
+        r = self.heavy('--measure', 'heavy-outer', '--', 'sh', '-c', f'"{HEAVY}" --measure heavy-inner -- {inner}',
+                       env=dict(self.env, HEAVY_STATE_DIR=state))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([x['kind'] for x in self.measured(state)], ['heavy-outer'])
+
+    def test_a_measured_heavy_killed_with_9_records_nothing_and_leaves_the_history_whole(self):
+        state = os.path.join(self.dir, 'state')
+        os.makedirs(state)
+        before = json.dumps({'v': 1, 'at': 'x', 'kind': 'heavy-test', 'end': 'exited', 'seconds': 1, 'usedMb': 5,
+                             'peakMb': 6}) + '\n'
+        with open(os.path.join(state, 'measured.jsonl'), 'w') as f:
+            f.write(before)
+        p = self.start('--measure', 'heavy-test', '--', 'sh', '-c', f'exec {self.sleeper}',
+                       env=dict(self.env, HEAVY_STATE_DIR=state))
+        wait_for(lambda: len(self.ours()) == 1, what='the command')
+        time.sleep(0.5)                             # the measurer has the scope open
+        p.kill()
+        p.communicate(timeout=60)
+        wait_for(lambda: not self.ours(), what='the guard to stop the scope')
+        with open(os.path.join(state, 'measured.jsonl')) as f:
+            self.assertEqual(f.read(), before)
+
     # --- red check -----------------------------------------------------------------------------------------------
 
     def test_red_check_the_old_wrapper_leaves_the_child_running(self):

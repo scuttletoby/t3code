@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "percentile": 95,
+  "marginPercent": 20,
+  "minRuns": 5,
+  "recentRuns": 50,
+  "roundMb": 128,
+  "minMb": 256,
+  "kinds": {
+    "review": { "fallbackMb": 1024, "note": "a read-only reviewer" },
+    "node-tests": { "fallbackMb": 1536, "note": "a writer that runs Node tests only" },
+    "python-tests": { "fallbackMb": 1536, "note": "a writer that runs Python tests only" },
+    "test-run": { "fallbackMb": 2048, "note": "a test run of a built project" },
+    "gradle-build": { "fallbackMb": 3072, "maxMb": 6144, "note": "a Gradle build" },
+    "test-server": { "fallbackMb": 3072, "maxMb": 6144, "note": "a private test server" }
+  }
+}

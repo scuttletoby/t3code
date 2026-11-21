@@ -28,6 +28,8 @@ Linux with systemd (user manager) and cgroup v2 only. Python 3 standard library 
 | `heavy --kind K <cmd>`       | waits in the memory queue until the job fits, then runs it (`--mb`, `--wait`: below)         |
 | `heavy queue [--json]`       | what the memory queue runs and holds, and the figures behind it                              |
 | `heavy waits [--days N]`     | minutes waited for memory per day (`--json` too)                                             |
+| `heavy --measure K <cmd>`    | runs it as usual and records its peak memory under the kind K (below)                        |
+| `heavy capacity ...`         | the front of the machine's capacity check: a kind becomes its measured MB (below)            |
 | `heavy -- <command>`         | runs a command named like one of the words above                                             |
 
 The command gets the same folder, environment, stdin, stdout, stderr and open files. heavy exits with the command's
@@ -195,6 +197,98 @@ refuses it.
   it exited); its process group is killed and the job asks again on the next look.
 - **One leaky run of a kind:** its peak counts (failed runs too), but the learned value is capped at the budget
   minus `vmReserveMb`, so the kind is still admitted while other jobs use the slice.
+
+## Measured need and the capacity front
+
+Before an agent starts a build, a test run or a server it asks the machine's capacity check whether there is room
+(`<check> 1536 && start`). The number it asks for was a guess per kind of job. `heavy --measure` writes down what
+each run really used, and `heavy capacity` turns a kind name into the amount its recent runs needed, so the check
+asks for what the job needs, not a guess.
+
+**Recording.** `heavy --measure <kind> <command>` (and `heavy --kind <kind> ...`, which queues; `--measure` there
+names another kind for the record) looks at the job's scope while it runs: `memory.peak` (the kernel's exact
+high-water mark; heavy opens it while the scope lives and reads it after the command ended, when the scope is
+already gone) and `used` (what the queue counts: `memory.current` less file cache the kernel can drop, at least the
+anon memory, plus swap; sampled every 3 s, at first every 0.2 s until the scope is seen). When the command ends one
+line is appended to `~/.local/state/heavy/measured.jsonl` (`HEAVY_STATE_DIR` names another absolute folder):
+
+```
+{"at":"2026-11-21T10:00:00Z","end":"exited","kind":"node-tests","peakMb":1210,"seconds":84.2,"usedMb":930,"v":1}
+```
+
+`end` is `exited` (the command ended by itself, any exit code) or `stopped` (heavy was signalled and stopped it;
+not counted). A nested heavy and `HEAVY_KEEP=1` record nothing. A failed write is one `heavy:` line on stderr, never
+a failed job.
+
+**The capacity front.** `heavy capacity --kinds FILE --check PROGRAM [--] [<kind> | <MB>] [args...]` runs the
+check `PROGRAM` (absolute path) with the caller's arguments, except that a first argument that is a kind becomes
+its amount in MB:
+
+| First argument           | What the check gets                                                                          |
+| ------------------------ | -------------------------------------------------------------------------------------------- |
+| none, or a whole number  | the same arguments: every caller of today keeps working, and the kinds file is not even read |
+| a kind of the kinds file | its amount (below), then the other arguments                                                 |
+| any other word           | nothing: exit 2 (a typo must not reach a check that would read it as 0)                      |
+
+The amount of a kind: the `percentile` of the `used` figure of its last `recentRuns` runs that `exited`, plus
+`marginPercent`, rounded up to `roundMb`, at least `minMb` and at most the kind's `maxMb` (default twice its
+`fallbackMb`). With fewer than `minRuns` such runs it is the kind's `fallbackMb`. `"measure": "peak"` uses the
+kernel's peak instead (it counts file cache too, so an IO-heavy job's peak grows towards the slice limit).
+
+The check runs with `HEAVY_CAPACITY_KIND` (the kind, or empty) and `HEAVY_CAPACITY_FRONT=1`; its stdout and exit
+code are heavy's. A check that calls the front again (`HEAVY_CAPACITY_FRONT=1` already set) is refused, exit 2.
+`heavy capacity --kinds FILE --show [--json] [<kind>...]` prints each kind's amount and how it was reached.
+
+**The kinds file** is the project's, not the kit's: its own file, or the `"capacity"` object of a larger project
+config. Example ([capacity-kinds.example.json](capacity-kinds.example.json)):
+
+```json
+{
+  "version": 1,
+  "percentile": 95,
+  "marginPercent": 20,
+  "minRuns": 5,
+  "recentRuns": 50,
+  "roundMb": 128,
+  "minMb": 256,
+  "kinds": {
+    "review": { "fallbackMb": 1024 },
+    "node-tests": { "fallbackMb": 1536 },
+    "gradle-build": { "fallbackMb": 3072, "maxMb": 6144 }
+  }
+}
+```
+
+Only `version` and `kinds` (each with `fallbackMb`) are required; the other values are the defaults shown. An
+unknown key, a wrong type or a value out of range refuses the file (exit 2 for a kind; a plain number still works).
+
+**Switching a machine to it** (owner): install a release with this file (the usual install line), write the
+project's kinds file, and put a front where the agents' capacity command calls the check, for example a script
+
+```sh
+#!/bin/sh
+exec /usr/local/bin/heavy capacity --kinds /etc/fork-kit/capacity-kinds.json --check /usr/local/bin/CHECK -- "$@"
+```
+
+that the agents' command runs instead of `CHECK` itself. Agents then ask by kind (`<command> node-tests`) and tag
+their runs (`heavy --measure node-tests npm test`); numbers keep working. `heavy capacity --kinds FILE --show`
+shows what each kind gets. To go back, point the command at the check again; the history stays and is unused.
+
+### The history runs again, stops half-way, or meets old or empty state
+
+- **First run, no history:** every kind gets its `fallbackMb` until it has `minRuns` measured runs.
+- **Missing or unreadable history** (gone, a folder or a link in its place, no permission): missing is the first
+  run; unreadable is not trusted, and every kind gets its `fallbackMb`. Never 0.
+- **Corrupt history:** a line that is not a record of this version is skipped. More than one such line and more
+  than 1 in 10: the whole history is not trusted (fallback for every kind) until rotation drops the bad lines.
+- **Two writers at once:** each record is one `write` of one line to a file opened with `O_APPEND`, so lines of
+  jobs that end at the same instant never mix and none is lost.
+- **A writer cut off half-way** (a line with no newline): the next writer starts on a new line, so only the cut
+  line is lost.
+- **A job killed before it records** (heavy killed with -9): no line, and the history is as before; the guard
+  still stops the scope.
+- **Runs again forever:** past 256 KiB the file is renamed to `measured.jsonl.1` (the older one goes), under a lock
+  nobody waits for; at most two files, 512 KiB. A reader reads at most the last MiB of each.
 
 ## Leftover sweep
 
@@ -393,7 +487,8 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | `/etc/fork-kit/machine.json`                    | written by the owner, never the kit: sweep and queue settings             |
 | `~/.local/state/heavy-sweep/`                   | each user's sweep log, last report and lock                               |
 | `/run/user/<uid>/heavy-queue/<slice>/`          | the memory queue: its lock and one ticket per queued job (tmpfs)          |
-| `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`)        |
+| `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
+|                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
 
 ## Install (owner, as root)
 
@@ -445,6 +540,13 @@ instant). Its red check breaks each admission and clean-up rule and shows the te
 `heavy.test.py` runs queued jobs with the real systemd user manager in a private queue folder (`HEAVY_QUEUE_ROOT`,
 never the user's live queue): one that runs, one that fails and still leaves its peak, one whose heavy is killed
 with -9 (its guard stops the scope, and the reservation ends with it) and one give-up (exit 76).
+
+`python3 -I -B fork-kit/heavy/tests/measure.test.py`: the measured history and the capacity front in temporary
+folders (`HEAVY_STATE_DIR`), a fake scope folder and a fake check script, no systemd: first run, missing,
+unreadable and corrupt history, eight writers at once, a writer and a job killed with -9, rotation, the amount
+rules, the kinds file and every refusal. `HEAVY_TEST_KIT=<older fork-kit/heavy>` runs it against an older kit (the
+red check). `heavy.test.py` records real runs (`--measure`, a queued `--kind`, nested, killed with -9) into a
+temporary `HEAVY_STATE_DIR`.
 
 `python3 -I -B fork-kit/heavy/tests/sweep.test.py`: the sweep on a fake host (a fake `/proc`, fake `systemctl`
 and `docker` from `tests/fake_tools.py`, a temporary machine file), no root and nothing real swept. Its red check
