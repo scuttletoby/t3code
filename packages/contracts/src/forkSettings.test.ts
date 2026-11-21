@@ -87,7 +87,7 @@ describe("fork settings seam", () => {
   it("reads a project's hand-written null as left out (the server's), never as off or null", () => {
     // `null` is the save's "clear", so a file that holds it means the same thing. It reads as the
     // key left out: a `null` kept would reach readers as the project's own value.
-    for (const key of ["playtest", "handoff", "reviewRules"] as const) {
+    for (const key of ["playtest", "handoff", "reviewRules", "placementNeeds"] as const) {
       const project = decodeProjectOverrides({ [key]: null, defaultAutoPull: false });
       expect(Object.hasOwn(project, key), key).toBe(false);
       const settings = decodeServerSettings({
@@ -108,7 +108,7 @@ describe("fork settings seam", () => {
 
   it("never writes a project's null to the file, while a patch's null (the clear) goes over the wire", () => {
     const encodePatch = Schema.encodeSync(ServerSettingsPatch);
-    for (const key of ["playtest", "handoff", "reviewRules"] as const) {
+    for (const key of ["playtest", "handoff", "reviewRules", "placementNeeds"] as const) {
       // No path puts a `null` in memory today; if one ever did, the save drops it (the same
       // meaning: the server's value), so it never reaches the file to be read back.
       const inMemory = (entry: Record<string, unknown>) =>
