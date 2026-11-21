@@ -190,8 +190,46 @@ class Probe(unittest.TestCase):
         self.assertIn('fork-ci-pressure: job failure', r.stdout)
 
 
+def step_run(verb):
+    """The probe step's command: a hang (a stalled machine) is stopped after 40 s with a warning, and the job goes on."""
+    tail = 'no numbers; the job goes on' if verb == 'start' else 'no numbers'
+    return (f'timeout -k 5 40 python3 -I .github/scripts/fork-ci-pressure.py {verb} || '
+            f'echo "::warning::fork-ci-pressure: {verb} stopped (exit $?), {tail}"')
+
+
 class Steps(unittest.TestCase):
     """Each app job of fork-tests.yml takes a sample right after its checkout and prints the numbers last."""
+
+    def run_step(self, verb, python3, limit='40'):
+        """The step's own text in GitHub's shell (bash -e), with a stand-in python3 and its time limit made short."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        with open(os.path.join(d, 'python3'), 'w', encoding='utf-8') as f:
+            f.write('#!/bin/sh\n' + python3 + '\n')
+        os.chmod(os.path.join(d, 'python3'), 0o755)
+        text = step_run(verb)
+        self.assertEqual(text.count(' 5 40 '), 1)
+        text = text.replace(' 5 40 ', f' 1 {limit} ')
+        return subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', text], capture_output=True,
+                              text=True, timeout=30, env={'PATH': d + os.pathsep + os.environ.get('PATH', '')})
+
+    def test_a_hung_probe_is_stopped_and_the_job_goes_on(self):
+        # A stalled machine can hang the probe itself: without its own limit the step's 1-minute timeout fails the
+        # step, and every later step (the tests) is skipped. Now the step ends well after the limit, with a warning.
+        for verb in ('start', 'end'):
+            with self.subTest(verb):
+                r = self.run_step(verb, 'sleep 25', limit='1')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f'::warning::fork-ci-pressure: {verb} stopped (exit 124)', r.stdout)
+
+    def test_a_probe_that_ignores_the_stop_signal_is_killed(self):
+        r = self.run_step('start', "trap '' TERM; sleep 25", limit='1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('::warning::fork-ci-pressure: start stopped (exit 137)', r.stdout)
+
+    def test_a_probe_that_ends_in_time_adds_no_warning(self):
+        r = self.run_step('start', 'echo "fork-ci-pressure: start sample saved"')
+        self.assertEqual((r.returncode, r.stdout), (0, 'fork-ci-pressure: start sample saved\n'), r.stderr)
 
     def test_every_app_job_has_the_start_and_end_steps(self):
         import yaml
@@ -202,10 +240,10 @@ class Steps(unittest.TestCase):
             with self.subTest(name):
                 steps = wf['jobs'][name]['steps']
                 self.assertEqual(steps[0]['name'], 'Checkout')
-                self.assertEqual(steps[1]['run'], 'python3 -I .github/scripts/fork-ci-pressure.py start')
+                self.assertEqual(steps[1]['run'], step_run('start'))
                 self.assertNotIn('if', steps[1])
                 end = steps[-1]
-                self.assertEqual(end['run'], 'python3 -I .github/scripts/fork-ci-pressure.py end')
+                self.assertEqual(end['run'], step_run('end'))
                 self.assertTrue(re.fullmatch(r"\$\{\{ always\(\) && hashFiles\('\.github/scripts/fork-ci-pressure"
                                              r"\.py'\) != '' \}\}", end['if']), end['if'])
                 self.assertEqual(end['env'], {'JOB_STATUS': '${{ job.status }}'})

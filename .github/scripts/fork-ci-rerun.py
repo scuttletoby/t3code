@@ -20,15 +20,19 @@ THE rules, in one place (the facts, patterns and numbers are CONFIG's, .github/f
     lost         GitHub says the runner lost communication or was shut down (signs.lost), the job ended failure
                  on that runner, none of its steps failed, no time limit was hit, and the probe's end step
                  (probe_end_step) never completed;
-    memory full  the job ended failure on a runner that is not GitHub-hosted (hosted_runner_groups: a kill there is
-                 the job's own), and its own pressure note shows a box with a memory limit stalled (full) at least
-                 memory_full.box_full_share_percent of the job AND OOM kills, memory.max hits or memory.high
-                 throttling in it. A machine-wide OOM kill, or one event without the stall, is no sign;
+    memory full  the job ended failure on a runner that is not GitHub-hosted (hosted_runner_groups), and its own
+                 pressure note shows the job's own cgroup AND a box with a memory limit (its own or an ancestor, which
+                 other jobs may share) stalled (full) at least memory_full.box_full_share_percent of the job, AND an
+                 OOM kill of one of the job's own processes (its own cgroup's count, never an ancestor's: that holds
+                 other jobs' kills), or memory.max hits or memory.high throttling in that box. A machine-wide or
+                 another job's OOM kill, or one event without the job's own stall, is no sign;
     limit        GitHub says the job or a step ran past its time limit (signs.limit, with the minutes), those minutes
                  are that job's (or step's) own timeout-minutes in the workflow file at the run's commit (never the
                  message's word alone: a step can print any number), the job (or that step) really ran that long, no
                  other step failed, and the note shows the machine or the box stalled (CONFIG stalled).
-  The note counts only when the probe's end step completed (so the job wrote its own) and is the job's only one.
+  The note counts only when the probe's end step completed (so the job wrote its own), it is the job's only one,
+  the job has fewer than annotation_cap annotations (GitHub drops the rest, and the note comes last), and its
+  seconds fit the runner's own times of the probe's start and end steps (a note printed earlier cannot know them).
   One failed job without a sign (a test failure, no note, a garbled note, two notes) leaves the run red: fail
   closed. GitHub's "canceled by" (signs.cancelled_by) on any failed job leaves it red: a person's cancel stands.
   A run whose branch has moved on, or is gone, is not re-run.
@@ -54,6 +58,7 @@ NOTE_HEAD = 'fork-ci-pressure v1 '
 RED = ('failure', 'cancelled', 'timed_out')
 CHECK_RUN = re.compile(r'/check-runs/([0-9]{1,20})$')
 MARK = re.compile(r'<!-- fork-ci-rerun run=([0-9]{1,20}) attempt=([0-9]{1,5}) what=(rerun|report) -->')
+ISSUE_MARK = '<!-- fork-ci-rerun tracking issue -->'   # the first line of the tracking issue's body
 # Each sign's named groups: `minutes` is how long GitHub says the limit was; `step` (when there) names the step.
 GROUPS = {'lost': set(), 'limit': {'minutes'}, 'cancelled_by': set()}
 LONGEST = 60000   # characters of a comment (GitHub takes 65536)
@@ -95,8 +100,8 @@ def check_config(cfg):
     if not isinstance(cfg, dict):
         return ['not a JSON object']
     known = {'_doc', 'trust', 'workflow', 'followers', 'list_hours', 'catch_up_minutes', 'window_hours', 'skip_when',
-             'hosted_runner_groups', 'probe_end_step', 'limit_slack_seconds', 'signs', 'stalled', 'memory_full',
-             'notice'}
+             'hosted_runner_groups', 'probe_start_step', 'probe_end_step', 'limit_slack_seconds',
+             'note_slack_seconds', 'annotation_cap', 'signs', 'stalled', 'memory_full', 'notice'}
     out += [f'unknown key {k!r}' for k in sorted(set(cfg) - known)]
     out += [f'missing key {k!r}' for k in sorted(known - {'_doc'} - set(cfg))]
     if not re.fullmatch(r'[A-Za-z0-9_.-]+\.json', str(cfg.get('trust', ''))):
@@ -105,7 +110,8 @@ def check_config(cfg):
         out.append('workflow must be a workflow file name')
     if not names(cfg.get('followers'), empty=True):
         out.append('followers must be a list of job names')
-    for key in ('list_hours', 'catch_up_minutes', 'window_hours', 'limit_slack_seconds'):
+    for key in ('list_hours', 'catch_up_minutes', 'window_hours', 'limit_slack_seconds', 'note_slack_seconds',
+                'annotation_cap'):
         if not number(cfg.get(key)) or cfg[key] <= 0:
             out.append(f'{key} must be a positive number')
     if number(cfg.get('list_hours')) and number(cfg.get('catch_up_minutes')) \
@@ -117,8 +123,11 @@ def check_config(cfg):
         out.append('skip_when must be {"variable": NAME, "is": [values]}')
     if not names(cfg.get('hosted_runner_groups')):
         out.append('hosted_runner_groups must be a list of runner group names')
-    if not (isinstance(cfg.get('probe_end_step'), str) and cfg['probe_end_step']):
-        out.append('probe_end_step must be the name of the probe\'s end step')
+    for key in ('probe_start_step', 'probe_end_step'):
+        if not (isinstance(cfg.get(key), str) and cfg[key]):
+            out.append(f'{key} must be the name of the probe\'s {key.split("_")[1]} step')
+    if cfg.get('probe_start_step') == cfg.get('probe_end_step'):
+        out.append('probe_start_step and probe_end_step must be two steps')
     signs = cfg.get('signs')
     if not isinstance(signs, dict) or set(signs) != set(GROUPS):
         out.append(f'signs must have exactly {", ".join(sorted(GROUPS))}')
@@ -250,6 +259,11 @@ def note_of(cfg, job, annotations):
     """The job's own pressure note (fork-ci-pressure.py) as a dict, or (None, why)."""
     if not end_step_ran(cfg, job):
         return None, f'its "{cfg["probe_end_step"]}" step did not complete, so it has no note of its own'
+    if len(annotations) >= cfg['annotation_cap']:
+        # GitHub keeps only the first annotation_cap of a job: the end step's note, written last, may be the one
+        # dropped, and a note a step printed earlier would then stand alone.
+        return None, (f'{len(annotations)} annotations, GitHub\'s cap of {cfg["annotation_cap"]} a job: its own note '
+                      'may have been dropped')
     notes = [a for a in annotations if a.get('title') == NOTE_TITLE]
     if not notes:
         return None, 'no pressure note (the note was dropped)'
@@ -266,7 +280,28 @@ def note_of(cfg, job, annotations):
     if not (isinstance(note, dict) and isinstance(note.get('host'), dict) and isinstance(note.get('cgroups'), list)
             and all(isinstance(c, dict) for c in note['cgroups']) and isinstance(note.get('status'), str)):
         return None, 'a garbled pressure note'
+    window = probe_window(cfg, job)
+    if window is None:
+        return None, f'no "{cfg["probe_start_step"]}" and "{cfg["probe_end_step"]}" times to check the note against'
+    if not (number(note.get('seconds')) and window[0] <= note['seconds'] <= window[1]):
+        return None, (f'the note says {note.get("seconds")} s from start to end, but the job\'s own steps say '
+                      f'{window[0]}-{window[1]} s: not its end step\'s')
     return note, None
+
+
+def probe_window(cfg, job):
+    """(fewest, most) seconds between the probe's start and end samples, by the runner's own step times (each sample
+    is taken inside its step), widened by note_slack_seconds for whole-second times; None without both steps' times.
+    A step that prints a note earlier cannot know when the end step will run."""
+    def times(name):
+        got = [(stamp(s.get('started_at')), stamp(s.get('completed_at'))) for s in job.get('steps') or []
+               if s.get('name') == name]
+        return got[0] if len(got) == 1 and None not in got[0] else None
+    start, end = times(cfg['probe_start_step']), times(cfg['probe_end_step'])
+    if start is None or end is None:
+        return None
+    slack = cfg['note_slack_seconds']
+    return end[0] - start[1] - slack, end[1] - start[0] + slack
 
 
 def at_least(value, bound):
@@ -292,20 +327,31 @@ def hosted(cfg, job):
 
 
 def memory_full(cfg, job, note):
-    """Evidence that the job's own box was full and stalled, or None. Only a failure on a runner that is not
-    GitHub-hosted, only a box with a memory limit, and only events together with that box's stall."""
+    """Evidence that the job itself was held by a full box, or None. Only a failure on a runner that is not
+    GitHub-hosted. The note's first cgroup is the job's own (fork-ci-pressure.py: the runner's unit, which runs one
+    job at a time); the others are its ancestors with a memory limit, which several jobs may share. So:
+    - the job's own tasks stalled (full) at least box_full_share_percent of the job (its own cgroup's pressure);
+    - a box with a memory limit (its own cgroup or an ancestor) stalled that much too;
+    - and an OOM kill of one of the job's own processes (its own cgroup's oom_kill: memory.events counts a cgroup's
+      whole subtree, so an ancestor's count holds other jobs' kills, which never count), or that box hit its
+      memory.max or memory.high (the box was full, and the stall above says it held this job up)."""
     if job.get('conclusion') != 'failure' or note.get('status') != 'failure' or hosted(cfg, job):
         return None
     mf = cfg['memory_full']
+    own = note['cgroups'][0] if note['cgroups'] else {}
+    if own.get('path') in (None, '', '/'):
+        return None   # no cgroup of its own (the root is the whole machine)
+    if not at_least(own.get('full_share'), mf['box_full_share_percent']):
+        return None   # the job's own tasks did not wait for memory
     for c in note['cgroups']:
         if not (number(c.get('max_mb')) or number(c.get('high_mb'))):
             continue   # no limit: not a box
         if not at_least(c.get('full_share'), mf['box_full_share_percent']):
             continue
         where = (f'box {c.get("path")} (max {c.get("max_mb")} MB, high {c.get("high_mb")} MB), stalled (full) '
-                 f'{c["full_share"]}% of the job')
-        if at_least(c.get('oom_kill'), mf['oom_kills']):
-            return f'{where}: {c["oom_kill"]} OOM kill(s) in it'
+                 f'{c["full_share"]}% of the job, the job\'s own cgroup {own["full_share"]}%')
+        if at_least(own.get('oom_kill'), mf['oom_kills']):
+            return f'{where}: {own["oom_kill"]} OOM kill(s) of the job\'s own processes'
         if at_least(c.get('max'), mf['max_events']):
             return f'{where}: hit its memory.max {c["max"]} time(s)'
         if at_least(c.get('high'), mf['high_events']):
@@ -537,9 +583,12 @@ def decide(cfg, gh, run, env):
 
 class Notice:
     """The one tracking issue (CONFIG notice): the durable, visible record of every automatic re-run outside this
-    sweep's own run. Only an open issue github-actions opened with exactly that title is ours, never one a person
-    opened; with none open, the first re-run opens it. Each re-run (and each fleet-mode report) is one comment with a
-    marker line (MARK: run, attempt, what), so a pass never writes the same one twice and the count reads them."""
+    sweep's own run. Only an open issue CONFIG notice author opened whose body starts with ISSUE_MARK is ours, never
+    one a person opened (whatever its title); with none open, the first re-run opens it, after looking once more. If
+    more than one is open (two passes opened one at once, or a pass stopped before closing its own), the lowest is
+    kept and the others are closed as its duplicates, by the next pass that reads them. Each re-run (and each
+    fleet-mode report) is one comment with a marker line (MARK: run, attempt, what), so a pass never writes the same
+    one twice and the count reads them."""
 
     def __init__(self, cfg, gh, now):
         self.cfg, self.gh, self.now, self.hours = cfg['notice'], gh, now, cfg['window_hours']
@@ -550,12 +599,21 @@ class Notice:
         listed = self.gh.pages(f'issues?state=open&creator={urllib.parse.quote(n["author"], safe="")}'
                                f'&sort=created&direction=asc')
         return sorted(int(i['number']) for i in listed if isinstance(i, dict) and 'pull_request' not in i
-                      and i.get('title') == n['title'] and login(i.get('user')) == n['author'])
+                      and str(i.get('body') or '').startswith(ISSUE_MARK) and login(i.get('user')) == n['author'])
+
+    def _close(self, number, keep):
+        self.gh.call(f'issues/{number}/comments', method='POST', data={'body': f'Duplicate of #{keep}.'})
+        self.gh.call(f'issues/{number}', method='PATCH', data={'state': 'closed', 'state_reason': 'not_planned'})
 
     def load(self, since=None):
         if self.comments is not None:
             return
         ours = self._ours()
+        for extra in ours[1:]:
+            try:
+                self._close(extra, ours[0])
+            except (OSError, ValueError):
+                pass   # ours[0] is used either way; the next pass closes it
         self.issue = ours[0] if ours else None
         start = iso(min(self.now() - self.hours * 3600, since or self.now()))
         self.comments = [] if self.issue is None else [
@@ -581,24 +639,26 @@ class Notice:
         return sum(1 for (_, _, what), at in self.marks().items() if what == 'rerun' and (stamp(at) or 0) >= since)
 
     def where(self):
-        return f'issue #{self.issue}' if self.issue else 'no tracking issue yet'
+        return f'issue #{self.issue}' if self.issue else 'no open tracking issue'
 
     def _open(self):
         n = self.cfg
         got = self.gh.call('issues', method='POST', data={
             'title': n['title'], 'labels': n['labels'],
-            'body': ('Each comment below is one automatic re-run of a failed run (or, in fleet mode, a run that '
-                     'would have had one), with its jobs, the signs and the memory pressure numbers. Many of them '
-                     'mean a machine that stalls or fills up: fix that, the re-run only hides it for one attempt. '
-                     'Closing this issue is fine; the next re-run opens a new one. Rules and runbook: '
+            'body': (f'{ISSUE_MARK}\nEach comment below is one automatic re-run of a failed run (or, in fleet '
+                     'mode, a run that would have had one), with its jobs, the signs and the memory pressure '
+                     'numbers. Many of them mean a machine that stalls or fills up: fix that, the re-run only '
+                     'hides it for one attempt. Closing this issue is fine; the next re-run opens a new one. '
+                     'Rules and runbook: '
                      '`.github/fork-ci-rerun.md`.')})
         mine = int(got['number'])
         # A dispatched pass may run beside a scheduled one (fork-ci-rerun.yml); if both opened one, the lowest wins
-        # and the other is closed, pointing at it, so there is only ever one.
+        # and the other is closed, pointing at it. A pass that stops before this leaves its own open: the next
+        # pass's load() closes it.
         ours = self._ours()
         if ours and ours[0] < mine:
-            self.gh.call(f'issues/{mine}/comments', method='POST', data={'body': f'Duplicate of #{ours[0]}.'})
-            self.gh.call(f'issues/{mine}', method='PATCH', data={'state': 'closed', 'state_reason': 'not_planned'})
+            if mine in ours:   # not already closed by another pass's load()
+                self._close(mine, ours[0])
             return ours[0]
         return mine
 
@@ -616,7 +676,10 @@ class Notice:
                 f'{quoted(run.get("event"))} `{quoted(run.get("head_branch"))}` `{str(run.get("head_sha"))[:12]}`\n\n'
                 + ''.join(f'- {quoted(part.strip())}\n' for part in text.split(' | ')))[:LONGEST]
         if self.issue is None:
-            self.issue = self._open()
+            # Look once more first: an issue this pass opened whose reply was lost, or one another pass opened
+            # since load(), is the one to use.
+            ours = self._ours()
+            self.issue = ours[0] if ours else self._open()
         got = self.gh.call(f'issues/{self.issue}/comments', method='POST', data={'body': body})
         self.comments.append(dict(got if isinstance(got, dict) else {}, body=body,
                                   created_at=(got or {}).get('created_at') or iso(self.now())))

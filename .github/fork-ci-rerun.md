@@ -7,13 +7,13 @@ a test failure, never for a person's cancel, never twice: a repeat red is left
 red, and it goes to an issue and its fix first. Every re-run is also a comment
 on one tracking issue, so a machine that keeps stalling is never hidden.
 
-| Part                                                | What it does                                                                                                                                                                                                                                                               |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.github/scripts/fork-ci-pressure.py`               | Two steps in each app job of `fork-tests.yml` (the routable jobs of `fork-fleet.json`): `start` after the checkout, `end` last (`if: always()`), each with a 1-minute timeout. Facts only: it never fails (it catches every error), and a hung one never holds up the job. |
-| `.github/scripts/fork-ci-rerun.py`                  | The decision, with every rule in one place, the tracking issue, and the re-run. Uses `fork-fleet.py`'s trust rule.                                                                                                                                                         |
-| `.github/fork-ci-rerun.json`                        | Every fact and number the decision uses: the trust config (`fork-fleet.json`), workflow, followers, windows, the hosted runner group, the probe's end step, sign patterns, thresholds, the fleet-mode switch, the tracking issue.                                          |
-| `.github/workflows/fork-ci-rerun.yml`               | Runs the decision every 10 minutes (minutes 5, 15, ...), GitHub-hosted, `actions: write`, `checks: read`, `issues: write`. `workflow_dispatch` with `run_id` checks one run, in a concurrency group of its own.                                                            |
-| `fork-ci-rerun.test.py`, `fork-ci-pressure.test.py` | Each sign, each refusal (each rule line is pinned: removing it turns a test red), the state cases below, the paging, the wiring.                                                                                                                                           |
+| Part                                                | What it does                                                                                                                                                                                                                                                                                                                                      |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.github/scripts/fork-ci-pressure.py`               | Two steps in each app job of `fork-tests.yml` (the routable jobs of `fork-fleet.json`): `start` after the checkout, `end` last (`if: always()`), each with a 1-minute timeout. Facts only: it never fails (it catches every error). Each runs under `timeout 40` (a stalled machine can hang it), then warns and goes on, so the tests still run. |
+| `.github/scripts/fork-ci-rerun.py`                  | The decision, with every rule in one place, the tracking issue, and the re-run. Uses `fork-fleet.py`'s trust rule.                                                                                                                                                                                                                                |
+| `.github/fork-ci-rerun.json`                        | Every fact and number the decision uses: the trust config (`fork-fleet.json`), workflow, followers, windows, the hosted runner group, the probe's two steps, the note's time slack, GitHub's annotation cap, sign patterns, thresholds, the fleet-mode switch, the tracking issue.                                                                |
+| `.github/workflows/fork-ci-rerun.yml`               | Runs the decision every 10 minutes (minutes 5, 15, ...), GitHub-hosted, `actions: write`, `checks: read`, `issues: write`. `workflow_dispatch` with `run_id` checks one run, in a concurrency group of its own.                                                                                                                                   |
+| `fork-ci-rerun.test.py`, `fork-ci-pressure.test.py` | Each sign, each refusal, each threshold at its edge, the state cases below, the paging, the wiring. Each rule line is pinned: a mutation sweep of the rule functions (each condition forced true and false, each comparison, `and`/`or`, `not`, `fullmatch` and sign changed) turns a test red for every mutant that changes what the code does.                                                                                                                                                                                                                  |
 
 ## The numbers in the job log
 
@@ -60,11 +60,16 @@ start sample, a reboot in between, a file the runner cannot see.
      of its steps failed, no time limit was hit, and the probe's end step never
      completed (the runner died before it). No note needed.
    - **memory full**: the job ended `failure` on a runner that is not
-     GitHub-hosted (`hosted_runner_groups`: an OOM kill there is the job's
-     own), and its own note shows a box with a memory limit stalled (full) at
-     least `box_full_share_percent` of the job AND, in that box, OOM kills,
-     `memory.max` hits or `memory.high` throttling. One event without the
-     stall, or a machine-wide OOM kill, is no sign.
+     GitHub-hosted (`hosted_runner_groups`), and its own note shows the job's
+     own cgroup (the note's first: the runner's unit, one job at a time)
+     stalled (full) at least `box_full_share_percent` of the job, a box with
+     a memory limit (that cgroup or an ancestor) stalled as much, AND an OOM
+     kill in the job's **own** cgroup, or `memory.max` hits or `memory.high`
+     throttling in that box. An ancestor's OOM count is never read:
+     `memory.events` counts a whole subtree, so a slice several jobs share
+     counts the other jobs' kills too. One event without the stall, a
+     machine-wide OOM kill, or a job whose own cgroup is the root (`/`) is
+     no sign.
    - **limit while stalled**: GitHub says the job or a step ran past its time
      limit; its minutes are that job's (or step's) own `timeout-minutes` in the
      workflow file at the run's commit (read through the contents API; a step
@@ -75,8 +80,14 @@ start sample, a reboot in between, a file the runner cannot see.
      machine or a box stalled (full) at least `full_share_percent` of the job,
      or a 5-minute full average at least `full_avg300_percent` at the end.
 4. The note counts only when the probe's end step completed (so the job wrote
-   its own) and it is the job's only one, a notice on `.github` with the
-   `fork-ci-pressure v1 ` header and the right shape.
+   its own), the job has fewer annotations than GitHub's cap
+   (`annotation_cap`: GitHub keeps only the first 50 of a job, and the end
+   step's note comes last, so at the cap the real one may be gone), it is the
+   job's only one, a notice on `.github` with the `fork-ci-pressure v1 `
+   header and the right shape, and its `seconds` fit the time between the
+   two probe steps by the runner's own step record (`note_slack_seconds` for
+   whole-second times). A step that prints a note earlier cannot know when
+   the end step will run.
 5. One failed job without a sign leaves the run red: a test failure, a job
    with no note, a garbled one, two notes. GitHub's "The run was canceled by
    @..." on a failed job leaves it red too: a person's cancel stands, whatever
@@ -93,9 +104,12 @@ start sample, a reboot in between, a file the runner cannot see.
   issue, by `github-actions`, with that title; every later re-run (and every
   fleet-mode report) is one comment on it: the run's link, event, branch and
   commit, each job's sign, GitHub's message and the pressure numbers. Never one
-  issue per re-run. Only an open issue by `github-actions` with exactly that
-  title is used; closing it is fine (the next re-run opens a new one). A
-  comment carries a marker line (`<!-- fork-ci-rerun run=N attempt=A
+  issue per re-run. The issue's body starts with a marker line
+  (`<!-- fork-ci-rerun tracking issue -->`): only an open issue by
+  `github-actions` whose body starts with it is used, whatever its title (a
+  person's issue never is). Closing it is fine (the next re-run opens a new
+  one). A pass looks for it again just before opening one. A comment carries a
+  marker line (`<!-- fork-ci-rerun run=N attempt=A
   what=rerun|report -->`); the comment is written **before** the request.
 - Each re-run is also a **warning annotation** on the `Fork CI re-run` run.
 - Each pass writes a **job summary**: a table of every red run it looked at and
@@ -106,20 +120,23 @@ start sample, a reboot in between, a file the runner cannot see.
 
 Nothing is kept between passes: each one reads GitHub (the runs and the issue).
 
-| Case                                                    | What happens                                                                                                                                                           |
-| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A pass runs again on a run it re-ran                    | The run is queued or running (skipped), or ended again with an attempt by `github-actions`: left red. No second comment.                                               |
-| Two passes (or this and the fleet sweep) race           | The run is read again just before the request. If GitHub refuses the second request and the run has a new attempt, that is fine.                                       |
-| Two passes open the issue at once                       | Each reads the open issues after opening its own; the lowest number wins and the other closes its own as a duplicate.                                                  |
-| A pass stops before its request reached GitHub          | The comment is there, the run unchanged; the next pass (within `catch_up_minutes`) sends the request once and adds no second comment.                                  |
-| A pass stops after GitHub took the request (reply lost) | The comment, written first, says why. The new attempt exists: the next passes see it queued or running, or later red with an attempt by `github-actions`. Never twice. |
-| The comment cannot be written                           | No re-run (it would be hidden): a warning, the pass ends red, the next pass tries both.                                                                                |
-| The tracking issue cannot be read                       | No re-run (its record cannot be checked) and no count: the pass ends red and says so; the next pass tries again.                                                       |
-| A dispatch with `run_id` while a scheduled pass waits   | Its own concurrency group: it is never replaced by a scheduled pass.                                                                                                   |
-| An old run, from before the probe steps                 | No note: only a lost runner can qualify. A time limit or a failure without the note is left red.                                                                       |
-| A run that ended more than `catch_up_minutes` ago       | Not looked at (except with `run_id`). Runs are listed by creation over `list_hours`, every page read; a listing past 10 pages ends the pass red, nothing re-run.       |
-| GitHub errors on one run                                | A warning; the other runs are still handled, and the pass ends red so the error is seen. The next pass tries again.                                                    |
-| No tracking issue, or it was closed                     | The count reads 0 from a new window; the next re-run opens a new one.                                                                                                  |
+| Case                                                      | What happens                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A pass runs again on a run it re-ran                      | The run is queued or running (skipped), or ended again with an attempt by `github-actions`: left red. No second comment.                                                                                                                                       |
+| Two passes (or this and the fleet sweep) race             | The run is read again just before the request. If GitHub refuses the second request and the run has a new attempt, that is fine.                                                                                                                               |
+| Two passes open the issue at once                         | Each reads the open issues after opening its own; the lowest number wins and the other closes its own as a duplicate.                                                                                                                                          |
+| A pass stops after opening the issue (reply lost)         | No comment, no re-run: the pass ends red. The next pass finds the open issue by its marker and uses it; no second issue.                                                                                                                                       |
+| Two tracking issues are open (a pass stopped half-way)    | The next pass keeps the lowest and closes the others as its duplicates. If a close fails, the lowest is still the one used, and a later pass closes it.                                                                                                        |
+| A pass stops before its request reached GitHub            | The comment is there, the run unchanged; the next pass (within `catch_up_minutes`) sends the request once and adds no second comment.                                                                                                                          |
+| A pass stops after GitHub took the request (reply lost)   | The comment, written first, says why. The new attempt exists: the next passes see it queued or running, or later red with an attempt by `github-actions`. Never twice.                                                                                         |
+| The comment cannot be written                             | No re-run (it would be hidden): a warning, the pass ends red, the next pass tries both.                                                                                                                                                                        |
+| The tracking issue cannot be read                         | No re-run (its record cannot be checked) and no count: the pass ends red and says so; the next pass tries again.                                                                                                                                               |
+| A dispatch with `run_id` while a scheduled pass waits     | Its own concurrency group: it is never replaced by a scheduled pass.                                                                                                                                                                                           |
+| An old run, from before the probe steps                   | No note: only a lost runner can qualify. A time limit or a failure without the note is left red.                                                                                                                                                               |
+| A run that ended more than `catch_up_minutes` ago         | Not looked at (except with `run_id`). Runs are listed by creation over `list_hours`, every page read; a listing past 10 pages ends the pass red, nothing re-run.                                                                                               |
+| A person re-runs a run created more than `list_hours` ago | Not looked at: GitHub lists runs only by creation time, and a re-run keeps its run's. Reading further back every 10 minutes costs API calls for a rare case; the person who re-ran it is watching it. Dispatch `Fork CI re-run` with its `run_id` to check it. |
+| GitHub errors on one run                                  | A warning; the other runs are still handled, and the pass ends red so the error is seen. The next pass tries again.                                                                                                                                            |
+| No tracking issue, or it was closed                       | The count reads 0 from a new window; the next re-run opens a new one.                                                                                                                                                                                          |
 
 ## Overlap with the fleet sweep
 
@@ -139,14 +156,20 @@ them); that is `fork-fleet.py`'s to change.
   qualifies, fail closed) and (b) for a `continue-on-error` step that failed;
   and on a real lost runner, its steps' state.
 - A note is the job's own words: a trusted run's code could still print one
-  and keep the real end step from writing its own (two notes are refused, and
-  a note without its end step's completion is not read). Only trusted runs are
-  read, and only once.
+  and keep the real end step from writing its own (two notes are refused, a
+  note without its end step's completion is not read, and its seconds must
+  fit the probe steps' own times). Only trusted runs are read, and only once.
 - An OOM kill by a user-space killer (earlyoom, systemd-oomd) is not in
   `memory.events` or `oom_kill`: it shows only as a stall, if at all.
 - GitHub keeps at most 10 notices per step and 50 annotations per job: on a
-  job with very many annotations the note can be dropped. The job then reads
-  as "no note" and stays red (fail closed).
+  job with very many annotations the note can be dropped. A job with 50
+  annotations (`annotation_cap`) is never read for a note, and stays red
+  (fail closed).
+- A probe step that hangs (a stalled machine) is stopped after 40 s
+  (`timeout -k 5 40`) with a warning, `fork-ci-pressure: start stopped`, and
+  the job goes on. A start step stopped that way leaves no start sample, so
+  the note has no `seconds` and the job can only qualify as `lost`. The
+  1-minute `timeout-minutes` stays as a backstop.
 - Text quoted into the public tracking issue (annotation messages, note
   paths) is made one line with no `@` mention and no HTML, and only a
   comment's first line is read as its marker.
