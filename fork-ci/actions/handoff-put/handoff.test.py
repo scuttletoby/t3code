@@ -114,7 +114,7 @@ class Base(unittest.TestCase):
         with open(path, 'wb') as f:
             f.write(data)
 
-    def play(self, folder, ws, inputs, stop_after=None, fail_on=None):
+    def play(self, folder, ws, inputs, stop_after=None, fail_on=None, attempt='1'):
         """The action's outputs, or None when the job stopped after step `stop_after`. A step that fails without
         continue-on-error fails the action: AssertionError (none of these steps may)."""
         with open(os.path.join(folder, 'action.yml')) as f:
@@ -139,7 +139,7 @@ class Base(unittest.TestCase):
                 out = os.path.join(temp, f'output-{sid}')
                 open(out, 'w').close()
                 env = {'PATH': os.environ['PATH'], 'HOME': self.d, 'GITHUB_OUTPUT': out, 'GITHUB_ACTION_PATH': folder,
-                       'RUNNER_TEMP': temp, 'GITHUB_WORKSPACE': ws,
+                       'RUNNER_TEMP': temp, 'GITHUB_WORKSPACE': ws, 'GITHUB_RUN_ATTEMPT': attempt,
                        **{k: expand(v, context) for k, v in (step.get('env') or {}).items()}}
                 if fail_on == sid:
                     env['PATH'] = self.d      # no python3: the step fails
@@ -184,7 +184,7 @@ class RoundTrip(Base):
         put = self.put(data)
         sha = self.head()
         self.assertEqual((put['ok'], put['artifact'], put['sha']), ('true', f'report-{sha}', sha), self.log)
-        self.assertEqual(self.store.calls[0][1]['retention-days'], '1')      # short retention by default
+        self.assertEqual(self.store.calls[0][1]['retention-days'], '3')      # short retention by default (a weekend)
         got = self.get()
         self.assertEqual((got['ok'], got['sha']), ('true', sha), self.log)
         self.assertEqual(self.read('in/report.json'), data)
@@ -286,6 +286,46 @@ class Refused(Base):
             with self.subTest(what):
                 self.assertIn('refused', self.planted(data)['reason'])
 
+    def forged(self, payload='"x"', name='"report"', sha=None):
+        sha = sha or json.dumps(self.head(self.consumer))
+        return f'{{"format": "{H.FORMAT}", "name": {name}, "sha": {sha}, "payload": {payload}}}'.encode()
+
+    def test_forged_files_are_refused_never_a_failed_step(self):
+        """Files put never writes, which a forged producer could upload: each is ok=false with a plain reason, path
+        absent, no traceback (play() fails the test when the get step fails)."""
+        for what, data, reason in [
+                ('a lone surrogate in the payload', self.forged(r'"\ud800"'), 'payload is not valid text'),
+                ('a lone surrogate in the name', self.forged(name=r'"\udfff"'), 'is for \\udfff, not report'),
+                ('nested 200000 deep', b'[' * 200000, 'not a JSON object'),
+                ('a payload nested 200000 deep', self.forged('[' * 200000), 'nested value'),
+                ('an object nested 200000 deep', self.forged('{"a":' * 200000), 'nested value'),
+                ('a number of 5000 digits', self.forged('1' * 5000), 'not JSON'),
+                ('a control character in a string', self.forged('"a\tb"'), 'not JSON'),
+                ('a key twice', self.forged('"x", "payload": "y"'), 'twice'),
+                ('data after the object', self.forged() + b' {}', 'not JSON'),
+                ('many keys', b'{' + b', '.join(b'"k%d": 1' % i for i in range(100000)) + b'}', 'too many keys')]:
+            with self.subTest(what):
+                got = self.planted(data)
+                self.assertIn(reason, got['reason'])
+                self.assertIn('refused', got['reason'])
+                self.assertNotIn('Traceback', self.log)
+
+    def test_an_unexpected_error_is_ok_false_not_a_traceback(self):
+        """Anything else that raises in a command: its not-ok outputs and one plain line, exit 0."""
+        out = os.path.join(self.d, 'out')
+        cwd = os.getcwd()
+        os.chdir(self.consumer)
+        self.addCleanup(os.chdir, cwd)
+        self.write(self.d, 'dl/handoff.json', H.envelope('report', self.head(), 'x'))
+        with mock.patch.dict(os.environ, {'GITHUB_OUTPUT': out}), mock.patch.object(H, 'unwrap', side_effect=MemoryError):
+            quiet(H.main, ['get', '--name', 'report', '--path', 'in/report.json', '--ready', 'true', '--outcome',
+                           'success', '--dir', os.path.join(self.d, 'dl')])
+        with open(out) as f:
+            lines = f.read().splitlines()
+        self.assertIn('ok=false', lines)
+        self.assertIn('reason=the hand-off could not be read (MemoryError): refused', lines)
+        self.absent()
+
     def test_a_symlink_in_the_artifact_is_not_followed(self):
         """handoff.json itself is opened with O_NOFOLLOW (a download folder that holds a link is refused)."""
         self.write(self.consumer, 'secret', H.envelope('report', self.head(), 'x'))
@@ -301,9 +341,39 @@ class Refused(Base):
 class Rerun(Base):
     def test_a_rerun_of_the_producer_overwrites_its_artifact(self):
         self.assertEqual(self.put(b'first')['ok'], 'true')
-        self.assertEqual(self.put(b'second')['ok'], 'true', self.log)    # GitHub refuses the name without overwrite
-        self.assertEqual(self.get()['ok'], 'true')
+        self.assertEqual(self.put(b'second', attempt='2')['ok'], 'true', self.log)    # GitHub refuses it without overwrite
+        self.assertEqual(self.get(attempt='2')['ok'], 'true')
         self.assertEqual(self.read('in/report.json'), b'second')
+
+    def test_a_second_producer_of_the_same_name_fails_closed(self):
+        """Two jobs (or two legs of a matrix) handing off the same name in one attempt: the first upload holds, the
+        second is refused by the store (no overwrite in a first attempt), so that producer's ok is 'false' with a
+        reason that says why, and its consumer falls back."""
+        self.assertEqual(self.put(b'leg one')['ok'], 'true')
+        second = self.put(b'leg two', ws=self.consumer, path='out/report.json')
+        self.assertEqual(second['ok'], 'false')
+        self.assertIn('one producer per name', second['reason'])
+        self.assertIn('::warning::', self.log)
+        self.assertEqual(self.get()['ok'], 'true')
+        self.assertEqual(self.read('in/report.json'), b'leg one')
+        self.assertEqual([c[1].get('overwrite') for c in self.store.calls if c[0] == 'upload'], ['false', 'false'])
+
+    def test_no_run_attempt_means_no_overwrite(self):
+        out = os.path.join(self.d, 'out')
+        cwd = os.getcwd()
+        os.chdir(self.producer)
+        self.addCleanup(os.chdir, cwd)
+        for attempt, want in ((None, 'false'), ('', 'false'), ('x', 'false'), ('1', 'false'), ('2', 'true'),
+                              ('12', 'true')):
+            with self.subTest(attempt=attempt):
+                env = {'GITHUB_OUTPUT': out, **({'GITHUB_RUN_ATTEMPT': attempt} if attempt is not None else {})}
+                with mock.patch.dict(os.environ, env):
+                    if attempt is None:
+                        os.environ.pop('GITHUB_RUN_ATTEMPT', None)
+                    quiet(H.main, ['put', '--name', 'r', '--path', 'src.txt', '--stage-dir', os.path.join(self.d, 's')])
+                with open(out) as f:
+                    self.assertIn(f'overwrite={want}', f.read().splitlines())
+                os.unlink(out)
 
     def test_a_rerun_of_the_consumer_alone_reads_it_again(self):
         self.assertEqual(self.put(b'first')['ok'], 'true')
@@ -330,7 +400,8 @@ class CutOff(Base):
     def test_a_failed_upload_is_ok_false(self):
         self.store.upload_fails = True
         put = self.put()
-        self.assertEqual((put['ok'], put['reason']), ('false', 'upload failure'))
+        self.assertEqual(put['ok'], 'false')
+        self.assertTrue(put['reason'].startswith('upload failure ('), put['reason'])
 
     # A kill runs no cleanup: os.unlink is a no-op while the write is stopped half-way (after its bytes, at fsync).
     killed = staticmethod(lambda: (mock.patch.object(H.os, 'fsync', side_effect=KeyboardInterrupt),
@@ -420,6 +491,38 @@ class Inputs(Base):
         with open(os.path.join(self.d, 'o')) as f:
             return f.read()
 
+    def test_a_symlinked_folder_cannot_lead_outside_the_workspace(self):
+        """A folder in path that is a symlink to outside the workspace: put reads nothing through it, get neither
+        removes nor writes anything through it."""
+        outside = os.path.join(self.d, 'outside')
+        self.write(self.d, 'outside/report.json', b'keep')
+        for ws in (self.producer, self.consumer):
+            os.symlink(outside, os.path.join(ws, 'o'))
+        put = self.put(None, path='o/report.json')
+        self.assertEqual(put['ok'], 'false')
+        self.assertIn('outside the workspace', put['reason'])
+        self.assertEqual(self.store.calls, [])
+        self.assertEqual(self.put()['ok'], 'true')
+        got = self.get(path='o/report.json')
+        self.assertEqual(got['ok'], 'false')
+        self.assertIn('outside the workspace', got['reason'])
+        self.assertEqual(os.listdir(outside), ['report.json'])
+        with open(os.path.join(outside, 'report.json'), 'rb') as f:
+            self.assertEqual(f.read(), b'keep')
+        os.makedirs(os.path.join(self.consumer, 'in'), exist_ok=True)
+        os.symlink('in', os.path.join(self.consumer, 'inside'))      # a symlinked folder inside the workspace is fine
+        self.assertEqual(self.get(path='inside/report.json')['ok'], 'true', self.log)
+        self.assertEqual(self.read('in/report.json'), b'report\n')
+
+    def test_the_written_file_has_the_usual_mode(self):
+        """path is written as a normally written file is (0666 less the umask), so a container step running as
+        another user can read it."""
+        self.assertEqual(self.put()['ok'], 'true')
+        self.assertEqual(self.get()['ok'], 'true')
+        umask = os.umask(0o022)
+        os.umask(umask)
+        self.assertEqual(os.stat(os.path.join(self.consumer, 'in/report.json')).st_mode & 0o777, 0o666 & ~umask)
+
     def test_a_newline_in_an_input_adds_no_output(self):
         put = self.play(PUT, self.producer, {'name': 'r', 'path': 'x\nstaged=true'})
         self.assertEqual(put['ok'], 'false')
@@ -470,7 +573,7 @@ class Pins(unittest.TestCase):
         with open(os.path.join(GET, 'action.yml')) as f:
             get = yaml.safe_load(f)['runs']['steps']
         upload = [s for s in put if 'uses' in s][0]
-        self.assertEqual(upload['with']['overwrite'], True)
+        self.assertEqual(upload['with']['overwrite'], '${{ steps.stage.outputs.overwrite }}')
         self.assertTrue(upload['continue-on-error'])
         download = [s for s in get if 'uses' in s][0]
         self.assertEqual(set(download['with']), {'name', 'path'})
@@ -497,11 +600,50 @@ class Example(unittest.TestCase):
         light, fallback = 'ubuntu-latest', ['self-hosted', 'build']
         for ok, want in [('true', light), ('false', fallback), ('', fallback), (None, fallback)]:
             with self.subTest(ok=ok):
-                got = evaluate(expression, {'needs': {'build': {'outputs': {'handoff': ok} if ok is not None else {}}}})
+                got = evaluate(expression, {'needs': {'build': {'outputs': {'handoff': ok} if ok is not None else {}}},
+                                            'github': self.own_pull_request})
                 self.assertEqual(got, want)
         steps = check['steps']
         get = [s for s in steps if 'handoff-get' in str(s.get('uses'))][0]
         self.assertNotIn('continue-on-error', get)
+
+    own_pull_request = {'event_name': 'pull_request', 'repository': 'o/r',
+                        'event': {'pull_request': {'head': {'repo': {'full_name': 'o/r'}}}}}
+
+    def runs_on(self, job, ok, github):
+        expression = re.fullmatch(r'\$\{\{(.*)\}\}', str(self.wf['jobs'][job]['runs-on']).strip(), re.S)
+        self.assertIsNotNone(expression, f'{job}: runs-on must decide the runner by the event (fleet-route\'s rule)')
+        return evaluate(expression[1], {'github': github,
+                                        'needs': {'build': {'outputs': {'handoff': ok} if ok is not None else {}}}})
+
+    def test_a_fork_pull_request_never_gets_a_self_hosted_runner(self):
+        """Neither the producer nor the consumer's fallback: a run that may hold another repository's code is
+        GitHub-hosted (fleet-route's trust rule), whatever the hand-off says."""
+        fork = {'event_name': 'pull_request', 'repository': 'o/r',
+                'event': {'pull_request': {'head': {'repo': {'full_name': 'someone/r'}}}}}
+        deleted = {'event_name': 'pull_request', 'repository': 'o/r', 'event': {'pull_request': {'head': {'repo': None}}}}
+        target = {'event_name': 'pull_request_target', 'repository': 'o/r',
+                  'event': {'pull_request': {'head': {'repo': {'full_name': 'o/r'}}}}}
+        run = {'event_name': 'workflow_run', 'repository': 'o/r', 'event': {}}
+        for name, github in (('fork', fork), ('deleted fork', deleted), ('pull_request_target', target),
+                             ('workflow_run', run)):
+            for job in ('build', 'check'):
+                for ok in ('true', 'false', '', None):
+                    with self.subTest(name, job=job, ok=ok):
+                        self.assertEqual(self.runs_on(job, ok, github), 'ubuntu-latest')
+        for name, github in (('push', {'event_name': 'push', 'repository': 'o/r', 'event': {}}),
+                             ('own pull request', self.own_pull_request)):
+            with self.subTest(name):
+                self.assertEqual(self.runs_on('build', None, github), ['self-hosted', 'build'])
+                self.assertEqual(self.runs_on('check', '', github), ['self-hosted', 'build'])
+                self.assertEqual(self.runs_on('check', 'true', github), 'ubuntu-latest')
+
+    def test_the_readme_shows_the_example_runners(self):
+        with open(os.path.join(HERE, 'README.md')) as f:
+            readme = f.read()
+        for job in ('build', 'check'):
+            with self.subTest(job):
+                self.assertIn(' '.join(str(self.wf['jobs'][job]['runs-on']).split()), ' '.join(readme.split()))
 
     def test_no_project_facts_in_the_actions(self):
         for folder in (PUT, GET):

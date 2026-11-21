@@ -12,9 +12,11 @@ inputs:
     description: The file to hand off, relative to the workspace (UTF-8 text, at most 16 MiB, not a symlink).
     required: true
   retention-days:
-    description: Days the artifact is kept (1-90). A re-run of the consumer alone after that finds no hand-off.
+    description: >-
+      Days the artifact is kept (1-90; 3 covers a weekend). A re-run of the consumer alone after that finds no
+      hand-off.
     required: false
-    default: "1"
+    default: "3"
 outputs:
   ok:
     description: "'true' only when the hand-off was uploaded; a consumer picks its light runner only on 'true'."
@@ -49,7 +51,8 @@ runs:
         fi
         exec python3 -I "$GITHUB_ACTION_PATH/handoff.py" put --name="$NAME" --path="$HANDOFF_PATH" \
           --stage-dir="$RUNNER_TEMP/fork-ci-handoff" --retention-days="$RETENTION"
-    # overwrite: a re-run of this job (same run, same commit) replaces the earlier attempt's artifact.
+    # overwrite only in a re-run attempt: a re-run of this job (same run, same commit) replaces the earlier attempt's
+    # artifact. In a first attempt a second job of this run uploading the same name is refused: ok 'false' (README).
     - id: upload
       if: steps.stage.outputs.staged == 'true'
       continue-on-error: true
@@ -58,7 +61,7 @@ runs:
         name: ${{ steps.stage.outputs.artifact }}
         path: ${{ steps.stage.outputs.file }}
         retention-days: ${{ steps.stage.outputs.retention }}
-        overwrite: true
+        overwrite: ${{ steps.stage.outputs.overwrite }}
         if-no-files-found: error
     - id: result
       name: Report the hand-off
@@ -67,7 +70,8 @@ runs:
         STAGED: ${{ steps.stage.outputs.staged }}
         OUTCOME: ${{ steps.upload.outcome }}
         ARTIFACT: ${{ steps.stage.outputs.artifact }}
+        OVERWRITE: ${{ steps.stage.outputs.overwrite }}
         WHY: ${{ steps.stage.outputs.reason }}
       run: >-
         exec python3 -I "$GITHUB_ACTION_PATH/handoff.py" uploaded --staged="$STAGED" --outcome="$OUTCOME"
-        --artifact="$ARTIFACT" --why="$WHY"
+        --artifact="$ARTIFACT" --overwrite="$OVERWRITE" --why="$WHY"

@@ -5,7 +5,7 @@ later job of the same run, keyed on the commit both jobs checked out.
   python3 -I handoff.py put --name N --path P --stage-dir D [--retention-days R]
       Wraps the file P as {format, name, sha, payload} in a new folder under D (written to a temporary name, then
       renamed). Outputs staged (true only once the file is complete), file, artifact (<name>-<sha>), sha, retention,
-      reason.
+      overwrite (true only in a re-run attempt, $GITHUB_RUN_ATTEMPT > 1), reason.
   python3 -I handoff.py uploaded --staged S --outcome O --artifact A [--why W]
       Outputs ok (true only when staged and the upload succeeded) and reason.
   python3 -I handoff.py where --name N --path P --download-dir D [--refused]
@@ -16,7 +16,7 @@ later job of the same run, keyed on the commit both jobs checked out.
       and the file is a hand-off of this name whose sha is this checkout's HEAD. Outputs ok, sha, reason.
 
 Every command writes its outputs to $GITHUB_OUTPUT and exits 0: a missing or refused hand-off is ok=false, never a
-failed step. The project checks the payload itself (its own keys and shape); this checks only the format, the name and
+failed step (an error nothing below expects too: main() writes the command's not-ok outputs and one plain line). The project checks the payload itself (its own keys and shape); this checks only the format, the name and
 the commit.
 """
 import argparse, json, os, re, stat, subprocess, sys, tempfile
@@ -57,11 +57,24 @@ def checked_name(name):
 
 
 def checked_path(path):
-    """A path relative to the workspace (the working directory): not absolute, no '..', not empty."""
+    """A path relative to the workspace (the working directory): not absolute, no '..', not empty, and its folder,
+    symlinks followed, inside the workspace (a symlinked folder must not lead the read, the removal or the write
+    elsewhere). The last part itself is never followed: it is opened O_NOFOLLOW, removed or renamed over."""
     parts = (path or '').split('/')
     if not path or path.startswith('/') or '\0' in path or '..' in parts or all(p in ('', '.') for p in parts):
         raise No(f'path {path!r} is not a file path relative to the workspace')
+    root = os.path.realpath('.')
+    folder = os.path.realpath(os.path.dirname(path) or '.')
+    if folder != root and not folder.startswith(root.rstrip(os.sep) + os.sep):
+        raise No(f'path {path!r} leads outside the workspace through a symlinked folder: refused')
     return path
+
+
+def file_mode():
+    """The mode a normally written file gets: 0666 less the umask (mkstemp's is 0600)."""
+    umask = os.umask(0o022)
+    os.umask(umask)
+    return 0o666 & ~umask
 
 
 def write_atomic(path, data):
@@ -71,6 +84,7 @@ def write_atomic(path, data):
     fd, tmp = tempfile.mkstemp(dir=folder, prefix='.handoff-')
     try:
         with os.fdopen(fd, 'wb') as f:
+            os.fchmod(f.fileno(), file_mode())   # a container step running as another user can read path
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -108,11 +122,53 @@ def envelope(name, sha, payload):
                       ensure_ascii=False).encode('utf-8') + b'\n'
 
 
+WS = re.compile(r'[ \t\n\r]*')
+SCALAR = json.JSONDecoder()   # strict: a raw control character in a string is an error
+
+
+def flat_object(text):
+    """The JSON object text holds, when each of its values is a string, number, true, false or null (a hand-off file
+    is such an object). A bounded parse: never more than 5 keys, and a nested value is refused before anything parses
+    it, so no file can recurse (a file nested 200000 deep is a plain refusal, not a RecursionError). A key twice, data
+    after the object or anything JSON does not allow: ValueError (or No)."""
+    i = WS.match(text).end()
+    if text[i:i + 1] != '{':
+        raise No('the hand-off file is not a JSON object: refused')
+    doc, i = {}, WS.match(text, i + 1).end()
+    if text[i:i + 1] == '}':
+        i += 1
+    else:
+        while True:
+            if len(doc) > 4:
+                raise No(f'the hand-off file is not a {FORMAT} file (too many keys): refused')
+            if text[i:i + 1] != '"':
+                raise ValueError('a key must be a string')
+            key, i = SCALAR.raw_decode(text, i)
+            i = WS.match(text, i).end()
+            if text[i:i + 1] != ':':
+                raise ValueError('a key must be followed by a colon')
+            i = WS.match(text, i + 1).end()
+            if text[i:i + 1] in ('{', '['):
+                raise No('the hand-off file holds a nested value: refused')
+            if key in doc:
+                raise No(f'the hand-off file has the key {shown(key)} twice: refused')
+            doc[key], i = SCALAR.raw_decode(text, i)
+            i = WS.match(text, i).end()
+            after, i = text[i:i + 1], WS.match(text, i + 1).end()
+            if after == '}':
+                break
+            if after != ',':
+                raise ValueError('a value must be followed by a comma or the end of the object')
+    if WS.match(text, i).end() != len(text):
+        raise ValueError('data after the object')
+    return doc
+
+
 def unwrap(data, name, sha):
     """The payload of a hand-off file, if it is one of this name and commit; No otherwise."""
     try:
-        doc = json.loads(data.decode('utf-8'))
-    except (UnicodeDecodeError, ValueError):
+        doc = flat_object(data.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):   # JSONDecodeError, a number of over 4300 digits
         raise No('the hand-off file is not JSON (garbled or cut short): refused')
     if not isinstance(doc, dict) or set(doc) != {'format', 'name', 'sha', 'payload'} or doc['format'] != FORMAT:
         raise No(f'the hand-off file is not a {FORMAT} file: refused')
@@ -122,7 +178,10 @@ def unwrap(data, name, sha):
         raise No(f'the hand-off file is for commit {shown(doc["sha"])}, not this checkout HEAD {sha}: refused')
     if not isinstance(doc['payload'], str):
         raise No('the hand-off payload is not text: refused')
-    return doc['payload'].encode('utf-8', 'strict')
+    try:
+        return doc['payload'].encode('utf-8', 'strict')
+    except UnicodeEncodeError:      # a lone surrogate (\ud800), which put never writes
+        raise No('the hand-off payload is not valid text (a lone surrogate): refused')
 
 
 def shown(value, limit=80):
@@ -148,7 +207,7 @@ def say(ok, text, warn=False):
 
 
 def put(a):
-    out = {'staged': 'false', 'file': '', 'artifact': '', 'sha': '', 'retention': ''}
+    out = {'staged': 'false', 'file': '', 'artifact': '', 'sha': '', 'retention': '', 'overwrite': 'false'}
     try:
         name, path = checked_name(a.name), checked_path(a.path)
         if not re.fullmatch(r'[1-9][0-9]?', a.retention_days or '') or int(a.retention_days) > 90:
@@ -161,8 +220,13 @@ def put(a):
         os.makedirs(a.stage_dir, exist_ok=True)
         staged = os.path.join(tempfile.mkdtemp(dir=a.stage_dir, prefix='handoff-put-'), FILE)
         write_atomic(staged, envelope(name, sha, payload))
+        # A first attempt never overwrites: a second job (or matrix leg) handing off the same name in this run then
+        # fails its upload and reports ok false, instead of silently replacing the first one's hand-off. A re-run
+        # attempt must overwrite its own earlier attempt's artifact.
+        rerun = re.fullmatch(r'[1-9][0-9]*', os.environ.get('GITHUB_RUN_ATTEMPT', '')) and \
+            os.environ['GITHUB_RUN_ATTEMPT'] != '1'
         out.update(staged='true', file=staged, artifact=f'{name}-{sha}', sha=sha, retention=a.retention_days,
-                   reason=f'staged {path} as {name}-{sha}')
+                   overwrite='true' if rerun else 'false', reason=f'staged {path} as {name}-{sha}')
         say(True, out['reason'])
     except (No, OSError) as e:
         out['reason'] = str(e)
@@ -174,9 +238,12 @@ def uploaded(a):
     if a.staged != 'true':
         output(ok='false', reason=a.why or 'nothing was staged (the step before did not finish)')
     elif a.outcome != 'success':
-        say(False, f'the upload of {a.artifact} did not succeed ({a.outcome or "did not run"}): nothing handed off',
-            warn=True)
-        output(ok='false', reason=f'upload {a.outcome or "did not run"}')
+        why = f'upload {a.outcome or "did not run"}'
+        if a.overwrite != 'true':
+            why += (f' (in a first attempt also what a second job or matrix leg of this run handing off {a.artifact} '
+                    f'gets: one producer per name per run)')
+        say(False, f'nothing handed off: {why}', warn=True)
+        output(ok='false', reason=why)
     else:
         say(True, f'handed off {a.artifact}')
         output(ok='true', reason=f'uploaded {a.artifact}')
@@ -234,11 +301,12 @@ def main(argv=None):
     c.add_argument('--name', required=True)
     c.add_argument('--path', required=True)
     c.add_argument('--stage-dir', required=True)
-    c.add_argument('--retention-days', default='1')
+    c.add_argument('--retention-days', default='3')
     c = sub.add_parser('uploaded')
     c.add_argument('--staged', default='')
     c.add_argument('--outcome', default='')
     c.add_argument('--artifact', default='')
+    c.add_argument('--overwrite', default='')
     c.add_argument('--why', default='', help="the stage's reason when nothing was staged")
     c = sub.add_parser('where')
     c.add_argument('--name', required=True)
@@ -253,7 +321,18 @@ def main(argv=None):
     c.add_argument('--dir', default='')
     c.add_argument('--why', default='', help="where's reason when it was not ready")
     a = p.parse_args(argv)
-    {'put': put, 'uploaded': uploaded, 'where': where, 'get': get}[a.command](a)
+    try:
+        {'put': put, 'uploaded': uploaded, 'where': where, 'get': get}[a.command](a)
+    except Exception as e:      # nothing above expects it: still the not-ok outputs and one plain line, exit 0
+        reason = f'the hand-off could not be {"read" if a.command in ("where", "get") else "made"} ' \
+                 f'({type(e).__name__}): refused'
+        say(False, reason, warn=True)
+        output(**NOT_OK[a.command], reason=reason)
+
+
+# The outputs that mean "no hand-off" for each command (main's last resort).
+NOT_OK = {'put': {'staged': 'false'}, 'uploaded': {'ok': 'false'}, 'where': {'ready': 'false'},
+          'get': {'ok': 'false', 'sha': ''}}
 
 
 if __name__ == '__main__':

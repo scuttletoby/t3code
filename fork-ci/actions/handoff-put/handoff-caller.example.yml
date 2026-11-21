@@ -12,7 +12,13 @@ permissions:
 
 jobs:
   build:
-    runs-on: [self-hosted, build] # BUILD RUNNER LABELS
+    # The project's own runs-on for this job, unchanged (BUILD RUNNER LABELS). A self-hosted runner only for a push or
+    # a pull request whose head is this repository; a fork's pull request may run another repository's code and goes
+    # GitHub-hosted (fleet-route's rule, ../fleet-route/README.md). With fleet-route, keep its expression here.
+    runs-on: >-
+      ${{ (github.event_name == 'push'
+           || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+          && fromJSON('["self-hosted","build"]') || 'ubuntu-latest' }}
     outputs:
       # 'true' only when the hand-off was uploaded. Empty when this job failed, was cut off or skipped the step.
       handoff: ${{ steps.handoff.outputs.ok }}
@@ -33,8 +39,14 @@ jobs:
     needs: build
     # Runs when build failed or was cut off too: GitHub counts a skipped required job as passing.
     if: ${{ !cancelled() }}
-    # The light runner only on 'true'; anything else (empty included) is the old runner, which makes the file itself.
-    runs-on: ${{ needs.build.outputs.handoff == 'true' && 'ubuntu-latest' || fromJSON('["self-hosted","build"]') }}
+    # The light runner only on 'true'. Anything else (empty included) is this job's old runs-on, unchanged, which
+    # makes the file itself: the same fork guard as build's, so a fork's pull request never reaches a self-hosted
+    # runner through the fallback (there the old rule was GitHub-hosted, which builds the file as before).
+    runs-on: >-
+      ${{ needs.build.outputs.handoff == 'true' && 'ubuntu-latest'
+          || (github.event_name == 'push'
+              || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+             && fromJSON('["self-hosted","build"]') || 'ubuntu-latest' }}
     steps:
       - uses: scuttletoby/t3code/fork-ci/actions/git-clean@<release sha> # ci/vN
       - uses: actions/checkout@<sha> # pin by full SHA
@@ -48,11 +60,12 @@ jobs:
         if: steps.handoff.outputs.ok != 'true'
         env:
           HANDED_OFF: ${{ needs.build.outputs.handoff }}
+          WHY: ${{ steps.handoff.outputs.reason }}
         run: |
           if [ "$HANDED_OFF" = true ]; then
-            # On the light runner, which cannot build: the producer said ok but the file is gone (expired, or not
-            # this commit's). Re-run all jobs so the producer runs again.
-            echo "::error::no hand-off for this commit; re-run all jobs"
+            # On the light runner, which cannot build: the producer said ok but the file is gone (expired) or was
+            # refused (not this commit's or name's). The reason says which. Re-run all jobs so the producer runs again.
+            echo "::error::no hand-off for this commit ($WHY); re-run all jobs"
             exit 1
           fi
           ./BUILD-AND-WRITE-THE-FILE out/handoff.txt
