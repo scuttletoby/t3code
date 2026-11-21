@@ -1,18 +1,20 @@
 // Fork (placement row P2): saving `placement` and `placementNeeds` through the settings patch, as
-// the server does (apply the patch, then write and read the file again).
+// the server does (apply the patch, check it, then write and read the file again).
 import {
-  DEFAULT_PLACEMENT_SETTINGS,
   DEFAULT_SERVER_SETTINGS,
   ProjectId,
   ServerSettings,
   ServerSettingsPatch,
+  readPlacementNeeds,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   clearProjectSettingsOverridesWithForkKeys,
+  forkSettingsWriteProblem,
   keepLeftOutForkProjectKeys,
+  placementFactsCommandSaveProblem,
 } from "./forkSettingsPatch.ts";
 import { resolveProjectSettings } from "./projectSettings.ts";
 import { applyServerSettingsPatch } from "./serverSettings.ts";
@@ -26,13 +28,26 @@ const PROJECT = ProjectId.make("project-1");
 const throughFile = (settings: ServerSettings): ServerSettings =>
   decodeSettings(JSON.parse(JSON.stringify(encodeSettings(settings))));
 
-/** One save as the server makes it: the patch over the wire, applied, written and read back. */
-const save = (current: ServerSettings, patch: unknown): ServerSettings => {
+/**
+ * One save as the server makes it: the patch over the wire, applied, checked (a refused save
+ * throws its problem), written and read back. `platform` is the server's OS.
+ */
+const save = (current: ServerSettings, patch: unknown, platform = "linux"): ServerSettings => {
   const decoded = decodePatch(JSON.parse(JSON.stringify(patch)));
-  return throughFile(
-    keepLeftOutForkProjectKeys(current, decoded, applyServerSettingsPatch(current, decoded)),
+  const next = keepLeftOutForkProjectKeys(
+    current,
+    decoded,
+    applyServerSettingsPatch(current, decoded),
   );
+  const problem =
+    forkSettingsWriteProblem(current, next) ??
+    placementFactsCommandSaveProblem(current, next, platform);
+  if (problem !== undefined) throw new Error(problem);
+  return throughFile(next);
 };
+
+/** The settings as a client holds them (sent over the wire, read again). */
+const onClient = (settings: ServerSettings): ServerSettings => throughFile(settings);
 
 /** Settings with other fork settings on, as one save leaves them (upstream adds derived keys). */
 const START = save(
@@ -100,8 +115,13 @@ describe("saving placement", () => {
     }
   });
 
-  it("keeps a bad value as written through other saves; saving the key replaces it from off", () => {
-    const bad = { mode: "always", labels: ["gpu"] };
+  it("keeps a bad value as written through other saves; only a whole save replaces it", () => {
+    const bad = {
+      mode: "enforce",
+      labels: ["gpu"],
+      never: [["ci-runner", "owner-logins"]],
+      weights: { "env-desk": "bad" },
+    };
     const stored = decodeSettings({ ...encodeSettings(START), placement: bad });
     expect(stored.placement.mode).toBe("off");
     expect(stored.placement.unreadable).toEqual(bad);
@@ -111,12 +131,65 @@ describe("saving placement", () => {
     expect(other.placement).toEqual(stored.placement);
     expect(encodeSettings(save(other, { usagePacingGate: "off" })).placement).toEqual(bad);
 
-    // A save of one field starts from off: the kept text and its problem are gone.
-    const fixed = save(stored, { placement: { mode: "advise" } });
-    expect(fixed.placement).toEqual({ ...DEFAULT_PLACEMENT_SETTINGS, mode: "advise" });
+    // A save of some fields is refused: merged onto off it would drop the never group (and here
+    // switch enforce on). Nothing changes; the text is kept. A no-op one is refused too.
+    for (const partial of [
+      { mode: "enforce" },
+      { mode: "off" },
+      { mode: "advise", labels: ["gpu"], factsCommand: "", never: [] },
+    ]) {
+      expect(() => save(stored, { placement: partial }), JSON.stringify(partial)).toThrow(
+        "placement is not valid; save the whole setting",
+      );
+    }
+    expect(encodeSettings(stored).placement).toEqual(bad);
+
+    // A save of every field replaces it: the kept text and its problem are gone.
+    const whole = { ...FULL, mode: "enforce" };
+    const fixed = save(stored, { placement: whole });
+    expect(fixed.placement).toEqual(whole);
     expect(Object.hasOwn(fixed.placement, "unreadable")).toBe(false);
     expect(Object.hasOwn(fixed.placement, "problem")).toBe(false);
-    expect(save(fixed, { placement: { mode: "advise" } })).toEqual(fixed);
+    expect(others(fixed, "placement")).toEqual(others(stored, "placement"));
+    // Runs again the same; after it, a partial save merges as usual.
+    expect(save(fixed, { placement: whole })).toEqual(fixed);
+    expect(save(fixed, { placement: { mode: "off" } }).placement).toEqual({
+      ...whole,
+      mode: "off",
+    });
+    // A whole save that is not valid is refused, as any bad save.
+    expect(() => save(stored, { placement: { ...whole, mode: "on" } })).toThrow();
+  });
+
+  // [factsCommand, the server's OS, refused]
+  const FACTS_SAVES: ReadonlyArray<readonly [string, string, boolean]> = [
+    ["/usr/local/bin/facts", "linux", false],
+    ["/usr/local/bin/facts", "darwin", false],
+    ["/usr/bin/x", "win32", true],
+    ["C:\\facts.exe", "linux", true],
+    ["C:\\facts.exe", "darwin", true],
+    ["C:\\facts.exe", "win32", false],
+    ["", "win32", false],
+  ];
+
+  it.each(FACTS_SAVES)("saving factsCommand %j on %s: refused %s", (command, platform, refused) => {
+    const patch = { placement: { ...FULL, factsCommand: command } };
+    if (refused) {
+      expect(() => save(START, patch, platform)).toThrow(
+        `placement: factsCommand "${command}" is not a full path on this server's OS`,
+      );
+    } else {
+      expect(save(START, patch, platform).placement.factsCommand).toBe(command);
+    }
+  });
+
+  it("never refuses another save over a stored factsCommand of another OS", () => {
+    // A hand edit the load did not catch (it reads it as off on the server): another save passes.
+    const stored = save(START, { placement: { ...FULL, factsCommand: "C:\\facts.exe" } }, "win32");
+    expect(save(stored, { usagePacingGate: "off" }, "linux").placement).toEqual(stored.placement);
+    expect(save(stored, { placement: { mode: "off" } }, "linux").placement.factsCommand).toBe(
+      "C:\\facts.exe",
+    );
   });
 });
 
@@ -137,6 +210,65 @@ describe("saving placementNeeds", () => {
     expect(resolveProjectSettings(withProject([]), PROJECT).settings.placementNeeds).toEqual([]);
     // Nothing set anywhere: no needs.
     expect(resolveProjectSettings(START, PROJECT).settings.placementNeeds).toEqual([]);
+  });
+
+  it("fails closed on bad needs: kept through other saves, replaced by a save of the key", () => {
+    for (const bad of ["gpu", ["gpu", "cuda 12"]]) {
+      const stored = decodeSettings({
+        ...encodeSettings(START),
+        placementNeeds: bad,
+        projectSettingsOverrides: { [PROJECT]: { placementNeeds: bad, defaultAutoPull: true } },
+      });
+      // Both the server's and the project's read as fitting no machine.
+      expect(readPlacementNeeds(stored.placementNeeds).fits).toBe("none");
+      const resolved = resolveProjectSettings(stored, PROJECT).settings.placementNeeds;
+      expect(readPlacementNeeds(resolved).fits).toBe("none");
+      const other = resolveProjectSettings(stored, ProjectId.make("project-2")).settings;
+      expect(readPlacementNeeds(other.placementNeeds).fits).toBe("none");
+
+      // Unrelated saves keep the person's text: a server key, an older client's project save that
+      // leaves the key out, and a client that resends the project's whole entry. Run twice: the
+      // same file, no growth.
+      const client = onClient(stored);
+      const project = client.projectSettingsOverrides[PROJECT]!;
+      for (const patch of [
+        { usagePacingGate: "off" },
+        { projectSettingsOverrides: { [PROJECT]: { defaultAutoPull: false } } },
+        { projectSettingsOverrides: { [PROJECT]: { ...project, defaultAutoPull: false } } },
+      ]) {
+        const once = save(stored, patch);
+        expect(encodeSettings(once).placementNeeds, JSON.stringify(patch)).toEqual(bad);
+        const file = encodeSettings(once).projectSettingsOverrides as Record<string, unknown>;
+        expect(file[PROJECT]).toMatchObject({ placementNeeds: bad });
+        expect(save(once, patch)).toEqual(once);
+        expect(JSON.stringify(encodeSettings(save(once, patch)))).toBe(
+          JSON.stringify(encodeSettings(once)),
+        );
+      }
+
+      // A resend of other kept text (changed elsewhere) is refused.
+      expect(() =>
+        save(stored, {
+          projectSettingsOverrides: { [PROJECT]: { placementNeeds: { unreadable: "cuda" } } },
+        }),
+      ).toThrow("Project project-1's placementNeeds sends back unreadable text");
+
+      // A save of the key replaces the text and clears the problem.
+      const fixed = save(stored, {
+        placementNeeds: ["GPU"],
+        projectSettingsOverrides: { [PROJECT]: { placementNeeds: ["cuda"] } },
+      });
+      expect(fixed.placementNeeds).toEqual(["gpu"]);
+      expect(fixed.projectSettingsOverrides[PROJECT]?.placementNeeds).toEqual(["cuda"]);
+      expect(readPlacementNeeds(fixed.placementNeeds)).toEqual({ fits: "labels", labels: ["gpu"] });
+      // A project's null clears its own; it then uses the server's.
+      const cleared = save(stored, {
+        projectSettingsOverrides: { [PROJECT]: { placementNeeds: null } },
+      });
+      expect(Object.hasOwn(cleared.projectSettingsOverrides[PROJECT] ?? {}, "placementNeeds")).toBe(
+        false,
+      );
+    }
   });
 
   it("keeps a project's needs when an older client's save leaves them out; null clears them", () => {

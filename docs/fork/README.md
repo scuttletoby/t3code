@@ -426,21 +426,32 @@ wiring). Fields, each with its default:
 
 - `mode`: `off` (an agent picks a machine as upstream's do), `advise` or `enforce`.
 - `labels`: `[]`. What this machine has, as free words (`"gpu"`, `"ci-runner"`, `"owner-logins"`):
-  each is trimmed, one word of at most 64 characters, at most 64 labels; a repeat is dropped.
-- `factsCommand`: `""`. Empty, or a program's absolute path (a relative path is not valid). Exit 0
-  means free for work, and each line it prints is one more label; any other exit or a timeout means
-  not available.
+  each is one word of at most 64 characters, at most 64 labels. They are stored trimmed and
+  lower-cased (`"GPU"` is `"gpu"`), a repeat dropped. There is no Unicode normalisation: `café`
+  written with a combining accent and without one are two labels.
+- `factsCommand`: `""`. Empty, or the absolute path of one program on this server's OS (`/…` on
+  Linux and macOS; `C:\…` or `\\server\…` on Windows). It is a path, never a command line: a
+  space is part of the path, and no shell runs it. A relative path or a control character is not
+  valid; a save that sets another OS's path is refused, and one in the file reads as `off` (below).
+  Exit 0 means free for work, and each line it prints is one more label; any other exit or a timeout
+  means not available.
 - `never`: `[]`. Label groups that must not meet on one machine, such as
-  `[["ci-runner", "owner-logins"]]`; each group has at least two different labels.
-- `weights`: `{}`. Linked machine id to `prefer`, `normal`, `less` or `manual` (upstream's
-  load-balancing words); a machine without one is `normal`.
+  `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
+  lower-casing (`["GPU", "gpu"]` is one label, so not a group).
+- `weights`: `{}`. Linked machine id (one word, no spaces) to `prefer`, `normal`, `less` or
+  `manual` (upstream's load-balancing words); a machine without one is `normal`.
 
-A value that is not valid (a bad field, a wrong type or a field this build does not know) reads as
-`off`, with a warning in the log and the reason kept beside it for Settings to show; the rest of
-the file still loads. The person's text is kept as written until the key is saved. A save that names
-only some fields keeps the others; a save over a kept unreadable value starts from `off`. Only a
-person changes it: no agent tool can, and a managed policy can lock it as a whole value (not one
-field inside it, as for `modelPolicy`).
+A value that is not valid (a bad field, a wrong type, a field this build does not know, or a
+`factsCommand` that is not a full path on this server's OS) reads as `off`, with a warning in the
+log and the reason kept beside it for Settings to show; the rest of the file still loads. The
+person's text is kept as written until the key is saved. A save that names only some fields keeps
+the others; over a kept unreadable value only a save of every field is taken (it replaces the text),
+and a partial one is refused ("placement is not valid; save the whole setting"), so it cannot drop a
+`never` group. A newer build's field reads as `off` here and is kept through saves of other keys; a
+save of `placement` on this build drops it. Only a person changes it: no agent tool can, and a
+managed policy can lock it as a whole value (not one field inside it, as for `modelPolicy`).
+"Person-only" means no T3 tool takes it; an agent with a shell can still edit the settings file or
+call the settings RPC, as for `modelPolicy`.
 
 ```json
 {
@@ -452,7 +463,11 @@ field inside it, as for `modelPolicy`).
 
 Labels a machine must have to take a project's work, for each project without its own
 (`projectOverride.placementNeeds`). Same label rules as `placement.labels`. Default `[]`: no needs.
-A value that is not valid reads as `[]` with a warning, and the next save writes `[]`.
+A value that is not valid fails closed: that work goes to no machine ("this project's
+placementNeeds setting is not valid: …; fix it in Settings"), never to any machine as `[]` would.
+The reason is kept beside it and logged, and the person's text is written back unchanged by saves
+of other settings until this key is saved, which replaces it. A managed policy can lock it as a
+whole list; the lock also holds each project's own needs.
 
 ### `server.agentSlots`
 
@@ -1048,8 +1063,10 @@ older client) keeps the stored value; only `null` clears it (also when written b
 
 A project's own needs, for example `["gpu"]`. It replaces the server's `placementNeeds` for that
 project as a whole; `[]` says the project needs nothing. Not set: the server's. A project value that
-is not valid reads as `[]` for that project, never as the server's. A project save that leaves this
-key out (an older client) keeps the stored value; only `null` clears it, as for `playtest`.
+is not valid fails closed as the server's does: that project's work goes to no machine (never the
+server's needs, never none), and its text is kept. A project save that leaves this key out (an older
+client) keeps the stored value, and one that sends back the kept text unchanged keeps it too (other
+text is refused); only `null` clears it, as for `playtest`.
 
 ### A setting the fork removed
 

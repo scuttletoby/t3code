@@ -136,6 +136,7 @@ const normalizeServerSettings = (
     Effect.map(foldProviderInstanceEnabledFlags),
     Effect.map((next) => withIdleCompaction(next, globalIdleCompaction(next))),
     Effect.map((next) => ({ ...next, ...deriveLegacyProjectOverrides(next) })),
+    Effect.flatMap(ForkSettingsWrite.forThisOs), // Fork: placement factsCommand on this OS
     Effect.mapError(
       (cause) =>
         new ServerSettingsError({
@@ -857,6 +858,7 @@ const make = Effect.gen(function* () {
     // it to `idleCompaction`, so that switch goes to clients as a boolean. The
     // defaults gain the field too, which tells clients this server reads modes.
     settings = withIdleCompaction(settings, globalIdleCompaction(settings));
+    settings = yield* ForkSettingsWrite.forThisOs(settings); // Fork: placement factsCommand on this OS
 
     // A file that failed to decode must stay on disk for the user to repair.
     const settingsFileTrusted = Option.isNone(parseFailure);

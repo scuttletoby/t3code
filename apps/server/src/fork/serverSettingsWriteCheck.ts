@@ -1,12 +1,14 @@
 /**
  * Fork: the server's save check for fork settings. A refused save fails with upstream's
  * `ServerSettingsError` (operation `normalize`), its cause a `ForkSettingsWriteError` with the fix.
- * The settings file calls `check` in its write path and `withCheck` in its test layer.
+ * The settings file calls `check` in its write path, `withCheck` in its test layer and `forThisOs`
+ * in its load.
  */
-import { type ServerSettings, ServerSettingsError } from "@t3tools/contracts";
+import { type ServerSettings, ServerSettingsError, placementOnPlatform } from "@t3tools/contracts";
 import {
   ForkSettingsWriteError,
   forkSettingsWriteProblem,
+  placementFactsCommandSaveProblem,
   playtestProgramProblem,
 } from "@t3tools/shared/forkSettingsPatch";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -20,7 +22,9 @@ export function check(
 ): Effect.Effect<void, ServerSettingsError> {
   return Effect.flatMap(HostProcess.Platform, (platform) => {
     const problem =
-      forkSettingsWriteProblem(current, next) ?? playtestProgramProblem(current, next, platform);
+      forkSettingsWriteProblem(current, next) ??
+      playtestProgramProblem(current, next, platform) ??
+      placementFactsCommandSaveProblem(current, next, platform);
     return problem === undefined
       ? Effect.void
       : Effect.fail(
@@ -32,6 +36,16 @@ export function check(
         );
   });
 }
+
+/**
+ * The settings as this machine reads them: a `placement.factsCommand` this OS cannot run reads as
+ * off, kept as written with its problem (contracts' `placementOnPlatform`). The load applies it.
+ */
+export const forThisOs = (settings: ServerSettings): Effect.Effect<ServerSettings> =>
+  Effect.map(HostProcess.Platform, (platform) => {
+    const placement = placementOnPlatform(settings.placement, platform);
+    return placement === settings.placement ? settings : { ...settings, placement };
+  });
 
 /** `update`, then {@link check} on what it returns. */
 export const withCheck =

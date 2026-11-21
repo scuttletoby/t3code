@@ -6,6 +6,7 @@
 import {
   DEFAULT_SERVER_SETTINGS,
   ForkServerSettingsFields,
+  ProjectId,
   ProviderDriverKind,
   ServerSettings,
 } from "@t3tools/contracts";
@@ -209,4 +210,32 @@ it("refuses a lock of one placement field, naming the whole setting to lock", ()
   const result = makeManagedSettings({ "placement.mode": { value: "off", locked: true } });
   assert.strictEqual(result._tag, "Invalid");
   if (result._tag === "Invalid") assert.match(result.reason, /manage "placement" as a whole/);
+});
+
+// Placement needs (row P2): a policy locks `placementNeeds` as a whole list, and the lock reaches
+// each project's own needs, as for every key a project overrides; a bad stored value goes too.
+it("locks placementNeeds on the server and in each project that sets its own", () => {
+  const result = makeManagedSettings({ placementNeeds: { value: ["gpu"], locked: true } });
+  if (result._tag !== "Valid") assert.fail(result.reason);
+  const project = ProjectId.make("project-1");
+  const user: ServerSettings = {
+    ...DEFAULT_SERVER_SETTINGS,
+    placementNeeds: { unreadable: "gpu", problem: "Expected array" },
+    projectSettingsOverrides: { [project]: { placementNeeds: [] } },
+  };
+  const applied = result.settings.applyLocks(user);
+  assert.deepEqual(applied.placementNeeds, ["gpu"]);
+  assert.deepEqual(applied.projectSettingsOverrides[project]?.placementNeeds, ["gpu"]);
+  const server = result.settings.vetWrite(
+    applied,
+    { ...applied, placementNeeds: [] },
+    { placementNeeds: [] },
+  );
+  assert.deepEqual(server, { _tag: "Locked", path: "placementNeeds" });
+  const inProject = result.settings.vetWrite(
+    applied,
+    { ...applied, projectSettingsOverrides: { [project]: { placementNeeds: [] } } },
+    { projectSettingsOverrides: { [project]: { placementNeeds: [] } } },
+  );
+  assert.strictEqual(inProject._tag, "Locked");
 });
