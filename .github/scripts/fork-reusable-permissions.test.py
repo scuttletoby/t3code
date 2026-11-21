@@ -97,6 +97,9 @@ def check_tree(root):
         walk(root, str(path.relative_to(root)), UNKNOWN, [], problems, set())
     return problems
 
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks = []
+
 
 def selftest():
     """The check must catch each rule it exists for and pass the fixed shapes."""
@@ -162,6 +165,7 @@ jobs:
             (root / ".github/workflows/leaf.yml").write_text(leaf_text)
             problems = check_tree(root)
         good = bool(problems) == want_fail
+        oks.extend([1] if good else [])
         print(("ok   " if good else "FAIL ") + "selftest: " + name + ("" if good else f"\n     | {problems}"))
         ok &= good
     return ok
@@ -174,7 +178,10 @@ def main():
     for p in problems:
         print("FAIL " + p)
     if not problems:
+        oks.append(1)
         print("ok   every called fork workflow asks for at most what its caller grants")
+    if ok and not problems:
+        print(f"all passed: {len(oks)} ok, 0 skipped")
     sys.exit(0 if ok and not problems else 1)
 
 

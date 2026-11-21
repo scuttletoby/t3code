@@ -30,9 +30,13 @@ wf = yaml.safe_load(text)
 failures = []
 GATE = "python3 -I -B toolkit/fork-ci/actions/head-check/head_gate.py"
 READ = {"contents": "read", "pull-requests": "read", "actions": "read"}
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks = []
 
 
 def check(name, ok, detail=""):
+    if ok:
+        oks.append(1)
     print(("ok   " if ok else "FAIL ") + name + ("" if ok or not detail else f"\n     | {detail}"))
     if not ok:
         failures.append(name)
@@ -465,4 +469,4 @@ check("release notes: the Upgrade's pin is ci/v15 or later, and the refused olde
 if failures:
     print(f"\n{len(failures)} failed")
     sys.exit(1)
-print("\nall passed")
+print(f"\nall passed: {len(oks)} ok, 0 skipped")

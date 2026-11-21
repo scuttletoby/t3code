@@ -92,7 +92,12 @@ export TMPDIR="$root/tmp"
 mkdir -p "$TMPDIR"
 
 failures=0
-pass() { echo "ok   $1"; }
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks=0
+pass() {
+  oks=$((oks + 1))
+  echo "ok   $1"
+}
 fail() {
   echo "FAIL $1"
   sed 's/^/     | /' "$root/out" 2> /dev/null || true
@@ -552,4 +557,4 @@ if (( failures )); then
   echo "$failures failed"
   exit 1
 fi
-echo "all passed"
+echo "all passed: $oks ok, 0 skipped"

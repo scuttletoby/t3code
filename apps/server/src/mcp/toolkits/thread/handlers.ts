@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
 import { topOfPinnedRunOrderKey } from "@t3tools/shared/pinOrderKey";
 
+import * as LaunchMcpProfile from "../../../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
@@ -117,6 +118,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           code: "invalid_request",
           message: "The scheduled task was not found.",
         });
+      yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch
       const { task, threadId } = yield* scheduler
         .runNow({ id: input.taskId })
         .pipe(
@@ -199,6 +201,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
             return { sequence: result.sequence, targetThreadId };
           }
           const targetThreadId = ThreadId.make(`${commandId}:fork`);
+          yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch
           const result = yield* threads
             .dispatch({
               type: "thread.fork",
