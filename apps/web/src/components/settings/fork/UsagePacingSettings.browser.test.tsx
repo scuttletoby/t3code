@@ -267,6 +267,35 @@ describe("ModelPolicySettings", () => {
     });
   });
 
+  it("marks the person's own model pick outside the rows, and only while the policy is on", async () => {
+    const allow = [
+      { driver: "claudeAgent", model: "claude-opus-5-5", efforts: ["high"], defaultEffort: "high" },
+    ];
+    const picks = {
+      defaultModelSelection: {
+        instanceId: "claude-a",
+        model: "claude-opus-5-5",
+        options: [{ id: "effort", value: "high" }],
+      },
+      reviewGuideModelSelection: { instanceId: "codex-b", model: "gpt-mini" },
+    };
+    setup({ modelPolicy: { mode: "advise", allow }, ...picks });
+    {
+      await using screen = await render(<ModelPolicySettings />);
+      await expect.element(screen.getByText("Review guide model")).toBeVisible();
+      await expect
+        .element(screen.getByText("outside policy (gpt-mini (codex) is in no row)"))
+        .toBeVisible();
+      // The pick inside the rows is listed without the mark.
+      await expect.element(screen.getByText("claude-opus-5-5, effort high")).toBeVisible();
+      expect(screen.getByText(/outside policy \(claude-opus-5-5/).elements()).toHaveLength(0);
+    }
+    setup({ modelPolicy: { mode: "off", allow }, ...picks });
+    await using off = await render(<ModelPolicySettings />);
+    await expect.element(off.getByText("Model policy").first()).toBeVisible();
+    expect(off.getByText(/^outside policy/).elements()).toHaveLength(0);
+  });
+
   it("flags a row whose driver no provider here has", async () => {
     setup({
       modelPolicy: {

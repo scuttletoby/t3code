@@ -1838,6 +1838,26 @@ class Contract(unittest.TestCase):
         self.assertIsNotNone(block, f'EFFORT_OPTION_IDS not found in {path}: keep the hook\'s list in step')
         self.assertEqual(sorted(re.findall(r'"([^"]+)"', block.group(1))), sorted(model_guard.EFFORT_OPTION_IDS))
 
+    def test_driver_effort_ids_are_read_by_the_servers_model_policy(self):
+        """#731: the server's model policy check (packages/contracts/src/modelPolicy.ts) reads a pick's effort under
+        each id a driver reads it from, as the hook does: every DRIVER_EFFORT_IDS entry is in its general list or is
+        that driver's own entry there. Kept here (not in an app test) so app code names no fork-owned path (#254);
+        the workflow runs this test when either side changes."""
+        path = os.path.join(REPO, 'packages', 'contracts', 'src', 'modelPolicy.ts')
+        with open(path, encoding='utf-8') as f:
+            source = f.read()
+        general = re.search(r'export const MODEL_POLICY_EFFORT_OPTION_IDS[^=]*= \[(.*?)\];', source, re.S)
+        drivers = re.search(r'const MODEL_POLICY_DRIVER_EFFORT_IDS[^=]*= \{(.*?)\};', source, re.S)
+        self.assertIsNotNone(general, f'MODEL_POLICY_EFFORT_OPTION_IDS not found in {path}: keep the lists in step')
+        self.assertIsNotNone(drivers, f'MODEL_POLICY_DRIVER_EFFORT_IDS not found in {path}: keep the lists in step')
+        general = set(re.findall(r'"([^"]+)"', general.group(1)))
+        drivers = dict(re.findall(r'(\w+): "([^"]+)"', drivers.group(1)))
+        self.assertIn('effort', general)
+        self.assertGreater(len(model_guard.DRIVER_EFFORT_IDS), 4)
+        for driver, effort_id in model_guard.DRIVER_EFFORT_IDS.items():
+            self.assertTrue(effort_id in general or drivers.get(driver) == effort_id,
+                            f'{driver} reads its effort from {effort_id}: the server must read it too')
+
     def test_ultracode_maps_like_the_server(self):
         """The old effort value "ultracode" runs at xhigh with the option "ultracode" on, as T3's shared model code
         maps it (packages/shared/src/model.ts withLegacyUltracodeEffort)."""
