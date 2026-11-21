@@ -13,6 +13,22 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: review findings, rounds and `override_authors` (#740)
+
+With a `review` block, the gate also judges the review itself from the lens comments. With `findings: true`, a lens's
+newest report needs a findings section (`blocker:` and `major:` lines, or `findings: none`), and a blocker or major in
+it fails the head. A round is a lens read of a different own change (a queue update adds none): from
+`rounds.approach_at` the approach lens is required, and past `rounds.max` a person decides. The new optional key
+`review.override_authors` lists the logins whose override comment counts as a person's (empty or left out: none
+does). In `shadow` the check summary only adds a row "findings and rounds (shadow): they would have said: ...". Without
+a `review` block nothing changes. First in the release after `ci/v20`.
+
+**Upgrade:** `ci/v20` and older refuse a config with `override_authors`: move every pin first, then add the key
+(pr-queue README, "Turning it on: release, pin, then config"). A config already in `enforce` with `findings: true`:
+after the move, a required lens whose newest report has no findings section fails the head, so have the lens prompts
+write `blocker: none` and `major: none` first, or switch to `shadow` before the move. In both modes a head whose
+rounds cannot be judged (an error while reading the lens comments) now fails instead of passing on the old rule.
+
 ### handoff-put and handoff-get: a file handed from one job to a later job of the same run (#247)
 
 - New actions [`handoff-put`](actions/handoff-put/README.md) and [`handoff-get`](actions/handoff-get/README.md). put
