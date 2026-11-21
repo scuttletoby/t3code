@@ -372,14 +372,18 @@ These routes start a new agent run and go through the same gate, with the same c
   If a slot is still taken between two threads, the refusal names the threads already created.
 - A scheduled task's run on its schedule (interval, once, fixed time) that is refused stays due: it
   is tried again on each poll (every 5 s) and starts, once, when a slot is free. Its history shows
-  one note, `Waiting for an agent slot: ` and the reason, until it runs; its run count does not
+  one note, `Waiting for an agent slot: ` and the current reason, until it runs (the note goes when
+  the task is paused or moved to a later time); its run count does not
   move, and it is one run however long it waited. A fixed-time run that waits is not dropped as
   missed while the server runs (its due time follows it); if the server is down more than 10
   minutes while it waits, upstream's missed-run rule applies. "Run now" fails with `Not run, no agent slot: ` and the reason and changes
   nothing; over MCP `run_scheduled_task_now` answers `slots_full`. A webhook delivery waits the
   same way and starts once when a slot is free; it ends without a run only if its task is paused,
-  deleted or changed while it waits. A waiting coalesced delivery stays in the store and is picked
-  up again after a restart; a direct one waits in memory, as upstream's own delivery queue does.
+  deleted, replaced or its trigger changed while it waits (other edits are not seen: it runs with
+  the task as it was when it began to wait). Every waiting delivery is in the store, so a restart
+  keeps it and it runs once: a direct one (no coalescing window) is moved there when it is first
+  refused. A scheduled run or a webhook takes a slot only when no agent that waits for one holds
+  it; there is no order between routes, so on a host kept full it can wait long.
 - A task bound to a thread whose run is active only queues its prompt there: no new run, so no slot
   and no wait. A bound thread that is idle starts a run and is gated, counted on the thread's
   current provider.
@@ -393,7 +397,9 @@ has no free slot, or could not count its agents.
 
 These start or wake a run and are not gated yet ([#711](https://github.com/scuttletoby/t3code/issues/711)):
 a message a person sends from the composer, `t3_thread_send` to an idle thread, a
-`t3_thread_transfer` fork, and a wait delivery that wakes an idle thread.
+`t3_thread_transfer` fork, and a wait delivery that wakes an idle thread. A scheduled run bound
+to a running thread whose run ends in the few milliseconds between the check and the send starts
+one run without a slot.
 
 The calling thread is left out of the count (it waits on its child). A start no thread on this
 machine asks for (a scheduled run, the owner's client, a call from another machine) has no caller, so

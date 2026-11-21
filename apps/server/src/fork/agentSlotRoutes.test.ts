@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
@@ -79,6 +80,8 @@ interface Harness {
   /** One pass of the due-task poll, as the scheduler runs it. */
   readonly poll: Effect.Effect<void>;
   readonly webhookWorker: Effect.Effect<void>;
+  /** One pass of the fork's waiting-note cleanup. */
+  readonly notesWorker: Effect.Effect<void>;
 }
 
 interface Options {
@@ -168,6 +171,7 @@ const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Op
         started,
         poll: Effect.suspend(() => workers.get("scheduled-tasks")!),
         webhookWorker: Effect.suspend(() => workers.get("webhook-coalescing")!),
+        notesWorker: Effect.suspend(() => workers.get("agent-slot-notes")!),
       });
     }).pipe(
       Effect.provide(Layer.fresh(ScheduledTaskService.layer.pipe(Layer.provide(dependencies)))),
@@ -217,6 +221,22 @@ const until = (done: () => boolean, label: string) =>
     }
     assert.fail(`never: ${label}`);
   });
+
+/** One pass of the webhook worker, then one slot retry, `count` times. */
+const workerRounds = (webhookWorker: Effect.Effect<void>, count: number) =>
+  Effect.forEach(
+    Array.from({ length: count }),
+    () =>
+      webhookWorker.pipe(
+        Effect.andThen(settle),
+        Effect.andThen(TestClock.adjust(AgentSlotRoutes.WEBHOOK_SLOT_RETRY)),
+      ),
+    { discard: true },
+  );
+
+const pendingStates = (sql: SqlClient.SqlClient, taskId: string) =>
+  sql<{ delivery_id: string; state: string }>`
+    SELECT delivery_id, state FROM scheduled_task_webhook_pending WHERE task_id = ${taskId}`;
 
 const launches = (started: ReadonlyArray<string>) => started.filter((s) => s.startsWith("launch:"));
 
@@ -360,6 +380,123 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
         }),
       { slots: slotWorld([BUSY]) },
     ),
+  );
+
+  it.effect("a count unreadable for many polls logs its warning once, not every poll", () => {
+    const slots = { ...slotWorld(), fails: true };
+    const logs: Array<Logger.Options<unknown>> = [];
+    const lines = (pattern: RegExp) =>
+      logs.filter((entry) => pattern.test(Logger.formatLogFmt.log(entry))).length;
+    return withService(
+      ({ service, poll, started }) =>
+        Effect.gen(function* () {
+          yield* dueTask(service);
+          for (let round = 0; round < 6; round++) {
+            yield* poll;
+            yield* TestClock.adjust("5 seconds");
+          }
+          assert.deepEqual(started, []);
+          // The fake read crashes: its warning, once.
+          assert.equal(lines(/counting running agents crashed/), 1);
+          // One info line per due time for the waiting run, too.
+          assert.equal(lines(/Scheduled run waits for an agent slot/), 1);
+          slots.fails = false;
+          yield* poll;
+          assert.equal(started.length, 1);
+          assert.equal(lines(/running agents can be counted again/), 1);
+        }),
+      { slots },
+    ).pipe(
+      Effect.provide(
+        Logger.layer([Logger.make((entry) => logs.push(entry))], { mergeWithExisting: false }),
+      ),
+    );
+  });
+
+  it.effect(
+    "the waiting note follows the reason, and a poll that changes nothing writes nothing",
+    () => {
+      const slots = { ...slotWorld([BUSY]), fails: true };
+      const updatedAt = (sql: SqlClient.SqlClient, id: string) =>
+        sql<{
+          updated_at: string;
+        }>`SELECT updated_at FROM scheduled_tasks WHERE task_id = ${id}`.pipe(
+          Effect.map((rows) => rows[0]!.updated_at),
+        );
+      return withService(
+        ({ service, sql, poll, notesWorker, started }) =>
+          Effect.gen(function* () {
+            const task = yield* dueTask(service);
+            yield* poll;
+            assert.match((yield* rowOf(sql, task.id)).last_run_error ?? "", /could not be counted/);
+            // The count reads again, the machine still full: the note says so.
+            slots.fails = false;
+            yield* TestClock.adjust("5 seconds");
+            yield* poll;
+            const full =
+              "Waiting for an agent slot: 1 agent is running on this machine, and the limit is 1. The run starts when a slot is free.";
+            assert.equal((yield* rowOf(sql, task.id)).last_run_error, full);
+            const written = yield* updatedAt(sql, task.id);
+            for (const _ of [1, 2]) {
+              yield* TestClock.adjust("5 seconds");
+              yield* poll;
+              // Still due: the cleanup keeps the note.
+              yield* notesWorker;
+            }
+            assert.equal(yield* updatedAt(sql, task.id), written);
+            assert.equal((yield* rowOf(sql, task.id)).last_run_error, full);
+            assert.deepEqual(started, []);
+          }),
+        { slots },
+      );
+    },
+  );
+
+  const NOTE_ENDS = [
+    {
+      name: "paused",
+      end: (service: Harness["service"], id: string) =>
+        service.setEnabled({ id, enabled: false } as never),
+    },
+    {
+      name: "moved to a later time",
+      end: (service: Harness["service"], id: string) =>
+        Effect.flatMap(
+          taskInput({ id, schedule: { type: "once", runAt: "2026-11-23T11:00:00.000Z" } }),
+          (input) => service.upsert(input),
+        ),
+    },
+  ] as const;
+  it.effect.each(NOTE_ENDS)(
+    "a waiting note goes when the task is $name; a later wait writes a fresh one",
+    ({ name, end }) =>
+      withService(
+        ({ service, sql, poll, notesWorker, started }) =>
+          Effect.gen(function* () {
+            const task = yield* dueTask(service, { schedule: SCHEDULES[1].schedule });
+            yield* poll;
+            assert.match(
+              (yield* rowOf(sql, task.id)).last_run_error ?? "",
+              /^Waiting for an agent slot: /,
+            );
+            yield* end(service, task.id);
+            yield* notesWorker;
+            const ended = yield* rowOf(sql, task.id);
+            assert.equal(ended.last_run_error, null);
+            assert.equal(ended.run_count, 0);
+            if (name === "moved to a later time") {
+              // Due again and still refused: a fresh note for the new due time.
+              yield* TestClock.setTime(Date.parse("2026-11-23T11:00:01.000Z"));
+              yield* poll;
+              assert.match(
+                (yield* rowOf(sql, task.id)).last_run_error ?? "",
+                /^Waiting for an agent slot: /,
+              );
+            }
+            assert.deepEqual(started, []);
+          }),
+        { slots: slotWorld([BUSY]) },
+      ),
   );
 
   it.effect("fixed time: a run that waits past the missed-run grace still runs, once", () => {
@@ -546,10 +683,10 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
     }),
   );
 
-  it.effect("full: a webhook delivery waits for a slot, then runs once", () => {
+  it.effect("full: a direct webhook delivery is stored, then runs once when a slot frees", () => {
     const slots = slotWorld([BUSY]);
     return withService(
-      ({ service, sql, started }) =>
+      ({ service, sql, started, webhookWorker }) =>
         Effect.gen(function* () {
           yield* TestClock.setTime(START);
           const { task } = yield* service.upsert(
@@ -557,11 +694,13 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
           );
           const accepted = yield* service.triggerWebhook(webhookRequest(task));
           if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
-          // A minute of retries: still waiting, not dropped.
-          for (let step = 0; step < 12; step++) {
-            yield* settle;
-            yield* TestClock.adjust(AgentSlotRoutes.WEBHOOK_SLOT_RETRY);
-          }
+          yield* settle;
+          // Refused: stored for the stored-delivery worker; the in-memory copy ended unrun.
+          assert.deepEqual(yield* pendingStates(sql, task.id), [
+            { delivery_id: accepted.deliveryId, state: "dispatching" },
+          ]);
+          // A minute of worker rounds and retries: still waiting, not dropped.
+          yield* workerRounds(webhookWorker, 12);
           assert.deepEqual(started, []);
           const waiting = yield* service.getWebhookDelivery({
             id: task.id,
@@ -570,16 +709,61 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
           assert.notEqual(waiting.delivery.outcome, "dispatch_failed");
           slots.running = [];
           yield* until(() => started.length === 1, "the delivery started");
-          for (let step = 0; step < 3; step++) {
-            yield* settle;
-            yield* TestClock.adjust(AgentSlotRoutes.WEBHOOK_SLOT_RETRY);
-          }
+          // Runs again: more rounds start nothing more (one owner, never twice).
+          yield* workerRounds(webhookWorker, 4);
           assert.equal(started.length, 1);
           assert.equal((yield* rowOf(sql, task.id)).run_count, 1);
+          assert.deepEqual(yield* pendingStates(sql, task.id), []);
         }),
       { slots },
     );
   });
+
+  it.effect("a direct webhook delivery waiting at a restart runs on the new server, once", () =>
+    Effect.gen(function* () {
+      const started: Array<string> = [];
+      const ids = yield* boot(
+        ({ service, sql, webhookWorker }) =>
+          Effect.gen(function* () {
+            yield* TestClock.setTime(START);
+            const { task } = yield* service.upsert(
+              yield* taskInput({ schedule: { type: "webhook" } }),
+            );
+            const accepted = yield* service.triggerWebhook(webhookRequest(task, '{"n":1}'));
+            if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+            // 30 s of waiting, the worker holding it, before the server stops.
+            yield* workerRounds(webhookWorker, 6);
+            assert.deepEqual(
+              (yield* pendingStates(sql, task.id)).map((row) => row.state),
+              ["dispatching"],
+            );
+            return { taskId: task.id, deliveryId: accepted.deliveryId };
+          }),
+        { slots: slotWorld([BUSY]), started },
+      );
+      assert.deepEqual(started, []);
+      yield* boot(
+        ({ service, sql, poll, webhookWorker }) =>
+          Effect.gen(function* () {
+            yield* webhookWorker;
+            yield* until(() => started.length === 1, "the delivery started after the restart");
+            for (let round = 0; round < 10; round++) {
+              yield* poll;
+              yield* workerRounds(webhookWorker, 1);
+            }
+            assert.equal(started.length, 1);
+            assert.equal((yield* rowOf(sql, ids.taskId)).run_count, 1);
+            assert.deepEqual(yield* pendingStates(sql, ids.taskId), []);
+            const { delivery } = yield* service.getWebhookDelivery({
+              id: ids.taskId,
+              deliveryId: ids.deliveryId,
+            });
+            assert.equal(delivery.outcome, "accepted");
+          }),
+        { slots: slotWorld(), started },
+      );
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+  );
 
   const WEBHOOK_STOPS = [
     {
@@ -591,12 +775,30 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
       name: "deleted",
       stop: (service: Harness["service"], id: string) => service.delete({ id } as never),
     },
+    {
+      // A run let through after the delete would start on the new task (same id, same trigger).
+      name: "deleted and made again under its id",
+      stop: (service: Harness["service"], id: string) =>
+        service.delete({ id } as never).pipe(
+          Effect.andThen(taskInput({ id, schedule: { type: "webhook" } })),
+          Effect.flatMap((input) => service.upsert(input)),
+        ),
+    },
+    {
+      name: "given another trigger",
+      stop: (service: Harness["service"], id: string) =>
+        Effect.flatMap(
+          taskInput({ id, schedule: { type: "interval", everyMs: EVERY_MS } }),
+          (input) => service.upsert(input),
+        ),
+    },
   ] as const;
   it.effect.each(WEBHOOK_STOPS)(
-    "a webhook delivery that waits ends when its task is $name, nothing started",
-    ({ name, stop }) =>
-      withService(
-        ({ service, started }) =>
+    "a webhook delivery that waits ends when its task is $name: the slot frees, nothing starts",
+    ({ name, stop }) => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        ({ service, started, webhookWorker }) =>
           Effect.gen(function* () {
             yield* TestClock.setTime(START);
             const { task } = yield* service.upsert(
@@ -604,12 +806,12 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
             );
             const accepted = yield* service.triggerWebhook(webhookRequest(task));
             if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
-            yield* settle;
+            // The worker holds it, waiting for a slot.
+            yield* workerRounds(webhookWorker, 2);
             yield* stop(service, task.id);
-            for (let step = 0; step < 4; step++) {
-              yield* TestClock.adjust(AgentSlotRoutes.WEBHOOK_SLOT_RETRY);
-              yield* settle;
-            }
+            // The slot frees: had the wait not seen the stop, the delivery would start now.
+            slots.running = [];
+            yield* workerRounds(webhookWorker, 4);
             assert.deepEqual(started, []);
             if (name === "paused") {
               const { delivery } = yield* service.getWebhookDelivery({
@@ -619,8 +821,9 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
               assert.equal(delivery.outcome, "dispatch_failed");
             }
           }),
-        { slots: slotWorld([BUSY]) },
-      ),
+        { slots },
+      );
+    },
   );
 
   it.effect("a coalesced webhook delivery waiting at a restart runs on the new server, once", () =>

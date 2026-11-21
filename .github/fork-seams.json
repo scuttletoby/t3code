@@ -245,14 +245,15 @@
       ]
     },
     "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
-      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot; a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706).",
+      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706).",
       "added": [
         "import { makeScheduledRunSlots } from \"../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
         "const runSlots = yield* makeScheduledRunSlots(WebhookDeliverySkipped); // Fork: agent slots",
         "const slot = yield* runSlots.admit(active, trigger, startedAt, rescheduleMissedRun); // Fork: agent slots",
         "if (slot.skipped !== null) return slot.skipped; // Fork: a skipped run is recorded",
         "yield* slot.end(threadId); // Fork: the slot names the run's thread",
-        "Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot"
+        "Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot",
+        "runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored"
       ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {

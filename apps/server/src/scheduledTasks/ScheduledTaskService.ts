@@ -2541,6 +2541,7 @@ export const layer = Layer.effect(
           yield* observe("accepted");
           const permit = yield* webhookPermit(task.id);
           yield* runWebhookDelivery(task, deliveryId, rendered.prompt).pipe(
+            runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored
             permit.withPermits(1),
             Effect.ensuring(release),
             Effect.forkIn(serviceScope),

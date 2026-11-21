@@ -283,6 +283,23 @@ const make = Effect.gen(function* () {
    * acquire. A caller cut off while it waits leaves the read to the others; the mask keeps it from
    * being cut off between the fork and the marker (a read the next caller could not see).
    */
+  /**
+   * The problem last logged while the count stays unreadable, so a count unreadable for hours logs
+   * once (and once more when its problem changes or it reads again), not on every read.
+   */
+  let unreadLogged: "timeout" | "error" | "crash" | null = null;
+  const logUnread = (problem: "timeout" | "error" | "crash", log: Effect.Effect<void>) =>
+    Effect.suspend(() => {
+      if (unreadLogged === problem) return Effect.void;
+      unreadLogged = problem;
+      return log;
+    });
+  const logReadAgain = Effect.suspend(() => {
+    if (unreadLogged === null) return Effect.void;
+    unreadLogged = null;
+    return Effect.logInfo("agent slots: running agents can be counted again");
+  });
+
   const readCount: Effect.Effect<CountRead> = Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
       const flight = yield* sharedRead;
@@ -305,12 +322,16 @@ const make = Effect.gen(function* () {
         (yield* Clock.currentTimeMillis) - flight.startedAtMs >
           Duration.toMillis(COUNT_READ_TIMEOUT);
       if (exit === null || late) {
-        yield* Effect.logWarning("agent slots: running agents could not be counted", {
-          problem: "timeout",
-        });
+        yield* logUnread(
+          "timeout",
+          Effect.logWarning("agent slots: running agents could not be counted", {
+            problem: "timeout",
+          }),
+        );
         return { type: "unread", problem: "timeout" } satisfies CountRead;
       }
       if (Exit.isSuccess(exit)) {
+        yield* logReadAgain;
         const threads = [...exit.value.threads, ...exit.value.archivedThreads];
         return {
           type: "read",
@@ -324,11 +345,19 @@ const make = Effect.gen(function* () {
         Cause.hasInterruptsOnly(exit.cause) && flight.stopped ? "timeout" : "error";
       // A bug in the count read (a defect, not a failure) is a failed read too.
       yield* Cause.hasDies(exit.cause)
-        ? Effect.logWarning("agent slots: counting running agents crashed", { cause: exit.cause })
-        : Effect.logWarning("agent slots: running agents could not be counted", {
+        ? logUnread(
+            "crash",
+            Effect.logWarning("agent slots: counting running agents crashed", {
+              cause: exit.cause,
+            }),
+          )
+        : logUnread(
             problem,
-            cause: exit.cause,
-          });
+            Effect.logWarning("agent slots: running agents could not be counted", {
+              problem,
+              cause: exit.cause,
+            }),
+          );
       return { type: "unread", problem } satisfies CountRead;
     }),
   );

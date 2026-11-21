@@ -14,13 +14,18 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import { slotRefusalReason, type SlotDecision } from "@t3tools/shared/agentSlots";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import { encodePendingTask } from "../scheduledTasks/webhookDedupe.ts";
+import type { WebhookRequest } from "../scheduledTasks/webhookTemplate.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 
 type Refused = Extract<SlotGate.SlotAcquire, { readonly type: "refuse" }>;
@@ -269,6 +274,35 @@ export const WEBHOOK_SLOT_RETRY = Duration.seconds(5);
 const FIXED_TIME_KEEP_DUE_MS = 5 * 60 * 1000;
 
 /**
+ * A direct webhook delivery (no coalescing window) on its way to its run, set by
+ * `directDelivery` around that run: what storing it needs, if the gate refuses it.
+ */
+interface DirectDelivery {
+  readonly deliveryId: string;
+  readonly request: WebhookRequest;
+  /** Wakes the stored-delivery worker (its due hint), so it looks at the new row. */
+  readonly wake: Effect.Effect<void>;
+}
+
+const CurrentDirectDelivery = Context.Reference<DirectDelivery | undefined>(
+  "t3/fork/agentSlotRoutes/CurrentDirectDelivery",
+  { defaultValue: () => undefined },
+);
+
+/** A stored delivery's request, in the shape the stored-delivery worker reads (`decodePendingRequest`). */
+const encodeStoredRequest = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      method: Schema.String,
+      path: Schema.String,
+      query: Schema.String,
+      headers: Schema.Record(Schema.String, Schema.String),
+      bodyText: Schema.String,
+    }),
+  ),
+);
+
+/**
  * Scheduled runs through the gate, built inside `ScheduledTaskService` (the gate is read if the
  * server runs one; a test of the service alone has none). `WebhookSkipped` is the service's own
  * "delivery skipped" failure.
@@ -279,6 +313,7 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const sql = yield* SqlClient.SqlClient;
+  const scheduler = yield* Scheduler.Scheduler;
   // The production wiring gives scheduled runs the gate; a boot test looks for this span.
   if (Option.isSome(gate))
     yield* Effect.void.pipe(Effect.withSpan("AgentSlotRoutes.scheduledRunsGated"));
@@ -331,7 +366,8 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
 
   /**
    * A run on its schedule that waits: the task stays due (the next poll asks again), with one
-   * history note per due time (only when none is there yet; the run that starts clears it). Its
+   * history note that says why (rewritten when the reason changes; the run that starts clears it,
+   * and so does `clearStaleNotes` once the task is paused or no longer due). Its
    * status stays as it is, so nothing counts as a run. A fixed-time run keeps its due time recent.
    */
   const keepDue = Effect.fnUntraced(function* (
@@ -340,11 +376,13 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
     refusal: SlotGate.SlotRefusal,
   ) {
     const nowIso = DateTime.formatIso(DateTime.toUtc(now));
+    const note = waitingNote(refusal);
+    // Written only when its text changes (a new reason), so a poll that changes nothing writes nothing.
     const noted = yield* sql<{ task_id: string }>`
-      UPDATE scheduled_tasks SET last_run_error = ${waitingNote(refusal)}, updated_at = ${nowIso}
+      UPDATE scheduled_tasks SET last_run_error = ${note}, updated_at = ${nowIso}
       WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
         AND next_run_at IS ${task.nextRunAt} AND last_run_status <> 'running'
-        AND (last_run_error IS NULL OR substr(last_run_error, 1, ${WAITING_NOTE_PREFIX.length}) <> ${WAITING_NOTE_PREFIX})
+        AND last_run_error IS NOT ${note}
       RETURNING task_id
     `;
     if (noted.length > 0) {
@@ -382,9 +420,48 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   });
 
   /**
-   * A webhook delivery waits for a slot: asked again every few seconds until one is free (its
-   * pending row stays as it is, so a restart picks it up again, once). It is dropped only for the
-   * reasons a queued delivery is (the task deleted, replaced, paused or no longer a webhook).
+   * A direct delivery the gate refused is stored as a pending delivery the stored-delivery worker
+   * owns (due now), so a restart keeps it; its in-memory copy then ends without running, and the
+   * worker runs it once. `false` when there is nothing to store (a stored delivery already) or the
+   * write failed: the delivery then waits in memory.
+   */
+  const storeDirect = Effect.fn("AgentSlotRoutes.storeDirect")(
+    function* (task: ScheduledTask, now: DateTime.DateTime) {
+      const direct = yield* CurrentDirectDelivery;
+      if (direct === undefined) return false;
+      const { method, path, query, headers, bodyText } = direct.request;
+      const requestJson = yield* encodeStoredRequest({ method, path, query, headers, bodyText });
+      const stored = yield* sql<{ delivery_id: string }>`
+        INSERT INTO scheduled_task_webhook_pending
+          (delivery_id, task_id, coalesce_key, due_at, state, task_json, request_json, delivery_ids_json)
+        VALUES (${direct.deliveryId}, ${task.id}, '', ${DateTime.toEpochMillis(now)}, 'dispatching',
+          ${yield* encodePendingTask(task)}, ${requestJson}, json_array(${direct.deliveryId}))
+        ON CONFLICT (delivery_id) DO NOTHING
+        RETURNING delivery_id
+      `;
+      if (stored.length === 0) return false;
+      yield* direct.wake;
+      yield* Effect.logInfo("Webhook delivery waits for an agent slot (stored)", {
+        taskId: task.id,
+        deliveryId: direct.deliveryId,
+      });
+      return true;
+    },
+    (effect, task) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Could not store a webhook delivery waiting for a slot", {
+            taskId: task.id,
+            cause,
+          }).pipe(Effect.as(false)),
+        ),
+      ),
+  );
+
+  /**
+   * A stored webhook delivery waits for a slot: asked again every few seconds until one is free
+   * (its pending row stays as it is, so a restart picks it up again, once). It is dropped only for
+   * the reasons a queued delivery is (the task deleted, replaced, paused or no longer a webhook).
    */
   const waitForWebhookSlot = Effect.fnUntraced(function* (task: ScheduledTask, first: Refused) {
     yield* Effect.logInfo("Webhook delivery waits for an agent slot", {
@@ -430,7 +507,14 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
         taskId: task.id,
       });
     }
-    if (trigger === "webhook") return yield* waitForWebhookSlot(task, slot);
+    if (trigger === "webhook") {
+      if (yield* storeDirect(task, now))
+        return {
+          skipped: { task, threadId: null, dispatchFailed: false },
+          end: () => Effect.void,
+        } as ScheduledSlot;
+      return yield* waitForWebhookSlot(task, slot);
+    }
     yield* keepDue(task, now, slot.refusal).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("Could not note a scheduled run waiting for a slot", {
@@ -448,5 +532,29 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   /** The task's run ended, any way: a slot its dispatch never ended is free again. */
   const ended = (taskId: string) => Effect.suspend(() => open.get(taskId)?.(null) ?? Effect.void);
 
-  return { admit: admitRun, ended };
+  /**
+   * Around a direct webhook delivery's run (inside its task's webhook permit): refused for a slot,
+   * the delivery is stored for the stored-delivery worker (`storeDirect`), woken with `wake`.
+   */
+  const directDelivery =
+    (deliveryId: string, request: WebhookRequest, wake: Effect.Effect<void>) =>
+    <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.provideService(effect, CurrentDirectDelivery, { deliveryId, request, wake });
+
+  /**
+   * A waiting note is cleared once its task no longer waits: paused, or its due time moved
+   * later (an edit). The next due time that waits writes a fresh note.
+   */
+  const clearStaleNotes = Effect.gen(function* () {
+    const nowIso = DateTime.formatIso(DateTime.toUtc(yield* DateTime.now));
+    yield* sql`
+      UPDATE scheduled_tasks SET last_run_error = NULL
+      WHERE substr(last_run_error, 1, ${WAITING_NOTE_PREFIX.length}) = ${WAITING_NOTE_PREFIX}
+        AND last_run_status <> 'running'
+        AND (enabled = 0 OR next_run_at IS NULL OR next_run_at > ${nowIso})
+    `;
+  });
+  yield* scheduler.register("agent-slot-notes", clearStaleNotes);
+
+  return { admit: admitRun, ended, directDelivery };
 });
