@@ -24,6 +24,7 @@ fork-kit/
 .github/fork-*
 # Read by app jobs or the runner routing every app job uses.
 !.github/scripts/fork-fleet.py
+!.github/scripts/fork-ci-pressure.py
 !.github/scripts/fork-test-shards.cjs
 !.github/scripts/fork-vitest-gc-check.cjs
 !.github/fork-fleet.json

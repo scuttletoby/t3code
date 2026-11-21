@@ -746,6 +746,12 @@ jobs:
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
 
+      # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      - name: Note memory pressure at the start
+        timeout-minutes: 1
+        run: python3 -I .github/scripts/fork-ci-pressure.py start
+
       - name: Reject repository-owned PR assets
         run: |
           files="$(git ls-files .github/pr-assets)"
@@ -800,6 +806,14 @@ jobs:
       - name: Check
         run: vp check
 
+      # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
+      - name: Note memory pressure at the end
+        timeout-minutes: 1
+        if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: python3 -I .github/scripts/fork-ci-pressure.py end
+
   build:
     name: Build and Typecheck
     needs: changes
@@ -817,6 +831,12 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
+
+      # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      - name: Note memory pressure at the start
+        timeout-minutes: 1
+        run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       # Runs in the background while Vite+ installs; the step before the build waits for it.
       # Xvfb is for the desktop launch check below.
@@ -956,6 +976,14 @@ jobs:
           cat "$RUNNER_TEMP/typecheck.log"
           exit "$(cat "$RUNNER_TEMP/typecheck-status")"
 
+      # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
+      - name: Note memory pressure at the end
+        timeout-minutes: 1
+        if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: python3 -I .github/scripts/fork-ci-pressure.py end
+
   # Everything except `t3` (apps/server) and the web app, which have their own jobs.
   # Upstream runs this on one large runner; one 4-CPU runner took 6 minutes.
   # Two runners split it (.github/scripts/fork-test-shards.cjs): each runs a
@@ -981,6 +1009,12 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
+
+      # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      - name: Note memory pressure at the start
+        timeout-minutes: 1
+        run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       # A shard with nothing to run says so in the summary and stops here.
       - name: Pick this shard's packages
@@ -1086,6 +1120,14 @@ jobs:
           done
           exit "$status"
 
+      # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
+      - name: Note memory pressure at the end
+        timeout-minutes: 1
+        if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: python3 -I .github/scripts/fork-ci-pressure.py end
+
   # Upstream runs this on one large runner; on a 4-CPU runner the 548 files
   # took 7.5 minutes, so each of the shards below takes a vitest slice.
   test_web:
@@ -1112,6 +1154,12 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
+
+      # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      - name: Note memory pressure at the start
+        timeout-minutes: 1
+        run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
@@ -1163,6 +1211,14 @@ jobs:
         working-directory: apps/web
         run: eval "$(jq -r .scripts.test package.json) --shard=$SHARD"
 
+      # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
+      - name: Note memory pressure at the end
+        timeout-minutes: 1
+        if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: python3 -I .github/scripts/fork-ci-pressure.py end
+
   # apps/server runs its test files one at a time; shards spread them over
   # separate runners. As upstream, the shards run the change detector
   # themselves, so the steps follow ci.yml one for one; a shard the change
@@ -1191,6 +1247,12 @@ jobs:
             !/.repos/
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
+
+      # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      - name: Note memory pressure at the start
+        timeout-minutes: 1
+        run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       - name: Detect affected jobs
         id: changes
@@ -1311,6 +1373,14 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
+      - name: Note memory pressure at the end
+        timeout-minutes: 1
+        if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: python3 -I .github/scripts/fork-ci-pressure.py end
+
   rust:
     name: Rust
     needs: changes
@@ -1329,6 +1399,12 @@ jobs:
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
 
+      # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      - name: Note memory pressure at the start
+        timeout-minutes: 1
+        run: python3 -I .github/scripts/fork-ci-pressure.py start
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -1346,6 +1422,14 @@ jobs:
           for crate in resource-monitor kde-snap-shot hyprland-snap-shot; do
             cargo test --locked --manifest-path "native/$crate/Cargo.toml"
           done
+
+      # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
+      - name: Note memory pressure at the end
+        timeout-minutes: 1
+        if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: python3 -I .github/scripts/fork-ci-pressure.py end
 
   # Upstream runs this on macOS 26. GitHub-hosted macOS minutes are free on a
   # public repository; it runs only for native mobile sources or a workflow change.
@@ -1398,6 +1482,12 @@ jobs:
             !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
           sparse-checkout-cone-mode: false
 
+      # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      - name: Note memory pressure at the start
+        timeout-minutes: 1
+        run: python3 -I .github/scripts/fork-ci-pressure.py start
+
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
         with:
@@ -1406,6 +1496,14 @@ jobs:
 
       - name: Exercise release-only workflow steps
         run: node scripts/release-smoke.ts
+
+      # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
+      - name: Note memory pressure at the end
+        timeout-minutes: 1
+        if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: python3 -I .github/scripts/fork-ci-pressure.py end
 
   # The one check a ruleset requires. Fails when any job fails or is cancelled,
   # or is skipped without a reason: `changes` said its gates were not needed,
