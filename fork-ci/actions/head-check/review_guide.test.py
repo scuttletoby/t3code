@@ -209,6 +209,9 @@ def git(*a, cwd=FORK_CI, check=False):
 REVIEW_CONFIG = 'fork-ci/actions/pr-queue/review_config.py'
 
 
+# fork-ci: may skip ReleaseTags.test_the_path_rules_are_first_in_the_release_the_guide_names
+# fork-ci: may skip ReleaseTags.test_override_authors_is_first_in_the_release_after_the_one_the_notes_name
+# (CI checks out without the ci/vN tags; these run in a clone that has them.)
 class ReleaseTags(unittest.TestCase):
     """The releases the guide and the notes name, against the ci/vN tags. CI checks out without tags (fetch-depth 2,
     no tags), so there these skip and only Releases runs; run them in a clone with the tags (git fetch --tags)."""
