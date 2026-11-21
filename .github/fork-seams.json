@@ -260,28 +260,17 @@
         "if (slot.skipped !== null) return slot.skipped; // Fork: a skipped run is recorded",
         "yield* slot.end(threadId); // Fork: the slot names the run's thread",
         "Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot",
-        "runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored"
-      ],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "yield* runSlots.saving(task, existingTask); // Fork: the saving thread's MCP profile"
-        ]
-      }
+        "runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored",
+        "yield* runSlots.saving(task, existingTask); // Fork: the saving thread's MCP profile"
+      ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693). A change from such a thread to the prompt or thread of a task bound to a wider thread is refused there too, before the service uses up a webhook secretRef (#699).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkScheduleMcpProfile(input); // Fork: MCP profile launch",
-        "yield* LaunchMcpProfile.checkScheduleEditMcpProfile(scheduledTaskId, bindToCurrentThread); // Fork: MCP profile launch"
-      ],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "yield* LaunchMcpProfile.checkEditMcpProfile(scheduledTaskId, bindToCurrentThread, prompt); // Fork: MCP profile launch"
-        ]
-      }
+        "yield* LaunchMcpProfile.checkEditMcpProfile(scheduledTaskId, bindToCurrentThread, prompt); // Fork: MCP profile launch"
+      ]
     },
     "apps/server/src/mcp/toolkits/thread/handlers.ts": {
       "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693); run_scheduled_task_now refused by the agent slot gate answers slots_full (fork/agentSlotRoutes.ts, #706; the prettier-ignore keeps upstream's run_scheduled_task_now lines as they are, since a second pipe step would make the formatter reflow them).",
