@@ -24,6 +24,7 @@ import {
   type ThreadActionMenuId,
 } from "../components/threadActionMenu.logic";
 import { titleRegenerationToast } from "../components/threadTitleRegenerationToast";
+import * as ForkMcp from "../components/fork/mcpProfile/threadMcpProfileMenu"; // Fork (MCP profile)
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { copyThreadReference } from "../lib/copyThreadReference";
 import { m } from "../i18n/messages";
@@ -154,6 +155,7 @@ export function useThreadActionMenu(input: {
         snoozePresets,
         canShareWithGuest,
         canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+        forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)
       });
       const clicked = await settlePromise(() => api.contextMenu.show(items, position));
       if (clicked._tag === "Failure" || clicked.value === null) return;
@@ -168,6 +170,7 @@ export function useThreadActionMenu(input: {
         );
         return;
       }
+      if (ForkMcp.runIfMcpProfileMenuAction(threadRef, action)) return; // Fork (MCP profile)
       if (action.startsWith("snooze:")) {
         const preset =
           action === "snooze:custom"

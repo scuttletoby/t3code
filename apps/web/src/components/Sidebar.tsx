@@ -180,6 +180,7 @@ import {
   buildThreadActionMenuItems,
   threadActionRequiresOperate,
 } from "./threadActionMenu.logic";
+import * as ForkMcp from "./fork/mcpProfile/threadMcpProfileMenu"; // Fork (MCP profile)
 import {
   applySidebarThreadDrop,
   filterSidebarV2VisibleThreads,
@@ -2696,6 +2697,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
               ),
               canTurnIntoProject: canTurnThreadIntoProject(threadRef),
               canRename: !fromSearch,
+              forkMcpProfile: ForkMcp.readMcpProfileMenuState(threadRef), // Fork (MCP profile)
               supports: {
                 settlement: configLoaded,
                 autoSettleOptOut: supportsAutoSettleOptOut,
@@ -2711,6 +2713,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         );
         if (clicked._tag === "Failure" || clicked.value === null) return;
         if (threadActionRequiresOperate(clicked.value) && !checkThreadOperations([thread])) return;
+        if (ForkMcp.runIfMcpProfileMenuAction(threadRef, clicked.value)) return; // Fork (MCP profile)
         if (clicked.value?.startsWith("snooze:")) {
           const preset =
             clicked.value === "snooze:custom"

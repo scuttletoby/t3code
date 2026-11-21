@@ -3,6 +3,7 @@ import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled"
 import { msg } from "gt-react";
 
 import { m, type MessageResolver } from "../i18n/messages";
+import * as ForkMcpMenu from "./fork/mcpProfile/threadMcpProfile.logic"; // Fork (MCP profile)
 
 export type ThreadActionMenuId =
   | "find"
@@ -30,6 +31,7 @@ export type ThreadActionMenuId =
   | "copy-thread"
   | "copy-thread-id"
   | "archive"
+  | ForkMcpMenu.McpProfileMenuId // Fork (MCP profile)
   | "delete";
 
 export type DraftActionMenuId =
@@ -123,6 +125,7 @@ export interface ThreadActionMenuState {
   readonly canShareWithGuest?: boolean;
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
+  readonly forkMcpProfile?: ForkMcpMenu.McpProfileMenuState | undefined; // Fork (MCP profile)
 }
 
 /** Local navigation, read markers, and copying remain available to read-only clients. */
@@ -265,6 +268,7 @@ export function buildThreadActionMenuItems(
           },
         ]
       : []),
+    ...ForkMcpMenu.mcpProfileMenuItems(state.forkMcpProfile), // Fork (MCP profile)
     {
       id: "copy",
       label: resolve(msg("Copy", { $context: "submenu of things to copy" })),
