@@ -171,9 +171,7 @@ function readList(text) {
     .map((line) => line.replace(/#.*/, "").trim())
     .filter(Boolean)
     .map((line) => {
-      const match = line.match(
-        /^(\S+)(?:\s+~([1-9]\d{0,4})s|\s+run by\s+(\S+))?(\s+ok lines)?$/,
-      );
+      const match = line.match(/^(\S+)(?:\s+~([1-9]\d{0,4})s|\s+run by\s+(\S+))?(\s+ok lines)?$/);
       if (!match)
         throw new Error(
           `${LIST}: cannot read "${line}" (expected "<test>", "<test> ~<seconds>s" or "<test> run by <file>", ` +
@@ -339,7 +337,8 @@ const RUN_ELSEWHERE = {
 const DECLARATION = /^\s*(?:#|\/\/)\s*fork-ci:(.*)$/;
 // Only a test's own switches: a declaration cannot set PATH, NODE_OPTIONS, PYTHON* or LD_*.
 const SWITCH = /^[A-Z][A-Z0-9_]*_TESTS=[\w./:-]*$/;
-const RUN_FORM = '"fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>]"';
+const RUN_FORM =
+  '"fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>[.<test_method>]]"';
 const SKIP_FORM = '"fork-ci: may skip <test>"';
 // A test's name as a record holds it: `Class.test_method` (Python; `module.Class.test_method` for a test of a module it
 // loads), or the word after `skip ` (an ok-lines test).
@@ -389,15 +388,17 @@ function declarations(text, file = "") {
       if (run.vars.length === 0) bad = "`with` takes <NAME>_TESTS=value words";
     }
     if (!bad && words[i] === "only") {
-      if (file.endsWith(".py") && /^[A-Z]\w*$/.test(words[i + 1] ?? "")) {
+      if (file.endsWith(".py") && /^[A-Z]\w*(?:\.[A-Za-z_]\w*)?$/.test(words[i + 1] ?? "")) {
         run.only = words[i + 1];
         i += 2;
-      } else bad = "`only` takes one test class, in a Python test";
+      } else bad = "`only` takes one test class or one of its tests, in a Python test";
     }
     if (!bad && i < words.length) bad = `\`${words.slice(i).join(" ")}\` is not understood`;
     const names = run.vars.map((v) => v.split("=")[0]);
     if (!bad && new Set(names).size !== names.length) bad = "a switch comes twice";
-    if (!bad && out.runs.some((other) => other.only === run.only))
+    const overlap = (a, b) =>
+      a === b || (a && b && (a.startsWith(`${b}.`) || b.startsWith(`${a}.`)));
+    if (!bad && out.runs.some((other) => overlap(other.only, run.only)))
       bad = "two own runs of the same tests";
     if (bad) out.problems.push(`${said}: ${bad}; expected ${RUN_FORM}`);
     else out.runs.push(run);
@@ -414,7 +415,7 @@ function ownRuns(entry, text) {
   return declared;
 }
 
-// The name of a test's record: the test for its run in a part, `<test> --run [only <TestClass>]` for an own run.
+// The name of a test's record: the test for its run in a part, `<test> --run [only <TestClass>[.<test_method>]]` for an own run.
 function runKey(file, run = null) {
   return run ? `${file} --run${run.only ? ` only ${run.only}` : ""}` : file;
 }
@@ -444,15 +445,10 @@ const isEnd = (u) =>
   Array.isArray(u.unloaded) &&
   u.unloaded.every((n) => typeof n === "string" && TEST_NAME.test(n));
 
-// What a test ran, { format, tests, skipped, names (skipped, by name), unloaded, failed, note }, or null (no count);
-// tests null: none known to have run (`note` says why). `lines`: its counter's lines (readCounts()). `how`: the
-// Python test's format as the list declares it (readList(): unittest unless "ok lines") and its own run's class.
-// Python, unittest: fork-ci-unittest.py's plan, then counts, per unittest run (a plan without counts: a hard exit),
-// then its end line (none: a hard exit; no line at all: one before its first run, as it loads). A test the file
-// defines that no run planned (the end line's `unloaded`; in an own run of one class, that class's) counts as skipped,
-// by name. node: fork-ci-node-counts.cjs's one line. Else (sh; Python that says "ok lines", whose shim lines are only
-// its end line, naming no test) stdout's `ok`, `FAIL` and `skip <name>` lines, which must end in OK_LINES_FORM with
-// the same counts.
+// What a test ran, { format, tests, skipped, names, unloaded, failed, note }, or null (no count; tests null: none known
+// to have run, `note` says why). `how`: the list's Python format and the own run's `only`. Python unittest: the shim's
+// plan and counts per run, then its end line, whose `unloaded` tests count as skipped by name; node: its one line;
+// else stdout's ok, FAIL and `skip <name>` lines, ending in OK_LINES_FORM with the same counts.
 function countTests(file, stdout, stderr, lines = [], how = {}) {
   const ext = file.match(TEST_FILE)?.[1];
   const whole = (n) => Number.isInteger(n) && n >= 0;
@@ -521,8 +517,9 @@ function countTests(file, stdout, stderr, lines = [], how = {}) {
         "it started no unittest run (an exit before unittest.main?); a Python test that prints ok lines says " +
           `"ok lines" in ${LIST}`,
       );
+    // An own run's `only`: one class (its tests and its nested classes' count), or one test (that test only).
     const unloaded = how.only
-      ? shimEnd.unloaded.filter((n) => n.startsWith(`${how.only}.`))
+      ? shimEnd.unloaded.filter((n) => n === how.only || n.startsWith(`${how.only}.`))
       : shimEnd.unloaded;
     const names = [...runs.flatMap((u) => u.skipped), ...unloaded];
     return {
@@ -619,8 +616,10 @@ function recordProblems(record) {
         `${name} skipped ${extra.join(", ")}, which it does not declare` +
           (unloaded.length
             ? ` (${unloaded.join(", ")}: defined in its source, but no unittest run loaded ` +
-              `${unloaded.length > 1 ? "them" : "it"}: a class defined only under a condition, or a load_tests ` +
-              `that leaves ${unloaded.length > 1 ? "them" : "it"} out?)`
+              `${unloaded.length > 1 ? "them" : "it"}: a class defined only under a condition, a load_tests ` +
+              `that leaves ${unloaded.length > 1 ? "them" : "it"} out, or a mixin of such a class? If one is no test ` +
+              `(a test* method of a mixin no loaded class uses, or of a class a del removed), give it a name ` +
+              `that does not start with "test")`
             : "") +
           `: run ${extra.length > 1 ? "them" : "it"} ` +
           `(a switch the test declares in a ${RUN_FORM} line) or, if ${extra.length > 1 ? "they" : "it"} cannot ` +

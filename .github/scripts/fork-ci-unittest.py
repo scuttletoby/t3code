@@ -11,7 +11,8 @@ A test the file never loads (a class defined only when a tool is there, a load_t
 no outcome counts it. A second source names those: the test methods the file's own source defines in a class
 (defined(): any branch of an if, try or with, so a class a condition leaves out is still named), each of which a run's
 plan must hold (the class that defines it, through the test's class and its bases). At the file's end, one line names
-the ones no plan held: the runner counts each as skipped, by name.
+the ones no plan held and unittest would load (unloaded(): not a helper class's method, a property, a name set to
+None, or a base's method every loaded subclass replaces): the runner counts each as skipped, by name.
 
 FORK_CI_TEST_COUNTS names the file to add JSON lines to (unset or empty: none written): for each TextTestRunner run
 {"plan": <the plan's size>} before it, and after it {"tests": <the plan's size>, "skipped": [<name> ...], "failed":
@@ -19,7 +20,9 @@ FORK_CI_TEST_COUNTS names the file to add JSON lines to (unset or empty: none wr
 end), {"unloaded": [<Class.test> ...]}. A hard stop (os._exit, a kill) leaves a plan without its counts, or no end
 line, either of which the runner counts as nothing run: so a hard stop before the first plan, while the file loads,
 leaves no line at all. A name is `Class.test` for a test of the file, `module.Class.test` for one of a module it loads.
-FORK_CI_TEST_COUNTS is removed from the environment before the test starts, so no child can write there."""
+FORK_CI_TEST_COUNTS is removed from the environment before the test starts, so no child can write there, and only this
+process writes (a child made by os.fork keeps the shim, and writes nothing): a forked child's end line never stands in
+for its parent's."""
 import ast
 import json
 import os
@@ -28,6 +31,7 @@ import sys
 import unittest
 
 COUNTS = os.environ.pop("FORK_CI_TEST_COUNTS", "")
+PID = os.getpid()
 
 
 def leaves(test):
@@ -52,17 +56,38 @@ def counted(test):
     return getattr(test, "test_case", test)
 
 
+def dotted(node):
+    """`A` or `A.B` for a name or an attribute of names, else None."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = dotted(node.value)
+        return head and f"{head}.{node.attr}"
+    return None
+
+
 def defined(path):
-    """The test methods (`test*`) the file's source defines in its classes, as `Class.test` (`Outer.Inner.test` for a
-    nested class), in every branch of an if, try, with, for, while or match, in a class body too: a class or method
-    that a condition leaves out is named all the same. None in a function (a class made at run time is not seen). None when the file cannot be
-    parsed (it cannot run either)."""
+    """(names, bases): the tests (`test*`) the file's source puts in its classes, as `Class.test` (`Outer.Inner.test`
+    for a nested class), and the last part of every class's bases' names. A test is a `def`, a name assigned in a
+    class body (`test_x = make()`, `test_x = None`), or a `setattr(Class, "test_x", ...)` call outside a function;
+    each in every branch of an if, try, with, for, while or match, in a class body too: a class or method that a
+    condition leaves out is named all the same. None in a function: a class made there, a setattr there, or a
+    setattr on a name that is not the class's (a loop variable) is not seen. unloaded() drops the names unittest would
+    not load. None when the file cannot be parsed (it cannot run either)."""
     try:
         with open(path, "rb") as f:
             tree = ast.parse(f.read(), path)
     except (OSError, SyntaxError, ValueError):
         return None
     out = set()
+    bases = set()
+
+    def named(owner, target):
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for each in target.elts:
+                named(owner, each)
+        elif isinstance(target, ast.Name) and target.id.startswith("test"):
+            out.add(f"{owner}.{target.id}")
 
     def walk(nodes, prefix, owner):
         """`owner`: the class whose body this is (a method under an if in it is its method too), else None."""
@@ -73,7 +98,20 @@ def defined(path):
                 continue
             if isinstance(node, ast.ClassDef):
                 here = f"{prefix}{node.name}"
+                bases.update(base.rpartition(".")[2] for base in map(dotted, node.bases) if base)
                 walk(node.body, here + ".", here)
+                continue
+            if owner is not None and isinstance(node, (ast.Assign, ast.AnnAssign)):
+                if getattr(node, "value", None) is not None:
+                    for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                        named(owner, target)
+                continue
+            call = node.value if isinstance(node, ast.Expr) else None
+            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "setattr"
+                    and len(call.args) >= 2 and dotted(call.args[0])
+                    and isinstance(call.args[1], ast.Constant) and isinstance(call.args[1].value, str)
+                    and call.args[1].value.startswith("test")):
+                out.add(f"{dotted(call.args[0])}.{call.args[1].value}")
                 continue
             for field in ("body", "orelse", "finalbody", "handlers", "cases"):
                 inner = getattr(node, field, None)
@@ -81,7 +119,7 @@ def defined(path):
                     walk([each for each in inner if isinstance(each, ast.AST)], prefix, owner)
 
     walk(tree.body, "", None)
-    return out
+    return out, bases
 
 
 def defining(test):
@@ -94,7 +132,56 @@ def defining(test):
     return None
 
 
+def first(klass, method):
+    """The first of a class and its bases that has `method` itself (where unittest's getattr finds it), else None."""
+    return next((each for each in klass.__mro__ if method in vars(each)), None)
+
+
+def unloaded(names, bases):
+    """The source's tests (defined()) that no run planned and that unittest would load all the same, so they did not
+    run: their class or method is not there at the file's end (a condition left it out, or a del), a loaded class or the
+    unittest.TestCase subclass it is did not load them (a load_tests, an own run of another class), or a class names
+    their class as a base (a mixin of a class a condition left out). Dropped, as unittest never loads them: a method
+    of a class that is no TestCase and no class's base (a helper), a name that is not callable on its class (a
+    property, `test_x = None`), and a base's method that every loaded class with that base replaces. A file that
+    started no run is not looked into (the runner counts no run as nothing run): every name is left."""
+    left = names - PLANNED
+    if not MAIN:
+        return left
+    module = MAIN[0]
+    seen = {each.__qualname__: each for loaded in LOADED for each in loaded.__mro__
+            if each.__module__ == "__main__"}
+    out = set()
+    for test in left:
+        qualname, _, method = test.rpartition(".")
+        klass = seen.get(qualname)
+        if klass is None:
+            klass = module
+            for part in qualname.split("."):
+                klass = getattr(klass, part, None)
+        if not isinstance(klass, type):
+            out.add(test)
+            continue
+        if not hasattr(klass, method):
+            out.add(test)  # a method a condition in the class body left out
+            continue
+        if not callable(getattr(klass, method)):
+            continue
+        here = first(klass, method)
+        if here is not None and here.__module__ == "__main__" and f"{here.__qualname__}.{method}" in PLANNED:
+            continue  # the same test by another name (`X = T; setattr(X, "test_y", f)`)
+        users = [loaded for loaded in LOADED if klass in loaded.__mro__]
+        if users:
+            if any(first(loaded, method) is here for loaded in users):
+                out.add(test)
+        elif issubclass(klass, unittest.TestCase) or klass.__name__ in bases:
+            out.add(test)
+    return out
+
+
 PLANNED = set()
+LOADED = set()
+MAIN = []
 STARTED = []
 _start = unittest.TestResult.startTest
 
@@ -109,7 +196,7 @@ _run = unittest.TextTestRunner.run
 
 
 def write(line):
-    if COUNTS:
+    if COUNTS and os.getpid() == PID:
         with open(COUNTS, "a", encoding="utf-8") as f:
             f.write(json.dumps(line) + "\n")
 
@@ -117,6 +204,9 @@ def write(line):
 def run(self, test):
     tests = list(leaves(test))
     PLANNED.update(defining(each) for each in tests)
+    LOADED.update(type(each) for each in tests if isinstance(getattr(each, "_testMethodName", None), str))
+    if not MAIN and sys.modules.get("__main__") is not None:
+        MAIN.append(sys.modules["__main__"])  # runpy's module for the file: gone from sys.modules once it ends
     plan = [each.id() for each in tests]
     write({"plan": len(plan)})
     first = len(STARTED)
@@ -152,7 +242,7 @@ def main():
         # Reached on a return, an exception and sys.exit (unittest.main), never on a hard stop. A file that cannot be
         # parsed writes nothing here (it cannot run, so it already fails).
         if source is not None:
-            write({"unloaded": sorted(source - PLANNED)})
+            write({"unloaded": sorted(unloaded(*source))})
 
 
 if __name__ == "__main__":

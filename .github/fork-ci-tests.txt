@@ -14,7 +14,7 @@
 #   ... ok lines            (after any of those, a Python test only) it prints ok lines, below;
 #                           a Python test without it is a unittest test
 # A test's own `fork-ci:` comment lines say more (the runner reads them):
-#   fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>]
+#   fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>[.<test_method>]]
 #                           an own run, by `fork-ci-tests.cjs --run <test>` in fork-tests.yml;
 #                           it may skip no test
 #   fork-ci: may skip <test>
