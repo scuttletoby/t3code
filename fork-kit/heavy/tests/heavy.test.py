@@ -108,8 +108,9 @@ class Heavy(unittest.TestCase):
             json.dump({'containers': []}, f)
         self.docker = self.script('docker', f'exec "{sys.executable}" -I -B "{FAKE_TOOLS}" "{self.docker_state}" '
                                             f'docker "$@"')
+        # HOME: heavy makes ~/.local/state/heavy/labelled; a test never makes it in the tester's real home (#761)
         self.env = dict(os.environ, HEAVY_SLICE=SLICE, HEAVY_CONFIG=os.path.join(self.dir, 'no-config.json'),
-                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root, HEAVY_DOCKER=self.docker)
+                        HEAVY_GRACE='1', HEAVY_QUEUE_ROOT=self.queue_root, HEAVY_DOCKER=self.docker, HOME=self.dir)
         self.env.pop('HEAVY_KEEP', None)
 
     def containers(self):
@@ -153,6 +154,13 @@ class Heavy(unittest.TestCase):
             except OSError:
                 continue
         return found
+
+    def the_guard(self):
+        """The pid of this test's one guard, once it has renamed itself: heavy starts the command without waiting for
+        that (the guard renames itself after its double fork), so on a busy machine the command can print first."""
+        wait_for(lambda: len(self.guards()) == 1, what='the guard to rename itself')
+        [guard] = self.guards()
+        return guard
 
     def docker_calls(self, verb):
         with open(self.docker_state) as f:
@@ -327,6 +335,8 @@ class Heavy(unittest.TestCase):
         # a run that never labelled a container never starts (socket activation) or waits for the Docker daemon
         r = self.heavy('sh', '-c', f'{self.sleeper} & echo "$HEAVY_SCOPE"')
         self.assertEqual(r.returncode, 0, r.stderr)
+        # heavy made its state notes folder in the test's HOME, not in the tester's real one (#761 item 9)
+        self.assertTrue(os.path.isdir(os.path.join(self.dir, '.local', 'state', 'heavy', 'labelled')))
         self.assertEqual(self.docker_calls('ps'), [])
         self.assertFalse(os.path.exists(self.mark(r.stdout.strip())))
         r = self.heavy('sh', '-c', f'{self.db_up()}; echo "$HEAVY_SCOPE"; test -e "{self.mark("$HEAVY_SCOPE")}"')
@@ -364,7 +374,7 @@ class Heavy(unittest.TestCase):
                              start_new_session=True)
         self.addCleanup(lambda: p.poll() is None and p.kill())
         self.assertEqual(read_line(p), 'up\n')
-        [guard] = self.guards()
+        guard = self.the_guard()
         os.kill(guard, signal.SIGSTOP)
         self.addCleanup(lambda: guard in self.guards() and os.kill(guard, signal.SIGCONT))
         open(go, 'w').close()
@@ -433,7 +443,7 @@ class Heavy(unittest.TestCase):
         # would dump a core)
         p = self.start('sh', '-c', f'{self.double_fork()}; echo up; exec {self.sleeper}')
         self.assertEqual(read_line(p), 'up\n')
-        [guard] = self.guards()
+        guard = self.the_guard()
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2):
             os.kill(guard, sig)
         p.kill()
@@ -710,7 +720,7 @@ class Heavy(unittest.TestCase):
         self.wait_ready(p)
         kids = [int(n) for n in os.listdir('/proc') if n.isdigit() and self.ppid(int(n)) == p.pid]
         names = [comm(k) for k in kids]
-        guards = self.guards()          # `pkill -9 heavy` must leave the guard to clean up
+        guards = [self.the_guard()]     # `pkill -9 heavy` must leave the guard to clean up
         p.send_signal(signal.SIGINT)
         out, err = p.communicate(timeout=60)
         self.assertIn('grp-sigprobe', names, err)
@@ -824,8 +834,7 @@ class Heavy(unittest.TestCase):
         jobs = self.queue_jobs(env)
         self.assertEqual([(j['kind'], j['state']) for j in jobs], [('heavy-test', 'admitted')])
         # the guard holds no file of the queue: the reservation ends with the job's processes, never later
-        guards = self.guards()
-        self.assertEqual(len(guards), 1)
+        guards = [self.the_guard()]
         held = []
         for fd in os.listdir(f'/proc/{guards[0]}/fd'):
             try:
@@ -997,9 +1006,9 @@ class Parts(unittest.TestCase):
         c = self.child()
         with open(f'/proc/{c.pid}/cgroup') as f:
             cg = next(line[3:].strip() for line in f if line.startswith('0::'))
-        self.mod.signal_in([c.pid], cg, signal.SIGTERM)
+        self.assertEqual(self.mod.signal_in([c.pid], cg, signal.SIGTERM), 1)
         self.assertEqual(c.wait(timeout=10), -signal.SIGTERM)
-        self.mod.signal_in([c.pid], cg, signal.SIGTERM)      # gone: nothing, no error
+        self.assertEqual(self.mod.signal_in([c.pid], cg, signal.SIGTERM), 0)     # gone: nothing sent, no error
 
     def test_without_pidfds_nothing_is_signalled_by_pid(self):
         # Linux before 5.3 or Python before 3.9: between the cgroup check and kill(pid) the pid could go to another
@@ -1016,6 +1025,103 @@ class Parts(unittest.TestCase):
                     with mock.patch.object(os, 'kill', side_effect=AssertionError('signalled by pid')):
                         self.mod.signal_in([c.pid], cg, signal.SIGTERM)
                 self.assertIsNone(c.poll())
+
+    def test_no_grace_wait_when_nothing_could_be_signalled(self):
+        # #761 item 2: without pidfds (Linux before 5.3, Python before 3.9) and without cgroup.kill heavy sends
+        # nothing by hand, so waiting the grace time (30 s by default) would only hold the caller up
+        from unittest import mock
+        c = self.child()
+        cg = '/heavy-test-0a1b2c3d.scope'
+        os.makedirs(self.dir + cg)
+        with open(self.dir + cg + '/cgroup.procs', 'w') as f:
+            f.write(f'{c.pid}\n')
+        self.mod.CGROUP_ROOTS = (self.dir,)
+        start = time.monotonic()
+        with mock.patch.object(os, 'pidfd_open', None):
+            left = self.mod.stop_scope(shutil.which('false'), 'heavy-test-0a1b2c3d.scope', cg, 30)
+        self.assertLess(time.monotonic() - start, 10, 'heavy waited although it sent nothing')
+        self.assertEqual(left, [c.pid])
+        self.assertIsNone(c.poll())
+
+    def foreign_folder(self):
+        """A folder another user owns: '/' for a user that is not root; as root (CI) a temporary one given away."""
+        if os.geteuid() != 0:
+            return '/'
+        d = os.path.join(self.dir, 'theirs')
+        os.mkdir(d, 0o755)
+        os.chown(d, 65534, 65534)
+        return d
+
+    def test_the_state_folder_is_made_only_in_a_home_this_user_owns(self):
+        # #761 items 1 and 8. heavy makes ~/.local/state when it is missing: never in another user's home (root with a
+        # user's HOME, `sudo -E heavy ...`, would leave a root-owned folder there) and never in the job's working
+        # folder (no HOME and no passwd entry: expanduser('~') is a relative '~'). docker-label finds the same folder.
+        import contextlib, pwd, types
+        from unittest import mock
+        sweep = load_sweep_of_wrapper()
+        mine, pw_home, work = (os.path.join(self.dir, n) for n in ('mine', 'pw-home', 'work'))
+        for d in (mine, pw_home, work):
+            os.mkdir(d, 0o700)
+        os.mkdir(os.path.join(work, 'rel'), 0o700)     # HOME=rel would name this folder if relative ones counted
+        theirs = self.foreign_folder()
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(work)
+
+        def state(home, pw, euid=None):
+            """(heavy's state notes folder, docker-label's base, heavy's base) for HOME=home (None: unset), a passwd
+            home pw (None: no entry) and maybe another effective uid."""
+            env = {k: v for k, v in os.environ.items() if k != 'HOME'}
+            if home is not None:
+                env['HOME'] = home
+            entry = ({'side_effect': KeyError(os.getuid())} if pw is None else
+                     {'return_value': types.SimpleNamespace(pw_dir=pw)})
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+                stack.enter_context(mock.patch.object(pwd, 'getpwuid', **entry))
+                if euid is not None:
+                    stack.enter_context(mock.patch.multiple(os, getuid=lambda: euid, geteuid=lambda: euid))
+                return self.mod.state_marks_dir(), sweep.state_base(), self.mod.state_base()
+
+        def labelled(home):
+            return os.path.join(home, '.local', 'state', 'heavy', 'labelled')
+
+        # HOME of this user: used and made
+        got = state(mine, pw_home)
+        self.assertEqual(got, (labelled(mine), os.path.join(mine, '.local', 'state'),
+                               os.path.join(mine, '.local', 'state')))
+        self.assertTrue(os.path.isdir(labelled(mine)))
+        self.assertEqual(state(mine, pw_home)[0], labelled(mine))              # again: the same, nothing new
+        # another user's HOME (as root with sudo -E): this user's own home from the passwd database instead
+        got = state(theirs, pw_home)
+        self.assertEqual(got[0], labelled(pw_home))
+        self.assertEqual(got[1], got[2])
+        if theirs != '/':
+            self.assertEqual(os.listdir(theirs), [], 'a folder was made in another user\'s home')
+        # HOME of a uid that is not this one (a uid that owns nothing here): no folder at all, none made in either
+        shutil.rmtree(os.path.join(mine, '.local'))
+        other = os.getuid() + 1
+        self.assertEqual(state(mine, pw_home, euid=other), ('', '', ''))
+        self.assertEqual(state(None, mine, euid=other), ('', '', ''))
+        self.assertFalse(os.path.exists(os.path.join(mine, '.local')), 'a folder was made in another user\'s home')
+        # HOME empty, unset or relative: the passwd database's home
+        for home in ('', None, 'rel', '~'):
+            with self.subTest(HOME=home):
+                got = state(home, pw_home)
+                self.assertEqual((got[0], got[1]), (labelled(pw_home), os.path.join(pw_home, '.local', 'state')))
+        # no HOME and no passwd entry: no second folder, and nothing made in the working folder
+        for home in (None, '', 'rel'):
+            with self.subTest(HOME=home, passwd=None):
+                self.assertEqual(state(home, None), ('', '', ''))
+        self.assertEqual((os.listdir(work), os.listdir(os.path.join(work, 'rel'))), (['rel'], []),
+                         'a folder was made in the working folder')
+        # docker-label with no such home: one reason, no note anywhere
+        sweep.RUNTIME_ROOT = os.path.join(self.dir, 'no-run')
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != 'HOME'}, clear=True), \
+                mock.patch.object(pwd, 'getpwuid', side_effect=KeyError(0)):
+            why = sweep.note_label(f'uid={os.getuid()},scope=heavy-sh-0a1b2c3d.scope', '1:1')
+        self.assertIn('no home folder this user owns', why)
+        self.assertEqual(os.listdir(work), ['rel'])
 
     def test_the_command_never_starts_when_heavy_died_before_it_could(self):
         # child_setup runs in the forked command before exec: its parent must still be the heavy that forked it.
@@ -1124,34 +1230,91 @@ class Parts(unittest.TestCase):
         self.assertEqual(env[b'HEAVY_MARKS'], f'{st.st_dev}:{st.st_ino}'.encode())
 
 
+UNTIMED_CALLS = ('run', 'check_output', 'check_call', 'call')
+PIPES = ('stdout', 'stderr')
+
+
+def untimed(source, name):
+    """Every wait for a test process in source that has no time limit (#744 item 7, #761 item 3): subprocess.run and
+    friends without timeout= (also passed on uncalled, as to addCleanup, or imported bare), wait() without a time,
+    communicate() without timeout= (its first positional argument is the input, not the time), and any read of or
+    loop over a process's stdout or stderr outside read_line."""
+    import ast
+    tree = ast.parse(source)
+    helpers = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'read_line']
+    inside = {id(x) for h in helpers for x in ast.walk(h)}
+
+    def is_pipe(n):
+        return isinstance(n, ast.Attribute) and n.attr in PIPES
+
+    def is_untimed_fn(n):
+        return (isinstance(n, ast.Attribute) and n.attr in UNTIMED_CALLS and isinstance(n.value, ast.Name)
+                and n.value.id == 'subprocess')
+
+    found = []
+    for n in ast.walk(tree):
+        if id(n) in inside:
+            continue
+        if isinstance(n, ast.ImportFrom) and n.module == 'subprocess':
+            found += [f'{name}:{n.lineno} from subprocess import {a.name}' for a in n.names
+                      if a.name in UNTIMED_CALLS]
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)) and is_pipe(n.iter):
+            found.append(f'{name}:{getattr(n, "lineno", n.iter.lineno)} loop over .{n.iter.attr} (use read_line)')
+        if not isinstance(n, ast.Call):
+            continue
+        timed = any(k.arg == 'timeout' for k in n.keywords)
+        for arg in n.args:          # addCleanup(subprocess.run, ...): the call happens later, with these keywords
+            if is_untimed_fn(arg) and not timed:
+                found.append(f'{name}:{n.lineno} subprocess.{arg.attr} passed on without a timeout')
+        if isinstance(n.func, ast.Name) and n.func.id in ('list', 'tuple', 'set', 'sorted', 'iter', 'next') and \
+                n.args and is_pipe(n.args[0]):
+            found.append(f'{name}:{n.lineno} {n.func.id}(.{n.args[0].attr}) (use read_line)')
+        if not isinstance(n.func, ast.Attribute):
+            continue
+        a, base = n.func.attr, n.func.value
+        if is_untimed_fn(n.func) and not timed:
+            found.append(f'{name}:{n.lineno} subprocess.{a}')
+        elif a == 'wait' and not n.args and not timed:
+            found.append(f'{name}:{n.lineno} wait()')
+        elif a == 'communicate' and len(n.args) < 2 and not timed:
+            found.append(f'{name}:{n.lineno} communicate() without timeout=')
+        elif a in ('read', 'readline', 'readlines') and is_pipe(base):
+            found.append(f'{name}:{n.lineno} {base.attr}.{a}() (use read_line)')
+    return found
+
+
 class Hygiene(unittest.TestCase):
     """#744 item 7: a test of heavy that waits for a process without a time limit hangs (once 19 minutes) where it
     should fail."""
     FILES = ('heavy.test.py', 'queue.test.py', 'sweep.test.py', 'install.test.py')
 
     def test_every_wait_for_a_test_process_has_a_timeout(self):
-        import ast
         here = os.path.dirname(os.path.abspath(__file__))
         found = []
         for name in self.FILES:
             with open(os.path.join(here, name), encoding='utf-8') as f:
-                tree = ast.parse(f.read())
-            helpers = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'read_line']
-            inside = {id(x) for h in helpers for x in ast.walk(h)}
-            for n in ast.walk(tree):
-                if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
-                    continue
-                a, base = n.func.attr, n.func.value
-                timed = any(k.arg == 'timeout' for k in n.keywords)
-                if a in ('run', 'check_output', 'check_call', 'call') and isinstance(base, ast.Name) and \
-                        base.id == 'subprocess' and not timed:
-                    found.append(f'{name}:{n.lineno} subprocess.{a}')
-                elif a in ('wait', 'communicate') and not n.args and not timed:
-                    found.append(f'{name}:{n.lineno} {a}()')
-                elif a in ('readline', 'read') and isinstance(base, ast.Attribute) and base.attr == 'stdout' and \
-                        id(n) not in inside:
-                    found.append(f'{name}:{n.lineno} stdout.{a}() (use read_line)')
+                found += untimed(f.read(), name)
         self.assertEqual(found, [])
+
+    def test_the_check_finds_every_form(self):
+        # #761 item 3: each of these hangs on a silent process; each timed form passes
+        cases = {
+            'p.wait()': 1, 'p.wait(5)': 0, 'p.wait(timeout=5)': 0,
+            'p.communicate()': 1, "p.communicate('x')": 1, "p.communicate('x', 5)": 0, 'p.communicate(timeout=5)': 0,
+            "subprocess.run(['x'])": 1, "subprocess.check_output(['x'])": 1, "subprocess.run(['x'], timeout=5)": 0,
+            'from subprocess import run': 1, 'from subprocess import check_output as co': 1,
+            'from subprocess import Popen, PIPE': 0,
+            "self.addCleanup(subprocess.run, ['x'])": 1, "self.addCleanup(subprocess.run, ['x'], timeout=5)": 0,
+            'p.stdout.read()': 1, 'p.stdout.readline()': 1, 'p.stdout.readlines()': 1,
+            'p.stderr.read()': 1, 'p.stderr.readline()': 1, 'p.stderr.readlines()': 1,
+            'for line in p.stdout: pass': 1, 'for line in p.stderr: pass': 1, '[x for x in p.stdout]': 1,
+            'list(p.stderr)': 1, 'next(p.stdout)': 1,
+            'p.stdout.close()': 0, 'f.read()': 0,
+            'def read_line(p):\n    return p.stdout.readline()': 0,
+        }
+        for text, want in cases.items():
+            with self.subTest(code=text):
+                self.assertEqual(len(untimed(text, 'x.py')), want, untimed(text, 'x.py'))
 
     def test_read_line_fails_instead_of_hanging(self):
         p = subprocess.Popen(['sleep', '60'], stdout=subprocess.PIPE, text=True)

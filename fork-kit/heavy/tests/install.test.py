@@ -220,12 +220,14 @@ class Install(unittest.TestCase):
         # heavy running it in /run/user/<uid>/heavy/labelled, which an installed heavy from before the notes keeps
         with open('/proc/self/cgroup') as f:
             leaf = ''.join(line[3:].strip() for line in f if line.startswith('0::')).rpartition('/')[2]
+        home = os.path.join(self.root, 'home')          # never the tester's real home (#761 item 9)
+        os.mkdir(home, 0o700)
         notes = [os.path.join(base, 'heavy', 'labelled', leaf) for base in
-                 (f'/run/user/{os.getuid()}', os.path.expanduser('~/.local/state'))] if leaf.endswith('.scope') else []
+                 (f'/run/user/{os.getuid()}', os.path.join(home, '.local', 'state'))] if leaf.endswith('.scope') else []
         before = [n for n in notes if os.path.lexists(n)]
         for args in (['sweep', '--help'], ['docker-label', '--value', '--owner-pid', str(os.getpid())]):
             r = subprocess.run([sys.executable, '-I', '-B', os.path.join(moved, 'bin', 'heavy'), *args],
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, timeout=60, env=dict(os.environ, HOME=home))
             self.assertEqual(r.returncode, 0, r.stderr)
         self.assertRegex(r.stdout, rf'^uid=\d+,pid={os.getpid()},start=\d+\n$')
         self.assertEqual([n for n in notes if os.path.lexists(n)], before, 'the test left a note behind')
