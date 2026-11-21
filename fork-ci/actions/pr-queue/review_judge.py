@@ -231,7 +231,10 @@ BLOCKING = ('blocker', 'major')
 
 def fold(text):
     """The text as the findings rules read it: NFKC, format characters (category Cf) gone, look-alike letters Latin."""
-    text = re.sub(r'\\([!-/:-@\[-`{-~])', r'\1', html.unescape(unicodedata.normalize('NFKC', text or '')))
+    text = unicodedata.normalize('NFKC', text or '')
+    # html.unescape raises on a number reference past int's 4,300-digit limit: its value, or one past Unicode (U+FFFD)
+    text = re.sub(r'&#0*([0-9]+)', lambda m: '&#' + (m[1] if len(m[1]) <= 7 else '1114112'), text)
+    text = re.sub(r'\\([!-/:-@\[-`{-~])', r'\1', html.unescape(text))
     return ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf').translate(CONFUSABLES)
 
 
@@ -271,17 +274,21 @@ def _read(body, narrow):
                 continue
             if TABLE_RULE_RE.fullmatch(raw.strip()):
                 continue
+            row, after, said = _plain(raw, narrow), [], ''   # once per row: per cell, a wide row took minutes
+            for c in reversed(cells):   # after[j]: the first non-empty cell after cell j
+                after.append(said)
+                said = c or said
+            after.reverse()
             for j, c in enumerate(cells):   # a label cell: the next cell says what it found
                 m = CELL_RE.fullmatch(c)
                 if m and _kind(m.group('kw')) in BLOCKING:
                     seen.add(_kind(m.group('kw')))
-                    said = next((x for x in cells[j + 1:] if x), '')
-                    if not _says_nothing(said):
-                        out.append((i, _kind(m.group('kw')), _plain(raw, narrow)))
+                    if not _says_nothing(after[j]):
+                        out.append((i, _kind(m.group('kw')), row))
             for j, kind in (columns or {}).items():
                 if kind in BLOCKING and j < len(cells):
                     if not _says_nothing(cells[j]):
-                        out.append((i, kind, _plain(raw, narrow)))
+                        out.append((i, kind, row))
             continue
         columns = None
         line = _plain(raw, narrow)
