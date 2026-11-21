@@ -3,11 +3,13 @@
  * per task (message ids name the task keys); at start, the last day's are checked once. Off with
  * `server.waitFor`. A reminder takes an agent slot; refused, it is asked again and never given up.
  */
-import type { OrchestrationV2Subagent, ThreadId } from "@t3tools/contracts";
+import { MessageId, type OrchestrationV2Subagent, type ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FiberMap from "effect/FiberMap";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -25,6 +27,7 @@ import {
   isDelegatedTask,
   isEndedTask,
   isRemindable,
+  legacyReminderMessageIds,
   parentBusy,
   REMINDER_MAX_AGE_MS,
   parentGone,
@@ -66,7 +69,8 @@ export type CheckOutcome =
   /** The agent slot gate refused: asked again after `slotRetryDelay`. */
   | { readonly type: "waitsForSlot"; readonly detail: string }
   | { readonly type: "sent"; readonly taskIds: ReadonlyArray<string> }
-  | { readonly type: "held"; readonly detail: string };
+  /** Stopped by a person, or a batch refused (`taskIds`: the other batches, sent). */
+  | { readonly type: "held"; readonly detail: string; readonly taskIds?: ReadonlyArray<string> };
 
 const TERMINAL_RUN = new Set(["completed", "failed", "interrupted", "cancelled", "rolled_back"]);
 
@@ -118,12 +122,29 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
       watched.add(parentThreadId);
       return { type: "unreadable" } satisfies CheckOutcome;
     }
-    const batches = reminderBatches(parentThreadId, owed, sentIds);
+    // A first-format message names its tasks in its text: read it, to split it per task.
+    const legacyIds = legacyReminderMessageIds(parentThreadId, sentIds);
+    const legacy =
+      legacyIds.length === 0
+        ? new Map<MessageId, { readonly text: string }>()
+        : yield* threads
+            .getMessagesById(
+              parentThreadId,
+              legacyIds.map((id) => MessageId.make(id)),
+            )
+            .pipe(Effect.orElseSucceed(() => null));
+    if (legacy === null) {
+      watched.add(parentThreadId);
+      return { type: "unreadable" } satisfies CheckOutcome;
+    }
+    const legacyTexts = new Map([...legacy].map(([id, message]) => [id as string, message.text]));
+    const batches = reminderBatches(parentThreadId, owed, sentIds, legacyTexts);
     if (batches.length === 0) {
       watched.delete(parentThreadId);
       return { type: "none" } satisfies CheckOutcome;
     }
     const sent: Array<string> = [];
+    let refused: string | undefined;
     for (const batch of batches) {
       const ids = reminderBatchIds(
         parentThreadId,
@@ -147,12 +168,14 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
           watched.add(parentThreadId);
           return { type: "held", detail: "stopped" } satisfies CheckOutcome;
         case "rejected":
-          watched.delete(parentThreadId);
+          // Its ids stay refused, so its tasks wait for the owed set to change; the next
+          // batches are other tasks, and are still sent.
           yield* Effect.logWarning("delegated result reminder refused", {
             threadId: parentThreadId,
             detail: result.detail,
           });
-          return { type: "held", detail: result.detail } satisfies CheckOutcome;
+          refused = result.detail;
+          continue;
         case "waitsForSlot":
           // Nothing of this batch was sent; the ones before it are recorded by their ids.
           watched.add(parentThreadId);
@@ -164,6 +187,9 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
       }
     }
     watched.delete(parentThreadId);
+    if (refused !== undefined) {
+      return { type: "held", detail: refused, taskIds: sent } satisfies CheckOutcome;
+    }
     return { type: "sent", taskIds: sent } satisfies CheckOutcome;
   });
 
@@ -264,25 +290,26 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
         );
         yield* Effect.sleep(options.delay);
         for (const parentThreadId of new Set([...recovering, ...unread])) {
-          // An event already moved this parent's check later.
-          if (yield* FiberMap.has(timers, parentThreadId)) continue;
-          const outcome = yield* check(parentThreadId).pipe(
-            Effect.map((done): CheckOutcome | undefined => done),
-            logFailure(parentThreadId),
+          // The scan's check runs in the parent's own timer, as an event's does, so the two never
+          // run at once: one an event already moved later is left to it (`onlyIfMissing`), and an
+          // event meanwhile replaces this one (what it sent is in the record) and checks later.
+          const firstDone = yield* Deferred.make<void>();
+          const timer = yield* FiberMap.run(
+            timers,
+            parentThreadId,
+            Effect.gen(function* () {
+              const outcome = yield* check(parentThreadId);
+              yield* Deferred.succeed(firstDone, undefined);
+              // Refused a slot: asked again in this timer, so the next parents are not held up.
+              if (outcome.type === "waitsForSlot") {
+                yield* Effect.sleep(slotRetryDelay);
+                yield* checkUntilDone(parentThreadId);
+              }
+            }).pipe(logFailure(parentThreadId)),
+            { onlyIfMissing: true },
           );
-          // Refused a slot: asked again in its own timer, so the next parents are not held up.
-          // An event meanwhile moves it later, as for any timer.
-          if (outcome?.type === "waitsForSlot") {
-            yield* FiberMap.run(
-              timers,
-              parentThreadId,
-              Effect.sleep(slotRetryDelay).pipe(
-                Effect.andThen(checkUntilDone(parentThreadId)),
-                logFailure(parentThreadId),
-              ),
-              { onlyIfMissing: true },
-            );
-          }
+          // One parent at a time: the next goes once this one's first check is done or replaced.
+          yield* Effect.raceFirst(Deferred.await(firstDone), Fiber.await(timer));
         }
       }),
     );
