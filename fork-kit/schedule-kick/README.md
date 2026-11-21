@@ -25,7 +25,9 @@ For each entry of the config:
 5. **Record** the slot in the state file (written to a temporary file, then renamed into place).
 
 The workflow needs a `workflow_dispatch:` trigger (with the inputs the entry sends). At most one runs-list call and
-one dispatch per entry per tick: 50 entries at most, so even a full config stays far inside the API budget.
+one dispatch per entry per tick: 50 entries at most, so even a full config stays far inside the API budget. With
+`ghAs` count about twice that (`gh` first looks the workflow file up, and `gh-as` may fetch a token for each call),
+out of the App installation's budget, which every user of that App shares.
 
 ## Config
 
@@ -54,11 +56,17 @@ with placeholder names:
   or a comma list of those. Anything else (names such as `MON`, `@daily`, `?`, `L`, six fields, `5/15`) is
   refused, so the tool never reads a line differently from GitHub. When both day fields are set, a day matches
   either (as in GitHub's cron).
+- A workflow with several `schedule` lines: only the entry's line is kicked. Its runs list cannot tell the lines
+  apart, so an on-time run of another line created after this line's slot counts as this slot's run. The late
+  check (below) never ends a run of another line.
 - One entry per repository and workflow file: the run list cannot tell two entries for the same workflow apart.
 - `inputs` are strings (`"true"`, not `true`) without control characters.
 - `graceMinutes` (0 to 60, default 5), for all entries at the top level or for one entry: how long after its slot
   an entry waits for GitHub's own run before it dispatches. Keep it above any gap between the host's clock and
-  GitHub's (see Clock jumps).
+  GitHub's (see Clock jumps). A cron whose slots can come less than `graceMinutes` + 5 minutes (the timer's tick)
+  apart is refused: its dispatch would land after the next slot and count for it, so only every other slot would
+  run. `*/5` needs `graceMinutes: 0` (safe with the late check: GitHub's on-time run then finds the dispatch and
+  ends); a line with slots under 5 minutes apart cannot be kicked.
 - `ref` should be the default branch: GitHub's `schedule` runs are on it, and only runs on `ref` count.
 - `auth` is exactly one of:
   - `{"ghAs": "/usr/local/bin/gh-as"}`: the [gh-apps kit](../gh-apps/README.md)'s App login (`gh run list` and
@@ -101,8 +109,8 @@ tick also logs one line per entry to the journal (`journalctl --user -u schedule
   doubling, at most an hour) before trying again. A tick that breaks outside one entry writes `ok: false` and the
   reason to the status file and exits 1. A rate limit (also GitHub's secondary limit: a 403 or 429 with
   `retry-after`, or its message), or fewer than 100 calls left on the token, pauses every entry until GitHub's
-  reset or `retry-after` (at most an hour; 15 minutes if GitHub gives none, as `gh-as` never does). No retries
-  inside a tick.
+  reset or `retry-after` (at most an hour; 15 minutes if GitHub gives none, as `gh-as` never does). `gh-as` reports
+  no count of calls left, so with `ghAs` only a rate-limit error pauses. No retries inside a tick.
 - **Many other runs:** one runs-list call reads up to 100 runs of the ref since the slot. If more than 100 push runs
   come first, the slot's run is not seen and one dispatch is sent: the tool errs towards running, never towards
   being held off.
@@ -113,16 +121,20 @@ GitHub's `schedule` run for a slot the tool already started still comes, often h
 can stop it. A `concurrency` group does not help: it only queues or cancels runs that overlap. So a workflow kicked
 by this tool runs twice per slot **unless** its first job is `schedule-kick late-check`:
 
-- on a `schedule` run it takes the run's cron line (`github.event.schedule`) and the run's own created time, which
-  gives the slot the run belongs to. If a `workflow_dispatch` run of the same workflow on the same branch was
-  created at or after that slot, the slot already ran: it writes `skip=true` to the job's outputs;
-- on any other event, or with no such run, `skip=false`;
-- when it cannot tell (no token, an API error, a cron line it does not read), `skip=false` with a warning: the run
-  goes ahead, as it would without the check.
+- on the first attempt of a `schedule` run of the kicked line (`SCHEDULE_KICK_CRON`, the entry's `cron`; the
+  run's line is `github.event.schedule`) it takes that line and the run's own created time, which gives the slot
+  the run belongs to. If a `workflow_dispatch` run of the same workflow on the same branch was created at or after
+  that slot, the slot already ran: it writes `skip=true` to the job's outputs;
+- on any other event, a re-run, a run of another `schedule` line, or with no such dispatch, `skip=false`;
+- when it cannot tell (no token, no `SCHEDULE_KICK_CRON`, an API error, a cron line it does not read),
+  `skip=false` with a warning: the run goes ahead, as it would without the check.
 
 Paste this into the listed workflow (placeholders in CAPITALS: the fork and a release commit, as for Install; pin
-`actions/checkout` the way the repository pins its actions), and give every other job `needs: late` and the same
-`if:` as `work` below:
+`actions/checkout` the way the repository pins its actions, `KICKED_CRON` the entry's `cron`). Give each job that
+needs no other job `needs: late` and the `if:` of `work` below. Give a job that needs other jobs, like `more`,
+`!cancelled()` and `needs.JOB.result == 'success'` for each job it needs: without `!cancelled()` GitHub skips it
+whenever `late` was skipped (every event but `schedule`), and without the results it would run after a job it
+needs failed. A job's own condition goes inside, `&& (OWN) }}`.
 
 ```yaml
 jobs:
@@ -147,6 +159,7 @@ jobs:
         run: python3 -I -B schedule-kick/fork-kit/schedule-kick/bin/schedule-kick late-check
         env:
           SCHEDULE_KICK_TOKEN: ${{ github.token }}
+          SCHEDULE_KICK_CRON: 'KICKED_CRON'
 
   work:
     needs: late
@@ -154,12 +167,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "the workflow's own steps"
+
+  more:
+    needs: work
+    if: ${{ !cancelled() && needs.work.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "a job after work"
 ```
 
-`!cancelled()` lets `work` run when `late` is skipped (every event but `schedule`) or fails. One window stays: a
-late run created while a tick is between its runs-list call and its dispatch sees no dispatch yet, so that slot
-runs twice; the workflow's own `concurrency` group is the guard there. A re-run of a late run that was skipped is
-skipped again.
+`!cancelled()` lets `work` run when `late` is skipped (every event but `schedule`) or fails; `work` needs only
+`late`, so no failure gate is lost. One window stays: a late run whose check runs while a tick is between its
+runs-list call and its dispatch sees no dispatch yet, so that slot runs twice; nothing guards it (a `concurrency`
+group only keeps the two runs from overlapping). If the workflow has a `concurrency` group, use
+`cancel-in-progress: false`: with `true`, a late run that comes while the dispatched run is still going cancels
+it, then finds that dispatch and skips itself, so the slot does no work. A re-run always runs.
 
 ## Install
 
@@ -192,7 +214,9 @@ The service runs with `UMask=0077` and no other sandboxing: `gh-as` gets the App
 `NoNewPrivileges=` blocks, and in a user unit `PrivateTmp=`, `ProtectSystem=` and the like turn on
 `PrivateUsers=`, where `sudo` cannot become root either. A user with `tokenFile` auth (no `sudo`) can add them in
 a drop-in: `systemctl --user edit schedule-kick.service`, then `NoNewPrivileges=yes`, `PrivateTmp=yes`,
-`ProtectSystem=strict` and `ReadWritePaths=%S/schedule-kick`.
+`ProtectSystem=strict`, `StateDirectory=schedule-kick` and `StateDirectoryMode=0700` (systemd makes the state
+folder if it is missing, so the drop-in works before the first tick). These need unprivileged user namespaces,
+which some distributions restrict: check `systemctl --user status schedule-kick.service` after adding them.
 
 ## Tests
 

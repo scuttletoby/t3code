@@ -2,14 +2,16 @@
 slot often comes hours late, after schedule-kick already started that slot by workflow_dispatch; this check tells
 such a late run to end early, so a slot runs once (fork-kit/schedule-kick/README.md, Late schedule runs).
 
-On a `schedule` run: slot = the run's cron line (the event's `schedule`) read at the run's own created time, the
-slot the run belongs to. A `workflow_dispatch` run of the same workflow on the same branch created at or after that
-slot means the slot already ran: `skip=true` goes to $GITHUB_OUTPUT. Anything else (another event, no such run)
-gives `skip=false`. A check that cannot decide (no token, an API error, a cron line it does not read) also gives
-`skip=false` with a warning: the run goes ahead, as it would without the check.
+On the first attempt of a `schedule` run of the kicked line (SCHEDULE_KICK_CRON, the entry's `cron`): slot = that
+line read at the run's own created time, the slot the run belongs to. A `workflow_dispatch` run of the same workflow
+on the same branch created at or after that slot means the slot already ran: `skip=true` goes to $GITHUB_OUTPUT.
+Anything else (another event, a re-run, a run of another `schedule` line of the workflow, no such dispatch) gives
+`skip=false`. A check that cannot decide (no token, no SCHEDULE_KICK_CRON, an API error, a cron line it does not
+read) also gives `skip=false` with a warning: the run goes ahead, as it would without the check.
 
-Reads only: GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_API_URL, GITHUB_OUTPUT
-(set by the runner) and SCHEDULE_KICK_TOKEN (the job passes `${{ github.token }}`; it needs `actions: read`).
+Reads only: GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT,
+GITHUB_API_URL, GITHUB_OUTPUT (set by the runner), SCHEDULE_KICK_TOKEN (the job passes `${{ github.token }}`; it needs
+`actions: read`) and SCHEDULE_KICK_CRON.
 """
 import json, re
 
@@ -33,6 +35,8 @@ def decide(env, api):
     """('true' | 'false', why). Raises Undecided (the caller says skip=false) when it cannot tell."""
     if env.get('GITHUB_EVENT_NAME') != 'schedule':
         return 'false', f'a {env.get("GITHUB_EVENT_NAME") or "unknown"} run, not a schedule run'
+    if env.get('GITHUB_RUN_ATTEMPT') != '1':
+        return 'false', 'a re-run (or no GITHUB_RUN_ATTEMPT): someone asked for it, so it runs'
     repo, run_id = env.get('GITHUB_REPOSITORY', ''), env.get('GITHUB_RUN_ID', '')
     if not REPO_RE.match(repo) or repo.split('/')[1] in ('.', '..') or not re.fullmatch(r'[0-9]{1,20}', run_id):
         raise Undecided('GITHUB_REPOSITORY or GITHUB_RUN_ID is not set right')
@@ -42,6 +46,12 @@ def decide(env, api):
         line = cronmod.Cron(event.get('schedule'))
     except (OSError, ValueError, AttributeError) as e:
         raise Undecided(f'no cron line in the event ({e})') from None
+    try:
+        kicked = cronmod.Cron(env.get('SCHEDULE_KICK_CRON'))
+    except ValueError as e:
+        raise Undecided(f'SCHEDULE_KICK_CRON is not the kicked cron line ({e})') from None
+    if line.line != kicked.line:
+        return 'false', f'this run\'s line {line.line!r} is not the kicked line {kicked.line!r}: it always runs'
     run = api.run(repo, run_id)
     created, branch, workflow = _time(run.get('created_at')), run.get('head_branch'), run.get('workflow_id')
     if created is None or not isinstance(branch, str) or type(workflow) is not int:

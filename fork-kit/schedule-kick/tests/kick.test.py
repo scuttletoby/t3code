@@ -159,7 +159,7 @@ class Config(Temp):
 
     def test_control_characters_are_refused_by_check(self):
         """A NUL in an input crashed every tick (argv cannot hold it) while `check` said the config was fine."""
-        for value in ('v\x00w', 'a\rb', 'esc\x1b[31m', 'del\x7f', 'lone\ud800'):
+        for value in ('v\x00w', 'a\rb', 'esc\x1b[31m', 'del\x7f', 'lone\ud800', 'c1\x85', 'line\u2028'):
             with self.subTest(value=value):
                 self.refused('without control characters', entries=self.entry(inputs={'k': value}))
                 self.assertEqual(kick.main(['check', '--config', self.write_config(self.entry(inputs={'k': value}))],
@@ -180,6 +180,24 @@ class Config(Temp):
                              entries=[dict(self.entry()[0], graceMinutes=bad)])
         self.refused('config.graceMinutes must be', raw={'version': 1, 'auth': {'ghAs': self.gh_as},
                                                         'graceMinutes': 99, 'entries': self.entry()})
+
+    def test_a_cron_closer_than_the_grace_and_the_tick_is_refused(self):
+        """With the default grace, the dispatch for one `*/5` slot lands after the next slot and counts for it:
+        only every other slot would run. `check` refuses it and says what to do."""
+        for cron, grace, needle in (('*/5 * * * *', None, 'Lower graceMinutes to 0 (0 is safe with late-check)'),
+                                    ('*/10 * * * *', 6, 'slots 10 minutes apart, less than graceMinutes (6)'),
+                                    ('0,55 0,23 * * *', None, 'slots 5 minutes apart'),     # 23:55, then 00:00
+                                    ('* * * * *', 0, 'Lower graceMinutes to 0 (0 is safe with late-check); a line '
+                                                     'with slots under 5 minutes apart cannot be kicked at all')):
+            with self.subTest(cron=cron, grace=grace):
+                entries = self.entry(cron=cron, graceMinutes=grace)
+                self.refused(needle, entries=entries)
+                self.assertEqual(kick.main(['check', '--config', self.write_config(entries)], out=io.StringIO(),
+                                           err=io.StringIO()), 2)
+        for cron, grace in (('*/5 * * * *', 0), ('*/10 * * * *', 5), ('0,55 0,23 * * 1,3', None),
+                            ('0,55 0,23 * * *', 0)):
+            with self.subTest(cron=cron, grace=grace):
+                self.assertEqual(self.config(self.entry(cron=cron, graceMinutes=grace)).entries[0].cron.line, cron)
 
     def test_an_unknown_entry_key_is_refused(self):
         self.refused("unknown key 'crom'", entries=self.entry(crom='0 0 * * *'))
@@ -231,6 +249,26 @@ class Config(Temp):
         os.chmod(os.path.dirname(self.gh_as), 0o777)
         self.addCleanup(os.chmod, os.path.dirname(self.gh_as), 0o755)
         self.refused('can be changed by someone other than root', auth={'ghAs': self.gh_as})
+
+    def test_gh_as_folders_must_be_roots_whatever_their_mode(self):
+        """A folder of another user (mode 755) can have its gh-as swapped by that user, so it is refused too."""
+        folder, real_stat = os.path.dirname(self.gh_as), os.stat
+
+        def stat_as_other(path, *a, **kw):
+            st = real_stat(path, *a, **kw)
+            return mock.Mock(st_uid=os.getuid() + 1, st_mode=stat.S_IFDIR | 0o755) if path == folder else st
+        self.config()                                                          # this user's folder: trusted here
+        with mock.patch.object(kick.os, 'stat', side_effect=stat_as_other):
+            self.refused(f'folder {folder} can be changed by someone other than root', auth={'ghAs': self.gh_as})
+
+    def test_a_link_named_gh_as_to_another_program_is_refused(self):
+        """Never plain gh: a link called gh-as whose real file is gh is caught by the real name."""
+        gh = os.path.join(self.tmp, 'bin', 'gh')
+        shutil.copy(self.gh_as, gh)
+        links = os.path.join(self.tmp, 'links')
+        os.makedirs(links)
+        os.symlink(gh, os.path.join(links, 'gh-as'))
+        self.refused(f'no such program (it is {gh})', auth={'ghAs': os.path.join(links, 'gh-as')})
 
     def test_gh_as_is_used_by_its_real_path(self):
         links = os.path.join(self.tmp, 'links')
@@ -342,8 +380,8 @@ class Tick(Temp):
         self.assertEqual(self.state()['entries'][f'{R1} nightly.yml']['result'], 'ran')
 
     def test_a_stop_between_entries_keeps_what_is_done(self):
-        cfg = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/5 * * * *', 'ref': 'main'},
-                           {'repo': R1, 'workflow': 'b.yml', 'cron': '*/5 * * * *', 'ref': 'main'}])
+        cfg = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/10 * * * *', 'ref': 'main'},
+                           {'repo': R1, 'workflow': 'b.yml', 'cron': '*/10 * * * *', 'ref': 'main'}])
 
         def die():
             if len(self.api.dispatches()) == 2:
@@ -374,8 +412,23 @@ class Tick(Temp):
                     self.assertIn('starting from empty state', self.err)
                 self.assertEqual(self.state()['entries'][f'{R1} nightly.yml']['result'], 'ran')
 
+    def test_a_frequent_cron_runs_every_slot(self):
+        """One simulated hour of ticks (every 5 minutes, 10 s late) and GitHub's own runs never come: one dispatch
+        per slot, never only every other slot (a dispatch that lands after the next slot counts for it)."""
+        for cron, grace, want in (('*/5 * * * *', 0, 12), ('*/10 * * * *', 5, 6), ('*/15 * * * *', 5, 4)):
+            with self.subTest(cron=cron, grace=grace):
+                shutil.rmtree(self.state_dir, True)
+                api = FakeApi(NOW)
+                cfg = self.config([{'repo': R1, 'workflow': 'often.yml', 'cron': cron, 'ref': 'main',
+                                    'graceMinutes': grace}])
+                start = at('2026-11-21T09:00:10')
+                for n in range(12):
+                    api.github_now = start + datetime.timedelta(minutes=5 * n)
+                    self.assertEqual(self.tick(cfg, api, now=api.github_now), 0)
+                self.assertEqual(len(api.dispatches()), want)
+
     def test_host_off_past_many_slots_sends_one_run_only(self):
-        cfg = self.config([{'repo': R1, 'workflow': 'often.yml', 'cron': '*/5 * * * *', 'ref': 'main'}])
+        cfg = self.config([{'repo': R1, 'workflow': 'often.yml', 'cron': '*/10 * * * *', 'ref': 'main'}])
         self.api.github_now = at('2026-11-18T09:00:10')
         self.tick(cfg, self.api, now=at('2026-11-18T09:00:10'))
         self.api.github_now = NOW
@@ -430,8 +483,8 @@ class Tick(Temp):
         self.assertNotIn('failures', self.state()['entries'][f'{R1} nightly.yml'])
 
     def test_one_entry_failing_does_not_stop_the_others(self):
-        cfg = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/5 * * * *', 'ref': 'main'},
-                           {'repo': R2, 'workflow': 'b.yml', 'cron': '*/5 * * * *', 'ref': 'main'}])
+        cfg = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/10 * * * *', 'ref': 'main'},
+                           {'repo': R2, 'workflow': 'b.yml', 'cron': '*/10 * * * *', 'ref': 'main'}])
         real = self.api.runs_since
 
         def runs_since(repo, *a, **kw):
@@ -443,8 +496,8 @@ class Tick(Temp):
         self.assertEqual([c[1] for c in self.api.dispatches()], [R2])
 
     def test_a_rate_limit_pauses_every_entry_until_the_reset(self):
-        cfg = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/5 * * * *', 'ref': 'main'},
-                           {'repo': R2, 'workflow': 'b.yml', 'cron': '*/5 * * * *', 'ref': 'main'}])
+        cfg = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/10 * * * *', 'ref': 'main'},
+                           {'repo': R2, 'workflow': 'b.yml', 'cron': '*/10 * * * *', 'ref': 'main'}])
         reset = int((NOW + datetime.timedelta(minutes=20)).timestamp())
         self.api.fail['list'] = github.ApiError('HTTP 403 rate limit', rate_limited=True, reset=reset)
         self.assertEqual(self.tick(cfg, self.api), 1)
@@ -458,8 +511,8 @@ class Tick(Temp):
         self.assertNotIn('pauseUntil', self.state())
 
     def test_few_calls_left_pauses_the_rest(self):
-        cfg = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/5 * * * *', 'ref': 'main'},
-                           {'repo': R2, 'workflow': 'b.yml', 'cron': '*/5 * * * *', 'ref': 'main'}])
+        cfg = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/10 * * * *', 'ref': 'main'},
+                           {'repo': R2, 'workflow': 'b.yml', 'cron': '*/10 * * * *', 'ref': 'main'}])
         self.api.remaining = 99
         self.tick(cfg, self.api)
         self.assertEqual([c[1] for c in self.api.dispatches()], [R1])
@@ -492,7 +545,7 @@ class Tick(Temp):
 
     def test_entries_gone_from_the_config_are_dropped_from_the_state(self):
         self.tick(self.cfg, self.api)
-        cfg = self.config([{'repo': R2, 'workflow': 'b.yml', 'cron': '*/5 * * * *', 'ref': 'main'}])
+        cfg = self.config([{'repo': R2, 'workflow': 'b.yml', 'cron': '*/10 * * * *', 'ref': 'main'}])
         self.tick(cfg, self.api)
         self.assertEqual(list(self.state()['entries']), [f'{R2} b.yml'])
 
@@ -574,8 +627,8 @@ class Faults(Temp):
     def setUp(self):
         super().setUp()
         self.api = FakeApi(NOW)
-        self.two = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/5 * * * *', 'ref': 'main'},
-                                {'repo': R2, 'workflow': 'b.yml', 'cron': '*/5 * * * *', 'ref': 'main'}])
+        self.two = self.config([{'repo': R1, 'workflow': 'a.yml', 'cron': '*/10 * * * *', 'ref': 'main'},
+                                {'repo': R2, 'workflow': 'b.yml', 'cron': '*/10 * * * *', 'ref': 'main'}])
 
     def test_a_crash_in_one_entry_does_not_stop_the_next(self):
         real = self.api.runs_since
@@ -889,6 +942,18 @@ MUTATIONS = {
                               'Config.test_grace_minutes_global_and_per_entry'),
     'grace checked': ('kick', '    if type(value) is not int or not 0 <= value <= MAX_GRACE_MINUTES:', '    if False:',
                       'Config.test_grace_minutes_global_and_per_entry'),
+    'a cron closer than the grace and the tick refused': (
+        'kick', '    if gap is not None and gap < wait + TICK_MINUTES:', '    if False:',
+        'Config.test_a_cron_closer_than_the_grace_and_the_tick_is_refused'),
+    'the grace counts in the gap': (
+        'kick', '    if gap is not None and gap < wait + TICK_MINUTES:', '    if gap is not None and gap < TICK_MINUTES:',
+        'Config.test_a_cron_closer_than_the_grace_and_the_tick_is_refused'),
+    'the advice never names a grace under 0': ('kick', '{max(gap - TICK_MINUTES, 0)}', '{gap - TICK_MINUTES}',
+                                                'Config.test_a_cron_closer_than_the_grace_and_the_tick_is_refused'),
+    'C1 control characters refused': ('kick', 'or 0x7f <= ord(c) <= 0x9f or', 'or ord(c) == 0x7f or',
+                                      'Config.test_control_characters_are_refused_by_check'),
+    'line separators refused': ('kick', ' or ord(c) in (0x2028, 0x2029)', '',
+                                'Config.test_control_characters_are_refused_by_check'),
     'repo . and .. refused': ('kick', " or raw['repo'].split('/')[1] in ('.', '..'):", ':',
                               'Config.test_repo_names_dot_and_dot_dot_are_refused'),
     'control characters refused': ('kick', "    return isinstance(text, str) and not any(", "    return isinstance(text, str) or not any(",
@@ -943,6 +1008,11 @@ MUTATIONS = {
                          'Config.test_gh_as_must_be_roots_never_a_users_own_copy'),
     'gh-as folders root-owned': ('kick', '        if not safe:', '        if False:',
                                  'Config.test_gh_as_must_be_roots_never_a_users_own_copy'),
+    'gh-as folders owned by root': ('kick', '    if st.st_uid not in TRUSTED_OWNERS:\n        return False',
+                                    '    if False:\n        return False',
+                                    'Config.test_gh_as_folders_must_be_roots_whatever_their_mode'),
+    'gh-as by its real name': ('kick', "    if os.path.basename(real) != 'gh-as' or not stat.S_ISREG(",
+                               '    if not stat.S_ISREG(', 'Config.test_a_link_named_gh_as_to_another_program_is_refused'),
     'gh-as by its real path': ('kick', '    return real\n', '    return path\n', 'Config.test_gh_as_is_used_by_its_real_path'),
     "token file this user's": ('kick', '        if st.st_uid != os.getuid():', '        if False:',
                                'Config.test_the_token_file_must_be_this_users'),

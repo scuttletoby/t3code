@@ -32,6 +32,7 @@ MAX_WAIT = datetime.timedelta(hours=1)
 MIN_REMAINING = 100
 PAUSE = datetime.timedelta(minutes=15)      # a limit without a usable reset time
 GRACE_MINUTES = 5
+TICK_MINUTES = 5                            # the timer's period (systemd/schedule-kick.timer)
 MAX_GRACE_MINUTES = 60
 COUNTED_EVENTS = ('schedule', 'workflow_dispatch')
 TRUSTED_OWNERS = (0,)                       # who may own gh-as and the folders above it (root)
@@ -50,8 +51,9 @@ USAGE = """usage: schedule-kick tick [--config FILE] [--state-dir DIR]
 tick    start each listed workflow whose last cron slot has no run yet (one workflow_dispatch at most per entry)
 check   read the config and print each entry's last slot; no network
 status  print the last tick's status file; exit 1 unless it was fine
-late-check  in a GitHub Actions job of a listed workflow: skip=true in $GITHUB_OUTPUT when this is a `schedule`
-        run and a workflow_dispatch run on its branch was created since its cron slot (README, Late schedule runs)
+late-check  in a GitHub Actions job of a listed workflow: skip=true in $GITHUB_OUTPUT when this is the first
+        attempt of a `schedule` run of the kicked line ($SCHEDULE_KICK_CRON) and a workflow_dispatch run on its
+        branch was created since its slot (README, Late schedule runs)
 
 FILE defaults to $XDG_CONFIG_HOME/schedule-kick/config.json (~/.config/...), DIR to
 $XDG_STATE_HOME/schedule-kick (~/.local/state/...). See fork-kit/schedule-kick/README.md.
@@ -124,9 +126,10 @@ def read_token(path):
 
 
 def plain(text):
-    """A string with no control character (NUL, newline, ...) and no lone surrogate: safe in argv, a path or JSON."""
-    return isinstance(text, str) and not any(ord(c) < 0x20 or ord(c) == 0x7f or 0xd800 <= ord(c) <= 0xdfff
-                                             for c in text)
+    """A string with no control character (C0, DEL, C1, the line and paragraph separators) and no lone surrogate:
+    safe in argv, a path or JSON."""
+    return isinstance(text, str) and not any(ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f or ord(c) in (0x2028, 0x2029)
+                                             or 0xd800 <= ord(c) <= 0xdfff for c in text)
 
 
 def _safe_folder(st):
@@ -208,7 +211,14 @@ def _entry(raw, n, default_grace=GRACE_MINUTES):
         if not INPUT_RE.match(key) or not isinstance(value, str) or len(value) > 1000 or not plain(value):
             raise ConfigError(f'{where}.inputs.{key}: names are letters, digits, _ and -; values are one-line '
                               'strings without control characters (write true, not a JSON true)')
-    return Entry(raw['repo'], raw['workflow'], line, raw['ref'], dict(inputs), grace(raw, where, default_grace))
+    wait, gap = grace(raw, where, default_grace), line.min_gap()
+    if gap is not None and gap < wait + TICK_MINUTES:
+        raise ConfigError(f'{where}.cron {raw["cron"]!r}: slots {gap} minutes apart, less than graceMinutes ({wait}) '
+                          f'+ the {TICK_MINUTES}-minute tick: each dispatch would land after the next slot and count '
+                          f'for it, so only every other slot would run. Lower graceMinutes to '
+                          f'{max(gap - TICK_MINUTES, 0)} (0 is safe with late-check); a line with slots under '
+                          f'{TICK_MINUTES} minutes apart cannot be kicked at all')
+    return Entry(raw['repo'], raw['workflow'], line, raw['ref'], dict(inputs), wait)
 
 
 def grace(raw, where, default):

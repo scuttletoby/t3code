@@ -13,6 +13,7 @@ UTC = datetime.timezone.utc
 FIELDS = (('minute', 0, 59), ('hour', 0, 23), ('day of month', 1, 31), ('month', 1, 12), ('day of week', 0, 6))
 PART_RE = re.compile(r'^(\*|(\d{1,2})(?:-(\d{1,2}))?)(?:/(\d{1,2}))?\Z')
 SEARCH_DAYS = 366 * 9       # 29 February comes at least once in any 9 years (1900-style gaps included)
+START = datetime.date(2024, 1, 1)
 
 
 class CronError(ValueError):
@@ -88,3 +89,13 @@ class Cron:
                         continue
                     return datetime.datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
         return None
+
+    def min_gap(self):
+        """The fewest minutes between two slots in a row: within a day, or from a day's last slot to the next
+        day's first when two days in a row both match (looked for over nine years from a fixed day)."""
+        times = sorted(h * 60 + m for h in self.hours for m in self.minutes)
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        days = [self.day_matches(START + datetime.timedelta(days=n)) for n in range(SEARCH_DAYS + 1)]
+        if any(a and b for a, b in zip(days, days[1:])):
+            gaps.append(24 * 60 - times[-1] + times[0])
+        return min(gaps, default=None)

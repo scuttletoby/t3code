@@ -40,12 +40,13 @@ class Temp(unittest.TestCase):
         self.output = os.path.join(self.tmp, 'output')
         open(self.output, 'w').close()
 
-    def env(self, cron='17 4 * * *', event_name='schedule', **over):
+    def env(self, cron='17 4 * * *', event_name='schedule', kicked='17 4 * * *', **over):
         path = os.path.join(self.tmp, 'event.json')
         with open(path, 'w') as f:
             json.dump({'schedule': cron} if cron is not None else {}, f)
         env = {'GITHUB_EVENT_NAME': event_name, 'GITHUB_EVENT_PATH': path, 'GITHUB_REPOSITORY': REPO,
-               'GITHUB_RUN_ID': str(RUN_ID), 'GITHUB_OUTPUT': self.output, 'SCHEDULE_KICK_TOKEN': 'ghs_example'}
+               'GITHUB_RUN_ID': str(RUN_ID), 'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_OUTPUT': self.output,
+               'SCHEDULE_KICK_TOKEN': 'ghs_example', 'SCHEDULE_KICK_CRON': kicked}
         env.update(over)
         return {k: v for k, v in env.items() if v is not None}
 
@@ -92,6 +93,47 @@ class Decide(Temp):
                 self.check(self.env(), api)
                 self.assertEqual(self.skip(), 'skip=false\n')
 
+    def test_a_dispatch_at_the_slot_second_counts(self):
+        api = FakeRunApi('2026-03-10T12:45:10Z')
+        api.add_run(REPO, 42, '2026-03-10T04:17:00Z', 'workflow_dispatch', 'main')
+        self.check(self.env(), api)
+        self.assertEqual(self.skip(), 'skip=true\n')
+
+    def test_a_dispatch_after_100_other_runs_is_still_found(self):
+        """GitHub is asked for workflow_dispatch runs only: 100 push runs since the slot do not hide the dispatch."""
+        api = FakeRunApi('2026-03-10T12:45:10Z')
+        api.add_run(REPO, 42, '2026-03-10T04:25:02Z', 'workflow_dispatch', 'main')
+        for n in range(github.LIST_LIMIT):
+            api.add_run(REPO, 42, f'2026-03-10T05:{n // 60:02d}:{n % 60:02d}Z', 'push', 'main')
+        self.check(self.env(), api)
+        self.assertEqual(self.skip(), 'skip=true\n')
+
+    def test_a_run_of_another_schedule_line_never_skips(self):
+        """Lines `0 3 * * *` (not kicked) and `0 4 * * *` (kicked): line 3's late run comes at 09:00, after the
+        kick's 04:05 dispatch for line 4. That dispatch is not line 3's run: the 03:00 slot must still run."""
+        for cron, want in (('0 3 * * *', 'skip=false\n'), ('0 4 * * *', 'skip=true\n'), ('0  4 * * *', 'skip=true\n')):
+            with self.subTest(cron=cron):
+                open(self.output, 'w').close()
+                api = FakeRunApi('2026-03-10T09:00:00Z')
+                api.add_run(REPO, 42, '2026-03-10T04:05:00Z', 'workflow_dispatch', 'main')
+                self.check(self.env(cron=cron, kicked='0 4 * * *'), api)
+                self.assertEqual(self.skip(), want)
+        api = FakeRunApi('2026-03-10T09:00:00Z')
+        self.check(self.env(cron='0 3 * * *', kicked='0 4 * * *'), api)
+        self.assertEqual(api.calls, [])                                         # not even asked
+        self.assertIn("this run's line '0 3 * * *' is not the kicked line '0 4 * * *'", self.out)
+
+    def test_a_re_run_never_skips(self):
+        """GitHub keeps the first attempt's created time, so a re-run of a run that really ran would look late."""
+        for attempt in ('2', '3', None):
+            with self.subTest(attempt=attempt):
+                open(self.output, 'w').close()
+                api = FakeRunApi('2026-03-10T04:17:40Z')
+                api.add_run(REPO, 42, '2026-03-11T04:25:02Z', 'workflow_dispatch', 'main')   # the next slot's
+                self.check(self.env(GITHUB_RUN_ATTEMPT=attempt), api)
+                self.assertEqual(self.skip(), 'skip=false\n')
+                self.assertEqual(api.calls, [])
+
     def test_a_run_that_is_not_a_schedule_run_never_skips(self):
         for name in ('workflow_dispatch', 'push', None):
             with self.subTest(event=name):
@@ -108,6 +150,8 @@ class Decide(Temp):
             'a bad token': dict(SCHEDULE_KICK_TOKEN='two words'),
             'no cron': dict(cron=None),
             'a cron it does not read': dict(cron='17 4 * * MON'),
+            'no kicked line': dict(kicked=None),
+            'a kicked line it does not read': dict(kicked='@daily'),
             'no event file': dict(GITHUB_EVENT_PATH=os.path.join(tempfile.gettempdir(), 'none', 'event.json')),
             'a bad run id': dict(GITHUB_RUN_ID='1; x'),
             'a bad repository': dict(GITHUB_REPOSITORY='owner/..'),
@@ -120,15 +164,19 @@ class Decide(Temp):
                 self.assertEqual(self.check(self.env(**over), api), 0)
                 self.assertEqual(self.skip(), 'skip=false\n')
                 self.assertIn('::warning title=schedule-kick late-check::', self.out)
+                if 'kicked' in over:
+                    self.assertIn('SCHEDULE_KICK_CRON is not the kicked cron line', self.out)
 
     def test_an_api_error_lets_the_run_go_ahead(self):
         api = FakeRunApi('2026-03-10T12:45:10Z')
-        api.fail['list'] = github.ApiError('GET ...: HTTP 403 Resource not accessible\n::error::x')
+        api.fail['list'] = github.ApiError('GET ...: HTTP 403 Resource not accessible\n::error::x\r::set-output '
+                                           'name=skip::true 100%0A')
         self.check(self.env(), api)
         self.assertEqual(self.skip(), 'skip=false\n')
-        warning = [line for line in self.out.splitlines() if line.startswith('::')]
+        warning = [line for line in self.out.splitlines() if line.startswith('::')]      # \n and \r both split
         self.assertEqual(len(warning), 1)                                        # no second command from it
-        self.assertIn('HTTP 403 Resource not accessible%0A::error::x', warning[0])
+        self.assertIn('HTTP 403 Resource not accessible%0A::error::x%0D::set-output name=skip::true 100%250A',
+                      warning[0])
 
     def test_a_run_without_its_fields_lets_the_run_go_ahead(self):
         api = FakeRunApi('2026-03-10T12:45:10Z', workflow_id='42')
@@ -172,18 +220,54 @@ class Snippet(Temp):
         for line in ("    if: github.event_name == 'schedule'", '      actions: read',
                      '      skip: ${{ steps.check.outputs.skip }}', '      - id: check',
                      '          SCHEDULE_KICK_TOKEN: ${{ github.token }}', '          persist-credentials: false',
+                     "          SCHEDULE_KICK_CRON: 'KICKED_CRON'",
                      '    needs: late', "    if: ${{ !cancelled() && needs.late.outputs.skip != 'true' }}"):
             self.assertIn(line + '\n', yaml)
+
+    def test_a_job_after_another_job_keeps_its_failure_gate(self):
+        """`!cancelled()` drops GitHub's implicit success(): a job that needs a job other than `late` must check
+        that job's result itself, or it runs after that job failed. A job that needs only `late` loses no gate."""
+        jobs = re.split(r'\n  ([a-z]+):\n', '\n' + self.snippet().split('jobs:', 1)[1])[1:]
+        jobs = dict(zip(jobs[::2], jobs[1::2]))
+        self.assertEqual(sorted(jobs), ['late', 'more', 'work'])
+        for name, body in jobs.items():
+            if name == 'late':
+                continue
+            with self.subTest(job=name):
+                needs = re.search(r'\n?    needs: \[?([a-z, ]+)\]?\n', body).group(1).replace(' ', '').split(',')
+                cond = re.search(r'    if: \$\{\{ (.*) \}\}\n', body).group(1).split(' && ')
+                self.assertEqual(cond[0], '!cancelled()')                     # else skipped when late is
+                if needs == ['late']:
+                    self.assertEqual(cond[1:], ["needs.late.outputs.skip != 'true'"])
+                else:
+                    self.assertNotIn('late', needs)
+                    self.assertEqual(cond[1:], [f"needs.{job}.result == 'success'" for job in needs])
+
+    def serve(self):
+        srv = http.server.HTTPServer(('127.0.0.1', 0), Answers)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return f'http://127.0.0.1:{srv.server_address[1]}'
+
+    def test_the_token_api_asks_for_dispatch_runs_on_the_branch_only(self):
+        """In this process (RedCheck's copy of the code), the real TokenApi against a local fake of the API."""
+        base = self.serve()
+        Answers.seen = []
+        Answers.answers = {
+            f'/repos/{REPO}/actions/runs/{RUN_ID}': (200, {'id': RUN_ID, 'created_at': '2026-03-10T12:45:10Z',
+                                                         'head_branch': 'main', 'workflow_id': 42}),
+            f'/repos/{REPO}/actions/workflows/42/runs': (200, {'workflow_runs': []})}
+        self.assertEqual(late.main(dict(self.env(), GITHUB_API_URL=base), io.StringIO(), io.StringIO()), 0)
+        self.assertEqual(self.skip(), 'skip=false\n')
+        self.assertIn('event=workflow_dispatch', Answers.seen[1][0])
+        self.assertIn('branch=main', Answers.seen[1][0])
 
     def test_the_readme_command_skips_a_late_run_and_not_an_on_time_one(self):
         command = re.search(r'\n        run: (python3 .*)\n', self.snippet()).group(1).split()
         self.assertEqual(command[:3], ['python3', '-I', '-B'])
         self.assertTrue(command[3].endswith('fork-kit/schedule-kick/bin/schedule-kick'), command)
-        srv = http.server.HTTPServer(('127.0.0.1', 0), Answers)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        self.addCleanup(srv.server_close)
-        self.addCleanup(srv.shutdown)
-        base = f'http://127.0.0.1:{srv.server_address[1]}'
+        base = self.serve()
         dispatch = {'created_at': '2026-03-10T04:25:02Z', 'event': 'workflow_dispatch', 'head_branch': 'main'}
         for created, runs, want in (('2026-03-10T12:45:10Z', [dispatch], 'skip=true\n'),
                                     ('2026-03-10T04:17:40Z', [], 'skip=false\n')):
@@ -221,6 +305,23 @@ MUTATIONS = {
                                         '    except ArithmeticError as e:          # noqa: BLE001 - undecided',
                                         'Decide.test_an_api_error_lets_the_run_go_ahead'),
     'one workflow command only': ('late', ".replace('\\n', '%0A')", '', 'Decide.test_an_api_error_lets_the_run_go_ahead'),
+    'a re-run always runs': ('late', "    if env.get('GITHUB_RUN_ATTEMPT') != '1':", '    if False:',
+                             'Decide.test_a_re_run_never_skips'),
+    'only the kicked line': ('late', '    if line.line != kicked.line:', '    if False:',
+                             'Decide.test_a_run_of_another_schedule_line_never_skips'),
+    'the kicked line must be read': ('late', "    except ValueError as e:\n        raise Undecided(f'SCHEDULE_KICK_CRON",
+                                     "    except ArithmeticError as e:\n        raise Undecided(f'SCHEDULE_KICK_CRON",
+                                     'Decide.test_a_check_that_cannot_tell_lets_the_run_go_ahead'),
+    'a dispatch at the slot second': ('late', 'when is not None and when >= slot:', 'when is not None and when > slot:',
+                                      'Decide.test_a_dispatch_at_the_slot_second_counts'),
+    'dispatch runs asked for': ('late', "api.runs_since(repo, workflow, branch, slot, event='workflow_dispatch')",
+                                'api.runs_since(repo, workflow, branch, slot)',
+                                'Decide.test_a_dispatch_after_100_other_runs_is_still_found'),
+    'dispatch runs asked for (token)': ('github', "                                        **({'event': event} if event else {})})",
+                                        '                                        })',
+                                        'Snippet.test_the_token_api_asks_for_dispatch_runs_on_the_branch_only'),
+    'no command from a \\r': ('late', ".replace('\\r', '%0D')", '', 'Decide.test_an_api_error_lets_the_run_go_ahead'),
+    'a % is escaped': ('late', ".replace('%', '%25')", '', 'Decide.test_an_api_error_lets_the_run_go_ahead'),
     'run fields checked': ('late', '    if created is None or not isinstance(branch, str) or type(workflow) is not int:',
                            '    if False:', 'Decide.test_a_run_without_its_fields_lets_the_run_go_ahead'),
 }

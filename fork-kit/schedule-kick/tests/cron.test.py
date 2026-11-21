@@ -114,6 +114,21 @@ class LastSlot(unittest.TestCase):
                     self.assertEqual(c.last_slot(now), brute_last(c, now))
 
 
+class MinGap(unittest.TestCase):
+    """The fewest minutes between two slots in a row: kick refuses an entry whose slots come closer than its grace
+    and the timer's tick."""
+
+    def test_within_a_day_across_midnight_and_across_the_year(self):
+        for line, gap in (('*/5 * * * *', 5), ('*/15 2,14 * * *', 15), ('0 4 * * *', 24 * 60),
+                          ('0,55 0,23 * * *', 5),            # 23:55, then 00:00 the next day
+                          ('0,55 0,23 * * 1,3', 55),         # no two days in a row: within a day only
+                          ('0 0 1,31 1,12 *', 24 * 60),      # 31 December, then 1 January
+                          ('0 0 28,29 2 *', 24 * 60),        # 28 and 29 February, in a leap year only
+                          ('0 4 * * 1', None), ('0 0 29 2 *', None), ('0 0 31 2 *', None)):
+            with self.subTest(line=line):
+                self.assertEqual(cron.Cron(line).min_gap(), gap)
+
+
 MUTATIONS = {
     'both day fields: either': ('cron', '        return dom or dow', '        return dom and dow',
                                 'LastSlot.test_both_day_fields_set_means_either'),
@@ -136,6 +151,13 @@ MUTATIONS = {
         '                    if False:', 'LastSlot.test_today_only_hours_and_minutes_not_yet_past_are_skipped'),
     'UTC': ('cron', '        now = now.astimezone(UTC).replace(second=0, microsecond=0)',
             '        now = now.replace(second=0, microsecond=0)', 'LastSlot.test_another_time_zone_is_read_as_utc'),
+    'gaps within a day': ('cron', '        gaps = [b - a for a, b in zip(times, times[1:])]', '        gaps = []',
+                          'MinGap.test_within_a_day_across_midnight_and_across_the_year'),
+    'midnight only with two days in a row': (
+        'cron', '        if any(a and b for a, b in zip(days, days[1:])):', '        if True:',
+        'MinGap.test_within_a_day_across_midnight_and_across_the_year'),
+    'midnight counted': ('cron', '        if any(a and b for a, b in zip(days, days[1:])):', '        if False:',
+                         'MinGap.test_within_a_day_across_midnight_and_across_the_year'),
 }
 
 
