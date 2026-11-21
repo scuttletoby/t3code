@@ -7,7 +7,9 @@ import {
   HandoffSettings,
   resolveHandoffSettings,
 } from "./handoff.ts";
+import { FORK_AGENT_WRITABLE_KEYS, FORK_PERSON_ONLY_KEYS } from "./forkSettings.ts";
 import { ProjectSettingsOverrides, ServerSettings, ServerSettingsPatch } from "./settings.ts";
+import { T3ProjectFile } from "./t3ProjectFile.ts";
 
 const decodeServer = Schema.decodeUnknownSync(ServerSettings);
 const decodeProject = Schema.decodeUnknownSync(ProjectSettingsOverrides);
@@ -15,6 +17,7 @@ const decodeHandoff = Schema.decodeSync(HandoffSettings);
 const readFile = (handoff: unknown) =>
   decodeServer(handoff === undefined ? {} : { handoff }).handoff;
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+const decodeRepoFile = Schema.decodeUnknownSync(T3ProjectFile);
 const ON = { mode: "handoff" } as const;
 
 describe("handoff settings", () => {
@@ -98,6 +101,21 @@ describe("handoff settings", () => {
     expect(resolveHandoffSettings(server, project, "t3").mode).toBe("off");
     // A thread id that no longer exists is never read; an inherited key name is no thread.
     expect(resolveHandoffSettings(server, null, "toString").mode).toBe("handoff");
+  });
+
+  it("takes the command from the person's settings only, never an agent or a repository file", () => {
+    const fromCommand = { ...ON, source: "command", command: ["print-state", "--json"] };
+    // The command is a field of `handoff`, a person-only key: no T3 tool's input may name it
+    // (personOnlySettings.test.ts), and no agent may write it.
+    expect(FORK_PERSON_ONLY_KEYS).toContain("handoff");
+    expect(FORK_AGENT_WRITABLE_KEYS).not.toContain("handoff");
+    expect(decodePatch({ handoff: fromCommand }).handoff?.command).toEqual(fromCommand.command);
+    // A repository's t3.json has no `handoff`: one written there is never read.
+    expect("handoff" in T3ProjectFile.fields).toBe(false);
+    const repoFile = decodeRepoFile({ handoff: fromCommand });
+    expect("handoff" in repoFile).toBe(false);
+    // `command` without a command is refused, never run as an empty program.
+    expect(() => decodePatch({ handoff: { ...ON, source: "command" } })).toThrow();
   });
 });
 
