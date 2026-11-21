@@ -30,8 +30,10 @@ import { forkParked } from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SlotGate from "../../slots/SlotGate.ts";
 import { type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
+import { leaveLine } from "../agentSlotRoutes.ts";
 import {
   dispatchHandoff,
+  handoffPlace,
   type HandoffWaitsForSlot,
   readHandoffRecords,
 } from "./handoffDispatch.ts";
@@ -104,15 +106,6 @@ export const make = Effect.gen(function* () {
     ids: { readonly commandId: string; readonly messageId: string },
     read: NonNullable<Effect.Success<ReturnType<typeof readThread>>>,
   ) {
-    const recent = read.records.runs
-      .toSorted((left, right) => right.ordinal - left.ordinal)
-      .slice(0, TRANSCRIPT_RUNS)
-      .map((recentRun) => recentRun.id);
-    const more = yield* projections.getThreadRecords(
-      threadId,
-      ["attempts", "subagents", "turnItems"],
-      { turnItemRunIds: recent, omitSettledSubagents: true },
-    );
     const firstSends = new Set(
       read.records.runs.flatMap((other) => {
         const parsed = parseHandoffMessageId(threadId, other.userMessageId);
@@ -127,12 +120,24 @@ export const make = Effect.gen(function* () {
         commandId: CommandId.make(ids.commandId),
         messageId: MessageId.make(ids.messageId),
         threadId,
-        text: handoffMessageText({
-          records: { ...read.records, ...more },
-          sourceRunId: run.id,
-          number: firstSends.size + 1,
-          nowIso: DateTime.formatIso(yield* DateTime.now),
-          modelSelection,
+        // Built only with a slot: a refused handoff asks again every 5 s and reads nothing more.
+        text: Effect.gen(function* () {
+          const recent = read.records.runs
+            .toSorted((left, right) => right.ordinal - left.ordinal)
+            .slice(0, TRANSCRIPT_RUNS)
+            .map((recentRun) => recentRun.id);
+          const more = yield* projections.getThreadRecords(
+            threadId,
+            ["attempts", "subagents", "turnItems"],
+            { turnItemRunIds: recent, omitSettledSubagents: true },
+          );
+          return handoffMessageText({
+            records: { ...read.records, ...more },
+            sourceRunId: run.id,
+            number: firstSends.size + 1,
+            nowIso: DateTime.formatIso(yield* DateTime.now),
+            modelSelection,
+          });
         }),
         attachments: [],
         createdBy: "agent",
@@ -144,8 +149,19 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const handOffWhenDue = Effect.fn("HandoffService.handOffWhenDue")(
-    function* (threadId: ThreadId, sourceRunId: RunId) {
+  /** A handoff's place in the gate's line while it waits for a slot; left when it stops waiting. */
+  interface Waiting {
+    key: string | undefined;
+  }
+  const leavePlace = (waiting: Waiting) =>
+    Effect.suspend(() => {
+      const key = waiting.key;
+      waiting.key = undefined;
+      return key === undefined ? Effect.void : leaveLine(gate, [key]);
+    });
+
+  const handOffLoop = Effect.fn("HandoffService.handOffWhenDue")(
+    function* (threadId: ThreadId, sourceRunId: RunId, waiting: Waiting) {
       let runId = sourceRunId;
       let trigger: HandoffTrigger = "turn-end";
       let slotWaitLogged = false;
@@ -202,6 +218,8 @@ export const make = Effect.gen(function* () {
           nowMs,
         });
         if (decision.kind !== "handoff") yield* endSettle;
+        // Not due now: it needs no slot, so it holds no place from the waiters behind it.
+        if (decision.kind !== "handoff") yield* leavePlace(waiting);
         if (decision.kind === "skip") return;
         if (decision.kind === "sleep") {
           yield* Effect.sleep(Duration.millis(decision.untilMs - nowMs));
@@ -256,6 +274,8 @@ export const make = Effect.gen(function* () {
           read,
         );
         if (!waitsForSlot(outcome)) return;
+        if (waiting.key !== handoffPlace(decision.commandId).key) yield* leavePlace(waiting);
+        waiting.key = handoffPlace(decision.commandId).key;
         // Settled already: it decides again and checks the relay's view, without a new settle.
         if (!slotWaitLogged) yield* logSlotWait(threadId, outcome);
         slotWaitLogged = true;
@@ -269,6 +289,12 @@ export const make = Effect.gen(function* () {
         Effect.catch((cause) => Effect.logWarning("handoff skipped", { threadId, cause })),
       ),
   );
+
+  /** Replaced by a newer run's timer, or stopped: its place in the line goes with it. */
+  const handOffWhenDue = (threadId: ThreadId, sourceRunId: RunId) => {
+    const waiting: Waiting = { key: undefined };
+    return handOffLoop(threadId, sourceRunId, waiting).pipe(Effect.ensuring(leavePlace(waiting)));
+  };
 
   /** A handoff run that ended: keep the thread read, or send the same text once more if it failed. */
   const handoffRunEnded = Effect.fn("HandoffService.handoffRunEnded")(
@@ -345,11 +371,18 @@ export const make = Effect.gen(function* () {
       // The busy check runs again at each try: a thread that moved on drops it.
       let outcome = yield* resend;
       if (waitsForSlot(outcome)) yield* logSlotWait(threadId, outcome);
-      while (waitsForSlot(outcome)) {
-        yield* Effect.sleep(HANDOFF_SLOT_RETRY);
-        if ((yield* readThread(threadId)) === null) return;
-        outcome = yield* resend;
-      }
+      // Its place in the line goes when it stops waiting, whichever way.
+      yield* Effect.gen(function* () {
+        while (waitsForSlot(outcome)) {
+          yield* Effect.sleep(HANDOFF_SLOT_RETRY);
+          if ((yield* readThread(threadId)) === null) return;
+          outcome = yield* resend;
+        }
+      }).pipe(
+        Effect.ensuring(
+          leaveLine(gate, [handoffPlace(`server:${run.userMessageId}${HANDOFF_RETRY_SUFFIX}`).key]),
+        ),
+      );
     },
     (effect, run) =>
       effect.pipe(

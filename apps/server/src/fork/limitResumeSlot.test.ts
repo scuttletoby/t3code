@@ -170,12 +170,15 @@ describe("usage-limit resumes take an agent slot", () => {
             (thread) => limitRecoveryCommand(thread, true, RESET_MS)?.commandId,
           ),
         );
-        // Each asked as the thread's own start.
+        // Each asked as the thread's own start, in its place in the gate's line.
         expect(gate.state.asks[0]).toEqual({
           callerThreadId: ThreadId.make("thread:a"),
           targetInstanceId: INSTANCE,
           intoThreadId: ThreadId.make("thread:a"),
           keepsHeld: true,
+          place: {
+            key: `limit-resume:${limitRecoveryCommand(armed("a"), true, RESET_MS)?.commandId}`,
+          },
         });
       }).pipe(
         Effect.provide(

@@ -26,6 +26,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -47,10 +48,12 @@ import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as PullRequestWatchReactor from "../orchestration-v2/PullRequestWatchReactor.ts";
+import { layerNoTaskFolders } from "../orchestration-v2/ProviderTurnStartService.testkit.ts";
 import * as RuntimeLayer from "../orchestration-v2/runtimeLayer.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ModelManifest from "../provider/ModelManifest.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -164,6 +167,8 @@ describe("pull request watch wake-ups take an agent slot", () => {
           targetInstanceId: INSTANCE,
           intoThreadId: THREAD,
           keepsHeld: true,
+          // Its place in the gate's line, kept over 2 missed sweeps (2 min each).
+          place: { key: `pull-request-watch:${THREAD}`, staleAfter: Duration.minutes(5) },
         },
       ]);
     }),
@@ -292,6 +297,8 @@ describe("pull request watch wake-ups take an agent slot", () => {
       yield* gone.wrapped.dispatch(command);
       expect(gone.sent).toEqual([command]);
       expect(gone.slots.asks).toEqual([]);
+      // Its wake is not owed any more: its place in the gate's line goes with it.
+      expect(gone.slots.left).toEqual([`pull-request-watch:${THREAD}`]);
     }),
   );
 
@@ -405,6 +412,8 @@ const layerRuntimeTest = Layer.mergeAll(
     }),
   ),
   Layer.provide(Layer.mock(ProjectService.ProjectService)({ getById: () => Effect.succeedNone })),
+  // Upstream's runtime layer now needs task folders and the model manifest (as in its own test).
+  Layer.provide(Layer.merge(layerNoTaskFolders, ModelManifest.layerTest)),
   Layer.provide(layerPlatformTest),
 );
 
