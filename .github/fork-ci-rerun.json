@@ -14,6 +14,9 @@
     "  between the two steps' own times, widened by this much (GitHub's step times are whole seconds).",
     "annotation_cap: how many annotations GitHub keeps of one job; a job with that many may have lost its note (the",
     "  end step writes it last), so its note is never read.",
+    "probe_limit_seconds: the probe steps' own time limit (fork-tests.yml `changes` output probe_seconds, the same).",
+    "  An end step that took this long was stopped (it warns and ends green, with no note of its own), and a job whose",
+    "  probe printed a warning (fork-ci-pressure: ...) may have none either: neither job's note is read.",
     "limit_slack_seconds: a time-limit message counts only when the job (or the step) ran its minutes less this.",
     "signs: GitHub's own runner messages, each pattern a whole message (re.fullmatch), only on an annotation in the",
     "  runner's form (failure, no title, .github), and only together with the job's step record (the script's rules).",
@@ -43,6 +46,7 @@
   "probe_end_step": "Note memory pressure at the end",
   "note_slack_seconds": 3,
   "annotation_cap": 50,
+  "probe_limit_seconds": 40,
   "limit_slack_seconds": 60,
   "signs": {
     "lost": [

@@ -55,6 +55,7 @@ CONFIG = os.path.join(os.path.dirname(HERE), 'fork-ci-rerun.json')
 API = os.environ.get('GITHUB_API_URL') or 'https://api.github.com'
 NOTE_TITLE = 'fork-ci-pressure'          # fork-ci-pressure.py's
 NOTE_HEAD = 'fork-ci-pressure v1 '
+PROBE_WARNS = 'fork-ci-pressure:'         # how each of its warnings (and the probe steps' own stop warning) starts
 RED = ('failure', 'cancelled', 'timed_out')
 CHECK_RUN = re.compile(r'/check-runs/([0-9]{1,20})$')
 MARK = re.compile(r'<!-- fork-ci-rerun run=([0-9]{1,20}) attempt=([0-9]{1,5}) what=(rerun|report) -->')
@@ -101,7 +102,8 @@ def check_config(cfg):
         return ['not a JSON object']
     known = {'_doc', 'trust', 'workflow', 'followers', 'list_hours', 'catch_up_minutes', 'window_hours', 'skip_when',
              'hosted_runner_groups', 'probe_start_step', 'probe_end_step', 'limit_slack_seconds',
-             'note_slack_seconds', 'annotation_cap', 'signs', 'stalled', 'memory_full', 'notice'}
+             'note_slack_seconds', 'annotation_cap', 'probe_limit_seconds', 'signs', 'stalled', 'memory_full',
+             'notice'}
     out += [f'unknown key {k!r}' for k in sorted(set(cfg) - known)]
     out += [f'missing key {k!r}' for k in sorted(known - {'_doc'} - set(cfg))]
     if not re.fullmatch(r'[A-Za-z0-9_.-]+\.json', str(cfg.get('trust', ''))):
@@ -111,7 +113,7 @@ def check_config(cfg):
     if not names(cfg.get('followers'), empty=True):
         out.append('followers must be a list of job names')
     for key in ('list_hours', 'catch_up_minutes', 'window_hours', 'limit_slack_seconds', 'note_slack_seconds',
-                'annotation_cap'):
+                'annotation_cap', 'probe_limit_seconds'):
         if not number(cfg.get(key)) or cfg[key] <= 0:
             out.append(f'{key} must be a positive number')
     if number(cfg.get('list_hours')) and number(cfg.get('catch_up_minutes')) \
@@ -264,6 +266,17 @@ def note_of(cfg, job, annotations):
         # dropped, and a note a step printed earlier would then stand alone.
         return None, (f'{len(annotations)} annotations, GitHub\'s cap of {cfg["annotation_cap"]} a job: its own note '
                       'may have been dropped')
+    # A probe the step's own limit stopped (timeout ... || echo) ends its step green with only a warning, and so
+    # does one that raised: the job then has no note of its own, and a note a step printed earlier would stand
+    # alone, in a window the stop made wide. Either sign is enough; a step that prints one only fails closed.
+    spent = [took(s) for s in job.get('steps') or [] if s.get('name') == cfg['probe_end_step']]
+    if any(t is not None and t >= cfg['probe_limit_seconds'] for t in spent):
+        return None, (f'its "{cfg["probe_end_step"]}" step took {max(t for t in spent if t is not None)} s, the '
+                      f'probe\'s limit of {cfg["probe_limit_seconds"]} s: it was stopped, so it has no note of its own')
+    warned = [a for a in annotations if str(a.get('message') or '').startswith(PROBE_WARNS)]
+    if warned:
+        return None, (f'the probe warned ("{str(warned[0].get("message"))[:120]}"), so it may have left no note of '
+                      'its own')
     notes = [a for a in annotations if a.get('title') == NOTE_TITLE]
     if not notes:
         return None, 'no pressure note (the note was dropped)'
@@ -292,7 +305,9 @@ def note_of(cfg, job, annotations):
 def probe_window(cfg, job):
     """(fewest, most) seconds between the probe's start and end samples, by the runner's own step times (each sample
     is taken inside its step), widened by note_slack_seconds for whole-second times; None without both steps' times.
-    A step that prints a note earlier cannot know when the end step will run."""
+    A note printed well before the end step cannot know when the end step will run, so it does not fit. One printed
+    by the step just before the end step can (it knows the start time): only trust stops that one (only trusted
+    runs are read, and each is re-run once at most)."""
     def times(name):
         got = [(stamp(s.get('started_at')), stamp(s.get('completed_at'))) for s in job.get('steps') or []
                if s.get('name') == name]
@@ -586,13 +601,15 @@ class Notice:
     sweep's own run. Only an open issue CONFIG notice author opened whose body starts with ISSUE_MARK is ours, never
     one a person opened (whatever its title); with none open, the first re-run opens it, after looking once more. If
     more than one is open (two passes opened one at once, or a pass stopped before closing its own), the lowest is
-    kept and the others are closed as its duplicates, by the next pass that reads them. Each re-run (and each
-    fleet-mode report) is one comment with a marker line (MARK: run, attempt, what), so a pass never writes the same
-    one twice and the count reads them."""
+    kept and the others are closed as its duplicates by load(), which every pass runs (its 24 h count reads the
+    issue at the end of the pass, if not before). Each re-run (and each fleet-mode report) is one comment with a
+    marker line (MARK: run, attempt, what), so a pass never writes the same one twice and the count reads them. The
+    markers on a closed duplicate drop out of the count: the count only informs, and never-twice comes from the
+    run's own attempts."""
 
     def __init__(self, cfg, gh, now):
         self.cfg, self.gh, self.now, self.hours = cfg['notice'], gh, now, cfg['window_hours']
-        self.issue, self.comments = None, None
+        self.issue, self.comments, self.unclosed = None, None, []
 
     def _ours(self):
         n = self.cfg
@@ -602,8 +619,10 @@ class Notice:
                       and str(i.get('body') or '').startswith(ISSUE_MARK) and login(i.get('user')) == n['author'])
 
     def _close(self, number, keep):
-        self.gh.call(f'issues/{number}/comments', method='POST', data={'body': f'Duplicate of #{keep}.'})
+        # Closed first, then the comment: a close that keeps failing posts nothing, so a later pass that retries it
+        # never adds a second "Duplicate of"; and a closed issue is never ours again, so it gets the comment once.
         self.gh.call(f'issues/{number}', method='PATCH', data={'state': 'closed', 'state_reason': 'not_planned'})
+        self.gh.call(f'issues/{number}/comments', method='POST', data={'body': f'Duplicate of #{keep}.'})
 
     def load(self, since=None):
         if self.comments is not None:
@@ -612,8 +631,9 @@ class Notice:
         for extra in ours[1:]:
             try:
                 self._close(extra, ours[0])
-            except (OSError, ValueError):
-                pass   # ours[0] is used either way; the next pass closes it
+            except (OSError, ValueError) as e:
+                # ours[0] is used either way, and the next pass tries again; the pass says so (a warning).
+                self.unclosed.append(f'#{extra}: {e.__class__.__name__}: {e}')
         self.issue = ours[0] if ours else None
         start = iso(min(self.now() - self.hours * 3600, since or self.now()))
         self.comments = [] if self.issue is None else [
@@ -788,6 +808,9 @@ def sweep(cfg, env, gh, now=time.time, run_id=None, out=None):
         count = (f'{asked} run(s) re-run by this pass; the tracking issue could not be read for the '
                  f'{cfg["window_hours"]} h count ({e.__class__.__name__}: {e}): red, the next pass tries again')
     say(f'fork-ci re-run: {count}', out)
+    for why in notice.unclosed:
+        say(f'::warning::fork-ci re-run: a second tracking issue could not be closed as a duplicate of '
+            f'{notice.where()} ({why}); the next pass tries again', out)
     lines = ['### fork-ci re-run', '', count, '']
     if rows:
         lines += ['| Run | Outcome | Why |', '| --- | --- | --- |'] + rows

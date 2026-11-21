@@ -794,6 +794,45 @@ class StepOutputIsNoSign(Rerun):
                 else:
                     self.assertLeft(gh, code, out, f"GitHub's cap of {cap}")
 
+    def test_a_stopped_end_probe_leaves_no_note_to_read(self):
+        """The end step runs its probe under `timeout -k 5 $FORK_CI_PROBE_SECONDS ... || echo "::warning::..."`. A
+        probe stopped at that limit (or one that raised) ends the step green, with a warning and no note of its own.
+        A note a step printed earlier is then the only one, and the stop widens the window enough for it to fit
+        (the review's record: start step 1 s, end step 45 s, the printed note's seconds in the window): refused, by
+        the end step's own time or by the probe's warning. Old code: re-run."""
+        limit = CFG['probe_limit_seconds']
+
+        def end_took(seconds):
+            return ran()[:-1] + [step(END_STEP, at=70, took=seconds)]
+        self.assertEqual(cr.probe_window(CFG, job(11, steps=end_took(45))), (57, 113))   # wide: a guess lands in it
+        for seconds, qualifies in ((limit - 1, True), (limit, False), (45, False), (limit + 600, False)):
+            with self.subTest(end_step_took=seconds):
+                gh = one([ann(EXIT_137), self.FORGED], dict(steps=end_took(seconds)))
+                code, out, _ = sweep(gh)
+                if qualifies:
+                    self.assertReran(gh, out)
+                else:
+                    self.assertLeft(gh, code, out, f"the probe's limit of {limit} s")
+                    self.assertEqual(gh.comments(), [])
+        warnings = {
+            'the end probe stopped': 'fork-ci-pressure: end stopped (exit 124), no numbers',
+            'the end probe killed': 'fork-ci-pressure: end stopped (exit 137), no numbers',
+            'the end probe raised': 'fork-ci-pressure: end: ValueError: Expecting value: line 1 column 1 (char 0)',
+            'the start probe stopped': 'fork-ci-pressure: start stopped (exit 124), no numbers; the job goes on',
+            'printed by a step, at notice level': ('fork-ci-pressure: anything', 'notice'),
+        }
+        for label, w in warnings.items():
+            text, level = w if isinstance(w, tuple) else (w, 'warning')
+            for where in ('before', 'after'):
+                with self.subTest(label, where=where):
+                    anns = [ann(EXIT_137), ann(text, level)]
+                    anns.insert(1 if where == 'before' else 2, self.FORGED)
+                    gh = one(anns)
+                    code, out, _ = sweep(gh)
+                    self.assertLeft(gh, code, out, 'the probe warned')
+        gh = one([ann(EXIT_137), ann('pressure: fork-ci-pressure: inside a line', 'warning'), self.FORGED])
+        self.assertReran(gh, sweep(gh)[1])   # only a message that starts with the probe's words is its warning
+
 
 class Cancel(Rerun):
     def test_a_run_a_person_cancelled_never_qualifies(self):
@@ -984,8 +1023,8 @@ class TheNotice(Rerun):
         self.assertEqual((len(gh.issues), len(ours['comments'])), (6, 2))
 
     def test_a_pass_whose_issue_reply_was_lost_opens_no_second_one(self):
-        # GitHub took the POST, the reply never came back: the pass stops red with the issue open. Old code: the
-        # next pass found nothing by the title search it trusted (a lost reply, a race), and opened a second one.
+        # GitHub took the POST, the reply never came back: the pass stops red with the issue open. The next pass
+        # finds it by its marker and uses it (#707's code found it by its title, which also held here).
         gh = lost()
         real = gh.call
         def call(path, method='GET', data=None):
@@ -1027,6 +1066,8 @@ class TheNotice(Rerun):
                          ('closed', 'not_planned', ['Duplicate of #10.']))
 
     def test_a_duplicate_that_cannot_be_closed_still_leaves_one_record(self):
+        # Each pass tries the close again; a close that keeps failing posts no "Duplicate of" (old code: one more
+        # every pass, 10 minutes apart), the pass warns, and the close that works posts it once.
         gh = lost()
         gh.issues = [tracking(10), tracking(12)]
         real = gh.call
@@ -1035,12 +1076,48 @@ class TheNotice(Rerun):
                 raise urllib.error.URLError('patch: reset')
             return real(path, method, data)
         gh.call = call
-        code, out, _ = sweep(gh)
-        self.assertEqual((code, len(gh.posts()), len(gh.issue(10)['comments'])), (0, 1, 1), out)
-        self.assertEqual(gh.issue(12)['state'], 'open')
+        for n in range(3):
+            code, out, _ = sweep(gh)
+            self.assertEqual((code, len(gh.posts()), len(gh.issue(10)['comments'])), (0, 1, 1), out)
+            self.assertEqual((gh.issue(12)['state'], gh.issue(12)['comments']), ('open', []), f'pass {n + 1}')
+            self.assertIn('::warning::fork-ci re-run: a second tracking issue could not be closed as a duplicate of '
+                          'issue #10 (#12: URLError', out)
         gh.call = real
-        sweep(gh)   # runs again: closes it this time, and writes nothing twice
-        self.assertEqual((gh.issue(12)['state'], len(gh.issue(10)['comments'])), ('closed', 1))
+        for _ in range(2):   # runs again: closes it this time, says so once, and writes nothing twice
+            code, out, _ = sweep(gh)
+            self.assertNotIn('could not be closed', out)
+        self.assertEqual((gh.issue(12)['state'], [c['body'] for c in gh.issue(12)['comments']],
+                          len(gh.issue(10)['comments'])), ('closed', ['Duplicate of #10.'], 1))
+
+    def test_every_pass_closes_a_duplicate_even_with_nothing_to_record(self):
+        # The runbook's promise: a pass reads the issue for its 24 h count at its end, so the next pass closes an
+        # extra one, even with no red run (or only a fleet-mode report) to record.
+        gh = Fake([])
+        gh.issues = [tracking(12), tracking(10)]
+        code, out, _ = sweep(gh)
+        self.assertEqual((code, gh.issue(10)['state'], gh.issue(12)['state']), (0, 'open', 'closed'), out)
+        self.assertIn('(issue #10)', out)
+
+    def test_a_pass_whose_own_duplicate_another_pass_closed_leaves_it_alone(self):
+        # Two passes open one each at once; the other pass's load() closes this pass's issue (#41) before this
+        # pass reads the open ones again. This pass uses #10 and neither closes #41 again nor posts a second
+        # "Duplicate of" (the `mine in ours` guard).
+        gh = lost()
+        real = gh.call
+        def call(path, method='GET', data=None):
+            got = real(path, method, data)
+            if method == 'POST' and path == 'issues':
+                gh.issues.insert(0, tracking(10))
+                gh.issue(41).update(state='closed', state_reason='not_planned')   # the other pass's load()
+                gh.issue(41)['comments'].append({'id': 1, 'body': 'Duplicate of #10.', 'user': {'login': BOT},
+                                                 'created_at': iso(gh.now)})
+            return got
+        gh.call = call
+        code, out, _ = sweep(gh)
+        self.assertEqual((code, gh.posts(), len(gh.issue(10)['comments'])), (0, ['actions/runs/1/rerun-failed-jobs'],
+                                                                             1), out)
+        self.assertEqual([c['body'] for c in gh.issue(41)['comments']], ['Duplicate of #10.'])
+        self.assertNotIn(('PATCH', 'issues/41'), gh.calls)
 
     def test_two_passes_opening_it_at_once_keep_the_lowest(self):
         gh = lost()
@@ -1307,6 +1384,8 @@ class Config(unittest.TestCase):
             'one step for both': lambda c: c.__setitem__('probe_start_step', c['probe_end_step']),
             'no note slack': lambda c: c.__setitem__('note_slack_seconds', 0),
             'no annotation cap': lambda c: c.__setitem__('annotation_cap', None),
+            'no probe limit': lambda c: c.pop('probe_limit_seconds'),
+            'a zero probe limit': lambda c: c.__setitem__('probe_limit_seconds', 0),
             'a notice by a person': lambda c: c['notice'].__setitem__('author', OWNER),
             'a notice without a title': lambda c: c['notice'].__setitem__('title', ''),
         }
