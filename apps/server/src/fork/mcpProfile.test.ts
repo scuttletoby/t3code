@@ -9,6 +9,7 @@ import {
   type McpProfileThread,
   isEveryMcpTool,
   resolveMcpProfile,
+  isWithinMcpProfile,
 } from "./mcpProfile.ts";
 
 /** The settings as a load decodes them from a settings file's JSON. */
@@ -600,5 +601,27 @@ describe("MCP profile resolver: a machine set to refuse carried profiles (#640)"
       (file) => resolveMcpProfile(fromFile(file), [child("task")], value)._tag,
     );
     expect(runs).toEqual(["CannotApply", "Resolved", "Resolved", "CannotApply"]);
+  });
+});
+
+describe("isWithinMcpProfile (#681)", () => {
+  const set = (
+    servers: "all" | ReadonlyArray<string>,
+    t3Tools: "all" | ReadonlyArray<"orchestration" | "threads"> = "all",
+  ) => ({ servers, t3Tools }) as Parameters<typeof isWithinMcpProfile>[0];
+
+  it("all covers everything, and only all covers all", () => {
+    expect(isWithinMcpProfile(set("all"), set("all"))).toBe(true);
+    expect(isWithinMcpProfile(set(["docs"]), set("all"))).toBe(true);
+    expect(isWithinMcpProfile(set("all"), set(["docs"]))).toBe(false);
+    expect(isWithinMcpProfile(set([], "all"), set([], ["threads"]))).toBe(false);
+  });
+
+  it("a keep-list is within another only when it keeps nothing the other does not", () => {
+    expect(isWithinMcpProfile(set([]), set(["docs"]))).toBe(true);
+    expect(isWithinMcpProfile(set(["docs"]), set(["docs", "search"]))).toBe(true);
+    expect(isWithinMcpProfile(set(["docs", "search"]), set(["docs"]))).toBe(false);
+    expect(isWithinMcpProfile(set(["docs"], ["threads"]), set(["docs"], ["threads"]))).toBe(true);
+    expect(isWithinMcpProfile(set(["docs"], ["threads"]), set(["docs"], []))).toBe(false);
   });
 });

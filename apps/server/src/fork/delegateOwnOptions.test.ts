@@ -221,10 +221,13 @@ interface Launch {
   readonly times?: number;
   /** The model policy's mode; `advise` unless named. */
   readonly policy?: "off" | "advise" | "enforce";
+  /** More settings (the MCP profile keys); the calls are then let fail into `refusals`. */
+  readonly settings?: Record<string, unknown>;
+  readonly refusals?: Array<string>;
 }
 
-const settingsWith = (policy: Launch["policy"] = "advise") =>
-  ServerSettings.layerTest({ modelPolicy: { mode: policy } });
+const settingsWith = (policy: Launch["policy"] = "advise", more: Record<string, unknown> = {}) =>
+  ServerSettings.layerTest({ modelPolicy: { mode: policy }, ...more } as never);
 
 /** The model selection each dispatch carried, for one tool on one service. */
 const launch = (tool: Tool, input: Launch) =>
@@ -305,7 +308,7 @@ const launch = (tool: Tool, input: Launch) =>
       Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
       Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
       Layer.mock(GitVcsDriver.GitVcsDriver)({}),
-      settingsWith(input.policy),
+      settingsWith(input.policy, input.settings),
     );
     yield* Effect.gen(function* () {
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;
@@ -325,7 +328,14 @@ const launch = (tool: Tool, input: Launch) =>
           const stopped = yield* Effect.exit(call(clientRequestId));
           assert.strictEqual(stopped._tag, "Failure", "the first dispatch stops the call");
         }
-        yield* call(clientRequestId);
+        const { refusals } = input;
+        if (refusals === undefined) yield* call(clientRequestId);
+        else
+          yield* call(clientRequestId).pipe(
+            Effect.catch((failure) =>
+              Effect.sync(() => refusals.push(`${failure.code}: ${failure.message}`)),
+            ),
+          );
       }
     }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
     return selections;
@@ -643,5 +653,89 @@ describe("a child's own options, remote delegate_task", () => {
           { instanceId, model: OPENCODE.model, options: OPENCODE.parent },
         ]);
       }),
+  );
+});
+
+describe("create_threads keeps the caller's MCP profile (#681)", () => {
+  const sameProject = {};
+  const DOCS = { mcpProfiles: { docs: { servers: ["docs"], t3Tools: "all" } } };
+  const narrowed = (profile: string) => ({ mcpThreadProfiles: { [parentThreadId]: profile } });
+
+  it.effect("a narrowed caller cannot make a top-level thread on all; runs again: refused", () =>
+    Effect.gen(function* () {
+      for (const profile of ["t3-only", "docs"]) {
+        const refusals: Array<string> = [];
+        const made = yield* launch("create_threads", {
+          setup: CLAUDE,
+          target: sameProject,
+          settings: { ...DOCS, ...narrowed(profile) },
+          refusals,
+          times: 2,
+        });
+        assert.strictEqual(made.length, 0, "no thread was made");
+        assert.strictEqual(refusals.length, 2);
+        for (const refused of refusals) {
+          assert.include(refused, `capability_denied: This thread's MCP profile is "${profile}"`);
+        }
+      }
+    }),
+  );
+
+  it.effect("stopped half-way: an accepted call's retry is left as it resolves", () =>
+    Effect.gen(function* () {
+      // Its command is stored (the receipt), so it makes no new thread and is not checked again.
+      const refusals: Array<string> = [];
+      yield* launch("create_threads", {
+        setup: CLAUDE,
+        target: sameProject,
+        settings: narrowed("t3-only"),
+        refusals,
+        retryOfAccepted: true,
+      });
+      assert.deepStrictEqual(refusals, []);
+    }),
+  );
+
+  it.effect("a caller on all, or a project within the caller's profile, makes its thread", () =>
+    Effect.gen(function* () {
+      const wide = yield* launch("create_threads", { setup: CLAUDE, target: sameProject });
+      assert.strictEqual(wide.length, 1);
+      const refusals: Array<string> = [];
+      const within = yield* launch("create_threads", {
+        setup: CLAUDE,
+        target: sameProject,
+        settings: {
+          ...DOCS,
+          ...narrowed("docs"),
+          projectSettingsFolded: true,
+          projectSettingsOverrides: { [projectId]: { mcpProfile: "t3-only" } },
+        },
+        refusals,
+      });
+      assert.deepStrictEqual(refusals, []);
+      assert.strictEqual(within.length, 1);
+    }),
+  );
+
+  it.effect("a project whose profile cannot be worked out is refused, never taken as all", () =>
+    Effect.gen(function* () {
+      const refusals: Array<string> = [];
+      const made = yield* launch("create_threads", {
+        setup: CLAUDE,
+        target: sameProject,
+        settings: {
+          ...narrowed("t3-only"),
+          projectSettingsFolded: true,
+          projectSettingsOverrides: { [projectId]: { mcpProfile: "deleted-profile" } },
+        },
+        refusals,
+      });
+      assert.strictEqual(made.length, 0);
+      assert.lengthOf(refusals, 1);
+      assert.include(
+        refusals[0],
+        "invalid_request: The new thread's MCP profile cannot be worked out",
+      );
+    }),
   );
 });
