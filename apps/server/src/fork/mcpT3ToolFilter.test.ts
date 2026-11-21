@@ -339,6 +339,8 @@ describe("the T3 tool filter on /mcp", () => {
             true,
           ]);
         }
+        // A name the server does not have: upstream's lookup refuses it, before the group rule.
+        expect((yield* call("prs", "no_such_tool")).error?.code).toBe(-32602);
         // A JSON-RPC batch: the transport (MCP 2025-06-18) refuses it whole, so no call in it runs.
         const batch = yield* rpc("prs", [
           {
@@ -488,6 +490,24 @@ describe("the T3 tool table", () => {
       expect(McpT3ToolFilter.T3_TOOL_GROUPS.get("request_secret")).toBe("ungrouped");
       expect(McpT3ToolFilter.T3_TOOL_GROUPS.get("send_to_user")).toBe("ungrouped");
       expect(McpT3ToolFilter.T3_TOOL_GROUPS.get("tool_search")).toBe("ungrouped");
+    }),
+  );
+});
+
+describe("the refusal of a tool in no group", () => {
+  it.effect("names the real cause (a T3 bug), not a setting that cannot fix it", () =>
+    Effect.sync(() => {
+      const set: T3ToolSets.T3ToolSet = { _tag: "Groups", name: "prs", groups: new Set(["waits"]) };
+      for (const name of ["orphan_tool", "send_to_user_in_a_new_toolkit"]) {
+        const message = McpT3ToolFilter.__testing.t3ToolRefusal(set, name);
+        expect(message).toBe(
+          `T3 refused "${name}": this tool has no T3 tool group, so MCP profile "prs" cannot keep it. This is a T3 bug, not a setting to change: report it.`,
+        );
+      }
+      // A tool in a group still gets the group and its fix.
+      expect(McpT3ToolFilter.__testing.t3ToolRefusal(set, "list_thread_pull_requests")).toContain(
+        'Ask the user to add "pull-requests" to that profile\'s t3Tools',
+      );
     }),
   );
 });

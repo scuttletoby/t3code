@@ -713,20 +713,28 @@ request of the thread's MCP credential. A T3 tool outside the profile's groups i
 its fix (the call gets a JSON-RPC error: ask the owner to add the group to the profile, or to pick
 a profile that has it). The server matches a call by the tool's exact name, and refuses a JSON-RPC
 batch whole, so no other way reaches it. `request_secret`, `send_to_user` and `tool_search` stay in
-every profile, and `[]` keeps only them. A tool in no group this version knows is refused by any
-profile but `all`. The groups are fixed as each turn starts (as a Claude query opens, or as a turn
+every profile, and `[]` keeps only them. A tool in no group is refused by any profile but `all`,
+and the refusal says that is a T3 bug to report (no setting fixes it); a test keeps every T3 tool
+in exactly one group, and every group with a toolkit. The groups are fixed as each turn starts (as a Claude query opens, or as a turn
 on another provider starts, also a resumed turn and a compaction): a running turn, and a message
 sent into it, keep the set it started with, and a change applies from the thread's next turn. A
 Claude thread whose groups changed starts a fresh Claude process for its next turn (resumed), so
 Claude lists T3's tools again; that costs one prompt-cache miss. Another provider may keep the
 list it read before: a tool it still shows is refused when called, and one newly kept is there the
-next time it lists. The sets live in memory with the credentials: after a restart, or for a thread
+next time it lists. The sets live in the server's memory, one per thread, not per credential (a
+credential reused after a change gets the thread's new set from its next turn): after a restart, or for a thread
 whose session lists its tools before its first turn, the set is worked out from the settings at
 the first request. A thread whose profile cannot be worked out (a missing or broken profile, a
 parent that cannot be read, settings that cannot be read, a thread T3 cannot read because it was
 deleted) keeps only the tools every profile keeps and is told why, never `all`. A delegated child
 is cut down to its parent's groups like its servers, so it never gets more. Clients from outside
 a thread (signed in with OAuth) have no profile.
+
+Profiles are not a sandbox. Only requests that come from a thread are filtered: a request with no
+thread (an OAuth client, the `t3 thread` CLI, a script run from a shell with the owner's access)
+gets every T3 tool. So a profile limits what an agent is offered and may call as its thread, not
+what an agent with a shell can reach. A thread that keeps the `orchestration` group can also ask a
+wider thread to act for it (`t3_thread_send`).
 
 A thread whose profile is narrower than `all` cannot start a top-level thread on this machine that
 gets more than its own profile ([#681](https://github.com/scuttletoby/t3code/issues/681)).
