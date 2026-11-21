@@ -159,7 +159,7 @@ jobs:
         run: python3 -I -B schedule-kick/fork-kit/schedule-kick/bin/schedule-kick late-check
         env:
           SCHEDULE_KICK_TOKEN: ${{ github.token }}
-          SCHEDULE_KICK_CRON: 'KICKED_CRON'
+          SCHEDULE_KICK_CRON: "KICKED_CRON"
 
   work:
     needs: late

@@ -220,7 +220,7 @@ class Snippet(Temp):
         for line in ("    if: github.event_name == 'schedule'", '      actions: read',
                      '      skip: ${{ steps.check.outputs.skip }}', '      - id: check',
                      '          SCHEDULE_KICK_TOKEN: ${{ github.token }}', '          persist-credentials: false',
-                     "          SCHEDULE_KICK_CRON: 'KICKED_CRON'",
+                     '          SCHEDULE_KICK_CRON: "KICKED_CRON"',
                      '    needs: late', "    if: ${{ !cancelled() && needs.late.outputs.skip != 'true' }}"):
             self.assertIn(line + '\n', yaml)
 
