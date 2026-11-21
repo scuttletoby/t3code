@@ -119,6 +119,13 @@ class Heavy(unittest.TestCase):
         """Shell text that starts a sleeper which leaves its parent and its session (a daemon's double fork)."""
         return f'(setsid {self.sleeper} &)'
 
+    def settled(self, n):
+        """Shell text that waits (at most 10 s) until n processes of the command's own scope are sleepers: a forked
+        `sh` that has not exec'd yet would otherwise be named as a leftover `sh`."""
+        return ('cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup); i=0; while [ $i -lt 200 ]; do c=0; '
+                'for p in $(cat "$cg/cgroup.procs"); do [ "$(cat /proc/$p/comm 2>/dev/null)" = sleeper ] && '
+                f'c=$((c + 1)); done; [ $c -ge {n} ] && break; i=$((i + 1)); sleep 0.05; done')
+
     def guards(self):
         """Pids of this test's heavy guards: named scope-guard, with heavy's command line (it names the test folder)."""
         found = []
@@ -272,7 +279,7 @@ class Heavy(unittest.TestCase):
         self.assertFalse(leaf.startswith('heavy-keep-'), leaf)
 
     def test_a_double_forked_child_is_stopped_too(self):
-        r = self.heavy('sh', '-c', f'{self.double_fork()}; {self.sleeper} & exit 0')
+        r = self.heavy('sh', '-c', f'{self.double_fork()}; {self.sleeper} & {self.settled(2)}; exit 0')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ours(), [])
         self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 2 leftover processes (sleeper)'])
@@ -792,6 +799,78 @@ class Heavy(unittest.TestCase):
             hq.release(q, t)
         self.assertEqual(r.returncode, 76, r.stderr)
         self.assertIn('gave up after waiting', r.stderr)
+
+    # --- measured need (lib/heavy_measure.py; the history and the capacity front are in measure.test.py) ----------
+
+    def measured(self, state):
+        try:
+            with open(os.path.join(state, 'measured.jsonl')) as f:
+                return [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def grow(self, mb, seconds):
+        """A command that holds mb MB of written memory for a while (the test folder is in its command line)."""
+        return [sys.executable, '-I', '-c', f'import time; b = b"x" * ({mb} << 20); time.sleep({seconds})  # {self.dir}']
+
+    def test_a_measured_job_records_its_memory_under_its_kind(self):
+        state = os.path.join(self.dir, 'state')
+        r = self.heavy('--measure', 'heavy-test', '--', *self.grow(120, 2), env=dict(self.env, HEAVY_STATE_DIR=state))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        records = self.measured(state)
+        self.assertEqual([(x['kind'], x['end']) for x in records], [('heavy-test', 'exited')], r.stderr)
+        self.assertGreaterEqual(records[0]['peakMb'], 120)         # the kernel's high-water mark, seen every second
+        self.assertGreaterEqual(records[0]['usedMb'], 100)
+        self.assertLess(records[0]['usedMb'], 1024)
+        self.assertGreaterEqual(records[0]['needMb'], records[0]['usedMb'])
+        self.assertEqual(records[0]['code'], 0)
+
+    def test_a_measured_job_records_its_exit_code_and_a_stopped_one_counts_as_stopped(self):
+        state = os.path.join(self.dir, 'state')
+        env = dict(self.env, HEAVY_STATE_DIR=state)
+        fails = f'"{sys.executable}" -I -c "import time; b = bytes(60 << 20).replace(bytes(1), bytes([1])); ' \
+                f'time.sleep(1)"; exit 3  # {self.dir}'
+        r = self.heavy('--measure', 'heavy-test', '--', 'sh', '-c', fails, env=env)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        p = self.start('--measure', 'heavy-test', '--', *self.grow(60, 300), env=env)
+        wait_for(lambda: len(self.ours()) == 1, what='the command')
+        time.sleep(1.5)                             # the measurer has seen the scope
+        p.send_signal(signal.SIGTERM)
+        p.communicate(timeout=60)
+        self.assertEqual([(x['end'], x['code']) for x in self.measured(state)],
+                         [('exited', 3), ('stopped', -signal.SIGTERM)])
+
+    def test_a_queued_job_records_under_its_queue_kind(self):
+        state = os.path.join(self.dir, 'state')
+        r = self.heavy('--kind', 'heavy-test', '--mb', '256', '--wait', '60', '--', *self.grow(80, 1),
+                       env=dict(self.env, HOME=self.dir, HEAVY_STATE_DIR=state))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([x['kind'] for x in self.measured(state)], ['heavy-test'])
+
+    def test_a_nested_heavy_records_nothing_of_its_own(self):
+        state = os.path.join(self.dir, 'state')
+        inner = ' '.join(f"'{a}'" for a in self.grow(60, 1))
+        r = self.heavy('--measure', 'heavy-outer', '--', 'sh', '-c', f'"{HEAVY}" --measure heavy-inner -- {inner}',
+                       env=dict(self.env, HEAVY_STATE_DIR=state))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([x['kind'] for x in self.measured(state)], ['heavy-outer'])
+
+    def test_a_measured_heavy_killed_with_9_records_nothing_and_leaves_the_history_whole(self):
+        state = os.path.join(self.dir, 'state')
+        os.makedirs(state)
+        before = json.dumps({'v': 1, 'at': 'x', 'kind': 'heavy-test', 'end': 'exited', 'seconds': 1, 'usedMb': 5,
+                             'peakMb': 6}) + '\n'
+        with open(os.path.join(state, 'measured.jsonl'), 'w') as f:
+            f.write(before)
+        p = self.start('--measure', 'heavy-test', '--', 'sh', '-c', f'exec {self.sleeper}',
+                       env=dict(self.env, HEAVY_STATE_DIR=state))
+        wait_for(lambda: len(self.ours()) == 1, what='the command')
+        time.sleep(0.5)                             # the measurer has the scope open
+        p.kill()
+        p.communicate(timeout=60)
+        wait_for(lambda: not self.ours(), what='the guard to stop the scope')
+        with open(os.path.join(state, 'measured.jsonl')) as f:
+            self.assertEqual(f.read(), before)
 
     # --- red check -----------------------------------------------------------------------------------------------
 
