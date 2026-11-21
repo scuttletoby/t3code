@@ -1,5 +1,6 @@
 /**
- * Fork: the agent slot gate on `delegate_task` (`agentSlots`). Off and `fixed`: reads only the
+ * Fork: the agent slot gate on `delegate_task` (`agentSlots`), and on every other route that starts
+ * an agent (`fork/agentSlotRoutes.ts`). Off and `fixed`: reads only the
  * settings. `observe`: the capacity rule runs beside each decision (`SlotObserver.ts`). Its own state
  * is memory only; slots held by delivered slot waits come from the wait store (`attachReservations`).
  */
@@ -111,11 +112,13 @@ export class SlotGate extends Context.Service<
   SlotGate,
   {
     /**
-     * Allow or refuse one new delegated agent on `targetInstanceId`. An allowed call counts as
-     * running at once, so concurrent callers never get more slots than are free.
+     * Allow or refuse one new agent on `targetInstanceId`. An allowed call counts as running at
+     * once, so concurrent callers never get more slots than are free. `callerThreadId` is the
+     * thread that starts it (its own run is not counted, and its held slot is used up), or `null`
+     * for a start no thread asks for (a scheduled run, the owner's client, a linked machine).
      */
     readonly acquire: (input: {
-      readonly callerThreadId: ThreadId;
+      readonly callerThreadId: ThreadId | null;
       readonly targetInstanceId: ProviderInstanceId;
     }) => Effect.Effect<SlotAcquire>;
     /** The dispatch named the child: its entry ends as soon as the child shows a run. */
@@ -421,7 +424,7 @@ const make = Effect.gen(function* () {
      * rule's own, so `started` and `release` reach the rule's record of that start.
      */
     caller?: {
-      readonly threadId: string;
+      readonly threadId: string | undefined;
       readonly instanceId: string;
       readonly untracked: (result: A) => boolean;
       readonly withToken: (result: A, token: SlotToken) => A;
@@ -530,7 +533,7 @@ const make = Effect.gen(function* () {
    */
   const decide = Effect.fn("SlotGate.decide")(
     function* (input: {
-      readonly callerThreadId: ThreadId;
+      readonly callerThreadId: ThreadId | null;
       readonly targetInstanceId: ProviderInstanceId;
     }) {
       const settings = yield* readSettings;
@@ -564,7 +567,7 @@ const make = Effect.gen(function* () {
         reservations: onePerThread(
           reservations.filter((reservation) => reservation.threadId !== input.callerThreadId),
         ),
-        accountOnly: hiddenHeld(waitsOn, nowMs, input.callerThreadId),
+        accountOnly: hiddenHeld(waitsOn, nowMs, input.callerThreadId ?? ""),
         targetInstanceId: input.targetInstanceId,
         freeMemoryBytes: yield* freeMemoryBytes(limits),
       });
@@ -577,13 +580,15 @@ const make = Effect.gen(function* () {
         { token, instanceId: input.targetInstanceId, atMs: nowMs },
       ]);
       // The agent it held a slot for starts now: its held slot is used up, with every older copy.
-      const used = yield* useUp(reservations, input.callerThreadId);
-      if (!heldRead.whole) unreadStarts.add(input.callerThreadId);
+      // A start no thread asks for holds no slot: it uses none up.
+      const caller = input.callerThreadId;
+      const used = caller === null ? [] : yield* useUp(reservations, caller);
+      if (!heldRead.whole && caller !== null) unreadStarts.add(caller);
       return asDecided({ type: "allow", token }, used);
     },
     (decided, input) =>
       observeBeside(decided, (result) => [result.outcome.type], {
-        threadId: input.callerThreadId,
+        threadId: input.callerThreadId ?? undefined,
         instanceId: input.targetInstanceId,
         untracked: (result) => result.outcome.type === "allow" && result.outcome.token === null,
         withToken: (result, token) => asDecided({ type: "allow", token }, result.used),
@@ -593,7 +598,7 @@ const make = Effect.gen(function* () {
   );
 
   const acquire = Effect.fn("SlotGate.acquire")(function* (input: {
-    readonly callerThreadId: ThreadId;
+    readonly callerThreadId: ThreadId | null;
     readonly targetInstanceId: ProviderInstanceId;
   }) {
     const { outcome, used } = yield* decide(input);

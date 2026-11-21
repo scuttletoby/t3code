@@ -31,6 +31,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
+import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
 import * as LaunchMcpProfile from "./launchMcpProfile.ts";
 
 /** A checked delegation target (the same shape as the service's resolved target). */
@@ -95,7 +96,11 @@ export interface DelegateHold {
 
 export interface BeforeCreateThreadInput {
   readonly isRetry: boolean;
-  readonly callerThreadId: ThreadId;
+  /**
+   * The thread to be created, and whether its creation starts a run (a prompt): only then does it
+   * take an agent slot. The caller is the parent.
+   */
+  readonly child: { readonly threadId: ThreadId; readonly startsRun: boolean };
   readonly parent: Parent;
   /** The target the caller asked for, before the parent's options were laid under it. */
   readonly requested: OrchestratorMcpTarget | undefined;
@@ -121,7 +126,9 @@ export interface DelegateChecks {
   ) => Effect.Effect<DelegateHold, OrchestratorMcpFailure, Scope.Scope>;
   /**
    * `create_threads`, per thread before its dispatch. A caller with a narrower MCP profile than
-   * `all` is refused a thread that would get more (`launchMcpProfile.ts`): it has no parent.
+   * `all` is refused a thread that would get more (`launchMcpProfile.ts`): it has no parent. A
+   * thread that starts a run takes an agent slot last, on the final target, or is refused
+   * `slots_full` (`agentSlotRoutes.ts`).
    */
   readonly beforeCreateThread: (
     input: BeforeCreateThreadInput,
@@ -476,6 +483,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         ? Effect.succeed(NO_HOLD)
         : acquireSlot(slotGate.value, input),
     // Placement (P1) adds its check here. The MCP profile check is first: a refusal starts nothing.
+    // The slot is last, on the final target; a retry of an accepted creation starts nothing new.
     beforeCreateThread: (input) =>
       input.isRetry
         ? Effect.succeed({ target: input.target })
@@ -483,9 +491,17 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
             projectId: input.parent.thread.projectId,
             route: "create_threads",
           }).pipe(
-            Effect.andThen(
-              Effect.map(ownTarget(input.target, input.requested), (target) => ({ target })),
+            Effect.andThen(ownTarget(input.target, input.requested)),
+            Effect.tap((target) =>
+              input.child.startsRun
+                ? AgentSlotRoutes.admitNamed(slotGate, {
+                    callerThreadId: input.parent.thread.id,
+                    targetInstanceId: target.modelSelection.instanceId,
+                    childThreadId: input.child.threadId,
+                  })
+                : Effect.void,
             ),
+            Effect.map((target) => ({ target })),
           ),
     remoteTarget: (target) =>
       remoteTarget(target) === target

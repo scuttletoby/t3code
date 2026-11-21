@@ -133,7 +133,11 @@ const parentProjection = (subagents: ReadonlyArray<unknown>): OrchestrationV2Thr
 
 const childProjection = (childThreadId: ThreadId) =>
   ({
-    thread: { id: childThreadId, title: "Child" },
+    thread: {
+      id: childThreadId,
+      title: "Child",
+      modelSelection: { instanceId: MAIN, model: MODEL },
+    },
     runs: [],
     contextTransfers: [],
     messages: [],
@@ -167,6 +171,8 @@ interface World {
   readonly dispatchBegun: Deferred.Deferred<void>;
   /** Requests whose delegation was accepted before (their receipt exists). */
   readonly accepted: Set<string>;
+  /** Threads `create_threads` dispatched (`thread.create`), and whether each started a run. */
+  readonly created: Array<{ readonly threadId: ThreadId; readonly startsRun: boolean }>;
 }
 
 const newWorld = (): World => ({
@@ -182,6 +188,7 @@ const newWorld = (): World => ({
   noTaskEvents: 0,
   dispatchBegun: Deferred.makeUnsafe<void>(),
   accepted: new Set(),
+  created: [],
 });
 
 /** The server's layers for one test: the gate and /mcp share one settings service and world. */
@@ -206,6 +213,11 @@ const serverLayer = (
     NodeCrypto.layer,
     Layer.mock(ThreadManagementService.ThreadManagementService)({
       hasReceipt: (commandId) => Effect.succeed(world.accepted.has(commandId)),
+      getThreadShell: (threadId) =>
+        Effect.succeed({
+          id: threadId,
+          modelSelection: { instanceId: MAIN, model: MODEL },
+        } as unknown as OrchestrationV2ThreadShell),
       getThreadRecords: (threadId) =>
         Effect.succeed(
           threadId === parentThreadId
@@ -218,6 +230,17 @@ const serverLayer = (
         Effect.gen(function* () {
           // Lets concurrent calls interleave between the gate and the dispatch.
           yield* Effect.yieldNow;
+          // create_threads: the thread (with its run when it has a prompt), then its record.
+          if (command.type === "thread.create") {
+            const startsRun = command.initialMessage !== undefined;
+            world.created.push({ threadId: command.threadId, startsRun });
+            world.accepted.add(command.commandId);
+            return {
+              sequence: world.created.length,
+              storedEvents: startsRun ? [{ event: { type: "run.created" } }] : [],
+            } as never;
+          }
+          if (command.type === "thread.created.record") return { sequence: 0, storedEvents: [] };
           yield* Deferred.succeed(world.dispatchBegun, undefined);
           const delayMs = world.dispatchDelaysMs.shift();
           if (delayMs !== undefined) yield* Effect.sleep(delayMs);
@@ -346,7 +369,21 @@ const delegate = (clientRequestId: string, target?: OrchestratorMcpTarget) =>
     Effect.result,
   );
 
-const failureOf = (result: Effect.Success<ReturnType<typeof delegate>>) => {
+/** `create_threads` from the parent: one thread per prompt (`undefined`: no prompt, no run). */
+const createThreads = (clientRequestId: string, prompts: ReadonlyArray<string | undefined>) =>
+  OrchestratorMcpService.OrchestratorMcpService.pipe(
+    Effect.flatMap((service) =>
+      service.createThreads(scope, {
+        threads: prompts.map((prompt) => (prompt === undefined ? {} : { prompt })),
+        clientRequestId,
+      }),
+    ),
+    Effect.result,
+  );
+
+const failureOf = (
+  result: Effect.Success<ReturnType<typeof delegate> | ReturnType<typeof createThreads>>,
+) => {
   if (result._tag !== "Failure") return assert.fail("expected a failure");
   return result.failure;
 };
@@ -674,6 +711,141 @@ describe("OrchestratorMcpService agent slot gate", () => {
         Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)),
       );
       assert.strictEqual(result._tag, "Success");
+    }),
+  );
+});
+
+/**
+ * Fork: `create_threads` takes the same slot as `delegate_task`, with the same count and
+ * refusal. On main's code it created every thread whatever the count.
+ */
+describe("create_threads through the agent slot gate", () => {
+  it.effect("full: refused with slots_full, and no thread is created", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.running = [{ id: "busy", instanceId: MAIN }];
+      const result = yield* createThreads("create-full", ["Work on it."]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)),
+      );
+      const failure = failureOf(result);
+      assert.strictEqual(failure.code, "slots_full");
+      assert.strictEqual(
+        failure.message,
+        "No free agent slot: 1 agent is running on this machine, and the limit is 1. Try again later. Or do the work yourself.",
+      );
+      assert.deepStrictEqual(world.created, []);
+      assert.strictEqual(world.accepted.size, 0);
+    }),
+  );
+
+  it.effect("free: the thread is created and started; the caller is not counted", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.running = [{ id: parentThreadId, instanceId: MAIN }];
+      const result = yield* createThreads("create-free", ["Work on it."]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)),
+      );
+      assert.strictEqual(result._tag, "Success");
+      assert.deepStrictEqual(
+        world.created.map((entry) => entry.startsRun),
+        [true],
+      );
+    }),
+  );
+
+  it.effect("a thread without a prompt starts no agent: created even when full", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.running = [{ id: "busy", instanceId: MAIN }];
+      const result = yield* createThreads("create-idle", [undefined]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)),
+      );
+      assert.strictEqual(result._tag, "Success");
+      assert.deepStrictEqual(
+        world.created.map((entry) => entry.startsRun),
+        [false],
+      );
+      assert.strictEqual(world.snapshotReads, 0);
+    }),
+  );
+
+  it.effect("one call counts its own threads: one free slot creates the first only", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      const result = yield* createThreads("create-two", ["First.", "Second."]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)),
+      );
+      assert.strictEqual(failureOf(result).code, "slots_full");
+      assert.strictEqual(world.created.length, 1);
+    }),
+  );
+
+  it.effect("runs again with the same key: refused, then created once a slot is free", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.running = [{ id: "busy", instanceId: MAIN }];
+      yield* Effect.gen(function* () {
+        assert.strictEqual(
+          failureOf(yield* createThreads("create-again", ["Work on it."])).code,
+          "slots_full",
+        );
+        world.running = [];
+        assert.strictEqual((yield* createThreads("create-again", ["Work on it."]))._tag, "Success");
+        assert.strictEqual(world.created.length, 1);
+        // Full again: a retry of the accepted creation starts nothing new, so it passes unread.
+        world.running = [{ id: "busy", instanceId: MAIN }];
+        const reads = world.snapshotReads;
+        assert.strictEqual((yield* createThreads("create-again", ["Work on it."]))._tag, "Success");
+        assert.strictEqual(world.snapshotReads, reads);
+      }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)));
+    }),
+  );
+
+  it.effect("a thread list that cannot be read refuses with slots_full (#684)", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.snapshotFails = true;
+      const result = yield* createThreads("create-unread", ["Work on it."]).pipe(
+        Effect.provide(serverLayer(world, slots({ maxPerMachine: 2 }), roomy)),
+      );
+      assert.strictEqual(failureOf(result).code, "slots_full");
+      assert.deepStrictEqual(world.created, []);
+    }),
+  );
+
+  it.effect(
+    "stops half-way: a created thread whose run never shows frees its slot after the grace",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        yield* Effect.gen(function* () {
+          assert.strictEqual((yield* createThreads("create-grace-1", ["Work."]))._tag, "Success");
+          // Its run does not show in the count: it holds the slot for the start grace only.
+          assert.strictEqual(
+            failureOf(yield* createThreads("create-grace-2", ["Work."])).code,
+            "slots_full",
+          );
+          yield* TestClock.adjust("30 seconds");
+          assert.strictEqual((yield* createThreads("create-grace-3", ["Work."]))._tag, "Success");
+        }).pipe(Effect.provide(serverLayer(world, slots({ maxPerMachine: 1 }), roomy)));
+      }),
+  );
+
+  it.effect("off or without a gate: created as upstream, nothing read", () =>
+    Effect.gen(function* () {
+      for (const options of [{ withGate: true }, { withGate: false }]) {
+        const world = newWorld();
+        world.running = [{ id: "busy", instanceId: MAIN }];
+        // Off (fixed mode, as in T19 above), or on with a limit but no gate on the server.
+        const settings = options.withGate
+          ? { agentSlots: { mode: "fixed" as const, maxPerMachine: 1 } }
+          : slots({ maxPerMachine: 1 });
+        const result = yield* createThreads("create-off", ["Work on it."]).pipe(
+          Effect.provide(serverLayer(world, settings, roomy, options)),
+        );
+        assert.strictEqual(result._tag, "Success");
+        assert.strictEqual(world.snapshotReads, 0);
+      }
     }),
   );
 });
