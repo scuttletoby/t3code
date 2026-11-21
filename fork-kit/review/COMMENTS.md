@@ -101,7 +101,7 @@ findings: none
 ```
 
 A quick check of a nit-only fix (SKILL.md, "Order", step 7). The `nit-only:` line is for the orchestrator; the gate
-reads the report as any other.
+reads the report as any other, and counts it as a round (a read of a new head).
 
 The gate reads: `lens quick-check, read, clean, state`
 

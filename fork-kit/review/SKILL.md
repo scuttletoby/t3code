@@ -25,7 +25,11 @@ weight any changed path hits decides. The tiers, with their defaults (the gate's
 | -------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | critical | stored data, migrations, deploy, security, the merge path, anything that loses data | at least **2 independent** lenses, each Opus 5.5 high |
 | normal   | other code                                                                          | at least **1** lens, Opus 5.5 high                    |
-| light    | docs, comments, config values with no code path change                              | **0**: CI only                                        |
+| light    | docs and other paths the rules mark light (never a protected path, below)           | **0**: CI only                                        |
+
+**Always critical** (the gate's built-in protected paths, whatever rule they fall under): the queue config file, every
+lens prompt file named in the review block's `lenses`, and `.github/workflows/**`. A comment-only change takes its
+path's tier.
 
 A project with its own tier names maps them onto these three in its rules (for example tiers 0-1 light, 2 normal, 3
 critical). A project with **no CI** (no queue config) has no gate: every change is normal with one lens, by hand.
@@ -75,12 +79,22 @@ Each step is done by another agent than the author.
 7. **Rounds:** at most `lens_rounds` (default **2**): round 1 lenses, one fix round, round 2 lenses on the fix (only
    those whose area the fix touches, and every lens that reported a blocker or major: the gate holds the head until
    that lens reads a fixed head). Stop early when a round finds no blocker and no major.
+   - **How the gate counts rounds:** every lens comment that reads a different change of the pull request is one more
+     round (a head that only merges the base in is the same change; a `r3` marker in a lens name counts too). From
+     round `rounds.approach_at` of the review block (3 in review.recommended.json; `plan` prints the project's) the
+     gate requires one more lens, `rounds.approach_lens`, on the same head as the others; past `rounds.max` it fails
+     the head (in `enforce`; `shadow` only reports both).
    - **Nit-only fix:** a fix diff that touches only tests, docs, comments, message text or names (judged by the diff,
-     not by the findings' severity) gets one quick check instead of a round: one lens on the fix diff whose comment
-     has a line `nit-only: yes` or `nit-only: no`. On `no` the fix goes to the next round.
+     not by the findings' severity) may get one quick check: one lens on the fix head whose comment has a line
+     `nit-only: yes` or `nit-only: no`. On `no` the fix goes to the next round. The quick check is a lens read of a
+     new head, so **the gate counts it as a round**. When that round reaches `rounds.approach_at`, run the approach
+     lens too: one more independent read-only agent with the prompt file the review block names for that lens, on
+     the same head, posting its own report under that lens name; or skip the quick check and use the override below,
+     which adds no round.
    - The rest the orchestrator checks itself from the fix diff and the lenses' proof tests, then posts the override
      comment (`<override prefix> <full sha>: <what was read, why no lens>`, COMMENTS.md). An override covers lens
-     reads; it clears a blocker or major only when its author is in the review block's `override_authors`.
+     reads; it clears a blocker or major, and waives a required approach lens, only when its author is in the review
+     block's `override_authors` (empty by default). An orchestrator's override never replaces the approach lens.
    - A note between rounds that is no lens report starts with `not a lens:` (COMMENTS.md).
    - **No round past the limit.** A pull request still stuck (a blocker or major left) gets one audit by the
      `audit_runner` ("good enough to merge, or what next"), posted as a `not a lens:` comment; then a person decides.
@@ -113,9 +127,8 @@ prompt files:
 test that shows it (red on the head it read) and names it in the finding; the fix makes it green and keeps it. An
 opinion without a test or exact trace is not a finding.
 
-**Twin lenses** (the two independent lenses of a critical change, or a lens the owner asked to run twice with
-`focus: <lens>`) have different names in the review block (`data-1`, `data-2`): the gate counts one name as one lens.
-A `focus:` lens runs twice and first.
+**Twin lenses** (the two independent lenses of a critical change, or a lens the person who decides asks to run twice)
+have different names in the review block (`data-1`, `data-2`): the gate counts one name as one lens.
 
 **Covered:** a lens lists every file and function it read in full; anything not listed counts as not reviewed.
 Every changed file must be in some lens's `covered:` in its final state; a fix round lists the files it changes.
@@ -128,8 +141,8 @@ A lens with no prompt file of its own (the fallback lens `review`) uses this tex
 > full and what they call into. Find bugs at their root: the unhappy branch of every `if`, error paths, empty and
 > bounds, and where else the same pattern occurs. Answer the state question on a `state:` line: _<state question>_
 > Every finding needs file:line and inputs or state leading to the wrong result. Post one comment in the format of
-> §6, the header first. Check it with `review_kit.py check --head <sha>` before posting; never edit a posted comment
-> (post a new one).
+> §6, the header first. Check it with `review_kit.py check --head <sha>` before posting (a blocker or major exits 1 by
+> design: post it as found, never softened); never edit a posted comment (post a new one).
 
 ## 5. Who runs what
 
@@ -165,8 +178,11 @@ Templates in briefs write `<sha>`, never a real one. Check before posting:
 python3 -I fork-kit/review/lib/review_kit.py check --root <checkout> --head <sha> comment.md
 ```
 
-Exit 0 only for a read of that head with a findings section, no blocker or major, and a state line; otherwise it
-prints how the gate reads it. A project may also have a check of the posted comment (who wrote it, edits): run it
-right after posting. A comment is never edited or hidden (an edited or hidden lens comment reads nothing): post a new
-one. A comment the gate reads as `reads nothing` keeps blocking the head even after a new post: delete it, or edit
-its first line to start with `not a lens:` and no line below it to hold `lens:` (COMMENTS.md).
+Exit 0 only for a read of that head with a findings section, no blocker or major, and a state line; otherwise exit 1,
+and it prints how the gate reads it. A report with a real blocker or major exits 1 **by design**: post it when the
+words read `read, blocker, state` or `read, major, state`. Never soften or drop a finding to get exit 0. A project may
+also have a check of the posted comment (who wrote it, edits): run it right after posting. A comment is never edited
+or hidden (an edited or hidden lens comment reads nothing): post a new one. A comment the gate reads as
+`reads nothing` keeps blocking the head even after a new post: delete it, or edit its first line to start with
+`not a lens:`, with no line below it holding `lens:` and no `read at` sha outside a `>` quote (COMMENTS.md, the
+`not a lens:` example).

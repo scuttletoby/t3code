@@ -5,7 +5,7 @@ copy of lib/review_kit.py and shows its test then fails.
 
   python3 -I -B fork-kit/review/tests/comments.test.py
 """
-import os, re, subprocess, sys, tempfile, shutil, types, unittest
+import inspect, json, os, re, subprocess, sys, tempfile, shutil, types, unittest
 
 sys.dont_write_bytecode = True   # the CI runner has no -B; keep the kit folder free of __pycache__
 
@@ -15,6 +15,8 @@ LIB = os.path.join(KIT, 'lib', 'review_kit.py')
 DOC = os.path.join(KIT, 'COMMENTS.md')
 sys.path.insert(0, os.path.join(KIT, 'lib'))
 import review_kit  # noqa: E402
+import review_config  # noqa: E402  (the gate's, on the path review_kit set)
+review_judge = review_kit.review_judge
 
 SHA = '0123456789abcdef0123456789abcdef01234567'
 OTHER = '89abcdef0123456789abcdef0123456789abcdef'
@@ -244,6 +246,12 @@ def kit_text(name):
         return f.read()
 
 
+def recommended():
+    """review.recommended.json through the gate's own parser."""
+    with open(os.path.join(REPO, 'fork-ci', 'actions', 'pr-queue', 'review.recommended.json'), encoding='utf-8') as f:
+        return review_config.parse_review(json.load(f))
+
+
 def templates(text):
     """Every fenced block whose first line is a lens header with a `<placeholder>`: the report shapes the docs tell a
     lens to write (the checked examples of COMMENTS.md hold real shas, so they are not templates)."""
@@ -316,6 +324,71 @@ class SkillFormat(unittest.TestCase):
         for weight, cell in tiers.items():
             with self.subTest(weight=weight):
                 self.assertEqual(int(re.search(r'\*\*(\d+)', cell).group(1)), mins[weight])
+
+    def test_the_skill_runner_text_is_the_kits_default(self):
+        """The tier table's `Opus 5.5 high` and §5's runner defaults are the kit's DEFAULTS, read, not copied."""
+        skill = ' '.join(kit_text('SKILL.md').split())
+        for key in ('runner', 'audit_runner'):
+            r = review_kit.DEFAULTS[key]
+            with self.subTest(setting=key):
+                self.assertIn(f"`{key}` (default `{r['model']}`, effort `{r['effort']}`)", skill)
+        r = review_kit.DEFAULTS['runner']
+        m = re.fullmatch(r'claude-([a-z]+)-(\d+)-(\d+)', r['model'])
+        self.assertTrue(m, f"the default runner {r['model']!r} has no display name rule here")
+        shown = f"{m.group(1).capitalize()} {m.group(2)}.{m.group(3)} {r['effort']}"
+        rows = re.findall(r'^\| (\w+) +\|[^|]*\| ([^|]*)\|\s*$', kit_text('SKILL.md'), re.M)
+        with_lenses = [(w, cell) for w, cell in rows if w in review_config.WEIGHTS and 'lens' in cell]
+        self.assertTrue(with_lenses)
+        for weight, cell in with_lenses:
+            with self.subTest(weight=weight):
+                self.assertIn(shown, cell)
+
+    def test_the_skill_names_the_gates_protected_paths(self):
+        """The skill's always-critical list is the gate's: the config, every lens prompt and the workflows glob, and
+        nothing else (a new kind of protected path in the gate fails here until the skill names it)."""
+        rv = recommended()
+        cfg = '.github/pr-queue.json'
+        self.assertEqual(review_judge.protected_paths(rv, cfg), {cfg, *(x.prompt for x in rv.lenses)})
+        used = set(re.findall(r'\b[A-Z][A-Z_]{2,}\b', inspect.getsource(review_judge.is_protected)))
+        self.assertEqual(used, {'WORKFLOWS'}, 'is_protected reads another list: name it in SKILL.md, "Always critical"')
+        skill = ' '.join(kit_text('SKILL.md').split())
+        line = re.search(r'\*\*Always critical\*\*.*?\.(?= |$)', skill)   # to the sentence's end
+        self.assertTrue(line, 'SKILL.md no longer lists the always-critical paths')
+        for words in ('the queue config file', 'every lens prompt file', f'`{review_judge.WORKFLOWS}`'):
+            with self.subTest(path=words):
+                self.assertIn(words, line.group(0))
+        # the gate really judges them critical, even under a light rule (`**/*.md` is light in the recommended rules)
+        for path in (cfg, rv.lenses[0].prompt, '.github/workflows/ci.yml'):
+            with self.subTest(judged=path):
+                self.assertEqual(review_judge.judge(rv, [('M', (path,))], cfg).weight, 'critical')
+        light = re.search(r'^\| light +\|([^|]*)\|', kit_text('SKILL.md'), re.M).group(1)
+        self.assertNotIn('config', light)
+
+    def test_the_skill_counts_rounds_as_the_gate(self):
+        """A quick check is a lens read of a new head: one more gate round, and from `rounds.approach_at` the approach
+        lens is required unless a listed person decided. The skill names the gate's own round keys and the recommended
+        approach_at as review_config parses it."""
+        rv = recommended()
+        skill = ' '.join(kit_text('SKILL.md').split())
+        for key in review_config.ROUND_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(f'`rounds.{key}`', skill)
+        said = re.search(r'`rounds\.approach_at` of the review block \((\d+) in review\.recommended\.json', skill)
+        self.assertTrue(said, 'SKILL.md no longer says the recommended rounds.approach_at')
+        self.assertEqual(int(said.group(1)), rv.rounds.approach_at)
+        for words in ('the gate counts it as a round', '`override_authors`',
+                      "An orchestrator's override never replaces the approach lens"):
+            with self.subTest(says=words):
+                self.assertIn(words, skill)
+        # the gate's own round count: rounds before the quick check, then the quick check on a new head
+        n = rv.rounds.approach_at
+        history = [('code' if i == 0 else f'code r{i + 1}', f'{i:040x}') for i in range(n - 1)]
+        before = review_judge.judge_rounds(rv, history, {})
+        self.assertEqual((before.round, before.approach), (n - 1, False))
+        history.append(('quick-check', f'{n:040x}'))
+        after = review_judge.judge_rounds(rv, history, {})
+        self.assertEqual((after.round, after.approach), (n, True))
+        self.assertFalse(review_judge.judge_rounds(rv, history, {}, decided=True).approach)
 
 
 class RedCheck(unittest.TestCase):
