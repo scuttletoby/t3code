@@ -112,9 +112,9 @@ why it ended and its last round. A thread has at most one session that is not en
 
 ## The `playtest` tool
 
-An agent runs its session with one T3 tool, `playtest`, in the `waits` tool group. It acts on the
-calling thread's own session only: the thread comes from the agent's T3 credential, and the tool
-takes no thread and no setting.
+An agent runs its session with one T3 tool, `playtest`, in a tool group of its own, `playtest` (a
+profile that keeps `waits` does not get it). It acts on the calling thread's own session only: the
+thread comes from the agent's T3 credential, and the tool takes no thread and no setting.
 
 | `action` | What it does                                                                                     |
 | -------- | ------------------------------------------------------------------------------------------------ |
@@ -125,8 +125,11 @@ takes no thread and no setting.
 
 The answer names what happened and what to do next. Refusals are plain: playtest off ("only a
 person can switch it on in the settings"), busy (a round runs: wait for it, or end the session),
-no session (start one), a thread that is gone. An outside MCP client (not in a T3 thread) is not
-offered the tool; a read-only client cannot use it.
+no session (start one), a thread that is gone. `start` and `push` need a full-access thread not in
+plan mode, by the thread's modes as T3 records them at each call (they run the person's steps
+outside the thread's sandbox, without an approval); any other thread is refused with what to do.
+`status` and `end` work in every thread, so a restricted thread can still release its target. An
+outside MCP client (not in a T3 thread) is not offered the tool; a read-only client cannot use it.
 
 ## The worker
 

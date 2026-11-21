@@ -4,7 +4,12 @@
  * tests show the tool reaches them for the calling thread only and says the answer plainly.
  */
 import { assert, describe, expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  type ProviderInteractionMode,
+  ProviderInstanceId,
+  type RuntimeMode,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -69,8 +74,17 @@ const client = McpSchema.McpServerClient.of({
   getClient: Effect.die("unused"),
 });
 
+/** The calling thread's modes as the server records them; a test may change them between calls. */
+type Modes = {
+  runtimeMode: RuntimeMode;
+  interactionMode: ProviderInteractionMode;
+};
+
 /** The fork's tools as the server registers them, with this playtest service behind them. */
-const toolsLayer = (service: PlaytestService.PlaytestService) =>
+const toolsLayer = (
+  service: PlaytestService.PlaytestService,
+  modes: Modes = { runtimeMode: "full-access", interactionMode: "default" },
+) =>
   McpHttpServer.layerForkTools.pipe(
     Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
     Layer.provideMerge(
@@ -78,7 +92,7 @@ const toolsLayer = (service: PlaytestService.PlaytestService) =>
         ServerSettingsService.layerTest({}),
         Layer.mock(ThreadManagement.ThreadManagementService)({
           getThreadShell: (threadId) =>
-            Effect.succeed(McpToolAccessTestkit.liveThreadShell(threadId)),
+            Effect.sync(() => McpToolAccessTestkit.liveThreadShell(threadId, { ...modes })),
         }),
         // The other fork tools' services; these tests never call them.
         Layer.mock(Waits)({}),
@@ -317,8 +331,17 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("playtest tool"
         yield* Effect.gen(function* () {
           // The thread is the credential's; the tool does not take one.
           for (const extra of [{ threadId: OTHER_THREAD }, { thread: OTHER_THREAD }]) {
-            for (const action of ["status", "push", "end"]) {
-              assert.include(yield* refused({ action, ...extra }), "Unknown argument", action);
+            for (const args of [
+              { action: "start", target: "dev-1" },
+              { action: "status" },
+              { action: "push" },
+              { action: "end" },
+            ]) {
+              assert.include(
+                yield* refused({ ...args, ...extra }),
+                "Unknown argument",
+                args.action,
+              );
             }
           }
           // The caller sees only its own (none); the other thread's session is untouched.
@@ -428,6 +451,125 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("playtest tool"
         }).pipe(Effect.provide(toolsLayer(service)));
         assert.deepStrictEqual(yield* ran(dir), []);
         assert.isFalse(yield* (yield* FileSystem.FileSystem).exists(fx.filePath));
+      }),
+    ),
+  );
+  // The thread's modes as the server records them: only full-access, not in plan mode, may start or
+  // push. Each row starts a session as full-access, then the thread switches to the row's modes.
+  it.live.each([
+    { runtimeMode: "full-access", interactionMode: "default", allowed: true },
+    { runtimeMode: "approval-required", interactionMode: "default", allowed: false },
+    { runtimeMode: "auto-accept-edits", interactionMode: "default", allowed: false },
+    { runtimeMode: "full-access", interactionMode: "plan", allowed: false },
+  ] as const)(
+    "$runtimeMode/$interactionMode: start and push allowed: $allowed; status and end work",
+    (row) =>
+      live(
+        Effect.gen(function* () {
+          const fx = yield* fixture;
+          const dir = yield* fx.adapterDir("a");
+          const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)));
+          const modes: Modes = { runtimeMode: "full-access", interactionMode: "default" };
+          yield* Effect.gen(function* () {
+            const id = succeeded(yield* call({ action: "start", target: "dev-1" })).session?.id;
+            modes.runtimeMode = row.runtimeMode;
+            modes.interactionMode = row.interactionMode;
+
+            const start = yield* call({ action: "start", target: "dev-1" });
+            const push = yield* call({ action: "push" });
+            if (row.allowed) {
+              expect(succeeded(start)).toMatchObject({ outcome: "already-on" });
+              expect(succeeded(push)).toMatchObject({ outcome: "done" });
+            } else {
+              for (const result of [start, push]) {
+                expect(failed(result)).toMatchObject({
+                  code: "capability_denied",
+                  message: expect.stringContaining(
+                    "Only a full-access thread, not in plan mode, can start or push a playtest; ask the owner",
+                  ),
+                });
+              }
+            }
+            expect(succeeded(yield* call({ action: "status" }))).toMatchObject({
+              outcome: "on",
+              session: { id, rounds: row.allowed ? 1 : 0 },
+            });
+            expect(succeeded(yield* call({ action: "end" }))).toMatchObject({
+              outcome: "ended",
+              session: { id, state: "ended" },
+            });
+            // With no session on, a start is refused the same way and claims nothing.
+            const again = yield* call({ action: "start", target: "dev-1" });
+            if (row.allowed) expect(succeeded(again)).toMatchObject({ outcome: "started" });
+            else expect(failed(again)).toMatchObject({ code: "capability_denied" });
+          }).pipe(Effect.provide(toolsLayer(service, modes)));
+          const steps = yield* stepsRan(dir);
+          assert.deepStrictEqual(
+            steps.filter((step) => !step.startsWith("release")),
+            row.allowed ? ["claim:0", "build:1", "deploy:1", "claim:0"] : ["claim:0"],
+          );
+        }),
+      ),
+  );
+
+  it.live("a thread switched between start and push is checked again on each call", () =>
+    live(
+      Effect.gen(function* () {
+        const fx = yield* fixture;
+        const dir = yield* fx.adapterDir("a");
+        const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)));
+        const modes: Modes = { runtimeMode: "full-access", interactionMode: "default" };
+        yield* Effect.gen(function* () {
+          succeeded(yield* call({ action: "start", target: "dev-1" }));
+          modes.runtimeMode = "approval-required";
+          expect(failed(yield* call({ action: "push" }))).toMatchObject({
+            code: "capability_denied",
+          });
+          // Switched back: the next push runs.
+          modes.runtimeMode = "full-access";
+          expect(succeeded(yield* call({ action: "push" }))).toMatchObject({
+            outcome: "done",
+            session: { rounds: 1 },
+          });
+          modes.interactionMode = "plan";
+          expect(failed(yield* call({ action: "push" }))).toMatchObject({
+            code: "capability_denied",
+          });
+          // A restricted thread can still release its target.
+          expect(succeeded(yield* call({ action: "end" }))).toMatchObject({ outcome: "ended" });
+        }).pipe(Effect.provide(toolsLayer(service, modes)));
+        assert.deepStrictEqual(yield* stepsRan(dir), [
+          "claim:0",
+          "build:1",
+          "deploy:1",
+          "release:1",
+        ]);
+      }),
+    ),
+  );
+
+  it.live("status says to call end for a claim cut off by a stop or a release not yet done", () =>
+    live(
+      Effect.gen(function* () {
+        const fx = yield* fixture;
+        const dir = yield* fx.adapterDir("a");
+        for (const [state, text] of [
+          ["claiming", "did not finish (T3 stopped); call end to release it."],
+          ["ending", "its release has not worked yet; T3 tries again, or call end again."],
+        ] as const) {
+          yield* writeStore(fx, [
+            storedSession(fx, dir, state === "ending" ? { state, endReason: "agent" } : { state }),
+          ]);
+          const service = yield* makeService(fx, yield* settingsWith(adapter(fx, dir)));
+          yield* Effect.gen(function* () {
+            const status = succeeded(yield* call({ action: "status" }));
+            expect(status).toMatchObject({ outcome: "on", session: { state } });
+            assert.notProperty(status.session, "running");
+            assert.include(status.message, text, state);
+          }).pipe(Effect.provide(toolsLayer(service)));
+        }
+        // Status runs no step.
+        assert.deepStrictEqual(yield* ran(dir), []);
       }),
     ),
   );

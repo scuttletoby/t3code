@@ -22,6 +22,7 @@ import { withoutMachineOnlyFields } from "./advertisedMachineFields.ts";
 import {
   MCP_T3_TOOLKIT_GROUPS,
   MCP_T3_TOOL_NOT_ALLOWED,
+  MCP_T3_TOOL_OWN_GROUPS,
   MCP_T3_UNGROUPED_TOOL_KITS,
   mcpT3ToolGroup,
 } from "./mcpProfile.ts";
@@ -281,6 +282,33 @@ describe("MCP profile T3 tool groups", () => {
       expect(toolsByFolder.get(toolkit)?.has(tool), `${toolkit} has ${tool}`).toBe(true);
       expect(mcpT3ToolGroup(toolkit, tool)).toBe("ungrouped");
     }
+  });
+
+  it("puts every T3 tool in exactly one known group, and playtest alone in its own", () => {
+    const known: ReadonlyArray<string> = [...MCP_T3_TOOL_GROUPS, "ungrouped"];
+    const members = new Map<string, Array<string>>();
+    for (const [folder, names] of toolsByFolder) {
+      for (const name of names) {
+        const group = mcpT3ToolGroup(folder, name);
+        expect(known, `${folder}/${name} -> ${group}`).toContain(group);
+        members.set(group, [...(members.get(group) ?? []), `${folder}/${name}`]);
+      }
+    }
+    // A profile that keeps waits (to wait and list tasks) does not get the playtest tool.
+    expect(members.get("playtest")).toEqual(["waits/playtest"]);
+    expect(members.get("waits")).not.toContain("waits/playtest");
+  });
+
+  it("pins each own-group tool to the toolkit that has it", () => {
+    for (const [tool, { toolkit, group }] of Object.entries(MCP_T3_TOOL_OWN_GROUPS)) {
+      expect(toolsByFolder.get(toolkit)?.has(tool), `${toolkit} has ${tool}`).toBe(true);
+      expect(MCP_T3_UNGROUPED_TOOLS).not.toContain(tool);
+      expect(mcpT3ToolGroup(toolkit, tool)).toBe(group);
+    }
+    // The toolkit's other tools keep its group; the same name in another toolkit is that one's.
+    expect(mcpT3ToolGroup("waits", "wait_for")).toBe("waits");
+    expect(mcpT3ToolGroup("thread", "playtest")).toBe("threads");
+    expect(mcpT3ToolGroup("message", "playtest")).toBe(MCP_T3_TOOL_NOT_ALLOWED);
   });
 
   it("does not take an ungrouped tool's name in another toolkit as ungrouped", () => {

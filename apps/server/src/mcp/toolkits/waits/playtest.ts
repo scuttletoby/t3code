@@ -5,7 +5,6 @@
  * credential; the tool takes no thread, so an agent never reaches another thread's session.
  */
 import {
-  OrchestratorMcpFailure,
   type PlaytestSessionView,
   type PlaytestToolAction,
   type PlaytestToolInput,
@@ -15,20 +14,22 @@ import {
 import * as Effect from "effect/Effect";
 
 import { Playtest } from "../../../playtest/PlaytestLayer.ts";
-import { loadCaller } from "../../threadAccess.ts";
+import { assertFullAccess } from "../../threadAccess.ts";
+import { callingThread as threadOfCaller } from "./callingThread.ts";
 
 /** Who calls: the server's record of the thread the credential names, never tool input. */
-const callingThread = Effect.gen(function* () {
-  const { caller } = yield* loadCaller();
-  if (caller === undefined) {
-    return yield* new OrchestratorMcpFailure({
-      code: "capability_denied",
-      message:
-        "A playtest session belongs to a thread. This MCP client is not running inside a T3 thread.",
-    });
-  }
-  return caller.id;
-});
+const callingThread = () =>
+  threadOfCaller(
+    "A playtest session belongs to a thread. This MCP client is not running inside a T3 thread.",
+  );
+
+/**
+ * `start` and `push` run the person's steps outside the thread's sandbox, so they need a full-access
+ * thread not in plan mode, by its modes as the server records them at this call. `status` and `end`
+ * stay open, so a restricted thread can still release its target.
+ */
+const fullAccessNeeded =
+  "Only a full-access thread, not in plan mode, can start or push a playtest; ask the owner to run it from such a thread.";
 
 const roundText = (session: PlaytestSessionView) => {
   const round = session.lastRound;
@@ -70,6 +71,13 @@ function playtestMessage(
     case "done":
       return `${roundText(session)}. The person can try it now.`;
     case "on": {
+      // Nothing runs for a claim or an end: T3 stopped during the claim, or the release failed.
+      if (session.running === undefined && session.state === "claiming") {
+        return `The claim of ${name} did not finish (T3 stopped); call end to release it.${problem}`;
+      }
+      if (session.running === undefined && session.state === "ending") {
+        return `Playtest of ${name} is ending, but its release has not worked yet; T3 tries again, or call end again.${problem}`;
+      }
       const running = session.running === undefined ? "" : ` A ${session.running} step runs now.`;
       const round = session.lastRound === undefined ? " No round yet." : ` ${roundText(session)}.`;
       return `Playtest of ${name} is ${session.state}.${round}${running}`;
@@ -100,10 +108,12 @@ const answer = (
 });
 
 export const playtestCall = Effect.fn("playtest.call")(function* (input: PlaytestToolInput) {
-  const threadId = yield* callingThread;
+  const caller = yield* callingThread();
+  const threadId = caller.caller.id;
   const playtest = yield* Playtest;
   switch (input.action) {
     case "start": {
+      yield* assertFullAccess(caller, fullAccessNeeded);
       const { outcome, session } = yield* playtest.start({
         threadId,
         target: input.target ?? "",
@@ -112,6 +122,7 @@ export const playtestCall = Effect.fn("playtest.call")(function* (input: Playtes
       return answer("start", outcome, session);
     }
     case "push": {
+      yield* assertFullAccess(caller, fullAccessNeeded);
       const { outcome, session } = yield* playtest.push({ threadId });
       return answer("push", outcome, session);
     }

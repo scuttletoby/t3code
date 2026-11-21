@@ -249,7 +249,7 @@ T3 runs the project's adapter, four kinds of step only the person sets: `claim` 
 `renew` keeps the claim alive, `push` (one or more named steps) sends a round to the target, and
 `release` puts the target back. Each step is a program given by its absolute path with fixed
 arguments, run without a shell; T3 passes the session's facts as environment variables. An agent
-starts, pushes, checks and ends its thread's session with the `playtest` tool (group `waits`); the
+starts, pushes, checks and ends its thread's session with the `playtest` tool (its own tool group, `playtest`); the
 thread controls come in a later pull request. The steps' contract and the tool are in
 [playtest.md](playtest.md).
 
