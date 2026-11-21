@@ -229,6 +229,11 @@ describe("reminder ids", () => {
     expect(
       legacyReminderKeys(PARENT, old.messageId, old.text.replace(/\n- t-09 [^\n]*/, "")),
     ).toEqual([]);
+    // Over ten there is no digest to match (it covers the unnamed rest too), so only this
+    // parent's own first-format id counts: another parent's, or a per-task id, gives nothing.
+    expect(legacyReminderKeys(ThreadId.make("other"), old.messageId, old.text)).toEqual([]);
+    const perTask = reminderBatchIds(PARENT, ids("t-00"));
+    expect(legacyReminderKeys(PARENT, perTask.messageId, old.text)).toEqual([]);
   });
 
   it("finds this parent's first-format ids, from messages and receipts", () => {
