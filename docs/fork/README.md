@@ -947,9 +947,10 @@ settings apply as they are), `handoff` (upstream's idle compaction then skips th
 only the handoff acts on it), or `compact` (the same as `off`, so one thread can opt out
 of its project's `handoff`). `threads` maps a thread id to a mode and wins over `mode` (at most
 500). `source` says who writes the handoff: `agent` (the old session, in one turn; `instructions`
-replaces the built-in text) or `command` (a program given as `command`, run without a shell; it
-must only read). Neither source writes a handoff yet; until they do, every handoff uses T3's state
-and the recent conversation only, and `source` sets only how early the idle handoff starts. `sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
+replaces the built-in text) or `command` (a program given as `command`, run without a shell in the
+project folder; it must only read and be safe to run twice; its output is the handoff). The `agent`
+source does not write a handoff yet; until it does, its handoffs use T3's state and the recent
+conversation only. `sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
 smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
 model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
