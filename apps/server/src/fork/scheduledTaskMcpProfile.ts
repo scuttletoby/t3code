@@ -436,10 +436,10 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
     }
     // Changed since its record (a save stopped half-way, two saves at once): writer not known.
     if (savedBy.digest !== savedDigest(task)) {
-      // Unless this copy is the stale one: a run holds the task as it read it (a run whose read a
-      // save overtook; a webhook delivery that waited for a slot is read again after a save, in
-      // `agentSlotRoutes.ts`), and a save since then wrote the row and its record. That run would use the old copy, so it is not started. Only
-      // for this same task (`created_at`): one deleted and made again under its id is not "saved".
+      // Unless this copy is the stale one (a run whose read a save overtook; a waiting webhook
+      // delivery is read again after a save, `agentSlotRoutes.ts`): a save since wrote the row and
+      // its record, and the run would use the old copy. Only for this same task (`created_at`):
+      // one deleted and made again under its id is not "saved".
       const [current] = yield* sql<{ prompt: string; project_id: string; created_at: string }>`
         SELECT prompt, project_id, created_at FROM scheduled_tasks WHERE task_id = ${task.id}
       `.pipe(Effect.orElseSucceed(() => []));
