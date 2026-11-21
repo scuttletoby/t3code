@@ -333,7 +333,7 @@ describe("placementNeeds", () => {
     const held: ServerSettings["placementNeeds"] = decodeSettings({
       placementNeeds: "gpu",
     }).placementNeeds;
-    const part: Partial<ServerSettings> = { placementNeeds: held };
+    const part: Pick<ServerSettings, "placementNeeds"> = { placementNeeds: held };
     const patch: ServerSettingsPatch = part;
     expect(patch.placementNeeds).toEqual(held);
   });
