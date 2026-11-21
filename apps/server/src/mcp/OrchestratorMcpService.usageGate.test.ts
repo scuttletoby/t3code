@@ -660,17 +660,20 @@ describe("OrchestratorMcpService usage pacing gate", () => {
     }),
   );
 
-  it.effect("settings that cannot be read count as off: the task runs as asked", () =>
+  // The pacer never reads a pace then: the model policy, which cannot be checked either, refuses
+  // first (fail closed, fork/modelPolicyCheck.ts), and nothing is dispatched.
+  it.effect("settings that cannot be read: the model policy refuses before the pacer reads", () =>
     Effect.gen(function* () {
       const { result, dispatched } = yield* delegate({
         providers: [main(100), second(10)],
         pacer: "untouched",
         settingsUnreadable: true,
       });
-      assert.isTrue(result._tag === "Success");
-      if (result._tag !== "Success") return;
-      assert.isUndefined(result.success.usagePacingNote);
-      assert.deepStrictEqual(dispatched[0]?.modelSelection, { instanceId: MAIN, model: MODEL });
+      assert.isTrue(result._tag === "Failure");
+      if (result._tag !== "Failure") return;
+      assert.strictEqual(result.failure.code, "model_unavailable");
+      assert.include(result.failure.message, "the server settings cannot be read");
+      assert.deepStrictEqual(dispatched, []);
     }),
   );
 
@@ -700,6 +703,43 @@ describe("OrchestratorMcpService usage pacing gate", () => {
       assert.isTrue(full.result._tag === "Failure");
       assert.deepStrictEqual(full.dispatched, []);
     }),
+  );
+
+  // The model policy checks what runs, too: the agent asked for an effort its row allows, and the
+  // pacer would lower it to one the row does not (fork/delegateChecks.ts).
+  it.effect(
+    "enforce, over the even pace: an effort the pacer lowers off the policy's row is refused",
+    () =>
+      Effect.gen(function* () {
+        const row = { driver: "codex", model: MODEL, efforts: ["high"], defaultEffort: "high" };
+        const target = { model: MODEL, options: [{ id: "reasoningEffort", value: "high" }] };
+        const lowered = yield* delegate({
+          settings: {
+            ...enforce,
+            usagePacingLowerEffort: { high: "medium" },
+            modelPolicy: { mode: "enforce", allow: [row] },
+          } as never,
+          providers: [main(60)],
+          target: target as never,
+        });
+        assert.isTrue(lowered.result._tag === "Failure");
+        if (lowered.result._tag !== "Failure") return;
+        assert.include(lowered.result.failure.message, `${MODEL} does not allow effort medium`);
+        assert.deepStrictEqual(lowered.dispatched, []);
+        // With the lower level in the row it runs there; under the pace it runs as asked.
+        const allowed = yield* delegate({
+          settings: {
+            ...enforce,
+            usagePacingLowerEffort: { high: "medium" },
+            modelPolicy: { mode: "enforce", allow: [{ ...row, efforts: ["medium", "high"] }] },
+          } as never,
+          providers: [main(60)],
+          target: target as never,
+        });
+        assert.deepStrictEqual(allowed.dispatched[0]?.modelSelection.options, [
+          { id: "reasoningEffort", value: "medium" },
+        ]);
+      }),
   );
 
   it.effect("enforce, unknown pace: the task runs as asked, with a note", () =>

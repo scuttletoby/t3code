@@ -68,6 +68,8 @@ const callerShell = (): OrchestrationV2ThreadShell =>
     archivedAt: null,
     activeRunId: "run:1",
     providerInstanceId: INSTANCE,
+    // What a launch that names no model inherits (the model policy's no-model test).
+    modelSelection: { instanceId: INSTANCE, model: "claude-opus" },
   }) as unknown as OrchestrationV2ThreadShell;
 
 /**
@@ -185,6 +187,8 @@ const harness = (
     readonly clientRequestId?: string | undefined;
     /** `null`: a launch without a message, which starts no run. */
     readonly message?: string | null;
+    /** The launch's model; `null` names none (it inherits the caller's). */
+    readonly modelSelection?: Record<string, unknown> | null;
   }) =>
     Effect.gen(function* () {
       const toolkit = yield* ProjectToolkit.pipe(
@@ -199,7 +203,14 @@ const harness = (
           title: "Launched",
           projectId: input.projectId ?? PROJECT,
           ...(input.message === null ? {} : { message: input.message ?? "Do the work" }),
-          modelSelection: { instanceId: INSTANCE, model: "claude-opus" },
+          ...(input.modelSelection === null
+            ? {}
+            : {
+                modelSelection: input.modelSelection ?? {
+                  instanceId: INSTANCE,
+                  model: "claude-opus",
+                },
+              }),
           ...(input.environmentId === undefined ? {} : { environmentId: input.environmentId }),
           ...(input.clientRequestId === undefined
             ? {}
@@ -511,6 +522,72 @@ describe("t3_thread_launch through the agent slot gate (#706)", () => {
       expect(forwarded).toHaveLength(1);
       expect(launched).toHaveLength(0);
       expect(slots.reads).toBe(0);
+    }),
+  );
+});
+
+describe("the model policy on t3_thread_launch (#731)", () => {
+  const ROW = {
+    driver: "claudeAgent",
+    model: "claude-opus",
+    efforts: ["high"],
+    defaultEffort: "high",
+  };
+  const policy = (mode: string, allow: ReadonlyArray<unknown> = [ROW]) =>
+    ({ modelPolicy: { mode, allow } }) as Settings;
+  const opus = (effort?: string) => ({
+    instanceId: INSTANCE,
+    model: "claude-opus",
+    ...(effort === undefined ? {} : { options: [{ id: "effort", value: effort }] }),
+  });
+
+  it.effect("enforce: an agent's launch off the rows, or naming no model, starts nothing", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce"));
+      const cases = [
+        [null, "the call names no model"],
+        [{ instanceId: INSTANCE, model: "claude-other" }, "claude-other is in no row"],
+        [opus("max"), "claude-opus does not allow effort max"],
+        [opus(), "claude-opus needs an effort from its row"],
+      ] as const;
+      for (const [modelSelection, why] of cases) {
+        const message = refusal(yield* launch({ modelSelection }));
+        expect(message).toContain(`model_unavailable: Model policy refused this pick: ${why}`);
+        expect(message).toContain("modelSelection.model");
+        // Runs again: refused again.
+        expect(refusal(yield* launch({ modelSelection, clientRequestId: "again" }))).toContain(why);
+      }
+      expect(launched).toHaveLength(0);
+      expect(refusal(yield* launch({ modelSelection: opus("high") }))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("empty state: enforce with no rows refuses every agent launch", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce", []));
+      expect(refusal(yield* launch({ modelSelection: opus("high") }))).toContain(
+        "the policy has no rows",
+      );
+      expect(launched).toHaveLength(0);
+    }),
+  );
+
+  it.effect("agents only: the owner's client launches any model (#125)", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce", []), { caller: false });
+      expect(refusal(yield* launch({ modelSelection: opus("max") }))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("advise and off: the launch starts as asked", () =>
+    Effect.gen(function* () {
+      for (const mode of ["advise", "off"]) {
+        const { launched, launch } = harness(policy(mode));
+        expect(refusal(yield* launch({ modelSelection: null }))).toBeUndefined();
+        expect(launched).toHaveLength(1);
+      }
     }),
   );
 });

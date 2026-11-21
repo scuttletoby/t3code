@@ -323,24 +323,42 @@ Which models (and efforts) agents may pick, per provider driver. `mode` is `off`
 model, as upstream's do), `advise` (agents are only told) or `enforce` (a pick off the list is
 refused). Each `allow` row names a `driver` and a `model`; `efforts` (non-empty) limits the efforts
 for that model, and a row without it checks only the model. `defaultEffort` must be one of the
-row's `efforts`; `useFor` is a short note shown to agents when they pick. The check comes in a later
-pull request. Today the server reads only whether the policy is on (`advise` or `enforce`): then a
-child that `delegate_task` (here or on a linked machine) or `create_threads` starts with a call that
-names its model keeps only the options the call names, none of its parent's others (an agent, a
-session mode, a service tier, an effort). With `off` it keeps upstream's way: a call that names the
-parent's model takes the parent's options under its own.
+row's `efforts`; `useFor` is a short note shown to agents when they pick.
+
+The server checks each agent pick (#731; agents only, #125): `delegate_task` (here, and before a
+task is sent to a linked machine), `create_threads`, `t3_thread_launch` and `t3_thread_configure`
+from an agent's thread. A pick is inside when it names a model (#128) that a row of its provider's
+driver lists (#127) and, for a row with `efforts`, names one of them (`ultracode` counts as its own
+effort; a row without `efforts` allows none). Without a known driver (a task for a linked machine),
+every row naming the model must allow it. In `enforce` a pick outside is refused with the rows; in
+`advise` it runs, and `delegate_task`'s reply says what `enforce` would refuse (the other routes
+only log it). A pick inside gets its row's `useFor` in `delegate_task`'s reply. Each checked pick is
+logged as "model policy pick" with its model, so one model's picks can be counted. A retry of an
+accepted call is not checked again (it starts nothing new); the target the usage pacer moves a task
+to is checked too. The owner's own picks (in the app, or `t3_thread_launch` from the owner's client)
+are never refused; Settings marks the server's model picks outside the rows ("outside policy").
+
+While the policy is on, a child that `delegate_task` (here or on a linked machine) or
+`create_threads` starts with a call that names its model also keeps only the options the call names,
+none of its parent's others (an agent, a session mode, a service tier, an effort). With `off` it
+keeps upstream's way: a call that names the parent's model takes the parent's options under its own.
 
 Only the person can change it; agents cannot. A save must give both `mode` and `allow` (it replaces
 the stored value whole) and is refused for a bad row, a `defaultEffort` not in its row's `efforts`,
 or an unknown key such as a misspelt `effort`. A hand-edited value that is not valid, an unknown key
-included, reads as `enforce` with nothing allowed (with a warning in the server log); it is kept as
-written, and saves of other settings write it back unchanged until the person saves this setting.
+included, reads as `enforce` with nothing allowed (with a warning in the server log): every agent pick
+is refused, unless the value's own text names the mode `advise`, which only warns. Settings that
+cannot be read at all refuse every agent pick too. The value is kept as written, and saves of other
+settings write it back unchanged until the person saves this setting.
 
 In the app: **Settings → Fork**, section Model policy (server only; a project cannot override it): the
 mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a save is. An unreadable
 value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
 then starts from the value's own rows and saves only once the person picks the mode, so a save never
-turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged.
+turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged. With no
+rows saved, **Edit allowed models** starts from the fork's start rows (#126: `claude-opus-5-5` and
+`claude-fable-5-2`, each `medium`, `high` or `xhigh`, default `high`), saved only when the person
+saves them; they are not the setting's default, so a file without rows keeps meaning none.
 
 ```json
 {

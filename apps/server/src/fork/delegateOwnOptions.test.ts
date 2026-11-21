@@ -224,10 +224,24 @@ interface Launch {
   /** More settings (the MCP profile keys); the calls are then let fail into `refusals`. */
   readonly settings?: Record<string, unknown>;
   readonly refusals?: Array<string>;
+  /** Each call's reply, when it is not refused. */
+  readonly replies?: Array<unknown>;
 }
 
+/**
+ * The settings, with a model policy in `policy`. Its rows allow each setup's model with no effort
+ * named (a row without efforts), so the policy's check passes and these tests see only the options
+ * rule; `modelPolicyCheck.test.ts` tests the check.
+ */
+const ALLOW_EACH_MODEL = [OPENCODE, CODEX, ACP, CLAUDE].map((setup) => ({
+  driver: setup.driver,
+  model: setup.model,
+}));
 const settingsWith = (policy: Launch["policy"] = "advise", more: Record<string, unknown> = {}) =>
-  ServerSettings.layerTest({ modelPolicy: { mode: policy }, ...more } as never);
+  ServerSettings.layerTest({
+    modelPolicy: { mode: policy, allow: ALLOW_EACH_MODEL },
+    ...more,
+  } as never);
 
 /** The model selection each dispatch carried, for one tool on one service. */
 const launch = (tool: Tool, input: Launch) =>
@@ -328,10 +342,13 @@ const launch = (tool: Tool, input: Launch) =>
           const stopped = yield* Effect.exit(call(clientRequestId));
           assert.strictEqual(stopped._tag, "Failure", "the first dispatch stops the call");
         }
-        const { refusals } = input;
-        if (refusals === undefined) yield* call(clientRequestId);
+        const { refusals, replies } = input;
+        const answered = call(clientRequestId).pipe(
+          Effect.tap((reply) => Effect.sync(() => replies?.push(reply))),
+        );
+        if (refusals === undefined) yield* answered;
         else
-          yield* call(clientRequestId).pipe(
+          yield* answered.pipe(
             Effect.catch((failure) =>
               Effect.sync(() => refusals.push(`${failure.code}: ${failure.message}`)),
             ),
@@ -551,6 +568,35 @@ describe("a child's own options, remote delegate_task", () => {
     }),
   );
 
+  it.effect("enforce: a remote pick outside the rows, or naming no model, is never sent", () =>
+    Effect.gen(function* () {
+      // Its row allows big-pickle with no effort; the linked machine's driver is not known here.
+      assert.deepStrictEqual(yield* sentTarget({ model: "other-model" }, "enforce"), []);
+      assert.deepStrictEqual(yield* sentTarget({ providerInstanceId: "opencode" }, "enforce"), []);
+      // Known gap: with no driver known here, OpenCode's own effort id (variant) is not read as
+      // an effort, so a row without efforts lets it through; a row with efforts would refuse it.
+      assert.lengthOf(
+        yield* sentTarget({ model: OPENCODE.model, options: { variant: "low" } }, "enforce"),
+        1,
+      );
+      assert.deepStrictEqual(
+        yield* sentTarget(
+          { driverKind: "opencode", model: OPENCODE.model, options: { variant: "low" } },
+          "enforce",
+        ),
+        [],
+        "named with its driver, the variant is its effort, which its row does not allow",
+      );
+      assert.deepStrictEqual(yield* sentTarget({ model: OPENCODE.model }, "enforce"), [
+        { environmentId: box, model: OPENCODE.model, options: [] },
+      ]);
+      // Advise: sent as asked.
+      assert.deepStrictEqual(yield* sentTarget({ model: "other-model" }, "advise"), [
+        { environmentId: box, model: "other-model", options: [] },
+      ]);
+    }),
+  );
+
   /** What the launch on the linked machine carried, through the real remote delegation. */
   const launchedThere = (target: Record<string, unknown>) =>
     Effect.scoped(
@@ -736,6 +782,159 @@ describe("create_threads keeps the caller's MCP profile (#681)", () => {
         refusals[0],
         "invalid_request: The new thread's MCP profile cannot be worked out",
       );
+    }),
+  );
+});
+
+describe("the model policy's check on delegate_task and create_threads (#731)", () => {
+  /** The rows for these tests: the Claude setup's model at effort high only. */
+  const rows = (allow: ReadonlyArray<unknown> = [ROW]) => ({
+    modelPolicy: { mode: "enforce", allow },
+  });
+  const ROW = {
+    driver: "claudeAgent",
+    model: CLAUDE.model,
+    efforts: ["high"],
+    defaultEffort: "high",
+    useFor: "the work in these tests",
+  };
+  const named = (effort: string) => ({ model: CLAUDE.model, options: { effort } });
+  /** Each tool's dispatches and refusals for one call (or `times` calls). */
+  const tryBoth = (input: Omit<Launch, "setup" | "refusals">) =>
+    Effect.forEach(TOOLS, (tool) =>
+      Effect.gen(function* () {
+        const refusals: Array<string> = [];
+        const replies: Array<unknown> = [];
+        const made = yield* launch(tool, { setup: CLAUDE, ...input, refusals, replies });
+        return { tool, made, refusals, replies };
+      }),
+    );
+
+  it.effect("enforce: an allowed pick runs, with its row's note in delegate_task's reply", () =>
+    Effect.gen(function* () {
+      for (const { tool, made, refusals, replies } of yield* tryBoth({
+        settings: rows(),
+        target: named("high"),
+      })) {
+        assert.deepStrictEqual(refusals, [], tool);
+        assert.deepStrictEqual(made, [
+          {
+            instanceId: instanceOf(CLAUDE),
+            model: CLAUDE.model,
+            options: [{ id: "effort", value: "high" }],
+          },
+        ]);
+        if (tool === "delegate_task") {
+          assert.include(
+            (replies[0] as { readonly usagePacingNote?: string }).usagePacingNote,
+            `Model policy: ${CLAUDE.model} is for the work in these tests.`,
+          );
+        }
+      }
+    }),
+  );
+
+  it.effect(
+    "enforce: no model (#128), a model in no row (#127), an effort off the row: refused",
+    () =>
+      Effect.gen(function* () {
+        const cases = [
+          [{}, "the call names no model"],
+          [{ providerInstanceId: CLAUDE.driver }, "the call names no model"],
+          [{ model: "other-model" }, "other-model (claudeAgent) is in no row"],
+          [named("xhigh"), `${CLAUDE.model} does not allow effort xhigh`],
+          [
+            { model: CLAUDE.model },
+            `${CLAUDE.model} needs an effort from its row, and the pick names none`,
+          ],
+          [named("ultracode"), `${CLAUDE.model} does not allow effort ultracode`],
+        ] as const;
+        for (const [target, why] of cases) {
+          // Runs again: the same call twice is refused twice, and nothing is dispatched.
+          for (const { tool, made, refusals } of yield* tryBoth({
+            settings: rows(),
+            target,
+            times: 2,
+          })) {
+            assert.deepStrictEqual(made, [], `${tool}: ${why}`);
+            assert.lengthOf(refusals, 2, `${tool}: ${why}`);
+            for (const refused of refusals) {
+              assert.include(refused, `model_unavailable: Model policy refused this pick: ${why}.`);
+              assert.include(
+                refused,
+                `Allowed: claudeAgent ${CLAUDE.model} (efforts high; default high).`,
+              );
+            }
+          }
+        }
+      }),
+  );
+
+  it.effect("empty state: enforce with no rows refuses every pick", () =>
+    Effect.gen(function* () {
+      for (const { made, refusals } of yield* tryBoth({
+        settings: rows([]),
+        target: named("high"),
+      })) {
+        assert.deepStrictEqual(made, []);
+        assert.include(refusals[0], "Allowed: none: the policy has no rows");
+      }
+    }),
+  );
+
+  it.effect("advise: a pick outside runs as asked, and delegate_task's reply says so", () =>
+    Effect.gen(function* () {
+      for (const { tool, made, refusals, replies } of yield* tryBoth({
+        settings: { modelPolicy: { mode: "advise", allow: [ROW] } },
+        target: { model: "other-model" },
+      })) {
+        assert.deepStrictEqual(refusals, []);
+        assert.lengthOf(made, 1);
+        if (tool === "delegate_task") {
+          assert.include(
+            (replies[0] as { readonly usagePacingNote?: string }).usagePacingNote,
+            "Model policy (advise): this pick is outside the policy (other-model (claudeAgent) is in no row); it runs",
+          );
+        }
+      }
+    }),
+  );
+
+  it.effect("old or missing state: a file without the key, or mode off, checks nothing", () =>
+    Effect.gen(function* () {
+      for (const settings of [{ modelPolicy: { mode: "off", allow: [] } }, { modelPolicy: {} }]) {
+        for (const { made, refusals } of yield* tryBoth({ settings, target: {} })) {
+          assert.deepStrictEqual(refusals, []);
+          assert.lengthOf(made, 1);
+        }
+      }
+    }),
+  );
+
+  it.effect("stopped half-way: the call made again is checked again and runs once", () =>
+    Effect.gen(function* () {
+      for (const { made, refusals } of yield* tryBoth({
+        settings: rows(),
+        target: named("high"),
+        firstDispatchFails: true,
+      })) {
+        assert.deepStrictEqual(refusals, []);
+        assert.lengthOf(made, 1);
+      }
+    }),
+  );
+
+  it.effect("runs again: the retry of an accepted call starts nothing new and is not checked", () =>
+    Effect.gen(function* () {
+      // The policy changed since the call was accepted: its retry is left as it resolves.
+      for (const { made, refusals } of yield* tryBoth({
+        settings: rows([]),
+        target: { model: "other-model" },
+        retryOfAccepted: true,
+      })) {
+        assert.deepStrictEqual(refusals, []);
+        assert.lengthOf(made, 1);
+      }
     }),
   );
 });

@@ -11,8 +11,9 @@ the self-check are made from it:
   `t3_thread_transfer`, `t3_thread_send`, `t3_thread_send_attachments`, `schedule_task`, `t3_project_create` and
   `t3_project_update` (under any MCP server name).
 
-Every other tool passes untouched. This is version 0 of the fork's model policy: a hook on the agent's side. A later
-version checks the same picks inside the T3 server, where it can also see the session's own model.
+Every other tool passes untouched. This is version 0 of the fork's model policy: a hook on the agent's side. The T3
+server checks an agent's pick too, against its own setting (`modelPolicy`, **Settings → Fork → Model policy**, #731):
+`delegate_task`, `create_threads`, `t3_thread_launch` and `t3_thread_configure`. Give both the same rows.
 
 Linux, Python 3 standard library only. No state: the hook reads the machine file and the policy again on every call.
 
@@ -316,6 +317,72 @@ key holds an `opencode` row's `agent` or a `kiro` row's `mode` (see **Agent opti
 kind in another case or with spaces around it is refused (see **Driver kinds are exact**). The file must be owned by root, not writable by group or others, and not a link (the same rules as the
 machine file), so an agent cannot widen its own policy.
 
+## Paste-ready install: the fork's two start rows, in advise mode
+
+The short way through "Turn it on" below, with the fork's start rows (#126): Opus 5.5 and Fable 5.2, each at
+`medium`, `high` or `xhigh` (default `high`). Run it as root on the agent host. Fill in the two lines at the top first:
+`FORK` is the fork's `owner/repo` on GitHub, `T3_HOME` is the folder T3 keeps its state in on this machine.
+
+```sh
+FORK=FORK_OWNER/FORK
+T3_HOME=/path/to/t3-home
+umask 022 && mkdir -p /etc/fork-kit
+# 1. The policy, in advise mode: every pick runs; one outside the rows gets a note and a log line.
+cat > /etc/fork-kit/model-policy.json <<'JSON'
+{
+  "mode": "advise",
+  "allow": [
+    {
+      "driver": "claudeAgent",
+      "model": "claude-opus-5-5",
+      "efforts": ["medium", "high", "xhigh"],
+      "defaultEffort": "high",
+      "aliases": ["opus"],
+      "useFor": "most work: building, routine work, review lenses"
+    },
+    {
+      "driver": "claudeAgent",
+      "model": "claude-fable-5-2",
+      "efforts": ["medium", "high", "xhigh"],
+      "defaultEffort": "high",
+      "aliases": ["fable"],
+      "useFor": "creative solutions and direction checks: design options, stuck audits, root causes others missed; it costs more, so not routine work"
+    }
+  ]
+}
+JSON
+# 2. Name it in the machine file; any other section, and any other key of this one, stays.
+T3_HOME="$T3_HOME" python3 - <<'PY'
+import json, os
+path = '/etc/fork-kit/machine.json'
+data = json.load(open(path)) if os.path.exists(path) else {'version': 1}
+data.setdefault('model-guard', {}).update(
+    policyFile='/etc/fork-kit/model-policy.json',
+    t3ModelManifests=[os.environ['T3_HOME'] + '/userdata/model-manifest.json'])
+with open(path + '.tmp', 'w') as out:
+    json.dump(data, out, indent=2)
+    out.write('\n')
+os.replace(path + '.tmp', path)
+PY
+# 3. Install the kit (the line from "Install" below), then check it.
+sha=$(git ls-remote "https://github.com/$FORK" refs/heads/ci-release | cut -f1) && curl -fsSL "https://raw.githubusercontent.com/$FORK/$sha/fork-kit/model-guard/bootstrap.sh" -o /root/model-guard-bootstrap.sh && sh /root/model-guard-bootstrap.sh --repo "$FORK" --sha "$sha"
+model-guard --self-check
+```
+
+The self-check names anything left to do (for example `allowManagedHooksOnly`, step 4 below, an owner choice).
+Then set the same rows in T3 (step 7 below). Watch what advise mode would refuse with `journalctl -t model-guard`
+(and T3's server log, "model policy pick", which also counts each model's picks).
+
+**Later, enforce** (when advise mode has shown no surprises; steps 5 and 6 below say why each part is there):
+
+```sh
+sed -i 's/"mode": "advise"/"mode": "enforce"/' /etc/fork-kit/model-policy.json
+model-guard --self-check   # prints the Claude Code model keys to put in managed-settings.json; add them, run again
+```
+
+and in T3: **Settings → Fork → Model policy**, mode Enforce. Back to advise: the same `sed` the other way round, and
+mode Advise in T3; both count from the next call.
+
 ## Turn it on (owner, as root)
 
 1. Write the policy, for example `/etc/fork-kit/model-policy.json`, root-owned, mode 644, in folders that are
@@ -415,10 +482,12 @@ machine file), so an agent cannot widen its own policy.
    some efforts itself (for example `xhigh` runs as `max` on some models), so start a T3 thread on each Claude row
    and check that it runs. Make the delegate instructions name `"ultracode": false` (see
    [Rules](#rules)), then set `"mode": "enforce"`. The change counts from the next call; nothing needs restarting.
-7. In each T3 on the machine, set its own model policy on: **Settings → Fork → Model policy**, mode `advise` (or
-   `"modelPolicy": {"mode": "advise", "allow": []}` in T3's `settings.json`). Then a child whose pick names its
-   model keeps only the options the pick names (see [Rules](#rules)); T3 reads nothing else of the setting yet. Off
-   again: mode `off`. It counts from the next call. A T3 whose settings cannot be read applies the rule.
+7. In each T3 on the machine, set its own model policy with the same rows: **Settings → Fork → Model policy**, mode
+   `advise`, then **Edit allowed models** (with no rows saved it starts from the fork's start rows, the two below)
+   and save. T3 then checks each agent pick on the server (a person's own pick is never refused; Settings marks one
+   outside the rows), and a child whose pick names its model keeps only the options the pick names (see
+   [Rules](#rules)). Off again: mode `off`. It counts from the next call. A T3 whose settings cannot be read refuses
+   every agent pick.
 
 ## What `enforce` does not stop
 
