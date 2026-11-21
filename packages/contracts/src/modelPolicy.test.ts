@@ -483,7 +483,8 @@ describe("an effort under the id the row's driver reads (#780)", () => {
           ),
         ).toEqual({
           inside: false,
-          why: "the option id acpRegistry reads acp-model's effort from is not known here (no catalog entry of the model on a acpRegistry provider here marks one), so the level it would run cannot be told",
+          why: "the option id acpRegistry reads acp-model's effort from is not known here (no acpRegistry model list here marks an effort control for acp-model), so the level it would run cannot be told",
+          fix: "effort-id",
         });
       }
     }
@@ -535,6 +536,137 @@ describe("an effort under the id the row's driver reads (#780)", () => {
     const ultracodeRow = [{ driver: "claudeAgent", model: OPUS, efforts: ["ultracode"] }] as never;
     expect(checkModelPolicyPick(ultracodeRow, pick("xhigh")).inside).toBe(false);
     expect(checkModelPolicyPick(rows, pick("high")).inside).toBe(false);
+  });
+});
+
+describe("an option the policy cannot read, while a policy is on (#793 review)", () => {
+  const kiroRows = [{ driver: "kiro", model: "k", efforts: ["high"] }] as never;
+  const acpRows = [{ driver: "acpRegistry", model: "acp-model", efforts: ["high"] }] as never;
+  const options = (...pairs: ReadonlyArray<readonly [string, unknown]>) =>
+    pairs.map(([id, value]) => ({ id, value }));
+  /** Each case: the rows, the pick (its lists' described ids given), and what refuses it. */
+  const cases = [
+    {
+      name: "Kiro: a second effort id the driver applies after its own (effortLevel)",
+      rows: kiroRows,
+      pick: {
+        model: "k",
+        options: options(["reasoningEffort", "high"], ["effortLevel", "max"]),
+        describedOptionIds: ["reasoningEffort"],
+      },
+      unreadable: "effortLevel",
+    },
+    {
+      name: "ACP: the hidden session mode that mirrors the thought levels",
+      rows: acpRows,
+      pick: {
+        model: "acp-model",
+        options: options(["thought_level", "high"], ["_t3/session-mode", "max"]),
+        effortOptionIds: ["thought_level"],
+        driverEffortIds: { acpRegistry: ["thought_level"] },
+        describedOptionIds: ["thought_level"],
+      },
+      unreadable: "_t3/session-mode",
+    },
+    {
+      name: "Grok: the agent's native thought_level beside reasoningEffort",
+      rows: [{ driver: "grok", model: "g", efforts: ["high"] }] as never,
+      pick: {
+        model: "g",
+        options: options(["reasoningEffort", "high"], ["thought_level", "max"]),
+        describedOptionIds: ["reasoningEffort"],
+      },
+      unreadable: "thought_level",
+    },
+  ];
+
+  it("refuses it, on a known driver and on a pick for a linked machine; leaving it out is inside", () => {
+    for (const { name, rows, pick, unreadable } of cases) {
+      const driver = (rows as ReadonlyArray<{ driver: string }>)[0]!.driver;
+      for (const known of [driver, undefined]) {
+        // Runs again: the same verdict.
+        for (const _ of [1, 2]) {
+          expect(checkModelPolicyPick(rows, { ...pick, driver: known }), name).toEqual({
+            inside: false,
+            why: `the option ${unreadable} is not described for ${pick.model} in this machine's model list and is not an effort id the policy reads, so the driver could apply it unchecked`,
+            fix: "option",
+          });
+        }
+        const without = pick.options.filter((option) => option.id !== unreadable);
+        expect(
+          checkModelPolicyPick(rows, { ...pick, driver: known, options: without }),
+          name,
+        ).toMatchObject({ inside: true });
+      }
+    }
+  });
+
+  it("a model option beside the allowed model is refused with the model field to use", () => {
+    for (const driver of ["kiro", undefined]) {
+      expect(
+        checkModelPolicyPick(kiroRows, {
+          driver,
+          model: "k",
+          options: options(["reasoningEffort", "high"], ["model", "model-in-no-row"]),
+          describedOptionIds: ["reasoningEffort"],
+        }),
+      ).toEqual({
+        inside: false,
+        why: "the option model (beside k) would change the model after this check",
+        fix: "model-option",
+      });
+    }
+  });
+
+  it("reads described ids, effort ids and ultracode; empty lists allow only those the policy reads", () => {
+    const claudeRows = MODEL_POLICY_START_ROWS;
+    const OPUS = "claude-opus-5-5";
+    // Described for the model here: inside (fastMode changes neither the model nor its effort).
+    expect(
+      checkModelPolicyPick(claudeRows, {
+        driver: "claudeAgent",
+        model: OPUS,
+        options: options(["effort", "high"], ["fastMode", true]),
+        describedOptionIds: ["effort", "fastMode"],
+      }),
+    ).toMatchObject({ inside: true });
+    // Old, empty or missing lists (no model list read yet, or the model not listed here): the
+    // effort ids the policy reads and ultracode still pass, as their values are checked.
+    for (const describedOptionIds of [[], undefined]) {
+      expect(
+        checkModelPolicyPick(claudeRows, {
+          driver: "claudeAgent",
+          model: OPUS,
+          options: options(["effort", "high"], ["reasoning", "high"], ["ultracode", false]),
+          describedOptionIds,
+        }),
+      ).toMatchObject({ inside: true });
+    }
+    expect(
+      checkModelPolicyPick(claudeRows, {
+        driver: "claudeAgent",
+        model: OPUS,
+        options: options(["effort", "high"], ["fastMode", true]),
+        describedOptionIds: [],
+      }),
+    ).toMatchObject({ inside: false, fix: "option" });
+    // Unset (Settings' marks of a person's pick): not checked.
+    expect(
+      checkModelPolicyPick(claudeRows, {
+        driver: "claudeAgent",
+        model: OPUS,
+        options: options(["effort", "high"], ["effortLevel", "max"]),
+      }),
+    ).toMatchObject({ inside: true });
+    // A model in no row is still told as such, before its options.
+    expect(
+      checkModelPolicyPick(claudeRows, {
+        driver: "claudeAgent",
+        model: "other",
+        options: options(["effortLevel", "max"]),
+        describedOptionIds: [],
+      }),
+    ).toEqual({ inside: false, why: "other (claudeAgent) is in no row" });
   });
 });
 

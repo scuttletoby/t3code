@@ -346,9 +346,17 @@ for Pi), else the effort control the machine's own catalog marks for the model o
 instances (an ACP agent's `thought_level`, a Cursor model's `effort`). Under another id the driver
 ignores it and runs its default level, so such a pick is refused (`reasoning: high` alone for
 Claude), and so is a pick for a driver whose id the catalog does not mark (not read from the agent
-yet, or the model not listed there): the level it would run cannot be told. Every effort option the pick names counts, so a second effort option cannot hide a higher
-effort, and one that holds no effort name (`{effort: true}`, which runs the driver's own default) is
-refused. A pick that leaves the ultracode option out runs at the model's default for it, so a model
+yet, or the model not listed there): the level it would run cannot be told; the refusal says to
+start that agent on the machine once, or to pick a model whose driver has a fixed id. Every effort
+option the pick names counts, and one that holds no effort name (`{effort: true}`, which runs the
+driver's own default) is refused. Every other option must be one this machine's model list
+describes for the model (the instance's list; for a call sent to a linked machine, any list here),
+or `ultracode` (#793): a driver can still apply an option the policy does not read, after the
+checked ones (Kiro's `effortLevel`, Grok's native `thought_level`, an ACP agent's `_t3/session-mode`
+that the list hides because it repeats the thought levels, or a `model` option written after the
+model). Such a pick is refused in `enforce` (pick the model in the model field; the option is not
+allowed while the policy is on) and reported in `advise`, as the model guard does. So a second
+effort option cannot hide a higher effort, and an option cannot change the model. A pick that leaves the ultracode option out runs at the model's default for it, so a model
 whose catalog default is ultracode reads as ultracode. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
 own claim and is not read), every row naming the model must allow it (the refusal names the drivers
 whose rows refuse it), and each row's driver needs the effort under its own id as above (so a pick

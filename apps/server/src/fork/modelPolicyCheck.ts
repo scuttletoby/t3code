@@ -43,6 +43,37 @@ const FIELDS: Record<PolicyRoute, string> = {
   t3_thread_configure: "modelSelection.model, with one of its efforts in modelSelection.options",
 };
 
+/** Where the call names its model alone, and its options. */
+const MODEL_FIELD: Record<PolicyRoute, string> = {
+  delegate_task: "target.model",
+  create_threads: "target.model",
+  t3_thread_launch: "modelSelection.model",
+  t3_thread_configure: "modelSelection.model",
+};
+const OPTIONS_FIELD: Record<PolicyRoute, string> = {
+  delegate_task: "target.options",
+  create_threads: "target.options",
+  t3_thread_launch: "modelSelection.options",
+  t3_thread_configure: "modelSelection.options",
+};
+
+/** What the agent does to fix a refused pick, per the verdict's `fix`. */
+const fixText = (
+  fix: "option" | "model-option" | "effort-id" | undefined,
+  route: PolicyRoute,
+): string => {
+  switch (fix) {
+    case "model-option":
+      return `Pick the model in the model field (${MODEL_FIELD[route]}) and leave the model option out of ${OPTIONS_FIELD[route]}: this option is not allowed while the model policy is on.`;
+    case "option":
+      return `Leave that option out of ${OPTIONS_FIELD[route]}: this option is not allowed while the model policy is on. Pick the model in ${MODEL_FIELD[route]} and its effort under the id its driver reads.`;
+    case "effort-id":
+      return "Start that agent on this machine once so its model list shows the effort control, or pick a model whose driver has a fixed effort id.";
+    case undefined:
+      return `Name one of these models in ${FIELDS[route]}.`;
+  }
+};
+
 const SETTINGS_PLACE = "Settings → Fork → Model policy";
 
 /**
@@ -100,7 +131,7 @@ export function answerPick(
       : `${verdict.why} (${pick.model} is an alias of ${pick.aliasOf}; an alias is not read as its model, so name the full id)`;
   if (stance.mode === "enforce") {
     return {
-      refuse: `Model policy refused this pick: ${why}. ${allowed} Name one of these models in ${FIELDS[route]}.`,
+      refuse: `Model policy refused this pick: ${why}. ${allowed} ${fixText(verdict.fix, route)}`,
     };
   }
   return {
@@ -132,6 +163,20 @@ const aliasTarget = (
   const targets = modelPolicyAliasTargets(lists, model);
   return targets.length === 1 ? targets[0]! : undefined;
 };
+
+/**
+ * Every option id these lists describe for the model: what the policy lets a pick name beside the
+ * effort ids it reads (`describedOptionIds`). A control the catalog hides (an ACP session mode that
+ * repeats the thought levels, an agent's `model` option) is not described, so it is refused.
+ */
+const describedIds = (lists: ReadonlyArray<ServerProvider["models"]>, model: string) => [
+  ...new Set(
+    lists
+      .flatMap((list) => list.filter((candidate) => candidate.slug === model))
+      .flatMap((candidate) => candidate.capabilities?.optionDescriptors ?? [])
+      .map((descriptor) => descriptor.id),
+  ),
+];
 
 /**
  * The option ids these lists mark as the model's effort control, read as its effort: from every
@@ -194,6 +239,8 @@ export function pickOfSelection(
     effortOptionIds,
     // The id this instance reads the effort from, from this machine's own catalog.
     driverEffortIds: provider === undefined ? {} : { [provider.driver]: effortOptionIds },
+    // Only what this instance's lists describe for the model (none for an instance not listed).
+    describedOptionIds: describedIds(lists, model),
     ...(aliasOf === undefined ? {} : { aliasOf }),
   };
 }
@@ -230,6 +277,8 @@ const pickOfRemote = (
     options,
     effortOptionIds: reasoningIds(lists, listed),
     driverEffortIds,
+    // What any list here describes for the model: the driver there is not known.
+    describedOptionIds: describedIds(lists, listed),
     ...(ultracodeByDefault(lists, listed, options) ? { ultracodeMaybeDefault: true } : {}),
     ...(aliasOf === undefined ? {} : { aliasOf }),
   };

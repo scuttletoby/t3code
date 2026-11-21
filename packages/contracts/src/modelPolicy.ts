@@ -192,6 +192,12 @@ export interface ModelPolicyPick {
    * way, so both readings count, the one with ultracode and the one without.
    */
   readonly ultracodeMaybeDefault?: boolean | undefined;
+  /**
+   * The option ids the checking machine's model lists describe for the model. When set, any other
+   * option the policy does not read as an effort is refused: the driver may still apply it (Kiro's
+   * `effortLevel`, a hidden `_t3/session-mode`, a `model` option). Unset (Settings): not checked.
+   */
+  readonly describedOptionIds?: ReadonlyArray<string> | undefined;
 }
 
 /**
@@ -357,12 +363,37 @@ const rowAllows = (row: ModelPolicyRow, efforts: ReadonlyArray<string>) =>
 
 export type ModelPolicyVerdict =
   | { readonly inside: true; readonly row: ModelPolicyRow }
-  | { readonly inside: false; readonly why: string };
+  | {
+      readonly inside: false;
+      readonly why: string;
+      /**
+       * What fixes it, when it is not "name a model in the rows": `option`, leave out an option the
+       * policy cannot read; `model-option`, pick the model in the model field, not in the options;
+       * `effort-id`, the driver's effort id is not known on this machine.
+       */
+      readonly fix?: "option" | "model-option" | "effort-id";
+    };
+
+/**
+ * The first option of a pick that the policy cannot read: not described for the model by the
+ * checking machine's lists, and not an id it reads as an effort (or ultracode). `undefined` when
+ * the pick has no such option, or when no lists were given ({@link ModelPolicyPick.describedOptionIds}).
+ */
+function unreadableOption(pick: ModelPolicyPick): string | undefined {
+  if (pick.describedOptionIds === undefined) return undefined;
+  const readable = new Set([
+    ...pick.describedOptionIds,
+    ...pickEffortIds(pick, true),
+    MODEL_POLICY_ULTRACODE,
+  ]);
+  return pick.options?.find((option) => !readable.has(option.id))?.id;
+}
 
 /**
  * Whether one pick is inside the rows: a named model in a row; for a row with efforts, one of them
  * under the id its driver reads (an id not known here refuses), and none for a row without. With no
- * driver, every row naming the model must allow it. An effort option with no effort name refuses.
+ * driver, every row naming the model must allow it. An effort option with no effort name refuses,
+ * as does an option the policy cannot read ({@link ModelPolicyPick.describedOptionIds}).
  */
 export function checkModelPolicyPick(
   allow: ReadonlyArray<ModelPolicyRow>,
@@ -391,38 +422,64 @@ export function checkModelPolicyPick(
   const efforts = modelPolicyPickEfforts(pick);
   const options = pick.options ?? [];
   /** Why one row refuses the pick, or `undefined` when it allows it. */
-  const refuses = (row: ModelPolicyRow): string | undefined => {
+  const refuses = (
+    row: ModelPolicyRow,
+  ): { readonly why: string; readonly fix?: "effort-id" } | undefined => {
     if (!rowAllows(row, efforts)) {
-      return efforts.length === 0
-        ? `${model} needs an effort from its row, and the pick names none`
-        : `${model} does not allow effort ${efforts.join(" + ")}`;
+      return {
+        why:
+          efforts.length === 0
+            ? `${model} needs an effort from its row, and the pick names none`
+            : `${model} does not allow effort ${efforts.join(" + ")}`,
+      };
     }
     if (row.efforts === undefined) return undefined;
     // The effort must be under the id the row's driver reads: under another, it runs its default.
     const own = driverReadIds(pick, row.driver);
     if (own.length === 0) {
-      return `the option id ${row.driver} reads ${model}'s effort from is not known here (no catalog entry of the model on a ${row.driver} provider here marks one), so the level it would run cannot be told`;
+      return {
+        why: `the option id ${row.driver} reads ${model}'s effort from is not known here (no ${row.driver} model list here marks an effort control for ${model}), so the level it would run cannot be told`,
+        fix: "effort-id",
+      };
     }
     const missing = own.find(
       (id) => !options.some((option) => option.id === id && typeof option.value === "string"),
     );
     return missing === undefined
       ? undefined
-      : `${model} names no effort under ${missing}, the option ${row.driver} reads it from (left out, the driver runs its default level)`;
+      : {
+          why: `${model} names no effort under ${missing}, the option ${row.driver} reads it from (left out, the driver runs its default level)`,
+        };
   };
-  const verdicts = rows.map((row) => ({ row, why: refuses(row) }));
-  const allowed = verdicts.filter((verdict) => verdict.why === undefined);
+  const verdicts = rows.map((row) => ({ row, refusal: refuses(row) }));
+  const allowed = verdicts.filter((verdict) => verdict.refusal === undefined);
   const row = allowed[0]?.row;
   if (row !== undefined && (pick.driver !== undefined || allowed.length === rows.length)) {
-    return { inside: true, row };
+    // Inside by the rows; an option the policy cannot read may still be applied by the driver,
+    // after the checked ones (a second effort id, a hidden session mode, a `model` option).
+    const unreadable = unreadableOption(pick);
+    if (unreadable === undefined) return { inside: true, row };
+    return unreadable === "model"
+      ? {
+          inside: false,
+          why: `the option model (beside ${model}) would change the model after this check`,
+          fix: "model-option",
+        }
+      : {
+          inside: false,
+          why: `the option ${unreadable} is not described for ${model} in this machine's model list and is not an effort id the policy reads, so the driver could apply it unchecked`,
+          fix: "option",
+        };
   }
-  const refusing = verdicts.filter((verdict) => verdict.why !== undefined);
-  const why = refusing[0]!.why!;
-  if (row === undefined) return { inside: false, why };
+  const refusing = verdicts.filter((verdict) => verdict.refusal !== undefined);
+  const { why, fix } = refusing[0]!.refusal!;
+  const withFix = fix === undefined ? {} : { fix };
+  if (row === undefined) return { inside: false, why, ...withFix };
   // Some rows allow it: the driver there is not known, and these rows refuse it.
   return {
     inside: false,
     why: `${why} (its ${refusing.map((verdict) => verdict.row.driver).join(", ")} row refuses it: the driver there is not known here, so every row naming the model must allow it)`,
+    ...withFix,
   };
 }
 

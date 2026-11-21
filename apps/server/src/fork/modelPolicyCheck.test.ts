@@ -47,6 +47,12 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
+import {
+  OPTION_CASE_PROVIDERS,
+  OPTION_CASE_ROWS,
+  OPTION_CASES,
+  type OptionCase,
+} from "./modelPolicyOptions.testkit.ts";
 
 const OPUS = "claude-opus-5-5";
 const FABLE = "claude-fable-5-2";
@@ -283,6 +289,7 @@ describe("a selection as the policy reads it", () => {
       options,
       effortOptionIds: ["level"],
       driverEffortIds: { claudeAgent: ["level"] },
+      describedOptionIds: ["level"],
     });
     assert.isUndefined(refusal(policy("enforce"), pick));
     // The select alone: Claude reads its effort under `effort` only.
@@ -829,6 +836,93 @@ const configureHarness = (
   return { dispatched, forwarded, configure };
 };
 
+describe("an option the policy cannot read (#793 review, lens A majors)", () => {
+  const optionPolicy = (mode: "advise" | "enforce") => policy(mode, OPTION_CASE_ROWS);
+  const picks = (testCase: OptionCase, options: ReadonlyArray<{ id: string; value: string }>) => ({
+    // Checked here: an agent's launch or configure here, or one a linked agent sent here.
+    here: ModelPolicyCheck.pickOfSelection(
+      OPTION_CASE_PROVIDERS,
+      { instanceId: testCase.instanceId, model: testCase.model, options },
+      true,
+    ),
+    // Sent to a linked machine: the driver there is not known, every list here is read.
+    sent: ModelPolicyCheck.pickOfRemoteTarget(OPTION_CASE_PROVIDERS, {
+      model: testCase.model,
+      options,
+    } as never),
+  });
+
+  it("enforce refuses it with the fix, here and before it is sent; advise runs it and says so", () => {
+    for (const testCase of OPTION_CASES) {
+      for (const [side, pick] of Object.entries(
+        picks(testCase, [testCase.allowed, testCase.extra]),
+      )) {
+        const name = `${testCase.name} (${side})`;
+        // Runs again: the same refusal.
+        for (const _ of [1, 2]) {
+          const refused = refusal(optionPolicy("enforce"), pick);
+          assert.include(refused, `Model policy refused this pick: ${testCase.why}`, name);
+          assert.include(refused, testCase.fix, name);
+          assert.notInclude(refused, "Name one of these models", name);
+        }
+        const advised = answer(optionPolicy("advise"), pick);
+        assert.deepStrictEqual("refuse" in advised, false, name);
+        assert.include("note" in advised ? advised.note : "", testCase.why, name);
+      }
+      // The allowed effort alone: inside on both sides.
+      for (const [side, pick] of Object.entries(picks(testCase, [testCase.allowed]))) {
+        assert.isUndefined(refusal(optionPolicy("enforce"), pick), `${testCase.name} (${side})`);
+      }
+    }
+  });
+
+  it("old, empty or missing catalog: only the ids the policy reads pass, nothing else", () => {
+    const [kiro] = OPTION_CASES;
+    const options = [kiro!.allowed, kiro!.extra];
+    const emptied = OPTION_CASE_PROVIDERS.map(
+      (provider) =>
+        ({
+          ...provider,
+          models: provider.models.map((model) => ({ ...model, capabilities: null })),
+        }) as unknown as ServerProvider,
+    );
+    for (const providers of [[], emptied]) {
+      for (const pick of [
+        ModelPolicyCheck.pickOfSelection(
+          providers,
+          { instanceId: kiro!.instanceId, model: kiro!.model, options },
+          true,
+        ),
+        ModelPolicyCheck.pickOfRemoteTarget(providers, { model: kiro!.model, options } as never),
+      ]) {
+        assert.include(refusal(policy("enforce", OPTION_CASE_ROWS), pick), kiro!.why);
+        // Kiro's fixed id alone is still read without a catalog.
+        assert.isUndefined(
+          refusal(policy("enforce", OPTION_CASE_ROWS), { ...pick, options: [kiro!.allowed] }),
+        );
+      }
+    }
+  });
+
+  it("the unknown effort id refusal says how to fix it", () => {
+    const acpRows = [{ driver: "acpRegistry", model: ACP_MODEL, efforts: ["high"] }] as never;
+    const refused = refusal(
+      policy("enforce", acpRows),
+      // No ACP agent here: its own id is not known, and the general one names an allowed effort.
+      ModelPolicyCheck.pickOfRemoteTarget([], {
+        model: ACP_MODEL,
+        options: [{ id: "effort", value: "high" }],
+      } as never),
+    );
+    assert.include(refused, "no acpRegistry model list here marks an effort control");
+    assert.include(
+      refused,
+      "Start that agent on this machine once so its model list shows the effort control, or pick a model whose driver has a fixed effort id.",
+    );
+    assert.notInclude(refused, "Name one of these models");
+  });
+});
+
 describe("t3_thread_configure through upstream's handler", () => {
   const effort = (value: string) => [{ id: "effort", value }];
   const enforce = { modelPolicy: { mode: "enforce", allow: ROWS } } as never;
@@ -1015,6 +1109,81 @@ describe("t3_thread_configure through upstream's handler", () => {
         "sent there",
       );
       assert.lengthOf(forwarded, 1);
+    }),
+  );
+});
+
+describe("t3_thread_configure: an option the policy cannot read (#793 review)", () => {
+  const settings = (mode: string) => ({ modelPolicy: { mode, allow: OPTION_CASE_ROWS } }) as never;
+  const THERE = EnvironmentId.make("environment-there");
+  const selection = (testCase: OptionCase, withExtra: boolean) =>
+    ({
+      instanceId: testCase.instanceId,
+      model: testCase.model,
+      options: withExtra ? [testCase.allowed, testCase.extra] : [testCase.allowed],
+    }) as never;
+  const routes = [
+    { route: "an agent here", caller: true, environmentId: undefined },
+    {
+      route: "a linked agent's change received here",
+      caller: "linked agent",
+      environmentId: undefined,
+    },
+    { route: "an agent's change sent to a linked machine", caller: true, environmentId: THERE },
+  ] as const;
+
+  it.effect("enforce: refused on each route, nothing changed or sent; without it, it goes", () =>
+    Effect.gen(function* () {
+      for (const { route, caller, environmentId } of routes) {
+        for (const testCase of OPTION_CASES) {
+          const name = `${route}: ${testCase.name}`;
+          const { dispatched, forwarded, configure } = configureHarness(settings("enforce"), {
+            caller,
+            providers: OPTION_CASE_PROVIDERS,
+          });
+          // Runs again: refused each time.
+          for (const _ of [1, 2]) {
+            const refused = yield* configure(selection(testCase, true), environmentId);
+            assert.include(
+              refused,
+              `model_unavailable: Model policy refused this pick: ${testCase.why}`,
+              name,
+            );
+            assert.include(refused, testCase.fix, name);
+            assert.include(refused, "modelSelection.", name);
+          }
+          assert.deepStrictEqual([dispatched.length, forwarded.length], [0, 0], name);
+          const allowed = yield* configure(selection(testCase, false), environmentId);
+          if (environmentId === undefined) {
+            assert.isUndefined(allowed, name);
+            assert.lengthOf(dispatched, 1, name);
+          } else {
+            assert.include(allowed, "sent there", name);
+            assert.lengthOf(forwarded, 1, name);
+          }
+        }
+      }
+    }),
+  );
+
+  it.effect("advise: the change goes through as today (the log says enforce would refuse it)", () =>
+    Effect.gen(function* () {
+      for (const { route, caller, environmentId } of routes) {
+        const { dispatched, forwarded, configure } = configureHarness(settings("advise"), {
+          caller,
+          providers: OPTION_CASE_PROVIDERS,
+        });
+        for (const testCase of OPTION_CASES) {
+          const result = yield* configure(selection(testCase, true), environmentId);
+          if (environmentId === undefined) assert.isUndefined(result, route);
+          else assert.include(result, "sent there", route);
+        }
+        assert.lengthOf(
+          environmentId === undefined ? dispatched : forwarded,
+          OPTION_CASES.length,
+          route,
+        );
+      }
     }),
   );
 });
