@@ -50,6 +50,7 @@ import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { renameRetiredAutoUpdateKeys } from "./cloud/autoUpdateSettings.ts";
 import { prepareSettingsFile } from "./fork/settingsFileRead.ts"; // Fork: renames, bad intervals
+import * as ForkPolicy from "./fork/modelPolicyFile.ts"; // Fork: model policy
 import {
   deriveLegacyProjectOverrides,
   fallbackTextGenerationModelSelection,
@@ -458,6 +459,7 @@ function decodeSettingsFile(
           enablePreviewTunnel: false,
           enableAgentBrowserAccess: false,
           defaultRuntimeMode: "approval-required",
+          modelPolicy: ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy
         };
   return { settings, legacy: Exit.isSuccess(legacy) ? legacy.value : undefined, failure };
 }

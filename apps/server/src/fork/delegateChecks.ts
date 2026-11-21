@@ -34,6 +34,7 @@ import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
 import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
 import * as LaunchMcpProfile from "./launchMcpProfile.ts";
+import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
 
 /** A checked delegation target (the same shape as the service's resolved target). */
 export interface DelegateTarget {
@@ -138,10 +139,13 @@ export interface DelegateChecks {
   readonly beforeCreateThread: (
     input: BeforeCreateThreadInput,
   ) => Effect.Effect<BeforeCreateThreadResult, OrchestratorMcpFailure>;
-  /** A remote `delegate_task`'s target, before it is sent: {@link remoteTarget} under the policy. */
+  /**
+   * A remote `delegate_task`'s target, before it is sent: {@link remoteTarget} under the policy,
+   * then the model policy's check of the pick (`modelPolicyCheck.ts`; a refusal sends nothing).
+   */
   readonly remoteTarget: <Target extends OrchestratorMcpTarget>(
     target: Target,
-  ) => Effect.Effect<Target>;
+  ) => Effect.Effect<Target, OrchestratorMcpFailure>;
 }
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
@@ -256,6 +260,9 @@ export const withOwnOptions = (
 export const remoteTarget = <Target extends OrchestratorMcpTarget>(target: Target): Target =>
   target.model === undefined || target.options !== undefined ? target : { ...target, options: [] };
 
+/** The pacer's lowered effort is outside the policy: the task runs at the effort it checked. */
+const KEEP_CHECKED = Symbol("keep the checked effort");
+
 const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void };
 
 /**
@@ -270,6 +277,28 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
   const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
   const launchMcpProfile = yield* LaunchMcpProfile.makeLaunchMcpProfileCheck;
+  const checkPick = yield* ModelPolicyCheck.makePickCheck;
+  /**
+   * The model policy's check of the agent's pick on a resolved target (`modelPolicyCheck.ts`): a
+   * call that names no model inherits one, which reads as no model.
+   */
+  const policyCheck = (
+    route: ModelPolicyCheck.PolicyRoute,
+    target: DelegateTarget,
+    requested: OrchestratorMcpTarget | undefined,
+    options?: ModelPolicyCheck.PickCheckOptions,
+  ) =>
+    checkPick(
+      route,
+      Effect.map(providerRegistry.getProviders, (providers) =>
+        ModelPolicyCheck.pickOfSelection(
+          providers,
+          target.modelSelection,
+          requested?.model !== undefined,
+        ),
+      ),
+      options,
+    );
   /**
    * Folder scans for a switch target that gave no settled answer: instance and folder -> the time a
    * scan may run again. Memory only: a restart costs one more scan. Entries that no longer back off
@@ -477,12 +506,47 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
 
   const checks: DelegateChecks = {
     // Before the pacer, so it paces the child's own options; a target it moves to keeps them too.
+    // The model policy checks the agent's pick first (a refusal holds and paces nothing), and again
+    // the target the pacer moved the task to or lowered its effort on: what runs is inside too. An
+    // effort the pacer lowers off the row keeps the checked one (the agent cannot fix that pick).
     beforeWorkspace: (input) =>
       input.isRetry
         ? Effect.succeed({ target: input.target })
-        : Effect.flatMap(ownTarget(input.target, input.requested), (target) =>
-            paceTarget({ ...input, target }),
-          ),
+        : Effect.gen(function* () {
+            const target = yield* ownTarget(input.target, input.requested);
+            const policyNote = yield* policyCheck("delegate_task", target, input.requested);
+            const paced = yield* paceTarget({ ...input, target });
+            const lowered =
+              paced.target.modelSelection.instanceId === target.modelSelection.instanceId &&
+              paced.target.modelSelection.model === target.modelSelection.model;
+            const pacedNote =
+              paced.target === target
+                ? undefined
+                : yield* policyCheck("delegate_task", paced.target, input.requested, {
+                    logAs: "model policy paced pick",
+                  }).pipe(
+                    Effect.catchIf(
+                      () => lowered,
+                      (refusal) =>
+                        Effect.logWarning(
+                          "usagePacingLowerEffort lowered an effort that modelPolicy does not allow: the task keeps its checked effort",
+                        ).pipe(
+                          Effect.annotateLogs({ refusal: refusal.message }),
+                          Effect.as(KEEP_CHECKED),
+                        ),
+                    ),
+                  );
+            if (pacedNote === KEEP_CHECKED) {
+              return { target, ...(policyNote === undefined ? {} : { note: policyNote }) };
+            }
+            const notes = [
+              policyNote,
+              pacedNote === policyNote ? undefined : pacedNote,
+              paced.note,
+            ];
+            const note = notes.filter((text) => text !== undefined).join(" ");
+            return { target: paced.target, ...(note === "" ? {} : { note }) };
+          }),
     afterWorkspace: (input) =>
       input.isRetry || Option.isNone(slotGate)
         ? Effect.succeed(NO_HOLD)
@@ -514,14 +578,23 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
             route: "create_threads",
           }).pipe(
             Effect.andThen(ownTarget(input.target, input.requested)),
+            // The model policy (advice goes to the log: the reply has no place for a note).
+            Effect.tap((target) => policyCheck("create_threads", target, input.requested)),
             Effect.tap((target) => slot(target, null)),
             Effect.map((target) => ({ target })),
           );
     },
     remoteTarget: (target) =>
-      remoteTarget(target) === target
+      (remoteTarget(target) === target
         ? Effect.succeed(target)
-        : Effect.map(ownOptionsOn, (on) => (on ? remoteTarget(target) : target)),
+        : Effect.map(ownOptionsOn, (on) => (on ? remoteTarget(target) : target))
+      ).pipe(
+        // The linked machine's driver is not known here (a driverKind the call names is the agent's
+        // claim, not read): every row naming the model must allow it.
+        Effect.tap((sent) =>
+          checkPick("delegate_task", Effect.succeed(ModelPolicyCheck.pickOfRemoteTarget(sent))),
+        ),
+      ),
   };
   return checks;
 });

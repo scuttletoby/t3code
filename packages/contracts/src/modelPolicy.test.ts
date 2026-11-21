@@ -6,8 +6,12 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "@effect/vitest";
 
 import {
+  checkModelPolicyPick,
   DEFAULT_MODEL_POLICY,
   MODEL_POLICY_FAIL_CLOSED,
+  MODEL_POLICY_START_ROWS,
+  modelPolicyPickEfforts,
+  modelPolicyStance,
   ModelPolicyPatch,
   ModelPolicyFromSettingsFile,
 } from "./modelPolicy.ts";
@@ -143,5 +147,263 @@ describe("model policy saves", () => {
     expect(decodePatch({ modelPolicy: { mode: "off", allow: [] } }).modelPolicy).toEqual(
       DEFAULT_MODEL_POLICY,
     );
+  });
+});
+
+describe("the fork's start rows (#126)", () => {
+  it("are Opus 5.5 and Fable 5.2 at medium, high or xhigh (default high), and save as they are", () => {
+    expect(
+      MODEL_POLICY_START_ROWS.map((row) => [row.driver, row.model, row.efforts, row.defaultEffort]),
+    ).toEqual([
+      ["claudeAgent", "claude-opus-5-5", ["medium", "high", "xhigh"], "high"],
+      ["claudeAgent", "claude-fable-5-2", ["medium", "high", "xhigh"], "high"],
+    ]);
+    const saved = { mode: "advise", allow: MODEL_POLICY_START_ROWS };
+    expect(decodePatch({ modelPolicy: saved }).modelPolicy).toEqual(saved);
+    expect(decodeServer(encodeServer(decodeServer({ modelPolicy: saved }))).modelPolicy).toEqual(
+      saved,
+    );
+  });
+
+  it("are not the setting's default: a file without rows keeps meaning none", () => {
+    expect(decodeServer({}).modelPolicy.allow).toEqual([]);
+    expect(decodeServer({ modelPolicy: { mode: "enforce" } }).modelPolicy.allow).toEqual([]);
+  });
+});
+
+describe("one pick against the rows", () => {
+  const rows = MODEL_POLICY_START_ROWS;
+  const pick = (
+    model: string | undefined,
+    options: ReadonlyArray<{ id: string; value: unknown }> = [],
+  ) => ({
+    driver: "claudeAgent",
+    model,
+    options,
+  });
+
+  it("reads the efforts a pick runs at, ultracode as its own effort", () => {
+    const efforts = (options: ReadonlyArray<{ id: string; value: unknown }>) =>
+      modelPolicyPickEfforts(pick("m", options));
+    expect(efforts([])).toEqual([]);
+    expect(efforts([{ id: "effort", value: "high" }])).toEqual(["high"]);
+    expect(efforts([{ id: "reasoningEffort", value: "low" }])).toEqual(["low"]);
+    expect(
+      efforts([
+        { id: "effort", value: "xhigh" },
+        { id: "ultracode", value: true },
+      ]),
+    ).toEqual(["ultracode"]);
+    expect(
+      efforts([
+        { id: "effort", value: "high" },
+        { id: "ultracode", value: true },
+      ]),
+    ).toEqual(["ultracode", "high"]);
+    expect(
+      efforts([
+        { id: "effort", value: "xhigh" },
+        { id: "ultracode", value: false },
+      ]),
+    ).toEqual(["xhigh"]);
+    // The old effort `ultracode`: xhigh with the option on, unless the option is given.
+    expect(efforts([{ id: "effort", value: "ultracode" }])).toEqual(["ultracode"]);
+    expect(
+      efforts([
+        { id: "effort", value: "ultracode" },
+        { id: "ultracode", value: false },
+      ]),
+    ).toEqual(["xhigh"]);
+    // A boolean under an effort id is not an effort.
+    expect(efforts([{ id: "thinking_level", value: true }])).toEqual([]);
+  });
+
+  it("reads every effort option, so a second effort-like option cannot hide a higher effort", () => {
+    // [reasoning: high, effort: max]: Claude runs at max (it reads `effort`); the pick is refused.
+    // `null`: a pick whose driver is not known (a default parameter would swallow `undefined`).
+    const decoy = (first: string, second: string, driver: string | null = "claudeAgent") => ({
+      driver: driver ?? undefined,
+      model: "claude-opus-5-5",
+      options: [
+        { id: first, value: "high" },
+        { id: second, value: "max" },
+      ],
+    });
+    for (const [first, second] of [
+      ["reasoning", "effort"],
+      ["effort", "reasoning"],
+      ["effort", "reasoningEffort"],
+      ["reasoning_effort", "effort"],
+      ["thinking_level", "effort"],
+    ]) {
+      expect(modelPolicyPickEfforts(decoy(first!, second!))).toEqual(["high", "max"]);
+      expect(checkModelPolicyPick(rows, decoy(first!, second!))).toMatchObject({
+        inside: false,
+        why: "claude-opus-5-5 does not allow effort high + max",
+      });
+    }
+    // A driver's own id is read for that driver, and for a pick whose driver is not known.
+    expect(modelPolicyPickEfforts(decoy("effort", "variant", "opencode"))).toEqual(["high", "max"]);
+    expect(modelPolicyPickEfforts(decoy("effort", "variant", null))).toEqual(["high", "max"]);
+    expect(modelPolicyPickEfforts(decoy("effort", "thinking", null))).toEqual(["high", "max"]);
+    // Another driver's id is not that driver's effort: Claude ignores `variant`.
+    expect(modelPolicyPickEfforts(decoy("effort", "variant"))).toEqual(["high"]);
+    // The same effort twice is one effort; inside its row.
+    const twice = {
+      ...decoy("effort", "reasoning"),
+      options: [
+        { id: "effort", value: "high" },
+        { id: "reasoning", value: "high" },
+      ],
+    };
+    expect(modelPolicyPickEfforts(twice)).toEqual(["high"]);
+    expect(checkModelPolicyPick(rows, twice)).toMatchObject({ inside: true });
+  });
+
+  it("refuses an effort option that holds no effort name, which runs the driver's default", () => {
+    const unnamed = [
+      { id: "reasoning", value: "high" },
+      { id: "effort", value: true },
+    ];
+    for (const driver of ["claudeAgent", undefined]) {
+      expect(
+        checkModelPolicyPick(rows, { driver, model: "claude-opus-5-5", options: unnamed }),
+      ).toEqual({
+        inside: false,
+        why: "claude-opus-5-5's effort option effort holds no effort name",
+      });
+    }
+    // Claude's `thinking: true` sent to a linked machine is no pi effort: still inside.
+    expect(
+      checkModelPolicyPick(rows, {
+        driver: undefined,
+        model: "claude-opus-5-5",
+        options: [
+          { id: "effort", value: "high" },
+          { id: "thinking", value: true },
+        ],
+      }),
+    ).toMatchObject({ inside: true });
+  });
+
+  it("reads OpenCode's Default variant (t3:default, sends no variant) as no effort, as if left out", () => {
+    const rows = [
+      { driver: "opencode", model: "oc-x", efforts: ["low", "high"] },
+      { driver: "opencode", model: "oc-plain" },
+    ] as never;
+    const pick = (model: string, value: string, driver?: string) => ({
+      driver,
+      model,
+      options: [{ id: "variant", value }],
+    });
+    const left = (model: string) => ({ driver: "opencode", model, options: [] });
+    expect(modelPolicyPickEfforts(pick("oc-x", "t3:default", "opencode"))).toEqual([]);
+    for (const model of ["oc-x", "oc-plain"]) {
+      expect(checkModelPolicyPick(rows, pick(model, "t3:default", "opencode"))).toEqual(
+        checkModelPolicyPick(rows, left(model)),
+      );
+    }
+    // A row with efforts still needs one named; a row without efforts takes it.
+    expect(checkModelPolicyPick(rows, pick("oc-x", "t3:default", "opencode"))).toMatchObject({
+      inside: false,
+      why: "oc-x needs an effort from its row, and the pick names none",
+    });
+    expect(checkModelPolicyPick(rows, pick("oc-plain", "t3:default", "opencode"))).toMatchObject({
+      inside: true,
+    });
+    // It never hides another effort option, and only OpenCode's own id with a known driver counts.
+    expect(
+      modelPolicyPickEfforts({
+        driver: "opencode",
+        model: "oc-x",
+        options: [
+          { id: "variant", value: "t3:default" },
+          { id: "effort", value: "max" },
+        ],
+      }),
+    ).toEqual(["max"]);
+    expect(modelPolicyPickEfforts(pick("oc-x", "t3:default"))).toEqual(["t3:default"]);
+    expect(
+      modelPolicyPickEfforts({
+        driver: "opencode",
+        model: "oc-x",
+        options: [{ id: "effort", value: "t3:default" }],
+      }),
+    ).toEqual(["t3:default"]);
+  });
+
+  it("names the drivers whose rows refuse a pick with no known driver that another row allows", () => {
+    const disagree = [
+      { driver: "codex", model: "gpt-x", efforts: ["high"] },
+      { driver: "opencode", model: "gpt-x" },
+    ] as never;
+    const remote = (options: ReadonlyArray<{ id: string; value: unknown }>) =>
+      checkModelPolicyPick(disagree, { driver: undefined, model: "gpt-x", options });
+    expect(remote([{ id: "reasoningEffort", value: "high" }])).toEqual({
+      inside: false,
+      why: "gpt-x does not allow effort high (its opencode row refuses it: the driver there is not known here, so every row naming the model must allow it)",
+    });
+    expect(remote([])).toEqual({
+      inside: false,
+      why: "gpt-x needs an effort from its row, and the pick names none (its codex row refuses it: the driver there is not known here, so every row naming the model must allow it)",
+    });
+    // No row allows it: the plain reason.
+    expect(remote([{ id: "reasoningEffort", value: "max" }])).toEqual({
+      inside: false,
+      why: "gpt-x does not allow effort max",
+    });
+  });
+
+  it("is inside only with a named model in a row of its driver, at one of the row's efforts", () => {
+    expect(
+      checkModelPolicyPick(rows, pick("claude-opus-5-5", [{ id: "effort", value: "xhigh" }])),
+    ).toMatchObject({
+      inside: true,
+      row: { model: "claude-opus-5-5" },
+    });
+    const outside = [
+      pick(undefined, [{ id: "effort", value: "high" }]),
+      pick("claude-sonnet-5-5", [{ id: "effort", value: "high" }]),
+      pick("claude-opus-5-5"),
+      pick("claude-opus-5-5", [{ id: "effort", value: "low" }]),
+      pick("claude-opus-5-5", [{ id: "effort", value: "max" }]),
+      pick("claude-fable-5-2", [
+        { id: "effort", value: "xhigh" },
+        { id: "ultracode", value: true },
+      ]),
+      { ...pick("claude-opus-5-5", [{ id: "effort", value: "high" }]), driver: "codex" },
+    ];
+    for (const candidate of outside) {
+      expect(checkModelPolicyPick(rows, candidate).inside, JSON.stringify(candidate)).toBe(false);
+    }
+    expect(
+      checkModelPolicyPick([], pick("claude-opus-5-5", [{ id: "effort", value: "high" }])).inside,
+    ).toBe(false);
+  });
+
+  it("reads an unreadable value as enforce, or advise when its own text says advise", () => {
+    const bad = (raw: unknown) => decodeFile(raw);
+    expect(modelPolicyStance(bad({ mode: "advise", allow: "x" }))).toEqual({
+      mode: "advise",
+      unreadable: true,
+    });
+    for (const raw of [
+      { mode: "off", allow: "x" },
+      { mode: "enforce", typo: 1 },
+      "advise",
+      [],
+      3,
+    ]) {
+      expect(modelPolicyStance(bad(raw)), JSON.stringify(raw)).toEqual({
+        mode: "enforce",
+        unreadable: true,
+      });
+    }
+    expect(modelPolicyStance(DEFAULT_MODEL_POLICY)).toEqual({ mode: "off" });
+    expect(modelPolicyStance({ mode: "advise", allow: rows })).toEqual({
+      mode: "advise",
+      allow: rows,
+      unreadable: false,
+    });
   });
 });

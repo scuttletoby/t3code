@@ -327,24 +327,71 @@ Which models (and efforts) agents may pick, per provider driver. `mode` is `off`
 model, as upstream's do), `advise` (agents are only told) or `enforce` (a pick off the list is
 refused). Each `allow` row names a `driver` and a `model`; `efforts` (non-empty) limits the efforts
 for that model, and a row without it checks only the model. `defaultEffort` must be one of the
-row's `efforts`; `useFor` is a short note shown to agents when they pick. The check comes in a later
-pull request. Today the server reads only whether the policy is on (`advise` or `enforce`): then a
-child that `delegate_task` (here or on a linked machine) or `create_threads` starts with a call that
-names its model keeps only the options the call names, none of its parent's others (an agent, a
-session mode, a service tier, an effort). With `off` it keeps upstream's way: a call that names the
-parent's model takes the parent's options under its own.
+row's `efforts`; `useFor` is a short note shown to agents when they pick.
+
+The server checks each agent pick (#731; agents only, #125): `delegate_task`, `create_threads`,
+`t3_thread_launch` and `t3_thread_configure` from an agent's thread, here and before a call is sent
+to a linked machine. The machine there checks an agent's launch or model change against its own
+policy too (the link names the agent's thread; a call the owner's client sends there is not checked),
+so each machine refuses an agent's pick outside its own rows, whatever the sending machine's policy
+says. An agent is
+a caller whose session is bound to a thread; the owner's client has none, and anything that reaches
+the server without such a session counts as a person, so the model guard hook is the backstop. A pick is inside when it
+names a model by its full id (#128; an alias such as `opus` is not read as its model, and the
+refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
+`efforts`, names one of them (`ultracode` counts as its own effort; a row without `efforts` allows
+none). Every effort option the pick names counts, so a second effort option cannot hide a higher
+effort, and one that holds no effort name (`{effort: true}`, which runs the driver's own default) is
+refused. A pick that leaves the ultracode option out runs at the model's default for it, so a model
+whose catalog default is ultracode reads as ultracode. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
+own claim and is not read), every row naming the model must allow it (the refusal names the drivers
+whose rows refuse it), and every driver's effort option is read. In `enforce` a pick outside is refused with the rows; in
+`advise` it runs, and `delegate_task`'s reply says what `enforce` would refuse (the other routes
+only log it). A pick inside gets its row's `useFor` in `delegate_task`'s reply. Each checked pick is
+logged as "model policy pick" with its model as asked, so one model's picks can be counted; the
+target the usage pacer moves a task to is checked too and logged as "model policy paced pick", the
+model it ran on. An effort the pacer lowers (`usagePacingLowerEffort`) to one the row does not allow
+keeps the checked effort instead, with a warning in the server log naming both settings: the policy
+wins over the pacer, as the agent cannot fix that pick. A retry of an accepted call is not checked again (it starts nothing new), except a
+`t3_thread_launch` retry that names a model: that model wins over the first one, so it is checked
+like a new launch. A call sent to a linked machine is checked each time it is sent, a retry too: after
+a policy change a retry is refused even when the first call already started its task there (that
+task runs on, with no record here). Not checked by the server: a project's default model (`t3_project_create`,
+`t3_project_update`) and `schedule_task`'s model, which a later run uses; the model guard hook
+(`fork-kit/model-guard`) refuses an agent's such call in `enforce`. The owner's own picks (in the app, or `t3_thread_launch` from the owner's client)
+are never refused; Settings marks the server's model picks outside the rows ("outside policy").
+
+Left (#731): a `t3_thread_launch` retry with the same key that names no model is not checked again.
+After a policy change, the retry of an idle launch (one without a message) that adds a message starts
+its run on the model checked under the old policy; so does an agent's retry of an idle launch the
+owner's client made with that key. A retry that names a model is checked again: in `advise` it is
+logged a second time (that model's picks count twice), and if the policy got stricter in between it
+is refused although the first call's thread exists. Each needs the key of an earlier launch.
+
+While the policy is on, a child that `delegate_task` (here or on a linked machine) or
+`create_threads` starts with a call that names its model also keeps only the options the call names,
+none of its parent's others (an agent, a session mode, a service tier, an effort). With `off` it
+keeps upstream's way: a call that names the parent's model takes the parent's options under its own.
 
 Only the person can change it; agents cannot. A save must give both `mode` and `allow` (it replaces
 the stored value whole) and is refused for a bad row, a `defaultEffort` not in its row's `efforts`,
 or an unknown key such as a misspelt `effort`. A hand-edited value that is not valid, an unknown key
-included, reads as `enforce` with nothing allowed (with a warning in the server log); it is kept as
-written, and saves of other settings write it back unchanged until the person saves this setting.
+included, reads as `enforce` with nothing allowed (with a warning in the server log): every agent pick
+is refused, unless the value's own text names the mode `advise`, which only warns. Settings that
+cannot be read at all refuse every agent pick too, also with the mode `off` (the mode cannot be
+seen). A settings.json that does not parse fails closed the same way (upstream then runs on its
+defaults, where the policy would be off; the server log says the model policy cannot be read), and a
+file that parses but fails on another key keeps its own policy. The value is kept as written, and
+saves of other settings write it back unchanged until the person saves this setting.
 
 In the app: **Settings → Fork**, section Model policy (server only; a project cannot override it): the
 mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a save is. An unreadable
 value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
 then starts from the value's own rows and saves only once the person picks the mode, so a save never
-turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged.
+turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged. With no
+rows saved, **Edit allowed models** starts from the fork's start rows (#126: `claude-opus-5-5` and
+`claude-fable-5-2`, each `medium`, `high` or `xhigh`, default `high`), saved only when the person
+saves them; they are not the setting's default, so a file without rows keeps meaning none.
 
 ```json
 {
