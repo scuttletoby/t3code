@@ -774,7 +774,8 @@ class SweepTests(unittest.TestCase):
         """Empty notes of docker-label (made in both folders), age seconds old on the fake clock."""
         for folder in folders or self.note_dirs:
             os.makedirs(folder, 0o700, exist_ok=True)
-            os.chmod(folder, 0o700)
+            for d in (folder, os.path.dirname(folder), os.path.dirname(os.path.dirname(folder))):
+                os.chmod(d, 0o700)                     # as heavy makes them (makedirs's parents follow the umask)
             for name in names:
                 path = os.path.join(folder, name)
                 open(path, 'w').close()
@@ -821,6 +822,32 @@ class SweepTests(unittest.TestCase):
         self.addCleanup(os.chmod, self.note_dirs[0], 0o700)
         self.assertEqual(self.run_sweep()[0], 0)
         self.assertEqual(self.left_notes(), [['heavy-gone-0a1b2c3d.scope'], []])
+
+    def test_notes_behind_a_linked_or_open_parent_folder_or_a_link_are_left(self):
+        # #767 item 3: the same folder rule as heavy's own (own_folder): labelled/, heavy/ and the base each a real
+        # folder of this user's that no one else can write. And a note that is a link is never followed (#764 nit)
+        elsewhere = os.path.join(self.root, 'elsewhere', 'heavy', 'labelled')
+        self.notes('heavy-gone-0a1b2c3d.scope', folders=(elsewhere,))
+        run_base, state_base = (os.path.dirname(os.path.dirname(d)) for d in self.note_dirs)
+        os.symlink(os.path.dirname(os.path.dirname(elsewhere)), run_base)            # the base a link
+        os.makedirs(state_base, 0o700)
+        os.symlink(os.path.dirname(elsewhere), os.path.join(state_base, 'heavy'))    # heavy/ a link
+        self.assertEqual(self.run_sweep()[0], 0)
+        self.assertEqual(os.listdir(elsewhere), ['heavy-gone-0a1b2c3d.scope'])
+        # real folders, but a base others can write: left too
+        os.remove(run_base)
+        os.remove(os.path.join(state_base, 'heavy'))
+        self.notes('heavy-gone-0a1b2c3d.scope')
+        os.chmod(run_base, 0o777)
+        self.addCleanup(os.chmod, run_base, 0o700)
+        # a note that links to an old empty file elsewhere: the link is not an empty file of docker-label's
+        target = os.path.join(self.root, 'old-empty')
+        open(target, 'w').close()
+        os.utime(target, (NOW - 700, NOW - 700))
+        os.symlink(target, os.path.join(self.note_dirs[1], 'heavy-link-0a1b2c3d.scope'))
+        self.assertEqual(self.run_sweep()[0], 0)
+        self.assertEqual(self.left_notes(), [['heavy-gone-0a1b2c3d.scope'], ['heavy-link-0a1b2c3d.scope']])
+        self.assertTrue(os.path.isfile(target))
 
     def test_the_user_s_own_note_folders_by_default(self):
         # the sweep the timer runs reads the folders heavy reads (bin/heavy marks_dirs): /run/user/<uid> and the
@@ -1598,10 +1625,13 @@ MUTATIONS = {
                            'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
     'only a note-shaped name': ('if not is_heavy_scope(name) or name in known:', 'if name in known:',
                                 'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
-    'only a folder of heavy\'s': ("if not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid or st.st_mode & 0o022:\n"
-                                  "                    continue\n                names",
-                                  "if False:\n                    continue\n                names",
+    'only a folder of heavy\'s': ('if any(not stat.S_ISDIR', 'if False and any(not stat.S_ISDIR',
                                   'test_notes_in_a_folder_others_can_write_or_a_missing_one_are_left'),
+    'its parent folders too': ('(folder, os.path.dirname(folder),\n' + ' ' * 48
+                               + 'os.path.dirname(os.path.dirname(folder)))', '(folder,)',
+                               'test_notes_behind_a_linked_or_open_parent_folder_or_a_link_are_left'),
+    'a link is never followed': ('st = os.lstat(path)', 'st = os.stat(path)',
+                                 'test_notes_behind_a_linked_or_open_parent_folder_or_a_link_are_left'),
     'notes only when the sweep acts': ('        if act:\n            pruned', '        if True:\n            pruned',
                                        'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
     'owner gone (reparented)': ('if p.pid in mine or p.pid in (1, manager) or p.ppid not in orphan_parents:',
