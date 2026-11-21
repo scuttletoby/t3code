@@ -1635,9 +1635,9 @@ def scan_mutant(mutate):
     wfs = copy.deepcopy(real)
     try:
         mutate(wfs)
-    except (KeyError, TypeError, StopIteration):  # nothing to break: the check above has already failed
+        return bool(secret_scan_problems(wfs))
+    except (KeyError, TypeError, AttributeError, StopIteration):  # nothing to break: the check above has already failed
         return False
-    return bool(secret_scan_problems(wfs))
 
 
 GROUP = {"group": "scan-${{ github.ref }}", "cancel-in-progress": True}
