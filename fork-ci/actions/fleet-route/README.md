@@ -87,6 +87,14 @@ The `runs-on` reads, in order:
    event may run another repository's code, so they never get a self-hosted label here;
 4. otherwise `ubuntu-latest`.
 
+Step 3 is **wider than the trust rule**. It does not check the config's `trusted` actors, workflows and branches,
+bots, `private` or `hosted`: when the route job fails, any push and any pull request from this repository (say a
+dependency bot's) gets the self-hosted label, where the router sends an untrusted one to `hosted`. A **public**
+repository, and any project whose config has a `hosted` label, puts its hosted label there instead of the
+self-hosted one (`fromJSON('["ubuntu-24.04"]')`), so a failed route never gives anyone a self-hosted runner. Only a
+private project with `"hosted": false` needs a self-hosted label in step 3 (its router sends untrusted runs of this
+repository to the always-on pool too); the example above is one.
+
 `fleet_route.test.py` runs this exact expression (copied from this README) for each of those cases.
 
 Without GitHub-hosted runners at all (`"hosted": false`), the route job is red for a run that may hold another
@@ -101,6 +109,14 @@ pool. A **static** pool (runners registered by hand, always there) has neither, 
 repositories only**: the config must say `"private": true`, and the router uses no static pool unless the event
 says the repository is private (unknown counts as public). Keep "Require approval for all outside collaborators" on
 as well.
+
+The router cannot stop a workflow file from naming a static pool's labels in `runs-on` itself. So on a private
+repository with static pools:
+
+- keep **Run workflows from fork pull requests** (Settings, Actions, General) turned off, or a fork's pull request
+  can name those labels and run on the static runners;
+- remove the static runners (or their registration) before the repository is made public. From then on `route`
+  refuses static pools (red), but any fork's pull request could still name their labels.
 
 ### Inputs
 
@@ -120,7 +136,7 @@ as well.
 | `attempt`  | the run attempt the labels were made for                                                                |
 | `fallback` | JSON runs-on for a job of another attempt (a re-run of failed jobs); never a dispatcher pool's label    |
 | `rerun`    | JSON, with `reruns`: `actors`, `pool` (label) and `labels` (job key -> run label without `-a<attempt>`) |
-| `watch`    | `true` when a job went to a fleet pool                                                                  |
+| `watch`    | `true` when a job went to a dispatcher or static pool, else `false`; it starts nothing itself (below)   |
 
 ## Modes
 
@@ -251,7 +267,9 @@ A config that breaks any rule above fails the step with the list of problems and
 
 This action ships `route` only. The fork's own CI also runs the router's `watch` (cancels a run whose fleet job waits
 too long) and `sweep` (re-runs it) with a token that may cancel runs; they are not part of this action, and a project
-that uses only the action has neither. So:
+that uses only the action has neither. The `watch` output only says whether any job went to a dispatcher or static
+pool: the fork's CI starts its watch job only when it is `true` (`if:` on that job), and nothing starts by itself on
+it. So:
 
 - **Old runner labels:** keep the old label on its runners, and in `retired_labels`, for a week after a pool's label
   changes. Runs routed before the change queue on it and still find a runner.

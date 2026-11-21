@@ -28,7 +28,7 @@ import * as PeerForwarding from "../../peer/PeerForwarding.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as WorkAdmission from "../../workAdmission.ts";
 import { legacyOrphanSetId, orphanBatchIds } from "./delegatedResults.ts";
-import { at, NOW, PARENT } from "./delegatedResults.testkit.ts";
+import { at, makeSlots, NOW, PARENT } from "./delegatedResults.testkit.ts";
 import * as DelegatedOrphanScan from "./DelegatedOrphanScan.ts";
 import type { RemoteChildKey } from "./DelegatedResultsStore.ts";
 import * as DelegatedResultsStore from "./DelegatedResultsStore.ts";
@@ -83,6 +83,8 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   const pageReads: Array<{ environmentId: EnvironmentId; cursor: number }> = [];
   const sent: Array<{ threadId: ThreadId; messageId: string; text: string }> = [];
   const receipts = new Map<string, ThreadId>();
+  // The agent slot gate, which lets every reminder through unless a test fills it.
+  const slots = makeSlots();
   const page = (environmentId: EnvironmentId, cursor: number) => {
     const all = there.get(environmentId) ?? [];
     // Two threads a page, newest first, as `t3_thread_list` orders them.
@@ -111,8 +113,10 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
     pageReads,
     sent,
     receipts,
+    slots,
     layer: Layer.mergeAll(
       ServerSettingsService.layerTest({ waitFor }),
+      slots.layer,
       Layer.mock(ServerEnvironment.ServerEnvironment)({
         getEnvironmentId: Effect.succeed(HERE),
       }),
@@ -633,6 +637,215 @@ describe("DelegatedOrphanScan.layerWith", () => {
       const held = yield* started(true);
       expect(held.pageReads).toHaveLength(0);
       expect(held.sent).toHaveLength(0);
+    }),
+  );
+});
+
+/**
+ * Fork (issue 711): an orphan reminder starts a run in an idle parent, so it asks the agent slot
+ * gate. A parent refused waits for a slot alone (no rescan), asked again every few seconds for as
+ * long as it takes; it is sent once a slot frees, never twice, and found again after a restart.
+ */
+describe("DelegatedOrphanScan and agent slots", () => {
+  const SLOT_RETRY = Duration.seconds(5);
+
+  it.effect("asks the gate as a wake-up of the parent; a refusal needs no rescan", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.slots.state.all = true;
+      const scan = yield* service(world);
+      const outcome = yield* scanned(scan.scan());
+      expect(outcome.parents.get(PARENT)).toMatchObject({ type: "waitsForSlot" });
+      expect(world.sent).toHaveLength(0);
+      expect(world.slots.asks).toEqual([
+        expect.objectContaining({
+          callerThreadId: PARENT,
+          intoThreadId: PARENT,
+          keepsHeld: true,
+        }),
+      ]);
+    }),
+  );
+
+  it.effect("waits for a slot past every attempt, logs it once, then sends once and ends", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.slots.state.all = true;
+      const infos: Array<string> = [];
+      const logger = Logger.make(({ message, logLevel }) => {
+        if (logLevel === "Info") infos.push(JSON.stringify(message));
+      });
+      const scan = yield* service(world);
+      const fiber = yield* scan
+        .run()
+        .pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          Effect.forkChild,
+        );
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      expect(world.slots.asks).toHaveLength(1);
+      // Far more tries than `attempts` (3), every 5 seconds, and none of them a new scan.
+      for (let step = 0; step < 24; step++) {
+        yield* TestClock.adjust(SLOT_RETRY);
+        yield* settle;
+      }
+      expect(world.slots.asks).toHaveLength(25);
+      expect(world.pageReads).toHaveLength(1);
+      expect(world.sent).toHaveLength(0);
+      expect(infos.filter((info) => info.includes("waits for an agent slot"))).toHaveLength(1);
+      world.slots.state.all = false;
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      expect(world.sent).toHaveLength(1);
+      expect(world.sent[0]!.text).toContain("lost-1");
+      // The run ends with its last wait: nothing more is asked or sent.
+      yield* Fiber.join(fiber);
+      yield* TestClock.adjust(Duration.hours(1));
+      yield* settle;
+      expect(world.slots.asks).toHaveLength(26);
+      expect(world.sent).toHaveLength(1);
+    }),
+  );
+
+  it.effect("a parent waiting for a slot is left to its wait by the next scan", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      // env-c does not answer, so the run scans again while the parent still waits.
+      world.there.set(ENV_C, [
+        { threadId: "lost-c", from: { environmentId: HERE, threadId: PARENT } },
+      ]);
+      world.silent.add(ENV_C);
+      world.slots.state.all = true;
+      const scan = yield* service(world);
+      const fiber = yield* scan.run().pipe(Effect.forkChild);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.pageTimeout);
+      yield* settle;
+      expect(world.slots.asks).toHaveLength(1);
+      // Past the second scan (10 minutes on, plus env-c's page timeout): one ask per 5 seconds,
+      // none from the scan, which leaves the parent to its wait.
+      const steps =
+        (Duration.toMillis(OPTIONS.retryDelay) + Duration.toMillis(OPTIONS.pageTimeout)) / 5_000;
+      for (let step = 0; step < steps; step++) {
+        yield* TestClock.adjust(SLOT_RETRY);
+        yield* settle;
+      }
+      expect(world.pageReads.filter((read) => read.environmentId === ENV_C)).toHaveLength(2);
+      expect(world.slots.asks).toHaveLength(1 + steps);
+      world.slots.state.all = false;
+      world.silent.delete(ENV_C);
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      // The wait's list, then a fresh one: env-c's orphan, unread by the scans, is named too.
+      expect(world.sent.map((message) => message.text.includes("lost-c"))).toEqual([false, true]);
+      yield* Fiber.interrupt(fiber);
+    }),
+  );
+
+  it.effect("an orphan found while its parent waits is named right after, from a fresh list", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.slots.state.all = true;
+      const fiber = yield* (yield* service(world)).run().pipe(Effect.forkChild);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      // Not in the list the first scan read: it shows only now.
+      world.there.get(ENV_B)!.push({ threadId: "lost-2" });
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      world.slots.state.all = false;
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      yield* Fiber.join(fiber);
+      expect(world.sent.map((message) => message.text.includes("lost-2"))).toEqual([false, true]);
+      expect(world.sent[0]!.text).toContain("lost-1");
+    }),
+  );
+
+  it.effect(
+    "a parent that stays unreadable: logged once, left to the next start after 3 tries",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        world.slots.state.all = true;
+        const warnings: Array<string> = [];
+        const logger = Logger.make(({ message, logLevel }) => {
+          if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+        });
+        const fiber = yield* (yield* service(world))
+          .run()
+          .pipe(
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+            Effect.forkChild,
+          );
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        yield* settle;
+        // Its tasks can no longer be read (a broken store or linked machine).
+        world.followed.set(PARENT, null);
+        yield* TestClock.adjust(SLOT_RETRY);
+        yield* settle;
+        for (let step = 0; step < OPTIONS.attempts; step++) {
+          yield* TestClock.adjust(OPTIONS.retryDelay);
+          yield* settle;
+        }
+        expect(fiber.pollUnsafe()).toBeDefined();
+        expect(warnings.filter((warning) => warning.includes("cannot be read"))).toHaveLength(1);
+        expect(
+          warnings.filter((warning) => warning.includes("left to the next start")),
+        ).toHaveLength(1);
+        expect(world.sent).toHaveLength(0);
+        // The next start finds it again once it can be read.
+        world.followed.set(PARENT, [{ environmentId: ENV_B, threadId: ThreadId.make("known-1") }]);
+        world.slots.state.all = false;
+        const again = yield* (yield* service(world)).run().pipe(Effect.forkChild);
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        yield* settle;
+        yield* Fiber.join(again);
+        expect(world.sent).toHaveLength(1);
+      }),
+  );
+
+  it.effect("a restart while one waits loses nothing: the next start names it once", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.slots.state.all = true;
+      const fiber = yield* (yield* service(world)).run().pipe(Effect.forkChild);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      expect(world.slots.asks).toHaveLength(2);
+      // Stopped half-way through its wait.
+      yield* Fiber.interrupt(fiber);
+      world.slots.state.all = false;
+      const again = yield* (yield* service(world)).run().pipe(Effect.forkChild);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      yield* Fiber.join(again);
+      expect(world.sent).toHaveLength(1);
+      expect(world.sent[0]!.text).toContain("lost-1");
+      // Runs again after that: never a second message.
+      const third = yield* (yield* service(world)).run().pipe(Effect.forkChild);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      yield* Fiber.join(third);
+      expect(world.sent).toHaveLength(1);
     }),
   );
 });
