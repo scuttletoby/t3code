@@ -8,6 +8,7 @@ One test sends real signals, to a child process this test starts.
 """
 import contextlib, fcntl, importlib.machinery, importlib.util, io, json, os, re, shutil, signal, subprocess, sys
 import tempfile, time, types, unittest
+from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWEEP = os.path.join(KIT, 'lib', 'heavy_sweep.py')
@@ -1330,9 +1331,10 @@ class Label(unittest.TestCase):
         with open('/proc/self/cgroup') as f:
             leaf = REAL.unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
         if REAL.is_heavy_scope(leaf):
-            note = os.path.join(REAL.RUNTIME_ROOT, str(UID), 'heavy', 'labelled', leaf)
-            if not os.path.lexists(note):
-                self.addCleanup(lambda: os.path.lexists(note) and os.unlink(note))
+            for base in (os.path.join(REAL.RUNTIME_ROOT, str(UID)), os.path.expanduser('~/.local/state')):
+                note = os.path.join(base, 'heavy', 'labelled', leaf)
+                if not os.path.lexists(note):
+                    self.addCleanup(lambda note=note: os.path.lexists(note) and os.unlink(note))
 
     def fake(self, pid, comm, uid=UID, start=4321):
         d = os.path.join(self.proc, str(pid))
@@ -1374,6 +1376,81 @@ class Label(unittest.TestCase):
         self.fake(4242, 'bash')                 # named on purpose: taken
         self.assertEqual(REAL.owner_value(pid=4242, proc=self.proc), f'uid={UID},pid=4242,start=4321')
 
+    def test_a_process_that_left_heavys_scope_under_a_shell_is_told_to_name_its_owner(self):
+        # systemd-run --scope sh -c 'docker run --label "$(heavy docker-label)" ...' from inside a heavy command: the
+        # shell exits at once, so it cannot own the container; the message says why (not "run it under heavy", it is)
+        os.environ['HEAVY_SCOPE'] = 'heavy-a-0a1b2c3d.scope'
+        self.fake(os.getppid(), 'sh')
+        self.cgroup('/user.slice/app.slice/run-r0a1b2c3d.scope')
+        with self.assertRaises(REAL.LabelRefused) as cm:
+            REAL.owner_value(proc=self.proc)
+        self.assertIn("left heavy's scope heavy-a-0a1b2c3d.scope (it runs in run-r0a1b2c3d.scope)", str(cm.exception))
+        self.assertIn('--owner-pid', str(cm.exception))
+        os.environ.pop('HEAVY_SCOPE')       # not under heavy at all: the plain advice
+        with self.assertRaises(REAL.LabelRefused) as cm:
+            REAL.owner_value(proc=self.proc)
+        self.assertIn('run the test under heavy', str(cm.exception))
+        # a refusal prints nothing on stdout: `--label "$(heavy docker-label)"` is then empty, and docker run refuses
+        # an empty label, so no container starts without an owner
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(REAL, 'owner_value', side_effect=REAL.LabelRefused('x')):
+            self.assertEqual(REAL.label_main([], out=out, err=err), 1)
+        self.assertEqual(out.getvalue(), '')
+
+    def notes(self):
+        """Temporary folders for the notes of note_label: (run folder, state folder) and their HEAVY_MARKS ids."""
+        root = tempfile.mkdtemp(prefix='heavy-notes-')
+        self.addCleanup(shutil.rmtree, root, True)
+        run_base = os.path.join(root, 'run', str(UID))
+        os.makedirs(run_base, 0o700)
+        for name, value in (('RUNTIME_ROOT', os.path.join(root, 'run')), ('STATE_ROOT', os.path.join(root, 'state'))):
+            patcher = mock.patch.object(REAL, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        run, state = (os.path.join(run_base, 'heavy', 'labelled'), os.path.join(root, 'state', 'heavy', 'labelled'))
+        for d in (run, state):
+            os.makedirs(d, 0o700)
+            for x in (d, os.path.dirname(d), os.path.dirname(os.path.dirname(d))):   # makedirs: umask's mode
+                os.chmod(x, 0o700)
+        ids = {d: f'{os.stat(d).st_dev}:{os.stat(d).st_ino}' for d in (run, state)}
+        return run, state, ids
+
+    def test_the_note_goes_where_heavy_reads_it(self):
+        # bin/heavy passes HEAVY_MARKS (device:inode of the folders it reads); a note in any other folder is never
+        # read, so heavy would skip Docker and leave the container to the sweep (#744 item 8)
+        unit = 'heavy-sh-0a1b2c3d.scope'
+        value = f'uid={UID},scope={unit}'
+        run, state, ids = self.notes()
+        both = f'{ids[run]},{ids[state]}'
+        self.assertEqual(REAL.note_label(value, both), '')                  # the usual case: /run/user
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([unit], []))
+        self.assertEqual(REAL.note_label(value, both), '')                  # runs again: the same one note
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([unit], []))
+        os.unlink(os.path.join(run, unit))
+        # the /run/user this process sees is not heavy's (a sandbox's own mount namespace): the state folder then
+        self.assertEqual(REAL.note_label(value, ids[state]), '')
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], [unit]))
+        os.unlink(os.path.join(state, unit))
+        os.chmod(run, 0o777)                                               # /run/user unusable: the same
+        self.assertEqual(REAL.note_label(value, both), '')
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], [unit]))
+        os.unlink(os.path.join(state, unit))
+        # heavy reads neither: no note anywhere, and why (docker-label warns; the sweep removes the container later)
+        os.chmod(run, 0o700)
+        problem = REAL.note_label(value, '1:1')
+        self.assertIn('not the folder heavy reads', problem)
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], []))
+        # no HEAVY_MARKS (an older heavy, or one with no such folder: it asks Docker after every run): /run/user only
+        self.assertEqual(REAL.note_label(value, ''), '')
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([unit], []))
+        os.unlink(os.path.join(run, unit))
+        os.chmod(run, 0o777)
+        self.assertIn('not a folder only this user can write', REAL.note_label(value, ''))
+        self.assertEqual(os.listdir(state), [])
+        os.chmod(run, 0o700)
+        self.assertEqual(REAL.note_label(f'uid={UID},pid=1,start=2', both), '')   # a process owner: no note
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], []))
+
     def test_another_users_owner_pid_is_refused(self):
         # the sweep sees only its own user's processes: it would count the owner as gone and remove the container
         self.fake(4242, 'python3', uid=UID + 1)
@@ -1392,7 +1469,7 @@ class Label(unittest.TestCase):
         env = dict(os.environ, HEAVY_SCOPE='')
         for flag in ('--owner-pid', '--pid'):
             r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', flag, str(os.getpid())],
-                               capture_output=True, text=True, env=env)
+                               capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
             key, _, value = r.stdout.strip().partition('=')
             self.assertEqual(key, LABEL)
@@ -1400,12 +1477,13 @@ class Label(unittest.TestCase):
             self.assertEqual((owner['uid'], owner['pid']), (UID, os.getpid()))
         # HEAVY_SCOPE names a scope this test is not in: its own cgroup decides (its own heavy scope, else its parent)
         r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', '--value'], capture_output=True,
-                           text=True, env=dict(env, HEAVY_SCOPE='heavy-a-0a1b2c3d.scope'))
+                           text=True, env=dict(env, HEAVY_SCOPE='heavy-a-0a1b2c3d.scope'), timeout=60)
         with open('/proc/self/cgroup') as f:
             leaf = REAL.unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
         self.assertEqual(r.stdout, f'uid={UID},scope={leaf}\n' if REAL.is_heavy_scope(leaf) else
                          f'uid={UID},pid={os.getpid()},start={REAL.read_owner(os.getpid())[1]}\n', r.stderr)
-        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', '--pid'], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', '--pid'], capture_output=True, text=True,
+                           timeout=60)
         self.assertEqual(r.returncode, 2)
 
     def test_label_from_a_setup_script(self):
@@ -1414,10 +1492,11 @@ class Label(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != 'HEAVY_SCOPE'}
         cmd = f'"{sys.executable}" -I -B "{HEAVY}" docker-label --value'
         r = subprocess.run(['bash', '-c', f'v=$({cmd} --owner-pid "$PPID") && echo "$v"; true'],
-                           capture_output=True, text=True, env=env)
+                           capture_output=True, text=True, env=env, timeout=60)
         owner = REAL.parse_owner(r.stdout.strip())
         self.assertEqual(owner['pid'], os.getpid(), r.stderr)
-        r = subprocess.run(['bash', '-c', f'v=$({cmd}) && echo "$v"; true'], capture_output=True, text=True, env=env)
+        r = subprocess.run(['bash', '-c', f'v=$({cmd}) && echo "$v"; true'], capture_output=True, text=True, env=env,
+                           timeout=60)
         owner = REAL.parse_owner(r.stdout.strip())
         if owner is not None and 'scope' in owner:
             self.skipTest('runs inside a heavy scope: the scope is the owner')
@@ -1432,7 +1511,7 @@ class RealSignal(unittest.TestCase):
         s = REAL.Sweep()
         s.stop_grace = 2
         child = subprocess.Popen(['sleep', '60'])
-        self.addCleanup(lambda: (child.kill(), child.wait()))
+        self.addCleanup(lambda: (child.kill(), child.wait(timeout=60)))
         p = s.read_proc(child.pid)
         self.assertEqual(p.uid, UID)
         wrong = REAL.Proc(**{k: getattr(p, k) for k in p.__slots__})
