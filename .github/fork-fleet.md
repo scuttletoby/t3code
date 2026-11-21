@@ -498,7 +498,10 @@ that uses the router (or the `fleet-route` action) may also set:
   the config must say `"private": true`, and `route` uses no static pool unless
   the event says `repository.private: true` (unknown refuses, with an error on
   the run page). A static pool's labels may not be a dispatcher pool's label or
-  a retired label.
+  a retired label. The router cannot stop a workflow file from naming those
+  labels in `runs-on` itself, so on a private repository with static pools keep
+  **Run workflows from fork pull requests** turned off, and remove the static
+  runners (or their registration) before the repository is made public.
 - **`"hosted": false`** (no GitHub-hosted runners). Each kind then needs a
   static pool, and `upstream_sync` is refused. Every job that is not routed (a
   change gate off, a manual, scheduled or bot run, an untrusted run of this

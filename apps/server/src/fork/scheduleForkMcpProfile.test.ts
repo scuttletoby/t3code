@@ -17,15 +17,18 @@ import {
   ProjectId,
   ProviderInstanceId,
   type ScheduledTask,
+  ScheduledTaskError,
   ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
+import { McpSchema, McpServer } from "effect/ai";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
+import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../mcp/McpToolAccess.ts";
 import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
@@ -35,6 +38,8 @@ import { OrchestratorToolkit } from "../mcp/toolkits/orchestrator/tools.ts";
 import * as ThreadHandlers from "../mcp/toolkits/thread/handlers.ts";
 import { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
@@ -42,8 +47,12 @@ import * as PeerLinkRequests from "../peer/PeerLinkRequests.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ProjectService from "../project/ProjectService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 
 const PROJECT = ProjectId.make("project:wide");
 const NARROW_PROJECT = ProjectId.make("project:narrow");
@@ -51,6 +60,8 @@ const BARE_PROJECT = ProjectId.make("project:bare");
 const CALLER = ThreadId.make("thread:caller");
 const WIDE = ThreadId.make("thread:wide");
 const ORPHAN = ThreadId.make("thread:orphan");
+/** A thread in another project than the caller's. */
+const ELSEWHERE = ThreadId.make("thread:elsewhere");
 const INSTANCE = ProviderInstanceId.make("claudeAgent");
 const HERE = EnvironmentId.make("environment-here");
 const THERE = EnvironmentId.make("environment-there");
@@ -99,11 +110,15 @@ const appThread = (
     deletedAt: null,
   }) as unknown as OrchestrationV2AppThread;
 
-/** The caller, a thread in PROJECT; a wide thread beside it; one whose parent is gone (old state). */
+/**
+ * The caller, a thread in PROJECT; a wide thread beside it; one whose parent is gone (old state);
+ * one in BARE_PROJECT.
+ */
 const THREADS = [
   appThread(CALLER, PROJECT),
   appThread(WIDE, PROJECT),
   appThread(ORPHAN, PROJECT, ThreadId.make("thread:deleted-parent")),
+  appThread(ELSEWHERE, BARE_PROJECT),
 ];
 
 const shellOf = (thread: OrchestrationV2AppThread): OrchestrationV2ThreadShell =>
@@ -173,10 +188,9 @@ interface Recorded {
 }
 
 /**
- * Runs `body` with upstream's orchestrator and thread toolkits over the settings given, a thread
- * caller (or the owner's own client with `caller: false`), a thread store holding THREADS, and
- * every scheduled task write, run, thread command and call sent to another machine recorded. `scheduledTasks: false` leaves the
- * scheduled task service out (it cannot be read).
+ * Upstream's orchestrator and thread toolkits over `settings`, a thread caller (`caller: false`:
+ * the owner's client) and a store of THREADS; task writes, runs, thread commands and forwarded
+ * calls are recorded. `scheduledTasks: false` leaves the task service out; `listFails` fails its list.
  */
 const withToolkits = <A, E>(
   settings: object,
@@ -186,7 +200,11 @@ const withToolkits = <A, E>(
     readonly fork: (threadId: ThreadId, params?: object) => Effect.Effect<string | undefined>;
     readonly runNow: (taskId: string, params?: object) => Effect.Effect<string | undefined>;
   }) => Effect.Effect<A, E>,
-  options: { readonly caller?: boolean; readonly scheduledTasks?: boolean } = {},
+  options: {
+    readonly caller?: boolean;
+    readonly scheduledTasks?: boolean;
+    readonly listFails?: boolean;
+  } = {},
 ) => {
   const recorded: Recorded = { scheduled: [], updated: [], dispatched: [], ran: [], forwarded: [] };
   const threadCaller = options.caller !== false;
@@ -237,7 +255,10 @@ const withToolkits = <A, E>(
     (options.scheduledTasks === false
       ? Layer.empty
       : Layer.mock(ScheduledTasks.ScheduledTaskService)({
-          list: () => Effect.succeed({ tasks: Object.values(TASKS) }),
+          list: () =>
+            options.listFails === true
+              ? Effect.fail(new ScheduledTaskError({ message: "the task table is locked" }))
+              : Effect.succeed({ tasks: Object.values(TASKS) }),
           runNow: (input) => {
             recorded.ran.push(input);
             const task = Object.values(TASKS).find((candidate) => candidate.id === input.id)!;
@@ -476,6 +497,43 @@ it.effect("a change is refused when the scheduled task service cannot be read", 
   ),
 );
 
+it.effect("a change is refused when the scheduled tasks cannot be listed, never let through", () =>
+  withToolkits(
+    NARROWED,
+    ({ recorded, schedule }) =>
+      Effect.gen(function* () {
+        // The task cannot be read, so whether its runs start a wider thread is not known. Runs
+        // again: refused each time, and the service's change is never reached.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const message = yield* schedule({ scheduledTaskId: TASKS.newThread.id, prompt: "New" });
+          expect(message).toContain("orchestration_error: Could not load scheduled task");
+          expect(message).toContain("the task table is locked");
+        }
+        expect(recorded.updated).toHaveLength(0);
+      }),
+    { listFails: true },
+  ),
+);
+
+it.effect("a fork is checked in its source's project, not the caller's", () =>
+  // The caller's project keeps its threads to `docs`; ELSEWHERE is in a project left on all.
+  withToolkits(
+    { ...DOCS_ONLY, ...projects({ [PROJECT]: { mcpProfile: "docs" } }) },
+    ({ recorded, fork }) =>
+      Effect.gen(function* () {
+        // The fork is made in ELSEWHERE's project and cut to ELSEWHERE: all, wider than docs.
+        const message = yield* fork(ELSEWHERE);
+        expect(message).toContain('capability_denied: This thread\'s MCP profile is "docs"');
+        expect(message).toContain('a fork of that thread would get "all"');
+        expect(yield* fork(ELSEWHERE)).toContain("capability_denied");
+        expect(recorded.dispatched).toHaveLength(0);
+        // A thread in the caller's own project forks within docs.
+        expect(yield* fork(WIDE)).toBeUndefined();
+        expect(recorded.dispatched).toHaveLength(1);
+      }),
+  ),
+);
+
 it.effect("a narrowed thread cannot fork a wider thread; it can fork itself", () =>
   withToolkits(NARROWED, ({ recorded, fork }) =>
     Effect.gen(function* () {
@@ -627,4 +685,93 @@ it.effect("a thread on all forks, changes and runs tasks on another machine as b
       ]);
     }),
   ),
+);
+
+const declaredFailure = (result: McpSchema.CallToolResult) => {
+  const text = result.content[0];
+  return result.isError === true && text?.type === "text" ? JSON.parse(text.text) : undefined;
+};
+
+/**
+ * `schedule_task` declares only its own services, not the scheduled task service its check reads.
+ * Through the server's own toolkit wiring (McpHttpServer.layerOrchestratorToolkit) a thread's call
+ * still finds it: the check reads the task and refuses on its profile, not with "cannot be read".
+ */
+it.effect(
+  "schedule_task's check finds the scheduled task service through the server's wiring",
+  () =>
+    Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const call = (args: Record<string, unknown>) =>
+        server.callTool({ name: "schedule_task", arguments: args }).pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: HERE,
+            requestNamespace: "thread:caller:session",
+            thread: {
+              threadId: CALLER,
+              providerSessionId: "session",
+              providerInstanceId: INSTANCE,
+            },
+            client: undefined,
+            issuedAt: 0,
+            capabilities: new Set(["orchestration" as const]),
+          }),
+          Effect.provideService(
+            McpSchema.McpServerClient,
+            McpSchema.McpServerClient.of({
+              clientId: 1,
+              protocolVersion: "2025-06-18",
+              clientCapabilities: {},
+              clientInfo: { name: "fork-test", version: "1" },
+              initializePayload: {
+                protocolVersion: "2025-06-18",
+                capabilities: {},
+                clientInfo: { name: "fork-test", version: "1" },
+              },
+              getClient: Effect.die("unused"),
+            }),
+          ),
+        );
+      const changed = declaredFailure(
+        yield* call({ scheduledTaskId: TASKS.newThread.id, prompt: "New" }),
+      );
+      expect(changed).toMatchObject({ code: "capability_denied" });
+      expect(changed.message).toContain("a thread this task's runs start in its project");
+    }).pipe(
+      Effect.provide(
+        McpHttpServer.layerOrchestratorToolkit.pipe(
+          Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: (threadId) => {
+                const thread = THREADS.find((candidate) => candidate.id === threadId);
+                return Effect.succeed(thread === undefined ? null : shellOf(thread));
+              },
+            }),
+          ),
+          Layer.provide(
+            ServerSettings.layerTest({
+              fallbackModelSelection: { instanceId: INSTANCE, model: "claude-opus" },
+              ...NARROWED,
+            } as Settings),
+          ),
+          Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
+          Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
+          Layer.provide(
+            Layer.mock(ScheduledTasks.ScheduledTaskService)({
+              list: () => Effect.succeed({ tasks: Object.values(TASKS) }),
+            }),
+          ),
+          Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
+          Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+          Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+          Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+          Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+          Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+        ),
+      ),
+    ),
 );

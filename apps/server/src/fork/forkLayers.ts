@@ -23,7 +23,9 @@ import * as ForkFeatures from "./forkFeatures.ts";
 import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as McpProfileTurnCheck from "./mcpProfileTurnCheck.ts";
+import * as PullRequestWatchSlot from "./pullRequestWatchSlot.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
+import * as WorkerWakeSlots from "./workerWakeSlots.ts";
 
 /**
  * Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. A
@@ -58,11 +60,14 @@ export const layerRuntimeServices = Layer.mergeAll(
 );
 
 /**
- * Provided to the runtime's core dependencies (server.ts's `layerRuntimeCoreDependenciesBase`, first
- * in its pipe, so only its own workers see it): upstream's orchestrator, except that idle compaction
- * skips a thread whose handoff mode is `handoff`, which the handoff service alone owns.
+ * For the runtime's own workers only (first in server.ts's `layerRuntimeCoreDependenciesBase`):
+ * idle compaction skips a thread the handoff service owns, then a run into an idle thread from a
+ * pull request watch, idle compaction or a delegated task's question takes an agent slot.
  */
-export const handoffThreadsSkipIdleCompaction = HandoffOwner.layer;
+export const handoffThreadsSkipIdleCompaction = PullRequestWatchSlot.layer.pipe(
+  Layer.provide(HandoffOwner.layer),
+  Layer.provide(WorkerWakeSlots.layer),
+);
 
 /**
  * Right below upstream's orchestration layer in server.ts, so every turn reads its adapter from it:
