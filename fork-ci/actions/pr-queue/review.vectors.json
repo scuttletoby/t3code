@@ -1,6 +1,7 @@
 {
-  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`.",
+  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a post that only looks like a report is a `comment without a first-line lens header` entry that reads nothing). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
   "config_path": ".github/pr-queue.json",
+  "override_prefix": "override for head",
   "globs": [
     ["**", "a", true],
     ["**", "a/b/c.py", true],
@@ -50,7 +51,10 @@
     ["a.b+c(d)$^|x", "aXb+c(d)$^|x", false],
     ["*.txt", "a\nb.txt", true],
     ["*", "a b", true],
-    ["src/**", "src/a b/c d.py", true]
+    ["src/**", "src/a b/c d.py", true],
+    ["?.py", "😀.py", true],
+    ["??.py", "😀.py", false],
+    ["a/*/b", "a/😀😀/b", true]
   ],
   "configs": {
     "basic": {
@@ -63,17 +67,43 @@
           "paths": ["src/storage/**", "migrations/**"],
           "lenses": ["data-1", "data-2"]
         },
-        { "name": "docs", "weight": "light", "paths": ["docs/**", "**/*.md"], "lenses": [] },
-        { "name": "code", "weight": "normal", "paths": ["**"], "lenses": ["code"] }
+        {
+          "name": "docs",
+          "weight": "light",
+          "paths": ["docs/**", "**/*.md"],
+          "lenses": []
+        },
+        {
+          "name": "code",
+          "weight": "normal",
+          "paths": ["**"],
+          "lenses": ["code"]
+        }
       ],
       "lenses": {
-        "data-1": { "prompt": ".github/lenses/data.md" },
-        "data-2": { "prompt": ".github/lenses/data.md" },
-        "code": { "prompt": ".github/lenses/code.md" },
-        "approach": { "prompt": ".github/lenses/approach.md" }
+        "data-1": {
+          "prompt": ".github/lenses/data.md"
+        },
+        "data-2": {
+          "prompt": ".github/lenses/data.md"
+        },
+        "code": {
+          "prompt": ".github/lenses/code.md"
+        },
+        "approach": {
+          "prompt": ".github/lenses/approach.md"
+        }
       },
-      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
-      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "min_lenses": {
+        "critical": 2,
+        "normal": 1,
+        "light": 0
+      },
+      "rounds": {
+        "approach_at": 3,
+        "max": 4,
+        "approach_lens": "approach"
+      },
       "findings": true,
       "state_line": true
     },
@@ -93,21 +123,58 @@
           "paths": ["src/**/schema.sql", "db/**"],
           "lenses": ["data-1", "data-2"]
         },
-        { "name": "api", "weight": "normal", "paths": ["src/api/*.py"], "lenses": ["api", "code"] },
-        { "name": "notes", "weight": "light", "paths": ["notes/*.txt", "config/*"], "lenses": [] },
-        { "name": "rest", "weight": "normal", "paths": ["*/**"], "lenses": ["code"] }
+        {
+          "name": "api",
+          "weight": "normal",
+          "paths": ["src/api/*.py"],
+          "lenses": ["api", "code"]
+        },
+        {
+          "name": "notes",
+          "weight": "light",
+          "paths": ["notes/*.txt", "config/*"],
+          "lenses": []
+        },
+        {
+          "name": "rest",
+          "weight": "normal",
+          "paths": ["*/**"],
+          "lenses": ["code"]
+        }
       ],
       "lenses": {
-        "security-1": { "prompt": "review/security.md" },
-        "security-2": { "prompt": "review/security.md" },
-        "data-1": { "prompt": "review/data.md" },
-        "data-2": { "prompt": "review/data-second.md" },
-        "api": { "prompt": "review/api.md" },
-        "code": { "prompt": "review/code.md" },
-        "approach": { "prompt": "review/approach.md" }
+        "security-1": {
+          "prompt": "review/security.md"
+        },
+        "security-2": {
+          "prompt": "review/security.md"
+        },
+        "data-1": {
+          "prompt": "review/data.md"
+        },
+        "data-2": {
+          "prompt": "review/data-second.md"
+        },
+        "api": {
+          "prompt": "review/api.md"
+        },
+        "code": {
+          "prompt": "review/code.md"
+        },
+        "approach": {
+          "prompt": "review/approach.md"
+        }
       },
-      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
-      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "min_lenses": {
+        "critical": 2,
+        "normal": 1,
+        "light": 0
+      },
+      "rounds": {
+        "approach_at": 3,
+        "max": 4,
+        "approach_lens": "approach"
+      },
       "findings": true,
       "state_line": true
     },
@@ -115,8 +182,18 @@
       "version": 1,
       "mode": "enforce",
       "rules": [
-        { "name": "light", "weight": "light", "paths": ["docs/**"], "lenses": [] },
-        { "name": "code", "weight": "normal", "paths": ["src/**"], "lenses": ["code"] },
+        {
+          "name": "light",
+          "weight": "light",
+          "paths": ["docs/**"],
+          "lenses": []
+        },
+        {
+          "name": "code",
+          "weight": "normal",
+          "paths": ["src/**"],
+          "lenses": ["code"]
+        },
         {
           "name": "everything",
           "weight": "critical",
@@ -125,13 +202,29 @@
         }
       ],
       "lenses": {
-        "code": { "prompt": "docs/lenses/code.md" },
-        "deep-1": { "prompt": "docs/lenses/deep.md" },
-        "deep-2": { "prompt": "docs/lenses/deep.md" },
-        "approach": { "prompt": "docs/lenses/approach.md" }
+        "code": {
+          "prompt": "docs/lenses/code.md"
+        },
+        "deep-1": {
+          "prompt": "docs/lenses/deep.md"
+        },
+        "deep-2": {
+          "prompt": "docs/lenses/deep.md"
+        },
+        "approach": {
+          "prompt": "docs/lenses/approach.md"
+        }
       },
-      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
-      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "min_lenses": {
+        "critical": 2,
+        "normal": 1,
+        "light": 0
+      },
+      "rounds": {
+        "approach_at": 3,
+        "max": 4,
+        "approach_lens": "approach"
+      },
       "findings": false,
       "state_line": false
     }
@@ -438,6 +531,2024 @@
       "lenses": ["code"],
       "hits": ["light", "code"],
       "protected": []
+    }
+  ],
+  "findings": [
+    {
+      "name": "heading, numbered item",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Blocking\n\n1. **The lock is gone.** Two writers race on the row.",
+      "findings": [["blocker", "Blocking The lock is gone. Two writers race on the row."]],
+      "section": false
+    },
+    {
+      "name": "heading, bold item",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Major\n**B1. The retry loops forever.**",
+      "findings": [["major", "Major B1. The retry loops forever."]],
+      "section": false
+    },
+    {
+      "name": "heading with a note",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Blocking (merge, not safety)\n1. The queue merges an unread head.",
+      "findings": [["blocker", "Blocking (merge, not safety) The queue merges an unread head."]],
+      "section": false
+    },
+    {
+      "name": "heading with a long note",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Major (older than this PR; a follow-up issue is fine)\n- the cache never expires",
+      "findings": [
+        ["major", "Major (older than this PR; a follow-up issue is fine) the cache never expires"]
+      ],
+      "section": false
+    },
+    {
+      "name": "bold inline",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n**Blocking:** the lock is gone.",
+      "findings": [["blocker", "Blocking: the lock is gone."]],
+      "section": false
+    },
+    {
+      "name": "bold bare, item under it",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n**Major**\n- two writers race",
+      "findings": [["major", "Major two writers race"]],
+      "section": false
+    },
+    {
+      "name": "plain",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nBlocking: x",
+      "findings": [["blocker", "Blocking: x"]],
+      "section": false
+    },
+    {
+      "name": "findings word",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nMajor findings: x",
+      "findings": [["major", "Major findings: x"]],
+      "section": false
+    },
+    {
+      "name": "findings word, list under it",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nMajor findings:\n1. x",
+      "findings": [["major", "Major findings: x"]],
+      "section": false
+    },
+    {
+      "name": "dash list",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n- major — x",
+      "findings": [["major", "major — x"]],
+      "section": false
+    },
+    {
+      "name": "en dash",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor – x",
+      "findings": [["major", "major – x"]],
+      "section": false
+    },
+    {
+      "name": "hyphen",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor - x",
+      "findings": [["major", "major - x"]],
+      "section": false
+    },
+    {
+      "name": "emoji",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n🔴 Major: x",
+      "findings": [["major", "Major: x"]],
+      "section": false
+    },
+    {
+      "name": "emoji, bold",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n⚠️ **Blocker**: x",
+      "findings": [["blocker", "Blocker: x"]],
+      "section": false
+    },
+    {
+      "name": "numbered label",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor 2: a retry loops",
+      "findings": [["major", "major 2: a retry loops"]],
+      "section": false
+    },
+    {
+      "name": "plural with a note",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nMajors (state): stopped half-way leaves a row",
+      "findings": [["major", "Majors (state): stopped half-way leaves a row"]],
+      "section": false
+    },
+    {
+      "name": "brackets",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n[major] x",
+      "findings": [["major", "[major] x"]],
+      "section": false
+    },
+    {
+      "name": "second label of a line",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nBlocker: none, major: two writers race",
+      "findings": [["major", "Blocker: none, major: two writers race"]],
+      "section": true
+    },
+    {
+      "name": "after a semicolon",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none; major: x",
+      "findings": [["major", "blocker: none; major: x"]],
+      "section": true
+    },
+    {
+      "name": "after and",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none and major: x",
+      "findings": [["major", "blocker: none and major: x"]],
+      "section": true
+    },
+    {
+      "name": "table row",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| severity | finding |\n|---|---|\n| major | x |",
+      "findings": [["major", "major x"]],
+      "section": false
+    },
+    {
+      "name": "table row, bold",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| **Blocker** | the lock is gone |",
+      "findings": [["blocker", "Blocker the lock is gone"]],
+      "section": false
+    },
+    {
+      "name": "table column",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| blocker | major |\n| --- | --- |\n| none | two writers race |",
+      "findings": [["major", "none two writers race"]],
+      "section": true
+    },
+    {
+      "name": "fullwidth M (NFKC)",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nＭajor: x",
+      "findings": [["major", "Major: x"]],
+      "section": false
+    },
+    {
+      "name": "zero-width space",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmaj​or: x",
+      "findings": [["major", "major: x"]],
+      "section": false
+    },
+    {
+      "name": "zero-width joiner in heading",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Bl‍ocking\n1. x",
+      "findings": [["blocker", "Blocking x"]],
+      "section": false
+    },
+    {
+      "name": "soft hyphen",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nma­jor: x",
+      "findings": [["major", "major: x"]],
+      "section": false
+    },
+    {
+      "name": "Cyrillic o",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajоr: x",
+      "findings": [["major", "major: x"]],
+      "section": false
+    },
+    {
+      "name": "Cyrillic M",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nМajor: x",
+      "findings": [["major", "Major: x"]],
+      "section": false
+    },
+    {
+      "name": "Greek omicron",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblοcker: x",
+      "findings": [["blocker", "blocker: x"]],
+      "section": false
+    },
+    {
+      "name": "digit zero for o",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmaj0r: x",
+      "findings": [["major", "maj0r: x"]],
+      "section": false
+    },
+    {
+      "name": "heading, code under it",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Major\n```\nthe race is in x\n```",
+      "findings": [["major", "Major ```"]],
+      "section": false
+    },
+    {
+      "name": "heading, nothing under it",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Major",
+      "findings": [["major", "Major (nothing under it)"]],
+      "section": false
+    },
+    {
+      "name": "heading, next heading under it",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Major\n### Minor\n- a typo",
+      "findings": [["major", "Major (nothing under it)"]],
+      "section": false
+    },
+    {
+      "name": "bare label, nothing under it",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor:",
+      "findings": [["major", "major: (nothing under it)"]],
+      "section": false
+    },
+    {
+      "name": "a none that is not one",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none of the retries stop",
+      "findings": [["major", "major: none of the retries stop"]],
+      "section": false
+    },
+    {
+      "name": "a no that is not one",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: no lock on the write path",
+      "findings": [["major", "major: no lock on the write path"]],
+      "section": false
+    },
+    {
+      "name": "a dash that is not one",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: - x",
+      "findings": [["major", "major: - x"]],
+      "section": false
+    },
+    {
+      "name": "see below",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: see below",
+      "findings": [["blocker", "blocker: see below"]],
+      "section": false
+    },
+    {
+      "name": "quoted (read: fail closed)",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n> major: quoted from round 1",
+      "findings": [["major", "major: quoted from round 1"]],
+      "section": false
+    },
+    {
+      "name": "indented (read: fail closed)",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    major: in an indented block",
+      "findings": [["major", "major: in an indented block"]],
+      "section": false
+    },
+    {
+      "name": "HTML tag",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n<b>major</b>: x",
+      "findings": [["major", "major: x"]],
+      "section": false
+    },
+    {
+      "name": "link",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n[major](http://e/x): y",
+      "findings": [["major", "major: y"]],
+      "section": false
+    },
+    {
+      "name": "summary tag",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n<details><summary>major: x</summary>",
+      "findings": [["major", "major: x"]],
+      "section": false
+    },
+    {
+      "name": "narrow read only",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor (see <b ): x <i>",
+      "findings": [["major", "major (see <b ): x"]],
+      "section": false
+    },
+    {
+      "name": "NOT SAFE header",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n## Review lens A, head 0123abc: **NOT SAFE**\nblocker: none\nmajor: none",
+      "findings": [["blocker", "the report says NOT SAFE: Review lens A, head 0123abc: NOT SAFE"]],
+      "section": true
+    },
+    {
+      "name": "NOT SAFE verdict",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nverdict: NOT SAFE\nblocker: none\nmajor: none",
+      "findings": [["blocker", "the report says NOT SAFE: verdict: NOT SAFE"]],
+      "section": true
+    },
+    {
+      "name": "finding line",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfinding: major src/a.py:3 loses data",
+      "findings": [["major", "finding: major src/a.py:3 loses data"]],
+      "section": true
+    },
+    {
+      "name": "finding line, blocker",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n- finding: blocker the lock is gone",
+      "findings": [["blocker", "finding: blocker the lock is gone"]],
+      "section": true
+    },
+    {
+      "name": "finding line after blocker: none",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nfinding: major src/a.py:3 loses data",
+      "findings": [["major", "finding: major src/a.py:3 loses data"]],
+      "section": true
+    },
+    {
+      "name": "finding line after findings: none",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfindings: none\nfinding: major x",
+      "findings": [["major", "finding: major x"]],
+      "section": true
+    },
+    {
+      "name": "recap of a fixed major",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\n- Major 1 (cap): fixed at the root.",
+      "findings": [["major", "Major 1 (cap): fixed at the root."]],
+      "section": true
+    },
+    {
+      "name": "recap of a fixed blocker",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\n**Blocking 1:** fixed.",
+      "findings": [["blocker", "Blocking 1: fixed."]],
+      "section": true
+    },
+    {
+      "name": "HTML entity",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\nma&#106;or: x",
+      "findings": [["major", "major: x"]],
+      "section": true
+    },
+    {
+      "name": "Markdown escape",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\nmajor\\: x",
+      "findings": [["major", "major: x"]],
+      "section": true
+    },
+    {
+      "name": "ratio sign for a colon",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\nmajor∶ x",
+      "findings": [["major", "major: x"]],
+      "section": true
+    },
+    {
+      "name": "a dash glued to none",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none-critical race",
+      "findings": [["major", "major: none-critical race"]],
+      "section": false
+    },
+    {
+      "name": "both on one line",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nBlocker: none, major: none",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "none found",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nMajor: none found",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "none with a note",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none (only minors)",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "none!",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none!",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "heading, none under it",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Major\nnone",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "headings, None.",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Blocking\nNone.\n\n### Major\nNone.",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "bold inline, none",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n**Blocking:** none.\n**Major:** none.",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "a rule between",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Major\n\n---\n\nNone.",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "table columns",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| blocker | major |\n|---|---|\n| none | none |",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "table columns, blanks round the rule",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| blocker | major |\n  |---|---|  \n| none | none |",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "table row, none",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| severity | finding |\n|---|---|\n| major | none |",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "n/a",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: n/a",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "zero",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: 0",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "em dash",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: —",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "list",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n- majors: none",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "bold no",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n**blockers:** no",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "nothing",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: nothing",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "NA",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: NA",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "minors do not block",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none\n### Minor\n- a typo\nminor: x\nnit: y",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "code block",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none\n```\nmajor: in code\n### Blocking\n1. x\n```",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "tilde fence",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n~~~\nblocker: x\n~~~",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "longer fence holds a shorter one",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none\n````\n```\nmajor: x\n```\n````",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "findings: none",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfindings: none",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "Unicode none",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nМajor: nоne",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "both, full stops",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nBlocker: none. Major: none.",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "nothing found",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: nothing found",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "a minor after it",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none; minor: x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "prose that says not safe",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none\nThe old code was not safe to run twice; this fixes it.",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "none, a dash, a note",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none — two minors below",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "none, a hyphen, a note",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none - two minors below",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "none in parentheses",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nMajor: (none)",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "none and an emoji",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: None ✅",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "only minor finding lines",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfinding: minor src/a.py:3 a typo\nfinding: nit y",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "a recap without a label",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\nround 1, fixed: the race",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "Blocker: none, major: none",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nBlocker: none, major: none",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "### Blocking\nNone.\n\n### Major\nNone.",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Blocking\nNone.\n\n### Major\nNone.",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "**Blocking:** none.\n**Major:** none.",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n**Blocking:** none.\n**Major:** none.",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "| blocker | major |\n|---|---|\n| none | none |",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| blocker | major |\n|---|---|\n| none | none |",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "findings: none alone is a section",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfindings: none",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "Blocker: none. Major: none.",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nBlocker: none. Major: none.",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "finding: minor a typo",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfinding: minor a typo",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "blocker: none\nmajor: none",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "| severity | finding |\n|---|---|\n| blocker | none |\n| major | none |",
+      "group": "section",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| severity | finding |\n|---|---|\n| blocker | none |\n| major | none |",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "F1 (major): x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nF1 (major): x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "1. **Retry drops rows** (major): x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n1. **Retry drops rows** (major): x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "- F1. Severity: major. x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n- F1. Severity: major. x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "- F1 — **Severity:** Major — x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n- F1 — **Severity:** Major — x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "- F1 — major: x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n- F1 — major: x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "F1: major: x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nF1: major: x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "One major: x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nOne major: x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "Major 1. x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nMajor 1. x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "minor: typo. Also major: x",
+      "group": "one-kind",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nminor: typo. Also major: x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "major: none",
+      "group": "one-label",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "blocker: none",
+      "group": "one-label",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "### Major\nNone.",
+      "group": "one-label",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n### Major\nNone.",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "| severity | finding |\n|---|---|\n| major | none |",
+      "group": "one-label",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n| severity | finding |\n|---|---|\n| major | none |",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "fixed: the major of round 1",
+      "group": "mention",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfixed: the major of round 1",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "no major found",
+      "group": "mention",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nno major found",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "majority: x",
+      "group": "mention",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajority: x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "Major version: 2",
+      "group": "mention",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nMajor version: 2",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "blockerx: y",
+      "group": "mention",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblockerx: y",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "major 12345: too long a number",
+      "group": "mention",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor 12345: too long a number",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "the blocking call in x",
+      "group": "mention",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nthe blocking call in x",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "named, no header",
+      "group": "named",
+      "body": "blocker: the lock is gone\n- **Major:** two writers race\nminor: a typo",
+      "findings": [
+        ["blocker", "blocker: the lock is gone"],
+        ["major", "Major: two writers race"]
+      ],
+      "section": true
+    },
+    {
+      "name": "bare heading, item under it",
+      "group": "named",
+      "body": "### Major\n- race",
+      "findings": [["major", "Major race"]],
+      "section": false
+    },
+    {
+      "name": "bare heading, nothing under it",
+      "group": "named",
+      "body": "### Major",
+      "findings": [["major", "Major (nothing under it)"]],
+      "section": false
+    },
+    {
+      "name": "an unclosed fence runs to the end",
+      "group": "clean",
+      "body": "blocker: none\nmajor: none\n```\nmajor: x",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "a fence ends a table",
+      "group": "clean",
+      "body": "| blocker | major |\n|---|---|\n| none | none |\n```\ncode\n```\n| a | b |",
+      "findings": [],
+      "section": true
+    },
+    {
+      "name": "a row after a table goes on with it",
+      "group": "named",
+      "body": "| blocker | major |\n|---|---|\n| none | none |\n| a | b |",
+      "findings": [["blocker", "a b"]],
+      "section": true
+    },
+    {
+      "name": "an emoji is two UTF-16 units",
+      "group": "named",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none\n🔴🔴 major: 😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+      "findings": [
+        [
+          "major",
+          "major: 😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"
+        ]
+      ],
+      "section": true
+    },
+    {
+      "name": "a finding line is cut at 120 characters",
+      "group": "named",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "findings": [
+        [
+          "major",
+          "major: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        ]
+      ],
+      "section": false
+    },
+    {
+      "name": "empty body",
+      "group": "mention",
+      "body": "",
+      "findings": [],
+      "section": false
+    },
+    {
+      "name": "a quote in a finding",
+      "group": "named",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: it's racy",
+      "findings": [["major", "major: it's racy"]],
+      "section": false
+    },
+    {
+      "name": "both quotes in a finding",
+      "group": "named",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: it's \"racy\" \\ x",
+      "findings": [["major", "major: it's \"racy\" \\ x"]],
+      "section": false
+    },
+    {
+      "name": "a number reference past 4,300 digits reads as its value",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nma&#00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000106;or: the cache is wrong",
+      "findings": [["major", "major: the cache is wrong"]],
+      "section": true
+    },
+    {
+      "name": "a number reference past 4,300 digits and past Unicode reads as U+FFFD",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none &#99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;",
+      "findings": [],
+      "section": true
+    }
+  ],
+  "scans": [
+    {
+      "name": "a pull request with no comments",
+      "posts": [],
+      "history": [],
+      "entries": {}
+    },
+    {
+      "name": "a comment that is no lens report",
+      "posts": [
+        {
+          "body": "Thanks, merging after CI."
+        }
+      ],
+      "history": [],
+      "entries": {}
+    },
+    {
+      "name": "one lens report",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "the same comment read twice",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      ],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a newer round replaces the older entry and both stay in the history",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: x"
+        },
+        {
+          "body": "lens: code r2 · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code r2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+      ],
+      "entries": {
+        "code": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null]
+      }
+    },
+    {
+      "name": "an edited comment reads nothing and still counts in the history",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens: code r2 · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none",
+          "edited": true
+        }
+      ],
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code r2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+      ],
+      "entries": {
+        "code": [null, "edited after posting: post a new comment instead"]
+      }
+    },
+    {
+      "name": "a hidden comment reads nothing and still counts in the history",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none",
+          "hidden": true
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": [null, "hidden: post a new comment instead"]
+      }
+    },
+    {
+      "name": "a short sha is kept as written",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: abcdef1\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [["code", "abcdef1"]],
+      "entries": {
+        "code": ["abcdef1", null]
+      }
+    },
+    {
+      "name": "an upper-case sha is read lower-case",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "an old report from before findings were read",
+      "posts": [
+        {
+          "body": "lens: correctness · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nchecks: ran the tests\nverdict: safe to merge"
+        }
+      ],
+      "history": [["correctness", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "correctness": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "old header forms",
+      "posts": [
+        {
+          "body": "**Lens:** data-1 · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## lens: data-2 · reviewer: y · read at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "- lens: Code R2 · reviewer: z · read at: cccccccccccccccccccccccccccccccccccccccc\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [
+        ["data-1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["data-2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["Code R2", "cccccccccccccccccccccccccccccccccccccccc"]
+      ],
+      "entries": {
+        "data-1": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "data-2": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null],
+        "code": ["cccccccccccccccccccccccccccccccccccccccc", null]
+      }
+    },
+    {
+      "name": "two lenses, each newest",
+      "posts": [
+        {
+          "body": "lens: data-1 · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens: data-2 · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "lens: data-1 r2 · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none"
+        }
+      ],
+      "history": [
+        ["data-1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["data-2", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["data-1 r2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+      ],
+      "entries": {
+        "data-1": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null],
+        "data-2": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "prose that names a lens is no header",
+      "posts": [
+        {
+          "body": "The code lens found nothing to fix."
+        }
+      ],
+      "history": [],
+      "entries": {}
+    },
+    {
+      "name": "a second lens header quoted under a valid one reads nothing; the older read stays",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n> lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]],
+      "entries": {
+        "code": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a second lens header in a code fence under a valid one reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n```\nlens: data · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n```"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a second lens header as a plain later line reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nlens: data · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a loose second lens line with a sha under a valid header reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nlens — data, reviewed at 1234567abc"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a lens field with a sha in prose and no header reads nothing",
+      "posts": [
+        {
+          "body": "Notes from the run.\nsee lens: data at commit 1234567abc"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line (a lens line with a sha not written `read at: <sha>`), starts with 'Notes from the run.')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "no header but a later read at reads nothing",
+      "posts": [
+        {
+          "body": "It's done.\nread at: 1234567"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with \"It's done.\")": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a first-line header that names only a round reads nothing",
+      "posts": [
+        {
+          "body": "lens: r2 · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, its first-line header names no lens (a placeholder, a round or nothing), starts with 'lens: r2 · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a first-line header with a placeholder name reads nothing",
+      "posts": [
+        {
+          "body": "lens: <name> · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, its first-line header names no lens (a placeholder, a round or nothing), starts with 'lens: <name> · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a lens header that is not the first line reads nothing",
+      "posts": [
+        {
+          "body": "Some prose first.\nlens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line that is not its first plain line (a later line, a code block, quote or table), starts with 'Some prose first.')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "not a lens with an unquoted read at reads nothing",
+      "posts": [
+        {
+          "body": "not a lens: fixes for round 2\nread at: 1234567"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote, starts with 'not a lens: fixes for round 2')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "not a lens with the read quoted is no lens comment",
+      "posts": [
+        {
+          "body": "not a lens: fixes for round 2\n> read at: 1234567"
+        }
+      ],
+      "history": [],
+      "entries": {}
+    },
+    {
+      "name": "headerless covered and checks fields read nothing",
+      "posts": [
+        {
+          "body": "Review done.\ncovered: the gate\nchecks: tests"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with 'Review done.')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "safe to merge in prose reads nothing, its start cut at 60 characters",
+      "posts": [
+        {
+          "body": "🎉 Looked through every changed file again today and I think this one is safe to merge."
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '🎉 Looked through every changed file again today and I think ')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a heading naming a lens near the top reads nothing",
+      "posts": [
+        {
+          "body": "## Code lens\nAll fine."
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '## Code lens')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an override comment that looks like a report is never one",
+      "posts": [
+        {
+          "body": "override for head 1234567890123456789012345678901234567890: read at: 1234567, safe to merge"
+        }
+      ],
+      "history": [],
+      "entries": {}
+    },
+    {
+      "name": "a hidden post that reads nothing says it is hidden",
+      "posts": [
+        {
+          "body": "It's done.\nread at: 1234567",
+          "hidden": true
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with \"It's done.\", hidden)": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a correct new post does not clear a post that reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nlens: data · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ],
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a first line that reads two ways reads nothing",
+      "posts": [
+        {
+          "body": "lens: [a [b](c) · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, its first line reads as a different lens header, or as one and as none, depending on how its HTML tags and links are read; starts with 'lens: [a [b](c) · reviewer: x · read at: aaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    }
+  ],
+  "rounds": [
+    {
+      "name": "a pull request with no lens comments is round 0 and passes",
+      "config": "basic",
+      "history": [],
+      "reports": {},
+      "expect": {
+        "round": 0,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 0 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "a major blocks",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: two writers race"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [["code", "major", "major: two writers race"]],
+        "problems": [
+          "lens code reported a major that no later round cleared (issue #99): 'major: two writers race'; fix it, and lens code posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+        ],
+        "text": "round 1 of 4; lens code reported a major that no later round cleared (issue #99): 'major: two writers race'; fix it, and lens code posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+      }
+    },
+    {
+      "name": "a later round of that lens clears it",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code r2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code r2 · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 2,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 2 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "a clean report passes",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 1 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "an old report from before findings were read has no findings section",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nchecks: ran the tests\nverdict: safe to merge"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [
+          "lens code: its newest report has no findings section, so it cannot be judged (issue #99): write `blocker: none` and `major: none`, or the findings, as lines of the report body (findings in inline review comments are not read)"
+        ],
+        "text": "round 1 of 4; lens code: its newest report has no findings section, so it cannot be judged (issue #99): write `blocker: none` and `major: none`, or the findings, as lines of the report body (findings in inline review comments are not read)"
+      }
+    },
+    {
+      "name": "an old report in the finding-line format is read",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfinding: major src/a.py:3 loses data"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [["code", "major", "finding: major src/a.py:3 loses data"]],
+        "problems": [
+          "lens code reported a major that no later round cleared (issue #99): 'finding: major src/a.py:3 loses data'; fix it, and lens code posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+        ],
+        "text": "round 1 of 4; lens code reported a major that no later round cleared (issue #99): 'finding: major src/a.py:3 loses data'; fix it, and lens code posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+      }
+    },
+    {
+      "name": "a section needs both labels: a major in a form not read fails closed",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nF1 (major): x"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [
+          "lens code: its newest report has no findings section, so it cannot be judged (issue #99): write `blocker: none` and `major: none`, or the findings, as lines of the report body (findings in inline review comments are not read)"
+        ],
+        "text": "round 1 of 4; lens code: its newest report has no findings section, so it cannot be judged (issue #99): write `blocker: none` and `major: none`, or the findings, as lines of the report body (findings in inline review comments are not read)"
+      }
+    },
+    {
+      "name": "a section needs both labels: one none label alone fails closed",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [
+          "lens code: its newest report has no findings section, so it cannot be judged (issue #99): write `blocker: none` and `major: none`, or the findings, as lines of the report body (findings in inline review comments are not read)"
+        ],
+        "text": "round 1 of 4; lens code: its newest report has no findings section, so it cannot be judged (issue #99): write `blocker: none` and `major: none`, or the findings, as lines of the report body (findings in inline review comments are not read)"
+      }
+    },
+    {
+      "name": "the same comment read twice is one round",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 1 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "an upper-case and a lower-case sha are one round",
+      "config": "basic",
+      "history": [
+        ["code", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 1 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "an edited newest comment still counts as a round and is not judged here",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code r2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+      ],
+      "reports": {
+        "code": [
+          "skip",
+          "lens: code r2 · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: x"
+        ]
+      },
+      "expect": {
+        "round": 2,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 2 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "a deleted older round no longer counts",
+      "config": "basic",
+      "history": [["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 1 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "a deleted older round still counts by a later round marker",
+      "config": "basic",
+      "history": [["code r3", "cccccccccccccccccccccccccccccccccccccccc"]],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code r3 · reviewer: x · read at: cccccccccccccccccccccccccccccccccccccccc\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 3,
+        "approach": true,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 3 of 4, approach lens approach required from round 3; no blocker or major open"
+      }
+    },
+    {
+      "name": "reads of one change are one round",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["code", "cccccccccccccccccccccccccccccccccccccccc"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "changes": {
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "x",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": "x",
+        "cccccccccccccccccccccccccccccccccccccccc": "y"
+      },
+      "expect": {
+        "round": 2,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 2 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "a short sha counts as a round",
+      "config": "basic",
+      "history": [
+        ["code", "abcdef1"],
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 2,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 2 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "an entry that reads nothing under an agents override cannot be judged",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": [
+          "unread",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [
+          "lens code: its newest report reads nothing and only an override that is no person's covers it, so its findings cannot be read (issue #99): that lens posts a new report, or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+        ],
+        "text": "round 1 of 4; lens code: its newest report reads nothing and only an override that is no person's covers it, so its findings cannot be read (issue #99): that lens posts a new report, or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+      }
+    },
+    {
+      "name": "a loose comment under an agents override is judged by its lines",
+      "config": "basic",
+      "history": [],
+      "reports": {
+        "x": ["loose", "major: still racy"]
+      },
+      "expect": {
+        "round": 0,
+        "approach": false,
+        "over_cap": false,
+        "findings": [["x", "major", "major: still racy"]],
+        "problems": [
+          "lens x reported a major that no later round cleared (issue #99): 'major: still racy'; fix it, and lens x posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+        ],
+        "text": "round 0 of 4; lens x reported a major that no later round cleared (issue #99): 'major: still racy'; fix it, and lens x posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+      }
+    },
+    {
+      "name": "a loose comment needs no section",
+      "config": "basic",
+      "history": [],
+      "reports": {
+        "x": ["loose", "fixed it"]
+      },
+      "expect": {
+        "round": 0,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 0 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "a cleared entry is not judged",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": ["cleared", "blocker: x"]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 1 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "findings false judges no finding",
+      "config": "basic",
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "reports": {
+        "code": ["report", "blocker: x"]
+      },
+      "findings": false,
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 1 of 4; findings are not judged (findings: false); no blocker or major open"
+      }
+    },
+    {
+      "name": "round 2 needs no approach lens",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 2,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 2 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "the approach lens is required from round 3",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["code", "cccccccccccccccccccccccccccccccccccccccc"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 3,
+        "approach": true,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 3 of 4, approach lens approach required from round 3; no blocker or major open"
+      }
+    },
+    {
+      "name": "round 4 of 4 may pass",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["code", "cccccccccccccccccccccccccccccccccccccccc"],
+        ["code", "dddddddddddddddddddddddddddddddddddddddd"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 4,
+        "approach": true,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 4 of 4, approach lens approach required from round 3; no blocker or major open"
+      }
+    },
+    {
+      "name": "a finding at the last round says no more rounds",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["code", "cccccccccccccccccccccccccccccccccccccccc"],
+        ["code", "dddddddddddddddddddddddddddddddddddddddd"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: still racy"
+        ]
+      },
+      "expect": {
+        "round": 4,
+        "approach": true,
+        "over_cap": false,
+        "findings": [["code", "major", "major: still racy"]],
+        "problems": [
+          "lens code reported a major that no later round cleared (issue #99): 'major: still racy'; this is round 4 of 4: no more rounds; a person decides: close the pull request, or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+        ],
+        "text": "round 4 of 4, approach lens approach required from round 3; lens code reported a major that no later round cleared (issue #99): 'major: still racy'; this is round 4 of 4: no more rounds; a person decides: close the pull request, or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+      }
+    },
+    {
+      "name": "a round past the cap stops with no person listed",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["code", "cccccccccccccccccccccccccccccccccccccccc"],
+        ["code", "dddddddddddddddddddddddddddddddddddddddd"],
+        ["code", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 5,
+        "approach": true,
+        "over_cap": true,
+        "findings": [],
+        "problems": [
+          "review round 5 is past the cap of 4 rounds (issue #100): no more rounds; a person decides: close the pull request, or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person). A person's override alone is enough, also for a required approach lens that never posted"
+        ],
+        "text": "round 5 of 4, approach lens approach required from round 3; review round 5 is past the cap of 4 rounds (issue #100): no more rounds; a person decides: close the pull request, or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person). A person's override alone is enough, also for a required approach lens that never posted"
+      }
+    },
+    {
+      "name": "a round past the cap names the listed people",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["code", "cccccccccccccccccccccccccccccccccccccccc"],
+        ["code", "dddddddddddddddddddddddddddddddddddddddd"],
+        ["code", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]
+      ],
+      "reports": {
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        ]
+      },
+      "override_authors": ["a-person", "b-person"],
+      "expect": {
+        "round": 5,
+        "approach": true,
+        "over_cap": true,
+        "findings": [],
+        "problems": [
+          "review round 5 is past the cap of 4 rounds (issue #100): no more rounds; a person decides: close the pull request, or an override comment `override for head <head sha>: <why>` for this head by a-person or b-person, newer than every lens comment. A person's override alone is enough, also for a required approach lens that never posted"
+        ],
+        "text": "round 5 of 4, approach lens approach required from round 3; review round 5 is past the cap of 4 rounds (issue #100): no more rounds; a person decides: close the pull request, or an override comment `override for head <head sha>: <why>` for this head by a-person or b-person, newer than every lens comment. A person's override alone is enough, also for a required approach lens that never posted"
+      }
+    },
+    {
+      "name": "a persons decision passes the cap and waives the approach lens",
+      "config": "basic",
+      "history": [
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        ["code", "cccccccccccccccccccccccccccccccccccccccc"],
+        ["code", "dddddddddddddddddddddddddddddddddddddddd"],
+        ["code", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]
+      ],
+      "reports": {
+        "code": ["cleared", ""]
+      },
+      "decided": true,
+      "override_authors": ["a-person"],
+      "expect": {
+        "round": 5,
+        "approach": false,
+        "over_cap": false,
+        "findings": [],
+        "problems": [],
+        "text": "round 5 of 4; no blocker or major open"
+      }
+    },
+    {
+      "name": "two lenses, findings in key order",
+      "config": "basic",
+      "history": [
+        ["data-1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      ],
+      "reports": {
+        "data-1": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: rows lost"
+        ],
+        "code": [
+          "report",
+          "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: it's gone\nmajor: none"
+        ]
+      },
+      "expect": {
+        "round": 1,
+        "approach": false,
+        "over_cap": false,
+        "findings": [
+          ["code", "blocker", "blocker: it's gone"],
+          ["data-1", "major", "major: rows lost"]
+        ],
+        "problems": [
+          "lens code reported a blocker that no later round cleared (issue #99): \"blocker: it's gone\"; fix it, and lens code posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)",
+          "lens data-1 reported a major that no later round cleared (issue #99): 'major: rows lost'; fix it, and lens data-1 posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+        ],
+        "text": "round 1 of 4; lens code reported a blocker that no later round cleared (issue #99): \"blocker: it's gone\"; fix it, and lens code posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person); lens data-1 reported a major that no later round cleared (issue #99): 'major: rows lost'; fix it, and lens data-1 posts a new report on the fixed head with no blocker or major (`major: none`); or a person's override comment, but no one is listed in review.override_authors yet, so no override is accepted (issue #78: until agents no longer post as the person's login, an override is not proof of a person)"
+      }
     }
   ]
 }
