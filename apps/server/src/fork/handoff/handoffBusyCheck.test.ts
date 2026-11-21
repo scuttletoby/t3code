@@ -436,20 +436,33 @@ it.effect("the write turn runs once, on the old session; its handoff lands only 
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect.each(["interrupted", "failed", "message"] as const)(
-  "after a write turn %s there is no handoff, and the old session carries on",
+it.effect.each(["interrupted", "failed"] as const)(
+  "after a write turn %s the check lets its handoff through (the service judges the reply)",
+  (ending) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make(`thread:handoff-write-ends-${ending}`);
+      const first = yield* quietThread(threadId);
+      yield* writeTurn(threadId, first.id);
+      yield* complete((yield* runs(threadId)).at(-1)!, { status: ending });
+      // The size backstop's fallback after a failed or T3-stopped write turn needs it; a person's
+      // Stop is no handoff, which the service decides before it sends.
+      assert.equal(yield* sendHandoff(threadId, first.id), "sent");
+      assert.equal(handoffRuns(yield* runs(threadId)).length, 1);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each(["message"] as const)(
+  "after a write turn and a %s there is no handoff, and the old session carries on",
   (ending) =>
     Effect.gen(function* () {
       const threadId = ThreadId.make(`thread:handoff-write-${ending}`);
       const first = yield* quietThread(threadId);
       yield* writeTurn(threadId, first.id);
       const write = (yield* runs(threadId)).at(-1)!;
-      if (ending === "message") {
-        // A message of the person's after the write turn ran: the thread moved on.
-        yield* complete(write);
-        yield* send(threadId, "second");
-        yield* complete((yield* runs(threadId)).at(-1)!);
-      } else yield* complete(write, { status: ending });
+      // A message of the person's after the write turn ran: the thread moved on.
+      yield* complete(write);
+      yield* send(threadId, "second");
+      yield* complete((yield* runs(threadId)).at(-1)!);
       assert.equal(yield* sendHandoff(threadId, first.id), "dropped");
       // A write turn made from an older run does not start either.
       assert.equal(yield* writeTurn(threadId, first.id, ":late"), "dropped");

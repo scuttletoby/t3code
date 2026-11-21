@@ -48,22 +48,41 @@ export function parseHandoffMessageId(
   return runId === "" ? null : { runId, loud, retry };
 }
 
-/** The write turn's (agent source) message id: `handoff-write:<thread>:<run>`, fixed per source run. */
-const HANDOFF_WRITE_PREFIX = "handoff-write:";
-export const handoffWriteIds = (threadId: ThreadId, sourceRunId: string) => ({
+/**
+ * The write turn's (agent source) message id: `handoff-write:<thread>:<run>`, fixed per source run,
+ * then `:loud` when its finish must alert (as a handoff's). The command id has no suffix, so a
+ * second trigger for the run cannot start a second write turn.
+ */
+export const HANDOFF_WRITE_PREFIX = "handoff-write:";
+export const handoffWriteIds = (threadId: ThreadId, sourceRunId: string, loud = false) => ({
   commandId: `server:${HANDOFF_WRITE_PREFIX}${threadId}:${sourceRunId}`,
-  messageId: `${HANDOFF_WRITE_PREFIX}${threadId}:${sourceRunId}`,
+  messageId: `${HANDOFF_WRITE_PREFIX}${threadId}:${sourceRunId}${loud ? HANDOFF_LOUD_SUFFIX : ""}`,
 });
 
-/** The source run a write turn's message id names; null for any other id. */
-export function parseHandoffWriteMessageId(threadId: ThreadId, messageId: string): string | null {
+/** The source run a write turn's message id names, and whether it alerts; null for any other id. */
+export function parseHandoffWrite(
+  threadId: ThreadId,
+  messageId: string,
+): { readonly runId: string; readonly loud: boolean } | null {
   const prefix = `${HANDOFF_WRITE_PREFIX}${threadId}:`;
-  const runId = messageId.startsWith(prefix) ? messageId.slice(prefix.length) : "";
-  return runId === "" ? null : runId;
+  if (!messageId.startsWith(prefix)) return null;
+  const rest = messageId.slice(prefix.length);
+  const loud = rest.endsWith(HANDOFF_LOUD_SUFFIX);
+  const runId = loud ? rest.slice(0, -HANDOFF_LOUD_SUFFIX.length) : rest;
+  return runId === "" ? null : { runId, loud };
 }
 
+/** The source run a write turn's message id names; null for any other id. */
+export const parseHandoffWriteMessageId = (threadId: ThreadId, messageId: string): string | null =>
+  parseHandoffWrite(threadId, messageId)?.runId ?? null;
+
+/** A write turn that ended this way may be followed by its handoff (the service judged it). */
+const WRITE_ENDS_BEFORE_HANDOFF = new Set(["completed", "failed", "interrupted"]);
+
 /** The newest run that is part of the thread (a removed queued message leaves a cancelled one). */
-function latestStartedRun(runs: ReadonlyArray<OrchestrationV2Run>): OrchestrationV2Run | undefined {
+export function latestStartedRun(
+  runs: ReadonlyArray<OrchestrationV2Run>,
+): OrchestrationV2Run | undefined {
   return runs
     .filter((run) => run.status !== "cancelled" || run.startedAt !== null)
     .reduce<OrchestrationV2Run | undefined>(
@@ -185,10 +204,11 @@ export function handoffDispatchDropped(
       latest.status !== "failed"
     );
   }
-  // After its source run, only that run's own write turn, completed (stopped or failed: no handoff).
+  // After its source run, only that run's own write turn, once it ended: the service judged it
+  // (a reply that counts, or a failed or timed-out one at the size backstop: parts 1, 3 and 4).
   const written =
     latest !== undefined &&
-    latest.status === "completed" &&
+    WRITE_ENDS_BEFORE_HANDOFF.has(latest.status) &&
     parseHandoffWriteMessageId(command.threadId, latest.userMessageId) === handoff.runId;
   return latest?.id !== handoff.runId && !written;
 }

@@ -52,13 +52,14 @@ export const run = (patch: Partial<OrchestrationV2Run> = {}): OrchestrationV2Run
   ...patch,
 });
 
-/** A user message or a reply in run `runId` (the write turn's items). */
+/** A user message, a reply or a stop request in run `runId` (the write turn's items). */
 export function turnItem(
   forRun: RunId,
   ordinal: number,
   item:
     | { readonly type: "user_message"; readonly messageId: string; readonly text: string }
-    | { readonly type: "assistant_message"; readonly text: string },
+    | { readonly type: "assistant_message"; readonly text: string }
+    | { readonly type: "run_interrupt_request"; readonly message: string },
 ): OrchestrationV2TurnItem {
   const base = {
     id: TurnItemId.make(`item:${forRun}:${ordinal}`),
@@ -76,6 +77,9 @@ export function turnItem(
     completedAt: null,
     updatedAt: at(),
   };
+  if (item.type === "run_interrupt_request") {
+    return { ...base, type: "run_interrupt_request", message: item.message };
+  }
   return item.type === "user_message"
     ? {
         ...base,

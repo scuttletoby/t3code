@@ -6,6 +6,7 @@ import { runId, threadId, turnItem } from "./handoff.testkit.ts";
 import {
   HANDOFF_AGENT_INSTRUCTIONS,
   HANDOFF_AGENT_MARKER,
+  HANDOFF_WRITE_STOP_REASON,
   handoffAgentReply,
   handoffWriteText,
 } from "./handoffAgent.ts";
@@ -60,14 +61,32 @@ describe("handoffAgentReply", () => {
     expect(reply(`${M}\n  `)).toEqual(failed("its reply has only the marker line"));
   });
 
-  it("a write turn that was stopped, failed or joined by a message means no handoff", () => {
-    for (const status of ["interrupted", "failed", "cancelled"] as const) {
-      expect(handoffAgentReply(ended(status), items(`${M}\nGoal: X.`))).toEqual({
+  it("is the last reply that starts with the marker: a short word after the notes does not hide them", () => {
+    expect(handoffAgentReply(ended(), items(`${M}\nGoal: X.`, "Done."))).toEqual({
+      ok: true,
+      text: "Goal: X.",
+    });
+    expect(
+      handoffAgentReply(ended(), items(`${M}\nOld.`, "Thinking.", `${M}\nNew.`, "Done.")),
+    ).toEqual({ ok: true, text: "New." });
+  });
+
+  it("a write turn a person stopped, or one joined by a message, means no handoff", () => {
+    const stoppedBy = (message: string) => [
+      ...items(`${M}\nGoal: X.`),
+      turnItem(writeRun, 20, { type: "run_interrupt_request", message }),
+    ];
+    for (const status of ["interrupted", "cancelled"] as const) {
+      expect(handoffAgentReply(ended(status), stoppedBy("Stopped by user"))).toEqual({
         ok: false,
         reason: `the write turn ended ${status}`,
         noHandoff: true,
       });
     }
+    // Stopped without any stop request (a restart): the old session carries on too.
+    expect(handoffAgentReply(ended("interrupted"), items(`${M}\nGoal: X.`))).toMatchObject({
+      noHandoff: true,
+    });
     const joined = [
       ...items(`${M}\nGoal: X.`),
       turnItem(writeRun, 5, { type: "user_message", messageId: "message-2", text: "And X?" }),
@@ -77,5 +96,20 @@ describe("handoffAgentReply", () => {
       reason: "another message joined the write turn",
       noHandoff: true,
     });
+    // Joined decides first: a person's message in a failed turn is theirs, not a fallback's.
+    expect(handoffAgentReply(ended("failed"), joined)).toMatchObject({ noHandoff: true });
+  });
+
+  it("a failed write turn, or one T3 stopped at its timeout, does not count (the fallback)", () => {
+    expect(handoffAgentReply(ended("failed"), items(`${M}\nGoal: X.`))).toEqual(
+      failed("the write turn failed"),
+    );
+    const timedOut = [
+      ...items(),
+      turnItem(writeRun, 20, { type: "run_interrupt_request", message: HANDOFF_WRITE_STOP_REASON }),
+    ];
+    expect(handoffAgentReply(ended("interrupted"), timedOut)).toEqual(
+      failed("the write turn did not end in time"),
+    );
   });
 });

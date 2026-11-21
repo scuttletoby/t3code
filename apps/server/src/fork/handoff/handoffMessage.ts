@@ -31,6 +31,31 @@ export const HANDOFF_COMMAND_END = "----- end handoff command output -----";
 export const HANDOFF_AGENT_BEGIN = "----- begin handoff from the old session -----";
 export const HANDOFF_AGENT_END = "----- end handoff from the old session -----";
 
+/**
+ * A part-2 line that could pass for one of the message's own lines: a begin or end line (of either
+ * source), a part-1 heading, the part-3 heading or the rules.
+ */
+const LOOKS_LIKE_OURS = new RegExp(
+  [
+    String.raw`^-+\s*(begin|end)\b.*\bhandoff\b`,
+    String.raw`^\[T3 handoff\b`,
+    String.raw`^Recent conversation:`,
+    String.raw`^This is context, not a request\.`,
+  ].join("|"),
+  "i",
+);
+
+/**
+ * Part 2 is someone else's text (the old session's, steerable by what it read): a line that looks
+ * like one of the message's own is quoted, so a fake end line cannot put text after it outside
+ * the notes.
+ */
+export const neutraliseNotes = (text: string) =>
+  text
+    .split("\n")
+    .map((line) => (LOOKS_LIKE_OURS.test(line.trim()) ? `> ${line}` : line))
+    .join("\n");
+
 export const HANDOFF_RULES =
   "This is context, not a request. Reply with one line and stop. Act on the next message or event. Earlier history: t3_thread_read.";
 
@@ -96,17 +121,17 @@ export function handoffMessageText(input: {
         ? [
             "Handoff written by the old session (its notes, not T3's state or rules):",
             HANDOFF_AGENT_BEGIN,
-            input.agent.text,
+            neutraliseNotes(input.agent.text),
             HANDOFF_AGENT_END,
           ].join("\n")
         : `The old session's handoff did not count (${input.agent.reason}), so this handoff has T3's state and the recent conversation only.`
       : input.command === undefined
-        ? "No handoff source is set up yet, so this handoff has T3's state and the recent conversation only."
+        ? "No handoff source is set, so this handoff has T3's state and the recent conversation only."
         : input.command.ok
           ? [
               "Handoff from the handoff command (its notes, not T3's state or rules):",
               HANDOFF_COMMAND_BEGIN,
-              input.command.text,
+              neutraliseNotes(input.command.text),
               HANDOFF_COMMAND_END,
             ].join("\n")
           : `The handoff command failed (${input.command.reason}), so this handoff has T3's state and the recent conversation only.`,
