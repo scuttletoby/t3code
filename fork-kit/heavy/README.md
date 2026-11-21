@@ -524,6 +524,51 @@ the owner as gone).
 | an install stopped half-way, or a rollback to a release without the sweep  | the timer is written only after the new release is in use, and runs the       |
 |                                                                            | sweep of the release in use; a release without one skips it (below)           |
 
+## Facts: may one more piece of work start?
+
+`heavy facts [--kind KIND] [--mb MB] [--fresh]` answers with one free/v1 object (`fork-kit/common/FREE.md`): exit
+0 free, 75 busy, anything else not available. It runs the capacity rule (`packages/shared/src/capacity`, installed
+as `capacity/` next to the kit; `lib/capacity_rule.py` is the kit's evaluator of it and passes the same vectors as
+the TypeScript one) on a ledger read from the kernel: memory and swap from `/proc/meminfo`, PSI from
+`/proc/pressure/memory` and the boxes' `memory.pressure`, cores and load, heavy's live queue tickets (admitted jobs
+with their kind and their scope's demand; waiting ones are counted only) and T3's agent scopes (`t3code-*.scope`
+under an `app-t3code*.slice` of the user manager; no kind label yet, so each counts as a writer). Learned job
+costs come from the queue's `peaks.json`. The object adds `fits` (how many more of each kind would start, one
+after another, up to the group's ceiling), the memory budget, the queue and notes.
+
+- **--kind K:** does the rule admit one piece of K (`agent-writer`, `job-build`, or heavy's own `build`). **--mb
+  MB** alone: do MB fit the free budget at level "ok"; with --kind, the piece declares MB.
+- **T3 down or not installed:** no agent scopes, still an answer from the kernel.
+- **Tiers:** full with cgroup v2 and a systemd user manager. Without them (Basic) no piece is counted, the margin is
+  the wider one, and a note says so.
+- **Unreadable signals** (PSI, a box without its `memory.pressure`) give "elevated", never "ok"; a missing
+  MemAvailable gives busy for every kind. Only a file the kernel does not have (no PSI, no box yet) is "none".
+- **Reservations:** files `~/.config/t3-capacity/reserve.d/*.conf` (or `$T3_CAPACITY_RESERVE_DIR`), lines
+  `<MB> <absolute folder prefix> [until=YYYY-MM-DD]`. A reservation holds back its MB less what processes working
+  in that folder already use; a caller working inside the folder is not held back by its own reservation. Ended,
+  broken or unreadable lines hold nothing and give a note.
+- **Cache:** `/run/user/<uid>/heavy-facts.json` (or `$HEAVY_FACTS_CACHE`), 0600, read again after 5 s (`--fresh`:
+  now). Pressure levels carry from it (at most 5 minutes old) so calm must last before a level drops.
+
+Two thin callers come with it (not linked onto PATH: a host wires them in itself):
+
+- `bin/t3-capacity [--kind KIND] [MB]`: the older host check's output (first line `available=..MB swapfree=..MB
+  load=..`, last line `OK` or `NOT OK: why`, exit 0 or 1), now from `heavy facts`. MB defaults to 3072.
+- `bin/agent-slots`: a Claude Code hook (UserPromptSubmit, Stop) for orchestrator sessions: free agent slots are
+  the smaller of the process limit and the machine's `fits` for its kind.
+
+A `heavy facts` that does not answer within 5 s (it is killed), fails or prints something else is never free for
+either caller.
+
+### Facts run again, stop half-way, or meet old or empty state
+
+- **Runs again:** within 5 s the cache answers; two callers in the same second both answer and leave one valid
+  cache (each writes its own temporary file and renames it).
+- **Stops half-way:** a temporary cache file is left; the next run removes ones older than a minute.
+- **Old, empty, broken or foreign cache** (another owner, group or other access, a link, a time in the future, an
+  unknown key or version): read again from the kernel. A cache that cannot be written gives a note.
+- **Cost file** (`peaks.json`) missing, empty or broken: the rule's start costs, with the queue's note.
+
 ## Settings
 
 `/etc/heavy/config.json` (written by the installer):
@@ -561,6 +606,8 @@ limit options. A user's own unit in `~/.config/systemd/user/` wins over the one 
 | `/run/user/<uid>/heavy-queue/<slice>/`          | the memory queue: its lock and one ticket per queued job (tmpfs)          |
 | `~/.local/state/heavy/`                         | the queue's wait log (`waits.log`) and peak history (`peaks.json`),       |
 |                                                 | measured runs for `heavy capacity` (`measured.jsonl`, `.1`, `.lock`)      |
+| `/run/user/<uid>/heavy-facts.json`              | `heavy facts`' 5 s cache (tmpfs)                                          |
+| `~/.config/t3-capacity/reserve.d/*.conf`        | each user's reservations for `heavy facts` and its callers                |
 
 ## Install (owner, as root)
 
@@ -626,6 +673,12 @@ and `docker` from `tests/fake_tools.py`, a temporary machine file), no root and 
 breaks each stop and report rule in a copy of the sweep and shows the test for that rule then fails. It also builds
 scope names through heavy's own `run()` (`HEAVY_KEEP=1` and a command named `keep`) and checks how the sweep
 treats them.
+
+`python3 -I -B fork-kit/heavy/tests/capacity_rule.test.py`: the kit's evaluator against every vector and format
+case of `packages/shared/src/capacity` (the files the TypeScript tests read); each number of the rule, changed,
+turns a vector red. `python3 -I -B fork-kit/heavy/tests/facts.test.py`: `heavy facts`, `t3-capacity` and
+`agent-slots` on a fake `/proc` and `/sys` (`HEAVY_FACTS_ROOT`), a temporary queue, home and cache, and fake slow
+or failing `heavy` scripts. Its red check removes the agent-scope count from a copy of `lib/heavy_facts.py`.
 
 `python3 -I -B fork-kit/heavy/tests/install.test.py` (the installer on a fake host in a temporary folder, no root)
 and `python3 -I -B fork-kit/heavy/tests/heavy.test.py` (the wrapper with the real systemd user manager and a slice

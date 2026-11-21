@@ -1,0 +1,89 @@
+#!/usr/bin/python3 -IB
+"""t3-capacity: may one more piece of work start here? A thin caller of `heavy facts` (lib/heavy_facts.py).
+
+  t3-capacity [--kind KIND] [MB]
+
+MB alone (default 3072): do MB fit the free budget at pressure level "ok". --kind: does the capacity rule admit one
+piece of KIND (agent-writer, job-build, build, ...); with MB too, that piece declares MB and they must fit as well.
+
+Output, kept as the older t3-capacity had it so hooks and scripts that read it keep working:
+  line 1   available=<MB>MB swapfree=<MB>MB load=<load>/<n>cores agents=<n> jobs=<n> waiting=<n> reserved=<MB>MB
+           need=<MB>MB free=<MB>MB level=<level> tier=<tier>   (available: after the reservations that hold back
+           this caller; reserved: what admitted jobs and agents may still grow into, and those reservations)
+  then     reservations: <name>:<MB>MB(using <MB>,holding <MB>) or <name>:own (a reservation of the caller's folder)
+           note: <text>, fits: <kind>=<n> ..., and last "NOT OK: <why>" or "OK".
+Exit 0 OK, 1 NOT OK (busy, or heavy facts did not answer within 5 s: never OK), 2 a wrong call. A NOT OK with stdout
+not a terminal also says on stderr that a pipe would hide the exit status.
+"""
+import os, sys
+
+
+def kit_file(rel):
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), rel)
+
+
+def main(argv):
+    kind, need, rest = None, None, list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a in ('-h', '--help'):
+            print(__doc__.strip())
+            return 0
+        if a.startswith('--kind'):
+            if kind is not None or (a == '--kind' and not rest):
+                return usage()
+            kind = rest.pop(0) if a == '--kind' else a.partition('=')[2]
+        elif a.isdigit() and need is None and len(a) <= 7:
+            need = int(a)
+        else:
+            return usage()
+    need = 3072 if need is None and kind is None else need
+    try:
+        hf = load(kit_file('lib/heavy_facts.py'))
+        verdict, why, d = hf.ask(os.environ.get('T3_CAPACITY_HEAVY') or kit_file('bin/heavy'), kind, need)
+    except Exception as e:      # the caller itself cannot run: never OK
+        verdict, why, d = 'unavailable', f'{e.__class__.__name__}: {e}', None
+    if d is None:
+        print(f'available=0MB swapfree=0MB load=0/0cores need={need or 0}MB facts=unavailable')
+        lines = [f'NOT OK: {why} (not free)']
+    else:
+        m, q, c = d['memory'], d['queue'], d['cpu']
+        hold = sum(max(0, r['mb'] - r['useMb']) for r in d['reservations'] if not r['own'])
+        avail = max(0, (m['availableMb'] or 0) - hold)
+        print(f'available={avail}MB swapfree={m["swapFreeMb"]}MB load={c["load1"]}/{c["cores"]}cores '
+              f'agents={q["agents"]} jobs={q["running"]} waiting={q["waiting"]} reserved={m["reservedMb"]}MB '
+              f'need={need if need is not None else m["costMb"]}MB free={m["freeMb"]}MB level={d["level"]} '
+              f'tier={d["tier"]}')
+        lines = []
+        if d['reservations']:
+            lines.append('reservations: ' + ' '.join(
+                f'{r["name"]}:own' if r['own'] else
+                f'{r["name"]}:{r["mb"]}MB(using {r["useMb"]},holding {max(0, r["mb"] - r["useMb"])})'
+                for r in d['reservations']))
+        lines += [f'note: {n}' for n in d['notes']]
+        lines.append('fits: ' + ' '.join(f'{k}={n}' for k, n in d['fits'].items()))
+        lines.append('OK' if verdict == 'free' else f'NOT OK: {why}')
+    print('\n'.join(lines))
+    if verdict == 'free':
+        return 0
+    if not sys.stdout.isatty():
+        print('t3-capacity: NOT OK (exit 1). A pipe hides this exit status: gate with `t3-capacity N && cmd`, '
+              'never pipe it', file=sys.stderr)
+    return 1
+
+
+def usage():
+    print('usage: t3-capacity [--kind KIND] [MB]', file=sys.stderr)
+    return 2
+
+
+def load(path):
+    import importlib.machinery, importlib.util
+    loader = importlib.machinery.SourceFileLoader('heavy_facts', path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('heavy_facts', loader))
+    loader.exec_module(mod)
+    return mod
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

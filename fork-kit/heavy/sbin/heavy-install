@@ -36,10 +36,12 @@ LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-inst
 
 SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'lib/heavy_queue.py',
                 'lib/heavy_measure.py', 'common/machine_file.py', 'systemd/heavy-sweep.service',
-                'systemd/heavy-sweep.timer')
+                'systemd/heavy-sweep.timer', 'lib/heavy_facts.py', 'lib/capacity_rule.py', 'bin/t3-capacity',
+                'bin/agent-slots', 'common/free_contract.py', 'capacity/capacity-rule.json',
+                'capacity/capacity-format.json', 'capacity/capacity-vectors.json')
 SWEEP_UNITS = ('heavy-sweep.service', 'heavy-sweep.timer')
 UNIT_HEADER = '# heavy kit: written by heavy-install.'
-EXECUTABLE = {'bin/heavy', 'sbin/heavy-install'}
+EXECUTABLE = {'bin/heavy', 'sbin/heavy-install', 'bin/t3-capacity', 'bin/agent-slots'}
 DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 30}
 SHA_RE = re.compile(r'^[0-9a-f]{40}\Z')
 SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
@@ -59,9 +61,13 @@ def p(path):
 
 def source_file(source, rel):
     """Where a kit file is in the source: common/ is shared by the kits and sits next to them (fork-kit/common);
-    a source folder that has its own common/ (a copy) is used as it is."""
+    a source folder that has its own common/ (a copy) is used as it is. capacity/ (the capacity rule) is the
+    repository's packages/shared/src/capacity, unless the source folder has its own copy."""
     if rel.startswith('common/') and not os.path.isfile(os.path.join(source, rel)):
         return os.path.join(os.path.dirname(os.path.normpath(source)), rel)
+    if rel.startswith('capacity/') and not os.path.isfile(os.path.join(source, rel)):
+        repo = os.path.dirname(os.path.dirname(os.path.normpath(source)))
+        return os.path.join(repo, 'packages', 'shared', 'src', rel)
     return os.path.join(source, rel)
 
 
@@ -336,7 +342,8 @@ def install(a, stop_after=None):
     dest = copy_tool(os.path.realpath(a.source), a.sha)
     done('copy')
     problems = tree_problems(dest)
-    for args in (['--help'], ['sweep', '--help'], ['queue', '--help'], ['capacity', '--help']):
+    for args in (['--help'], ['sweep', '--help'], ['queue', '--help'], ['capacity', '--help'],
+                 ['facts', '--help']):
         r = subprocess.run([sys.executable, '-I', '-B', os.path.join(dest, 'bin', 'heavy'), *args],
                            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
         if r.returncode != 0 or 'heavy' not in r.stdout:
