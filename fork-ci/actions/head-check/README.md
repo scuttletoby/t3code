@@ -52,13 +52,19 @@ All of them are the queue's, imported from `../pr-queue`, never copied:
   Without the block, nothing of this runs.
 - **Findings and rounds** (`review_judge.judge_rounds`, the pr-queue README,
   "Findings and rounds"): with a `review` block in `enforce`, a lens whose
-  newest report has a `blocker:` or `major:` line fails the head until a later
-  round of that lens clears it or a person's override covers it
-  (`findings: true`); from round `rounds.approach_at` the approach lens is
-  required; a round past `rounds.max` fails the head until a person's override
-  covers every lens (no more rounds: the person overrides or closes). In
-  `shadow` the summary only adds a row "they would have said: ...". Comments
-  that cannot be judged fail the head, in either mode.
+  newest report has a blocker or major finding (a `blocker:` or `major:` line,
+  a `### Blocking` or `### Major` heading with items, a table row ...) fails
+  the head until a later round of that lens clears it or a person's override
+  newer than the report covers it (`findings: true`); a report with no findings
+  section at all fails too. A person is a login in `override_authors`; none
+  listed (the default) means no override clears a finding or passes the cap
+  (issue #78). A round is a read of a different own change (`own_change`: a
+  head that only merges the base in is no new round); from round
+  `rounds.approach_at` the approach lens is required; a round past
+  `rounds.max` fails the head until a person's override for it, newer than
+  every lens comment, lets it through on its own. In `shadow` the summary only
+  adds a row "they would have said: ...". Comments that cannot be judged fail
+  the head, in either mode.
 
 It passes when:
 

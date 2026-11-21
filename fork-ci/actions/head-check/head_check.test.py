@@ -1285,11 +1285,15 @@ class FindingsAndRounds(unittest.TestCase):
     setUp, base, head, check = PathRules.setUp, PathRules.base, PathRules.head, PathRules.check
 
     def said(self, name, sha, *lines, **kw):
+        """A lens report; with no lines a clean one (`blocker: none`, `major: none`)."""
+        lines = lines or ('blocker: none', 'major: none')
         return self.p.post(f'{LENS}: {name} · reviewer: x · read at: {sha}\n' + '\n'.join(lines), **kw)
 
-    def pair(self, mode='enforce'):
-        b = self.base(mode)
-        return b, self.head(b, mode, **{'src/app.py': 'a\n'})
+    def pair(self, mode='enforce', **change):
+        """A base with the review block (changed by `change`) and a head on it that changes one normal path."""
+        cfg = review_cfg(mode, **change)
+        b = self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE}), [self.m0])
+        return b, self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE, 'src/app.py': 'a\n'}), [b])
 
     def test_a_major_in_the_newest_report_fails_the_head(self):
         base, head = self.pair()
@@ -1348,25 +1352,96 @@ class FindingsAndRounds(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn('round 3 of 4, approach lens approach required from round 3', out)
 
-    def test_past_the_cap_it_stops_and_only_an_override_passes(self):
+    def test_past_the_cap_it_stops_and_only_a_persons_override_passes(self):   # #100
         base, head = self.pair()
         five = [self.said('code', sha) for sha in OLD] + [self.said('code', head), self.said('approach', head)]
         code, out = self.check(base, head, comments=five)
         self.assertEqual(code, 1, out)
         self.assertIn('review round 5 is past the cap of 4 rounds (issue #100): no more rounds; a person decides', out)
         code, out = self.check(base, head, comments=five + [self.p.override(head)])
-        self.assertEqual(code, 0, out)
+        self.assertEqual(code, 1, out)   # no override_authors (the default, #78): the owner's login proves no person
+        self.assertIn('no one is listed in review.override_authors yet, so no override is accepted', out)
+        base, head = self.pair(override_authors=['owner'])
+        five = [self.said('code', sha) for sha in OLD] + [self.said('code', head)]   # no approach lens at all
+        code, out = self.check(base, head, comments=five)
+        self.assertEqual(code, 1, out)
+        self.assertIn('an override comment `tool ready --head <head sha>: <why>` for this head by owner', out)
+        code, out = self.check(base, head, comments=five + [self.p.override(head)])
+        self.assertEqual(code, 0, out)   # the override alone is enough: the approach lens is waived too
         stranger = self.p.override(head, assoc='CONTRIBUTOR', login='someone')   # not the owner's: counts for nothing
         self.assertEqual(self.check(base, head, comments=five + [stranger])[0], 1)
+        other = self.p.override(head, login='agent-login')   # the right association, a login not listed
+        self.assertEqual(self.check(base, head, comments=five + [other])[0], 1)
+        override = self.p.override(head)
+        later = self.said('code', head)   # a lens comment newer than the override: the person decided before it
+        self.assertEqual(self.check(base, head, comments=five + [override, later])[0], 1)
 
-    def test_an_override_clears_a_wrong_finding(self):   # #99: a person's override comment
+    def test_only_a_listed_persons_override_clears_a_finding(self):   # #99, #78
         base, head = self.pair()
         report = self.said('code', head, 'blocker: wrong, the lock is there')
         self.assertEqual(self.check(base, head, comments=[report])[0], 1)
+        code, out = self.check(base, head, comments=[report, self.p.override(head)])
+        self.assertEqual(code, 1, out)   # an override from a login agents still post as clears nothing
+        self.assertIn("lens code reported a blocker that no later round cleared (issue #99): 'blocker: wrong", out)
+        base, head = self.pair(override_authors=['Owner'])   # logins compare case-insensitively
+        report = self.said('code', head, 'blocker: wrong, the lock is there')
         self.assertEqual(self.check(base, head, comments=[report, self.p.override(head)])[0], 0)
         override = self.p.override(head)
         later = self.said('code r2', head, 'blocker: wrong again')   # a report newer than the override counts again
         self.assertEqual(self.check(base, head, comments=[report, override, later])[0], 1)
+
+    def test_an_unreadable_report_under_an_agents_override_fails(self):   # hidden after the override covered it
+        base, head = self.pair()
+        hidden = self.said('code', head, 'blocker: x', hidden=True)
+        code, out = self.check(base, head, comments=[hidden, self.p.override(head)])
+        self.assertEqual(code, 1, out)
+        self.assertIn('lens code: its newest report reads nothing and only an override that is no person', out)
+        base, head = self.pair(override_authors=['owner'])
+        hidden = self.said('code', head, 'blocker: x', hidden=True)
+        self.assertEqual(self.check(base, head, comments=[hidden, self.p.override(head)])[0], 0)
+
+    def test_a_report_with_no_findings_section_fails_the_head(self):   # #99: never passes as clean
+        base, head = self.pair()
+        code, out = self.check(base, head, comments=[self.said('code', head, 'Looks good to me.')])
+        self.assertEqual(code, 1, out)
+        self.assertIn('lens code: its newest report has no findings section, so it cannot be judged (issue #99)', out)
+        self.assertEqual(self.check(base, head, comments=[self.said('code', head, '### Major', 'None.')])[0], 0)
+
+    def test_a_finding_in_a_heading_or_table_or_lookalike_fails_the_head(self):   # #99, both ways
+        base, head = self.pair()
+        for lines in (('### Blocking', '1. **The lock is gone.**'), ('| major | two writers race |',),
+                      ('maj\u043er: x',), ('Blocker: none, major: x',)):
+            with self.subTest(lines):
+                self.assertEqual(self.check(base, head, comments=[self.said('code', head, *lines)])[0], 1)
+        clean = ('blocker: none', '```', 'major: quoted from a test vector', '```', 'Major: none found')
+        self.assertEqual(self.check(base, head, comments=[self.said('code', head, *clean)])[0], 0)
+
+    def test_a_queue_update_is_no_new_round(self):   # #100: a round is a read after a fix, not a new sha
+        base, h1 = self.pair()
+        cfg = review_cfg('enforce')
+        tree = dict(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE, 'src/app.py': 'a\nb\n'}))
+        h2 = self.w.commit(tree, [h1])   # the fix: round 2
+        base2 = self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE, 'docs/d.md': 'd\n'}), [base])
+        h3 = self.w.merge(h2, base2)   # the queue merges the base in: the same change, no round
+        reads = [self.said('code', h1), self.said('code r2', h2), self.said('code', h3)]
+        code, out = self.check(base2, h3, comments=reads)
+        self.assertEqual(code, 0, out)   # round 3 would need the approach lens
+        self.assertIn('round 2 of 4; no blocker or major open', out)
+        again = self.w.commit({**tree, 'docs/d.md': 'd\n'}, [base2])   # the fix rebased onto the new base: the same
+        code, out = self.check(base2, again, comments=reads[:2] + [self.said('code', again)])
+        self.assertEqual(code, 0, out)
+        self.assertIn('round 2 of 4', out)
+        fixed = self.w.merge(h2, base2, files={**tree, 'docs/d.md': 'd\n', 'src/app.py': 'a\nc\n'})   # a fix in it
+        code, out = self.check(base2, fixed, comments=reads[:2] + [self.said('code', fixed)])
+        self.assertEqual(code, 1, out)
+        self.assertIn('round 3 of 4, approach lens approach required from round 3', out)
+
+    def test_a_short_sha_read_still_counts_a_round(self):   # old state: a lens that wrote 12 characters
+        base, head = self.pair()
+        short = self.said('code', OLD[0][:12])
+        code, out = self.check(base, head, comments=[short, self.said('code', head)])
+        self.assertEqual(code, 0, out)
+        self.assertIn('round 2 of 4', out)
 
     def test_a_strangers_finding_neither_blocks_nor_counts_a_round(self):   # anyone can comment on a public repo
         base, head = self.pair()

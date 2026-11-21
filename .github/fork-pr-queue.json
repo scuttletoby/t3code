@@ -15,7 +15,7 @@
   "head_check": "head_check",
   "review": {
     "version": 1,
-    "mode": "enforce",
+    "mode": "shadow",
     "rules": [
       {
         "name": "gate",

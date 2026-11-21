@@ -68,20 +68,21 @@ yet. `review.recommended.json` (next to this file) is a complete example with
 made-up paths; a test parses it. Real paths, lens names and prompt files belong
 in the project's own config (below, "Turning it on").
 
-Every key is required and an unknown key is an error, as in the rest of the
-config. A wrong block makes the whole config invalid, naming every problem at
+Every key is required except `override_authors`, and an unknown key is an
+error, as in the rest of the config. A wrong block makes the whole config invalid, naming every problem at
 once.
 
-| Key          | Meaning                                                                                                                                                                                                                       |
-| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `version`    | `1`. Any other version is refused by name (a newer one: update the pinned release first).                                                                                                                                     |
-| `mode`       | `shadow`: the gate keeps judging by its `required-lenses` input and only reports what the path rules would have said. `enforce`: the path rules decide.                                                                       |
-| `rules`      | An ordered list of `{"name", "weight", "paths", "lenses"}`. A changed file belongs to the first rule with a matching glob. `weight` is `critical`, `normal` or `light`; `lenses` are names from `lenses`.                     |
-| `lenses`     | `{"<lens name>": {"prompt": "<file>"}}`: every lens a rule or `rounds` names, with its prompt file (repo-relative, no `..`, no leading `/`, no glob characters).                                                              |
-| `min_lenses` | `{"critical", "normal", "light"}`: the fewest different lenses a rule of that weight must list, 0-10, never falling with weight.                                                                                              |
-| `rounds`     | `{"approach_at", "max", "approach_lens"}`: from round `approach_at` the approach lens is required too; after round `max` a person must write an override comment or close the pull request. `max` is not below `approach_at`. |
-| `findings`   | `true` or `false`: lens comments carry `blocker:`, `major:` and `minor:` lines, and a blocker or major at the head fails the gate.                                                                                            |
-| `state_line` | `true` or `false`: a required lens comment needs a `state:` line to count. Not enforced yet.                                                                                                                                  |
+| Key                | Meaning                                                                                                                                                                                                                       |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`          | `1`. Any other version is refused by name (a newer one: update the pinned release first).                                                                                                                                     |
+| `mode`             | `shadow`: the gate keeps judging by its `required-lenses` input and only reports what the path rules would have said. `enforce`: the path rules decide.                                                                       |
+| `rules`            | An ordered list of `{"name", "weight", "paths", "lenses"}`. A changed file belongs to the first rule with a matching glob. `weight` is `critical`, `normal` or `light`; `lenses` are names from `lenses`.                     |
+| `lenses`           | `{"<lens name>": {"prompt": "<file>"}}`: every lens a rule or `rounds` names, with its prompt file (repo-relative, no `..`, no leading `/`, no glob characters).                                                              |
+| `min_lenses`       | `{"critical", "normal", "light"}`: the fewest different lenses a rule of that weight must list, 0-10, never falling with weight.                                                                                              |
+| `rounds`           | `{"approach_at", "max", "approach_lens"}`: from round `approach_at` the approach lens is required too; after round `max` a person must write an override comment or close the pull request. `max` is not below `approach_at`. |
+| `findings`         | `true` or `false`: lens comments carry a findings section (`blocker:` and `major:` lines, or headings), and a blocker or major at the head fails the gate.                                                                    |
+| `override_authors` | Optional, default `[]`: the GitHub logins whose override comment is a person's decision (clears a finding, passes the round cap). `[]`: no override is a person's, so none does that (issue #78).                             |
+| `state_line`       | `true` or `false`: a required lens comment needs a `state:` line to count. Not enforced yet.                                                                                                                                  |
 
 The config is refused when:
 
@@ -193,29 +194,58 @@ be up to date, which the queue needs anyway.
 comments it reads anyway (section "Lens comments"; `review_judge.judge_rounds`).
 Owner decisions: issue #99 (findings), issue #100 (rounds).
 
-- **Findings** (`findings: true`): a lens report writes each finding on a line
-  of its own that starts `blocker:`, `major:` or `minor:` (any case; Markdown
-  list, quote and emphasis marks do not count; `Majors:`, `major 2:` and
-  `major (state):` are the same). A lens whose newest report that counts as a
-  read has a `blocker:` or `major:` line fails the head. Only an explicit
-  nothing after the colon is no finding (`major: none`, `nothing`, `no`, `0`,
-  `n/a`, `-`); any other text is one, also an empty one. Every line counts, in
-  code blocks and quotes too, so a report names an earlier finding it saw fixed
-  without that form (`fixed: the major of round 1 ...`). The ways out: fix it,
-  and the lens posts a new report (a later round: its newest comment counts)
-  without a blocker or major line; or a person posts an override comment for
-  the head (config `override`), which covers every lens whose report is older.
-  `minor:` lines never block.
-- **Rounds:** each different full sha that the counted lens headers name is a
-  fix-and-review round, and a round marker in a lens name (`code r3`) counts as
-  that round, whichever is higher. Hidden and edited lens comments count too
-  (hiding old rounds does not lower the count); a deleted one does not, so keep
-  the round marker in the names. From round `rounds.approach_at` the lens
-  `rounds.approach_lens` is required as well. Round `rounds.max` is the last:
-  a round past it fails the head, whatever the lenses said, with "no more
-  rounds; a person decides", until a person's override comment newer than every
-  lens comment covers the head; else the pull request is closed. At round
-  `rounds.max` a blocker or major says the same.
+- **Findings** (`findings: true`): a lens report has a findings section in its
+  body: a `blocker:` and a `major:` line (`blocker: none`, `major: none` when it
+  found nothing), or headings `### Blocking` / `### Major` with the findings,
+  or `None.`, under them. What counts as a finding (`review_judge.read_findings`,
+  table in `review_judge.test.py`): a label `blocker`, `blocking` or `major`
+  (plural, `Major findings`, `major 2`, `major (state)` too; bold, list, emoji
+  and heading marks do not matter) followed by text on the same line
+  (`major: x`, `**Blocking:** x`, `major — x`, `[major] x`, a table row
+  `| major | x |` or a table column headed `major`), or, for a bare label, the
+  first line under it (a heading or nothing under it is a finding too). Every
+  label of a line counts (`blocker: none, major: x`). Only an explicit nothing
+  is no finding (`none`, `None found`, `none (only minors)`, `nothing`, `no`,
+  `0`, `n/a`, `-`). Before reading, the text is folded: NFKC, zero-width and
+  other format characters removed, Cyrillic and Greek look-alike letters read
+  as Latin, `0` for `o` in a label. Lines inside a fenced code block are never
+  labels, so quote code and example findings in one; quotes and indented
+  blocks are read (fail closed). A title line or `verdict:` line that says
+  NOT SAFE is a blocker. `minor:` and `nit:` never block.
+  A lens whose newest report has a blocker or major fails the head. A report
+  with no findings section at all (not even `major: none`) cannot be judged and
+  fails that lens. Findings go in the report body: findings in inline review
+  comments (on a line of the diff) are not read, so a lens posted as a PR review
+  whose body has no findings section fails. The ways out: fix it, and the lens
+  posts a new report on the fixed head without a blocker or major; or a person
+  posts an override comment for the head (config `override`) newer than the
+  report. A person is a login listed in `override_authors`; an override by any
+  other author of the override association covers a lens's read as before, but
+  clears no finding and passes no cap. While agents still post as the owner's
+  login (issue #78) an override from it proves no person, so keep the list
+  empty until they no longer do: then no override clears a finding, and a
+  finding is fixed or the pull request closed.
+- **Rounds:** a round is a lens read of a fixed change, not of a new sha. The
+  gate counts the different own changes the counted lens headers read: for each
+  read sha, `git diff -U0` from its merge base with the base to it, line numbers
+  dropped (`head_check.own_change`). A head that only merges the base in (a
+  queue update, `gh pr update-branch`) or the same change rebased onto a newer
+  base is the same change, so the same round; a merge that also changes the pull
+  request's own diff is a new one. A short sha counts as well, and a sha the
+  gate cannot fetch, or one with several merge bases, counts as a round of its
+  own (unknown counts more, never fewer). A round marker in a lens name
+  (`code r3`, also `**r3**`) counts as that round when it is higher. The count
+  comes from the lens comments the gate reads now: hidden and edited ones count
+  too, so hiding or editing old rounds does not lower it. A deleted comment is
+  gone from GitHub, and only lens authors can delete one, so the round marker of
+  a later header is what keeps it counted; counting from commits instead would
+  count every push, the opposite of a round. From round `rounds.approach_at`
+  the lens `rounds.approach_lens` is required as well. Round `rounds.max` is the
+  last: a round past it fails the head with "no more rounds; a person decides":
+  the pull request is closed, or a person's override comment for the head,
+  newer than every lens comment, lets it through on its own (it also waives the
+  approach lens). With `override_authors` empty no override does: the reason
+  says so. At round `rounds.max` a blocker or major says the same.
 - In `shadow` the summary adds a row "findings and rounds (shadow): they would
   have said: ..." and nothing fails. Lens comments that cannot be judged fail
   the head in both modes. Without the `review` key nothing of this runs.
@@ -232,7 +262,9 @@ the fork: add the `review` block to the queue config its head gate reads
 `shadow` first. Read a few gate summaries, fix every config warning, then set
 `mode` to `enforce` and dispatch the backfill (head-check README). The fork's
 own config is [`.github/fork-pr-queue.json`](../../../.github/fork-pr-queue.json),
-in `enforce`.
+in `shadow`, without `override_authors` (no person yet) until issue #78 is done; its lens
+prompts (`.github/fork-lens-*.md`) tell each lens the exact header and findings
+lines, so a switch to `enforce` does not fail every pull request.
 
 **The empty input.** The gate refuses an empty `required-lenses` input (a head
 with no lens comment would pass), except when the config at the base tip has a
@@ -249,7 +281,8 @@ posts a failure that says why, in `shadow` as in `enforce`. Never a pass, never
 **Adding the block.** A release that does not know the `review` key refuses the
 whole config (an unknown key), so: release first, then pin that release in every
 caller of the queue and the gate, then add the key. Roll back in the reverse order:
-remove the key, then the pin.
+remove the key, then the pin. The same holds for `override_authors`: a
+release from before it refuses a config that has it.
 
 ## Lens comments
 
