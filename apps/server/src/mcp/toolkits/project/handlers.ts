@@ -38,6 +38,7 @@ import {
 } from "@t3tools/shared/projectSettings";
 import { resolveProjectScripts } from "@t3tools/shared/projectScripts";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
+import * as LaunchMcpProfile from "../../../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
 import {
   providerOptionDescriptors,
   refuseAgentModePick,
@@ -283,6 +284,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                 ),
               )).projectId
             : yield* resolveProjectId(context, input.projectId);
+        yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch
         // A retry of an accepted launch replays it: it keeps the model it started
         // with and skips the checks only a new launch needs, which the project
         // may no longer pass, such as a base branch deleted since.

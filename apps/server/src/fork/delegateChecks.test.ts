@@ -8,6 +8,7 @@ import * as NodeFS from "node:fs";
 
 import { assert, describe, it } from "@effect/vitest";
 import {
+  DEFAULT_SERVER_SETTINGS,
   type OrchestratorMcpTarget,
   ProjectId,
   ProviderInstanceId,
@@ -99,8 +100,10 @@ describe("fork delegation checks: upstream seat calls", () => {
 const callerThreadId = ThreadId.make("thread:seam-parent");
 const parent = {
   thread: {
+    id: callerThreadId,
     projectId: ProjectId.make("project:seam"),
     runtimeMode: "full-access",
+    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: callerThreadId },
   },
 } as unknown as Pick<OrchestrationV2ThreadProjection, "thread">;
 const target: DelegateChecks.DelegateTarget = {
@@ -108,11 +111,8 @@ const target: DelegateChecks.DelegateTarget = {
   supportedRuntimeModes: undefined,
 };
 
-/** Every service the checks may read fails the test if it is read. */
-const untouched = Layer.mergeAll(
-  Layer.mock(ServerSettings.ServerSettingsService)({
-    getSettings: Effect.die("settings read"),
-  }),
+/** Every service the checks may read but settings fails the test if it is read. */
+const untouchedButSettings = Layer.mergeAll(
   Layer.mock(ThreadManagementService.ThreadManagementService)({}),
   Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.die("providers read") }),
   Layer.mock(SlotGate.SlotGate)({
@@ -121,6 +121,25 @@ const untouched = Layer.mergeAll(
     release: () => Effect.die("slot released"),
   }),
 );
+/** Every service the checks may read fails the test if it is read. */
+const untouched = Layer.merge(
+  untouchedButSettings,
+  Layer.mock(ServerSettings.ServerSettingsService)({ getSettings: Effect.die("settings read") }),
+);
+/**
+ * As {@link untouched}, but settings read the defaults (every thread on MCP profile `all`), and
+ * each read counts: a new `create_threads` thread reads them for its MCP profile check.
+ */
+const settingsCounted = (reads: { count: number }) =>
+  Layer.merge(
+    untouchedButSettings,
+    Layer.mock(ServerSettings.ServerSettingsService)({
+      getSettings: Effect.sync(() => {
+        reads.count += 1;
+        return DEFAULT_SERVER_SETTINGS;
+      }),
+    }),
+  );
 const host: DelegateChecks.DelegateChecksHost = {
   resolveTarget: () => Effect.die("target resolved"),
   scanWorkspace: () => Effect.die("folder scanned"),
@@ -145,20 +164,29 @@ describe("fork delegation checks: runs again", () => {
     }).pipe(Effect.scoped, Effect.provide(untouched)),
   );
 
+  const reads = { count: 0 };
   it.effect("create_threads' seat on a retry reads nothing and keeps the target", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
-      for (const isRetry of [false, true]) {
-        // A target without options reads nothing, retry or not.
-        const result = yield* checks.beforeCreateThread({
-          isRetry,
-          callerThreadId,
-          parent,
-          requested: { model: "gpt-5.4" },
-          target,
-        });
-        assert.deepStrictEqual(result, { target });
-      }
+      // A target without options reads nothing on a retry; a new thread reads only the MCP
+      // profile settings (launchMcpProfile.ts), once.
+      const fresh = yield* checks.beforeCreateThread({
+        isRetry: false,
+        callerThreadId,
+        parent,
+        requested: { model: "gpt-5.4" },
+        target,
+      });
+      assert.deepStrictEqual(fresh, { target });
+      assert.strictEqual(reads.count, 1);
+      const result = yield* checks.beforeCreateThread({
+        isRetry: true,
+        callerThreadId,
+        parent,
+        requested: { model: "gpt-5.4" },
+        target,
+      });
+      assert.deepStrictEqual(result, { target });
       // A retry keeps even an option the call did not name: it starts no work (the receipt holds
       // the target it was first dispatched with).
       const withAgent = agentTarget([{ id: "agent", value: "build" }]);
@@ -179,7 +207,8 @@ describe("fork delegation checks: runs again", () => {
         target: withAgent,
       });
       assert.deepStrictEqual(before, { target: withAgent });
-    }).pipe(Effect.provide(untouched)),
+      assert.strictEqual(reads.count, 1, "the retries read nothing");
+    }).pipe(Effect.provide(settingsCounted(reads))),
   );
 });
 
@@ -196,7 +225,11 @@ const pacingOff = (mode: "off" | "advise" | "enforce" | "unreadable") =>
       getSettings:
         mode === "unreadable"
           ? Effect.fail(new Error("settings unreadable") as never)
-          : Effect.succeed({ usagePacingGate: "off", modelPolicy: { mode, allow: [] } } as never),
+          : Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              usagePacingGate: "off",
+              modelPolicy: { mode, allow: [] },
+            } as never),
     }),
     Layer.mock(ThreadManagementService.ThreadManagementService)({}),
     Layer.mock(ProviderRegistry.ProviderRegistry)({
@@ -298,13 +331,10 @@ describe("fork delegation checks: a child's own options", () => {
   /** Both local seats and the remote target, under one settings layer. */
   const seats = Effect.gen(function* () {
     const checks = yield* DelegateChecks.make(host);
-    const created = yield* checks.beforeCreateThread({
-      isRetry: false,
-      callerThreadId,
-      parent,
-      requested,
-      target: given,
-    });
+    // A refusal shows as its code.
+    const created = yield* checks
+      .beforeCreateThread({ isRetry: false, callerThreadId, parent, requested, target: given })
+      .pipe(Effect.match({ onFailure: (refusal) => refusal.code, onSuccess: (r) => r.target }));
     const before = yield* checks.beforeWorkspace({
       isRetry: false,
       parent,
@@ -314,7 +344,7 @@ describe("fork delegation checks: a child's own options", () => {
       target: given,
     });
     const remote = yield* checks.remoteTarget<Target>({ model: "big-pickle" });
-    return { created: created.target, before: before.target, remote };
+    return { created, before: before.target, remote };
   });
 
   // An unreadable setting counts as on: a policy that cannot be read is enforced.
@@ -323,7 +353,9 @@ describe("fork delegation checks: a child's own options", () => {
     (mode) =>
       Effect.gen(function* () {
         assert.deepStrictEqual(yield* seats, {
-          created: agentTarget([effort]),
+          // Settings that cannot be read leave the caller's MCP profile unknown: refused, never
+          // a thread on `all` (launchMcpProfile.ts).
+          created: mode === "unreadable" ? "invalid_request" : agentTarget([effort]),
           before: agentTarget([effort]),
           remote: { model: "big-pickle", options: [] },
         });
@@ -340,11 +372,14 @@ describe("fork delegation checks: a child's own options", () => {
     }).pipe(Effect.provide(pacingOff("off"))),
   );
 
-  it.effect("a call with nothing to drop reads no setting, on any path", () =>
+  const reads = { count: 0 };
+  it.effect("a call with nothing to drop reads no setting for it, on any path", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
       const own = agentTarget([effort]);
-      for (const req of [requested, undefined, { options: [effort] }]) {
+      // create_threads reads settings once per thread, for its MCP profile check alone.
+      const cases = [requested, undefined, { options: [effort] }];
+      for (const req of cases) {
         const created = yield* checks.beforeCreateThread({
           isRetry: false,
           callerThreadId,
@@ -354,11 +389,13 @@ describe("fork delegation checks: a child's own options", () => {
         });
         assert.strictEqual(created.target, own);
       }
+      assert.strictEqual(reads.count, cases.length);
       const named = { model: "m", options: [agent] };
       assert.strictEqual(yield* checks.remoteTarget(named), named);
       const unnamed = { options: [agent] };
       assert.strictEqual(yield* checks.remoteTarget(unnamed), unnamed);
-    }).pipe(Effect.provide(untouched)),
+      assert.strictEqual(reads.count, cases.length, "the remote targets read nothing");
+    }).pipe(Effect.provide(settingsCounted(reads))),
   );
 });
 
