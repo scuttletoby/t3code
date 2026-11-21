@@ -16,6 +16,10 @@
 # The fork's composite actions and host kits: only the `workflows`, `action_tests` and `kit_tests` jobs read them.
 fork-ci/
 fork-kit/
+# The review rules' shared vectors and the gate's lens corpus: the server's review-rules test reads them, so a pull
+# request changing the gate and its vectors runs that test too.
+!fork-ci/actions/pr-queue/review.vectors.json
+!fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl
 
 # The fork's scripts and settings under .github; the `workflows` job tests them.
 .github/scripts/fork-*
