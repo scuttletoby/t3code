@@ -273,7 +273,7 @@
       ]
     },
     "apps/server/src/mcp/toolkits/thread/handlers.ts": {
-      "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693); run_scheduled_task_now refused by the agent slot gate answers slots_full (fork/agentSlotRoutes.ts, #706).",
+      "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693); run_scheduled_task_now refused by the agent slot gate answers slots_full (fork/agentSlotRoutes.ts, #706; the prettier-ignore keeps upstream's run_scheduled_task_now lines as they are, since a second pipe step would make the formatter reflow them).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch",
@@ -283,6 +283,7 @@
         "since": "2026-11-21",
         "added": [
           "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+          "// prettier-ignore",
           "Effect.mapError(AgentSlotRoutes.runNowSlotRefusal), // Fork: agent slots"
         ]
       }
