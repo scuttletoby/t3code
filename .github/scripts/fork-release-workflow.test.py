@@ -161,7 +161,7 @@ check("preflight runs this shape test", "fork-release-workflow.test.py" in
 sums = [s for s in steps(jobs["assemble"]) if "> SHA256SUMS" in str(s.get("run", ""))]
 sums_run = str(sums[0].get("run", "")) if len(sums) == 1 else ""
 check("assemble writes one SHA256SUMS over the server archives and the desktop files",
-      len(sums) == 1 and "sha256sum t3-*.tar.gz *.zip *.dmg *.exe *.AppImage > SHA256SUMS" in sums_run
+      len(sums) == 1 and "sha256sum -- t3-*.tar.gz *.zip *.dmg *.exe *.AppImage > SHA256SUMS" in sums_run
       and {"desktop_linux_x64", "desktop_win_x64", "desktop_mac_arm64", "desktop_mac_x64"}
       <= set(jobs["assemble"].get("needs", [])))
 
@@ -174,6 +174,33 @@ check("verify_mac_signature unpacks each macOS zip and dmg and runs codesign --v
       and "macos" in str(verify_mac.get("runs-on", ""))
       and "ditto -x -k" in verify_runs and "hdiutil attach" in verify_runs
       and "codesign --verify --deep --strict" in verify_runs)
+check("verify_mac_signature holds no token and detaches each dmg on any exit",
+      verify_mac.get("permissions") == {}
+      and "trap 'hdiutil detach \"$mount\" -force" in verify_runs)
+
+# The macOS files that ship are the ones verified: assemble compares SHA256SUMS with the hashes
+# verify_mac_signature printed (#822).
+compare = [s for s in steps(jobs["assemble"])
+           if "needs.verify_mac_signature.outputs.sums" in str(s.get("env", {}).get("VERIFIED", ""))]
+assemble_names = [s.get("name") for s in steps(jobs["assemble"])]
+check("assemble compares the macOS lines of SHA256SUMS with the verified hashes",
+      "shasum -a 256 --" in verify_runs and "steps.verify.outputs.sums" in str(verify_mac.get("outputs", {}).get("sums"))
+      and len(compare) == 1 and "SHA256SUMS" in str(compare[0].get("run", ""))
+      and sums and assemble_names.index(compare[0].get("name")) > assemble_names.index(sums[0].get("name")))
+
+# Every file the publish job uploads for people has a SHA256SUMS line: the check's patterns are the
+# publish list less the files the apps read (*.blockmap, *.yml) and SHA256SUMS itself.
+draft = [s for s in steps(jobs["publish"]) if "action-gh-release" in str(s.get("uses", ""))]
+published = {line.strip().removeprefix("release-assets/")
+             for line in str(draft[0].get("with", {}).get("files", "") if draft else "").splitlines() if line.strip()}
+shipped = published - {"*.blockmap", "*.yml", "SHA256SUMS"}
+covers = [s for s in steps(jobs["assemble"]) if "sha256sum --check" in str(s.get("run", ""))]
+covers_run = str(covers[0].get("run", "")) if len(covers) == 1 else ""
+loop = re.search(r"for file in ([^;]+); do", covers_run)
+check("assemble checks SHA256SUMS has a line for every file the publish job uploads",
+      bool(shipped) and loop is not None and set(loop.group(1).split()) == shipped
+      and assemble_names.index(covers[0].get("name")) < assemble_names.index("Upload release files"),
+      f"publish uploads {sorted(shipped)}, the check reads {loop.group(1) if loop else None}")
 
 # The server bundle check skips dist/client, which names this repository on every Actions build.
 bundle_steps = [s for s in steps(jobs["build_bundle"]) if "apps/server/dist" in str(s.get("run", ""))]

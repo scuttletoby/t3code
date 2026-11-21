@@ -397,11 +397,18 @@ jobs:
   # The shipped macOS apps, as a person unpacks them: each zip and dmg holds an app whose signature
   # (ad hoc without signing secrets, scripts/fork-codesign.cjs) seals the whole bundle. A bundle
   # changed after signing, or never signed, fails `codesign --verify --deep --strict` (#822).
+  # Green means each bundle is unchanged since it was signed, not who made it: an ad hoc signature
+  # names nobody. Who built the files is the attested SHA256SUMS. The check reads the built files
+  # only, so "Re-run failed jobs" repeats a failure; it needs a new build. assemble compares the
+  # hashes this job prints with SHA256SUMS, so the files that ship are the ones checked here.
   verify_mac_signature:
     name: Verify macOS signatures
     needs: [desktop_mac_arm64, desktop_mac_x64]
     runs-on: ${{ vars.FORK_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 15
+    permissions: {}
+    outputs:
+      sums: ${{ steps.verify.outputs.sums }}
     steps:
       - name: Download macOS builds
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -411,10 +418,12 @@ jobs:
           path: release-assets
 
       - name: Verify the app in each zip and dmg
+        id: verify
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
+          cd release-assets
           verify() {
             local apps=("$1"/*.app)
             if (( ${#apps[@]} != 1 )); then
@@ -422,9 +431,17 @@ jobs:
               exit 1
             fi
             codesign --verify --deep --strict --verbose=2 "${apps[0]}"
+            # Ad hoc shows "Signature=adhoc" and no Authority; a Developer ID shows its chain.
+            info="$(codesign -dv --verbose=2 "${apps[0]}" 2>&1)"
+            {
+              echo "**$2**"
+              echo '```'
+              grep -E '^(Identifier|Signature|Authority|TeamIdentifier)=' <<< "$info" || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
           }
-          zips=(release-assets/T3-Code-*.zip)
-          dmgs=(release-assets/*.dmg)
+          zips=(T3-Code-*.zip)
+          dmgs=(*.dmg)
           if (( ${#zips[@]} != 2 || ${#dmgs[@]} != 2 )); then
             echo "::error::Expected the arm64 and x64 zip and dmg, found: ${zips[*]} ${dmgs[*]}" >&2
             exit 1
@@ -436,10 +453,19 @@ jobs:
           done
           for dmg in "${dmgs[@]}"; do
             mount="$(mktemp -d "$RUNNER_TEMP/dmg.XXXXXX")"
+            # Detached on any exit, a failed check included.
+            trap 'hdiutil detach "$mount" -force > /dev/null 2>&1 || true' EXIT
             hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg" > /dev/null
             verify "$mount" "$dmg"
             hdiutil detach "$mount" -force > /dev/null
+            trap - EXIT
           done
+          # The hashes of the four checked files, by bare name as in SHA256SUMS, for assemble.
+          {
+            echo "sums<<SUMS_EOF"
+            shasum -a 256 -- "${zips[@]}" "${dmgs[@]}"
+            echo "SUMS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
   # Collects and checks every release file with a read-only token; package code runs here only.
   assemble:
@@ -520,15 +546,27 @@ jobs:
             echo "::error::The Linux x64 server archive is missing." >&2
             exit 1
           fi
-          for desktop in "*.dmg" "*.exe" "*.AppImage" "T3-Code-*.zip"; do
-            files=($desktop)
-            if (( ${#files[@]} == 0 )); then
-              echo "::error::No desktop file matches $desktop." >&2
-              exit 1
-            fi
+          for pattern in "*.dmg" "*.exe" "*.AppImage" "T3-Code-*.zip"; do
+            compgen -G "$pattern" > /dev/null || { echo "::error::No desktop file matches $pattern." >&2; exit 1; }
           done
-          sha256sum t3-*.tar.gz *.zip *.dmg *.exe *.AppImage > SHA256SUMS
+          sha256sum -- t3-*.tar.gz *.zip *.dmg *.exe *.AppImage > SHA256SUMS
           cat SHA256SUMS
+
+      # The macOS files that ship are the ones verify_mac_signature checked: another job of this
+      # run could upload a desktop-* artifact with the same file name after it.
+      - name: Compare the macOS files with the verified ones
+        shell: bash
+        env:
+          VERIFIED: ${{ needs.verify_mac_signature.outputs.sums }}
+        run: |
+          set -euo pipefail
+          listed="$(awk '{ name = substr($0, 67) } name ~ /\.dmg$/ || name ~ /^T3-Code-.*\.zip$/' release-assets/SHA256SUMS | sort)"
+          verified="$(sort <<< "$VERIFIED")"
+          if [[ -z "$verified" || "$listed" != "$verified" ]]; then
+            echo "::error::The macOS files in SHA256SUMS are not the ones verify_mac_signature checked." >&2
+            diff <(echo "$verified") <(echo "$listed") >&2 || true
+            exit 1
+          fi
 
       # The `t3` executable in each archive bundles the server again (release-desktop.yml build-exe).
       - name: Check the CLI archives name this repository
@@ -584,6 +622,25 @@ jobs:
             git log --reverse --format='- %s (%h)' "refs/upstream/$BASE_TAG..$REF"
           } > release-assets/release-notes.md
           cat release-assets/release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Every file the publish job uploads for people (its list less *.blockmap and *.yml, which the
+      # apps read) has a SHA256SUMS line, and every line still matches its file.
+      - name: Check SHA256SUMS covers the shipped files
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd release-assets
+          sha256sum --check --quiet SHA256SUMS
+          listed="$(cut -c67- SHA256SUMS)"
+          missing=0
+          for file in *.dmg *.zip *.AppImage *.exe *.tar.gz; do
+            if ! grep -qxF -- "$file" <<< "$listed"; then
+              echo "::error::$file is published but has no SHA256SUMS line." >&2
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Upload release files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
