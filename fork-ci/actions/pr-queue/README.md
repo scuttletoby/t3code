@@ -149,8 +149,20 @@ whole). Then (`review_judge.py`, `review_glob.py`):
   each one count together: more paths, never fewer.
 
 `review.vectors.json` holds the shared cases (globs, rule sets, changed paths with
-their status, and the expected weight and lenses); the Python tests read it, and
-T3 tests its own matcher on the same file.
+their status, and the expected weight and lenses; lens report bodies and the
+findings read in them; lens comment scans; review rounds). The Python tests and
+T3's pure copy of these rules (`apps/server/src/fork/reviewRules/`) both replay
+every vector, and each side fails on a section or field it does not run. A rule
+change updates both sides and the vectors in one pull request.
+
+How a vector is made: write its input (name, body or posts, config) by hand,
+run the gate's own function on it (`review_judge.judge`, `read_findings`,
+`judge_rounds`, or `lens.Review.lens_scan` the way `review_judge.test.py`'s
+`scan()` posts it, with `override_prefix`), and paste the gate's answer as the
+expected value. Check that the answer is the one the rule means: a vector
+copied from a broken gate holds both sides to the broken answer. The Python
+test checks each expected value against the gate, so a stale one fails there.
+The file is formatted with `vp fmt`.
 
 Notes for T3's matcher and its GitHub reader (no change in the gate):
 
