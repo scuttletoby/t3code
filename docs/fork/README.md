@@ -185,8 +185,9 @@ owed, and also when it has no delivery state at all: an old row, or a `mode: "wa
 acknowledgement failed. Each task is reminded once, also across restarts and when another result
 becomes owed later (the later message names only the new task); a message names at most ten tasks.
 A message the thread refuses holds back only its own tasks (until the set changes); the other
-messages of that check are still sent. The refusal is logged once, when it happens, not on each
-later check. A reminder sent before per-task ids (one id for the whole set) is split into its tasks
+messages of that check are still sent. Each refused message is logged once per server run, not on
+each later check (also when another thread holds its id); after a restart a message still refused
+is logged once more, so a refusal whose log line a stop cut off is still logged. A reminder sent before per-task ids (one id for the whole set) is split into its tasks
 from its text, so after an upgrade a task it named is not reminded again; only tasks past the first
 ten of such a message, which it never named, may be reminded once more. Such a message whose text
 cannot be read is left out alone: its tasks may be reminded once more, and the parent's other

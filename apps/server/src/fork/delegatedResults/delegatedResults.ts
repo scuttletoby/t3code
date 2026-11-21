@@ -112,6 +112,24 @@ export const isRemindable = (task: OrchestrationV2Subagent, nowMs: number): bool
 };
 
 /**
+ * Whether a refusal is new to this process, so each refused batch is logged once per process: every
+ * later check finds its refused receipt (or another thread's receipt) again. Not stored, so a
+ * restart logs a batch still refused once more, also one whose log line a stop cut off. A refusal
+ * is forgotten after `REMINDER_MAX_AGE_MS`: its tasks ended before it, so none is reminded then.
+ */
+export const makeRefusalLog = () => {
+  const logged = new Map<string, number>();
+  return (commandId: string, nowMs: number): boolean => {
+    for (const [id, atMs] of logged) {
+      if (nowMs - atMs > REMINDER_MAX_AGE_MS) logged.delete(id);
+    }
+    if (logged.has(commandId)) return false;
+    logged.set(commandId, nowMs);
+    return true;
+  };
+};
+
+/**
  * Busy: the parent's run is going or holds a question, so its own run end comes first and checks
  * again. Background work the parent left running (a monitor, a command) does not hold it: upstream
  * counts that as a live child, but no run end may come for hours, and a queued message is safe.
@@ -236,10 +254,10 @@ export const legacyReminderKeys = (
       listed.map((id) => NodeId.make(id)),
     );
     if (more.length !== 0 || exact !== messageId) return [];
+  } else {
     // Over ten, no digest check: it covers the unnamed rest too. No risk added: a writer of this
     // parent's reminder ids can already mark any task told with its one-task id.
-  } else if (more.length !== 1 || more[0] !== count - MAX_LISTED) {
-    return [];
+    if (more.length !== 1 || more[0] !== count - MAX_LISTED) return [];
   }
   return listed.map((id) => reminderKey(NodeId.make(id)));
 };
