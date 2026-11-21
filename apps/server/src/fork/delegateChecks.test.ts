@@ -226,7 +226,8 @@ const agentTarget = (
 });
 /**
  * Pacing off, a model policy in `mode` (a failed read for `unreadable`) whose one row allows the
- * pick: `big-pickle` with no effort (no provider is listed, so the pick has no driver).
+ * pick: `big-pickle` at `high` (no provider is listed, so the pick has no driver and every
+ * driver's effort id counts, `variant` too).
  */
 const pacingOff = (mode: "off" | "advise" | "enforce" | "unreadable") =>
   Layer.mergeAll(
@@ -237,7 +238,10 @@ const pacingOff = (mode: "off" | "advise" | "enforce" | "unreadable") =>
           : Effect.succeed({
               ...DEFAULT_SERVER_SETTINGS,
               usagePacingGate: "off",
-              modelPolicy: { mode, allow: [{ driver: "opencode", model: "big-pickle" }] },
+              modelPolicy: {
+                mode,
+                allow: [{ driver: "opencode", model: "big-pickle", efforts: ["high"] }],
+              },
             } as never),
     }),
     Layer.mock(ThreadManagementService.ThreadManagementService)({}),
@@ -355,7 +359,7 @@ describe("fork delegation checks: a child's own options", () => {
       })
       .pipe(Effect.match({ onFailure: (refusal) => refusal.code, onSuccess: (r) => r.target }));
     const remote = yield* checks
-      .remoteTarget<Target>({ model: "big-pickle" })
+      .remoteTarget<Target>({ model: "big-pickle", options: [effort] })
       .pipe(Effect.match({ onFailure: (refusal) => refusal.code, onSuccess: (r) => r }));
     return { created, before, remote };
   });
@@ -367,7 +371,7 @@ describe("fork delegation checks: a child's own options", () => {
         assert.deepStrictEqual(yield* seats, {
           created: agentTarget([effort]),
           before: agentTarget([effort]),
-          remote: { model: "big-pickle", options: [] },
+          remote: { model: "big-pickle", options: [effort] },
         });
       }).pipe(Effect.provide(pacingOff(mode))),
   );
@@ -390,7 +394,7 @@ describe("fork delegation checks: a child's own options", () => {
       assert.deepStrictEqual(yield* seats, {
         created: given,
         before: given,
-        remote: { model: "big-pickle" },
+        remote: { model: "big-pickle", options: [effort] },
       });
     }).pipe(Effect.provide(pacingOff("off"))),
   );

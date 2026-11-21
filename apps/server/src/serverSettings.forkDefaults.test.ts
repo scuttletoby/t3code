@@ -1,8 +1,10 @@
 // Fork: a machine whose settings file says nothing about a fork setting runs it at its pinned
-// default (packages/contracts/src/forkDefaults.ts), whatever state the file is in.
+// default (packages/contracts/src/forkDefaults.ts), whatever state the file is in. One exception:
+// a file that does not parse may hold an enforced model policy, so the policy fails closed.
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { MODEL_POLICY_FAIL_CLOSED } from "@t3tools/contracts";
 import {
   FORK_SETTING_DEFAULTS,
   forkSettingAsSaved,
@@ -16,6 +18,7 @@ import * as Layer from "effect/Layer";
 
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ServerConfig from "./config.ts";
+import { SETTINGS_FILE_UNPARSEABLE } from "./fork/modelPolicyFile.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import * as ServerSettingsModule from "./serverSettings.ts";
@@ -50,7 +53,27 @@ const loadedForkSettings = (contents: string | undefined) =>
 
 const PINNED = Object.fromEntries(SERVER_ROWS.map((row) => [row.key, row.default]));
 
-const STATES: ReadonlyArray<{ readonly state: string; readonly contents: string | undefined }> = [
+/** As PINNED, but the model policy fails closed (fork/modelPolicyFile.ts). */
+const UNPARSEABLE = Object.fromEntries(
+  SERVER_ROWS.map((row) => [
+    row.key,
+    row.key === "modelPolicy"
+      ? pinnedPart(
+          row,
+          forkSettingAsSaved(row, {
+            ...MODEL_POLICY_FAIL_CLOSED,
+            unreadable: SETTINGS_FILE_UNPARSEABLE,
+          }),
+        )
+      : row.default,
+  ]),
+);
+
+const STATES: ReadonlyArray<{
+  readonly state: string;
+  readonly contents: string | undefined;
+  readonly expected?: Readonly<Record<string, unknown>>;
+}> = [
   { state: "no settings file", contents: undefined },
   { state: "an empty settings object", contents: "{}" },
   // Upstream writes only values that differ from its defaults, and its automatic updates default
@@ -59,7 +82,7 @@ const STATES: ReadonlyArray<{ readonly state: string; readonly contents: string 
     state: "a file an upstream build wrote",
     contents: JSON.stringify({ enableAgentBrowserAccess: false }),
   },
-  { state: "a file cut off half-way", contents: '{ "automaticUpdates": tr' },
+  { state: "a file cut off half-way", contents: '{ "automaticUpdates": tr', expected: UNPARSEABLE },
   {
     state: "a file with a value of the wrong type",
     contents: JSON.stringify({ automaticUpdates: "yes" }),
@@ -69,9 +92,9 @@ const STATES: ReadonlyArray<{ readonly state: string; readonly contents: string 
 it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork setting defaults", (it) => {
   it.effect.each(STATES)(
     "loads every fork setting at its pinned default with $state",
-    ({ contents }) =>
+    ({ contents, expected }) =>
       Effect.gen(function* () {
-        assert.deepStrictEqual(yield* loadedForkSettings(contents), PINNED);
+        assert.deepStrictEqual(yield* loadedForkSettings(contents), expected ?? PINNED);
       }).pipe(Effect.provide(layerServerSettings())),
   );
 
