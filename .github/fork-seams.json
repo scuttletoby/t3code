@@ -185,6 +185,17 @@
         "...input.mcpProfileOptions?.hooks,"
       ]
     },
+    "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": {
+      "why": "MCP profiles part 5: each Codex thread gets its profile's outside MCP servers switched off in its own per-thread config (mcp_servers.<name>.enabled = false for every server Codex's config/read lists for the thread's folder that the profile leaves out, launch-argument servers included; T3's own entries stay), and a turn is refused, saying why and the fix, when the thread's live servers (mcpServerStatus/list) still include one outside its profile. The adapter's app-server client factory is wrapped by apps/server/src/fork/codexMcpProfile.ts; the overrides travel per request, so other threads on the shared app-server keep their own sets. Additions only; tested in apps/server/src/fork/codexMcpProfile.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as CodexMcpProfile from \"../../fork/codexMcpProfile.ts\"; // Fork: MCP profiles",
+          "...(yield* CodexMcpProfile.profiledClientFactory(clientFactory)), // Fork: MCP profiles"
+        ]
+      }
+    },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",
       "added": ["\"ClaudeMcpProfileError\","]
