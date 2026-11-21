@@ -112,6 +112,36 @@ export const isRemindable = (task: OrchestrationV2Subagent, nowMs: number): bool
 };
 
 /**
+ * Whether a refusal is new to this process (each later check finds its receipt again); a restart
+ * logs a batch still refused once more. `forgetAfterMs`: when a logged id can no longer come back
+ * (the reminder's tasks ended before the refusal, so none is reminded a day later); `null` keeps
+ * every id for the process.
+ */
+export const makeRefusalLog = (
+  forgetAfterMs: number | null = REMINDER_MAX_AGE_MS,
+): ((commandId: string, nowMs: number) => boolean) => {
+  if (forgetAfterMs === null) {
+    // Nothing is forgotten, so no time is kept.
+    const logged = new Set<string>();
+    return (commandId) => {
+      if (logged.has(commandId)) return false;
+      logged.add(commandId);
+      return true;
+    };
+  }
+  // When each id was logged: the prune reads it.
+  const logged = new Map<string, number>();
+  return (commandId, nowMs) => {
+    for (const [id, atMs] of logged) {
+      if (nowMs - atMs > forgetAfterMs) logged.delete(id);
+    }
+    if (logged.has(commandId)) return false;
+    logged.set(commandId, nowMs);
+    return true;
+  };
+};
+
+/**
  * Busy: the parent's run is going or holds a question, so its own run end comes first and checks
  * again. Background work the parent left running (a monitor, a command) does not hold it: upstream
  * counts that as a live child, but no run end may come for hours, and a queued message is safe.
@@ -236,10 +266,10 @@ export const legacyReminderKeys = (
       listed.map((id) => NodeId.make(id)),
     );
     if (more.length !== 0 || exact !== messageId) return [];
+  } else {
     // Over ten, no digest check: it covers the unnamed rest too. No risk added: a writer of this
     // parent's reminder ids can already mark any task told with its one-task id.
-  } else if (more.length !== 1 || more[0] !== count - MAX_LISTED) {
-    return [];
+    if (more.length !== 1 || more[0] !== count - MAX_LISTED) return [];
   }
   return listed.map((id) => reminderKey(NodeId.make(id)));
 };

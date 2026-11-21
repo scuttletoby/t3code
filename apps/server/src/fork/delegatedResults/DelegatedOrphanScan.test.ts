@@ -80,6 +80,8 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   /** Answers its first page only. */
   const cutShort = new Set<EnvironmentId>();
   const linksOff = { value: false };
+  /** Every send fails as a store that cannot be read now does (tried again, same id). */
+  const sendFails = { value: false };
   const pageReads: Array<{ environmentId: EnvironmentId; cursor: number }> = [];
   const sent: Array<{ threadId: ThreadId; messageId: string; text: string }> = [];
   const receipts = new Map<string, ThreadId>();
@@ -113,6 +115,7 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
     silent,
     cutShort,
     linksOff,
+    sendFails,
     pageReads,
     sent,
     receipts,
@@ -137,24 +140,32 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
             ),
           ),
         sendToThread: (input) =>
-          refusing.has(input.commandId)
-            ? Effect.sync(() => refused.add(input.commandId)).pipe(
-                Effect.andThen(
-                  Effect.fail({
-                    _tag: "ThreadManagementCommandInvariantError",
-                    message: "refused",
-                  } as never),
-                ),
-              )
-            : Effect.sync(() => {
-                sent.push({
+          sendFails.value
+            ? Effect.fail(
+                new ThreadManagement.ThreadManagementProjectionLoadError({
+                  projectId: input.projectId,
                   threadId: input.threadId,
-                  messageId: input.messageId!,
-                  text: input.text,
-                });
-                receipts.set(input.commandId, input.threadId);
-                return {} as never;
-              }),
+                  cause: new Error("store busy"),
+                }),
+              )
+            : refusing.has(input.commandId)
+              ? Effect.sync(() => refused.add(input.commandId)).pipe(
+                  Effect.andThen(
+                    Effect.fail({
+                      _tag: "ThreadManagementCommandInvariantError",
+                      message: "refused",
+                    } as never),
+                  ),
+                )
+              : Effect.sync(() => {
+                  sent.push({
+                    threadId: input.threadId,
+                    messageId: input.messageId!,
+                    text: input.text,
+                  });
+                  receipts.set(input.commandId, input.threadId);
+                  return {} as never;
+                }),
       }),
       Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
         getByCommandId: (commandId: CommandId) =>
@@ -489,9 +500,8 @@ describe("DelegatedOrphanScan.scan", () => {
       const refusedOutcome = { type: "held", detail: "refused" };
       const once = scanned(scan.scan()).pipe(Effect.provide(warningLogs(warnings)));
       expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
-      // Runs again, and after a restart: answered from its refused receipt, no new warning.
+      // Runs again: answered from its refused receipt, no new warning.
       expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
-      yield* scanned((yield* service(world)).scan()).pipe(Effect.provide(warningLogs(warnings)));
       const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
       expect(refusals()).toHaveLength(1);
       expect(world.sent).toHaveLength(0);
@@ -501,6 +511,63 @@ describe("DelegatedOrphanScan.scan", () => {
       world.refusing.add(orphanBatchIds(PARENT, lost2).commandId);
       expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
       expect(refusals()).toHaveLength(2);
+      expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
+      expect(refusals()).toHaveLength(2);
+    }),
+  );
+
+  it.effect("a refusal whose log line a stop cut off is logged once after the restart", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const lost1 = [{ environmentId: ENV_B, threadId: ThreadId.make("lost-1") }];
+      const { commandId } = orphanBatchIds(PARENT, lost1);
+      // The server stopped after the refusal, before its warning: only the refused receipt is left.
+      world.refused.add(commandId);
+      const warnings: Array<string> = [];
+      const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
+      const once = scanned((yield* service(world)).scan()).pipe(
+        Effect.provide(warningLogs(warnings)),
+      );
+      expect((yield* once).parents.get(PARENT)).toEqual({ type: "held", detail: "refused" });
+      expect(refusals()).toHaveLength(1);
+      expect(refusals()[0]).toContain(commandId);
+      expect((yield* once).parents.get(PARENT)).toEqual({ type: "held", detail: "refused" });
+      expect(refusals()).toHaveLength(1);
+      expect(world.sent).toHaveLength(0);
+    }),
+  );
+
+  it.effect("a receipt another thread holds warns once per run, not on every pass", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const lost1 = [{ environmentId: ENV_B, threadId: ThreadId.make("lost-1") }];
+      const { commandId } = orphanBatchIds(PARENT, lost1);
+      // The message's command id is taken by another thread's accepted command.
+      world.receipts.set(commandId, ThreadId.make("thread-other"));
+      const warnings: Array<string> = [];
+      const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
+      const held = {
+        type: "held",
+        detail: `Command ${commandId} belongs to thread thread-other.`,
+      };
+      const once = scanned((yield* service(world)).scan()).pipe(
+        Effect.provide(warningLogs(warnings)),
+      );
+      expect((yield* once).parents.get(PARENT)).toEqual(held);
+      expect((yield* once).parents.get(PARENT)).toEqual(held);
+      expect((yield* once).parents.get(PARENT)).toEqual(held);
+      expect(refusals()).toHaveLength(1);
+      expect(refusals()[0]).toContain(commandId);
+      // After a restart: once more, then not again.
+      const restarted = scanned((yield* service(world)).scan()).pipe(
+        Effect.provide(warningLogs(warnings)),
+      );
+      expect((yield* restarted).parents.get(PARENT)).toEqual(held);
+      expect((yield* restarted).parents.get(PARENT)).toEqual(held);
+      expect(refusals()).toHaveLength(2);
+      expect(world.sent).toHaveLength(0);
     }),
   );
 
@@ -719,6 +786,8 @@ describe("DelegatedOrphanScan and agent slots", () => {
           callerThreadId: PARENT,
           intoThreadId: PARENT,
           keepsHeld: true,
+          // Asked again every 5 s through the wait service's delivery, in one place in line.
+          place: { key: expect.stringMatching(/^wait-delivery:/) },
         }),
       ]);
     }),
@@ -870,6 +939,125 @@ describe("DelegatedOrphanScan and agent slots", () => {
         yield* settle;
         yield* Fiber.join(again);
         expect(world.sent).toHaveLength(1);
+      }),
+  );
+
+  it.effect("a send that keeps failing is logged as a failed send, not an unreadable parent", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.slots.state.all = true;
+      const warnings: Array<string> = [];
+      const logger = Logger.make(({ message, logLevel }) => {
+        if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+      });
+      const fiber = yield* (yield* service(world))
+        .run()
+        .pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          Effect.forkChild,
+        );
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      // A slot frees, but every send fails.
+      world.slots.state.all = false;
+      world.sendFails.value = true;
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      for (let step = 0; step < OPTIONS.attempts; step++) {
+        yield* TestClock.adjust(OPTIONS.retryDelay);
+        yield* settle;
+      }
+      expect(fiber.pollUnsafe()).toBeDefined();
+      expect(warnings.filter((warning) => warning.includes("its send failed"))).toHaveLength(1);
+      expect(warnings.filter((warning) => warning.includes("cannot be read"))).toHaveLength(0);
+      expect(
+        warnings.filter((warning) => warning.includes("left to the next start: its send kept")),
+      ).toHaveLength(1);
+      expect(world.sent).toHaveLength(0);
+    }),
+  );
+
+  it.effect(
+    "the give-up warning lists a parent whose send kept failing apart from unread ones",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        // A slot is free, but every send to the parent fails: each scan tries it again.
+        world.sendFails.value = true;
+        const warnings: Array<string> = [];
+        const logger = Logger.make(({ message, logLevel }) => {
+          if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+        });
+        const fiber = yield* (yield* service(world))
+          .run()
+          .pipe(
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+            Effect.forkChild,
+          );
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        for (let attempt = 1; attempt <= OPTIONS.attempts; attempt += 1) {
+          yield* settle;
+          if (attempt < OPTIONS.attempts) yield* TestClock.adjust(OPTIONS.retryDelay);
+        }
+        yield* Fiber.join(fiber);
+        const left = warnings.filter((warning) => warning.includes("work unchecked"));
+        expect(left).toHaveLength(1);
+        const fields = (JSON.parse(left[0]!) as Array<unknown>).find(
+          (part): part is Record<string, unknown> => typeof part === "object" && part !== null,
+        );
+        expect(fields?.failedSendParentThreadIds).toEqual([PARENT]);
+        expect(fields?.unreadableParentThreadIds).toEqual([]);
+        expect(world.sent).toHaveLength(0);
+      }),
+  );
+
+  it.effect(
+    "a refused message before one that waits for a slot is logged once, also past a day",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        // Eleven orphans: two messages, the first (ten) refused before this start, the second
+        // (one) waits for a slot. Each pass of the wait finds the first one's refused receipt.
+        const lost = Array.from({ length: 11 }, (_, index) => ({
+          threadId: `lost-${String(index).padStart(2, "0")}`,
+        }));
+        world.there.set(ENV_B, [...lost, { threadId: "known-1" }]);
+        const first = lost
+          .slice(0, 10)
+          .map((thread) => ({ environmentId: ENV_B, threadId: ThreadId.make(thread.threadId) }));
+        world.refused.add(orphanBatchIds(PARENT, first).commandId);
+        world.slots.state.all = true;
+        const warnings: Array<string> = [];
+        const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
+        const scan = yield* service(world, { maxPages: 10, slotRetryDelay: Duration.hours(1) });
+        const fiber = yield* scan
+          .run()
+          .pipe(Effect.provide(warningLogs(warnings)), Effect.forkChild);
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        yield* settle;
+        expect(refusals()).toHaveLength(1);
+        // The slot stays taken for more than a day (the one-day window is from the start).
+        for (let step = 0; step < 26; step++) {
+          yield* TestClock.adjust(Duration.hours(1));
+          yield* settle;
+        }
+        expect(world.slots.asks).toHaveLength(27);
+        expect(refusals()).toHaveLength(1);
+        expect(world.sent).toHaveLength(0);
+        // A slot frees: the second message goes, the first stays refused and is not logged again.
+        world.slots.state.all = false;
+        yield* TestClock.adjust(Duration.hours(1));
+        yield* settle;
+        yield* Fiber.join(fiber);
+        expect(world.sent).toHaveLength(1);
+        expect(world.sent[0]!.text).toContain("lost-10");
+        expect(refusals()).toHaveLength(1);
       }),
   );
 
