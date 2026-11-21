@@ -2261,6 +2261,7 @@ const make = Effect.gen(function* () {
       // Its questions and approvals are answered in the environment it runs in.
       hasPendingQuestion: false,
       pendingApproval: null,
+      ...(yield* delegateChecks.remotePrompts(task, status)), // Fork: reported here (fork/remoteTaskPrompts.ts)
       waitTimedOut,
     } satisfies OrchestratorMcpDelegateTaskResult;
   });
@@ -2927,7 +2928,6 @@ const make = Effect.gen(function* () {
         },
       };
     }),
-    // Fork: `Effect.scoped` closes the hold of a call that stops half-way (fork/delegateChecks.ts).
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
       const environmentId =
         input.target === undefined
@@ -3135,7 +3135,7 @@ const make = Effect.gen(function* () {
           return usagePacingNote === undefined ? task : { ...task, usagePacingNote };
         }),
       );
-    }, Effect.scoped),
+    }, Effect.scoped), // Fork: closes the hold of a call that stops half-way (fork/delegateChecks.ts)
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");
       return yield* readTask(scope, taskId, false, true);
