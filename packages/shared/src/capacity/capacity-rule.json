@@ -43,9 +43,9 @@
     "calm": {
       "psiSomeAvg10Pct": 5,
       "psiFullAvg10Pct": 1,
-      "availableAtLeastMarginPercent": 150,
-      "swapFreeAtLeastPercent": 30
+      "availableAtLeastMarginPercent": 150
     },
+    "swapFillingMb": 64,
     "elevatedClearSeconds": 60,
     "severeClearSeconds": 120
   }

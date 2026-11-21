@@ -32,7 +32,10 @@ export interface CapacityAsk {
 
 export interface CapacityRefusal {
   readonly reason: string;
-  /** Free MB and the agent's cost (budget), or agents counted and the ceiling (ceiling, writers). */
+  /**
+   * Free MB and the agent's cost (budget); agents counted and the ceiling (ceiling), or the floor
+   * (unreadable); writers counted (writers); else agents counted.
+   */
   readonly used: number;
   readonly max: number;
 }
@@ -439,8 +442,10 @@ export function capacityRefusalReason(
       return `${used} agents are running or starting on ${where}, and the limit is ${max} now`;
     case "writers":
       return `${used} writing agents are running or starting on ${where}, as many as its build room allows`;
+    case "starting":
+      return `the slot gate on ${where} started a short while ago and waits for about a minute of calm memory readings`;
     case "unreadable":
-      return `the memory of ${where} cannot be read now`;
+      return `the memory of ${where} cannot be read now and ${used} agents are running or starting; only ${max} start without readings, and the fixed limit applies if they stay unreadable for 2 minutes`;
     default:
       return `the memory of ${where} is under pressure (${reason ?? "unknown"})`;
   }

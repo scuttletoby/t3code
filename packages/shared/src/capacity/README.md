@@ -38,11 +38,16 @@ the size the piece declares (`declaredFallbackMb` when missing or impossible). L
 `learnedBounds` percent of the start cost; a broken one is the start cost.
 
 **Pressure level.** `severe` or `elevated` when any of its limits is met (PSI, available against the margin,
-swap free; the OS level where there is no PSI). PSI is the worst of the machine's (`psi`) and the box's the piece
+swap under `swapFreeBelowPercent` free that is also filling; the OS level where there is no PSI). Swap
+counts by its trend, not its level: it is filling when its free MB fell by more than `swapFillingMb` since
+the last read, and swap full of old cold pages is no signal. `calm` needs no stall, available memory at
+`availableAtLeastMarginPercent` of the margin and swap that is not filling. A read with no swap trend yet (the
+first after a start) may start the calm wait but never ends it: the step down waits for a read that sees the
+trend. PSI is the worst of the machine's (`psi`) and the box's the piece
 goes into (`boxPsi`): a box can stall at its cap while the machine has free memory, and the machine can stall
 while one box is calm. An unreadable PSI, box PSI, swap or OS level is `elevated`. Up at once; `severe` steps
 down to `elevated` after `severeClearSeconds` without severe readings, `elevated` to `ok` after
-`elevatedClearSeconds` of readings under the `calm` limits. The caller keeps `{level, calmSinceMs}` between
+`elevatedClearSeconds` of readings under the `calm` limits. The caller keeps `{level, calmSinceMs, swapFreeMb}` between
 reads, one per box it asks for (the level includes that box's PSI); no previous state means the raw level; no
 clock means no step down; a clock that went back restarts the wait.
 

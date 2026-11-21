@@ -8,6 +8,7 @@ import type { SlotRuleObservation } from "@t3tools/contracts/waitFor";
 import {
   capacityDecision,
   type CapacityDecision,
+  capacityLevel,
   type CapacityFacts,
   type CapacityLearned,
   type CapacityPerGroup,
@@ -95,142 +96,335 @@ export const LIGHT_KIND = "agent-light";
 export const WRITER_KIND = "agent-writer";
 
 /**
- * The capacity kind of a delegated agent, from upstream's `delegate_task` role: `research`, `review`
- * and `design` are light; any other role, or none, is a writer (the rule's default). The caller
- * names the role, so it may lie: a light agent that grows past a light cost counts as a writer
- * (`runningKind`), and what it grew is out of the available memory read anyway.
+ * Capacity kind from upstream's `delegate_task` role: research, review and design are light, any
+ * other role or none is a writer. The role may lie: a light agent that grows past the light cost,
+ * or whose memory cannot be read, counts as a writer (`runningKind`).
  */
 export const kindOfRole = (role: string | undefined): string =>
   role === "research" || role === "review" || role === "design" ? LIGHT_KIND : WRITER_KIND;
 
-/**
- * The start cost of an agent of either kind until costs are learned: measured idle agents use
- * about 300 MB (209-322 MB; p95 x 1.15, rounded up to 128 MB). Passed as a learned cost, so the
- * rule's own bounds (half to four times its start cost) still hold.
- */
-const MEASURED_AGENT_MB = 384;
-/** Swap with less free than this (percent of swap) trips the fallback (earlyoom's own line). */
+/** Swap with less free than this (percent of swap) that is also filling trips the fallback. */
 const SWAP_FULL_FREE_PERCENT = 10;
-/** Whole readings with no trip for this long end the fallback. */
+/** Whole, calm readings for this long end the fallback, and then lower one cost raise each. */
 export const FALLBACK_CALM_MS = 10 * 60 * 1000;
-/** Each trip raises the agent costs by this much (design section 4: 25 % per kill). */
-const FALLBACK_RAISE_PERCENT = 125;
+/**
+ * And at least this many of them, each `FALLBACK_READING_GAP_MS` after the last one counted, so a
+ * clock that jumps forward (suspend and resume, an NTP step) never ends the wait in one reading.
+ */
+export const FALLBACK_CALM_READINGS = 10;
+export const FALLBACK_READING_GAP_MS = 25 * 1000;
+/** Each kill in the agents' own slices raises the agent costs by this much (design: 25 % per kill). */
+const RAISE_PERCENT = 125;
+/**
+ * Kills that cannot be told apart (no agent slice to read) raise the costs at most this many times:
+ * a build box hitting its own cap there raises them by about half at most, and that falls again.
+ */
+export const UNTOLD_MAX_RAISES = 2;
 /** The highest derived agent ceiling (design section 4: min(3 x cores, 64)). */
 export const MAX_AGENT_CEILING = 64;
+/**
+ * Readings that fail for this long (no whole reading since): the gate decides by count alone, up to
+ * the rule's fixed ceilings (10 agents), until a whole reading comes back. Never a wait without end.
+ */
+export const UNREADABLE_FIXED_MS = 2 * 60 * 1000;
+
+/** Raises past this change nothing: the rule clamps a cost at `learnedBounds.maxPercent` anyway. */
+export const maxRaises = (rule: CapacityRule): number =>
+  Math.ceil(Math.log(rule.learnedBounds.maxPercent / 100) / Math.log(RAISE_PERCENT / 100));
 
 /**
  * The automatic fallback to the fixed ceilings (owner decision: lift at once, fall back after an
- * OOM kill or a swap-full reading). Memory only: a restart starts in it (`FALLBACK_START`).
+ * OOM kill or swap that fills up). Memory only: a restart starts in it (`FALLBACK_START`).
  */
 export interface FallbackState {
   readonly on: boolean;
   /** Since when every reading was whole and calm; `null` while not (or not read yet). */
   readonly calmSinceMs: number | null;
-  /** The kernel's OOM kill counter last read; `null`: none read yet. */
+  /** Calm readings counted since then (at least `FALLBACK_READING_GAP_MS` apart). */
+  readonly calmReadings: number;
+  /** When the last calm reading was counted. */
+  readonly calmCountedMs: number | null;
+  /** The kernel's OOM kill counter last read (`/proc/vmstat`); `null`: none read yet. */
   readonly oomKills: number | null;
-  /** The last reading tripped (one swap-full spell raises the costs once). */
+  /** The OOM kills of each agents' slice last read (`memory.events`), by cgroup path. */
+  readonly agentKills: Readonly<Record<string, number>>;
+  /** The swap free of the last reading (MB), for its trend. */
+  readonly swapFreeMb: number | null;
+  /** The last reading tripped (one spell logs one trip). */
   readonly tripping: boolean;
-  /** Trips since the start: each raised the agent costs once. */
-  readonly trips: number;
+  /** Agent cost raises in force: one per kill that matters, one less per calm spell. */
+  readonly raises: number;
 }
 
 export const FALLBACK_START: FallbackState = {
   on: true,
   calmSinceMs: null,
+  calmReadings: 0,
+  calmCountedMs: null,
   oomKills: null,
+  agentKills: {},
+  swapFreeMb: null,
   tripping: false,
-  trips: 0,
+  raises: 0,
 };
 
 export interface FallbackReading {
   /** The kernel's OOM kill counter (`/proc/vmstat`); `null` on a system without one. */
   readonly oomKills: number | null | "unreadable";
+  /**
+   * The OOM kills of each agents' slice read now (`memory.events`, which counts the kills of its
+   * processes by any OOM killer); `null`: no agent slice could be read, so a kill cannot be told
+   * apart from one in a build box.
+   */
+  readonly agentKills: Readonly<Record<string, number>> | null;
   readonly swap: CapacityFacts["swap"];
   readonly nowMs: number;
 }
 
+export type FallbackEvent = "trip" | "recover" | "lower" | null;
+
 /**
- * One reading of the fallback. A new OOM kill, or swap below `SWAP_FULL_FREE_PERCENT` free, trips
- * it (on, costs raised once per spell); `FALLBACK_CALM_MS` of whole, calm readings end it. An
- * unreadable reading starts the calm wait again, a clock that went back too; a counter that went
- * down (another boot) is the new baseline.
+ * One fallback reading: a new OOM kill or swap nearly full and filling trips it. Only an agent-slice
+ * kill raises costs (an untold kill at most `UNTOLD_MAX_RAISES`). Each calm spell (time and readings)
+ * ends it and lowers one raise; an unreadable reading or a clock going back restarts the wait.
  */
 export function fallbackStep(
+  rule: CapacityRule,
   state: FallbackState,
   reading: FallbackReading,
-): { readonly state: FallbackState; readonly event: "trip" | "recover" | null } {
+): { readonly state: FallbackState; readonly event: FallbackEvent } {
   const { oomKills: kills, swap, nowMs } = reading;
   const oomKills = typeof kills === "number" ? kills : state.oomKills;
   const killed = typeof kills === "number" && state.oomKills !== null && kills > state.oomKills;
+  const agentKills = reading.agentKills ?? state.agentKills;
+  const agentKilled = Object.entries(agentKills).some(([slice, count]) => {
+    const before = state.agentKills[slice];
+    return before !== undefined && count > before;
+  });
+  const swapRead = typeof swap === "object" && swap !== null && swap.totalMb > 0 ? swap : null;
+  const swapFreeMb = swapRead === null ? null : swapRead.freeMb;
   const swapFull =
-    typeof swap === "object" &&
-    swap !== null &&
-    swap.totalMb > 0 &&
-    swap.freeMb * 100 < swap.totalMb * SWAP_FULL_FREE_PERCENT;
-  if (killed || swapFull) {
-    const news = killed || !state.tripping;
-    const trips = state.trips + (news ? 1 : 0);
+    swapRead !== null &&
+    state.swapFreeMb !== null &&
+    swapRead.freeMb * 100 < swapRead.totalMb * SWAP_FULL_FREE_PERCENT &&
+    state.swapFreeMb - swapRead.freeMb > rule.pressure.swapFillingMb;
+  const base = { oomKills, agentKills, swapFreeMb };
+  if (killed || agentKilled || swapFull) {
+    const raised = agentKilled
+      ? state.raises + 1
+      : killed && reading.agentKills === null && state.raises < UNTOLD_MAX_RAISES
+        ? state.raises + 1
+        : state.raises;
+    const news = killed || agentKilled || !state.tripping;
     return {
-      state: { on: true, calmSinceMs: null, oomKills, tripping: true, trips },
+      state: {
+        ...base,
+        on: true,
+        calmSinceMs: null,
+        calmReadings: 0,
+        calmCountedMs: null,
+        tripping: true,
+        raises: Math.min(raised, maxRaises(rule)),
+      },
       event: news ? "trip" : null,
     };
   }
   if (kills === "unreadable" || swap === "unreadable") {
-    return { state: { ...state, oomKills, calmSinceMs: null }, event: null };
+    return {
+      state: { ...state, ...base, calmSinceMs: null, calmReadings: 0, calmCountedMs: null },
+      event: null,
+    };
   }
-  const since = state.calmSinceMs === null || nowMs < state.calmSinceMs ? nowMs : state.calmSinceMs;
-  const recover = state.on && nowMs - since >= FALLBACK_CALM_MS;
+  const restart = state.calmSinceMs === null || nowMs < state.calmSinceMs;
+  const since = restart ? nowMs : state.calmSinceMs!;
+  const counts =
+    restart ||
+    state.calmCountedMs === null ||
+    nowMs - state.calmCountedMs >= FALLBACK_READING_GAP_MS;
+  const calmReadings = restart ? 1 : state.calmReadings + (counts ? 1 : 0);
+  const calmCountedMs = counts ? nowMs : state.calmCountedMs;
+  const done =
+    nowMs - since >= FALLBACK_CALM_MS &&
+    calmReadings >= FALLBACK_CALM_READINGS &&
+    (state.on || state.raises > 0);
+  if (done) {
+    return {
+      state: {
+        ...base,
+        on: false,
+        calmSinceMs: nowMs,
+        calmReadings: 1,
+        calmCountedMs: nowMs,
+        tripping: false,
+        raises: Math.max(0, state.raises - 1),
+      },
+      event: state.on ? "recover" : "lower",
+    };
+  }
   return {
-    state: {
-      on: state.on && !recover,
-      calmSinceMs: since,
-      oomKills,
-      tripping: false,
-      trips: state.trips,
-    },
-    event: recover ? "recover" : null,
+    state: { ...state, ...base, calmSinceMs: since, calmReadings, calmCountedMs, tripping: false },
+    event: null,
   };
 }
 
-/** The agent costs after `trips` trips: the measured cost, raised 25 % per trip (rule-bounded). */
-export function enforceCosts(trips: number): CapacityLearned {
-  const mb = Math.ceil(MEASURED_AGENT_MB * (FALLBACK_RAISE_PERCENT / 100) ** Math.min(trips, 20));
-  return { [LIGHT_KIND]: { mb }, [WRITER_KIND]: { mb } };
+/**
+ * The agent costs after `raises` raises: the rule file's start cost of each kind, raised 25 % per
+ * raise (the rule clamps them at its `learnedBounds`). No cost lives in code.
+ */
+export function enforceCosts(rule: CapacityRule, raises: number): CapacityLearned {
+  const factor = (RAISE_PERCENT / 100) ** Math.min(Math.max(0, raises), maxRaises(rule));
+  const raised = (kind: string) => ({ mb: Math.ceil(rule.kinds[kind]!.startMb * factor) });
+  return { [LIGHT_KIND]: raised(LIGHT_KIND), [WRITER_KIND]: raised(WRITER_KIND) };
 }
 
 /**
- * Derived: agents min(3 x cores, 64). In fallback the rule's fixed ceilings (10 agents, 4 jobs),
- * never above the derived one. Cores that cannot be read keep the fixed ceiling.
+ * Where the gate can see what it needs to lift the ceilings: `full` is Linux with cgroup v2, agents
+ * in their own scopes and the kernel's OOM kill counter. Anywhere else (`basic`: macOS, Windows,
+ * Linux without systemd or cgroup v2) the rule's fixed ceilings always apply (design: "ceilings stay
+ * at today's numbers").
+ */
+export type EnforceTier = "full" | "basic";
+
+/**
+ * Derived: agents min(3 x cores, 64) on the full tier out of the fallback. In the fallback, on the
+ * basic tier and when the cores cannot be read: the rule's fixed ceilings (10 agents, 4 jobs), never
+ * above the derived one.
  */
 export function enforceCeilings(
   rule: CapacityRule,
   cpuCores: unknown,
   fallback: boolean,
+  tier: EnforceTier,
 ): CapacityPerGroup {
   const derived =
     typeof cpuCores === "number" && cpuCores >= 1
       ? Math.min(Math.floor(3 * cpuCores), MAX_AGENT_CEILING)
       : rule.ceilings.agent;
   return {
-    agent: fallback ? Math.min(rule.ceilings.agent, derived) : derived,
+    agent: fallback || tier === "basic" ? Math.min(rule.ceilings.agent, derived) : derived,
     job: rule.ceilings.job,
   };
 }
 
-/** A light agent that uses more than a light agent costs is a writer (a kind lie, or it grew). */
+/**
+ * The kind a running agent counts as. Its memory unread: a writer whatever its role (growth that
+ * cannot be seen is never cheap). A light agent that uses more than a light agent costs (clamped as
+ * the rule clamps that cost) is a writer: a kind lie, or it grew.
+ */
 export function runningKind(
+  rule: CapacityRule,
   kind: string,
   demandMb: number | null,
   learned: CapacityLearned,
 ): string {
-  if (kind !== LIGHT_KIND || demandMb === null) return kind;
-  return demandMb > (learned[LIGHT_KIND]?.mb ?? MEASURED_AGENT_MB) ? WRITER_KIND : kind;
+  if (demandMb === null) return WRITER_KIND;
+  if (kind !== LIGHT_KIND) return kind;
+  const start = rule.kinds[LIGHT_KIND]!.startMb;
+  const light = Math.min(
+    learned[LIGHT_KIND]?.mb ?? start,
+    Math.floor((start * rule.learnedBounds.maxPercent) / 100),
+  );
+  return demandMb > light ? WRITER_KIND : kind;
 }
+
+/** The gate's rule state, memory only; a restart starts at `ENFORCE_START`. */
+export interface EnforceState {
+  /**
+   * After a restart the level starts "elevated" and waits for calm readings (design section 6): the
+   * rule never says "ok" before it has seen the machine calm for a while.
+   */
+  readonly pressure: PressureState;
+  readonly fallback: FallbackState;
+  /** Since when no reading was whole; `null` while they are. */
+  readonly unreadSinceMs: number | null;
+  /** The level was "ok" once since the start: before, an "elevated" refusal says it just started. */
+  readonly settled: boolean;
+}
+
+export const ENFORCE_START: EnforceState = {
+  pressure: OBSERVE_START_PRESSURE,
+  fallback: FALLBACK_START,
+  unreadSinceMs: null,
+  settled: false,
+};
+
+/**
+ * The rule a level steps by. Until the level was "ok" once since the start, calm needs available
+ * memory only above the margin (not the 150 % that guards a step down from real pressure): the
+ * start's "elevated" is a wait, not pressure seen, so a host that sits just above its margin with
+ * no stall lifts too. PSI and the swap trend still have to be calm.
+ */
+function levelRule(rule: CapacityRule, settled: boolean): CapacityRule {
+  if (settled) return rule;
+  const { pressure } = rule;
+  return {
+    ...rule,
+    pressure: {
+      ...pressure,
+      calm: {
+        ...pressure.calm,
+        availableAtLeastMarginPercent: pressure.elevated.availableBelowMarginPercent,
+      },
+    },
+  };
+}
+
+export interface EnforceReading extends Omit<FallbackReading, "swap"> {
+  /** The machine as read now (pieces not needed here); `null`: nothing could be read. */
+  readonly facts: CapacityFacts | null;
+}
+
+/**
+ * One reading of the machine (a decision's, or the gate's timer): steps the level, the fallback and
+ * the unread time. `previous` is the level before it, for the decisions on this same reading (the
+ * rule steps the level from it again, to the same answer, so a reading is never its own trend).
+ */
+export function enforceStep(
+  rule: CapacityRule,
+  state: EnforceState,
+  reading: EnforceReading,
+): {
+  readonly state: EnforceState;
+  readonly previous: PressureState;
+  /** Whether the level was "ok" once before this reading (`levelRule`). */
+  readonly settledBefore: boolean;
+  readonly event: FallbackEvent;
+} {
+  const level = capacityLevel(levelRule(rule, state.settled), {
+    // The machine alone: whether it reads whole, and its level (the pieces are the decision's).
+    facts: reading.facts === null ? NO_FACTS : { ...reading.facts, pieces: [] },
+    previous: state.pressure,
+    nowMs: reading.nowMs,
+  });
+  const whole = level.marginMb !== null;
+  const step = fallbackStep(rule, state.fallback, {
+    oomKills: reading.oomKills,
+    agentKills: reading.agentKills,
+    swap: whole ? reading.facts!.swap : "unreadable",
+    nowMs: reading.nowMs,
+  });
+  return {
+    state: {
+      pressure: level.pressure,
+      fallback: step.state,
+      unreadSinceMs: whole ? null : (state.unreadSinceMs ?? reading.nowMs),
+      settled: state.settled || level.level === "ok",
+    },
+    previous: state.pressure,
+    settledBefore: state.settled,
+    event: step.event,
+  };
+}
+
+/** Readings failed for `UNREADABLE_FIXED_MS`: decide by count alone (fixed ceilings). */
+export const unreadFixed = (state: EnforceState, nowMs: number): boolean =>
+  state.unreadSinceMs !== null && nowMs - state.unreadSinceMs >= UNREADABLE_FIXED_MS;
 
 export interface EnforceInput {
   /** The machine as read for this decision (its `pieces` are set here); `null`: unread. */
   readonly facts: CapacityFacts | null;
-  /** Agents that show a run: their kind and memory demand now (`null`: unread, owes in full). */
+  readonly tier: EnforceTier;
+  /** Agents that show a run: their kind and memory demand now (`null`: unread). */
   readonly running: ReadonlyArray<{ readonly kind: string; readonly demandMb: number | null }>;
   /**
    * Kinds of the agents allowed but not running yet (starts, held slots, wake-ups, waiters ahead):
@@ -238,24 +432,34 @@ export interface EnforceInput {
    */
   readonly starting: ReadonlyArray<string>;
   readonly ask: string;
-  readonly fallback: FallbackState;
+  /** The state after this reading (`enforceStep`). */
+  readonly state: EnforceState;
+  /** The level before this reading (`enforceStep`'s `previous`). */
   readonly previous: PressureState;
+  /** `enforceStep`'s `settledBefore`. */
+  readonly settledBefore: boolean;
   readonly nowMs: number;
 }
 
-/** The rule's answer for one more agent of kind `ask` (lifted or fallback ceilings, floors). */
+/**
+ * The rule's answer for one more agent of kind `ask`. An unread running agent already uses a light
+ * start (counted once) and owes the rest of a writer's. With no readings the floor still starts, and
+ * after `UNREADABLE_FIXED_MS` the fixed ceiling counts alone (an admit with reason `unreadable`).
+ */
 export function enforceDecision(rule: CapacityRule, input: EnforceInput): CapacityDecision {
-  const learned = enforceCosts(input.fallback.trips);
+  const learned = enforceCosts(rule, input.state.fallback.raises);
+  const inUseMb = rule.kinds[LIGHT_KIND]!.startMb;
   const pieces: Array<CapacityPiece> = [
     ...input.running.map((piece) => ({
-      kind: runningKind(piece.kind, piece.demandMb, learned),
-      demandMb: piece.demandMb,
+      kind: runningKind(rule, piece.kind, piece.demandMb, learned),
+      demandMb: piece.demandMb ?? inUseMb,
     })),
     ...input.starting.map((kind) => ({ kind, demandMb: null })),
   ];
   const facts = input.facts;
-  return capacityDecision(
-    { ...rule, ceilings: enforceCeilings(rule, facts?.cpuCores, input.fallback.on) },
+  const ceilings = enforceCeilings(rule, facts?.cpuCores, input.state.fallback.on, input.tier);
+  const decision = capacityDecision(
+    { ...levelRule(rule, input.settledBefore), ceilings },
     {
       facts: facts === null ? NO_FACTS : { ...facts, pieces },
       ask: { kind: input.ask },
@@ -264,4 +468,12 @@ export function enforceDecision(rule: CapacityRule, input: EnforceInput): Capaci
       nowMs: input.nowMs,
     },
   );
+  if (decision.reason !== "unreadable") return decision;
+  // Nothing whole to read: counted agents only, against the floor and then the fixed ceiling.
+  const counted = pieces.length;
+  if (counted < rule.floors.agent) return { ...decision, admit: true, reason: "floor" };
+  if (!unreadFixed(input.state, input.nowMs)) return decision;
+  return counted < rule.ceilings.agent
+    ? { ...decision, admit: true }
+    : { ...decision, reason: "ceiling" };
 }

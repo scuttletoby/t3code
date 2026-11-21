@@ -176,14 +176,13 @@ const run = <A, E>(
 
 describe("SlotGate", () => {
   it.effect(
-    "off or with no limit: allows and reads neither projection nor memory (fixed mode; observe in SlotObserver.test.ts)",
+    "off or with no limit: allows and reads neither projection nor memory (fixed mode; observe in SlotObserver.test.ts); unreadable settings count",
     () =>
       Effect.gen(function* () {
         for (const settings of [
           { agentSlots: { mode: "fixed" } },
           { agentSlots: { mode: "fixed", maxPerMachine: 1, minFreeMemoryMb: 100_000 } },
           on({}),
-          "unreadable" as const,
         ]) {
           const world = newWorld();
           world.threads = [{ id: "a", instanceId: MAIN }];
@@ -192,6 +191,13 @@ describe("SlotGate", () => {
           assert.strictEqual(world.snapshotReads, 0);
           assert.strictEqual(world.memoryReads, 0);
         }
+        // Settings that cannot be read never turn the gate off: the fixed limit counts the start.
+        const world = newWorld();
+        world.threads = [{ id: "a", instanceId: MAIN }];
+        const outcome = yield* run(world, "unreadable", acquire());
+        assert.strictEqual(outcome.type, "allow");
+        assert.isNumber(outcome.type === "allow" ? outcome.token : null);
+        assert.strictEqual(world.snapshotReads, 1);
       }),
   );
 
