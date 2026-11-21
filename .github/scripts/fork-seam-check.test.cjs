@@ -15,8 +15,11 @@ const {
   findListedGone,
   findLostLines,
   findListedNotFork,
+  findLostNotUpstream,
+  findOwnHiddenFiles,
   FETCH_ATTEMPT_MS,
   FETCH_TOTAL_MS,
+  listEditedCounts,
   listEditedFiles,
   findStaleSeamLines,
   findUnlistedChanges,
@@ -897,13 +900,16 @@ test("a pull request's own list is parsed for its format (never its rules) and r
         assert.doesNotMatch(result.stderr, /a file of the fork's own/, what);
       }
     }
-    // A well-formed list passes, whatever its "pending" or "forkFiles" (main's list judges the
-    // change).
+    // A well-formed list that widens "pending" or "forkFiles" is counted from upstream too; main
+    // names no upstream here, so it is refused as uncountable, never passed or blamed on the list.
     git("checkout", "-q", "-f", "-B", "pr", main);
     const wide = { files: SEAM, pending: { "z.ts": 9 }, forkFiles: ["tools/"] };
-    const fine = commit(seams(wide), "a wider list");
-    assert.equal(run(main, fine).status, 0);
-    // A seam line it lists more often (or less) is counted from upstream (#626); main names no
+    const wider = run(main, commit(seams(wide), "a wider list"));
+    assert.equal(wider.status, 1, wider.stdout);
+    assert.match(wider.stderr, /^Could not count this change's list edits from upstream/m);
+    assert.match(wider.stderr, /changes the "pending" ceiling of z\.ts, and changes "forkFiles"/);
+    assert.doesNotMatch(wider.stderr, /Fix the list in this change/);
+    // A seam line it lists more often (or less) is counted from upstream; main names no
     // upstream here, so that is refused rather than passed unchecked.
     const raised = commit(
       seams({ files: { "a.ts": { why: "mine", added: ["anything: 1,"] } } }),
@@ -2261,10 +2267,8 @@ test("a pull request's new announcement that expires within 3 days is a warning,
       result.stdout,
       /^Warning: n\.ts: "announced" on 2020-01-01, so fork-follow refuses it from 2020-01-16/m,
     );
-    const other = commit(
-      seams({ ...ANNOUNCED("2020-01-01"), forkFiles: ["tools/"] }),
-      "a later list change",
-    );
+    const reworded = { ...ANNOUNCED("2020-01-01").files, "a.ts": { ...SEAM["a.ts"], why: "new" } };
+    const other = commit(seams({ files: reworded }), "a later list change");
     const again = run(step1, other);
     assert.equal(again.status, 0, again.stderr);
     assert.doesNotMatch(again.stdout, /Warning:/);
@@ -2757,7 +2761,9 @@ test("property: a pending ceiling the pull request accepts passes the run from u
 });
 
 test("the command line refuses a pull request that shrinks a pending file but keeps its ceiling", () => {
-  withRepo(({ git, commit, run }) => {
+  withRepo(({ git, commit, run, publish }) => {
+    // The lowered ceiling is counted from upstream, so upstream is published.
+    publish(commit({ "p.ts": UP }, "upstream"));
     const config = { files: {}, pending: { "p.ts": 2 } };
     const main = commit({ ...seams(config), "p.ts": `${UP}forkA();\nforkB();\n` }, "main");
     git("checkout", "-q", "-b", "pr", main);
@@ -3076,7 +3082,7 @@ test("from main, a change that drops a listed seam copy drops it from its own li
   assert.match(judged(0)[0], /list it 1× under "added" .*\(its list has none;/);
 });
 
-// #621's surviving mutants: both `Math.max(0, …)` only showed in the wording ("-1×").
+// Earlier surviving mutants: both `Math.max(0, …)` only showed in the wording ("-1×").
 test("a fork that removes upstream copies of a listed line, or a change that drops more copies than listed, names the right fix", () => {
   const generic = (count) => ({ "a.ts": { why: "t", added: Array(count).fill("};") } });
   // From upstream: upstream has `};` twice, the fork keeps one: no copy over upstream.
@@ -3097,7 +3103,7 @@ test("a fork that removes upstream copies of a listed line, or a change that dro
   ]);
 });
 
-// #626 minor 2: main's count comes from the list's commit, the drop from the branch; a branch
+// Main's count comes from the list's commit, the drop from the branch; a branch
 // whose merge-base lists another count is told to update, not only given a number.
 test("from main, a drop judged by a list main changed since the merge-base says to update the branch", () => {
   const seam = (count) => ({ "a.ts": { why: "t", added: ["x();", ...Array(count).fill("};")] } });
@@ -3292,7 +3298,10 @@ test("with no upstream named, a move or a seam count change is refused, not skip
     );
     git("checkout", "-q", "-f", "-B", "raise", main);
     const raised = commit(
-      seams({ files: { "a.ts": { ...SEAM["a.ts"], added: [...SEAM["a.ts"].added, "};"] } } }),
+      seams({
+        files: { "a.ts": { ...SEAM["a.ts"], added: [...SEAM["a.ts"].added, "};"] } },
+        pending: { "p.ts": 1 },
+      }),
       "raise a count",
     );
     for (const [pr, what] of [
@@ -3357,8 +3366,22 @@ test("--upstream: an unreachable, empty, unrelated or self-naming upstream is re
       assert.match(
         result.stderr,
         new RegExp(
-          `- p\\.ts: this change moves p\\.ts from "pending" to "files" in its \\.github/fork-seams\\.json, but could not fetch the default branch of ${reEscape(GONE_URL)}: .*, so their fork lines cannot be counted: run the check again`,
+          `- p\\.ts: this change moves p\\.ts from "pending" to "files" in its \\.github/fork-seams\\.json, but could not fetch the default branch of ${reEscape(GONE_URL)}: .*, so their fork lines cannot be counted\\.$`,
+          "m",
         ),
+      );
+      // Said as an upstream or fetch problem with how to run it again, not as a wrong list.
+      assert.match(
+        result.stderr,
+        /^Could not count this change's list edits from upstream \(an upstream, fetch or branch problem, not a wrong list;/,
+      );
+      assert.match(
+        result.stderr,
+        /Run the check again once the cause is fixed: "Re-run failed jobs" on the pull request's Fork checks run/,
+      );
+      assert.doesNotMatch(
+        result.stderr,
+        /must stay within the seam lines|Lower each "pending" ceiling/,
       );
       assert.equal(ref(), undefined);
     }
@@ -3563,20 +3586,21 @@ test("a hung upstream is refused within the total fetch time, which stays well b
     const script = uploadPack(dir, "exec 2>/dev/null\nsleep 5");
     try {
       git("config", "remote.fork-seam-upstream.uploadpack", script);
-      const started = Date.now();
+      // A fake clock, no timing: the first attempt is capped at the 1.5 s total (not its own 10 s),
+      // and the clock then says the total is spent, so no second attempt starts. Uncapped, or
+      // tried again with nothing left (a 0 timeout is none), git waits out the 5 s sleep instead.
+      const clock = [0, 0];
       const found = upstreamBase(UPSTREAM_URL, main, [main], {
         cwd: dir,
-        attemptMs: 1_500,
-        totalMs: 1_700,
+        attemptMs: 10_000,
+        totalMs: 1_500,
+        now: () => clock.shift() ?? 1_500,
       });
-      const took = Date.now() - started;
       assert.match(
         found.problem,
-        /could not fetch the default branch of .*: no answer within 2 s in all \(SIGTERM\)/,
+        /^could not fetch the default branch of .*: no answer within 2 s in all \(SIGTERM\)$/,
       );
-      // Two attempts: 1.5 s, then what is left of the 1.7 s (not another 1.5 s: 3 s in all).
-      assert.equal(attempts(dir), 2);
-      assert.ok(took < 2_600, `${took} ms`);
+      assert.equal(attempts(dir), 1);
       assert.equal(ref(), undefined);
     } finally {
       fs.rmSync(script, { force: true });
@@ -3651,14 +3675,14 @@ test("a branch without the upstream commit main sits on is told to update, not c
   });
 });
 
-// #626: the pull request's run judged only a list change that lowered a count. One that raised a
+// The pull request's run used to judge only a list change that lowered a count. One that raised a
 // count with no copy added (spare room), or dropped a line still in use (fork-follow stops), passed
 // its own run and stopped the next fork-follow instead. Now both are counted from upstream.
 test("a seam count the pull request raises without the line, or lowers while the line is in use, is refused in its own run", () => {
   withRepo(({ git, commit, run, fromUpstream, publish }) => {
     const upstream = commit({ ...BASE, "u.ts": UP }, "upstream");
-    // Main announces `forkMore();` (step 1), so a step 2 below may add it.
-    const since = new Date().toISOString().slice(0, 10);
+    // Main announces `forkMore();` (step 1) on upstream's commit day, so a step 2 may add it.
+    const since = git("show", "-s", "--format=%cs", upstream).trim();
     const announced = { since, added: ["forkMore();"] };
     const main = commit(
       { ...seams({ files: { "a.ts": { ...SEAM["a.ts"], announced } } }), ...SEAMED },
@@ -3763,6 +3787,192 @@ test("a seam count the pull request raises without the line, or lowers while the
   });
 });
 
+// A list-only change to a "pending" ceiling, a "lost" count or "forkFiles" was not counted in
+// the pull request's run: one raised a ceiling and "lost" with no line changed, a second swapped
+// upstream lines for fork lines within them, and neither run nor fork-follow refused either.
+test("a pending ceiling, lost count, forkFiles pattern or entry the pull request's list changes is counted from upstream", () => {
+  withRepo(({ git, commit, run, fromUpstream, publish }) => {
+    const upstream = commit({ "p.ts": "a();\nb();\nc();\n", "q.ts": "q();\n" }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    const P = "a();\nforkA();\nb();\nforkB();\nc();\n";
+    const main = commit({ ...seams({ files: {}, pending: { "p.ts": 2 } }), "p.ts": P }, "main");
+    publish(upstream);
+    assert.equal(fromUpstream(upstream, main).status, 0);
+    const pr = (name, list, files = {}, from = main) => {
+      git("checkout", "-q", "-f", "-B", name, from);
+      return commit({ ...seams(list), ...files }, name);
+    };
+    const lost = (lines, gone) => ({ "p.ts": { lines, gone } });
+    const swap = pr("swap-list", { files: {}, pending: { "p.ts": 4 }, lost: lost(2, 2) });
+    const cases = [
+      [
+        "raise",
+        { files: {}, pending: { "p.ts": 4 } },
+        /- p\.ts: "pending" with a ceiling of 4 in this change's \.github\/fork-seams\.json, but the fork adds 2 lines over upstream \([0-9a-f]{12}\): set its ceiling to 2 \(a ceiling above the count is room for a fork line later/,
+      ],
+      [
+        "swap",
+        swap,
+        /- p\.ts: set in "lost" in this change's .* \({"lines": 2, "gone": 2}\), but the fork loses 0 upstream lines over upstream \([0-9a-f]{12}\) .*: remove it from "lost"/,
+      ],
+      [
+        "lost",
+        { files: {}, pending: { "p.ts": 2 }, lost: lost(1, 0) },
+        /- p\.ts: set in "lost" .*remove it from "lost"/,
+      ],
+      [
+        "lower",
+        { files: {}, pending: { "p.ts": 1 } },
+        /ceiling of 1 .*adds 2 lines over upstream .*: set its ceiling to 2/,
+      ],
+      [
+        "drop",
+        { files: {} },
+        /- p\.ts: dropped from "pending" in this change's .*, but the fork adds 2 lines over upstream \([0-9a-f]{12}\): keep its entry/,
+      ],
+      [
+        "new",
+        { files: {}, pending: { "p.ts": 2, "q.ts": 1 }, lost: { "q.ts": { lines: 1, gone: 1 } } },
+        /- q\.ts: "pending" with a ceiling of 1 .*adds 0 lines over upstream .*: remove it from "pending"[^]*- q\.ts: set in "lost" .*remove it from "lost"/,
+      ],
+      [
+        "forkFiles",
+        { files: {}, pending: { "p.ts": 2 }, forkFiles: ["tools/", "q.*"] },
+        /- q\.ts: upstream has it, but this change's \.github\/fork-seams\.json "forkFiles" takes it for a fork file .*: exclude it with "!q\.ts", or narrow the pattern\./,
+      ],
+      [
+        "ghost",
+        { files: { "ghost.ts": { why: "w", added: ["evil();"] } }, pending: { "p.ts": 2 } },
+        /- ghost\.ts: listed in this change's \.github\/fork-seams\.json, but the head does not have it: list only a file this change keeps\./,
+      ],
+    ];
+    for (const [name, list, why] of cases) {
+      const head = typeof list === "string" ? list : pr(name, list);
+      for (const args of [
+        [main, head],
+        ["--config-ref", main, main, head],
+      ]) {
+        const result = run(...args);
+        assert.equal(result.status, 1, `${name}: ${result.stdout}`);
+        assert.match(result.stderr, why, name);
+      }
+    }
+    // Why the swap matters: merged, a change that swaps two upstream lines for fork lines fits
+    // the raised ceiling and "lost", and neither its run nor fork-follow's refuses it.
+    const swapped = pr(
+      "swapped",
+      { files: {}, pending: { "p.ts": 4 }, lost: lost(2, 2) },
+      {
+        "p.ts": "forkC();\nforkA();\nforkD();\nforkB();\nc();\n",
+      },
+      swap,
+    );
+    assert.equal(run(swap, swapped).status, 0);
+    assert.equal(fromUpstream(upstream, swapped).status, 0);
+    // The right changes pass, each counted: a ceiling lowered with its line, a list-only fix of
+    // main's spare ceiling, and a fork-only "forkFiles" pattern.
+    const lowered = pr(
+      "lowered",
+      { files: {}, pending: { "p.ts": 1 } },
+      {
+        "p.ts": "a();\nforkA();\nb();\nc();\n",
+      },
+    );
+    const spareMain = pr("spare", { files: {}, pending: { "p.ts": 3 } });
+    const fix = pr("fix", { files: {}, pending: { "p.ts": 2 } }, {}, spareMain);
+    const tools = pr("tools", { files: {}, pending: { "p.ts": 2 }, forkFiles: ["tools/"] });
+    for (const [base, head] of [
+      [main, lowered],
+      [spareMain, fix],
+      [main, tools],
+    ]) {
+      const result = run(base, head);
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(
+        result.stdout,
+        /; each entry lists exactly the fork lines counted from upstream/,
+      );
+      assert.equal(fromUpstream(upstream, head).status, 0);
+    }
+  });
+});
+
+test("listEditedCounts: a ceiling or lost count set, changed or dropped, and forkFiles changed", () => {
+  const list = (pending, lost = {}, forkFiles = []) => ({ files: {}, pending, lost, forkFiles });
+  const base = list({ "p.ts": 2 }, { "p.ts": { lines: 1, gone: 0 } }, ["tools/"]);
+  const none = { pending: [], lost: [], forkFiles: false };
+  assert.deepEqual(listEditedCounts(base, base), none);
+  assert.deepEqual(
+    listEditedCounts(base, list({ "p.ts": 2 }, base.lost, ["tools/", "tools/"])),
+    none,
+  );
+  assert.deepEqual(listEditedCounts(base, list({ "p.ts": 3, "q.ts": 1 }, {}, ["x/"])), {
+    pending: ["p.ts", "q.ts"],
+    lost: ["p.ts"],
+    forkFiles: true,
+  });
+  assert.deepEqual(
+    listEditedCounts(base, list({}, { "p.ts": { lines: 1, gone: 1 } }, ["tools/"])),
+    {
+      ...none,
+      pending: ["p.ts"],
+      lost: ["p.ts"],
+    },
+  );
+  assert.deepEqual(listEditedCounts(undefined, list({ "p.ts": 2 })), {
+    pending: ["p.ts"],
+    lost: [],
+    forkFiles: true,
+  });
+});
+
+test("findLostNotUpstream and findOwnHiddenFiles count from upstream", () => {
+  const up = "a();\nb();\nc();\n";
+  const at = (head) => ({ atUpstream: () => up, atHead: () => head, name: "abc" });
+  // b(); deleted: one line lost, its text gone; c(); moved above a(): one more lost, not gone.
+  assert.deepEqual(
+    findLostNotUpstream(["p.ts"], { "p.ts": { lines: 1, gone: 1 } }, at("a();\nc();\n")),
+    [],
+  );
+  assert.deepEqual(
+    findLostNotUpstream(["p.ts"], { "p.ts": { lines: 2, gone: 1 } }, at("c();\na();\n")),
+    [],
+  );
+  assert.deepEqual(findLostNotUpstream(["p.ts"], {}, at(up)), []);
+  assert.deepEqual(findLostNotUpstream(["p.ts"], { "p.ts": { lines: 2, gone: 2 } }, at(up)), [
+    'p.ts: set in "lost" in this change\'s .github/fork-seams.json ({"lines": 2, "gone": 2}), but the fork loses 0 upstream lines over upstream (abc) (deleted, moved or re-indented), 0 of them gone: remove it from "lost" (a count above the lines lost is room to swap one for a fork line later).',
+  ]);
+  assert.match(
+    findLostNotUpstream(["p.ts"], {}, at("a();\nc();\n"))[0],
+    /^p\.ts: dropped from "lost" .*\(no entry\), but the fork loses 1 upstream line over .*, 1 of them gone: set it to {"lines": 1, "gone": 1}/,
+  );
+  assert.match(
+    findLostNotUpstream(
+      ["p.ts"],
+      { "p.ts": { lines: 1, gone: 1 } },
+      { ...at(up), atUpstream: () => undefined },
+    )[0],
+    /upstream \(abc\) does not have it, so its lost lines cannot be counted/,
+  );
+  assert.match(
+    findLostNotUpstream(["p.ts"], { "p.ts": { lines: 1, gone: 1 } }, at(undefined))[0],
+    /but the head does not have it/,
+  );
+  assert.deepEqual(findLostNotUpstream(["p.ts"], {}, at(undefined)), []);
+  const has = () => "x";
+  const files = ["src/a.ts", "src/b.ts", "tools/t.ts"];
+  assert.deepEqual(findOwnHiddenFiles(files, ["tools/"], [], has).length, 1);
+  assert.deepEqual(findOwnHiddenFiles(files, ["tools/"], ["tools/"], has), []);
+  assert.deepEqual(
+    findOwnHiddenFiles(files, ["src/", "!src/b.ts"], undefined, has).map((r) => r.split(":")[0]),
+    ["src/a.ts"],
+  );
+  assert.deepEqual(
+    findOwnHiddenFiles(files, ["tools/"], [], () => undefined),
+    [],
+  );
+});
+
 test("listEditedFiles: only a line listed more or less often, and every entry when the base list is unreadable", () => {
   const entry = (...added) => ({ why: "w", added });
   const base = { "a.ts": entry("x();", "y();"), "b.ts": entry() };
@@ -3807,15 +4017,21 @@ test("findListedNotFork: exact copies both ways, a file upstream lacks, a droppe
     'p.ts: dropped from "files" in this change\'s .github/fork-seams.json, but the fork adds 2 lines over upstream (abc): keep its entry, listing each (every fork line the file holds is listed).',
   ]);
   assert.deepEqual(findListedNotFork(["p.ts"], {}, at(up, none, { "p.ts": 2 })), []);
+  assert.deepEqual(findListedNotFork(["p.ts"], {}, at(up, none, { "p.ts": 1 })), [
+    "p.ts: \"pending\" with a ceiling of 1 in this change's .github/fork-seams.json, but the fork adds 2 lines over upstream (abc): set its ceiling to 2 (a ceiling above the count is room for a fork line later; below it, fork-follow's next run refuses main).",
+  ]);
   assert.match(
-    findListedNotFork(["p.ts"], {}, at(up, none, { "p.ts": 1 }))[0],
-    /adds 2 lines over upstream \(abc\), not its "pending" ceiling of 1: keep its entry/,
+    findListedNotFork(["p.ts"], {}, at(head, none, { "p.ts": 3 }))[0],
+    /ceiling of 3 .*, but the fork adds 0 lines over upstream \(abc\): remove it from "pending"/,
   );
-  // A file the head deletes is refused elsewhere.
-  assert.deepEqual(
-    findListedNotFork(["p.ts"], promoted("x();"), { ...at(up), atHead: () => undefined }),
-    [],
-  );
+  // An entry for a file the head does not have is refused; a dropped one is a deletion, refused
+  // elsewhere (or right).
+  const gone = { ...at(up), atHead: () => undefined };
+  assert.deepEqual(findListedNotFork(["p.ts"], promoted("x();"), gone), [
+    'p.ts: moved to "files" in this change\'s .github/fork-seams.json, but the head does not have it: list only a file this change keeps.',
+  ]);
+  assert.equal(findListedNotFork(["p.ts"], {}, { ...gone, ownPending: { "p.ts": 1 } }).length, 1);
+  assert.deepEqual(findListedNotFork(["p.ts"], {}, { ...gone, promoted: none }), []);
   assert.deepEqual(
     promotedFiles(
       { pending: { "p.ts": 1, "q.ts": 1, "r.ts": 1 } },

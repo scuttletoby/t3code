@@ -1,8 +1,7 @@
 // Usage: [--config-ref <rev>] [--upstream <url> | --no-upstream] <base> <head> | --from-upstream [--after-rebase [--lowered-list <path>]] <upstream> <head>.
-// Refuses <head>'s upstream-file changes beyond .github/fork-seams.json: a PR uses <base>'s list (its own only for
-// "pending" ceilings it must lower), and holds each seam entry its own list changes or moves from "pending" to the
-// fork lines counted from upstream (--upstream, else the list commit's .github/fork-upstream.json). Writes only
-// --lowered-list's file.
+// Refuses <head>'s upstream-file changes beyond .github/fork-seams.json: a PR uses <base>'s list, and holds each entry
+// its own list changes (seam counts, ceilings, "lost", "forkFiles") to upstream (--upstream, else the list commit's
+// .github/fork-upstream.json). Writes only --lowered-list's file.
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -617,11 +616,9 @@ const promotedFiles = (config, ownFiles = {}, ownPending = {}) =>
   );
 
 /**
- * The seam files for which this change's own list lists some line more or less often than the
- * merge-base's list (`baseFiles`; a missing entry lists nothing): a raised count with no copy added
- * is spare room, a line dropped while still in use stops fork-follow, and main's list cannot tell
- * either from upstream's lines, so only upstream can. A new or dropped entry that lists nothing, or a
- * change to "announced" only, changes no count. `baseFiles` undefined (unreadable): every entry.
+ * The seam files whose own "added" lists some line more or less often than the merge-base's list
+ * (`baseFiles`; a missing entry lists nothing). Only upstream can tell spare room or a dropped line
+ * in use; an entry that lists nothing, or "announced" alone, changes no count. Unreadable: all.
  */
 function listEditedFiles(baseFiles, ownFiles) {
   const counts = (files, file) =>
@@ -639,25 +636,66 @@ function listEditedFiles(baseFiles, ownFiles) {
 }
 
 /**
- * Entries of this change's own list (`ownFiles`, `ownPending`) for `files` whose "added" is not exactly
- * the head's fork lines counted from `upstream` (an upstream commit: `name` says which), both ways: a
- * line listed more often than the fork adds it (a later change could then add that line unannounced),
- * or a fork line listed less often (fork-follow's next run refuses main). An entry the list drops
- * from "files" lists nothing (or, moved back to "pending", its ceiling counts the lines). `promoted`:
- * the files moved from "pending", named so in the reasons.
+ * The rest of the own list that only upstream can check, against the merge-base's (`baseList`,
+ * undefined when unreadable: all of it): "pending" ceilings and "lost" counts it sets, raises,
+ * lowers or drops, and whether "forkFiles" changed. A raised one is room for fork lines later.
  */
-function findListedNotFork(files, ownFiles, { atUpstream, atHead, name, promoted, ownPending }) {
+function listEditedCounts(baseList, own) {
+  const differ = (key, same) =>
+    [...new Set([...Object.keys(baseList?.[key] ?? {}), ...Object.keys(own[key])])].filter(
+      (file) =>
+        baseList === undefined ||
+        !Object.hasOwn(baseList[key], file) ||
+        !Object.hasOwn(own[key], file) ||
+        !same(baseList[key][file], own[key][file]),
+    );
+  const sameLost = (a, b) => a.lines === b.lines && a.gone === b.gone;
+  const patterns = (list) => JSON.stringify([...new Set(list.forkFiles)].sort());
+  return {
+    pending: differ("pending", (a, b) => a === b),
+    lost: differ("lost", sameLost),
+    forkFiles: baseList === undefined || patterns(baseList) !== patterns(own),
+  };
+}
+
+const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+
+/**
+ * Own-list entries for `files` that differ from the head's fork lines counted over `atUpstream`
+ * (`name`): each "added" line exactly (more is spare room, fewer stops fork-follow), a "pending"
+ * ceiling as a total, and a dropped entry none left. `promoted`: files moved from "pending";
+ * `wasPending`: files main's or the merge-base's list has in "pending".
+ */
+function findListedNotFork(
+  files,
+  ownFiles,
+  { atUpstream, atHead, name, promoted, ownPending, wasPending },
+) {
   const ceilings = [];
   const times = (count) => (count === 1 ? "" : ` ${count}×`);
   for (const file of files) {
-    const head = atHead(file);
-    if (head === undefined) continue; // Refused elsewhere.
     const listedHere = Object.hasOwn(ownFiles, file);
+    const ceiling =
+      !listedHere && ownPending !== undefined && Object.hasOwn(ownPending, file)
+        ? ownPending[file]
+        : undefined;
     const where = promoted?.has(file)
       ? `moved to "files" in this change's ${CONFIG}`
       : listedHere
         ? `listed in this change's ${CONFIG}`
-        : `dropped from "files" in this change's ${CONFIG}`;
+        : ceiling !== undefined
+          ? `"pending" with a ceiling of ${ceiling} in this change's ${CONFIG}`
+          : `dropped from ${wasPending?.has(file) ? '"pending"' : '"files"'} in this change's ${CONFIG}`;
+    const head = atHead(file);
+    if (head === undefined) {
+      // A dropped entry for a file the head deletes is refused as a deletion (or is right).
+      if (listedHere || ceiling !== undefined) {
+        ceilings.push(
+          `${file}: ${where}, but the head does not have it: list only a file this change keeps.`,
+        );
+      }
+      continue;
+    }
     const up = atUpstream(file);
     if (up === undefined) {
       ceilings.push(
@@ -667,12 +705,14 @@ function findListedNotFork(files, ownFiles, { atUpstream, atHead, name, promoted
     }
     const fork = new Map(addedLines(up, head));
     if (!listedHere) {
-      const ceiling =
-        ownPending !== undefined && Object.hasOwn(ownPending, file) ? ownPending[file] : 0;
       const forkLines = total([...fork]);
-      if (forkLines !== ceiling) {
+      if (ceiling !== undefined && forkLines !== ceiling) {
         ceilings.push(
-          `${file}: ${where}, but the fork adds ${forkLines} line${forkLines === 1 ? "" : "s"} over upstream (${name})${ceiling === 0 ? "" : `, not its "pending" ceiling of ${ceiling}`}: keep its entry, listing each (every fork line the file holds is listed).`,
+          `${file}: ${where}, but the fork adds ${plural(forkLines, "line")} over upstream (${name}): ${forkLines === 0 ? 'remove it from "pending"' : `set its ceiling to ${forkLines}`} (a ceiling above the count is room for a fork line later; below it, fork-follow's next run refuses main).`,
+        );
+      } else if (ceiling === undefined && forkLines !== 0) {
+        ceilings.push(
+          `${file}: ${where}, but the fork adds ${plural(forkLines, "line")} over upstream (${name}): keep its entry, listing each (every fork line the file holds is listed).`,
         );
       }
       continue;
@@ -694,6 +734,60 @@ function findListedNotFork(files, ownFiles, { atUpstream, atHead, name, promoted
     }
   }
   return ceilings;
+}
+
+/**
+ * Own "lost" entries for `files` that differ from the upstream lines the head loses over
+ * `atUpstream` (`name`), as fork-follow counts them: a count set too high lets a later change swap
+ * an upstream line for a fork line unseen; too low, or dropped, stops fork-follow.
+ */
+function findLostNotUpstream(files, ownLost, { atUpstream, atHead, name }) {
+  const ceilings = [];
+  for (const file of files) {
+    const own = Object.hasOwn(ownLost, file) ? ownLost[file] : undefined;
+    const where = `${own === undefined ? "dropped from" : "set in"} "lost" in this change's ${CONFIG}`;
+    const head = atHead(file);
+    if (head === undefined) {
+      if (own !== undefined) {
+        ceilings.push(
+          `${file}: ${where}, but the head does not have it: list only a file this change keeps.`,
+        );
+      }
+      continue;
+    }
+    const up = atUpstream(file);
+    if (up === undefined) {
+      ceilings.push(
+        `${file}: ${where}, but upstream (${name}) does not have it, so its lost lines cannot be counted: keep main's entry (upstream moved or removed it?).`,
+      );
+      continue;
+    }
+    const lines = lostLines(orderedLines(up), orderedLines(head));
+    const gone = total(addedLines(head, up));
+    const held = own ?? { lines: 0, gone: 0 };
+    if (held.lines === lines && held.gone === gone) continue;
+    const says = own === undefined ? "no entry" : `{"lines": ${own.lines}, "gone": ${own.gone}}`;
+    ceilings.push(
+      `${file}: ${where} (${says}), but the fork loses ${plural(lines, "upstream line")} over upstream (${name}) (deleted, moved or re-indented), ${gone} of them gone: ${lines === 0 ? 'remove it from "lost"' : `set it to {"lines": ${lines}, "gone": ${gone}}`} (a count above the lines lost is room to swap one for a fork line later).`,
+    );
+  }
+  return ceilings;
+}
+
+/**
+ * Upstream files (in `upstreamFiles`, those the head has) that this change's own "forkFiles"
+ * takes for the fork's own where the merge-base's (`baseForkFiles`, undefined: none) did not:
+ * merged, pull requests could then change them unchecked.
+ */
+function findOwnHiddenFiles(upstreamFiles, ownForkFiles, baseForkFiles, atHead) {
+  const isOwn = forkFileTest(ownForkFiles);
+  const wasOwn = baseForkFiles === undefined ? () => false : forkFileTest(baseForkFiles);
+  return upstreamFiles
+    .filter((file) => isOwn(file) && !wasOwn(file) && atHead(file) !== undefined)
+    .map(
+      (file) =>
+        `${file}: upstream has it, but this change's ${CONFIG} "forkFiles" takes it for a fork file (merged, pull requests could change it unchecked): exclude it with "!${file}", or narrow the pattern.`,
+    );
 }
 
 // Where a pull request's run keeps upstream's default branch while it finds the merge-base. A
@@ -744,18 +838,15 @@ function upstreamNamedAt(rev) {
 }
 
 /**
- * Fetches upstream's default branch from `url` (read-only, commits only: filter tree:0, whatever
- * the clone) and returns { rev: merge-base of `main` and it }, or
- * { problem } when it cannot (shallow clone, unreachable, slow, no common history, or a URL whose
- * branch holds `main` itself). The merge-base is in `main`'s history, so its files are read from
- * the clone; negotiated from `tips` (the checkout has no branch), only upstream's commits since
- * the fork's base come. `cwd`, `attemptMs` and `totalMs` are for tests.
+ * Fetches upstream's default branch from `url` (commits only, negotiated from `tips`) and returns
+ * { rev: its merge-base with `main` }, whose files the clone has, or { problem } (shallow clone,
+ * unreachable, slow, no common history, or a branch holding `main`). Options are for tests.
  */
 function upstreamBase(
   url,
   main,
   tips,
-  { cwd, attemptMs = FETCH_ATTEMPT_MS, totalMs = FETCH_TOTAL_MS } = {},
+  { cwd, attemptMs = FETCH_ATTEMPT_MS, totalMs = FETCH_TOTAL_MS, now = Date.now } = {},
 ) {
   const run = (args, timeout) =>
     execFileSync("git", args, {
@@ -771,15 +862,12 @@ function upstreamBase(
       problem: `this clone is shallow, so the commit main shares with upstream is not in it (fetch its whole history: git fetch --unshallow)`,
     };
   }
-  // A promisor remote for this one command only (-c), so none is left in the config: git fetches
-  // from it with its partialclonefilter (commits only). A --filter flag instead would write that
-  // filter into the clone's config.
+  // A remote for this one command only (-c), so none is left in the config: its partialclonefilter
+  // makes it a promisor, fetched commits only. A --filter flag would write it into the config.
   const remote = "fork-seam-upstream";
   const fetch = [
     "-c",
     `remote.${remote}.url=${url}`,
-    "-c",
-    `remote.${remote}.promisor=true`,
     "-c",
     `remote.${remote}.partialclonefilter=tree:0`,
     "fetch",
@@ -792,11 +880,11 @@ function upstreamBase(
     `+HEAD:${UPSTREAM_REF}`,
   ];
   try {
-    const started = Date.now();
+    const started = now();
     let error;
     // One retry, within the total: a dropped connection is not a reason to refuse.
     for (let attempt = 0; attempt < 2; attempt++) {
-      const left = totalMs - (Date.now() - started);
+      const left = totalMs - (now() - started);
       if (left <= 0) break;
       try {
         run(fetch, Math.min(attemptMs, left));
@@ -826,8 +914,8 @@ function upstreamBase(
         problem: `upstream's default branch (${url}, ${tip.slice(0, 12)}) shares no commit with ${main}`,
       };
     }
-    // Upstream holding main whole: the URL names this fork (or a copy of it), and every fork line
-    // would count as upstream's.
+    // Upstream holding main whole: the URL names this fork (or a copy), and every fork line would
+    // count as upstream's. Not caught: such a URL while fork-follow rewrites main mid-run.
     if (rev === run(["rev-parse", `${main}^{commit}`]).trim()) {
       return {
         problem: `upstream's default branch (${url}, ${tip.slice(0, 12)}) holds ${main.slice(0, 12)} itself, so the URL names this fork, not its upstream`,
@@ -1385,19 +1473,22 @@ function main(argv) {
   let ownPending;
   let ownFiles;
   let ownLost;
-  let baseFiles;
+  let ownConfig;
+  let baseList;
   if (!upstream && listProblem === undefined && ownList !== undefined) {
     try {
-      ({ pending: ownPending, files: ownFiles, lost: ownLost } = parseConfig(ownList));
+      ownConfig = parseConfig(ownList);
+      ({ pending: ownPending, files: ownFiles, lost: ownLost } = ownConfig);
     } catch {
       ownPending = undefined; // The list judged it is main's; a malformed own one is said below.
     }
     try {
-      baseFiles = readConfigAt(mergeBase).files;
+      baseList = readConfigAt(mergeBase);
     } catch {
-      baseFiles = undefined; // Unreadable: every entry counts as edited (listEditedFiles).
+      baseList = undefined; // Unreadable: every entry counts as edited (listEditedFiles).
     }
   }
+  const baseFiles = baseList?.files;
   const lowered =
     parsed.loweredList === undefined
       ? undefined
@@ -1433,18 +1524,35 @@ function main(argv) {
     baseFiles,
     lowered,
   });
-  // A move to "files", or a seam's "added" changed, lists lines main's list cannot tell from
-  // upstream's (a raised count with no copy added, a line dropped while still in use): only
-  // upstream can. Every way the count cannot run refuses (fail closed); fork-tests' run on the
-  // merge commit passes --no-upstream, as fork-checks' run counts it.
+  // Counts the own list changes (seam "added", "pending", "lost", "forkFiles", a move to "files")
+  // main's list cannot check: only upstream can. Every way the count cannot run refuses (fail
+  // closed); fork-tests' run on the merge commit passes --no-upstream, as fork-checks' run counts.
   const promoted = upstream ? [] : promotedFiles(config, ownFiles, ownPending);
-  const toCount =
-    upstream || ownFiles === undefined
-      ? []
-      : [...new Set([...promoted, ...listEditedFiles(baseFiles, ownFiles)])].sort();
+  const edits =
+    upstream || ownConfig === undefined
+      ? { files: [], pending: [], lost: [], forkFiles: false }
+      : { files: listEditedFiles(baseFiles, ownFiles), ...listEditedCounts(baseList, ownConfig) };
+  const toCount = [...new Set([...promoted, ...edits.files, ...edits.pending])].sort();
+  const lostToCount = [...edits.lost].sort();
   const countedCeilings = [];
-  if (toCount.length > 0) {
-    const what = `${toCount.join(", ")}: ${promoted.length > 0 ? `this change moves ${promoted.join(", ")} from "pending" to "files"` : "this change edits their seam lines"} in its ${CONFIG}`;
+  const cannotCount = [];
+  if (toCount.length > 0 || lostToCount.length > 0 || edits.forkFiles) {
+    const seamEdited = edits.files.filter((file) => !promoted.includes(file));
+    const ceilingEdited = edits.pending.filter((file) => !promoted.includes(file));
+    const does = [
+      ...(promoted.length > 0
+        ? [`moves ${promoted.join(", ")} from "pending" to "files"`]
+        : seamEdited.length > 0
+          ? ["edits their seam lines"]
+          : []),
+      ...(ceilingEdited.length > 0
+        ? [`changes the "pending" ceiling of ${ceilingEdited.join(", ")}`]
+        : []),
+      ...(lostToCount.length > 0 ? [`changes the "lost" entry of ${lostToCount.join(", ")}`] : []),
+      ...(edits.forkFiles ? ['changes "forkFiles"'] : []),
+    ];
+    const subjects = [...new Set([...toCount, ...lostToCount])].sort();
+    const what = `${subjects.length > 0 ? subjects.join(", ") : '"forkFiles"'}: this change ${does.join(", and ")} in its ${CONFIG}`;
     const named = parsed.noUpstream
       ? {}
       : parsed.upstreamUrl === undefined
@@ -1460,29 +1568,41 @@ function main(argv) {
         ),
       );
     } else if (named.problem !== undefined) {
-      countedCeilings.push(
+      cannotCount.push(
         `${what}, but ${named.problem}, so their fork lines cannot be counted: fix that with a pull request to main first.`,
       );
     } else {
       const found = upstreamBase(named.url, configRef, [configRef, head]);
       if (found.problem !== undefined) {
-        countedCeilings.push(
-          `${what}, but ${found.problem}, so their fork lines cannot be counted: run the check again, and if it still cannot, fix the cause first.`,
-        );
+        cannotCount.push(`${what}, but ${found.problem}, so their fork lines cannot be counted.`);
       } else if (!isAncestor(found.rev, head)) {
-        countedCeilings.push(
+        cannotCount.push(
           `${what}, but this branch does not have upstream's commit ${found.rev.slice(0, 12)} that ${configRef.slice(0, 12)} sits on, so their fork lines cannot be counted: update the branch from its base.`,
         );
       } else {
         const name = found.rev.slice(0, 12);
+        const atUpstream = (file) => textAt(found.rev, file);
         countedCeilings.push(
           ...findListedNotFork(toCount, ownFiles, {
-            atUpstream: (file) => textAt(found.rev, file),
+            atUpstream,
             atHead,
             name,
             promoted: new Set(promoted),
             ownPending,
+            wasPending: new Set([
+              ...Object.keys(config.pending),
+              ...Object.keys(baseList?.pending ?? {}),
+            ]),
           }),
+          ...findLostNotUpstream(lostToCount, ownLost, { atUpstream, atHead, name }),
+          ...(edits.forkFiles
+            ? findOwnHiddenFiles(
+                git(["ls-tree", "-r", "-z", "--name-only", found.rev]).split("\0").filter(Boolean),
+                ownConfig.forkFiles,
+                baseList?.forkFiles,
+                atHead,
+              )
+            : []),
         );
         if (countedCeilings.length === 0) {
           console.log(
@@ -1562,8 +1682,18 @@ function main(argv) {
     );
   }
   const refused = [...reasons, ...late, ...rises, ...ceilings, ...expired, ...landed];
+  if (cannotCount.length > 0) {
+    // Not a seam breach: the count could not run, so nothing in this change is known wrong yet.
+    console.error(
+      `Could not count this change's list edits from upstream (an upstream, fetch or branch problem, not a wrong list; list from ${from}):`,
+    );
+    for (const problem of cannotCount) console.error(printable(`- ${problem}`));
+    console.error(
+      "Run the check again once the cause is fixed: \"Re-run failed jobs\" on the pull request's Fork checks run (the same commits and main's script), or push to the branch. By hand: --upstream <https url>.",
+    );
+  }
   if (refused.length === 0) {
-    if (listProblem !== undefined) return 1;
+    if (listProblem !== undefined || cannotCount.length > 0) return 1;
     if (lowered !== undefined) {
       // After a rebase only: fork-follow commits the lowered list into the rebased series.
       const listText = textAt(configRef, CONFIG);
@@ -1633,8 +1763,11 @@ module.exports = {
   findListedGone,
   findLostLines,
   findListedNotFork,
+  findLostNotUpstream,
+  findOwnHiddenFiles,
   FETCH_ATTEMPT_MS,
   FETCH_TOTAL_MS,
+  listEditedCounts,
   listEditedFiles,
   findSeamBreaches,
   findSpareSeamLines,
