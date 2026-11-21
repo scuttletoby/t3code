@@ -77,6 +77,7 @@ Needs PyYAML, git and bash. Each check prints ok/FAIL; any FAIL exits 1.
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -85,6 +86,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
+import zipfile
 
 import yaml
 
@@ -974,7 +977,133 @@ CHECKOUT_CODE = re.compile(
     r"""(?:^|[\s;&|(<>'"=])(?:\.\.?/|\.github/|[\w.-]+/|[\w-]+\.(?:sh|py|js|mjs|cjs|ts|pl|rb)\b)|""" + INTERPRETER)
 SCAN_STEP_CODE = re.compile(r"(?:^|[\s;&|(])\.\.?/|" + INTERPRETER)
 CHECKOUT_ACTION = re.compile(r"actions/checkout@[0-9a-f]{40}")
-SCAN_RUN_LINE = 'bash "$RUNNER_TEMP/scan-from-default-branch.sh"'
+SCAN_RUN_LINE = 'bash "${RUNNER_TEMP:?}/scan-from-default-branch.sh"'
+
+
+# The sweep's record of the deleted tips a scan read (#691, #701): read by the scan job's first step
+# (before the checkout, so nothing of the checkout has run yet) and kept by an artifact step after the
+# scan step, exactly these two steps and nothing else from outside. No cache: any job of a branch can
+# write a cache that branch's runs restore, and actions/cache unpacks it with tar -P anywhere on the
+# runner (#701 review A); and the repository's caches outgrow their 10 GB, so the record was evicted
+# within hours (review B). The read step runs only for the sweep, holds only the job's read-only token
+# (no secret), takes the record only from a run of fork-secret-sweep.yml (that path, schedule or
+# workflow_dispatch, this branch, this repository and not a fork, ended success or failure, an ancestor
+# commit, not this run) and its one artifact of that name, never unpacks the archive (one plain file
+# read in memory, every line checked), and falls back to a first run on any doubt; reset_record skips
+# it. Its behaviour: the reader e2e below. The keep step uploads only once the scan step has written
+# the record whole (its output `record`), for 90 days (the repository's most). What the scan step
+# trusts the record for is in SCANNED_LOOKUP_TEXT.
+UPLOAD_SHA = "cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+READ_RECORD_NAME = "Read the sweep's record"
+READ_RECORD_TEXT = r'''set -euo pipefail
+dir="${RUNNER_TEMP:?}/sweep-record"
+zip="${RUNNER_TEMP:?}/sweep-record.zip"
+rm -rf -- "$dir" "$zip"
+mkdir -m 700 -- "$dir"
+none() {
+  rm -rf -- "$zip" "$dir/deleted-tips"
+  echo "::warning title=Secret scan::$1, so every listed tip is checked as on a first run" >&2
+  exit 0
+}
+[[ "$RESET" != true ]] || none "the sweep's record is reset (input reset_record)"
+[[ "$GITHUB_REF" == refs/heads/* ]] || none "a run on a tag reads no record of the sweep"
+export BRANCH="${GITHUB_REF#refs/heads/}"
+if ! runs="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/fork-secret-sweep.yml/runs" \
+    -f branch="$BRANCH" -f status=completed -f per_page=30 --jq '.workflow_runs[] |
+      select(.path == ".github/workflows/fork-secret-sweep.yml" and (.event == "schedule" or .event == "workflow_dispatch")
+        and .head_branch == env.BRANCH and .repository.full_name == env.GITHUB_REPOSITORY
+        and .head_repository.full_name == env.GITHUB_REPOSITORY and .status == "completed"
+        and (.conclusion == "success" or .conclusion == "failure")) | "\(.id) \(.head_sha)"')"; then
+  none "the sweep's earlier runs cannot be listed"
+fi
+from=""
+while read -r id sha; do
+  [[ "$id" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ && "$id" != "$GITHUB_RUN_ID" ]] || continue
+  if ! found="$(RUN="$id" gh api -X GET "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" -f name=fork-secret-sweep-record \
+      --jq '[.artifacts[] | select(.name == "fork-secret-sweep-record" and .expired == false and (.workflow_run.id | tostring) == env.RUN)] |
+        if length == 0 then empty elif length == 1 then "\(.[0].id) \(.[0].size_in_bytes)" else error("more than one") end')"; then
+    none "the record of sweep run $id cannot be listed"
+  fi
+  [[ -n "$found" ]] || continue
+  read -r artifact size <<< "$found"
+  [[ "$artifact" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && "$size" -le 4000000 ]] || none "the record of sweep run $id is not the sweep's own"
+  if ! has="$(gh api -X GET "repos/$GITHUB_REPOSITORY/compare/$sha...$GITHUB_SHA" -f per_page=1 --jq .status)"; then
+    none "whether this branch has the commit of sweep run $id cannot be checked"
+  fi
+  [[ "$has" == ahead || "$has" == identical ]] || continue
+  gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > "$zip" || none "the record of sweep run $id cannot be downloaded"
+  [[ "$(stat -c %s -- "$zip")" -le 4000000 ]] || none "the record of sweep run $id is not the sweep's own"
+  from="$id"
+  break
+done <<< "$runs"
+[[ -n "$from" ]] || none "no earlier sweep on $BRANCH kept a record (or it expired)"
+# The archive's one file, never unpacked: exactly one member, named deleted-tips, a plain
+# file (no link, no folder, not encrypted), at most 4 MB; its lines exactly the sweep's own
+# (header, then "<commit id> scanned", each once: no other byte, so no NUL or CR).
+python3 -I - "$zip" "$dir/deleted-tips" <<'EOF' || none "the record of sweep run $from cannot be read"
+import re, stat, sys, zipfile
+src, dst = sys.argv[1:3]
+try:
+    with zipfile.ZipFile(src) as z:
+        [m] = z.infolist()
+        mode = m.external_attr >> 16
+        if (m.filename != "deleted-tips" or m.is_dir() or stat.S_IFMT(mode) not in (0, stat.S_IFREG)
+                or m.flag_bits & 1 or m.file_size > 4000000):
+            raise ValueError("not one plain file named deleted-tips")
+        with z.open(m) as f:
+            data = f.read(4000001)
+except Exception as e:
+    sys.exit(f"the archive: {type(e).__name__}: {e}")
+if len(data) > 4000000 or not re.fullmatch(rb"fork secret sweep record 2\n(?:[0-9a-f]{40} scanned\n)*", data):
+    sys.exit("not the sweep's own lines")
+tips = data.split(b"\n")[1:-1]
+if len(set(tips)) != len(tips):
+    sys.exit("a tip listed twice")
+with open(dst, "xb") as f:
+    f.write(data)
+EOF
+rm -f -- "$zip"
+echo "::notice title=Secret scan::the sweep's record from run $from: $(($(wc -l < "$dir/deleted-tips") - 1)) deleted tip(s) a scan read"
+'''
+RECORD_STEPS = {
+    "read": {"if": "${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}",
+             "env": {"GH_TOKEN": "${{ github.token }}", "RESET": "${{ inputs.reset_record }}"},
+             "run": READ_RECORD_TEXT},
+    "keep": {"if": "${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') "
+                   "&& steps.scan.outputs.record == 'written' }}",
+             "uses": f"actions/upload-artifact@{UPLOAD_SHA}",
+             "with": {"name": "fork-secret-sweep-record", "path": "${{ runner.temp }}/sweep-record/deleted-tips",
+                      "if-no-files-found": "error", "retention-days": 90, "overwrite": True}},
+}
+
+
+def record_step(step):
+    """Which of the record's two steps this step is, exactly (its name aside), else None."""
+    bare = {k: v for k, v in step.items() if k != "name"}
+    return next((kind for kind, want in RECORD_STEPS.items() if bare == want), None)
+
+
+def record_problems(scan):
+    problems = []
+    for j, job in (scan.get("jobs") or {}).items():
+        job_steps = job.get("steps") or []
+        at = next((i for i, s in enumerate(job_steps) if "scan-from-default-branch" in str(s.get("run", ""))), None)
+        if at is None:
+            continue
+        kinds = [(i, record_step(s)) for i, s in enumerate(job_steps)]
+        reads = [i for i, kind in kinds if kind == "read"]
+        keeps = [i for i, kind in kinds if kind == "keep"]
+        if reads != [0]:
+            problems.append(f"{SCAN_FILE}/{j}: the sweep's record is not read exactly once, by the first step, "
+                            "in its exact form (#691, #701)")
+        if len(keeps) != 1 or keeps[0] < at:
+            problems.append(f"{SCAN_FILE}/{j}: the sweep's record is not kept exactly once, after the scan (#691)")
+        if job_steps[at].get("id") != "scan":
+            problems.append(f"{SCAN_FILE}/{j}: the scan step's id is not `scan` (the keep step reads its output)")
+        if job.get("permissions", {"contents": "read"}) != {"contents": "read"} or scan.get("permissions") != {"contents": "read"}:
+            problems.append(f"{SCAN_FILE}/{j}: the scan job's token is not exactly contents: read (the record's "
+                            "read step needs no more: this repository's runs and artifacts are public)")
+    return problems
 
 
 def scan_job_problems(scan):
@@ -995,9 +1124,12 @@ def scan_job_problems(scan):
             if step.get("continue-on-error"):
                 problems.append(f"{label}: continue-on-error (a failed step would pass)")
             if "uses" in step:
-                if not CHECKOUT_ACTION.fullmatch(str(step["uses"])):
-                    problems.append(f"{label}: an action other than the pinned checkout runs in the scan job")
+                if not CHECKOUT_ACTION.fullmatch(str(step["uses"])) and record_step(step) != "keep":
+                    problems.append(f"{label}: an action other than the pinned checkout and the sweep record's "
+                                    "keep step (exactly as RECORD_STEPS) runs in the scan job")
                 continue
+            if record_step(step) == "read":
+                continue  # before the checkout, and in its exact form (record_problems; the reader e2e)
             run = str(step.get("run", ""))
             if "scan-from-default-branch" in run:
                 # The scan step: git, gh and the one line that runs the default branch's script.
@@ -1048,93 +1180,218 @@ def with_sweep_lookup(run):
     return run.replace("fi\nunset LOOKUP_TOKEN\n", SWEEP_LOOKUP_TEXT + "fi\nunset LOOKUP_TOKEN\n", 1)
 
 
-# The sweep's lookup of the deleted tips a scan read (#482), allowed in this exact form only (each
-# line as written; indentation aside), between the sweep's lookup and the token's unset: git fetches
-# first (so a tip GitHub drops meanwhile is asked about), a failed query fails the job, only a null
-# GraphQL answer counts as deleted (an answer naming another commit fails the query), only a
-# successful secret-scan job of a run whose head commit is the tip counts as read, and nothing else
-# sets SCANNED_GONE, which the scan script trusts to turn a gone tip's failure into a warning.
-SCANNED_LOOKUP_TEXT = (
-    'SCANNED_GONE=""\n'
-    'if [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then\n'
-    'mapfile -t tips < <(tr -s \'[:space:]\' \'\\n\' <<< "$OLD_HEADS" | grep -E \'^[0-9a-f]{40}$\' | grep -vE'
-    " '^0+$' | sort -u)\n"
-    '# Which of them this blob-less clone lacks: one git process for all, lazy fetching off\n'
-    '# (#637). A lazy fetch asks for the whole history again (no negotiation) and every lookup\n'
-    '# of a missing commit reads every pack, so one by one that outran the job\'s 30 minutes.\n'
-    'if ! lacked="$(printf \'%s^{commit}\\n\' "${tips[@]}" | GIT_NO_LAZY_FETCH=1 git cat-file'
-    ' --batch-check=\'%(objectname)\' 2> /dev/null)"; then\n'
-    'echo "::error::Secret scan: cannot check which listed tips this clone lacks. Re-run the job." >&2\n'
-    'exit 2\n'
-    'fi\n'
-    "mapfile -t missing < <(sed -n 's/^\\([0-9a-f]\\{40\\}\\)^{commit} missing$/\\1/p' <<< \"$lacked\")\n"
-    'unserved=()\n'
-    'if [[ ${#missing[@]} -gt 0 ]] \\\n'
-    '&& ! timeout 600 git fetch --quiet --no-tags --filter=blob:none origin "${missing[@]}" 2> /dev/null; then\n'
-    'for tip in "${missing[@]}"; do\n'
-    'timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n'
-    '|| unserved+=("$tip")\n'
-    'done\n'
-    'fi\n'
-    'deleted=()\n'
-    "# shellcheck disable=SC2016 # $owner, $name and $id are GraphQL and jq variables, not the shell's\n"
-    'for ((i = 0; i < ${#unserved[@]}; i += 100)); do\n'
-    "query='query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {'\n"
-    'for tip in "${unserved[@]:i:100}"; do query+=" c_$tip: object(oid: \\"$tip\\") { oid }"; done\n'
-    'if ! absent="$(GH_TOKEN="$LOOKUP_TOKEN" gh api graphql -f query="$query } }" \\\n'
-    '-f owner="${GITHUB_REPOSITORY%%/*}" -f name="${GITHUB_REPOSITORY#*/}" \\\n'
-    '--jq \'.data.repository | to_entries[] | (.key | ltrimstr("c_")) as $id |\n'
-    'if .value == null then $id elif .value.oid == $id then empty else error("not the asked commit") end\')"; then\n'
-    'echo "::error::Secret scan: cannot ask GitHub\'s API which listed tips it has no commit for, so a'
-    ' tip git no longer serves could not be told from one GitHub still shows. Re-run the job." >&2\n'
-    'exit 2\n'
-    'fi\n'
-    '[[ -z "$absent" ]] || mapfile -t -O "${#deleted[@]}" deleted <<< "$absent"\n'
-    'done\n'
-    'for tip in "${deleted[@]}"; do\n'
-    'if ! runs="$(GH_TOKEN="$LOOKUP_TOKEN" TIP="$tip" gh api --paginate -X GET'
-    ' "repos/$GITHUB_REPOSITORY/actions/runs" \\\n'
-    '-f head_sha="$tip" -f per_page=100 --jq \'.workflow_runs[] |\n'
-    'if .head_sha != env.TIP then error("not the asked commit") else . end |\n'
-    'select(.path == ".github/workflows/fork-secret-scan.yml" or .path =='
-    ' ".github/workflows/fork-tests.yml") | .id\')"; then\n'
-    'echo "::error::Secret scan: cannot list the runs of deleted tip $tip, so whether a scan read it is'
-    ' unknown. Re-run the job." >&2\n'
-    'exit 2\n'
-    'fi\n'
-    'mapfile -t ids <<< "$runs"\n'
-    'for id in "${ids[@]}"; do\n'
-    '[[ "$id" =~ ^[0-9]+$ ]] || continue\n'
-    'if ! scanned="$(GH_TOKEN="$LOOKUP_TOKEN" TIP="$tip" gh api --paginate -X GET'
-    ' "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \\\n'
-    '-f filter=all -f per_page=100 --jq \'.jobs[] | select(.head_sha == env.TIP and .conclusion == "success" and\n'
-    '(.name == "Secret scan" or .name == "Secret scan / Secret scan")) | .id\')"; then\n'
-    'echo "::error::Secret scan: cannot list the jobs of run $id of deleted tip $tip, so whether a scan'
-    ' read it is unknown. Re-run the job." >&2\n'
-    'exit 2\n'
-    'fi\n'
-    'if [[ -n "$scanned" ]]; then\n'
-    'SCANNED_GONE+="$tip "\n'
-    'break\n'
-    'fi\n'
-    'done\n'
-    'done\n'
-    'fi\n'
-    'unset LOOKUP_TOKEN\n')
+# The sweep's lookup of the deleted tips a scan read (#482, #691), allowed in this exact form only
+# (each line as written; indentation aside), between the sweep's lookup and the token's unset:
+# GitHub's GraphQL API is asked about every tip the clone lacks, every run (a failed query fails the
+# job; only a null answer counts as deleted, an answer naming another commit fails the query); the
+# tips it shows are fetched in one batch (one by one only when that fails, and one that still fails
+# is asked about again); a tip it has no commit for is fetched every run unless the record has it as
+# read by a scan, and any failure but "not our ref" fails the job; only a successful secret-scan job
+# of a run whose head commit is the tip counts as read; the last sweep's record (the read step) is read
+# strictly, any doubt is a first run, and it spares a scanned deleted tip's fetch and lookup (when a
+# lookup fails, the tips already proven are kept before the job fails); nothing else sets
+# SCANNED_GONE, which the scan script trusts to turn a gone tip's failure into a warning, or
+# DELETED_TIPS, which it trusts to skip a gone tip's fetch.
+SCANNED_LOOKUP_TEXT = r'''SCANNED_GONE=""
+DELETED_TIPS=""
+if [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then
+mapfile -t tips < <(tr -s '[:space:]' '\n' <<< "$OLD_HEADS" | grep -E '^[0-9a-f]{40}$' | grep -vE '^0+$' | sort -u)
+# Which of them this blob-less clone lacks: one git process for all, lazy fetching off
+# (#637). A lazy fetch asks for the whole history again (no negotiation) and every lookup
+# of a missing commit reads every pack, so one by one that outran the job's 30 minutes.
+if ! lacked="$(printf '%s^{commit}\n' "${tips[@]}" | GIT_NO_LAZY_FETCH=1 git cat-file --batch-check='%(objectname)' 2> /dev/null)"; then
+echo "::error::Secret scan: cannot check which listed tips this clone lacks. Re-run the job." >&2
+exit 2
+fi
+mapfile -t missing < <(sed -n 's/^\([0-9a-f]\{40\}\)^{commit} missing$/\1/p' <<< "$lacked")
+# The last sweep's record (#691, read by the job's first step): each deleted tip a scan
+# read. Exactly its own lines or nothing: anything else (an older version's, a poisoned
+# one) is a warning and removed, and every tip is checked as on a first run. The bytes
+# are counted, not captured: a captured NUL would be dropped, and mapfile drops it too.
+record="${RUNNER_TEMP:?}/sweep-record/deleted-tips"
+declare -A recorded=()
+if [[ -e "$record" || -L "$record" ]]; then
+lines=()
+valid=""
+if [[ -f "$record" && ! -L "$record" ]] && [[ "$(stat -c %s -- "$record")" -le 4000000 ]] \
+&& [[ "$(LC_ALL=C tr -d 'a-z0-9 \n' < "$record" | wc -c)" -eq 0 ]] && mapfile -t lines < "$record" \
+&& [[ "${lines[0]:-}" == "fork secret sweep record 2" ]]; then
+valid=1
+fi
+for line in "${lines[@]:1}"; do
+if [[ -n "$valid" && "$line" =~ ^([0-9a-f]{40})\ scanned$ ]] \
+&& [[ -z "${recorded[${BASH_REMATCH[1]}]:-}" ]]; then
+recorded[${BASH_REMATCH[1]}]=1
+else
+valid=""
+fi
+done
+if [[ -z "$valid" ]]; then
+recorded=()
+rm -rf -- "$record"
+echo "::warning title=Secret scan::the last sweep's record of deleted tips cannot be read, so every listed tip is checked as on a first run" >&2
+fi
+fi
+# The reviewed list of tips known gone, as the scan script reads it (the default branch's
+# tip): a tip on it needs no lookup of its runs. Read loosely here, as the script checks
+# the list itself: a misread tip is only looked up, or counted unscanned.
+declare -A reviewed=()
+if [[ ${#missing[@]} -gt 0 ]]; then
+git fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"
+while read -r tip; do reviewed[$tip]=1; done < <(git show "refs/scan-script/head:.github/fork-secret-sweep-gone-tips.txt" 2> /dev/null \
+| sed -nE 's/^([0-9a-f]{40})[[:space:]].*/\1/p')
+fi
+# ask TIP...: GitHub's GraphQL API, 100 tips a query; sets absent to those it has no commit
+# for at all. A failed query, or an answer naming another commit, fails the job.
+declare -A absent=()
+# shellcheck disable=SC2016 # $owner, $name and $id are GraphQL and jq variables, not the shell's
+ask() {
+local i tip query answer
+absent=()
+for ((i = 1; i <= $#; i += 100)); do
+query='query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {'
+for tip in "${@:i:100}"; do query+=" c_$tip: object(oid: \"$tip\") { oid }"; done
+if ! answer="$(GH_TOKEN="$LOOKUP_TOKEN" gh api graphql -f query="$query } }" \
+-f owner="${GITHUB_REPOSITORY%%/*}" -f name="${GITHUB_REPOSITORY#*/}" \
+--jq '.data.repository | to_entries[] | (.key | ltrimstr("c_")) as $id |
+if .value == null then $id elif .value.oid == $id then empty else error("not the asked commit") end')"; then
+echo "::error::Secret scan: cannot ask GitHub's API which listed tips it has no commit for, so a tip git no longer serves could not be told from one GitHub still shows. Re-run the job." >&2
+exit 2
+fi
+while read -r tip; do
+[[ ! "$tip" =~ ^[0-9a-f]{40}$ ]] || absent[$tip]=1
+done <<< "$answer"
+done
+}
+# GitHub is asked about every tip this clone lacks first (#691): those it still has are
+# fetched all at once (one by one only when that fails), and none it deleted can fail
+# that batch. A tip it has no commit for: git asked once every run (a tip git serves
+# again is fetched, so scanned), unless the record has it as read by a scan.
+ask "${missing[@]}"
+shown=()
+new=()
+deleted=()
+for tip in "${missing[@]}"; do
+if [[ -z "${absent[$tip]:-}" ]]; then
+shown+=("$tip")
+elif [[ -n "${recorded[$tip]:-}" ]]; then
+deleted+=("$tip")
+else
+new+=("$tip")
+fi
+done
+unserved=()
+if [[ ${#shown[@]} -gt 0 ]] \
+&& ! timeout 600 git fetch --quiet --no-tags --filter=blob:none origin "${shown[@]}" 2> /dev/null; then
+for tip in "${shown[@]}"; do
+timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \
+|| unserved+=("$tip")
+done
+fi
+for tip in "${new[@]}"; do
+if ! err="$(timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2>&1)"; then
+if ! grep -qiE 'not our ref|no such object' <<< "$err"; then
+echo "::error::Secret scan: cannot fetch listed tip $tip, which GitHub's API has no commit for, and origin did not say it no longer has it (a network or server failure?). Re-run the job." >&2
+exit 2
+fi
+deleted+=("$tip")
+fi
+done
+# A tip GitHub showed that git could not fetch: asked again (GitHub may have deleted it
+# meanwhile); one it still shows stays listed, and the scan script fails on it.
+if [[ ${#unserved[@]} -gt 0 ]]; then
+ask "${unserved[@]}"
+for tip in "${unserved[@]}"; do
+[[ -z "${absent[$tip]:-}" ]] || deleted+=("$tip")
+done
+fi
+# keep: this run's record, for the next one (the job's last step keeps it): the deleted
+# tips a scan read, as far as proven now (the last record's still deleted ones come first
+# in the loop below, so they are in even when a lookup fails), nothing older (a tip GitHub
+# shows again, or the activity record no longer lists, is dropped). Written whole, then renamed, and only
+# then marked written: a run stopped before that keeps nothing. Also when a lookup fails
+# half-way, before the job fails: the next sweep goes on from there (#701).
+declare -A read_by_scan=()
+keep() {
+local tip
+mkdir -p -- "${RUNNER_TEMP:?}/sweep-record"
+rm -rf -- "$record.new"
+{
+echo "fork secret sweep record 2"
+for tip in "${deleted[@]}"; do
+[[ -z "${read_by_scan[$tip]:-}" ]] || echo "$tip scanned"
+done
+} > "$record.new"
+mv -f -- "$record.new" "$record"
+echo "record=written" >> "${GITHUB_OUTPUT:?}"
+}
+# Which deleted tips a scan read: on the record as read, no lookup (a scan read it for
+# good); on the reviewed list, none either (no evidence needed); any other, the runs that
+# had it as their head commit, one whose secret-scan job succeeded (fork-secret-scan.yml's
+# "Secret scan", or fork-tests.yml's, called or, in older runs, its own).
+for tip in "${deleted[@]}"; do
+DELETED_TIPS+="$tip "
+if [[ -n "${recorded[$tip]:-}" ]]; then
+read_by_scan[$tip]=1
+SCANNED_GONE+="$tip "
+continue
+fi
+[[ -z "${reviewed[$tip]:-}" ]] || continue
+if ! runs="$(GH_TOKEN="$LOOKUP_TOKEN" TIP="$tip" gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/actions/runs" \
+-f head_sha="$tip" -f per_page=100 --jq '.workflow_runs[] |
+if .head_sha != env.TIP then error("not the asked commit") else . end |
+select(.path == ".github/workflows/fork-secret-scan.yml" or .path == ".github/workflows/fork-tests.yml") | .id')"; then
+echo "::error::Secret scan: cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Re-run the job." >&2
+keep
+exit 2
+fi
+mapfile -t ids <<< "$runs"
+for id in "${ids[@]}"; do
+[[ "$id" =~ ^[0-9]+$ ]] || continue
+if ! scanned="$(GH_TOKEN="$LOOKUP_TOKEN" TIP="$tip" gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+-f filter=all -f per_page=100 --jq '.jobs[] | select(.head_sha == env.TIP and .conclusion == "success" and
+(.name == "Secret scan" or .name == "Secret scan / Secret scan")) | .id')"; then
+echo "::error::Secret scan: cannot list the jobs of run $id of deleted tip $tip, so whether a scan read it is unknown. Re-run the job." >&2
+keep
+exit 2
+fi
+if [[ -n "$scanned" ]]; then
+read_by_scan[$tip]=1
+SCANNED_GONE+="$tip "
+break
+fi
+done
+done
+keep
+fi
+unset LOOKUP_TOKEN
+'''
 
 
-# The lists' hand-over to the scan (#637), in this exact form only, right before the scan script is
-# fetched: each id once, both lists in files under RUNNER_TEMP (written afresh each run), the files
-# exported, and the variables too only while they fit in one environment string (the kernel caps one
-# at 128 KiB; past that every program the step starts fails, "Argument list too long").
-HANDOFF_TEXT = (
-    'OLD_HEADS="$(tr -s \'[:space:]\' \'\\n\' <<< "$OLD_HEADS" | sort -u)"\n'
-    'printf \'%s\\n\' "$OLD_HEADS" > "$RUNNER_TEMP/old-heads"\n'
-    'printf \'%s\\n\' "$SCANNED_GONE" > "$RUNNER_TEMP/scanned-gone"\n'
-    'export UPSTREAM OLD_HEADS_FILE="$RUNNER_TEMP/old-heads" SCANNED_GONE_FILE="$RUNNER_TEMP/scanned-gone"\n'
-    'if [[ ${#OLD_HEADS} -le 100000 ]]; then export OLD_HEADS; fi\n'
-    'if [[ ${#SCANNED_GONE} -le 100000 ]]; then export SCANNED_GONE; fi\n'
-    'git fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"\n')
+# The lists' hand-over to the scan (#637), in this exact form only, at the step's end: each id once,
+# the lists in files under RUNNER_TEMP (written afresh each run; "${RUNNER_TEMP:?}", #691), the files
+# exported, the variables too only while they fit in one environment string (the kernel caps one at
+# 128 KiB; past that every program the step starts fails, "Argument list too long"), and a default
+# branch's script that reads only the variables refused when a list does not fit (#691).
+HANDOFF_TEXT = r'''OLD_HEADS="$(tr -s '[:space:]' '\n' <<< "$OLD_HEADS" | sort -u)"
+printf '%s\n' "$OLD_HEADS" > "${RUNNER_TEMP:?}/old-heads"
+printf '%s\n' "$SCANNED_GONE" > "${RUNNER_TEMP:?}/scanned-gone"
+printf '%s\n' "$DELETED_TIPS" > "${RUNNER_TEMP:?}/deleted-tips"
+export UPSTREAM OLD_HEADS_FILE="${RUNNER_TEMP:?}/old-heads" SCANNED_GONE_FILE="${RUNNER_TEMP:?}/scanned-gone" \
+DELETED_TIPS_FILE="${RUNNER_TEMP:?}/deleted-tips"
+if [[ ${#OLD_HEADS} -le 100000 ]]; then export OLD_HEADS; fi
+if [[ ${#SCANNED_GONE} -le 100000 ]]; then export SCANNED_GONE; fi
+git fetch --quiet --no-tags --filter=blob:none origin "+refs/heads/$CONFIG_BRANCH:refs/scan-script/head"
+git show "refs/scan-script/head:.github/scripts/fork-secret-scan.sh" > "${RUNNER_TEMP:?}/scan-from-default-branch.sh"
+# A default branch's script from before the files reads only the variables: a list too
+# long to export would reach it as an empty list, so a tip it names would go unscanned.
+if [[ ${#OLD_HEADS} -gt 100000 || ${#SCANNED_GONE} -gt 100000 ]] \
+&& ! grep -q OLD_HEADS_FILE "${RUNNER_TEMP:?}/scan-from-default-branch.sh"; then
+echo "::error::Secret scan: the default branch's scan script reads the lists only from the environment, and they are too long for it, so it would scan none of the tips they name. Re-run the job once the default branch has the current script." >&2
+exit 2
+fi
+bash "${RUNNER_TEMP:?}/scan-from-default-branch.sh"
+'''
 
 
 def stripped_lines(run):
@@ -1156,13 +1413,15 @@ def lookup_problems(scan):
                 problems.append(f"{SCAN_FILE}/{j}: the lists are not handed to the scan in files in their exact "
                                 "form (#637)")
             scanned_lookup = SCANNED_LOOKUP_TEXT in stripped_lines(run)
-            if re.search(r"\bSCANNED_GONE\b", run) and (
-                    not scanned_lookup or not handoff
-                    or len(re.findall(r"\bSCANNED_GONE\b", run)) != 2 + len(re.findall(r"\bSCANNED_GONE\b", HANDOFF_TEXT))):
-                problems.append(f"{SCAN_FILE}/{j}: SCANNED_GONE is not set by the sweep's lookup of deleted tips a "
-                                "scan read in its exact form (#482), or is set or used outside it")
+            for name in ("SCANNED_GONE", "DELETED_TIPS"):
+                word = rf"\b{name}\b"
+                if re.search(word, run) and (
+                        not scanned_lookup or not handoff
+                        or len(re.findall(word, run)) != len(re.findall(word, SCANNED_LOOKUP_TEXT + HANDOFF_TEXT))):
+                    problems.append(f"{SCAN_FILE}/{j}: {name} is not set by the sweep's lookup of deleted tips in "
+                                    "its exact form (#482, #691), or is set or used outside it")
             want = (2 + len(re.findall(r"\bOLD_HEADS\b", HANDOFF_TEXT)) + (1 if SWEEP_LOOKUP.search(run) else 0)
-                    + (1 if scanned_lookup else 0))
+                    + (len(re.findall(r"\bOLD_HEADS\b", SCANNED_LOOKUP_TEXT)) if scanned_lookup else 0))
             if len(re.findall(r"\bOLD_HEADS\b", run)) != want:
                 problems.append(f"{SCAN_FILE}/{j}: OLD_HEADS is set or used outside the lookups")
             env = step.get("env") or {}
@@ -1250,6 +1509,10 @@ def tests_job_problems(scan):
 ALERT_RUN = re.compile(r'bash \.github/scripts/fork-run-alert\.sh --title "[^"]+" --result "\$RESULT"(?: --message "[^"]*")?')
 
 
+# The sweep's one input to the scan: reset_record, only when a hand run asks for it (#701).
+SWEEP_WITH = {"reset_record": "${{ inputs.reset_record == true }}"}
+
+
 def sweep_problems(wfs):
     """fork-secret-sweep.yml: the daily and manual sweep, a call of the scan workflow that only
     reads, and one alert job after it, whatever its result, that hands that result to
@@ -1273,8 +1536,14 @@ def sweep_problems(wfs):
         problems.append(f"{SWEEP_FILE}: not exactly one job calls {SCAN_CALL}")
         return problems
     caller = callers[0]
-    if not set(jobs[caller]) <= {"name", "uses"}:
-        problems.append(f"{SWEEP_FILE}/{caller}: more than name and uses (an if, inputs or permissions)")
+    if not set(jobs[caller]) <= {"name", "uses", "with"} or jobs[caller].get("with") != SWEEP_WITH:
+        problems.append(f"{SWEEP_FILE}/{caller}: more than name, uses and the reset input (an if, other inputs "
+                        "or permissions)")
+    dispatch = (sweep.get(True) or sweep.get("on") or {}).get("workflow_dispatch") or {}
+    if (dispatch.get("inputs") or {}).get("reset_record", {}).get("type") != "boolean" or (
+            dispatch["inputs"]["reset_record"].get("default") is not False):
+        problems.append(f"{SWEEP_FILE}: no workflow_dispatch input reset_record (boolean, default false): the "
+                        "documented way to start the sweep's record afresh (#701)")
     alerts = [j for j, job in jobs.items() if any("fork-run-alert.sh" in str(s.get("run", "")) for s in job.get("steps") or [])]
     if len(alerts) != 1:
         problems.append(f"{SWEEP_FILE}: not exactly one job runs fork-run-alert.sh")
@@ -1342,7 +1611,8 @@ def secret_scan_problems(wfs):
         problems.append(f"{SCAN_FILE}: a workflow concurrency group (a newer push could cancel a scan)")
     problems += [f"{SCAN_FILE}: job {j} has a concurrency group"
                  for j, job in (scan.get("jobs") or {}).items() if "concurrency" in job]
-    problems += scan_job_problems(scan) + lookup_problems(scan) + scan_if_problems(scan) + tests_job_problems(scan)
+    problems += (scan_job_problems(scan) + record_problems(scan) + lookup_problems(scan) + scan_if_problems(scan)
+                 + tests_job_problems(scan))
     caller = ((wfs.get("fork-tests.yml") or {}).get("jobs") or {}).get("secrets") or {}
     if caller.get("uses") != SCAN_CALL or (caller.get("with") or {}).get("test") is not True:
         problems.append(f"fork-tests.yml: job secrets does not call {SCAN_CALL} with test: true")
@@ -1365,16 +1635,29 @@ def scan_mutant(mutate):
     wfs = copy.deepcopy(real)
     try:
         mutate(wfs)
-    except (KeyError, TypeError):  # nothing to break: the check above has already failed
+        return bool(secret_scan_problems(wfs))
+    except (KeyError, TypeError, AttributeError, StopIteration):  # nothing to break: the check above has already failed
         return False
-    return bool(secret_scan_problems(wfs))
 
 
 GROUP = {"group": "scan-${{ github.ref }}", "cancel-in-progress": True}
 
 
+def before_scan(wfs, step):
+    job_steps = wfs[SCAN_FILE]["jobs"]["scan"]["steps"]
+    job_steps.insert(next(i for i, s in enumerate(job_steps) if "scan-from-default-branch" in str(s.get("run", ""))), step)
+
+
 def scan_step(wfs):
     return next(s for _, s in steps(wfs[SCAN_FILE]) if "scan-from-default-branch" in str(s.get("run", "")))
+
+
+def read_step(wfs):
+    return next((s for s in wfs[SCAN_FILE]["jobs"]["scan"]["steps"] if s.get("name") == READ_RECORD_NAME), None)
+
+
+def keep_step(wfs):
+    return next((s for s in wfs[SCAN_FILE]["jobs"]["scan"]["steps"] if "upload-artifact" in str(s.get("uses"))), None)
 
 
 for label, mutate in {
@@ -1399,18 +1682,13 @@ for label, mutate in {
         "secrets", {"runs-on": "ubuntu-24.04", "steps": [{"run": "bash .github/scripts/fork-secret-scan.sh"}]}),
     "fork-tests.yml calling it without its tests": lambda w: w["fork-tests.yml"]["jobs"]["secrets"].pop("with"),
     # s1: nothing from the checkout in the job that scans.
-    "the tests back in the scan job, before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
-        -1, w[SCAN_FILE]["jobs"]["tests"]["steps"][-1]),
+    "the tests back in the scan job, before the scan": lambda w: before_scan(w, w[SCAN_FILE]["jobs"]["tests"]["steps"][-1]),
     "the tests in the scan job, after the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].append(
         w[SCAN_FILE]["jobs"]["tests"]["steps"][-1]),
-    "a local action before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
-        -1, {"uses": "./.github/actions/setup"}),
-    "a package install before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
-        -1, {"run": "pnpm install --frozen-lockfile"}),
-    "a checkout file run by path before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
-        -1, {"run": "scripts/prepare"}),
-    "an unpinned action before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
-        -1, {"uses": "actions/setup-node@v4"}),
+    "a local action before the scan": lambda w: before_scan(w, {"uses": "./.github/actions/setup"}),
+    "a package install before the scan": lambda w: before_scan(w, {"run": "pnpm install --frozen-lockfile"}),
+    "a checkout file run by path before the scan": lambda w: before_scan(w, {"run": "scripts/prepare"}),
+    "an unpinned action before the scan": lambda w: before_scan(w, {"uses": "actions/setup-node@v4"}),
     "the scan step running a checkout file too": lambda w: scan_step(w).__setitem__(
         "run", "./tools/x\n" + scan_step(w)["run"]),
     "a scan step that may fail quietly": lambda w: scan_step(w).__setitem__("continue-on-error", True),
@@ -1452,9 +1730,9 @@ for label, mutate in {
     "an absent-tips lookup that takes any answer": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace('else error("not the asked commit") end', "else $id end")),
     "an absent-tips lookup whose failure does not fail the job": lambda w: scan_step(w).__setitem__(
-        "run", re.sub(r"(Re-run the job\.\" >&2\n\s*)exit 2(\n\s*fi\n\s*\[\[ -z \"\$absent\" \]\])", r"\1true\2",
+        "run", re.sub(r"(Re-run the job\.\" >&2\n\s*)exit 2(\n\s*fi\n\s*while read -r tip; do)", r"\1true\2",
                       scan_step(w)["run"], count=1)),
-    "absent tips asked about without git's fetch first (a tip dropped meanwhile fails)": lambda w: scan_step(w).__setitem__(
+    "shown tips not fetched one by one when the batch fails": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace(
             'timeout 300 git fetch --quiet --no-tags --filter=blob:none origin "$tip" 2> /dev/null \\\n', "")),
     "the lacked tips checked with lazy fetching on (#637)": lambda w: scan_step(w).__setitem__(
@@ -1476,17 +1754,70 @@ for label, mutate in {
     "SCANNED_GONE set outside its lookup": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace("unset LOOKUP_TOKEN\n", 'SCANNED_GONE="$OLD_HEADS"\nunset LOOKUP_TOKEN\n')),
     "SCANNED_GONE not exported to the scan": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace(' SCANNED_GONE_FILE="$RUNNER_TEMP/scanned-gone"\n', "\n")),
+        "run", scan_step(w)["run"].replace(' SCANNED_GONE_FILE="${RUNNER_TEMP:?}/scanned-gone"', "")),
     # #637: the lists handed over in files, the variables only while they fit.
     "the earlier heads not handed over in a file": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace(' OLD_HEADS_FILE="$RUNNER_TEMP/old-heads"', "")),
+        "run", scan_step(w)["run"].replace(' OLD_HEADS_FILE="${RUNNER_TEMP:?}/old-heads"', "")),
     "the earlier heads exported whatever their size (Argument list too long)": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace("if [[ ${#OLD_HEADS} -le 100000 ]]; then export OLD_HEADS; fi", "export OLD_HEADS")),
     "SCANNED_GONE exported whatever its size": lambda w: scan_step(w).__setitem__(
         "run", scan_step(w)["run"].replace("if [[ ${#SCANNED_GONE} -le 100000 ]]; then export SCANNED_GONE; fi",
                                            "export SCANNED_GONE")),
     "the earlier heads' file appended to, not written afresh": lambda w: scan_step(w).__setitem__(
-        "run", scan_step(w)["run"].replace('"$OLD_HEADS" > "$RUNNER_TEMP/old-heads"', '"$OLD_HEADS" >> "$RUNNER_TEMP/old-heads"')),
+        "run", scan_step(w)["run"].replace('"$OLD_HEADS" > "${RUNNER_TEMP:?}/old-heads"',
+                                           '"$OLD_HEADS" >> "${RUNNER_TEMP:?}/old-heads"')),
+    # #691: the sweep's record, and the hand-over's two minors.
+    "DELETED_TIPS not handed to the scan": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r' \\\n\s*DELETED_TIPS_FILE="\$\{RUNNER_TEMP:\?\}/deleted-tips"', "", scan_step(w)["run"])),
+    "DELETED_TIPS set outside its lookup": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("unset LOOKUP_TOKEN\n", 'DELETED_TIPS="$OLD_HEADS"\nunset LOOKUP_TOKEN\n')),
+    "a list too long for an old default-branch script handed over anyway (read as empty)": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r"\n *# A default branch's script from before the files(?:.*\n)*? *fi\n", "\n", scan_step(w)["run"])),
+    "the hand-over with RUNNER_TEMP unguarded": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace('> "${RUNNER_TEMP:?}/old-heads"', '> "$RUNNER_TEMP/old-heads"')),
+    "the record trusted for a tip GitHub shows (recorded tips not asked about)": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace('ask "${missing[@]}"', 'ask $(for tip in "${missing[@]}"; do [[ -n "${recorded[$tip]:-}" ]] || echo "$tip"; done)')),
+    "a record with any line taken": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r'(else\n\s*)valid=""\n', r"\1true\n", scan_step(w)["run"])),
+    "a record that cannot be read trusted as empty and silent": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r"\n *echo \"::warning title=Secret scan::the last sweep's record[^\n]*", "", scan_step(w)["run"])),
+    "the record written in place (a stopped run leaves half of one)": lambda w: scan_step(w).__setitem__(
+        "run", re.sub(r'\} > "\$record\.new"\n\s*mv -f -- "\$record\.new" "\$record"\n', '} > "$record"\n',
+                      scan_step(w)["run"])),
+    "a new deleted tip's fetch failure taken as deleted (a network error)": lambda w: scan_step(w).__setitem__(
+        "run", scan_step(w)["run"].replace("if ! grep -qiE 'not our ref|no such object' <<< \"$err\"; then", "if false; then")),
+    # #701: the record as an artifact of the sweep's own runs, read before the checkout, no cache.
+    "the record read on every event (a pull request's or push's scan)": lambda w: read_step(w).pop("if"),
+    "the record read with a secret in its step": lambda w: read_step(w)["env"].__setitem__(
+        "PUSH", "${{ secrets.FORK_PUSH_TOKEN }}"),
+    "the record read after the checkout": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        2, w[SCAN_FILE]["jobs"]["scan"]["steps"].pop(0)),
+    "the record read twice": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        3, copy.deepcopy(read_step(w))),
+    "the record read by an edited step (no ancestor check)": lambda w: read_step(w).__setitem__(
+        "run", re.sub(r'\n *\[\[ "\$has" == ahead[^\n]*', "", read_step(w)["run"])),
+    "the record read with the archive unpacked": lambda w: read_step(w).__setitem__(
+        "run", read_step(w)["run"].replace('python3 -I - "$zip"', 'unzip -o "$zip" -d "$dir"; : python3 -I - "$zip"')),
+    "the scan job with actions: write": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
+        "permissions", {"contents": "read", "actions": "write"}),
+    "the record kept by an action by tag, not pinned": lambda w: keep_step(w).__setitem__(
+        "uses", "actions/upload-artifact@v7"),
+    "the record kept for a day (the next sweep would not find it)": lambda w: keep_step(w)["with"].__setitem__(
+        "retention-days", 1),
+    "the record kept though not written whole": lambda w: keep_step(w).__setitem__("if", "${{ always() }}"),
+    "the record kept on every event": lambda w: keep_step(w).__setitem__(
+        "if", "${{ always() && steps.scan.outputs.record == 'written' }}"),
+    "the record kept from the workspace": lambda w: keep_step(w)["with"].__setitem__("path", "sweep-record"),
+    "the record kept before the scan": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        2, w[SCAN_FILE]["jobs"]["scan"]["steps"].pop()),
+    "the record not kept": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].pop(),
+    "the record restored from a cache again": lambda w: w[SCAN_FILE]["jobs"]["scan"]["steps"].insert(
+        1, {"uses": "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+            "with": {"path": "${{ runner.temp }}/sweep-record", "key": "x", "restore-keys": "fork-secret-sweep-record-"}}),
+    "the scan step without its id": lambda w: scan_step(w).pop("id"),
+    "a sweep that always resets its record": lambda w: w[SWEEP_FILE]["jobs"]["sweep"].__setitem__(
+        "with", {"reset_record": True}),
+    "a sweep without its reset input": lambda w: (w[SWEEP_FILE][True]["workflow_dispatch"] or {}).pop("inputs", None),
     # c2: the jobs' if: as GitHub evaluates it.
     "every push skipped": lambda w: w[SCAN_FILE]["jobs"]["scan"].__setitem__(
         "if", w[SCAN_FILE]["jobs"]["scan"]["if"].replace("(github.event.deleted ||", "(true || github.event.deleted ||")),
@@ -1546,14 +1877,19 @@ check("secret-scan: the sweep's activity lookup (#239) in its exact form passes"
       not scan_mutant(lambda w: scan_step(w).__setitem__("run", with_sweep_lookup(scan_step(w)["run"])))
       and SWEEP_LOOKUP.search(with_sweep_lookup(scan_step(real)["run"])) is not None)
 
-# #637, end to end: the sweep's lookup of the tips it lacks, as the workflow has it (bash -e -o
-# pipefail), in a blob-less clone of a local origin that still serves three tips no ref holds and
-# lacks one (gone), with a gh stub that answers as GitHub would. The sweep of 11-20 ran out of the
-# job's 30 minutes here: `git cat-file -e` per tip, with lazy fetching on, fetched each lacked tip
-# with the whole history again (no negotiation), and each lookup of a missing commit read every pack
-# that left. Now: one cat-file for all tips, no lazy fetch, one batch fetch, one by one only when a
-# gone tip fails the batch. Also: run again in the same clone, stopped half-way (one tip fetched
-# before), no tips at all, and no clone.
+# #637 and #691, end to end: the sweep's lookup of the tips it lacks, as the workflow has it (bash
+# -e -o pipefail), in a blob-less clone of a local origin that still serves three tips no ref holds
+# and lacks others (deleted), with a gh stub that answers as GitHub would. The sweep of 11-20 ran
+# out of the job's 30 minutes here: `git cat-file -e` per tip, with lazy fetching on, fetched each
+# lacked tip with the whole history again (no negotiation), and each lookup of a missing commit read
+# every pack that left. Then (#691) its cost grew with the deleted tips: each was fetched again and
+# its runs looked up again every day (231 of about 250 API calls), and one deleted tip in the batch
+# sent every served one to the one-by-one fetch. Now: one cat-file for all tips, no lazy fetch,
+# GitHub asked first, one batch of the tips it shows, git asked about a deleted tip until a scan is
+# known to have read it, and the record (RUNNER_TEMP/sweep-record, the read step's) spares the rest.
+# Also: run again (same clone, or a new runner with the record), stopped half-way (before or while
+# writing the record), the first run (no record), a record that cannot be read, a tip that comes
+# back, no tips at all, and no clone.
 def sweep_lookup_code(run):
     start, end = run.find('SCANNED_GONE=""\n'), run.find("unset LOOKUP_TOKEN\n")
     return run[start:end] if 0 <= start < end else "exit 99\n"
@@ -1578,23 +1914,57 @@ for n in range(3):  # a branch pushed, then deleted: no ref holds its tip, origi
     git(sweep_origin, "checkout", "-q", "main")
     git(sweep_origin, "branch", "-q", "-D", f"side{n}")
 sweep_gone = "ab" * 20  # listed by the activity record, garbage-collected by GitHub
+sweep_gone2 = "cd" * 20  # another, on the reviewed list of a branch "reviewed"
+git(sweep_origin, "checkout", "-q", "-b", "reviewed", sweep_main)
+(sweep_origin / ".github").mkdir()
+(sweep_origin / ".github" / "fork-secret-sweep-gone-tips.txt").write_text(f"{sweep_gone2} checked by hand (test)\n")
+git(sweep_origin, "add", "-A")
+git(sweep_origin, "commit", "-q", "-m", "the reviewed list")
+git(sweep_origin, "checkout", "-q", "main")
 sweep_stub = sweep_work / "bin"
 sweep_stub.mkdir()
+# GitHub as the stub has it: GraphQL has no commit for FAKE_GONE's tips, nor for FAKE_LATE's after
+# the first question about it (deleted meanwhile); a run's secret-scan job succeeded for FAKE_SCANNED's.
 (sweep_stub / "gh").write_text(r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$GH_LOG"
 case "$*" in
   *graphql*)
     for a in "$@"; do [[ "$a" != query=* ]] || q="$a"; done
     for id in $(grep -oE 'c_[0-9a-f]{40}' <<< "$q" | cut -c3-); do
-      [[ " $FAKE_GONE " != *" $id "* ]] || echo "$id"
+      if [[ "$id" == "${FAKE_LATE:-}" ]]; then
+        if [[ -e "$GH_LOG.late" ]]; then echo "$id"; else : > "$GH_LOG.late"; fi
+      elif [[ " $FAKE_GONE " == *" $id "* ]]; then
+        echo "$id"
+      fi
     done ;;
-  *actions/runs/*/jobs*) [[ -z "${FAKE_SCANNED:-}" ]] || echo 9001 ;;
-  *actions/runs*) echo 101 ;;
+  *actions/runs*)
+    # FAKE_BUDGET: the token's lookups left; past them every Actions call fails, as at a rate limit.
+    if [[ -n "${FAKE_BUDGET:-}" ]]; then
+      used=$(( $(cat "$GH_LOG.used" 2> /dev/null || echo 0) + 1 ))
+      echo "$used" > "$GH_LOG.used"
+      if (( used > FAKE_BUDGET )); then echo "gh stub: HTTP 403: API rate limit exceeded" >&2; exit 1; fi
+    fi ;;&
+  *actions/runs/*/jobs*)
+    if [[ -n "${FAKE_JOBS_FAIL:-}" ]]; then echo "gh stub: HTTP 502" >&2; exit 1; fi
+    [[ " $FAKE_SCANNED " != *" $TIP "* ]] || echo 9001 ;;
+  *actions/runs*)
+    if [[ -n "${FAKE_RUNS_FAIL:-}" ]]; then echo "gh stub: HTTP 502" >&2; exit 1; fi
+    echo 101 ;;
   *) echo "gh stub: unexpected call: $*" >&2; exit 97 ;;
 esac
 """)
-(sweep_stub / "gh").chmod(0o755)
+# A network failure on git's one fetch of FAKE_NET_FAIL (not git saying it lacks the commit).
+(sweep_stub / "timeout").write_text(rf"""#!/usr/bin/env bash
+if [[ -n "${{FAKE_NET_FAIL:-}}" && " $* " == *" $FAKE_NET_FAIL "* ]]; then
+  echo "fatal: unable to access 'https://github.com/me/t3code/': Could not resolve host: github.com" >&2
+  exit 128
+fi
+exec {shutil.which("timeout")} "$@"
+""")
+for stub in ("gh", "timeout"):
+    (sweep_stub / stub).chmod(0o755)
 lookup_code = sweep_lookup_code(scan_step(real)["run"])
+RECORD_HEAD = "fork secret sweep record 2\n"
 
 
 def sweep_clone(label):
@@ -1603,24 +1973,58 @@ def sweep_clone(label):
     return dest
 
 
-def sweep_lookup(dest, old_heads, label, code=None):
-    """Runs the lookup in dest; returns (exit, SCANNED_GONE, git trace, gh calls)."""
-    trace, gh_log = sweep_work / f"{label}.trace", sweep_work / f"{label}.gh"
-    trace.write_text("")
-    gh_log.write_text("")
-    script = (code or lookup_code) + 'printf "SCANNED_GONE=[%s]\\n" "$SCANNED_GONE"\n'
+def sweep_temp(label, record=None):
+    """A runner's RUNNER_TEMP, with the record as the read step leaves it (None: no record)."""
+    temp = sweep_work / f"{label}.temp"
+    temp.mkdir()
+    if record is not None:
+        (temp / "sweep-record").mkdir()
+        (temp / "sweep-record" / "deleted-tips").write_text(record)
+    return temp
+
+
+def sweep_lookup(dest, old_heads, label, code=None, temp=None, gone=None, scanned=None, branch="main", **env):
+    """Runs the lookup in dest, with RUNNER_TEMP temp (by default a new one: no record); returns its
+    exit (.r), SCANNED_GONE (.gone) and DELETED_TIPS (.deleted) as word lists, the git trace, the gh
+    calls, the record it leaves (None: none) and its step output."""
+    trace, gh_log, output = (sweep_work / f"{label}.{x}" for x in ("trace", "gh", "out"))
+    for f in (trace, gh_log, output):
+        f.write_text("")
+    pathlib.Path(f"{gh_log}.late").unlink(missing_ok=True)
+    pathlib.Path(f"{gh_log}.used").unlink(missing_ok=True)
+    temp = temp or sweep_temp(label)
+    script = (code or lookup_code) + 'printf "SCANNED_GONE=[%s]\\nDELETED_TIPS=[%s]\\n" "$SCANNED_GONE" "$DELETED_TIPS"\n'
     r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=dest,
                        env={**base_env, "PATH": f"{sweep_stub}:{base_env['PATH']}", "GITHUB_REPOSITORY": "me/t3code",
                             "EVENT_NAME": "schedule", "OLD_HEADS": old_heads, "LOOKUP_TOKEN": "x",
-                            "GH_LOG": str(gh_log), "FAKE_GONE": sweep_gone, "FAKE_SCANNED": "1",
-                            "GIT_TRACE": str(trace), "GIT_CEILING_DIRECTORIES": str(sweep_work)},
+                            "RUNNER_TEMP": str(temp), "GITHUB_OUTPUT": str(output), "CONFIG_BRANCH": branch,
+                            "GH_LOG": str(gh_log), "FAKE_GONE": " ".join([sweep_gone, sweep_gone2]) if gone is None else gone,
+                            "FAKE_SCANNED": sweep_gone if scanned is None else scanned,
+                            "GIT_TRACE": str(trace), "GIT_CEILING_DIRECTORIES": str(sweep_work), **env},
                        capture_output=True, text=True)
-    found = re.search(r"SCANNED_GONE=\[(.*)\]", r.stdout)
-    return r, (found.group(1).strip() if found else None), trace.read_text(), gh_log.read_text()
+
+    def listed(name):
+        found = re.search(rf"^{name}=\[(.*)\]$", r.stdout, re.M)
+        return found.group(1).split() if found else None
+    record = temp / "sweep-record" / "deleted-tips"
+    return types.SimpleNamespace(
+        r=r, gone=listed("SCANNED_GONE"), deleted=listed("DELETED_TIPS"), trace=trace.read_text(), calls=gh_log.read_text(),
+        record=record.read_text() if record.is_file() and not record.is_symlink() else None, output=output.read_text(),
+        temp=temp)
+
+
+def sweep_detail(s):
+    return (f"exit {s.r.returncode}: {s.r.stderr.strip()[-400:]} gone={s.gone} deleted={s.deleted} record={s.record!r} "
+            f"output={s.output!r} fetches={commands(s.trace, 'fetch')} gh={s.calls.strip()[-600:]!r}")
 
 
 def commands(trace, name):
     return len(re.findall(rf"trace: built-in: git {name}\b", trace))
+
+
+def fetches_of(trace, sha):
+    """How many git fetches named sha (the batch, one alone)."""
+    return len(re.findall(rf"trace: built-in: git fetch [^\n]*\b{sha}\b", trace))
 
 
 def lazy_fetches(trace):
@@ -1642,51 +2046,600 @@ if not lazy_honoured and os.environ.get("CI") == "true":
     check("secret-scan e2e: git on CI honours GIT_NO_LAZY_FETCH (else the no-lazy-fetch checks prove nothing)", False)
 
 all_heads = " ".join([sweep_main, *sweep_vanished, sweep_gone, "0" * 40, "not-a-sha"])
+first_record = RECORD_HEAD + f"{sweep_gone} scanned\n"
+
+
+def served_in_one_batch(s):
+    """The served tips this clone lacked fetched together, once, and none of them alone."""
+    return all(fetches_of(s.trace, v) == 1 for v in sweep_vanished) and any(
+        all(v in line for v in sweep_vanished) for line in s.trace.splitlines() if "built-in: git fetch" in line)
+
+
 fresh = sweep_clone("fresh")
-r, gone, trace, calls = sweep_lookup(fresh, all_heads, "fresh")
-check("secret-scan e2e (#637): a fresh blob-less clone: the deleted tip a scan read is SCANNED_GONE, the served "
-      "ones are fetched (GitHub is asked only about the deleted one), with one cat-file for all tips"
+s = sweep_lookup(fresh, all_heads, "fresh")
+check("secret-scan e2e (#637, #691): the first run (no record), a fresh blob-less clone: GitHub asked once about every "
+      "tip the clone lacks, the served ones fetched in one batch, the deleted one fetched once alone, its runs looked "
+      "up; it is SCANNED_GONE and DELETED_TIPS, and the record says so; one cat-file for all tips"
       + ("" if lazy_honoured else " (lazy-fetch half skipped: this git ignores GIT_NO_LAZY_FETCH)"),
-      r.returncode == 0 and gone == sweep_gone and all(has_commit(fresh, v) for v in sweep_vanished)
-      and calls.count("graphql") == 1 and not any(v in calls for v in sweep_vanished)
-      and commands(trace, "cat-file") == 1 and (not lazy_honoured or lazy_fetches(trace) == 0),
-      f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone} cat-files={commands(trace, 'cat-file')} "
-      f"lazy={lazy_fetches(trace)} gh={calls.strip()!r}")
-r, gone, trace, calls = sweep_lookup(fresh, all_heads, "again")
-check("secret-scan e2e: run again in the same clone: the same answer, only the deleted tip fetched (batch + alone)",
-      r.returncode == 0 and gone == sweep_gone and commands(trace, "fetch") == 2 and lazy_fetches(trace) == 0
-      and calls.count("graphql") == 1, f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone} "
-      f"fetches={commands(trace, 'fetch')}")
+      s.r.returncode == 0 and s.gone == [sweep_gone] and s.deleted == [sweep_gone]
+      and all(has_commit(fresh, v) for v in sweep_vanished) and served_in_one_batch(s)
+      and fetches_of(s.trace, sweep_gone) == 1 and s.calls.count("graphql") == 1
+      and s.calls.count(f"head_sha={sweep_gone}") == 1 and s.record == first_record and s.output == "record=written\n"
+      and commands(s.trace, "cat-file") == 1 and (not lazy_honoured or lazy_fetches(s.trace) == 0), sweep_detail(s))
+s = sweep_lookup(sweep_clone("rerun"), all_heads, "rerun", temp=sweep_temp("rerun", first_record))
+check("secret-scan e2e (#691): run again on a new runner with the record: the deleted tip neither fetched nor looked "
+      "up, the same answer, the served tips still fetched in one batch, the same record",
+      s.r.returncode == 0 and s.gone == [sweep_gone] and s.deleted == [sweep_gone] and fetches_of(s.trace, sweep_gone) == 0
+      and "actions/runs" not in s.calls and s.calls.count("graphql") == 1 and served_in_one_batch(s)
+      and s.record == first_record and s.output == "record=written\n", sweep_detail(s))
+first_temp = sweep_lookup(fresh, all_heads, "again-1").temp
+s = sweep_lookup(fresh, all_heads, "again", temp=first_temp)
+check("secret-scan e2e: run again in the same clone and RUNNER_TEMP: the same answer, nothing fetched but the "
+      "default branch's tip, nothing looked up, no lazy fetch",
+      s.r.returncode == 0 and s.gone == [sweep_gone] and s.deleted == [sweep_gone] and commands(s.trace, "fetch") == 1
+      and lazy_fetches(s.trace) == 0 and s.calls.count("graphql") == 1 and "actions/runs" not in s.calls
+      and s.record == first_record, sweep_detail(s))
 half = sweep_clone("half")
 git(half, "fetch", "-q", "--no-tags", "--filter=blob:none", "origin", sweep_vanished[1])
-r, gone, trace, calls = sweep_lookup(half, all_heads, "half")
+s = sweep_lookup(half, all_heads, "half")
 check("secret-scan e2e: stopped half-way (one served tip fetched before): the same answer, all served tips here",
-      r.returncode == 0 and gone == sweep_gone and all(has_commit(half, v) for v in sweep_vanished)
-      and (not lazy_honoured or lazy_fetches(trace) == 0), f"exit {r.returncode}: {r.stderr.strip()[-400:]} gone={gone}")
+      s.r.returncode == 0 and s.gone == [sweep_gone] and all(has_commit(half, v) for v in sweep_vanished)
+      and s.record == first_record and (not lazy_honoured or lazy_fetches(s.trace) == 0), sweep_detail(s))
+stale = sweep_temp("stale", first_record)
+(stale / "sweep-record" / "deleted-tips.new").write_text(RECORD_HEAD + f"{sweep_vanished[0]} scanned\n" + "ab" * 7)
+s = sweep_lookup(sweep_clone("stale"), all_heads, "stale", temp=stale)
+check("secret-scan e2e: stopped half-way while writing the record (its .new left beside it): the record read, the "
+      ".new never, and written afresh",
+      s.r.returncode == 0 and s.gone == [sweep_gone] and fetches_of(s.trace, sweep_gone) == 0
+      and has_commit(s.temp.parent / "stale", sweep_vanished[0]) and s.record == first_record
+      and not (stale / "sweep-record" / "deleted-tips.new").exists(), sweep_detail(s))
+older = RECORD_HEAD + "ef" * 20 + " scanned\n"  # a tip the activity record no longer lists
+cut = sweep_temp("cut", older)
+s = sweep_lookup(sweep_clone("cut"), all_heads, "cut", temp=cut, FAKE_RUNS_FAIL="1")
+check("secret-scan e2e (#701): stopped half-way (a runs lookup fails): the job fails, but first keeps what is proven "
+      "so far (none here: the one deleted tip's lookup failed; the old tip the activity record no longer lists dropped), "
+      "written whole and marked for keeping",
+      s.r.returncode == 2 and "cannot list the runs of deleted tip" in s.r.stderr and s.record == RECORD_HEAD
+      and s.output == "record=written\n" and not (cut / "sweep-record" / "deleted-tips.new").exists(), sweep_detail(s))
+s = sweep_lookup(s.temp.parent / "cut", all_heads, "cut-again", temp=cut)
+check("secret-scan e2e: and run again: passes, and the record holds this run's deleted tips only (the old one dropped)",
+      s.r.returncode == 0 and s.gone == [sweep_gone] and s.record == first_record and s.output == "record=written\n",
+      sweep_detail(s))
+s = sweep_lookup(sweep_clone("net"), all_heads, "net", FAKE_NET_FAIL=sweep_gone)
+check("secret-scan e2e (#691): git's fetch of a tip GitHub has no commit for fails for another reason (a network "
+      "error): the job fails, the tip is not taken as deleted, no record",
+      s.r.returncode == 2 and "cannot fetch listed tip" in s.r.stderr and s.record is None and s.output == "",
+      sweep_detail(s))
+
+# The lookup budget (#701, review B major): the token's Actions lookups run out half-way. The job
+# fails, but first keeps what it proved (the deleted tips a scan read so far, and those on the last
+# record), so each next sweep goes on from there and the sweep catches up over a few days instead of
+# failing at the same tip every day. Three deleted tips a scan read, two lookups each, a budget of 3.
+# Each case below is a function of the lookup's code, so that the guard it is about can be removed
+# (the mutants after them) and the case seen to go red.
+budget_tips = ["a1" * 20, "a2" * 20, "a3" * 20]
+budget_heads = " ".join([sweep_main, *budget_tips])
+budget_env = {"gone": " ".join(budget_tips), "scanned": " ".join(budget_tips)}
+e2e_runs = iter(range(10 ** 6))
+
+
+def budget_case(code):
+    n = next(e2e_runs)
+    clone, temp = sweep_clone(f"budget{n}"), sweep_temp(f"budget{n}")
+    runs = [sweep_lookup(clone, budget_heads, f"budget{n}-{k}", code, temp, FAKE_BUDGET="3", **budget_env)
+            for k in range(3)]
+    return ([b.r.returncode for b in runs] == [2, 2, 0]
+            and [b.record for b in runs] == [RECORD_HEAD + "".join(f"{x} scanned\n" for x in budget_tips[:k])
+                                            for k in (1, 2, 3)]
+            and all(b.output == "record=written\n" for b in runs)
+            and "cannot list the jobs of run 101 of deleted tip " + budget_tips[1] in runs[0].r.stderr
+            and runs[2].gone == budget_tips and f"head_sha={budget_tips[0]}" not in runs[1].calls), runs
+
+
+def unreached_case(code):
+    n = next(e2e_runs)
+    s = sweep_lookup(sweep_clone(f"unreached{n}"), budget_heads, f"unreached{n}", code,
+                     sweep_temp(f"unreached{n}", RECORD_HEAD + f"{budget_tips[2]} scanned\n"), FAKE_RUNS_FAIL="1",
+                     **budget_env)
+    return (s.r.returncode == 2 and s.record == RECORD_HEAD + f"{budget_tips[2]} scanned\n"
+            and s.output == "record=written\n"), [s]
+
+
+# The record's write (review B minor 3): whatever an earlier run (or anything else) left at the
+# record's .new path, it is removed first and never written through; the record is written whole to
+# .new and renamed, and marked written only after the rename.
+def link_case(code):
+    n = next(e2e_runs)
+    temp = sweep_temp(f"link{n}", first_record)
+    (temp / "outside").write_text("outside\n")
+    (temp / "sweep-record" / "deleted-tips.new").symlink_to(temp / "outside")
+    s = sweep_lookup(sweep_clone(f"link{n}"), all_heads, f"link{n}", code, temp)
+    return (s.r.returncode == 0 and (temp / "outside").read_text() == "outside\n" and s.record == first_record
+            and not (temp / "sweep-record" / "deleted-tips").is_symlink()
+            and not os.path.lexists(temp / "sweep-record" / "deleted-tips.new")), [s]
+
+
+def newdir_case(code):
+    n = next(e2e_runs)
+    temp = sweep_temp(f"newdir{n}", first_record)
+    (temp / "sweep-record" / "deleted-tips.new" / "x").mkdir(parents=True)
+    s = sweep_lookup(sweep_clone(f"newdir{n}"), all_heads, f"newdir{n}", code, temp)
+    return (s.r.returncode == 0 and s.record == first_record
+            and not os.path.lexists(temp / "sweep-record" / "deleted-tips.new")), [s]
+
+
+kill_stub = sweep_work / "kill-bin"
+kill_stub.mkdir()
+(kill_stub / "mv").write_text("#!/usr/bin/env bash\nkill -9 \"$PPID\"\n")
+(kill_stub / "mv").chmod(0o755)
+
+
+def kill_case(code):
+    n = next(e2e_runs)
+    temp = sweep_temp(f"kill{n}", older)
+    s = sweep_lookup(sweep_clone(f"kill{n}"), all_heads, f"kill{n}", code, temp,
+                     PATH=f"{kill_stub}:{sweep_stub}:{base_env['PATH']}")
+    return (s.r.returncode != 0 and s.record == older and s.output == ""
+            and (temp / "sweep-record" / "deleted-tips.new").read_text() == first_record), [s]
+
+
+def nul_case(code):
+    n = next(e2e_runs)
+    s = sweep_lookup(sweep_clone(f"nul{n}"), all_heads, f"nul{n}", code,
+                     sweep_temp(f"nul{n}", RECORD_HEAD + f"{sweep_gone} scanned\0x\n"), scanned="")
+    return (s.r.returncode == 0 and "record of deleted tips cannot be read" in s.r.stderr and s.gone == []
+            and fetches_of(s.trace, sweep_gone) == 1 and s.record == RECORD_HEAD), [s]
+
+
+E2E_CASES = {
+    "budget": ("(#701): the lookup budget runs out half-way: each run fails, but keeps the tips proven so far (the "
+               "last record's too), so the third run passes with all three recorded", budget_case),
+    "unreached": ("(#701): a runs lookup fails at the first tip: the last record's tips, though not reached, are kept "
+                  "(proven on an earlier day)", unreached_case),
+    "link": ("(#701): a .new left as a link to a file outside: removed, the file it named untouched, the record "
+             "written whole (a plain file)", link_case),
+    "newdir": ("(#701): a .new left as a directory: removed, and the record written", newdir_case),
+    "kill": ("(#701): stopped right before the rename: the last record whole as it was, nothing marked for keeping "
+             "(a half-written record is never kept)", kill_case),
+    "nul": ("(#701): a record with a NUL byte (<id> scanned\\0x; mapfile ends the line at a NUL and a captured one is "
+            "dropped, so it would read as scanned): a "
+            "warning, the tip fetched and looked up as on a first run, not trusted", nul_case),
+}
+for name, (what, case) in E2E_CASES.items():
+    ok, runs = case(lookup_code)
+    check(f"secret-scan e2e {what}", ok, " | ".join(sweep_detail(r) for r in runs))
+# Each guard of the record's write and read, removed: the case about it goes red.
+for what, old, new, cases in (
+    ("the record's partial write before a failed runs lookup",
+     'whether a scan read it is unknown. Re-run the job." >&2\nkeep\nexit 2\n',
+     'whether a scan read it is unknown. Re-run the job." >&2\nexit 2\n', ("budget", "unreached")),
+    ("the removal of a left .new", 'rm -rf -- "$record.new"\n', "", ("link", "newdir")),
+    ("write-then-rename (the record written in place)", '} > "$record.new"\nmv -f -- "$record.new" "$record"\n',
+     '} > "$record"\n', ("kill",)),
+    ("marked written only after the rename",
+     'mv -f -- "$record.new" "$record"\necho "record=written" >> "${GITHUB_OUTPUT:?}"\n',
+     'echo "record=written" >> "${GITHUB_OUTPUT:?}"\nmv -f -- "$record.new" "$record"\n', ("kill",)),
+    ("the NUL check (bytes counted, not captured)", """[[ "$(LC_ALL=C tr -d 'a-z0-9 \\n' < "$record" | wc -c)" -eq 0 ]]""",
+     """[[ -z "$(LC_ALL=C tr -d 'a-z0-9 \\n' < "$record")" ]]""", ("nul",)),
+):
+    flat = stripped_lines(lookup_code)  # the same code without its indentation (no heredoc in it)
+    mutated = flat.replace(old, new)
+    check(f"secret-scan e2e (#701): without {what}, the case about it goes red",
+          mutated != flat and E2E_CASES[cases[0]][1](flat)[0] and not any(E2E_CASES[c][1](mutated)[0] for c in cases),
+          "unchanged" if mutated == flat else "still green")
+
+# A record that cannot be read, however it came about: a warning, every tip checked as on a first
+# run, and the record written afresh. Never "skip all".
+corrupt = sweep_clone("corrupt")
+git(corrupt, "fetch", "-q", "--no-tags", "--filter=blob:none", "origin", *sweep_vanished)
+huge_record = RECORD_HEAD + "".join(f"{i} scanned\n" for i in (hashlib.sha1(str(n).encode()).hexdigest()
+                                                                for n in range(4000000 // 48 + 1000)))
+for n, (what, record) in enumerate({
+    "garbage": "not a record\n",
+    "an empty file": "",
+    "no header": f"{sweep_gone} scanned\n",
+    "another version's header (the cache's, with unscanned lines)": f"fork secret sweep record 1\n{sweep_gone} scanned\n",
+    "a later version's header": f"fork secret sweep record 3\n{sweep_gone} scanned\n",
+    "a NUL byte (bash would drop it: scan\\0ned read as scanned)": RECORD_HEAD + f"{sweep_gone} scan\0ned\n",
+    "a NUL byte in the header": "fork secret sweep record 2\0\n" + f"{sweep_gone} scanned\n",
+    "CRLF line ends": f"fork secret sweep record 2\r\n{sweep_gone} scanned\r\n",
+    "a line cut short": RECORD_HEAD + sweep_gone[:20],
+    "a duplicate line": RECORD_HEAD + f"{sweep_gone} scanned\n" * 2,
+    "an id in capitals": RECORD_HEAD + f"{sweep_gone.upper()} scanned\n",
+    "an unknown state": RECORD_HEAD + f"{sweep_gone} maybe\n",
+    "the cache's unscanned state": RECORD_HEAD + f"{sweep_gone} unscanned\n",
+    "a trailing space": RECORD_HEAD + f"{sweep_gone} scanned \n",
+    "a short id": RECORD_HEAD + f"{sweep_gone[:39]} scanned\n",
+    "over the size limit": huge_record + f"{sweep_gone} scanned\n",
+    "a directory": None,
+    "a symlink to a good record": None,
+}.items()):
+    temp = sweep_temp(f"corrupt{n}", record)
+    if what == "a directory":
+        (temp / "sweep-record" / "deleted-tips").mkdir(parents=True)
+    if what == "a symlink to a good record":
+        (temp / "good").write_text(first_record)
+        (temp / "sweep-record").mkdir()
+        (temp / "sweep-record" / "deleted-tips").symlink_to(temp / "good")
+    s = sweep_lookup(corrupt, all_heads, f"corrupt{n}", temp=temp)
+    check(f"secret-scan e2e (#691): a record with {what}: a warning, every tip checked as on a first run, the record "
+          "written afresh",
+          s.r.returncode == 0 and "record of deleted tips cannot be read" in s.r.stderr and s.gone == [sweep_gone]
+          and fetches_of(s.trace, sweep_gone) == 1 and s.calls.count(f"head_sha={sweep_gone}") == 1
+          and s.record == first_record and s.output == "record=written\n", sweep_detail(s))
+s = sweep_lookup(corrupt, all_heads, "good", temp=sweep_temp("good", first_record))
+check("secret-scan e2e: a good record: no warning", s.r.returncode == 0 and "cannot be read" not in s.r.stderr
+      and fetches_of(s.trace, sweep_gone) == 0, sweep_detail(s))
+
+# A tip that comes back: the record says deleted, but GitHub shows it again (or a ref holds it).
+back = RECORD_HEAD + "".join(f"{t} scanned\n" for t in (sweep_vanished[0], sweep_main, sweep_gone))
+back_clone = sweep_clone("back")
+s = sweep_lookup(back_clone, all_heads, "back", temp=sweep_temp("back", back))
+check("secret-scan e2e (#691): a recorded tip GitHub shows again: fetched with the batch (so scanned), not SCANNED_GONE "
+      "nor DELETED_TIPS, and dropped from the record; one a ref holds again is dropped too",
+      s.r.returncode == 0 and s.gone == [sweep_gone] and s.deleted == [sweep_gone] and has_commit(back_clone, sweep_vanished[0])
+      and served_in_one_batch(s) and s.record == first_record, sweep_detail(s))
+unscanned_clone = sweep_clone("unscanned")
+s = sweep_lookup(unscanned_clone, all_heads, "unscanned-1", scanned="")
+s = sweep_lookup(unscanned_clone, all_heads, "unscanned", temp=s.temp, scanned="")
+check("secret-scan e2e (#701): a deleted tip no scan is known to have read: fetched again every run (so one git serves "
+      "again is scanned), its runs looked up again every run (a scan of it may yet be found), and left off the record",
+      s.r.returncode == 0 and s.gone == [] and s.deleted == [sweep_gone] and fetches_of(s.trace, sweep_gone) == 1
+      and s.calls.count(f"head_sha={sweep_gone}") == 1 and s.record == RECORD_HEAD, sweep_detail(s))
+s = sweep_lookup(unscanned_clone, all_heads, "found", temp=s.temp)
+check("secret-scan e2e: and once a scan of it is found: SCANNED_GONE, and recorded as read",
+      s.r.returncode == 0 and s.gone == [sweep_gone] and s.record == first_record, sweep_detail(s))
+s = sweep_lookup(sweep_clone("reviewed"), all_heads + " " + sweep_gone2, "reviewed", branch="reviewed")
+check("secret-scan e2e (#691): a deleted tip on the default branch's reviewed list: fetched once, its runs not looked "
+      "up, DELETED_TIPS but not SCANNED_GONE, and not on the record",
+      s.r.returncode == 0 and s.gone == [sweep_gone] and sorted(s.deleted) == sorted([sweep_gone, sweep_gone2])
+      and fetches_of(s.trace, sweep_gone2) == 1 and f"head_sha={sweep_gone2}" not in s.calls
+      and s.record == first_record, sweep_detail(s))
+s = sweep_lookup(sweep_clone("reviewed-again"), all_heads + " " + sweep_gone2, "reviewed-again", branch="reviewed",
+                 temp=s.temp)
+check("secret-scan e2e (#701, review A minor 1): and run again with that record: the reviewed tip is fetched again "
+      "(git may serve it again; then it is scanned), the recorded one is not",
+      s.r.returncode == 0 and fetches_of(s.trace, sweep_gone2) == 1 and fetches_of(s.trace, sweep_gone) == 0
+      and s.record == first_record, sweep_detail(s))
+served_again = sweep_clone("served-again")
+s = sweep_lookup(served_again, all_heads, "served-again", temp=sweep_temp("served-again", first_record),
+                 gone=f"{sweep_gone} {sweep_vanished[0]}", scanned="")
+check("secret-scan e2e (#701, review A minor 1): a tip GitHub's API has no commit for, off the record, that git serves "
+      "again: fetched (so scanned), not deleted, not recorded",
+      s.r.returncode == 0 and s.deleted == [sweep_gone] and has_commit(served_again, sweep_vanished[0])
+      and fetches_of(s.trace, sweep_vanished[0]) == 1 and s.record == first_record, sweep_detail(s))
+late, kept = "ef" * 20, "12" * 20  # origin has neither; GitHub shows both at first, then only kept
+late_clone = sweep_clone("late")
+s = sweep_lookup(late_clone, " ".join([*sweep_vanished, late, kept]), "late", FAKE_LATE=late, scanned=late)
+check("secret-scan e2e (#691): GitHub shows two tips git cannot fetch: the batch fails, so one by one (the served "
+      "ones still fetched); GitHub asked again: the one it deleted meanwhile is deleted (no third fetch), the one "
+      "it still shows stays listed and out of the record (the scan script fails on it)",
+      s.r.returncode == 0 and s.gone == [late] and s.deleted == [late] and fetches_of(s.trace, late) == 2
+      and fetches_of(s.trace, kept) == 2 and s.calls.count("graphql") == 2
+      and all(has_commit(late_clone, v) for v in sweep_vanished) and s.record == RECORD_HEAD + f"{late} scanned\n",
+      sweep_detail(s))
+served_null = sweep_clone("served-null")
+s = sweep_lookup(served_null, all_heads, "served-null", gone=f"{sweep_gone} {sweep_vanished[0]}")
+check("secret-scan e2e (#691): GitHub's API has no commit for a tip git still serves: git's one fetch gets it (so "
+      "it is scanned), and it is not deleted",
+      s.r.returncode == 0 and s.deleted == [sweep_gone] and has_commit(served_null, sweep_vanished[0])
+      and s.record == first_record, sweep_detail(s))
 served = sweep_clone("served")
-r, gone, trace, calls = sweep_lookup(served, " ".join(sweep_vanished), "served")
-check("secret-scan e2e: no tip gone: one batch fetch, nothing one by one, GitHub not asked",
-      r.returncode == 0 and gone == "" and commands(trace, "fetch") == 1 and calls == ""
-      and all(has_commit(served, v) for v in sweep_vanished),
-      f"exit {r.returncode}: {r.stderr.strip()[-400:]} fetches={commands(trace, 'fetch')} gh={calls.strip()!r}")
-r, gone, trace, calls = sweep_lookup(sweep_clone("empty"), "", "empty")
-check("secret-scan e2e: no tips listed: passes with nothing fetched or asked",
-      r.returncode == 0 and gone == "" and commands(trace, "fetch") == 0 and calls == "",
-      f"exit {r.returncode}: {r.stderr.strip()[-400:]}")
+s = sweep_lookup(served, " ".join(sweep_vanished), "served")
+check("secret-scan e2e: no tip deleted: GitHub asked once, one batch fetch, nothing one by one or looked up, an "
+      "empty record",
+      s.r.returncode == 0 and s.gone == [] and s.deleted == [] and served_in_one_batch(s) and s.calls.count("graphql") == 1
+      and "actions/runs" not in s.calls and all(has_commit(served, v) for v in sweep_vanished) and s.record == RECORD_HEAD,
+      sweep_detail(s))
+s = sweep_lookup(sweep_clone("empty"), "", "empty", temp=sweep_temp("empty", first_record))
+check("secret-scan e2e: no tips listed: passes with nothing fetched or asked, and an empty record",
+      s.r.returncode == 0 and s.gone == [] and commands(s.trace, "fetch") == 0 and s.calls == "" and s.record == RECORD_HEAD,
+      sweep_detail(s))
 not_a_clone = sweep_work / "not-a-clone"
 not_a_clone.mkdir()
-r, gone, _, calls = sweep_lookup(not_a_clone, all_heads, "no-clone")
-check("secret-scan e2e: no clone (cat-file fails): the job fails before asking GitHub anything",
-      r.returncode == 2 and gone is None and calls == "" and "cannot check which listed tips" in r.stderr,
-      f"exit {r.returncode}: {r.stderr.strip()[-400:]}")
+s = sweep_lookup(not_a_clone, all_heads, "no-clone", temp=sweep_temp("no-clone", first_record))
+check("secret-scan e2e: no clone (cat-file fails): the job fails before asking GitHub anything; the record untouched",
+      s.r.returncode == 2 and s.gone is None and s.calls == "" and "cannot check which listed tips" in s.r.stderr
+      and s.record == first_record and s.output == "", sweep_detail(s))
+
+# #701, end to end: the record's read step, as the workflow has it, with a gh stub that serves canned
+# answers through the real jq (as gh's --jq does) and archives built here. It takes the record only
+# from the newest run of fork-secret-sweep.yml (that path; schedule or workflow_dispatch; this branch;
+# this repository, not a fork; completed, success or failure; not this run; whose commit this run's
+# has) and its one live artifact of that name; never unpacks the archive (exactly one plain file
+# named deleted-tips, read in memory), checks every line, and on any doubt warns and leaves no record
+# (a first run). Run again, stopped half-way (a zip or record left in RUNNER_TEMP), a link where the
+# record's folder goes, reset_record, a tag: the same.
+read_work = pathlib.Path(tempfile.mkdtemp(prefix="fork-contracts-read-"))
+read_stub = read_work / "bin"
+read_stub.mkdir()
+(read_stub / "gh").write_text(r"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+if [[ -n "${FAKE_FAIL:-}" && "$*" == *"$FAKE_FAIL"* ]]; then echo "gh stub: HTTP 502" >&2; exit 1; fi
+filter="" path=""
+args=("$@")
+for ((i = 1; i < ${#args[@]}; i++)); do
+  case "${args[i]}" in
+    --jq) filter="${args[i + 1]}"; i=$((i + 1)) ;;
+    -X|-f) i=$((i + 1)) ;;
+    *) [[ -n "$path" ]] || path="${args[i]}" ;;
+  esac
+done
+case "$path" in
+  repos/me/t3code/actions/workflows/fork-secret-sweep.yml/runs) file="$FAKE_DIR/runs.json" ;;
+  repos/me/t3code/actions/runs/*/artifacts) id="${path#*/actions/runs/}"; file="$FAKE_DIR/artifacts-${id%/artifacts}.json" ;;
+  repos/me/t3code/compare/*) base="${path#*/compare/}"; file="$FAKE_DIR/compare-${base%%...*}.json" ;;
+  repos/me/t3code/actions/artifacts/*/zip) id="${path#*/actions/artifacts/}"; cat "$FAKE_DIR/zip-${id%/zip}.zip"; exit ;;
+  *) echo "gh stub: unexpected call: $*" >&2; exit 97 ;;
+esac
+[[ -e "$file" ]] || file="$FAKE_DIR/default-${path##*/}.json"
+if [[ -n "$filter" ]]; then jq -r "$filter" < "$file"; else cat "$file"; fi
+""")
+(read_stub / "gh").chmod(0o755)
+SWEEP_PATH = ".github/workflows/fork-secret-sweep.yml"
+read_sha = {n: hashlib.sha1(f"commit {n}".encode()).hexdigest() for n in range(800, 810)}
+good_record = RECORD_HEAD + f"{sweep_gone} scanned\n"
+other_record = RECORD_HEAD + f"{sweep_gone2} scanned\n"  # what a run the step must not read kept
+
+
+def a_run(n, **kw):
+    return {"id": n, "head_sha": read_sha[n], "path": SWEEP_PATH, "event": "schedule", "head_branch": "main",
+            "repository": {"full_name": "me/t3code"}, "head_repository": {"full_name": "me/t3code"},
+            "status": "completed", "conclusion": "success", **kw}
+
+
+def an_artifact(n, run, **kw):
+    return {"id": n, "name": "fork-secret-sweep-record", "expired": False, "size_in_bytes": 200,
+            "workflow_run": {"id": run}, **kw}
+
+
+def a_zip(members):
+    """An archive of (ZipInfo or name, bytes) members."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for info, data in members:
+            z.writestr(info, data)
+    return buf.getvalue()
+
+
+def zip_info(name, mode=0o100644):
+    info = zipfile.ZipInfo(name)
+    info.external_attr = mode << 16
+    return info
+
+
+def encrypted(data):
+    """The archive with its members marked encrypted (Python's writer clears the flag as it writes)."""
+    data = bytearray(data)
+    for sig, at in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        i = data.find(sig)
+        while i >= 0:
+            data[i + at] |= 1
+            i = data.find(sig, i + 4)
+    return bytes(data)
+
+
+good_zip = a_zip([("deleted-tips", good_record)])
+other_zip = a_zip([("deleted-tips", other_record)])
+read_runs = iter(range(10 ** 6))
+
+
+def read_record(code, runs=None, artifacts=None, zips=None, compare=None, temp=None, before=None, **env):
+    """Runs the read step in a new RUNNER_TEMP (or temp); by default the newest sweep run (801) kept
+    the good record. Returns its exit, stderr, the record it leaves (None: none), what else is left in
+    RUNNER_TEMP, and the gh calls."""
+    n = next(read_runs)
+    fake = read_work / f"fake{n}"
+    fake.mkdir()
+    temp = temp or read_work / f"temp{n}"
+    temp.mkdir(exist_ok=True)
+    if before:
+        before(temp)
+    (fake / "runs.json").write_text(json.dumps({"workflow_runs": [a_run(801)] if runs is None else runs}))
+    (fake / "default-artifacts.json").write_text(json.dumps({"artifacts": []}))
+    for run, arts in ({801: [an_artifact(901, 801)]} if artifacts is None else artifacts).items():
+        (fake / f"artifacts-{run}.json").write_text(json.dumps({"artifacts": arts}))
+    for art, data in ({901: good_zip} if zips is None else zips).items():
+        (fake / f"zip-{art}.zip").write_bytes(data)
+    for sha in read_sha.values():
+        (fake / f"compare-{sha}.json").write_text(json.dumps({"status": (compare or {}).get(sha, "ahead")}))
+    gh_log = fake / "gh.log"
+    gh_log.write_text("")
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", code], cwd=read_work,
+                       env={**base_env, "PATH": f"{read_stub}:{base_env['PATH']}", "GITHUB_REPOSITORY": "me/t3code",
+                            "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ID": "900", "GITHUB_SHA": "f" * 40,
+                            "RUNNER_TEMP": str(temp), "RESET": "false", "GH_TOKEN": "x", "FAKE_DIR": str(fake),
+                            "GH_LOG": str(gh_log), **env}, capture_output=True, text=True)
+    record = temp / "sweep-record" / "deleted-tips"
+    return types.SimpleNamespace(
+        r=r, out=r.stdout + r.stderr, record=record.read_text() if record.is_file() and not record.is_symlink() else None, temp=temp,
+        left=sorted(str(p.relative_to(temp)) for p in temp.rglob("*") if p != record and p != record.parent),
+        calls=gh_log.read_text())
+
+
+def read_detail(s):
+    return (f"exit {s.r.returncode}: {s.out.strip()[-500:]!r} record={s.record!r} left={s.left} "
+            f"gh={s.calls.strip()[-500:]!r}")
+
+
+def read_as(want, frm=801):
+    """The case's check: the record from run frm (want: its text), or none and a warning."""
+    def ok(s):
+        if want is None:
+            return (s.r.returncode == 0 and s.record is None and "::warning title=Secret scan::" in s.out
+                    and "checked as on a first run" in s.out and "sweep-record.zip" not in s.left)
+        return (s.r.returncode == 0 and s.record == want and f"the sweep's record from run {frm}:" in s.out
+                and "::warning" not in s.out and s.left == [])
+    return ok
+
+
+def two_runs(bad):
+    """The newest run (802) is one the step must not read, with a record of its own; 801 is good."""
+    return {"runs": [a_run(802, **bad), a_run(801)],
+            "artifacts": {802: [an_artifact(902, 802)], 801: [an_artifact(901, 801)]},
+            "zips": {902: other_zip, 901: good_zip}}
+
+
+def link_before(temp):
+    (temp / "outside").mkdir()
+    (temp / "outside" / "keep").write_text("keep\n")
+    (temp / "sweep-record").symlink_to(temp / "outside")
+
+
+def stale_before(temp):
+    (temp / "sweep-record").mkdir()
+    (temp / "sweep-record" / "deleted-tips").write_text(other_record)
+    (temp / "sweep-record.zip").write_bytes(other_zip)
+
+
+huge_lines = RECORD_HEAD + "".join(f"{hashlib.sha1(str(n).encode()).hexdigest()} scanned\n" for n in range(4000000 // 48 + 10))
+READ_CASES = {
+    "the newest sweep run's record": ({}, read_as(good_record)),
+    "a plain file with its type in the mode (as upload-artifact writes it)": (
+        {"zips": {901: a_zip([(zip_info("deleted-tips"), good_record)])}}, read_as(good_record)),
+    "a device file in the archive": ({"zips": {901: a_zip([(zip_info("deleted-tips", 0o20644), good_record)])}}, read_as(None)),
+    "a header-only record (no deleted tip a scan read)": (
+        {"zips": {901: a_zip([("deleted-tips", RECORD_HEAD)])}}, read_as(RECORD_HEAD)),
+    "reset_record: no record, nothing asked": ({"RESET": "true"}, lambda s: read_as(None)(s) and s.calls == ""),
+    "a run on a tag: no record, nothing asked": (
+        {"GITHUB_REF": "refs/tags/v1"}, lambda s: read_as(None)(s) and s.calls == ""),
+    "no sweep run kept one yet (or it expired): a first run": ({"runs": []}, read_as(None)),
+    "the newest run kept none: the one before": (
+        {"runs": [a_run(802), a_run(801)]}, lambda s: read_as(good_record)(s) and "runs/802/artifacts" in s.calls),
+    "this run itself listed: skipped": (
+        {**two_runs({}), "runs": [a_run(800, id=900), a_run(801)], "artifacts": {900: [an_artifact(902, 900)],
+                                                                                  801: [an_artifact(901, 801)]}},
+        read_as(good_record)),
+    "another workflow's run (fork-tests.yml)": (two_runs({"path": ".github/workflows/fork-tests.yml"}), read_as(good_record)),
+    "the scan workflow's own run (a push's)": (two_runs({"path": ".github/workflows/fork-secret-scan.yml"}), read_as(good_record)),
+    "a pull request's run": (two_runs({"event": "pull_request"}), read_as(good_record)),
+    "a push's run": (two_runs({"event": "push"}), read_as(good_record)),
+    "another branch's run": (two_runs({"head_branch": "feature"}), read_as(good_record)),
+    "a fork's run (head repository)": (two_runs({"head_repository": {"full_name": "other/t3code"}}), read_as(good_record)),
+    "another repository's run": (two_runs({"repository": {"full_name": "other/t3code"}}), read_as(good_record)),
+    "a cancelled run": (two_runs({"conclusion": "cancelled"}), read_as(good_record)),
+    "a run still in progress": (two_runs({"status": "in_progress", "conclusion": None}), read_as(good_record)),
+    "a failed run (its record is whole: the scan step wrote it)": (
+        {**two_runs({"conclusion": "failure"}), "zips": {902: good_zip, 901: other_zip}}, read_as(good_record, 802)),
+    "a run whose commit this branch lacks (diverged)": (
+        {**two_runs({}), "compare": {read_sha[802]: "diverged"}}, read_as(good_record)),
+    "a run whose commit is ahead of this one (behind)": (
+        {**two_runs({}), "compare": {read_sha[802]: "behind"}}, read_as(good_record)),
+    "an expired artifact": (
+        {**two_runs({}), "artifacts": {802: [an_artifact(902, 802, expired=True)], 801: [an_artifact(901, 801)]}},
+        read_as(good_record)),
+    "an artifact of another name": (
+        {**two_runs({}), "artifacts": {802: [an_artifact(902, 802, name="x")], 801: [an_artifact(901, 801)]}},
+        read_as(good_record)),
+    "an artifact another run kept": (
+        {**two_runs({}), "artifacts": {802: [an_artifact(902, 999)], 801: [an_artifact(901, 801)]}},
+        read_as(good_record)),
+    "two artifacts of that name: no record": (
+        {**two_runs({}), "artifacts": {802: [an_artifact(902, 802), an_artifact(903, 802)]}}, read_as(None)),
+    "an artifact listed over 4 MB": ({"artifacts": {801: [an_artifact(901, 801, size_in_bytes=4000001)]}}, read_as(None)),
+    "an archive bigger than 4 MB (a good one behind 4 MB of junk, which zipfile still reads)": (
+        {"zips": {901: b"\0" * 4000001 + good_zip}}, read_as(None)),
+    "the runs cannot be listed": ({"FAKE_FAIL": "actions/workflows"}, read_as(None)),
+    "the artifacts cannot be listed": ({"FAKE_FAIL": "/artifacts -f"}, read_as(None)),
+    "the commits cannot be compared": ({"FAKE_FAIL": "compare/"}, read_as(None)),
+    "the archive cannot be downloaded": ({"zips": {}}, read_as(None)),
+    "a stopped run's zip and record left in RUNNER_TEMP, and no record now": (
+        {"runs": [], "before": stale_before}, lambda s: read_as(None)(s) and s.left == []),
+    "a stopped run's zip and record left, then a good one": ({"before": stale_before}, read_as(good_record)),
+    "a link where the record's folder goes: removed, its target untouched": (
+        {"before": link_before}, lambda s: s.r.returncode == 0 and s.record == good_record
+        and "the sweep's record from run 801:" in s.out and s.left == ["outside", "outside/keep"]
+        and (s.temp / "outside" / "keep").read_text() == "keep\n" and not (s.temp / "sweep-record").is_symlink()),
+    "an archive that is no zip": ({"zips": {901: b"not a zip"}}, read_as(None)),
+    "an empty archive": ({"zips": {901: a_zip([])}}, read_as(None)),
+    "two files in the archive": ({"zips": {901: a_zip([("deleted-tips", good_record), ("x", "x")])}}, read_as(None)),
+    "the record as a link in the archive": (
+        {"zips": {901: a_zip([(zip_info("deleted-tips", 0o120777), "/etc/passwd")])}}, read_as(None)),
+    "the record as a folder in the archive": ({"zips": {901: a_zip([(zip_info("deleted-tips/", 0o40755), "")])}}, read_as(None)),
+    "a path out of the folder (../deleted-tips)": ({"zips": {901: a_zip([("../deleted-tips", good_record)])}}, read_as(None)),
+    "a path in a subfolder (x/deleted-tips)": ({"zips": {901: a_zip([("x/deleted-tips", good_record)])}}, read_as(None)),
+    "another file name": ({"zips": {901: a_zip([("record", good_record)])}}, read_as(None)),
+    "an encrypted member": ({"zips": {901: encrypted(good_zip)}}, read_as(None)),
+    "a record over 4 MB": ({"zips": {901: a_zip([("deleted-tips", huge_lines)])}}, read_as(None)),
+    "a NUL byte": ({"zips": {901: a_zip([("deleted-tips", RECORD_HEAD + f"{sweep_gone} scanned\0x\n")])}}, read_as(None)),
+    "CRLF line ends": ({"zips": {901: a_zip([("deleted-tips", good_record.replace("\n", "\r\n"))])}}, read_as(None)),
+    "a duplicate line": ({"zips": {901: a_zip([("deleted-tips", good_record + f"{sweep_gone} scanned\n")])}}, read_as(None)),
+    "the cache's header (record 1)": (
+        {"zips": {901: a_zip([("deleted-tips", good_record.replace("record 2", "record 1"))])}}, read_as(None)),
+    "the cache's unscanned state": (
+        {"zips": {901: a_zip([("deleted-tips", RECORD_HEAD + f"{sweep_gone} unscanned\n")])}}, read_as(None)),
+    "a line cut short (no newline at the end)": ({"zips": {901: a_zip([("deleted-tips", good_record[:-1])])}}, read_as(None)),
+    "an id in capitals": ({"zips": {901: a_zip([("deleted-tips", good_record.upper().replace("FORK SECRET SWEEP RECORD", "fork secret sweep record").replace(" SCANNED", " scanned"))])}}, read_as(None)),
+    "no header": ({"zips": {901: a_zip([("deleted-tips", f"{sweep_gone} scanned\n")])}}, read_as(None)),
+}
+read_code = (read_step(real) or {}).get("run", "exit 99\n")  # (no read step: every case red)
+
+
+def read_results(code, names=None, first_red=False):
+    """Each case's (ok, run); with first_red, stops at the first red one (a mutant needs only one)."""
+    out = {}
+    for name, (setup, ok) in READ_CASES.items():
+        if names is not None and name not in names:
+            continue
+        setup = dict(setup)
+        s = read_record(code, setup.pop("runs", None), setup.pop("artifacts", None), setup.pop("zips", None),
+                        setup.pop("compare", None), before=setup.pop("before", None), **setup)
+        out[name] = (bool(ok(s)), s)
+        if first_red and not out[name][0]:
+            break
+    return out
+
+
+for name, (ok, s) in read_results(read_code).items():
+    check(f"secret-scan e2e (#701): the record's read step, {name}", ok, read_detail(s))
+# The read step, then the scan step's lookup on that RUNNER_TEMP: the deleted tip the last sweep's scan
+# read is neither fetched nor looked up.
+s = read_record(read_code)
+s = sweep_lookup(sweep_clone("read-then-scan"), all_heads, "read-then-scan", temp=s.temp)
+check("secret-scan e2e (#701): the record the read step left is the one the scan step reads: the tip it lists "
+      "neither fetched nor looked up",
+      s.r.returncode == 0 and s.gone == [sweep_gone] and fetches_of(s.trace, sweep_gone) == 0
+      and "actions/runs" not in s.calls and s.record == first_record, sweep_detail(s))
+# Each of the read step's guards, removed: a case above goes red. (Two are only belts and braces, so no
+# mutant: a run not completed has no conclusion yet, and zipfile will not read an encrypted member.)
+for what, old, new in (
+    ("the workflow path check", '.path == ".github/workflows/fork-secret-sweep.yml" and ', ""),
+    ("the event check", '(.event == "schedule" or .event == "workflow_dispatch")', "true"),
+    ("the branch check", ".head_branch == env.BRANCH and ", ""),
+    ("the repository check", ".repository.full_name == env.GITHUB_REPOSITORY\n", "true\n"),
+    ("the head repository check", ".head_repository.full_name == env.GITHUB_REPOSITORY and ", ""),
+    ("the conclusion check", '(.conclusion == "success" or .conclusion == "failure")', "true"),
+    ("this run's own skip", ' && "$id" != "$GITHUB_RUN_ID"', ""),
+    ("the artifact's name check", 'select(.name == "fork-secret-sweep-record" and ', "select("),
+    ("the expired check", ".expired == false and ", ""),
+    ("the artifact's run check", " and (.workflow_run.id | tostring) == env.RUN", ""),
+    ("the one-artifact check", 'else error("more than one") end', 'else "\\(.[0].id) \\(.[0].size_in_bytes)" end'),
+    ("the ancestor check", '[[ "$has" == ahead || "$has" == identical ]] || continue', ":"),
+    ("the listed size check", ' && "$size" -le 4000000', ""),
+    ("the archive's size check", '[[ "$(stat -c %s -- "$zip")" -le 4000000 ]] ||', ": ||"),
+    ("reset_record", '[[ "$RESET" != true ]] ||', ": ||"),
+    ("the tag check", '[[ "$GITHUB_REF" == refs/heads/* ]] ||', ": ||"),
+    ("the one-member check", "[m] = z.infolist()", "m = z.infolist()[0]"),
+    ("the member's name check", 'm.filename != "deleted-tips" or ', ""),
+    ("the plain-file check", "m.is_dir() or stat.S_IFMT(mode) not in (0, stat.S_IFREG)", "False"),
+    ("the whole-text match", "re.fullmatch(", "re.match("),
+    ("the duplicate check", "if len(set(tips)) != len(tips):", "if False:"),
+    ("the fresh folder", 'rm -rf -- "$dir" "$zip"\n', ""),
+):
+    mutated = read_code.replace(old, new)
+    results = read_results(mutated, first_red=True) if mutated != read_code else {}
+    check(f"secret-scan e2e (#701): the record's read step without {what}: a case above goes red",
+          mutated != read_code and not all(ok for ok, _ in results.values()),
+          "unchanged" if mutated == read_code else "every case still green")
 
 # #637, end to end: the lists' hand-over, as the workflow has it (from the token's unset to the end),
 # in a clone whose origin's default branch holds a stub scan script that reports what it was given.
 # The sweep of 11-20's dispatch got past the lookup and then failed here: OLD_HEADS (every activity
 # entry's before and after, 131 KB) went out as one environment string, over the kernel's 128 KiB,
 # and the next program (git) could not start ("Argument list too long", exit 126). Also: a list
-# too long even with each id once (only the file carries it), small and empty lists, and the files
-# of an earlier or stopped run left in RUNNER_TEMP (written afresh, nothing of theirs read).
+# too long even with each id once (only the file carries it), small and empty lists, the files
+# of an earlier or stopped run left in RUNNER_TEMP (written afresh, nothing of theirs read), and
+# (#691) a default branch whose script predates the files: a list too long to export fails the job.
 def handoff_code(run):
     start = run.find("unset LOOKUP_TOKEN\n")
     return run[start:] if start >= 0 else "exit 99\n"
@@ -1695,38 +2648,46 @@ def handoff_code(run):
 handoff_origin = sweep_work / "handoff-origin"
 (handoff_origin / ".github" / "scripts").mkdir(parents=True)
 git(handoff_origin, "init", "-q", "-b", "main")
-(handoff_origin / ".github" / "scripts" / "fork-secret-scan.sh").write_text(r"""#!/usr/bin/env bash
+handoff_script = handoff_origin / ".github" / "scripts" / "fork-secret-scan.sh"
+handoff_script.write_text(r"""#!/usr/bin/env bash
 set -euo pipefail
 printf 'env_old=%s\nenv_gone=%s\n' "${OLD_HEADS+set}" "${SCANNED_GONE+set}"
 printf 'env_old_words=%s\n' "$(wc -w <<< "${OLD_HEADS:-}")"
 printf 'file_old=%s\nfile_gone=%s\nupstream=%s\n' "${OLD_HEADS_FILE:-}" "${SCANNED_GONE_FILE:-}" "${UPSTREAM-unset}"
+printf 'file_deleted=%s\n' "${DELETED_TIPS_FILE:-}"
 """)
 git(handoff_origin, "add", "-A")
 git(handoff_origin, "commit", "-q", "-m", "stub scan script")
+git(handoff_origin, "checkout", "-q", "-b", "old")
+handoff_script.write_text("#!/usr/bin/env bash\nprintf 'old_script=ran\\nenv_old_words=%s\\n' \"$(wc -w <<< \"${OLD_HEADS:-}\")\"\n")
+git(handoff_origin, "commit", "-q", "-am", "a scan script from before the files")
+git(handoff_origin, "checkout", "-q", "main")
 handoff_clone = sweep_work / "handoff-clone"
 git(sweep_work, "clone", "-q", f"file://{handoff_origin}", str(handoff_clone))
 handoff_temp = sweep_work / "handoff-temp"
 handoff_temp.mkdir()
 
 
-def handoff(old_heads, scanned_gone, label, code=None):
+def handoff(old_heads, scanned_gone, label, code=None, deleted="", branch="main"):
     """Runs the hand-over with these lists (shell variables, as the lookups leave them); returns
-    (exit, stub report, the words of the old-heads file, the words of the scanned-gone file)."""
-    (sweep_work / f"{label}.old").write_text(old_heads)
-    (sweep_work / f"{label}.gone").write_text(scanned_gone)
+    (exit, stub report, the words of the old-heads file, the words of the scanned-gone file, the
+    words of the deleted-tips file)."""
+    for ext, text in (("old", old_heads), ("gone", scanned_gone), ("deleted", deleted)):
+        (sweep_work / f"{label}.{ext}").write_text(text)
     script = ('set -euo pipefail\nUPSTREAM=up/stream\nLOOKUP_TOKEN=x\n'
               f'OLD_HEADS="$(cat {sweep_work / (label + ".old")})"\n'
               f'SCANNED_GONE="$(cat {sweep_work / (label + ".gone")})"\n'
+              f'DELETED_TIPS="$(cat {sweep_work / (label + ".deleted")})"\n'
               + (code or handoff_code(scan_step(real)["run"])))
     r = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=handoff_clone,
-                       env={**base_env, "RUNNER_TEMP": str(handoff_temp), "CONFIG_BRANCH": "main",
+                       env={**base_env, "RUNNER_TEMP": str(handoff_temp), "CONFIG_BRANCH": branch,
                             "GIT_CEILING_DIRECTORIES": str(sweep_work)}, capture_output=True, text=True)
     report = dict(re.findall(r"^(\w+)=(.*)$", r.stdout, re.M))
 
     def words(key):
         path = report.get(key) or ""
         return pathlib.Path(path).read_text().split() if path and pathlib.Path(path).is_file() else None
-    return r, report, words("file_old"), words("file_gone")
+    return r, report, words("file_old"), words("file_gone"), words("file_deleted")
 
 
 def ids(n, salt):
@@ -1736,29 +2697,41 @@ def ids(n, salt):
 day_ids = ids(1700, "tip")  # the 11-20 shape: each id twice (a push's after is the next one's before)
 day_gone = ids(130, "gone")
 day_list = "\n".join(x for i in day_ids for x in (i, i)) + "\n"
-r, rep_, old_words, gone_words = handoff(day_list, " ".join(day_gone) + " ", "day")
+r, rep_, old_words, gone_words, deleted_words = handoff(day_list, " ".join(day_gone) + " ", "day",
+                                                        deleted=" ".join(day_gone) + " ")
 check("secret-scan e2e (#637): a list over 128 KiB: the scan script starts, the lists reach it in files (each id once), "
       "the variables are still exported for an older script while they fit",
       len(day_list) > 131072 and r.returncode == 0 and old_words == sorted(day_ids) and gone_words == day_gone
-      and rep_.get("env_old") == "set" and rep_.get("env_old_words") == str(len(day_ids))
+      and deleted_words == day_gone and rep_.get("env_old") == "set" and rep_.get("env_old_words") == str(len(day_ids))
       and rep_.get("env_gone") == "set" and rep_.get("upstream") == "up/stream",
       f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_} old={len(old_words or [])}")
 huge_ids = ids(3000, "huge")
-r, rep_, old_words, _ = handoff("\n".join(huge_ids), "", "huge")
+r, rep_, old_words, _, _ = handoff("\n".join(huge_ids), "", "huge")
 check("secret-scan e2e: a list over 128 KiB with each id once: only the file carries it, and the scan starts",
       r.returncode == 0 and old_words == sorted(huge_ids) and rep_.get("env_old") == "",
       f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_}")
-r, rep_, old_words, gone_words = handoff("", "", "nothing")
+for what, lists in {"the earlier heads": ("\n".join(huge_ids), ""), "SCANNED_GONE": ("", " ".join(huge_ids))}.items():
+    r, rep_, *_ = handoff(*lists, "huge-old", branch="old")
+    check(f"secret-scan e2e (#691): {what} too long to export, and a default branch whose script reads only the "
+          "variables (it would read an empty list): the job fails, that script not run",
+          r.returncode == 2 and "too long for it" in r.stderr and "old_script" not in rep_,
+          f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_}")
+r, rep_, *_ = handoff(" ".join(day_ids), "", "small-old", branch="old")
+check("secret-scan e2e: lists that fit, and that older default-branch script: it runs, with the list in its variable",
+      r.returncode == 0 and rep_.get("old_script") == "ran" and rep_.get("env_old_words") == str(len(day_ids)),
+      f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_}")
+r, rep_, old_words, gone_words, deleted_words = handoff("", "", "nothing")
 check("secret-scan e2e: no tips listed, none gone: empty files, empty variables, the scan starts",
-      r.returncode == 0 and old_words == [] and gone_words == [] and rep_.get("env_old") == "set"
+      r.returncode == 0 and old_words == [] and gone_words == [] and deleted_words == [] and rep_.get("env_old") == "set"
       and rep_.get("env_old_words") == "0", f"exit {r.returncode}: {r.stderr.strip()[-300:]} report={rep_}")
 (handoff_temp / "old-heads").write_text("\n".join(huge_ids[:5]) + "\n")  # a run stopped half-way left these
 (handoff_temp / "scanned-gone").write_text(day_gone[0] + "\n")
+(handoff_temp / "deleted-tips").write_text(day_gone[1] + "\n")
 small = [sweep_main, *sweep_vanished]
-r, rep_, old_words, gone_words = handoff(" ".join(small + small), "", "again")
+r, rep_, old_words, gone_words, deleted_words = handoff(" ".join(small + small), "", "again")
 check("secret-scan e2e: run again over an earlier or stopped run's files: only this run's lists are read",
-      r.returncode == 0 and old_words == sorted(small) and gone_words == [],
-      f"exit {r.returncode}: {r.stderr.strip()[-300:]} old={old_words} gone={gone_words}")
+      r.returncode == 0 and old_words == sorted(small) and gone_words == [] and deleted_words == [],
+      f"exit {r.returncode}: {r.stderr.strip()[-300:]} old={old_words} gone={gone_words} deleted={deleted_words}")
 
 check("secret-scan: the expression evaluator reads GitHub's rules (&& and || give an operand, == ignores case)",
       gh_eval("'a' && 'B' == 'b'", {}) and not gh_eval("'' || null", {}) and gh_eval("!x.y", {})
@@ -1794,10 +2767,11 @@ def token_drop_problems(scan):
         job_steps = job.get("steps") or []
         if not any("scan-from-default-branch" in str(s.get("run", "")) for s in job_steps):
             continue
-        if len(job_steps) < 2 or not CHECKOUT_ACTION.fullmatch(str(job_steps[0].get("uses", ""))):
-            problems.append(f"{SCAN_FILE}/{j}: the checkout is not the first step")
+        first = 1 if job_steps and record_step(job_steps[0]) == "read" else 0
+        if len(job_steps) < first + 2 or not CHECKOUT_ACTION.fullmatch(str(job_steps[first].get("uses", ""))):
+            problems.append(f"{SCAN_FILE}/{j}: the checkout is not the first step (but the record's read step)")
             continue
-        step = job_steps[1]
+        step = job_steps[first + 1]
         if step.get("name") != TOKEN_DROP_NAME or str(step.get("run", "")).strip() != TOKEN_DROP_RUN.strip():
             problems.append(f"{SCAN_FILE}/{j}: the step right after the checkout is not `{TOKEN_DROP_NAME}` "
                             "in its exact form")
