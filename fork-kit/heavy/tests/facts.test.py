@@ -4,11 +4,13 @@ tree (HEAVY_FACTS_ROOT: /proc and /sys), a temporary queue, home and cache. No s
   python3 -I -B fork-kit/heavy/tests/facts.test.py
 
 What the lenses attack, one test each: T3 down or not installed (the kernel still answers), agent scopes counted
-(unlabelled = writer), the Basic tier, an unreadable signal (elevated, never ok), reservations (own prefix, other
-prefix, ended, broken, missing), the state question (a second call within 5 s, an old, future, broken, empty or
-foreign cache, a writer stopped half-way, a broken cost file), two callers at once, and a caller whose `heavy facts`
-is slow or fails (5 s, never free). Expected numbers come from capacity-rule.json, never copied here. RedCheck takes
-the agent-scope count out of a copy of lib/heavy_facts.py and shows the agent test fails.
+(unlabelled = writer), every heavy ticket a job (unknown kinds: the job default, up to the job ceiling), other
+users' jobs and agents, the Basic tier (never free), an unreadable signal (elevated, never ok), container limits,
+reservations (own folder, other folder, sibling folder, with and without '/', through a link, ended, broken,
+missing), the state question (a second call within 5 s, an old, future, broken, empty, foreign or other-settings
+cache, no cache folder at all, a writer stopped half-way, a broken cost file), two callers at once, and a caller
+whose `heavy facts` is slow or fails (5 s, never free). Expected numbers come from capacity-rule.json, never copied
+here. RedCheck takes fix lines out of a copy of lib/heavy_facts.py and shows their tests fail.
 """
 import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess
 import sys, tempfile, time, types, unittest
@@ -24,6 +26,16 @@ UID = os.getuid()
 MANAGER = f'/sys/fs/cgroup/user.slice/user-{UID}.slice/user@{UID}.service'
 AGENTS = MANAGER + '/app.slice/app-t3code.slice/app-t3code-agents.slice/app-t3code-agents-a1.slice'
 NOW = datetime.datetime(2026, 11, 20, 12, 0, 0, tzinfo=datetime.timezone.utc)
+OTHER = '/sys/fs/cgroup/user.slice/user-4000000001.slice/user@4000000001.service'     # another user's manager
+
+
+def psi(some=0.0, full=0.0):
+    """A memory.pressure file as the kernel writes it."""
+    return (f'some avg10={some:.2f} avg60=0.00 avg300=0.00 total=0\n'
+            f'full avg10={full:.2f} avg60=0.00 avg300=0.00 total=0\n')
+
+
+CALM = psi()
 
 
 def load_module(name, path, source=None):
@@ -56,12 +68,11 @@ class Machine:
         for d in (self.home, os.path.join(self.queue, 'heavy.slice'), self.reserve, os.path.dirname(self.cache)):
             os.makedirs(d)
         self.write('/proc/meminfo', self.meminfo(16384, 12288))
-        self.write('/proc/pressure/memory', 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
-                                            'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+        self.write('/proc/pressure/memory', CALM)
         self.write('/proc/loadavg', '1.50 1.00 0.50 2/300 4000\n')
         self.write('/sys/devices/system/cpu/online', '0-7\n')
         self.write('/sys/fs/cgroup/cgroup.controllers', 'cpu memory pids\n')
-        self.write(MANAGER + '/heavy.slice/memory.pressure', 'some avg10=0.00\nfull avg10=0.00\n')
+        self.write(MANAGER + '/heavy.slice/memory.pressure', CALM)
         os.makedirs(self.root + MANAGER + '/app.slice')
 
     @staticmethod
@@ -79,7 +90,7 @@ class Machine:
         folder = f'{AGENTS}/t3code-{name}-0a1b2c3d.scope'
         self.write(folder + '/memory.stat', f'anon {demand_mb * MB}\nfile 999999999\nshmem 0\n')
         for box in (MANAGER + '/app.slice/app-t3code.slice', AGENTS):   # every v2 cgroup has one (PSI on)
-            self.write(box + '/memory.pressure', 'some avg10=0.00\nfull avg10=0.00\n')
+            self.write(box + '/memory.pressure', CALM)
 
     def job(self, kind, mb, demand_mb=None, state='admitted', hold=True, raw=None, seq=None):
         seq = seq or len(os.listdir(os.path.join(self.queue, 'heavy.slice'))) + 1
@@ -120,13 +131,14 @@ class Case(unittest.TestCase):
         self.work = os.path.join(self.tmp, 'work')
         os.makedirs(self.work)
 
-    def facts(self, *args, now=NOW, cwd=None, mod=None):
+    def facts(self, *args, now=NOW, cwd=None, mod=None, env=None):
         """In-process `heavy facts` at a fixed time: (exit code, object or None)."""
         mod = mod or hf
         cwd = cwd or self.work
         out = io.StringIO()
         old = os.getcwd()
-        with mock.patch.dict(os.environ, self.m.env(PWD=cwd), clear=True), mock.patch.object(mod, 'ROOT', self.m.root), \
+        with mock.patch.dict(os.environ, dict(self.m.env(PWD=cwd), **(env or {})), clear=True), \
+                mock.patch.object(mod, 'ROOT', self.m.root), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             os.chdir(cwd)
             try:
@@ -182,7 +194,7 @@ class Ledger(Case):
         self.assertEqual(d['queue']['running'], 2)
         self.assertEqual(d['memory']['owedMb'], self.cost(build) - 1000 + self.cost(RULE['unknownKinds']['job']))
 
-    def test_basic_tier_without_cgroup_v2_widens_the_margin(self):
+    def test_basic_tier_counts_no_agents_so_it_is_never_free(self):
         self.m.agent('a', 100)
         full = self.facts()[1]
         os.unlink(self.m.root + '/sys/fs/cgroup/cgroup.controllers')
@@ -194,20 +206,38 @@ class Ledger(Case):
         self.assertEqual(full['memory']['marginMb'], -(-base100 // 100))
         self.assertEqual(d['memory']['marginMb'], -(-base100 * m['noSwapOrNoCapsPercent'] // 10000))
         self.assertGreater(d['memory']['marginMb'], full['memory']['marginMb'])
-        self.assertTrue(any(n.startswith('basic tier') for n in d['notes']))
+        self.assertIn(hf.BASIC_WHY, d['notes'])
+        for args in ((), ('--kind', WRITER), ('--kind', 'build'), ('--mb', '1')):
+            code, d = self.facts(*args)
+            self.assertEqual((code, d['free'], set(d['fits'].values())), (75, False, {0}), args)
+            self.assertIn('basic tier', d['reason'])
+        self.m.write('/sys/fs/cgroup/cgroup.controllers', 'memory\n')      # cgroup v2 but no user manager
+        shutil.rmtree(self.m.root + MANAGER)
+        code, d = self.facts('--kind', WRITER, '--fresh')
+        self.assertEqual((code, d['tier'], set(d['fits'].values())), (75, 'basic', {0}))
 
     def test_an_unreadable_signal_is_elevated_never_ok(self):
         self.m.write('/proc/pressure/memory', 'some garbage\nfull avg10=x\n')
         code, d = self.facts('--mb', '64')
         self.assertEqual((code, d['free'], d['level']), (75, False, 'elevated'))
-        self.m.write('/proc/pressure/memory', 'some avg10=0.00\nfull avg10=0.00\n')
+        self.m.write('/proc/pressure/memory', CALM)
         self.m.write(MANAGER + '/heavy.slice/memory.pressure', 'nonsense\n')
+        os.unlink(self.m.cache)                     # (else the elevated reading carries: calm must last first)
+        self.assertEqual(self.facts('--mb', '64')[1]['level'], 'ok', 'no job of its own: the box passes nothing')
+        self.m.job('build', 3072, demand_mb=100)
         self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['level'], 'elevated')
         os.unlink(self.m.root + MANAGER + '/heavy.slice/memory.pressure')     # a box without its PSI file
-        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['level'], 'elevated')
-        os.rmdir(self.m.root + MANAGER + '/heavy.slice')                      # no box yet (no job ran): no signal
-        os.unlink(self.m.cache)                     # (else the elevated reading carries: calm must last first)
-        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['level'], 'ok')
+        os.unlink(self.m.cache)
+        self.assertEqual(self.facts('--mb', '64')[1]['level'], 'elevated')
+        shutil.rmtree(self.m.root + MANAGER + '/heavy.slice')                 # a live job, its box missing
+        os.unlink(self.m.cache)
+        code, d = self.facts('--mb', '64')
+        self.assertEqual(d['level'], 'elevated')
+        self.assertEqual(d['memory']['owedMb'], self.cost('job-build'), 'its scope is missing: it owes in full')
+        for name in os.listdir(os.path.join(self.m.queue, 'heavy.slice')):    # the job ended: no box, no signal
+            os.unlink(os.path.join(self.m.queue, 'heavy.slice', name))
+        os.unlink(self.m.cache)
+        self.assertEqual(self.facts('--mb', '64')[1]['level'], 'ok')
         self.m.agent('a', 100)
         os.unlink(self.m.root + MANAGER + '/app.slice/app-t3code.slice/memory.pressure')
         self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['level'], 'ok', 'the job box answers a --mb ask')
@@ -283,7 +313,9 @@ class State(Case):
             good = f.read()
         self.m.write('/proc/meminfo', self.m.meminfo(16384, 6000))
         for text, mode in ((good, 0o644), ('', 0o600), ('{"v": 1', 0o600), ('[1]', 0o600),
-                           (json.dumps(dict(json.loads(good), v=2)), 0o600),
+                           (json.dumps(dict(json.loads(good), v=hf.CACHE_VERSION + 1)), 0o600),
+                           (json.dumps(dict({k: v for k, v in json.loads(good).items() if k != 'key'}, v=1)), 0o600),
+                           (json.dumps(dict(json.loads(good), key='other.slice\n/q\n/r')), 0o600),
                            (json.dumps(dict(json.loads(good), extra=1)), 0o600), ('{"v": NaN}', 0o600)):
             with self.subTest(text=text[:20], mode=oct(mode)):
                 with open(self.m.cache, 'w') as f:
@@ -315,9 +347,9 @@ class State(Case):
         self.assertTrue(any(n.startswith('cache not written') for n in d['notes']))
 
     def test_pressure_carries_from_the_last_reading(self):
-        self.m.write('/proc/pressure/memory', 'some avg10=50.00\nfull avg10=0.00\n')
+        self.m.write('/proc/pressure/memory', psi(50))
         self.assertEqual(self.facts('--mb', '64')[1]['level'], 'elevated')
-        self.m.write('/proc/pressure/memory', 'some avg10=0.00\nfull avg10=0.00\n')
+        self.m.write('/proc/pressure/memory', CALM)
         wait = RULE['pressure']['elevatedClearSeconds']
         t = NOW + datetime.timedelta(seconds=6)
         self.assertEqual(self.facts('--mb', '64', now=t)[1]['level'], 'elevated', 'calm starts, the wait begins')
@@ -326,9 +358,9 @@ class State(Case):
                 for s in range(6, wait, 6)]
         self.assertEqual(set(hops), {'elevated'})
         self.assertEqual(self.facts('--mb', '64', now=t2)[1]['level'], 'ok')
-        self.m.write('/proc/pressure/memory', 'some avg10=50.00\nfull avg10=0.00\n')
+        self.m.write('/proc/pressure/memory', psi(50))
         self.facts('--fresh', now=t2 + datetime.timedelta(seconds=6))
-        self.m.write('/proc/pressure/memory', 'some avg10=0.00\nfull avg10=0.00\n')
+        self.m.write('/proc/pressure/memory', CALM)
         later = t2 + datetime.timedelta(seconds=6 + hf.CARRY_SECONDS + 1)
         self.assertEqual(self.facts('--mb', '64', now=later)[1]['level'], 'ok', 'a reading older than 5 min is not carried')
 
@@ -361,8 +393,19 @@ class State(Case):
             self.assertEqual(json.loads(out)['queue']['agents'], 1)
         self.assertEqual(os.listdir(os.path.dirname(self.m.cache)), [os.path.basename(self.m.cache)])
         with open(self.m.cache) as f:
-            at = json.load(f)['atMs']
-        self.assertEqual(hf.read_cache(self.m.cache, at)[0]['queue']['agents'], 1)
+            data = json.load(f)
+        self.assertEqual(hf.read_cache(self.m.cache, data['atMs'], data['key'])[0]['queue']['agents'], 1)
+        self.assertEqual(hf.read_cache(self.m.cache, data['atMs'], 'another key'), (None, None))
+
+    def test_without_a_cache_folder_the_level_never_drops_straight_to_ok(self):
+        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')):
+            for i in range(3):                      # a calm machine, called again and again: every call starts over
+                code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(minutes=i * 10),
+                                     env={'HEAVY_FACTS_CACHE': ''})
+                self.assertEqual((code, d['level']), (75, 'elevated'), i)
+            code, d = self.facts('--kind', WRITER, env={'HEAVY_FACTS_CACHE': ''})
+            self.assertEqual((code, d['level']), (0, 'elevated'), 'the floor still admits')
+        self.assertFalse(os.path.exists(self.m.cache))
 
 
 def fake_heavy(tmp, body):
@@ -406,6 +449,13 @@ class T3Capacity(Case):
         code, out, _ = self.cli([T3CAP, '64'], cwd=other)
         self.assertEqual(out.splitlines()[1], 'reservations: game:own')
         self.assertIn('available=12288MB', out.splitlines()[0])
+
+    def test_available_counts_every_reservation_even_those_trimmed_from_the_answer(self):
+        with open(os.path.join(self.m.reserve, 'many.conf'), 'w') as f:
+            for i in range(80):
+                f.write(f'10 {self.tmp}/{"long-folder-name-" * 4}{i}\n')
+        code, out, _ = self.cli([T3CAP, '64'])
+        self.assertIn('available=11488MB', out.splitlines()[0])
 
     def test_slow_failing_or_garbled_facts_are_never_ok(self):
         for body in ('exec sleep 60', 'exit 1', 'echo "not json"; exit 0', 'echo \'{"v":1,"free":true}\'; exit 0',
@@ -474,18 +524,190 @@ class AgentSlots(Case):
         self.assertEqual((p.returncode, p.stdout), (0, ''))
 
 
+class Kinds(Case):
+    """Every heavy ticket is a job: a kind the rule does not know (tsc, gradle, a project's own) is the rule's
+    unknownKinds.job, never an agent."""
+    JOB = RULE['unknownKinds']['job']
+
+    def job_fits(self, d):
+        return {k: v for k, v in d['fits'].items() if RULE['kinds'][k]['group'] == 'job'}
+
+    def test_unknown_kinds_at_the_job_ceiling_leave_no_job_free(self):
+        ceiling = RULE['ceilings']['job']
+        for _ in range(ceiling):
+            self.m.job('tsc', 3072, demand_mb=10)
+        code, d = self.facts('--kind', 'build')
+        self.assertEqual((code, d['free'], d['kind']), (75, False, 'job-build'))
+        self.assertIn('ceiling', d['reason'])
+        self.assertEqual(d['queue'], {'running': ceiling, 'waiting': 0, 'agents': 0})
+        self.assertEqual(d['memory']['owedMb'], ceiling * (self.cost(self.JOB) - 10), 'the growth they still owe')
+        self.assertEqual(set(self.job_fits(d).values()), {0})
+        self.assertEqual(self.facts('--kind', 'gradle')[0], 75)
+
+    def test_one_unknown_kind_owes_the_job_default_not_a_writer(self):
+        self.assertNotEqual(self.cost(self.JOB), self.cost(WRITER))
+        for kind in ('tsc', 'gradle', 'my-project.kind'):
+            with self.subTest(kind=kind):
+                for name in os.listdir(os.path.join(self.m.queue, 'heavy.slice')):
+                    os.unlink(os.path.join(self.m.queue, 'heavy.slice', name))
+                self.m.job(kind, 3072, demand_mb=10)
+                code, d = self.facts('--kind', kind, '--fresh')
+                self.assertEqual((code, d['kind'], d['queue']['running']), (0, self.JOB, 1))
+                self.assertEqual(d['memory']['owedMb'], self.cost(self.JOB) - 10)
+
+    def test_a_known_job_kind_keeps_its_own_cost(self):
+        self.m.job('test', 3072, demand_mb=10)
+        self.m.job('job-typecheck', 3072, demand_mb=10)
+        d = self.facts('--kind', 'build')[1]
+        self.assertEqual(d['memory']['owedMb'], self.cost('job-test') + self.cost('job-typecheck') - 20)
+
+
+class OtherUsers(Case):
+    """A caller running as another user (a CI runner) sees this user's work, and the other way round."""
+
+    def test_other_users_jobs_and_agents_are_counted(self):
+        idle = self.facts('--kind', 'build')[1]
+        self.m.write(OTHER + '/heavy.slice/run-x1.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
+        self.m.write(OTHER + '/heavy.slice/memory.pressure', CALM)
+        self.m.write(OTHER + '/app.slice/app-t3code.slice/t3code-z-1.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
+        self.m.write(OTHER + '/app.slice/app-t3code.slice/other.scope/memory.stat', 'anon 0\nshmem 0\n')
+        os.makedirs(self.m.root + OTHER + '/heavy.slice/run-gone.scope')          # ended: no memory.stat
+        code, d = self.facts('--kind', 'build', '--fresh')
+        self.assertEqual(d['queue'], {'running': 1, 'waiting': 0, 'agents': 1})
+        self.assertEqual(d['memory']['owedMb'], self.cost(RULE['unknownKinds']['job']) - 10 + self.cost(WRITER) - 10)
+        self.assertTrue(any(n.startswith('other users: 1 heavy job(s), 1 agent(s)') for n in d['notes']))
+        self.assertLess(d['fits']['job-build'], idle['fits']['job-build'])
+        for i in range(2, RULE['ceilings']['job'] + 1):
+            self.m.write(OTHER + f'/heavy.slice/run-x{i}.scope/memory.stat', 'anon 0\nshmem 0\n')
+        code, d = self.facts('--kind', 'build', '--fresh')
+        self.assertEqual((code, d['queue']['running']), (75, RULE['ceilings']['job']))
+        self.assertIn('ceiling', d['reason'])
+
+    def test_a_user_folder_that_cannot_be_listed_is_never_free(self):
+        box = self.m.root + OTHER + '/heavy.slice'
+        os.makedirs(box)
+        listdir = os.listdir
+
+        def refused(path='.'):                      # as a folder of mode 0 for a user who is not root
+            if path == box:
+                raise PermissionError(13, 'Permission denied', path)
+            return listdir(path)
+        with mock.patch('os.listdir', refused):
+            code, d = self.facts('--kind', WRITER)
+        self.assertEqual((code, d['tier'], set(d['fits'].values())), (75, 'basic', {0}))
+        self.assertTrue(any('cannot be listed' in n for n in d['notes']))
+
+    def test_strange_names_under_user_slice_are_skipped(self):
+        for name in ('user-x.slice', 'user-1.slice.bak', 'session.slice'):
+            self.m.write(f'/sys/fs/cgroup/user.slice/{name}/user@1.service/heavy.slice/run-a.scope/memory.stat',
+                         'anon 0\nshmem 0\n')
+        self.assertEqual(self.facts('--kind', 'build')[1]['queue']['running'], 0)
+
+
+class Folders(Case):
+    """A reservation's folder matches itself and what is below it, written with or without a trailing '/', never a
+    sibling that shares its first letters; through a link it matches its real folder."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = os.path.join(self.tmp, 'kotoba')
+        self.sib = self.base + '-x'
+        os.makedirs(self.base + '/sub')
+        os.makedirs(self.sib)
+        self.m.process(4001, self.sib, 300)               # a sibling's process uses nothing of kotoba
+        self.m.process(4002, self.base + '/sub', 100)
+
+    def check(self, written):
+        with open(os.path.join(self.m.reserve, 'k.conf'), 'w') as f:
+            f.write(f'1000 {written}\n')
+        d = self.facts('--mb', '64', '--fresh', cwd=self.sib)[1]
+        self.assertEqual([(r['useMb'], r['own']) for r in d['reservations']], [(100, False)], written)
+        self.assertEqual(d['memory']['holdMb'], 900, f'{written}: a sibling is held back')
+        for cwd in (self.base, self.base + '/sub'):
+            d = self.facts('--mb', '64', cwd=cwd)[1]
+            self.assertEqual(([r['own'] for r in d['reservations']], d['memory']['holdMb']), ([True], 0),
+                             f'{written} from {cwd}')
+
+    def test_without_a_trailing_slash(self):
+        self.check(self.base)
+
+    def test_with_a_trailing_slash(self):
+        self.check(self.base + '/')
+        self.check(self.base + '//')
+
+    def test_through_a_link(self):
+        link = os.path.join(self.tmp, 'link')
+        os.symlink(self.base, link)
+        self.check(link)
+
+
+class Container(Case):
+    """Container limits (the cgroup root's memory.max and cpu.max) are read; a limit that cannot be read is busy."""
+
+    def test_limits_are_read(self):
+        self.m.write('/sys/fs/cgroup/memory.max', f'{8192 * MB}\n')
+        self.m.write('/sys/fs/cgroup/memory.current', f'{3000 * MB}\n')
+        self.m.write('/sys/fs/cgroup/memory.stat', f'anon 1\ninactive_file {1000 * MB}\n')
+        self.m.write('/sys/fs/cgroup/cpu.max', '200000 100000\n')
+        d = self.facts('--fresh')[1]
+        self.assertEqual((d['memory']['availableMb'], d['cpu']['cores']), (8192 - 2000, 2))
+        self.m.write('/sys/fs/cgroup/memory.max', 'max\n')
+        self.m.write('/sys/fs/cgroup/cpu.max', 'max 100000\n')
+        d = self.facts('--fresh')[1]
+        self.assertEqual((d['memory']['availableMb'], d['cpu']['cores']), (12288, 8))
+
+    def test_a_limit_that_cannot_be_read_is_busy(self):
+        for path, text in (('/sys/fs/cgroup/memory.max', 'lots\n'), ('/sys/fs/cgroup/cpu.max', '0 0\n')):
+            with self.subTest(path=path):
+                self.m.write(path, text)
+                code, d = self.facts('--kind', WRITER, '--fresh')
+                self.assertEqual((code, d['free'], set(d['fits'].values())), (75, False, {0}))
+                os.unlink(self.m.root + path)
+
+    def test_a_cut_short_memory_stat_owes_in_full(self):
+        self.m.job('build', 3072, demand_mb=1000)
+        self.assertEqual(self.facts('--kind', 'build')[1]['memory']['owedMb'], self.cost('job-build') - 1000)
+        self.m.write(f'{MANAGER}/heavy.slice/run-j1.scope/memory.stat', f'anon {1000 * MB}\nfi')
+        self.assertEqual(self.facts('--kind', 'build', '--fresh')[1]['memory']['owedMb'], self.cost('job-build'))
+
+
 class RedCheck(Case):
-    def test_without_the_agent_scope_count_the_agent_test_fails(self):
+    """Each fix line taken out of a copy of lib/heavy_facts.py makes its test fail."""
+
+    def broken(self, line, instead):
         with open(FACTS) as f:
             src = f.read()
-        line = "        pieces.append({'kind': '', 'demandMb': demand_mb(s)})"
-        self.assertIn(line, src)
-        broken = load_module('heavy_facts_broken', FACTS, src.replace(line, '        pass'))
-        for i in range(3):
-            self.m.agent(f'a{i}', 100)
-        d = self.facts('--kind', WRITER, mod=broken)[1]
-        self.assertNotEqual(d['memory']['owedMb'], 3 * (self.cost(WRITER) - 100))
-        self.assertEqual(self.facts('--kind', WRITER, '--fresh')[1]['memory']['owedMb'], 3 * (self.cost(WRITER) - 100))
+        self.assertEqual(src.count(line), 1, line)
+        return load_module('heavy_facts_broken', FACTS, src.replace(line, instead))
+
+    def failing(self, cls, name, mod):
+        """How many of one test's checks (or subtests) fail with `heavy facts` from `mod`."""
+        result = unittest.TestResult()
+        with mock.patch.object(sys.modules[__name__], 'hf', mod):
+            cls(name).run(result)
+        return len(result.failures) + len(result.errors)
+
+    def test_without_the_agent_scope_count_the_agent_test_fails(self):
+        mod = self.broken("                pieces.append({'kind': rule['unknownKinds']['other'], 'demandMb': demand})"
+                          "   # no kind label: a writer\n", '                pass\n')
+        self.assertGreater(self.failing(Ledger, 'test_agent_scopes_count_as_writers', mod), 0)
+        self.assertEqual(self.failing(Ledger, 'test_agent_scopes_count_as_writers', hf), 0)
+
+    def test_without_unknown_kinds_as_jobs_the_kinds_tests_fail(self):
+        mod = self.broken("    return rule['unknownKinds']['job']\n\n\ndef folder_prefixes",
+                          "    return rule['unknownKinds']['other']\n\n\ndef folder_prefixes")
+        for name in ('test_unknown_kinds_at_the_job_ceiling_leave_no_job_free',
+                     'test_one_unknown_kind_owes_the_job_default_not_a_writer'):
+            self.assertGreater(self.failing(Kinds, name, mod), 0, name)
+            self.assertEqual(self.failing(Kinds, name, hf), 0, name)
+
+    def test_without_the_trailing_slash_the_folder_tests_fail(self):
+        for line, instead, name in (
+                ("        p = f.rstrip('/') + '/'\n", "        p = f\n", 'test_without_a_trailing_slash'),
+                ("    c = cwd.rstrip('/') + '/'\n", "    c = cwd\n", 'test_with_a_trailing_slash')):
+            mod = self.broken(line, instead)
+            self.assertGreater(self.failing(Folders, name, mod), 0, line)
+            self.assertEqual(self.failing(Folders, name, hf), 0, name)
 
 
 if __name__ == '__main__':

@@ -4,39 +4,52 @@
 
 Prints one free/v1 object (fork-kit/common/FREE.md) and exits 0 free, 75 busy, 1 when it cannot answer. --kind asks
 for one piece of KIND: a kind of capacity-rule.json, a heavy job kind the rule knows as job-KIND (build: job-build),
-else the rule's unknownKinds. --mb alone asks whether MB fit the free budget at level "ok"; with --kind it is the
-piece's declared MB and must fit too. Neither: the rule's unknownKinds.job. "fits" says for every kind how many more
-pieces of it the rule admits now, one after another (capacityFill up to the group's ceiling).
+else a heavy job of a kind the rule does not know (the rule's unknownKinds.job: never cheap). --mb alone asks whether
+MB fit the free budget at level "ok"; with --kind it is the piece's declared MB and must fit too. Neither: the rule's
+unknownKinds.job. "fits" says for every kind how many more pieces of it the rule admits now, one after another
+(capacityFill up to the group's ceiling).
 
-The ledger comes from the kernel only, so the answer stands with T3 down or not installed: /proc/meminfo, PSI, heavy's
-admitted jobs (its live queue tickets; demand from each job's scope) and T3's agent scopes (`t3code-*.scope` under an
-`app-t3code*` slice; a scope has no kind label, so it counts as unknownKinds.other: a writer). Full tier: cgroup v2
-and a systemd user manager. Basic tier (either missing): no agent scopes or per-piece demand can be read, so jobs owe
-their whole cost and the rule's wider margin applies. A signal that is there but unreadable is "elevated", never
-"ok"; facts that cannot be read are busy.
+The ledger comes from the kernel only, so the answer stands with T3 down or not installed. Memory, swap, PSI, cores
+and container limits come from lib/capacity_readings.py (the shared reader's port: the same answers as
+capacityReadings.ts). Pieces: heavy's admitted jobs (its live queue tickets; every ticket is a job, of the rule's
+kind for its name or else unknownKinds.job; demand from the job's scope) and T3's agent scopes (`t3code-*.scope`
+under an `app-t3code*` slice; a scope has no kind label, so it counts as unknownKinds.other: a writer), plus the
+other users' heavy jobs and agent scopes read from their user managers' cgroups (unknownKinds.job and writers).
+Full tier: cgroup v2 and this user's systemd user manager. Basic tier (either missing): agents and other users'
+work cannot be counted, so the answer is never free (a note says why). A signal that is there but unreadable is
+"elevated": then only the rule's floors admit, never the budget; facts that cannot be read admit nothing.
 
-Reservations: lines `<MB> <path prefix> [until=YYYY-MM-DD]` in *.conf files of $T3_CAPACITY_RESERVE_DIR, else
-~/.config/t3-capacity/reserve.d. Each holds MB less what this user's processes working under the prefix use
-(RssAnon + RssShmem + VmSwap); it does not hold back a caller working under its prefix; past its until date, or
-broken, it holds nothing (a note says so).
+Reservations: lines `<MB> <folder> [until=YYYY-MM-DD]` in *.conf files of $T3_CAPACITY_RESERVE_DIR, else
+~/.config/t3-capacity/reserve.d. A folder matches itself and what is below it, never a sibling that shares its
+first letters (`/x/kotoba` is not `/x/kotoba-x`); its real path (links resolved) matches too. Each holds MB less what
+this user's processes working in the folder use (RssAnon + RssShmem + VmSwap); it does not hold back a caller whose
+working folder is in it; past its until date, or broken, it holds nothing (a note says so).
 
 Readings are kept 5 seconds in /run/user/<uid>/heavy-facts.json ($HEAVY_FACTS_CACHE; --fresh reads again), written
-whole through a rename; a cache that is old, from the future, broken, of another version or not this user's own is
-read again. The pressure level carries from one reading to the next (the rule's hysteresis) while the last one is at
-most 5 minutes old. Learned job costs: heavy's peaks (lib/heavy_queue.py reservation(); missing or broken: start).
+whole through a rename; a cache that is old, from the future, broken, of another version, of other settings (slice,
+queue, reservations folder) or not this user's own is read again. The pressure level carries from one reading to the
+next (the rule's hysteresis) while the last one is at most 5 minutes old; without a cache folder nothing can carry,
+so the level starts "elevated" on every call (it never drops straight to ok). Learned job costs: heavy's peaks
+(lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost, not heavy's own
+reservation for it (heavy's queue holds that one back itself).
 """
 import datetime, errno, fcntl, json, math, os, re, signal, stat, subprocess, sys, time
 
-MB = 1 << 20
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
+CACHE_VERSION = 2
 AGENT_SCOPE_RE = re.compile(r'^t3code-[A-Za-z0-9_.:-]+\.scope\Z')
 SCOPE_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\.scope\Z')
 TICKET_RE = re.compile(r'^t-[0-9]{1,15}-[0-9]{1,10}\.json\Z')
 KIND_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,59}\Z')
-CACHE_KEYS = {'v', 'atMs', 'tier', 'facts', 'boxPsi', 'reservations', 'learned', 'carry', 'notes', 'load1', 'queue',
-              'pressure'}
+USER_RE = re.compile(r'^user-([0-9]{1,10})\.slice\Z')
+CACHE_KEYS = {'v', 'key', 'atMs', 'tier', 'facts', 'boxPsi', 'reservations', 'learned', 'carry', 'notes', 'load1',
+              'queue', 'pressure'}
+USERS = '/sys/fs/cgroup/user.slice'
+RUN_USER = '/run/user'                          # the cache's folder: /run/user/<uid>
 ROOT = os.environ.get('HEAVY_FACTS_ROOT', '')     # tests: /proc and /sys are read under this folder
+BASIC_WHY = 'basic tier: no cgroup v2 or no systemd user manager for this user, so agents and other users\' work ' \
+            'cannot be counted: never free here'
 
 
 def _read(path, limit=1 << 16):
@@ -44,78 +57,16 @@ def _read(path, limit=1 << 16):
         return f.read(limit).decode('ascii', 'replace')
 
 
-def meminfo():
-    """(totalMb, availableMb, swap): a missing figure is None; swap {totalMb, freeMb} or 'unreadable'."""
-    got = {}
+def load1():
     try:
-        for line in _read('/proc/meminfo').splitlines():
-            key, _, rest = line.partition(':')
-            words = rest.split()
-            if len(words) == 2 and words[1] == 'kB' and words[0].isdigit():
-                got[key] = int(words[0]) / 1024
-    except OSError:
-        pass
-    swap = {'totalMb': got['SwapTotal'], 'freeMb': got['SwapFree']} if 'SwapTotal' in got and 'SwapFree' in got \
-        else 'unreadable'
-    return got.get('MemTotal'), got.get('MemAvailable'), swap
-
-
-def box_psi(folder, machine_psi):
-    """A box's PSI: None when the box is not there (a slice not started yet) or the kernel has no PSI at all; a box
-    without its memory.pressure is 'unreadable' (as in the capacity README's readings table)."""
-    if not folder or machine_psi is None or not os.path.isdir(ROOT + folder):
-        return None
-    return psi(folder + '/memory.pressure') or 'unreadable'
-
-
-def psi(path):
-    """{someAvg10Pct, fullAvg10Pct}; None when the file is not there (no PSI, no such box); 'unreadable' when it is
-    there but cannot be read."""
-    try:
-        text = _read(path)
-    except OSError as e:
-        return None if e.errno in (errno.ENOENT, errno.EOPNOTSUPP) else 'unreadable'
-    out = {}
-    for line in text.splitlines():
-        words = line.split()
-        if words[:1] in (['some'], ['full']):
-            try:
-                out[words[0] + 'Avg10Pct'] = float(dict(w.split('=', 1) for w in words[1:] if '=' in w)['avg10'])
-            except (KeyError, ValueError):
-                return 'unreadable'
-    return out if len(out) == 2 and all(math.isfinite(v) for v in out.values()) else 'unreadable'
-
-
-def cpu():
-    """(cores this process may use or None, 1-minute load or None)."""
-    try:
-        n = 0
-        for part in _read('/sys/devices/system/cpu/online').strip().split(','):
-            lo, _, hi = part.partition('-')
-            n += int(hi or lo) - int(lo) + 1
-    except (OSError, ValueError):
-        n = None
-    if not ROOT and hasattr(os, 'sched_getaffinity'):
-        n = min(n or 1 << 20, len(os.sched_getaffinity(0)))
-    try:
-        load = float(_read('/proc/loadavg').split()[0])
+        return float(_read('/proc/loadavg').split()[0])
     except (OSError, ValueError, IndexError):
-        load = None
-    return n, load
-
-
-def demand_mb(folder):
-    """anon + shmem + swap of a cgroup folder in MB (what it holds that is not page cache), None when unreadable."""
-    try:
-        st = dict(line.split() for line in _read(folder + '/memory.stat').splitlines() if len(line.split()) == 2)
-        used = int(st['anon']) + int(st.get('shmem', 0))
-    except (OSError, ValueError, KeyError):
         return None
-    try:
-        used += int(_read(folder + '/memory.swap.current'))
-    except (OSError, ValueError):
-        pass
-    return used / MB
+
+
+def cg(path):
+    """A /sys/fs/cgroup/... folder as the shared reader names it (below the cgroup root)."""
+    return path[len(rd.CGROUP):]
 
 
 def slice_path(name):
@@ -174,14 +125,39 @@ def tickets(queue_dir):
 
 
 def ask_kind(rule, kind):
-    """The rule's kind for a name: itself, job-NAME when the rule has that, else the rule's unknownKinds."""
+    """The rule's kind for an asked name: itself, job-NAME when the rule has that, else a heavy job of a kind the rule
+    does not know (unknownKinds.job): `heavy facts` is heavy's verb, so an unknown name is a job, never a writer."""
     if kind in rule['kinds']:
         return kind
-    return 'job-' + kind if 'job-' + kind in rule['kinds'] else cr.capacity_kind(rule, kind)
+    return 'job-' + kind if 'job-' + kind in rule['kinds'] else rule['unknownKinds']['job']
+
+
+def ticket_kind(rule, kind):
+    """A heavy ticket is always a job: the rule's job kind for its name (NAME or job-NAME), else unknownKinds.job."""
+    for k in (kind, 'job-' + kind):
+        if k and k in rule['kinds'] and rule['kinds'][k]['group'] == 'job':
+            return k
+    return rule['unknownKinds']['job']
+
+
+def folder_prefixes(folder):
+    """A reservation's folder as prefixes that end in exactly one '/': as written and with its links resolved."""
+    out = []
+    for f in (folder, os.path.realpath(folder)):
+        p = f.rstrip('/') + '/'
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def under(cwd, prefixes):
+    """Is the working folder cwd the reservation's folder or below it (never a sibling sharing its first letters)?"""
+    c = cwd.rstrip('/') + '/'
+    return any(c.startswith(p) for p in prefixes)
 
 
 def reservations(cfg_dir, today):
-    """([{name, prefix, mb, useMb}], notes)."""
+    """([{name, prefixes, mb, useMb}], notes)."""
     out, notes = [], []
     try:
         files = sorted(f for f in os.listdir(cfg_dir) if f.endswith('.conf'))
@@ -201,39 +177,82 @@ def reservations(cfg_dir, today):
             until = [w[6:] for w in words[2:] if w.startswith('until=')]
             try:
                 if not (words[0].isdigit() and len(words) >= 2 and words[1].startswith('/')):
-                    raise ValueError('not "<MB> <absolute path prefix>"')
+                    raise ValueError('not "<MB> <absolute folder>"')
                 if until and datetime.date.fromisoformat(until[0]) < today:
                     notes.append(f'reservation {f}:{n} ended {until[0]}: holds nothing')
                     continue
             except ValueError as e:
                 notes.append(f'reservation {f}:{n} ignored ({e})')
                 continue
-            out.append({'name': f[:-5], 'prefix': words[1], 'mb': int(words[0]), 'useMb': 0})
+            out.append({'name': f[:-5], 'prefixes': folder_prefixes(words[1]), 'mb': int(words[0]), 'useMb': 0})
     if out:
         for pid in os.listdir(ROOT + '/proc'):
             try:
                 if not pid.isdigit() or os.stat(f'{ROOT}/proc/{pid}').st_uid != os.getuid():
                     continue
-                cwd = os.readlink(f'{ROOT}/proc/{pid}/cwd') + '/'
+                cwd = os.readlink(f'{ROOT}/proc/{pid}/cwd')
                 st = dict(line.split(':', 1) for line in _read(f'/proc/{pid}/status').splitlines() if ':' in line)
                 kb = sum(int(st.get(k, '0 kB').split()[0]) for k in ('RssAnon', 'RssShmem', 'VmSwap'))
             except (OSError, ValueError, IndexError):
                 continue                            # gone meanwhile, or not readable
             for r in out:
-                if cwd.startswith(r['prefix']):
+                if under(cwd, r['prefixes']):
                     r['useMb'] += kb / 1024
     return out, notes
 
 
+def scope_demand(host, folder):
+    """A live piece's demand in MB (None: owes its whole cost), or False when its cgroup has ended."""
+    d = rd.read_piece_demand(host, 'v2', cg(folder))
+    return False if d['gone'] else d['demandMb']
+
+
+def other_users(rule, host, uid, heavy_rel):
+    """The other users' heavy jobs and T3 agent scopes, from their user managers' cgroups (readable by every user):
+    (pieces, jobs, agents, notes). A folder that exists but cannot be listed is a note and 'blind'."""
+    pieces, jobs, agents, blind = [], 0, 0, []
+    try:
+        names = sorted(os.listdir(ROOT + USERS))
+    except FileNotFoundError:
+        return pieces, jobs, agents, blind
+    except OSError as e:
+        return pieces, jobs, agents, [f'{USERS} cannot be listed ({e.strerror})']
+    for name in names:
+        m = USER_RE.match(name)
+        if not m or int(m.group(1)) == uid:
+            continue
+        manager = f'{USERS}/{name}/user@{m.group(1)}.service'
+        box = manager + heavy_rel
+        try:
+            scopes = sorted(n for n in os.listdir(ROOT + box) if SCOPE_RE.match(n))
+        except FileNotFoundError:
+            scopes = []
+        except OSError as e:
+            blind.append(f'{box} cannot be listed ({e.strerror})')
+            continue
+        for n in scopes:
+            demand = scope_demand(host, f'{box}/{n}')
+            if demand is not False:
+                pieces.append({'kind': rule['unknownKinds']['job'], 'demandMb': demand})
+                jobs += 1
+        for s in agent_scopes(manager)[0]:
+            demand = scope_demand(host, s)
+            if demand is not False:
+                pieces.append({'kind': rule['unknownKinds']['other'], 'demandMb': demand})
+                agents += 1
+    return pieces, jobs, agents, blind
+
+
 def read_machine(rule, where, carry, now):
-    """This machine's readings now: what the cache keeps (the same for every caller)."""
+    """This machine's readings now: what the cache keeps (the same for every caller with these settings)."""
     notes = []
     uid = os.getuid()
-    total, avail, swap = meminfo()
-    cores, load = cpu()
-    manager = f'/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service'
-    full = os.path.isfile(ROOT + '/sys/fs/cgroup/cgroup.controllers') and os.path.isdir(ROOT + manager)
-    heavy_box = manager + '/' + slice_path(where['slice'])
+    host = rd.RealHost(ROOT)
+    m = rd.read_machine(host)
+    manager = f'{USERS}/user-{uid}.slice/user@{uid}.service'
+    full = m['cgroup'] == 'v2' and os.path.isdir(ROOT + manager)
+    heavy_rel = '/' + slice_path(where['slice'])
+    heavy_box = manager + heavy_rel
     pieces, running, waiting = [], 0, 0
     for t in tickets(where['queueDir']):
         if t['state'] == 'waiting':
@@ -241,28 +260,47 @@ def read_machine(rule, where, carry, now):
             continue
         running += 1
         scope = t.get('scope')
-        readable = full and isinstance(scope, str) and SCOPE_RE.match(scope)
-        pieces.append({'kind': ask_kind(rule, t['kind']) if t['kind'] else rule['unknownKinds']['job'],
-                       'demandMb': demand_mb(heavy_box + '/' + scope) if readable else None,
-                       'declaredMb': t.get('mb')})
-    scopes, agent_box = agent_scopes(manager) if full else ([], None)
-    for s in scopes:
-        pieces.append({'kind': '', 'demandMb': demand_mb(s)})     # no kind label: unknownKinds.other, a writer
+        demand = None
+        if full and isinstance(scope, str) and SCOPE_RE.match(scope):
+            # an admitted job whose scope is not there (yet) owes its whole cost: it is never dropped
+            demand = rd.read_piece_demand(host, 'v2', cg(heavy_box + '/' + scope)).get('demandMb')
+        pieces.append({'kind': ticket_kind(rule, t['kind']), 'demandMb': demand, 'declaredMb': t.get('mb')})
+    own_jobs = running
+    agents, agent_box = 0, None
+    if full:
+        scopes, agent_box = agent_scopes(manager)
+        for s in scopes:
+            demand = scope_demand(host, s)
+            if demand is not False:
+                pieces.append({'kind': rule['unknownKinds']['other'], 'demandMb': demand})   # no kind label: a writer
+                agents += 1
+        more, jobs, other_agents, blind = other_users(rule, host, uid, heavy_rel)
+        pieces += more
+        running, agents = running + jobs, agents + other_agents
+        if jobs or other_agents:
+            notes.append(f'other users: {jobs} heavy job(s), {other_agents} agent(s) (counted)')
+        if blind:
+            full = False
+            notes += blind
     res, more = reservations(where['reserveDir'], now.date())
     notes += more
+    notes += [f'{g["reading"]}: {g["instead"]}' for g in m['gaps']]
     if not full:
-        notes.append('basic tier: no cgroup v2 or no systemd user manager (wider margin, agents not counted)')
-    machine_psi = psi('/proc/pressure/memory')
-    return {'v': 1, 'atMs': int(now.timestamp() * 1000), 'tier': 'full' if full else 'basic',
-            'facts': {'totalMb': total, 'availableMb': avail, 'cpuCores': cores, 'pieceCaps': full, 'swap': swap,
-                      'psi': machine_psi, 'osLevel': None, 'pieces': pieces},
-            'boxPsi': {'job': box_psi(heavy_box if full else None, machine_psi),
-                       'agent': box_psi(agent_box, machine_psi)},
-            'reservations': res, 'learned': where['learned'](notes), 'carry': carry, 'notes': notes,
-            'load1': load, 'queue': {'running': running, 'waiting': waiting, 'agents': len(scopes)}}
+        notes.append(BASIC_WHY)
+    # A box with no live piece of its own passes no box pressure (as the server's observer); one that has some is
+    # read by the shared reader: missing or broken is "unreadable".
+    box_psi = {'job': rd.read_box_psi(host, m, cg(heavy_box)) if full and own_jobs else None,
+               'agent': rd.read_box_psi(host, m, cg(agent_box)) if full and agent_box and agents else None}
+    return {'v': CACHE_VERSION, 'key': where['key'], 'atMs': int(now.timestamp() * 1000),
+            'tier': 'full' if full else 'basic',
+            'facts': {'totalMb': m['totalMb'], 'availableMb': m['availableMb'], 'cpuCores': m['cpuCores'],
+                      'pieceCaps': full, 'swap': m['swap'], 'psi': m['psi'], 'osLevel': m['osLevel'],
+                      'pieces': pieces},
+            'boxPsi': box_psi, 'reservations': res, 'learned': where['learned'](notes), 'carry': carry,
+            'notes': notes, 'load1': load1(), 'queue': {'running': running, 'waiting': waiting, 'agents': agents}}
 
 
-def read_cache(path, now_ms):
+def read_cache(path, now_ms, key):
     """(readings while fresh, else None; the pressure state to carry on, else None). Anything odd is not trusted."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
@@ -277,8 +315,9 @@ def read_cache(path, now_ms):
         return None, None
     finally:
         os.close(fd)
-    if not (isinstance(data, dict) and data.get('v') == 1 and set(data) == CACHE_KEYS and type(data['atMs']) is int
-            and isinstance(data['pressure'], dict) and isinstance(data['facts'], dict)):
+    if not (isinstance(data, dict) and data.get('v') == CACHE_VERSION and set(data) == CACHE_KEYS
+            and data['key'] == key and type(data['atMs']) is int and isinstance(data['pressure'], dict)
+            and isinstance(data['facts'], dict)):
         return None, None
     age = now_ms - data['atMs']
     carry = data['pressure'] if 0 <= age <= CARRY_SECONDS * 1000 else None
@@ -305,13 +344,13 @@ def write_cache(path, data):
     os.replace(tmp, path)
 
 
-def own(prefix, cwds):
-    return any((c.rstrip('/') + '/').startswith(prefix) for c in cwds if c)
+def own(r, cwds):
+    return any(under(c, r['prefixes']) for c in cwds if c)
 
 
 def facts_for(readings, group, cwds):
     """The rule's facts for a piece of the group, as its caller sees them (its own reservations left out)."""
-    res = [{'mb': r['mb'], 'useMb': r['useMb']} for r in readings['reservations'] if not own(r['prefix'], cwds)]
+    res = [{'mb': r['mb'], 'useMb': r['useMb']} for r in readings['reservations'] if not own(r, cwds)]
     return dict(readings['facts'], boxPsi=readings['boxPsi'][group], reservations=res)
 
 
@@ -324,19 +363,22 @@ def answer(rule, readings, kind=None, need_mb=None, cwds=()):
     if need_mb is not None:
         ask['declaredMb'] = need_mb
     d = cr.decision(rule, facts_for(readings, group, cwds), ask, learned, carry.get(group), now_ms)
-    free = (d['admit'] if kind else d['level'] == 'ok') and (need_mb is None or d['freeMb'] is not None
-                                                              and need_mb <= d['freeMb'])
+    basic = readings['tier'] != 'full'
+    free = not basic and (d['admit'] if kind else d['level'] == 'ok') and (
+        need_mb is None or d['freeMb'] is not None and need_mb <= d['freeMb'])
     fits = {}
     for k, spec in rule['kinds'].items():
         g = spec['group']
-        fits[k] = cr.fill(rule, facts_for(readings, g, cwds), [{'kind': k, 'count': rule['ceilings'][g]}], learned,
-                          carry.get(g), now_ms)['admitted'][0]
+        fits[k] = 0 if basic else cr.fill(rule, facts_for(readings, g, cwds),
+                                          [{'kind': k, 'count': rule['ceilings'][g]}], learned, carry.get(g),
+                                          now_ms)['admitted'][0]
     facts, swap = readings['facts'], readings['facts']['swap']
     swap = swap if isinstance(swap, dict) and swap['totalMb'] > 0 else None
     avail = None if facts['availableMb'] is None else math.floor(facts['availableMb'])
     out = {'v': 1, 'free': free, 'at': datetime.datetime.fromtimestamp(now_ms / 1000, datetime.timezone.utc)
            .isoformat(timespec='seconds'), 'kind': kind, 'level': d['level'], 'tier': readings['tier'], 'fits': fits,
-           'memory': {'availableMb': avail, 'budgetMb': None if d['marginMb'] is None else avail - d['marginMb'],
+           'memory': {'availableMb': avail,
+                      'budgetMb': None if d['marginMb'] is None or avail is None else avail - d['marginMb'],
                       'reservedMb': None if d['owedMb'] is None else d['owedMb'] + d['reservedMb'],
                       'freeMb': d['freeMb'], 'marginMb': d['marginMb'], 'owedMb': d['owedMb'],
                       'holdMb': d['reservedMb'], 'costMb': d['costMb'],
@@ -345,10 +387,12 @@ def answer(rule, readings, kind=None, need_mb=None, cwds=()):
                       'pressureFull10': facts['psi']['fullAvg10Pct'] if isinstance(facts['psi'], dict) else None},
            'queue': readings['queue'], 'cpu': {'cores': facts['cpuCores'], 'load1': readings['load1']},
            'reservations': [{'name': r['name'], 'mb': r['mb'], 'useMb': math.floor(r['useMb']),
-                             'own': own(r['prefix'], cwds)} for r in readings['reservations']],
+                             'own': own(r, cwds)} for r in readings['reservations']],
            'notes': list(readings['notes'])}
     if not free:
-        out['reason'] = (f'{kind}: {d["reason"]}' if kind else f'{need_mb} MB') + \
+        why = 'basic tier' if basic and (d['admit'] if kind else d['level'] == 'ok') else \
+            (d['reason'] if kind else f'{need_mb} MB')
+        out['reason'] = (f'{kind}: {why}' if kind else why) + \
             f' ({d["freeMb"]} MB free, {need_mb if need_mb is not None else d["costMb"]} MB needed, level {d["level"]})'
     while len(json.dumps(out)) > 4000 and (out['notes'] or out['reservations']):
         (out['notes'] or out['reservations']).pop()
@@ -387,7 +431,7 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
         return 2
     try:
         rule = cr.shipped_rule()
-        run = f'/run/user/{os.getuid()}'
+        run = f'{RUN_USER}/{os.getuid()}'
         state_dir = hq.Box(slice_name, '', None).state_dir
 
         def learned(notes):
@@ -401,10 +445,14 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
                  'queueDir': os.path.join(queue_root or run + '/heavy-queue', slice_name),
                  'reserveDir': os.environ.get('T3_CAPACITY_RESERVE_DIR') or os.path.join(
                      os.path.expanduser('~'), '.config', 't3-capacity', 'reserve.d')}
+        where['key'] = '\n'.join((slice_name, where['queueDir'], where['reserveDir']))
         cache = os.environ.get('HEAVY_FACTS_CACHE') or (run + '/heavy-facts.json' if os.path.isdir(run) else None)
         now = now or datetime.datetime.now(datetime.timezone.utc)
         now_ms = int(now.timestamp() * 1000)
-        readings, carry = read_cache(cache, now_ms) if cache else (None, None)
+        # Without a cache folder nothing carries the pressure level from one call to the next: start every call
+        # "elevated" (the rule's floors only) so the level never drops straight to ok past the hold-down.
+        readings, carry = read_cache(cache, now_ms, where['key']) if cache else \
+            (None, {g: {'level': 'elevated', 'calmSinceMs': None} for g in ('agent', 'job')})
         if readings is None or opts.get('--fresh'):
             readings = read_machine(rule, where, carry, now)
             readings['pressure'] = {g: cr.level(rule, dict(readings['facts'], boxPsi=readings['boxPsi'][g]),
@@ -415,7 +463,7 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
                 except OSError as e:
                     readings['notes'].append(f'cache not written ({e.strerror or e})')
         code, out = answer(rule, readings, opts.get('--kind'), int(opts['--mb']) if '--mb' in opts else None,
-                           (os.getcwd(), os.environ.get('PWD', '')))
+                           (os.getcwd(),))
     except Exception as e:      # a reading this code did not expect: no answer, never "free"
         print(f'heavy: facts: {e.__class__.__name__}: {e}', file=sys.stderr)
         return EXIT_ERROR
@@ -467,3 +515,4 @@ def load(name, rel):
 
 
 cr = load('capacity_rule', 'lib/capacity_rule.py')
+rd = load('capacity_readings', 'lib/capacity_readings.py')

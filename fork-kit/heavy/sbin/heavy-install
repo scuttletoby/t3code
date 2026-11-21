@@ -36,8 +36,8 @@ LINKS = {WRAPPER: CURRENT + '/bin/heavy', INSTALLER: CURRENT + '/sbin/heavy-inst
 
 SOURCE_FILES = ('bin/heavy', 'sbin/heavy-install', 'README.md', 'lib/heavy_sweep.py', 'lib/heavy_queue.py',
                 'lib/heavy_measure.py', 'common/machine_file.py', 'systemd/heavy-sweep.service',
-                'systemd/heavy-sweep.timer', 'lib/heavy_facts.py', 'lib/capacity_rule.py', 'bin/t3-capacity',
-                'bin/agent-slots', 'common/free_contract.py', 'capacity/capacity-rule.json',
+                'systemd/heavy-sweep.timer', 'lib/heavy_facts.py', 'lib/capacity_rule.py', 'lib/capacity_readings.py',
+                'bin/t3-capacity', 'bin/agent-slots', 'common/free_contract.py', 'capacity/capacity-rule.json',
                 'capacity/capacity-format.json', 'capacity/capacity-vectors.json')
 SWEEP_UNITS = ('heavy-sweep.service', 'heavy-sweep.timer')
 UNIT_HEADER = '# heavy kit: written by heavy-install.'

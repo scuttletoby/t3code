@@ -1,6 +1,6 @@
 {
   "format": "capacity-rule/1",
-  "//": "Every number of the capacity rule. Read by the TypeScript evaluator (packages/shared/src/capacityRule.ts) and, later, the kit's Python one; both must pass capacity-vectors.json. Format: README.md beside this file. Memory in MB (1 MB = 1048576 bytes), CPU in hundredths of a core.",
+  "//": "Every number of the capacity rule. Read by the TypeScript evaluator (packages/shared/src/capacityRule.ts) and the kit's Python one (fork-kit/heavy/lib/capacity_rule.py); both must pass capacity-vectors.json. Format: README.md beside this file. Memory in MB (1 MB = 1048576 bytes), CPU in hundredths of a core.",
   "margin": {
     "minMb": 1024,
     "totalPercent": 10,

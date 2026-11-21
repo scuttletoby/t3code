@@ -1,6 +1,7 @@
-"""The kit's capacity evaluator (lib/capacity_rule.py) against the same files the TypeScript evaluator's tests read
-(packages/shared/src/capacityRule.test.ts): every vector of capacity-vectors.json and every case of
-capacity-format.json, read from packages/shared/src/capacity (one source: no number is copied here).
+"""The kit's capacity evaluator (lib/capacity_rule.py) and reader (lib/capacity_readings.py) against the same files
+the TypeScript tests read (packages/shared/src/capacityRule.test.ts, capacityReadings.test.ts): every vector of
+capacity-vectors.json, every case of capacity-format.json and of capacity-readings.json, read from
+packages/shared/src/capacity (one source: no number is copied here).
 
   python3 -I -B fork-kit/heavy/tests/capacity_rule.test.py
 
@@ -22,9 +23,11 @@ def load_module(name, path):
 
 
 cr = load_module('capacity_rule', os.path.join(KIT, 'lib', 'capacity_rule.py'))
+rd = load_module('capacity_readings', os.path.join(KIT, 'lib', 'capacity_readings.py'))
 FORMAT = cr.load('capacity-format.json', SHARED)
 RULE_JSON = cr.load('capacity-rule.json', SHARED)
 VECTORS = cr.load('capacity-vectors.json', SHARED)
+READINGS = cr.load('capacity-readings.json', SHARED)
 
 
 def failing(rule):
@@ -132,6 +135,94 @@ class Vectors(unittest.TestCase):
                           {'name': 'x', 'facts': '//', 'ask': {'kind': 'agent-light'}})
         name = next(k for k in VECTORS['factSets'] if not k.startswith('//'))
         self.assertRaises(ValueError, cr.run_vector, self.rule, VECTORS, {'name': 'x', 'facts': name})
+
+    def test_a_fill_count_is_read_as_the_typescript_loop_reads_it(self):
+        """capacityFill runs `index < count`: a count of 2.5 asks three times (the format makes it a uint, so this
+        only holds the two evaluators together)."""
+        facts = next(v for k, v in VECTORS['factSets'].items() if not k.startswith('//'))
+        kind = self.rule['unknownKinds']['other']
+        whole = cr.fill(self.rule, facts, [{'kind': kind, 'count': 3}])
+        self.assertEqual(cr.fill(self.rule, facts, [{'kind': kind, 'count': 2.5}]), whole)
+        self.assertEqual(cr.fill(self.rule, facts, [{'kind': kind, 'count': 2.0}]),
+                         cr.fill(self.rule, facts, [{'kind': kind, 'count': 2}]))
+
+
+class FixtureHost:
+    """A host of capacity-readings.json with a case's patch: files and commands merged key by key (null removes)."""
+
+    def __init__(self, name, patch=None):
+        base, patch = READINGS['hosts'][name], dict(patch or {})
+        files, commands = dict(base['files']), dict(base['commands'])
+        files.update(patch.pop('files', {}))
+        commands.update(patch.pop('commands', {}))
+        merged = dict(base, **patch)
+        self.platform, self.files, self.commands, self.n = merged['platform'], files, commands, merged
+
+    def read_file(self, path):
+        f = self.files.get(path)
+        if f is None:
+            return {'error': 'missing'}
+        return {'text': f} if isinstance(f, str) else dict(f)
+
+    def run(self, file, args):
+        return self.commands.get(' '.join([file, *args]))
+
+    def total_mem_bytes(self):
+        return self.n['totalMemBytes']
+
+    def free_mem_bytes(self):
+        return self.n['freeMemBytes']
+
+    def cpu_count(self):
+        return self.n['cpuCount']
+
+
+def run_reading(case):
+    host = FixtureHost(case['host'], case.get('patch'))
+    machine = rd.read_machine(host)
+    read = case['read']
+    if read == 'machine':
+        return dict(machine, gaps=[g['reading'] for g in machine['gaps']])
+    if 'piece' in read:
+        return rd.read_piece_demand(host, machine['cgroup'], read['piece'])
+    return {'psi': rd.read_box_psi(host, machine, read['box'])}
+
+
+class Readings(unittest.TestCase):
+    """The kit's reader answers every shared readings case as capacityReadings.ts does."""
+
+    def test_every_readings_case(self):
+        self.assertEqual(READINGS['format'], 'capacity-readings/1')
+        self.assertGreaterEqual(len(READINGS['cases']), 50)
+        for case in READINGS['cases']:
+            with self.subTest(case['name']):
+                got = run_reading(case)
+                self.assertEqual({k: got.get(k, '<absent>') for k in case['expect']}, case['expect'], case['why'])
+
+    def test_a_failed_reading_never_admits_more_than_the_healthy_host(self):
+        rule = cr.shipped_rule(SHARED)
+        rank = {'ok': 0, 'elevated': 1, 'severe': 2}
+
+        def decide(case):
+            m = rd.read_machine(FixtureHost(case['host'], case.get('patch')))
+            facts = {k: m[k] for k in ('totalMb', 'availableMb', 'cpuCores', 'swap', 'psi', 'osLevel')}
+            return cr.decision(rule, dict(facts, pieceCaps=True, pieces=[]), {'kind': 'agent-light'})
+        for case in READINGS['cases']:
+            if not case.get('failed'):
+                continue
+            with self.subTest(case['name']):
+                bad, good = decide(case), decide(dict(case, patch=None))
+                if bad['admit']:
+                    self.assertTrue(good['admit'])
+                self.assertGreaterEqual(rank[bad['level']], rank[good['level']])
+                if bad['freeMb'] is not None:
+                    self.assertLessEqual(bad['freeMb'], good['freeMb'])
+
+    def test_file_errors_sort_as_the_typescript_host_sorts_them(self):
+        import errno
+        self.assertEqual([rd.file_error(e) for e in (errno.ENOENT, errno.ENOTDIR, errno.EOPNOTSUPP, errno.EACCES,
+                                                     errno.EIO)],
+                         ['missing', 'missing', 'unsupported', 'unreadable', 'unreadable'])
 
 
 if __name__ == '__main__':

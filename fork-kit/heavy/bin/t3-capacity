@@ -48,8 +48,8 @@ def main(argv):
         lines = [f'NOT OK: {why} (not free)']
     else:
         m, q, c = d['memory'], d['queue'], d['cpu']
-        hold = sum(max(0, r['mb'] - r['useMb']) for r in d['reservations'] if not r['own'])
-        avail = max(0, (m['availableMb'] or 0) - hold)
+        avail = max(0, (m['availableMb'] or 0) - (m['holdMb'] or 0))   # the rule's hold (all of it, not the
+        # trimmed reservations list)
         print(f'available={avail}MB swapfree={m["swapFreeMb"]}MB load={c["load1"]}/{c["cores"]}cores '
               f'agents={q["agents"]} jobs={q["running"]} waiting={q["waiting"]} reserved={m["reservedMb"]}MB '
               f'need={need if need is not None else m["costMb"]}MB free={m["freeMb"]}MB level={d["level"]} '

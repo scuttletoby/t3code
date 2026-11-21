@@ -376,7 +376,7 @@ def fill(rule, facts, steps, learned=None, previous=None, now_ms=None):
     admitted, stopped = [], []
     for step in steps:
         count, stop = 0, None
-        for _ in range(int(step['count'])):     # 2.0 is 2 (a JSON parser may give a float)
+        while count < step['count']:            # as the TypeScript loop (index < count): 2.5 asks three times
             ask = {'kind': step['kind']}
             if 'declaredMb' in step:
                 ask['declaredMb'] = step['declaredMb']
