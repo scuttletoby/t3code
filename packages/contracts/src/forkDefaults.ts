@@ -136,6 +136,24 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
   },
   {
     scope: "server",
+    key: "placement",
+    default: { mode: "off" },
+    fields: true,
+    off: true,
+    reason:
+      "No delegated task is placed on another machine by rule; an agent picks a machine as upstream's do. A bad value reads as off.",
+    decidedIn: "#134",
+  },
+  {
+    scope: "server",
+    key: "placementNeeds",
+    default: [],
+    off: true,
+    reason: "No project's work needs a label, and nothing reads it while placement is off.",
+    decidedIn: "#134",
+  },
+  {
+    scope: "server",
     key: "agentSlots",
     default: { enabled: false },
     fields: true,
@@ -241,6 +259,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     off: true,
     reason: "A project without its own review rules uses the server's.",
     decidedIn: "#291",
+  },
+  {
+    scope: "projectOverride",
+    key: "placementNeeds",
+    default: undefined,
+    off: true,
+    reason: "A project without its own needs uses the server's.",
+    decidedIn: "#134",
   },
 ];
 
