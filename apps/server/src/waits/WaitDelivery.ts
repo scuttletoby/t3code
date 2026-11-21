@@ -180,6 +180,8 @@ export const make = Effect.fn("WaitDelivery.make")(function* (
       threadId: message.threadId,
       instanceId: shell!.modelSelection.instanceId,
       keepsHeld: true,
+      // Asked again every WAKE_SLOT_RETRY_MS while refused: it keeps its place in the line.
+      place: { key: `wait-delivery:${message.commandId}` },
     });
     if (slot.type === "refuse") return { type: "waitsForSlot", detail: reasonHere(slot.refusal) };
     return yield* threads
