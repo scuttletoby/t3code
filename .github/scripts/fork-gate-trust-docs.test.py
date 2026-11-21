@@ -28,9 +28,13 @@ root = pathlib.Path(__file__).resolve().parents[2]
 PAGE = root / "docs/fork/gate-trust.md"
 failures = []
 BASE = tempfile.TemporaryDirectory(prefix="gate-trust-")  # every run's folder, removed at exit
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks = []
 
 
 def check(cond, what):
+    if cond:
+        oks.append(1)
     print(("ok   " if cond else "FAIL ") + what)
     if not cond:
         failures.append(what)
@@ -636,5 +640,5 @@ for f in [*root.glob("docs/**/*.md"), *root.glob("fork-ci/**/*.md"), *root.glob(
         copies.append(str(f.relative_to(root)))
 check(not copies, f"the owner's commands live only in the gate-trust page ({copies})")
 
-print(f"\n{len(failures)} failed" if failures else "\nall ok")
+print(f"\n{len(failures)} failed" if failures else f"\nall passed: {len(oks)} ok, 0 skipped")
 sys.exit(1 if failures else 0)

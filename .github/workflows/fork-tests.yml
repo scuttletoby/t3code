@@ -429,6 +429,8 @@ jobs:
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
       - name: Fork script tests
+        env:
+          FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records
         run: node .github/scripts/fork-ci-tests.cjs '!fork-kit/' '!fork-ci/' '!.github/scripts/fork-fleet-walls'
 
       # The fleet launcher with real runner users (created and deleted by the test):
@@ -439,9 +441,21 @@ jobs:
       - name: Install nftables for the launcher's network test
         run: command -v nft >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq nftables; }
 
-      # -v: the log names every test, and a skipped one with its reason.
+      # The test file's own run (its `fork-ci: run` line: as root, FORK_FLEET_ROOT_TESTS=1, only LauncherAsRoot, -v so
+      # the log names every test); none of its tests may skip.
       - name: Fleet launcher as root
-        run: sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py -v LauncherAsRoot
+        env:
+          FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records
+        run: node .github/scripts/fork-ci-tests.cjs --run .github/scripts/fork-fleet.test.py
+      # What each fork test of this job ran (fork-ci-tests.cjs's records), for fork-ci-result, keyed by job, leg and
+      # attempt so no other job's, leg's or attempt's records can stand in; none fails the job (fork-contracts.test.py).
+      - name: Upload the fork test records
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fork-test-records/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Compare upstream's test jobs with the recorded copy
         run: node .github/scripts/fork-tests-drift.cjs
@@ -530,7 +544,18 @@ jobs:
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
       - name: Fork action and fleet walls tests
+        env:
+          FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records
         run: node .github/scripts/fork-ci-tests.cjs fork-ci/ .github/scripts/fork-fleet-walls
+      # What each fork test of this job ran (fork-ci-tests.cjs's records), for fork-ci-result, keyed by job, leg and
+      # attempt so no other job's, leg's or attempt's records can stand in; none fails the job (fork-contracts.test.py).
+      - name: Upload the fork test records
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fork-test-records/
+          if-no-files-found: error
+          retention-days: 7
 
   # The host kits' tests (fork-kit/), split from `workflows` so the fork's script tests run
   # side by side: one job of all of them was the longest in the run. They are CPU-bound (every
@@ -615,7 +640,17 @@ jobs:
       - name: Fork kit tests
         env:
           FORK_CI_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+          FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records
         run: node .github/scripts/fork-ci-tests.cjs fork-kit/
+      # What each fork test of this job ran (fork-ci-tests.cjs's records), for fork-ci-result, keyed by job, leg and
+      # attempt so no other job's, leg's or attempt's records can stand in; none fails the job (fork-contracts.test.py).
+      - name: Upload the fork test records
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fork-test-records/
+          if-no-files-found: error
+          retention-days: 7
 
   # The kits' tests that need root or a real systemd user manager, on their own runner: they
   # change the machine (users, sudoers, linger), and beside the shards they add no time.
@@ -626,27 +661,34 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      # Both tests read only their kits.
+      # Both tests read only their kits; the runner reads the list (and the tests' `fork-ci:` lines) and runs each
+      # Python test through fork-ci-unittest.py (a node test with fork-ci-node-counts.cjs).
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.changes.outputs.sha }}
           sparse-checkout: |
             /fork-kit/
+            /.github/fork-ci-tests.txt
+            /.github/scripts/fork-ci-tests.cjs
+            /.github/scripts/fork-ci-unittest.py
+            /.github/scripts/fork-ci-node-counts.cjs
           sparse-checkout-cone-mode: false
 
       # The gh-apps host kit installed for real (fork-kit/gh-apps/README.md): real service
       # users, the real sudoers file and sudo, an agent user that tries to reach the keys,
       # the token cache, gh-mint and the environment. It creates and deletes its users and
-      # refuses to run anywhere but a throw-away runner. sudo drops GITHUB_ACTIONS, so it is
-      # passed on again.
+      # refuses to run anywhere but a throw-away runner. Its own run (its `fork-ci: run` line: as
+      # root, GH_APPS_ROOT_TESTS=1; the runner hands GITHUB_ACTIONS on, which sudo drops).
       - name: gh-apps kit as root
-        run: sudo env GH_APPS_ROOT_TESTS=1 GITHUB_ACTIONS="$GITHUB_ACTIONS" python3 -I -B fork-kit/gh-apps/tests/root.test.py
+        env:
+          FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records
+        run: node .github/scripts/fork-ci-tests.cjs --run fork-kit/gh-apps/tests/root.test.py
 
       # The heavy kit's wrapper with a real systemd user manager (fork-kit/heavy/README.md):
       # linger starts the runner user's manager, and the slice gets a unit with a memory
-      # limit (heavy refuses a slice without one). HEAVY_REAL_TESTS=1: no manager fails
-      # the step instead of skipping it; so does a slice without the limit (the show line).
+      # limit (heavy refuses a slice without one). HEAVY_REAL_TESTS=1 (its `fork-ci: run` line):
+      # no manager fails the step instead of skipping it; so does a slice without the limit (the show line).
       # The set-up is a step of its own (the test step is only its command), so the test step
       # sets XDG_RUNTIME_DIR itself.
       - name: Start a systemd user manager with a heavy slice
@@ -660,7 +702,18 @@ jobs:
           systemctl --user daemon-reload
           systemctl --user show heavy.slice -p LoadState,FragmentPath,MemoryMax
       - name: heavy kit with a real systemd user manager
-        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" HEAVY_REAL_TESTS=1 python3 -I -B fork-kit/heavy/tests/heavy.test.py
+        env:
+          FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records
+        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" node .github/scripts/fork-ci-tests.cjs --run fork-kit/heavy/tests/heavy.test.py
+      # What each fork test of this job ran (fork-ci-tests.cjs's records), for fork-ci-result, keyed by job, leg and
+      # attempt so no other job's, leg's or attempt's records can stand in; none fails the job (fork-contracts.test.py).
+      - name: Upload the fork test records
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fork-test-records/
+          if-no-files-found: error
+          retention-days: 7
 
   # Every commit a pull request or a push to main adds, history included: a
   # secret committed and then deleted is still public. Release runs test a
@@ -707,7 +760,18 @@ jobs:
       # Here, not in `workflows`: it greps app code, so it needs the whole tree (#254). Lint runs on every
       # pull request, fork-only ones too. Listed in .github/fork-ci-tests.txt as run by this file.
       - name: Check that app code reads no fork-owned path
-        run: python3 -I -B .github/scripts/fork-owned-reads.test.py
+        env:
+          FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records
+        run: node .github/scripts/fork-ci-tests.cjs --run .github/scripts/fork-owned-reads.test.py
+      # What each fork test of this job ran (fork-ci-tests.cjs's records), for fork-ci-result, keyed by job, leg and
+      # attempt so no other job's, leg's or attempt's records can stand in; none fails the job (fork-contracts.test.py).
+      - name: Upload the fork test records
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fork-test-records-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fork-test-records/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Cache Electron download
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -1436,6 +1500,152 @@ jobs:
                   or (.value.result == "skipped"
                     and (if .key == "secrets" then $release == "true"
                          else (($renamed[.key] // [.key]) | all(.[]; $gates[.] == "false")) end)) end)' > /dev/null
+
+      # What every listed fork test ran (#664): each job that runs them uploads its runner's records
+      # (fork-ci-tests.cjs, RECORDS there), named by job, leg and attempt. A job of this run that passed
+      # uploaded them in the attempt it passed in (its upload step fails on none), so the newest attempt of
+      # each job and leg is the one that counts; an older one, another run's or another commit's never does.
+      # Red: a job or leg with no records, a listed test with no record (or two), one that failed, showed no
+      # test count, ran none, or skipped other tests than exactly those its `fork-ci: may skip <test>` lines
+      # name (each skip by name; an own run: none).
+      - name: Download the fork test records
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: fork-test-records-*
+          path: ${{ runner.temp }}/fork-test-records
+      - name: Require a record of every listed fork test
+        env:
+          RECORDS: ${{ runner.temp }}/fork-test-records
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          # The commit every job's checkout tests: a release run's resolved one, else the run's own.
+          SHA: ${{ needs.changes.outputs.sha || github.sha }}
+          # Each job that runs listed fork tests, with its number of legs (fork-contracts.test.py keeps it so).
+          RECORD_JOBS: '{"workflows": 1, "action_tests": 1, "kit_tests": 3, "kit_root_tests": 1, "lint": 1}'
+        run: |
+          python3 -I - <<'CHECK'
+          import json, os, re
+
+          here = os.environ['RECORDS']
+          run_id = os.environ['RUN_ID']
+          attempt = int(os.environ['RUN_ATTEMPT'])
+          sha = os.environ['SHA']
+          legs = json.loads(os.environ['RECORD_JOBS'])
+          problems = []
+          if not re.fullmatch(r'[0-9a-f]{40}', sha):
+              problems.append(f'the commit to compare the records with is {sha!r}, not a full SHA')
+
+          # The newest attempt's artifact of each job and leg.
+          newest = {}
+          for name in sorted(os.listdir(here)) if os.path.isdir(here) else []:
+              m = re.fullmatch(r'fork-test-records-([a-z0-9_]+)-([0-9]+)-([0-9]+)', name)
+              if not m or m[1] not in legs or int(m[2]) >= legs[m[1]] or not 1 <= int(m[3]) <= attempt:
+                  problems.append(f'{name}: no records artifact of a job, leg and attempt of this run')
+                  continue
+              leg, at = (m[1], int(m[2])), int(m[3])
+              if leg not in newest or at > newest[leg][0]:
+                  newest[leg] = (at, name)
+          for job, count in sorted(legs.items()):
+              for index in range(count):
+                  if (job, index) not in newest:
+                      problems.append(f'{job} (leg {index + 1} of {count}): uploaded no fork test records')
+
+          def names(value):
+              ok = isinstance(value, list) and all(type(n) is str for n in value) and len(set(value)) == len(value)
+              return value if ok else None
+
+          def judge(row, where):
+              key = row['key']
+              tests, skipped, failed = row.get('tests'), row.get('skipped'), row.get('failed')
+              # Each skipped test by name, and the ones the test declares it may skip (an own run: none).
+              skipped_tests = names(row.get('skipped_tests'))
+              allowed = [] if row.get('own') is not False else names(row.get('allowed'))
+              if row.get('status') != 0:
+                  return [f'{key} failed (exit {row.get("status")}) ({where})']
+              if not all(type(n) is int and n >= 0 for n in (tests, skipped, failed)):
+                  return [f'{key}: no test count, so no test is known to have run ({where})']
+              out = []
+              if tests - skipped <= 0:
+                  out.append(f'{key} ran no test ({tests} found, {skipped} skipped) ({where})')
+              if skipped_tests is None or allowed is None or len(skipped_tests) != skipped:
+                  out.append(f'{key} skipped {skipped} tests, not each once by name ({where})')
+              elif set(skipped_tests) != set(allowed):
+                  out.append(f'{key} skipped {sorted(skipped_tests)}, but may and must skip {sorted(allowed)} ({where})')
+              if failed:
+                  out.append(f'{key}: {failed} failed ({where})')
+              return out
+
+          wanted = None
+          recorded = {}
+          ran = skips = 0
+          for (job, index), (at, name) in sorted(newest.items()):
+              folder = os.path.join(here, name)
+              files = sorted(os.listdir(folder))
+              if not files:
+                  problems.append(f'{name}: empty')
+              for file in files:
+                  where = f'{name}/{file}'
+                  try:
+                      with open(os.path.join(folder, file), encoding='utf-8') as f:
+                          body = json.load(f)
+                  except (OSError, ValueError) as e:
+                      problems.append(f'{where}: unreadable ({e})')
+                      continue
+                  if not isinstance(body, dict) or body.get('v') != 1:
+                      problems.append(f'{where}: not a version 1 record')
+                      continue
+                  if (body.get('run_id'), body.get('run_attempt'), body.get('job')) != (run_id, at, job):
+                      problems.append(f'{where}: written by another run, attempt or job')
+                      continue
+                  if body.get('sha') != sha:
+                      problems.append(f'{where}: tests {body.get("sha")}, not {sha}')
+                      continue
+                  call = body.get('call') if isinstance(body.get('call'), dict) else {}
+                  if 'parts' in call:
+                      if call.get('shard') != f'{index + 1}/{legs[job]}':
+                          problems.append(f'{where}: shard {call.get("shard")}, not leg {index + 1}/{legs[job]}')
+                      if not isinstance(body.get('all'), list):
+                          problems.append(f'{where}: no list of the tests to run')
+                      elif wanted is None:
+                          wanted = (body['all'], where)
+                      elif body['all'] != wanted[0]:
+                          problems.append(f'{where}: its tests to run differ from {wanted[1]}')
+                  elif not isinstance(call.get('run'), str):
+                      problems.append(f'{where}: neither a part nor an own run')
+                  rows, owed = body.get('results'), body.get('owed')
+                  if not isinstance(rows, list) or not isinstance(owed, list):
+                      problems.append(f'{where}: no results')
+                      continue
+                  rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get('key'), str)]
+                  if sorted(r['key'] for r in rows) != sorted(owed):
+                      missing = sorted(set(owed) - {r['key'] for r in rows})
+                      problems.append(f'{where}: results do not match what it owed (missing: {missing})')
+                  for row in rows:
+                      if row['key'] in recorded:
+                          problems.append(f'{row["key"]}: recorded twice ({recorded[row["key"]]}, {where})')
+                          continue
+                      recorded[row['key']] = where
+                      problems += judge(row, where)
+                      if type(row.get('tests')) is int and type(row.get('skipped')) is int:
+                          ran += row['tests'] - row['skipped']
+                          skips += row['skipped']
+
+          if wanted is None:
+              problems.append('no part records: the tests to run are unknown')
+          else:
+              for key in sorted(set(wanted[0]) - set(recorded)):
+                  problems.append(f'{key}: listed, but no job recorded it: it did not run')
+              for key in sorted(set(recorded) - set(wanted[0])):
+                  problems.append(f'{key}: recorded, but not among the tests to run')
+
+          for problem in problems:
+              print(f'::error::{problem}')
+          line = f'Fork test records: {len(recorded)} runs of listed tests, {ran} tests ran, {skips} skipped.'
+          print(line)
+          with open(os.environ.get('GITHUB_STEP_SUMMARY', os.devnull), 'a', encoding='utf-8') as f:
+              f.write(f'\n{line}' + (f' {len(problems)} problems (the log names them).' if problems else '') + '\n')
+          raise SystemExit(1 if problems else 0)
+          CHECK
 
       # A run whose server tests ran must have produced the transfer measurements.
       - name: Require transfer measurements

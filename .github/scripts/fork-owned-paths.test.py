@@ -36,9 +36,13 @@ WORKFLOW = root / ".github/workflows/fork-tests.yml"
 wf = yaml.safe_load(WORKFLOW.read_text())
 jobs = wf["jobs"]
 failures = []
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks = []
 
 
 def check(name, ok, detail=""):
+    if ok:
+        oks.append(1)
     print(("ok   " if ok else "FAIL ") + name + ("" if ok or not detail else f"\n     | {detail}"))
     if not ok:
         failures.append(name)
@@ -333,5 +337,5 @@ check("result: a run with every job passed passes", code == 0 and "Fork-only" no
 code, text = result_run(mixed, set(app_jobs))
 check("result: the app jobs skipped on a run that is not fork-only fails", code != 0, text[-300:])
 
-print(f"\n{len(failures)} failed" if failures else "\nall passed")
+print(f"\n{len(failures)} failed" if failures else f"\nall passed: {len(oks)} ok, 0 skipped")
 sys.exit(1 if failures else 0)
