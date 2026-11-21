@@ -65,6 +65,26 @@ describe("a thread's effective MCP profile", () => {
     );
   });
 
+  it("cuts a task another machine delegated down to the profile it carried", () => {
+    const settings = fromFile({ mcpProfiles: PROFILES, mcpSubagentProfile: "docs" });
+    const carried = { name: "narrow", servers: ["docs"], t3Tools: "all" };
+    const task = shell("task", null, {
+      delegatedFrom: { environmentId: "env-b", threadId: "far", title: "Far", mcpProfile: carried },
+    } as unknown as Partial<McpProfileShell>);
+    expect(threadMcpProfile(settings, "task", [task])).toMatchObject({
+      name: "docs",
+      source: "subagent-rule",
+      narrowedByParent: true,
+      profile: { servers: ["docs"] },
+    });
+    // The client's shells hold null for a thread nobody delegated: a top-level thread.
+    const local = shell("local", null, { delegatedFrom: null });
+    expect(threadMcpProfile(settings, "local", [local])).toMatchObject({
+      name: "all",
+      source: "environment",
+    });
+  });
+
   it("does not guess when a parent is not loaded or a profile is missing", () => {
     const settings = fromFile({ mcpProfiles: PROFILES, mcpProfile: "narrow" });
     expect(threadMcpProfile(settings, "child", [shell("child", "gone")])._tag).toBe("Unknown");

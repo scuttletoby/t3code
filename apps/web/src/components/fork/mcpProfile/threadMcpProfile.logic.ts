@@ -23,11 +23,10 @@ import {
   threadPickPatch,
 } from "../../settings/fork/mcpProfileSettings.logic";
 
-/** What the resolver needs of a thread shell. */
-export type McpProfileShell = Pick<
-  OrchestrationV2ThreadShell,
-  "id" | "projectId" | "lineage" | "delegatedFrom"
->;
+/** What the resolver needs of a thread shell (the client's shells hold `null` for no delegation). */
+export type McpProfileShell = Pick<OrchestrationV2ThreadShell, "id" | "projectId" | "lineage"> & {
+  readonly delegatedFrom?: OrchestrationV2ThreadShell["delegatedFrom"] | null;
+};
 
 export type McpProfileSettingsForThread = McpProfileSettings &
   Pick<ServerSettings, "projectSettingsOverrides">;
@@ -74,8 +73,8 @@ export function threadMcpProfile(
         threadId: shell.id,
         delegated: isDelegatedAppThread({
           lineage: shell.lineage,
-          delegatedFrom: shell.delegatedFrom,
-        } as Parameters<typeof isDelegatedAppThread>[0]),
+          ...(shell.delegatedFrom == null ? {} : { delegatedFrom: shell.delegatedFrom }),
+        }),
         project: {
           mcpProfile: project?.mcpProfile,
           mcpSubagentProfile: project?.mcpSubagentProfile,
