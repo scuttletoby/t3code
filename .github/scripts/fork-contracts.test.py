@@ -4171,6 +4171,10 @@ MAY_SKIP = {
     # Needs a checkout that is not a merge commit; CI's pull request checkout is one.
     "fork-ci/actions/head-check/head_check.test.py": [
         "SameChangeBare.test_a_checkout_that_is_not_a_merge_commit_is_refused"],
+    # Need the ci/vN tags; CI's checkout fetches none (only its Releases class runs there).
+    "fork-ci/actions/head-check/review_guide.test.py": ["ReleaseTags." + t for t in (
+        "test_override_authors_is_first_in_the_release_after_the_one_the_notes_name",
+        "test_the_path_rules_are_first_in_the_release_the_guide_names")],
 }
 check("records: the tests a part run may skip are exactly the pinned ones, each by name (MAY_SKIP)",
       {f: sorted(n) if isinstance(n, list) else n for f, n in DECLARED_SKIPS.items()} == MAY_SKIP,
