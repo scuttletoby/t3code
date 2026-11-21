@@ -2149,6 +2149,14 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             }
           }
         }
+        // A stopped receiver starts nothing while it waits to be handed over: its slot frees now.
+        const stoppedSlots = results.flatMap(([group, result]) =>
+          result.type === "stopped"
+            ? group.waits.flatMap((wait) => (wait.kind === "slot" ? [wait.id] : []))
+            : [],
+        );
+        if (input.slots !== undefined && stoppedSlots.length > 0)
+          yield* input.slots.drop(stoppedSlots);
         for (const [group, result] of results) {
           const at = nextTry(group, result, waits, now, settings);
           if (at === null) forgetMessage(group.messageId);
