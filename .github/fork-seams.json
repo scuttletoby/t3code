@@ -291,6 +291,84 @@
         "import * as ModelPolicyCheck from \"../../../fork/modelPolicyCheck.ts\"; // Fork: model policy",
         "yield* ModelPolicyCheck.checkConfigure(modelSelection); // Fork: model policy"
       ]
+    },
+    "apps/web/src/components/threadActionMenu.logic.ts": {
+      "why": "The thread menu gets \"Hand off now\" (handoff, HO5): one more menu id, one optional state field the menu's callers fill, and the item spread into the list; the item and its rules are in fork/handoff/handoffMenu.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
+          "| typeof ForkHandoffMenu.HAND_OFF_NOW; // Fork (HO5)",
+          "readonly forkHandoff?: ForkHandoffMenu.HandoffMenuState; // Fork (HO5)",
+          "...ForkHandoffMenu.handOffNowItems(state.forkHandoff, resolve), // Fork (HO5)"
+        ]
+      }
+    },
+    "apps/web/src/hooks/useThreadActionMenu.ts": {
+      "why": "The thread menu's hook reads the handoff state for \"Hand off now\" before it builds the menu and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffMenu from \"../components/fork/handoff/handoffMenu\"; // Fork (HO5)",
+          "forkHandoff: await ForkHandoffMenu.readHandoffMenuState(threadRef), // Fork (HO5)",
+          "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
+          "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)"
+        ]
+      }
+    },
+    "apps/web/src/components/Sidebar.tsx": {
+      "why": "The sidebar builds its own thread menu: it reads the handoff state for \"Hand off now\" before the menu opens (the menu is built in a callback that does not await) and runs the handoff when it is clicked (handoff, HO5; fork/handoff/handoffMenu.ts).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffMenu from \"./fork/handoff/handoffMenu\"; // Fork (HO5)",
+          "const forkHandoff = await ForkHandoffMenu.readHandoffMenuState(threadRef); // Fork (HO5)",
+          "forkHandoff, // Fork (HO5)",
+          "case ForkHandoffMenu.HAND_OFF_NOW: // Fork (HO5)",
+          "return void ForkHandoffMenu.handOffNow(threadRef); // Fork (HO5)"
+        ]
+      }
+    },
+    "apps/web/src/components/ChatView.tsx": {
+      "why": "A thread whose handoff waits shows it in the composer's banners (handoff, HO5): one hook call and its items spread into both banner lists (fork/handoff/useForkHandoffWaitingItems.ts).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import { useForkHandoffWaitingItems } from \"./fork/handoff/useForkHandoffWaitingItems\"; // Fork (HO5)",
+          "const forkHandoffWaitingItems = useForkHandoffWaitingItems(routeThreadRef); // Fork (HO5)",
+          "...forkHandoffWaitingItems, // Fork (HO5)",
+          "...forkHandoffWaitingItems, // Fork (HO5)"
+        ]
+      }
+    },
+    "apps/web/src/components/chat/TimelineUserMessageRow.tsx": {
+      "why": "A handoff's first message shows the handoff divider in place of \"New session\" (handoff, HO5): a scope around upstream's fresh-session row tells that row which message it is (fork/handoff/handoffDivider.tsx). JSX children cannot end in a // comment, so a JSX comment line marks the two tags.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffDivider from \"../fork/handoff/handoffDivider\"; // Fork (HO5)",
+          "{/* Fork (HO5): a handoff's first message shows the handoff divider. */}",
+          "<ForkHandoffDivider.Scope row={row}>",
+          "</ForkHandoffDivider.Scope>"
+        ]
+      }
+    },
+    "apps/web/src/components/chat/V2LifecycleRow.tsx": {
+      "why": "Upstream's fresh-session row shows the handoff divider's label when its scope (TimelineUserMessageRow.tsx) marks a handoff (handoff, HO5; fork/handoff/handoffDivider.tsx).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkHandoffDivider from \"../fork/handoff/handoffDivider\"; // Fork (HO5)",
+          "const forkHandoffLabel = ForkHandoffDivider.useLabel(); // Fork (HO5)",
+          "if (forkHandoffLabel) return <TimelineSystemDivider label={forkHandoffLabel} icon={EraserIcon} />; // Fork (HO5)"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
