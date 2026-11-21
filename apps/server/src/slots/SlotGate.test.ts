@@ -2290,6 +2290,30 @@ describe("SlotGate: one line for every waiting start (issue 738)", () => {
     }),
   );
 
+  it.effect("a slot wait younger than a waiting wake-up waits behind it", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "busy", instanceId: MAIN }];
+      yield* run(
+        world,
+        waitsOn({ maxPerMachine: 1, reserveSeconds: 120 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const nowMs = yield* Clock.currentTimeMillis;
+          assert.strictEqual((yield* wake("w", "w")).type, "refuse");
+          const younger = { key: "young", threadId: ThreadId.make("young"), sinceMs: nowMs + 1 };
+          world.threads = [];
+          // The sweep asks first, but the wake-up is older: the slot is its.
+          assert.deepStrictEqual(
+            (yield* gate.grant([younger])).map((grant) => grant.type),
+            ["full"],
+          );
+          assert.strictEqual((yield* wake("w", "w")).type, "allow");
+        }),
+      );
+    }),
+  );
+
   it.effect("a waiter that left, or stopped asking, or shows a run, holds nothing", () =>
     Effect.gen(function* () {
       const world = newWorld();

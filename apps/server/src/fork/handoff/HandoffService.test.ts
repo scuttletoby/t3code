@@ -590,7 +590,31 @@ describe("HandoffService", () => {
     }),
   );
 
-  it.effect("a waiting handoff whose thread gets busy, or a newer run, leaves its place", () =>
+  it.effect("a waiting handoff whose thread gets busy leaves its place, and waits", () =>
+    Effect.gen(function* () {
+      const gate = countingGate(0);
+      const data = projection({ usedTokens: 160_000 });
+      const state = { data, settings: on, gate: gate.layer };
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* TestClock.adjust(MINUTE_MS);
+      expect(gate.slots.left).toEqual([]);
+      // A question to the person opens: not due now, so it needs no slot and holds no place.
+      state.data = {
+        ...data,
+        runtimeRequests: [
+          { id: RuntimeRequestId.make("request-1"), status: "pending" },
+        ] as unknown as OrchestrationV2ThreadProjection["runtimeRequests"],
+      };
+      yield* emit(threadChanged(state.data), "readThread", 14);
+      yield* settle;
+      expect(gate.slots.left).toEqual([`handoff:server:handoff:${threadId}:${runId}`]);
+      expect(sent).toEqual([]);
+    }),
+  );
+
+  it.effect("a waiting handoff replaced by a newer run's timer leaves its place", () =>
     Effect.gen(function* () {
       const gate = countingGate(0);
       const data = projection({ usedTokens: 160_000 });
