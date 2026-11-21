@@ -13,6 +13,17 @@ nothing.
 
 ## After ci/v14
 
+### handoff-put and handoff-get: a file handed from one job to a later job of the same run (#247)
+
+- New actions [`handoff-put`](actions/handoff-put/README.md) and [`handoff-get`](actions/handoff-get/README.md). put
+  wraps a text file as `{format, name, sha, payload}` with the checkout's HEAD and uploads it as the artifact
+  `<name>-<sha>` (pinned `actions/upload-artifact`, one day's retention by default, a re-run overwrites it). get
+  downloads it from the same run only (pinned `actions/download-artifact`) and writes the payload only when the `sha`
+  inside is the checkout's HEAD. Neither fails its step for a missing or refused hand-off: `ok` is `'false'` and the
+  consumer falls back (README, "How the consumer picks its runner").
+- git-clean's test now also counts an action that runs another action folder's script (handoff-get runs
+  handoff-put's `handoff.py`) as one that runs git.
+
 ### pr-queue: `notify_command` runs once for each notice on an armed pull request it passes over (#129)
 
 - New optional config keys `notify_command` (an argv list) and `notify_timeout_seconds` (default 30). When set, the

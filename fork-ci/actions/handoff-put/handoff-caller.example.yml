@@ -1,0 +1,60 @@
+# An example of the hand-off pair (README.md): a build job that runs anyway hands a file to a light check job, which
+# then needs no build runner. Fill in the CAPITALS and the pins; the job ids, names and commands are the project's.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, build] # BUILD RUNNER LABELS
+    outputs:
+      # 'true' only when the hand-off was uploaded. Empty when this job failed, was cut off or skipped the step.
+      handoff: ${{ steps.handoff.outputs.ok }}
+    steps:
+      - uses: scuttletoby/t3code/fork-ci/actions/git-clean@<release sha> # ci/vN
+      - uses: actions/checkout@<sha> # pin by full SHA
+      - run: ./BUILD-AND-WRITE-THE-FILE out/handoff.txt
+      # continue-on-error: a hand-off that could not be made never fails the build.
+      - id: handoff
+        continue-on-error: true
+        uses: scuttletoby/t3code/fork-ci/actions/handoff-put@<release sha> # ci/vN
+        with:
+          name: HANDOFF-NAME
+          path: out/handoff.txt
+
+  # The required check. Its job id and name stay the same on both runners (the runner is not in the name).
+  check:
+    needs: build
+    # Runs when build failed or was cut off too: GitHub counts a skipped required job as passing.
+    if: ${{ !cancelled() }}
+    # The light runner only on 'true'; anything else (empty included) is the old runner, which makes the file itself.
+    runs-on: ${{ needs.build.outputs.handoff == 'true' && 'ubuntu-latest' || fromJSON('["self-hosted","build"]') }}
+    steps:
+      - uses: scuttletoby/t3code/fork-ci/actions/git-clean@<release sha> # ci/vN
+      - uses: actions/checkout@<sha> # pin by full SHA
+      - id: handoff
+        if: needs.build.outputs.handoff == 'true'
+        uses: scuttletoby/t3code/fork-ci/actions/handoff-get@<release sha> # ci/vN
+        with:
+          name: HANDOFF-NAME
+          path: out/handoff.txt
+      - name: Make the file here (no hand-off)
+        if: steps.handoff.outputs.ok != 'true'
+        env:
+          HANDED_OFF: ${{ needs.build.outputs.handoff }}
+        run: |
+          if [ "$HANDED_OFF" = true ]; then
+            # On the light runner, which cannot build: the producer said ok but the file is gone (expired, or not
+            # this commit's). Re-run all jobs so the producer runs again.
+            echo "::error::no hand-off for this commit; re-run all jobs"
+            exit 1
+          fi
+          ./BUILD-AND-WRITE-THE-FILE out/handoff.txt
+      # The project checks the payload itself (its keys and shape); the action checked only commit and format.
+      - run: ./CHECK-THE-FILE out/handoff.txt

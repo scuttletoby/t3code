@@ -1,0 +1,73 @@
+name: handoff-put
+description: >-
+  Hands a text file from this job to a later job of the same run (handoff-get), keyed on the commit this job checked
+  out: wraps it as {format, name, sha, payload} with this checkout's HEAD and uploads it as the artifact <name>-<sha>
+  (short retention, a re-run overwrites it). Never fails the step for a hand-off it could not make: output ok is
+  'true' only once the artifact is uploaded. Usage: README.md next to this file.
+inputs:
+  name:
+    description: The hand-off's name (1-60 of A-Z a-z 0-9 . _ -); handoff-get asks for the same name.
+    required: true
+  path:
+    description: The file to hand off, relative to the workspace (UTF-8 text, at most 16 MiB, not a symlink).
+    required: true
+  retention-days:
+    description: Days the artifact is kept (1-90). A re-run of the consumer alone after that finds no hand-off.
+    required: false
+    default: "1"
+outputs:
+  ok:
+    description: "'true' only when the hand-off was uploaded; a consumer picks its light runner only on 'true'."
+    value: ${{ steps.result.outputs.ok }}
+  artifact:
+    description: The artifact name, <name>-<sha> (empty when nothing was staged).
+    value: ${{ steps.stage.outputs.artifact }}
+  sha:
+    description: The commit the hand-off is for (this checkout's HEAD; empty when nothing was staged).
+    value: ${{ steps.stage.outputs.sha }}
+  reason:
+    description: One line saying what happened.
+    value: ${{ steps.result.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    # Only code from this action's folder (the caller's pinned SHA) runs. Before the one git call (HEAD), the
+    # checkout's .git config must be one actions/checkout writes (fork-ci git-clean): when it is not, nothing is
+    # staged and ok is 'false'; the step still passes. The file is complete before staged is 'true' (README, "State").
+    - id: stage
+      name: Stage the hand-off file
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        HANDOFF_PATH: ${{ inputs.path }}
+        RETENTION: ${{ inputs.retention-days }}
+      run: |
+        if ! python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path . --require; then
+          echo "::warning::handoff-put: nothing handed off, git-clean refused the checkout's git config (above)"
+          echo "reason=git-clean refused the checkout's git config" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        exec python3 -I "$GITHUB_ACTION_PATH/handoff.py" put --name="$NAME" --path="$HANDOFF_PATH" \
+          --stage-dir="$RUNNER_TEMP/fork-ci-handoff" --retention-days="$RETENTION"
+    # overwrite: a re-run of this job (same run, same commit) replaces the earlier attempt's artifact.
+    - id: upload
+      if: steps.stage.outputs.staged == 'true'
+      continue-on-error: true
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.stage.outputs.artifact }}
+        path: ${{ steps.stage.outputs.file }}
+        retention-days: ${{ steps.stage.outputs.retention }}
+        overwrite: true
+        if-no-files-found: error
+    - id: result
+      name: Report the hand-off
+      shell: bash
+      env:
+        STAGED: ${{ steps.stage.outputs.staged }}
+        OUTCOME: ${{ steps.upload.outcome }}
+        ARTIFACT: ${{ steps.stage.outputs.artifact }}
+        WHY: ${{ steps.stage.outputs.reason }}
+      run: >-
+        exec python3 -I "$GITHUB_ACTION_PATH/handoff.py" uploaded --staged="$STAGED" --outcome="$OUTCOME"
+        --artifact="$ARTIFACT" --why="$WHY"
