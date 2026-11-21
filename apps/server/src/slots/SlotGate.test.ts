@@ -1757,3 +1757,155 @@ describe("SlotGate: a batch's later starts (alsoNeeds)", () => {
     }),
   );
 });
+
+describe("a message into an existing thread (`intoThreadId`, #711)", () => {
+  const bound = ThreadId.make("thread:slot-bound");
+  const holder = ThreadId.make("thread:slot-holder");
+  const other = ThreadId.make("thread:slot-other");
+  /** The gate as a send asks it: decided, then named for the thread and ended at once. */
+  const send = (
+    intoThreadId: ThreadId,
+    options: { readonly callerThreadId?: ThreadId; readonly keepsHeld?: boolean } = {},
+  ) =>
+    Effect.gen(function* () {
+      const gate = yield* SlotGate.SlotGate;
+      const outcome = yield* gate.acquire({
+        callerThreadId: options.callerThreadId ?? caller,
+        targetInstanceId: MAIN,
+        intoThreadId,
+        ...(options.keepsHeld === undefined ? {} : { keepsHeld: options.keepsHeld }),
+      });
+      if (outcome.type === "allow") {
+        yield* gate.started(outcome.token, intoThreadId);
+        yield* gate.release(outcome.token);
+      }
+      return outcome.type;
+    });
+  const types = Effect.fnUntraced(function* (count: number) {
+    const out: Array<string> = [];
+    for (let index = 0; index < count; index++) out.push((yield* acquire()).type);
+    return out;
+  });
+
+  it.effect("into a thread that shows a run it only queues: allowed when full, takes no slot", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [
+        { id: bound, instanceId: MAIN },
+        { id: other, instanceId: MAIN },
+      ];
+      yield* run(
+        world,
+        on({ maxPerMachine: 3, startGraceSeconds: 30 }),
+        Effect.gen(function* () {
+          // Full for a start (2 running, a third slot is free): the queued message takes none.
+          assert.strictEqual(yield* send(bound), "allow");
+          assert.deepStrictEqual(yield* types(2), ["allow", "refuse"]);
+        }),
+      );
+      const full = newWorld();
+      full.threads = world.threads;
+      assert.strictEqual(yield* run(full, on({ maxPerMachine: 2 }), send(bound)), "allow");
+    }),
+  );
+
+  it.effect(
+    "the race: its run ends before the message lands, so the message starts one; it counts for the start grace",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [
+          { id: bound, instanceId: MAIN },
+          { id: other, instanceId: MAIN },
+        ];
+        yield* run(
+          world,
+          on({ maxPerMachine: 2, startGraceSeconds: 30 }),
+          Effect.gen(function* () {
+            assert.strictEqual(yield* send(bound), "allow");
+            // The bound thread's run ended between the decision and the send: the message starts
+            // the next run, so it holds the slot the old run had.
+            world.threads = [{ id: other, instanceId: MAIN }];
+            assert.deepStrictEqual(yield* types(1), ["refuse"]);
+            // Its new run shows: counted once, as running.
+            world.threads = [
+              { id: bound, instanceId: MAIN },
+              { id: other, instanceId: MAIN },
+            ];
+            assert.deepStrictEqual(yield* types(1), ["refuse"]);
+            world.threads = [{ id: other, instanceId: MAIN }];
+            // Never started (the message was lost elsewhere): free after the start grace.
+            yield* TestClock.adjust("30 seconds");
+            assert.deepStrictEqual(yield* types(2), ["allow", "refuse"]);
+          }),
+        );
+      }),
+  );
+
+  it.effect("into a thread that shows no run it is a start: full refuses, free takes the slot", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: other, instanceId: MAIN }];
+      yield* run(
+        world,
+        on({ maxPerMachine: 1, startGraceSeconds: 30 }),
+        Effect.gen(function* () {
+          assert.strictEqual(yield* send(bound), "refuse");
+          world.threads = [];
+          assert.strictEqual(yield* send(bound), "allow");
+          // Sent, its run not shown yet: the slot is its own.
+          assert.deepStrictEqual(yield* types(1), ["refuse"]);
+          world.threads = [{ id: bound, instanceId: MAIN }];
+          assert.deepStrictEqual(yield* types(1), ["refuse"]);
+        }),
+      );
+    }),
+  );
+
+  it.effect(
+    "a count that cannot be read refuses where a count limit applies; off reads nothing",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [{ id: bound, instanceId: MAIN }];
+        world.snapshotFails = true;
+        // Running or not cannot be told: fails closed, even into a thread that runs.
+        assert.strictEqual(yield* run(world, on({ maxPerMachine: 5 }), send(bound)), "refuse");
+        // Only another account is limited: no count limit applies here, so nothing to refuse.
+        const elsewhere = on({ maxPerAccount: { [SECOND]: 1 } });
+        assert.strictEqual(yield* run(world, elsewhere, send(bound)), "allow");
+        for (const settings of [{}, { agentSlots: { mode: "fixed" } }, on({})]) {
+          const off = newWorld();
+          off.threads = [{ id: other, instanceId: MAIN }];
+          assert.strictEqual(yield* run(off, settings, send(bound)), "allow");
+          assert.strictEqual(off.snapshotReads, 0);
+        }
+      }),
+  );
+
+  it.effect("a woken thread (`keepsHeld`) keeps the slot its slot wait holds for its agent", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      yield* run(
+        world,
+        { ...on({ maxPerMachine: 2, reserveSeconds: 60 }), waitFor: { enabled: true } },
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const grants = yield* gate.grant([{ key: "w1", threadId: holder }]);
+          assert.strictEqual(grants[0]?.type, "granted");
+          yield* gate.keep(["w1"]);
+          // The wake-up starts the holder's run; its held slot stays for the agent it starts.
+          assert.strictEqual(
+            yield* send(holder, { callerThreadId: holder, keepsHeld: true }),
+            "allow",
+          );
+          world.threads = [{ id: holder, instanceId: MAIN }];
+          const asOther = gate.acquire({ callerThreadId: other, targetInstanceId: MAIN });
+          assert.strictEqual((yield* asOther).type, "refuse");
+          const delegated = yield* gate.acquire({ callerThreadId: holder, targetInstanceId: MAIN });
+          assert.strictEqual(delegated.type, "allow");
+        }),
+      );
+    }),
+  );
+});

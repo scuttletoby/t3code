@@ -142,6 +142,8 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
             detail: result.detail,
           });
           return { type: "held", detail: result.detail } satisfies CheckOutcome;
+        // Not given a gate (`WaitDelivery.make`): never answered here.
+        case "waitsForSlot":
         case "retry":
           // The batches sent so far are recorded by their ids; the next try sends the rest.
           watched.add(parentThreadId);

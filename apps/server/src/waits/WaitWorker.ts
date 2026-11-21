@@ -9,6 +9,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
@@ -82,7 +83,8 @@ export const layer = Layer.effect(
     const checkPlaceOf = yield* makeCheckPlaceOf();
     const waits = yield* WaitService.make({
       filePath: path.join(config.stateDir, WAIT_STORE_FILE),
-      delivery: yield* WaitDelivery.make(),
+      // The wake-ups it sends take a slot like any start (the same gate as below).
+      delivery: yield* WaitDelivery.make(Option.some(yield* SlotGate.SlotGate)),
       judges: {
         check: yield* makeCheckJudge({ placeOf: checkPlaceOf }),
         unit: yield* makeUnitJudge(),

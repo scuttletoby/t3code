@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   agentSlotsMode,
+  countedStarting,
   DISPATCH_SAFETY_MS,
   effectiveSlotLimits,
   limitsCount,
@@ -157,6 +158,31 @@ describe("liveStarting", () => {
     ];
     const visible = new Set(["child-1", "child-2"]);
     expect(liveStarting(entries, visible, 1_000, 30_000).map((e) => e.token)).toEqual([3, 4]);
+  });
+});
+
+describe("countedStarting (#711)", () => {
+  const queued = (token: number, into: string, endedAtMs?: number): StartingEntry => ({
+    token,
+    instanceId: MAIN,
+    atMs: 0,
+    queuedInto: into,
+    ...(endedAtMs === undefined ? {} : { endedAtMs }),
+  });
+
+  it("counts a message queued into a thread only while that thread shows no run", () => {
+    const entries = [queued(1, "busy"), queued(2, "ended"), { token: 3, instanceId: MAIN, atMs: 0 }];
+    // "busy" still runs: its run is counted, not its queued message too.
+    expect(countedStarting(entries, new Set(["busy"])).map((e) => e.token)).toEqual([2, 3]);
+    expect(countedStarting(entries, new Set()).map((e) => e.token)).toEqual([1, 2, 3]);
+  });
+
+  it("a queued message never ends by its thread showing a run: only by time", () => {
+    const ended = [queued(1, "thread-1", 10_000)];
+    // Its thread shows a run: kept (not counted now), so it counts again if that run ends.
+    expect(liveStarting(ended, new Set(["thread-1"]), 20_000, 30_000)).toHaveLength(1);
+    expect(liveStarting(ended, new Set(), 39_999, 30_000)).toHaveLength(1);
+    expect(liveStarting(ended, new Set(), 40_000, 30_000)).toEqual([]);
   });
 });
 

@@ -13,6 +13,7 @@ import type { SlotRuleStatus, WaitToolFailure } from "@t3tools/contracts/waitFor
 import {
   accountOnlyThreads,
   agentSlotsMode,
+  countedStarting,
   effectiveSlotLimits,
   limitsCount,
   liveReservations,
@@ -132,6 +133,19 @@ export interface SlotAcquireInput {
    * only when all of them would be too. Only this start is taken; the others take their own later.
    */
   readonly alsoNeeds?: ReadonlyArray<ProviderInstanceId> | undefined;
+  /**
+   * The start is a message into this existing thread. While the count shows it with a run, the
+   * message only queues: allowed whatever the limits, and recorded so that it counts only while
+   * the thread shows no run (its run ended before the message landed; see `queuedInto`). Idle,
+   * it is a start like any other. The count is read for it even when no count limit applies;
+   * unread, it refuses only where a count limit applies.
+   */
+  readonly intoThreadId?: ThreadId | undefined;
+  /**
+   * The caller is the woken thread itself (a wait's message): its held slots are not counted
+   * against it and are not used up, so the agent it wakes up for still has its slot.
+   */
+  readonly keepsHeld?: boolean | undefined;
 }
 
 export class SlotGate extends Context.Service<
@@ -149,7 +163,8 @@ export class SlotGate extends Context.Service<
     /**
      * The dispatch ended, whichever way (call it from a finalizer). Without a started child the
      * slot is free again at once; a started child that shows no run yet still counts for the
-     * start grace. Calling it again does nothing more.
+     * start grace, and so does a message queued into a running thread (`intoThreadId`), while
+     * that thread shows no run. Calling it again does nothing more.
      */
     readonly release: (token: SlotToken | null) => Effect.Effect<void>;
     /** The wait service gives the gate the slots its store holds (once, when it starts). */
@@ -595,10 +610,11 @@ const make = Effect.gen(function* () {
       const waitsOn = settings.value.waitFor.enabled;
       const nowMs = yield* Clock.currentTimeMillis;
       const counted = limitsCount(limits, input.targetInstanceId);
-      const count = counted ? yield* readCount : undefined;
+      const into = input.intoThreadId;
+      const count = counted || into !== undefined ? yield* readCount : undefined;
       // Fails closed: a count it needs but cannot read refuses before anything is
       // recorded, so the refused call starts nothing, uses no held slot and writes nothing.
-      if (count?.type === "unread") {
+      if (count?.type === "unread" && counted) {
         return asDecided(
           {
             type: "refuse",
@@ -608,9 +624,22 @@ const make = Effect.gen(function* () {
           [],
         );
       }
-      const read = count;
+      const shown = count?.type === "read" ? count : undefined;
+      // A message into a thread that shows a run only queues: it starts no agent now.
+      if (into !== undefined && shown?.visible.has(into) === true) {
+        yield* keepStarting(shown.visible, nowMs, limits);
+        const token = yield* Ref.getAndUpdate(nextToken, (value) => value + 1);
+        yield* Ref.update(entries, (current) => [
+          ...current,
+          { token, instanceId: input.targetInstanceId, atMs: nowMs, queuedInto: into },
+        ]);
+        return asDecided({ type: "allow", token }, []);
+      }
+      // The running agents only where a count limit applies (no count means none to check).
+      const read = counted ? shown : undefined;
       const running = read?.running.filter((agent) => agent.threadId !== input.callerThreadId);
-      const kept = yield* keepStarting(read?.visible, nowMs, limits);
+      const visible = shown?.visible ?? new Set<string>();
+      const kept = countedStarting(yield* keepStarting(shown?.visible, nowMs, limits), visible);
       // A store that cannot be read: its holds go uncounted (memory only); the caller's stored
       // holds are used up at the next good read.
       const heldRead = yield* liveHeld(waitsOn, nowMs);
@@ -664,8 +693,8 @@ const make = Effect.gen(function* () {
         { token, instanceId: input.targetInstanceId, atMs: nowMs },
       ]);
       // The agent it held a slot for starts now: its held slot is used up, with every older copy.
-      // A start no thread asks for holds no slot: it uses none up.
-      const caller = input.callerThreadId;
+      // A start no thread asks for holds no slot: it uses none up. A woken thread keeps its own.
+      const caller = input.keepsHeld === true ? null : input.callerThreadId;
       const used = caller === null ? [] : yield* useUp(reservations, caller);
       if (!heldRead.whole && caller !== null) unreadStarts.add(caller);
       return asDecided({ type: "allow", token }, used);
@@ -709,7 +738,10 @@ const make = Effect.gen(function* () {
       );
       // Read only when a count limit applies to one of them (3.6).
       const read = counted ? yield* readRunning : undefined;
-      const kept = yield* keepStarting(read?.visible, nowMs, limits);
+      const kept = countedStarting(
+        yield* keepStarting(read?.visible, nowMs, limits),
+        read?.visible ?? new Set(),
+      );
       const memoryBytes = yield* freeMemoryBytes(limits);
       const reserveMs = settings.value.agentSlots.reserveSeconds * 1000;
       const heldRead = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
@@ -830,7 +862,10 @@ const make = Effect.gen(function* () {
     const starting =
       limits === null
         ? []
-        : liveStarting(yield* Ref.get(entries), read.visible, nowMs, limits.startGraceMs);
+        : countedStarting(
+            liveStarting(yield* Ref.get(entries), read.visible, nowMs, limits.startGraceMs),
+            read.visible,
+          );
     const heldRead = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
     // Not under the semaphore: a hold this read used up is cleared in the store here.
     yield* clearUsedLater;
@@ -897,7 +932,12 @@ const make = Effect.gen(function* () {
       token === null
         ? Effect.void
         : Ref.update(entries, (current) =>
-            current.map((entry) => (entry.token === token ? { ...entry, childThreadId } : entry)),
+            current.map((entry) =>
+              // A queued message is tied to its thread already and ends by time only.
+              entry.token === token && entry.queuedInto === undefined
+                ? { ...entry, childThreadId }
+                : entry,
+            ),
           ).pipe(Effect.andThen(observer.started(token, childThreadId))),
     ),
     release: Effect.fn("SlotGate.release")(function* (token: SlotToken | null) {
@@ -907,7 +947,7 @@ const make = Effect.gen(function* () {
         current.flatMap((entry) =>
           entry.token !== token
             ? [entry]
-            : entry.childThreadId === undefined
+            : entry.childThreadId === undefined && entry.queuedInto === undefined
               ? []
               : [entry.endedAtMs === undefined ? { ...entry, endedAtMs: nowMs } : entry],
         ),

@@ -111,6 +111,12 @@ export interface StartingEntry {
   readonly atMs: number;
   readonly childThreadId?: string;
   readonly endedAtMs?: number;
+  /**
+   * A message sent into this existing thread while it showed a run: it only queued, so it counts
+   * only while that thread shows none (its run ended before the message landed, so the message
+   * starts the next one). Never named: it ends by time only (`liveStarting`).
+   */
+  readonly queuedInto?: string;
 }
 
 /**
@@ -131,6 +137,19 @@ export function liveStarting<Entry extends StartingEntry>(
       ? nowMs - entry.atMs < DISPATCH_SAFETY_MS
       : nowMs - entry.endedAtMs < startGraceMs;
   });
+}
+
+/**
+ * The live entries that count now: a message queued into a thread (`queuedInto`) counts only
+ * while that thread shows no run (else its run is counted, once).
+ */
+export function countedStarting<Entry extends StartingEntry>(
+  entries: ReadonlyArray<Entry>,
+  visibleRunIds: ReadonlySet<string>,
+): ReadonlyArray<Entry> {
+  return entries.filter(
+    (entry) => entry.queuedInto === undefined || !visibleRunIds.has(entry.queuedInto),
+  );
 }
 
 /**

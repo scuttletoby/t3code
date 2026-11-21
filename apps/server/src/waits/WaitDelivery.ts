@@ -2,6 +2,8 @@
  * Fork (waits): sends a wait's message through the thread tools' send, at most once. A retry
  * first looks for its message in the thread, then reads its command's receipt, and only then
  * sends; so a send that was accepted but whose answer was lost is never sent a second time.
+ * Given the slot gate, a message that would wake a thread showing no run first takes a slot
+ * (`fork/agentSlotRoutes.ts`); refused, nothing is sent and the message waits for one.
  */
 import {
   CommandId,
@@ -13,8 +15,10 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import { admitSend, reasonHere } from "../fork/agentSlotRoutes.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import type * as SlotGate from "../slots/SlotGate.ts";
 import type { WaitMessage } from "./WaitService.ts";
 
 /** Where a receiver stands now. Only a subagent's parent is a parent; a fork has none. */
@@ -39,6 +43,12 @@ export type WaitDeliveryResult =
   | { readonly type: "rejected"; readonly detail: string }
   /** Nothing was recorded for this command id; the same id is tried again later. */
   | { readonly type: "retry"; readonly detail: string }
+  /**
+   * The message would wake a thread that shows no run, and the slot gate has no free slot (or
+   * cannot count): nothing was sent; the same command id is tried again once a slot may be free,
+   * however long that takes.
+   */
+  | { readonly type: "waitsForSlot"; readonly detail: string }
   | Exclude<WaitReceiver, { readonly type: "ok" }>;
 
 export interface WaitDelivery {
@@ -83,7 +93,13 @@ const RETRY_SAME_ID: ReadonlySet<string> = new Set([
 const describe = (error: unknown) =>
   error instanceof Error ? error.message : typeof error === "string" ? error : String(error);
 
-export const make = Effect.fn("WaitDelivery.make")(function* () {
+/**
+ * `slots`: the server's gate, for the wait service's own messages (wait deliveries and lost-wait
+ * notices). Without it (the delegated-result reminders) nothing is gated.
+ */
+export const make = Effect.fn("WaitDelivery.make")(function* (
+  slots: Option.Option<SlotGate.SlotGate["Service"]> = Option.none(),
+) {
   const threads = yield* ThreadManagement.ThreadManagementService;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
 
@@ -159,6 +175,15 @@ export const make = Effect.fn("WaitDelivery.make")(function* () {
     if (receipt !== "none") return receipt;
     // shell is not null here: receiverOf answers "gone" for null.
     const projectId = shell!.projectId;
+    // Last before the send: a wake-up of a thread that shows no run starts it, so it takes a
+    // slot. Its own held slot stays held for the agent it wakes up to start.
+    const slot = yield* admitSend(slots, {
+      callerThreadId: message.threadId,
+      threadId: message.threadId,
+      instanceId: shell!.modelSelection.instanceId,
+      keepsHeld: true,
+    });
+    if (slot.type === "refuse") return { type: "waitsForSlot", detail: reasonHere(slot.refusal) };
     return yield* threads
       .sendToThread({
         projectId,

@@ -141,6 +141,11 @@ const NOTICE_TEXT_MAX = 1000;
 const STOPPED_RECHECK_MS = 60_000;
 /** After the store could not be read, or a notice not sent, the next try is this much later. */
 const PROBLEM_RECHECK_MS = 60_000;
+/**
+ * A wake-up refused for an agent slot is asked again this often (memory only: after a restart
+ * its `delivering` wait is sent at once, and the gate is asked again).
+ */
+export const WAKE_SLOT_RETRY_MS = 5_000;
 const WAIT_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 
 /** A message to a thread, sent through a `WaitDelivery`. */
@@ -469,6 +474,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   const sending = new Map<string, object>();
   /** Messages whose send crashed or ran late, already logged; cleared when the message is done. */
   const sendTroubleLogged = new Set<string>();
+  /** Messages waiting for an agent slot, already logged; cleared when the message is done. */
+  const slotWaitLogged = new Set<string>();
 
   const judgeOf = (kind: WaitKind) => judges[kind] as WaitJudge | undefined;
 
@@ -1872,6 +1879,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
     retryAt.delete(messageId);
     failures.delete(messageId);
     sendTroubleLogged.delete(messageId);
+    slotWaitLogged.delete(messageId);
   };
 
   /** The events one send's answer makes for each wait of its message. */
@@ -1893,6 +1901,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           now >= Date.parse(wait.deadlineAt) + settings.waitFor.keepEndedHours * 3_600_000;
         return late ? [{ type: "rejected" }] : [];
       }
+      case "waitsForSlot":
+        // Nothing was sent; the wake-up waits for a slot however long it takes, never late.
+        return [];
       case "gone":
         return [{ type: "threadGone", parentThreadId: result.parentThreadId }];
       case "stopped":
@@ -1927,6 +1938,9 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         failures.set(group.messageId, tries);
         return now + deliveryRetryDelayMs(attempt + tries);
       }
+      case "waitsForSlot":
+        // Not a failure (no back-off): asked again soon, as a waiting webhook delivery is.
+        return now + WAKE_SLOT_RETRY_MS;
       case "stopped": {
         const since = Math.min(
           ...still.map((wait) =>
@@ -2075,6 +2089,13 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             yield* Effect.logWarning(
               `waits: message ${group.messageId} to thread ${group.threadId} not sent yet: ${result.detail}`,
             );
+          } else if (result.type === "waitsForSlot") {
+            if (!slotWaitLogged.has(group.messageId)) {
+              slotWaitLogged.add(group.messageId);
+              yield* Effect.logInfo(
+                `waits: message ${group.messageId} to thread ${group.threadId} waits for an agent slot: ${result.detail}`,
+              );
+            }
           } else if (result.type === "rejected") {
             yield* Effect.logWarning(
               `waits: thread ${group.threadId} refused message ${group.messageId}: ${result.detail}`,
@@ -2269,6 +2290,7 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         }
         // Tried again later.
         case "retry":
+        case "waitsForSlot":
           held = true;
           break;
       }

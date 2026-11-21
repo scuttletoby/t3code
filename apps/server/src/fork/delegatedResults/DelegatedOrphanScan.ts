@@ -163,6 +163,8 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
           refused = result.detail;
           break;
         case "retry":
+        // Not given a gate (`WaitDelivery.make`): never answered here.
+        case "waitsForSlot":
           retry = true;
           break;
       }
