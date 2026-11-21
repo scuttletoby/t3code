@@ -17,6 +17,7 @@ import {
   ScheduledTaskUpsertInput,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -1164,11 +1165,29 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
     );
 
   /** Slot retries in the unreadable limit. */
-  const LIMIT_RETRIES =
-    Duration.toMillis(AgentSlotRoutes.WEBHOOK_UNREADABLE_LIMIT) /
-    Duration.toMillis(AgentSlotRoutes.WEBHOOK_SLOT_RETRY);
+  const LIMIT_RETRIES = AgentSlotRoutes.WEBHOOK_UNREADABLE_RETRIES;
 
   const UNREADABLE_WARNING = /waiting for a slot cannot read its task/;
+  const SKIPPED_WARNING = /waiting for a slot is skipped: its task stayed unreadable/;
+
+  /**
+   * Runs `body` on a clock whose wall time `sleep` moves ahead with no timer woken, as when the
+   * host sleeps between two retries (its timers count awake time only).
+   */
+  const withHostSleep = <A, E>(body: (sleep: (ms: number) => void) => Effect.Effect<A, E>) =>
+    Clock.clockWith((clock) => {
+      let asleepMs = 0;
+      const wallMs = () => clock.currentTimeMillisUnsafe() + asleepMs;
+      const host: Clock.Clock = Object.assign(Object.create(clock), {
+        currentTimeMillisUnsafe: wallMs,
+        currentTimeMillis: Effect.sync(wallMs),
+        currentTimeNanosUnsafe: () => BigInt(wallMs()) * 1_000_000n,
+        currentTimeNanos: Effect.sync(() => BigInt(wallMs()) * 1_000_000n),
+      });
+      return body((ms) => {
+        asleepMs += ms;
+      }).pipe(Effect.provideService(Clock.Clock, host));
+    });
 
   it.effect(
     "a waiting delivery whose task stays unreadable is skipped after the limit, warned once, and the next delivery is not stuck (#756)",
@@ -1189,8 +1208,13 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
             // The row stays unreadable (a column the service reads is gone), and a slot is free.
             yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt TO prompt_away`;
             slots.running = [];
+            // Its cause changes within the stretch (another column gone instead): still one
+            // stretch, warned once, with the first cause.
+            yield* retries(10);
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt_away TO prompt`;
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN title TO title_away`;
             // Just short of the limit: nothing starts, nothing is dropped, one warning so far.
-            yield* retries(LIMIT_RETRIES - 1);
+            yield* retries(LIMIT_RETRIES - 11);
             assert.deepEqual(started, []);
             assert.deepEqual(yield* pendingStates(sql, task.id), [
               { delivery_id: deliveryId, state: "dispatching" },
@@ -1198,8 +1222,10 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
             assert.equal((yield* deliveryRow(sql, deliveryId)).outcome, "accepted");
             assert.equal((yield* deliveryRow(sql, next.deliveryId)).outcome, "accepted");
             assert.equal(lines(UNREADABLE_WARNING), 1);
-            // At the limit: skipped with its reason, its row gone; nothing started on it.
-            yield* retries(2);
+            assert.equal(lines(SKIPPED_WARNING), 0);
+            // At the limit: skipped with its reason, its row gone; nothing started on it. The
+            // skip logs the cause it ended on (the last one), not only the first.
+            yield* retries(1);
             assert.deepEqual(started, []);
             assert.deepEqual(yield* deliveryRow(sql, deliveryId), {
               outcome: "dispatch_failed",
@@ -1210,8 +1236,14 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
             // whose task cannot be read, not left waiting.
             assert.equal((yield* deliveryRow(sql, next.deliveryId)).outcome, "dispatch_failed");
             assert.equal(lines(UNREADABLE_WARNING), 1);
+            const skipped = logs
+              .map((entry) => Logger.formatLogFmt.log(entry))
+              .filter((line) => SKIPPED_WARNING.test(line));
+            assert.equal(skipped.length, 1);
+            assert.include(skipped[0], "title");
+            assert.notInclude(skipped[0], "prompt");
             // Readable again: the next delivery runs, once.
-            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt_away TO prompt`;
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN title_away TO title`;
             const after = yield* service.triggerWebhook(webhookRequest(task));
             if (after._tag !== "accepted") return assert.fail(`not accepted: ${after._tag}`);
             yield* until(() => started.length === 1, "the next delivery started");
@@ -1230,7 +1262,7 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
   );
 
   it.effect(
-    "a waiting delivery whose task's row is gone while its pause check cannot read is skipped after the limit too (#756)",
+    "a waiting delivery whose task's row is gone while its pause check cannot read ends at the next retry as deleted (#763)",
     () => {
       const slots = slotWorld([BUSY]);
       return withService(
@@ -1238,21 +1270,51 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
           Effect.gen(function* () {
             const { sql, started } = harness;
             const { task, deliveryId } = yield* waitingDelivery(harness);
-            // `webhookGone` cannot read (a column it reads is gone), and the row is gone: no
-            // check can end the delivery as deleted, so only the limit does.
+            // `webhookGone` cannot read (a column it reads is gone), and the row is gone: the
+            // compare's read finds no row, so it ends as deleted, not as unreadable.
             yield* sql`DELETE FROM scheduled_tasks WHERE task_id = ${task.id}`;
             yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN enabled TO enabled_away`;
             slots.running = [];
-            yield* retries(LIMIT_RETRIES - 1);
-            assert.equal((yield* deliveryRow(sql, deliveryId)).outcome, "accepted");
-            yield* retries(2);
+            yield* retries(1);
             assert.deepEqual(started, []);
             assert.deepEqual(yield* deliveryRow(sql, deliveryId), {
               outcome: "dispatch_failed",
-              error: AgentSlotRoutes.UNREADABLE_WHILE_WAITING,
+              error: AgentSlotRoutes.DELETED_WHILE_WAITING,
             });
           }),
         { slots },
+      );
+    },
+  );
+
+  it.effect(
+    "a host asleep between two unreadable retries does not use up the limit: it counts retries (#763)",
+    () => {
+      const slots = slotWorld([BUSY]);
+      return withHostSleep((sleep) =>
+        withService(
+          (harness) =>
+            Effect.gen(function* () {
+              const { sql, started, webhookWorker } = harness;
+              const { task, deliveryId } = yield* waitingDelivery(harness);
+              yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt TO prompt_away`;
+              yield* retries(1);
+              // The host sleeps longer than the limit's 5 minutes, then the next retry fails too.
+              sleep(Duration.toMillis(Duration.minutes(10)));
+              yield* retries(LIMIT_RETRIES - 2);
+              assert.deepEqual(started, []);
+              assert.equal((yield* deliveryRow(sql, deliveryId)).outcome, "accepted");
+              // Readable with a slot free: it runs, once.
+              yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt_away TO prompt`;
+              slots.running = [];
+              yield* until(() => started.length === 1, "the delivery started");
+              yield* workerRounds(webhookWorker, 3);
+              assert.equal(started.length, 1);
+              assert.equal((yield* rowOf(sql, task.id)).run_count, 1);
+              assert.deepEqual(yield* pendingStates(sql, task.id), []);
+            }),
+          { slots },
+        ),
       );
     },
   );

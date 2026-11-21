@@ -398,9 +398,11 @@ These routes start a new agent run and go through the same gate, with the same c
   [#750](https://github.com/scuttletoby/t3code/issues/750)). A write that changes none of that (a
   new webhook token, a pause undone before the next retry) does not hand it back, and a retry that
   cannot read the task asks again at the next one. The first such retry logs a warning (again only
-  after a good read); a delivery whose task stays unreadable for 5 minutes ends without a run,
-  saying why, so later deliveries of the task do not wait behind it
-  ([#756](https://github.com/scuttletoby/t3code/issues/756)). Not covered: a save in the instant
+  after a good read); a delivery whose task stays unreadable for 60 retries in a row (5 minutes,
+  counted in retries so a sleeping host does not end it early) ends without a run, saying why and
+  logging the last cause, so later deliveries of the task do not wait behind it
+  ([#756](https://github.com/scuttletoby/t3code/issues/756),
+  [#763](https://github.com/scuttletoby/t3code/issues/763)). Not covered: a save in the instant
   between the last check and the start, or between a direct delivery's read (no coalescing window)
   and its first try for a slot: upstream's read-then-run window, as for any run. Closing the direct
   one needs no new upstream line: it would change the existing fork seam line on upstream's
