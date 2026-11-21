@@ -819,7 +819,8 @@ describe("SlotGate", () => {
       world.threads = [{ id: "a", instanceId: MAIN }];
       yield* run(
         world,
-        {},
+        // Off: `fixed` while switched off (no mode is `enforce`, the capacity rule).
+        { agentSlots: { mode: "fixed" } },
         Effect.gen(function* () {
           assert.strictEqual((yield* acquire()).type, "allow");
           const settings = yield* ServerSettings.ServerSettingsService;
@@ -870,7 +871,11 @@ describe("SlotGate", () => {
 
     it.effect("off, or no limit: every request is 'off', nothing read, nothing held", () =>
       Effect.gen(function* () {
-        for (const settings of [{}, { waitFor: { enabled: true } }, waitsOn({})]) {
+        for (const settings of [
+          { agentSlots: { mode: "fixed" } },
+          { agentSlots: { mode: "fixed" }, waitFor: { enabled: true } },
+          waitsOn({}),
+        ]) {
           const world = newWorld();
           world.threads = [{ id: "a", instanceId: MAIN }];
           const grants = yield* run(
@@ -973,7 +978,7 @@ describe("SlotGate", () => {
             }
             // Slots turned off: everything is allowed and slot waits are 'off'.
             yield* settings.updateSettings({ waitFor: { enabled: true } });
-            yield* settings.updateSettings({ agentSlots: { enabled: false } });
+            yield* settings.updateSettings({ agentSlots: { enabled: false, mode: "fixed" } });
             assert.strictEqual((yield* acquireAs(other)).type, "allow");
             assert.deepStrictEqual(types(yield* grant({ key: "w2", threadId: other })), ["off"]);
           }),
@@ -1911,7 +1916,7 @@ describe("a message into an existing thread (`intoThreadId`, #711)", () => {
         // Only another account is limited: no count limit applies here, so nothing to refuse.
         const elsewhere = on({ maxPerAccount: { [SECOND]: 1 } });
         assert.strictEqual(yield* run(world, elsewhere, send(bound)), "allow");
-        for (const settings of [{}, { agentSlots: { mode: "fixed" } }, on({})]) {
+        for (const settings of [{ agentSlots: { mode: "fixed" } }, on({})]) {
           const off = newWorld();
           off.threads = [{ id: other, instanceId: MAIN }];
           assert.strictEqual(yield* run(off, settings, send(bound)), "allow");

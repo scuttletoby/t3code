@@ -655,11 +655,18 @@ memory readings and only records what it would have answered: one log line per d
 last result with counts under `slotRule` in `wait_list`. It never changes or delays a decision; a
 reading that fails or takes over 2 seconds counts as "unreadable". While switched off the gate keeps
 no records of new agents, so the rule counts each agent allowed in the last `startGraceSeconds` as
-starting. Without `mode`, a switched-on
-gate is `"fixed"` (a file from an older build decides exactly as before) and a switched-off one is
-`"observe"`; a mode this build does not know (from a newer build) is `"fixed"`. Not "off" for that
-reason: with the default the server reads memory files at each `delegate_task`; `"mode": "fixed"`
-stops it.
+starting. `"enforce"`: the capacity rule decides. Every agent still starting owes its full cost
+(two starts in one second both count), an agent's kind comes from its task `role` (`research`,
+`review` and `design` are light, anything else or no role is a writer; a light agent that grows past
+the light cost counts as a writer, so a wrong role cannot hide one), and the floors (2 agents, 1 job)
+and ceilings apply. The agent ceiling is 3 per core, at most 64. After an OOM kill (`oom_kill` in
+`/proc/vmstat` rises) or with swap under 10% free the gate falls back to at most 10 agents and 4 jobs
+and raises each start cost by 25% per trip; it lifts again after 10 minutes of calm, whole readings.
+A restarted server starts in that fallback, and a reading it cannot take counts as "elevated", never
+as calm. Typed limits (`maxPerMachine`, ...) still apply while `enabled`. Without `mode`, a
+switched-on gate is `"fixed"` (a file from an older build decides exactly as before) and a
+switched-off one is `"enforce"`; a mode this build does not know (from a newer build) is `"fixed"`.
+`"mode": "fixed"` turns the rule off and stops the memory reads at each `delegate_task`.
 
 ### `server.headlessUsageRefreshInterval`
 

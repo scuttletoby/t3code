@@ -18,6 +18,7 @@ import {
   type ServerProvider,
   type ThreadId,
 } from "@t3tools/contracts";
+import { kindOfRole } from "@t3tools/shared/slotObserve";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -40,6 +41,8 @@ import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
 export interface DelegateTarget {
   readonly modelSelection: ModelSelection;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
+  /** The slot gate's capacity kind, from the task's `role` (`kindOfRole`); absent: a writer. */
+  readonly agentKind?: string;
 }
 
 type Parent = Pick<OrchestrationV2ThreadProjection, "thread">;
@@ -66,7 +69,10 @@ export interface BeforeWorkspaceInput {
   /** A retry of a delegation that was accepted: it starts no work, so nothing is checked. */
   readonly isRetry: boolean;
   readonly parent: Parent;
-  readonly requested: OrchestratorMcpTarget | undefined;
+  /** The task's target, with its `role` (the slot gate's kind; the caller may lie about it). */
+  readonly requested:
+    | (OrchestratorMcpTarget & { readonly role?: OrchestratorMcpDelegateTaskInput["role"] })
+    | undefined;
   readonly runtimeMode: OrchestratorMcpDelegateTaskInput["runtimeMode"];
   /**
    * The parent's folder, as the target lookup reads it, or none. The checks read the providers
@@ -488,6 +494,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         .acquire({
           callerThreadId: input.callerThreadId,
           targetInstanceId: input.target.modelSelection.instanceId,
+          kind: input.target.agentKind,
         })
         .pipe(
           Effect.flatMap((outcome) =>
@@ -510,8 +517,8 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
     // the target the pacer moved the task to or lowered its effort on: what runs is inside too. An
     // effort the pacer lowers off the row keeps the checked one (the agent cannot fix that pick).
     beforeWorkspace: (input) =>
-      input.isRetry
-        ? Effect.succeed({ target: input.target })
+      (input.isRetry
+        ? Effect.succeed<BeforeWorkspaceResult>({ target: input.target })
         : Effect.gen(function* () {
             const target = yield* ownTarget(input.target, input.requested);
             const policyNote = yield* policyCheck("delegate_task", target, input.requested);
@@ -546,7 +553,19 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
             ];
             const note = notes.filter((text) => text !== undefined).join(" ");
             return { target: paced.target, ...(note === "" ? {} : { note }) };
-          }),
+          })
+      ).pipe(
+        // The task's kind rides on the final target to the slot gate (`afterWorkspace`); a retry
+        // holds no slot, so its target stays as it came.
+        Effect.map((result) =>
+          input.isRetry
+            ? result
+            : {
+                ...result,
+                target: { ...result.target, agentKind: kindOfRole(input.requested?.role) },
+              },
+        ),
+      ),
     afterWorkspace: (input) =>
       input.isRetry || Option.isNone(slotGate)
         ? Effect.succeed(NO_HOLD)

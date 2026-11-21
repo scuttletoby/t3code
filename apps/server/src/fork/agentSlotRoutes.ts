@@ -13,7 +13,12 @@ import {
   ScheduledTaskError,
   type ThreadId,
 } from "@t3tools/contracts";
-import { slotRefusalReason, slotRunningText, type SlotDecision } from "@t3tools/shared/agentSlots";
+import {
+  capacityRefusalReason,
+  slotRefusalReason,
+  slotRunningText,
+  type SlotDecision,
+} from "@t3tools/shared/agentSlots";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -114,7 +119,9 @@ const reasonThere = (decision: FullDecision) =>
     ? `${slotRunningText(decision, " there")}, and the limit is ${decision.max}`
     : decision.rule === "account"
       ? `${slotRunningText(decision, ` there on account ${decision.instanceId}`)}, and the limit is ${decision.max}`
-      : `only ${decision.used} MB of memory is free there, and a new agent needs at least ${decision.max} MB`;
+      : decision.rule === "capacity"
+        ? capacityRefusalReason(decision.capacity, decision.used, decision.max, "that machine")
+        : `only ${decision.used} MB of memory is free there, and a new agent needs at least ${decision.max} MB`;
 
 /** Why, in one clause, for a reader on this machine (a scheduled task's history, run now, logs). */
 export const reasonHere = (refusal: SlotGate.SlotRefusal) =>

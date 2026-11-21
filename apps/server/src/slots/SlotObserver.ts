@@ -165,21 +165,32 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
     return capacityFactsOf(machine, { pieceCaps: false, pieces: read, boxPsi });
   };
 
+  /** The kernel's OOM kill counter (Linux); `null` where there is none. */
+  const readOomKills = async (): Promise<number | null | "unreadable"> => {
+    if (host.platform !== "linux") return null;
+    const read = await host.readFile("/proc/vmstat");
+    const match = "text" in read ? /^oom_kill (\d+)$/m.exec(read.text) : null;
+    return match === null ? "unreadable" : Number(match[1]);
+  };
+
   /** Never fails, never waits past the time limit, never piles up hanging reads. */
-  const readings = (pieces: ReadonlyArray<OwnPiece>) =>
+  const timed = <A>(read: () => Promise<A>) =>
     Effect.suspend(() => {
       if (hanging >= OBSERVE_MAX_HANGING) {
         return Effect.succeed({ facts: null, readings: "busy" as SlotReadings });
       }
       hanging += 1;
       const promise = Promise.resolve()
-        .then(() => readFacts(pieces))
+        .then(read)
         .finally(() => {
           hanging -= 1;
         });
       return Effect.tryPromise({ try: () => promise, catch: () => "failed" as const }).pipe(
         Effect.timeout(OBSERVE_READ_TIMEOUT),
-        Effect.map((facts) => ({ facts, readings: "ok" as SlotReadings })),
+        Effect.map((facts): { facts: A | null; readings: SlotReadings } => ({
+          facts,
+          readings: "ok",
+        })),
         Effect.catch((error) =>
           Effect.succeed({
             facts: null,
@@ -188,6 +199,28 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
         ),
       );
     });
+  const readings = (pieces: ReadonlyArray<OwnPiece>) => timed(() => readFacts(pieces));
+
+  /**
+   * `enforce`, on the decision path: the machine, the demand of each agent that shows a run (by
+   * thread; `null` when its scope is unknown or gone: it owes in full) and the OOM kill counter,
+   * within the time limit. `facts: null`: nothing could be read (the rule answers "unreadable").
+   */
+  const enforceRead = Effect.fn("SlotObserver.enforceRead")(function* (
+    threadIds: ReadonlyArray<string>,
+  ) {
+    const scopes = yield* Effect.forEach(threadIds, (threadId) =>
+      agentScope.ownScope === undefined ? Effect.undefined : agentScope.ownScope(threadId),
+    );
+    const read = yield* timed(async () => {
+      const facts = await readFacts(scopes.map((scope) => ({ scope })));
+      const demand = new Map(
+        threadIds.map((threadId, index) => [threadId, facts.pieces?.[index]?.demandMb ?? null]),
+      );
+      return { facts, demand, oomKills: await readOomKills() };
+    });
+    return read.facts;
+  });
 
   const run = Effect.fn("SlotObserver.run")(function* (
     input: SlotObserveInput,
@@ -322,6 +355,7 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
 
   return {
     observe,
+    enforceRead,
     /** The gate's `started` with one of the rule's own tokens: the child that start names. */
     started: (token: number, childThreadId: string) =>
       Effect.sync(() => {

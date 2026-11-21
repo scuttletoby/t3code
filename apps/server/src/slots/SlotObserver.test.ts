@@ -260,12 +260,12 @@ describe("SlotGate observe mode", () => {
     }),
   );
 
-  it.effect("off without a mode (the default) observes; the answer stays today's", () =>
+  it.effect("off in observe mode observes; the answer stays today's", () =>
     Effect.gen(function* () {
       const world = newWorld();
       const status = yield* run(
         world,
-        {},
+        observe(),
         Effect.gen(function* () {
           const answer = yield* acquire;
           // A token for the rule's own record of the start (the gate keeps none while off).
@@ -1220,4 +1220,193 @@ describe("SlotGate observe mode", () => {
       "/app.slice/app-t3code.slice/app-t3code-agents.slice/app-t3code-agents-0123.slice",
     );
   });
+});
+
+describe("SlotGate enforce mode (the default)", () => {
+  // Literal names (capacity-rule.json), so these fail on a build without the kinds.
+  const LIGHT_KIND = "agent-light";
+  const WRITER_KIND = "agent-writer";
+  /** `availableMb` free on the 16 GB machine, and the kernel's OOM kill count. */
+  const enforceWorld = (availableMb: number, oomKills = 0) => {
+    const world = newWorld();
+    world.files.set(
+      "/proc/meminfo",
+      `MemTotal:       16777216 kB\nMemFree:         1048576 kB\nMemAvailable:   ${availableMb * 1024} kB\nSwapCached:            0 kB\nSwapTotal:       4194304 kB\nSwapFree:        4194304 kB\n`,
+    );
+    world.files.set("/proc/vmstat", `nr_free_pages 1\noom_kill ${oomKills}\n`);
+    return world;
+  };
+  const ask = (kind?: string) =>
+    SlotGate.SlotGate.pipe(
+      Effect.flatMap((gate) =>
+        gate.acquire({
+          callerThreadId: caller,
+          targetInstanceId: MAIN,
+          ...(kind === undefined ? {} : { kind }),
+        }),
+      ),
+    );
+  const status = SlotGate.SlotGate.pipe(Effect.flatMap((gate) => gate.observed));
+  /**
+   * The first decision after a (re)start is "elevated" (under the floor of two it may still start:
+   * released at once); past the calm wait the rule decides. Its answer.
+   */
+  const warmUp = Effect.gen(function* () {
+    const first = yield* ask(LIGHT_KIND);
+    yield* SlotGate.SlotGate.pipe(
+      Effect.flatMap((gate) => gate.release(first.type === "allow" ? first.token : null)),
+    );
+    yield* TestClock.adjust(CALM_WAIT);
+    return first;
+  });
+
+  it.effect("no settings: the rule decides, and wait_list shows it with the fallback", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000);
+      world.threads = TWO_RUNNING;
+      const [allowed, shown] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          const first = yield* warmUp;
+          assert.strictEqual(first.type, "refuse");
+          if (first.type === "refuse") assert.include(first.message, "under pressure (elevated)");
+          return [yield* ask(), yield* status] as const;
+        }),
+      );
+      assert.strictEqual(allowed.type, "allow");
+      assert.deepInclude(shown, { mode: "enforce", fallback: true, observed: 2 });
+      assert.deepInclude(shown?.last, { rule: "allow", reason: "fits", pieces: 2 });
+    }),
+  );
+
+  it.effect("two starts in one second: the second counts the first's whole cost", () =>
+    Effect.gen(function* () {
+      // Margin 2458 MB; two running agents with no reading owe 768 MB: 574 MB left, one agent.
+      const world = enforceWorld(3_800);
+      world.threads = TWO_RUNNING;
+      const [first, second, shown] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          yield* warmUp;
+          const first = yield* ask(LIGHT_KIND);
+          const second = yield* ask(LIGHT_KIND);
+          return [first, second, yield* status] as const;
+        }),
+      );
+      assert.strictEqual(first.type, "allow");
+      assert.strictEqual(second.type, "refuse");
+      if (second.type === "refuse") {
+        assert.include(second.message, "only 190 MB of memory is free for new work");
+        assert.deepInclude(second.refusal, { type: "full" });
+      }
+      assert.deepInclude(shown?.last, { rule: "refuse", reason: "budget", owedMb: 1152 });
+    }),
+  );
+
+  it.effect(
+    "a restart mid-run counts every running agent as a writer, elevated and in fallback",
+    () =>
+      Effect.gen(function* () {
+        // 8 cores and room for four builds: four writers at most (two per build that fits, by cores).
+        const world = enforceWorld(12_000);
+        world.threads = [];
+        const before = yield* run(
+          world,
+          {},
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            yield* warmUp;
+            for (const id of ["l1", "l2", "l3", "l4"]) {
+              const allowed = yield* ask(LIGHT_KIND);
+              assert.strictEqual(allowed.type, "allow", id);
+              yield* gate.started(
+                allowed.type === "allow" ? allowed.token : null,
+                ThreadId.make(id),
+              );
+              world.threads.push({ id });
+            }
+            // The four run as light agents: a writer still fits.
+            return yield* ask(WRITER_KIND);
+          }),
+        );
+        assert.strictEqual(before.type, "allow");
+        // A new gate (a server restart, the four still running) knows no kinds: four writers.
+        const after = yield* run(
+          world,
+          {},
+          Effect.gen(function* () {
+            yield* warmUp;
+            const writer = yield* ask(WRITER_KIND);
+            // Runs again: the same answer, no record left behind by the refusal.
+            return [writer, yield* ask(WRITER_KIND), yield* status] as const;
+          }),
+        );
+        assert.deepStrictEqual(
+          after.slice(0, 2).map((answer) => answer.type),
+          ["refuse", "refuse"],
+        );
+        assert.deepInclude(after[2]?.last, { reason: "writers", pieces: 4 });
+        assert.strictEqual(after[2]?.fallback, true);
+      }),
+  );
+
+  it.effect("the fallback ends after ten calm minutes and trips again on a new OOM kill", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000, 7);
+      world.threads = Array.from({ length: 10 }, (_, index) => ({ id: `r${index}` }));
+      const [fixed, lifted, tripped, shown] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          yield* warmUp;
+          // Ten running: the fixed ceiling while in fallback (after a start too).
+          const fixed = yield* ask(LIGHT_KIND);
+          yield* TestClock.adjust(Duration.minutes(10));
+          // Kills from before the start are no new kill: the derived ceiling (24) applies.
+          const lifted = yield* ask(LIGHT_KIND);
+          yield* SlotGate.SlotGate.pipe(
+            Effect.flatMap((gate) => gate.release(lifted.type === "allow" ? lifted.token : null)),
+          );
+          world.files.set("/proc/vmstat", "oom_kill 8\n");
+          const tripped = yield* ask(LIGHT_KIND);
+          return [fixed, lifted, tripped, yield* status] as const;
+        }),
+      );
+      assert.strictEqual(fixed.type, "refuse");
+      if (fixed.type === "refuse") assert.include(fixed.message, "the limit is 10 now");
+      assert.strictEqual(lifted.type, "allow");
+      assert.strictEqual(tripped.type, "refuse");
+      assert.deepInclude(shown, { fallback: true });
+      assert.deepInclude(shown?.last, { reason: "ceiling" });
+    }),
+  );
+
+  it.effect("readings that fail refuse (unreadable), never fit; it recovers after calm", () =>
+    Effect.gen(function* () {
+      const world = enforceWorld(12_000);
+      world.threads = TWO_RUNNING;
+      const [thrown, shown, calming, back] = yield* run(
+        world,
+        {},
+        Effect.gen(function* () {
+          yield* warmUp;
+          world.host = "throw";
+          const thrown = yield* ask(LIGHT_KIND);
+          const shown = yield* status;
+          world.host = "ok";
+          // Unreadable left the level elevated: calm again before the rule says yes.
+          const calming = yield* ask(LIGHT_KIND);
+          yield* TestClock.adjust(CALM_WAIT);
+          return [thrown, shown, calming, yield* ask(LIGHT_KIND)] as const;
+        }),
+      );
+      assert.strictEqual(thrown.type, "refuse");
+      if (thrown.type === "refuse") assert.include(thrown.message, "cannot be read now");
+      assert.deepInclude(shown?.last, { rule: "refuse", reason: "unreadable", level: "elevated" });
+      assert.strictEqual(calming.type, "refuse");
+      assert.strictEqual(back.type, "allow");
+    }),
+  );
 });

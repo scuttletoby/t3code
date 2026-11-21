@@ -1,15 +1,18 @@
 /**
- * Fork: the agent slot gate on `delegate_task` (`agentSlots`), and on every other route that starts
- * an agent (`fork/agentSlotRoutes.ts`). Off and `fixed`: reads only the
- * settings. `observe`: the capacity rule runs beside each decision (`SlotObserver.ts`). Its own state
- * is memory only; slots held by delivered slot waits come from the wait store (`attachReservations`).
+ * Fork: the agent slot gate on `delegate_task` and every route that starts an agent. `fixed` reads
+ * only the settings; `observe` runs the capacity rule beside it; `enforce` (default) lets it decide.
+ * Memory only; held slots come from the wait store (`attachReservations`).
  */
 import type {
   OrchestrationV2ThreadShellSnapshot,
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
-import type { SlotRuleStatus, WaitToolFailure } from "@t3tools/contracts/waitFor";
+import type {
+  SlotRuleObservation,
+  SlotRuleStatus,
+  WaitToolFailure,
+} from "@t3tools/contracts/waitFor";
 import {
   accountOnlyThreads,
   agentSlotsMode,
@@ -24,12 +27,25 @@ import {
   slotDecision,
   slotRefusalText,
   visibleRunThreadIds,
+  type CapacityAsk,
+  type CapacityRefusal,
   type RunningAgent,
   type SlotDecision,
   type SlotLimits,
   type SlotReservation,
   type StartingEntry,
 } from "@t3tools/shared/agentSlots";
+import { CAPACITY_RULE } from "@t3tools/shared/capacityRule";
+import {
+  enforceCeilings,
+  enforceDecision,
+  FALLBACK_START,
+  fallbackStep,
+  OBSERVE_START_PRESSURE,
+  slotRuleObservation,
+  WRITER_KIND,
+} from "@t3tools/shared/slotObserve";
+import * as DateTime from "effect/DateTime";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -180,6 +196,8 @@ export interface SlotAcquireInput {
    * from the back of the line: it never takes a slot a waiter in line is owed.
    */
   readonly place?: SlotPlace | undefined;
+  /** The capacity kind of the agent it starts (`kindOfRole`); absent: a writer. */
+  readonly kind?: string | undefined;
 }
 
 export class SlotGate extends Context.Service<
@@ -236,7 +254,7 @@ export class SlotGate extends Context.Service<
      * cannot be read.
      */
     readonly usage: Effect.Effect<SlotUsage | null>;
-    /** For `wait_list`: the capacity rule beside the gate; null unless the mode is `observe`. */
+    /** For `wait_list`: the capacity rule beside the gate (`observe`) or deciding (`enforce`). */
     readonly observed: Effect.Effect<SlotRuleStatus | null>;
   }
 >()("t3/slots/SlotGate") {}
@@ -278,6 +296,8 @@ interface LineEntry {
   readonly threadId: string;
   /** The account of its last ask: a thread moved to another account is modelled on that one. */
   instanceId: string | null;
+  /** The capacity kind of its last ask (a slot wait's: none, a writer). */
+  askKind: string | undefined;
   readonly sinceMs: number;
   /** Joins at the same time keep their order. */
   readonly order: number;
@@ -288,6 +308,8 @@ interface LineEntry {
   /** Since when a free slot is kept for it, untouched by its own ask since; `null`: none is. */
   offeredAtMs: number | null;
 }
+
+const kindOf = (input: SlotAcquireInput) => (input.kind === undefined ? {} : { kind: input.kind });
 
 const staleMsOf = (place: SlotPlace) =>
   Duration.toMillis(Duration.fromInputUnsafe(place.staleAfter ?? LINE_STALE));
@@ -360,6 +382,7 @@ const make = Effect.gen(function* () {
     readonly kind: LineEntry["kind"];
     readonly threadId: string;
     readonly instanceId: string | null;
+    readonly askKind?: string | undefined;
     readonly sinceMs: number;
     readonly nowMs: number;
     readonly staleMs: number;
@@ -369,6 +392,7 @@ const make = Effect.gen(function* () {
     if (seen !== undefined) {
       seen.lastAskMs = entry.nowMs;
       seen.instanceId = entry.instanceId;
+      seen.askKind = entry.askKind;
       seen.staleMs = entry.staleMs;
       seen.holdMs = entry.holdMs;
       // It came back: a slot kept for it is its own ask's now.
@@ -380,6 +404,7 @@ const make = Effect.gen(function* () {
       kind: entry.kind,
       threadId: entry.threadId,
       instanceId: entry.instanceId,
+      askKind: entry.askKind,
       sinceMs: entry.sinceMs,
       order: lineOrder++,
       lastAskMs: entry.nowMs,
@@ -457,6 +482,7 @@ const make = Effect.gen(function* () {
         accountOnly: input.accountOnly(entry.threadId),
         targetInstanceId: entry.instanceId ?? "",
         freeMemoryBytes: input.freeMemoryBytes,
+        kind: entry.askKind,
       });
       if (decision.type === "allow") {
         taken.push({
@@ -464,6 +490,7 @@ const make = Effect.gen(function* () {
           instanceId: entry.instanceId ?? "",
           atMs: input.nowMs,
           childThreadId: entry.threadId,
+          ...(entry.askKind === undefined ? {} : { kind: entry.askKind }),
         });
         entry.offeredAtMs ??= input.nowMs;
       } else {
@@ -595,6 +622,94 @@ const make = Effect.gen(function* () {
   );
 
   const observer = yield* makeSlotObserver(readRunning);
+
+  /**
+   * `enforce`: the rule's state, memory only. A restart starts at "elevated" (a calm wait) and in
+   * the fallback (fixed ceilings), so nothing is kept that a stop half-way could leave wrong.
+   */
+  let fallback = FALLBACK_START;
+  let pressure = OBSERVE_START_PRESSURE;
+  let enforced: { readonly last: SlotRuleObservation | null; readonly decided: number } = {
+    last: null,
+    decided: 0,
+  };
+  /** The kinds of children the gate started, while they run or start; any other agent: a writer. */
+  const kinds = new Map<string, string>();
+
+  /**
+   * `enforce`: `limits` with the capacity rule, on readings taken now (on the decision path, within
+   * `OBSERVE_READ_TIMEOUT`; unread is "unreadable", a refusal). Every agent counted owes its cost
+   * less what it uses now: a start, held slot or waiter ahead owes all of it (the owed term).
+   */
+  const withCapacity = Effect.fn("SlotGate.withCapacity")(function* (
+    limits: SlotLimits,
+    read: { readonly running: ReadonlyArray<RunningAgent>; readonly visible: ReadonlySet<string> },
+    nowMs: number,
+  ) {
+    const facts = yield* observer.enforceRead(read.running.map((agent) => agent.threadId));
+    const named = new Set((yield* Ref.get(entries)).flatMap((entry) => entry.childThreadId ?? []));
+    for (const threadId of kinds.keys()) {
+      if (!named.has(threadId) && !read.visible.has(threadId)) kinds.delete(threadId);
+    }
+    const step = fallbackStep(fallback, {
+      oomKills: facts === null ? "unreadable" : facts.oomKills,
+      swap: facts === null ? "unreadable" : facts.facts.swap,
+      nowMs,
+    });
+    fallback = step.state;
+    if (step.event === "trip") {
+      yield* Effect.logWarning(
+        "agent slots: an OOM kill or full swap; fixed ceilings again, agent costs raised",
+        { trips: fallback.trips },
+      );
+    } else if (step.event === "recover") {
+      yield* Effect.logInfo("agent slots: calm again; the derived ceilings apply");
+    }
+    const previous = pressure;
+    const at = DateTime.formatIso(DateTime.makeUnsafe(nowMs));
+    const capacity = (ask: CapacityAsk): CapacityRefusal | null => {
+      const decision = enforceDecision(CAPACITY_RULE, {
+        facts: facts?.facts ?? null,
+        running: ask.running.map((agent) => ({
+          kind: kinds.get(agent.threadId) ?? WRITER_KIND,
+          demandMb: facts?.demand.get(agent.threadId) ?? null,
+        })),
+        starting: [
+          ...ask.starting.map((entry) => entry.kind ?? WRITER_KIND),
+          ...Array.from({ length: ask.reservations }, () => WRITER_KIND),
+        ],
+        ask: ask.kind ?? WRITER_KIND,
+        fallback,
+        previous,
+        nowMs,
+      });
+      const counted = ask.running.length + ask.starting.length + ask.reservations;
+      pressure = decision.pressure;
+      enforced = {
+        decided: enforced.decided + 1,
+        last: slotRuleObservation({
+          at,
+          today: decision.admit ? "allow" : "refuse",
+          decision,
+          pieces: counted,
+          readings: facts === null ? "failed" : "ok",
+        }),
+      };
+      if (decision.admit) return null;
+      return decision.reason === "budget"
+        ? {
+            reason: "budget",
+            used: Math.max(0, Math.floor(decision.freeMb ?? 0)),
+            max: decision.costMb,
+          }
+        : {
+            reason: decision.reason,
+            used: counted,
+            max: enforceCeilings(CAPACITY_RULE, facts?.facts.cpuCores, fallback.on).agent,
+          };
+    };
+    return { ...limits, capacity };
+  });
 
   /** Ended entries go for good: a child seen with a run counts as running from now on. */
   const keepStarting = (
@@ -847,6 +962,7 @@ const make = Effect.gen(function* () {
               kind: "wake",
               threadId: askingThread ?? place.key,
               instanceId: input.targetInstanceId,
+              askKind: input.kind,
               sinceMs: place.sinceMs ?? nowMs,
               nowMs,
               staleMs: staleMsOf(place),
@@ -882,6 +998,11 @@ const make = Effect.gen(function* () {
       }
       // The running agents only where a count limit applies (no count means none to check).
       const read = counted ? shown : undefined;
+      // `enforce` always counts (a machine limit), so a read that failed refused above.
+      const ruled =
+        limits.enforce === true && read !== undefined
+          ? yield* withCapacity(limits, read, nowMs)
+          : limits;
       const running = read?.running.filter((agent) => agent.threadId !== input.callerThreadId);
       const visible = shown?.visible ?? new Set<string>();
       const kept = countedStarting(yield* keepStarting(shown?.visible, nowMs, limits), visible);
@@ -904,7 +1025,7 @@ const make = Effect.gen(function* () {
               // From its thread's oldest place: two places of one thread never block each other.
               ahead: own === undefined ? ordered : beforeThread(ordered, own.threadId),
               threadId: own?.threadId ?? askingThread,
-              limits,
+              limits: ruled,
               running: read.running,
               visible,
               kept,
@@ -916,18 +1037,24 @@ const make = Effect.gen(function* () {
       const decisionWith = (
         targetInstanceId: ProviderInstanceId,
         starting: ReadonlyArray<StartingEntry>,
+        kind?: string,
       ) =>
         slotDecision({
           // Read only when a count limit applies (`counted`), so no count means none to check.
-          limits,
+          limits: ruled,
           running: running ?? [],
           starting,
           reservations: others,
           accountOnly: hiddenHeld(waitsOn, nowMs, input.callerThreadId ?? ""),
           targetInstanceId,
           freeMemoryBytes: memoryBytes,
+          kind,
         });
-      const decision = decisionWith(input.targetInstanceId, [...kept, ...wakes, ...ahead]);
+      const decision = decisionWith(
+        input.targetInstanceId,
+        [...kept, ...wakes, ...ahead],
+        input.kind,
+      );
       const alsoNeeds = input.alsoNeeds ?? [];
       const full = (
         refused: Extract<SlotDecision, { readonly type: "refuse" }>,
@@ -951,7 +1078,7 @@ const make = Effect.gen(function* () {
         ...kept,
         ...wakes,
         ...ahead,
-        { token: -1, instanceId: input.targetInstanceId, atMs: nowMs },
+        { token: -1, instanceId: input.targetInstanceId, atMs: nowMs, ...kindOf(input) },
       ];
       for (const [index, instanceId] of alsoNeeds.entries()) {
         const next = decisionWith(instanceId, starting);
@@ -967,6 +1094,7 @@ const make = Effect.gen(function* () {
           token,
           instanceId: input.targetInstanceId,
           atMs: nowMs,
+          ...kindOf(input),
           ...(into === undefined ? {} : { childThreadId: into }),
         },
       ]);
@@ -1009,14 +1137,22 @@ const make = Effect.gen(function* () {
       if (requests.length === 0) return [];
       const nowMs = yield* Clock.currentTimeMillis;
       pruneLine(nowMs);
-      /** A wait without an account waits for the machine limit and the memory floor only. */
-      const limitsFor = (request: SlotRequest): SlotLimits =>
-        request.account === undefined ? { ...limits, account: () => null } : limits;
       const counted = requests.some((request) =>
-        limitsCount(limitsFor(request), request.account ?? ""),
+        limitsCount(
+          request.account === undefined ? { ...limits, account: () => null } : limits,
+          request.account ?? "",
+        ),
       );
       // Read only when a count limit applies to one of them (3.6).
       const read = counted ? yield* readRunning : undefined;
+      // A slot wait names no kind: it is held as a writer.
+      const ruled =
+        limits.enforce === true && read !== undefined
+          ? yield* withCapacity(limits, read, nowMs)
+          : limits;
+      /** A wait without an account waits for the machine limit and the memory floor only. */
+      const limitsFor = (request: SlotRequest): SlotLimits =>
+        request.account === undefined ? { ...ruled, account: () => null } : ruled;
       const kept = countedStarting(
         yield* keepStarting(read?.visible, nowMs, limits),
         read?.visible ?? new Set(),
@@ -1075,7 +1211,7 @@ const make = Effect.gen(function* () {
                 ahead: beforeThread(ordered, request.threadId),
                 threadId: request.threadId,
                 // Each waiter ahead by its own limits (its account's too), not this wait's.
-                limits,
+                limits: ruled,
                 running: read.running,
                 visible,
                 kept,
@@ -1233,9 +1369,22 @@ const make = Effect.gen(function* () {
     acquire,
     grant,
     usage,
-    observed: observing.pipe(
-      Effect.flatMap((observe) =>
-        Option.isSome(observe) ? observer.status : Effect.succeed(null),
+    observed: readSettings.pipe(
+      Effect.flatMap((settings) =>
+        Option.isSome(settings) && agentSlotsMode(settings.value.agentSlots) === "enforce"
+          ? Effect.sync((): SlotRuleStatus => ({
+              mode: "enforce",
+              fallback: fallback.on,
+              last: enforced.last,
+              observed: enforced.decided,
+              disagreed: 0,
+              skipped: 0,
+            }))
+          : observing.pipe(
+              Effect.flatMap((observe) =>
+                Option.isSome(observe) ? observer.status : Effect.succeed(null),
+              ),
+            ),
       ),
     ),
     attachReservations: Effect.fn("SlotGate.attachReservations")((source: StoredReservations) =>
@@ -1282,12 +1431,13 @@ const make = Effect.gen(function* () {
       token === null
         ? Effect.void
         : Ref.update(entries, (current) =>
-            current.map((entry) =>
+            current.map((entry) => {
               // A queued message is tied to its thread already and ends by time only.
-              entry.token === token && entry.queuedInto === undefined
-                ? { ...entry, childThreadId }
-                : entry,
-            ),
+              if (entry.token !== token || entry.queuedInto !== undefined) return entry;
+              // Its kind is kept while it runs (`enforce`); one not kept counts as a writer.
+              if (entry.kind !== undefined) kinds.set(childThreadId, entry.kind);
+              return { ...entry, childThreadId };
+            }),
           ).pipe(Effect.andThen(observer.started(token, childThreadId))),
     ),
     release: Effect.fn("SlotGate.release")(function* (token: SlotToken | null) {
