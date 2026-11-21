@@ -1,5 +1,6 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import { searchableT3Tool } from "../fork/mcpT3ToolFilter.ts"; // Fork: MCP profile T3 tool groups
 
 export const TOOL_SEARCH = "tool_search";
 
@@ -67,6 +68,7 @@ export const make = (
         .filter(Boolean);
       const found = tools()
         .filter((tool) => tool.name !== TOOL_SEARCH)
+        .filter(searchableT3Tool) // Fork: MCP profile T3 tool groups
         .map((tool) => ({ tool, score: score(tool, terms) }))
         .filter((match) => match.score > 0)
         .sort((a, b) => b.score - a.score)
