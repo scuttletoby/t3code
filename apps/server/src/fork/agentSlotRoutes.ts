@@ -55,6 +55,10 @@ export interface RouteStart {
   readonly childThreadId?: ThreadId | undefined;
   /** More starts right after this one: allowed only when they all fit (`SlotGate.acquire`). */
   readonly alsoNeeds?: ReadonlyArray<ProviderInstanceId> | undefined;
+  /** A message into this existing thread: it takes a slot only if the thread shows no run. */
+  readonly intoThreadId?: ThreadId | undefined;
+  /** The caller is the woken thread itself: its held slot stays held (`SlotGate.acquire`). */
+  readonly keepsHeld?: boolean | undefined;
 }
 
 const ENDED: RouteSlot = { type: "allow", end: () => Effect.void };
@@ -77,6 +81,8 @@ const admit = (
             callerThreadId: start.callerThreadId,
             targetInstanceId: start.targetInstanceId,
             ...(start.alsoNeeds === undefined ? {} : { alsoNeeds: start.alsoNeeds }),
+            ...(start.intoThreadId === undefined ? {} : { intoThreadId: start.intoThreadId }),
+            ...(start.keepsHeld === undefined ? {} : { keepsHeld: start.keepsHeld }),
           });
           if (outcome.type === "refuse") return outcome;
           const token = outcome.token;
@@ -108,8 +114,8 @@ const reasonThere = (decision: FullDecision) =>
       ? `${agents(decision.used)} running there on account ${decision.instanceId}, and the limit is ${decision.max}`
       : `only ${decision.used} MB of memory is free there, and a new agent needs at least ${decision.max} MB`;
 
-/** Why, in one clause, for a reader on this machine (a scheduled task's history, run now). */
-const reasonHere = (refusal: SlotGate.SlotRefusal) =>
+/** Why, in one clause, for a reader on this machine (a scheduled task's history, run now, logs). */
+export const reasonHere = (refusal: SlotGate.SlotRefusal) =>
   refusal.type === "full"
     ? slotRefusalReason(refusal.decision)
     : `the running agents could not be counted (${unreadReason(refusal.problem)})`;
@@ -164,6 +170,70 @@ export const checkLaunchSlot = Effect.fn("AgentSlotRoutes.checkLaunchSlot")(func
     targetInstanceId: launch.modelSelection.instanceId,
     childThreadId: launch.threadId,
   });
+});
+
+/** A message into an existing thread, as the gate is asked about it. */
+export interface SendSlot {
+  /** The thread here that sends it; `null` for the owner's client, a linked machine or the server. */
+  readonly callerThreadId: ThreadId | null;
+  readonly threadId: ThreadId;
+  /** The thread's provider instance, where its next run starts. */
+  readonly instanceId: ProviderInstanceId;
+  /** The receiver is the caller (a wait's message): its held slot stays held. */
+  readonly keepsHeld?: boolean | undefined;
+}
+
+/**
+ * A message into an existing thread: into one that shows a run it only queues; into one that
+ * shows none it takes a slot like `delegate_task`. One gate step decides both, so a run that
+ * ends between the check and the send never starts one without a slot. Asked last before the send.
+ */
+export const admitSend = (
+  gate: Option.Option<SlotGate.SlotGate["Service"]>,
+  send: SendSlot,
+): Effect.Effect<RouteSlot> =>
+  admit(gate, {
+    callerThreadId: send.callerThreadId,
+    targetInstanceId: send.instanceId,
+    intoThreadId: send.threadId,
+    childThreadId: send.threadId,
+    ...(send.keepsHeld === undefined ? {} : { keepsHeld: send.keepsHeld }),
+  });
+
+/**
+ * `t3_thread_send` and `t3_thread_send_attachments`, last before the send: {@link admitSend},
+ * refused `slots_full` with nothing sent (an agent that asked is told to wait for a slot; a
+ * caller without a thread here is told what happened only). A thread that is gone, archived or
+ * unknown is left to the send, which refuses it with its own error.
+ */
+export const checkSendSlot = Effect.fn("AgentSlotRoutes.checkSendSlot")(function* (
+  callerThreadId: ThreadId | undefined,
+  threadId: ThreadId,
+) {
+  const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
+  if (Option.isNone(gate)) return;
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const shell = yield* threads.getThreadShell(threadId).pipe(
+    Effect.mapError(
+      (error) =>
+        new OrchestratorMcpFailure({
+          code: "orchestration_error",
+          message: `This call sent nothing to thread ${threadId}: it could not be read to check for a free agent slot (${error.message}).`,
+        }),
+    ),
+  );
+  if (shell === null || shell.deletedAt !== null || shell.archivedAt !== null) return;
+  const caller = callerThreadId ?? null;
+  const slot = yield* admitSend(gate, {
+    callerThreadId: caller,
+    threadId,
+    instanceId: shell.modelSelection.instanceId,
+  });
+  if (slot.type === "refuse") {
+    return yield* slotsFull(
+      `This call sent nothing to thread ${threadId}. ${refusalFor(caller, slot)}`,
+    );
+  }
 });
 
 /** One thread of a `create_threads` call, as its seat sees it. */
@@ -329,30 +399,33 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   const open = new Map<string, (threadId: ThreadId | null) => Effect.Effect<void>>();
 
   /**
-   * Where a run starts, and whether it starts one: a bound task runs on its thread's current
-   * provider, and a bound thread that is running already only gets the prompt queued (no new run,
-   * no slot). A thread that cannot be read is counted on the task's stored provider, as a start.
+   * Where a run starts: a bound task runs on its thread's current provider (a thread that cannot
+   * be read: the task's stored provider). Whether a bound run starts one is the gate's to say,
+   * from the same count it decides on (`intoThreadId`): into a thread that shows a run the prompt
+   * only queues (no slot); into one that shows none it is a start.
    */
   const targetOf = (task: ScheduledTask) =>
     task.threadId === null
-      ? Effect.succeed({ instanceId: task.modelSelection.instanceId, queuesOnly: false })
+      ? Effect.succeed({ instanceId: task.modelSelection.instanceId, intoThreadId: undefined })
       : threads.getThreadShell(task.threadId).pipe(
-          Effect.map((shell) => ({
-            instanceId: shell?.modelSelection.instanceId ?? task.modelSelection.instanceId,
-            queuesOnly: shell != null && shell.activeRunId !== null,
-          })),
-          Effect.orElseSucceed(() => ({
-            instanceId: task.modelSelection.instanceId,
-            queuesOnly: false,
-          })),
+          Effect.map((shell) => shell?.modelSelection.instanceId ?? task.modelSelection.instanceId),
+          Effect.orElseSucceed(() => task.modelSelection.instanceId),
+          Effect.map((instanceId) => ({ instanceId, intoThreadId: task.threadId ?? undefined })),
         );
 
   /**
    * The slot is named for the run's thread when its dispatch ends (`end`), bound or new, so a
    * dispatch that failed frees it at once; `ended` frees it on a path that never got there.
    */
-  const take = (instanceId: ProviderInstanceId) =>
-    admit(gate, { callerThreadId: null, targetInstanceId: instanceId });
+  const take = (target: {
+    readonly instanceId: ProviderInstanceId;
+    readonly intoThreadId: ThreadId | undefined;
+  }) =>
+    admit(gate, {
+      callerThreadId: null,
+      targetInstanceId: target.instanceId,
+      intoThreadId: target.intoThreadId,
+    });
 
   const allowed = (
     task: ScheduledTask,
@@ -479,9 +552,8 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       // Checked again as it would start: the owner may have widened the project meanwhile.
       const refused = task.threadId === null ? yield* profiles.runRefusal(task) : null;
       if (refused !== null) return yield* Effect.fail(new WebhookSkipped({ reason: refused }));
-      const target = yield* targetOf(task);
-      if (target.queuesOnly) return allowed(task, () => Effect.void);
-      const slot = yield* take(target.instanceId);
+      // A bound thread that shows a run only queues: the gate lets it pass (`intoThreadId`).
+      const slot = yield* take(yield* targetOf(task));
       if (slot.type === "allow") return allowed(task, slot.end);
     }
   });
@@ -526,9 +598,7 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       } as ScheduledSlot;
     }
     if (Option.isNone(gate)) return { skipped: null, end: () => Effect.void } as ScheduledSlot;
-    const target = yield* targetOf(task);
-    if (target.queuesOnly) return allowed(task, () => Effect.void);
-    const slot = yield* take(target.instanceId);
+    const slot = yield* take(yield* targetOf(task));
     if (slot.type === "allow") return allowed(task, slot.end);
     if (trigger === "manual") {
       return yield* new ScheduledTaskError({

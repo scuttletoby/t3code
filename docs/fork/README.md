@@ -387,19 +387,89 @@ These routes start a new agent run and go through the same gate, with the same c
 - A task bound to a thread whose run is active only queues its prompt there: no new run, so no slot
   and no wait. A bound thread that is idle starts a run and is gated, counted on the thread's
   current provider.
-- A call that asks another machine to start an agent (`delegate_task` or `t3_thread_launch` with an
-  `environmentId`) is decided by that machine's gate, the one that would run the agent; this
-  machine's gate is not asked. A machine on a build without this gate starts it as before.
+- An agent's message into an existing thread, `t3_thread_send` or `t3_thread_send_attachments`
+  ([#711](https://github.com/scuttletoby/t3code/issues/711)): into a thread that shows no run it
+  starts one, so it takes a slot like `delegate_task`; refused, it answers `slots_full` with
+  `delegate_task`'s wording ("This call sent nothing to thread …" and, with `waitFor` on, the
+  `wait_for` call to make before ending the turn) and nothing is sent. Into a thread that shows a run it only
+  queues: no slot, also when full. A receiver that is gone, deleted or archived is left to the
+  send, which refuses it with its own error; one that cannot be read is refused
+  (`orchestration_error`, nothing sent). The check is the last step before the send, after
+  upstream's own checks of access and the thread; a send that still fails after an allowed check
+  holds its slot until the start grace ends (it fails safe: never an agent without a slot). A
+  retry with the same `clientRequestId` into a thread that has gone idle, on a full host, is
+  refused although upstream would answer it as the earlier send: this call sends nothing, and the
+  earlier call's message stays sent (the refusal says "this call", not that nothing was ever sent).
+  A `mode: "restart"` send into a thread whose run waits in `t3_thread_wait` is let through as a
+  message into a running thread (that run is not counted while it waits), so the run it starts can
+  go one over the limit until it ends.
+- A wait's message (`wait_for` result, a child that finished, a lost-wait notice) that would wake
+  a thread that shows no run takes a slot the same way. Refused, nothing is sent and the wake-up
+  waits for a slot however long it takes: it is never marked late and never dropped, also long
+  past its deadline. A wait's message is asked again every 5 s (logged once); a lost-wait notice
+  every 60 s, as its other retries are. The wait stays `delivering` in the wait store with its
+  message id and command id, so a restart keeps it: the new server sends that same message at
+  once if a slot is free (it asks the gate again), and the message's found-check and command
+  receipt keep it from ever being sent twice. A `delivering` wait cannot be cancelled
+  (`wait_cancel` stops `waiting` waits only), so a wake-up that waits for a slot is sent once a
+  slot frees. A wake-up keeps the thread's own held slot (from a `slot` wait) for the agent it
+  wakes up to start, and every other thread's held slot whose wake-up is still to come counts that
+  wake-up as an agent of its own, so slot waits met in one sweep are each woken.
+- The fork's delegated-result reminder and its orphan scan (a parent that is idle and still owed a
+  child's result is sent one reminder) take a slot the same way. Refused, nothing is sent: the
+  reminder is asked again every 5 s, however long it takes, and a refusal is not counted as a
+  failed try (logged once). Its message and command ids are fixed per result, so a restart's
+  startup scan finds the result still owed, waits again and sends it once.
+- Upstream's pull request watch wake-ups (checks passed or failed, a review, merged or closed,
+  "stopped watching") into a thread that shows no run take a slot the same way
+  (`apps/server/src/fork/pullRequestWatchSlot.ts`). Refused, the update fails and nothing is
+  stored or sent: upstream's watch reactor reads the pull request again on its next sweep (every
+  2 minutes), finds the same news against the stored watch and sends it then, once. A restart
+  finds it again from the stored watch. A watch that ends because its pull request cannot be read
+  keeps its "stopped watching" wake-up the same way, and is not ended without it. Into a thread
+  that shows a run a wake-up only queues: no slot.
+- Upstream's usage-limit resume ("Continue where you left off." into each thread that failed on a
+  limit, at its reset) takes a slot the same way (`apps/server/src/fork/limitResumeSlot.ts`), so a
+  reset does not start every failed thread at once. Refused, nothing is sent: the thread stays
+  failed and armed, and upstream's recovery worker asks again on its next tick (every 5 s; logged
+  once per resume). An armed resume has no time limit, a restart finds it from the stored thread,
+  and its id is fixed per failed run and reset, so it is sent once.
+- There is no order between wake-ups, and none between them and other routes: a wake-up holds no
+  place in line and asks again on its own timer, so a busy host can pass one over again and again
+  while other starts take the slots that free.
+- The bound-thread and message routes decide "running or idle" from the gate's own count in the
+  same step that takes the slot. When the thread's run ends between that check and the send, the
+  queued message starts the next run: the call then holds a slot until that run shows, for the
+  start grace (`startGraceSeconds`) at most, so no start ever goes past the gate.
+- A call that asks another machine to start an agent (`delegate_task`, `t3_thread_launch` or
+  `t3_thread_send` with an `environmentId`) is decided by that machine's gate, the one that would
+  run the agent; this machine's gate is not asked. A machine on a build without this gate starts
+  it as before.
 
 Only an agent caller is told it can wait for a slot (`wait_for`) and end its turn. A start with no
 caller here (another machine's call, a scheduled run) is told plainly what happened: the machine
 has no free slot, or could not count its agents.
 
-These start or wake a run and are not gated yet ([#711](https://github.com/scuttletoby/t3code/issues/711)):
-a message a person sends from the composer, `t3_thread_send` to an idle thread, a
-`t3_thread_transfer` fork, and a wait delivery that wakes an idle thread. A scheduled run bound
-to a running thread whose run ends in the few milliseconds between the check and the send starts
-one run without a slot.
+These are not gated, on purpose:
+
+- A message a person sends from the composer (or any client of the owner's that is not an agent
+  tool): the person decides, and a person is never refused for slots.
+- `t3_thread_transfer`: a fork copies context into a new thread and runs no turn; merge_back
+  leaves the context for the target's next run. The first message into the fork is a
+  `t3_thread_send`, gated as above.
+- A delegated task's result delivered to its parent: this mostly takes the slot the finished child
+  gives back. Restart recovery resumes runs that were running when the server stopped.
+  `t3_worktree_handoff` continues the same agent's work after its own turn.
+
+These four are not gated yet. Each can **start a run in an idle thread with no slot**, so a full
+host can go over its limit through them. Gating them is follow-up #724:
+
+- The fork's context handoff (`apps/server/src/fork/handoff/HandoffService.ts`): the idle-timer
+  trigger starts a run with fresh context after the thread's turn ended. It is off by default.
+- Upstream's provider continuation ("Background task completed"): an agent that ended its turn
+  while its own background work ran starts again when that work ends.
+- Upstream's delegated question replies: a child's question answered back into an idle parent.
+- Upstream's idle compaction: a compaction run started in an idle thread.
 
 The calling thread is left out of the count (it waits on its child). A start no thread on this
 machine asks for (a scheduled run, the owner's client, a call from another machine) has no caller, so
