@@ -33,7 +33,7 @@
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs ~11s
 .github/scripts/fork-checks-ran.test.py
-.github/scripts/fork-contracts.test.py
+.github/scripts/fork-contracts.test.py ~45s
 .github/scripts/fork-fleet-desk-agent.test.py ~23s
 .github/scripts/fork-fleet-desk-key.test.py ~10s
 .github/scripts/fork-fleet-desk-seed.test.py ~34s

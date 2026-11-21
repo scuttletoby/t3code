@@ -18,9 +18,15 @@
 #                secret-scan job had as its head commit (the workflow asks GitHub's Actions API),
 #                with the job's token; whitespace-separated commit ids; may be empty. See "sweep,
 #                gone tips"
-#   OLD_HEADS_FILE, SCANNED_GONE_FILE  a file holding that list, read instead of the variable when
-#                set (#637: the kernel caps one environment string at 128 KiB, and the sweep's
-#                list outgrew it); a file that cannot be read fails the job
+#   DELETED_TIPS the sweep: those OLD_HEADS GitHub's API has no commit for at all that origin did
+#                not serve either (the workflow asked both; or its record, #691, has the tip as read
+#                by a scan on an earlier day, so git is not asked again), SCANNED_GONE among them;
+#                whitespace-separated commit ids; may be empty. The workflow gives it as
+#                DELETED_TIPS_FILE only (the list can outgrow the environment); the variable is read
+#                when no file is set, as for the others. See "sweep, deleted tips"
+#   OLD_HEADS_FILE, SCANNED_GONE_FILE, DELETED_TIPS_FILE  a file holding that list, read instead of
+#                the variable when set (#637: the kernel caps one environment string at 128 KiB,
+#                and the sweep's list outgrew it); a file that cannot be read fails the job
 #   AFTER       push: the branch tip after the push
 #   PUSH_REF     push: the ref pushed (refs/heads/<name> or refs/tags/<name>); empty is read as the
 #                default branch
@@ -111,6 +117,10 @@
 #                  has a carriage return anywhere (CRLF line ends: one rule for every line, comments
 #                  included) fails the job (exit 2), whether or not a tip is gone. Entries the record
 #                  no longer lists change nothing.
+#   sweep, deleted tips  a listed tip DELETED_TIPS names that this clone lacks is gone without a
+#                  fetch (#691): one by one, with retries, the fetches of over a hundred deleted
+#                  tips made every sweep slower. It is then a gone tip as above (a warning only when
+#                  SCANNED_GONE or the reviewed list names it). One this clone has is scanned.
 #
 # Commit objects: each commit of the range as git stores it (`git cat-file`: its message, author
 # and committer names and emails, signature and other headers), and on a tag push the pushed tag's
@@ -213,9 +223,9 @@
 # fetches there and a content still missing is a fatal git error, which fails the scan.
 set -euo pipefail
 
-# OLD_HEADS_FILE / SCANNED_GONE_FILE, when set, are read instead of the variable (#637), which is
+# OLD_HEADS_FILE / SCANNED_GONE_FILE / DELETED_TIPS_FILE, when set, are read instead of the variable (#637), which is
 # then no longer exported; a file that cannot be read fails the job rather than leaving the list empty.
-for list in OLD_HEADS SCANNED_GONE; do
+for list in OLD_HEADS SCANNED_GONE DELETED_TIPS; do
   file_var="${list}_FILE"
   [[ -n "${!file_var:-}" ]] || continue
   if ! words="$(cat -- "${!file_var}" 2> /dev/null)"; then
@@ -255,7 +265,9 @@ zero() { [[ -z "$1" || "$1" =~ ^0+$ ]]; }
 # earlier WHAT ID...: the earlier tips a pull request's branch (BEFORE, OLD_HEADS) or, in the sweep,
 # any ref (OLD_HEADS) has had. Each id once, all zeros skipped; a word that is not a commit id fails
 # the job. Sets listed (fetched, so readable) and gone (origin says it no longer has them); a fetch
-# that fails for any other reason fails the job (see fetch_earlier).
+# that fails for any other reason fails the job (see fetch_earlier). An id in skip_fetch (the sweep's
+# DELETED_TIPS) this clone lacks is gone without a fetch.
+declare -A skip_fetch=()
 earlier() {
   local label="$1" old got ids=() missing=()
   shift
@@ -269,7 +281,7 @@ earlier() {
     fi
     [[ " ${ids[*]} " != *" $old "* ]] || continue
     ids+=("$old")
-    have "$old" || missing+=("$old")
+    have "$old" || [[ -n "${skip_fetch[$old]:-}" ]] || missing+=("$old")
   done
   # One fetch for all of them first (the sweep may list hundreds); one by one, with retries, only
   # when it fails (any of them gone fails the whole fetch).
@@ -277,6 +289,7 @@ earlier() {
     timeout 600 git fetch --no-tags --quiet --filter=blob:none origin "${missing[@]}" 2> /dev/null || true
   fi
   for old in "${ids[@]}"; do
+    if [[ -n "${skip_fetch[$old]:-}" ]] && ! have "$old"; then gone+=("$old"); continue; fi
     got=0
     fetch_earlier "$old" || got=$?
     if [[ $got -eq 1 ]]; then gone+=("$old"); continue; fi
@@ -531,7 +544,15 @@ case "$EVENT_NAME" in
     mapfile -t tips < <(printf '%s\n' "${tips[@]}" | sort -u)
     what="every ref of origin but refs/pull/* (${#tips[@]} distinct tip(s))"
     # Tips no ref holds any more (a branch deleted or force-pushed after a push no run scanned):
-    # every tip GitHub's activity record lists (OLD_HEADS; see "sweep" in the header).
+    # every tip GitHub's activity record lists (OLD_HEADS; see "sweep" in the header), but those
+    # the workflow found deleted (DELETED_TIPS) that this clone lacks, which are gone unfetched.
+    for old in ${DELETED_TIPS:-}; do
+      if ! [[ "$old" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || zero "$old"; then
+        echo "::error::Secret scan: '$old' in DELETED_TIPS is not a commit id" >&2
+        exit 2
+      fi
+      skip_fetch[$old]=1
+    done
     earlier "the listed tip" ${OLD_HEADS:-}
     vanished=()
     for old in "${listed[@]}"; do
