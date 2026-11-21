@@ -177,17 +177,7 @@ export interface ModelPolicyPick {
  */
 export function modelPolicyPickEfforts(pick: ModelPolicyPick): ReadonlyArray<string> {
   const options = pick.options ?? [];
-  const driverIds =
-    pick.driver === undefined
-      ? Object.values(MODEL_POLICY_DRIVER_EFFORT_IDS)
-      : Object.hasOwn(MODEL_POLICY_DRIVER_EFFORT_IDS, pick.driver)
-        ? [MODEL_POLICY_DRIVER_EFFORT_IDS[pick.driver]!]
-        : [];
-  const effortIds = new Set([
-    ...MODEL_POLICY_EFFORT_OPTION_IDS,
-    ...driverIds,
-    ...(pick.effortOptionIds ?? []),
-  ]);
+  const effortIds = pickEffortIds(pick, true);
   const named = [
     ...new Set(
       options.flatMap((option) =>
@@ -205,6 +195,26 @@ export function modelPolicyPickEfforts(pick: ModelPolicyPick): ReadonlyArray<str
   return [MODEL_POLICY_ULTRACODE, ...efforts.filter((effort) => effort !== "xhigh")];
 }
 
+/**
+ * The option ids read as a pick's effort. `guess`: without a known driver, every driver's own id
+ * counts too (another driver's id may hold a toggle there, such as Claude's `thinking: true`).
+ */
+function pickEffortIds(pick: ModelPolicyPick, guess: boolean): ReadonlySet<string> {
+  const driverIds =
+    pick.driver === undefined
+      ? guess
+        ? Object.values(MODEL_POLICY_DRIVER_EFFORT_IDS)
+        : []
+      : Object.hasOwn(MODEL_POLICY_DRIVER_EFFORT_IDS, pick.driver)
+        ? [MODEL_POLICY_DRIVER_EFFORT_IDS[pick.driver]!]
+        : [];
+  return new Set([
+    ...MODEL_POLICY_EFFORT_OPTION_IDS,
+    ...driverIds,
+    ...(pick.effortOptionIds ?? []),
+  ]);
+}
+
 const rowAllows = (row: ModelPolicyRow, efforts: ReadonlyArray<string>) =>
   row.efforts === undefined
     ? efforts.length === 0
@@ -215,8 +225,8 @@ export type ModelPolicyVerdict =
   | { readonly inside: false; readonly why: string };
 
 /**
- * Whether one pick is inside the rows. A pick that names no model is outside, and so is a
- * model in no row. A row with efforts needs the pick to name one of them; a row without
+ * Whether one pick is inside the rows. A pick that names no model is outside, and so are a
+ * model in no row and an effort option that holds no effort name. A row with efforts needs the pick to name one of them; a row without
  * efforts allows none. Without a driver, every row that names the model must allow the pick.
  */
 export function checkModelPolicyPick(
@@ -227,6 +237,13 @@ export function checkModelPolicyPick(
     return { inside: false, why: "the call names no model" };
   }
   const model = pick.model;
+  // `{effort: true}`: the driver runs its own default effort, which the pick does not show.
+  const unnamed = pick.options?.find(
+    (option) => pickEffortIds(pick, false).has(option.id) && typeof option.value !== "string",
+  );
+  if (unnamed !== undefined) {
+    return { inside: false, why: `${model}'s effort option ${unnamed.id} holds no effort name` };
+  }
   const rows = allow.filter(
     (row) => row.model === model && (pick.driver === undefined || row.driver === pick.driver),
   );
@@ -242,12 +259,16 @@ export function checkModelPolicyPick(
   if (row !== undefined && (pick.driver !== undefined || allowed.length === rows.length)) {
     return { inside: true, row };
   }
+  const why =
+    efforts.length === 0
+      ? `${model} needs an effort from its row, and the pick names none`
+      : `${model} does not allow effort ${efforts.join(" + ")}`;
+  if (row === undefined) return { inside: false, why };
+  // Some rows allow it: the driver there is not known, and these rows refuse it.
+  const refusing = rows.filter((candidate) => !allowed.includes(candidate));
   return {
     inside: false,
-    why:
-      efforts.length === 0
-        ? `${model} needs an effort from its row, and the pick names none`
-        : `${model} does not allow effort ${efforts.join(" + ")}`,
+    why: `${why} (its ${refusing.map((candidate) => candidate.driver).join(", ")} row refuses it: the driver there is not known here, so every row naming the model must allow it)`,
   };
 }
 

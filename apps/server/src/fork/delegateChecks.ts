@@ -260,6 +260,9 @@ export const withOwnOptions = (
 export const remoteTarget = <Target extends OrchestratorMcpTarget>(target: Target): Target =>
   target.model === undefined || target.options !== undefined ? target : { ...target, options: [] };
 
+/** The pacer's lowered effort is outside the policy: the task runs at the effort it checked. */
+const KEEP_CHECKED = Symbol("keep the checked effort");
+
 const NO_HOLD: DelegateHold = { started: () => Effect.void, release: Effect.void };
 
 /**
@@ -504,7 +507,8 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const checks: DelegateChecks = {
     // Before the pacer, so it paces the child's own options; a target it moves to keeps them too.
     // The model policy checks the agent's pick first (a refusal holds and paces nothing), and again
-    // the target the pacer moved the task to or lowered its effort on: what runs is inside too.
+    // the target the pacer moved the task to or lowered its effort on: what runs is inside too. An
+    // effort the pacer lowers off the row keeps the checked one (the agent cannot fix that pick).
     beforeWorkspace: (input) =>
       input.isRetry
         ? Effect.succeed({ target: input.target })
@@ -512,12 +516,29 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
             const target = yield* ownTarget(input.target, input.requested);
             const policyNote = yield* policyCheck("delegate_task", target, input.requested);
             const paced = yield* paceTarget({ ...input, target });
+            const lowered =
+              paced.target.modelSelection.instanceId === target.modelSelection.instanceId &&
+              paced.target.modelSelection.model === target.modelSelection.model;
             const pacedNote =
               paced.target === target
                 ? undefined
                 : yield* policyCheck("delegate_task", paced.target, input.requested, {
                     logAs: "model policy paced pick",
-                  });
+                  }).pipe(
+                    Effect.catchIf(
+                      () => lowered,
+                      (refusal) =>
+                        Effect.logWarning(
+                          "usagePacingLowerEffort lowered an effort that modelPolicy does not allow: the task keeps its checked effort",
+                        ).pipe(
+                          Effect.annotateLogs({ refusal: refusal.message }),
+                          Effect.as(KEEP_CHECKED),
+                        ),
+                    ),
+                  );
+            if (pacedNote === KEEP_CHECKED) {
+              return { target, ...(policyNote === undefined ? {} : { note: policyNote }) };
+            }
             const notes = [
               policyNote,
               pacedNote === policyNote ? undefined : pacedNote,

@@ -27,6 +27,7 @@ import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Ref from "effect/Ref";
 import type * as Result from "effect/Result";
 import { TestClock } from "effect/testing";
@@ -706,13 +707,22 @@ describe("OrchestratorMcpService usage pacing gate", () => {
   );
 
   // The model policy checks what runs, too: the agent asked for an effort its row allows, and the
-  // pacer would lower it to one the row does not (fork/delegateChecks.ts).
+  // pacer would lower it to one the row does not. The agent cannot fix that pick, so the policy
+  // wins: the task runs at its checked effort, with a warning naming both settings
+  // (fork/delegateChecks.ts).
   it.effect(
-    "enforce, over the even pace: an effort the pacer lowers off the policy's row is refused",
+    "enforce, over the even pace: an effort the pacer lowers off the policy's row keeps the checked one",
     () =>
       Effect.gen(function* () {
-        const row = { driver: "codex", model: MODEL, efforts: ["high"], defaultEffort: "high" };
+        const row = {
+          driver: "codex",
+          model: MODEL,
+          efforts: ["high"],
+          defaultEffort: "high",
+          useFor: "paced work",
+        };
         const target = { model: MODEL, options: [{ id: "reasoningEffort", value: "high" }] };
+        const logs: Array<string> = [];
         const lowered = yield* delegate({
           settings: {
             ...enforce,
@@ -721,11 +731,27 @@ describe("OrchestratorMcpService usage pacing gate", () => {
           } as never,
           providers: [main(60)],
           target: target as never,
-        });
-        assert.isTrue(lowered.result._tag === "Failure");
-        if (lowered.result._tag !== "Failure") return;
-        assert.include(lowered.result.failure.message, `${MODEL} does not allow effort medium`);
-        assert.deepStrictEqual(lowered.dispatched, []);
+        }).pipe(
+          Effect.provide(
+            Logger.layer([Logger.make((entry) => logs.push(Logger.formatLogFmt.log(entry)))], {
+              mergeWithExisting: false,
+            }),
+          ),
+        );
+        assert.isTrue(lowered.result._tag === "Success");
+        if (lowered.result._tag !== "Success") return;
+        // The reply keeps the row's note, not the pacer's (which names the effort it did not use).
+        assert.strictEqual(
+          lowered.result.success.usagePacingNote,
+          `Model policy: ${MODEL} is for paced work.`,
+        );
+        assert.deepStrictEqual(lowered.dispatched[0]?.modelSelection.options, [
+          { id: "reasoningEffort", value: "high" },
+        ]);
+        const warning = logs.filter((line) => line.includes("the task keeps its checked effort"));
+        assert.lengthOf(warning, 1);
+        assert.include(warning[0], "usagePacingLowerEffort lowered an effort that modelPolicy");
+        assert.include(warning[0], `${MODEL} does not allow effort medium`);
         // With the lower level in the row it runs there; under the pace it runs as asked.
         const allowed = yield* delegate({
           settings: {
@@ -739,6 +765,31 @@ describe("OrchestratorMcpService usage pacing gate", () => {
         assert.deepStrictEqual(allowed.dispatched[0]?.modelSelection.options, [
           { id: "reasoningEffort", value: "medium" },
         ]);
+        // Only a lowered effort keeps the checked pick: a move to an account whose model marks
+        // another option as its reasoning control (read as a second effort there) is still refused.
+        const level = { id: "level", label: "Level", type: "select", options: [{ id: "max" }] };
+        const withLevel = (base: ServerProvider, role?: "reasoning") =>
+          ({
+            ...base,
+            models: base.models.map((model) => ({
+              ...model,
+              capabilities: {
+                optionDescriptors: [
+                  ...(model.capabilities?.optionDescriptors ?? []),
+                  { ...level, ...(role === undefined ? {} : { role }) },
+                ],
+              },
+            })),
+          }) as ServerProvider;
+        const moved = yield* delegate({
+          settings: { ...enforce, modelPolicy: { mode: "enforce", allow: [row] } } as never,
+          providers: [withLevel(main(60)), withLevel(second(10), "reasoning")],
+          target: { model: MODEL, options: [...target.options, { id: "level", value: "max" }] },
+        });
+        assert.isTrue(moved.result._tag === "Failure");
+        if (moved.result._tag !== "Failure") return;
+        assert.include(moved.result.failure.message, `${MODEL} does not allow effort high + max`);
+        assert.deepStrictEqual(moved.dispatched, []);
       }),
   );
 

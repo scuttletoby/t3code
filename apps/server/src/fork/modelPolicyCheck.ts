@@ -20,6 +20,7 @@ import type { Tool } from "effect/ai";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import { loadCaller } from "../mcp/threadAccess.ts";
 import type { ProjectToolkit } from "../mcp/toolkits/project/tools.ts";
 import type { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
@@ -154,9 +155,31 @@ const reasoningIds = (lists: ReadonlyArray<ServerProvider["models"]>, model: str
 ];
 
 /**
+ * A pick that leaves the ultracode option out runs at the model's default for it (the Claude
+ * driver reads the catalog's `currentValue`), so a default that is on reads as ultracode.
+ */
+const withUltracodeDefault = (
+  lists: ReadonlyArray<ServerProvider["models"]>,
+  model: string,
+  options: ModelSelection["options"],
+): ModelSelection["options"] =>
+  options?.some((option) => option.id === "ultracode") === true ||
+  !lists.some((list) =>
+    list.some(
+      (candidate) =>
+        candidate.slug === model &&
+        candidate.capabilities?.optionDescriptors?.some(
+          (descriptor) => descriptor.id === "ultracode" && descriptor.currentValue === true,
+        ),
+    ),
+  )
+    ? options
+    : [...(options ?? []), { id: "ultracode", value: true }];
+
+/**
  * A resolved selection as the policy reads it: its driver from the instance, the model as named
- * (an alias is not read as its model), its options. `named: false` (the call named no model, it
- * inherits one) reads as no model.
+ * (an alias is not read as its model), its options with the model's ultracode default. `named:
+ * false` (the call named no model, it inherits one) reads as no model.
  */
 export function pickOfSelection(
   providers: ReadonlyArray<ServerProvider>,
@@ -166,12 +189,13 @@ export function pickOfSelection(
   const provider = providers.find((candidate) => candidate.instanceId === selection.instanceId);
   const lists = modelLists(provider);
   const aliasOf = aliasTarget(lists, selection.model);
+  // A row may name the alias itself: its effort control and defaults are still the model's.
+  const model = aliasOf ?? selection.model;
   return {
     driver: provider?.driver,
     model: named ? selection.model : undefined,
-    options: selection.options,
-    // A row may name the alias itself: its effort control is still the model's.
-    effortOptionIds: reasoningIds(lists, aliasOf ?? selection.model),
+    options: withUltracodeDefault(lists, model, selection.options),
+    effortOptionIds: reasoningIds(lists, model),
     ...(aliasOf === undefined ? {} : { aliasOf }),
   };
 }
@@ -275,9 +299,21 @@ const currentProviders = Effect.serviceOption(ProviderRegistry.ProviderRegistry)
 );
 
 /**
- * `t3_thread_launch` once its model is known: only an agent's launch (a calling thread) is checked;
- * a linked machine's task was checked where it was sent ({@link checkForwarded}). A replay is checked
- * again only when it names a model (that model wins and can start a run). Advice goes to the log.
+ * A call an agent on a linked machine sent here: upstream's forwarder names the calling thread
+ * (`T3-Sender-Thread`) only for a thread's call, read only from a linked client. The sender checked
+ * it against its own policy ({@link checkForwarded}); this machine checks it against its own too.
+ */
+const fromLinkedAgent = Effect.map(
+  Effect.serviceOption(McpInvocationContext.McpInvocationContext),
+  Option.exists(
+    (scope) => scope.client?.linked === true && scope.client.senderThread !== undefined,
+  ),
+);
+
+/**
+ * `t3_thread_launch` once its model is known: an agent's launch (a calling thread here, or one on a
+ * linked machine that sent it) is checked; the owner's client is not. A replay is checked again only
+ * when it names a model (that model wins and can start a run). Advice goes to the log.
  */
 export const checkLaunch = Effect.fn("ModelPolicyCheck.checkLaunch")(function* (
   caller: { readonly id: unknown } | undefined,
@@ -285,7 +321,8 @@ export const checkLaunch = Effect.fn("ModelPolicyCheck.checkLaunch")(function* (
   input: { readonly modelSelection?: ModelSelection | undefined },
   replaying: boolean,
 ) {
-  if (caller === undefined || (replaying && input.modelSelection === undefined)) return;
+  if (replaying && input.modelSelection === undefined) return;
+  if (caller === undefined && !(yield* fromLinkedAgent)) return;
   const check = yield* makePickCheck;
   yield* check(
     "t3_thread_launch",
@@ -296,14 +333,15 @@ export const checkLaunch = Effect.fn("ModelPolicyCheck.checkLaunch")(function* (
 });
 
 /**
- * `t3_thread_configure` with a model: an agent's change of a thread's model is checked like a
- * launch (the thread's next run uses it). A caller with no thread (the owner's client) is not.
+ * `t3_thread_configure` with a model: an agent's change of a thread's model (a calling thread here,
+ * or one on a linked machine that sent it) is checked like a launch (the thread's next run uses it).
+ * The owner's client is not.
  */
 export const checkConfigure = Effect.fn("ModelPolicyCheck.checkConfigure")(function* (
   modelSelection: ModelSelection,
 ) {
   const { caller } = yield* loadCaller();
-  if (caller === undefined) return;
+  if (caller === undefined && !(yield* fromLinkedAgent)) return;
   const check = yield* makePickCheck;
   yield* check(
     "t3_thread_configure",
@@ -323,8 +361,8 @@ const MODEL_SELECTION = "modelSelection" satisfies keyof Tool.Parameters<
   keyof Tool.Parameters<(typeof ThreadToolkit)["tools"][typeof CONFIGURE_TOOL]>;
 
 /**
- * An agent's `t3_thread_launch` or `t3_thread_configure` sent to a linked machine, checked before it
- * is sent (the machine there sees no calling thread). The driver there is not known ({@link
+ * An agent's `t3_thread_launch` or `t3_thread_configure` sent to a linked machine, checked against
+ * this machine's policy before it is sent (the machine there checks its own). The driver there is not known ({@link
  * pickOfRemote}); a launch naming no model is refused in enforce; a configure without one only reads.
  */
 export const checkForwarded = Effect.fn("ModelPolicyCheck.checkForwarded")(function* (

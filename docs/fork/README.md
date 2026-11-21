@@ -331,21 +331,28 @@ row's `efforts`; `useFor` is a short note shown to agents when they pick.
 
 The server checks each agent pick (#731; agents only, #125): `delegate_task`, `create_threads`,
 `t3_thread_launch` and `t3_thread_configure` from an agent's thread, here and before a call is sent
-to a linked machine (the machine there sees no calling thread, so it does not check it). An agent is
+to a linked machine. The machine there checks an agent's launch or model change against its own
+policy too (the link names the agent's thread; a call the owner's client sends there is not checked),
+so each machine refuses an agent's pick outside its own rows, whatever the sending machine's policy
+says. An agent is
 a caller whose session is bound to a thread; the owner's client has none, and anything that reaches
 the server without such a session counts as a person, so the model guard hook is the backstop. A pick is inside when it
 names a model by its full id (#128; an alias such as `opus` is not read as its model, and the
 refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
 `efforts`, names one of them (`ultracode` counts as its own effort; a row without `efforts` allows
 none). Every effort option the pick names counts, so a second effort option cannot hide a higher
-effort. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
-own claim and is not read), every row naming the model must allow it, and every driver's effort
-option is read. In `enforce` a pick outside is refused with the rows; in
+effort, and one that holds no effort name (`{effort: true}`, which runs the driver's own default) is
+refused. A pick that leaves the ultracode option out runs at the model's default for it, so a model
+whose catalog default is ultracode reads as ultracode. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
+own claim and is not read), every row naming the model must allow it (the refusal names the drivers
+whose rows refuse it), and every driver's effort option is read. In `enforce` a pick outside is refused with the rows; in
 `advise` it runs, and `delegate_task`'s reply says what `enforce` would refuse (the other routes
 only log it). A pick inside gets its row's `useFor` in `delegate_task`'s reply. Each checked pick is
 logged as "model policy pick" with its model as asked, so one model's picks can be counted; the
 target the usage pacer moves a task to is checked too and logged as "model policy paced pick", the
-model it ran on. A retry of an accepted call is not checked again (it starts nothing new), except a
+model it ran on. An effort the pacer lowers (`usagePacingLowerEffort`) to one the row does not allow
+keeps the checked effort instead, with a warning in the server log naming both settings: the policy
+wins over the pacer, as the agent cannot fix that pick. A retry of an accepted call is not checked again (it starts nothing new), except a
 `t3_thread_launch` retry that names a model: that model wins over the first one, so it is checked
 like a new launch. A call sent to a linked machine is checked each time it is sent, a retry too: after
 a policy change a retry is refused even when the first call already started its task there (that
@@ -353,6 +360,13 @@ task runs on, with no record here). Not checked by the server: a project's defau
 `t3_project_update`) and `schedule_task`'s model, which a later run uses; the model guard hook
 (`fork-kit/model-guard`) refuses an agent's such call in `enforce`. The owner's own picks (in the app, or `t3_thread_launch` from the owner's client)
 are never refused; Settings marks the server's model picks outside the rows ("outside policy").
+
+Left (#731): a `t3_thread_launch` retry with the same key that names no model is not checked again.
+After a policy change, the retry of an idle launch (one without a message) that adds a message starts
+its run on the model checked under the old policy; so does an agent's retry of an idle launch the
+owner's client made with that key. A retry that names a model is checked again: in `advise` it is
+logged a second time (that model's picks count twice), and if the policy got stricter in between it
+is refused although the first call's thread exists. Each needs the key of an earlier launch.
 
 While the policy is on, a child that `delegate_task` (here or on a linked machine) or
 `create_threads` starts with a call that names its model also keeps only the options the call names,

@@ -40,6 +40,7 @@ import { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
+import { withUltracodeToggle } from "../provider/ClaudeModelCatalog.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -317,6 +318,55 @@ describe("a selection as the policy reads it", () => {
     assert.include(refusal(policy("enforce"), pick), "does not allow effort high + max");
   });
 
+  it("a pick that leaves ultracode out reads the catalog's default for it: on is ultracode", () => {
+    // The catalog as the Claude driver builds it from a manifest whose effort default is ultracode.
+    const ultracodeByDefault = {
+      ...provider,
+      models: [
+        {
+          slug: OPUS,
+          name: "Opus",
+          isCustom: false,
+          capabilities: withUltracodeToggle({
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Effort",
+                type: "select",
+                currentValue: "ultracode",
+                options: ["medium", "high", "xhigh", "ultracode"].map((id) => ({ id, label: id })),
+              },
+            ],
+          }),
+        },
+      ],
+    } as unknown as ServerProvider;
+    const read = (providers: ReadonlyArray<ServerProvider>, ultracode?: boolean) =>
+      ModelPolicyCheck.pickOfSelection(
+        providers,
+        {
+          instanceId: INSTANCE,
+          model: OPUS,
+          options: [
+            { id: "effort", value: "high" },
+            ...(ultracode === undefined ? [] : [{ id: "ultracode", value: ultracode }]),
+          ],
+        },
+        true,
+      );
+    assert.include(
+      refusal(policy("enforce"), read([ultracodeByDefault])),
+      "does not allow effort ultracode + high",
+    );
+    // The pick turns it off: its own value stands, inside. A catalog without the default: inside.
+    assert.deepStrictEqual(read([ultracodeByDefault], false).options, [
+      { id: "effort", value: "high" },
+      { id: "ultracode", value: false },
+    ]);
+    assert.isUndefined(refusal(policy("enforce"), read([ultracodeByDefault], false)));
+    assert.isUndefined(refusal(policy("enforce"), read([provider])));
+  });
+
   it("a call that named no model reads as none (#128), whatever it inherits", () => {
     const pick = ModelPolicyCheck.pickOfSelection(
       [provider],
@@ -401,19 +451,21 @@ const INSTANCE = ProviderInstanceId.make("claudeAgent");
 
 /**
  * Upstream's real `t3_thread_configure` handler with a thread caller (or the owner's client with
- * `caller: false`), the settings given, and every model change it dispatches recorded.
+ * `caller: false`, a linked machine's link with `"linked agent"` (its agent's call, naming the
+ * thread) or `"linked owner"`), the settings given, and every model change it dispatches recorded.
  */
 const configureHarness = (
   settings: Parameters<typeof ServerSettings.layerTest>[0],
   options: {
-    readonly caller?: boolean;
+    readonly caller?: boolean | "linked agent" | "linked owner";
     /** The settings as the server holds them, for a state a file decodes to (a kept bad value). */
     readonly held?: ModelPolicy;
   } = {},
 ) => {
   const dispatched: Array<unknown> = [];
   const forwarded: Array<unknown> = [];
-  const threadCaller = options.caller !== false;
+  const threadCaller = options.caller === undefined || options.caller === true;
+  const linkSender = { environmentId: "environment-there", threadId: "thread:s", title: "Sender" };
   const shell = (id: ThreadId) =>
     ({
       id,
@@ -449,7 +501,15 @@ const configureHarness = (
         : undefined,
       client: threadCaller
         ? undefined
-        : { sessionId: "session-1", label: "Owner", access: "full-access" },
+        : options.caller === false
+          ? { sessionId: "session-1", label: "Owner", access: "full-access" }
+          : {
+              sessionId: "link-1",
+              label: "Laptop",
+              access: "full-access",
+              linked: true,
+              ...(options.caller === "linked agent" ? { senderThread: linkSender as never } : {}),
+            },
       issuedAt: 0,
       capabilities: new Set(["orchestration" as const]),
     }),
@@ -536,6 +596,20 @@ describe("t3_thread_configure through upstream's handler", () => {
       const { dispatched, configure } = configureHarness(enforce, { caller: false });
       assert.isUndefined(yield* configure({ model: "claude-haiku-5-5" }));
       assert.lengthOf(dispatched, 1);
+    }),
+  );
+
+  it.effect("a change an agent on a linked machine sent here is checked against this policy", () =>
+    Effect.gen(function* () {
+      const { dispatched, configure } = configureHarness(enforce, { caller: "linked agent" });
+      assert.include(yield* configure({ model: "claude-haiku-5-5" }), "is in no row");
+      assert.deepStrictEqual(dispatched, []);
+      assert.isUndefined(yield* configure({ model: FABLE, options: effort("high") }));
+      assert.lengthOf(dispatched, 1);
+      // A change the link sends for no thread (the owner's client there) stays unchecked.
+      const owner = configureHarness(enforce, { caller: "linked owner" });
+      assert.isUndefined(yield* owner.configure({ model: "claude-haiku-5-5" }));
+      assert.lengthOf(owner.dispatched, 1);
     }),
   );
 

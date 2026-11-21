@@ -73,17 +73,22 @@ const callerShell = (): OrchestrationV2ThreadShell =>
   }) as unknown as OrchestrationV2ThreadShell;
 
 /**
- * Upstream's launch handler with a thread caller (or the owner's client with `caller: false`),
- * the settings given, and every launch and forwarded call recorded. With `slots`, the server's
- * slot gate runs over that world; without, the host runs none.
+ * Upstream's launch handler with a thread caller (or the owner's client with `caller: false`, a
+ * linked machine's link with `"linked agent"` (its agent's call, naming the thread) or `"linked
+ * owner"`), the settings given, and every launch and forwarded call recorded. With `slots`, the
+ * server's slot gate runs over that world; without, the host runs none.
  */
 const harness = (
   settings: Settings,
-  options: { readonly caller?: boolean; readonly slots?: SlotWorld } = {},
+  options: {
+    readonly caller?: boolean | "linked agent" | "linked owner";
+    readonly slots?: SlotWorld;
+  } = {},
 ) => {
   const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
   const forwarded: Array<unknown> = [];
-  const threadCaller = options.caller !== false;
+  const threadCaller = options.caller === undefined || options.caller === true;
+  const linkSender = { environmentId: THERE, threadId: "thread:sender", title: "Sender" };
   const base = Layer.mergeAll(
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed([]),
@@ -101,7 +106,15 @@ const harness = (
         : undefined,
       client: threadCaller
         ? undefined
-        : { sessionId: "session-1", label: "Owner", access: "full-access" },
+        : options.caller === false
+          ? { sessionId: "session-1", label: "Owner", access: "full-access" }
+          : {
+              sessionId: "link-1",
+              label: "Laptop",
+              access: "full-access",
+              linked: true,
+              ...(options.caller === "linked agent" ? { senderThread: linkSender as never } : {}),
+            },
       issuedAt: 0,
       capabilities: new Set(["orchestration" as const]),
     }),
@@ -689,6 +702,30 @@ describe("the model policy on a launch sent to a linked machine (#731)", () => {
         refusal(yield* launch({ environmentId: THERE, modelSelection: opus("high") })),
       ).toContain("sent there");
       expect(forwarded).toHaveLength(1);
+    }),
+  );
+
+  it.effect("sender off, this machine enforce: an agent's launch sent here is refused here", () =>
+    Effect.gen(function* () {
+      // The agent's machine has the policy off: it sends the launch.
+      const sender = harness(policy("off"));
+      expect(
+        refusal(yield* sender.launch({ environmentId: THERE, modelSelection: opus("max") })),
+      ).toContain("sent there");
+      // This machine (enforce) gets it from the link, naming the agent's thread: checked, refused.
+      const { launched, launch } = harness(policy("enforce"), { caller: "linked agent" });
+      for (const clientRequestId of ["k", "k"]) {
+        expect(refusal(yield* launch({ modelSelection: opus("max"), clientRequestId }))).toContain(
+          "Model policy refused this pick: claude-opus does not allow effort max",
+        );
+      }
+      expect(launched).toHaveLength(0);
+      expect(refusal(yield* launch({ modelSelection: opus("high") }))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+      // A call the link sends for no thread (the owner's client there) stays unchecked.
+      const owner = harness(policy("enforce"), { caller: "linked owner" });
+      expect(refusal(yield* owner.launch({ modelSelection: opus("max") }))).toBeUndefined();
+      expect(owner.launched).toHaveLength(1);
     }),
   );
 

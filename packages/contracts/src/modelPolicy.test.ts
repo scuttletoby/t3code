@@ -260,6 +260,54 @@ describe("one pick against the rows", () => {
     expect(checkModelPolicyPick(rows, twice)).toMatchObject({ inside: true });
   });
 
+  it("refuses an effort option that holds no effort name, which runs the driver's default", () => {
+    const unnamed = [
+      { id: "reasoning", value: "high" },
+      { id: "effort", value: true },
+    ];
+    for (const driver of ["claudeAgent", undefined]) {
+      expect(
+        checkModelPolicyPick(rows, { driver, model: "claude-opus-5-5", options: unnamed }),
+      ).toEqual({
+        inside: false,
+        why: "claude-opus-5-5's effort option effort holds no effort name",
+      });
+    }
+    // Claude's `thinking: true` sent to a linked machine is no pi effort: still inside.
+    expect(
+      checkModelPolicyPick(rows, {
+        driver: undefined,
+        model: "claude-opus-5-5",
+        options: [
+          { id: "effort", value: "high" },
+          { id: "thinking", value: true },
+        ],
+      }),
+    ).toMatchObject({ inside: true });
+  });
+
+  it("names the drivers whose rows refuse a pick with no known driver that another row allows", () => {
+    const disagree = [
+      { driver: "codex", model: "gpt-x", efforts: ["high"] },
+      { driver: "opencode", model: "gpt-x" },
+    ] as never;
+    const remote = (options: ReadonlyArray<{ id: string; value: unknown }>) =>
+      checkModelPolicyPick(disagree, { driver: undefined, model: "gpt-x", options });
+    expect(remote([{ id: "reasoningEffort", value: "high" }])).toEqual({
+      inside: false,
+      why: "gpt-x does not allow effort high (its opencode row refuses it: the driver there is not known here, so every row naming the model must allow it)",
+    });
+    expect(remote([])).toEqual({
+      inside: false,
+      why: "gpt-x needs an effort from its row, and the pick names none (its codex row refuses it: the driver there is not known here, so every row naming the model must allow it)",
+    });
+    // No row allows it: the plain reason.
+    expect(remote([{ id: "reasoningEffort", value: "max" }])).toEqual({
+      inside: false,
+      why: "gpt-x does not allow effort max",
+    });
+  });
+
   it("is inside only with a named model in a row of its driver, at one of the row's efforts", () => {
     expect(
       checkModelPolicyPick(rows, pick("claude-opus-5-5", [{ id: "effort", value: "xhigh" }])),
