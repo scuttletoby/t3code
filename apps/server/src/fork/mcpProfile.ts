@@ -364,6 +364,12 @@ const sameList = (a: "all" | ReadonlyArray<string>, b: "all" | ReadonlyArray<str
     ? a === b
     : a.length === b.length && a.every((value) => b.includes(value));
 
+/** True when `child` keeps nothing `parent` does not: cutting it to `parent` takes nothing away. */
+export function isWithinMcpProfile(child: McpProfileSet, parent: McpProfileSet): boolean {
+  const cut = cutTo(child, parent);
+  return sameList(cut.servers, child.servers) && sameList(cut.t3Tools, child.t3Tools);
+}
+
 const FIX = `pick "${MCP_PROFILE_ALL}" for this thread, or fix the profile in Settings`;
 
 /** ` "name"` for a message, or nothing when the name is empty (a carried value it cannot read). */
