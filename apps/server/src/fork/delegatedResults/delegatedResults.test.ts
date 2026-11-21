@@ -254,6 +254,16 @@ describe("reminder ids", () => {
     expect(newRefusal("command-b", NOW + REMINDER_MAX_AGE_MS + 1)).toBe(false);
   });
 
+  it("keeps a refusal for the whole process when told never to forget (the orphan scan)", () => {
+    const newRefusal = makeRefusalLog(null);
+    expect(newRefusal("command-a", NOW)).toBe(true);
+    // An orphan batch's ids do not age: a slot wait finds its refused receipt days later too.
+    expect(newRefusal("command-a", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(false);
+    expect(newRefusal("command-b", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(true);
+    // A restart is still a new log.
+    expect(makeRefusalLog(null)("command-a", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(true);
+  });
+
   it("finds this parent's first-format ids, from messages and receipts", () => {
     const old = firstFormatReminder(PARENT, ["a", "b"]);
     const otherParent = firstFormatReminder(ThreadId.make("other"), ["a"]);

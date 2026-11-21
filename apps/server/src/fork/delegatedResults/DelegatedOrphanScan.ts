@@ -119,7 +119,10 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
   const slotRetryDelay = options.slotRetryDelay ?? Duration.millis(WAKE_SLOT_RETRY_MS);
   /** Parents whose own retry runs (`run`): a later scan leaves them to it. */
   const waitingForSlot = new Map<ThreadId, ParentOutcome>();
-  const newRefusal = makeRefusalLog();
+  // Never forgotten: an orphan batch's ids do not age, and a slot wait checks its parent again for
+  // as long as the slot stays taken, a day or more. One run per start, so this holds at most the
+  // refused batches of that run.
+  const newRefusal = makeRefusalLog(null);
   const settings = yield* ServerSettingsService;
   const store = yield* DelegatedResultsStore.DelegatedResultsStore;
   const forwarding = yield* PeerForwarding.PeerForwarding;
