@@ -29,6 +29,7 @@ import {
   orphanBatchIds,
   orphanReminderText,
   orphansOf,
+  makeRefusalLog,
   parentGone,
   REMINDER_MAX_AGE_MS,
 } from "./delegatedResults.ts";
@@ -118,6 +119,7 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
   const slotRetryDelay = options.slotRetryDelay ?? Duration.millis(WAKE_SLOT_RETRY_MS);
   /** Parents whose own retry runs (`run`): a later scan leaves them to it. */
   const waitingForSlot = new Map<ThreadId, ParentOutcome>();
+  const newRefusal = makeRefusalLog();
   const settings = yield* ServerSettingsService;
   const store = yield* DelegatedResultsStore.DelegatedResultsStore;
   const forwarding = yield* PeerForwarding.PeerForwarding;
@@ -178,10 +180,11 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
           // A person stopped it: never restart it from here.
           return { type: "held", detail: "stopped" } satisfies ParentOutcome;
         case "rejected":
-          // Logged when refused, not on each later pass that finds its refused receipt.
-          if (result.earlier !== true) {
+          // Logged once per message and process, not on each pass that finds its refused receipt.
+          if (newRefusal(ids.commandId, yield* Clock.currentTimeMillis)) {
             yield* Effect.logWarning("delegated orphan reminder refused", {
               threadId: parentThreadId,
+              commandId: ids.commandId,
               detail: result.detail,
             });
           }

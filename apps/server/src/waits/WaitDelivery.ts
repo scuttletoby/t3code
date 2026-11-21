@@ -37,12 +37,8 @@ export type WaitReceiver =
 export type WaitDeliveryResult =
   /** The message is in the thread: sent now, sent before, or replayed from its receipt. */
   | { readonly type: "delivered" }
-  /**
-   * This command id was refused and stays refused; the next try needs a new one. `earlier`: it
-   * was refused before this try (answered from its receipt, nothing sent now), so a caller that
-   * logged that refusal need not log it again.
-   */
-  | { readonly type: "rejected"; readonly detail: string; readonly earlier?: true }
+  /** This command id was refused and stays refused; the next try needs a new one. */
+  | { readonly type: "rejected"; readonly detail: string }
   /** Nothing was recorded for this command id; the same id is tried again later. */
   | { readonly type: "retry"; readonly detail: string }
   /**
@@ -134,7 +130,7 @@ export const make = Effect.fn("WaitDelivery.make")(function* (
           onNone: () => "none" as const,
           onSome: (stored) =>
             stored.status === "rejected"
-              ? { type: "rejected", detail: stored.error ?? "Refused.", earlier: true }
+              ? { type: "rejected", detail: stored.error ?? "Refused." }
               : // A receipt held by another thread is a refusal for this one.
                 stored.threadId === message.threadId
                 ? { type: "delivered" }
@@ -152,12 +148,7 @@ export const make = Effect.fn("WaitDelivery.make")(function* (
     if ((yield* found(message)) === true) return { type: "delivered" } as const;
     const receipt = yield* receiptOf(message);
     if (receipt === null) return { type: "retry", detail: describe(error) } as const;
-    // Its receipt is this send's own answer: refused now, not before.
-    if (receipt !== "none") {
-      return receipt.type === "rejected"
-        ? ({ type: "rejected", detail: receipt.detail } as const)
-        : receipt;
-    }
+    if (receipt !== "none") return receipt;
     const tag = (error as { readonly _tag?: unknown } | null)?._tag;
     return typeof tag === "string" && RETRY_SAME_ID.has(tag)
       ? ({ type: "retry", detail: describe(error) } as const)

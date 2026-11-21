@@ -489,9 +489,8 @@ describe("DelegatedOrphanScan.scan", () => {
       const refusedOutcome = { type: "held", detail: "refused" };
       const once = scanned(scan.scan()).pipe(Effect.provide(warningLogs(warnings)));
       expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
-      // Runs again, and after a restart: answered from its refused receipt, no new warning.
+      // Runs again: answered from its refused receipt, no new warning.
       expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
-      yield* scanned((yield* service(world)).scan()).pipe(Effect.provide(warningLogs(warnings)));
       const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
       expect(refusals()).toHaveLength(1);
       expect(world.sent).toHaveLength(0);
@@ -501,6 +500,30 @@ describe("DelegatedOrphanScan.scan", () => {
       world.refusing.add(orphanBatchIds(PARENT, lost2).commandId);
       expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
       expect(refusals()).toHaveLength(2);
+      expect((yield* once).parents.get(PARENT)).toEqual(refusedOutcome);
+      expect(refusals()).toHaveLength(2);
+    }),
+  );
+
+  it.effect("a refusal whose log line a stop cut off is logged once after the restart", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const lost1 = [{ environmentId: ENV_B, threadId: ThreadId.make("lost-1") }];
+      const { commandId } = orphanBatchIds(PARENT, lost1);
+      // The server stopped after the refusal, before its warning: only the refused receipt is left.
+      world.refused.add(commandId);
+      const warnings: Array<string> = [];
+      const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
+      const once = scanned((yield* service(world)).scan()).pipe(
+        Effect.provide(warningLogs(warnings)),
+      );
+      expect((yield* once).parents.get(PARENT)).toEqual({ type: "held", detail: "refused" });
+      expect(refusals()).toHaveLength(1);
+      expect(refusals()[0]).toContain(commandId);
+      expect((yield* once).parents.get(PARENT)).toEqual({ type: "held", detail: "refused" });
+      expect(refusals()).toHaveLength(1);
+      expect(world.sent).toHaveLength(0);
     }),
   );
 

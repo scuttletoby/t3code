@@ -124,6 +124,7 @@ fork-kit/gh-apps/tests/wrapper.test.py
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
 fork-kit/heavy/tests/install.test.py ~8s
+fork-kit/heavy/tests/measure.test.py ~10s
 fork-kit/heavy/tests/queue.test.py ~18s
 fork-kit/heavy/tests/sweep.test.py ~37s
 # A real systemd user manager (the step starts one for the runner user).
