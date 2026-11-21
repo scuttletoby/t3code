@@ -16,6 +16,10 @@ _spec.loader.exec_module(probe)
 # The jobs that run app builds and tests on a fleet or GitHub-hosted runner (each routable job of fork-fleet.json).
 with open(os.path.join(ROOT, '.github/fork-fleet.json'), encoding='utf-8') as f:
     APP_JOBS = sorted({j['job'] for j in json.load(f)['jobs']})
+with open(os.path.join(ROOT, '.github/fork-ci-rerun.json'), encoding='utf-8') as f:
+    RERUN_CFG = json.load(f)
+WORKFLOW = os.path.join(ROOT, '.github/workflows/fork-tests.yml')
+LIMIT = '${{ needs.changes.outputs.probe_seconds }}'   # the probe's time limit, one value of the changes job
 GIB = 1024 ** 3
 
 
@@ -190,8 +194,97 @@ class Probe(unittest.TestCase):
         self.assertIn('fork-ci-pressure: job failure', r.stdout)
 
 
+def step_run(verb):
+    """The probe step's command: a hang (a stalled machine) is stopped after the changes job's probe_seconds with a
+    warning, and the job goes on."""
+    tail = 'no numbers; the job goes on' if verb == 'start' else 'no numbers'
+    return (f'timeout -k 5 "{LIMIT}" python3 -I .github/scripts/fork-ci-pressure.py {verb} || '
+            f'echo "::warning::fork-ci-pressure: {verb} stopped (exit $?), {tail}"')
+
+
+def load_rerun():
+    spec = importlib.util.spec_from_file_location('fork_ci_rerun', os.path.join(HERE, 'fork-ci-rerun.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class Steps(unittest.TestCase):
     """Each app job of fork-tests.yml takes a sample right after its checkout and prints the numbers last."""
+
+    def run_step(self, verb, python3, limit=str(RERUN_CFG['probe_limit_seconds'])):
+        """The step's own text in GitHub's shell (bash -e), with a stand-in python3 and its time limit made short."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        with open(os.path.join(d, 'python3'), 'w', encoding='utf-8') as f:
+            f.write('#!/bin/sh\n' + python3 + '\n')
+        os.chmod(os.path.join(d, 'python3'), 0o755)
+        text = step_run(verb)
+        self.assertEqual((text.count(' -k 5 '), text.count(LIMIT)), (1, 1))
+        text = text.replace(' -k 5 ', ' -k 1 ').replace(LIMIT, limit)   # as GitHub fills in the expression
+        return subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', text], capture_output=True,
+                              text=True, timeout=30, env={'PATH': d + os.pathsep + os.environ.get('PATH', '')})
+
+    def test_a_hung_probe_is_stopped_and_the_job_goes_on(self):
+        # A stalled machine can hang the probe itself: without its own limit the step's 1-minute timeout fails the
+        # step, and every later step (the tests) is skipped. Now the step ends well after the limit, with a warning.
+        for verb in ('start', 'end'):
+            with self.subTest(verb):
+                r = self.run_step(verb, 'sleep 25', limit='1')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f'::warning::fork-ci-pressure: {verb} stopped (exit 124)', r.stdout)
+
+    def test_a_probe_that_ignores_the_stop_signal_is_killed(self):
+        r = self.run_step('start', "trap '' TERM; sleep 25", limit='1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('::warning::fork-ci-pressure: start stopped (exit 137)', r.stdout)
+
+    def test_a_stopped_end_probe_leaves_the_rerun_no_note_to_read(self):
+        # The stop warning, as GitHub hands it back, with a note a step printed earlier that fits the window: the
+        # re-run reads no note (fork-ci-rerun.py PROBE_WARNS), so the job stays red.
+        rerun = load_rerun()
+        r = self.run_step('end', 'sleep 25', limit='1')
+        line = r.stdout.strip().splitlines()[-1]
+        self.assertTrue(line.startswith('::warning::' + rerun.PROBE_WARNS), line)
+        end = RERUN_CFG['probe_end_step']
+        stamp = lambda s: '2026-01-01T00:%02d:%02dZ' % divmod(s, 60)
+        steps = [{'name': n, 'status': 'completed', 'conclusion': 'success', 'started_at': stamp(a),
+                  'completed_at': stamp(b)} for n, a, b in ((RERUN_CFG['probe_start_step'], 0, 1), ('Test', 1, 60),
+                                                            (end, 60, 62))]
+        body = {'status': 'failure', 'seconds': 61, 'host': {}, 'cgroups': []}
+        printed = {'message': rerun.NOTE_HEAD + json.dumps(body), 'annotation_level': 'notice',
+                   'title': rerun.NOTE_TITLE, 'path': '.github'}
+        cfg = dict(RERUN_CFG)
+        self.assertIsNotNone(rerun.note_of(cfg, {'steps': steps}, [printed])[0])   # alone, it would be read
+        warning = {'message': line[len('::warning::'):], 'annotation_level': 'warning', 'title': '',
+                   'path': '.github'}
+        got, why = rerun.note_of(cfg, {'steps': steps}, [printed, warning])
+        self.assertIsNone(got)
+        self.assertIn('the probe warned', why)
+
+    def test_the_probe_limit_is_in_one_place(self):
+        # One value of the changes job (every app job needs it); the re-run's config holds the same number (it reads
+        # no note from an end step that took that long). No step or comment keeps a copy of the number.
+        import yaml
+        with open(WORKFLOW, encoding='utf-8') as f:
+            text = f.read()
+        wf = yaml.safe_load(text)
+        limit = RERUN_CFG['probe_limit_seconds']
+        self.assertEqual(wf['jobs']['changes']['outputs']['probe_seconds'], str(limit))
+        probes = [line for line in text.splitlines() if 'fork-ci-pressure.py' in line and 'timeout' in line]
+        self.assertEqual(len(probes), 2 * len(APP_JOBS))
+        for line in probes:
+            self.assertIn(f'timeout -k 5 "{LIMIT}" python3 ', line)
+        for name in APP_JOBS:
+            needs = wf['jobs'][name]['needs']
+            self.assertIn('changes', [needs] if isinstance(needs, str) else needs, name)
+        self.assertEqual(re.findall(rf'timeout +(?:-k +[0-9]+ +)?[0-9]+ +python3|\b{limit} ?s\b', text), [])
+        # The step's 1-minute timeout-minutes stays a backstop: the limit and the kill's 5 s end well inside it.
+        self.assertLessEqual(limit + 5, 50)
+
+    def test_a_probe_that_ends_in_time_adds_no_warning(self):
+        r = self.run_step('start', 'echo "fork-ci-pressure: start sample saved"')
+        self.assertEqual((r.returncode, r.stdout), (0, 'fork-ci-pressure: start sample saved\n'), r.stderr)
 
     def test_every_app_job_has_the_start_and_end_steps(self):
         import yaml
@@ -202,10 +295,10 @@ class Steps(unittest.TestCase):
             with self.subTest(name):
                 steps = wf['jobs'][name]['steps']
                 self.assertEqual(steps[0]['name'], 'Checkout')
-                self.assertEqual(steps[1]['run'], 'python3 -I .github/scripts/fork-ci-pressure.py start')
+                self.assertEqual(steps[1]['run'], step_run('start'))
                 self.assertNotIn('if', steps[1])
                 end = steps[-1]
-                self.assertEqual(end['run'], 'python3 -I .github/scripts/fork-ci-pressure.py end')
+                self.assertEqual(end['run'], step_run('end'))
                 self.assertTrue(re.fullmatch(r"\$\{\{ always\(\) && hashFiles\('\.github/scripts/fork-ci-pressure"
                                              r"\.py'\) != '' \}\}", end['if']), end['if'])
                 self.assertEqual(end['env'], {'JOB_STATUS': '${{ job.status }}'})
