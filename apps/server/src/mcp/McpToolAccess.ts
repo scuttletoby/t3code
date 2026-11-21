@@ -465,6 +465,7 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
         if (target === undefined) return yield* here(params);
         if (scope.linkedEnvironments === false) return yield* PeerForwarding.linkedEnvironmentsOff;
         yield* (remote as RemoteCheck<typeof params>)(params);
+        yield* LaunchMcpProfile.checkForwarded(name, params); // Fork: MCP profile launch
         if (Option.isNone(forwarding)) return yield* linksUnavailable;
         const result = yield* forwarding.value.call(scope, tool, target, {
           ...params,

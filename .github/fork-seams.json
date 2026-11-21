@@ -238,14 +238,9 @@
       "added": [
         "import * as LaunchMcpProfile from \"../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.refuseUnlessHere(caller); // Fork: MCP profile launch",
-        "LaunchMcpProfile.startsHere(caller); // Fork: MCP profile launch"
-      ],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "yield* LaunchMcpProfile.checkForwarded(name, params); // Fork: MCP profile launch"
-        ]
-      }
+        "LaunchMcpProfile.startsHere(caller); // Fork: MCP profile launch",
+        "yield* LaunchMcpProfile.checkForwarded(name, params); // Fork: MCP profile launch"
+      ]
     },
     "apps/server/src/mcp/toolkits/project/handlers.ts": {
       "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681).",
@@ -256,27 +251,19 @@
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-20",
-        "added": [
-          "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
-          "yield* LaunchMcpProfile.checkScheduleMcpProfile(input); // Fork: MCP profile launch",
-          "yield* LaunchMcpProfile.checkScheduleEditMcpProfile(scheduledTaskId, bindToCurrentThread); // Fork: MCP profile launch"
-        ]
-      }
+      "added": [
+        "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
+        "yield* LaunchMcpProfile.checkScheduleMcpProfile(input); // Fork: MCP profile launch",
+        "yield* LaunchMcpProfile.checkScheduleEditMcpProfile(scheduledTaskId, bindToCurrentThread); // Fork: MCP profile launch"
+      ]
     },
     "apps/server/src/mcp/toolkits/thread/handlers.ts": {
       "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-20",
-        "added": [
-          "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
-          "yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch",
-          "yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch"
-        ]
-      }
+      "added": [
+        "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
+        "yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch",
+        "yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
