@@ -49,6 +49,27 @@
     "policyFile": "/etc/fork-kit/model-policy.json",
     "t3ModelManifests": ["/srv/example/t3-home/userdata/model-manifest.json"]
   },
+  "agent-guards": {
+    "actionsDisable": {
+      "stateDir": "~/.local/state/actions-disable-guard",
+      "refuseScripts": [{ "name": "example_garden.py", "flag": "--fix", "why": "disables workflows in the forks" }]
+    },
+    "capacityPipe": { "commands": ["t3-capacity"] },
+    "memoryIndex": { "maxChars": 6000, "maxLine": 160, "stateDir": "~/.cache/memory-index-guard" },
+    "bgGuard": {
+      "skipSessionsFiles": ["~/.local/state/example-orch/slot-sessions.txt"],
+      "maxBlocks": 3,
+      "stateDir": "~/.local/state/bg-guard"
+    },
+    "agentSlots": {
+      "sessionsFile": "~/.local/state/example-orch/slot-sessions.txt",
+      "queue": "/srv/example/QUEUE.md",
+      "readyHeading": "## Ready",
+      "maxAlive": 10,
+      "processName": "claude",
+      "note": "at most 4 build agents"
+    }
+  },
   "cleaner": {
     "logFile": "~/.local/state/fork-cleaner/cleaner.log",
     "mustKeep": ["/srv/example/ledger"],

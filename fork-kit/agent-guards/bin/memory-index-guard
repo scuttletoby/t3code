@@ -1,0 +1,189 @@
+#!/usr/bin/python3 -IB
+"""Claude Code hook: keep the auto-memory index (MEMORY.md) inside a size budget, at the moment it changes.
+Part of fork-kit/agent-guards (README.md there: install, settings entries, the machine file's "agent-guards" section).
+
+General (any project, any Claude config dir): the session's index is <dir of transcript_path>/memory/MEMORY.md.
+Budget (machine file, memoryIndex): maxChars (default 6000) characters in total, maxLine (default 160) per line.
+
+- PreToolUse (Write/Edit/MultiEdit on a memory index): works out the new text and refuses the call when it would be
+  over budget, unless it shrinks an index that was already over (so cutting down is always allowed).
+- PostToolUse (any tool, mainly Bash): if the index changed since this session last looked and is over budget, it
+  blocks with the reason, so the agent cuts it in the same turn. Cheap: one stat per call, the file is read only
+  after a change. State: <memoryIndex.stateDir>/<session> (default ~/.cache/memory-index-guard), written whole
+  (temp file, then rename), so two hooks at once leave one of their two answers, never half of one.
+
+Never fails a tool call because of its own error (exit 0 on anything unexpected). A broken machine file section:
+the default budget, and one line on stderr. Tests: fork-kit/agent-guards/tests/memory-index.test.py
+"""
+import json, os, sys, tempfile, time
+
+
+def _settings():
+    """(memoryIndex settings, problem or None); a copy without the kit's lib keeps the defaults and says so."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        c, problem = config.load('memoryIndex')
+        c['stateDir'] = config.expand(c['stateDir'])
+        return c, problem
+    except BaseException as e:   # noqa: BLE001 - the guard works without its config
+        return ({'maxChars': 6000, 'maxLine': 160, 'stateDir': os.path.expanduser('~/.cache/memory-index-guard')},
+                f'cannot load the kit\'s config code ({type(e).__name__}: {e})')
+
+
+SETTINGS, SETTINGS_PROBLEM = _settings()
+MAX_CHARS = SETTINGS['maxChars']
+MAX_LINE = SETTINGS['maxLine']
+STATE = SETTINGS['stateDir']
+
+
+def problems(text):
+    out = []
+    if len(text) > MAX_CHARS:
+        out.append(f'{len(text)} chars, budget {MAX_CHARS}')
+    long = [i + 1 for i, l in enumerate(text.split('\n')) if len(l) > MAX_LINE]
+    if long:
+        out.append(f'line(s) {", ".join(map(str, long[:8]))} longer than {MAX_LINE} chars')
+    return out
+
+
+def badness(text):
+    return max(0, len(text) - MAX_CHARS) + sum(max(0, len(l) - MAX_LINE) for l in text.split('\n'))
+
+
+def message(path, probs):
+    return (f'Memory index {path} is over budget: {"; ".join(probs)}. It is sent on every call of every session. '
+            f'Cut it now: one line per memory, "- [Title](file.md) - hook" under {MAX_LINE} chars; merge duplicates, '
+            'delete memories a tool now enforces or that are only history, and keep detail in the memory files.')
+
+
+def index_of(data):
+    t = data.get('transcript_path') or ''
+    return os.path.join(os.path.dirname(t), 'memory', 'MEMORY.md') if t else ''
+
+
+def is_index(path, idx):
+    if not path or os.path.basename(path) != 'MEMORY.md':
+        return False
+    rp = os.path.realpath(path)
+    if idx and rp == os.path.realpath(idx):
+        return True
+    parts = rp.split(os.sep)
+    return len(parts) >= 4 and parts[-2] == 'memory' and parts[-4] == 'projects'
+
+
+def read(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def pre(data):
+    name = data.get('tool_name')
+    ti = data.get('tool_input') or {}
+    path = ti.get('file_path') or ''
+    if name not in ('Write', 'Edit', 'MultiEdit') or not is_index(path, index_of(data)):
+        return None
+    old = read(path) or ''
+    if name == 'Write':
+        new = ti.get('content') or ''
+    else:
+        new = old
+        for e in (ti.get('edits') or [ti]):
+            o, n = e.get('old_string') or '', e.get('new_string') or ''
+            if not o or o not in new:
+                return None  # the tool itself will refuse it
+            new = new.replace(o, n) if e.get('replace_all') else new.replace(o, n, 1)
+    probs = problems(new)
+    if not probs or badness(new) < badness(old):
+        return None
+    return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                                   'permissionDecisionReason': message(path, probs)}}
+
+
+def session_start(data):
+    try:
+        with open(data.get('transcript_path') or '') as f:
+            for _ in range(20):
+                line = f.readline()
+                if not line:
+                    break
+                if '"timestamp"' in line:
+                    ts = json.loads(line).get('timestamp') or ''
+                    return time.mktime(time.strptime(ts[:19], '%Y-%m-%dT%H:%M:%S')) - time.timezone
+    except (OSError, ValueError):
+        pass
+    return time.time()
+
+
+def save(sf, text):
+    """Whole or not at all: two runs at once each rename their own temp file; a state folder that cannot be written
+    only means the next call looks again."""
+    tmp = None
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(sf) + '.', dir=STATE)
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+        os.replace(tmp, sf)
+        tmp = None
+    except OSError:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def post(data):
+    idx = index_of(data)
+    try:
+        st = os.stat(idx)
+    except OSError:
+        return None
+    sig = f'{st.st_mtime_ns} {st.st_size}'
+    sid = ''.join(c for c in (data.get('session_id') or 'none') if c.isalnum() or c == '-')[:64]
+    sf = os.path.join(STATE, sid)
+    try:
+        with open(sf) as f:
+            last = f.read().strip()
+    except OSError:
+        last = None
+    if last == sig:
+        return None
+    save(sf, sig)
+    if last is None and st.st_mtime < session_start(data):
+        return None  # first look in this session, and nobody changed it since the session started
+    probs = problems(read(idx) or '')
+    if not probs:
+        return None
+    return {'decision': 'block', 'reason': message(idx, probs)}
+
+
+def main():
+    if sys.argv[1:]:
+        sys.stderr.write('usage: memory-index-guard (hook: PreToolUse or PostToolUse JSON on stdin)\n')
+        return 1
+    if SETTINGS_PROBLEM:
+        try:
+            sys.stderr.write('memory-index-guard: the machine file\'s "agent-guards" section cannot be used '
+                             f'({SETTINGS_PROBLEM}); built-in defaults used. Run `agent-guards self-check`.\n')
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        data = json.load(sys.stdin)
+        ev = data.get('hook_event_name')
+        out = pre(data) if ev == 'PreToolUse' else post(data) if ev == 'PostToolUse' else None
+    except Exception:  # never break a tool call because of this guard
+        return 0
+    if out:
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

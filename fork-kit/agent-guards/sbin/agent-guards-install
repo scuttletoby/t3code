@@ -1,0 +1,127 @@
+#!/usr/bin/python3 -IB
+"""agent-guards-install: install, uninstall or check the agent-guards kit, as root (fork-kit/agent-guards/README.md).
+
+  agent-guards-install install --source KIT_FOLDER --sha RELEASE_SHA [--settings | --no-settings]
+  agent-guards-install uninstall
+  agent-guards-install self-check
+
+install copies bin/ (the five hooks and agent-guards), sbin/agent-guards-install, lib/agent_guards/, README.md and
+fork-kit/common/{machine_file,kit_install}.py of one release into /usr/local/libexec/agent-guards/versions/<sha>/
+(with MANIFEST.sha256), checks the copy, switches the link `current` to it and links /usr/local/bin/<hook> and
+/usr/local/bin/agent-guards to it. With --settings it also writes the hooks' Claude Code managed settings drop-in
+(/etc/claude-code/managed-settings.d/agent-guards.json), which every session of every user on the machine reads
+and only root can change; --no-settings removes it. The choice is kept in /etc/agent-guards/config.json, so a run
+without either option keeps it (the first install: no drop-in). The drop-in is written only after the links, so a
+hook it names is always there. Safe to run again, and to stop at any step; one installer at a time. The steps every
+kit shares are in fork-kit/common/kit_install.py.
+"""
+import json, os, sys
+_kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_common = os.path.join(_kit, 'common')
+sys.path[:0] = [_common if os.path.isdir(_common) else os.path.join(os.path.dirname(_kit), 'common'),
+                os.path.join(_kit, 'lib')]
+try:
+    import kit_install  # noqa: E402
+    from agent_guards import wiring  # noqa: E402
+except ImportError as e:     # a copy with a part missing: the bootstrap makes it whole again
+    sys.exit(f'agent-guards-install: cannot load its installer code ({e}): install again with the bootstrap, as root '
+             '(fork-kit/agent-guards/README.md, Install)')
+
+HOOKS = wiring.HOOKS
+
+
+class AgentGuardsInstaller(kit_install.Installer):
+    PROG = 'agent-guards-install'
+    PROGRAM = __file__
+    KIT = 'agent-guards'
+    ETC = '/etc/agent-guards'
+    LIBEXEC = '/usr/local/libexec/agent-guards'
+    LINKS = dict({f'{wiring.BIN}/{h}': f'bin/{h}' for h in HOOKS + ('agent-guards',)},
+                 **{'/usr/local/sbin/agent-guards-install': 'sbin/agent-guards-install'})
+    SOURCE_FILES = tuple(f'bin/{h}' for h in HOOKS + ('agent-guards',)) + (
+        'sbin/agent-guards-install', 'README.md', 'common/machine_file.py', 'common/kit_install.py')
+    EXECUTABLE = frozenset([f'bin/{h}' for h in HOOKS + ('agent-guards',)] + ['sbin/agent-guards-install'])
+    PACKAGE = 'agent_guards'
+    MODULES = ('__init__', 'check', 'config', 'wiring')
+    HELP = ('bin/agent-guards', 'agent-guards check')
+    HAS_CONFIG = True
+    KIT_STEPS = ('settings',)
+
+    def add_install_options(self, parser):
+        parser.add_argument('--settings', dest='settings', action='store_true', default=None)
+        parser.add_argument('--no-settings', dest='settings', action='store_false')
+
+    def drop_in_ours(self):
+        """The drop-in is a plain file this kit wrote (only the kit's hooks in it), or not there."""
+        real = self.p(wiring.DROP_IN)
+        if not os.path.lexists(real):
+            return None
+        if os.path.islink(real) or not os.path.isfile(real):
+            return False
+        try:
+            with open(real, encoding='utf-8') as f:
+                return wiring.ours(json.load(f))
+        except (OSError, ValueError):
+            return False
+
+    def check_managed(self):
+        for path in (wiring.MANAGED_DIR, os.path.dirname(wiring.DROP_IN)):
+            real = self.p(path)
+            if os.path.lexists(real) and (os.path.islink(real) or not os.path.isdir(real)
+                                          or os.lstat(real).st_uid != self.ROOT_UID):
+                raise self.Refused(f'{path} exists and is not a root-owned folder: fix it by hand and run again')
+        if self.drop_in_ours() is False:
+            raise self.Refused(f'{wiring.DROP_IN} exists and was not written by this kit: remove it and run again, '
+                               'or run with --no-settings to leave it alone')
+
+    def plan(self, a):
+        settings = a.settings if a.settings is not None else bool(self.read_config().get('settings'))
+        if settings or self.drop_in_ours():
+            self.check_managed()
+        return {'settings': settings}
+
+    def config(self, a, plan):
+        return {'version': 1, 'settings': plan['settings']}
+
+    def kit_step(self, step, a, plan, dest):
+        # after the links: every hook the drop-in names is the one of this release
+        if plan['settings']:
+            self.check_managed()
+            for path in (wiring.MANAGED_DIR, os.path.dirname(wiring.DROP_IN)):
+                self.ensure_dir(path)
+            if self.write_file(wiring.DROP_IN, wiring.drop_in_text()):
+                self.say(f'wrote {wiring.DROP_IN}: every new Claude Code session runs the hooks '
+                         '(sessions already running keep the hooks they started with)')
+        elif self.drop_in_ours():
+            os.unlink(self.p(wiring.DROP_IN))
+            self.say(f'removed {wiring.DROP_IN}')
+
+    def kit_rows(self, plan):
+        if not plan['settings']:
+            return []
+        return [(wiring.DROP_IN, 'file', kit_install.sha256_file(self.p(wiring.DROP_IN)))]
+
+    def kit_uninstall(self):
+        if self.drop_in_ours():
+            os.unlink(self.p(wiring.DROP_IN))
+            self.say(f'removed {wiring.DROP_IN}')
+
+    def _remove(self):
+        # the drop-in goes first: while it is there, the hooks it names must be too (a missing
+        # actions-disable-guard refuses every Bash command); the shared steps then remove the links
+        self.kit_uninstall()
+        return super()._remove()
+
+    def installed_summary(self, plan):
+        return ', hooks in managed settings' if plan['settings'] else ', hooks not in managed settings'
+
+
+INSTALLER = AgentGuardsInstaller()
+
+
+def main(argv, stop_after=None):
+    return INSTALLER.main(argv, stop_after, doc=__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

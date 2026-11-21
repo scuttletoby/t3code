@@ -94,6 +94,14 @@ fork-ci/actions/test-select/test-select.test.py ~26s
 fork-ci/actions/test-select/trace-check.test.py
 fork-ci/actions/weakened-tests/weakened_tests.test.py
 fork-ci/laws/laws.test.py
+fork-kit/agent-guards/tests/actions-disable.test.py ~45s
+fork-kit/agent-guards/tests/agent-slots.test.py
+fork-kit/agent-guards/tests/bg-guard.test.py
+fork-kit/agent-guards/tests/capacity-pipe.test.py
+fork-kit/agent-guards/tests/config.test.py
+fork-kit/agent-guards/tests/install.test.py ~20s
+fork-kit/agent-guards/tests/memory-index.test.py
+fork-kit/agent-guards/tests/wiring.test.py
 fork-kit/cleaner/tests/compress.test.py ~15s
 fork-kit/cleaner/tests/daily.test.py ~19s
 fork-kit/cleaner/tests/dedupe.test.py ~22s
@@ -104,7 +112,7 @@ fork-kit/cleaner/tests/report.test.py
 fork-kit/cleaner/tests/scratch.test.py
 fork-kit/cleaner/tests/worktrees.test.py ~43s
 fork-kit/common/tests/free_contract.test.py ~6s
-fork-kit/common/tests/kit_install.test.py ~93s
+fork-kit/common/tests/kit_install.test.py ~125s
 fork-kit/common/tests/machine_file.test.py
 fork-kit/desk/tests/install.test.py ~103s
 fork-kit/desk/tests/windows.test.py ~65s

@@ -1,0 +1,77 @@
+#!/usr/bin/python3 -IB
+"""agent-guards: the command of the agent-guards kit (fork-kit/agent-guards/README.md).
+
+  agent-guards self-check              the machine file's "agent-guards" section, the hook files, the managed
+                                       settings drop-in (exit 1 on a problem)
+  agent-guards check [--settings F]    run each hook wired in F (default: the managed settings drop-in) with one
+                                       case it must refuse and one it must pass (exit 1 on a problem)
+  agent-guards hooks [--bin DIR]       print the "hooks" settings of every hook of the kit, for a settings file
+"""
+import argparse, json, os, sys
+
+_kit = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(_kit, 'lib'))
+
+PROG = 'agent-guards'
+
+
+def self_check(bin_dir, drop_in):
+    from agent_guards import config, wiring
+    problems, notes = [], []
+    settings, cfg_problems = config.load_all()
+    problems += [f'machine file: {p} (the hooks use their built-in defaults)' for p in cfg_problems]
+    for hook in wiring.HOOKS:
+        if not os.access(os.path.join(bin_dir, hook), os.R_OK):
+            problems.append(f'{os.path.join(bin_dir, hook)} is missing or cannot be read')
+    try:
+        with open(drop_in, encoding='utf-8') as f:
+            text = f.read()
+        if json.loads(text) != {'hooks': wiring.hooks()}:
+            problems.append(f'{drop_in} is not the kit\'s drop-in of this release: run the installer again '
+                            '(agent-guards-install install ... --settings)')
+        else:
+            notes.append(f'{drop_in}: every hook is wired in managed settings')
+    except FileNotFoundError:
+        notes.append(f'{drop_in} is not there: the hooks are not in managed settings (installer --settings, or '
+                     'by hand from `agent-guards hooks`)')
+    except (OSError, ValueError) as e:
+        problems.append(f'{drop_in} cannot be read ({e})')
+    for hook, s in settings.items():
+        notes.append(f'{hook}: {json.dumps(s, sort_keys=True)}')
+    for n in notes:
+        print(f'note: {n}')
+    for p in problems:
+        print(f'PROBLEM: {p}')
+    print(f'{PROG} self-check: ' + ('OK' if not problems else f'{len(problems)} problem(s)'))
+    return 0 if not problems else 1
+
+
+def main(argv):
+    if argv in (['-h'], ['--help']):
+        print(__doc__.strip())
+        return 0
+    from agent_guards import check, wiring
+    ap = argparse.ArgumentParser(prog=PROG)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('self-check')
+    c = sub.add_parser('check')
+    c.add_argument('--settings', default=wiring.DROP_IN)
+    h = sub.add_parser('hooks')
+    h.add_argument('--bin', default=wiring.BIN)
+    a = ap.parse_args(argv)
+    if a.cmd == 'self-check':
+        return self_check(os.path.dirname(os.path.realpath(__file__)), wiring.DROP_IN)
+    if a.cmd == 'hooks':
+        print(json.dumps({'hooks': wiring.hooks(a.bin)}, indent=2))
+        return 0
+    try:
+        with open(a.settings, encoding='utf-8') as f:
+            settings = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f'{PROG}: cannot read {a.settings} ({e})', file=sys.stderr)
+        return 1
+    return check.run(settings, a.settings)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

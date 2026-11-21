@@ -1,0 +1,350 @@
+#!/usr/bin/python3 -IB
+"""Claude Code PreToolUse hook (Bash, Monitor): refuse a command that pipes the output of a capacity check.
+Part of fork-kit/agent-guards (README.md there: install, settings entry, the machine file's "agent-guards" section).
+
+The checks are the commands in the machine file's capacityPipe.commands (default ["t3-capacity"]): a tool that
+answers OK (exit 0) or NOT OK (exit 1) before a heavy step. Why: agents ran `t3-capacity 2048 | tail -1 && <heavy
+step>`. A pipeline's exit status is its LAST command's, so NOT OK (exit 1) was lost and the heavy step ran on a full
+machine. A line in the agents' briefs did not stop it.
+
+Rule: EVERY pipe (`|`, `|&`) out of such a command is refused, also one that decides nothing (`t3-capacity | cat`)
+and one under `set -o pipefail`: nothing needs the pipe, and "is the status used" cannot be read from the text
+reliably. Passes: `t3-capacity N && cmd`, `t3-capacity`, `t3-capacity; echo $?`, `if t3-capacity N; then ..`,
+`t3-capacity N > file && cmd`, `out=$(t3-capacity N) && cmd`, `t3-capacity N || ..`, and a group that gates inside
+and is piped as a whole (`{ t3-capacity N && cmd; } | tail`).
+
+How it reads a command (small on purpose; actions-disable-guard is the full shell reader, and what it guards is an
+attack, this is a mistake):
+  - shell text as a shell reads it: quotes, backslashes, comments, redirections, `&& || ; & |` and newlines;
+  - the check must be the command word (any path; after NAME=value, `!`, if/while/until/then/do/else, and the
+    wrappers sudo, env, command, exec, nohup, nice, ionice, timeout, stdbuf, setsid, time, builtin with their flags);
+  - commands inside `$(..)`, backticks, `<(..)`, and a `( .. )` or `{ ..; }` group whose LAST command is the check;
+  - shell text handed on, read again by the same rules: `bash -c '..'` (sh, zsh, dash, ksh, su; also behind another
+    word: `heavy bash -c`, `timeout 60 bash -lc`), `eval ..`, `ssh host '..'`, `watch '..'`, and a heredoc into a shell.
+Text that only mentions it passes: echo, grep, commit messages, a heredoc into cat/tee/a file (briefs), comments.
+
+Not covered (the check's own stderr line is the second layer when it has one: say "NOT OK .. never pipe it" on
+stderr whenever it answers NOT OK into a pipe or a file): a command kept in a variable (`$C | tail`), a script file,
+`sh t3-capacity`, a heredoc piped into a shell (`cat <<EOF | bash`), `$(..)` inside `${..}` or inside an unquoted
+heredoc into a non-shell, xargs / find -exec, a wrapper's long flag with its value as the next word
+(`sudo --user someone`), text more than 40 levels deep. Tools other than Bash and Monitor are not read.
+
+Fail open: on its own failure (broken input, a bug) it writes one line to stderr and exits 1, which Claude Code
+treats as "hook failed, run the command". Exit 2 (refuse) is only ever the answer to a pipe it found. The settings
+entry (`agent-guards hooks`) also exits 1 with a line on stderr when this file is missing (a bare `python3 <missing>`
+would exit 2 and refuse every Bash call). A broken machine file section: the default command list, one line on
+stderr. Tests: fork-kit/agent-guards/tests/capacity-pipe.test.py
+"""
+import json, os, re, sys
+
+
+def _settings():
+    """(capacityPipe settings, problem or None); a copy without the kit's lib keeps the defaults and says so."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+        from agent_guards import config
+        return config.load('capacityPipe')
+    except BaseException as e:   # noqa: BLE001 - the guard works without its config
+        return {'commands': ['t3-capacity']}, f'cannot load the kit\'s config code ({type(e).__name__}: {e})'
+
+
+SETTINGS, SETTINGS_PROBLEM = _settings()
+CHECKS = tuple(SETTINGS['commands'])   # the capacity checks whose output must not be piped
+NAME = 'capacity-pipe-guard'
+HID = '\x00'   # text the guard cannot know ($X, ${..}, the output of $(..)), as part of a word
+MAX_DEPTH = 40
+SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'su'}   # `<shell> .. -c TEXT`; a heredoc into one is commands
+TEXT_ARGS = {'ssh', 'watch'}                           # each argument that names the tool is shell text
+TOOLS = {'Bash', 'Monitor'}                            # the tools whose `command` is shell text
+WRAPPERS = {   # a command follows them; value: their one-letter flags whose value is the NEXT word (sudo -u someone)
+    'sudo': 'ughpCDRTUrt', 'env': 'uCS', 'timeout': 'ks', 'nice': 'n', 'ionice': 'cnp', 'stdbuf': 'ioe', 'exec': 'a',
+    'time': 'fo', 'command': '', 'builtin': '', 'nohup': '', 'setsid': ''}
+KEYWORDS = {'!', '{', 'if', 'then', 'elif', 'else', 'while', 'until', 'do'}   # a command follows them
+OPENERS = {'{', 'if', 'while', 'until'}        # ... and these open a group that CLOSERS end
+HEADS = {'for', 'case', 'select'}              # open a group too; the rest of their line is no command
+CLOSERS = {'}', 'fi', 'done', 'esac'}
+ASSIGN = re.compile(r'[A-Za-z_]\w*\+?=')
+PLAIN = re.compile(r'-|\d+(\.\d+)?[smhd]?$')   # a wrapper's flag, or its number / duration (timeout 5m, nice 10)
+FLAGS = re.compile(r'-[A-Za-z]+$')             # -u, -iu: the last letter decides whether a value follows
+C_FLAG = re.compile(r'-[A-Za-z]*c[A-Za-z]*$')  # -c, -lc, -ec
+REDIR = re.compile(r'&>>|&>|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>')
+VAR = re.compile(r'\$(?:[A-Za-z_]\w*|[0-9@*#?$!-])')
+
+
+def reason(tool):
+    return (f'Refused by {NAME}: this command pipes the output of {tool} (`{tool} N | ...`). A pipeline has the exit '
+            f'status of its LAST command, so NOT OK (exit 1) is lost and the step after `&&` runs on a full machine. '
+            f'Every pipe out of {tool} is refused, also a harmless one: nothing needs it. Gate with '
+            f'`{tool} N && <cmd>` (or `if {tool} N; then ..`, `{tool} N; echo $?`). For less output: '
+            f'`{tool} N > "$f" && <cmd>` or `out=$({tool} N) && <cmd>`. Text that only mentions such a command '
+            f'(echo, grep, a commit message, a heredoc into a file) is not refused.')
+
+
+REASON = reason(CHECKS[0])
+
+
+class Piped(Exception):
+    """The command pipes a check's output (args[0]: the check)."""
+
+
+def base(word):
+    return word.rsplit('/', 1)[-1]
+
+
+def command_at(ws):
+    """Index of the command word of a simple command: behind NAME=value and wrappers. len(ws) when there is none."""
+    i = 0
+    while i < len(ws):
+        if ASSIGN.match(ws[i]):
+            i += 1
+            continue
+        if base(ws[i]) not in WRAPPERS:
+            return i
+        asks, values = base(ws[i]) == 'command', WRAPPERS[base(ws[i])]
+        i += 1
+        while i < len(ws) and (PLAIN.match(ws[i]) or ASSIGN.match(ws[i])):
+            if asks and ws[i] in ('-v', '-V'):
+                return len(ws)   # `command -v x` only looks x up
+            i += 2 if FLAGS.match(ws[i]) and ws[i][-1] in values else 1
+    return len(ws)
+
+
+def handed_on(ws, depth):
+    """Read the shell text a simple command hands on. True when a shell is among its words (its heredoc is commands)."""
+    shell = False
+    for k, w in enumerate(ws):
+        if base(w) in SHELLS:
+            shell = True
+        elif shell and C_FLAG.match(w) and k + 1 < len(ws):
+            read(ws[k + 1], depth=depth + 1)
+            break
+    k = command_at(ws)
+    if k < len(ws):
+        word, args = base(ws[k]), ws[k + 1:]
+        if word == 'eval':
+            read(' '.join(args), depth=depth + 1)
+        elif word in TEXT_ARGS:
+            for a in args:
+                if any(t in a for t in CHECKS):
+                    read(a, depth=depth + 1)
+    return shell
+
+
+def dollar(s, i, out, depth):
+    """s[i] is `$` or a backtick: commands inside are read, the value is hidden. Returns the index behind it."""
+    n = len(s)
+    if s[i] == '`':
+        j, buf = i + 1, []
+        while j < n and s[j] != '`':
+            if s[j] == '\\' and s[j + 1:j + 2] in ('`', '\\', '$'):
+                j += 1
+            buf.append(s[j])
+            j += 1
+        read(''.join(buf), depth=depth + 1)
+        out.append(HID)
+        return j + 1
+    nxt = s[i + 1:i + 2]
+    if nxt == '(':
+        out.append(HID)
+        return read(s, i + 2, ')', depth + 1)
+    if nxt == '{':
+        j, open_ = i + 2, 1
+        while j < n and open_:
+            open_ += (s[j] == '{') - (s[j] == '}')
+            j += 2 if s[j] == '\\' else 1
+        out.append(HID)
+        return j
+    m = VAR.match(s, i)
+    out.append(HID if m else '$')
+    return m.end() if m else i + 1
+
+
+def word(s, i, depth):
+    """One word from s[i:], as the shell would hand it on (quotes gone): (text, index behind it)."""
+    n, out = len(s), []
+    while i < n and s[i] not in ' \t\n;&|()<>':
+        c = s[i]
+        if c == '\\':
+            if s[i + 1:i + 2] != '\n':
+                out.append(s[i + 1:i + 2])
+            i += 2
+        elif c == "'":
+            j = s.find("'", i + 1)
+            j = n if j < 0 else j
+            out.append(s[i + 1:j])
+            i = j + 1
+        elif c == '$' and s[i + 1:i + 2] == "'":
+            j = i + 2
+            while j < n and s[j] != "'":
+                j += 1 if s[j] == '\\' else 0
+                out.append(s[j:j + 1])
+                j += 1
+            i = j + 1
+        elif c == '"':
+            i += 1
+            while i < n and s[i] != '"':
+                if s[i] == '\\' and i + 1 < n:
+                    if s[i + 1] != '\n':
+                        out.append(s[i + 1] if s[i + 1] in '"\\$`' else s[i:i + 2])
+                    i += 2
+                elif s[i] in '$`':
+                    i = dollar(s, i, out, depth)
+                else:
+                    out.append(s[i])
+                    i += 1
+            i += 1
+        elif c in '$`':
+            i = dollar(s, i, out, depth)
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out), i
+
+
+def heredoc(s, i, delim, tabs):
+    """(body, index behind it) of the heredoc that starts at s[i:]."""
+    lines = []
+    while i < len(s):
+        j = s.find('\n', i)
+        j = len(s) if j < 0 else j
+        line, i = s[i:j], j + 1
+        if (line.lstrip('\t') if tabs else line) == delim:
+            break
+        lines.append(line)
+    return '\n'.join(lines), min(i, len(s))
+
+
+def read(s, i=0, closer='', depth=0):
+    """Read the commands in s[i:], to the `)` that ends this $(..) (closer) or to the end; raise Piped where
+    a check's output goes into a pipe. Returns the index it stopped at."""
+    n = len(s)
+    if depth > MAX_DEPTH or (i == 0 and not any(t in s for t in CHECKS)):   # i == 0: once per text, not once per $(..) in it
+        return n   # nothing (more) to find; past MAX_DEPTH the rest is not read
+    ws, doc, groups, pending = [], {}, [], []
+    tool = False   # the command or group that just ended is a check (its last command is): its name
+
+    def end():
+        nonlocal ws, doc, tool
+        cmd, ws, mine, doc = ws, [], doc, {}
+        while cmd and (cmd[0] in KEYWORDS or cmd[0] == 'function'):
+            if cmd[0] in OPENERS:
+                groups.append(cmd[0])
+            cmd = cmd[2:] if cmd[0] == 'function' else cmd[1:]   # `function NAME { ..`: the rest is a command
+        if not cmd:
+            return
+        if cmd[0] in HEADS:
+            groups.append(cmd[0])
+            tool = False
+        elif cmd[0] in CLOSERS:
+            if groups and groups[-1] != '(':
+                groups.pop()   # tool stays: the group ends with what its last command was
+        else:
+            k = command_at(cmd)
+            tool = base(cmd[k]) if k < len(cmd) and base(cmd[k]) in CHECKS else False
+            mine['shell'] = handed_on(cmd, depth)
+
+    while i < n:
+        c = s[i]
+        if c in ' \t':
+            i += 1
+        elif c == '\\' and s[i + 1:i + 2] == '\n':
+            i += 2
+        elif c == '#':
+            j = s.find('\n', i)
+            i = n if j < 0 else j
+        elif c == '\n':
+            end()
+            i += 1
+            for delim, tabs, owner in pending:
+                body, i = heredoc(s, i, delim, tabs)
+                if owner.get('shell'):
+                    read(body, depth=depth + 1)
+            pending = []
+        elif c == ';':
+            end()
+            i += 1
+        elif c == '(':
+            end()
+            groups.append('(')
+            tool = False
+            i += 1
+        elif c == ')':
+            end()
+            i += 1
+            if groups and groups[-1] == 'case':
+                tool = False   # the `)` of a case pattern
+            elif groups and groups[-1] == '(':
+                groups.pop()   # tool stays, as for `}`
+            elif closer:
+                return i
+            else:
+                tool = False
+        elif c == '|':
+            end()
+            if s.startswith('||', i):
+                i += 2
+            elif tool:
+                raise Piped(tool)
+            else:
+                i += 2 if s.startswith('|&', i) else 1
+            tool = False
+        elif c == '&' and not s.startswith('&>', i):
+            end()
+            tool = False
+            i += 2 if s.startswith('&&', i) else 1
+        elif c in '<>&':
+            op = REDIR.match(s, i).group()
+            i += len(op)
+            if op in ('<', '>') and s[i:i + 1] == '(':
+                i = read(s, i + 1, ')', depth + 1)   # <(..) and >(..) are commands
+                continue
+            while i < n and s[i] in ' \t':
+                i += 1
+            target, i = word(s, i, depth)
+            if op in ('<<', '<<-'):
+                pending.append((target, op == '<<-', doc))
+        else:
+            text, j = word(s, i, depth)
+            if not (text.isdigit() and s[j:j + 1] in ('<', '>')):   # the 2 of 2>&1 is no word
+                ws.append(text)
+            i = max(j, i + 1)
+    end()
+    return n
+
+
+def piped(command):
+    """The check whose output this Bash command pipes, or None."""
+    try:
+        read(command)
+    except Piped as e:
+        return e.args[0]
+    return None
+
+
+def main(argv=None):
+    """Exit 2 with the reason on stderr refuses; 0 lets the command run; 1 (this guard failed) lets it run, loudly."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv:
+        sys.stderr.write(f'usage: {NAME} (hook: PreToolUse JSON on stdin; its settings entry: `agent-guards hooks`)\n')
+        return 1
+    try:
+        if SETTINGS_PROBLEM:
+            sys.stderr.write(f'{NAME}: the machine file\'s "agent-guards" section cannot be used ({SETTINGS_PROBLEM}); '
+                             'built-in defaults used. Run `agent-guards self-check`.\n')
+        event = json.loads(sys.stdin.read())
+        if event.get('tool_name') not in TOOLS:
+            return 0
+        command = (event.get('tool_input') or {}).get('command')
+        tool = piped(command) if isinstance(command, str) else None
+        if not tool:
+            return 0
+    except BaseException as e:   # fail open: this guards a mistake, not an attack
+        sys.stderr.write(f'{NAME}: failed ({type(e).__name__}: {e}); the command is NOT checked and runs. '
+                         'Tell the owner if this repeats.\n')
+        return 1
+    sys.stderr.write(reason(tool) + '\n')
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
