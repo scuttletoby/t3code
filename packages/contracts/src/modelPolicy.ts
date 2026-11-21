@@ -215,6 +215,35 @@ function pickEffortIds(pick: ModelPolicyPick, guess: boolean): ReadonlySet<strin
   ]);
 }
 
+/** A model as a provider's model list holds it: its id and the aliases that name it. */
+export interface ModelPolicyListedModel {
+  readonly slug: string;
+  readonly aliases?: ReadonlyArray<string> | undefined;
+}
+
+/**
+ * The models an alias names in these lists (case does not matter), or none for a model's own id or
+ * a name that is no alias. The server reads an alias as given, never as its model; Settings flags a
+ * row that names one (a provider may move an alias to a new model, so the row would follow it).
+ */
+export function modelPolicyAliasTargets(
+  lists: ReadonlyArray<ReadonlyArray<ModelPolicyListedModel>>,
+  model: string,
+): ReadonlyArray<string> {
+  if (lists.some((list) => list.some((candidate) => candidate.slug === model))) return [];
+  return [
+    ...new Set(
+      lists.flatMap((list) =>
+        list
+          .filter((candidate) =>
+            candidate.aliases?.some((alias) => alias.toLowerCase() === model.toLowerCase()),
+          )
+          .map((candidate) => candidate.slug),
+      ),
+    ),
+  ];
+}
+
 const rowAllows = (row: ModelPolicyRow, efforts: ReadonlyArray<string>) =>
   row.efforts === undefined
     ? efforts.length === 0

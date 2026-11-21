@@ -511,15 +511,27 @@ describe("a child's own options, local delegate_task and create_threads", () => 
 });
 
 describe("a child's own options, remote delegate_task", () => {
-  /** The target the service hands the remote delegation, for one call. */
-  const sentTarget = (target: unknown, policy?: Launch["policy"]) =>
+  /**
+   * The target the service hands the remote delegation, for one call. `more`: settings beside the
+   * policy's mode (rows of its own); `providers`: what this machine has (none unless named).
+   */
+  const sentTarget = (
+    target: unknown,
+    policy?: Launch["policy"],
+    more: {
+      readonly settings?: Record<string, unknown>;
+      readonly providers?: ReadonlyArray<ServerProvider>;
+    } = {},
+  ) =>
     Effect.gen(function* () {
       const sent: Array<unknown> = [];
       const dependencies = Layer.mergeAll(
         NodeServices.layer,
         NodeCrypto.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({}),
-        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({
+          getProviders: Effect.succeed(more.providers ?? []),
+        }),
         Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
         Layer.mock(ProjectService.ProjectService)({}),
         Layer.mock(SecretRequests.SecretRequests)({}),
@@ -532,7 +544,7 @@ describe("a child's own options, remote delegate_task", () => {
         Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
         Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
         Layer.mock(GitVcsDriver.GitVcsDriver)({}),
-        settingsWith(policy),
+        settingsWith(policy, more.settings),
       );
       yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
@@ -580,17 +592,36 @@ describe("a child's own options, remote delegate_task", () => {
         [],
       );
       // A driverKind the agent names is its own claim, not read: a claim of a driver whose effort
-      // id is another does not hide the variant.
+      // id is another does not hide the variant. The claudeAgent and codex rows for the model match
+      // their claims and allow no effort, so reading the claim would read no variant and send it.
+      const claimRows = {
+        modelPolicy: {
+          mode: "enforce",
+          allow: [
+            ...ALLOW_EACH_MODEL,
+            { driver: "claudeAgent", model: OPENCODE.model },
+            { driver: "codex", model: OPENCODE.model },
+          ],
+        },
+      };
       for (const driverKind of ["opencode", "claudeAgent", "codex"]) {
         assert.deepStrictEqual(
           yield* sentTarget(
             { driverKind, model: OPENCODE.model, options: { variant: "low" } },
             "enforce",
+            { settings: claimRows },
           ),
           [],
           `claimed ${driverKind}`,
         );
       }
+      // The rows themselves allow the model with no effort named: sent.
+      assert.deepStrictEqual(
+        yield* sentTarget({ driverKind: "claudeAgent", model: OPENCODE.model }, "enforce", {
+          settings: claimRows,
+        }),
+        [{ environmentId: box, driverKind: "claudeAgent", model: OPENCODE.model, options: [] }],
+      );
       assert.deepStrictEqual(yield* sentTarget({ model: OPENCODE.model }, "enforce"), [
         { environmentId: box, model: OPENCODE.model, options: [] },
       ]);
@@ -598,6 +629,55 @@ describe("a child's own options, remote delegate_task", () => {
       assert.deepStrictEqual(yield* sentTarget({ model: "other-model" }, "advise"), [
         { environmentId: box, model: "other-model", options: [] },
       ]);
+    }),
+  );
+
+  it.effect("enforce: an ACP model's own reasoning id is read from this machine's catalog", () =>
+    Effect.gen(function* () {
+      const acp = {
+        ...providerOf(ACP),
+        models: [
+          {
+            slug: ACP.model,
+            name: ACP.model,
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: [
+                { ...select("thought_level", ["low", "high"]), role: "reasoning" },
+              ],
+            },
+          },
+        ],
+      } as ServerProvider;
+      const more = {
+        settings: {
+          modelPolicy: {
+            mode: "enforce",
+            allow: [{ driver: ACP.driver, model: ACP.model, efforts: ["high"] }],
+          },
+        },
+        providers: [acp],
+      };
+      const decoy = { model: ACP.model, options: { effort: "high", thought_level: "low" } };
+      // A decoy general id beside the model's own control: read as high + low, not sent. Runs
+      // again: still not sent.
+      for (const _ of [1, 2]) assert.deepStrictEqual(yield* sentTarget(decoy, "enforce", more), []);
+      // Without the model in this catalog, only the fixed ids are read (the fallback).
+      assert.lengthOf(yield* sentTarget(decoy, "enforce", { settings: more.settings }), 1);
+      assert.deepStrictEqual(
+        yield* sentTarget(
+          { model: ACP.model, options: { thought_level: "high" } },
+          "enforce",
+          more,
+        ),
+        [
+          {
+            environmentId: box,
+            model: ACP.model,
+            options: [{ id: "thought_level", value: "high" }],
+          },
+        ],
+      );
     }),
   );
 

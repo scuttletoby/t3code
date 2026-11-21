@@ -49,6 +49,31 @@ import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
 const OPUS = "claude-opus-5-5";
 const FABLE = "claude-fable-5-2";
 const ROWS = MODEL_POLICY_START_ROWS;
+/** An ACP model whose reasoning control has an id of its own (no fixed effort id). */
+const ACP_MODEL = "acp-model";
+const ACP_REASONING_ID = "thought_level";
+const ACP_PROVIDER = {
+  instanceId: ProviderInstanceId.make("acp"),
+  driver: ProviderDriverKind.make("acpRegistry"),
+  models: [
+    {
+      slug: ACP_MODEL,
+      name: "ACP model",
+      isCustom: false,
+      capabilities: {
+        optionDescriptors: [
+          {
+            id: ACP_REASONING_ID,
+            label: "Thought level",
+            type: "select",
+            role: "reasoning",
+            options: [],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as ServerProvider;
 const policy = (mode: "off" | "advise" | "enforce", allow = ROWS): ModelPolicy => ({
   mode,
   allow,
@@ -270,7 +295,7 @@ describe("a selection as the policy reads it", () => {
       assert.include(text, "name the full id");
       // Its effort control is still the model's, for a row that names the alias itself.
       assert.deepStrictEqual(pick.effortOptionIds, ["level"]);
-      const remote = ModelPolicyCheck.pickOfRemoteTarget({
+      const remote = ModelPolicyCheck.pickOfRemoteTarget([provider], {
         model: alias,
         options: [{ id: "effort", value: "high" }],
       } as never);
@@ -405,7 +430,7 @@ describe("a selection as the policy reads it", () => {
       { driver: ProviderDriverKind.make("codex"), model: "shared", efforts: ["high", "max"] },
     ];
     // Claims codex (whose row allows max), but sends to a machine where the model is Claude's.
-    const claim = ModelPolicyCheck.pickOfRemoteTarget({
+    const claim = ModelPolicyCheck.pickOfRemoteTarget([], {
       driverKind: "codex",
       model: "shared",
       options: [{ id: "reasoningEffort", value: "max" }],
@@ -413,7 +438,7 @@ describe("a selection as the policy reads it", () => {
     assert.isUndefined(claim.driver);
     assert.include(refusal(policy("enforce", rows), claim), "effort max");
     // A driver's own effort id beside a general one: a decoy is read too.
-    const decoy = ModelPolicyCheck.pickOfRemoteTarget({
+    const decoy = ModelPolicyCheck.pickOfRemoteTarget([], {
       driverKind: "claudeAgent",
       model: "shared",
       options: [
@@ -422,12 +447,52 @@ describe("a selection as the policy reads it", () => {
       ],
     } as never);
     assert.include(refusal(policy("enforce", rows), decoy), "does not allow effort high + max");
-    const inside = ModelPolicyCheck.pickOfRemoteTarget({
+    const inside = ModelPolicyCheck.pickOfRemoteTarget([], {
       driverKind: "codex",
       model: "shared",
       options: [{ id: "reasoningEffort", value: "high" }],
     } as never);
     assert.isUndefined(refusal(policy("enforce", rows), inside));
+  });
+
+  it("a remote pick reads the model's own reasoning id from this machine's catalog (an ACP model)", () => {
+    const rows: ReadonlyArray<ModelPolicyRow> = [
+      { driver: ProviderDriverKind.make("acpRegistry"), model: ACP_MODEL, efforts: ["high"] },
+    ];
+    const remote = (
+      providers: ReadonlyArray<ServerProvider>,
+      options: ReadonlyArray<{ readonly id: string; readonly value: unknown }>,
+    ) => ModelPolicyCheck.pickOfRemoteTarget(providers, { model: ACP_MODEL, options } as never);
+    // A decoy general id beside the model's own control: both are read, so the pick is refused.
+    const decoy = [
+      { id: "effort", value: "high" },
+      { id: ACP_REASONING_ID, value: "max" },
+    ];
+    assert.include(
+      refusal(policy("enforce", rows), remote([ACP_PROVIDER], decoy)),
+      `${ACP_MODEL} does not allow effort high + max`,
+    );
+    // Its own id alone names an effort the row allows.
+    assert.isUndefined(
+      refusal(
+        policy("enforce", rows),
+        remote([ACP_PROVIDER], [{ id: ACP_REASONING_ID, value: "high" }]),
+      ),
+    );
+    // Runs again: the same answer.
+    assert.deepStrictEqual(
+      remote([ACP_PROVIDER], decoy).effortOptionIds,
+      remote([ACP_PROVIDER], decoy).effortOptionIds,
+    );
+    // Fallback: a machine without the model (or with no providers read) has only the fixed ids.
+    assert.deepStrictEqual(modelPolicyPickEfforts(remote([], decoy)), ["high"]);
+    const otherModel = { ...ACP_PROVIDER, models: [{ ...ACP_PROVIDER.models[0]!, slug: "other" }] };
+    assert.deepStrictEqual(modelPolicyPickEfforts(remote([otherModel], decoy)), ["high"]);
+    // A pick that names no model reads no catalog id.
+    assert.deepStrictEqual(
+      ModelPolicyCheck.pickOfRemoteTarget([ACP_PROVIDER], {} as never).effortOptionIds,
+      [],
+    );
   });
 
   it("the effort option ids are the usage pacing gate's", () => {
@@ -460,6 +525,8 @@ const configureHarness = (
     readonly caller?: boolean | "linked agent" | "linked owner";
     /** The settings as the server holds them, for a state a file decodes to (a kept bad value). */
     readonly held?: ModelPolicy;
+    /** More providers this machine has, beside its Claude instance. */
+    readonly providers?: ReadonlyArray<ServerProvider>;
   } = {},
 ) => {
   const dispatched: Array<unknown> = [];
@@ -491,6 +558,7 @@ const configureHarness = (
           driver: ProviderDriverKind.make("claudeAgent"),
           models: [{ slug: OPUS }, { slug: FABLE }, { slug: "claude-haiku-5-5" }],
         } as unknown as ServerProvider,
+        ...(options.providers ?? []),
       ]),
     }),
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
@@ -671,6 +739,37 @@ describe("t3_thread_configure through upstream's handler", () => {
       const owner = configureHarness(enforce, { caller: false });
       assert.include(yield* owner.configure({ model: "claude-haiku-5-5" }, THERE), "sent there");
       assert.lengthOf(owner.forwarded, 1);
+    }),
+  );
+
+  it.effect("a change sent there reads an ACP model's own reasoning id from this catalog", () =>
+    Effect.gen(function* () {
+      const THERE = EnvironmentId.make("environment-there");
+      const rows = [{ driver: "acpRegistry", model: ACP_MODEL, efforts: ["high"] }];
+      const { forwarded, configure } = configureHarness(
+        { modelPolicy: { mode: "enforce", allow: rows } } as never,
+        { providers: [ACP_PROVIDER] },
+      );
+      const decoy = [
+        { id: "effort", value: "high" },
+        { id: ACP_REASONING_ID, value: "max" },
+      ];
+      // Runs again: refused each time, nothing sent.
+      for (const _ of [1, 2]) {
+        assert.include(
+          yield* configure({ model: ACP_MODEL, options: decoy }, THERE),
+          `${ACP_MODEL} does not allow effort high + max`,
+        );
+      }
+      assert.lengthOf(forwarded, 0);
+      assert.include(
+        yield* configure(
+          { model: ACP_MODEL, options: [{ id: ACP_REASONING_ID, value: "high" }] },
+          THERE,
+        ),
+        "sent there",
+      );
+      assert.lengthOf(forwarded, 1);
     }),
   );
 });
