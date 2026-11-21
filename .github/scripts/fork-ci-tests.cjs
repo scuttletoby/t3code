@@ -1,6 +1,6 @@
 // Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit is listed in .github/fork-ci-tests.txt and
 // runs here by extension (RUNNER, Python through fork-ci-unittest.py), FORK_CI_TEST_JOBS at once, or `run by <file>`
-// (a fork test: only fork-tests.yml or RUN_ELSEWHERE). Unlisted, runner-less, or gone-once-listed tests fail.
+// (only fork-tests.yml, or as RUN_ELSEWHERE says). Unlisted, runner-less, or gone-once-listed tests fail.
 // Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all), FORK_CI_TEST_SHARD one shard of it.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
@@ -123,8 +123,8 @@ function codeLines(text, file = "") {
 
 // `entries`: [{ file, runBy, weight }]; `present`: test files in the tree;
 // `ever(file)` says whether the file is in the tested commit's history;
-// `read(file)` returns a runner file's text, or null when it does not exist.
-function plan(entries, present, ever, read = () => null) {
+// `read(file)` returns a runner file's text, or null when it does not exist; `allowed`: RUN_ELSEWHERE.
+function plan(entries, present, ever, read = () => null, allowed = RUN_ELSEWHERE) {
   const listed = entries.map((entry) => entry.file);
   const unlisted = present.filter((file) => !listed.includes(file));
   const missing = listed.filter((file) => !present.includes(file));
@@ -141,10 +141,10 @@ function plan(entries, present, ever, read = () => null) {
     let why = null;
     if (UPSTREAM_WORKFLOW.test(runBy))
       why = `${runBy} is an upstream workflow, disabled in the fork`;
-    else if (!elsewhereAllowed({ file, runBy }))
+    else if (!elsewhereAllowed({ file, runBy }, allowed))
       why =
-        `a fork test is run by ${THIS_WORKFLOW} (a part, or its own runs), which records it; another runner ` +
-        `only where RUN_ELSEWHERE in .github/scripts/fork-ci-tests.cjs names it`;
+        `a listed test is run by ${THIS_WORKFLOW} (a fork test: a part, or its own runs, which it records), or ` +
+        `by another runner only where RUN_ELSEWHERE in .github/scripts/fork-ci-tests.cjs names it`;
     else {
       const text = read(runBy);
       if (text === null) why = `${runBy} does not exist`;
@@ -317,24 +317,28 @@ function presentTests(root = ROOT) {
 const FORK_OWN = /^(?:fork-kit\/|fork-ci\/|\.github\/scripts\/fork-)\S*\.test\.\w+$/;
 const THIS_WORKFLOW = ".github/workflows/fork-tests.yml";
 const UNITTEST_SHIM = ".github/scripts/fork-ci-unittest.py";
-// The fork tests another workflow runs, each with that workflow (`run by` it in the list); every other fork test is run
-// by fork-tests.yml, which records it (a `run by` anything else would take it out of the records). fork-contracts.test.py
-// pins this table, so a new entry is a change of its own.
+// The node --test reporter each node test also reports to, which counts its tests (countTests()).
+const NODE_COUNTS = ".github/scripts/fork-ci-node-counts.cjs";
+// The listed tests another workflow or script runs (`run by` it in the list). Any other `run by` names fork-tests.yml:
+// a fork test's own runs (recorded) or upstream's tests in its `test` job. This table, not a test's name, decides where
+// a test may run, so a fork test named like upstream's cannot leave the records either. fork-contracts.test.py pins it.
 const RUN_ELSEWHERE = {
   ".github/scripts/fork-secret-scan.test.sh": ".github/workflows/fork-secret-scan.yml",
+  ".github/scripts/relay-state-output.test.cjs": "scripts/release-smoke.ts",
 };
 const DECLARATION = /^\s*(?:#|\/\/)\s*fork-ci:(.*)$/;
 // Only a test's own switches: a declaration cannot set PATH, NODE_OPTIONS, PYTHON* or LD_*.
 const SWITCH = /^[A-Z][A-Z0-9_]*_TESTS=[\w./:-]*$/;
 const RUN_FORM = '"fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>]"';
 const SKIP_FORM = '"fork-ci: may skip <test>"';
-// A test's name as a record holds it: `Class.test_method` (Python), or the word after `skip ` (an ok-lines test).
-const TEST_NAME = /^[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)?$/;
+// A test's name as a record holds it: `Class.test_method` (Python; `module.Class.test_method` for a test of a module it
+// loads), or the word after `skip ` (an ok-lines test).
+const TEST_NAME = /^[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*$/;
 
-// Whether the list's `run by` for a listed test is allowed: an upstream test anywhere (plan() checks the runner names
-// it), a fork test only by fork-tests.yml or as RUN_ELSEWHERE says.
-function elsewhereAllowed({ file, runBy }) {
-  return !FORK_OWN.test(file) || runBy === THIS_WORKFLOW || RUN_ELSEWHERE[file] === runBy;
+// Whether the list's `run by` for a listed test is allowed: fork-tests.yml (plan() checks it names an upstream test),
+// or as RUN_ELSEWHERE says.
+function elsewhereAllowed({ file, runBy }, elsewhere = RUN_ELSEWHERE) {
+  return runBy === THIS_WORKFLOW || elsewhere[file] === runBy;
 }
 
 // A test's whole-line `fork-ci:` comments: RUN_FORM is an own run (made by `--run <test>`, it may skip no test);
@@ -423,55 +427,89 @@ function expectedKeys(entries, present, read) {
 const OK_LINES_END = /^all passed: (\d+) ok, (\d+) skipped$/;
 const OK_LINES_FORM = '"all passed: <n> ok, <n> skipped"';
 
-// What a test ran, { format, tests, skipped, names (skipped, by name), failed, note }, or null (no count). Python:
-// fork-ci-unittest.py's `unittest` lines (each test by its own outcome). node --test: its last totals (no skip names).
-// Else stdout's `ok`, `FAIL` and `skip <name>` lines, which must end in OK_LINES_FORM with the same counts: a test
-// that stopped early or miscounts counts nothing (`note` says why).
-function countTests(file, stdout, stderr, unittest = []) {
+// What a test ran, { format, tests, skipped, names (skipped, by name), failed, note }, or null (no count); tests null:
+// none known to have run (`note` says why). `lines`: its counter's lines (readCounts()). Python: fork-ci-unittest.py's
+// plan, then counts, per unittest run (a plan without counts: a hard exit). node: fork-ci-node-counts.cjs's one line.
+// Else stdout's `ok`, `FAIL` and `skip <name>` lines, which must end in OK_LINES_FORM with the same counts.
+function countTests(file, stdout, stderr, lines = []) {
   const ext = file.match(TEST_FILE)?.[1];
-  if (ext === "py" && unittest.length) {
-    const good = unittest.every(
-      (u) =>
+  const whole = (n) => Number.isInteger(n) && n >= 0;
+  const none = (format, note) => ({
+    format,
+    tests: null,
+    skipped: null,
+    names: [],
+    failed: null,
+    note,
+  });
+  if (ext === "py" && lines.length) {
+    const runs = [];
+    const open = [];
+    for (const u of lines) {
+      if (u && Object.keys(u).length === 1 && whole(u.plan)) open.push(u.plan);
+      else if (
         u &&
-        Number.isInteger(u.tests) &&
-        u.tests >= 0 &&
-        Number.isInteger(u.failed) &&
-        u.failed >= 0 &&
+        whole(u.tests) &&
+        whole(u.failed) &&
         Array.isArray(u.skipped) &&
-        u.skipped.every((n) => typeof n === "string"),
-    );
-    if (!good) return null;
-    const names = unittest.flatMap((u) => u.skipped);
+        u.skipped.every((n) => typeof n === "string") &&
+        open.length &&
+        open.pop() === u.tests
+      )
+        runs.push(u);
+      else return null;
+    }
+    if (open.length)
+      return none(
+        "unittest",
+        `a unittest run of ${open.at(-1)} tests started but never ended (an exit before its end)`,
+      );
+    const names = runs.flatMap((u) => u.skipped);
     return {
       format: "unittest",
-      tests: unittest.reduce((sum, u) => sum + u.tests, 0),
+      tests: runs.reduce((sum, u) => sum + u.tests, 0),
       skipped: names.length,
       names,
-      failed: unittest.reduce((sum, u) => sum + u.failed, 0),
+      failed: runs.reduce((sum, u) => sum + u.failed, 0),
       note: null,
     };
   }
   if (ext === "cjs" || ext === "mjs" || ext === "js") {
-    const total = (name) => {
-      const all = [...stdout.matchAll(new RegExp(`^(?:#|ℹ) ${name} (\\d+)$`, "gm"))];
-      return all.length ? Number(all.at(-1)[1]) : null;
+    const [n, ...more] = lines;
+    const keys = ["tests", "skipped", "failed", "started", "stopped"];
+    if (
+      more.length ||
+      !n ||
+      !keys.every((key) => whole(n[key])) ||
+      typeof n.file_test !== "boolean"
+    )
+      return null;
+    if (n.file_test)
+      return none(
+        "node",
+        "node reported only the file itself as a test (no test of its own: none, a return at its top, or an exit " +
+          "before its tests reported)",
+      );
+    if (n.stopped || n.started !== n.tests)
+      return none("node", `${n.started} tests started and ${n.tests} ended (an exit half-way)`);
+    return {
+      format: "node",
+      tests: n.tests,
+      skipped: n.skipped,
+      names: [],
+      failed: n.failed,
+      note: null,
     };
-    if (total("tests") !== null)
-      return {
-        format: "node",
-        tests: total("tests"),
-        skipped: (total("skipped") ?? 0) + (total("todo") ?? 0),
-        names: [],
-        failed: total("fail") ?? 0,
-        note: null,
-      };
   }
   const passed = stdout.match(/^ok\s/gm)?.length ?? 0;
   const failed = stdout.match(/^FAIL\s/gm)?.length ?? 0;
   const names = [...stdout.matchAll(/^skip\s+(\S+)/gm)].map((m) => m[1]);
   if (passed + failed + names.length === 0) return null;
-  const lines = stdout.split("\n").filter((line) => line.trim() !== "");
-  const end = lines.at(-1)?.match(OK_LINES_END);
+  const end = stdout
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .at(-1)
+    ?.match(OK_LINES_END);
   let note = null;
   if (failed === 0 && !end)
     note = `its stdout does not end in ${OK_LINES_FORM}, so it may have stopped before its end`;
@@ -648,9 +686,22 @@ function command(file, run = null, env = process.env, counts = null) {
   const childEnv = { ...env };
   delete childEnv.FORK_CI_TEST_RECORDS;
   delete childEnv.FORK_CI_TEST_COUNTS;
+  // A runner run by node --test (its own tests) must not hand that on: node would report to it, not to the reporters.
+  delete childEnv.NODE_TEST_CONTEXT;
   const py = file.endsWith(".py");
   // A Python test runs through fork-ci-unittest.py, which counts each of its tests (countTests()) into `counts`.
-  const shim = py ? [UNITTEST_SHIM] : [];
+  // A node test also reports to fork-ci-node-counts.cjs, which counts its tests into `counts`; its log shows spec.
+  const node = RUNNER[file.match(TEST_FILE)[1]][0] === "node";
+  const shim = py
+    ? [UNITTEST_SHIM]
+    : node && counts
+      ? [
+          "--test-reporter=spec",
+          "--test-reporter-destination=stdout",
+          `--test-reporter=./${NODE_COUNTS}`,
+          `--test-reporter-destination=${counts}`,
+        ]
+      : [];
   const count = py && counts ? [`FORK_CI_TEST_COUNTS=${counts}`] : [];
   if (py && counts) childEnv.FORK_CI_TEST_COUNTS = counts;
   if (!run) return { argv: [...RUNNER[file.match(TEST_FILE)[1]], ...shim, file], env: childEnv };
@@ -678,7 +729,8 @@ function runLabel(run) {
     .join(" ");
 }
 
-// The lines fork-ci-unittest.py wrote to `file` (a line that is not JSON is null: countTests() then counts nothing).
+// The lines a test's counter (fork-ci-unittest.py, fork-ci-node-counts.cjs) wrote to `file` (a line that is not JSON
+// is null: countTests() then counts nothing).
 function readCounts(file) {
   let text = "";
   try {
@@ -699,8 +751,8 @@ function readCounts(file) {
 }
 
 // Runs one test file (`run`: one of its own runs), its stdout and stderr shown together as one group when it ends, and
-// each also kept on its own (countTests()), with a Python test's own counts (`unittest`, readCounts()) from a file of
-// this run only: a new folder each time, made here (so a run as root adds to a file this user owns), then removed.
+// each also kept on its own (countTests()), with a Python or node test's counts (`unittest`, readCounts()) from a file
+// of this run only: a new folder each time, made here (so a run as root adds to a file this user owns), then removed.
 function runTest(file, run = null) {
   const countsDir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-counts-"));
   const counts = path.join(countsDir, "counts.jsonl");
@@ -966,6 +1018,7 @@ module.exports = {
   elsewhereAllowed,
   RUN_ELSEWHERE,
   UNITTEST_SHIM,
+  NODE_COUNTS,
   ownRuns,
   runKey,
   expectedKeys,

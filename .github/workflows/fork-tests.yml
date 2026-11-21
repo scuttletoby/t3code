@@ -662,7 +662,7 @@ jobs:
     timeout-minutes: 10
     steps:
       # Both tests read only their kits; the runner reads the list (and the tests' `fork-ci:` lines) and runs each
-      # Python test through fork-ci-unittest.py.
+      # Python test through fork-ci-unittest.py (a node test with fork-ci-node-counts.cjs).
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -672,6 +672,7 @@ jobs:
             /.github/fork-ci-tests.txt
             /.github/scripts/fork-ci-tests.cjs
             /.github/scripts/fork-ci-unittest.py
+            /.github/scripts/fork-ci-node-counts.cjs
           sparse-checkout-cone-mode: false
 
       # The gh-apps host kit installed for real (fork-kit/gh-apps/README.md): real service

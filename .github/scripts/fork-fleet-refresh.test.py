@@ -3,7 +3,9 @@
 A fake https release server on 127.0.0.1 (a certificate made here) and temp folders only: nothing is downloaded from
 GitHub, nothing runs as root. Run: python3 <this>. Linux only; needs curl, openssl, tar and flock."""
 # On a GitHub-hosted runner one test skips: its user manager applies no sandbox (no user namespaces for it). The CI
-# runner records each skipped test by name and it must be exactly this one (fork-ci-tests.cjs).
+# runner records each skipped test by name and it must be exactly this one (fork-ci-tests.cjs). The skip depends on
+# the runner image: if an update gives that manager a sandbox, the test runs and every run is red (a declared skip
+# that ran). Then delete this line and its MAY_SKIP entry in fork-contracts.test.py.
 # fork-ci: may skip Refresh.test_a_real_run_in_the_services_sandbox
 import configparser, hashlib, http.server, io, json, os, platform, re, resource, shutil, signal, ssl, stat, subprocess
 import sys, tarfile, tempfile, threading, time, unittest

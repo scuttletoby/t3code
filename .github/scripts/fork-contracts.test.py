@@ -66,9 +66,10 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                commit, a listed test (or own run) not recorded, recorded twice, failed, without a test count,
                with none run, or with skips other than exactly the tests its `fork-ci: may skip <test>` lines name
                (each skip by name; an own run: none; old records without names too), and a records file cut off.
-               Those lines are pinned (MAY_SKIP), and so is the one fork test another workflow runs (RUN_ELSEWHERE).
-               The check's script imports only json, os and re, and of os uses only environ, listdir, devnull and
-               path (isdir, join): it reads the records and the env, and starts nothing.
+               Those lines are pinned (MAY_SKIP), and so are the listed tests another runner runs (RUN_ELSEWHERE).
+               The check's script imports only json, os and re (no aliases), uses of them only the names it needs,
+               opens files only to read them or to add to the step summary, and reaches no builtins table, dunder
+               attribute, exec, eval or getattr.
   policies     every workflow with a pull_request_target trigger is listed in
                .github/fork-actions-policies.json (#401): allowed (the fork workflows the repository's
                Actions policy allows; each there, with that trigger and no other) or upstream_blocked;
@@ -2396,9 +2397,11 @@ def check_script(run):
     return None if "\nCHECK\n" in body + "\n" or body.startswith("CHECK\n") else body + "\n"
 
 
-# The files the runner needs beside the tests (its list, itself, and the shim it runs each Python test through), so a
-# sparse checkout of a job that calls it must hold each (#664: a root job without the shim failed every Python test).
-RUNNER_FILES = [".github/fork-ci-tests.txt", RUNNER, ".github/scripts/fork-ci-unittest.py"]
+# The files the runner needs beside the tests (its list, itself, the shim it runs each Python test through and the
+# reporter each node test reports to), so a sparse checkout of a job that calls it must hold each (#664: a root job
+# without the shim failed every Python test).
+RUNNER_FILES = [".github/fork-ci-tests.txt", RUNNER, ".github/scripts/fork-ci-unittest.py",
+                ".github/scripts/fork-ci-node-counts.cjs"]
 
 
 def checks_out(step, path):
@@ -2446,7 +2449,7 @@ def record_problems(wf, record_jobs):
         missing = [f for f in RUNNER_FILES for st in job_steps if not checks_out(st, f)]
         if missing:
             problems.append(f"fork-tests.yml/{j}: calls the runner, but its checkout leaves out {sorted(set(missing))} "
-                            "(the runner's own files: its list, itself and fork-ci-unittest.py)")
+                            "(the runner's own files: its list, itself, fork-ci-unittest.py and fork-ci-node-counts.cjs)")
     result = jobs.get("fork_ci_result") or {}
     steps = result.get("steps") or []
     downloads = [i for i, st in enumerate(steps) if st == RECORD_DOWNLOAD]
@@ -2722,6 +2725,8 @@ QUIET_REFUSED = {
         upload_step(jobs, "lint"))),
     "the kit-as-root checkout without the unittest shim": lambda jobs: sparse_edit(
         jobs, "kit_root_tests", lambda lines: [x for x in lines if "fork-ci-unittest" not in x]),
+    "the kit-as-root checkout without the node reporter": lambda jobs: sparse_edit(
+        jobs, "kit_root_tests", lambda lines: [x for x in lines if "fork-ci-node-counts" not in x]),
     "the kit-as-root checkout without the runner": lambda jobs: sparse_edit(
         jobs, "kit_root_tests", lambda lines: [x for x in lines if "fork-ci-tests.cjs" not in x]),
     "a kit shard checkout that drops the scripts folder": lambda jobs: sparse_edit(
@@ -2908,29 +2913,35 @@ MAY_SKIP = {
 check("records: the tests a part run may skip are exactly the pinned ones, each by name (MAY_SKIP)",
       {f: sorted(n) if isinstance(n, list) else n for f, n in DECLARED_SKIPS.items()} == MAY_SKIP,
       json.dumps(DECLARED_SKIPS))
-# The one fork test another workflow runs (its `run by`): any other `run by` of a fork test would take it out of the
-# records, so the runner refuses it and still expects the test's record (fork-ci-tests.cjs, RUN_ELSEWHERE).
-RUN_ELSEWHERE = {".github/scripts/fork-secret-scan.test.sh": ".github/workflows/fork-secret-scan.yml"}
+# The listed tests another workflow or script runs (their `run by`): any other `run by` but fork-tests.yml could take a
+# fork test out of the records, whatever its name, so the runner refuses it and still expects the test's record
+# (fork-ci-tests.cjs, RUN_ELSEWHERE). A change here is a change of its own, which review sees.
+RUN_ELSEWHERE = {".github/scripts/fork-secret-scan.test.sh": ".github/workflows/fork-secret-scan.yml",
+                 ".github/scripts/relay-state-output.test.cjs": "scripts/release-smoke.ts"}
 _ELSEWHERE = json.loads(subprocess.run(
     ["node", "-e", "const r = require(process.argv[1]); console.log(JSON.stringify(r.RUN_ELSEWHERE ?? null))",
      str(scripts_dir / "fork-ci-tests.cjs")], check=True, capture_output=True, text=True).stdout)
 _SHIM = json.loads(subprocess.run(
     ["node", "-e", "const r = require(process.argv[1]); console.log(JSON.stringify(r.UNITTEST_SHIM ?? null))",
      str(scripts_dir / "fork-ci-tests.cjs")], check=True, capture_output=True, text=True).stdout)
+_NODE_COUNTS = json.loads(subprocess.run(
+    ["node", "-e", "const r = require(process.argv[1]); console.log(JSON.stringify(r.NODE_COUNTS ?? null))",
+     str(scripts_dir / "fork-ci-tests.cjs")], check=True, capture_output=True, text=True).stdout)
 check("records: the shim the runner runs Python tests through is the one each record job's checkout must hold",
       _SHIM == RUNNER_FILES[2] and (root / RUNNER_FILES[2]).is_file(), json.dumps(_SHIM))
+check("records: the reporter the runner gives node tests is the one each record job's checkout must hold",
+      _NODE_COUNTS == RUNNER_FILES[3] and (root / RUNNER_FILES[3]).is_file(), json.dumps(_NODE_COUNTS))
 check("records: checks_out reads sparse checkouts (a file, a folder, all, a negated path, none, another repository)",
       [checks_out({"uses": "actions/checkout@x", "with": w}, ".github/scripts/fork-ci-unittest.py") for w in (
           {"sparse-checkout": "/.github/scripts/fork-ci-unittest.py\n"}, {"sparse-checkout": "/.github/\n"},
           {"sparse-checkout": "/*\n!/.repos/\n"}, {"sparse-checkout": "/*\n!/.github/scripts/\n"},
           {"sparse-checkout": "/fork-kit/\n"}, {}, {"repository": "o/r", "sparse-checkout": "/x\n"})]
       == [True, True, True, False, False, True, True])
-check("records: the fork tests another workflow runs are exactly the pinned one (RUN_ELSEWHERE)",
+check("records: the listed tests another workflow or script runs are exactly the pinned ones (RUN_ELSEWHERE)",
       _ELSEWHERE == RUN_ELSEWHERE, json.dumps(_ELSEWHERE))
-check("records: each fork test the list says another workflow runs is in RUN_ELSEWHERE, with that workflow",
+check("records: each listed test the list says another workflow or script runs is in RUN_ELSEWHERE, with that one",
       all(RUN_ELSEWHERE.get(e["file"]) == e["runBy"] for e in LISTED
-          if e["runBy"] and e["runBy"] != ".github/workflows/fork-tests.yml"
-          and re.match(r"(?:fork-kit/|fork-ci/|\.github/scripts/fork-)\S*\.test\.\w+$", e["file"])),
+          if e["runBy"] and e["runBy"] != ".github/workflows/fork-tests.yml"),
       json.dumps([e for e in LISTED if e["runBy"]]))
 
 # The record check's own script (from the workflow, as fork_ci_result runs it) on records the real runner writes
@@ -2943,16 +2954,25 @@ CHECK_STEP = result_step(fork_tests["jobs"], RECORD_CHECK)
 CHECK_SCRIPT = check_script(CHECK_STEP["run"])
 REAL_RECORD_JOBS = json.loads(CHECK_STEP["env"]["RECORD_JOBS"])
 FIX_RUN, FIX_SHA = "4242", "c0ffee" + "0" * 34
-# A Python test's result as the runner reads it: the lines fork-ci-unittest.py wrote (`unittest`), each test by name.
-PY_OK = {"status": 0, "seconds": "1.0", "stdout": "", "stderr": "Ran 4 tests in 0.1s\n\nOK\n",
-         "unittest": [{"tests": 4, "skipped": [], "failed": 0}]}
-PY_SKIP1 = {**PY_OK, "unittest": [{"tests": 4, "skipped": ["A.test_net"], "failed": 0}]}
-PY_SKIP_OTHER = {**PY_OK, "unittest": [{"tests": 4, "skipped": ["A.test_disk"], "failed": 0}]}
-PY_ALL_SKIPPED = {**PY_OK, "unittest": [{"tests": 2, "skipped": ["A.test_net", "A.test_disk"], "failed": 0}]}
-PY_NONE = {**PY_OK, "unittest": [{"tests": 0, "skipped": [], "failed": 0}]}
-JS_OK = {"status": 0, "seconds": "1.0", "stdout": "# tests 3\n# pass 3\n# fail 0\n# skipped 0\n# todo 0\n",
-         "stderr": ""}
-JS_SKIP1 = {**JS_OK, "stdout": "# tests 3\n# pass 2\n# fail 0\n# skipped 1\n# todo 0\n"}
+# A Python test's result as the runner reads it: the lines fork-ci-unittest.py wrote (`unittest`: a plan, then its
+# counts), each test by name; a node test's, the line fork-ci-node-counts.cjs wrote.
+def py(tests, skipped=()):
+    return {"status": 0, "seconds": "1.0", "stdout": "", "stderr": f"Ran {tests} tests in 0.1s\n\nOK\n",
+            "unittest": [{"plan": tests}, {"tests": tests, "skipped": list(skipped), "failed": 0}]}
+
+
+def js(tests, skipped=0, **more):
+    line = {"tests": tests, "skipped": skipped, "failed": 0, "started": tests, "file_test": False, "stopped": 0}
+    return {"status": 0, "seconds": "1.0", "stdout": "", "stderr": "", "unittest": [{**line, **more}]}
+
+
+PY_OK = py(4)
+PY_SKIP1 = py(4, ["A.test_net"])
+PY_SKIP_OTHER = py(4, ["A.test_disk"])
+PY_ALL_SKIPPED = py(2, ["A.test_net", "A.test_disk"])
+PY_NONE = py(0)
+JS_OK = js(3)
+JS_SKIP1 = js(3, 1)
 SH_OK = {"status": 0, "seconds": "1.0", "stdout": "ok one\nok two\nall passed: 2 ok, 0 skipped\n", "stderr": ""}
 SH_SILENT = {"status": 0, "seconds": "1.0", "stdout": "all passed\n", "stderr": ""}
 ROOT_RUN = {"root": True, "vars": ["X_TESTS=1"], "only": None}
@@ -3091,34 +3111,51 @@ def old_format(body):
 check("records: the record check's script is read from its step", CHECK_SCRIPT is not None
       and "raise SystemExit" in CHECK_SCRIPT)
 
+# The names of each module the record check's script may use, and where it may write: only the step summary.
+SCRIPT_NAMES = {"json": {"load", "loads"}, "re": {"fullmatch"}, "os": {"environ", "listdir", "path", "devnull"},
+                "os.path": {"isdir", "join"}}
+SUMMARY = "os.environ.get('GITHUB_STEP_SUMMARY', os.devnull)"
+
+
 def script_reach(script):
-    """What the record check's script could reach beyond reading the records and the env: its imports other than json,
-    os and re, its os names other than environ, listdir, devnull and path (isdir, join), and any exec, eval, compile,
-    __import__, getattr or globals (empty: none)."""
+    """What the record check's script could reach beyond reading the records and the env and adding to the step
+    summary (empty: nothing): an import but of json, os and re, or under another name; a name of those modules but
+    SCRIPT_NAMES; an open() but to read or to add to the summary; a dunder; exec, eval, compile, getattr and the like."""
     out = []
     tree = ast.parse(script)
+    calls = {id(n.func): n for n in ast.walk(tree) if isinstance(n, ast.Call)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            out += [a.name for a in node.names if a.name not in {"json", "os", "re"}]
+            out += [a.name if a.name not in SCRIPT_NAMES else f"import {a.name} as {a.asname}"
+                    for a in node.names if a.name not in SCRIPT_NAMES or a.asname]
         elif isinstance(node, ast.ImportFrom):
             out.append(f"from {node.module}")
-        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "os":
-            if node.attr not in {"environ", "listdir", "path", "devnull"}:
-                out.append(f"os.{node.attr}")
-        elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute)
-              and isinstance(node.value.value, ast.Name) and node.value.value.id == "os" and node.value.attr == "path"):
-            if node.attr not in {"isdir", "join"}:
-                out.append(f"os.path.{node.attr}")
-        elif isinstance(node, ast.Name) and node.id in {"exec", "eval", "compile", "__import__", "getattr", "globals"}:
+        elif isinstance(node, ast.Attribute) and ast.unparse(node.value) in SCRIPT_NAMES:
+            if node.attr not in SCRIPT_NAMES[ast.unparse(node.value)]:
+                out.append(ast.unparse(node))
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            out.append(f".{node.attr}")
+        elif isinstance(node, ast.Name) and node.id == "open":
+            call = calls.get(id(node))
+            mode = [ast.unparse(m) for m in (call.args[1:2] if call else [])] + [
+                ast.unparse(k.value) for k in (call.keywords if call else []) if k.arg == "mode"]
+            if call is None or not (mode == [] or mode == ["'a'"] and ast.unparse(call.args[0]) == SUMMARY):
+                out.append(f"open({', '.join(mode)})" if call else "open")
+        elif isinstance(node, ast.Name) and (node.id.startswith("__") or node.id in {
+                "exec", "eval", "compile", "getattr", "setattr", "delattr", "globals", "locals", "vars",
+                "breakpoint", "input", "memoryview"}):
             out.append(node.id)
     return out
 
 
-check("records: the record check's script imports only json, os and re, and starts nothing",
+check("records: the record check's script reads only the records and the env, and writes only to the step summary",
       CHECK_SCRIPT is not None and not script_reach(CHECK_SCRIPT), str(CHECK_SCRIPT and script_reach(CHECK_SCRIPT)))
-check("records: a record check that would start a process is caught",
-      sorted(script_reach("import subprocess\nimport os\nos.system('x')\nfrom shutil import which\neval('1')\n"))
-      == ["eval", "from shutil", "os.system", "subprocess"])
+check("records: a record check that would start a process, write a file or reach past its modules is caught",
+      sorted(script_reach("import subprocess\nimport os\nos.system('x')\nfrom shutil import which\neval('1')\n"
+                          "import os as o\no.system('x')\nopen('/etc/x', 'w')\nopen(p, mode='w')\nf = open\n"
+                          "__builtins__.__dict__['exec']\njson.decoder.sys.modules\nre.sub\n"))
+      == sorted(["eval", "from shutil", "os.system", "subprocess", "import os as o", "open('w')", "open('w')",
+                 "open", "__builtins__", ".__dict__", "json.decoder", "re.sub"]))
 status, out = run_check(good_records())
 check("records: a run with every job's and leg's records, each listed test recorded once and run, passes",
       status == 0 and "9 runs of listed tests" in out, out)
@@ -3208,7 +3245,15 @@ RECORDS_REFUSED = {
         **SH_OK, "stdout": "ok one\nok two\nok a child's\nall passed: 2 ok, 0 skipped\n"}), {},
         "fork-s.test.sh: no test count"),
     "a Python test whose counts line was cut off (no count)": (set_row("fork-kit/k1.test.py", {
-        **PY_OK, "unittest": [None]}), {}, "fork-kit/k1.test.py: no test count"),
+        **PY_OK, "unittest": [{"plan": 4}, None]}), {}, "fork-kit/k1.test.py: no test count"),
+    # A test that stopped hard half-way (exit 0), or ran nothing but the file: no count, whatever its stdout says.
+    "a Python test that exited hard half-way (a plan, no counts), its stdout a child's ok lines": (set_row(
+        "fork-kit/k1.test.py", {**PY_OK, "stdout": "ok child\nall passed: 1 ok, 0 skipped\n",
+                                "unittest": [{"plan": 4}]}), {}, "fork-kit/k1.test.py: no test count"),
+    "a node test whose only test was the file itself (empty, a top-level return, an early exit)": (set_row(
+        "fork-ci/b.test.cjs", js(0, file_test=True)), {}, "fork-ci/b.test.cjs: no test count"),
+    "a node test that exited half-way (tests started that never ended)": (set_row(
+        "fork-ci/b.test.cjs", js(2, started=4, stopped=2)), {}, "fork-ci/b.test.cjs: no test count"),
     "a test whose output shows no test count": (set_row("fork-s.test.sh", SH_SILENT), {},
                                                 "fork-s.test.sh: no test count"),
     "a test with a failure its exit status hid": (set_row("fork-s.test.sh", {
@@ -3231,6 +3276,12 @@ for label, tweak, reason in [
     ("a record whose skipped names were dropped", edit_record(
         "fork-test-records-workflows-0-1", lambda b: b["results"][0].update(skipped_tests=None)),
      "not each once by name"),
+    # A record without names at all, even with no skip, and one that names one skip twice, are not the runner's.
+    ("a record with no skipped names and no skip", edit_record(
+        "fork-test-records-kit_tests-0-1", lambda b: b["results"][0].pop("skipped_tests")), "not each once by name"),
+    ("a record that names its two skips as one test twice (declared once)", edit_record(
+        "fork-test-records-workflows-0-1", lambda b: b["results"][0].update(
+            skipped=2, skipped_tests=["A.test_net", "A.test_net"])), "not each once by name"),
 ]:
     status, out = run_check(good_records(), tweak=tweak)
     check(f"records: {label} fails, saying why", status == 1 and reason in out, out)

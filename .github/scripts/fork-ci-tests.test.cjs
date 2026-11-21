@@ -35,6 +35,7 @@ const {
   recordsTo,
   writeRecords,
   command,
+  NODE_COUNTS,
 } = require("./fork-ci-tests.cjs");
 
 const never = () => false;
@@ -106,11 +107,14 @@ test("a test run elsewhere must be named by its runner, which is not an upstream
     { file: "x/block-ts.test.cjs", runBy: "scripts/smoke.ts" },
     { file: "x/url-ts.test.cjs", runBy: "scripts/smoke.ts" },
   ];
+  // Each `run by` but fork-tests.yml as RUN_ELSEWHERE would name it (else refused: the test below).
+  const elsewhere = Object.fromEntries(entries.map((e) => [e.file, e.runBy]));
   const result = plan(
     entries,
     entries.map((e) => e.file),
     never,
     (file) => files[file] ?? null,
+    elsewhere,
   );
   assert.deepEqual(result.run, []);
   assert.deepEqual(result.elsewhere, [
@@ -168,6 +172,7 @@ test("a JS or TS runner's comment markers inside strings, templates and regular 
     entries.map((e) => e.file),
     never,
     (file) => files[file] ?? null,
+    Object.fromEntries(entries.map((e) => [e.file, "scripts/smoke.ts"])),
   );
   assert.deepEqual(
     result.elsewhere.map((e) => e.file),
@@ -560,6 +565,7 @@ function runScript(tests, jobs, args = [], list = Object.keys(tests).join("\n"),
     ".github/scripts/fork-ci-unittest.py",
     fs.readFileSync(path.join(__dirname, "fork-ci-unittest.py")),
   );
+  write(NODE_COUNTS, fs.readFileSync(path.join(__dirname, path.basename(NODE_COUNTS))));
   write(".github/fork-ci-tests.txt", list + "\n");
   for (const [file, text] of Object.entries(tests)) write(file, text);
   const env = {
@@ -834,10 +840,11 @@ test("no listed shell test pipes into a reader that stops early", () => {
 
 // The records of what each test ran, which fork-ci-result checks.
 
-test("countTests reads fork-ci-unittest.py's lines, node's totals from stdout, else ok lines with their end line", () => {
+test("countTests reads fork-ci-unittest.py's plan and count lines, node's reporter line, else ok lines", () => {
   const py = "fork-ci/a.test.py";
   const line = (tests, skipped = [], failed = 0) => ({ tests, skipped, failed });
-  assert.deepEqual(countTests(py, "", "", [line(3, ["T.test_b"])]), {
+  const plan = (n) => ({ plan: n });
+  assert.deepEqual(countTests(py, "", "", [plan(3), line(3, ["T.test_b"])]), {
     format: "unittest",
     tests: 3,
     skipped: 1,
@@ -845,33 +852,70 @@ test("countTests reads fork-ci-unittest.py's lines, node's totals from stdout, e
     failed: 0,
     note: null,
   });
-  // Two unittest runs in one test (two TextTestRunner runs): summed.
-  assert.deepEqual(countTests(py, "", "", [line(2, [], 1), line(4, ["U.test_x", "U.test_y"], 2)]), {
-    format: "unittest",
-    tests: 6,
-    skipped: 2,
-    names: ["U.test_x", "U.test_y"],
-    failed: 3,
-    note: null,
-  });
-  // Stopped half-way through writing a line, or a line of another shape: no count at all.
-  assert.equal(countTests(py, "", "", [line(2), null]), null);
-  assert.equal(countTests(py, "", "", [{ tests: 2, skipped: 1, failed: 0 }]), null);
+  // Two unittest runs in one test (two TextTestRunner runs, one after the other or one inside the other): summed.
+  for (const lines of [
+    [plan(2), line(2, [], 1), plan(4), line(4, ["U.test_x", "U.test_y"], 2)],
+    [plan(4), plan(2), line(2, [], 1), line(4, ["U.test_x", "U.test_y"], 2)],
+  ])
+    assert.deepEqual(countTests(py, "", "", lines), {
+      format: "unittest",
+      tests: 6,
+      skipped: 2,
+      names: ["U.test_x", "U.test_y"],
+      failed: 3,
+      note: null,
+    });
+  // A hard exit (os._exit, a signal) after the plan: nothing counts, whatever ok lines its stdout has.
+  for (const lines of [[plan(4)], [plan(2), line(2), plan(3)], [plan(4), plan(2), line(2)]]) {
+    const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", lines);
+    assert.equal(counted.format, "unittest");
+    assert.equal(counted.tests, null);
+    assert.match(counted.note, /started but never ended/);
+  }
+  // Stopped half-way through writing a line, counts without their plan, a count not its plan's, or another shape.
+  assert.equal(countTests(py, "", "", [plan(2), line(2), null]), null);
+  assert.equal(countTests(py, "", "", [line(2)]), null);
+  assert.equal(countTests(py, "", "", [plan(3), line(2)]), null);
+  assert.equal(countTests(py, "", "", [plan(2), { tests: 2, skipped: 1, failed: 0 }]), null);
+  assert.equal(countTests(py, "", "", [{ plan: 2, tests: 2 }, line(2)]), null);
   // unittest's own summary is never read (a class skip counts once there; stderr may go on after it).
   assert.equal(countTests(py, "", "Ran 3 tests in 0.01s\n\nOK (skipped=1)\n", []), null);
   const js = "fork-ci/a.test.cjs";
-  assert.deepEqual(
-    countTests(js, "# tests 1\n# pass 1\n# tests 4\n# skipped 1\n# todo 1\n# fail 1\n", ""),
-    { format: "node", tests: 4, skipped: 2, names: [], failed: 1, note: null },
-  );
-  assert.deepEqual(countTests(js, "ℹ tests 2\nℹ pass 2\nℹ fail 0\n", ""), {
-    format: "node",
-    tests: 2,
+  const node = (tests, more = {}) => ({
+    tests,
     skipped: 0,
-    names: [],
     failed: 0,
+    started: tests,
+    stopped: 0,
+    file_test: false,
+    ...more,
+  });
+  assert.deepEqual(countTests(js, "", "", [node(4, { skipped: 2, failed: 1 })]), {
+    format: "node",
+    tests: 4,
+    skipped: 2,
+    names: [],
+    failed: 1,
     note: null,
   });
+  // node's totals on stdout are never read: an empty file, a top-level return or an early exit says "tests 1, pass 1".
+  assert.equal(countTests(js, "# tests 1\n# pass 1\nℹ tests 2\nℹ pass 2\n", "", []), null);
+  for (const [n, note] of [
+    [node(1, { file_test: true }), /only the file itself/],
+    [node(0, { file_test: true, started: 0 }), /only the file itself/],
+    [node(40, { started: 60, stopped: 20 }), /60 tests started and 40 ended/],
+    [node(2, { started: 3 }), /3 tests started and 2 ended/],
+    [node(2, { stopped: 1 }), /2 tests started and 2 ended/],
+  ]) {
+    const counted = countTests(js, "", "", [n]);
+    assert.equal(counted.tests, null, JSON.stringify(n));
+    assert.match(counted.note, note);
+  }
+  // Two lines (two reporters in one file?), a line cut off, or a line of another shape: no count at all.
+  assert.equal(countTests(js, "", "", [node(1), node(1)]), null);
+  assert.equal(countTests(js, "", "", [null]), null);
+  assert.equal(countTests(js, "", "", [{ ...node(1), file_test: 0 }]), null);
+  assert.equal(countTests(js, "", "", [{ ...node(1), started: undefined }]), null);
   const sh = "fork-ci/a.test.sh";
   // A failure counts without the end line (the test failed: red either way); stderr's lines never count.
   assert.deepEqual(countTests(sh, "ok one\nFAIL two\n", "ok three\n"), {
@@ -910,7 +954,7 @@ test("countTests reads fork-ci-unittest.py's lines, node's totals from stdout, e
     assert.match(counted.note, note, out);
   }
   assert.equal(countTests(sh, "all fine\n", ""), null);
-  assert.equal(countTests(js, "nothing\n", ""), null);
+  assert.equal(countTests(js, "ok one\nall passed: 1 ok, 0 skipped\n", ""), null);
 });
 
 test("readCounts: one object a line; a missing or empty file none; a line cut off is null", () => {
@@ -934,6 +978,7 @@ test("declarations read run and may-skip lines and refuse every other fork-ci: l
       "#fork-ci: run",
       "  // fork-ci: may skip T.test_b",
       "# fork-ci: may skip net",
+      "# fork-ci: may skip helper_mod.T.test_b",
       'x = "# fork-ci: run as root"  # not a whole comment line',
     ].join("\n"),
     "fork-ci/a.test.py",
@@ -943,7 +988,7 @@ test("declarations read run and may-skip lines and refuse every other fork-ci: l
       { root: true, vars: ["A_TESTS=1", "B_TESTS=x/y"], only: "Launcher" },
       { root: false, vars: [], only: null },
     ],
-    skips: ["T.test_b", "net"],
+    skips: ["T.test_b", "net", "helper_mod.T.test_b"],
     problems: [],
   });
   const bad = {
@@ -951,7 +996,8 @@ test("declarations read run and may-skip lines and refuse every other fork-ci: l
     "# fork-ci: skips at most 1": /expected "fork-ci: may skip <test>"/,
     "# fork-ci: may skip": /expected "fork-ci: may skip <test>"/,
     "# fork-ci: may skip T.a T.b": /expected "fork-ci: may skip <test>"/,
-    "# fork-ci: may skip m.T.a": /expected "fork-ci: may skip <test>"/,
+    "# fork-ci: may skip m.T.": /expected "fork-ci: may skip <test>"/,
+    "# fork-ci: may skip m..T.a": /expected "fork-ci: may skip <test>"/,
     "# fork-ci: may skip 9": /expected "fork-ci: may skip <test>"/,
     "# fork-ci: may skip T.a\n# fork-ci: may skip T.a": /T\.a is named twice/,
     "# fork-ci: runs": /expected "fork-ci: run/,
@@ -1015,13 +1061,14 @@ test("runKey and expectedKeys name one record per part run and one per own run",
     { file: "fork-ci/part.test.py", runBy: null },
     { file: "fork-ci/heavy.test.py", runBy: yml },
     { file: "fork-ci/own.test.py", runBy: yml },
-    // A fork test another workflow runs: only as RUN_ELSEWHERE says; any other `run by` still owes its record.
+    // A test another runner runs: only as RUN_ELSEWHERE says; any other `run by` (a fork test or not) owes its record.
     { file: "fork-ci/other.test.py", runBy: ".github/workflows/fork-other.yml" },
     {
       file: ".github/scripts/fork-secret-scan.test.sh",
       runBy: ".github/workflows/fork-secret-scan.yml",
     },
     { file: "scripts/upstream.test.ts", runBy: "scripts/smoke.ts" },
+    { file: ".github/scripts/relay-state-output.test.cjs", runBy: "scripts/release-smoke.ts" },
     { file: "fork-ci/pending.test.py", runBy: null },
   ];
   const present = [
@@ -1029,6 +1076,7 @@ test("runKey and expectedKeys name one record per part run and one per own run",
     "fork-ci/other.test.py",
     ".github/scripts/fork-secret-scan.test.sh",
     "scripts/upstream.test.ts",
+    ".github/scripts/relay-state-output.test.cjs",
   ];
   assert.deepEqual(
     expectedKeys(entries, present, (file) => texts[file] ?? ""),
@@ -1039,6 +1087,7 @@ test("runKey and expectedKeys name one record per part run and one per own run",
       "fork-ci/part.test.py",
       "fork-ci/part.test.py --run only L",
       "fork-ci/plain.test.sh",
+      "scripts/upstream.test.ts",
     ],
   );
 });
@@ -1104,7 +1153,7 @@ test("record keeps what a run was, what its output counted and the skips its tes
         seconds: "1.5",
         stdout: "",
         stderr: "Ran 2 tests in 0.1s\n\nOK\n",
-        unittest: [{ tests: 2, skipped: ["L.test_x"], failed: 0 }],
+        unittest: [{ plan: 2 }, { tests: 2, skipped: ["L.test_x"], failed: 0 }],
       },
       ["L.test_y", "L.test_x"],
     ),
@@ -1229,6 +1278,25 @@ test("command: Python through the counting shim; an own run as root through sudo
   assert.equal(user.env.FORK_CI_TEST_RECORDS, undefined);
   assert.equal(user.env.FORK_CI_TEST_COUNTS, undefined);
   assert.equal(env.A_TESTS, undefined); // the caller's environment is left alone
+  // A node test also reports to the counting reporter (spec still on stdout for the log); node's own context is not
+  // handed on (this file runs under node --test), or node would report to that and not to the reporters.
+  const node = command(
+    "fork-ci/a.test.cjs",
+    null,
+    { ...env, NODE_TEST_CONTEXT: "child-v8" },
+    "/c/n.jsonl",
+  );
+  assert.deepEqual(node.argv, [
+    "node",
+    "--test",
+    "--test-reporter=spec",
+    "--test-reporter-destination=stdout",
+    "--test-reporter=./.github/scripts/fork-ci-node-counts.cjs",
+    "--test-reporter-destination=/c/n.jsonl",
+    "fork-ci/a.test.cjs",
+  ]);
+  assert.equal(node.env.NODE_TEST_CONTEXT, undefined);
+  assert.equal(node.env.FORK_CI_TEST_COUNTS, undefined);
 });
 
 // An ok-lines test's end line: its own count of its ok lines (countTests()).
@@ -1521,9 +1589,10 @@ test("an ok-lines test that stops before its end line, or prints a child's ok li
   }
 });
 
-test("a fork test `run by` a workflow other than fork-tests.yml (and not RUN_ELSEWHERE's) fails and still owes its record", () => {
+test("a test `run by` a workflow other than fork-tests.yml (and not RUN_ELSEWHERE's) fails and still owes its record", () => {
   assert.deepEqual(RUN_ELSEWHERE, {
     ".github/scripts/fork-secret-scan.test.sh": ".github/workflows/fork-secret-scan.yml",
+    ".github/scripts/relay-state-output.test.cjs": "scripts/release-smoke.ts",
   });
   assert.equal(
     elsewhereAllowed({ file: "fork-ci/a.test.sh", runBy: ".github/workflows/fork-other.yml" }),
@@ -1533,7 +1602,27 @@ test("a fork test `run by` a workflow other than fork-tests.yml (and not RUN_ELS
     elsewhereAllowed({ file: "fork-ci/a.test.sh", runBy: ".github/workflows/fork-tests.yml" }),
     true,
   );
-  assert.equal(elsewhereAllowed({ file: "scripts/a.test.ts", runBy: "scripts/smoke.ts" }), true);
+  // A test named like upstream's is decided by the table too: a fork test without the prefix cannot leave the records.
+  assert.equal(
+    elsewhereAllowed({ file: ".github/scripts/a.test.py", runBy: "scripts/smoke.ts" }),
+    false,
+  );
+  assert.equal(
+    elsewhereAllowed(
+      { file: ".github/scripts/a.test.py", runBy: "scripts/smoke.ts" },
+      {
+        ".github/scripts/a.test.py": "scripts/smoke.ts",
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    elsewhereAllowed({
+      file: ".github/scripts/relay-state-output.test.cjs",
+      runBy: "scripts/release-smoke.ts",
+    }),
+    true,
+  );
   assert.equal(
     elsewhereAllowed({
       file: ".github/scripts/fork-secret-scan.test.sh",
@@ -1552,13 +1641,32 @@ test("a fork test `run by` a workflow other than fork-tests.yml (and not RUN_ELS
     assert.equal(run.status, 1, run.stdout + run.stderr);
     assert.match(
       run.stdout,
-      /fork-ci\/b\.test\.sh.*a fork test is run by \.github\/workflows\/fork-tests\.yml/,
+      /fork-ci\/b\.test\.sh.*a listed test is run by \.github\/workflows\/fork-tests\.yml/,
     );
     const part = Object.values(readRecords(records))[0];
     assert.deepEqual(part.all, ["fork-ci/a.test.sh", "fork-ci/b.test.sh"]); // fork-ci-result: b not recorded
     assert.deepEqual(part.owed, ["fork-ci/a.test.sh"]);
   } finally {
     cleanup();
+  }
+  // The same for a fork test without the fork- prefix, which its runner names.
+  const plain = runRecording(
+    {
+      "fork-ci/a.test.sh": 'echo "ok a"\n' + END(1),
+      ".github/scripts/b.test.sh": 'echo "ok b"\n' + END(1),
+      ".github/workflows/fork-other.yml": "      - run: bash .github/scripts/b.test.sh\n",
+    },
+    ["fork-ci/", ".github/scripts/"],
+    "fork-ci/a.test.sh\n.github/scripts/b.test.sh run by .github/workflows/fork-other.yml\n",
+  );
+  try {
+    assert.equal(plain.run.status, 1, plain.run.stdout + plain.run.stderr);
+    assert.match(plain.run.stdout, /\.github\/scripts\/b\.test\.sh.*only where RUN_ELSEWHERE/);
+    const part = Object.values(readRecords(plain.records))[0];
+    assert.deepEqual(part.all, [".github/scripts/b.test.sh", "fork-ci/a.test.sh"]);
+    assert.deepEqual(part.owed, ["fork-ci/a.test.sh"]);
+  } finally {
+    plain.cleanup();
   }
 });
 
@@ -1690,6 +1798,100 @@ test("a part's owed list is its plan (its shard's tests), not what came back fro
     "fork-ci/a.test.sh",
     "fork-ci/z.test.sh",
   ]);
+});
+
+// One test file run as a listed part test, recording: [exit status, its record, the part's stdout].
+function recordOf(file, text, more = {}) {
+  const { run, records, cleanup } = runRecording({ [file]: text, ...more }, [], file);
+  try {
+    return [run.status, Object.values(readRecords(records))[0].results[0], run.stdout + run.stderr];
+  } finally {
+    cleanup();
+  }
+}
+
+test("a node test counts the tests node's reporter saw end; the file alone, or tests that never ended, count nothing", () => {
+  const file = "fork-ci/n.test.cjs";
+  const t = 'const test = require("node:test");\n';
+  const exits = 'test("b", () => process.exit(0));\ntest("c", () => {});\ntest("d", () => {});\n';
+  const sub =
+    'test("a", async (t) => { await t.test("x", () => {}); await t.test("y", () => process.exit(0)); ' +
+    'await t.test("z", () => {}); });\n';
+  // node itself says "tests 1, pass 1" (the file as its one test) for each of these.
+  for (const [text, why] of [
+    ["", /only the file itself/],
+    ["return;\n" + t + 'test("a", () => {});\n', /only the file itself/],
+    [t + 'test("a", () => {});\n' + exits, /only the file itself|tests started and \d+ ended/],
+    [t + sub, /only the file itself|tests started and \d+ ended/],
+    [
+      t +
+        Array.from(
+          { length: 60 },
+          (_, i) => `test("t${i}", () => { if (${i} === 40) process.exit(0); });\n`,
+        ).join(""),
+      /only the file itself|tests started and \d+ ended/,
+    ],
+  ]) {
+    const [status, r, out] = recordOf(file, text);
+    assert.equal(status, 1, text + out);
+    assert.deepEqual([r.format, r.tests], ["node", null], text);
+    assert.match(r.note, why, text);
+    assert.match(out, /fork-ci\/n\.test\.cjs: its output shows no test count/, text);
+  }
+  const good =
+    t +
+    'const { describe, it } = test;\ntest("a", () => {});\n' +
+    'describe("s", () => { it("b", () => {}); it("c", () => {}); });\n';
+  const [status, r, out] = recordOf(file, good);
+  assert.equal(status, 0, out);
+  assert.deepEqual([r.format, r.tests, r.skipped, r.failed, r.note], ["node", 3, 0, 0, null]);
+  // A run again in a new part writes its own record from its own reporter file: the same count, nothing carried over.
+  assert.deepEqual(recordOf(file, good)[1].tests, 3);
+});
+
+test("a Python test that exits hard after its plan counts nothing, even with a child's ok and end lines on stdout", () => {
+  const [status, r, out] = recordOf(
+    "fork-ci/h.test.py",
+    "import os, unittest\n" +
+      "class T(unittest.TestCase):\n" +
+      "    def test_a(self):\n" +
+      "        print('ok child'); print('all passed: 1 ok, 0 skipped', flush=True); os._exit(0)\n" +
+      "    def test_b(self): pass\n" +
+      "unittest.main()\n",
+  );
+  assert.equal(status, 1, out);
+  assert.deepEqual([r.format, r.tests], ["unittest", null]);
+  assert.match(r.note, /a unittest run of 2 tests started but never ended/);
+});
+
+test("the shim counts an expected failure that passed as a failure, and names a loaded module's tests by module", () => {
+  const [status, r] = recordOf(
+    "fork-ci/x.test.py",
+    "import unittest\n" +
+      "class T(unittest.TestCase):\n" +
+      "    @unittest.expectedFailure\n" +
+      "    def test_a(self): pass\n" +
+      "unittest.main()\n",
+  );
+  assert.equal(status, 1);
+  assert.deepEqual([r.tests, r.failed], [1, 1]);
+  // Two modules with the same class and test, one skipped: the record says which.
+  const mod = (skip) =>
+    "import unittest\nclass T(unittest.TestCase):\n" +
+    (skip ? "    @unittest.skip('off')\n" : "") +
+    "    def test_x(self): pass\n";
+  const [status2, r2, out2] = recordOf(
+    "fork-ci/m.test.py",
+    "# fork-ci: may skip mod_b.T.test_x\n" +
+      "import sys, unittest\nsys.path.insert(0, __import__('os').path.dirname(__file__))\n" +
+      "import mod_a, mod_b\n" +
+      "load = unittest.defaultTestLoader.loadTestsFromModule\n" +
+      "ok = unittest.TextTestRunner().run(unittest.TestSuite([load(mod_a), load(mod_b)])).wasSuccessful()\n" +
+      "raise SystemExit(0 if ok else 1)\n",
+    { "fork-ci/mod_a.py": mod(false), "fork-ci/mod_b.py": mod(true) },
+  );
+  assert.equal(status2, 0, out2);
+  assert.deepEqual([r2.tests, r2.skipped_tests], [2, ["mod_b.T.test_x"]]);
 });
 
 test("a part that ran a test whose output counts nothing fails", () => {
