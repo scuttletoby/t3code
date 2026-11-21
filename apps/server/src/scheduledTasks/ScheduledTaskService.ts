@@ -54,6 +54,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import { makeScheduledRunSlots } from "../fork/agentSlotRoutes.ts"; // Fork: agent slots
 import { OrchestratorDispatchError } from "../orchestration-v2/Orchestrator.ts";
 import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -494,6 +495,7 @@ export const layer = Layer.effect(
     const mac = yield* Mac.Mac;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    const runSlots = yield* makeScheduledRunSlots(WebhookDeliverySkipped); // Fork: agent slots
     const serviceScope = yield* Effect.scope;
     const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
     const secretRequests = yield* SecretRequests.SecretRequests;
@@ -1057,6 +1059,8 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
+        const slot = yield* runSlots.admit(active, trigger, startedAt, rescheduleMissedRun); // Fork: agent slots
+        if (slot.skipped !== null) return slot.skipped; // Fork: a skipped run is recorded
         if (webhook === undefined) yield* markRunning(active.id, startedAtIso);
         else
           yield* sql
@@ -1165,6 +1169,7 @@ export const layer = Layer.effect(
         const lastRunStatus = runSucceeded ? ("succeeded" as const) : ("failed" as const);
         const lastRunError = runSucceeded ? null : dispatchErrorMessage(result.cause);
         const threadId = runSucceeded ? result.value : null;
+        yield* slot.end(threadId); // Fork: the slot names the run's thread
         // One transaction, so an edit cannot land between reading the schedule and
         // writing the next run computed from it. The origin is read first: it reads
         // files, and the transaction holds SQLite's writer lock.
@@ -1246,6 +1251,7 @@ export const layer = Layer.effect(
         Effect.onError((cause) =>
           releaseStuckRun(task, startedAtIso, errorMessage(cause), webhook?.deliveryId),
         ),
+        Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot
       );
 
       // Reserve and release as one bracket so an interrupt cannot leave the task marked busy.
@@ -2556,6 +2562,7 @@ export const layer = Layer.effect(
           yield* observe("accepted");
           const permit = yield* webhookPermit(task.id);
           yield* runWebhookDelivery(task, deliveryId, rendered.prompt).pipe(
+            runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored
             permit.withPermits(1),
             Effect.ensuring(release),
             // A relay-delivered webhook is traced to the relay; the run it starts is local work

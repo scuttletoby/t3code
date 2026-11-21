@@ -1,0 +1,560 @@
+/**
+ * Fork: every route that starts an agent takes a slot from the gate `delegate_task` uses
+ * (`slots/SlotGate.ts`): same count. A start no thread here asks for (a scheduled run, the owner's
+ * client, a linked machine) has no caller. Each route words a refusal for who reads it: only an
+ * agent that asked is told to wait for a slot. Routes: docs/fork/README.md.
+ */
+import {
+  type ModelSelection,
+  type OrchestratorMcpCreateThreadRequest,
+  OrchestratorMcpFailure,
+  type ProviderInstanceId,
+  type ScheduledTask,
+  ScheduledTaskError,
+  type ThreadId,
+} from "@t3tools/contracts";
+import { slotRefusalReason, type SlotDecision } from "@t3tools/shared/agentSlots";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
+
+import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import { encodePendingTask } from "../scheduledTasks/webhookDedupe.ts";
+import type { WebhookRequest } from "../scheduledTasks/webhookTemplate.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as SlotGate from "../slots/SlotGate.ts";
+
+type Refused = Extract<SlotGate.SlotAcquire, { readonly type: "refuse" }>;
+type FullDecision = Extract<SlotDecision, { readonly type: "refuse" }>;
+
+/** One start through the gate. */
+export type RouteSlot =
+  | Refused
+  | {
+      readonly type: "allow";
+      /**
+       * The dispatch ended: `childThreadId` is the thread it started, or `null` when it started
+       * none. Until then the start counts (at most `DISPATCH_SAFETY_MS` if never called). Safe to
+       * call more than once.
+       */
+      readonly end: (childThreadId: ThreadId | null) => Effect.Effect<void>;
+    };
+
+export interface RouteStart {
+  readonly callerThreadId: ThreadId | null;
+  readonly targetInstanceId: ProviderInstanceId;
+  /**
+   * The thread the start will run in, when known before its dispatch: the slot is named for it at
+   * once, and counts until its run shows (for the start grace at most), so nothing is left to end.
+   */
+  readonly childThreadId?: ThreadId | undefined;
+  /** More starts right after this one: allowed only when they all fit (`SlotGate.acquire`). */
+  readonly alsoNeeds?: ReadonlyArray<ProviderInstanceId> | undefined;
+}
+
+const ENDED: RouteSlot = { type: "allow", end: () => Effect.void };
+
+/**
+ * Takes a slot for one start, or says why not. No gate (a host that runs none) allows at once.
+ * Uninterruptible from the acquire to the naming of the child, so a slot is never taken unnamed
+ * by a call that stopped in between; a call stopped after it counts as a start never released.
+ */
+const admit = (
+  gate: Option.Option<SlotGate.SlotGate["Service"]>,
+  start: RouteStart,
+): Effect.Effect<RouteSlot> =>
+  Option.match(gate, {
+    onNone: () => Effect.succeed(ENDED),
+    onSome: (slots) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const outcome = yield* slots.acquire({
+            callerThreadId: start.callerThreadId,
+            targetInstanceId: start.targetInstanceId,
+            ...(start.alsoNeeds === undefined ? {} : { alsoNeeds: start.alsoNeeds }),
+          });
+          if (outcome.type === "refuse") return outcome;
+          const token = outcome.token;
+          const end = (childThreadId: ThreadId | null) =>
+            (childThreadId === null ? Effect.void : slots.started(token, childThreadId)).pipe(
+              Effect.andThen(slots.release(token)),
+            );
+          if (start.childThreadId === undefined) return { type: "allow", end } satisfies RouteSlot;
+          yield* end(start.childThreadId);
+          return ENDED;
+        }),
+      ),
+  });
+
+const slotsFull = (message: string) => new OrchestratorMcpFailure({ code: "slots_full", message });
+
+const agents = (count: number) => (count === 1 ? "1 agent is" : `${count} agents are`);
+
+const unreadReason = (problem: SlotGate.CountReadProblem) =>
+  problem === "timeout"
+    ? `the read took longer than ${Duration.toSeconds(SlotGate.COUNT_READ_TIMEOUT)} seconds`
+    : "the read failed with an error";
+
+/** {@link slotRefusalReason}, for a reader on another machine ("there", not "this machine"). */
+const reasonThere = (decision: FullDecision) =>
+  decision.rule === "machine"
+    ? `${agents(decision.used)} running there, and the limit is ${decision.max}`
+    : decision.rule === "account"
+      ? `${agents(decision.used)} running there on account ${decision.instanceId}, and the limit is ${decision.max}`
+      : `only ${decision.used} MB of memory is free there, and a new agent needs at least ${decision.max} MB`;
+
+/** Why, in one clause, for a reader on this machine (a scheduled task's history, run now). */
+const reasonHere = (refusal: SlotGate.SlotRefusal) =>
+  refusal.type === "full"
+    ? slotRefusalReason(refusal.decision)
+    : `the running agents could not be counted (${unreadReason(refusal.problem)})`;
+
+/**
+ * The refusal of a start no agent here asked for (a linked machine or the owner's client): it
+ * says what happened on the machine that was asked, and gives no advice to wait or retry.
+ */
+export const noCallerRefusalText = (refusal: SlotGate.SlotRefusal): string =>
+  refusal.type === "full"
+    ? `No agent was started: the machine asked to start it has no free agent slot (${reasonThere(refusal.decision)}).`
+    : `No agent was started: the machine asked to start it could not count its running agents (${unreadReason(refusal.problem)}).`;
+
+/** The refusal for a route: an agent that asked gets the gate's own text (it may wait for a slot). */
+const refusalFor = (callerThreadId: ThreadId | null, slot: Refused) =>
+  callerThreadId === null ? noCallerRefusalText(slot.refusal) : slot.message;
+
+/** {@link admit} for a start whose thread is known, refused with `slots_full`. */
+const admitNamed = (
+  gate: Option.Option<SlotGate.SlotGate["Service"]>,
+  start: RouteStart & { readonly childThreadId: ThreadId },
+): Effect.Effect<void, OrchestratorMcpFailure> =>
+  Effect.flatMap(admit(gate, start), (slot) =>
+    slot.type === "refuse"
+      ? Effect.fail(slotsFull(refusalFor(start.callerThreadId, slot)))
+      : Effect.void,
+  );
+
+export interface LaunchSlot {
+  readonly threadId: ThreadId;
+  readonly modelSelection: Pick<ModelSelection, "instanceId">;
+  /** A retry of an accepted launch: it starts nothing new, so it is not counted again. */
+  readonly replaying: boolean;
+  readonly input: { readonly message?: string | undefined };
+  readonly attachments: ReadonlyArray<unknown>;
+}
+
+/**
+ * `t3_thread_launch`, last before the launch: a launch that starts a run (a message or an
+ * attachment) takes a slot on its model's instance, or is refused `slots_full`. `caller` is the
+ * thread here that asks, if any; a launch from a linked machine or the owner's client has none.
+ * The gate is the one the handlers were built with (none in a host that runs none).
+ */
+export const checkLaunchSlot = Effect.fn("AgentSlotRoutes.checkLaunchSlot")(function* (
+  caller: { readonly id: ThreadId } | undefined,
+  launch: LaunchSlot,
+) {
+  if (launch.replaying) return;
+  if (launch.input.message === undefined && launch.attachments.length === 0) return;
+  yield* admitNamed(yield* Effect.serviceOption(SlotGate.SlotGate), {
+    callerThreadId: caller?.id ?? null,
+    targetInstanceId: launch.modelSelection.instanceId,
+    childThreadId: launch.threadId,
+  });
+});
+
+/** One thread of a `create_threads` call, as its seat sees it. */
+export interface CreateThreadSlot {
+  readonly callerThreadId: ThreadId;
+  /** Its id; the batch's ids differ only in the index at the end. */
+  readonly threadId: ThreadId;
+  readonly index: number;
+  readonly batch: ReadonlyArray<OrchestratorMcpCreateThreadRequest>;
+  /** Its final target's instance. */
+  readonly targetInstanceId: ProviderInstanceId;
+  /** The instance a later thread without its own target is counted on (the parent's). */
+  readonly defaultInstanceId: ProviderInstanceId;
+  /** A retry of an accepted creation: `hasRun` says whether its run already started. */
+  readonly retry: { readonly hasRun: Effect.Effect<boolean> } | null;
+}
+
+const startsRun = (request: OrchestratorMcpCreateThreadRequest) => request.prompt !== undefined;
+
+/**
+ * `create_threads`, per thread before its creation: the first checks the whole batch fits; each
+ * thread with a prompt then takes its own slot. A later refusal names the threads already created;
+ * a retried thread whose run never started takes a slot like a new one.
+ */
+export const admitCreateThread = Effect.fn("AgentSlotRoutes.admitCreateThread")(function* (
+  gate: Option.Option<SlotGate.SlotGate["Service"]>,
+  input: CreateThreadSlot,
+) {
+  if (Option.isNone(gate)) return;
+  const own = input.batch[input.index];
+  if (own === undefined) return;
+  const later = input.batch
+    .slice(input.index + 1)
+    .filter(startsRun)
+    .map((request) => request.target?.providerInstanceId ?? input.defaultInstanceId);
+  const created = Array.from({ length: input.index }, (_, index) =>
+    String(input.threadId).replace(/\d+$/, String(index)),
+  );
+  const refuse = (slot: Refused) => {
+    const batch = slot.refusal.type === "full" ? slot.refusal.batch : undefined;
+    const head =
+      created.length > 0
+        ? `Thread ${input.index + 1} was not created. Created before it in this call: ${created.join(", ")}.`
+        : batch === undefined
+          ? "No thread was created."
+          : `No thread was created: the ${batch.needed} threads with a prompt need ${batch.needed} free agent slots, and ${batch.free} ${batch.free === 1 ? "is" : "are"} free.`;
+    return Effect.fail(slotsFull(`${head} ${slot.message}`));
+  };
+  if (input.retry !== null) {
+    if (!startsRun(own) || (yield* input.retry.hasRun)) return;
+  } else if (!startsRun(own)) {
+    // A thread without a prompt takes no slot; the first one still checks the whole batch.
+    if (input.index > 0 || later.length === 0) return;
+    const [first, ...rest] = later;
+    const check = yield* admit(gate, {
+      callerThreadId: input.callerThreadId,
+      targetInstanceId: first!,
+      alsoNeeds: rest,
+    });
+    if (check.type === "refuse") return yield* refuse(check);
+    // Only a check: the threads with a prompt take their own slots.
+    yield* check.end(null);
+    return;
+  }
+  const slot = yield* admit(gate, {
+    callerThreadId: input.callerThreadId,
+    targetInstanceId: input.targetInstanceId,
+    childThreadId: input.threadId,
+    ...(later.length === 0 ? {} : { alsoNeeds: later }),
+  });
+  if (slot.type === "refuse") return yield* refuse(slot);
+});
+
+/** What a scheduled run that was let through owes the gate, or the run's result when skipped. */
+export interface ScheduledSlot {
+  /** `runTask`'s result for a run on its schedule that waits for a slot; else `null`. */
+  readonly skipped: {
+    readonly task: ScheduledTask;
+    readonly threadId: null;
+    readonly dispatchFailed: false;
+  } | null;
+  /** The dispatch ended, with the thread it ran in or `null`. */
+  readonly end: (threadId: ThreadId | null) => Effect.Effect<void>;
+}
+
+/** How a waiting run's history note starts; one note per due time (a run clears it). */
+export const WAITING_NOTE_PREFIX = "Waiting for an agent slot: ";
+
+/** The history note of a run on its schedule that waits for a slot. */
+export const waitingNote = (refusal: SlotGate.SlotRefusal) =>
+  `${WAITING_NOTE_PREFIX}${reasonHere(refusal)}. The run starts when a slot is free.`;
+
+/** How a refused "run now" starts; `runNowSlotRefusal` answers it `slots_full`. */
+export const RUN_NOW_REFUSED_PREFIX = "Not run, no agent slot: ";
+
+/** `run_scheduled_task_now`: a run the gate refused answers `slots_full`, its text unchanged. */
+export const runNowSlotRefusal = (error: OrchestratorMcpFailure): OrchestratorMcpFailure =>
+  error.code === "orchestration_error" && error.message.startsWith(RUN_NOW_REFUSED_PREFIX)
+    ? slotsFull(error.message)
+    : error;
+
+/** How often a webhook delivery that waits for a slot asks again (the scheduler's poll). */
+export const WEBHOOK_SLOT_RETRY = Duration.seconds(5);
+
+/**
+ * A fixed-time run is dropped as missed once it is 10 minutes late (`isMissedFixedTimeRun`); one
+ * that waits for a slot moves its due time up to now after half of that, so it stays due.
+ */
+const FIXED_TIME_KEEP_DUE_MS = 5 * 60 * 1000;
+
+/**
+ * A direct webhook delivery (no coalescing window) on its way to its run, set by
+ * `directDelivery` around that run: what storing it needs, if the gate refuses it.
+ */
+interface DirectDelivery {
+  readonly deliveryId: string;
+  readonly request: WebhookRequest;
+  /** Wakes the stored-delivery worker (its due hint), so it looks at the new row. */
+  readonly wake: Effect.Effect<void>;
+}
+
+const CurrentDirectDelivery = Context.Reference<DirectDelivery | undefined>(
+  "t3/fork/agentSlotRoutes/CurrentDirectDelivery",
+  { defaultValue: () => undefined },
+);
+
+/** A stored delivery's request, in the shape the stored-delivery worker reads (`decodePendingRequest`). */
+const encodeStoredRequest = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      method: Schema.String,
+      path: Schema.String,
+      query: Schema.String,
+      headers: Schema.Record(Schema.String, Schema.String),
+      bodyText: Schema.String,
+    }),
+  ),
+);
+
+/**
+ * Scheduled runs through the gate, built inside `ScheduledTaskService` (the gate is read if the
+ * server runs one; a test of the service alone has none). `WebhookSkipped` is the service's own
+ * "delivery skipped" failure.
+ */
+export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
+  WebhookSkipped: new (fields: { readonly reason: string }) => W,
+) {
+  const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const sql = yield* SqlClient.SqlClient;
+  const scheduler = yield* Scheduler.Scheduler;
+  // The production wiring gives scheduled runs the gate; a boot test looks for this span.
+  if (Option.isSome(gate))
+    yield* Effect.void.pipe(Effect.withSpan("AgentSlotRoutes.scheduledRunsGated"));
+
+  /**
+   * The slot each running task holds until its dispatch ends (one run per task at a time), so
+   * `ended` frees it on a path that never reached the end (a failure before the dispatch).
+   */
+  const open = new Map<string, (threadId: ThreadId | null) => Effect.Effect<void>>();
+
+  /**
+   * Where a run starts, and whether it starts one: a bound task runs on its thread's current
+   * provider, and a bound thread that is running already only gets the prompt queued (no new run,
+   * no slot). A thread that cannot be read is counted on the task's stored provider, as a start.
+   */
+  const targetOf = (task: ScheduledTask) =>
+    task.threadId === null
+      ? Effect.succeed({ instanceId: task.modelSelection.instanceId, queuesOnly: false })
+      : threads.getThreadShell(task.threadId).pipe(
+          Effect.map((shell) => ({
+            instanceId: shell?.modelSelection.instanceId ?? task.modelSelection.instanceId,
+            queuesOnly: shell != null && shell.activeRunId !== null,
+          })),
+          Effect.orElseSucceed(() => ({
+            instanceId: task.modelSelection.instanceId,
+            queuesOnly: false,
+          })),
+        );
+
+  /**
+   * The slot is named for the run's thread when its dispatch ends (`end`), bound or new, so a
+   * dispatch that failed frees it at once; `ended` frees it on a path that never got there.
+   */
+  const take = (instanceId: ProviderInstanceId) =>
+    admit(gate, { callerThreadId: null, targetInstanceId: instanceId });
+
+  const allowed = (
+    task: ScheduledTask,
+    end: (threadId: ThreadId | null) => Effect.Effect<void>,
+  ) => {
+    const once = (threadId: ThreadId | null) =>
+      Effect.suspend(() => {
+        if (open.get(task.id) !== once) return Effect.void;
+        open.delete(task.id);
+        return end(threadId);
+      });
+    open.set(task.id, once);
+    return { skipped: null, end: once } satisfies ScheduledSlot;
+  };
+
+  /**
+   * A run on its schedule that waits: the task stays due (the next poll asks again), with one
+   * history note that says why (rewritten when the reason changes; the run that starts clears it,
+   * and so does `clearStaleNotes` once the task is paused or no longer due). Its
+   * status stays as it is, so nothing counts as a run. A fixed-time run keeps its due time recent.
+   */
+  const keepDue = Effect.fnUntraced(function* (
+    task: ScheduledTask,
+    now: DateTime.DateTime,
+    refusal: SlotGate.SlotRefusal,
+  ) {
+    const nowIso = DateTime.formatIso(DateTime.toUtc(now));
+    const note = waitingNote(refusal);
+    // Written only when its text changes (a new reason), so a poll that changes nothing writes nothing.
+    const noted = yield* sql<{ task_id: string }>`
+      UPDATE scheduled_tasks SET last_run_error = ${note}, updated_at = ${nowIso}
+      WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+        AND next_run_at IS ${task.nextRunAt} AND last_run_status <> 'running'
+        AND last_run_error IS NOT ${note}
+      RETURNING task_id
+    `;
+    if (noted.length > 0) {
+      yield* Effect.logInfo("Scheduled run waits for an agent slot", {
+        taskId: task.id,
+        dueAt: task.nextRunAt,
+        reason: reasonHere(refusal),
+      });
+    }
+    if (task.schedule.type !== "fixed_time" || task.nextRunAt === null) return;
+    const dueMs = Date.parse(task.nextRunAt);
+    if (!(DateTime.toEpochMillis(now) - dueMs > FIXED_TIME_KEEP_DUE_MS)) return;
+    yield* sql`
+      UPDATE scheduled_tasks SET next_run_at = ${nowIso}
+      WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+        AND next_run_at IS ${task.nextRunAt} AND last_run_status <> 'running'
+    `;
+  });
+
+  /** Why a webhook delivery that waited no longer runs, or `null` while its task still takes it. */
+  const webhookGone = Effect.fnUntraced(function* (task: ScheduledTask) {
+    const [row] = yield* sql<{ created_at: string; enabled: number; trigger: string | null }>`
+      SELECT created_at, enabled, json_extract(schedule_json, '$.type') AS trigger
+      FROM scheduled_tasks WHERE task_id = ${task.id}
+    `;
+    return row === undefined
+      ? "The task was deleted before this delivery ran."
+      : row.created_at !== task.createdAt
+        ? "The task was replaced before this delivery ran."
+        : row.trigger !== "webhook"
+          ? "The task's trigger changed before this delivery ran."
+          : !row.enabled
+            ? "The task was paused before this delivery ran."
+            : null;
+  });
+
+  /**
+   * A direct delivery the gate refused is stored as a pending delivery the stored-delivery worker
+   * owns (due now), so a restart keeps it; its in-memory copy then ends without running, and the
+   * worker runs it once. `false` when there is nothing to store (a stored delivery already) or the
+   * write failed: the delivery then waits in memory.
+   */
+  const storeDirect = Effect.fn("AgentSlotRoutes.storeDirect")(
+    function* (task: ScheduledTask, now: DateTime.DateTime) {
+      const direct = yield* CurrentDirectDelivery;
+      if (direct === undefined) return false;
+      const { method, path, query, headers, bodyText } = direct.request;
+      const requestJson = yield* encodeStoredRequest({ method, path, query, headers, bodyText });
+      const stored = yield* sql<{ delivery_id: string }>`
+        INSERT INTO scheduled_task_webhook_pending
+          (delivery_id, task_id, coalesce_key, due_at, state, task_json, request_json, delivery_ids_json)
+        VALUES (${direct.deliveryId}, ${task.id}, '', ${DateTime.toEpochMillis(now)}, 'dispatching',
+          ${yield* encodePendingTask(task)}, ${requestJson}, json_array(${direct.deliveryId}))
+        ON CONFLICT (delivery_id) DO NOTHING
+        RETURNING delivery_id
+      `;
+      if (stored.length === 0) return false;
+      yield* direct.wake;
+      yield* Effect.logInfo("Webhook delivery waits for an agent slot (stored)", {
+        taskId: task.id,
+        deliveryId: direct.deliveryId,
+      });
+      return true;
+    },
+    (effect, task) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Could not store a webhook delivery waiting for a slot", {
+            taskId: task.id,
+            cause,
+          }).pipe(Effect.as(false)),
+        ),
+      ),
+  );
+
+  /**
+   * A stored webhook delivery waits for a slot: asked again every few seconds until one is free
+   * (its pending row stays as it is, so a restart picks it up again, once). It is dropped only for
+   * the reasons a queued delivery is (the task deleted, replaced, paused or no longer a webhook).
+   */
+  const waitForWebhookSlot = Effect.fnUntraced(function* (task: ScheduledTask, first: Refused) {
+    yield* Effect.logInfo("Webhook delivery waits for an agent slot", {
+      taskId: task.id,
+      reason: reasonHere(first.refusal),
+    });
+    while (true) {
+      yield* Effect.sleep(WEBHOOK_SLOT_RETRY);
+      const gone = yield* webhookGone(task).pipe(Effect.orElseSucceed(() => null));
+      if (gone !== null) return yield* Effect.fail(new WebhookSkipped({ reason: gone }));
+      const target = yield* targetOf(task);
+      if (target.queuesOnly) return allowed(task, () => Effect.void);
+      const slot = yield* take(target.instanceId);
+      if (slot.type === "allow") return allowed(task, slot.end);
+    }
+  });
+
+  /**
+   * Last before the run is marked running. Refused, a run on its schedule stays due (asked again
+   * at the next poll, never dropped, one run when it starts), "run now" fails and writes nothing,
+   * a webhook delivery waits for a slot.
+   */
+  const admitRun = Effect.fnUntraced(function* <E, R>(
+    task: ScheduledTask,
+    trigger: "scheduled" | "manual" | "webhook",
+    now: DateTime.DateTime,
+    // The missed-run rescheduler: a run that waits is not rescheduled.
+    _reschedule: (
+      task: ScheduledTask,
+      now: DateTime.DateTime,
+      reason: string,
+      runError: string,
+    ) => Effect.Effect<void, E, R>,
+  ) {
+    if (Option.isNone(gate)) return { skipped: null, end: () => Effect.void } as ScheduledSlot;
+    const target = yield* targetOf(task);
+    if (target.queuesOnly) return allowed(task, () => Effect.void);
+    const slot = yield* take(target.instanceId);
+    if (slot.type === "allow") return allowed(task, slot.end);
+    if (trigger === "manual") {
+      return yield* new ScheduledTaskError({
+        message: `${RUN_NOW_REFUSED_PREFIX}${reasonHere(slot.refusal)}.`,
+        taskId: task.id,
+      });
+    }
+    if (trigger === "webhook") {
+      if (yield* storeDirect(task, now))
+        return {
+          skipped: { task, threadId: null, dispatchFailed: false },
+          end: () => Effect.void,
+        } as ScheduledSlot;
+      return yield* waitForWebhookSlot(task, slot);
+    }
+    yield* keepDue(task, now, slot.refusal).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Could not note a scheduled run waiting for a slot", {
+          taskId: task.id,
+          cause,
+        }),
+      ),
+    );
+    return {
+      skipped: { task, threadId: null, dispatchFailed: false },
+      end: () => Effect.void,
+    } as ScheduledSlot;
+  });
+
+  /** The task's run ended, any way: a slot its dispatch never ended is free again. */
+  const ended = (taskId: string) => Effect.suspend(() => open.get(taskId)?.(null) ?? Effect.void);
+
+  /**
+   * Around a direct webhook delivery's run (inside its task's webhook permit): refused for a slot,
+   * the delivery is stored for the stored-delivery worker (`storeDirect`), woken with `wake`.
+   */
+  const directDelivery =
+    (deliveryId: string, request: WebhookRequest, wake: Effect.Effect<void>) =>
+    <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.provideService(effect, CurrentDirectDelivery, { deliveryId, request, wake });
+
+  /**
+   * A waiting note is cleared once its task no longer waits: paused, or its due time moved
+   * later (an edit). The next due time that waits writes a fresh note.
+   */
+  const clearStaleNotes = Effect.gen(function* () {
+    const nowIso = DateTime.formatIso(DateTime.toUtc(yield* DateTime.now));
+    yield* sql`
+      UPDATE scheduled_tasks SET last_run_error = NULL
+      WHERE substr(last_run_error, 1, ${WAITING_NOTE_PREFIX.length}) = ${WAITING_NOTE_PREFIX}
+        AND last_run_status <> 'running'
+        AND (enabled = 0 OR next_run_at IS NULL OR next_run_at > ${nowIso})
+    `;
+  });
+  yield* scheduler.register("agent-slot-notes", clearStaleNotes);
+
+  return { admit: admitRun, ended, directDelivery };
+});

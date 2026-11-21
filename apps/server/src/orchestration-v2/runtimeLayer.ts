@@ -341,6 +341,7 @@ const layerFeedbackStoreProvided = FeedbackStore.layer.pipe(
   Layer.provide(layerThreadManagementProvided),
 );
 const layerScheduledTaskProvided = ScheduledTaskService.layer.pipe(
+  Layer.provide(SlotGate.layer),
   Layer.provide(
     Layer.mergeAll(
       layerThreadLaunchProvided,
@@ -463,8 +464,7 @@ export const layerProduction = Layer.mergeAll(
   ),
   // Fork (waits): off by default; the sweep reads and writes nothing until it is switched on.
   WaitWorker.layer.pipe(
-    // The server's slot gate: the very layer server.ts gives /mcp (layers memoize by reference),
-    // so slot waits and delegate_task share one gate. Its needs are provided below and by server.ts.
+    // One slot gate for /mcp, waits and scheduled runs: layers memoize by reference (server.ts).
     Layer.provide(SlotGate.layer),
     Layer.provide(
       Layer.mergeAll(

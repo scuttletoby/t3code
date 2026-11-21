@@ -4,7 +4,7 @@
  */
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { expect, it } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   OrchestratorMcpFailure,
@@ -41,6 +41,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import { type SlotWorld, slotGateOver, slotWorld } from "./slotWorld.testkit.ts";
 
 const PROJECT = ProjectId.make("project:wide");
 const NARROW_PROJECT = ProjectId.make("project:narrow");
@@ -71,13 +72,17 @@ const callerShell = (): OrchestrationV2ThreadShell =>
 
 /**
  * Upstream's launch handler with a thread caller (or the owner's client with `caller: false`),
- * the settings given, and every launch and forwarded call recorded.
+ * the settings given, and every launch and forwarded call recorded. With `slots`, the server's
+ * slot gate runs over that world; without, the host runs none.
  */
-const harness = (settings: Settings, options: { readonly caller?: boolean } = {}) => {
+const harness = (
+  settings: Settings,
+  options: { readonly caller?: boolean; readonly slots?: SlotWorld } = {},
+) => {
   const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
   const forwarded: Array<unknown> = [];
   const threadCaller = options.caller !== false;
-  const dependencies = Layer.mergeAll(
+  const base = Layer.mergeAll(
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed([]),
       refreshWorkspaceSnapshot: () => Effect.succeed([]),
@@ -170,10 +175,16 @@ const harness = (settings: Settings, options: { readonly caller?: boolean } = {}
     ),
     Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
+  const dependencies =
+    options.slots === undefined
+      ? base
+      : slotGateOver(options.slots, INSTANCE).pipe(Layer.provideMerge(base));
   const launch = (input: {
     readonly projectId?: ProjectId;
     readonly environmentId?: EnvironmentId;
     readonly clientRequestId?: string | undefined;
+    /** `null`: a launch without a message, which starts no run. */
+    readonly message?: string | null;
   }) =>
     Effect.gen(function* () {
       const toolkit = yield* ProjectToolkit.pipe(
@@ -187,7 +198,7 @@ const harness = (settings: Settings, options: { readonly caller?: boolean } = {}
         .handle("t3_thread_launch", {
           title: "Launched",
           projectId: input.projectId ?? PROJECT,
-          message: "Do the work",
+          ...(input.message === null ? {} : { message: input.message ?? "Do the work" }),
           modelSelection: { instanceId: INSTANCE, model: "claude-opus" },
           ...(input.environmentId === undefined ? {} : { environmentId: input.environmentId }),
           ...(input.clientRequestId === undefined
@@ -393,3 +404,113 @@ it.effect(
       expect(narrow.launched).toHaveLength(2);
     }),
 );
+
+describe("t3_thread_launch through the agent slot gate (#706)", () => {
+  const ONE_SLOT = { agentSlots: { enabled: true, maxPerMachine: 1 } } as unknown as Settings;
+  const world = slotWorld;
+  const BUSY = ThreadId.make("thread:busy");
+
+  it.effect("full: refused slots_full, nothing launched; free: launched", () =>
+    Effect.gen(function* () {
+      const full = harness(ONE_SLOT, { slots: world([BUSY]) });
+      const message = refusal(yield* full.launch({}));
+      expect(message).toMatch(/^slots_full: /);
+      expect(full.launched).toHaveLength(0);
+      const free = harness(ONE_SLOT, { slots: world() });
+      expect(refusal(yield* free.launch({}))).toBeUndefined();
+      expect(free.launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("the calling thread is not counted against its own launch", () =>
+    Effect.gen(function* () {
+      // The launcher's own run is the only one: it waits on the child, so its slot is not one.
+      const slots = world([CALLER]);
+      const { launched, launch } = harness(ONE_SLOT, { slots });
+      expect(refusal(yield* launch({}))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("the owner's client (and a launch a linked machine sent here) has no caller", () =>
+    Effect.gen(function* () {
+      // No thread asks, so nothing is left out: the one running agent fills the slot.
+      const full = harness(ONE_SLOT, { caller: false, slots: world([CALLER]) });
+      expect(refusal(yield* full.launch({}))).toMatch(/^slots_full: /);
+      expect(full.launched).toHaveLength(0);
+      const free = harness(ONE_SLOT, { caller: false, slots: world() });
+      expect(refusal(yield* free.launch({}))).toBeUndefined();
+      expect(free.launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("a launch without a message starts no run, so it is not gated", () =>
+    Effect.gen(function* () {
+      const slots = world([BUSY]);
+      const { launched, launch } = harness(ONE_SLOT, { slots });
+      expect(refusal(yield* launch({ message: null }))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+      expect(slots.reads).toBe(0);
+    }),
+  );
+
+  it.effect("runs again with the same key: refused while full, replayed once accepted", () =>
+    Effect.gen(function* () {
+      const slots = world([BUSY]);
+      const { launched, launch } = harness(ONE_SLOT, { slots });
+      expect(refusal(yield* launch({ clientRequestId: "same" }))).toMatch(/^slots_full: /);
+      expect(refusal(yield* launch({ clientRequestId: "same" }))).toMatch(/^slots_full: /);
+      expect(launched).toHaveLength(0);
+      slots.running = [];
+      expect(refusal(yield* launch({ clientRequestId: "same" }))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+      // Full again: the retry of the accepted launch starts nothing new, so it is not refused.
+      slots.running = [BUSY];
+      const reads = slots.reads;
+      expect(refusal(yield* launch({ clientRequestId: "same" }))).toBeUndefined();
+      expect(slots.reads).toBe(reads);
+      // A new key is a new start, and is refused.
+      expect(refusal(yield* launch({ clientRequestId: "other" }))).toMatch(/^slots_full: /);
+      // Two launch calls, one thread: the replay asked for the same one.
+      expect(launched).toHaveLength(2);
+      expect(launched[1]!.threadId).toBe(launched[0]!.threadId);
+    }),
+  );
+
+  it.effect("a count that cannot be read refuses (fails closed), nothing launched", () =>
+    Effect.gen(function* () {
+      const slots = { ...world(), fails: true };
+      const { launched, launch } = harness(ONE_SLOT, { slots });
+      expect(refusal(yield* launch({}))).toMatch(/^slots_full: /);
+      expect(launched).toHaveLength(0);
+    }),
+  );
+
+  it.effect("off, or a host that runs no gate: launched as before, nothing read", () =>
+    Effect.gen(function* () {
+      const slots = world([BUSY]);
+      const off = harness(
+        { agentSlots: { mode: "fixed", maxPerMachine: 1 } } as unknown as Settings,
+        { slots },
+      );
+      expect(refusal(yield* off.launch({}))).toBeUndefined();
+      expect(off.launched).toHaveLength(1);
+      expect(slots.reads).toBe(0);
+      const none = harness(ONE_SLOT);
+      expect(refusal(yield* none.launch({}))).toBeUndefined();
+      expect(none.launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("a launch on another machine is that machine's to gate, not this one's", () =>
+    Effect.gen(function* () {
+      // Full here: the call still goes there (an old machine without the gate starts it as before).
+      const slots = world([BUSY]);
+      const { forwarded, launched, launch } = harness(ONE_SLOT, { slots });
+      expect(refusal(yield* launch({ environmentId: THERE }))).toContain("sent there");
+      expect(forwarded).toHaveLength(1);
+      expect(launched).toHaveLength(0);
+      expect(slots.reads).toBe(0);
+    }),
+  );
+});
