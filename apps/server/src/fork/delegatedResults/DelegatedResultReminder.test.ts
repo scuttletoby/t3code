@@ -12,6 +12,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -29,8 +30,15 @@ import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import { legacyReminderSetId, REMINDER_MAX_AGE_MS } from "./delegatedResults.ts";
-import { at, delegatedTask, makeSlots, NOW, PARENT } from "./delegatedResults.testkit.ts";
+import { legacyReminderSetId, REMINDER_MAX_AGE_MS, reminderBatchIds } from "./delegatedResults.ts";
+import {
+  at,
+  delegatedTask,
+  firstFormatReminder,
+  makeSlots,
+  NOW,
+  PARENT,
+} from "./delegatedResults.testkit.ts";
 import * as DelegatedResultReminder from "./DelegatedResultReminder.ts";
 import * as DelegatedResultsStore from "./DelegatedResultsStore.ts";
 
@@ -65,10 +73,19 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
   const tasks = new Map<ThreadId, Array<OrchestrationV2Subagent>>([[PARENT, [delegatedTask()]]]);
   const sent: Array<Sent> = [];
   const receipts = new Map<string, ThreadId>();
+  // Commands the thread refuses, and their refused receipts (never counted as sent).
+  const refusing: { commandIds: ReadonlyArray<string> } = { commandIds: [] };
+  const refused = new Map<string, ThreadId>();
+  // While `latch` is set, a send waits for it before it lands; `inFlight` counts sends under way.
+  const sends: { latch: Deferred.Deferred<void> | null; inFlight: number; mostAtOnce: number } = {
+    latch: null,
+    inFlight: 0,
+    mostAtOnce: 0,
+  };
   let okSends = 0;
   let failSends = 0;
   // The record of earlier reminders cannot be read while this is set.
-  const record = { unreadable: false };
+  const record = { unreadable: false, messagesUnreadable: false };
   // Parents whose wake upstream reserved (null: every parent with tasks), and those the table names.
   const recovery: { ids: ReadonlyArray<ThreadId> | null } = { ids: null };
   const unread: { ids: ReadonlyArray<ThreadId>; since: Array<string> } = { ids: [], since: [] };
@@ -83,6 +100,9 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
     unread,
     record,
     receipts,
+    refusing,
+    refused,
+    sends,
     /** The next `count` sends fail, after `after` more succeed. */
     failNextSends: (count: number, after = 0) => {
       okSends = after;
@@ -97,16 +117,36 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
           getThreadRecords: ((threadId: ThreadId) =>
             Effect.succeed({ subagents: tasks.get(threadId) ?? [] })) as never,
           getMessagesById: (threadId, ids) =>
-            Effect.succeed(
-              new Map(
-                sent
-                  .filter((message) => message.threadId === threadId)
-                  .filter((message) => ids.includes(MessageId.make(message.messageId)))
-                  .map((message) => [MessageId.make(message.messageId), {} as never]),
-              ),
-            ),
+            record.messagesUnreadable
+              ? Effect.fail({ _tag: "OrchestratorProjectionError", message: "busy" } as never)
+              : Effect.succeed(
+                  new Map(
+                    sent
+                      .filter((message) => message.threadId === threadId)
+                      .filter((message) => ids.includes(MessageId.make(message.messageId)))
+                      .map((message) => [
+                        MessageId.make(message.messageId),
+                        { text: message.text } as never,
+                      ]),
+                  ),
+                ),
           sendToThread: (input) =>
             Effect.gen(function* () {
+              if (refusing.commandIds.includes(input.commandId)) {
+                refused.set(input.commandId, input.threadId);
+                return yield* Effect.fail({
+                  _tag: "ThreadManagementCommandInvariantError",
+                  message: "refused",
+                } as never);
+              }
+              sends.inFlight += 1;
+              sends.mostAtOnce = Math.max(sends.mostAtOnce, sends.inFlight);
+              yield* Effect.ensuring(
+                sends.latch === null ? Effect.void : Deferred.await(sends.latch),
+                Effect.sync(() => {
+                  sends.inFlight -= 1;
+                }),
+              );
               if (okSends > 0) okSends -= 1;
               else if (failSends > 0) {
                 failSends -= 1;
@@ -131,7 +171,13 @@ const makeWorld = (waitFor: { readonly enabled: boolean } = { enabled: true }) =
             Effect.succeed(
               receipts.has(commandId)
                 ? Option.some({ status: "accepted", threadId: receipts.get(commandId)! } as never)
-                : Option.none(),
+                : refused.has(commandId)
+                  ? Option.some({
+                      status: "rejected",
+                      threadId: refused.get(commandId)!,
+                      error: "refused",
+                    } as never)
+                  : Option.none(),
             ),
         }),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
@@ -171,6 +217,12 @@ const service = (
 ) => DelegatedResultReminder.make(OPTIONS).pipe(Effect.provide(world.layer(events)));
 
 const setClock = TestClock.setTime(NOW);
+
+const reminderIdsOf = (tasks: ReadonlyArray<OrchestrationV2Subagent>) =>
+  reminderBatchIds(
+    PARENT,
+    tasks.map((task) => task.id),
+  );
 
 /** Lets forked fibers reach their next sleep (or finish) before the clock moves or a check. */
 const settle = Effect.repeat(Effect.yieldNow, { times: 20 });
@@ -283,6 +335,90 @@ describe("DelegatedResultReminder.check", () => {
         type: "sent",
         taskIds: ["task-2"],
       });
+    }),
+  );
+
+  it.effect(
+    "a first-format reminder is split per task: a set grown after it names the new one",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        // A server before the upgrade reminded tasks 1 and 2 with one id for the set.
+        const old = firstFormatReminder(PARENT, ["task-1", "task-2"]);
+        world.sent.push({ threadId: PARENT, ...old });
+        // Task 3 ends after the upgrade, while 1 and 2 are still unread.
+        world.tasks.set(PARENT, [
+          delegatedTask(),
+          delegatedTask({ id: "task-2" }),
+          delegatedTask({ id: "task-3" }),
+        ]);
+        const reminder = yield* service(world);
+        expect(yield* reminder.check(PARENT)).toEqual({ type: "sent", taskIds: ["task-3"] });
+        expect(world.sent[1]!.text).toContain("task-3");
+        expect(world.sent[1]!.text).not.toContain("task-1");
+        // Runs again, and after a restart: nothing more.
+        expect(yield* reminder.check(PARENT)).toEqual({ type: "none" });
+        expect(yield* (yield* service(world)).check(PARENT)).toEqual({ type: "none" });
+        // Task 2 is read; task 4 ends: only task 4.
+        world.tasks.set(PARENT, [
+          delegatedTask(),
+          delegatedTask({ id: "task-3" }),
+          delegatedTask({ id: "task-4" }),
+        ]);
+        expect(yield* (yield* service(world)).check(PARENT)).toEqual({
+          type: "sent",
+          taskIds: ["task-4"],
+        });
+        expect(world.sent).toHaveLength(3);
+      }),
+  );
+
+  it.effect("sends nothing while a first-format reminder's text cannot be read", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const old = firstFormatReminder(PARENT, ["task-1", "task-2"]);
+      world.sent.push({ threadId: PARENT, ...old });
+      world.tasks.set(PARENT, [delegatedTask(), delegatedTask({ id: "task-3" })]);
+      world.record.messagesUnreadable = true;
+      const reminder = yield* service(world);
+      expect(yield* reminder.check(PARENT)).toEqual({ type: "unreadable" });
+      expect(world.sent).toHaveLength(1);
+      expect(reminder.watched.has(PARENT)).toBe(true);
+      world.record.messagesUnreadable = false;
+      expect(yield* reminder.check(PARENT)).toEqual({ type: "sent", taskIds: ["task-3"] });
+    }),
+  );
+
+  it.effect("a refused batch does not hold the next ones back; it stays refused, sent once", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const many = Array.from({ length: 25 }, (_, index) =>
+        delegatedTask({ id: `task-${String(index).padStart(2, "0")}` }),
+      );
+      world.tasks.set(PARENT, many);
+      // The thread refuses the first batch (tasks 00 to 09) only.
+      const first = reminderIdsOf(many.slice(0, 10));
+      world.refusing.commandIds = [first.commandId];
+      const reminder = yield* service(world);
+      expect(yield* reminder.check(PARENT)).toEqual({
+        type: "held",
+        detail: "refused",
+        taskIds: many.slice(10).map((task) => task.id),
+      });
+      expect(world.sent).toHaveLength(2);
+      // Runs again, and after a restart: the refused batch is answered from its receipt, and
+      // nothing is sent twice.
+      expect(yield* reminder.check(PARENT)).toEqual({
+        type: "held",
+        detail: "refused",
+        taskIds: [],
+      });
+      expect(yield* (yield* service(world)).check(PARENT)).toMatchObject({ type: "held" });
+      expect(world.sent).toHaveLength(2);
+      expect(world.refused.size).toBe(1);
     }),
   );
 
@@ -552,6 +688,44 @@ describe("DelegatedResultReminder.start", () => {
       yield* TestClock.adjust(Duration.minutes(1));
       yield* settle;
       expect(world.sent).toHaveLength(1);
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("a startup check slower than the delay never runs beside an event's check", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const pubsub = yield* PubSub.unbounded<Event>();
+      const reminder = yield* service(world, Stream.fromPubSub(pubsub));
+      // The scan's send of task 1 hangs (a slow database), far past the delay.
+      world.sends.latch = yield* Deferred.make<void>();
+      const fiber = yield* reminder.start().pipe(Effect.andThen(Effect.never), Effect.forkScoped);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      expect(world.sends.inFlight).toBe(1);
+      // Task 2 ends meanwhile; its check comes after the delay, while the scan's still hangs.
+      const second = delegatedTask({ id: "task-2" });
+      world.tasks.set(PARENT, [delegatedTask(), second]);
+      yield* PubSub.publish(pubsub, {
+        type: "subagent.updated",
+        threadId: PARENT,
+        payload: second,
+      });
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      yield* Deferred.succeed(world.sends.latch, undefined);
+      yield* settle;
+      yield* TestClock.adjust(Duration.minutes(10));
+      yield* settle;
+      // One check at a time, and each task named in one message only.
+      expect(world.sends.mostAtOnce).toBe(1);
+      const named = world.sent.flatMap((message) =>
+        ["task-1", "task-2"].filter((id) => message.text.includes(id)),
+      );
+      expect(named.toSorted()).toEqual(["task-1", "task-2"]);
       yield* Fiber.interrupt(fiber);
     }).pipe(Effect.scoped),
   );
