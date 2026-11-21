@@ -9,7 +9,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   isLiveSubagentShell,
   type EnvironmentId,
-  type NodeId,
+  NodeId,
   type OrchestrationV2RunStatus,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadShell,
@@ -112,6 +112,26 @@ export const isRemindable = (task: OrchestrationV2Subagent, nowMs: number): bool
 };
 
 /**
+ * Whether a refusal is new to this process (each later check finds its receipt again); a restart
+ * logs a batch still refused once more. `forgetAfterMs`: when a logged id can no longer come back
+ * (the reminder's tasks ended before the refusal, so none is reminded a day later); `null` keeps
+ * every id for the process.
+ */
+export const makeRefusalLog = (forgetAfterMs: number | null = REMINDER_MAX_AGE_MS) => {
+  const logged = new Map<string, number>();
+  return (commandId: string, nowMs: number): boolean => {
+    if (forgetAfterMs !== null) {
+      for (const [id, atMs] of logged) {
+        if (nowMs - atMs > forgetAfterMs) logged.delete(id);
+      }
+    }
+    if (logged.has(commandId)) return false;
+    logged.set(commandId, nowMs);
+    return true;
+  };
+};
+
+/**
  * Busy: the parent's run is going or holds a question, so its own run end comes first and checks
  * again. Background work the parent left running (a monitor, a command) does not hold it: upstream
  * counts that as a live child, but no run end may come for hours, and a queued message is safe.
@@ -124,7 +144,7 @@ export const parentGone = (
   shell: Pick<OrchestrationV2ThreadShell, "archivedAt" | "deletedAt"> | null,
 ): boolean => shell === null || shell.archivedAt !== null || shell.deletedAt !== null;
 
-/** The start of every reminder id, of both formats (see `legacyReminderSetIds`). */
+/** The start of every reminder id, of both formats (see `legacyReminderSetId`). */
 export const REMINDER_ID_PREFIX = "delegated-reminder:";
 const reminderPrefix = (parentThreadId: ThreadId) => `${REMINDER_ID_PREFIX}${parentThreadId}:`;
 const TASK_KEY = /^[0-9a-f]{12}$/;
@@ -144,6 +164,9 @@ export const reminderKey = (taskId: NodeId): string => digestOf([taskId]).slice(
 
 /** At most this many tasks in one reminder, each listed by name. */
 export const REMINDERS_PER_MESSAGE = 10;
+
+/** A reminder's text lists this many tasks by name (a batch is never longer). */
+const MAX_LISTED = 10;
 
 /**
  * A reminder's ids name the key of each task it tells about, so the parent's message and receipt
@@ -177,18 +200,79 @@ export const toldReminderKeys = (
 
 /**
  * Ids of the first reminder format: one message for a whole owed set (a 16-digit digest, never a
- * task key). A message of that id for exactly the owed set, or for one task alone, means those
- * were told. A legacy reminder for some other set cannot be read back, so its tasks may be
- * reminded once more after the upgrade.
+ * task key). Its message's text is split into the tasks it told (`legacyReminderKeys`). With no
+ * text to read (only its receipt is left), a message of that id for exactly the owed set, or for
+ * one task alone, means those were told.
  */
 export const legacyReminderSetId = (parentThreadId: ThreadId, taskIds: ReadonlyArray<NodeId>) =>
   idsFor(REMINDER_ID_PREFIX, parentThreadId, taskIds).messageId;
 
-/** The owed tasks not reminded yet, sorted, in messages of at most `REMINDERS_PER_MESSAGE`. */
+const LEGACY_SET_DIGEST = /^[0-9a-f]{16}$/;
+
+/** The first-format message ids among this parent's sent ids (receipts' command ids included). */
+export const legacyReminderMessageIds = (
+  parentThreadId: ThreadId,
+  sentIds: ReadonlyArray<string>,
+): ReadonlyArray<string> => {
+  const prefix = reminderPrefix(parentThreadId);
+  const ids = sentIds
+    .map((id) => id.replace(/:0$/, ""))
+    .filter((id) => id.startsWith(prefix) && LEGACY_SET_DIGEST.test(id.slice(prefix.length)));
+  return [...new Set(ids)].toSorted();
+};
+
+const LEGACY_HEADER = /^\[delegated results\] (\d+) delegated tasks? ended, /;
+const LEGACY_TASK_LINE = /^- (\S+) "/;
+const LEGACY_MORE_LINE = /^- and (\d+) more$/;
+
+/**
+ * The keys of the tasks a first-format reminder told, from its text (sorted `- <id> "..."` lines,
+ * ten at most), for this parent's own first-format id only. Up to ten, the ids must give its id
+ * back; over ten, the ten listed count (the rest were never named). Else it gives nothing.
+ */
+export const legacyReminderKeys = (
+  parentThreadId: ThreadId,
+  messageId: string,
+  text: string,
+): ReadonlyArray<string> => {
+  if (!legacyReminderMessageIds(parentThreadId, [messageId]).includes(messageId)) return [];
+  const lines = text.split("\n");
+  const header = LEGACY_HEADER.exec(lines[0] ?? "");
+  if (header === null) return [];
+  const count = Number(header[1]);
+  const listed = lines.flatMap((line) => {
+    const match = LEGACY_TASK_LINE.exec(line);
+    return match === null ? [] : [match[1]!];
+  });
+  const more = lines.flatMap((line) => {
+    const match = LEGACY_MORE_LINE.exec(line);
+    return match === null ? [] : [Number(match[1])];
+  });
+  const sorted = listed.every((id, index) => index === 0 || listed[index - 1]! < id);
+  if (!sorted || listed.length !== Math.min(count, MAX_LISTED)) return [];
+  if (count <= MAX_LISTED) {
+    const exact = legacyReminderSetId(
+      parentThreadId,
+      listed.map((id) => NodeId.make(id)),
+    );
+    if (more.length !== 0 || exact !== messageId) return [];
+  } else {
+    // Over ten, no digest check: it covers the unnamed rest too. No risk added: a writer of this
+    // parent's reminder ids can already mark any task told with its one-task id.
+    if (more.length !== 1 || more[0] !== count - MAX_LISTED) return [];
+  }
+  return listed.map((id) => reminderKey(NodeId.make(id)));
+};
+
+/**
+ * The owed tasks not reminded yet, sorted, in messages of at most `REMINDERS_PER_MESSAGE`.
+ * `legacyTexts`: the text of each first-format message still in the thread, by message id.
+ */
 export const reminderBatches = <T extends Pick<OrchestrationV2Subagent, "id">>(
   parentThreadId: ThreadId,
   owed: ReadonlyArray<T>,
   sentIds: ReadonlyArray<string>,
+  legacyTexts: ReadonlyMap<string, string> = new Map(),
 ): ReadonlyArray<ReadonlyArray<T>> => {
   const sent = new Set(sentIds.map((id) => id.replace(/:0$/, "")));
   if (
@@ -202,7 +286,10 @@ export const reminderBatches = <T extends Pick<OrchestrationV2Subagent, "id">>(
   ) {
     return [];
   }
-  const told = toldReminderKeys(parentThreadId, sentIds);
+  const told = new Set(toldReminderKeys(parentThreadId, sentIds));
+  for (const [messageId, text] of legacyTexts) {
+    for (const key of legacyReminderKeys(parentThreadId, messageId, text)) told.add(key);
+  }
   const fresh = [...new Map(owed.map((task) => [task.id, task])).values()]
     .filter(
       (task) =>
@@ -216,8 +303,6 @@ export const reminderBatches = <T extends Pick<OrchestrationV2Subagent, "id">>(
   }
   return batches;
 };
-
-const MAX_LISTED = 10;
 
 export const reminderText = (tasks: ReadonlyArray<OrchestrationV2Subagent>): string => {
   const sorted = tasks.toSorted((a, b) => (a.id < b.id ? -1 : 1));

@@ -87,7 +87,10 @@ def ann(message, level='failure', title='', path='.github'):
     return {'message': message, 'annotation_level': level, 'title': title, 'path': path}
 
 
-def note(host=None, cgroups=None, status='failure', seconds=600):
+FIT = 'fit'   # a note's seconds: the fake GitHub puts in the time between the job's own probe steps
+
+
+def note(host=None, cgroups=None, status='failure', seconds=FIT):
     """A pressure note as fork-ci-pressure.py writes it, decoded as GitHub hands it back."""
     h = {'full_share': 0.0, 'some_share': 0.5, 'full_avg10': 0.0, 'full_avg60': 0.0, 'full_avg300': 0.0,
          'some_avg60': 0.1, 'some_avg300': 0.1, 'available_mb': 9000, 'swap_used_mb': 0, 'oom_kill': 0}
@@ -95,6 +98,29 @@ def note(host=None, cgroups=None, status='failure', seconds=600):
     boxes = cgroups if cgroups is not None else [box()]
     body = json.dumps({'status': status, 'seconds': seconds, 'host': h, 'cgroups': boxes}, separators=(',', ':'))
     return ann(cr.NOTE_HEAD + body, level='notice', title=cr.NOTE_TITLE)
+
+
+def fitted(annotations, j):
+    """The annotations with a FIT note's seconds set to the middle of the job's probe window (600 without one)."""
+    out = []
+    for a in annotations:
+        if a.get('title') == cr.NOTE_TITLE and a['message'].startswith(cr.NOTE_HEAD):
+            try:
+                body = json.loads(a['message'][len(cr.NOTE_HEAD):])
+            except ValueError:
+                body = None   # a garbled note stays as it is
+            if isinstance(body, dict) and body.get('seconds') == FIT:
+                window = cr.probe_window(CFG, j) if j else None
+                body['seconds'] = int(sum(window) / 2) if window else 600
+                a = dict(a, message=cr.NOTE_HEAD + json.dumps(body, separators=(',', ':')))
+        out.append(a)
+    return out
+
+
+def tracking(number, state='open', user=BOT, body=None, **kw):
+    """A tracking issue as GitHub lists it: the bot's, its body starting with the script's marker."""
+    return dict({'number': number, 'title': TITLE, 'state': state, 'user': {'login': user}, 'comments': [],
+                 'body': cr.ISSUE_MARK + '\nEach comment below ...' if body is None else body}, **kw)
 
 
 def box(**kw):
@@ -245,7 +271,8 @@ class Fake:
             return copy.deepcopy(got)
         m = re.fullmatch(r'check-runs/(\d+)/annotations', base)
         if m:
-            return paged(self.ann.get(int(m[1]), []))
+            j = next((j for js in self.jobs.values() for j in js if j['id'] == int(m[1])), None)
+            return paged(fitted(self.ann.get(int(m[1]), []), j))
         m = re.fullmatch(r'branches/(.+)', base)
         if m:
             if m[1] not in self.heads:
@@ -338,7 +365,7 @@ class Signs(Rerun):
                 code, out, text = sweep(gh)
                 self.assertReran(gh, out)
                 self.assertIn('memory full', out)
-                self.assertRegex(out, r'machine: full [0-9.]+% some [0-9.]+% of 600 s')
+                self.assertRegex(out, r'machine: full [0-9.]+% some [0-9.]+% of 65 s')
                 self.assertIn('box /fleet.slice/job-1.service: max', out)
                 self.assertIn('memory full', text)
 
@@ -358,6 +385,65 @@ class Signs(Rerun):
             with self.subTest(label):
                 gh = one([ann(EXIT_137), n])
                 self.assertLeft(gh, *sweep(gh)[:2], 'no infrastructure sign')
+
+    def test_only_the_jobs_own_oom_kill_counts(self):
+        """memory.events counts a cgroup's whole subtree: a shared slice's OOM kill can be another job's. The note's
+        first cgroup is the job's own (one job a runner at a time): only its OOM kills are the job's, and only its
+        own stall says the job waited for memory."""
+        own = dict(path='/fleet.slice/job-1.service', high_mb=None, max_mb=None)
+        shared = dict(path='/fleet.slice', high_mb=None, max_mb=8192)
+        rerun = {
+            'its own OOM kill and stall in a stalled slice': [box(**own, oom_kill=1, full_share=30.0),
+                                                             box(**shared, oom_kill=1, full_share=30.0)],
+            'its own stall while the slice hit memory.max': [box(**own, full_share=30.0),
+                                                              box(**shared, max=2, full_share=30.0)],
+            'its own stall while the slice was throttled': [box(**own, full_share=30.0),
+                                                             box(**dict(shared, high_mb=6144), high=5, full_share=30.0)],
+        }
+        left = {
+            "another job's OOM kill, its own cgroup calm": [box(**own), box(**shared, oom_kill=2, full_share=40.0)],
+            "another job's OOM kill while it stalled too": [box(**own, full_share=30.0),
+                                                            box(**shared, oom_kill=2, full_share=40.0)],
+            'its own OOM kill, its own tasks not stalled': [box(**own, oom_kill=1, full_share=2.0),
+                                                            box(**shared, oom_kill=1, full_share=40.0)],
+            'its own OOM kill and stall, no box stalled': [box(**own, oom_kill=1, full_share=30.0),
+                                                           box(**shared, oom_kill=1, full_share=2.0)],
+            'no cgroup of its own (the root)': [box(path='/', oom_kill=1, full_share=40.0)],
+            'no cgroup read at all': [],
+        }
+        for label, boxes in list(rerun.items()) + list(left.items()):
+            with self.subTest(label):
+                gh = one([ann(EXIT_137), note(cgroups=boxes)])
+                code, out, _ = sweep(gh)
+                if label in rerun:
+                    self.assertReran(gh, out)
+                    self.assertIn("the job's own cgroup 30.0%", out)
+                else:
+                    self.assertLeft(gh, code, out, 'no infrastructure sign')
+
+    def test_each_memory_threshold_is_where_the_config_puts_it(self):
+        mf = CFG['memory_full']
+        at, under = mf['box_full_share_percent'], mf['box_full_share_percent'] - 0.1
+        own = dict(path='/fleet.slice/job-1.service', high_mb=None, max_mb=None)
+        shared = dict(path='/fleet.slice', max_mb=8192)
+        cases = {
+            'the box stalled just enough': ([box(oom_kill=mf['oom_kills'], full_share=at)], True),
+            'the box stalled just too little': ([box(oom_kill=mf['oom_kills'], full_share=under)], False),
+            'its own cgroup stalled just enough': ([box(**own, oom_kill=1, full_share=at),
+                                                    box(**shared, full_share=50.0)], True),
+            'its own cgroup stalled just too little': ([box(**own, oom_kill=1, full_share=under),
+                                                        box(**shared, full_share=50.0)], False),
+            'memory.max hit just enough': ([box(max=mf['max_events'], full_share=50.0)], True),
+            'memory.max hit too little': ([box(max=mf['max_events'] - 1, full_share=50.0)], False),
+            'memory.high hit just enough': ([box(high=mf['high_events'], full_share=50.0)], True),
+            'memory.high hit too little': ([box(high=mf['high_events'] - 1, full_share=50.0)], False),
+            'OOM kills just too few': ([box(oom_kill=mf['oom_kills'] - 1, full_share=50.0)], False),
+        }
+        for label, (boxes, qualifies) in cases.items():
+            with self.subTest(label):
+                gh = one([ann(EXIT_137), note(cgroups=boxes)])
+                code, out, _ = sweep(gh)
+                (self.assertReran if qualifies else lambda gh, out: self.assertLeft(gh, code, out))(gh, out)
 
     def test_an_oom_kill_on_a_github_hosted_runner_never_qualifies(self):
         for group in (HOSTED, None, ''):
@@ -387,6 +473,72 @@ class Signs(Rerun):
         gh = one([ann(JOB_LIMIT), STALLED], dict(conclusion='timed_out', steps=ran('cancelled', took=880), took=900),
                  conclusion='timed_out')
         self.assertReran(gh, sweep(gh)[1])
+
+    def test_each_stall_threshold_is_where_the_config_puts_it(self):
+        st = CFG['stalled']
+        cases = {
+            'the machine stalled just enough': (dict(host={'full_share': st['full_share_percent']}), True),
+            'the machine stalled just too little': (dict(host={'full_share': st['full_share_percent'] - 0.1}), False),
+            'a box stalled just enough': (dict(cgroups=[box(full_share=st['full_share_percent'])]), True),
+            'a box stalled just too little': (dict(cgroups=[box(full_share=st['full_share_percent'] - 0.1)]), False),
+            'an ancestor box stalled': (dict(cgroups=[box(), box(path='/fleet.slice', full_share=50.0)]), True),
+            'the 5-minute average just enough': (dict(host={'full_avg300': st['full_avg300_percent']}), True),
+            'the 5-minute average just too little': (dict(host={'full_avg300': st['full_avg300_percent'] - 0.1}),
+                                                     False),
+            'only the 10-second average high': (dict(host={'full_avg10': 90.0, 'full_avg60': 90.0}), False),
+            'only some tasks stalled': (dict(host={'some_share': 90.0, 'some_avg300': 90.0}), False),
+        }
+        for label, (kw, qualifies) in cases.items():
+            with self.subTest(label):
+                gh = one([ann(STEP_LIMIT), note(**kw)], dict(steps=ran('failure', took=600)))
+                code, out, _ = sweep(gh)
+                if qualifies:
+                    self.assertReran(gh, out)
+                else:
+                    self.assertLeft(gh, code, out, 'not stalled')
+
+    def test_the_time_limit_slack_is_where_the_config_puts_it(self):
+        slack = CFG['limit_slack_seconds']
+        cases = {
+            'the job ran its minutes less the slack': (JOB_LIMIT, dict(conclusion='cancelled', took=900 - slack,
+                                                                      steps=ran('cancelled', took=820)), True),
+            'the job ran a second less': (JOB_LIMIT, dict(conclusion='cancelled', took=900 - slack - 1,
+                                                          steps=ran('cancelled', took=820)), False),
+            'the step ran its minutes less the slack': (STEP_LIMIT, dict(steps=ran('failure', took=600 - slack)),
+                                                        True),
+            'the step ran a second less': (STEP_LIMIT, dict(steps=ran('failure', took=600 - slack - 1)), False),
+        }
+        for label, (message, kw, qualifies) in cases.items():
+            with self.subTest(label):
+                gh = one([ann(message), STALLED], kw)
+                code, out, _ = sweep(gh)
+                if qualifies:
+                    self.assertReran(gh, out)
+                else:
+                    self.assertLeft(gh, code, out, "GitHub's time-limit text, but")
+
+    def test_a_step_limit_needs_the_step_itself_ended_red(self):
+        # GitHub ends a step that ran past its limit cancelled or failed; a step that passed or was skipped did not
+        # hit it, however long it took.
+        for conclusion, qualifies in (('failure', True), ('cancelled', True), ('success', False), ('skipped', False)):
+            with self.subTest(conclusion):
+                steps = ran('failure', took=600)
+                steps[2] = step('Test', conclusion, took=600, at=10)
+                gh = one([ann(STEP_LIMIT), STALLED], dict(steps=steps))
+                code, out, _ = sweep(gh)
+                if qualifies:
+                    self.assertReran(gh, out)
+                else:
+                    self.assertLeft(gh, code, out, "no step 'Test' ran 10 min and ended red")
+
+    def test_a_time_limit_message_counts_only_as_a_whole_runner_message(self):
+        for label, a in {'inside a longer line': ann('Error: ' + JOB_LIMIT), 'with text after': ann(JOB_LIMIT + ' x'),
+                         'as a warning': ann(JOB_LIMIT, 'warning'), 'with a title': ann(JOB_LIMIT, title='Error'),
+                         'on a file': ann(JOB_LIMIT, path='src/x.test.ts')}.items():
+            with self.subTest(label):
+                gh = one([a, ann(CANCELED), STALLED], dict(conclusion='cancelled', steps=ran('cancelled', took=880),
+                                                            took=900))
+                self.assertLeft(gh, *sweep(gh)[:2])
 
     def test_a_time_limit_message_needs_the_time_really_spent(self):
         cases = {
@@ -441,6 +593,54 @@ class Signs(Rerun):
         self.assertEqual(cr.limit_of(wf, 'Lint', CFG['probe_end_step']), 1)
         self.assertEqual(cr.limit_of(wf, 'Lint'), real['lint']['timeout-minutes'])
         self.assertIsNone(cr.limit_of(wf, 'Lint', 'Check'), 'a step without timeout-minutes has none of its own')
+
+    def test_the_reader_takes_only_values_it_is_sure_of(self):
+        cases = {
+            'plain': ('10', '10'), 'a comment after it': ("10   # the step's own", '10'),
+            'single-quoted': ("'Note it'", 'Note it'), 'a quote in single quotes': ("'it''s'", "it's"),
+            'empty single quotes': ("''", ''), 'double-quoted': ('"Test"', 'Test'), 'empty double quotes': ('""', ''),
+            'an escape in double quotes': ('"a\\tb"', None), 'a block': ('|', None), 'a folded block': ('>-', None),
+            'an anchor': ('&x 10', None), 'a list': ('[1]', None), 'a map': ('{a: 1}', None), 'a lone quote': ("'", None),
+            'mismatched quotes': ('\'a"', None), 'a quote only at the end': ("x'", "x'"),
+            'a double quote only at the end': ('x"', 'x"'), 'a bar inside': ('a|', 'a|'), 'empty': ('', None),
+        }
+        for label, (raw, want) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(cr.scalar(raw), want)
+        text = WORKFLOW.replace('    timeout-minutes: 15', '    timeout-minutes: ${{ inputs.minutes || 15 }}') + (
+            'env:\n  A: 1\n  B:\n    C:\n      - name: x\n        timeout-minutes: 3\n')
+        wf = cr.workflow_limits(text)   # a key after `jobs:` ends the jobs; a limit that is not a number is none
+        self.assertEqual((sorted(wf), wf['test']['minutes'], cr.limit_of(wf, 'Test (1)', 'Test')),
+                         (['lint', 'test'], None, 10))
+        self.assertEqual([s['name'] for s in wf['test']['steps']],
+                         ['Checkout', 'Note memory pressure at the start', 'Test', END_STEP])
+
+    def test_a_name_matches_only_as_github_shows_it(self):
+        wf = cr.workflow_limits(WORKFLOW)
+        self.assertEqual((cr.limit_of(wf, 'Test (1)'), cr.limit_of(wf, 'Test'), cr.limit_of(wf, 'Test (1)', 'Test')),
+                         (15, 15, 10))
+        self.assertIsNone(cr.limit_of(wf, 'Pre Test (1)'), 'a longer name is another job')
+        self.assertIsNone(cr.limit_of(wf, 'Test (1) x'))
+        self.assertIsNone(cr.limit_of(wf, 'Test (1)', 'Test (2)'), "a step's name never carries matrix values")
+        self.assertIsNone(cr.limit_of(wf, 'Test (1)', 'Pre Test'))
+
+    def test_the_workflow_is_read_once_at_the_runs_own_commit(self):
+        gh = Fake([run()])
+        limits = cr.workflow_reader(CFG, gh, run())
+        self.assertEqual((limits('Test (1)', 'Test'), limits('Test (2)'), limits('Lint')), (10, 15, 20))
+        self.assertEqual(sum(1 for _, p in gh.calls if p.startswith('contents/')), 1)
+        for sha in ('main', SHA + '&ref=main', 'v' + SHA):   # not exactly one commit: could change under the reader
+            with self.assertRaisesRegex(ValueError, 'no commit to read the workflow at'):
+                cr.workflow_reader(CFG, gh, dict(run(), head_sha=sha))('Test (1)')
+        self.assertEqual(sum(1 for _, p in gh.calls if p.startswith('contents/')), 1)
+        real = gh.call
+        gh.call = lambda path, method='GET', data=None: dict(real(path, method, data), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'not readable through the contents API'):
+            cr.workflow_reader(CFG, gh, run())('Test (1)')
+
+    def test_a_job_with_no_note_at_all_is_left_red(self):
+        gh = one([ann(EXIT_137)])
+        self.assertLeft(gh, *sweep(gh)[:2], 'no pressure note')
 
     def test_a_stalled_note_without_its_status_is_no_limit_sign(self):
         n = dict(STALLED, message=STALLED['message'].replace('"status":"failure",', ''))
@@ -553,6 +753,85 @@ class StepOutputIsNoSign(Rerun):
             with self.subTest(label):
                 gh = one([ann(EXIT_137), self.FORGED], dict(steps=steps))
                 self.assertLeft(gh, *sweep(gh)[:2], 'did not complete')
+
+    def test_a_note_must_fit_the_runners_own_times_of_the_probe_steps(self):
+        """A step can print a note in the runner's own form and keep the end step from writing its own (or have the
+        real one dropped at GitHub's cap). Its seconds must fit the time between the two probe steps by the runner's
+        own record, which a step that prints a note earlier cannot know."""
+        window = cr.probe_window(CFG, job(11))
+        self.assertEqual(window, (70 - 10 - CFG['note_slack_seconds'], 75 - 5 + CFG['note_slack_seconds']))
+        full = [box(oom_kill=1, full_share=30.0)]
+        for seconds, qualifies in ((window[0], True), (window[1], True), (window[0] - 1, False), (window[1] + 1, False),
+                                   (600, False), (None, False), ('65', False), (True, False)):
+            with self.subTest(seconds=seconds):
+                gh = one([ann(EXIT_137), note(cgroups=full, seconds=seconds)])
+                code, out, _ = sweep(gh)
+                if qualifies:
+                    self.assertReran(gh, out)
+                else:
+                    self.assertLeft(gh, code, out, "not its end step's")
+        start = 'Note memory pressure at the start'
+        for label, steps in {'no start step': [s for s in ran() if s['name'] != start],
+                             'two start steps': ran()[:2] + ran()[1:],
+                             'a start step that never completed': [s if s['name'] != start else
+                                                                   step(start, None, 'in_progress', at=5)
+                                                                   for s in ran()]}.items():
+            with self.subTest(label):
+                gh = one([ann(EXIT_137), note(cgroups=full, seconds=65)], dict(steps=steps))
+                self.assertLeft(gh, *sweep(gh)[:2], 'times to check the note against')
+
+    def test_at_githubs_annotation_cap_no_note_is_trusted(self):
+        """GitHub keeps the first annotation_cap annotations of a job. The end step's note comes last, so at the cap
+        the real one may be gone and a step's printed note stands alone: refused, whatever it says."""
+        cap = CFG['annotation_cap']
+        lint = [ann(f'line {i}: unused', 'warning', path='src/x.ts') for i in range(cap)]
+        for others, qualifies in ((cap - 2, True), (cap - 1, False), (cap, False)):
+            with self.subTest(annotations=others + 1):
+                gh = one(lint[:others] + [self.FORGED])
+                code, out, _ = sweep(gh)
+                if qualifies:
+                    self.assertReran(gh, out)
+                else:
+                    self.assertLeft(gh, code, out, f"GitHub's cap of {cap}")
+
+    def test_a_stopped_end_probe_leaves_no_note_to_read(self):
+        """The end step runs its probe under `timeout -k 5 $FORK_CI_PROBE_SECONDS ... || echo "::warning::..."`. A
+        probe stopped at that limit (or one that raised) ends the step green, with a warning and no note of its own.
+        A note a step printed earlier is then the only one, and the stop widens the window enough for it to fit
+        (the review's record: start step 1 s, end step 45 s, the printed note's seconds in the window): refused, by
+        the end step's own time or by the probe's warning. Old code: re-run."""
+        limit = CFG['probe_limit_seconds']
+
+        def end_took(seconds):
+            return ran()[:-1] + [step(END_STEP, at=70, took=seconds)]
+        self.assertEqual(cr.probe_window(CFG, job(11, steps=end_took(45))), (57, 113))   # wide: a guess lands in it
+        for seconds, qualifies in ((limit - 1, True), (limit, False), (45, False), (limit + 600, False)):
+            with self.subTest(end_step_took=seconds):
+                gh = one([ann(EXIT_137), self.FORGED], dict(steps=end_took(seconds)))
+                code, out, _ = sweep(gh)
+                if qualifies:
+                    self.assertReran(gh, out)
+                else:
+                    self.assertLeft(gh, code, out, f"the probe's limit of {limit} s")
+                    self.assertEqual(gh.comments(), [])
+        warnings = {
+            'the end probe stopped': 'fork-ci-pressure: end stopped (exit 124), no numbers',
+            'the end probe killed': 'fork-ci-pressure: end stopped (exit 137), no numbers',
+            'the end probe raised': 'fork-ci-pressure: end: ValueError: Expecting value: line 1 column 1 (char 0)',
+            'the start probe stopped': 'fork-ci-pressure: start stopped (exit 124), no numbers; the job goes on',
+            'printed by a step, at notice level': ('fork-ci-pressure: anything', 'notice'),
+        }
+        for label, w in warnings.items():
+            text, level = w if isinstance(w, tuple) else (w, 'warning')
+            for where in ('before', 'after'):
+                with self.subTest(label, where=where):
+                    anns = [ann(EXIT_137), ann(text, level)]
+                    anns.insert(1 if where == 'before' else 2, self.FORGED)
+                    gh = one(anns)
+                    code, out, _ = sweep(gh)
+                    self.assertLeft(gh, code, out, 'the probe warned')
+        gh = one([ann(EXIT_137), ann('pressure: fork-ci-pressure: inside a line', 'warning'), self.FORGED])
+        self.assertReran(gh, sweep(gh)[1])   # only a message that starts with the probe's words is its warning
 
 
 class Cancel(Rerun):
@@ -721,19 +1000,124 @@ class TheNotice(Rerun):
         sweep(gh)
         self.assertEqual((len(gh.issues), len(issue['comments'])), (1, 3))
 
-    def test_only_an_open_issue_the_bot_opened_with_exactly_the_title_is_ours(self):
+    def test_only_an_open_issue_the_bot_opened_with_the_marker_is_ours(self):
         gh = lost()
         gh.issues = [
-            {'number': 3, 'title': TITLE, 'state': 'open', 'user': {'login': OWNER}, 'comments': []},
-            {'number': 4, 'title': TITLE + ' (old)', 'state': 'open', 'user': {'login': BOT}, 'comments': []},
-            {'number': 5, 'title': TITLE, 'state': 'closed', 'user': {'login': BOT}, 'comments': []},
-            {'number': 6, 'title': TITLE, 'state': 'open', 'user': {'login': BOT}, 'comments': [],
-             'pull_request': {}},
+            tracking(3, user=OWNER),                                   # a person's, marker and all
+            tracking(4, body=f'Seen it.\n{cr.ISSUE_MARK}'),            # the marker not first: quoted, not ours
+            tracking(5, state='closed'),
+            tracking(6, pull_request={}),
+            tracking(7, title='Secret sweep failed', body='The sweep failed.'),   # the bot's other issues
         ]
         sweep(gh)
         [ours] = [i for i in gh.issues if i['comments']]
-        self.assertNotIn(ours['number'], (3, 4, 5, 6))
+        self.assertNotIn(ours['number'], (3, 4, 5, 6, 7))
         self.assertEqual((ours['title'], ours['user']['login']), (TITLE, BOT))
+        self.assertTrue(ours['body'].startswith(cr.ISSUE_MARK + '\n'))
+        # Renaming the issue keeps it ours: the marker, not the title, finds it.
+        ours['title'] = 'CI re-runs (renamed)'
+        gh.runs[3] = run(3, created=T0 - 60)
+        gh.jobs[3] = [job(31, steps=died())]
+        gh.ann[31] = [ann(LOST)]
+        sweep(gh)
+        self.assertEqual((len(gh.issues), len(ours['comments'])), (6, 2))
+
+    def test_a_pass_whose_issue_reply_was_lost_opens_no_second_one(self):
+        # GitHub took the POST, the reply never came back: the pass stops red with the issue open. The next pass
+        # finds it by its marker and uses it (#707's code found it by its title, which also held here).
+        gh = lost()
+        real = gh.call
+        def call(path, method='GET', data=None):
+            got = real(path, method, data)
+            if method == 'POST' and path == 'issues':
+                raise urllib.error.URLError('issue: reply lost')
+            return got
+        gh.call = call
+        code, out, _ = sweep(gh)
+        self.assertEqual((code, gh.posts(), len(gh.issues), gh.comments()), (1, [], 1, []), out)
+        gh.call = real
+        for _ in range(2):   # runs again: the open issue is found by its marker, never a second one
+            code, out, _ = sweep(gh)
+            self.assertEqual(code, 0, out)
+        self.assertEqual((len(gh.posts()), len(gh.issues), len(gh.comments())), (1, 1, 1), out)
+
+    def test_an_issue_another_pass_opened_since_this_one_loaded_is_used(self):
+        gh = lost()
+        real = gh.call
+        def call(path, method='GET', data=None):
+            got = real(path, method, data)
+            if method == 'GET' and path.startswith('issues?') and not gh.issues:
+                gh.issues.append(tracking(41))   # a dispatched pass opened it just after this pass's load()
+            return got
+        gh.call = call
+        code, out, _ = sweep(gh)
+        self.assertEqual((code, [i['number'] for i in gh.issues], len(gh.issues[0]['comments'])), (0, [41], 1), out)
+        self.assertNotIn(('POST', 'issues'), gh.calls)
+
+    def test_two_open_issues_are_made_one_by_the_next_pass(self):
+        # A pass stopped after opening its own and before closing it as a duplicate: both are open.
+        gh = lost()
+        gh.issues = [tracking(12), tracking(10)]
+        code, out, _ = sweep(gh)
+        self.assertEqual(code, 0, out)
+        first, second = sorted(gh.issues, key=lambda i: i['number'])
+        self.assertEqual((first['state'], len(first['comments'])), ('open', 1))
+        self.assertEqual((second['state'], second['state_reason'], [c['body'] for c in second['comments']]),
+                         ('closed', 'not_planned', ['Duplicate of #10.']))
+
+    def test_a_duplicate_that_cannot_be_closed_still_leaves_one_record(self):
+        # Each pass tries the close again; a close that keeps failing posts no "Duplicate of" (old code: one more
+        # every pass, 10 minutes apart), the pass warns, and the close that works posts it once.
+        gh = lost()
+        gh.issues = [tracking(10), tracking(12)]
+        real = gh.call
+        def call(path, method='GET', data=None):
+            if method == 'PATCH':
+                raise urllib.error.URLError('patch: reset')
+            return real(path, method, data)
+        gh.call = call
+        for n in range(3):
+            code, out, _ = sweep(gh)
+            self.assertEqual((code, len(gh.posts()), len(gh.issue(10)['comments'])), (0, 1, 1), out)
+            self.assertEqual((gh.issue(12)['state'], gh.issue(12)['comments']), ('open', []), f'pass {n + 1}')
+            self.assertIn('::warning::fork-ci re-run: a second tracking issue could not be closed as a duplicate of '
+                          'issue #10 (#12: URLError', out)
+        gh.call = real
+        for _ in range(2):   # runs again: closes it this time, says so once, and writes nothing twice
+            code, out, _ = sweep(gh)
+            self.assertNotIn('could not be closed', out)
+        self.assertEqual((gh.issue(12)['state'], [c['body'] for c in gh.issue(12)['comments']],
+                          len(gh.issue(10)['comments'])), ('closed', ['Duplicate of #10.'], 1))
+
+    def test_every_pass_closes_a_duplicate_even_with_nothing_to_record(self):
+        # The runbook's promise: a pass reads the issue for its 24 h count at its end, so the next pass closes an
+        # extra one, even with no red run (or only a fleet-mode report) to record.
+        gh = Fake([])
+        gh.issues = [tracking(12), tracking(10)]
+        code, out, _ = sweep(gh)
+        self.assertEqual((code, gh.issue(10)['state'], gh.issue(12)['state']), (0, 'open', 'closed'), out)
+        self.assertIn('(issue #10)', out)
+
+    def test_a_pass_whose_own_duplicate_another_pass_closed_leaves_it_alone(self):
+        # Two passes open one each at once; the other pass's load() closes this pass's issue (#41) before this
+        # pass reads the open ones again. This pass uses #10 and neither closes #41 again nor posts a second
+        # "Duplicate of" (the `mine in ours` guard).
+        gh = lost()
+        real = gh.call
+        def call(path, method='GET', data=None):
+            got = real(path, method, data)
+            if method == 'POST' and path == 'issues':
+                gh.issues.insert(0, tracking(10))
+                gh.issue(41).update(state='closed', state_reason='not_planned')   # the other pass's load()
+                gh.issue(41)['comments'].append({'id': 1, 'body': 'Duplicate of #10.', 'user': {'login': BOT},
+                                                 'created_at': iso(gh.now)})
+            return got
+        gh.call = call
+        code, out, _ = sweep(gh)
+        self.assertEqual((code, gh.posts(), len(gh.issue(10)['comments'])), (0, ['actions/runs/1/rerun-failed-jobs'],
+                                                                             1), out)
+        self.assertEqual([c['body'] for c in gh.issue(41)['comments']], ['Duplicate of #10.'])
+        self.assertNotIn(('PATCH', 'issues/41'), gh.calls)
 
     def test_two_passes_opening_it_at_once_keep_the_lowest(self):
         gh = lost()
@@ -742,8 +1126,7 @@ class TheNotice(Rerun):
             got = real(path, method, data)
             if method == 'POST' and path == 'issues' and len(gh.issues) == 1:
                 # A dispatched pass opened one too, just before this one.
-                gh.issues.insert(0, {'number': 10, 'title': TITLE, 'state': 'open', 'user': {'login': BOT},
-                                     'comments': []})
+                gh.issues.insert(0, tracking(10))
             return got
         gh.call = call
         sweep(gh)
@@ -753,7 +1136,7 @@ class TheNotice(Rerun):
 
     def test_the_24_hour_count_reads_every_comment_past_hundreds_of_reruns(self):
         gh = Fake([])
-        gh.issues = [{'number': 2, 'title': TITLE, 'state': 'open', 'user': {'login': BOT}, 'comments': []}]
+        gh.issues = [tracking(2)]
         comments = gh.issues[0]['comments']
         for n in range(350):   # one every 4 minutes: 350 in the last 24 h
             comments.append({'id': n, 'user': {'login': BOT}, 'created_at': iso(T0 - 26 * 3600 + n * 240),
@@ -774,7 +1157,7 @@ class TheNotice(Rerun):
     def test_an_issue_that_cannot_be_read_ends_the_pass_red_and_asks_nothing(self):
         for label, gh in (('no run to look at', Fake([])), ('a run that qualifies', lost())):
             with self.subTest(label):
-                gh.issues = [{'number': 2, 'title': TITLE, 'state': 'open', 'user': {'login': BOT}, 'comments': []}]
+                gh.issues = [tracking(2)]
                 gh.comments_fail = True
                 code, out, text = sweep(gh)
                 self.assertEqual((code, gh.posts(), gh.comments()), (1, [], []), out)
@@ -804,8 +1187,8 @@ class TheNotice(Rerun):
     def test_no_issue_yet_counts_zero_and_opens_nothing(self):
         code, out, text = sweep(Fake([]))
         self.assertEqual(code, 0, out)
-        self.assertIn('0 run(s) re-run by this pass; 0 automatic re-run(s) asked in the last 24 h (no tracking '
-                      'issue yet)', out)
+        self.assertIn('0 run(s) re-run by this pass; 0 automatic re-run(s) asked in the last 24 h (no open '
+                      'tracking issue)', out)
         self.assertIn('### fork-ci re-run', text)
 
     def test_fleet_mode_reports_once_and_does_not_rerun(self):
@@ -997,6 +1380,12 @@ class Config(unittest.TestCase):
             'a listing shorter than the window': lambda c: c.__setitem__('list_hours', 0.5),
             'no hosted group': lambda c: c.__setitem__('hosted_runner_groups', []),
             'no end step': lambda c: c.__setitem__('probe_end_step', ''),
+            'no start step': lambda c: c.pop('probe_start_step'),
+            'one step for both': lambda c: c.__setitem__('probe_start_step', c['probe_end_step']),
+            'no note slack': lambda c: c.__setitem__('note_slack_seconds', 0),
+            'no annotation cap': lambda c: c.__setitem__('annotation_cap', None),
+            'no probe limit': lambda c: c.pop('probe_limit_seconds'),
+            'a zero probe limit': lambda c: c.__setitem__('probe_limit_seconds', 0),
             'a notice by a person': lambda c: c['notice'].__setitem__('author', OWNER),
             'a notice without a title': lambda c: c['notice'].__setitem__('title', ''),
         }
@@ -1047,10 +1436,12 @@ class ProbeToDecider(unittest.TestCase):
         self.assertNotIn('\n', data)
         message = data.replace('%0A', '\n').replace('%0D', '\r').replace('%25', '%')   # what the runner does
         anns = [ann(EXIT_137), ann(message, 'notice', cr.NOTE_TITLE)]
-        got, why = cr.note_of(CFG, job(1), anns)
+        j = job(1, steps=ran(took=300))   # its probe steps 297 to 313 s apart: the note's 300 s fit
+        got, why = cr.note_of(CFG, j, anns)
         self.assertIsNone(why)
         self.assertEqual(got['cgroups'][0]['path'], '/a%b\nc')
-        self.assertEqual(cr.job_sign(CFG, job(1), anns)[0], 'memory full')
+        self.assertEqual(cr.job_sign(CFG, j, anns)[0], 'memory full')
+        self.assertIn('not its end step', cr.note_of(CFG, job(1), anns)[1])   # 300 s on a job of 57 to 73 s
         self.assertEqual((probe.NOTE_TITLE, probe.NOTE_HEAD), (cr.NOTE_TITLE, cr.NOTE_HEAD))
 
 

@@ -120,6 +120,10 @@ jobs:
       fleet_mode: ${{ steps.route.outputs.mode }}
       fleet_attempt: ${{ steps.route.outputs.attempt }}
       fleet_watch: ${{ steps.route.outputs.watch || 'false' }}
+      # The memory pressure probe's time limit in seconds (fork-ci-pressure.py, the first and last step of each
+      # app job), here only. fork-ci-rerun.py reads no note from a job whose end step took this long
+      # (.github/fork-ci-rerun.json probe_limit_seconds is the same number: fork-ci-pressure.test.py).
+      probe_seconds: "40"
     steps:
       - name: Checkout
         if: inputs.ref == ''
@@ -427,6 +431,15 @@ jobs:
         run: |
           if ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
+          fi
+      # fork-fleet-refresh.test.py runs the refresh service's sandbox for real, as a transient unit of the runner
+      # user's systemd manager. Ubuntu 24.04's AppArmor keeps unprivileged user namespaces from that manager, so it
+      # would apply no sandbox and the test would skip (red: no test of it may skip). Allowed here, so the test runs
+      # whatever the runner image's default; a kernel without the switch has no such restriction.
+      - name: Let the user manager apply a services sandbox
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Fork script tests
         env:
@@ -749,10 +762,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
-      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job,
+      # and one that hangs on a stalled machine is stopped after the `changes` job's probe_seconds with a warning:
+      # the tests still run).
       - name: Note memory pressure at the start
         timeout-minutes: 1
-        run: python3 -I .github/scripts/fork-ci-pressure.py start
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       - name: Reject repository-owned PR assets
         run: |
@@ -814,7 +829,7 @@ jobs:
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
-        run: python3 -I .github/scripts/fork-ci-pressure.py end
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py end || echo "::warning::fork-ci-pressure: end stopped (exit $?), no numbers"'
 
   build:
     name: Build and Typecheck
@@ -835,10 +850,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
-      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job,
+      # and one that hangs on a stalled machine is stopped after the `changes` job's probe_seconds with a warning:
+      # the tests still run).
       - name: Note memory pressure at the start
         timeout-minutes: 1
-        run: python3 -I .github/scripts/fork-ci-pressure.py start
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       # Runs in the background while Vite+ installs; the step before the build waits for it.
       # Xvfb is for the desktop launch check below.
@@ -984,7 +1001,7 @@ jobs:
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
-        run: python3 -I .github/scripts/fork-ci-pressure.py end
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py end || echo "::warning::fork-ci-pressure: end stopped (exit $?), no numbers"'
 
   # Everything except `t3` (apps/server) and the web app, which have their own jobs.
   # Upstream runs this on one large runner; one 4-CPU runner took 6 minutes.
@@ -1013,10 +1030,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
-      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job,
+      # and one that hangs on a stalled machine is stopped after the `changes` job's probe_seconds with a warning:
+      # the tests still run).
       - name: Note memory pressure at the start
         timeout-minutes: 1
-        run: python3 -I .github/scripts/fork-ci-pressure.py start
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       # A shard with nothing to run says so in the summary and stops here.
       - name: Pick this shard's packages
@@ -1128,7 +1147,7 @@ jobs:
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
-        run: python3 -I .github/scripts/fork-ci-pressure.py end
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py end || echo "::warning::fork-ci-pressure: end stopped (exit $?), no numbers"'
 
   # Upstream runs this on one large runner; on a 4-CPU runner the 548 files
   # took 7.5 minutes, so each of the shards below takes a vitest slice.
@@ -1158,10 +1177,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
-      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job,
+      # and one that hangs on a stalled machine is stopped after the `changes` job's probe_seconds with a warning:
+      # the tests still run).
       - name: Note memory pressure at the start
         timeout-minutes: 1
-        run: python3 -I .github/scripts/fork-ci-pressure.py start
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
@@ -1219,7 +1240,7 @@ jobs:
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
-        run: python3 -I .github/scripts/fork-ci-pressure.py end
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py end || echo "::warning::fork-ci-pressure: end stopped (exit $?), no numbers"'
 
   # apps/server runs its test files one at a time; shards spread them over
   # separate runners. As upstream, the shards run the change detector
@@ -1251,10 +1272,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
-      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job,
+      # and one that hangs on a stalled machine is stopped after the `changes` job's probe_seconds with a warning:
+      # the tests still run).
       - name: Note memory pressure at the start
         timeout-minutes: 1
-        run: python3 -I .github/scripts/fork-ci-pressure.py start
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       - name: Detect affected jobs
         id: changes
@@ -1381,7 +1404,7 @@ jobs:
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
-        run: python3 -I .github/scripts/fork-ci-pressure.py end
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py end || echo "::warning::fork-ci-pressure: end stopped (exit $?), no numbers"'
 
   rust:
     name: Rust
@@ -1402,10 +1425,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
-      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job,
+      # and one that hangs on a stalled machine is stopped after the `changes` job's probe_seconds with a warning:
+      # the tests still run).
       - name: Note memory pressure at the start
         timeout-minutes: 1
-        run: python3 -I .github/scripts/fork-ci-pressure.py start
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -1431,7 +1456,7 @@ jobs:
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
-        run: python3 -I .github/scripts/fork-ci-pressure.py end
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py end || echo "::warning::fork-ci-pressure: end stopped (exit $?), no numbers"'
 
   # Upstream runs this on macOS 26. GitHub-hosted macOS minutes are free on a
   # public repository; it runs only for native mobile sources or a workflow change.
@@ -1485,10 +1510,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
-      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
+      # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job,
+      # and one that hangs on a stalled machine is stopped after the `changes` job's probe_seconds with a warning:
+      # the tests still run).
       - name: Note memory pressure at the start
         timeout-minutes: 1
-        run: python3 -I .github/scripts/fork-ci-pressure.py start
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py start || echo "::warning::fork-ci-pressure: start stopped (exit $?), no numbers; the job goes on"'
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
@@ -1505,7 +1532,7 @@ jobs:
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
-        run: python3 -I .github/scripts/fork-ci-pressure.py end
+        run: 'timeout -k 5 "${{ needs.changes.outputs.probe_seconds }}" python3 -I .github/scripts/fork-ci-pressure.py end || echo "::warning::fork-ci-pressure: end stopped (exit $?), no numbers"'
 
   # The one check a ruleset requires. Fails when any job fails or is cancelled,
   # or is skipped without a reason: `changes` said its gates were not needed,

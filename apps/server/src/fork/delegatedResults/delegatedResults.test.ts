@@ -14,7 +14,10 @@ import {
   ORPHANS_PER_MESSAGE,
   orphansOf,
   parentBusy,
+  legacyReminderKeys,
+  legacyReminderMessageIds,
   legacyReminderSetId,
+  makeRefusalLog,
   REMINDER_MAX_AGE_MS,
   reminderBatches,
   reminderBatchIds,
@@ -26,7 +29,7 @@ import {
   toldOrphanKeys,
   toldReminderKeys,
 } from "./delegatedResults.ts";
-import { at, delegatedTask, NOW, PARENT } from "./delegatedResults.testkit.ts";
+import { at, delegatedTask, firstFormatReminder, NOW, PARENT } from "./delegatedResults.testkit.ts";
 
 describe("resultDelivery", () => {
   it("is null while the task runs", () => {
@@ -163,6 +166,118 @@ describe("reminder ids", () => {
     // One task told the old way: a grown set names only the new task.
     const legacyA = legacyReminderSetId(PARENT, ids("a"));
     expect(named(reminderBatches(PARENT, tasks("a", "b"), [legacyA]))).toEqual([["b"]]);
+  });
+
+  it("splits a first-format reminder into its tasks from its text (issue 695)", () => {
+    // Told {a, b} the old way; b was read since, and c ended after the upgrade.
+    const old = firstFormatReminder(PARENT, ["a", "b"]);
+    const texts = new Map([[old.messageId, old.text]]);
+    expect(legacyReminderKeys(PARENT, old.messageId, old.text)).toEqual([
+      reminderKey(NodeId.make("a")),
+      reminderKey(NodeId.make("b")),
+    ]);
+    expect(named(reminderBatches(PARENT, tasks("a", "c"), [old.commandId], texts))).toEqual([
+      ["c"],
+    ]);
+    expect(named(reminderBatches(PARENT, tasks("a", "b", "c"), [old.messageId], texts))).toEqual([
+      ["c"],
+    ]);
+    // Without its text (only the receipt is left) the set no longer matches: all are reminded.
+    expect(named(reminderBatches(PARENT, tasks("a", "c"), [old.commandId]))).toEqual([["a", "c"]]);
+    // The first wording ("never reached") reads the same.
+    const first = firstFormatReminder(PARENT, ["a"], "never");
+    expect(legacyReminderKeys(PARENT, first.messageId, first.text)).toEqual([
+      reminderKey(NodeId.make("a")),
+    ]);
+  });
+
+  it("trusts a first-format text only when it reads back exactly", () => {
+    const old = firstFormatReminder(PARENT, ["a", "b"]);
+    // Another parent's id, or a text that names another set: the digest does not match.
+    expect(legacyReminderKeys(ThreadId.make("other"), old.messageId, old.text)).toEqual([]);
+    const other = firstFormatReminder(PARENT, ["a", "c"]);
+    expect(legacyReminderKeys(PARENT, old.messageId, other.text)).toEqual([]);
+    // A title that broke its line adds a task line: the count no longer matches.
+    const injected = old.text.replace('- b "a task"', '- b "x"\n- c "y"');
+    expect(legacyReminderKeys(PARENT, old.messageId, injected)).toEqual([]);
+    // Unsorted, duplicated, or another kind of message.
+    const swapped = old.text
+      .replace("- a ", "- tmp ")
+      .replace("- b ", "- a ")
+      .replace("- tmp ", "- b ");
+    expect(legacyReminderKeys(PARENT, old.messageId, swapped)).toEqual([]);
+    expect(legacyReminderKeys(PARENT, old.messageId, old.text.replace("- b ", "- a "))).toEqual([]);
+    expect(legacyReminderKeys(PARENT, old.messageId, "hello")).toEqual([]);
+    expect(legacyReminderKeys(PARENT, old.messageId, `${old.text}\n- and 2 more`)).toEqual([]);
+  });
+
+  it("over ten tasks, takes the ten a first-format text listed; the rest are reminded once", () => {
+    const names = Array.from({ length: 12 }, (_, index) => `t-${String(index).padStart(2, "0")}`);
+    const old = firstFormatReminder(PARENT, names);
+    expect(old.text).toContain("- and 2 more");
+    const listed = names.slice(0, 10).map((name) => reminderKey(NodeId.make(name)));
+    expect(legacyReminderKeys(PARENT, old.messageId, old.text)).toEqual(listed);
+    const texts = new Map([[old.messageId, old.text]]);
+    // A new task ends: the set changed, so the exact match is gone; the two unlisted and the
+    // new one are reminded, the ten listed are not.
+    expect(named(reminderBatches(PARENT, tasks(...names, "t-12"), [old.messageId], texts))).toEqual(
+      [["t-10", "t-11", "t-12"]],
+    );
+    // A count that does not match the listed ones gives nothing.
+    expect(
+      legacyReminderKeys(PARENT, old.messageId, old.text.replace("and 2 more", "and 3 more")),
+    ).toEqual([]);
+    expect(
+      legacyReminderKeys(PARENT, old.messageId, old.text.replace(/\n- t-09 [^\n]*/, "")),
+    ).toEqual([]);
+    // Over ten there is no digest to match (it covers the unnamed rest too), so only this
+    // parent's own first-format id counts: another parent's, or a per-task id, gives nothing.
+    expect(legacyReminderKeys(ThreadId.make("other"), old.messageId, old.text)).toEqual([]);
+    const perTask = reminderBatchIds(PARENT, ids("t-00"));
+    expect(legacyReminderKeys(PARENT, perTask.messageId, old.text)).toEqual([]);
+  });
+
+  it("logs a refusal once per command id and process, and forgets it after a day", () => {
+    const newRefusal = makeRefusalLog();
+    expect(newRefusal("command-a", NOW)).toBe(true);
+    // Each later check finds its refused receipt again: not logged again.
+    expect(newRefusal("command-a", NOW + 60_000)).toBe(false);
+    // Another batch (new ids) is logged.
+    expect(newRefusal("command-b", NOW + 60_000)).toBe(true);
+    // A restart is a new log: a batch still refused is logged once more.
+    expect(makeRefusalLog()("command-a", NOW + 60_000)).toBe(true);
+    // Kept for the reminder age; past it its tasks are no longer reminded, so it is dropped
+    // (command-b, logged a minute later, is still kept).
+    expect(newRefusal("command-a", NOW + REMINDER_MAX_AGE_MS)).toBe(false);
+    expect(newRefusal("command-c", NOW + REMINDER_MAX_AGE_MS + 1)).toBe(true);
+    expect(newRefusal("command-a", NOW + REMINDER_MAX_AGE_MS + 1)).toBe(true);
+    expect(newRefusal("command-b", NOW + REMINDER_MAX_AGE_MS + 1)).toBe(false);
+  });
+
+  it("keeps a refusal for the whole process when told never to forget (the orphan scan)", () => {
+    const newRefusal = makeRefusalLog(null);
+    expect(newRefusal("command-a", NOW)).toBe(true);
+    // An orphan batch's ids do not age: a slot wait finds its refused receipt days later too.
+    expect(newRefusal("command-a", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(false);
+    expect(newRefusal("command-b", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(true);
+    // A restart is still a new log.
+    expect(makeRefusalLog(null)("command-a", NOW + 3 * REMINDER_MAX_AGE_MS)).toBe(true);
+  });
+
+  it("finds this parent's first-format ids, from messages and receipts", () => {
+    const old = firstFormatReminder(PARENT, ["a", "b"]);
+    const otherParent = firstFormatReminder(ThreadId.make("other"), ["a"]);
+    const perTask = reminderBatchIds(PARENT, ids("c"));
+    expect(
+      legacyReminderMessageIds(PARENT, [
+        old.commandId,
+        old.messageId,
+        otherParent.messageId,
+        perTask.messageId,
+        perTask.commandId,
+      ]),
+    ).toEqual([old.messageId]);
+    expect(legacyReminderMessageIds(PARENT, [])).toEqual([]);
   });
 });
 
