@@ -152,6 +152,7 @@ class SweepTests(unittest.TestCase):
         self.stubborn = set()
         self.before_open = None
         self.after_send = None
+        self.note_dirs = tuple(os.path.join(self.root, d, 'heavy', 'labelled') for d in ('run', 'state'))
 
     def write_machine(self, data=None):
         data = data if data is not None else {'version': 1, 'heavy': {'sweep': self.cfg}}
@@ -172,6 +173,8 @@ class SweepTests(unittest.TestCase):
         s.systemctl, s.docker = self.shim('systemctl'), (self.shim('docker') if docker else '')
         s.uid, s.pid, s.clk, s.stop_grace = UID, SELF, CLK, 0.3
         s._now = lambda: NOW
+        # docker-label's notes: this test's folders, never the user's (the fake host's scopes are not the real ones)
+        s.note_dirs = self.note_dirs
         sampled = []
 
         def sleep(_seconds):
@@ -767,6 +770,67 @@ class SweepTests(unittest.TestCase):
         self.nothing_stopped()
         self.assertNotIn('300', out.replace('3000', ''))
 
+    def notes(self, *names, age=700, folders=None):
+        """Empty notes of docker-label (made in both folders), age seconds old on the fake clock."""
+        for folder in folders or self.note_dirs:
+            os.makedirs(folder, 0o700, exist_ok=True)
+            os.chmod(folder, 0o700)
+            for name in names:
+                path = os.path.join(folder, name)
+                open(path, 'w').close()
+                os.utime(path, (NOW - age, NOW - age))
+
+    def left_notes(self):
+        return [sorted(os.listdir(d)) if os.path.isdir(d) else None for d in self.note_dirs]
+
+    def test_old_notes_of_gone_scopes_are_removed_and_no_other(self):
+        # #761 item 7: heavy and its guard both killed with -9 (or a kept scope that ended) leave docker-label's empty
+        # note; in ~/.local/state nothing else would ever remove it
+        live = 'heavy-pytest-0a1b2c3d.scope'
+        self.host.add(3000, SERVICE, 'python3', 'python3 heavy pytest', f'{CG}/app.slice/t3code.service', 3600)
+        self.host.add(3001, 3000, 'pytest', 'pytest -x', f'{CG}/{self.scope(live)}', 3600)
+        listed = 'heavy-keep-db-0a1b2c3d.scope'         # a kept scope systemd still lists, with no process
+        self.host.load()['units'][listed] = {'ActiveState': 'active'}
+        self.host.save()
+        self.notes('heavy-gone-0a1b2c3d.scope', 'heavy-keep-gone-0a1b2c3d.scope', live, listed)
+        self.notes('heavy-young-0a1b2c3d.scope', age=100)              # its scope may have just ended: next time
+        self.notes('notes.txt')                                       # not a note of heavy's
+        for d in self.note_dirs:
+            with open(os.path.join(d, 'heavy-full-0a1b2c3d.scope'), 'w') as f:
+                f.write('x')                                           # not empty: not docker-label's
+            os.utime(os.path.join(d, 'heavy-full-0a1b2c3d.scope'), (NOW - 700, NOW - 700))
+            os.symlink('/nowhere', os.path.join(d, 'heavy-link-0a1b2c3d.scope'))
+        kept = sorted(['heavy-young-0a1b2c3d.scope', 'notes.txt', 'heavy-full-0a1b2c3d.scope',
+                       'heavy-link-0a1b2c3d.scope', live, listed])
+        code, out, _ = self.run_sweep('--dry-run')                     # a dry run changes nothing
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.left_notes()[0]), len(kept) + 2)
+        code, out, _ = self.run_sweep()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.left_notes(), [kept, kept])
+        with open(os.path.join(self.report, 'sweep.log')) as f:
+            self.assertIn('removed 4 old notes of docker-label for scopes that are gone', f.read())
+        code, out, _ = self.run_sweep()                                # again: nothing more, no error
+        self.assertEqual((code, self.left_notes()), (0, [kept, kept]))
+
+    def test_notes_in_a_folder_others_can_write_or_a_missing_one_are_left(self):
+        # missing folders (no note ever written, a fresh machine): nothing to do, no error
+        self.assertEqual((self.run_sweep()[0], self.left_notes()), (0, [None, None]))
+        self.notes('heavy-gone-0a1b2c3d.scope')
+        os.chmod(self.note_dirs[0], 0o777)              # not a folder of heavy's (heavy and docker-label skip it too)
+        self.addCleanup(os.chmod, self.note_dirs[0], 0o700)
+        self.assertEqual(self.run_sweep()[0], 0)
+        self.assertEqual(self.left_notes(), [['heavy-gone-0a1b2c3d.scope'], []])
+
+    def test_the_user_s_own_note_folders_by_default(self):
+        # the sweep the timer runs reads the folders heavy reads (bin/heavy marks_dirs): /run/user/<uid> and the
+        # state folder of a home this user owns
+        s = self.mod.Sweep()
+        with mock.patch.object(self.mod, 'RUNTIME_ROOT', os.path.join(self.root, 'run')), \
+                mock.patch.dict(os.environ, {'HOME': self.root}):
+            self.assertEqual(s.note_folders(), (os.path.join(self.root, 'run', str(UID), 'heavy', 'labelled'),
+                                                os.path.join(self.root, '.local', 'state', 'heavy', 'labelled')))
+
     def test_scope_whose_heavy_is_gone_is_stopped_as_a_whole(self):
         self.orphan(3002, 'node worker.js', unit=self.scope(), age=1200, cpu=0)      # not test-shaped, not busy
         self.host.add(3003, 3002, 'sleep', 'sleep 9', f'{CG}/{self.scope()}', 1200)
@@ -1331,7 +1395,7 @@ class Label(unittest.TestCase):
         with open('/proc/self/cgroup') as f:
             leaf = REAL.unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
         if REAL.is_heavy_scope(leaf):
-            for base in (os.path.join(REAL.RUNTIME_ROOT, str(UID)), os.path.expanduser('~/.local/state')):
+            for base in filter(None, REAL.note_bases()):
                 note = os.path.join(base, 'heavy', 'labelled', leaf)
                 if not os.path.lexists(note):
                     self.addCleanup(lambda note=note: os.path.lexists(note) and os.unlink(note))
@@ -1526,6 +1590,20 @@ class RealSignal(unittest.TestCase):
 
 # Each rule broken on purpose in a copy of lib/heavy_sweep.py: (text, broken text, the test that must then fail)
 MUTATIONS = {
+    "a live scope's note stays": ('if not is_heavy_scope(name) or name in known:', 'if not is_heavy_scope(name):',
+                                  'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
+    'a young note stays': ('and st.st_mtime < before:', ':',
+                           'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
+    'only an empty file': ('if stat.S_ISREG(st.st_mode) and st.st_size == 0 and', 'if',
+                           'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
+    'only a note-shaped name': ('if not is_heavy_scope(name) or name in known:', 'if name in known:',
+                                'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
+    'only a folder of heavy\'s': ("if not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid or st.st_mode & 0o022:\n"
+                                  "                    continue\n                names",
+                                  "if False:\n                    continue\n                names",
+                                  'test_notes_in_a_folder_others_can_write_or_a_missing_one_are_left'),
+    'notes only when the sweep acts': ('        if act:\n            pruned', '        if True:\n            pruned',
+                                       'test_old_notes_of_gone_scopes_are_removed_and_no_other'),
     'owner gone (reparented)': ('if p.pid in mine or p.pid in (1, manager) or p.ppid not in orphan_parents:',
                                 'if p.pid in mine or p.pid in (1, manager):',
                                 'test_process_with_a_living_parent_is_left_alone'),

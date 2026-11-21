@@ -58,7 +58,7 @@ HEAVY_SLICE and HEAVY_GRACE override single values (HEAVY_SYSTEMCTL: another sys
 folder for the memory queue's state, HEAVY_STATE_DIR: another folder for the measured history, HEAVY_DOCKER:
 another docker; all for tests). Standard library only; Linux with systemd and cgroup v2.
 """
-import hashlib, json, os, re, secrets, signal, stat, subprocess, sys, time
+import hashlib, json, os, pwd, re, secrets, signal, stat, subprocess, sys, time
 
 CONFIG = '/etc/heavy/config.json'
 INSTALLED = '/etc/heavy/installed.tsv'
@@ -285,14 +285,15 @@ def in_cgroup(pid, cg):
 
 
 def signal_in(pids, cg, sig):
-    """Send sig to each of the pids that is still in the cgroup. A pid read from cgroup.procs can be another
-    process by now (the first one ended, the pid was reused): a pidfd pins the process before its cgroup is checked,
-    so such a pid is never signalled. Without pidfds (Linux before 5.3, Python before 3.9) nothing is sent: between
-    the check and a kill by pid the pid could go to another process. The KILL then goes to cgroup.kill alone, or
-    the processes are reported as still running (and the leftover sweep looks again)."""
+    """Send sig to each of the pids that is still in the cgroup; returns how many got it. A pid read from
+    cgroup.procs can be another process by now (the first one ended, the pid was reused): a pidfd pins the process
+    before its cgroup is checked, so such a pid is never signalled. Without pidfds (Linux before 5.3, Python before
+    3.9) nothing is sent: between the check and a kill by pid the pid could go to another process. The KILL then goes
+    to cgroup.kill alone, or the processes are reported as still running (and the leftover sweep looks again)."""
     pidfd_open = getattr(os, 'pidfd_open', None)
     if pidfd_open is None:
-        return
+        return 0
+    sent = 0
     for pid in pids:
         try:
             fd = pidfd_open(pid)
@@ -301,10 +302,12 @@ def signal_in(pids, cg, sig):
         try:
             if in_cgroup(pid, cg):
                 signal.pidfd_send_signal(fd, sig)
+                sent += 1
         except OSError:
             pass
         finally:
             os.close(fd)
+    return sent
 
 
 def kill_cgroup(cg):
@@ -325,8 +328,9 @@ def kill_cgroup(cg):
 def stop_scope(systemctl, unit, cg, grace):
     """Stop the scope (systemd sends TERM, then KILL after TimeoutStopSec = the grace time). If systemd cannot do
     it, stop what is left by hand: TERM to each process still in the scope, then after the grace time KILL to the
-    whole cgroup (cgroup.kill; each process by hand only without it). Returns the pids still alive afterwards
-    (empty when all are gone)."""
+    whole cgroup (cgroup.kill; each process by hand only without it). No wait after a step that sent nothing (no
+    pidfds, or none of the pids still in the scope): nothing would end sooner for it. Returns the pids still alive
+    afterwards (empty when all are gone)."""
     try:
         subprocess.run([systemctl, '--user', 'stop', unit], stdin=subprocess.DEVNULL, capture_output=True,
                        timeout=grace * 2 + 30)
@@ -335,12 +339,14 @@ def stop_scope(systemctl, unit, cg, grace):
     left = cgroup_pids(cg) or []
     if left:
         for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 5)):
-            if sig != signal.SIGKILL or not kill_cgroup(cg):
-                signal_in(left, cg, sig)
-            end = time.monotonic() + wait
-            while time.monotonic() < end:
+            if sig == signal.SIGKILL and kill_cgroup(cg):
+                sent = True
+            else:
+                sent = signal_in(left, cg, sig) > 0
+            end = time.monotonic() + (wait if sent else 0)
+            while True:
                 left = cgroup_pids(cg) or []
-                if not left:
+                if not left or time.monotonic() >= end:
                     break
                 time.sleep(0.05)
             if not left:
@@ -405,10 +411,35 @@ def marks_dir():
     return own_folder(os.path.join(RUNTIME_ROOT, str(os.getuid())))
 
 
+def state_base():
+    """<home>/.local/state for the second notes folder (lib/heavy_sweep.py state_base, the same rule), or '' for none.
+    The home is $HOME, else the password database's; only an absolute folder this user owns. heavy makes the folder
+    when it is missing, so never in another user's home (root with a user's HOME, `sudo -E heavy ...`, uses root's
+    own home) and never relative to the job's working folder (no HOME and no passwd entry: no second folder)."""
+    if STATE_ROOT:
+        return STATE_ROOT
+    homes = [os.environ.get('HOME') or '']
+    try:
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except KeyError:
+        pass
+    for home in homes:
+        if not home or not os.path.isabs(home):
+            continue
+        try:
+            st = os.stat(home)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid():
+            return os.path.join(home, '.local', 'state')
+    return ''
+
+
 def state_marks_dir():
     """The second folder for those notes, in the user's state folder: `heavy docker-label` writes there when its
     note in marks_dir() cannot reach heavy (/run/user full, or another one in a sandbox's own mount namespace)."""
-    return own_folder(STATE_ROOT or os.path.join(os.path.expanduser('~'), '.local', 'state'), make_base=True)
+    base = state_base()
+    return own_folder(base, make_base=True) if base else ''
 
 
 def marks_dirs():
