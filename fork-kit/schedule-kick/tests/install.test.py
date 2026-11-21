@@ -80,6 +80,8 @@ class Install(fx.FakeHost):
         self.assertIn('ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/schedule-kick/current/bin/schedule-kick '
                       'tick\n', text)
         self.assertIn('Type=oneshot\n', text)
+        self.assertIn('UMask=0077\n', text)                            # files it makes: this user's only
+        self.assertNotIn('\nNoNewPrivileges=', text)                   # gh-as needs sudo
         with open(self.path(UNITS[1])) as f:
             text = f.read()
         self.assertIn('OnCalendar=*:0/5\n', text)

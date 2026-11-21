@@ -24,28 +24,31 @@ class FakeApi:
 
     def __init__(self, github_now):
         self.github_now = github_now
-        self.runs = {}              # (repo, workflow) -> [(created ISO, event)]
+        self.runs = {}              # (repo, workflow) -> [(created ISO, event, branch)]
         self.calls = []
         self.fail = {}              # 'list' | 'dispatch' -> ApiError to raise
         self.ignore_filter = False  # answer every run, as if GitHub ignored `created`
         self.remaining = None
+        self.reset = None           # x-ratelimit-reset of the last answer (epoch seconds)
         self.after_dispatch = None  # called after a dispatch is made (a stop half-way)
 
-    def add_run(self, repo, workflow, created, event='schedule'):
-        self.runs.setdefault((repo, workflow), []).append((created, event))
+    def add_run(self, repo, workflow, created, event='schedule', branch='main'):
+        self.runs.setdefault((repo, workflow), []).append((created, event, branch))
 
-    def runs_since(self, repo, workflow, since):
+    def runs_since(self, repo, workflow, ref, since, event=None):
+        """GitHub's answer filtered by time only (and `event` when asked): the caller picks the runs that count."""
         self.calls.append(('list', repo, workflow, github.iso(since)))
         if 'list' in self.fail:
             raise self.fail['list']
         found = sorted(self.runs.get((repo, workflow), []), reverse=True)
-        return [c for c, _ in found if self.ignore_filter or c >= github.iso(since)][:github.LIST_LIMIT]
+        return [{'created': c, 'event': e, 'branch': b} for c, e, b in found
+                if (self.ignore_filter or c >= github.iso(since)) and event in (None, e)][:github.LIST_LIMIT]
 
     def dispatch(self, repo, workflow, ref, inputs):
         self.calls.append(('dispatch', repo, workflow, ref, dict(inputs)))
         if 'dispatch' in self.fail:
             raise self.fail['dispatch']
-        self.add_run(repo, workflow, github.iso(self.github_now), 'workflow_dispatch')
+        self.add_run(repo, workflow, github.iso(self.github_now), 'workflow_dispatch', ref)
         if self.after_dispatch:
             self.after_dispatch()
 

@@ -44,7 +44,7 @@ class ScheduleKickInstaller(kit_install.Installer):
                     'systemd/schedule-kick.service', 'systemd/schedule-kick.timer')
     EXECUTABLE = frozenset({'bin/schedule-kick', 'sbin/schedule-kick-install'})
     PACKAGE = 'schedulekick'
-    MODULES = ('__init__', 'cron', 'github', 'kick')
+    MODULES = ('__init__', 'cron', 'github', 'kick', 'late')
     HELP = ('bin/schedule-kick', 'schedule-kick tick')
     HAS_CONFIG = True
     KIT_STEPS = ('timer-units',)

@@ -2,17 +2,20 @@
 `schedule` runs hours late (fork-kit/schedule-kick/README.md). A systemd timer runs `schedule-kick tick` every few
 minutes; each tick, for each entry of the config:
 
-1. slot = the entry's last cron slot at or before now (UTC);
+1. slot = the entry's last cron slot at or before now minus the grace (graceMinutes, 5 by default: GitHub's own
+   run, when it comes on time, is then found and nothing is sent);
 2. that slot already handled (the state file says so): nothing, no API call;
 3. after an error, wait (5 minutes, doubling, at most an hour) before the next call;
-4. one runs-list call: a run of the workflow created at or after the slot (any event: schedule, by hand, ours)
-   means the slot is done; otherwise one workflow_dispatch;
+4. one runs-list call: a `schedule` or `workflow_dispatch` run of the workflow on the entry's ref, created at or
+   after the slot, means the slot is done (a pull_request or push run, or one on another branch, does not);
+   otherwise one workflow_dispatch;
 5. record the slot (state file, written whole and renamed into place).
 
 The run list, not the state file, is what stops a second run: a dispatch sent but not recorded (stopped half-way),
 a lost or broken state file, or a clock that jumped back all end at step 4, which finds the run. Missed slots
 while the host was off end in one run for the latest slot only. A rate limit (or under MIN_REMAINING calls left)
-stops the tick and pauses all entries until GitHub's reset (at most an hour).
+stops the tick and pauses all entries until GitHub's reset (at most an hour). GitHub's late `schedule` run for a slot
+already started here ends early with `schedule-kick late-check` (late.py) as the workflow's first job.
 """
 import argparse, datetime, fcntl, json, os, re, stat, sys
 
@@ -27,24 +30,33 @@ MAX_INPUTS = 10
 BACKOFF = datetime.timedelta(minutes=5)
 MAX_WAIT = datetime.timedelta(hours=1)
 MIN_REMAINING = 100
+PAUSE = datetime.timedelta(minutes=15)      # a limit without a usable reset time
+GRACE_MINUTES = 5
+MAX_GRACE_MINUTES = 60
+COUNTED_EVENTS = ('schedule', 'workflow_dispatch')
+TRUSTED_OWNERS = (0,)                       # who may own gh-as and the folders above it (root)
 
 REPO_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z')
 WORKFLOW_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.ya?ml\Z')
 REF_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z')
 INPUT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]{0,99}\Z')
-ENTRY_KEYS = {'repo', 'workflow', 'cron', 'ref', 'inputs'}
+ENTRY_KEYS = {'repo', 'workflow', 'cron', 'ref', 'inputs', 'graceMinutes'}
 
 USAGE = """usage: schedule-kick tick [--config FILE] [--state-dir DIR]
        schedule-kick check [--config FILE]
        schedule-kick status [--state-dir DIR]
+       schedule-kick late-check
 
 tick    start each listed workflow whose last cron slot has no run yet (one workflow_dispatch at most per entry)
 check   read the config and print each entry's last slot; no network
 status  print the last tick's status file; exit 1 unless it was fine
+late-check  in a GitHub Actions job of a listed workflow: skip=true in $GITHUB_OUTPUT when this is a `schedule`
+        run and a workflow_dispatch run on its branch was created since its cron slot (README, Late schedule runs)
 
 FILE defaults to $XDG_CONFIG_HOME/schedule-kick/config.json (~/.config/...), DIR to
 $XDG_STATE_HOME/schedule-kick (~/.local/state/...). See fork-kit/schedule-kick/README.md.
-Exit: 0 fine, 1 an entry failed (the next tick tries again), 2 the config was refused (nothing sent)."""
+Exit: 0 fine, 1 an entry failed or the tick broke (the next tick tries again), 2 the config was refused
+(nothing sent)."""
 
 
 class ConfigError(Exception):
@@ -52,9 +64,14 @@ class ConfigError(Exception):
 
 
 class Entry:
-    def __init__(self, repo, workflow, cron, ref, inputs):
+    def __init__(self, repo, workflow, cron, ref, inputs, grace=GRACE_MINUTES):
         self.repo, self.workflow, self.cron, self.ref, self.inputs = repo, workflow, cron, ref, inputs
+        self.grace = datetime.timedelta(minutes=grace)
         self.key = f'{repo.lower()} {workflow}'
+
+    def slot(self, now):
+        """The slot a tick at `now` handles: the last one at least the grace ago."""
+        return self.cron.last_slot(now - self.grace)
 
 
 class Config:
@@ -106,24 +123,63 @@ def read_token(path):
     return token
 
 
+def plain(text):
+    """A string with no control character (NUL, newline, ...) and no lone surrogate: safe in argv, a path or JSON."""
+    return isinstance(text, str) and not any(ord(c) < 0x20 or ord(c) == 0x7f or 0xd800 <= ord(c) <= 0xdfff
+                                             for c in text)
+
+
+def _safe_folder(st):
+    """A folder above gh-as that only a trusted owner can change (root's sticky /tmp is fine)."""
+    if st.st_uid not in TRUSTED_OWNERS:
+        return False
+    return not st.st_mode & 0o022 or (st.st_mode & stat.S_ISVTX and st.st_uid == 0)
+
+
+def gh_as_path(path):
+    """The real path of the gh-apps kit's gh-as: a program owned by root (TRUSTED_OWNERS) that group and others
+    cannot change, in folders only root can change. A user's own copy (~/.local/bin/gh-as) is refused: it could be
+    anything, a shim with the person's own gh login too."""
+    if os.path.basename(path) != 'gh-as':
+        raise ConfigError(f'auth.ghAs {path}: must be the gh-apps kit\'s gh-as, never gh itself')
+    real = os.path.realpath(path)
+    try:
+        st = os.stat(real)
+    except OSError:
+        raise ConfigError(f'auth.ghAs {path}: no such program') from None
+    if os.path.basename(real) != 'gh-as' or not stat.S_ISREG(st.st_mode) or not os.access(real, os.X_OK):
+        raise ConfigError(f'auth.ghAs {path}: no such program (it is {real})')
+    if st.st_uid not in TRUSTED_OWNERS or st.st_mode & 0o022:
+        raise ConfigError(f'auth.ghAs {path}: {real} must be root-owned and not writable by group or others '
+                          '(the gh-apps kit installs it so); a user\'s own copy is never used')
+    folder = os.path.dirname(real)
+    while True:
+        try:
+            safe = _safe_folder(os.stat(folder))
+        except OSError:
+            safe = False
+        if not safe:
+            raise ConfigError(f'auth.ghAs {path}: folder {folder} can be changed by someone other than root')
+        if folder == os.path.dirname(folder):
+            break
+        folder = os.path.dirname(folder)
+    return real
+
+
 def _auth(raw):
     if not isinstance(raw, dict) or len(raw) != 1 or set(raw) - {'tokenFile', 'ghAs'}:
         raise ConfigError('auth must be exactly one of {"tokenFile": "/abs/path"} or {"ghAs": "/abs/path/gh-as"} '
                           '(a person\'s own gh login is never used)')
     (kind, path), = raw.items()
-    if not isinstance(path, str) or not os.path.isabs(path):
-        raise ConfigError(f'auth.{kind} must be an absolute path')
+    if not plain(path) or not os.path.isabs(path):
+        raise ConfigError(f'auth.{kind} must be an absolute path (no control characters)')
     if kind == 'tokenFile':
         read_token(path)                                        # checked now; read again for each tick
         return ('tokenFile', path)
-    if os.path.basename(path) != 'gh-as':
-        raise ConfigError(f'auth.ghAs {path}: must be the gh-apps kit\'s gh-as, never gh itself')
-    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
-        raise ConfigError(f'auth.ghAs {path}: no such program')
-    return ('ghAs', path)
+    return ('ghAs', gh_as_path(path))
 
 
-def _entry(raw, n):
+def _entry(raw, n, default_grace=GRACE_MINUTES):
     where = f'entries[{n}]'
     if not isinstance(raw, dict):
         raise ConfigError(f'{where} must be an object')
@@ -133,7 +189,7 @@ def _entry(raw, n):
     for key in ('repo', 'workflow', 'cron', 'ref'):
         if not isinstance(raw.get(key), str):
             raise ConfigError(f'{where}.{key} is missing or not a string')
-    if not REPO_RE.match(raw['repo']):
+    if not REPO_RE.match(raw['repo']) or raw['repo'].split('/')[1] in ('.', '..'):
         raise ConfigError(f'{where}.repo {raw["repo"]!r} is not OWNER/NAME')
     if not WORKFLOW_RE.match(raw['workflow']):
         raise ConfigError(f'{where}.workflow {raw["workflow"]!r} is not a workflow file name (name.yml)')
@@ -149,10 +205,17 @@ def _entry(raw, n):
     if not isinstance(inputs, dict) or len(inputs) > MAX_INPUTS:
         raise ConfigError(f'{where}.inputs must be an object of at most {MAX_INPUTS} inputs')
     for key, value in inputs.items():
-        if not INPUT_RE.match(key) or not isinstance(value, str) or len(value) > 1000 or '\n' in value:
+        if not INPUT_RE.match(key) or not isinstance(value, str) or len(value) > 1000 or not plain(value):
             raise ConfigError(f'{where}.inputs.{key}: names are letters, digits, _ and -; values are one-line '
-                              'strings (write true, not a JSON true)')
-    return Entry(raw['repo'], raw['workflow'], line, raw['ref'], dict(inputs))
+                              'strings without control characters (write true, not a JSON true)')
+    return Entry(raw['repo'], raw['workflow'], line, raw['ref'], dict(inputs), grace(raw, where, default_grace))
+
+
+def grace(raw, where, default):
+    value = raw.get('graceMinutes', default)
+    if type(value) is not int or not 0 <= value <= MAX_GRACE_MINUTES:
+        raise ConfigError(f'{where}.graceMinutes must be a whole number of minutes, 0 to {MAX_GRACE_MINUTES}')
+    return value
 
 
 def load_config(path):
@@ -170,19 +233,20 @@ def load_config(path):
         raise ConfigError(f'{path}: not JSON ({e})') from None
     if not isinstance(raw, dict):
         raise ConfigError(f'{path}: must be a JSON object')
-    unknown = set(raw) - {'version', 'auth', 'entries', '//'}
+    unknown = set(raw) - {'version', 'auth', 'entries', 'graceMinutes', '//'}
     if unknown:
         raise ConfigError(f'{path}: unknown key {sorted(unknown)[0]!r}')
     if raw.get('version') != VERSION:
         raise ConfigError(f'{path}: version must be {VERSION}')
     try:
         auth = _auth(raw.get('auth'))
+        default_grace = grace(raw, 'config', GRACE_MINUTES)
         entries = raw.get('entries')
         if not isinstance(entries, list) or not entries or len(entries) > MAX_ENTRIES:
             raise ConfigError(f'entries must be a list of 1 to {MAX_ENTRIES} entries')
         out, seen = [], set()
         for n, item in enumerate(entries):
-            entry = _entry(item, n)
+            entry = _entry(item, n, default_grace)
             if entry.key in seen:
                 raise ConfigError(f'entries[{n}]: {entry.repo} {entry.workflow} is listed twice (one entry per '
                                   'workflow: the run list cannot tell two entries apart)')
@@ -268,9 +332,31 @@ def waiting_until(text, now):
 
 # -- the tick -------------------------------------------------------------------------------------------------------
 
+def epoch(seconds):
+    """An epoch time GitHub gave, as a UTC time; None when it is missing or no time at all."""
+    try:
+        return datetime.datetime.fromtimestamp(seconds, UTC) if seconds is not None else None
+    except (OverflowError, ValueError, OSError, TypeError):
+        return None
+
+
+def counts(row, entry, slot):
+    """A run that is this slot's run: `schedule` or `workflow_dispatch`, on the entry's ref, since the slot. A
+    pull_request or push run (anyone can make one) or a run on another branch never holds off the dispatch."""
+    return row['event'] in COUNTED_EVENTS and row['branch'] == entry.ref and row['time'] >= slot
+
+
+def fail(state, key, now, message):
+    """An error for one entry: it waits (BACKOFF, doubling, at most MAX_WAIT) before its next call."""
+    old = state['entries'].get(key, {})
+    failures = int(old.get('failures', 0)) + 1 if type(old.get('failures', 0)) is int else 1
+    delay = min(BACKOFF * 2 ** min(failures - 1, 10), MAX_WAIT)
+    state['entries'][key] = dict(old, failures=failures, retryAfter=iso(now + delay), error=message)
+
+
 def kick_one(entry, api, state, now):
     """(result, message) for one entry; state['entries'][key] updated in place."""
-    slot = entry.cron.last_slot(now)
+    slot = entry.slot(now)
     old = state['entries'].get(entry.key, {})
     if old.get('slot') == iso(slot) and old.get('cron') == entry.cron.line:
         return 'done', f'slot {iso(slot)} already {old.get("result", "handled")}'
@@ -278,22 +364,21 @@ def kick_one(entry, api, state, now):
     if wait is not None:
         return 'waiting', f'after {old.get("failures", 1)} error(s), next try after {iso(wait)}'
     try:
-        created = api.runs_since(entry.repo, entry.workflow, slot)
-        times = [parse_time(c) for c in created]
-        if None in times:
+        rows = api.runs_since(entry.repo, entry.workflow, entry.ref, slot)
+        for row in rows:
+            row['time'] = parse_time(row['created'])
+        if any(row['time'] is None for row in rows):
             raise ApiError(f'runs of {entry.repo} {entry.workflow}: a run without a readable created time')
-        if any(t >= slot for t in times):
+        if any(counts(row, entry, slot) for row in rows):
             result = 'ran'
         else:
             api.dispatch(entry.repo, entry.workflow, entry.ref, entry.inputs)
             result = 'dispatched'
     except ApiError as e:
-        failures = int(old.get('failures', 0)) + 1 if isinstance(old.get('failures', 0), int) else 1
-        delay = min(BACKOFF * 2 ** min(failures - 1, 10), MAX_WAIT)
-        state['entries'][entry.key] = dict(old, failures=failures, retryAfter=iso(now + delay), error=str(e))
+        fail(state, entry.key, now, str(e))
         if e.rate_limited:
-            reset = datetime.datetime.fromtimestamp(e.reset, UTC) if e.reset else None
-            pause(state, now, reset)
+            pause(state, now, now + datetime.timedelta(seconds=e.retry_after) if e.retry_after
+                  else epoch(e.reset))
         return 'error', str(e)
     state['entries'][entry.key] = {'cron': entry.cron.line, 'slot': iso(slot), 'result': result, 'at': iso(now)}
     return result, f'slot {iso(slot)}: ' + ('a run exists' if result == 'ran' else
@@ -301,9 +386,10 @@ def kick_one(entry, api, state, now):
 
 
 def pause(state, now, until=None):
-    if until is None or not now < until <= now + MAX_WAIT:
-        until = now + datetime.timedelta(minutes=15)
-    state['pauseUntil'] = iso(until)
+    """Every entry waits until GitHub's reset: PAUSE without one (or one already past), at most MAX_WAIT."""
+    if until is None or until <= now:
+        until = now + PAUSE
+    state['pauseUntil'] = iso(min(until, now + MAX_WAIT))
 
 
 def tick(cfg, state_dir, api, now=None, out=sys.stdout, err=sys.stderr):
@@ -334,10 +420,14 @@ def _tick(cfg, folder, api, now, out, err):
             status[entry.key] = {'result': 'paused', 'message': f'GitHub API budget: paused until {iso(paused)}'}
             continue
         before = json.dumps(state, sort_keys=True)
-        result, message = kick_one(entry, api, state, now)
+        try:
+            result, message = kick_one(entry, api, state, now)
+        except Exception as e:      # noqa: BLE001 - one entry's fault never stops the entries after it
+            result, message = 'error', f'internal error: {type(e).__name__}: {e}'
+            fail(state, entry.key, now, message)
         remaining = getattr(api, 'remaining', None)
         if result != 'done' and remaining is not None and remaining < MIN_REMAINING:
-            pause(state, now)
+            pause(state, now, epoch(getattr(api, 'reset', None)))
             message += f' (only {remaining} API calls left: pausing)'
         status[entry.key] = {'result': result, 'message': message}
         line = f'schedule-kick: {entry.repo} {entry.workflow}: {result}: {message}'
@@ -368,6 +458,19 @@ def default_state_dir():
     return os.path.join(base, 'schedule-kick')
 
 
+def broken(e, state_dir, err):
+    """The tick broke (a fault outside one entry): say so on stderr and in the status file, so `status` and
+    `systemctl --user --failed` show it; the next tick tries again."""
+    message = f'the tick broke: {type(e).__name__}: {e}'
+    print(f'schedule-kick: {message}', file=err)
+    try:
+        write_json(os.path.join(state_folder(state_dir), 'status.json'),
+                   {'version': VERSION, 'at': iso(_now()), 'ok': False, 'error': message, 'entries': {}})
+    except Exception as e2:         # noqa: BLE001 - nothing more to do than say so
+        print(f'schedule-kick: cannot write the status file either: {e2}', file=err)
+    return 1
+
+
 def refuse(message, state_dir, out_err):
     """Config refused: say so on stderr (the journal) and in the status file; nothing is sent."""
     print(f'schedule-kick: refused, nothing sent: {message}', file=out_err)
@@ -386,7 +489,7 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
         print(USAGE, file=out)
         return 0
     parser = argparse.ArgumentParser(prog='schedule-kick', add_help=False)
-    parser.add_argument('command', choices=('tick', 'check', 'status'))
+    parser.add_argument('command', choices=('tick', 'check', 'status', 'late-check'))
     parser.add_argument('--config')
     parser.add_argument('--state-dir')
     try:
@@ -394,6 +497,9 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
     except SystemExit:
         print(USAGE, file=err)
         return 2
+    if a.command == 'late-check':
+        from . import late
+        return late.main(os.environ, out, err)
     state_dir = a.state_dir or default_state_dir()
     if a.command == 'status':
         try:
@@ -411,8 +517,8 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
     if a.command == 'check':
         now = _now()
         for e in cfg.entries:
-            print(f'{e.repo} {e.workflow} ({e.cron.line}, ref {e.ref}): last slot {iso(e.cron.last_slot(now))}',
-                  file=out)
+            print(f'{e.repo} {e.workflow} ({e.cron.line}, ref {e.ref}, grace {e.grace.seconds // 60} min): '
+                  f'slot to handle now {iso(e.slot(now))}', file=out)
         print(f'config fine: {len(cfg.entries)} entries, auth {cfg.auth[0]}', file=out)
         return 0
     try:
@@ -420,3 +526,5 @@ def main(argv, api_factory=make_api, out=sys.stdout, err=sys.stderr):
         return tick(cfg, state_dir, api, out=out, err=err)
     except ConfigError as e:
         return refuse(str(e), None, err)
+    except Exception as e:          # noqa: BLE001 - a broken tick must not leave an old `ok: true` behind
+        return broken(e, state_dir, err)
