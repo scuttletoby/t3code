@@ -301,11 +301,87 @@ function mcpProfileRefProblem(
   return `${setting} names MCP profile "${name}", which is not set up: add that profile first, or pick "${MCP_PROFILE_ALL}" or "${MCP_PROFILE_T3_ONLY}".`;
 }
 
+/** A setting that names an MCP profile: what `mcpProfileUses` lists. */
+export type McpProfileUse =
+  | { readonly kind: "default" }
+  | { readonly kind: "subagent-rule" }
+  | { readonly kind: "project-default"; readonly projectId: string }
+  | { readonly kind: "project-subagent-rule"; readonly projectId: string }
+  | { readonly kind: "thread-pick"; readonly threadId: string };
+
+const namesProfile = (value: unknown, name: string) =>
+  typeof value === "string" && value.trim() === name;
+
+/**
+ * Every setting that names profile `name`, the thread picks last (by id). The one rule the client
+ * (before it offers a delete) and the server (before it takes one) use.
+ */
+export function mcpProfileUses(
+  settings: {
+    readonly mcpProfile?: string | undefined;
+    readonly mcpSubagentProfile?: string | undefined;
+    readonly mcpThreadProfiles: Readonly<Record<string, string>>;
+    readonly projectSettingsOverrides: {
+      readonly [projectId: string]:
+        | {
+            readonly mcpProfile?: string | undefined;
+            readonly mcpSubagentProfile?: string | undefined;
+          }
+        | undefined;
+    };
+  },
+  name: string,
+): ReadonlyArray<McpProfileUse> {
+  const uses: Array<McpProfileUse> = [];
+  if (namesProfile(settings.mcpProfile, name)) uses.push({ kind: "default" });
+  if (namesProfile(settings.mcpSubagentProfile, name)) uses.push({ kind: "subagent-rule" });
+  for (const [projectId, overrides] of Object.entries(settings.projectSettingsOverrides)) {
+    if (namesProfile(overrides?.mcpProfile, name)) {
+      uses.push({ kind: "project-default", projectId });
+    }
+    if (namesProfile(overrides?.mcpSubagentProfile, name)) {
+      uses.push({ kind: "project-subagent-rule", projectId });
+    }
+  }
+  for (const threadId of Object.keys(settings.mcpThreadProfiles).sort()) {
+    if (namesProfile(settings.mcpThreadProfiles[threadId], name)) {
+      uses.push({ kind: "thread-pick", threadId });
+    }
+  }
+  return uses;
+}
+
+const describeUse = (use: McpProfileUse): string =>
+  use.kind === "default"
+    ? "mcpProfile"
+    : use.kind === "subagent-rule"
+      ? "mcpSubagentProfile"
+      : use.kind === "project-default"
+        ? `project ${use.projectId}'s mcpProfile`
+        : use.kind === "project-subagent-rule"
+          ? `project ${use.projectId}'s mcpSubagentProfile`
+          : `the pick for thread ${use.threadId}`;
+
+/**
+ * A profile this save deletes while a setting still names it: those threads would be refused. A
+ * hand entry under a built-in's name may go (the built-in stays), and a save that changes the users
+ * in the same patch is taken.
+ */
+function mcpProfileInUseProblem(current: ServerSettings, next: ServerSettings): string | undefined {
+  for (const name of Object.keys(current.mcpProfiles)) {
+    if (Object.hasOwn(next.mcpProfiles, name) || isBuiltInMcpProfileName(name)) continue;
+    const uses = mcpProfileUses(next, name);
+    if (uses.length === 0) continue;
+    return `MCP profile "${name}" cannot be deleted: it is in use by ${uses.map(describeUse).join(", ")}. Change those first.`;
+  }
+  return undefined;
+}
+
 /**
  * Why the server must refuse this save of fork settings or of an interval (any setting's, see
  * forkSettingsIntervals.ts), or `undefined`. Checks `next` against `current`, so it also sees a
- * value a client sent back unchanged (kept `reviewRules` text must be the stored one). Deleting a
- * profile still in use is not refused yet (a later PR).
+ * value a client sent back unchanged (kept `reviewRules` text must be the stored one), and a
+ * profile deleted while a setting still names it.
  */
 export function forkSettingsWriteProblem(
   current: ServerSettings,
@@ -314,6 +390,7 @@ export function forkSettingsWriteProblem(
   const problems: Array<string | undefined> = [
     settingsIntervalProblem(current, next),
     maxEntriesProblem(current, next),
+    mcpProfileInUseProblem(current, next),
     mcpProfileRefProblem(next, "mcpProfile", next.mcpProfile, current.mcpProfile, false),
     mcpProfileRefProblem(
       next,
