@@ -3,7 +3,7 @@
  * per task (message ids name the task keys); at start, the last day's are checked once. Off with
  * `server.waitFor`. A reminder takes an agent slot; refused, it is asked again and never given up.
  */
-import { MessageId, type OrchestrationV2Subagent, type ThreadId } from "@t3tools/contracts";
+import { type OrchestrationV2Subagent, type ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -28,6 +28,7 @@ import {
   isEndedTask,
   isRemindable,
   legacyReminderMessageIds,
+  makeRefusalLog,
   parentBusy,
   REMINDER_MAX_AGE_MS,
   parentGone,
@@ -87,6 +88,7 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
   // Parents that were busy (or could not be reached) while a result was owed: their next run end
   // checks again. In memory; a restart rebuilds it from the startup scan.
   const watched = new Set<ThreadId>();
+  const newRefusal = makeRefusalLog();
 
   const check = Effect.fn("DelegatedResultReminder.check")(function* (parentThreadId: ThreadId) {
     const enabled = yield* settings.getSettings.pipe(
@@ -122,22 +124,14 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
       watched.add(parentThreadId);
       return { type: "unreadable" } satisfies CheckOutcome;
     }
-    // A first-format message names its tasks in its text: read it, to split it per task.
+    // A first-format message names its tasks in its text: read it, to split it per task. One
+    // whose text cannot be read is left out alone: its tasks fall back to its receipt's rule.
     const legacyIds = legacyReminderMessageIds(parentThreadId, sentIds);
-    const legacy =
-      legacyIds.length === 0
-        ? new Map<MessageId, { readonly text: string }>()
-        : yield* threads
-            .getMessagesById(
-              parentThreadId,
-              legacyIds.map((id) => MessageId.make(id)),
-            )
-            .pipe(Effect.orElseSucceed(() => null));
-    if (legacy === null) {
+    const legacyTexts = yield* store.messageTexts(parentThreadId, legacyIds);
+    if (legacyTexts === null) {
       watched.add(parentThreadId);
       return { type: "unreadable" } satisfies CheckOutcome;
     }
-    const legacyTexts = new Map([...legacy].map(([id, message]) => [id as string, message.text]));
     const batches = reminderBatches(parentThreadId, owed, sentIds, legacyTexts);
     if (batches.length === 0) {
       watched.delete(parentThreadId);
@@ -169,11 +163,15 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
           return { type: "held", detail: "stopped" } satisfies CheckOutcome;
         case "rejected":
           // Its ids stay refused, so its tasks wait for the owed set to change; the next
-          // batches are other tasks, and are still sent.
-          yield* Effect.logWarning("delegated result reminder refused", {
-            threadId: parentThreadId,
-            detail: result.detail,
-          });
+          // batches are other tasks, and are still sent. Logged once per batch and process,
+          // not on each later check that finds its refused receipt.
+          if (newRefusal(ids.commandId, nowMs)) {
+            yield* Effect.logWarning("delegated result reminder refused", {
+              threadId: parentThreadId,
+              commandId: ids.commandId,
+              detail: result.detail,
+            });
+          }
           refused = result.detail;
           continue;
         case "waitsForSlot":

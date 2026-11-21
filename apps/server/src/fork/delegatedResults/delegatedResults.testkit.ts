@@ -2,7 +2,14 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Rebuilds the first reminder format's digest.
 import * as NodeCrypto from "node:crypto";
 
-import { NodeId, type OrchestrationV2Subagent, ThreadId } from "@t3tools/contracts";
+import {
+  EventId,
+  MessageId,
+  NodeId,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2Subagent,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -40,6 +47,8 @@ export const makeSlots = () => {
   const full = new Set<ThreadId>();
   const state = { all: false };
   const asks: Array<SlotGate.SlotAcquireInput> = [];
+  /** Keys that left the gate's line. */
+  const left: Array<string> = [];
   const layer = Layer.mock(SlotGate.SlotGate)({
     acquire: (input) =>
       Effect.sync((): SlotGate.SlotAcquire => {
@@ -52,8 +61,9 @@ export const makeSlots = () => {
       }),
     started: () => Effect.void,
     release: () => Effect.void,
+    leave: (keys) => Effect.sync(() => left.push(...keys)),
   });
-  return { full, state, asks, layer };
+  return { full, state, asks, left, layer };
 };
 
 /**
@@ -80,3 +90,32 @@ export const firstFormatReminder = (
   ].join("\n");
   return { messageId, commandId: `${messageId}:0`, text };
 };
+
+/**
+ * Fork (issue 741): the event that projects a message the reminder sent into the real message
+ * table, as upstream writes it (its own encoding of the row's payload).
+ */
+export const reminderMessageEvent = (
+  threadId: ThreadId,
+  messageId: string,
+  text: string,
+): OrchestrationV2DomainEvent => ({
+  id: EventId.make(`event:${messageId}`),
+  threadId,
+  occurredAt: at(NOW - 30_000),
+  type: "message.updated",
+  payload: {
+    id: MessageId.make(messageId),
+    threadId,
+    runId: null,
+    nodeId: null,
+    role: "user",
+    text,
+    attachments: [],
+    streaming: false,
+    createdBy: "agent",
+    creationSource: "mcp",
+    createdAt: at(NOW - 30_000),
+    updatedAt: at(NOW - 30_000),
+  },
+});

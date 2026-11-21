@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -54,8 +55,14 @@ interface World {
   /** Threads the gate refuses whatever is free. */
   full: Set<ThreadId>;
   asks: Array<SlotGate.SlotAcquireInput>;
+  /** The gate's calls after an ask: `started <thread>`, `release <token>`, `leave <key>`. */
+  calls: Array<string>;
+  /** Threads whose ask takes this long (a slow count read), then is refused. */
+  slow: Set<ThreadId>;
   /** Threads gone (`null` shell), and whether a shell read fails. */
   gone: Set<ThreadId>;
+  /** Threads the gate sees live but upstream's worker then reads archived. */
+  archivedForUpstream: Set<ThreadId>;
   unreadable: boolean;
   logs: Array<string>;
 }
@@ -64,7 +71,10 @@ const newWorld = (free: number): World => ({
   free,
   full: new Set(),
   asks: [],
+  calls: [],
+  slow: new Set(),
   gone: new Set(),
+  archivedForUpstream: new Set(),
   unreadable: false,
   logs: [],
 });
@@ -72,19 +82,25 @@ const newWorld = (free: number): World => ({
 const gateOf = (world: World) =>
   Layer.mock(SlotGate.SlotGate)({
     acquire: (input) =>
-      Effect.sync((): SlotGate.SlotAcquire => {
+      Effect.gen(function* () {
         world.asks.push(input);
-        if (world.free === 0 || world.full.has(input.callerThreadId!))
-          return {
-            type: "refuse",
-            message: "full",
-            refusal: { type: "unread", problem: "timeout" },
-          };
+        const refused: SlotGate.SlotAcquire = {
+          type: "refuse",
+          message: "full",
+          refusal: { type: "unread", problem: "timeout" },
+        };
+        if (world.slow.has(input.callerThreadId!)) {
+          yield* Effect.sleep("5 seconds");
+          return refused;
+        }
+        if (world.free === 0 || world.full.has(input.callerThreadId!)) return refused;
         world.free -= 1;
-        return { type: "allow", token: world.asks.length };
+        return { type: "allow", token: world.asks.length } satisfies SlotGate.SlotAcquire;
       }),
-    started: () => Effect.void,
-    release: () => Effect.void,
+    started: (token, childThreadId) =>
+      Effect.sync(() => world.calls.push(`started ${childThreadId} ${token}`)),
+    release: (token) => Effect.sync(() => world.calls.push(`release ${token}`)),
+    leave: (keys) => Effect.sync(() => world.calls.push(...keys.map((key) => `leave ${key}`))),
   });
 
 const projection = {
@@ -115,7 +131,7 @@ const server = (
           ),
     getThreadRecords: (threadId) =>
       Effect.succeed(
-        world.gone.has(threadId)
+        world.gone.has(threadId) || world.archivedForUpstream.has(threadId)
           ? { ...projection, thread: { archivedAt: "2026-11-21T00:00:00.000Z", deletedAt: null } }
           : projection,
       ) as never,
@@ -152,6 +168,12 @@ const offer = (value: ProviderContinuationRequests.ProviderContinuationRequest) 
     Effect.flatMap((requests) => requests.offer(value)),
   );
 
+/** Lets forked fibers run (scheduler turns, no clock moved). */
+const settle = Effect.forEach(Array.from({ length: 50 }), () => Effect.yieldNow, { discard: true });
+
+/** The gate's slot calls, without the line's. */
+const slotCalls = (world: World) => world.calls.filter((call) => !call.startsWith("leave "));
+
 const waitLogs = (world: World) =>
   world.logs.filter((log) => log.includes("provider continuation waits for an agent slot"));
 
@@ -182,7 +204,10 @@ describe("provider continuations take an agent slot", () => {
             targetInstanceId: INSTANCE,
             intoThreadId: A,
             keepsHeld: true,
+            place: { key: "continuation:0" },
           });
+          // Every ask in its one place in the gate's line.
+          assert.isTrue(world.asks.every((asked) => asked.place?.key === "continuation:0"));
           world.free = 1;
           yield* TestClock.adjust("5 seconds");
           const sent = yield* Queue.take(dispatched);
@@ -214,6 +239,69 @@ describe("provider continuations take an agent slot", () => {
     }),
   );
 
+  it.effect("a slow count read for one thread holds up no other thread's continuation", () =>
+    Effect.gen(function* () {
+      const world = newWorld(5);
+      world.slow.add(A);
+      const dispatched = yield* Queue.unbounded<OrchestrationV2ServerCommand>();
+      yield* Effect.gen(function* () {
+        yield* offer(request(A));
+        yield* offer(request(B));
+        // No time passes: B is not queued behind A's 5-second ask.
+        yield* settle;
+        assert.strictEqual(yield* Queue.size(dispatched), 1);
+        const sent = yield* Queue.take(dispatched);
+        assert.strictEqual(sent.type === "message.dispatch" && sent.threadId, B);
+        // A's ask ends (it cannot be cut off half-way), so the server can stop.
+        yield* TestClock.adjust("5 seconds");
+      }).pipe(Effect.provide(server(world, dispatched)), Effect.scoped);
+    }),
+  );
+
+  it.effect(
+    "a granted slot is held until upstream's dispatch of it ends, however long it waits",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld(1);
+        const dispatched = yield* Queue.unbounded<OrchestrationV2ServerCommand>();
+        const lockFree = yield* Deferred.make<void>();
+        yield* Effect.gen(function* () {
+          yield* offer(
+            request(A, {
+              // Behind its own thread's earlier dispatch (its parent's lock) for 2 minutes.
+              dispatchIfCurrent: (effect) =>
+                Deferred.await(lockFree).pipe(Effect.andThen(Effect.asSome(effect))),
+            }),
+          );
+          yield* TestClock.adjust("2 minutes");
+          assert.lengthOf(world.asks, 1);
+          // Asked and granted, not ended: the start counts whatever the start grace.
+          assert.deepStrictEqual(slotCalls(world), []);
+          yield* Deferred.succeed(lockFree, undefined);
+          yield* Queue.take(dispatched);
+          yield* settle;
+          assert.deepStrictEqual(slotCalls(world), [`started ${A} 1`, "release 1"]);
+        }).pipe(Effect.provide(server(world, dispatched)), Effect.scoped);
+      }),
+  );
+
+  it.effect("a granted request upstream drops (its thread archived meanwhile) frees its slot", () =>
+    Effect.gen(function* () {
+      const world = newWorld(1);
+      const dispatched = yield* Queue.unbounded<OrchestrationV2ServerCommand>();
+      const cleared: Array<ThreadId> = [];
+      yield* Effect.gen(function* () {
+        // Granted on a live shell; upstream then reads the thread archived and clears the latch.
+        world.archivedForUpstream.add(A);
+        yield* offer(request(A, { clearIfCurrent: () => Effect.sync(() => cleared.push(A)) }));
+        yield* settle;
+        assert.deepStrictEqual(cleared, [A]);
+        assert.strictEqual(yield* Queue.size(dispatched), 0);
+        assert.deepStrictEqual(slotCalls(world), [`started ${A} 1`, "release 1"]);
+      }).pipe(Effect.provide(server(world, dispatched)), Effect.scoped);
+    }),
+  );
+
   it.effect("a thread that cannot be read waits, then is sent once", () =>
     Effect.gen(function* () {
       const world = newWorld(5);
@@ -241,7 +329,7 @@ describe("provider continuations take an agent slot", () => {
       const cleared: Array<ThreadId> = [];
       yield* Effect.gen(function* () {
         yield* offer(request(A, { clearIfCurrent: () => Effect.sync(() => cleared.push(A)) }));
-        yield* TestClock.adjust("0 seconds");
+        yield* settle;
         assert.deepStrictEqual(cleared, [A]);
         assert.deepStrictEqual(world.asks, []);
         assert.strictEqual(yield* Queue.size(dispatched), 0);
@@ -254,7 +342,7 @@ describe("provider continuations take an agent slot", () => {
       const world = newWorld(0);
       const inner =
         yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
-      const gated = ContinuationSlot.gateContinuations(
+      const gated = yield* ContinuationSlot.gateContinuations(
         {
           offer: (value) => Queue.offer(inner, value).pipe(Effect.asVoid),
           take: Queue.take(inner),
@@ -291,6 +379,8 @@ describe("provider continuations take an agent slot", () => {
         yield* TestClock.adjust("12 seconds");
       }).pipe(Effect.provide(server(world, dispatched)), Effect.scoped);
       const asked = world.asks.length;
+      // Its place in the line goes with it.
+      assert.include(world.calls, "leave continuation:0");
       world.free = 5;
       yield* TestClock.adjust("1 minute");
       assert.strictEqual(yield* Queue.size(dispatched), 0);
@@ -308,7 +398,7 @@ describe("provider continuations take an agent slot", () => {
       }).pipe(Effect.provide(server(world, dispatched, null)), Effect.scoped);
       const inner = { offer: () => Effect.void, take: Effect.never };
       assert.strictEqual(
-        ContinuationSlot.gateContinuations(
+        yield* ContinuationSlot.gateContinuations(
           inner,
           Option.none(),
           () => Effect.succeed(null),
