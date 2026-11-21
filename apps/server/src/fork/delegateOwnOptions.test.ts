@@ -662,8 +662,14 @@ describe("a child's own options, remote delegate_task", () => {
       // A decoy general id beside the model's own control: read as high + low, not sent. Runs
       // again: still not sent.
       for (const _ of [1, 2]) assert.deepStrictEqual(yield* sentTarget(decoy, "enforce", more), []);
-      // Without the model in this catalog, only the fixed ids are read (the fallback).
-      assert.lengthOf(yield* sentTarget(decoy, "enforce", { settings: more.settings }), 1);
+      // Without the model in this catalog, the id its driver reads is not known here: not sent
+      // (before, only the fixed ids were read and the agent's own `low` went through).
+      assert.deepStrictEqual(yield* sentTarget(decoy, "enforce", { settings: more.settings }), []);
+      // The general id only, with the catalog: the agent there never reads it, not sent either.
+      assert.deepStrictEqual(
+        yield* sentTarget({ model: ACP.model, options: { effort: "high" } }, "enforce", more),
+        [],
+      );
       assert.deepStrictEqual(
         yield* sentTarget(
           { model: ACP.model, options: { thought_level: "high" } },

@@ -13,6 +13,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
+  MODEL_POLICY_DRIVER_ALIASES,
   MODEL_POLICY_EFFORT_OPTION_IDS,
   MODEL_POLICY_START_ROWS,
   modelPolicyPickEfforts,
@@ -267,23 +268,35 @@ describe("a selection as the policy reads it", () => {
   } as unknown as ServerProvider;
 
   it("reads the driver from the instance and a reasoning select", () => {
+    const options = [
+      { id: "effort", value: "high" },
+      { id: "level", value: "high" },
+    ];
     const pick = ModelPolicyCheck.pickOfSelection(
       [provider],
-      { instanceId: INSTANCE, model: OPUS, options: [{ id: "level", value: "high" }] },
+      { instanceId: INSTANCE, model: OPUS, options },
       true,
     );
     assert.deepStrictEqual(pick, {
       driver: "claudeAgent",
       model: OPUS,
-      options: [{ id: "level", value: "high" }],
+      options,
       effortOptionIds: ["level"],
+      driverEffortIds: { claudeAgent: ["level"] },
     });
     assert.isUndefined(refusal(policy("enforce"), pick));
+    // The select alone: Claude reads its effort under `effort` only.
+    const alone = ModelPolicyCheck.pickOfSelection(
+      [provider],
+      { instanceId: INSTANCE, model: OPUS, options: [{ id: "level", value: "high" }] },
+      true,
+    );
+    assert.include(refusal(policy("enforce"), alone), `${OPUS} names no effort under effort`);
   });
 
   it("an alias is read as given, not as its model: refused with the full id to name", () => {
-    // Local and remote agree: an alias here is not widened to its model (a provider may move an
-    // alias to a new model), and a remote pick has no model list to look it up in.
+    // Local and remote agree: an alias is not widened to its model (a provider may move an alias
+    // to a new model). A remote pick looks it up in this machine's lists too, for the hint only.
     for (const alias of ["Opus", "opus"]) {
       const pick = ModelPolicyCheck.pickOfSelection(
         [provider],
@@ -300,7 +313,12 @@ describe("a selection as the policy reads it", () => {
         model: alias,
         options: [{ id: "effort", value: "high" }],
       } as never);
-      assert.include(refusal(policy("enforce"), remote), "is in no row");
+      assert.strictEqual(remote.model, alias);
+      const remoteText = refusal(policy("enforce"), remote);
+      assert.include(remoteText, `${alias} is in no row`);
+      // The same full-id hint as a pick here.
+      assert.include(remoteText, `(${alias} is an alias of ${OPUS}; an alias is not read`);
+      assert.include(remoteText, "name the full id");
     }
   });
 
@@ -448,10 +466,14 @@ describe("a selection as the policy reads it", () => {
       ],
     } as never);
     assert.include(refusal(policy("enforce", rows), decoy), "does not allow effort high + max");
+    // Each row's driver reads its own id, so the pick names the effort under both.
     const inside = ModelPolicyCheck.pickOfRemoteTarget([], {
       driverKind: "codex",
       model: "shared",
-      options: [{ id: "reasoningEffort", value: "high" }],
+      options: [
+        { id: "reasoningEffort", value: "high" },
+        { id: "effort", value: "high" },
+      ],
     } as never);
     assert.isUndefined(refusal(policy("enforce", rows), inside));
   });
@@ -516,6 +538,166 @@ describe("a selection as the policy reads it", () => {
       options: [{ id: "variant", value: DEFAULT_VARIANT_CHOICE_ID }],
     };
     assert.deepStrictEqual(modelPolicyPickEfforts(pick), []);
+  });
+});
+
+describe("an effort named only under a driver's own option id (#780)", () => {
+  const acpRows: ReadonlyArray<ModelPolicyRow> = [
+    { driver: ProviderDriverKind.make("acpRegistry"), model: ACP_MODEL, efforts: ["high"] },
+  ];
+  const remote = (
+    providers: ReadonlyArray<ServerProvider>,
+    model: string,
+    options: ReadonlyArray<{ readonly id: string; readonly value: unknown }>,
+  ) => ModelPolicyCheck.pickOfRemoteTarget(providers, { model, options } as never);
+  /** An ACP provider here that lists Opus with its own `thought_level` control (lens A's probe). */
+  const acpOpus = {
+    ...ACP_PROVIDER,
+    models: [{ ...ACP_PROVIDER.models[0]!, slug: OPUS }],
+  } as unknown as ServerProvider;
+  /** The ACP provider with the model listed but no option read yet (an old or empty catalog). */
+  const acpUnprobed = {
+    ...ACP_PROVIDER,
+    models: [{ ...ACP_PROVIDER.models[0]!, capabilities: { optionDescriptors: [] } }],
+  } as unknown as ServerProvider;
+
+  it("sent to a linked machine: an id the row's driver does not read names no effort there", () => {
+    // Lens A's probes: both were inside before. Claude (the Opus row's driver) reads only `effort`.
+    const probes = [
+      remote([acpOpus], OPUS, [{ id: ACP_REASONING_ID, value: "high" }]),
+      remote([], OPUS, [{ id: "reasoning", value: "high" }]),
+    ];
+    for (const pick of probes) {
+      assert.include(
+        refusal(policy("enforce"), pick),
+        `${OPUS} names no effort under effort, the option claudeAgent reads it from`,
+      );
+    }
+    assert.isUndefined(
+      refusal(policy("enforce"), remote([acpOpus], OPUS, [{ id: "effort", value: "high" }])),
+    );
+  });
+
+  it("sent to a linked machine: a driver whose id this machine does not know refuses (old, empty or missing catalog)", () => {
+    // The agent's own id at max beside an allowed general one: before, read as `high` alone.
+    const decoy = [
+      { id: "effort", value: "high" },
+      { id: ACP_REASONING_ID, value: "max" },
+    ];
+    for (const providers of [[], [acpUnprobed]]) {
+      // Runs again: the same refusal.
+      for (const _ of [1, 2]) {
+        assert.include(
+          refusal(policy("enforce", acpRows), remote(providers, ACP_MODEL, decoy)),
+          `the option id acpRegistry reads ${ACP_MODEL}'s effort from is not known here`,
+        );
+      }
+    }
+    // With the catalog here: the agent's own id at an allowed level is inside.
+    assert.isUndefined(
+      refusal(
+        policy("enforce", acpRows),
+        remote([ACP_PROVIDER], ACP_MODEL, [{ id: ACP_REASONING_ID, value: "high" }]),
+      ),
+    );
+  });
+
+  it("checked here (the receiver): read with this machine's own catalog for the instance", () => {
+    const ACP_INSTANCE = ACP_PROVIDER.instanceId;
+    const read = (
+      provider: ServerProvider,
+      options: ReadonlyArray<{ id: string; value: string }>,
+    ) =>
+      ModelPolicyCheck.pickOfSelection(
+        [provider],
+        { instanceId: ACP_INSTANCE, model: ACP_MODEL, options },
+        true,
+      );
+    // The general id only: the agent never reads it and runs its own default.
+    assert.include(
+      refusal(policy("enforce", acpRows), read(ACP_PROVIDER, [{ id: "effort", value: "high" }])),
+      `${ACP_MODEL} names no effort under ${ACP_REASONING_ID}, the option acpRegistry reads it from`,
+    );
+    // The model listed with no option read yet: its id is not known, refused.
+    assert.include(
+      refusal(
+        policy("enforce", acpRows),
+        read(acpUnprobed, [
+          { id: "effort", value: "high" },
+          { id: ACP_REASONING_ID, value: "max" },
+        ]),
+      ),
+      "is not known here",
+    );
+    assert.isUndefined(
+      refusal(
+        policy("enforce", acpRows),
+        read(ACP_PROVIDER, [{ id: ACP_REASONING_ID, value: "high" }]),
+      ),
+    );
+  });
+
+  it("sent to a linked machine: the model's ultracode default counts both ways", () => {
+    const ultracodeByDefault = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      models: [
+        {
+          slug: OPUS,
+          name: "Opus",
+          isCustom: false,
+          capabilities: withUltracodeToggle({
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Effort",
+                type: "select",
+                currentValue: "ultracode",
+                options: ["medium", "high", "xhigh", "ultracode"].map((id) => ({ id, label: id })),
+              },
+            ],
+          }),
+        },
+      ],
+    } as unknown as ServerProvider;
+    const pick = remote([ultracodeByDefault], OPUS, [{ id: "effort", value: "high" }]);
+    assert.isTrue(pick.ultracodeMaybeDefault);
+    // Before: read as `high` and sent, though the model there may run ultracode by default.
+    assert.include(refusal(policy("enforce"), pick), "does not allow effort ultracode + high");
+    // A row allowing ultracode but not xhigh: the reading without the default still refuses.
+    const ultracodeOnly: ReadonlyArray<ModelPolicyRow> = [
+      { driver: ProviderDriverKind.make("claudeAgent"), model: OPUS, efforts: ["ultracode"] },
+    ];
+    assert.include(
+      refusal(
+        policy("enforce", ultracodeOnly),
+        remote([ultracodeByDefault], OPUS, [{ id: "effort", value: "xhigh" }]),
+      ),
+      "does not allow effort ultracode + xhigh",
+    );
+    // The pick names the option: its own value stands. No catalog here: no default read.
+    const off = remote([ultracodeByDefault], OPUS, [
+      { id: "effort", value: "high" },
+      { id: "ultracode", value: false },
+    ]);
+    assert.isUndefined(off.ultracodeMaybeDefault);
+    assert.isUndefined(refusal(policy("enforce"), off));
+    assert.isUndefined(
+      refusal(policy("enforce"), remote([], OPUS, [{ id: "effort", value: "high" }])),
+    );
+  });
+
+  it("the aliases a driver resolves by itself are Claude Code's own", () => {
+    const source = NodeFS.readFileSync(
+      new URL("../claudeModelOptions.ts", import.meta.url),
+      "utf8",
+    );
+    const list = /const CLAUDE_CODE_MODEL_ALIASES = new Set\(\[([^\]]*)\]\)/.exec(source)?.[1];
+    assert.isDefined(list);
+    assert.deepStrictEqual(
+      [...(list ?? "").matchAll(/"([^"]+)"/g)].map((match) => match[1]).toSorted(),
+      [...(MODEL_POLICY_DRIVER_ALIASES.claudeAgent ?? [])].toSorted(),
+    );
   });
 });
 
@@ -689,6 +871,59 @@ describe("t3_thread_configure through upstream's handler", () => {
       assert.isUndefined(yield* owner.configure({ model: "claude-haiku-5-5" }));
       assert.lengthOf(owner.dispatched, 1);
     }),
+  );
+
+  it.effect(
+    "a change a linked agent sent here: an effort under an id the driver here does not read is refused (#780)",
+    () =>
+      Effect.gen(function* () {
+        const ACP_INSTANCE = ACP_PROVIDER.instanceId;
+        const unprobed = {
+          ...ACP_PROVIDER,
+          instanceId: ProviderInstanceId.make("acp-unprobed"),
+          models: [{ ...ACP_PROVIDER.models[0]!, capabilities: { optionDescriptors: [] } }],
+        } as unknown as ServerProvider;
+        const rows = [...ROWS, { driver: "acpRegistry", model: ACP_MODEL, efforts: ["high"] }];
+        const { dispatched, configure } = configureHarness(
+          { modelPolicy: { mode: "enforce", allow: rows } } as never,
+          { caller: "linked agent", providers: [ACP_PROVIDER, unprobed] },
+        );
+        // Runs again: refused each time, nothing changed.
+        for (const _ of [1, 2]) {
+          // Claude here reads only `effort`: before, `reasoning: high` ran Claude's default unchecked.
+          assert.include(
+            yield* configure({ model: OPUS, options: [{ id: "reasoning", value: "high" }] }),
+            `${OPUS} names no effort under effort, the option claudeAgent reads it from`,
+          );
+          // The ACP agent here reads `thought_level`: a general id only runs its own default.
+          assert.include(
+            yield* configure({
+              instanceId: ACP_INSTANCE,
+              model: ACP_MODEL,
+              options: effort("high"),
+            } as never),
+            `${ACP_MODEL} names no effort under ${ACP_REASONING_ID}, the option acpRegistry reads it from`,
+          );
+          // An instance whose catalog has no option read yet: the agent's own id is not known.
+          assert.include(
+            yield* configure({
+              instanceId: unprobed.instanceId,
+              model: ACP_MODEL,
+              options: [...effort("high"), { id: ACP_REASONING_ID, value: "max" }],
+            } as never),
+            "is not known here",
+          );
+        }
+        assert.deepStrictEqual(dispatched, []);
+        assert.isUndefined(
+          yield* configure({
+            instanceId: ACP_INSTANCE,
+            model: ACP_MODEL,
+            options: [{ id: ACP_REASONING_ID, value: "high" }],
+          } as never),
+        );
+        assert.lengthOf(dispatched, 1);
+      }),
   );
 
   it.effect("advise and off: the change goes through", () =>

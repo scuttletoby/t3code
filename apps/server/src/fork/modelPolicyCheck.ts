@@ -8,6 +8,7 @@ import {
   checkModelPolicyPick,
   type ModelPolicy,
   modelPolicyAliasTargets,
+  modelPolicyCatalogEffortIds,
   type ModelPolicyPick,
   modelPolicyPickEfforts,
   modelPolicyRowsText,
@@ -133,18 +134,29 @@ const aliasTarget = (
 };
 
 /**
- * The option ids a model marks as its reasoning control, read as its effort: from every list that
- * holds the model, a folder's own list included (a folder-only model has its control there).
+ * The option ids these lists mark as the model's effort control, read as its effort: from every
+ * list that holds the model, a folder's own list included (a folder-only model has its control
+ * there). The rule is shared with Settings (`modelPolicyCatalogEffortIds`).
  */
-const reasoningIds = (lists: ReadonlyArray<ServerProvider["models"]>, model: string) => [
-  ...new Set(
-    lists
-      .flatMap((list) => list.filter((candidate) => candidate.slug === model))
-      .flatMap((candidate) => candidate.capabilities?.optionDescriptors ?? [])
-      .filter((descriptor) => "role" in descriptor && descriptor.role === "reasoning")
-      .map((descriptor) => descriptor.id),
-  ),
-];
+const reasoningIds = (lists: ReadonlyArray<ServerProvider["models"]>, model: string) =>
+  modelPolicyCatalogEffortIds(lists, model);
+
+/** Whether a pick leaves the ultracode option out while these lists turn it on for the model. */
+const ultracodeByDefault = (
+  lists: ReadonlyArray<ServerProvider["models"]>,
+  model: string,
+  options: ModelPolicyPick["options"],
+): boolean =>
+  options?.some((option) => option.id === "ultracode") !== true &&
+  lists.some((list) =>
+    list.some(
+      (candidate) =>
+        candidate.slug === model &&
+        candidate.capabilities?.optionDescriptors?.some(
+          (descriptor) => descriptor.id === "ultracode" && descriptor.currentValue === true,
+        ),
+    ),
+  );
 
 /**
  * A pick that leaves the ultracode option out runs at the model's default for it (the Claude
@@ -155,18 +167,9 @@ const withUltracodeDefault = (
   model: string,
   options: ModelSelection["options"],
 ): ModelSelection["options"] =>
-  options?.some((option) => option.id === "ultracode") === true ||
-  !lists.some((list) =>
-    list.some(
-      (candidate) =>
-        candidate.slug === model &&
-        candidate.capabilities?.optionDescriptors?.some(
-          (descriptor) => descriptor.id === "ultracode" && descriptor.currentValue === true,
-        ),
-    ),
-  )
-    ? options
-    : [...(options ?? []), { id: "ultracode", value: true }];
+  ultracodeByDefault(lists, model, options)
+    ? [...(options ?? []), { id: "ultracode", value: true }]
+    : options;
 
 /**
  * A resolved selection as the policy reads it: its driver from the instance, the model as named
@@ -183,34 +186,52 @@ export function pickOfSelection(
   const aliasOf = aliasTarget(lists, selection.model);
   // A row may name the alias itself: its effort control and defaults are still the model's.
   const model = aliasOf ?? selection.model;
+  const effortOptionIds = reasoningIds(lists, model);
   return {
     driver: provider?.driver,
     model: named ? selection.model : undefined,
     options: withUltracodeDefault(lists, model, selection.options),
-    effortOptionIds: reasoningIds(lists, model),
+    effortOptionIds,
+    // The id this instance reads the effort from, from this machine's own catalog.
+    driverEffortIds: provider === undefined ? {} : { [provider.driver]: effortOptionIds },
     ...(aliasOf === undefined ? {} : { aliasOf }),
   };
 }
 
 /**
- * A pick sent to a linked machine. Its driver is unknown (a `driverKind` the call names is the
- * agent's claim, not read): every row naming the model must allow it, and every built-in driver's
- * effort id counts, plus the reasoning control this machine's catalog marks for the model, if any.
+ * A pick sent to a linked machine, its driver unknown (`driverKind` is the agent's claim, not
+ * read): every row naming the model must allow it, each under its driver's id, read per driver from
+ * this machine's catalog. Every catalog control here counts as a decoy; an ultracode default here
+ * counts both ways; an alias gets the full-id hint.
  */
 const pickOfRemote = (
   providers: ReadonlyArray<ServerProvider>,
   selection:
     | { readonly model?: string | undefined; readonly options?: ModelPolicyPick["options"] }
     | undefined,
-): ModelPolicyPick => {
+): ServerPick => {
   const model = selection?.model;
+  const options = selection?.options;
+  if (model === undefined) return { driver: undefined, model, options, effortOptionIds: [] };
   const lists = providers.flatMap(modelLists);
+  const aliasOf = aliasTarget(lists, model);
+  const listed = aliasOf ?? model;
+  const driverEffortIds: Record<string, ReadonlyArray<string>> = {};
+  for (const provider of providers) {
+    const ids = reasoningIds(modelLists(provider), listed);
+    if (ids.length === 0) continue;
+    driverEffortIds[provider.driver] = [
+      ...new Set([...(driverEffortIds[provider.driver] ?? []), ...ids]),
+    ];
+  }
   return {
     driver: undefined,
     model,
-    options: selection?.options,
-    effortOptionIds:
-      model === undefined ? [] : reasoningIds(lists, aliasTarget(lists, model) ?? model),
+    options,
+    effortOptionIds: reasoningIds(lists, listed),
+    driverEffortIds,
+    ...(ultracodeByDefault(lists, listed, options) ? { ultracodeMaybeDefault: true } : {}),
+    ...(aliasOf === undefined ? {} : { aliasOf }),
   };
 };
 
@@ -218,7 +239,7 @@ const pickOfRemote = (
 export const pickOfRemoteTarget = (
   providers: ReadonlyArray<ServerProvider>,
   target: OrchestratorMcpTarget,
-): ModelPolicyPick => pickOfRemote(providers, target);
+): ServerPick => pickOfRemote(providers, target);
 
 const describePick = (pick: ModelPolicyPick) => ({
   driver: pick.driver ?? "(not known)",

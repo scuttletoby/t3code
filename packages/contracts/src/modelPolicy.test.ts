@@ -10,6 +10,7 @@ import {
   DEFAULT_MODEL_POLICY,
   MODEL_POLICY_FAIL_CLOSED,
   MODEL_POLICY_START_ROWS,
+  modelPolicyAliasTargets,
   modelPolicyPickEfforts,
   modelPolicyStance,
   ModelPolicyPatch,
@@ -405,5 +406,149 @@ describe("one pick against the rows", () => {
       allow: rows,
       unreadable: false,
     });
+  });
+});
+
+describe("an effort under the id the row's driver reads (#780)", () => {
+  const rows = MODEL_POLICY_START_ROWS;
+  const OPUS = "claude-opus-5-5";
+  const acpRows = [{ driver: "acpRegistry", model: "acp-model", efforts: ["high"] }] as never;
+  const options = (...pairs: ReadonlyArray<readonly [string, unknown]>) =>
+    pairs.map(([id, value]) => ({ id, value }));
+
+  it("a Claude row needs the effort under effort: another id only is the driver's default level", () => {
+    // Claude reads only `effort`; `reasoning: high` alone runs its catalog default, unchecked.
+    for (const driver of ["claudeAgent", undefined]) {
+      expect(
+        checkModelPolicyPick(rows, {
+          driver,
+          model: OPUS,
+          options: options(["reasoning", "high"]),
+        }),
+      ).toEqual({
+        inside: false,
+        why: `${OPUS} names no effort under effort, the option claudeAgent reads it from (left out, the driver runs its default level)`,
+      });
+    }
+    // An ACP model's own id for Opus on this machine does not name Claude's effort either.
+    expect(
+      checkModelPolicyPick(rows, {
+        driver: undefined,
+        model: OPUS,
+        options: options(["thought_level", "high"]),
+        effortOptionIds: ["thought_level"],
+        driverEffortIds: { acpRegistry: ["thought_level"] },
+      }).inside,
+    ).toBe(false);
+    // Under `effort`: inside, on either route.
+    for (const driver of ["claudeAgent", undefined]) {
+      expect(
+        checkModelPolicyPick(rows, { driver, model: OPUS, options: options(["effort", "high"]) }),
+      ).toMatchObject({ inside: true });
+    }
+  });
+
+  it("a driver with no fixed id reads the id its catalog marks; none known refuses (fail closed)", () => {
+    const acp = (
+      pairs: ReadonlyArray<readonly [string, unknown]>,
+      driverEffortIds?: Readonly<Record<string, ReadonlyArray<string>>>,
+      driver: string | undefined = "acpRegistry",
+    ) =>
+      checkModelPolicyPick(acpRows, {
+        driver,
+        model: "acp-model",
+        options: options(...pairs),
+        ...(driverEffortIds === undefined ? {} : { driverEffortIds }),
+      });
+    const known = { acpRegistry: ["thought_level"] };
+    expect(acp([["thought_level", "high"]], known)).toMatchObject({ inside: true });
+    expect(acp([["thought_level", "high"]], known, undefined)).toMatchObject({ inside: true });
+    // The general id only: the agent never sees it and runs its own default.
+    expect(acp([["effort", "high"]], known)).toEqual({
+      inside: false,
+      why: "acp-model names no effort under thought_level, the option acpRegistry reads it from (left out, the driver runs its default level)",
+    });
+    // Missing or empty catalog (not probed yet, or the model not listed there): not known, refused,
+    // whatever the pick names, also the agent's own id beside an allowed general one.
+    for (const missing of [undefined, {}, { acpRegistry: [] }, { cursor: ["effort"] }]) {
+      for (const driver of ["acpRegistry", undefined]) {
+        expect(
+          acp(
+            [
+              ["effort", "high"],
+              ["thought_level", "max"],
+            ],
+            missing,
+            driver,
+          ),
+        ).toEqual({
+          inside: false,
+          why: "the option id acpRegistry reads acp-model's effort from is not known here (no catalog entry of the model on a acpRegistry provider here marks one), so the level it would run cannot be told",
+        });
+      }
+    }
+    // A row without efforts asks for no id: a pick that names none is inside.
+    expect(
+      checkModelPolicyPick([{ driver: "acpRegistry", model: "plain" }] as never, {
+        driver: "acpRegistry",
+        model: "plain",
+      }),
+    ).toMatchObject({ inside: true });
+  });
+
+  it("a catalog id holding no effort name is refused, and a decoy beside it still counts", () => {
+    const known = { acpRegistry: ["thought_level"] };
+    expect(
+      checkModelPolicyPick(acpRows, {
+        driver: undefined,
+        model: "acp-model",
+        options: options(["thought_level", true]),
+        driverEffortIds: known,
+      }).inside,
+    ).toBe(false);
+    expect(
+      checkModelPolicyPick(acpRows, {
+        driver: undefined,
+        model: "acp-model",
+        options: options(["thought_level", "high"], ["reasoning", "max"]),
+        driverEffortIds: known,
+      }),
+    ).toEqual({ inside: false, why: "acp-model does not allow effort high + max" });
+  });
+
+  it("an ultracode default a catalog may turn on counts both ways for a pick with no known driver", () => {
+    const pick = (value: string) => ({
+      driver: undefined,
+      model: OPUS,
+      options: options(["effort", value]),
+      ultracodeMaybeDefault: true,
+    });
+    expect(modelPolicyPickEfforts(pick("xhigh"))).toEqual(["ultracode", "xhigh"]);
+    expect(modelPolicyPickEfforts(pick("high"))).toEqual(["ultracode", "high"]);
+    // The pick's own option wins over a default.
+    expect(
+      modelPolicyPickEfforts({
+        ...pick("high"),
+        options: [...options(["effort", "high"], ["ultracode", false])],
+      }),
+    ).toEqual(["high"]);
+    const ultracodeRow = [{ driver: "claudeAgent", model: OPUS, efforts: ["ultracode"] }] as never;
+    expect(checkModelPolicyPick(ultracodeRow, pick("xhigh")).inside).toBe(false);
+    expect(checkModelPolicyPick(rows, pick("high")).inside).toBe(false);
+  });
+});
+
+describe("modelPolicyAliasTargets", () => {
+  const OPUS = "claude-opus-5-5";
+  it("names the model an alias names, case aside", () => {
+    expect(modelPolicyAliasTargets([[{ slug: OPUS, aliases: ["opus"] }]], "Opus")).toEqual([OPUS]);
+  });
+
+  it("an id is never an alias: a name that is one model's id and another's alias names none", () => {
+    // A custom model `opus` in one list, the catalog's `opus` alias in another.
+    const lists = [[{ slug: "opus" }], [{ slug: OPUS, aliases: ["opus"] }]];
+    expect(modelPolicyAliasTargets(lists, "opus")).toEqual([]);
+    expect(modelPolicyAliasTargets([lists[1]!, lists[0]!], "opus")).toEqual([]);
+    expect(modelPolicyAliasTargets(lists, OPUS)).toEqual([]);
   });
 });
