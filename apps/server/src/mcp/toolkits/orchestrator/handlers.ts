@@ -2,6 +2,7 @@ import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import { OrchestratorToolkit } from "./tools.ts";
 import * as Effect from "effect/Effect";
 
+import * as LaunchMcpProfile from "../../../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../../../peer/PeerLinkRequests.ts";
 import * as PeerLinks from "../../../peer/PeerLinks.ts";
@@ -98,6 +99,7 @@ const handlers = {
               message: "A new scheduled task needs `prompt` and `schedule`.",
             });
           }
+          yield* LaunchMcpProfile.checkScheduleMcpProfile(input); // Fork: MCP profile launch
           const scope = yield* McpInvocationContext.McpInvocationContext;
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           return yield* service.scheduleTask(scope, { ...input, prompt, schedule });
@@ -109,6 +111,7 @@ const handlers = {
       ({ scheduledTaskId, prompt, title, schedule, enabled, freshSession, bindToCurrentThread }) =>
         Effect.gen(function* () {
           if (scheduledTaskId === undefined) return yield* Effect.die("unreachable");
+          yield* LaunchMcpProfile.checkScheduleEditMcpProfile(scheduledTaskId, bindToCurrentThread); // Fork: MCP profile launch
           const scope = yield* McpInvocationContext.McpInvocationContext;
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           return yield* service.updateScheduledTask(scope, {
