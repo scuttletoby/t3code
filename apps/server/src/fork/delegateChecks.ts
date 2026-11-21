@@ -31,6 +31,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
+import * as LaunchMcpProfile from "./launchMcpProfile.ts";
 
 /** A checked delegation target (the same shape as the service's resolved target). */
 export interface DelegateTarget {
@@ -118,7 +119,10 @@ export interface DelegateChecks {
   readonly afterWorkspace: (
     input: AfterWorkspaceInput,
   ) => Effect.Effect<DelegateHold, OrchestratorMcpFailure, Scope.Scope>;
-  /** `create_threads`, per thread before its dispatch. */
+  /**
+   * `create_threads`, per thread before its dispatch. A caller with a narrower MCP profile than
+   * `all` is refused a thread that would get more (`launchMcpProfile.ts`): it has no parent.
+   */
   readonly beforeCreateThread: (
     input: BeforeCreateThreadInput,
   ) => Effect.Effect<BeforeCreateThreadResult, OrchestratorMcpFailure>;
@@ -253,6 +257,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const usagePacer = yield* Effect.serviceOption(UsagePacer.UsagePacer);
   const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
+  const launchMcpProfile = yield* LaunchMcpProfile.makeLaunchMcpProfileCheck;
   /**
    * Folder scans for a switch target that gave no settled answer: instance and folder -> the time a
    * scan may run again. Memory only: a restart costs one more scan. Entries that no longer back off
@@ -470,11 +475,18 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
       input.isRetry || Option.isNone(slotGate)
         ? Effect.succeed(NO_HOLD)
         : acquireSlot(slotGate.value, input),
-    // Placement (P1) adds its check here.
+    // Placement (P1) adds its check here. The MCP profile check is first: a refusal starts nothing.
     beforeCreateThread: (input) =>
       input.isRetry
         ? Effect.succeed({ target: input.target })
-        : Effect.map(ownTarget(input.target, input.requested), (target) => ({ target })),
+        : launchMcpProfile(input.parent.thread, {
+            projectId: input.parent.thread.projectId,
+            route: "create_threads",
+          }).pipe(
+            Effect.andThen(
+              Effect.map(ownTarget(input.target, input.requested), (target) => ({ target })),
+            ),
+          ),
     remoteTarget: (target) =>
       remoteTarget(target) === target
         ? Effect.succeed(target)
