@@ -132,6 +132,44 @@ describe("aliasModelPolicyRows (#127)", () => {
     expect(aliasModelPolicyRows(rows, [])).toEqual([]);
     expect(aliasModelPolicyRows(rows, [{ driver: "claudeAgent" }])).toEqual([]);
   });
+
+  it("an id is never an alias: a name that is one model's id and another's alias is not flagged", () => {
+    const row = rows[0]!; // opus
+    // A custom model `opus` beside the catalog's `opus` alias, on the same machine.
+    const custom = { driver: "claudeAgent", models: [{ slug: "opus" }] };
+    expect(aliasModelPolicyRows([row], [custom, claude])).toEqual([]);
+    expect(aliasModelPolicyRows([row], [claude, custom])).toEqual([]);
+  });
+
+  it("reads each machine on its own lists, as its server does (#780)", () => {
+    const row = rows[0]!; // opus
+    const here = { driver: "claudeAgent", environmentId: "here", models: [{ slug: "opus" }] };
+    const there = { ...claude, environmentId: "there" };
+    // `opus` is a model's id here, an alias there: the server there reads a pick of it as named.
+    expect(aliasModelPolicyRows([row], [here, there])).toEqual([
+      { row, aliasOf: ["claude-opus-5-5"] },
+    ]);
+    // Only the machine where it is an id: not flagged.
+    expect(aliasModelPolicyRows([row], [here])).toEqual([]);
+    // Runs again: the same answer.
+    expect(aliasModelPolicyRows([row], [here, there])).toEqual(
+      aliasModelPolicyRows([row], [here, there]),
+    );
+  });
+
+  it("flags a name Claude Code resolves by itself, also when no list holds it as an alias (#780)", () => {
+    const sonnet = fromFile({
+      modelPolicy: { mode: "enforce", allow: [{ driver: "claudeAgent", model: "sonnet" }] },
+    }).modelPolicy.allow;
+    const plain = { driver: "claudeAgent", models: [{ slug: "claude-opus-5-5" }] };
+    expect(aliasModelPolicyRows(sonnet, [plain])).toEqual([{ row: sonnet[0], aliasOf: [] }]);
+    // Not for another driver, nor a machine whose model list is not known yet, nor a custom id.
+    expect(aliasModelPolicyRows(sonnet, [{ driver: "claudeAgent" }])).toEqual([]);
+    expect(
+      aliasModelPolicyRows(sonnet, [{ driver: "claudeAgent", models: [{ slug: "sonnet" }] }]),
+    ).toEqual([]);
+    expect(aliasModelPolicyRows([rows[2]!], [{ driver: "codex", models: [] }])).toEqual([]);
+  });
 });
 
 describe("the editor's start rows (#126)", () => {
@@ -203,6 +241,46 @@ describe("personModelPickMarks: the outside policy mark (#125)", () => {
     expect(personModelPickMarks(policy("advise"), picks, providers)).toEqual(
       personModelPickMarks(policy("enforce"), picks, providers),
     );
+  });
+
+  it("reads an instance's effort as the server reads an agent's pick: its catalog's own id (#780)", () => {
+    const acp = {
+      instanceId: "acp",
+      driver: "acpRegistry",
+      models: [
+        {
+          slug: "acp-model",
+          capabilities: {
+            optionDescriptors: [{ id: "thought_level", type: "select", role: "reasoning" }],
+          },
+        },
+      ],
+    };
+    const rows = [{ driver: "acpRegistry", model: "acp-model", efforts: ["high"] }];
+    const mark = (options: ReadonlyArray<{ id: string; value: string }>) =>
+      personModelPickMarks(
+        policy("enforce", rows),
+        { defaultModelSelection: { instanceId: "acp", model: "acp-model", options } } as never,
+        [acp],
+      )[0]?.outside;
+    expect(mark([{ id: "thought_level", value: "high" }])).toBeNull();
+    expect(mark([{ id: "effort", value: "high" }])).toBe(
+      "acp-model names no effort under thought_level, the option acpRegistry reads it from (left out, the driver runs its default level)",
+    );
+    // Claude reads only `effort`: another id alone is marked.
+    expect(
+      personModelPickMarks(
+        policy("enforce"),
+        {
+          defaultModelSelection: {
+            instanceId: "claudeAgent",
+            model: "claude-opus-5-5",
+            options: [{ id: "reasoning", value: "high" }],
+          },
+        } as never,
+        providers,
+      )[0]?.outside,
+    ).toContain("names no effort under effort");
   });
 
   it("marks nothing while the policy is off or cannot be read; empty rows mark every pick", () => {

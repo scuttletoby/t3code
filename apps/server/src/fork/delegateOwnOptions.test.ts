@@ -48,6 +48,12 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as DelegateChecks from "./delegateChecks.ts";
+import {
+  OPTION_CASE_PROVIDERS,
+  OPTION_CASE_ROWS,
+  OPTION_CASES,
+  type OptionCase,
+} from "./modelPolicyOptions.testkit.ts";
 
 const parentThreadId = ThreadId.make("thread:own-options-parent");
 const childThreadId = ThreadId.make("thread:own-options-child");
@@ -662,8 +668,14 @@ describe("a child's own options, remote delegate_task", () => {
       // A decoy general id beside the model's own control: read as high + low, not sent. Runs
       // again: still not sent.
       for (const _ of [1, 2]) assert.deepStrictEqual(yield* sentTarget(decoy, "enforce", more), []);
-      // Without the model in this catalog, only the fixed ids are read (the fallback).
-      assert.lengthOf(yield* sentTarget(decoy, "enforce", { settings: more.settings }), 1);
+      // Without the model in this catalog, the id its driver reads is not known here: not sent
+      // (before, only the fixed ids were read and the agent's own `low` went through).
+      assert.deepStrictEqual(yield* sentTarget(decoy, "enforce", { settings: more.settings }), []);
+      // The general id only, with the catalog: the agent there never reads it, not sent either.
+      assert.deepStrictEqual(
+        yield* sentTarget({ model: ACP.model, options: { effort: "high" } }, "enforce", more),
+        [],
+      );
       assert.deepStrictEqual(
         yield* sentTarget(
           { model: ACP.model, options: { thought_level: "high" } },
@@ -1018,6 +1030,127 @@ describe("the model policy's check on delegate_task and create_threads (#731)", 
       })) {
         assert.deepStrictEqual(refusals, []);
         assert.lengthOf(made, 1);
+      }
+    }),
+  );
+});
+
+describe("delegate_task and create_threads: an option the policy cannot read (#793 review)", () => {
+  const settings = (mode: string) => ({ modelPolicy: { mode, allow: OPTION_CASE_ROWS } });
+  /** The case's provider as one setup, its parent running the allowed effort. */
+  const setupOf = (testCase: OptionCase): Setup => {
+    const provider = OPTION_CASE_PROVIDERS.find(
+      (candidate) => candidate.instanceId === testCase.instanceId,
+    )!;
+    return {
+      name: testCase.name,
+      driver: provider.driver,
+      model: testCase.model,
+      descriptors: provider.models[0]!.capabilities!.optionDescriptors!,
+      parent: [testCase.allowed],
+    };
+  };
+  const targetOf = (testCase: OptionCase, withExtra: boolean) => ({
+    model: testCase.model,
+    options: Object.fromEntries(
+      (withExtra ? [testCase.allowed, testCase.extra] : [testCase.allowed]).map((option) => [
+        option.id,
+        option.value,
+      ]),
+    ),
+  });
+
+  it.effect("local, enforce and advise: refused, nothing dispatched; without it, it runs", () =>
+    Effect.gen(function* () {
+      for (const testCase of OPTION_CASES) {
+        for (const tool of TOOLS) {
+          // Here the instance is known: its unknown option was already refused before the policy
+          // (upstream's option check), in every mode; enforce's own refusal is behind it.
+          for (const mode of ["enforce", "advise"]) {
+            const name = `${tool} ${mode}: ${testCase.name}`;
+            const refusals: Array<string> = [];
+            // Runs again: refused each time, nothing dispatched.
+            const made = yield* launch(tool, {
+              setup: setupOf(testCase),
+              target: targetOf(testCase, true),
+              settings: settings(mode),
+              times: 2,
+              refusals,
+            });
+            assert.deepStrictEqual(made, [], name);
+            assert.lengthOf(refusals, 2, name);
+            for (const refused of refusals) {
+              assert.include(refused, `Unknown option ${testCase.extra.id}`, name);
+            }
+          }
+          const made = yield* launch(tool, {
+            setup: setupOf(testCase),
+            target: targetOf(testCase, false),
+            settings: settings("enforce"),
+          });
+          assert.lengthOf(made, 1, `${tool}: ${testCase.name}`);
+        }
+      }
+    }),
+  );
+
+  /** The target the service hands the remote delegation (as in the remote tests above). */
+  const sentTo = (target: unknown, mode: string) =>
+    Effect.gen(function* () {
+      const sent: Array<unknown> = [];
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({
+          getProviders: Effect.succeed(OPTION_CASE_PROVIDERS),
+        }),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(RemoteDelegation.RemoteDelegation)({
+          delegate: (_scope, input) =>
+            Effect.sync(() => {
+              sent.push(input.target);
+            }).pipe(Effect.andThen(Effect.fail("stop after the hand-over" as never))),
+        }),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+        ServerSettings.layerTest(settings(mode) as never),
+      );
+      const refused = yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* service
+          .delegateTask(scopeOf(OPENCODE), {
+            task: "Review the change on the box.",
+            target: decodeTarget({ environmentId: box, ...(target as object) }),
+            mode: "async",
+            clientRequestId: "option-case-remote",
+          })
+          .pipe(
+            Effect.flip,
+            Effect.map((failure) =>
+              typeof failure === "string" ? undefined : (failure as OrchestratorMcpFailure).message,
+            ),
+          );
+      }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+      return { sent, refused };
+    });
+
+  it.effect("sent to a linked machine: enforce refuses it before it is sent; advise sends it", () =>
+    Effect.gen(function* () {
+      for (const testCase of OPTION_CASES) {
+        // Runs again: refused each time, nothing sent.
+        for (const _ of [1, 2]) {
+          const { sent, refused } = yield* sentTo(targetOf(testCase, true), "enforce");
+          assert.deepStrictEqual(sent, [], testCase.name);
+          assert.include(refused, `Model policy refused this pick: ${testCase.why}`, testCase.name);
+          assert.include(refused, testCase.fix, testCase.name);
+          assert.include(refused, "target.", testCase.name);
+        }
+        assert.lengthOf((yield* sentTo(targetOf(testCase, false), "enforce")).sent, 1);
+        assert.lengthOf((yield* sentTo(targetOf(testCase, true), "advise")).sent, 1);
       }
     }),
   );
