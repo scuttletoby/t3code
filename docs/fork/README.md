@@ -386,13 +386,20 @@ These routes start a new agent run and go through the same gate, with the same c
   minutes while it waits, upstream's missed-run rule applies. "Run now" fails with `Not run, no agent slot: ` and the reason and changes
   nothing; over MCP `run_scheduled_task_now` answers `slots_full`. A webhook delivery waits the
   same way and starts once when a slot is free; it ends without a run only if its task is paused,
-  deleted, replaced or its trigger changed while it waits. A save while it waits (any other edit)
-  is seen at its next retry: it is never run on the task as it was before the save, and not
-  dropped. It stays stored, and the stored-delivery worker reads the task again, renders the
-  prompt again and waits again if no slot is free
-  ([#719](https://github.com/scuttletoby/t3code/issues/719)). Every waiting delivery is in the
-  store, so a restart keeps it and it runs once: a direct one (no coalescing window) is moved there
-  when it is first refused. If that store fails, the delivery waits in memory; a save then stores
+  deleted, replaced or its trigger changed while it waits. A save while it waits that changes
+  what a run uses (prompt, title, project, thread, mode, model, workspace, schedule; a save in the
+  same millisecond too) is seen at its next retry, and so is a save between the stored-delivery
+  worker's read of the task and the run's own read, wait or not: it is not run on the task or
+  prompt from before the save, and not dropped. It stays stored, and the stored-delivery worker
+  reads the task again, renders the prompt again and waits again if no slot is free
+  ([#719](https://github.com/scuttletoby/t3code/issues/719),
+  [#750](https://github.com/scuttletoby/t3code/issues/750)). A write that changes none of that (a
+  new webhook token, a pause undone before the next retry) does not hand it back, and a retry
+  that cannot read the task asks again at the next one. Not covered: a save in the instant
+  between the last check and the start, or between a direct delivery's read (no coalescing
+  window) and its first try for a slot: upstream's read-then-run window, as for any run. Every
+  waiting delivery is in the store, so a restart keeps it and it runs once: a direct one is moved
+  there when it is first refused. If that store fails, the delivery waits in memory; a save then stores
   it, and if the store fails again it ends without a run, saying why. A scheduled run or a webhook
   takes a slot only when no agent that waits for one holds it; there is no order between routes,
   so on a host kept full it can wait long.
