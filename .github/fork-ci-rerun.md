@@ -18,7 +18,7 @@ and its fix first.
 The `end` step prints one line in every app job, passed or not:
 
 ```
-fork-ci pressure: job failure; 612 s since start; memory stall full 14.2% some 30.1% of the job;
+fork-ci-pressure: job failure; 612 s since start; memory stall full 14.2% some 30.1% of the job;
 full avg10/60/300 22.0/18.4/12.9%; available 310 MB, swap used 1024 MB, OOM kills 1;
 cgroup /fleet.slice/fork-fleet-x.service: high None MB max None MB use 2900 MB, events high None max None oom_kill None, full 15.0%; ...
 ```
@@ -33,7 +33,7 @@ cgroup /fleet.slice/fork-fleet-x.service: high None MB max None MB use 2900 MB, 
   `memory.events` (high, max, oom_kill) since `start` and its own stall share.
 
 A job that did not succeed also leaves the same numbers as one notice
-annotation (`fork-ci pressure`), which the decision reads from GitHub after the
+annotation (`fork-ci-pressure`), which the decision reads from GitHub after the
 run. `null` (or `None` in the line) is a number that could not be read: no
 start sample, a reboot in between, a file the runner cannot see.
 

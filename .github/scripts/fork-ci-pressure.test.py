@@ -95,7 +95,7 @@ class Probe(unittest.TestCase):
         self.stall()
         code, out = run(self.m, 'end', self.temp, 'failure', t=1600.0)
         self.assertEqual(code, 0)
-        self.assertIn('fork-ci pressure: job failure; 600 s since start; memory stall full 10.0% some 20.0%', out)
+        self.assertIn('fork-ci-pressure: job failure; 600 s since start; memory stall full 10.0% some 20.0%', out)
         self.assertIn('full avg10/60/300 30.0/0.0/12.5%', out)
         self.assertIn('available 8000 MB, swap used 1024 MB, OOM kills 2', out)
         self.assertIn('cgroup /fleet.slice: high None MB max 8192 MB', out)
@@ -113,7 +113,7 @@ class Probe(unittest.TestCase):
         run(self.m, 'start', self.temp)
         code, out = run(self.m, 'end', self.temp, 'success', t=1600.0)
         self.assertEqual(code, 0)
-        self.assertIn('fork-ci pressure: job success', out)
+        self.assertIn('fork-ci-pressure: job success', out)
         self.assertIsNone(the_note(out))
 
     def test_a_cancelled_job_and_an_unknown_status_leave_a_note(self):
@@ -183,11 +183,11 @@ class Probe(unittest.TestCase):
         if os.geteuid() != 0:
             code, text = run(self.m, 'start', self.temp)
             self.assertEqual(code, 0)
-            self.assertIn('::warning::fork-ci pressure: start', text)
+            self.assertIn('::warning::fork-ci-pressure: start', text)
         r = subprocess.run([sys.executable, '-I', SCRIPT, 'end'], capture_output=True, text=True,
                            env={'PATH': os.environ.get('PATH', ''), 'RUNNER_TEMP': self.temp, 'JOB_STATUS': 'failure'})
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('fork-ci pressure: job failure', r.stdout)
+        self.assertIn('fork-ci-pressure: job failure', r.stdout)
 
 
 class Steps(unittest.TestCase):

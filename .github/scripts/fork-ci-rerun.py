@@ -33,7 +33,7 @@ import urllib.error, urllib.parse, urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(os.path.dirname(HERE), 'fork-ci-rerun.json')
 API = os.environ.get('GITHUB_API_URL') or 'https://api.github.com'
-NOTE_TITLE = 'fork-ci pressure'          # fork-ci-pressure.py's
+NOTE_TITLE = 'fork-ci-pressure'          # fork-ci-pressure.py's
 NOTE_HEAD = 'fork-ci-pressure v1 '
 RED = ('failure', 'cancelled', 'timed_out')
 CHECK_RUN = re.compile(r'/check-runs/([0-9]{1,20})$')

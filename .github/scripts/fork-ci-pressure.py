@@ -19,7 +19,7 @@ and any other error prints a warning and exits 0. Standard library only.
 """
 import json, os, sys, time
 
-NOTE_TITLE = 'fork-ci pressure'
+NOTE_TITLE = 'fork-ci-pressure'
 NOTE_HEAD = 'fork-ci-pressure v1 '
 SAMPLE = 'fork-ci-pressure-start.json'
 EVENTS = ('high', 'max', 'oom', 'oom_kill')
@@ -155,7 +155,7 @@ def numbers(start, end):
 
 def line(status, n):
     h = n['host']
-    out = [f'fork-ci pressure: job {status}', f'{n["seconds"]} s since start' if n['seconds'] is not None
+    out = [f'fork-ci-pressure: job {status}', f'{n["seconds"]} s since start' if n['seconds'] is not None
            else 'no start sample (numbers since start unknown)',
            f'memory stall full {h["full_share"]}% some {h["some_share"]}% of the job',
            f'full avg10/60/300 {h["full_avg10"]}/{h["full_avg60"]}/{h["full_avg300"]}%',
@@ -175,7 +175,7 @@ def main(argv, env=os.environ, out=sys.stdout, proc='/proc', root='/sys/fs/cgrou
     verb = argv[1] if len(argv) == 2 else ''
     temp = env.get('RUNNER_TEMP') or ''
     if verb not in ('start', 'end') or not temp:
-        print('::warning::fork-ci pressure: usage: fork-ci-pressure.py start|end, with RUNNER_TEMP set', file=out)
+        print('::warning::fork-ci-pressure: usage: fork-ci-pressure.py start|end, with RUNNER_TEMP set', file=out)
         return 0
     path = os.path.join(temp, SAMPLE)
     try:
@@ -183,7 +183,7 @@ def main(argv, env=os.environ, out=sys.stdout, proc='/proc', root='/sys/fs/cgrou
         if verb == 'start':
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(now_sample, f)
-            print(f'fork-ci pressure: start sample saved ({len(now_sample["cgroups"])} cgroup(s))', file=out)
+            print(f'fork-ci-pressure: start sample saved ({len(now_sample["cgroups"])} cgroup(s))', file=out)
             return 0
         try:
             start = json.loads(read(path) or 'null')
@@ -196,7 +196,7 @@ def main(argv, env=os.environ, out=sys.stdout, proc='/proc', root='/sys/fs/cgrou
             note = json.dumps({'status': status, **n}, separators=(',', ':'), sort_keys=True)
             print(f'::notice title={NOTE_TITLE}::{command(NOTE_HEAD + note)}', file=out)
     except Exception as e:   # never fail the job
-        print(f'::warning::fork-ci pressure: {verb}: {e.__class__.__name__}: {e}', file=out)
+        print(f'::warning::fork-ci-pressure: {verb}: {e.__class__.__name__}: {e}', file=out)
     return 0
 
 
