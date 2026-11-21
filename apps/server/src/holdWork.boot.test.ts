@@ -381,15 +381,17 @@ const HELD_SPANS = ["autoPullProjects", "RemoteDelegation.followOnce", ...CONNEC
 /**
  * Spans only the fork's own server layers make while built (fork/forkLayers.ts). A server.ts that
  * lost `ForkLayers.layerRuntimeServices` and `layerRoutes`, or `ForkLayers.mcpProfileTurnCheck`,
- * still boots and keeps every hold, so only these show the gates are gone. The last is the agent
- * slot gate on scheduled runs (`Layer.provide(SlotGate.layer)` in orchestration-v2/runtimeLayer.ts).
+ * still boots and keeps every hold, so only these show the gates are gone.
  */
 const FORK_LAYER_SPANS = [
   "ForkLayers.mcpGatesPresent",
   "HeadlessUsageRefresher.make",
   "cloud.auto_update.make",
   "McpProfileTurnCheck.make",
+  // The agent slot gate on scheduled runs: `Layer.provide(SlotGate.layer)` in runtimeLayer.ts.
   "AgentSlotRoutes.scheduledRunsGated",
+  // The record of who saved each scheduled task, which needs the server's state folder.
+  "ScheduledTaskMcpProfiles.stored",
 ];
 
 const missingForkLayers = (spans: ReadonlySet<string>) =>

@@ -285,16 +285,17 @@ export const carryMcpProfile = (resolved: McpProfileResolved): McpProfileCarried
   t3Tools: resolved.profile.t3Tools,
 });
 
-type CarriedLookup =
+export type CarriedLookup =
   | { readonly ok: true; readonly name: string; readonly profile: McpProfileSet }
   | { readonly ok: false; readonly name: string; readonly issue: string };
 
 /**
  * A carried profile, checked as strictly as a settings entry: a field this build does not know
  * could narrow the profile, so it refuses rather than being dropped. T3 tool groups it does not
- * know keep nothing, which only narrows.
+ * know keep nothing, which only narrows. Also reads a profile a scheduled task was saved with
+ * (`scheduledTaskMcpProfile.ts`).
  */
-function readCarried(value: unknown): CarriedLookup {
+export function readCarried(value: unknown): CarriedLookup {
   const name = isRecord(value) && typeof value.name === "string" ? value.name : "";
   if (!isRecord(value)) return { ok: false, name, issue: "it is not an object" };
   const extra = Object.keys(value).filter((field) => !CARRIED_FIELDS.has(field));
