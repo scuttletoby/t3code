@@ -7,6 +7,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -466,11 +467,12 @@ describe("makeClaudeMcpProfiles", () => {
             assert.include(refused, "fix settings.json");
           }
         }
-        // Fixed, the next turn reads it again; removed, the defaults apply as before.
+        // Fixed, the next turn reads it again; removed after that, the keys read stay (a
+        // rename-then-write gap), never the defaults' all.
         yield* fs.writeFileString(settingsPath, JSON.stringify({ mcpProfile: "t3-only" }));
         assert.strictEqual(yield* run(), "t3-only");
         yield* fs.remove(settingsPath);
-        assert.strictEqual(yield* run(), "all");
+        assert.strictEqual(yield* run(), "t3-only");
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -503,7 +505,7 @@ describe("makeClaudeMcpProfiles: settings.json broken before its MCP profile key
       Effect.orElseSucceed(() => fromFile({})),
     );
     /** A server start: a new settings service, so nothing read before it is remembered. */
-    const start = () =>
+    const start = (self: LineageThread = thread("t")) =>
       makeClaudeMcpProfiles.pipe(
         Effect.provideService(ServerSettingsService.ServerSettingsService, {
           ...service,
@@ -511,19 +513,39 @@ describe("makeClaudeMcpProfiles: settings.json broken before its MCP profile key
         }),
         Effect.map(
           (plan) => () =>
-            plan(thread("t"), {}).pipe(
+            plan(self, {}).pipe(
               Effect.match({ onFailure: (refusal) => refusal.message, onSuccess: (r) => r.name }),
             ),
         ),
       );
     const write = (text: string) => fs.writeFileString(settingsPath, text);
-    return { start, write };
+    /** No file: an editor's rename-then-write gap, or a delete. */
+    const remove = () => fs.remove(settingsPath);
+    return { start, write, remove };
   });
-  const files = Layer.mergeAll(
-    ServerSettingsService.ServerSettingsService.layerTest(),
-    ManagedPolicy.layerTest(),
-    Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
-  ).pipe(Layer.provideMerge(NodeServices.layer));
+  const filesWith = (policy?: unknown) =>
+    Layer.mergeAll(
+      ServerSettingsService.ServerSettingsService.layerTest(),
+      ManagedPolicy.layerTest(policy === undefined ? undefined : policyDocument(policy)),
+      Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-profile-" })),
+    ).pipe(Layer.provideMerge(NodeServices.layer));
+  const files = filesWith();
+  /** A task another machine delegated here, carrying t3-only. */
+  const carriedTask: LineageThread = {
+    ...thread("task"),
+    delegatedFrom: {
+      environmentId: "environment-there" as never,
+      threadId: ThreadId.make("thread-there"),
+      title: "Parent there",
+      mcpProfile: { name: "t3-only", servers: [], t3Tools: "all" },
+    },
+  };
+  /** Whole files with a JSON typo and no MCP profile key: nothing cut off, so they set none. */
+  const WHOLE_TYPOS = [
+    '{ "theme": "dark" "defaultRuntimeMode": "full-access" }',
+    '{ "theme": "dark", "providers": { "codex": { "enabled": tru } } }',
+    "{ theme: 'dark' }",
+  ];
   const NARROWED = JSON.stringify({ theme: "dark", mcpProfile: "t3-only" });
   /** Cut off before the key, empty, cut off in a value, garbage, a list: none can say. */
   const CANNOT_SAY = ['{ "theme": "dark", ', "", '{ "theme": "da', "\u0000\u0001 zz", "[1, 2]"];
@@ -590,6 +612,168 @@ describe("makeClaudeMcpProfiles: settings.json broken before its MCP profile key
       assert.strictEqual(yield* fresh(), "all");
       yield* write("");
       assert.strictEqual(yield* fresh(), "all");
+    }).pipe(Effect.provide(files)),
+  );
+
+  it.effect("narrowed, then removed, then empty or cut off: the profile last read stays", () =>
+    Effect.gen(function* () {
+      const { start, write, remove } = yield* asUpstreamLoads;
+      const run = yield* start();
+      yield* write(NARROWED);
+      assert.strictEqual(yield* run(), "t3-only");
+      // An editor that saves by renaming the old file away leaves no file for a moment, then an
+      // empty or half-written one; a write that stops there must not leave every thread on all.
+      for (const _ of [1, 2]) {
+        yield* remove();
+        assert.strictEqual(yield* run(), "t3-only");
+        yield* write("");
+        assert.strictEqual(yield* run(), "t3-only");
+        yield* write('{ "theme": "dark", ');
+        assert.strictEqual(yield* run(), "t3-only");
+      }
+      // Removed with a cut-off file before it: still the keys last read, never reset.
+      yield* remove();
+      assert.strictEqual(yield* run(), "t3-only");
+      // Written back whole: read again.
+      yield* write(JSON.stringify({ theme: "dark" }));
+      assert.strictEqual(yield* run(), "all");
+      yield* write(NARROWED);
+      assert.strictEqual(yield* run(), "t3-only");
+      // A server started with no file is a fresh install: all, and that is what it keeps.
+      yield* remove();
+      const fresh = yield* start();
+      assert.strictEqual(yield* fresh(), "all");
+      yield* write('{ "theme": ');
+      assert.strictEqual(yield* fresh(), "all");
+    }).pipe(Effect.provide(files)),
+  );
+
+  it.effect("a server started on a whole file with a JSON typo and no MCP key gives all", () =>
+    Effect.gen(function* () {
+      const { start, write } = yield* asUpstreamLoads;
+      for (const typo of WHOLE_TYPOS) {
+        yield* write(typo);
+        // A restart: nothing read before, and the file sets none, so T3 keeps working.
+        const run = yield* start();
+        for (const _ of [1, 2]) assert.strictEqual(yield* run(), "all", typo);
+        // It is the last read too: cut off after it, still all.
+        yield* write('{ "theme": "dark", ');
+        assert.strictEqual(yield* run(), "all", typo);
+      }
+      // Narrowed in this run, then a whole typo file that names no key: it sets none, as the
+      // same file without its typo would.
+      const run = yield* start();
+      yield* write(NARROWED);
+      assert.strictEqual(yield* run(), "t3-only");
+      yield* write(WHOLE_TYPOS[0]!);
+      assert.strictEqual(yield* run(), "all");
+    }).pipe(Effect.provide(files)),
+  );
+
+  it.effect("a server started on a cut-off file or one whose key cannot be read refuses", () =>
+    Effect.gen(function* () {
+      const { start, write } = yield* asUpstreamLoads;
+      const cases: ReadonlyArray<readonly [string, string]> = [
+        // Cut off, typo or not: its keys may be in the part not written yet.
+        ['{ "theme": "dark" "defaultRuntimeMode": ', "has not read its MCP profiles"],
+        ['{ "theme": "dark", "x": { "y": 1 }', "has not read its MCP profiles"],
+        ['{ "theme": "da}', "has not read its MCP profiles"],
+        // Whole, but it names a key that cannot be read.
+        ['{ "theme": "dark" "mcpProfile": "t3-only" }', "sets MCP profiles but cannot be read"],
+      ];
+      for (const [raw, refusal] of cases) {
+        yield* write(raw);
+        const run = yield* start();
+        for (const _ of [1, 2]) assert.include(yield* run(), refusal, raw);
+      }
+    }).pipe(Effect.provide(files)),
+  );
+
+  it.effect("the kept keys read carried profiles as refuse, under the policy's locks", () =>
+    Effect.gen(function* () {
+      const { start, write, remove } = yield* asUpstreamLoads;
+      // The file sets nothing about carried tasks (apply), so the task runs, cut to its t3-only.
+      const task = yield* start(carriedTask);
+      yield* write(JSON.stringify({ theme: "dark" }));
+      assert.strictEqual(yield* task(), "all");
+      // Cut off or removed: the file may now say refuse, so a narrower carried task is refused,
+      // though the service's settings (the broken load's defaults) say apply.
+      for (const step of [() => write('{ "theme": "dark", '), remove]) {
+        yield* step();
+        assert.include(yield* task(), "set to refuse such tasks");
+      }
+    }).pipe(Effect.provide(files)),
+  );
+
+  it.effect("the policy's locks stand over the kept keys", () =>
+    Effect.gen(function* () {
+      const { start, write, remove } = yield* asUpstreamLoads;
+      const run = yield* start();
+      // Text a full decode refuses: its keys are the file's own, all, under a lock of t3-only.
+      yield* write(JSON.stringify({ defaultRuntimeMode: 5, mcpProfile: "all" }));
+      assert.strictEqual(yield* run(), "t3-only");
+      for (const step of [() => write('{ "theme": "dark", '), () => write(""), remove]) {
+        yield* step();
+        assert.strictEqual(yield* run(), "t3-only");
+      }
+    }).pipe(
+      Effect.provide(
+        filesWith({
+          schemaVersion: 1,
+          organization: "Example Corp",
+          settings: { mcpProfile: { value: "t3-only", locked: true } },
+        }),
+      ),
+    ),
+  );
+
+  it.effect("two reads at once: the one that started last is the one kept", () =>
+    Effect.gen(function* () {
+      const { settingsPath } = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const service = yield* ServerSettingsService.ServerSettingsService;
+      // The first read gets its text, then waits: a slow disk, or a busy server.
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let reads = 0;
+      const slowFirstRead: FileSystem.FileSystem = {
+        ...fs,
+        readFileString: (path, encoding) =>
+          fs
+            .readFileString(path, encoding)
+            .pipe(
+              Effect.tap(() =>
+                reads++ === 0
+                  ? Deferred.succeed(reached, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    )
+                  : Effect.void,
+              ),
+            ),
+      };
+      const plan = yield* makeClaudeMcpProfiles.pipe(
+        Effect.provideService(ServerSettingsService.ServerSettingsService, {
+          ...service,
+          getSettings: Effect.succeed(fromFile({})),
+        }),
+        Effect.provideService(FileSystem.FileSystem, slowFirstRead),
+      );
+      const run = () =>
+        plan(thread("t"), {}).pipe(
+          Effect.match({ onFailure: (refusal) => refusal.message, onSuccess: (r) => r.name }),
+        );
+      yield* fs.writeFileString(settingsPath, JSON.stringify({ theme: "dark" }));
+      const older = yield* run().pipe(Effect.forkChild);
+      yield* Deferred.await(reached);
+      // The owner narrows the file while the older read waits; a newer read gets it.
+      yield* fs.writeFileString(settingsPath, NARROWED);
+      assert.strictEqual(yield* run(), "t3-only");
+      // The older read ends last, with the wider keys it read.
+      yield* Deferred.succeed(release, undefined);
+      assert.strictEqual(yield* Fiber.join(older), "all");
+      // Then the file is cut off: the keys kept are the newer read's, never the older's all.
+      yield* fs.writeFileString(settingsPath, '{ "theme": "dark", ');
+      for (const _ of [1, 2]) assert.strictEqual(yield* run(), "t3-only");
     }).pipe(Effect.provide(files)),
   );
 

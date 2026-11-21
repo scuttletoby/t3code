@@ -388,11 +388,27 @@ const settingsFileReader = Effect.gen(function* () {
 });
 
 /**
- * The MCP profile keys settings.json last gave (a file that decodes, text that reads, or no file),
- * per settings service, so per server process. Memory only: a server that starts with a file that
- * cannot say has none, and refuses until the file is fixed.
+ * The MCP profile keys settings.json last gave (a file that decodes, text that reads, or no file)
+ * per settings service, so per server process, with the read's number and whether a file gave
+ * them. Memory only: a server that starts with a file that cannot say refuses until it is fixed.
  */
-const LAST_READ_KEYS = new WeakMap<object, McpProfileFileKeys>();
+const LAST_READ_KEYS = new WeakMap<
+  object,
+  { readonly read: number; readonly fromFile: boolean; readonly keys: McpProfileFileKeys }
+>();
+/** Numbers reads in the order they start, so a read that ends late never stores older keys last. */
+let readsStarted = 0;
+const rememberKeys = (
+  service: object,
+  read: number,
+  fromFile: boolean,
+  keys: McpProfileFileKeys,
+) => {
+  const last = LAST_READ_KEYS.get(service);
+  if (last === undefined || last.read < read) {
+    LAST_READ_KEYS.set(service, { read, fromFile, keys });
+  }
+};
 
 const cannotReadSettings = () =>
   new ClaudeMcpProfileError({
@@ -414,7 +430,8 @@ const noReadSettingsFile = (issue: string) =>
 /**
  * The settings MCP profiles read, or a refusal. settings.json's own MCP keys win on every read (the
  * service may still hold a broken load's defaults). Undecodable text gives its keys and carried
- * `refuse`; text that cannot say keeps the keys last read, refusing with none since start.
+ * `refuse`; text that cannot say, or no file once keys were read, keeps the keys last read,
+ * refusing with none since start.
  */
 export const makeMcpProfileSettings = Effect.gen(function* () {
   const settingsService = yield* Effect.serviceOption(ServerSettingsService.ServerSettingsService);
@@ -435,6 +452,8 @@ export const makeMcpProfileSettings = Effect.gen(function* () {
       });
       return yield* cannotReadSettings();
     }
+    readsStarted += 1;
+    const readNumber = readsStarted;
     const fileRead = yield* reader.read.pipe(Effect.result);
     if (fileRead._tag === "Failure") {
       // The service's settings may be a broken file's defaults from an earlier load, so they do
@@ -446,10 +465,25 @@ export const makeMcpProfileSettings = Effect.gen(function* () {
     }
     const file = fileRead.success;
     const base = read._tag === "Success" ? read.success : reader.defaults;
+    const last = LAST_READ_KEYS.get(service);
+    const kept = last?.keys;
+    if (file.kind === "missing" && last?.fromFile === true && kept !== undefined) {
+      // No file after this run read a file's keys: an editor's rename-then-write gap, or a
+      // delete. Keep them, never the defaults' all; with no file before, a fresh install.
+      yield* Effect.logWarning(
+        "MCP profiles: settings.json is missing, so the MCP profile settings last read stand, and carried MCP profiles read as refuse",
+      );
+      return reader.layOver(base, kept);
+    }
     switch (file.kind) {
       case "missing":
       case "decoded": {
-        LAST_READ_KEYS.set(service, mcpProfileFileKeysOf(file.settings));
+        rememberKeys(
+          service,
+          readNumber,
+          file.kind === "decoded",
+          mcpProfileFileKeysOf(file.settings),
+        );
         if (read._tag === "Failure") {
           yield* Effect.logWarning(
             "MCP profiles: settings could not be read in full, so the MCP profile settings come from settings.json alone",
@@ -466,7 +500,7 @@ export const makeMcpProfileSettings = Effect.gen(function* () {
         };
       }
       case "text":
-        LAST_READ_KEYS.set(service, file.keys);
+        rememberKeys(service, readNumber, true, file.keys);
         yield* Effect.logWarning(
           "MCP profiles: settings.json does not decode, so the MCP profile settings come from its text, and carried MCP profiles read as refuse",
         );
@@ -478,7 +512,6 @@ export const makeMcpProfileSettings = Effect.gen(function* () {
         );
         return yield* unreadableSettingsFile(file.issue);
       case "unknown": {
-        const kept = LAST_READ_KEYS.get(service);
         if (kept === undefined) {
           yield* Effect.logWarning(
             "MCP profiles: settings.json cannot be read and no MCP profile settings were read since the server started, so threads are refused until it is fixed",

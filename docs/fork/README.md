@@ -550,14 +550,22 @@ This machine's own threads do not get a wider profile from a broken file
 `mcpProfile`, `mcpSubagentProfile`, `mcpThreadProfiles` and each project's `mcpProfile` and
 `mcpSubagentProfile`) are read from the file on each read, over the settings the server holds
 (which can still be an earlier load's, such as a broken file's defaults until it reloads). A file
-that is a JSON object but does not decode (a typo in another setting) gives the keys its text holds,
-read the way a full decode reads them; a valid file that names none of them sets none, so `all`.
-Text that is not a JSON object and names none of them (empty, cut off before its MCP keys, garbage)
-cannot say, so the server keeps the MCP profile keys it last read in this run; a server started on
-such a file has none, and refuses every turn, delegation and launch until the file is fixed. Text
-that names one of them but cannot be read as a JSON object (cut off half-way through a write, a
-list, a project map that is not a map), or a file that cannot be read from disk at all, refuses
-the same way, saying why. The next turn reads the file again. When the settings cannot be read in full (they read provider secrets too), the MCP
+that is a JSON object but does not decode (a wrong value in another setting) gives the keys its text
+holds, read the way a full decode reads them; a valid file that names none of them sets none, so
+`all`. A whole file with a JSON syntax typo (a missing comma, a stray quote) whose text names none
+of them sets none too, so `all`, and T3 keeps working as upstream does, also after a restart.
+"Whole" means its braces, outside strings and comments, close back to the start exactly at its
+last character, a `}`. Text that is not a JSON object, names none of them and is not whole (empty,
+cut off before its MCP keys, garbage, a list) cannot say, so the server keeps the MCP profile keys
+it last read in this run; a server started on such a file has none, and refuses every turn,
+delegation and launch until the file is fixed. A missing file is a fresh install (the settings
+the server holds, `all` by default) only while the server has read no file's keys since it started;
+once it has, a missing file (an editor that saves by renaming the old file away, or a delete) keeps
+the keys last read too, until the file is back or the server restarts. Kept keys read carried MCP profiles as `refuse`, and a managed
+policy's locks stay over them. Text that names one of them but cannot be read as a JSON object
+(cut off half-way through a write, a whole file with a typo, a list, a project map that is not a
+map), or a file that cannot be read from disk at all, refuses the same way, saying why. The next
+turn reads the file again. When the settings cannot be read in full (they read provider secrets too), the MCP
 profile settings come from `settings.json` alone; when that cannot be read either, a turn or a
 delegation is refused and the route answers `false`, never anything wider. Only the person can
 change it; agents cannot.
