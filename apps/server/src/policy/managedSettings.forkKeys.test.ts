@@ -5,6 +5,7 @@
 
 import {
   DEFAULT_SERVER_SETTINGS,
+  EnvironmentId,
   ForkServerSettingsFields,
   ProjectId,
   ProviderDriverKind,
@@ -196,20 +197,46 @@ it("locks placement whole, so neither the mode nor a label can change", () => {
   if (result._tag !== "Valid") assert.fail(result.reason);
   const applied = result.settings.applyLocks(placementUser);
   assert.deepEqual(applied.placement, value);
-  for (const patch of [{ mode: "enforce" }, { labels: ["gpu"] }, { never: [] }] as const) {
+  const patches: ReadonlyArray<Partial<ServerSettings["placement"]>> = [
+    { mode: "enforce" },
+    { labels: ["gpu"] },
+    { factsCommand: "/usr/local/bin/placement-facts" },
+    { never: [] },
+    { weights: { [EnvironmentId.make("env-1")]: "prefer" } },
+  ];
+  for (const patch of patches) {
     const write = result.settings.vetWrite(
       applied,
       { ...applied, placement: { ...applied.placement, ...patch } },
       { placement: patch },
     );
-    assert.deepEqual(write, { _tag: "Locked", path: "placement" });
+    assert.deepEqual(write, { _tag: "Locked", path: "placement" }, JSON.stringify(patch));
   }
 });
 
-it("refuses a lock of one placement field, naming the whole setting to lock", () => {
-  const result = makeManagedSettings({ "placement.mode": { value: "off", locked: true } });
-  assert.strictEqual(result._tag, "Invalid");
-  if (result._tag === "Invalid") assert.match(result.reason, /manage "placement" as a whole/);
+it("refuses a lock of any one placement field, naming the whole setting to lock", () => {
+  for (const [path, value] of [
+    ["placement.mode", "off"],
+    ["placement.labels", ["gpu"]],
+    ["placement.factsCommand", ""],
+    ["placement.never", []],
+    ["placement.weights", {}],
+  ] as const) {
+    const result = makeManagedSettings({ [path]: { value, locked: true } });
+    assert.strictEqual(result._tag, "Invalid", path);
+    if (result._tag === "Invalid")
+      assert.match(result.reason, /manage "placement" as a whole/, path);
+  }
+});
+
+it("lists placement as one manageable path, none inside it", () => {
+  const paths = listManageableSettings().map(([path]) => path);
+  assert.include(paths, "placement");
+  assert.include(paths, "placementNeeds");
+  assert.deepEqual(
+    paths.filter((path) => path.startsWith("placement.")),
+    [],
+  );
 });
 
 // Placement needs (row P2): a policy locks `placementNeeds` as a whole list, and the lock reaches
