@@ -83,7 +83,13 @@
         "automaticUpdates: false,",
         "import * as ForkPolicy from \"./fork/modelPolicyFile.ts\"; // Fork: model policy",
         "modelPolicy: ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "modelPolicy: yield* ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy"
+        ]
+      }
     },
     "packages/shared/src/AgentScope.ts": {
       "why": "The slot observer (apps/server/src/slots/SlotObserver.ts) reads an agent's memory from its own systemd scope; one optional method on upstream's interface asks for it.",
