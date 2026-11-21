@@ -4133,9 +4133,9 @@ CHECK_STEP = result_step(fork_tests["jobs"], RECORD_CHECK)
 CHECK_SCRIPT = check_script(CHECK_STEP["run"])
 REAL_RECORD_JOBS = json.loads(CHECK_STEP["env"]["RECORD_JOBS"])
 FIX_RUN, FIX_SHA = "4242", "c0ffee" + "0" * 34
-# A Python test's result as the runner reads it: the lines fork-ci-unittest.py wrote (`unittest`: a plan, then its
-# counts, each test by name, then its end line: the tests the file defines that no run loaded); a node test's, the
-# line fork-ci-node-counts.cjs wrote.
+# A Python test's result as the runner reads it, the list saying "unittest" for each (#702): the lines
+# fork-ci-unittest.py wrote (`unittest`: a plan, then its counts, each test by name, then its end line: the tests the
+# file defines that no run loaded); a node test's, the line fork-ci-node-counts.cjs wrote.
 def py(tests, skipped=(), unloaded=()):
     return {"status": 0, "seconds": "1.0", "stdout": "", "stderr": f"Ran {tests} tests in 0.1s\n\nOK\n",
             "unittest": [{"plan": tests}, {"tests": tests, "skipped": list(skipped), "failed": 0},
@@ -4203,7 +4203,8 @@ WRITE_RECORDS = (
     "for (const [name, calls] of Object.entries(artifacts)) { fs.mkdirSync(path.join(folder, name), "
     "{ recursive: true }); for (const c of calls) r.writeRecords({ dir: path.join(folder, name), run_id: c.run_id, "
     "run_attempt: c.attempt, job: c.job }, c.name, { sha: c.sha, call: c.call, all: c.all, owed: c.owed, "
-    "results: c.results.map(([key, file, run, result, allowed]) => r.record(key, file, run, result, allowed)) }); }")
+    "results: c.results.map(([key, file, run, result, allowed]) => r.record(key, file, run, result, allowed, "
+    "file.endsWith('.py') ? 'unittest' : null)) }); }")
 
 
 def run_check(artifacts, attempt=1, tweak=None, sha=FIX_SHA):
