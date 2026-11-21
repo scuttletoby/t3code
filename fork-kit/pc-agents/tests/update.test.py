@@ -22,6 +22,12 @@ AUTO = {**CONFIG, 't3ReleaseBaseUrl': f'https://github.com/{FORK}/releases/downl
         'autoUpdate': {'enabled': True, 'follow': FORK}}
 VERSIONS = '/opt/pc-agents/t3/runtime/versions'
 GROUP = '/sys/fs/cgroup/system.slice/t3code-agents.service'   # T3's unit's control group (the fake systemctl's)
+# The fake processes a test puts in /proc (process()): T3's own helper, work in T3's unit, a process outside it. Their
+# PIDs are above Linux's PID_MAX_LIMIT, which no real process has: T3's main PID here is a real one (the fake
+# systemctl's own, fake_distro.py), and the kit skips T3's main PID as T3 itself, so a fake process with the PID the
+# kernel gave that systemctl would read as T3, not as work (issue #766: on a fresh CI machine PIDs are near 4000).
+PID_MAX_LIMIT = 1 << 22
+HELPER, WORK, OUTSIDE = PID_MAX_LIMIT + 1, PID_MAX_LIMIT + 2, PID_MAX_LIMIT + 3
 DB = k.HOME + k.DB_DIR
 
 
@@ -90,6 +96,7 @@ class Update(Case):
 
     def process(self, pid, exe, name='claude', group=''):
         """A process (its program exe) in T3's unit's control group (or a group below it), or in none (None)."""
+        self.assertGreater(pid, PID_MAX_LIMIT, 'a fake process needs a PID no real one can have (see WORK)')
         self.write(f'/proc/{pid}/comm', name + '\n')
         os.symlink(exe, self.path(f'/proc/{pid}/exe'))
         if group is not None:
@@ -357,13 +364,13 @@ class Update(Case):
     def test_waits_for_a_quiet_point(self):
         self.releases(release('1.2.4'))
         main = self.main_pid()
-        self.process(4001, VERSIONS + '/1.2.3/t3', 't3-helper')   # T3's own helper: not work
-        self.process(4002, '/home/agent/.local/bin/claude', group='/sub')   # setsid'd, in a group below: still T3's
-        self.process(4003, '/usr/bin/node', 'node', group=None)   # a process outside T3's unit: holds nothing
+        self.process(HELPER, VERSIONS + '/1.2.3/t3', 't3-helper')   # T3's own helper: not work
+        self.process(WORK, '/home/agent/.local/bin/claude', group='/sub')   # setsid'd, in a group below: still T3's
+        self.process(OUTSIDE, '/usr/bin/node', 'node', group=None)   # a process outside T3's unit: holds nothing
         code, out = self.update()
         self.assertEqual(code, 0, out)
-        self.assertIn('T3 1.2.4 is downloaded; waiting for a quiet point (T3 runs 1 other process(es): claude (4002))',
-                      out)
+        self.assertIn('T3 1.2.4 is downloaded; waiting for a quiet point (T3 runs 1 other process(es): '
+                      f'claude ({WORK}))', out)
         self.assertEqual((self.version(), self.serving(), self.main_pid()), ('1.2.3', '1.2.3', main))
         self.assertTrue(os.path.isfile(self.path(VERSIONS + '/1.2.4/t3')))   # downloaded ahead
         state = self.state()
@@ -372,12 +379,12 @@ class Update(Case):
         self.assertEqual(code, 1, out)
         self.assertIn(f'an update has waited {k.QUIET_WAIT_DAYS} days', self.state()['alert'])
         if os.geteuid():   # unreadable (only as a user: root reads it): busy
-            os.chmod(self.path('/proc/4002'), 0)
+            os.chmod(self.path(f'/proc/{WORK}'), 0)
             try:
-                self.assertIn('cannot read process 4002', self.update()[1])
+                self.assertIn(f'cannot read process {WORK}', self.update()[1])
             finally:
-                os.chmod(self.path('/proc/4002'), 0o755)
-        shutil.rmtree(self.path('/proc/4002'))   # it ended
+                os.chmod(self.path(f'/proc/{WORK}'), 0o755)
+        shutil.rmtree(self.path(f'/proc/{WORK}'))   # it ended
         installs = self.installs()
         code, out = self.update()
         self.assertEqual(code, 0, out)
@@ -580,12 +587,12 @@ class Update(Case):
     def test_a_cut_switch_waits_for_a_quiet_point_when_t3_runs_again(self):
         self.releases(release('1.2.4'))
         self.cut('serves')   # T3 runs as 1.2.4 (setup started it), and may have taken work since
-        self.process(4002, '/home/agent/.local/bin/claude')
+        self.process(WORK, '/home/agent/.local/bin/claude')
         code, out = self.update()
         self.assertEqual(code, 0, out)
         self.assertIn('the cut update to T3 1.2.4 is finished at a quiet point (T3 runs 1 other process(es)', out)
         self.assertEqual((self.state()['phase'], self.state()['tries']), ('switching', 1))
-        shutil.rmtree(self.path('/proc/4002'))
+        shutil.rmtree(self.path(f'/proc/{WORK}'))
         code, out = self.update()
         self.assertEqual(code, 0, out)
         self.updated()
@@ -671,14 +678,14 @@ class Update(Case):
             self.assertEqual(state['phase'], 'rolling-back')
             self.assertIn('T3\'s database is back as it was before the update', state['restored'])
             self.write(DB + '/statev2.sqlite', 'work on 1.2.3 since')   # T3 1.2.3 runs, and is at work
-            self.process(4002, '/home/agent/.local/bin/claude')
+            self.process(WORK, '/home/agent/.local/bin/claude')
             stops = self.log().count('stop t3code-agents.service')
             code, out = self.update()
             self.assertEqual(code, 0, out)
             self.assertIn('the cut rollback from T3 1.2.4 to 1.2.3 is finished at a quiet point (T3 runs 1 other', out)
             self.assertEqual(self.state()['phase'], 'rolling-back')
             self.assertEqual(self.log().count('stop t3code-agents.service'), stops)
-            shutil.rmtree(self.path('/proc/4002'))
+            shutil.rmtree(self.path(f'/proc/{WORK}'))
             code, out = self.update()
             self.assertEqual(code, 1, out)
             self.assertEqual((self.version(), self.serving(), self.state()['failed']), ('1.2.3', '1.2.3', '1.2.4'))
@@ -714,14 +721,14 @@ class Update(Case):
                     self.cut('setup')   # the machine file says 1.2.4; T3 stopped, its unit still 1.2.3's
                 k.run(['/usr/bin/systemctl', 'restart', k.UNIT])   # a boot starts it: 1.2.3 runs, takes work
                 self.write(DB + '/statev2.sqlite', 'after the boot')
-                self.process(4002, '/home/agent/.local/bin/claude')
+                self.process(WORK, '/home/agent/.local/bin/claude')
                 stops = self.log().count('stop t3code-agents.service')
                 code, out = self.update()
                 self.assertEqual(code, 0, out)
                 self.assertIn(f'{waits} is finished at a quiet point (T3 runs 1 other', out)
                 self.assertEqual(self.log().count('stop t3code-agents.service'), stops)   # not stopped at work
                 self.assertEqual(self.read(DB + '/statev2.sqlite'), 'after the boot')
-                shutil.rmtree(self.path('/proc/4002'))
+                shutil.rmtree(self.path(f'/proc/{WORK}'))
                 code, out = self.update()
                 self.assertEqual(code, 1, out)
                 self.assertIn(f'did not come up (its switch was cut {k.UPDATE_TRIES} times)', out)

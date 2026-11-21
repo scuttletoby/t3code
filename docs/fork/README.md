@@ -56,6 +56,8 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
 | [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
+| [`server.placement`](#serverplacement)                                       | `{"mode":"off"}`            | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
+| [`server.placementNeeds`](#serverplacementneeds)                             | `[]`                        | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 | [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
 | [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
@@ -70,9 +72,10 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                     | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 
 For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
-only `mode`; their other fields are tuning that does nothing while the switch is off.
+and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
 
 ## Each setting
 
@@ -248,9 +251,10 @@ a staging site) while the agent changes it, round after round, without a pull re
 T3 runs the project's adapter, four kinds of step only the person sets: `claim` takes the target,
 `renew` keeps the claim alive, `push` (one or more named steps) sends a round to the target, and
 `release` puts the target back. Each step is a program given by its absolute path with fixed
-arguments, run without a shell; T3 passes the session's facts as environment variables. Nothing
-starts a session yet: the session store and the worker (renew, the idle and time limits, ends for
-gone threads) are there, and the tool and the thread controls come in later pull requests. The steps' contract is in [playtest.md](playtest.md).
+arguments, run without a shell; T3 passes the session's facts as environment variables. An agent
+starts, pushes, checks and ends its thread's session with the `playtest` tool (its own tool group, `playtest`); the
+thread controls come in a later pull request. The steps' contract and the tool are in
+[playtest.md](playtest.md).
 
 In the app: **Settings → Fork**, section Playtest: the switch (it stays off until all four steps are
 set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
@@ -340,14 +344,31 @@ the server without such a session counts as a person, so the model guard hook is
 names a model by its full id (#128; an alias such as `opus` is not read as its model, and the
 refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
 `efforts`, names one of them (`ultracode` counts as its own effort; a row without `efforts` allows
-none). Every effort option the pick names counts, so a second effort option cannot hide a higher
-effort, and one that holds no effort name (`{effort: true}`, which runs the driver's own default) is
-refused. A pick that leaves the ultracode option out runs at the model's default for it, so a model
+none) under the option id that driver reads it from (#780): a built-in driver's own id (`effort` for
+Claude and FX, `reasoningEffort` for Codex, Grok, Kiro and Muse, `variant` for OpenCode, `thinking`
+for Pi), else the effort control the machine's own catalog marks for the model on that driver's
+instances (an ACP agent's `thought_level`, a Cursor model's `effort`). Under another id the driver
+ignores it and runs its default level, so such a pick is refused (`reasoning: high` alone for
+Claude), and so is a pick for a driver whose id the catalog does not mark (not read from the agent
+yet, or the model not listed there): the level it would run cannot be told; the refusal says to
+start that agent on the machine once, or to pick a model whose driver has a fixed id. Every effort
+option the pick names counts, and one that holds no effort name (`{effort: true}`, which runs the
+driver's own default) is refused. Every other option must be one this machine's model list
+describes for the model (the instance's list; for a call sent to a linked machine, any list here),
+or `ultracode` (#793): a driver can still apply an option the policy does not read, after the
+checked ones (Kiro's `effortLevel`, Grok's native `thought_level`, an ACP agent's `_t3/session-mode`
+that the list hides because it repeats the thought levels, or a `model` option written after the
+model). Such a pick is refused in `enforce` (pick the model in the model field; the option is not
+allowed while the policy is on) and reported in `advise`, as the model guard does. So a second
+effort option cannot hide a higher effort, and an option cannot change the model. A pick that leaves the ultracode option out runs at the model's default for it, so a model
 whose catalog default is ultracode reads as ultracode. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
 own claim and is not read), every row naming the model must allow it (the refusal names the drivers
-whose rows refuse it), and every built-in driver's effort option is read, plus the reasoning control
-this machine's own catalog marks for the model, when it has the model (so an ACP model's own id is
-read; a model this machine does not have is read with the fixed ids only). In `enforce` a pick outside is refused with the rows; in
+whose rows refuse it), and each row's driver needs the effort under its own id as above (so a pick
+for an ACP model this machine's catalog does not describe is refused here), every built-in driver's
+effort option and every control this machine's catalog marks for the model is read too (a decoy
+cannot hide a higher effort), a model this machine's catalog turns ultracode on for by default is
+read both with and without it, and an alias gets the same "name the full id" hint as here. The
+machine there checks the pick again with its own catalog (#780). In `enforce` a pick outside is refused with the rows; in
 `advise` it runs, and `delegate_task`'s reply says what `enforce` would refuse (the other routes
 only log it). A pick inside gets its row's `useFor` in `delegate_task`'s reply. Each checked pick is
 logged as "model policy pick" with its model as asked, so one model's picks can be counted; the
@@ -391,8 +412,10 @@ mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a sav
 value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
 then starts from the value's own rows and saves only once the person picks the mode, so a save never
 turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged, and so is
-a row whose model is an alias in its driver's model lists (`opus`): the driver resolves an alias
-through the catalog, so the row would follow it when a provider moves it to a new model (#127). With no
+a row whose model is an alias in its driver's model lists on a selected machine (`opus`; each
+machine is read on its own lists, as its server reads only its own, so a model's id on one machine
+does not hide an alias on another), or a name Claude Code resolves by itself (`opus`, `sonnet`,
+`haiku`, `fable`) that no list there holds as a model's id: the driver resolves an alias, so the row would follow it when a provider moves it to a new model (#127). With no
 rows saved, **Edit allowed models** starts from the fork's start rows (#126: `claude-opus-5-5` and
 `claude-fable-5-2`, each `medium`, `high` or `xhigh`, default `high`), saved only when the person
 saves them; they are not the setting's default, so a file without rows keeps meaning none.
@@ -414,6 +437,61 @@ saves them; they are not the setting's default, so a file without rows keeps mea
   }
 }
 ```
+
+### `server.placement`
+
+What this machine has, and how it places delegated work on linked machines. Only the settings are in
+the fork so far; nothing reads them yet (later placement rows add the facts, the rules and the
+wiring). Fields, each with its default:
+
+- `mode`: `off` (an agent picks a machine as upstream's do), `advise` or `enforce`.
+- `labels`: `[]`. What this machine has, as free words (`"gpu"`, `"ci-runner"`, `"owner-logins"`):
+  each is one word of at most 64 characters, at most 64 labels. They are stored trimmed and
+  lower-cased (`"GPU"` is `"gpu"`), a repeat dropped. There is no Unicode normalisation: `café`
+  written with a combining accent and without one are two labels.
+- `factsCommand`: `""`. Empty, or the absolute path of one program on this server's OS (`/…` on
+  Linux and macOS; `C:\…` or `\\server\…` on Windows). It is a path, never a command line: a
+  space is part of the path, and no shell runs it. A relative path or a control character is not
+  valid; a save that sets another OS's path is refused, and placing reads one in the file as `off` (below).
+  Exit 0 means free for work, and each line it prints is one more label; any other exit or a timeout
+  means not available.
+- `never`: `[]`. Label groups that must not meet on one machine, such as
+  `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
+  lower-casing (`["GPU", "gpu"]` is one label, so not a group).
+- `weights`: `{}`. Linked machine id (one word, no spaces) to `prefer`, `normal`, `less` or
+  `manual` (upstream's load-balancing words); a machine without one is `normal`.
+
+A value that is not valid (a bad field, a wrong type, a field this build does not know) reads as
+`off`, with a warning in the log and the reason kept beside it for Settings to show; the rest of the
+file still loads. The person's text is kept as written until the key is saved. A `factsCommand`
+that is not a full path on this server's OS (a hand edit) is not converted by the load: Settings
+shows it as written. Placing work reads `placement` only through the server's
+`readPlacementForThisOs` (`apps/server/src/fork/placementRead.ts`), which reads it as `off`, kept
+as written with the reason, each time; the machine that runs `factsCommand` checks the path again
+before it runs it. A save that names only some fields keeps
+the others; over a kept unreadable value only a save of every field is taken (it replaces the text),
+and a partial one is refused ("placement is not valid; save the whole setting"), so it cannot drop a
+`never` group. A newer build's field reads as `off` here and is kept through saves of other keys; a
+save of `placement` on this build drops it. Only a person changes it: no agent tool can, and a
+managed policy can lock it as a whole value (not one field inside it, as for `modelPolicy`).
+"Person-only" means no T3 tool takes it; an agent with a shell can still edit the settings file or
+call the settings RPC, as for `modelPolicy`.
+
+```json
+{
+  "placement": { "mode": "advise", "labels": ["gpu"], "never": [["ci-runner", "owner-logins"]] }
+}
+```
+
+### `server.placementNeeds`
+
+Labels a machine must have to take a project's work, for each project without its own
+(`projectOverride.placementNeeds`). Same label rules as `placement.labels`. Default `[]`: no needs.
+A value that is not valid fails closed: that work goes to no machine ("this project's
+placementNeeds setting is not valid: …; fix it in Settings"), never to any machine as `[]` would.
+The reason is kept beside it and logged, and the person's text is written back unchanged by saves
+of other settings until this key is saved, which replaces it. A managed policy can lock it as a
+whole list; the lock also holds each project's own needs.
 
 ### `server.agentSlots`
 
@@ -928,9 +1006,10 @@ settings apply as they are), `handoff` (upstream's idle compaction then skips th
 only the handoff acts on it), or `compact` (the same as `off`, so one thread can opt out
 of its project's `handoff`). `threads` maps a thread id to a mode and wins over `mode` (at most
 500). `source` says who writes the handoff: `agent` (the old session, in one turn; `instructions`
-replaces the built-in text) or `command` (a program given as `command`, run without a shell; it
-must only read). Neither source writes a handoff yet; until they do, every handoff uses T3's state
-and the recent conversation only, and `source` sets only how early the idle handoff starts. `sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
+replaces the built-in text) or `command` (a program given as `command`, run without a shell in the
+project folder; it must only read and be safe to run twice; its output is the handoff). The `agent`
+source does not write a handoff yet; until it does, its handoffs use T3's state and the recent
+conversation only. `sizeTokens` (150,000) is the size backstop, `idleTokens` (75,000; `0` never) the
 smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
 model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
@@ -1003,6 +1082,15 @@ to the server's value. A thread's own mode in the project's or the server's `thr
 either `mode`, the project's entry first. A project save that leaves this key out (an
 older client) keeps the stored value; only `null` clears it (also when written by hand, as for
 `playtest`, including the change for old files).
+
+### `projectOverride.placementNeeds`
+
+A project's own needs, for example `["gpu"]`. It replaces the server's `placementNeeds` for that
+project as a whole; `[]` says the project needs nothing. Not set: the server's. A project value that
+is not valid fails closed as the server's does: that project's work goes to no machine (never the
+server's needs, never none), and its text is kept. A project save that leaves this key out (an older
+client) keeps the stored value, and one that sends back the kept text unchanged keeps it too (other
+text is refused); only `null` clears it, as for `playtest`.
 
 ### A setting the fork removed
 
