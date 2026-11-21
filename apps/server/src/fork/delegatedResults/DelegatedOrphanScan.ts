@@ -29,6 +29,7 @@ import {
   orphanBatchIds,
   orphanReminderText,
   orphansOf,
+  makeRefusalLog,
   parentGone,
   REMINDER_MAX_AGE_MS,
 } from "./delegatedResults.ts";
@@ -75,7 +76,8 @@ export type ParentOutcome =
   /** No orphan, or every one was named before. */
   | { readonly type: "none" }
   | { readonly type: "gone" }
-  | { readonly type: "unreadable" }
+  /** The parent could not be read, or (`sendFailed`, why) a reminder's send failed: tried again. */
+  | { readonly type: "unreadable"; readonly sendFailed?: string }
   /**
    * The agent slot gate refused (nothing of that message was sent): `run` asks again for this
    * parent alone, with the threads this scan found.
@@ -118,6 +120,11 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
   const slotRetryDelay = options.slotRetryDelay ?? Duration.millis(WAKE_SLOT_RETRY_MS);
   /** Parents whose own retry runs (`run`): a later scan leaves them to it. */
   const waitingForSlot = new Map<ThreadId, ParentOutcome>();
+  // Never forgotten: an orphan batch's ids do not age, and a slot wait checks its parent again for
+  // as long as the slot stays taken, a day or more. One run per start, so this holds at most the
+  // refused batches of that run. A regrouped batch (new keys after a relist, or after a send) has
+  // a new command id: it counts as a new batch, so it is logged once more.
+  const newRefusal = makeRefusalLog(null);
   const settings = yield* ServerSettingsService;
   const store = yield* DelegatedResultsStore.DelegatedResultsStore;
   const forwarding = yield* PeerForwarding.PeerForwarding;
@@ -158,7 +165,7 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
     // A busy parent is not held: its run's end changes nothing about an orphan, and the message
     // waits in its queue until that run (a question to a person included) is over.
     const sent: Array<ThreadId> = [];
-    let retry = false;
+    let sendFailed: string | undefined;
     let refused: string | undefined;
     for (const batch of batches) {
       const ids = orphanBatchIds(parentThreadId, batch);
@@ -178,35 +185,39 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
           // A person stopped it: never restart it from here.
           return { type: "held", detail: "stopped" } satisfies ParentOutcome;
         case "rejected":
-          yield* Effect.logWarning("delegated orphan reminder refused", {
-            threadId: parentThreadId,
-            detail: result.detail,
-          });
+          // Logged once per message and process, not on each pass that finds its refused receipt.
+          if (newRefusal(ids.commandId, yield* Clock.currentTimeMillis)) {
+            yield* Effect.logWarning("delegated orphan reminder refused", {
+              threadId: parentThreadId,
+              commandId: ids.commandId,
+              detail: result.detail,
+            });
+          }
           refused = result.detail;
           break;
         case "retry":
-          retry = true;
+          sendFailed = result.detail;
           break;
         case "waitsForSlot":
           // The next batches go to the same idle thread: they wait too. Sent ones are recorded.
           return { type: "waitsForSlot", detail: result.detail, linked } satisfies ParentOutcome;
       }
     }
-    if (retry) return { type: "unreadable" } satisfies ParentOutcome;
+    if (sendFailed !== undefined) return { type: "unreadable", sendFailed } satisfies ParentOutcome;
     if (refused !== undefined) return { type: "held", detail: refused } satisfies ParentOutcome;
     return { type: "sent", threadIds: sent } satisfies ParentOutcome;
   });
 
-  /** One pass over every linked environment; a parent is checked once, over all of them. */
-  const scan = Effect.fn("DelegatedOrphanScan.scan")(function* () {
+  /** Every linked environment's threads made from here, by parent; `null` while off. */
+  const listByParent = Effect.fn("DelegatedOrphanScan.listByParent")(function* () {
     const enabled = yield* settings.getSettings.pipe(
       Effect.map((current) => current.waitFor.enabled),
       Effect.orElseSucceed(() => false),
     );
-    if (!enabled) return OFF;
+    if (!enabled) return null;
     // Fails while Linked environments is off here.
     const links = yield* forwarding.links(scope).pipe(Effect.orElseSucceed(() => null));
-    if (links === null) return OFF;
+    if (links === null) return null;
     const sinceMs = startedAtMs - REMINDER_MAX_AGE_MS;
     const unreachable: Array<EnvironmentId> = [];
     const cutShort: Array<EnvironmentId> = [];
@@ -243,6 +254,14 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
         ),
       { concurrency: 4, discard: true },
     );
+    return { byParent, unreachable, cutShort, partial };
+  });
+
+  /** One pass over every linked environment; a parent is checked once, over all of them. */
+  const scan = Effect.fn("DelegatedOrphanScan.scan")(function* () {
+    const listed = yield* listByParent();
+    if (listed === null) return OFF;
+    const { byParent, unreachable, cutShort, partial } = listed;
     const parents = new Map<ThreadId, ParentOutcome>();
     for (const [parentThreadId, linked] of byParent) {
       const waiting = waitingForSlot.get(parentThreadId);
@@ -257,9 +276,14 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
     return { type: "scanned", unreachable, cutShort, partial, parents } satisfies ScanOutcome;
   });
 
-  const unreadableParents = (outcome: ScanOutcome) =>
+  /** Parents tried again: unreadable ones, or (`sendFailed`) ones whose reminder's send failed. */
+  const unreadableParents = (outcome: ScanOutcome, sendFailed?: boolean) =>
     [...outcome.parents.entries()]
-      .filter(([, parent]) => parent.type === "unreadable")
+      .filter(
+        ([, parent]) =>
+          parent.type === "unreadable" &&
+          (sendFailed === undefined || (parent.sendFailed !== undefined) === sendFailed),
+      )
       .map(([threadId]) => threadId);
 
   /** Another pass while an environment did not answer (fully) or a parent could not be read. */
@@ -270,9 +294,9 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
       unreadableParents(outcome).length > 0);
 
   /**
-   * One parent refused a slot: its check runs again every `slotRetryDelay` while the gate refuses
-   * (logged once), and every `retryDelay` while it cannot be read, until it is done. A restart
-   * meanwhile loses nothing: the next start's scan finds the same orphans unnamed.
+   * One parent refused a slot: checked again every `slotRetryDelay` while refused, and every
+   * `retryDelay` while unreadable, `attempts` times in a row at most (then the next start). Once
+   * through, listed afresh: an orphan that ended meanwhile is named too. A restart loses nothing.
    */
   const untilSlot = Effect.fn("DelegatedOrphanScan.untilSlot")(
     function* (parentThreadId: ThreadId, first: ParentOutcome & { type: "waitsForSlot" }) {
@@ -280,10 +304,41 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
         threadId: parentThreadId,
         detail: first.detail,
       });
+      let linked = first.linked;
       let outcome: ParentOutcome = first;
-      while (outcome.type === "waitsForSlot" || outcome.type === "unreadable") {
+      let relisted = false;
+      let unreadable = 0;
+      while (true) {
+        if ((outcome.type === "sent" || outcome.type === "none") && !relisted) {
+          relisted = true;
+          const fresh = (yield* listByParent())?.byParent.get(parentThreadId) ?? [];
+          const freshKeys = new Set(fresh.map((thread) => thread.threadId));
+          linked = [...fresh, ...linked.filter((thread) => !freshKeys.has(thread.threadId))];
+          outcome = yield* checkParent(parentThreadId, linked);
+          continue;
+        }
+        if (outcome.type !== "waitsForSlot" && outcome.type !== "unreadable") return;
+        unreadable = outcome.type === "unreadable" ? unreadable + 1 : 0;
+        // A failed send is told as one, not as a parent that cannot be read.
+        const sendFailed = outcome.type === "unreadable" ? outcome.sendFailed : undefined;
+        if (unreadable === 1)
+          yield* sendFailed === undefined
+            ? Effect.logWarning("delegated orphan reminder: its parent cannot be read", {
+                threadId: parentThreadId,
+              })
+            : Effect.logWarning("delegated orphan reminder: its send failed", {
+                threadId: parentThreadId,
+                detail: sendFailed,
+              });
+        if (unreadable >= options.attempts)
+          return yield* Effect.logWarning(
+            sendFailed === undefined
+              ? "delegated orphan reminder left to the next start: its parent stayed unreadable"
+              : "delegated orphan reminder left to the next start: its send kept failing",
+            { threadId: parentThreadId, tries: unreadable },
+          );
         yield* Effect.sleep(outcome.type === "waitsForSlot" ? slotRetryDelay : options.retryDelay);
-        outcome = yield* checkParent(parentThreadId, first.linked);
+        outcome = yield* checkParent(parentThreadId, linked);
       }
     },
     (effect, parentThreadId) =>
@@ -325,7 +380,8 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
             scans: options.attempts,
             unansweredEnvironmentIds: outcome.unreachable,
             cutShortEnvironmentIds: outcome.cutShort,
-            unreadableParentThreadIds: unreadableParents(outcome),
+            unreadableParentThreadIds: unreadableParents(outcome, false),
+            failedSendParentThreadIds: unreadableParents(outcome, true),
           },
         );
       }

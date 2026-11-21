@@ -8,6 +8,8 @@ import * as Effect from "effect/Effect";
 
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as SlotGate from "../../slots/SlotGate.ts";
+import { admitSend, leaveLine, reasonHere } from "../agentSlotRoutes.ts";
 import { type HandoffRecords, handoffDispatchDropped } from "./handoffFacts.ts";
 
 export type HandoffDispatchCommand = Extract<
@@ -51,20 +53,52 @@ export const readHandoffRecords = Effect.fn("HandoffDispatch.readRecords")(funct
   return { ...records, thread, messages } satisfies HandoffRecords;
 });
 
+/** Nothing was sent: the gate refused the run the handoff would start (`detail` says why). */
+export interface HandoffWaitsForSlot {
+  readonly type: "waitsForSlot";
+  readonly detail: string;
+}
+
+/** A handoff's place in the gate's line, while it waits for a slot. */
+export const handoffPlace = (commandId: string): SlotGate.SlotPlace => ({
+  key: `handoff:${commandId}`,
+});
+
 /**
- * Sends a handoff message only to a quiet thread at its source run (see the file comment). One
- * uninterruptible step: a replaced timer or a shutdown cannot stop it between the send and the cancel.
+ * Sends a handoff message only to a quiet thread at its source run (see the file comment), with an
+ * agent slot when the server has a gate. One uninterruptible step: a replaced timer or a shutdown
+ * cannot stop it between the send and the cancel. A text given as an effect is built only once
+ * the gate gave a slot, so a refused handoff reads nothing more.
  */
-export const dispatchHandoff = Effect.fn("HandoffDispatch.dispatch")(function* (
-  command: HandoffDispatchCommand,
+export const dispatchHandoff = Effect.fn("HandoffDispatch.dispatch")(function* <
+  E = never,
+  R = never,
+>(
+  command: Omit<HandoffDispatchCommand, "text"> & {
+    readonly text: string | Effect.Effect<string, E, R>;
+  },
 ) {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
-  if (handoffDispatchDropped(command, yield* readHandoffRecords(command.threadId))) {
+  const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
+  const place = handoffPlace(command.commandId);
+  const records = yield* readHandoffRecords(command.threadId);
+  if (handoffDispatchDropped(command, records)) {
+    yield* leaveLine(gate, [place.key]);
     yield* Effect.logInfo("handoff dropped: the thread moved on", { threadId: command.threadId });
     return "dropped" as const;
   }
-  yield* orchestrator.dispatch(command);
+  const slot = yield* admitSend(gate, {
+    callerThreadId: command.threadId,
+    threadId: command.threadId,
+    instanceId: (command.modelSelection ?? records.thread.modelSelection).instanceId,
+    keepsHeld: true,
+    place,
+  });
+  if (slot.type === "refuse")
+    return { type: "waitsForSlot", detail: reasonHere(slot.refusal) } satisfies HandoffWaitsForSlot;
+  const text = typeof command.text === "string" ? command.text : yield* command.text;
+  yield* orchestrator.dispatch({ ...command, text });
   const { runs } = yield* projections.getThreadRecords(command.threadId, ["runs"], {
     runStatuses: ["queued"],
   });

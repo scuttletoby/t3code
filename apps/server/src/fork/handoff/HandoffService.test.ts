@@ -31,6 +31,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SlotGate from "../../slots/SlotGate.ts";
 import * as HandoffService from "./HandoffService.ts";
 import {
   adapterRegistry,
@@ -94,12 +95,15 @@ const harness = (state: {
   projectProviderInstances?: Record<string, { readonly enabled: boolean }> | undefined;
   /** Instance ids upstream's registry does not have (removed); read at each lookup. */
   missing?: Set<string>;
+  /** The server's agent slot gate (none: a server without one). */
+  gate?: Layer.Layer<SlotGate.SlotGate>;
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
     const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
     const sent: Array<OrchestrationV2ServerCommand> = [];
-    const reads = { count: 0 };
+    /** `text`: the reads that build a handoff's text (its transcript part). */
+    const reads = { count: 0, text: 0 };
     const ended = new Map<string, number>();
     const milestones: Array<{
       readonly name: string;
@@ -144,9 +148,10 @@ const harness = (state: {
       }),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({
         getThread: () => Effect.succeed(state.data.thread),
-        getThreadRecords: () =>
+        getThreadRecords: (_threadId, fields) =>
           Effect.sync(() => {
             reads.count++;
+            if ((fields as ReadonlyArray<string>).includes("attempts")) reads.text++;
             return state.data;
           }),
       }),
@@ -171,6 +176,7 @@ const harness = (state: {
         })),
       }),
       adapterRegistry(() => state.missing ?? new Set()),
+      state.gate ?? Layer.empty,
     );
     yield* HandoffService.make.pipe(
       Effect.flatMap((service) => service.start()),
@@ -520,6 +526,143 @@ describe("HandoffService", () => {
       state.settings = {};
       yield* emit(runUpdated({ ...failed, id: RunId.make("run-4") }), "handoffRunEnded", 3);
       expect(messages(sent).length).toBe(1);
+    }),
+  );
+
+  /** A gate with `free` slots: each allowed start takes one; the test frees them. */
+  const countingGate = (free: number) => {
+    const slots = {
+      free,
+      asks: [] as Array<SlotGate.SlotAcquireInput>,
+      left: [] as Array<string>,
+    };
+    const layer = Layer.mock(SlotGate.SlotGate)({
+      acquire: (input) =>
+        Effect.sync((): SlotGate.SlotAcquire => {
+          slots.asks.push(input);
+          if (slots.free === 0)
+            return {
+              type: "refuse",
+              message: "full",
+              refusal: { type: "unread", problem: "timeout" },
+            };
+          slots.free -= 1;
+          return { type: "allow", token: slots.asks.length };
+        }),
+      started: () => Effect.void,
+      release: () => Effect.void,
+      leave: (keys) => Effect.sync(() => slots.left.push(...keys)),
+    });
+    return { slots, layer };
+  };
+
+  it.effect("no free agent slot: the handoff waits without a new settle, then is sent once", () =>
+    Effect.gen(function* () {
+      const gate = countingGate(0);
+      const state = { data: projection({ usedTokens: 160_000 }), settings: on, gate: gate.layer };
+      const { sent, emit, reads } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* TestClock.adjust(MINUTE_MS);
+      expect(sent).toEqual([]);
+      // Asked again every 5 s, each time after the busy check, as the thread's own start, in
+      // its one place in the gate's line.
+      expect(gate.slots.asks.length).toBeGreaterThanOrEqual(12);
+      const place = { key: `handoff:server:handoff:${threadId}:${runId}` };
+      expect(gate.slots.asks[0]).toEqual({
+        callerThreadId: threadId,
+        targetInstanceId: modelSelection.instanceId,
+        intoThreadId: threadId,
+        keepsHeld: true,
+        place,
+      });
+      expect(gate.slots.asks.every((asked) => asked.place?.key === place.key)).toBe(true);
+      // Refused: its text (the transcript read) is not built at all.
+      expect(reads.text).toBe(0);
+      gate.slots.free = 1;
+      yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
+      yield* emit(null, "handOffWhenDue", 1);
+      expect(messages(sent).map((message) => message.commandId)).toEqual([
+        `server:handoff:${threadId}:${runId}`,
+      ]);
+      // Built once, with the slot.
+      expect(reads.text).toBe(1);
+    }),
+  );
+
+  it.effect("a waiting handoff whose thread gets busy leaves its place, and waits", () =>
+    Effect.gen(function* () {
+      const gate = countingGate(0);
+      const data = projection({ usedTokens: 160_000 });
+      const state = { data, settings: on, gate: gate.layer };
+      const { sent, emit } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* TestClock.adjust(MINUTE_MS);
+      expect(gate.slots.left).toEqual([]);
+      // A question to the person opens: not due now, so it needs no slot and holds no place.
+      state.data = {
+        ...data,
+        runtimeRequests: [
+          { id: RuntimeRequestId.make("request-1"), status: "pending" },
+        ] as unknown as OrchestrationV2ThreadProjection["runtimeRequests"],
+      };
+      yield* emit(threadChanged(state.data), "readThread", 14);
+      yield* settle;
+      expect(gate.slots.left).toEqual([`handoff:server:handoff:${threadId}:${runId}`]);
+      expect(sent).toEqual([]);
+    }),
+  );
+
+  it.effect("a waiting handoff replaced by a newer run's timer leaves its place", () =>
+    Effect.gen(function* () {
+      const gate = countingGate(0);
+      const data = projection({ usedTokens: 160_000 });
+      const state = { data, settings: on, gate: gate.layer };
+      const { sent, emit, events } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* TestClock.adjust(MINUTE_MS);
+      expect(gate.slots.left).toEqual([]);
+      // A newer run completes: its own timer replaces the waiting one, which leaves the line.
+      const newer = run({ id: RunId.make("run-2"), ordinal: 2 });
+      state.data = { ...data, runs: [...data.runs, newer] };
+      yield* Queue.offer(events, runUpdated(newer));
+      yield* settle;
+      expect(gate.slots.left).toContain(`handoff:server:handoff:${threadId}:${runId}`);
+      expect(sent).toEqual([]);
+    }),
+  );
+
+  it.effect("no free agent slot: a failed handoff's retry waits too, then is sent once", () =>
+    Effect.gen(function* () {
+      const data = projection({ usedTokens: 160_000 });
+      const failed = run({
+        id: RunId.make("run-2"),
+        ordinal: 2,
+        userMessageId: handoffMessageId,
+        status: "failed",
+      });
+      const gate = countingGate(0);
+      const state = {
+        data: {
+          ...data,
+          runs: [...data.runs, failed],
+          messages: [{ ...data.messages[0]!, id: handoffMessageId, text: "the first text" }],
+        },
+        settings: on as Partial<HandoffSettings>,
+        gate: gate.layer,
+      };
+      const { sent, emit, events } = yield* harness(state);
+      yield* Queue.offer(events, runUpdated(failed));
+      yield* TestClock.adjust(MINUTE_MS);
+      expect(sent).toEqual([]);
+      gate.slots.free = 1;
+      yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
+      yield* emit(null, "handoffRunEnded", 1);
+      expect(messages(sent).map((message) => message.messageId)).toEqual([
+        `${handoffMessageId}:retry1`,
+      ]);
     }),
   );
 

@@ -1731,10 +1731,10 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
   const grantSweep = Effect.fnUntraced(function* (settings: ServerSettings) {
     const gate = input.slots;
     if (gate === undefined) return 0;
-    const waiting = yield* lock.withPermits(1)(
+    const read = yield* lock.withPermits(1)(
       Effect.gen(function* () {
         const loaded = yield* ensureLoaded(true);
-        if (!loaded.ok) return [];
+        if (!loaded.ok) return null;
         return loaded.contents.waits
           .flatMap((wait) => (wait.kind === "slot" && wait.state === "waiting" ? [wait] : []))
           .sort((a, b) =>
@@ -1748,6 +1748,11 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
           );
       }),
     );
+    // Unread: the gate's line keeps the slot waits it has (they end by time if they ended).
+    if (read === null) return 0;
+    const waiting = read;
+    // The slot waits that ended since (met, cancelled, handed over) leave the gate's line.
+    yield* gate.slotWaitsWaiting(waiting.map((wait) => wait.id));
     if (waiting.length === 0) return 0;
     // Outside the lock: the gate reads the store's held slots under it.
     const grants = yield* gate.grant(
@@ -1755,6 +1760,8 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
         key: wait.id,
         threadId: wait.threadId,
         account: wait.spec.account,
+        // Its place in the gate's one line, beside the routes' waiting wake-ups.
+        sinceMs: Date.parse(wait.createdAt),
       })),
     );
     const answers = waiting.map((wait, index) => {
@@ -2149,6 +2156,14 @@ export const make = Effect.fn("WaitService.make")(function* (input: {
             }
           }
         }
+        // A stopped receiver starts nothing while it waits to be handed over: its slot frees now.
+        const stoppedSlots = results.flatMap(([group, result]) =>
+          result.type === "stopped"
+            ? group.waits.flatMap((wait) => (wait.kind === "slot" ? [wait.id] : []))
+            : [],
+        );
+        if (input.slots !== undefined && stoppedSlots.length > 0)
+          yield* input.slots.drop(stoppedSlots);
         for (const [group, result] of results) {
           const at = nextTry(group, result, waits, now, settings);
           if (at === null) forgetMessage(group.messageId);

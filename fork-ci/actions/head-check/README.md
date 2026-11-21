@@ -457,7 +457,11 @@ head "not passed" unless it judged the head and the head passed.
     fails every try, and after a 5xx or a rate limit GraphQL (which has its
     own rate limit) does not name it either. Comment spam can spend the job
     token's hourly REST limit; while GraphQL still names the Environment the
-    gate posts failures instead. The gate job does not start, as the
+    gate posts failures instead. The guard job's token needs no extra
+    permission for that GraphQL read: with only the job's `contents`,
+    `pull-requests` and `actions` read (no `deployments`) it gets the
+    Environment's name, and `NOT_FOUND` for one that does not exist (checked
+    in a live run). The gate job does not start, as the
     Environment may not exist and naming it would create it. Fix: once GitHub
     answers again, post an issue comment on the pull request or dispatch the
     gate.
