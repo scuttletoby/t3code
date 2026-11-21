@@ -886,6 +886,7 @@ const make = Effect.gen(function* () {
       settings = file.settings;
       if (file.failure !== undefined) {
         parseFailure = Option.some(Cause.squash(file.failure));
+        yield* ForkPolicy.warnAfterLoadFailure(settings.modelPolicy); // Fork: model policy
         yield* Effect.logWarning("failed to parse settings.json, using defaults", {
           path: settingsPath,
           issues: Cause.pretty(file.failure),
