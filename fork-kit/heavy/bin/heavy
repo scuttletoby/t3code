@@ -65,6 +65,7 @@ INSTALLED = '/etc/heavy/installed.tsv'
 DEFAULTS = {'slice': 'heavy.slice', 'grace_seconds': 30}
 SLICE_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,200}\.slice\Z')
 CGROUP_ROOTS = ('/sys/fs/cgroup', '/sys/fs/cgroup/unified')
+SETTLE = 1               # seconds stop_scope still looks after a step that sent nothing (processes ending anyway)
 WATCH = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)   # stop the scope after the grace time
 FORWARD = (signal.SIGUSR1, signal.SIGUSR2)                               # only passed on to the command
 # Signals heavy dies of again itself (the caller sees the same signal). Signals that dump core are reported as
@@ -328,9 +329,10 @@ def kill_cgroup(cg):
 def stop_scope(systemctl, unit, cg, grace):
     """Stop the scope (systemd sends TERM, then KILL after TimeoutStopSec = the grace time). If systemd cannot do
     it, stop what is left by hand: TERM to each process still in the scope, then after the grace time KILL to the
-    whole cgroup (cgroup.kill; each process by hand only without it). No wait after a step that sent nothing (no
-    pidfds, or none of the pids still in the scope): nothing would end sooner for it. Returns the pids still alive
-    afterwards (empty when all are gone)."""
+    whole cgroup (cgroup.kill; each process by hand only without it). After a step that sent nothing (no pidfds,
+    or none of the pids still in the scope) only a short settle (SETTLE seconds), not the grace time: nothing heavy
+    did would end them sooner, but systemd's own failed stop may already have signalled them, and those are not
+    named as still running while they end. Returns the pids still alive afterwards (empty when all are gone)."""
     try:
         subprocess.run([systemctl, '--user', 'stop', unit], stdin=subprocess.DEVNULL, capture_output=True,
                        timeout=grace * 2 + 30)
@@ -343,7 +345,7 @@ def stop_scope(systemctl, unit, cg, grace):
                 sent = True
             else:
                 sent = signal_in(left, cg, sig) > 0
-            end = time.monotonic() + (wait if sent else 0)
+            end = time.monotonic() + (wait if sent else SETTLE)
             while True:
                 left = cgroup_pids(cg) or []
                 if not left or time.monotonic() >= end:
@@ -383,14 +385,23 @@ def docker_context():
 
 def own_folder(base, make_base=False):
     """<base>/heavy/labelled, made if missing: '' unless it, its parent and base are folders this user owns and
-    only this user can write."""
+    only this user can write. make_base: base (~/.local/state) and its parent (~/.local) are made too, one at a
+    time, and the parent must be a real folder (no symlink) this user owns, so a planted ~/.local link never
+    leads heavy to make folders elsewhere."""
     uid = os.getuid()
     path = os.path.join(base, 'heavy', 'labelled')
     try:
         if make_base:
-            os.makedirs(base, 0o700, exist_ok=True)
+            parent = os.path.dirname(base)
+            try:
+                os.mkdir(parent, 0o700)
+            except FileExistsError:
+                pass
+            st = os.lstat(parent)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+                return ''
         for folder in (base, os.path.dirname(path), path):
-            if folder != base:
+            if folder != base or make_base:
                 try:
                     os.mkdir(folder, 0o700)
                 except FileExistsError:
@@ -413,9 +424,11 @@ def marks_dir():
 
 def state_base():
     """<home>/.local/state for the second notes folder (lib/heavy_sweep.py state_base, the same rule), or '' for none.
-    The home is $HOME, else the password database's; only an absolute folder this user owns. heavy makes the folder
-    when it is missing, so never in another user's home (root with a user's HOME, `sudo -E heavy ...`, uses root's
-    own home) and never relative to the job's working folder (no HOME and no passwd entry: no second folder)."""
+    The home is $HOME, else the password database's; only an absolute folder this user owns, that no group or other
+    user can write, and not /. heavy makes the folder when it is missing, so never in another user's home (root
+    with a user's HOME, `sudo -E heavy ...`, uses root's own home), never under a folder anyone can write (root
+    with HOME=/tmp: another user could plant /tmp/.local first) and never relative to the job's working folder (no
+    HOME and no passwd entry: no second folder)."""
     if STATE_ROOT:
         return STATE_ROOT
     homes = [os.environ.get('HOME') or '']
@@ -430,7 +443,8 @@ def state_base():
             st = os.stat(home)
         except OSError:
             continue
-        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid():
+        if (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022
+                and os.path.realpath(home) != '/'):
             return os.path.join(home, '.local', 'state')
     return ''
 

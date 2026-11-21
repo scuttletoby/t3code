@@ -936,7 +936,8 @@ class Sweep:
         sweep began, and that was already minAgeSeconds old then: a live run's scope is listed, and a scope
         started since is newer than its note could be old. A note heavy has not read yet (its scope ended a moment
         before this sweep began) costs at most a container that this sweep or the next removes instead of heavy.
-        Returns how many were removed."""
+        Only in a folder heavy would use (bin/heavy own_folder): labelled/, heavy/ and the base each a real folder
+        (no symlink) of this user's that no one else can write. Returns how many were removed."""
         listed_at, known = getattr(self, 'known_scopes', (None, None))
         if known is None:
             return 0
@@ -944,8 +945,10 @@ class Sweep:
         removed = 0
         for folder in self.note_folders():
             try:
-                st = os.lstat(folder)
-                if not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid or st.st_mode & 0o022:
+                # the folder, heavy/ and the base: each a real folder of this user's only it can write (own_folder)
+                if any(not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid or st.st_mode & 0o022
+                       for st in map(os.lstat, (folder, os.path.dirname(folder),
+                                                os.path.dirname(os.path.dirname(folder))))):
                     continue
                 names = os.listdir(folder)
             except OSError:
@@ -1232,7 +1235,8 @@ STATE_ROOT = ''         # '' = ~/.local/state (bin/heavy STATE_ROOT)
 
 def state_base():
     """<home>/.local/state for the second notes folder (bin/heavy state_base, the same rule), or '' for none: $HOME,
-    else the password database's home; only an absolute folder this user owns."""
+    else the password database's home; only an absolute folder this user owns, that no group or other user can write,
+    and not /."""
     if STATE_ROOT:
         return STATE_ROOT
     homes = [os.environ.get('HOME') or '']
@@ -1245,7 +1249,8 @@ def state_base():
             st = os.stat(home)
         except OSError:
             continue
-        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid():
+        if (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022
+                and os.path.realpath(home) != '/'):
             return os.path.join(home, '.local', 'state')
     return ''
 
