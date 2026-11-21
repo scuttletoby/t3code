@@ -117,13 +117,23 @@ export const isRemindable = (task: OrchestrationV2Subagent, nowMs: number): bool
  * (the reminder's tasks ended before the refusal, so none is reminded a day later); `null` keeps
  * every id for the process.
  */
-export const makeRefusalLog = (forgetAfterMs: number | null = REMINDER_MAX_AGE_MS) => {
+export const makeRefusalLog = (
+  forgetAfterMs: number | null = REMINDER_MAX_AGE_MS,
+): ((commandId: string, nowMs: number) => boolean) => {
+  if (forgetAfterMs === null) {
+    // Nothing is forgotten, so no time is kept.
+    const logged = new Set<string>();
+    return (commandId) => {
+      if (logged.has(commandId)) return false;
+      logged.add(commandId);
+      return true;
+    };
+  }
+  // When each id was logged: the prune reads it.
   const logged = new Map<string, number>();
-  return (commandId: string, nowMs: number): boolean => {
-    if (forgetAfterMs !== null) {
-      for (const [id, atMs] of logged) {
-        if (nowMs - atMs > forgetAfterMs) logged.delete(id);
-      }
+  return (commandId, nowMs) => {
+    for (const [id, atMs] of logged) {
+      if (nowMs - atMs > forgetAfterMs) logged.delete(id);
     }
     if (logged.has(commandId)) return false;
     logged.set(commandId, nowMs);

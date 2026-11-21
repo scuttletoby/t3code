@@ -121,7 +121,8 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
   const waitingForSlot = new Map<ThreadId, ParentOutcome>();
   // Never forgotten: an orphan batch's ids do not age, and a slot wait checks its parent again for
   // as long as the slot stays taken, a day or more. One run per start, so this holds at most the
-  // refused batches of that run.
+  // refused batches of that run. A regrouped batch (new keys after a relist, or after a send) has
+  // a new command id: it counts as a new batch, so it is logged once more.
   const newRefusal = makeRefusalLog(null);
   const settings = yield* ServerSettingsService;
   const store = yield* DelegatedResultsStore.DelegatedResultsStore;
