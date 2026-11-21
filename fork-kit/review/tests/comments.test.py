@@ -234,6 +234,90 @@ MUTATIONS = {
 }
 
 
+TEMPLATE_DOCS = ('SKILL.md', os.path.join('eval', 'lens.md'), 'COMMENTS.md')
+FENCE_RE = re.compile(r'^(`{3,})[a-z]*\s*$')
+PLACEHOLDER_RE = re.compile(r'<([^<>\n]*)>')
+
+
+def kit_text(name):
+    with open(os.path.join(KIT, name), encoding='utf-8') as f:
+        return f.read()
+
+
+def templates(text):
+    """Every fenced block whose first line is a lens header with a `<placeholder>`: the report shapes the docs tell a
+    lens to write (the checked examples of COMMENTS.md hold real shas, so they are not templates)."""
+    lines, out, i = text.splitlines(), [], 0
+    while i < len(lines):
+        m = FENCE_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        body, i = [], i + 1
+        while i < len(lines) and lines[i].strip() != m.group(1):
+            body.append(lines[i])
+            i += 1
+        i += 1
+        if body and re.match(r'lens\s*:', body[0], re.I) and PLACEHOLDER_RE.search(body[0]):
+            out.append('\n'.join(body))
+    return out
+
+
+def fill(template):
+    """A template as a lens would fill it on a clean read: a sha placeholder takes a full sha, a choice
+    (`<blocker|major|minor>`) its last, lightest option, anything else plain text."""
+    def one(m):
+        inner = m.group(1)
+        if 'sha' in inner:
+            return SHA
+        if '|' in inner:
+            return inner.split('|')[-1].strip()
+        return 'text'
+    return PLACEHOLDER_RE.sub(one, template)
+
+
+class SkillFormat(unittest.TestCase):
+    """The report shape the skill, the eval lens and COMMENTS.md tell a lens to write is a clean read with a state line
+    to the gate's own parser, and the skill's tiers and state question are the gate's and the kit's: the skill text and
+    the gate cannot drift apart again."""
+
+    def test_every_documented_report_shape_reads_clean_with_the_gates_parser(self):
+        for name in TEMPLATE_DOCS:
+            found = templates(kit_text(name))
+            with self.subTest(doc=name):
+                self.assertTrue(found, f'{name} no longer shows the report shape')
+            for t in found:
+                with self.subTest(doc=name, header=t.splitlines()[0]):
+                    words = review_kit.verdict(fill(t), 'tool ready --head', SHA)
+                    self.assertEqual(words[1:], ['read', 'clean', 'state'])
+                    self.assertEqual(review_kit.check(fill(t), 'tool ready --head', SHA)[0], 0)
+
+    def test_a_shape_without_its_state_or_findings_lines_fails(self):
+        t = templates(kit_text('SKILL.md'))[0]
+        no_state = '\n'.join(x for x in t.splitlines() if not x.startswith('state:'))
+        self.assertIn('no state', review_kit.verdict(fill(no_state), 'tool ready --head', SHA))
+        no_blocker = '\n'.join(x for x in t.splitlines() if not x.startswith('blocker:'))
+        self.assertIn('no findings section', review_kit.verdict(fill(no_blocker), 'tool ready --head', SHA))
+
+    def test_the_skill_carries_the_state_question_word_for_word(self):
+        for name in ('SKILL.md', os.path.join('eval', 'lens.md'), 'REVIEW.md'):
+            with self.subTest(doc=name):
+                self.assertIn(review_kit.STATE_QUESTION, ' '.join(kit_text(name).split()))
+
+    def test_the_skill_tiers_are_the_gates_weights_and_recommended_lens_counts(self):
+        import json
+        import review_config
+        gate = os.path.join(REPO, 'fork-ci', 'actions', 'pr-queue')
+        with open(os.path.join(gate, 'review.recommended.json'), encoding='utf-8') as f:
+            mins = json.load(f)['min_lenses']
+        rows = re.findall(r'^\| (\w+) +\|[^|]*\| ([^|]*)\|\s*$', kit_text('SKILL.md'), re.M)
+        tiers = {w: cell for w, cell in rows if w in review_config.WEIGHTS}
+        self.assertEqual(list(tiers), list(review_config.WEIGHTS))
+        for weight, cell in tiers.items():
+            with self.subTest(weight=weight):
+                self.assertEqual(int(re.search(r'\*\*(\d+)', cell).group(1)), mins[weight])
+
+
 class RedCheck(unittest.TestCase):
     def test_each_rule_has_a_test_that_fails_without_it(self):
         with open(LIB, encoding='utf-8') as f:
