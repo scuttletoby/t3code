@@ -73,6 +73,7 @@ fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/fleet-watch/fleet_watch.test.py
 fork-ci/actions/git-clean/git_clean.test.py ~8s
 fork-ci/actions/gradle-cache/gradle_cache.test.py
+fork-ci/actions/handoff-put/handoff.test.py ~16s
 fork-ci/actions/head-check/head_check.test.py ~28s
 fork-ci/actions/head-check/head_gate.test.py
 fork-ci/actions/job-changed/job-changed.test.py ~21s

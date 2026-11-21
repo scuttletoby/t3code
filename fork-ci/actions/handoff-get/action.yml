@@ -1,0 +1,66 @@
+name: handoff-get
+description: >-
+  Takes the file a handoff-put of this run handed off for this checkout's HEAD (the artifact <name>-<sha>, an earlier
+  attempt's too) and writes its payload to path, only when the sha inside the file is this checkout's HEAD (the
+  artifact's name alone is not trusted). A missing or refused hand-off is ok 'false' and no file at path, never a
+  failed step. Usage: README.md in ../handoff-put.
+inputs:
+  name:
+    description: The hand-off's name, as given to handoff-put.
+    required: true
+  path:
+    description: >-
+      Where to write the payload, relative to the workspace. A file already there is removed first, so after the step
+      it exists only when ok is 'true'.
+    required: true
+outputs:
+  ok:
+    description: "'true' only when path holds this commit's hand-off; anything else means fall back."
+    value: ${{ steps.get.outputs.ok }}
+  sha:
+    description: This checkout's HEAD, the commit the hand-off had to be for (empty when it could not be read).
+    value: ${{ steps.get.outputs.sha }}
+  reason:
+    description: One line saying what happened.
+    value: ${{ steps.get.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    # Only code from the action folders of the caller's pinned SHA runs. Before the one git call (HEAD), the
+    # checkout's .git config must be one actions/checkout writes (fork-ci git-clean): when it is not, path is still
+    # cleared, nothing is downloaded and ok is 'false'; the step still passes.
+    - id: where
+      name: Clear the path; name the artifact for this checkout
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        HANDOFF_PATH: ${{ inputs.path }}
+      run: |
+        refused=()
+        if ! python3 -I "$GITHUB_ACTION_PATH/../git-clean/git_clean.py" check --path . --require; then
+          echo "::warning::handoff-get: no hand-off, git-clean refused the checkout's git config (above)"
+          refused=(--refused)
+        fi
+        exec python3 -I "$GITHUB_ACTION_PATH/../handoff-put/handoff.py" where --name="$NAME" --path="$HANDOFF_PATH" \
+          --download-dir="$RUNNER_TEMP/fork-ci-handoff" "${refused[@]}"
+    # This run's artifacts only: no run-id, repository or token is passed, so another run's artifact is never read.
+    - id: download
+      if: steps.where.outputs.ready == 'true'
+      continue-on-error: true
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: ${{ steps.where.outputs.artifact }}
+        path: ${{ steps.where.outputs.dir }}
+    - id: get
+      name: Check the hand-off and write its payload
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        HANDOFF_PATH: ${{ inputs.path }}
+        READY: ${{ steps.where.outputs.ready }}
+        OUTCOME: ${{ steps.download.outcome }}
+        DOWNLOADED: ${{ steps.where.outputs.dir }}
+        WHY: ${{ steps.where.outputs.reason }}
+      run: >-
+        exec python3 -I "$GITHUB_ACTION_PATH/../handoff-put/handoff.py" get --name="$NAME" --path="$HANDOFF_PATH"
+        --ready="$READY" --outcome="$OUTCOME" --dir="$DOWNLOADED" --why="$WHY"
