@@ -2,9 +2,11 @@
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: the fork's own settings are English only; upstream's translation catalogs hold no fork keys. */
 import {
   checkModelPolicyPick,
+  MODEL_POLICY_DRIVER_ALIASES,
   MODEL_POLICY_START_ROWS,
   type ModelPolicy,
   modelPolicyAliasTargets,
+  modelPolicyCatalogEffortIds,
   type ModelPolicyListedModel,
   type ModelPolicyMode,
   ModelPolicyPatch,
@@ -96,38 +98,63 @@ export function unknownModelPolicyDrivers(
   return [...new Set(rows.map((row) => row.driver))].filter((driver) => !knownDrivers.has(driver));
 }
 
-/** A provider as the alias check reads it: its driver and the model lists it has. */
+/**
+ * A provider as the alias check reads it: its driver, the model lists it has, and the machine it is
+ * on (`environmentId`; providers without one read as one machine).
+ */
 export interface ModelPolicyAliasProvider {
   readonly driver: string;
+  readonly environmentId?: string | undefined;
   readonly models?: ReadonlyArray<ModelPolicyListedModel> | undefined;
   readonly workspaceSnapshots?:
     | ReadonlyArray<{ readonly models?: ReadonlyArray<ModelPolicyListedModel> | undefined }>
     | undefined;
 }
 
+/** The instance's model list and every folder's list it scanned. */
+const providerLists = (provider: ModelPolicyAliasProvider) => [
+  provider.models ?? [],
+  ...(provider.workspaceSnapshots ?? []).flatMap((snapshot) =>
+    snapshot.models === undefined ? [] : [snapshot.models],
+  ),
+];
+
 /**
- * Each row whose model is an alias in its driver's model lists here, with the models the alias
- * names (`opus` for `claude-opus-5-5`). The driver resolves an alias through the catalog, so such a
- * row follows the alias when a provider moves it to a new model; the server reads a pick as named,
- * so the row also misses a pick of the full id. Empty when no provider of the driver is known.
+ * Rows naming an alias on some selected machine, with its models there (none for a name the driver
+ * resolves by itself): such a row follows the alias to a new model and misses the full id. Each
+ * machine is read on its own lists, as its server is. Empty with no provider of the driver known.
  */
 export function aliasModelPolicyRows(
   rows: ReadonlyArray<ModelPolicyRow>,
   providers: ReadonlyArray<ModelPolicyAliasProvider>,
 ): ReadonlyArray<{ readonly row: ModelPolicyRow; readonly aliasOf: ReadonlyArray<string> }> {
+  const machines = new Map<string | undefined, Array<ModelPolicyAliasProvider>>();
+  for (const provider of providers) {
+    machines.set(provider.environmentId, [
+      ...(machines.get(provider.environmentId) ?? []),
+      provider,
+    ]);
+  }
   return rows.flatMap((row) => {
-    const lists = providers.flatMap((provider) =>
-      provider.driver !== row.driver
-        ? []
-        : [
-            provider.models ?? [],
-            ...(provider.workspaceSnapshots ?? []).flatMap((snapshot) =>
-              snapshot.models === undefined ? [] : [snapshot.models],
-            ),
-          ],
-    );
-    const aliasOf = modelPolicyAliasTargets(lists, row.model);
-    return aliasOf.length === 0 ? [] : [{ row, aliasOf }];
+    let flagged = false;
+    const aliasOf = new Set<string>();
+    for (const machineProviders of machines.values()) {
+      const own = machineProviders.filter((provider) => provider.driver === row.driver);
+      if (own.length === 0) continue;
+      const lists = own.flatMap(providerLists);
+      if (lists.some((list) => list.some((candidate) => candidate.slug === row.model))) continue;
+      const targets = modelPolicyAliasTargets(lists, row.model);
+      // A name the driver resolves by itself, once a model list of the driver is known there.
+      const driverOwn =
+        own.some((provider) => provider.models !== undefined) &&
+        (MODEL_POLICY_DRIVER_ALIASES[row.driver] ?? []).some(
+          (alias) => alias.toLowerCase() === row.model.toLowerCase(),
+        );
+      if (targets.length === 0 && !driverOwn) continue;
+      flagged = true;
+      for (const target of targets) aliasOf.add(target);
+    }
+    return flagged ? [{ row, aliasOf: [...aliasOf] }] : [];
   });
 }
 
@@ -195,17 +222,25 @@ export interface PersonModelPickMark {
 export function personModelPickMarks(
   policy: ModelPolicy,
   picks: Partial<Record<PersonModelPickKey, ModelSelection | null | undefined>>,
-  providers: ReadonlyArray<{ readonly instanceId: string; readonly driver: string }>,
+  providers: ReadonlyArray<ModelPolicyAliasProvider & { readonly instanceId: string }>,
 ): ReadonlyArray<PersonModelPickMark> {
   const stance = modelPolicyStance(policy);
   if (stance.mode === "off" || stance.unreadable) return [];
   return PERSON_MODEL_PICKS.flatMap(({ key, label }) => {
     const selection = picks[key];
     if (selection === null || selection === undefined) return [];
+    const provider = providers.find((candidate) => candidate.instanceId === selection.instanceId);
+    // The effort control the instance's catalog marks, as the server reads an agent's pick.
+    const effortOptionIds =
+      provider === undefined
+        ? []
+        : modelPolicyCatalogEffortIds(providerLists(provider), selection.model);
     const pick = {
-      driver: providers.find((provider) => provider.instanceId === selection.instanceId)?.driver,
+      driver: provider?.driver,
       model: selection.model,
       options: selection.options,
+      effortOptionIds,
+      driverEffortIds: provider === undefined ? {} : { [provider.driver]: effortOptionIds },
     };
     const efforts = modelPolicyPickEfforts(pick);
     const verdict = checkModelPolicyPick(stance.allow, pick);
