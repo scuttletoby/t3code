@@ -11,6 +11,7 @@ import {
   loadCaller,
   unavailable,
 } from "../../threadAccess.ts";
+import { playtestCall } from "./playtest.ts";
 import { listTasks } from "./taskList.ts";
 import { WaitsToolkit } from "./tools.ts";
 
@@ -103,6 +104,7 @@ const handlers = {
       }),
   ),
   task_list: McpToolAccess.readsAsCaller((input) => listTasks(input)),
+  playtest: McpToolAccess.actsAsCaller((input) => playtestCall(input)),
 } satisfies McpToolAccess.Handlers<typeof WaitsToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(WaitsToolkit, handlers);

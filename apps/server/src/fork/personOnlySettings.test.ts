@@ -174,6 +174,7 @@ describe("person-only fork settings", () => {
       "t3_project_update",
       "t3_thread_configure",
       "wait_for",
+      "playtest",
       "tool_search",
       "request_secret",
       "send_to_user",
