@@ -184,7 +184,7 @@ describe("saving placement", () => {
   });
 
   it("never refuses another save over a stored factsCommand of another OS", () => {
-    // A hand edit the load did not catch (it reads it as off on the server): another save passes.
+    // A hand edit of another OS's path (placing reads it as off on the server): another save passes.
     const stored = save(START, { placement: { ...FULL, factsCommand: "C:\\facts.exe" } }, "win32");
     expect(save(stored, { usagePacingGate: "off" }, "linux").placement).toEqual(stored.placement);
     expect(save(stored, { placement: { mode: "off" } }, "linux").placement.factsCommand).toBe(

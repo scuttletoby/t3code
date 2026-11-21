@@ -1,7 +1,8 @@
 /**
- * Fork (placement row P2): the server reads `placement.factsCommand` against its own OS. A path of
- * another OS in the file reads as off, kept as written with its problem; a save that sets one is
- * refused. The OS is injected (`HostProcess.Platform`), so both cases run on any machine.
+ * Fork (placement row P2): the server reads `placement.factsCommand` against its own OS when it
+ * places work (`readPlacementForThisOs`). A path of another OS in the file reads there as off, kept
+ * as written with its problem, on load and after every save; a save that sets one is refused. The
+ * OS is injected (`HostProcess.Platform`), so each case runs on any machine.
  */
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -18,6 +19,7 @@ import * as ServerConfig from "../config.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
+import { readPlacementForThisOs } from "./placementRead.ts";
 
 const decodeServerSettingsJson = Schema.decodeUnknownEffect(Schema.fromJsonString(ServerSettings));
 
@@ -49,7 +51,7 @@ const CASES = [
 
 it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("placement on this OS", (it) => {
   it.effect.each(CASES)(
-    "on %s, reads %s as off, kept; refuses saving it",
+    "on %s, places with %s as off, kept; refuses saving it",
     ([platform, foreign, own]) =>
       Effect.gen(function* () {
         const config = yield* ServerConfig.ServerConfig;
@@ -60,32 +62,41 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("placement on thi
           config.settingsPath,
           JSON.stringify({ placement: written, defaultAutoPull: false }),
         );
+        const placing = () => Effect.flatMap(service.getSettings, readPlacementForThisOs);
 
-        const { unreadable, problem, ...rules } = (yield* service.getSettings).placement;
+        // The load holds the file's value; placing reads it as off, kept, with its problem.
+        assert.deepEqual((yield* service.getSettings).placement, { ...written, weights: {} });
+        const read = yield* placing();
+        const { unreadable, problem, ...rules } = read;
         assert.deepEqual(rules, { ...DEFAULT_PLACEMENT_SETTINGS });
         assert.deepEqual(unreadable, { ...written, weights: {} });
         assert.include(problem, "is not a full path on this server's OS");
+        // Reading it again (an off value) gives the same.
+        assert.deepEqual(yield* readPlacementForThisOs({ placement: read }), read);
 
-        // A save of another setting writes it back unchanged (and runs again the same).
+        // A save of another setting writes it back unchanged, and placing still reads it as off
+        // (runs again the same).
         for (let run = 0; run < 2; run++) {
-          yield* service.updateSettings({ defaultAutoPull: true });
+          yield* service.updateSettings({ defaultAutoPull: run === 0 });
           const file = JSON.parse(yield* fs.readFileString(config.settingsPath));
-          // As read: each field, defaults filled in (`weights: {}`); the same on every run.
-          assert.deepEqual(file.placement, { ...written, weights: {} });
-          const reread = (yield* service.getSettings).placement;
-          assert.deepEqual(reread.unreadable, unreadable);
-          assert.strictEqual(reread.problem, problem);
+          assert.deepEqual(file.placement, written);
+          assert.deepEqual(yield* placing(), read);
         }
 
-        // A save that sets another OS's path is refused; one of this OS's replaces the kept text.
-        const whole = { ...PLACEMENT, factsCommand: foreign, weights: {} };
-        const refused = yield* Effect.flip(service.updateSettings({ placement: whole }));
-        assert.include(String(refused.cause), "is not a full path on this server's OS");
+        // A save that sets this OS's path is taken and read as it is; one that sets another OS's
+        // path over it is refused and leaves the file as it was.
+        const whole = { ...PLACEMENT, weights: {} };
         const saved = yield* service.updateSettings({
           placement: { ...whole, factsCommand: own },
         });
         assert.strictEqual(saved.placement.factsCommand, own);
-        assert.isFalse(Object.hasOwn(saved.placement, "problem"));
+        const placed = yield* placing();
+        assert.strictEqual(placed.factsCommand, own);
+        assert.isFalse(Object.hasOwn(placed, "problem"));
+        const refused = yield* Effect.flip(
+          service.updateSettings({ placement: { ...whole, factsCommand: foreign } }),
+        );
+        assert.include(String(refused.cause), "is not a full path on this server's OS");
         const persisted = yield* decodeServerSettingsJson(
           yield* fs.readFileString(config.settingsPath),
         );

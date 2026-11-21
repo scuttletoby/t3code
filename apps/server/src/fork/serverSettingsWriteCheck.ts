@@ -1,10 +1,9 @@
 /**
  * Fork: the server's save check for fork settings. A refused save fails with upstream's
  * `ServerSettingsError` (operation `normalize`), its cause a `ForkSettingsWriteError` with the fix.
- * The settings file calls `check` in its write path, `withCheck` in its test layer and `forThisOs`
- * in its load.
+ * The settings file calls `check` in its write path and `withCheck` in its test layer.
  */
-import { type ServerSettings, ServerSettingsError, placementOnPlatform } from "@t3tools/contracts";
+import { type ServerSettings, ServerSettingsError } from "@t3tools/contracts";
 import {
   ForkSettingsWriteError,
   forkSettingsWriteProblem,
@@ -36,16 +35,6 @@ export function check(
         );
   });
 }
-
-/**
- * The settings as this machine reads them: a `placement.factsCommand` this OS cannot run reads as
- * off, kept as written with its problem (contracts' `placementOnPlatform`). The load applies it.
- */
-export const forThisOs = (settings: ServerSettings): Effect.Effect<ServerSettings> =>
-  Effect.map(HostProcess.Platform, (platform) => {
-    const placement = placementOnPlatform(settings.placement, platform);
-    return placement === settings.placement ? settings : { ...settings, placement };
-  });
 
 /** `update`, then {@link check} on what it returns. */
 export const withCheck =

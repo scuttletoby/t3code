@@ -432,7 +432,7 @@ wiring). Fields, each with its default:
 - `factsCommand`: `""`. Empty, or the absolute path of one program on this server's OS (`/…` on
   Linux and macOS; `C:\…` or `\\server\…` on Windows). It is a path, never a command line: a
   space is part of the path, and no shell runs it. A relative path or a control character is not
-  valid; a save that sets another OS's path is refused, and one in the file reads as `off` (below).
+  valid; a save that sets another OS's path is refused, and placing reads one in the file as `off` (below).
   Exit 0 means free for work, and each line it prints is one more label; any other exit or a timeout
   means not available.
 - `never`: `[]`. Label groups that must not meet on one machine, such as
@@ -441,10 +441,14 @@ wiring). Fields, each with its default:
 - `weights`: `{}`. Linked machine id (one word, no spaces) to `prefer`, `normal`, `less` or
   `manual` (upstream's load-balancing words); a machine without one is `normal`.
 
-A value that is not valid (a bad field, a wrong type, a field this build does not know, or a
-`factsCommand` that is not a full path on this server's OS) reads as `off`, with a warning in the
-log and the reason kept beside it for Settings to show; the rest of the file still loads. The
-person's text is kept as written until the key is saved. A save that names only some fields keeps
+A value that is not valid (a bad field, a wrong type, a field this build does not know) reads as
+`off`, with a warning in the log and the reason kept beside it for Settings to show; the rest of the
+file still loads. The person's text is kept as written until the key is saved. A `factsCommand`
+that is not a full path on this server's OS (a hand edit) is not converted by the load: Settings
+shows it as written. Placing work reads `placement` only through the server's
+`readPlacementForThisOs` (`apps/server/src/fork/placementRead.ts`), which reads it as `off`, kept
+as written with the reason, each time; the machine that runs `factsCommand` checks the path again
+before it runs it. A save that names only some fields keeps
 the others; over a kept unreadable value only a save of every field is taken (it replaces the text),
 and a partial one is refused ("placement is not valid; save the whole setting"), so it cannot drop a
 `never` group. A newer build's field reads as `off` here and is kept through saves of other keys; a

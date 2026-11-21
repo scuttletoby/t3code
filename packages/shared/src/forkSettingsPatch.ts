@@ -261,8 +261,8 @@ export function playtestProgramProblem(
 
 /**
  * A `placement.factsCommand` a save sets that is not a full path on the server's OS (`platform`).
- * One already stored is never refused, so a hand edit blocks no other save (the server reads it as
- * off when it loads the file, contracts' `placementOnPlatform`).
+ * One already stored is never refused, so a hand edit blocks no other save (placing work reads it
+ * as off, through contracts' `placementOnPlatform`).
  */
 export function placementFactsCommandSaveProblem(
   current: ServerSettings,

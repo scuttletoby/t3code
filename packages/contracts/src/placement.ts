@@ -240,7 +240,7 @@ const encodeStoredSync = Schema.encodeSync(PlacementStored);
  * Why this machine (`platform`, Node's `process.platform` name) cannot run `factsCommand`, or
  * `undefined`: it is not a full path on this OS (`C:\\…` on Linux or macOS, `/…` on Windows), by
  * playtest's check for its programs. The settings do not know the server's OS, so the server checks
- * it when it reads the file ({@link placementOnPlatform}) and when a save sets it.
+ * it when it reads placement to place work ({@link placementOnPlatform}) and when a save sets it.
  */
 export const placementFactsCommandProblem = (
   factsCommand: string,
