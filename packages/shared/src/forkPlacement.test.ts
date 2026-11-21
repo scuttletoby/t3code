@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { chooseLoadBalancedEnvironment } from "../../client-runtime/src/load-balancing.ts";
 import {
+  canonicalLabels,
   checkHardRules,
   choosePlacement,
   type HardRule,
@@ -100,6 +101,16 @@ const table: Record<HardRule, Row[]> = {
       reason: "The link to this machine has expired.",
     },
     {
+      name: "expires 1 ms from now: still open",
+      machine: machine("a", { link: { ...link, expiresAt: NOW + 1 } }),
+      reason: null,
+    },
+    {
+      name: "expiry time NaN",
+      machine: machine("a", { link: { ...link, expiresAt: Number.NaN } }),
+      reason: "The link's expiry time is not a valid number.",
+    },
+    {
       name: "beta off there",
       machine: machine("a", { link: { ...link, betaThere: false } }),
       reason: "Linked machines beta is off at one end.",
@@ -135,10 +146,32 @@ const table: Record<HardRule, Row[]> = {
       reason: "The machine sent no CPU and memory facts.",
     },
     {
-      name: "zero cores",
-      machine: machine("a", { facts: withHost({ cpuCount: 0 }) }),
-      reason: "The machine's CPU and memory facts are incomplete.",
+      name: "exactly 5 s ahead is still trusted",
+      machine: machine("a", { facts: facts({ receivedAt: NOW + 5_000 }) }),
+      reason: null,
     },
+    ...(
+      [
+        ["zero cores", { cpuCount: 0 }],
+        ["NaN cores", { cpuCount: Number.NaN }],
+        ["negative cores", { cpuCount: -2 }],
+        ["infinite cores", { cpuCount: Number.POSITIVE_INFINITY }],
+        ["NaN total memory", { totalMemoryBytes: Number.NaN }],
+        ["negative total memory", { totalMemoryBytes: -GB }],
+        ["NaN free memory", { availableMemoryBytes: Number.NaN }],
+        ["negative free memory", { availableMemoryBytes: -GB }],
+        ["infinite free memory", { availableMemoryBytes: Number.POSITIVE_INFINITY }],
+      ] as const
+    ).map(([name, over]) => ({
+      name,
+      machine: machine("a", { facts: withHost(over) }),
+      reason: "The machine's CPU and memory facts are incomplete or not valid numbers.",
+    })),
+    ...[Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY].map((receivedAt) => ({
+      name: `receipt time ${receivedAt}`,
+      machine: machine("a", { facts: facts({ receivedAt }) }),
+      reason: "The facts have no valid receipt time, so they count as too old.",
+    })),
     {
       name: "stale",
       machine: machine("a", { facts: facts({ receivedAt: NOW - 15_001 }) }),
@@ -174,6 +207,18 @@ const table: Record<HardRule, Row[]> = {
       name: "no link",
       machine: machine("a", { link: null }),
       reason: "There is no link, so its access is unknown.",
+    },
+    {
+      name: "an access value this build does not know",
+      machine: machine("a", { link: { ...link, access: "admin" as never } }),
+      task: { runtimeMode: "approval-required" },
+      reason: "The link allows admin, which this build does not know.",
+    },
+    {
+      name: "the task's mode left unresolved (inherit)",
+      machine: machine("a"),
+      task: { runtimeMode: "inherit" as never },
+      reason: "The task's runtime mode inherit is not one this build knows.",
     },
   ],
   H4: [
@@ -224,6 +269,24 @@ const table: Record<HardRule, Row[]> = {
       task: { never: [["ci-runner", "owner-logins"]] },
       reason: "No labels to check the never groups against.",
     },
+    {
+      name: "mixed case and spaces still match (labels are trimmed and lower-cased)",
+      machine: machine("a", { facts: withPlacement({ labels: ["work", "laptop "] }) }),
+      task: { never: [["Work", " LAPTOP"]] },
+      reason: "The machine has all of a never group: work + laptop.",
+    },
+    {
+      name: "a blank label in a group is dropped, so the group gets stricter",
+      machine: machine("a", { facts: withPlacement({ labels: ["work"] }) }),
+      task: { never: [["work", "  "]] },
+      reason: "The machine has all of a never group: work.",
+    },
+    {
+      name: "a group of blanks only is no group",
+      machine: machine("a"),
+      task: { never: [[" ", ""]] },
+      reason: null,
+    },
   ],
   H6: [
     { name: "no needs", machine: machine("a"), reason: null },
@@ -243,6 +306,18 @@ const table: Record<HardRule, Row[]> = {
       name: "no labels to check",
       machine: machine("a", { facts: null }),
       reason: "No labels to check the project's needs against.",
+    },
+    {
+      name: "mixed case and spaces still match (the same canonical form)",
+      machine: machine("a", { facts: withPlacement({ labels: [" GPU", "Cuda "] }) }),
+      task: { needs: ["gpu ", " CUDA"] },
+      reason: null,
+    },
+    {
+      name: "a blank need is never met",
+      machine: machine("a", { facts: withPlacement({ labels: ["gpu"] }) }),
+      task: { needs: ["gpu", "  "] },
+      reason: "The machine lacks what the project needs: (a blank need).",
     },
   ],
   H7: [
@@ -305,16 +380,70 @@ const table: Record<HardRule, Row[]> = {
       reason: "No agent slot is free there.",
     },
     {
-      name: "memory at the floor",
+      name: "memory at the floor: available, as the slot gate and P3",
       machine: machine("a", {
         facts: withPlacement({ memoryFloorMb: 4096, freeMemoryMb: 4096 }),
       }),
-      reason: "Free memory 4096 MB is not above the machine's floor of 4096 MB.",
+      reason: null,
+    },
+    {
+      name: "memory below the floor",
+      machine: machine("a", {
+        facts: withPlacement({ memoryFloorMb: 4096, freeMemoryMb: 4095 }),
+      }),
+      reason: "Free memory 4095 MB is below the machine's floor of 4096 MB.",
+    },
+    {
+      name: "host memory at the floor",
+      machine: machine("a", { facts: withPlacement({ memoryFloorMb: 8192 }) }),
+      reason: null,
     },
     {
       name: "host memory below the floor",
-      machine: machine("a", { facts: withPlacement({ memoryFloorMb: 8192 }) }),
-      reason: "Free memory 8192 MB is not above the machine's floor of 8192 MB.",
+      machine: machine("a", { facts: withPlacement({ memoryFloorMb: 8193 }) }),
+      reason: "Free memory 8192 MB is below the machine's floor of 8193 MB.",
+    },
+    {
+      name: "a floor of 0 keeps nothing back",
+      machine: machine("a", { facts: withPlacement({ memoryFloorMb: 0, freeMemoryMb: 0 }) }),
+      reason: null,
+    },
+    ...[Number.NaN, -1, Number.POSITIVE_INFINITY].flatMap((bad) => [
+      {
+        name: `free slot count ${bad}`,
+        machine: machine("a", { facts: withPlacement({ slotsFree: bad }) }),
+        reason: "The machine's free slot count is not a valid number.",
+      },
+      {
+        name: `memory floor ${bad}`,
+        machine: machine("a", { facts: withPlacement({ memoryFloorMb: bad }) }),
+        reason: "The machine's memory floor is not a valid number.",
+      },
+      {
+        name: `free memory ${bad}`,
+        machine: machine("a", { facts: withPlacement({ freeMemoryMb: bad }) }),
+        reason: "The machine's free memory is not a valid number.",
+      },
+      {
+        name: `CPU use ${bad}`,
+        machine: machine("a", { facts: withHost({ cpuUtilization: bad }) }),
+        reason: "The machine's CPU use is not a valid number.",
+      },
+    ]),
+    {
+      name: "host free memory NaN under a floor",
+      machine: machine("a", {
+        facts: facts({
+          hostResources: { ...host, availableMemoryBytes: Number.NaN },
+          placement: { labels: [], available: true, factsAt: NOW, memoryFloorMb: 1024 },
+        }),
+      }),
+      reason: "The machine's free memory is not a valid number.",
+    },
+    {
+      name: "CPU just under 95 %",
+      machine: machine("a", { facts: withHost({ cpuUtilization: 0.9499 }) }),
+      reason: null,
     },
     {
       name: "CPU at 95 %",
@@ -414,6 +543,19 @@ describe("rank: upstream's score, unchanged", () => {
       "Upstream's score leaves it out (free memory 5 % or less).",
     );
   });
+
+  it("a weight word this build does not know: not ranked, and the reason names the word", () => {
+    for (const weight of ["Prefer", "toString", ""]) {
+      const odd = machine("a", { weight: weight as never });
+      const result = place([odd]);
+      expect(result).toMatchObject({
+        kind: "none",
+        reason: `No machine fits. a: Its weight word "${weight}" is not one of prefer, normal, less or manual.`,
+      });
+      // Named: the weight is not a rule, so it is still used.
+      expect(place([odd], { task: task({ named: "a" }) })).toMatchObject({ kind: "picked" });
+    }
+  });
 });
 
 describe("the state question (design section 7, rows with no I/O)", () => {
@@ -443,23 +585,76 @@ describe("the state question (design section 7, rows with no I/O)", () => {
     });
   });
 
-  it("no facts or an older build: never chosen automatically; named, only H1 and H3", () => {
-    const old = machine("old", { facts: null, workspace: null });
+  it("no facts or an older build: never chosen automatically; named, the rules that need none", () => {
+    const old = machine("old", { facts: null });
     expect(place([old])).toMatchObject({ kind: "none" });
     expect(place([old, machine("a")])).toMatchObject({ environmentId: "a", order: ["a"] });
-    expect(place([old], { task: task({ named: "old" }) })).toMatchObject({
+    const named = place([old], { task: task({ named: "old" }) });
+    expect(named).toMatchObject({
       kind: "picked",
       environmentId: "old",
-      why: "old was named and passes the hard rules that need no facts (H1, H3).",
+      why: "old was named and passes the hard rules that need no facts (H1, H3, H7, H9).",
     });
-    const expired = machine("old", { facts: null, link: { ...link, expiresAt: NOW - 1 } });
-    const named = place([expired], { task: task({ named: "old" }) });
-    expect(named.kind === "none" && named.verdicts[0]?.failures.map((f) => f.rule)).toEqual(["H1"]);
-    const narrow = machine("old", { facts: null, link: { ...link, access: "auto" } });
-    const narrowNamed = place([narrow], { task: task({ named: "old" }) });
-    expect(
-      narrowNamed.kind === "none" && narrowNamed.verdicts[0]?.failures.map((f) => f.rule),
-    ).toEqual(["H3"]);
+    // Runs again: the same answer.
+    expect(place([old], { task: task({ named: "old" }) })).toEqual(named);
+  });
+
+  const noFactsRows: ReadonlyArray<{
+    readonly name: string;
+    readonly over: Partial<PlacementMachine>;
+    readonly task?: Partial<PlacementTask>;
+    readonly rule: HardRule;
+    readonly reason: string;
+  }> = [
+    {
+      name: "link expired",
+      over: { link: { ...link, expiresAt: NOW - 1 } },
+      rule: "H1",
+      reason: "The link to this machine has expired.",
+    },
+    {
+      name: "link access below the task's mode",
+      over: { link: { ...link, access: "auto" } },
+      rule: "H3",
+      reason: "The link allows auto, lower than the task's full-access.",
+    },
+    {
+      name: "two checkouts there",
+      over: { workspace: { matchingCheckouts: 2, providerPresent: true, modelPresent: true } },
+      rule: "H7",
+      reason: "2 matching checkouts there, not exactly one.",
+    },
+    {
+      name: "no provider there",
+      over: { workspace: { matchingCheckouts: 1, providerPresent: false, modelPresent: false } },
+      rule: "H7",
+      reason: "The provider is not there.",
+    },
+    {
+      name: "the lookup did not run (a missing lookup never fits)",
+      over: { workspace: null },
+      rule: "H7",
+      reason: "The checkout, provider and model there were not checked.",
+    },
+    {
+      name: "asked by a placed child",
+      over: {},
+      task: { fromPlacedChild: true },
+      rule: "H9",
+      reason: "This task was itself placed: its children run where it runs.",
+    },
+  ];
+  it.each(noFactsRows)("named without facts, $name: refused by $rule", (row) => {
+    const result = place([machine("old", { facts: null, ...row.over })], {
+      task: task({ named: "old", ...row.task }),
+    });
+    expect(result).toMatchObject({
+      kind: "none",
+      reason: `old was named but fails ${row.rule}: ${row.reason}`,
+    });
+    expect(result.kind === "none" && result.verdicts[0]?.failures.map((f) => f.rule)).toEqual([
+      row.rule,
+    ]);
   });
 
   it("named with facts: every hard rule, no ranking", () => {
@@ -541,6 +736,18 @@ describe("the state question (design section 7, rows with no I/O)", () => {
     expect(place([here()])).toMatchObject({ kind: "picked", environmentId: "here" });
   });
 
+  it("duplicate machine ids: a plain refusal, whatever the order or a name", () => {
+    const reason = "Two machines share the id a, so none is picked.";
+    const twins = [machine("a"), machine("a", { facts: null }), machine("b")];
+    for (const machines of [twins, [...twins].reverse()]) {
+      expect(place(machines)).toEqual({ kind: "none", mode: "enforce", reason, verdicts: [] });
+      expect(place(machines, { task: task({ named: "b" }) })).toMatchObject({ reason });
+    }
+    expect(place([here({ environmentId: "a" }), machine("a")])).toMatchObject({
+      reason,
+    });
+  });
+
   it("an empty machine list: a plain no machine result", () => {
     expect(place([])).toEqual({
       kind: "none",
@@ -555,5 +762,16 @@ describe("the state question (design section 7, rows with no I/O)", () => {
       task: task({ fromPlacedChild: true }),
     });
     expect(result).toMatchObject({ kind: "picked", environmentId: "here", order: ["here"] });
+  });
+});
+
+describe("labels: one canonical form (trimmed, lower-cased, blanks and repeats dropped)", () => {
+  it("canonicalLabels", () => {
+    expect(canonicalLabels([" GPU", "gpu", "Work ", "", "  ", "ci-runner"])).toEqual([
+      "gpu",
+      "work",
+      "ci-runner",
+    ]);
+    expect(canonicalLabels([])).toEqual([]);
   });
 });
