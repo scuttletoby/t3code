@@ -207,14 +207,15 @@ const LEGACY_MORE_LINE = /^- and (\d+) more$/;
 
 /**
  * The keys of the tasks a first-format reminder told, from its text (sorted `- <id> "..."` lines,
- * ten at most). Up to ten, the ids must give its own id back; over ten, the ten listed count (the
- * rest were never named). A text that does not read back exactly gives nothing.
+ * ten at most), for this parent's own first-format id only. Up to ten, the ids must give its id
+ * back; over ten, the ten listed count (the rest were never named). Else it gives nothing.
  */
 export const legacyReminderKeys = (
   parentThreadId: ThreadId,
   messageId: string,
   text: string,
 ): ReadonlyArray<string> => {
+  if (!legacyReminderMessageIds(parentThreadId, [messageId]).includes(messageId)) return [];
   const lines = text.split("\n");
   const header = LEGACY_HEADER.exec(lines[0] ?? "");
   if (header === null) return [];
@@ -235,6 +236,8 @@ export const legacyReminderKeys = (
       listed.map((id) => NodeId.make(id)),
     );
     if (more.length !== 0 || exact !== messageId) return [];
+    // Over ten, no digest check: it covers the unnamed rest too. No risk added: a writer of this
+    // parent's reminder ids can already mark any task told with its one-task id.
   } else if (more.length !== 1 || more[0] !== count - MAX_LISTED) {
     return [];
   }
