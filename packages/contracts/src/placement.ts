@@ -333,6 +333,28 @@ export const PlacementNeedsFromSettingsFile = Schema.Unknown.pipe(
   ),
 );
 
+const decodeLabelsEffect = Schema.decodeUnknownEffect(PlacementLabels);
+
+/**
+ * The server's `placementNeeds` in a save, replaced whole. Strict: only labels are taken (a bad
+ * label, or a kept bad value sent back, is refused); a save of labels replaces a kept bad value.
+ * Typed as {@link PlacementNeeds}, so a settings value fits a patch as every other setting's does.
+ */
+export const PlacementNeedsPatch = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    PlacementNeeds,
+    SchemaTransformation.transformEffect({
+      decode: (raw: unknown) =>
+        decodeLabelsEffect(raw).pipe(
+          Effect.mapError((error) => error.issue),
+          Effect.as(raw as typeof PlacementNeeds.Encoded),
+        ),
+      encode: (needs) => Effect.succeed(needs as unknown),
+    }),
+  ),
+);
+export type PlacementNeedsPatch = typeof PlacementNeedsPatch.Type;
+
 /**
  * A project's kept bad value as a client sends it back with the project's other settings: only text
  * that still does not read as needs, so a save cannot set needs through it. The server also takes it
@@ -342,8 +364,6 @@ const isKeptBrokenNeeds = (raw: unknown): raw is { readonly unreadable: unknown 
   isPlacementNeedsBroken(raw) &&
   Object.keys(raw).every((key) => key === "unreadable" || key === "problem") &&
   needsProblemOf(raw.unreadable) !== undefined;
-
-const decodeLabelsEffect = Schema.decodeUnknownEffect(PlacementLabels);
 
 /**
  * A project's `placementNeeds` in a save. Strict (a bad label is refused), but clients resend a

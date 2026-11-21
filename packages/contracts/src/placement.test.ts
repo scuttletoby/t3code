@@ -327,6 +327,17 @@ describe("placementNeeds", () => {
     expect(() => decodePatch({ placementNeeds: { unreadable: "gpu" } })).toThrow();
   });
 
+  it("types the server's needs in a patch as the settings hold them", () => {
+    // Settings code builds a patch from part of the settings (`Partial<ServerSettings>`), so the
+    // held value, a kept bad one included, must fit the patch's type; the decode stays strict.
+    const held: ServerSettings["placementNeeds"] = decodeSettings({
+      placementNeeds: "gpu",
+    }).placementNeeds;
+    const part: Partial<ServerSettings> = { placementNeeds: held };
+    const patch: ServerSettingsPatch = part;
+    expect(patch.placementNeeds).toEqual(held);
+  });
+
   it("reads a project's hand-written null as not set, and a save's null as the clear", () => {
     expect(decodeOverrides({ placementNeeds: null })).toEqual({});
     const clear = { projectSettingsOverrides: { [PROJECT]: { placementNeeds: null } } };

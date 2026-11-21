@@ -29,8 +29,8 @@ import {
 } from "./mcpProfile.ts";
 import { ModelPolicyFromSettingsFile, ModelPolicyPatch } from "./modelPolicy.ts";
 import {
-  PlacementLabels,
   PlacementNeedsFromSettingsFile,
+  PlacementNeedsPatch,
   PlacementNeedsProjectPatch,
   PlacementSettingsFromSettingsFile,
   PlacementSettingsPatch,
@@ -175,7 +175,7 @@ export const ForkServerSettingsPatchFields = {
   /** Strict: a save refuses a bad field or an unknown key; a field left out keeps its value. */
   placement: Schema.optionalKey(PlacementSettingsPatch),
   /** Strict: a save refuses a bad label; it replaces a kept bad value. */
-  placementNeeds: Schema.optionalKey(PlacementLabels),
+  placementNeeds: Schema.optionalKey(PlacementNeedsPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
