@@ -40,6 +40,8 @@ export const makeSlots = () => {
   const full = new Set<ThreadId>();
   const state = { all: false };
   const asks: Array<SlotGate.SlotAcquireInput> = [];
+  /** Keys that left the gate's line. */
+  const left: Array<string> = [];
   const layer = Layer.mock(SlotGate.SlotGate)({
     acquire: (input) =>
       Effect.sync((): SlotGate.SlotAcquire => {
@@ -52,8 +54,9 @@ export const makeSlots = () => {
       }),
     started: () => Effect.void,
     release: () => Effect.void,
+    leave: (keys) => Effect.sync(() => left.push(...keys)),
   });
-  return { full, state, asks, layer };
+  return { full, state, asks, left, layer };
 };
 
 /**

@@ -68,8 +68,16 @@ const compactionRunOf = (command: MessageDispatch): RunId | null => {
 };
 
 /**
+ * A retried compaction needs this much of its cache window left: half the lead upstream's worker
+ * sends it with (`LEAD_MS`, 2 min, in `orchestration-v2/IdleCompaction.ts`), the time a session
+ * takes to resume and send it while the cache is warm. Later it would most likely read cold.
+ */
+export const COMPACTION_MIN_LEFT_MS = 60_000;
+
+/**
  * A refused idle compaction is still due: its thread is idle at its run, and the prompt cache
- * window is open, by the rule upstream's worker sent it by (`idleCompactionWindow`).
+ * window is open, by the rule upstream's worker sent it by (`idleCompactionWindow`), with at
+ * least `COMPACTION_MIN_LEFT_MS` of it left.
  */
 export const compactionWindowOpen = (
   records: IdleCompactionRecords,
@@ -78,7 +86,7 @@ export const compactionWindowOpen = (
 ): boolean => {
   const runId = compactionRunOf(command);
   const window = idleCompactionWindow(records, nowMs);
-  return runId !== null && window?.runId === runId && nowMs < window.endMs;
+  return runId !== null && window?.runId === runId && nowMs < window.endMs - COMPACTION_MIN_LEFT_MS;
 };
 
 /** Places in the gate's line: one per held question wake and per waiting compaction. */
@@ -244,7 +252,18 @@ export const makeWorkerWakeSlots = Effect.fn("WorkerWakeSlots.make")(function* <
       while (detail !== null) {
         yield* Effect.sleep(COMPACTION_SLOT_RETRY);
         // Checked again in the fork before each ask: still idle at its run, window still open.
-        const due = yield* input.compactionDue(command).pipe(Effect.orElseSucceed(() => false));
+        // A check that fails skips it too (fail-safe), logged as what it is, with its cause.
+        const due = yield* input
+          .compactionDue(command)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning(
+                "idle compaction skipped: whether it is still due could not be read",
+                { threadId: command.threadId, cause },
+              ).pipe(Effect.as("unread" as const)),
+            ),
+          );
+        if (due === "unread") return NOTHING_STORED;
         if (!due) {
           yield* Effect.logInfo(
             "idle compaction skipped: no agent slot while its cache window was open",
@@ -339,13 +358,11 @@ export const fileStore = Effect.fn("WorkerWakeSlots.fileStore")(function* (fileP
     const file = decodeFile(yield* fs.readFileString(filePath));
     if (Option.isNone(file)) {
       const keptAs = `${filePath}.corrupt-${yield* Clock.currentTimeMillis}`;
-      const kept = yield* fs.rename(filePath, keptAs).pipe(
-        Effect.as(keptAs),
-        Effect.orElseSucceed(() => null),
-      );
+      // Not set aside: a read error (the caller keeps it, saves nothing over it, reads it again).
+      yield* fs.rename(filePath, keptAs);
       yield* Effect.logWarning("held wakes file unreadable; its wakes are not sent", {
         filePath,
-        keptAs: kept,
+        keptAs,
       });
       return [];
     }
@@ -391,6 +408,54 @@ export const fileStore = Effect.fn("WorkerWakeSlots.fileStore")(function* (fileP
   return { load, save } satisfies HeldWakesStore;
 });
 
+/**
+ * The server's check that a refused idle compaction is still due: idle compaction on for the
+ * thread's provider (`beforeCacheExpires`), the provider on for its project, and the window open
+ * over the records upstream's worker reads (a copy of its query in
+ * `orchestration-v2/IdleCompactionService.ts`: keep the two the same).
+ */
+export const compactionDueOver = (
+  settings: ServerSettings.ServerSettingsService["Service"],
+  projections: ProjectionStore.ProjectionStoreV2["Service"],
+) =>
+  Effect.fn("WorkerWakeSlots.compactionDue")(function* (command: MessageDispatch) {
+    const runId = compactionRunOf(command);
+    const current = yield* settings.getSettings;
+    const thread = yield* projections.getThread(command.threadId);
+    if (
+      runId === null ||
+      resolveIdleCompaction(current, thread.providerInstanceId) !== "beforeCacheExpires" ||
+      !resolveProjectProviderInstanceEnabled(current, thread.projectId, thread.providerInstanceId)
+    )
+      return false;
+    const active = thread.activeProviderThreadId === null ? [] : [thread.activeProviderThreadId];
+    // The records upstream's idle compaction worker reads for its window.
+    const records = yield* projections.getThreadRecords(
+      command.threadId,
+      [
+        "runs",
+        "messages",
+        "providerThreads",
+        "providerTurns",
+        "runtimeRequests",
+        "turnItems",
+        "contextTransfers",
+      ],
+      {
+        messageRunIds: [runId],
+        turnItemStatuses: ["pending", "running", "waiting"],
+        runStatuses: ["preparing", "starting", "running", "rolled_back"],
+        includeLatestRun: true,
+        providerThreadIds: active,
+        providerTurnThreadIds: active,
+        latestProviderTurnUsageOnly: true,
+        runtimeRequestStatuses: ["pending"],
+        contextTransferStatuses: ["pending"],
+      },
+    );
+    return compactionWindowOpen(records, command, yield* Clock.currentTimeMillis);
+  });
+
 /** Upstream's orchestrator for the runtime's workers, gated as the file's doc says. */
 export const layerOver = Layer.effect(
   Orchestrator.OrchestratorV2,
@@ -421,48 +486,7 @@ export const layerOver = Layer.effect(
           (task) => asked.taskIds.includes(task.id) && SETTLED_TASK.has(task.status),
         );
       }),
-      compactionDue: Effect.fn("WorkerWakeSlots.compactionDue")(function* (command) {
-        const runId = compactionRunOf(command);
-        const current = yield* settings.getSettings;
-        const thread = yield* projections.getThread(command.threadId);
-        if (
-          runId === null ||
-          resolveIdleCompaction(current, thread.providerInstanceId) !== "beforeCacheExpires" ||
-          !resolveProjectProviderInstanceEnabled(
-            current,
-            thread.projectId,
-            thread.providerInstanceId,
-          )
-        )
-          return false;
-        const active =
-          thread.activeProviderThreadId === null ? [] : [thread.activeProviderThreadId];
-        // The records upstream's idle compaction worker reads for its window.
-        const records = yield* projections.getThreadRecords(
-          command.threadId,
-          [
-            "runs",
-            "messages",
-            "providerThreads",
-            "providerTurns",
-            "runtimeRequests",
-            "turnItems",
-            "contextTransfers",
-          ],
-          {
-            messageRunIds: [runId],
-            turnItemStatuses: ["pending", "running", "waiting"],
-            runStatuses: ["preparing", "starting", "running", "rolled_back"],
-            includeLatestRun: true,
-            providerThreadIds: active,
-            providerTurnThreadIds: active,
-            latestProviderTurnUsageOnly: true,
-            runtimeRequestStatuses: ["pending"],
-            contextTransferStatuses: ["pending"],
-          },
-        );
-        return compactionWindowOpen(records, command, yield* Clock.currentTimeMillis);
-      }),
+      compactionDue: compactionDueOver(settings, projections),
       store: yield* fileStore(path.join(config.stateDir, HELD_WAKES_FILE)),
     });
     // A stop waits for a send's file write: a send it cut off would be sent again (receipts dedupe).

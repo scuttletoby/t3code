@@ -19,7 +19,7 @@ import * as Schema from "effect/Schema";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
-import { admitSend, reasonHere } from "./agentSlotRoutes.ts";
+import { admitSend, leaveLine, reasonHere } from "./agentSlotRoutes.ts";
 
 type WatchSync = Extract<
   OrchestrationV2ServerCommand,
@@ -93,7 +93,12 @@ export const gatePullRequestWatchWakes = <E>(
     const instanceId = yield* instanceOf(command.threadId).pipe(
       Effect.orElseSucceed(() => "unreadable" as const),
     );
-    if (instanceId === null) return yield* orchestrator.dispatch(command);
+    const place = { key: `pull-request-watch:${command.threadId}`, staleAfter: WATCH_PLACE_STALE };
+    // No such thread: its wake is not owed, so its place goes (upstream refuses the command).
+    if (instanceId === null)
+      return yield* leaveLine(gate, [place.key]).pipe(
+        Effect.andThen(orchestrator.dispatch(command)),
+      );
     if (instanceId === "unreadable")
       return yield* waitsForSlot(command, "the thread could not be read to check for a slot");
     const slot = yield* admitSend(gate, {
@@ -101,8 +106,9 @@ export const gatePullRequestWatchWakes = <E>(
       threadId: command.threadId,
       instanceId,
       keepsHeld: true,
-      // Asked again at upstream's next sweep (2 min) while refused: it keeps its place in line.
-      place: { key: `pull-request-watch:${command.threadId}`, staleAfter: WATCH_PLACE_STALE },
+      // Asked again at upstream's next sweep (2 min) while refused: it keeps its place in line,
+      // but holds a free slot only `SlotGate.LINE_HOLD` (15 s) without asking.
+      place,
     });
     const keys = watchesOf(command).map((watch) => watchKey(command.threadId, watch));
     if (slot.type === "refuse") {

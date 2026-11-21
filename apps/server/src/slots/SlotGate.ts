@@ -136,18 +136,25 @@ export interface SlotUsage {
 }
 
 /**
- * A start that asks again while it is refused (a wake-up of an idle thread): its place in the
- * gate's one line. Its first ask joins the line; every later ask keeps that place, so a slot that
- * frees goes to the oldest waiter, never to whoever asks first. It leaves when it is allowed, by
- * `leave`, or when it has not asked for `staleAfter` (default `LINE_STALE`).
+ * A start that asks again while refused (a wake-up, a scheduled run, a webhook delivery): its place
+ * in the gate's one line, kept from its first ask, so a freed slot goes to the oldest waiter. It
+ * leaves when allowed, by `leave`, or after `staleAfter` without asking (default `LINE_STALE`).
  */
 export interface SlotPlace {
   readonly key: string;
   readonly staleAfter?: Duration.Input | undefined;
+  /** When it became due (a scheduled run's due time, a stored delivery's): its age; else now. */
+  readonly sinceMs?: number | undefined;
 }
 
 /** A waiter that has not asked again for this long has left the line (6 asks of 5 s). */
 const LINE_STALE = Duration.seconds(30);
+/**
+ * A waiter a free slot is kept for holds it this long without asking again (3 asks of 5 s); then
+ * the waiters behind it go first until it asks again. It keeps its place. A waiter that asks
+ * seldom (a pull request watch: every 2 min) or that died so leaves no slot idle for long.
+ */
+export const LINE_HOLD = Duration.seconds(15);
 
 export interface SlotAcquireInput {
   readonly callerThreadId: ThreadId | null;
@@ -222,6 +229,8 @@ export class SlotGate extends Context.Service<
     readonly slotWaitsWaiting: (keys: ReadonlyArray<string>) => Effect.Effect<void>;
     /** The line's keys, oldest first (waiters that went stale are left out). */
     readonly line: Effect.Effect<ReadonlyArray<string>>;
+    /** How many places memory keeps, stale ones not dropped yet too (dropped at every ask). */
+    readonly lineKept: Effect.Effect<number>;
     /**
      * For `wait_list`: null while slots are off, or when the running agents or the held slots
      * cannot be read.
@@ -273,10 +282,31 @@ interface LineEntry {
   readonly order: number;
   lastAskMs: number;
   staleMs: number;
+  /** How long a free slot is kept for it while it does not ask (`LINE_HOLD`). */
+  holdMs: number;
+  /** Since when a free slot is kept for it, untouched by its own ask since; `null`: none is. */
+  offeredAtMs: number | null;
 }
 
 const staleMsOf = (place: SlotPlace) =>
   Duration.toMillis(Duration.fromInputUnsafe(place.staleAfter ?? LINE_STALE));
+
+/**
+ * A count refusal says how many of its `used` are waiters in line ahead of it (`inLine`), as
+ * `wait_list` shows only what runs, starts or is held.
+ */
+const withLine = (
+  refused: Extract<SlotDecision, { readonly type: "refuse" }>,
+  ahead: ReadonlyArray<StartingEntry>,
+): Extract<SlotDecision, { readonly type: "refuse" }> => {
+  const inLine =
+    refused.rule === "machine"
+      ? ahead.length
+      : refused.rule === "account"
+        ? ahead.filter((entry) => entry.instanceId === refused.instanceId).length
+        : 0;
+  return inLine === 0 ? refused : { ...refused, inLine };
+};
 
 const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -332,11 +362,15 @@ const make = Effect.gen(function* () {
     readonly sinceMs: number;
     readonly nowMs: number;
     readonly staleMs: number;
+    readonly holdMs: number;
   }): LineEntry => {
     const seen = line.get(entry.key);
     if (seen !== undefined) {
       seen.lastAskMs = entry.nowMs;
       seen.staleMs = entry.staleMs;
+      seen.holdMs = entry.holdMs;
+      // It came back: a slot kept for it is its own ask's now.
+      seen.offeredAtMs = null;
       return seen;
     }
     const joined: LineEntry = {
@@ -348,25 +382,36 @@ const make = Effect.gen(function* () {
       order: lineOrder++,
       lastAskMs: entry.nowMs,
       staleMs: entry.staleMs,
+      holdMs: entry.holdMs,
+      offeredAtMs: null,
     };
     line.set(entry.key, joined);
     return joined;
   };
 
-  /** The live line, oldest first; a waiter that stopped asking has left it. */
+  const isStale = (entry: LineEntry, nowMs: number) => nowMs - entry.lastAskMs > entry.staleMs;
+  /** A waiter that stopped asking has left the line: dropped at every ask, whatever the limits. */
+  const pruneLine = (nowMs: number) => {
+    for (const [key, entry] of line) if (isStale(entry, nowMs)) line.delete(key);
+  };
+  /** The live line, oldest first. */
   const lineInOrder = (nowMs: number) => {
-    for (const [key, entry] of line) {
-      if (nowMs - entry.lastAskMs > entry.staleMs) line.delete(key);
-    }
+    pruneLine(nowMs);
     return [...line.values()].sort(
       (left, right) => left.sinceMs - right.sinceMs || left.order - right.order,
     );
+  };
+  /** The waiters ahead of `threadId`'s oldest place (one thread, one place in line). */
+  const beforeThread = (ordered: ReadonlyArray<LineEntry>, threadId: string) => {
+    const first = ordered.findIndex((entry) => entry.threadId === threadId);
+    return first < 0 ? ordered : ordered.slice(0, first);
   };
 
   /**
    * The waiters ahead of a start, oldest first, as starts: each that would get a slot now keeps it
    * from those behind; one that would not (its account full) holds none. Left out: the asker's own
-   * thread, a thread that shows a run (it only queues), and one counted already (held, or named).
+   * thread, a thread that shows a run (it only queues), one counted already (held, or named), and
+   * one a slot was kept for longer than its hold without it asking (`LINE_HOLD`).
    */
   const lineAhead = (input: {
     readonly ahead: ReadonlyArray<LineEntry>;
@@ -392,6 +437,8 @@ const make = Effect.gen(function* () {
       if (counted.has(entry.threadId) || input.visible.has(entry.threadId)) continue;
       // A slot wait is granted only when the held slots read whole: until then it takes none.
       if (entry.kind === "slotWait" && !input.held.whole) continue;
+      // A slot kept for it that it did not come back for: the next waiter goes (till it asks).
+      if (entry.offeredAtMs !== null && input.nowMs - entry.offeredAtMs > entry.holdMs) continue;
       counted.add(entry.threadId);
       const others = onePerThread(
         input.held.held.filter((reservation) => reservation.threadId !== entry.threadId),
@@ -416,6 +463,9 @@ const make = Effect.gen(function* () {
           atMs: input.nowMs,
           childThreadId: entry.threadId,
         });
+        entry.offeredAtMs ??= input.nowMs;
+      } else {
+        entry.offeredAtMs = null;
       }
     }
     return taken;
@@ -784,18 +834,21 @@ const make = Effect.gen(function* () {
       const counted = limitsCount(limits, input.targetInstanceId);
       const into = input.intoThreadId;
       const askingThread = into ?? input.callerThreadId;
-      // A waiter keeps its place from its first ask, refused or not.
+      pruneLine(nowMs);
+      // A waiter keeps its place from its first ask, refused or not. One for a thread not made yet
+      // (a scheduled run's new thread) is that start's own, by its key.
       const own =
-        place === undefined || askingThread === null
+        place === undefined
           ? undefined
           : joinLine({
               key: place.key,
               kind: "wake",
-              threadId: askingThread,
+              threadId: askingThread ?? place.key,
               instanceId: input.targetInstanceId,
-              sinceMs: nowMs,
+              sinceMs: place.sinceMs ?? nowMs,
               nowMs,
               staleMs: staleMsOf(place),
+              holdMs: Duration.toMillis(LINE_HOLD),
             });
       const allowed = (outcome: SlotAcquire, used: ReadonlyArray<string>) => {
         if (place !== undefined) line.delete(place.key);
@@ -846,8 +899,9 @@ const make = Effect.gen(function* () {
         read === undefined
           ? []
           : lineAhead({
-              ahead: own === undefined ? ordered : ordered.slice(0, ordered.indexOf(own)),
-              threadId: askingThread,
+              // From its thread's oldest place: two places of one thread never block each other.
+              ahead: own === undefined ? ordered : beforeThread(ordered, own.threadId),
+              threadId: own?.threadId ?? askingThread,
               limits,
               running: read.running,
               visible,
@@ -876,16 +930,19 @@ const make = Effect.gen(function* () {
       const full = (
         refused: Extract<SlotDecision, { readonly type: "refuse" }>,
         free: number,
-      ): SlotAcquire => ({
-        type: "refuse",
-        message: slotRefusalText(refused, waitsOn),
-        refusal: {
-          type: "full",
-          decision: refused,
-          waitsOn,
-          ...(alsoNeeds.length === 0 ? {} : { batch: { needed: alsoNeeds.length + 1, free } }),
-        },
-      });
+      ): SlotAcquire => {
+        const decision = withLine(refused, ahead);
+        return {
+          type: "refuse",
+          message: slotRefusalText(decision, waitsOn),
+          refusal: {
+            type: "full",
+            decision,
+            waitsOn,
+            ...(alsoNeeds.length === 0 ? {} : { batch: { needed: alsoNeeds.length + 1, free } }),
+          },
+        };
+      };
       if (decision.type === "refuse") return asDecided(full(decision, 0), []);
       // The later starts of the batch, counted as starting one after another (nothing recorded).
       const starting: Array<StartingEntry> = [
@@ -949,6 +1006,7 @@ const make = Effect.gen(function* () {
       }
       if (requests.length === 0) return [];
       const nowMs = yield* Clock.currentTimeMillis;
+      pruneLine(nowMs);
       /** A wait without an account waits for the machine limit and the memory floor only. */
       const limitsFor = (request: SlotRequest): SlotLimits =>
         request.account === undefined ? { ...limits, account: () => null } : limits;
@@ -968,10 +1026,10 @@ const make = Effect.gen(function* () {
       const grants: Array<SlotGrant> = [];
       const grantedThreads = new Set<string>();
       // Every slot wait is in the line at its own age; one the sweep stopped asking for leaves it.
-      const staleMs = Math.max(
-        Duration.toMillis(LINE_STALE),
-        3 * settings.value.waitFor.unitSweepSeconds * 1000,
-      );
+      const sweepMs = settings.value.waitFor.unitSweepSeconds * 1000;
+      const staleMs = Math.max(Duration.toMillis(LINE_STALE), 3 * sweepMs);
+      // Asked at each sweep: a slot kept for it is held over one sweep it may just miss.
+      const holdMs = Math.max(Duration.toMillis(LINE_HOLD), 2 * sweepMs);
       const places = requests.map((request) =>
         joinLine({
           key: request.key,
@@ -981,6 +1039,7 @@ const make = Effect.gen(function* () {
           sinceMs: request.sinceMs ?? nowMs,
           nowMs,
           staleMs,
+          holdMs,
         }),
       );
       for (const [index, request] of requests.entries()) {
@@ -1011,7 +1070,7 @@ const make = Effect.gen(function* () {
           read === undefined || place === undefined || !ordered.includes(place)
             ? []
             : lineAhead({
-                ahead: ordered.slice(0, ordered.indexOf(place)),
+                ahead: beforeThread(ordered, request.threadId),
                 threadId: request.threadId,
                 // Each waiter ahead by its own limits (its account's too), not this wait's.
                 limits,
@@ -1040,7 +1099,7 @@ const make = Effect.gen(function* () {
         });
         if (decision.type === "refuse") {
           // Refused: a slot it already holds stays as it is.
-          grants.push({ type: "full", decision });
+          grants.push({ type: "full", decision: withLine(decision, ahead) });
           continue;
         }
         // Asking again moves its hold but never extends it: a thread that keeps asking without
@@ -1200,8 +1259,14 @@ const make = Effect.gen(function* () {
       }),
     ),
     line: Clock.currentTimeMillis.pipe(
-      Effect.map((nowMs) => lineInOrder(nowMs).map((entry) => entry.key)),
+      Effect.map((nowMs) =>
+        [...line.values()]
+          .filter((entry) => !isStale(entry, nowMs))
+          .sort((left, right) => left.sinceMs - right.sinceMs || left.order - right.order)
+          .map((entry) => entry.key),
+      ),
     ),
+    lineKept: Effect.sync(() => line.size),
     drop: Effect.fn("SlotGate.drop")(function* (keys: ReadonlyArray<string>) {
       if (keys.length === 0) return;
       for (const key of keys) {

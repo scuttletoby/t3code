@@ -387,8 +387,11 @@ These routes start a new agent run and go through the same gate, with the same c
   deleted, replaced or its trigger changed while it waits (other edits are not seen: it runs with
   the task as it was when it began to wait). Every waiting delivery is in the store, so a restart
   keeps it and it runs once: a direct one (no coalescing window) is moved there when it is first
-  refused. A scheduled run or a webhook takes a slot only when no agent that waits for one holds
-  it; there is no order between routes, so on a host kept full it can wait long.
+  refused. A run on its schedule and a webhook delivery that wait keep a place in the gate's one
+  line (below), a run at its due time and a delivery at the time it was stored, so a waiter that
+  joins later never passes them. The place goes when the run starts, when the delivery is given up
+  (task paused, deleted, replaced or retriggered), and within 5 s of its task being paused,
+  deleted or no longer due (moved to a later time). "Run now" asks once, from the back of the line.
 - A task bound to a thread whose run is active only queues its prompt there: no new run, so no slot
   and no wait. A bound thread that is idle starts a run and is gated, counted on the thread's
   current provider.
@@ -451,15 +454,26 @@ These routes start a new agent run and go through the same gate, with the same c
   and its id is fixed per failed run and reset, so it is sent once.
 - One line, oldest first ([#738](https://github.com/scuttletoby/t3code/issues/738)): every
   wake-up that asks again while refused keeps a place in the gate's line from its first ask (the
-  PR-watch wake-up, the usage-limit resume, a wait's message and the four below), and so does
-  every slot wait, at its own age. A slot that frees goes to the oldest waiter that can use it: a
-  start without a place (`delegate_task`, a send, a scheduled run) and every younger waiter count
-  the waiters ahead of them as starts. A waiter whose own account is full holds nothing from the
-  others, a thread that shows a run only queues, and a thread with a held slot starts on it. A
-  waiter leaves the line when it is let through, when its wake is no longer owed (its thread gone,
-  its question answered, a handoff that is no longer due), or when it has not asked again for 30 s
-  (a PR-watch wake-up: 5 minutes; a slot wait: 3 sweeps). The line is memory only: after a restart
-  each waiter joins again at its next ask, held question wakes first, in their file's order.
+  PR-watch wake-up, the usage-limit resume, a wait's message, a waiting scheduled run or webhook
+  delivery, and the four below), and so does every slot wait, at its own age. A slot that frees
+  goes to the oldest waiter that can use it: a start without a place (`delegate_task`, a send,
+  "run now") and every younger waiter count the waiters ahead of them as starts. A thread with two
+  places (a question wake and a continuation) counts from its oldest. A waiter whose own account is
+  full holds nothing from the others, a thread that shows a run only queues, and a thread with a
+  held slot starts on it. A free slot is kept for the oldest waiter for 15 s (a slot wait: 2
+  sweeps) without it asking; if it does not come back by then, the waiters behind it go first until
+  it asks again, still in its place. So a waiter that asks seldom (the PR-watch wake-up, at
+  upstream's 2-minute sweep) or that died leaves a slot idle 15 s at most; the PR-watch wake-up
+  gets a slot only when one is free as it asks, as before the line. A waiter leaves the line when
+  it is let through, when its wake is no longer owed (its thread gone, its question answered, a
+  handoff that is no longer due), or when it has not asked again for 30 s (a PR-watch wake-up: 5
+  minutes; a slot wait: 3 sweeps); places that stopped asking are dropped at the next ask, under
+  any limit. A refusal names the waiters in line ahead apart from the running agents ("2 agents
+  are running on this machine and 1 start is waiting in line ahead of this one"), since
+  `wait_list` shows only what runs, starts or is held. The line is memory only: after a restart
+  each waiter joins again at its next ask. Held question wakes ask at once, in their file's order,
+  but at the time of that ask (the file keeps no age): a slot wait made before the restart, or a
+  scheduled run due before it, comes first.
 - The bound-thread and message routes decide "running or idle" from the gate's own count in the
   same step that takes the slot. When the thread's run ends between that check and the send, the
   queued message starts the next run: the call then holds a slot until that run shows, for the
@@ -515,15 +529,17 @@ only queues: no slot.
   keeps a send cut off before the file write from making a second message. Saves run one at a
   time, each writing what is held then, synced to disk before the rename and the folder after it.
   A file that does not decode is moved to `fork-held-wakes.json.corrupt-<ms>` beside it and
-  logged, so the next save does not write over it; an entry that does not decode is logged and
+  logged, so the next save does not write over it (when that move fails, the file is handled as
+  one that cannot be read, below: kept as it is, nothing written over it); an entry that does not decode is logged and
   left out. A file that cannot be checked or read (an I/O error, not "missing") is logged once and
   never written over: new holds stay in memory, and every 5 s it is read again, its wakes then
   going first. A held wake whose parent or question cannot be read waits, logged once.
 - Upstream's idle compaction (same file), after the handoff owner's check. Refused, it is held in
   upstream's own timer and asked again every 5 s in its place in line (logged once), while the
-  fork reads again that the thread is still idle at that run and its prompt cache window is still
-  open (upstream's `idleCompactionWindow`). Once not, it is skipped (logged): a late compaction
-  costs a full uncached read. A newer completed run replaces it, as upstream's timer does; a
+  fork reads again that the thread is still idle at that run and at least a minute of its prompt
+  cache window is left (upstream's `idleCompactionWindow`; half the 2-minute lead upstream sends
+  it with). Once not, it is skipped (logged): a late compaction costs a full uncached read. A
+  check that cannot be read skips it too, logged with its cause. A newer completed run replaces it, as upstream's timer does; a
   restart drops it (upstream).
 
 The calling thread is left out of the count (it waits on its child). A start no thread on this

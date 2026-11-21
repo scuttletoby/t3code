@@ -295,6 +295,8 @@ describe("pull request watch wake-ups take an agent slot", () => {
       yield* gone.wrapped.dispatch(command);
       expect(gone.sent).toEqual([command]);
       expect(gone.slots.asks).toEqual([]);
+      // Its wake is not owed any more: its place in the gate's line goes with it.
+      expect(gone.slots.left).toEqual([`pull-request-watch:${THREAD}`]);
     }),
   );
 

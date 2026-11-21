@@ -19,6 +19,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
@@ -32,6 +33,7 @@ import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as SlotGate from "../slots/SlotGate.ts";
 import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
 import { type SlotWorld, slotGateOver, slotWorld } from "./slotWorld.testkit.ts";
 
@@ -82,6 +84,8 @@ interface Harness {
   readonly webhookWorker: Effect.Effect<void>;
   /** One pass of the fork's waiting-note cleanup. */
   readonly notesWorker: Effect.Effect<void>;
+  /** The server's gate the runs ask (with \`slots\`). */
+  readonly gate: Option.Option<SlotGate.SlotGate["Service"]>;
 }
 
 interface Options {
@@ -165,7 +169,9 @@ const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Op
     return yield* Effect.gen(function* () {
       const service = yield* ScheduledTaskService.ScheduledTaskService;
       const sql = yield* SqlClient.SqlClient;
+      const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
       return yield* body({
+        gate,
         service,
         sql,
         started,
@@ -174,7 +180,9 @@ const boot = <A, E>(body: (harness: Harness) => Effect.Effect<A, E>, options: Op
         notesWorker: Effect.suspend(() => workers.get("agent-slot-notes")!),
       });
     }).pipe(
-      Effect.provide(Layer.fresh(ScheduledTaskService.layer.pipe(Layer.provide(dependencies)))),
+      Effect.provide(
+        Layer.fresh(ScheduledTaskService.layer.pipe(Layer.provideMerge(dependencies))),
+      ),
     );
   });
 
@@ -824,7 +832,7 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
     ({ name, stop }) => {
       const slots = slotWorld([BUSY]);
       return withService(
-        ({ service, started, webhookWorker }) =>
+        ({ service, started, webhookWorker, gate }) =>
           Effect.gen(function* () {
             yield* TestClock.setTime(START);
             const { task } = yield* service.upsert(
@@ -839,6 +847,8 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
             slots.running = [];
             yield* workerRounds(webhookWorker, 4);
             assert.deepEqual(started, []);
+            // Given up: its place in the gate's line is gone too.
+            assert.deepEqual(yield* Option.getOrThrow(gate).line, []);
             if (name === "paused") {
               const { delivery } = yield* service.getWebhookDelivery({
                 id: task.id,
@@ -921,6 +931,161 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
         }),
       );
     }),
+  );
+});
+
+describe("a scheduled run or webhook delivery that waits keeps its place in the gate's line (#738)", () => {
+  const LATER = ThreadId.make("thread:later-waiter");
+  /** A wake-up of another idle thread that joins the line after the run (asks every 5 s). */
+  const laterWaiter = (gate: Harness["gate"]) =>
+    Option.getOrThrow(gate).acquire({
+      callerThreadId: LATER,
+      targetInstanceId: INSTANCE,
+      intoThreadId: LATER,
+      keepsHeld: true,
+      place: { key: "later-waiter" },
+    });
+  const lineOf = (gate: Harness["gate"]) => Option.getOrThrow(gate).line;
+
+  it.effect(
+    "full: a waiter that joins later does not pass a scheduled run; the run starts first",
+    () => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        ({ service, poll, started, gate }) =>
+          Effect.gen(function* () {
+            const task = yield* dueTask(service);
+            yield* poll;
+            assert.deepEqual(started, []);
+            assert.deepEqual(yield* lineOf(gate), [`scheduled-run:${task.id}`]);
+            yield* TestClock.adjust("5 seconds");
+            assert.equal((yield* laterWaiter(gate)).type, "refuse");
+            // Runs again: each poll keeps its place (no second place).
+            yield* poll;
+            assert.deepEqual(yield* lineOf(gate), [`scheduled-run:${task.id}`, "later-waiter"]);
+            // A slot frees and the later waiter asks first: the run is ahead of it.
+            slots.running = [];
+            yield* TestClock.adjust("1 second");
+            assert.equal((yield* laterWaiter(gate)).type, "refuse");
+            yield* TestClock.adjust("4 seconds");
+            yield* poll;
+            assert.deepEqual(launches(started).length, 1);
+            // Let through: its place is gone; the waiter is next.
+            assert.deepEqual(yield* lineOf(gate), ["later-waiter"]);
+          }),
+        { slots },
+      );
+    },
+  );
+
+  it.effect(
+    "a run due before a waiter joined is ahead of it, though the poll asks after it",
+    () => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        ({ service, poll, started, gate }) =>
+          Effect.gen(function* () {
+            const task = yield* dueTask(service);
+            // The waiter asks a second after the due time, before the poll does.
+            assert.equal((yield* laterWaiter(gate)).type, "refuse");
+            yield* poll;
+            assert.deepEqual(yield* lineOf(gate), [`scheduled-run:${task.id}`, "later-waiter"]);
+            slots.running = [];
+            assert.equal((yield* laterWaiter(gate)).type, "refuse");
+            yield* poll;
+            assert.equal(launches(started).length, 1);
+          }),
+        { slots },
+      );
+    },
+  );
+
+  it.effect("full: a waiter that joins later does not pass a stored webhook delivery", () => {
+    const slots = slotWorld([BUSY]);
+    return withService(
+      ({ service, started, webhookWorker, gate }) =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(START);
+          const { task } = yield* service.upsert(
+            yield* taskInput({ schedule: { type: "webhook" } }),
+          );
+          const accepted = yield* service.triggerWebhook(webhookRequest(task));
+          if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+          // Refused and stored; the worker holds it, asking every 5 s in its place.
+          yield* workerRounds(webhookWorker, 2);
+          assert.deepEqual(yield* lineOf(gate), [`webhook-delivery:${accepted.deliveryId}`]);
+          assert.equal((yield* laterWaiter(gate)).type, "refuse");
+          slots.running = [];
+          assert.equal((yield* laterWaiter(gate)).type, "refuse");
+          yield* until(() => started.length === 1, "the delivery started");
+          assert.deepEqual(yield* lineOf(gate), ["later-waiter"]);
+        }),
+      { slots },
+    );
+  });
+
+  it.effect(
+    "a stored delivery's place goes when its task is deleted before the worker runs it",
+    () => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        ({ service, webhookWorker, notesWorker, gate }) =>
+          Effect.gen(function* () {
+            yield* TestClock.setTime(START);
+            const { task } = yield* service.upsert(
+              yield* taskInput({ schedule: { type: "webhook" } }),
+            );
+            const accepted = yield* service.triggerWebhook(webhookRequest(task));
+            if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+            yield* settle;
+            // Refused and stored: its place waits for the worker.
+            assert.deepEqual(yield* lineOf(gate), [`webhook-delivery:${accepted.deliveryId}`]);
+            yield* service.delete({ id: task.id } as never);
+            // The worker drops it without asking the gate; the sweep sees it is no longer pending.
+            yield* webhookWorker;
+            yield* settle;
+            yield* notesWorker;
+            assert.deepEqual(yield* lineOf(gate), []);
+          }),
+        { slots },
+      );
+    },
+  );
+
+  it.effect(
+    "a waiting run's place goes when its task is deleted or paused (no slot kept for it)",
+    () => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        ({ service, poll, notesWorker, gate }) =>
+          Effect.gen(function* () {
+            const deleted = yield* dueTask(service);
+            const paused = yield* service.upsert(
+              yield* taskInput({
+                title: "Second",
+                schedule: { type: "interval", everyMs: 60_000 },
+              }),
+            );
+            yield* TestClock.adjust("2 minutes");
+            yield* poll;
+            assert.sameMembers(
+              [...(yield* lineOf(gate))],
+              [`scheduled-run:${deleted.id}`, `scheduled-run:${paused.task.id}`],
+            );
+            // Still due: the sweep keeps both.
+            yield* notesWorker;
+            assert.lengthOf(yield* lineOf(gate), 2);
+            yield* service.delete({ id: deleted.id } as never);
+            yield* service.setEnabled({ id: paused.task.id, enabled: false } as never);
+            yield* notesWorker;
+            assert.deepEqual(yield* lineOf(gate), []);
+            // A later start is not held back by them.
+            slots.running = [];
+            assert.equal((yield* laterWaiter(gate)).type, "allow");
+          }),
+        { slots },
+      );
+    },
   );
 });
 

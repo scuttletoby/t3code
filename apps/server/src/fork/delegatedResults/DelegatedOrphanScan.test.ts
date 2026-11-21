@@ -871,6 +871,42 @@ describe("DelegatedOrphanScan and agent slots", () => {
     }),
   );
 
+  it.effect(
+    "the give-up warning lists a parent whose send kept failing apart from unread ones",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        // A slot is free, but every send to the parent fails: each scan tries it again.
+        world.sendFails.value = true;
+        const warnings: Array<string> = [];
+        const logger = Logger.make(({ message, logLevel }) => {
+          if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+        });
+        const fiber = yield* (yield* service(world))
+          .run()
+          .pipe(
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+            Effect.forkChild,
+          );
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        for (let attempt = 1; attempt <= OPTIONS.attempts; attempt += 1) {
+          yield* settle;
+          if (attempt < OPTIONS.attempts) yield* TestClock.adjust(OPTIONS.retryDelay);
+        }
+        yield* Fiber.join(fiber);
+        const left = warnings.filter((warning) => warning.includes("work unchecked"));
+        expect(left).toHaveLength(1);
+        const fields = (JSON.parse(left[0]!) as Array<unknown>).find(
+          (part): part is Record<string, unknown> => typeof part === "object" && part !== null,
+        );
+        expect(fields?.failedSendParentThreadIds).toEqual([PARENT]);
+        expect(fields?.unreadableParentThreadIds).toEqual([]);
+        expect(world.sent).toHaveLength(0);
+      }),
+  );
+
   it.effect("a restart while one waits loses nothing: the next start names it once", () =>
     Effect.gen(function* () {
       yield* setClock;

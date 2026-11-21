@@ -200,7 +200,7 @@ interface Disk {
   readonly dir: string;
   readonly files: Map<string, string>;
   readonly ops: Array<string>;
-  readonly failing: { exists: boolean };
+  readonly failing: { exists: boolean; rename: boolean };
   readonly layer: Layer.Layer<FileSystem.FileSystem>;
 }
 
@@ -211,7 +211,7 @@ const diskError = (tag: "NotFound" | "PermissionDenied", method: string, file: s
 const diskOver = (dir: string): Disk => {
   const files = new Map<string, string>();
   const ops: Array<string> = [];
-  const failing = { exists: false };
+  const failing = { exists: false, rename: false };
   const layer = FileSystem.layerNoop({
     exists: (file) =>
       failing.exists && baseName(file) === WorkerWakeSlots.HELD_WAKES_FILE
@@ -226,6 +226,8 @@ const diskOver = (dir: string): Disk => {
       }),
     rename: (from, to) =>
       Effect.suspend(() => {
+        if (failing.rename && baseName(from) === WorkerWakeSlots.HELD_WAKES_FILE)
+          return Effect.fail(diskError("PermissionDenied", "rename", from));
         const text = files.get(from);
         if (text === undefined) return Effect.fail(diskError("NotFound", "rename", from));
         ops.push(`rename ${baseName(from)} ${baseName(to)}`);
@@ -611,6 +613,36 @@ describe("a delegated task's question to an idle parent takes an agent slot", ()
   );
 
   it.effect(
+    "a broken file that cannot be set aside is kept as it is: nothing written over it, read again",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tempDir;
+        const world = newWorld(0);
+        const file = yield* heldFile(dir);
+        dir.files.set(file, "{not json");
+        dir.failing.rename = true;
+        yield* Effect.gen(function* () {
+          yield* ask;
+          yield* TestClock.adjust("20 seconds");
+          // Held in memory; the broken file is untouched, and the failure logged once.
+          assert.strictEqual(dir.files.get(file), "{not json");
+          assert.lengthOf(
+            world.logs.filter((log) => log.includes("held wakes file could not be read")),
+            1,
+          );
+          // It can be set aside now: kept as .corrupt-<ms>, and the held wake is written.
+          dir.failing.rename = false;
+          yield* TestClock.adjust("5 seconds");
+          const kept = [...dir.files.keys()]
+            .map(baseName)
+            .filter((name) => name.startsWith(`${WorkerWakeSlots.HELD_WAKES_FILE}.corrupt-`));
+          assert.lengthOf(kept, 1);
+          assert.deepStrictEqual(yield* heldIds(dir), [WAKE_COMMAND]);
+        }).pipe(Effect.provide(server(world, dir)), Effect.scoped);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
     "a file that cannot be read yet: a new hold is kept in memory, the file's own wakes go first",
     () =>
       Effect.gen(function* () {
@@ -723,7 +755,13 @@ describe("a delegated task's question to an idle parent takes an agent slot", ()
  * runs from now to 2 minutes on; `thread.data` is what both upstream and the fork's check read.
  * Returns when upstream's worker is done with the run.
  */
-const compaction = (world: World, thread: { data: ReturnType<typeof projection> }) =>
+const compaction = (
+  world: World,
+  thread: { data: ReturnType<typeof projection> },
+  due?: (
+    command: Extract<OrchestrationV2ServerCommand, { type: "message.dispatch" }>,
+  ) => Effect.Effect<boolean, string>,
+) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
     const decided = yield* Deferred.make<void>();
@@ -760,10 +798,14 @@ const compaction = (world: World, thread: { data: ReturnType<typeof projection> 
       gate: Option.some(yield* SlotGate.SlotGate.pipe(Effect.provide(gateOf(world)))),
       threadOf: () => Effect.succeed({ instanceId: thread.data.thread.modelSelection.instanceId }),
       questionOpen: () => Effect.succeed(true),
-      compactionDue: (command) =>
-        Clock.currentTimeMillis.pipe(
-          Effect.map((nowMs) => WorkerWakeSlots.compactionWindowOpen(thread.data, command, nowMs)),
-        ),
+      compactionDue:
+        due ??
+        ((command) =>
+          Clock.currentTimeMillis.pipe(
+            Effect.map((nowMs) =>
+              WorkerWakeSlots.compactionWindowOpen(thread.data, command, nowMs),
+            ),
+          )),
       store: { load: Effect.succeed([]), save: () => Effect.void },
     });
     yield* IdleCompactionService.make.pipe(
@@ -851,6 +893,38 @@ describe("upstream's idle compaction takes an agent slot", () => {
     }),
   );
 
+  it.effect("full until under a minute of its window is left: skipped then, not sent cold", () =>
+    Effect.gen(function* () {
+      const world = newWorld(0);
+      const decided = yield* compaction(world, warm());
+      // The window ends 2 minutes on; a slot that frees with less than a minute left is not used.
+      yield* TestClock.adjust("55 seconds");
+      assert.isFalse(world.left.includes(COMPACTION_PLACE.key));
+      world.free = 5;
+      yield* TestClock.adjust("5 seconds");
+      yield* Deferred.await(decided);
+      assert.deepStrictEqual(world.sent, []);
+      assert.include(world.left, COMPACTION_PLACE.key);
+    }),
+  );
+
+  it.effect("a check that fails: skipped, logged with its cause, not as a full gate", () =>
+    Effect.gen(function* () {
+      const world = newWorld(0);
+      const decided = yield* compaction(world, warm(), () => Effect.fail("records unreadable"));
+      yield* TestClock.adjust("5 seconds");
+      yield* Deferred.await(decided);
+      assert.deepStrictEqual(world.sent, []);
+      assert.isTrue(
+        world.logs.some((log) =>
+          log.includes("idle compaction skipped: whether it is still due could not be read"),
+        ),
+      );
+      assert.isFalse(world.logs.some((log) => log.includes("no agent slot while its cache")));
+      assert.include(world.left, COMPACTION_PLACE.key);
+    }),
+  );
+
   it.effect("full, and the thread is no longer idle: skipped at the next check, never sent", () =>
     Effect.gen(function* () {
       const world = newWorld(0);
@@ -866,6 +940,105 @@ describe("upstream's idle compaction takes an agent slot", () => {
       yield* Deferred.await(decided);
       assert.deepStrictEqual(world.sent, []);
       assert.include(world.left, COMPACTION_PLACE.key);
+    }),
+  );
+});
+
+describe("the server's check that a waiting idle compaction is still due", () => {
+  const commandFor = (run: string) =>
+    ({
+      type: "message.dispatch",
+      commandId: `server:idle-compact:${threadId}:${run}`,
+      threadId,
+    }) as never as Extract<OrchestrationV2ServerCommand, { type: "message.dispatch" }>;
+
+  it("open only for the run upstream's window is for, with a minute of it left", () => {
+    const records = warm().data;
+    // The window runs to 2 minutes on (NOW_MS + 2 min).
+    assert.isTrue(WorkerWakeSlots.compactionWindowOpen(records, commandFor(runId), NOW_MS));
+    // Another run's compaction (a newer run completed since): not this window's.
+    assert.isFalse(WorkerWakeSlots.compactionWindowOpen(records, commandFor("run-older"), NOW_MS));
+    const endMs = NOW_MS + 2 * MINUTE_MS;
+    const minLeft = WorkerWakeSlots.COMPACTION_MIN_LEFT_MS;
+    assert.isTrue(
+      WorkerWakeSlots.compactionWindowOpen(records, commandFor(runId), endMs - minLeft - 1),
+    );
+    assert.isFalse(
+      WorkerWakeSlots.compactionWindowOpen(records, commandFor(runId), endMs - minLeft),
+    );
+  });
+
+  it.effect("reads the settings, the project, and upstream's records as its worker does", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const thread = warm();
+      const queries: Array<unknown> = [];
+      let idleCompaction: "beforeCacheExpires" | "off" = "beforeCacheExpires";
+      let projectOff = false;
+      const projections = {
+        getThread: () => Effect.sync(() => thread.data.thread),
+        getThreadRecords: (id: ThreadId, kinds: unknown, options: unknown) =>
+          Effect.sync(() => {
+            queries.push({ id, kinds, options });
+            return thread.data;
+          }),
+      } as never as ProjectionStore.ProjectionStoreV2["Service"];
+      const settings = {
+        getSettings: Effect.sync(() => ({
+          ...DEFAULT_SERVER_SETTINGS,
+          idleCompaction,
+          ...(projectOff
+            ? {
+                projectSettingsOverrides: {
+                  [thread.data.thread.projectId]: {
+                    providerInstances: {
+                      [thread.data.thread.providerInstanceId]: { enabled: false },
+                    },
+                  },
+                },
+              }
+            : {}),
+        })),
+      } as never as ServerSettings.ServerSettingsService["Service"];
+      const due = WorkerWakeSlots.compactionDueOver(settings, projections);
+      assert.isTrue(yield* due(commandFor(runId)));
+      assert.isFalse(yield* due(commandFor("run-older")));
+      // Upstream's query for its window: the same records, kinds and filters.
+      const active = [thread.data.thread.activeProviderThreadId];
+      assert.deepStrictEqual(queries[0], {
+        id: threadId,
+        kinds: [
+          "runs",
+          "messages",
+          "providerThreads",
+          "providerTurns",
+          "runtimeRequests",
+          "turnItems",
+          "contextTransfers",
+        ],
+        options: {
+          messageRunIds: [runId],
+          turnItemStatuses: ["pending", "running", "waiting"],
+          runStatuses: ["preparing", "starting", "running", "rolled_back"],
+          includeLatestRun: true,
+          providerThreadIds: active,
+          providerTurnThreadIds: active,
+          latestProviderTurnUsageOnly: true,
+          runtimeRequestStatuses: ["pending"],
+          contextTransferStatuses: ["pending"],
+        },
+      });
+      // Idle compaction turned off since: no longer due, and nothing more read.
+      idleCompaction = "off";
+      const before = queries.length;
+      assert.isFalse(yield* due(commandFor(runId)));
+      assert.strictEqual(queries.length, before);
+      idleCompaction = "beforeCacheExpires";
+      projectOff = true;
+      const enabled = yield* due(commandFor(runId));
+      projectOff = false;
+      assert.isFalse(enabled);
+      assert.isTrue(yield* due(commandFor(runId)));
     }),
   );
 });
