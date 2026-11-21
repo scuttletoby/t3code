@@ -743,9 +743,78 @@ describe("DelegatedOrphanScan and agent slots", () => {
       world.silent.delete(ENV_C);
       yield* TestClock.adjust(SLOT_RETRY);
       yield* settle;
-      expect(world.sent).toHaveLength(1);
+      // The wait's list, then a fresh one: env-c's orphan, unread by the scans, is named too.
+      expect(world.sent.map((message) => message.text.includes("lost-c"))).toEqual([false, true]);
       yield* Fiber.interrupt(fiber);
     }),
+  );
+
+  it.effect("an orphan found while its parent waits is named right after, from a fresh list", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      world.slots.state.all = true;
+      const fiber = yield* (yield* service(world)).run().pipe(Effect.forkChild);
+      yield* settle;
+      yield* TestClock.adjust(OPTIONS.delay);
+      yield* settle;
+      // Not in the list the first scan read: it shows only now.
+      world.there.get(ENV_B)!.push({ threadId: "lost-2" });
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      world.slots.state.all = false;
+      yield* TestClock.adjust(SLOT_RETRY);
+      yield* settle;
+      yield* Fiber.join(fiber);
+      expect(world.sent.map((message) => message.text.includes("lost-2"))).toEqual([false, true]);
+      expect(world.sent[0]!.text).toContain("lost-1");
+    }),
+  );
+
+  it.effect(
+    "a parent that stays unreadable: logged once, left to the next start after 3 tries",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        world.slots.state.all = true;
+        const warnings: Array<string> = [];
+        const logger = Logger.make(({ message, logLevel }) => {
+          if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+        });
+        const fiber = yield* (yield* service(world))
+          .run()
+          .pipe(
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+            Effect.forkChild,
+          );
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        yield* settle;
+        // Its tasks can no longer be read (a broken store or linked machine).
+        world.followed.set(PARENT, null);
+        yield* TestClock.adjust(SLOT_RETRY);
+        yield* settle;
+        for (let step = 0; step < OPTIONS.attempts; step++) {
+          yield* TestClock.adjust(OPTIONS.retryDelay);
+          yield* settle;
+        }
+        expect(fiber.pollUnsafe()).toBeDefined();
+        expect(warnings.filter((warning) => warning.includes("cannot be read"))).toHaveLength(1);
+        expect(
+          warnings.filter((warning) => warning.includes("left to the next start")),
+        ).toHaveLength(1);
+        expect(world.sent).toHaveLength(0);
+        // The next start finds it again once it can be read.
+        world.followed.set(PARENT, [{ environmentId: ENV_B, threadId: ThreadId.make("known-1") }]);
+        world.slots.state.all = false;
+        const again = yield* (yield* service(world)).run().pipe(Effect.forkChild);
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        yield* settle;
+        yield* Fiber.join(again);
+        expect(world.sent).toHaveLength(1);
+      }),
   );
 
   it.effect("a restart while one waits loses nothing: the next start names it once", () =>

@@ -197,16 +197,16 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
     return { type: "sent", threadIds: sent } satisfies ParentOutcome;
   });
 
-  /** One pass over every linked environment; a parent is checked once, over all of them. */
-  const scan = Effect.fn("DelegatedOrphanScan.scan")(function* () {
+  /** Every linked environment's threads made from here, by parent; `null` while off. */
+  const listByParent = Effect.fn("DelegatedOrphanScan.listByParent")(function* () {
     const enabled = yield* settings.getSettings.pipe(
       Effect.map((current) => current.waitFor.enabled),
       Effect.orElseSucceed(() => false),
     );
-    if (!enabled) return OFF;
+    if (!enabled) return null;
     // Fails while Linked environments is off here.
     const links = yield* forwarding.links(scope).pipe(Effect.orElseSucceed(() => null));
-    if (links === null) return OFF;
+    if (links === null) return null;
     const sinceMs = startedAtMs - REMINDER_MAX_AGE_MS;
     const unreachable: Array<EnvironmentId> = [];
     const cutShort: Array<EnvironmentId> = [];
@@ -243,6 +243,14 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
         ),
       { concurrency: 4, discard: true },
     );
+    return { byParent, unreachable, cutShort, partial };
+  });
+
+  /** One pass over every linked environment; a parent is checked once, over all of them. */
+  const scan = Effect.fn("DelegatedOrphanScan.scan")(function* () {
+    const listed = yield* listByParent();
+    if (listed === null) return OFF;
+    const { byParent, unreachable, cutShort, partial } = listed;
     const parents = new Map<ThreadId, ParentOutcome>();
     for (const [parentThreadId, linked] of byParent) {
       const waiting = waitingForSlot.get(parentThreadId);
@@ -270,9 +278,9 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
       unreadableParents(outcome).length > 0);
 
   /**
-   * One parent refused a slot: its check runs again every `slotRetryDelay` while the gate refuses
-   * (logged once), and every `retryDelay` while it cannot be read, until it is done. A restart
-   * meanwhile loses nothing: the next start's scan finds the same orphans unnamed.
+   * One parent refused a slot: checked again every `slotRetryDelay` while refused, and every
+   * `retryDelay` while unreadable, `attempts` times in a row at most (then the next start). Once
+   * through, listed afresh: an orphan that ended meanwhile is named too. A restart loses nothing.
    */
   const untilSlot = Effect.fn("DelegatedOrphanScan.untilSlot")(
     function* (parentThreadId: ThreadId, first: ParentOutcome & { type: "waitsForSlot" }) {
@@ -280,10 +288,32 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
         threadId: parentThreadId,
         detail: first.detail,
       });
+      let linked = first.linked;
       let outcome: ParentOutcome = first;
-      while (outcome.type === "waitsForSlot" || outcome.type === "unreadable") {
+      let relisted = false;
+      let unreadable = 0;
+      while (true) {
+        if ((outcome.type === "sent" || outcome.type === "none") && !relisted) {
+          relisted = true;
+          const fresh = (yield* listByParent())?.byParent.get(parentThreadId) ?? [];
+          const freshKeys = new Set(fresh.map((thread) => thread.threadId));
+          linked = [...fresh, ...linked.filter((thread) => !freshKeys.has(thread.threadId))];
+          outcome = yield* checkParent(parentThreadId, linked);
+          continue;
+        }
+        if (outcome.type !== "waitsForSlot" && outcome.type !== "unreadable") return;
+        unreadable = outcome.type === "unreadable" ? unreadable + 1 : 0;
+        if (unreadable === 1)
+          yield* Effect.logWarning("delegated orphan reminder: its parent cannot be read", {
+            threadId: parentThreadId,
+          });
+        if (unreadable >= options.attempts)
+          return yield* Effect.logWarning(
+            "delegated orphan reminder left to the next start: its parent stayed unreadable",
+            { threadId: parentThreadId, tries: unreadable },
+          );
         yield* Effect.sleep(outcome.type === "waitsForSlot" ? slotRetryDelay : options.retryDelay);
-        outcome = yield* checkParent(parentThreadId, first.linked);
+        outcome = yield* checkParent(parentThreadId, linked);
       }
     },
     (effect, parentThreadId) =>

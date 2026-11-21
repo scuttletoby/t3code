@@ -2011,6 +2011,29 @@ describe("slot waits granted in one sweep: every wake-up granted is let through"
     }),
   );
 
+  it.effect("a start between a wake-up's acquire and its `started` counts that wake-up once", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      yield* run(
+        world,
+        waitsOn(3),
+        Effect.gen(function* () {
+          assert.deepStrictEqual(yield* sweep(1), ["granted"]);
+          const gate = yield* SlotGate.SlotGate;
+          const woken = yield* gate.acquire({
+            callerThreadId: waiter(0),
+            targetInstanceId: MAIN,
+            intoThreadId: waiter(0),
+            keepsHeld: true,
+          });
+          assert.strictEqual(woken.type, "allow");
+          // Its hold and its start: 2 of 3. The start is its wake-up, not a third one to come.
+          assert.strictEqual(yield* delegateAs(outsider), "allow");
+        }),
+      );
+    }),
+  );
+
   it.effect("three grants in one sweep (6 slots), woken in any order: all start", () =>
     Effect.gen(function* () {
       for (const order of [

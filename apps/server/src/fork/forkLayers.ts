@@ -25,6 +25,7 @@ import * as HandoffService from "./handoff/HandoffService.ts";
 import * as McpProfileTurnCheck from "./mcpProfileTurnCheck.ts";
 import * as PullRequestWatchSlot from "./pullRequestWatchSlot.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
+import * as WorkerWakeSlots from "./workerWakeSlots.ts";
 
 /**
  * Wraps upstream's agent activity relay: a held server (`serve --hold-work`) publishes none. A
@@ -60,11 +61,12 @@ export const layerRuntimeServices = Layer.mergeAll(
 
 /**
  * For the runtime's own workers only (first in server.ts's `layerRuntimeCoreDependenciesBase`):
- * idle compaction skips a thread the handoff service owns, and a pull request watch wake-up into an
- * idle thread takes an agent slot or waits for one (fork/pullRequestWatchSlot.ts).
+ * idle compaction skips a thread the handoff service owns, then a run into an idle thread from a
+ * pull request watch, idle compaction or a delegated task's question takes an agent slot.
  */
 export const handoffThreadsSkipIdleCompaction = PullRequestWatchSlot.layer.pipe(
   Layer.provide(HandoffOwner.layer),
+  Layer.provide(WorkerWakeSlots.layer),
 );
 
 /**
