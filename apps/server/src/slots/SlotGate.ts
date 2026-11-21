@@ -13,11 +13,13 @@ import type { SlotRuleStatus, WaitToolFailure } from "@t3tools/contracts/waitFor
 import {
   accountOnlyThreads,
   agentSlotsMode,
+  countedStarting,
   effectiveSlotLimits,
   limitsCount,
   liveReservations,
   liveStarting,
   onePerThread,
+  pendingWakes,
   runningAgents,
   slotDecision,
   slotRefusalText,
@@ -90,6 +92,8 @@ export interface StoredReservations {
 interface HeldRead {
   readonly held: ReadonlyArray<SlotReservation>;
   readonly whole: boolean;
+  /** Keys of holds whose wait was delivered (the store's): their thread was woken already. */
+  readonly woken: ReadonlySet<string>;
 }
 
 /** One slot wait asking for a slot; `key` is its wait id. */
@@ -97,6 +101,11 @@ export interface SlotRequest {
   readonly key: string;
   readonly threadId: ThreadId;
   readonly account?: ProviderInstanceId | undefined;
+  /**
+   * The thread asks from its own run and is answered at once (a slot wait met when registered):
+   * it needs no wake-up, so its hold counts no wake-up still to start (`pendingWakes`).
+   */
+  readonly awake?: boolean | undefined;
 }
 
 export type SlotGrant =
@@ -132,6 +141,17 @@ export interface SlotAcquireInput {
    * only when all of them would be too. Only this start is taken; the others take their own later.
    */
   readonly alsoNeeds?: ReadonlyArray<ProviderInstanceId> | undefined;
+  /**
+   * A message into this existing thread. Shown with a run, it only queues: allowed, and counted
+   * only while the thread shows no run (its run ended first; `queuedInto`). Idle, it is a start.
+   * Unread, it refuses only where a count limit applies.
+   */
+  readonly intoThreadId?: ThreadId | undefined;
+  /**
+   * The caller is the woken thread itself (a wait's message): its held slots are not counted
+   * against it and are not used up, so the agent it wakes up for still has its slot.
+   */
+  readonly keepsHeld?: boolean | undefined;
 }
 
 export class SlotGate extends Context.Service<
@@ -149,7 +169,8 @@ export class SlotGate extends Context.Service<
     /**
      * The dispatch ended, whichever way (call it from a finalizer). Without a started child the
      * slot is free again at once; a started child that shows no run yet still counts for the
-     * start grace. Calling it again does nothing more.
+     * start grace, and so does a message queued into a running thread (`intoThreadId`), while
+     * that thread shows no run. Calling it again does nothing more.
      */
     readonly release: (token: SlotToken | null) => Effect.Effect<void>;
     /** The wait service gives the gate the slots its store holds (once, when it starts). */
@@ -230,6 +251,8 @@ const make = Effect.gen(function* () {
   const hiddenKeys = () =>
     new Set([...replacing.values()].flatMap((olds) => olds.map((old) => old.key)));
   let stored: StoredReservations | null = null;
+  /** Holds granted to a thread that asked from its own run (`awake`), by key, until their end. */
+  const awakeKeys = new Map<string, number>();
   /**
    * Threads started while the wait store could not be read: the next good read uses their stored
    * holds up and clears this. A counted grant needs a good read (or waits off, which clears this),
@@ -386,6 +409,7 @@ const make = Effect.gen(function* () {
    */
   const heldAt = Effect.fn("SlotGate.heldAt")(function* (waitsOn: boolean, nowMs: number) {
     for (const [key, untilMs] of usedKeys) if (untilMs <= nowMs) usedKeys.delete(key);
+    for (const [key, untilMs] of awakeKeys) if (untilMs <= nowMs) awakeKeys.delete(key);
     // A grant never kept nor dropped (a cut-off call) hides the old holds only until they end.
     for (const [key, olds] of replacing) {
       if (olds.every((old) => old.untilMs <= nowMs)) replacing.delete(key);
@@ -395,7 +419,7 @@ const make = Effect.gen(function* () {
       // Stored holds do not count while waits are off; a start then never uses them up either.
       unreadStarts.clear();
       storeProblem = null;
-      return Effect.succeed<HeldRead>({ held: [], whole: true });
+      return Effect.succeed<HeldRead>({ held: [], whole: true, woken: new Set() });
     }
     const skipped = new Set([...usedKeys.keys(), ...hiddenKeys()]);
     const source = stored;
@@ -412,10 +436,19 @@ const make = Effect.gen(function* () {
         }
         unreadStarts.clear();
         storeProblem = null;
-        return { held: live([...memory, ...fromStore]), whole: true };
+        return {
+          held: live([...memory, ...fromStore]),
+          whole: true,
+          woken: new Set([...awakeKeys.keys(), ...fromStore.map((reservation) => reservation.key)]),
+        };
       }),
       Effect.catch((cause) => {
-        const unread = Effect.succeed<HeldRead>({ held: live(memory), whole: false });
+        // Unread: every hold in memory counts its wake-up as still to start (fewer starts, never more).
+        const unread = Effect.succeed<HeldRead>({
+          held: live(memory),
+          whole: false,
+          woken: new Set(awakeKeys.keys()),
+        });
         // Every decision and observation reads the store: one warning per reason, not per read.
         if (cause.message === storeProblem) return unread;
         storeProblem = cause.message;
@@ -595,10 +628,11 @@ const make = Effect.gen(function* () {
       const waitsOn = settings.value.waitFor.enabled;
       const nowMs = yield* Clock.currentTimeMillis;
       const counted = limitsCount(limits, input.targetInstanceId);
-      const count = counted ? yield* readCount : undefined;
+      const into = input.intoThreadId;
+      const count = counted || into !== undefined ? yield* readCount : undefined;
       // Fails closed: a count it needs but cannot read refuses before anything is
       // recorded, so the refused call starts nothing, uses no held slot and writes nothing.
-      if (count?.type === "unread") {
+      if (count?.type === "unread" && counted) {
         return asDecided(
           {
             type: "refuse",
@@ -608,13 +642,31 @@ const make = Effect.gen(function* () {
           [],
         );
       }
-      const read = count;
+      const shown = count?.type === "read" ? count : undefined;
+      // A message into a thread that shows a run only queues: it starts no agent now.
+      if (into !== undefined && shown?.visible.has(into) === true) {
+        yield* keepStarting(shown.visible, nowMs, limits);
+        const token = yield* Ref.getAndUpdate(nextToken, (value) => value + 1);
+        yield* Ref.update(entries, (current) => [
+          ...current,
+          { token, instanceId: input.targetInstanceId, atMs: nowMs, queuedInto: into },
+        ]);
+        return asDecided({ type: "allow", token }, []);
+      }
+      // The running agents only where a count limit applies (no count means none to check).
+      const read = counted ? shown : undefined;
       const running = read?.running.filter((agent) => agent.threadId !== input.callerThreadId);
-      const kept = yield* keepStarting(read?.visible, nowMs, limits);
+      const visible = shown?.visible ?? new Set<string>();
+      const kept = countedStarting(yield* keepStarting(shown?.visible, nowMs, limits), visible);
       // A store that cannot be read: its holds go uncounted (memory only); the caller's stored
       // holds are used up at the next good read.
       const heldRead = yield* liveHeld(waitsOn, nowMs);
       const reservations = heldRead.held;
+      const others = onePerThread(
+        reservations.filter((reservation) => reservation.threadId !== input.callerThreadId),
+      );
+      // Other held threads not woken yet: each wake-up is a run of its own.
+      const wakes = pendingWakes(others, visible, kept, heldRead.woken);
       const memoryBytes = yield* freeMemoryBytes(limits);
       const decisionWith = (
         targetInstanceId: ProviderInstanceId,
@@ -625,14 +677,12 @@ const make = Effect.gen(function* () {
           limits,
           running: running ?? [],
           starting,
-          reservations: onePerThread(
-            reservations.filter((reservation) => reservation.threadId !== input.callerThreadId),
-          ),
+          reservations: others,
           accountOnly: hiddenHeld(waitsOn, nowMs, input.callerThreadId ?? ""),
           targetInstanceId,
           freeMemoryBytes: memoryBytes,
         });
-      const decision = decisionWith(input.targetInstanceId, kept);
+      const decision = decisionWith(input.targetInstanceId, [...kept, ...wakes]);
       const alsoNeeds = input.alsoNeeds ?? [];
       const full = (
         refused: Extract<SlotDecision, { readonly type: "refuse" }>,
@@ -651,6 +701,7 @@ const make = Effect.gen(function* () {
       // The later starts of the batch, counted as starting one after another (nothing recorded).
       const starting: Array<StartingEntry> = [
         ...kept,
+        ...wakes,
         { token: -1, instanceId: input.targetInstanceId, atMs: nowMs },
       ];
       for (const [index, instanceId] of alsoNeeds.entries()) {
@@ -659,13 +710,20 @@ const make = Effect.gen(function* () {
         starting.push({ token: -2 - index, instanceId, atMs: nowMs });
       }
       const token = yield* Ref.getAndUpdate(nextToken, (value) => value + 1);
+      // A message into an idle thread names that thread at once, so no other caller counts its
+      // wake-up again (`pendingWakes`) before `started` runs.
       yield* Ref.update(entries, (current) => [
         ...current,
-        { token, instanceId: input.targetInstanceId, atMs: nowMs },
+        {
+          token,
+          instanceId: input.targetInstanceId,
+          atMs: nowMs,
+          ...(into === undefined ? {} : { childThreadId: into }),
+        },
       ]);
       // The agent it held a slot for starts now: its held slot is used up, with every older copy.
-      // A start no thread asks for holds no slot: it uses none up.
-      const caller = input.callerThreadId;
+      // A start no thread asks for holds no slot: it uses none up. A woken thread keeps its own.
+      const caller = input.keepsHeld === true ? null : input.callerThreadId;
       const used = caller === null ? [] : yield* useUp(reservations, caller);
       if (!heldRead.whole && caller !== null) unreadStarts.add(caller);
       return asDecided({ type: "allow", token }, used);
@@ -709,7 +767,10 @@ const make = Effect.gen(function* () {
       );
       // Read only when a count limit applies to one of them (3.6).
       const read = counted ? yield* readRunning : undefined;
-      const kept = yield* keepStarting(read?.visible, nowMs, limits);
+      const kept = countedStarting(
+        yield* keepStarting(read?.visible, nowMs, limits),
+        read?.visible ?? new Set(),
+      );
       const memoryBytes = yield* freeMemoryBytes(limits);
       const reserveMs = settings.value.agentSlots.reserveSeconds * 1000;
       const heldRead = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
@@ -733,14 +794,19 @@ const make = Effect.gen(function* () {
           });
           continue;
         }
+        const others = onePerThread(
+          reservations.filter((reservation) => reservation.threadId !== request.threadId),
+        );
+        const visible = read?.visible ?? new Set<string>();
         const decision = slotDecision({
           limits: own,
           running: (read?.running ?? []).filter((agent) => agent.threadId !== request.threadId),
-          starting: kept,
+          // Every other held thread not woken yet needs a slot for its wake-up as well as its
+          // agent, the ones granted earlier in this call too. Its own wake-up is
+          // not counted, as a thread's own run never counts against its own start.
+          starting: [...kept, ...pendingWakes(others, visible, kept, heldRead.woken)],
           // Its own held slot is not counted: a grant moves it here, so the thread keeps one.
-          reservations: onePerThread(
-            reservations.filter((reservation) => reservation.threadId !== request.threadId),
-          ),
+          reservations: others,
           // Read again for each request: a grant earlier in this call may have hidden holds.
           accountOnly: hiddenHeld(settings.value.waitFor.enabled, nowMs, request.threadId),
           targetInstanceId: request.account ?? "",
@@ -782,6 +848,7 @@ const make = Effect.gen(function* () {
         ];
         // A slot held for 0 s is not held after this call; the wait is still woken.
         if (reserveMs > 0) yield* Ref.update(held, (current) => [...current, reservation]);
+        if (request.awake === true) awakeKeys.set(request.key, untilMs);
         grantedThreads.add(request.threadId);
         grants.push({ type: "granted", untilMs });
       }
@@ -830,12 +897,17 @@ const make = Effect.gen(function* () {
     const starting =
       limits === null
         ? []
-        : liveStarting(yield* Ref.get(entries), read.visible, nowMs, limits.startGraceMs);
+        : countedStarting(
+            liveStarting(yield* Ref.get(entries), read.visible, nowMs, limits.startGraceMs),
+            read.visible,
+          );
     const heldRead = yield* liveHeld(settings.value.waitFor.enabled, nowMs);
     // Not under the semaphore: a hold this read used up is cleared in the store here.
     yield* clearUsedLater;
     if (!heldRead.whole) return null;
     const reservations = onePerThread(heldRead.held);
+    // Wake-ups still to start: on the machine only, as `decide` counts them.
+    const wakes = pendingWakes(reservations, read.visible, starting, heldRead.woken).length;
     // Holds hidden by a re-ask not kept yet: on their own account only, as `decide` counts them.
     const hidden = hiddenHeld(settings.value.waitFor.enabled, nowMs, "");
     const accountMax = (id: string) => {
@@ -853,7 +925,7 @@ const make = Effect.gen(function* () {
     const memory = yield* hostResources.read;
     return {
       machine: {
-        used: read.running.length + starting.length + reservations.length,
+        used: read.running.length + starting.length + reservations.length + wakes,
         max: agentSlots.maxPerMachine > 0 ? agentSlots.maxPerMachine : null,
       },
       accounts: [...ids].sort().map((id) => ({
@@ -889,7 +961,10 @@ const make = Effect.gen(function* () {
     }),
     drop: Effect.fn("SlotGate.drop")(function* (keys: ReadonlyArray<string>) {
       if (keys.length === 0) return;
-      for (const key of keys) replacing.delete(key);
+      for (const key of keys) {
+        replacing.delete(key);
+        awakeKeys.delete(key);
+      }
       yield* Ref.update(held, (current) => current.filter((entry) => !keys.includes(entry.key)));
     }),
     // A token is the gate's or the capacity rule's (`observeBeside`); each ignores the other's.
@@ -897,7 +972,12 @@ const make = Effect.gen(function* () {
       token === null
         ? Effect.void
         : Ref.update(entries, (current) =>
-            current.map((entry) => (entry.token === token ? { ...entry, childThreadId } : entry)),
+            current.map((entry) =>
+              // A queued message is tied to its thread already and ends by time only.
+              entry.token === token && entry.queuedInto === undefined
+                ? { ...entry, childThreadId }
+                : entry,
+            ),
           ).pipe(Effect.andThen(observer.started(token, childThreadId))),
     ),
     release: Effect.fn("SlotGate.release")(function* (token: SlotToken | null) {
@@ -907,7 +987,7 @@ const make = Effect.gen(function* () {
         current.flatMap((entry) =>
           entry.token !== token
             ? [entry]
-            : entry.childThreadId === undefined
+            : entry.childThreadId === undefined && entry.queuedInto === undefined
               ? []
               : [entry.endedAtMs === undefined ? { ...entry, endedAtMs: nowMs } : entry],
         ),

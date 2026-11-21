@@ -269,26 +269,17 @@
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkScheduleMcpProfile(input); // Fork: MCP profile launch",
-        "yield* LaunchMcpProfile.checkEditMcpProfile(scheduledTaskId, bindToCurrentThread, prompt); // Fork: MCP profile launch"
-      ],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
-          "yield* AgentSlotRoutes.checkSendSlot(scope.thread?.threadId, input.threadId); // Fork: agent slots"
-        ]
-      }
+        "yield* LaunchMcpProfile.checkEditMcpProfile(scheduledTaskId, bindToCurrentThread, prompt); // Fork: MCP profile launch",
+        "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+        "yield* AgentSlotRoutes.checkSendSlot(scope.thread?.threadId, input.threadId); // Fork: agent slots"
+      ]
     },
     "apps/server/src/mcp/toolkits/attachment/handlers.ts": {
       "why": "t3_thread_send_attachments from an agent that would start a run in an idle thread takes a slot from the agent slot gate like t3_thread_send, or is refused slots_full and nothing is sent (fork/agentSlotRoutes.ts, #711).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
-          "yield* AgentSlotRoutes.checkSendSlot(caller?.id, projection.thread.id); // Fork: agent slots"
-        ]
-      }
+      "added": [
+        "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+        "yield* AgentSlotRoutes.checkSendSlot(caller?.id, projection.thread.id); // Fork: agent slots"
+      ]
     },
     "apps/server/src/mcp/toolkits/thread/handlers.ts": {
       "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693); run_scheduled_task_now refused by the agent slot gate answers slots_full (fork/agentSlotRoutes.ts, #706; the prettier-ignore keeps upstream's run_scheduled_task_now lines as they are, since a second pipe step would make the formatter reflow them).",

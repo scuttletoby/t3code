@@ -9,10 +9,12 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
 import { ServerConfig } from "../config.ts";
+import * as LimitResumeSlot from "../fork/limitResumeSlot.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -82,7 +84,8 @@ export const layer = Layer.effect(
     const checkPlaceOf = yield* makeCheckPlaceOf();
     const waits = yield* WaitService.make({
       filePath: path.join(config.stateDir, WAIT_STORE_FILE),
-      delivery: yield* WaitDelivery.make(),
+      // The wake-ups it sends take a slot like any start (the same gate as below).
+      delivery: yield* WaitDelivery.make(Option.some(yield* SlotGate.SlotGate)),
       judges: {
         check: yield* makeCheckJudge({ placeOf: checkPlaceOf }),
         unit: yield* makeUnitJudge(),
@@ -117,3 +120,10 @@ export const layer = Layer.effect(
     return waits;
   }),
 ).pipe(Layer.provide(ProcessRunner.layer));
+
+/**
+ * Upstream's usage-limit resume, which waits for a slot as a wait's wake-up does
+ * (fork/limitResumeSlot.ts). runtimeLayer.ts gives it to upstream's recovery worker from here, so
+ * that file needs no import of a fork module more than it has.
+ */
+export const limitResumeSlot = LimitResumeSlot.layer;

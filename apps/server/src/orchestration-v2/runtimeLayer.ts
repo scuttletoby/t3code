@@ -454,6 +454,7 @@ export const layerProduction = Layer.mergeAll(
     Layer.provide(Layer.merge(layerOrchestratorProvided, layerCommandOutputHubProvided)),
   ),
   UsageLimitRecoveryWorker.layer.pipe(
+    Layer.provide(WaitWorker.limitResumeSlot), // Fork: a resume waits for an agent slot
     Layer.provide(
       Layer.mergeAll(
         ProjectionStore.layer,
@@ -464,8 +465,7 @@ export const layerProduction = Layer.mergeAll(
   ),
   // Fork (waits): off by default; the sweep reads and writes nothing until it is switched on.
   WaitWorker.layer.pipe(
-    // One slot gate for /mcp, waits and scheduled runs: layers memoize by reference (server.ts).
-    Layer.provide(SlotGate.layer),
+    Layer.provide(SlotGate.layer), // The server's one slot gate: layers memoize by reference.
     Layer.provide(
       Layer.mergeAll(
         layerThreadManagementProvided,
