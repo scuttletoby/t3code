@@ -1,8 +1,22 @@
 /**
- * Port of lens.py's header rules (fork-ci/actions/pr-queue), held to the shared vectors and the gate's lens corpus.
- * Not ported: lens.Review.lens_problem (a comment that only looks like a report); lensScan reads it as no lens comment.
+ * Port of lens.py's header rules and lens.Review.lens_problem/lens_scan (fork-ci/actions/pr-queue), held to the shared
+ * vectors and the gate's lens corpus. A comment that only looks like a report, or holds a second header, is a
+ * NO_HEADER entry that reads nothing, as in the gate. The caller picks the posts that count, in the gate's order.
  */
-import { ALNUM, B, S, WS, isBlank, pyI, split, splitlines, strip, stripChars } from "./pyText.ts";
+import {
+  ALNUM,
+  B,
+  S,
+  WS,
+  cut,
+  isBlank,
+  pyI,
+  repr,
+  split,
+  splitlines,
+  strip,
+  stripChars,
+} from "./pyText.ts";
 
 const TAG_OPEN = /<\/?[A-Za-z]/gu;
 const TAG_NARROW = /<\/?[A-Za-z][^<>]*>/gu;
@@ -21,10 +35,28 @@ const FIELD_RE = new RegExp(
 );
 const READ_AT_RE = new RegExp(`${B}read[${WS}-]*at${B}${S}*(?::${S}*)?([0-9a-f]{7,40})${B}`, "iu");
 const MARKER = /^(?:r\p{Nd}+|lens|re-?check)$/u;
+// lens_problem's patterns (lens.py): Python's re.I `[a-z]` also holds `İ` and `ı`.
+const DASHES = `${/\u2014/u.source}${/\u2013/u.source}`;
+const FIELD_START_RE = new RegExp(`^lens(?:${S}*[:${DASHES}]|=)${S}*([^\n]*)`, "iu");
+const LOOSE_RE = new RegExp(`${B}lens${S}*[:=${DASHES}]([^\n]*)`, "iu");
+const NOT_A_LENS_SUB = new RegExp(`${B}not${S}+a${S}+lens${S}*:`, "giu");
+const NOT_A_LENS_RE = new RegExp(`^not${S}+a${S}+lens${S}*:`, "iu");
+const LOOKS_RE = new RegExp(
+  `${B}lens${S}*:|${B}read[${WS}-]*at${B}${S}*(?::|[0-9a-f]{7})|${B}safe${S}+to${S}+merge${B}`,
+  "iu",
+);
+const FIELD_LINE_RE = new RegExp(`^(?:covered|checks)${S}*:`, "iu");
+const LOOKS_HEADING_RE = new RegExp(`^ {0,3}#{1,6}[ \t][^\n]*${B}lens${B}`, "iu");
+const HEX_RE =
+  /(?<![0-9a-z\u0130\u0131])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}(?![0-9a-z\u0130\u0131])/iu;
+const TOP_LINES = 5;
 
 export const NO_HEADER = "comment without a first-line lens header";
 export const EDITED = "edited after posting: post a new comment instead";
 export const HIDDEN = "hidden: post a new comment instead";
+export const EMBEDDED = "holds a lens header line";
+const OPT_OUT_READ =
+  "says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote";
 
 /** Each tag to the first `>` after its start, in linear time; no `>` left: no later tag closes either. */
 function stripTags(text: string): string {
@@ -128,6 +160,106 @@ export function fenceStep(fence: string | null, line: string): [string | null, b
   return m ? [m[1] ?? m[2]!, true] : [null, false];
 }
 
+/** The lines outside fences, 4-space/tab indented blocks and quotes (lens.plain_lines). */
+function plainLines(body: string): string[] {
+  const out: string[] = [];
+  let fence: string | null = null;
+  for (const line of splitlines(body)) {
+    let fenced: boolean;
+    [fence, fenced] = fenceStep(fence, line);
+    if (!fenced && !isBlank(line) && !/^(?: {4}|\t| {0,3}>)/u.test(line)) out.push(line);
+  }
+  return out;
+}
+
+/** The lines except those of a `>` quote outside a fence (lens.unquoted_lines). */
+function unquotedLines(body: string): string[] {
+  const out: string[] = [];
+  let fence: string | null = null;
+  for (const line of splitlines(body)) {
+    let fenced: boolean;
+    [fence, fenced] = fenceStep(fence, line);
+    if (!fenced && /^ {0,3}>/u.test(line)) continue;
+    out.push(line);
+  }
+  return out;
+}
+
+const headerLine = (line: string) => LENS_RE.test(line) && READ_AT_RE.test(line);
+
+/** A lens field anywhere in the line naming a hex sha after it (lens.loose_header). */
+function looseHeader(line: string): boolean {
+  const m = LOOSE_RE.exec(line.replace(NOT_A_LENS_SUB, " "));
+  return !!m && HEX_RE.test(m[1]!);
+}
+
+const starts = (first: string) => `starts with ${repr(cut(strip(first), 60))}`;
+
+/** lens.Review.read_problem: lensProblem's rules with one way of reading tags and links. */
+function readProblem(body: string, narrow: boolean): string | null {
+  const norm = (line: string) => normLine(line, narrow);
+  const lines = splitlines(body);
+  const at = Math.max(
+    0,
+    lines.findIndex((line) => !isBlank(line)),
+  );
+  const first = lines.find((line) => !isBlank(line)) ?? "";
+  const normed = lines.map(norm);
+  const start = starts(first);
+  let headers = 0;
+  for (const [i, line] of normed.entries()) {
+    const m = i > at ? FIELD_START_RE.exec(line) : null;
+    if (headerLine(line) || (m && HEX_RE.test(m[1]!))) headers++;
+  }
+  if (headers > 1) return `${EMBEDDED} ${headers} times (post one comment per lens), ${start}`;
+  if (lensHeader(body, narrow)) return null;
+  if (opensPlain(first) && LENS_RE.test(norm(first)))
+    return `its first-line header names no lens (a placeholder, a round or nothing), ${start}`;
+  if (headers)
+    return `${EMBEDDED} that is not its first plain line (a later line, a code block, quote or table), ${start}`;
+  if (normed.some(looseHeader))
+    return `${EMBEDDED} (a lens line with a sha not written \`read at: <sha>\`), ${start}`;
+  if (opensPlain(first) && NOT_A_LENS_RE.test(norm(first))) {
+    return unquotedLines(body).some((line) => READ_AT_RE.test(norm(line)))
+      ? `${OPT_OUT_READ}, ${start}`
+      : null;
+  }
+  const plain = plainLines(body);
+  if (plain.filter((line) => FIELD_LINE_RE.test(norm(line))).length >= 2) return start;
+  if (
+    normed.some((line) => READ_AT_RE.test(line)) ||
+    plain.some((line) => LOOKS_RE.test(norm(line))) ||
+    plain.slice(0, TOP_LINES).some((line) => LOOKS_HEADING_RE.test(line))
+  )
+    return start;
+  return null;
+}
+
+/**
+ * lens.Review.lens_problem: why a comment that looks like a lens report is not one valid read, or null. Every line
+ * counts, in fences and quotes too; read both ways (narrow or not). An override comment (`<prefix> <40-hex sha>:`)
+ * never counts.
+ */
+export function lensProblem(body: string, overridePrefix?: string): string | null {
+  if (
+    overridePrefix !== undefined &&
+    body.startsWith(`${overridePrefix} `) &&
+    /^[0-9a-f]{40}:/u.test(body.slice(overridePrefix.length + 1))
+  )
+    return null;
+  const problem = readProblem(body, false) ?? readProblem(body, true);
+  if (
+    problem === null &&
+    JSON.stringify(lensHeader(body)) !== JSON.stringify(lensHeader(body, true))
+  ) {
+    return (
+      "its first line reads as a different lens header, or as one and as none, depending on how its HTML " +
+      `tags and links are read; ${starts(splitlines(body).find((line) => !isBlank(line)) ?? "")}`
+    );
+  }
+  return problem;
+}
+
 /** A pull request comment or review whose author counts (a lens author association, no bot), in posting order. */
 export interface LensPost {
   readonly body: string;
@@ -135,6 +267,8 @@ export interface LensPost {
   readonly edited: boolean;
   /** GitHub's isMinimized. */
   readonly hidden: boolean;
+  /** How the gate names the post in a NO_HEADER key: its url, else `by <login> at <createdAt>`. Default `post <n>`. */
+  readonly where?: string;
 }
 
 export interface LensScan {
@@ -144,18 +278,18 @@ export interface LensScan {
   readonly entries: Record<string, [string | null, string | null]>;
 }
 
-/** lens.Review.lens_scan on posts that count. */
-export function lensScan(posts: ReadonlyArray<LensPost>): LensScan {
+/** lens.Review.lens_scan on posts that count, with the repository's override prefix. */
+export function lensScan(posts: ReadonlyArray<LensPost>, overridePrefix?: string): LensScan {
   const history: Array<[string, string | null]> = [];
   const entries: Record<string, [string | null, string | null]> = {};
   posts.forEach((post, i) => {
-    const header = lensHeader(post.body);
-    if (JSON.stringify(header) !== JSON.stringify(lensHeader(post.body, true))) {
-      entries[
-        `${NO_HEADER} (post ${i + 1}: its first line reads as a different lens header, or as one and as none)`
-      ] = [null, null];
+    const problem = lensProblem(post.body, overridePrefix);
+    if (problem) {
+      const where = post.where ?? `post ${i + 1}`;
+      entries[`${NO_HEADER} (${where}, ${problem}${post.hidden ? ", hidden" : ""})`] = [null, null];
       return;
     }
+    const header = lensHeader(post.body);
     if (!header) return;
     history.push(header);
     const why = post.hidden ? HIDDEN : post.edited ? EDITED : null;

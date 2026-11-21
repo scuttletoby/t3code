@@ -6,7 +6,16 @@ import * as NodeFS from "node:fs";
 import { assert, describe, it } from "@effect/vitest";
 
 import { fold, readFindings } from "./findings.ts";
-import { EDITED, HIDDEN, NO_HEADER, lensHeader, lensKey, lensScan } from "./lensComment.ts";
+import {
+  EDITED,
+  EMBEDDED,
+  HIDDEN,
+  NO_HEADER,
+  lensHeader,
+  lensKey,
+  lensProblem,
+  lensScan,
+} from "./lensComment.ts";
 import { ReviewPlanError, globMatches, planReview, type ReviewBlock } from "./plan.ts";
 import { repr, splitlines } from "./pyText.ts";
 import {
@@ -20,9 +29,11 @@ import {
   type EntryHow,
 } from "./rounds.ts";
 
-const GATE = new URL("../../../../../fork-ci/actions/pr-queue/", import.meta.url);
-const V = JSON.parse(NodeFS.readFileSync(new URL("review.vectors.json", GATE), "utf8"));
-const CORPUS = NodeFS.readFileSync(new URL("testdata/lens-corpus.jsonl", GATE), "utf8")
+// Each read names its whole path: both files are `!` lines of .github/fork-owned-paths.txt, the rest of the folder is not.
+const gate = (path: string) =>
+  NodeFS.readFileSync(new URL(`../../../../../${path}`, import.meta.url), "utf8");
+const V = JSON.parse(gate("fork-ci/actions/pr-queue/review.vectors.json"));
+const CORPUS = gate("fork-ci/actions/pr-queue/testdata/lens-corpus.jsonl")
   .split("\n")
   .filter(Boolean)
   .map((line) => JSON.parse(line));
@@ -31,6 +42,7 @@ const CORPUS = NodeFS.readFileSync(new URL("testdata/lens-corpus.jsonl", GATE), 
 const FIELDS: Record<string, ReadonlyArray<string> | null> = {
   about: null,
   config_path: null,
+  override_prefix: null,
   configs: null,
   globs: null,
   cases: ["name", "config", "changes", "weight", "lenses", "hits", "protected"],
@@ -75,12 +87,17 @@ function replayRound(v: any) {
   };
 }
 
+// Each post as the Python side's scan() posts it: by `someone`, one second apart, so the gate names it the same way.
+const at = (i: number) =>
+  `2026-01-01T00:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z`;
 const posts = (v: any) =>
-  (v.posts as Array<{ body: string; edited?: boolean; hidden?: boolean }>).map((p) => ({
+  (v.posts as Array<{ body: string; edited?: boolean; hidden?: boolean }>).map((p, i) => ({
     body: p.body,
     edited: p.edited ?? false,
     hidden: p.hidden ?? false,
+    where: `by someone at ${at(i)}`,
   }));
+const scan = (v: any) => lensScan(posts(v), V.override_prefix);
 
 describe("the shared vectors", () => {
   it("runs every section and every field, each vector name once", () => {
@@ -120,7 +137,7 @@ describe("the shared vectors", () => {
   });
 
   it("every findings vector", () => {
-    assert.isAtLeast(V.findings.length, 131);
+    assert.isAtLeast(V.findings.length, 133);
     for (const f of V.findings) {
       assert.deepStrictEqual(
         readFindings(f.body),
@@ -131,14 +148,9 @@ describe("the shared vectors", () => {
   });
 
   it("every scan", () => {
-    assert.isAtLeast(V.scans.length, 13);
-    for (const s of V.scans) {
-      assert.deepStrictEqual(
-        lensScan(posts(s)),
-        { history: s.history, entries: s.entries },
-        s.name,
-      );
-    }
+    assert.isAtLeast(V.scans.length, 31);
+    for (const s of V.scans)
+      assert.deepStrictEqual(scan(s), { history: s.history, entries: s.entries }, s.name);
   });
 
   it("every round", () => {
@@ -167,20 +179,20 @@ describe("rounds meet old, repeated, edited, deleted and empty state", () => {
   };
   it("the same comment read twice is one entry and one round", () => {
     const s = named("scans", "the same comment read twice");
-    assert.deepStrictEqual(Object.keys(lensScan(posts(s)).entries), ["code"]);
+    assert.deepStrictEqual(Object.keys(scan(s).entries), ["code"]);
     assert.strictEqual(
       replayRound(named("rounds", "the same comment read twice is one round")).round,
       1,
     );
   });
   it("an edited or hidden comment reads nothing but stays a round", () => {
-    const edited = lensScan(
-      posts(named("scans", "an edited comment reads nothing and still counts in the history")),
+    const edited = scan(
+      named("scans", "an edited comment reads nothing and still counts in the history"),
     );
     assert.deepStrictEqual(edited.entries.code, [null, EDITED]);
     assert.strictEqual(edited.history.length, 2);
-    const hidden = lensScan(
-      posts(named("scans", "a hidden comment reads nothing and still counts in the history")),
+    const hidden = scan(
+      named("scans", "a hidden comment reads nothing and still counts in the history"),
     );
     assert.deepStrictEqual(hidden.entries.code, [null, HIDDEN]);
   });
@@ -212,14 +224,33 @@ describe("rounds meet old, repeated, edited, deleted and empty state", () => {
   it("judging the same input again gives the same answer", () => {
     for (const r of V.rounds) assert.deepStrictEqual(replayRound(r), replayRound(r), r.name);
   });
-  it("a post whose first line reads two ways is no lens comment", () => {
-    // The gate reads `a [b` one way and `[a b` the other (checked with lens.lens_header): it names no lens.
-    const body = `lens: [a [b](c) · reviewer: x · read at: ${"a".repeat(40)}`;
-    assert.notDeepEqual(lensHeader(body), lensHeader(body, true));
-    const got = lensScan([{ body, edited: false, hidden: false }]);
+  it("a post whose first line reads two ways reads nothing", () => {
+    const got = scan(named("scans", "a first line that reads two ways reads nothing"));
     assert.deepStrictEqual(got.history, []);
     assert.deepStrictEqual(Object.values(got.entries), [[null, null]]);
     assert.isTrue(Object.keys(got.entries)[0]!.startsWith(NO_HEADER));
+  });
+  it("a second header under a valid one reads nothing, keeps the older read, and a new post does not clear it", () => {
+    const quoted = scan(
+      named(
+        "scans",
+        "a second lens header quoted under a valid one reads nothing; the older read stays",
+      ),
+    );
+    assert.deepStrictEqual(quoted.history, [["code", "b".repeat(40)]]);
+    assert.deepStrictEqual(quoted.entries.code, ["b".repeat(40), null]);
+    const reposted = scan(
+      named("scans", "a correct new post does not clear a post that reads nothing"),
+    );
+    assert.lengthOf(Object.keys(reposted.entries), 2);
+    assert.include(Object.keys(reposted.entries)[0], EMBEDDED);
+  });
+  it("an override comment never reads as a lens report, with the repository's prefix only", () => {
+    const body = named("scans", "an override comment that looks like a report is never one")
+      .posts[0].body;
+    assert.isNull(lensProblem(body, V.override_prefix));
+    assert.isNotNull(lensProblem(body));
+    assert.isNotNull(lensProblem(body, "another prefix"));
   });
 });
 
@@ -318,7 +349,15 @@ describe("the T3 side's own edges", () => {
     ]);
   });
 
-  // The gate's linear-time lines and its answers (review_judge.test.py): quadratic work outruns the test timeout.
+  // The gate's linear-time lines and its answers (review_judge.test.py), each with its own time bound: the server's
+  // test timeout is 120 s, so a slow but not hanging path would pass without one.
+  const timed = (f: () => unknown, ms: number) => {
+    // oxlint-disable-next-line t3code/no-wall-clock-in-tests -- a linear-time bound, as the gate's own test has
+    const t = performance.now();
+    f();
+    // oxlint-disable-next-line t3code/no-wall-clock-in-tests -- the same bound
+    return assert.isBelow(performance.now() - t, ms);
+  };
   it("reads a long run of spaces in linear time, as the gate does", () => {
     const n = 200_000;
     const sp = " ".repeat(n);
@@ -333,6 +372,30 @@ describe("the T3 side's own edges", () => {
       [`major: none${" \t".repeat(n / 2)}x`, [["major", "major: none x"]]],
     ];
     for (const [line, want] of cases)
-      assert.deepStrictEqual(readFindings(HEAD + line), [want, false]);
+      timed(() => assert.deepStrictEqual(readFindings(HEAD + line), [want, false]), 2000);
+  });
+
+  it("reads a wide table row in linear time, as the gate does", () => {
+    // The old per-cell read took 39.5 s at 4,000 cells. Each about one full-size comment (65,536 characters).
+    const rows = [
+      "| " + "major | ".repeat(8000),
+      "| " + "major | ".repeat(4000) + "x | ".repeat(4000),
+      "| " + "major | ".repeat(3000) + "\n|" + "---|".repeat(3000) + "\n| " + "x | ".repeat(3000),
+      "| major |" + " |".repeat(30_000) + " x |",
+      "|" + "---|".repeat(16_000) + "x",
+    ];
+    for (const row of rows) timed(() => readFindings(HEAD + row), 2000);
+    assert.deepStrictEqual(readFindings(HEAD + rows[0]!)[0], [["major", "major ".repeat(20)]]);
+  });
+
+  it("reads a full-size comment's lens problem in linear time", () => {
+    const n = 16_000;
+    for (const body of [
+      `${HEAD}${"lens: x read at 1234567\n".repeat(n / 8)}`,
+      `${HEAD}${"> ".repeat(n)}lens: code · read at: ${"a".repeat(40)}`,
+      `x\n${" ".repeat(n * 4)}read at 1234567`,
+      `not a lens: x\n${"> read at: 1234567\n".repeat(n / 8)}`,
+    ])
+      timed(() => lensProblem(body), 2000);
   });
 });

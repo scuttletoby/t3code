@@ -1,6 +1,7 @@
 {
-  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads (the history of [name, sha] and each lens key's newest [sha, why]). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). Every section is run by both sides: a test fails if one side meets a section or a vector it does not run.",
+  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a post that only looks like a report is a `comment without a first-line lens header` entry that reads nothing). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
   "config_path": ".github/pr-queue.json",
+  "override_prefix": "override for head",
   "globs": [
     ["**", "a", true],
     ["**", "a/b/c.py", true],
@@ -66,17 +67,43 @@
           "paths": ["src/storage/**", "migrations/**"],
           "lenses": ["data-1", "data-2"]
         },
-        { "name": "docs", "weight": "light", "paths": ["docs/**", "**/*.md"], "lenses": [] },
-        { "name": "code", "weight": "normal", "paths": ["**"], "lenses": ["code"] }
+        {
+          "name": "docs",
+          "weight": "light",
+          "paths": ["docs/**", "**/*.md"],
+          "lenses": []
+        },
+        {
+          "name": "code",
+          "weight": "normal",
+          "paths": ["**"],
+          "lenses": ["code"]
+        }
       ],
       "lenses": {
-        "data-1": { "prompt": ".github/lenses/data.md" },
-        "data-2": { "prompt": ".github/lenses/data.md" },
-        "code": { "prompt": ".github/lenses/code.md" },
-        "approach": { "prompt": ".github/lenses/approach.md" }
+        "data-1": {
+          "prompt": ".github/lenses/data.md"
+        },
+        "data-2": {
+          "prompt": ".github/lenses/data.md"
+        },
+        "code": {
+          "prompt": ".github/lenses/code.md"
+        },
+        "approach": {
+          "prompt": ".github/lenses/approach.md"
+        }
       },
-      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
-      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "min_lenses": {
+        "critical": 2,
+        "normal": 1,
+        "light": 0
+      },
+      "rounds": {
+        "approach_at": 3,
+        "max": 4,
+        "approach_lens": "approach"
+      },
       "findings": true,
       "state_line": true
     },
@@ -96,21 +123,58 @@
           "paths": ["src/**/schema.sql", "db/**"],
           "lenses": ["data-1", "data-2"]
         },
-        { "name": "api", "weight": "normal", "paths": ["src/api/*.py"], "lenses": ["api", "code"] },
-        { "name": "notes", "weight": "light", "paths": ["notes/*.txt", "config/*"], "lenses": [] },
-        { "name": "rest", "weight": "normal", "paths": ["*/**"], "lenses": ["code"] }
+        {
+          "name": "api",
+          "weight": "normal",
+          "paths": ["src/api/*.py"],
+          "lenses": ["api", "code"]
+        },
+        {
+          "name": "notes",
+          "weight": "light",
+          "paths": ["notes/*.txt", "config/*"],
+          "lenses": []
+        },
+        {
+          "name": "rest",
+          "weight": "normal",
+          "paths": ["*/**"],
+          "lenses": ["code"]
+        }
       ],
       "lenses": {
-        "security-1": { "prompt": "review/security.md" },
-        "security-2": { "prompt": "review/security.md" },
-        "data-1": { "prompt": "review/data.md" },
-        "data-2": { "prompt": "review/data-second.md" },
-        "api": { "prompt": "review/api.md" },
-        "code": { "prompt": "review/code.md" },
-        "approach": { "prompt": "review/approach.md" }
+        "security-1": {
+          "prompt": "review/security.md"
+        },
+        "security-2": {
+          "prompt": "review/security.md"
+        },
+        "data-1": {
+          "prompt": "review/data.md"
+        },
+        "data-2": {
+          "prompt": "review/data-second.md"
+        },
+        "api": {
+          "prompt": "review/api.md"
+        },
+        "code": {
+          "prompt": "review/code.md"
+        },
+        "approach": {
+          "prompt": "review/approach.md"
+        }
       },
-      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
-      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "min_lenses": {
+        "critical": 2,
+        "normal": 1,
+        "light": 0
+      },
+      "rounds": {
+        "approach_at": 3,
+        "max": 4,
+        "approach_lens": "approach"
+      },
       "findings": true,
       "state_line": true
     },
@@ -118,8 +182,18 @@
       "version": 1,
       "mode": "enforce",
       "rules": [
-        { "name": "light", "weight": "light", "paths": ["docs/**"], "lenses": [] },
-        { "name": "code", "weight": "normal", "paths": ["src/**"], "lenses": ["code"] },
+        {
+          "name": "light",
+          "weight": "light",
+          "paths": ["docs/**"],
+          "lenses": []
+        },
+        {
+          "name": "code",
+          "weight": "normal",
+          "paths": ["src/**"],
+          "lenses": ["code"]
+        },
         {
           "name": "everything",
           "weight": "critical",
@@ -128,13 +202,29 @@
         }
       ],
       "lenses": {
-        "code": { "prompt": "docs/lenses/code.md" },
-        "deep-1": { "prompt": "docs/lenses/deep.md" },
-        "deep-2": { "prompt": "docs/lenses/deep.md" },
-        "approach": { "prompt": "docs/lenses/approach.md" }
+        "code": {
+          "prompt": "docs/lenses/code.md"
+        },
+        "deep-1": {
+          "prompt": "docs/lenses/deep.md"
+        },
+        "deep-2": {
+          "prompt": "docs/lenses/deep.md"
+        },
+        "approach": {
+          "prompt": "docs/lenses/approach.md"
+        }
       },
-      "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
-      "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+      "min_lenses": {
+        "critical": 2,
+        "normal": 1,
+        "light": 0
+      },
+      "rounds": {
+        "approach_at": 3,
+        "max": 4,
+        "approach_lens": "approach"
+      },
       "findings": false,
       "state_line": false
     }
@@ -1355,7 +1445,13 @@
       ],
       "section": false
     },
-    { "name": "empty body", "group": "mention", "body": "", "findings": [], "section": false },
+    {
+      "name": "empty body",
+      "group": "mention",
+      "body": "",
+      "findings": [],
+      "section": false
+    },
     {
       "name": "a quote in a finding",
       "group": "named",
@@ -1369,13 +1465,36 @@
       "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmajor: it's \"racy\" \\ x",
       "findings": [["major", "major: it's \"racy\" \\ x"]],
       "section": false
+    },
+    {
+      "name": "a number reference past 4,300 digits reads as its value",
+      "group": "finding",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nma&#00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000106;or: the cache is wrong",
+      "findings": [["major", "major: the cache is wrong"]],
+      "section": true
+    },
+    {
+      "name": "a number reference past 4,300 digits and past Unicode reads as U+FFFD",
+      "group": "clean",
+      "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none &#99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;",
+      "findings": [],
+      "section": true
     }
   ],
   "scans": [
-    { "name": "a pull request with no comments", "posts": [], "history": [], "entries": {} },
+    {
+      "name": "a pull request with no comments",
+      "posts": [],
+      "history": [],
+      "entries": {}
+    },
     {
       "name": "a comment that is no lens report",
-      "posts": [{ "body": "Thanks, merging after CI." }],
+      "posts": [
+        {
+          "body": "Thanks, merging after CI."
+        }
+      ],
       "history": [],
       "entries": {}
     },
@@ -1387,7 +1506,9 @@
         }
       ],
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
-      "entries": { "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null] }
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
     },
     {
       "name": "the same comment read twice",
@@ -1403,7 +1524,9 @@
         ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
       ],
-      "entries": { "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null] }
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
     },
     {
       "name": "a newer round replaces the older entry and both stay in the history",
@@ -1419,7 +1542,9 @@
         ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         ["code r2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
       ],
-      "entries": { "code": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null] }
+      "entries": {
+        "code": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null]
+      }
     },
     {
       "name": "an edited comment reads nothing and still counts in the history",
@@ -1436,7 +1561,9 @@
         ["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         ["code r2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
       ],
-      "entries": { "code": [null, "edited after posting: post a new comment instead"] }
+      "entries": {
+        "code": [null, "edited after posting: post a new comment instead"]
+      }
     },
     {
       "name": "a hidden comment reads nothing and still counts in the history",
@@ -1447,15 +1574,21 @@
         }
       ],
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
-      "entries": { "code": [null, "hidden: post a new comment instead"] }
+      "entries": {
+        "code": [null, "hidden: post a new comment instead"]
+      }
     },
     {
       "name": "a short sha is kept as written",
       "posts": [
-        { "body": "lens: code · reviewer: x · read at: abcdef1\nblocker: none\nmajor: none" }
+        {
+          "body": "lens: code · reviewer: x · read at: abcdef1\nblocker: none\nmajor: none"
+        }
       ],
       "history": [["code", "abcdef1"]],
-      "entries": { "code": ["abcdef1", null] }
+      "entries": {
+        "code": ["abcdef1", null]
+      }
     },
     {
       "name": "an upper-case sha is read lower-case",
@@ -1465,7 +1598,9 @@
         }
       ],
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
-      "entries": { "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null] }
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
     },
     {
       "name": "an old report from before findings were read",
@@ -1475,7 +1610,9 @@
         }
       ],
       "history": [["correctness", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
-      "entries": { "correctness": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null] }
+      "entries": {
+        "correctness": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
     },
     {
       "name": "old header forms",
@@ -1526,9 +1663,282 @@
     },
     {
       "name": "prose that names a lens is no header",
-      "posts": [{ "body": "The code lens found nothing to fix." }],
+      "posts": [
+        {
+          "body": "The code lens found nothing to fix."
+        }
+      ],
       "history": [],
       "entries": {}
+    },
+    {
+      "name": "a second lens header quoted under a valid one reads nothing; the older read stays",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n> lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [["code", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]],
+      "entries": {
+        "code": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a second lens header in a code fence under a valid one reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\n```\nlens: data · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n```"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a second lens header as a plain later line reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nlens: data · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a loose second lens line with a sha under a valid header reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nlens — data, reviewed at 1234567abc"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a lens field with a sha in prose and no header reads nothing",
+      "posts": [
+        {
+          "body": "Notes from the run.\nsee lens: data at commit 1234567abc"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line (a lens line with a sha not written `read at: <sha>`), starts with 'Notes from the run.')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "no header but a later read at reads nothing",
+      "posts": [
+        {
+          "body": "It's done.\nread at: 1234567"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with \"It's done.\")": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a first-line header that names only a round reads nothing",
+      "posts": [
+        {
+          "body": "lens: r2 · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, its first-line header names no lens (a placeholder, a round or nothing), starts with 'lens: r2 · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a first-line header with a placeholder name reads nothing",
+      "posts": [
+        {
+          "body": "lens: <name> · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, its first-line header names no lens (a placeholder, a round or nothing), starts with 'lens: <name> · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a lens header that is not the first line reads nothing",
+      "posts": [
+        {
+          "body": "Some prose first.\nlens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line that is not its first plain line (a later line, a code block, quote or table), starts with 'Some prose first.')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "not a lens with an unquoted read at reads nothing",
+      "posts": [
+        {
+          "body": "not a lens: fixes for round 2\nread at: 1234567"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote, starts with 'not a lens: fixes for round 2')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "not a lens with the read quoted is no lens comment",
+      "posts": [
+        {
+          "body": "not a lens: fixes for round 2\n> read at: 1234567"
+        }
+      ],
+      "history": [],
+      "entries": {}
+    },
+    {
+      "name": "headerless covered and checks fields read nothing",
+      "posts": [
+        {
+          "body": "Review done.\ncovered: the gate\nchecks: tests"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with 'Review done.')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "safe to merge in prose reads nothing, its start cut at 60 characters",
+      "posts": [
+        {
+          "body": "🎉 Looked through every changed file again today and I think this one is safe to merge."
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '🎉 Looked through every changed file again today and I think ')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a heading naming a lens near the top reads nothing",
+      "posts": [
+        {
+          "body": "## Code lens\nAll fine."
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with '## Code lens')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an override comment that looks like a report is never one",
+      "posts": [
+        {
+          "body": "override for head 1234567890123456789012345678901234567890: read at: 1234567, safe to merge"
+        }
+      ],
+      "history": [],
+      "entries": {}
+    },
+    {
+      "name": "a hidden post that reads nothing says it is hidden",
+      "posts": [
+        {
+          "body": "It's done.\nread at: 1234567",
+          "hidden": true
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, starts with \"It's done.\", hidden)": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a correct new post does not clear a post that reads nothing",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nlens: data · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, holds a lens header line 2 times (post one comment per lens), starts with 'lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ],
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      }
+    },
+    {
+      "name": "a first line that reads two ways reads nothing",
+      "posts": [
+        {
+          "body": "lens: [a [b](c) · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, its first line reads as a different lens header, or as one and as none, depending on how its HTML tags and links are read; starts with 'lens: [a [b](c) · reviewer: x · read at: aaaaaaaaaaaaaaaaaaa')": [
+          null,
+          null
+        ]
+      }
     }
   ],
   "rounds": [
@@ -1871,7 +2281,9 @@
       "name": "a loose comment under an agents override is judged by its lines",
       "config": "basic",
       "history": [],
-      "reports": { "x": ["loose", "major: still racy"] },
+      "reports": {
+        "x": ["loose", "major: still racy"]
+      },
       "expect": {
         "round": 0,
         "approach": false,
@@ -1887,7 +2299,9 @@
       "name": "a loose comment needs no section",
       "config": "basic",
       "history": [],
-      "reports": { "x": ["loose", "fixed it"] },
+      "reports": {
+        "x": ["loose", "fixed it"]
+      },
       "expect": {
         "round": 0,
         "approach": false,
@@ -1901,7 +2315,9 @@
       "name": "a cleared entry is not judged",
       "config": "basic",
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
-      "reports": { "code": ["cleared", "blocker: x"] },
+      "reports": {
+        "code": ["cleared", "blocker: x"]
+      },
       "expect": {
         "round": 1,
         "approach": false,
@@ -1915,7 +2331,9 @@
       "name": "findings false judges no finding",
       "config": "basic",
       "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
-      "reports": { "code": ["report", "blocker: x"] },
+      "reports": {
+        "code": ["report", "blocker: x"]
+      },
       "findings": false,
       "expect": {
         "round": 1,
@@ -2086,7 +2504,9 @@
         ["code", "dddddddddddddddddddddddddddddddddddddddd"],
         ["code", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]
       ],
-      "reports": { "code": ["cleared", ""] },
+      "reports": {
+        "code": ["cleared", ""]
+      },
       "decided": true,
       "override_authors": ["a-person"],
       "expect": {

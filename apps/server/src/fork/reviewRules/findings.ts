@@ -121,18 +121,24 @@ function read(lines: ReadonlyArray<string>, narrow: boolean): Read {
         continue;
       }
       if (TABLE_RULE_RE.test(strip(raw))) continue;
+      // Once per row: per cell, a wide row took minutes. after[j]: the first non-empty cell after cell j.
+      const row = plain(raw, narrow);
+      const after: string[] = Array.from({ length: cells.length });
+      let said = "";
+      for (let j = cells.length - 1; j >= 0; j--) {
+        after[j] = said;
+        said = cells[j] || said;
+      }
       for (const [j, c] of cells.entries()) {
         const m = CELL_RE.exec(c);
         const kind = m && kindOf(m);
         if (kind && blocking(kind)) {
           seen.add(kind);
-          if (!saysNothing(cells.slice(j + 1).find(Boolean) ?? ""))
-            out.push([i, kind, plain(raw, narrow)]);
+          if (!saysNothing(after[j]!)) out.push([i, kind, row]);
         }
       }
       for (const [j, kind] of columns ?? []) {
-        if (blocking(kind) && j < cells.length && !saysNothing(cells[j]!))
-          out.push([i, kind, plain(raw, narrow)]);
+        if (blocking(kind) && j < cells.length && !saysNothing(cells[j]!)) out.push([i, kind, row]);
       }
       continue;
     }

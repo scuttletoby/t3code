@@ -201,7 +201,7 @@ class Findings(unittest.TestCase):
 
     def test_each_rule_keeps_its_vectors(self):   # a vector dropped from the file is a rule no longer shown
         sizes = {g: len(group(g)) for g in ('finding', 'clean', 'section', 'one-kind', 'one-label', 'mention')}
-        self.assertEqual(sizes, {'finding': 57, 'clean': 36, 'section': 9, 'one-kind': 9, 'one-label': 4,
+        self.assertEqual(sizes, {'finding': 58, 'clean': 37, 'section': 9, 'one-kind': 9, 'one-label': 4,
                                  'mention': 8})
 
     def test_each_real_finding_format_counts(self):
@@ -235,6 +235,15 @@ class Findings(unittest.TestCase):
             with self.subTest(line[:12]):
                 start = time.monotonic()
                 rj.read_findings(HEAD + line)
+                self.assertLess(time.monotonic() - start, 2)
+
+    def test_a_wide_table_row_takes_linear_time(self):   # the old per-cell read: 13 s at 4,000 cells, minutes at 65,536 chars
+        for text in ('| ' + 'major | ' * 8_000, '| ' + 'major | ' * 4_000 + 'x | ' * 4_000,
+                     '| ' + 'major | ' * 3_000 + '\n|' + '---|' * 3_000 + '\n| ' + 'x | ' * 3_000,
+                     '| major |' + ' |' * 30_000 + ' x |', '|' + '---|' * 16_000 + 'x'):
+            with self.subTest(text[:12]):   # each about one full-size comment (65,536 characters): 0.2-0.5 s here
+                start = time.monotonic()
+                rj.read_findings(HEAD + text)
                 self.assertLess(time.monotonic() - start, 2)
 
     def test_a_table_does_not_go_on_past_a_fence(self):   # a fence ends the table, as GitHub renders it
@@ -350,13 +359,13 @@ class Rounds(unittest.TestCase):
 
 # Every section of review.vectors.json, replayed whole: the TypeScript side (apps/server/src/reviewRules) runs the same
 # sections, and each side fails on a section or a vector field it does not run, so neither can skip one quietly.
-SECTIONS = {'about', 'config_path', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds'}
+SECTIONS = {'about', 'config_path', 'override_prefix', 'globs', 'configs', 'cases', 'findings', 'scans', 'rounds'}
 FIELDS = {'cases': {'name', 'config', 'changes', 'weight', 'lenses', 'hits', 'protected'},
           'findings': {'name', 'group', 'body', 'findings', 'section'},
           'scans': {'name', 'posts', 'history', 'entries'},
           'rounds': {'name', 'config', 'history', 'reports', 'decided', 'changes', 'override_authors', 'findings',
                      'expect'}}
-SCAN = lens.Review((), 'override for head', 'OWNER', ('OWNER',))
+SCAN = lens.Review((), VECTORS['override_prefix'], 'OWNER', ('OWNER',))
 
 
 def scan(posts):
@@ -388,7 +397,7 @@ class SharedVectors(unittest.TestCase):
                 self.assertLessEqual(set(v), fields, f'{section}: {v["name"]}')
 
     def test_every_scan(self):   # same comment twice, edited, hidden, old forms, no comment at all
-        self.assertGreaterEqual(len(VECTORS['scans']), 13)
+        self.assertGreaterEqual(len(VECTORS['scans']), 31)
         for v in VECTORS['scans']:
             with self.subTest(v['name']):
                 self.assertEqual(scan(v['posts']), (v['history'], v['entries']))
