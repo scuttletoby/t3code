@@ -171,16 +171,26 @@ function readList(text) {
     .map((line) => line.replace(/#.*/, "").trim())
     .filter(Boolean)
     .map((line) => {
-      const match = line.match(/^(\S+)(?:\s+~([1-9]\d{0,4})s|\s+run by\s+(\S+))?$/);
+      const match = line.match(
+        /^(\S+)(?:\s+~([1-9]\d{0,4})s|\s+run by\s+(\S+))?(\s+ok lines)?$/,
+      );
       if (!match)
         throw new Error(
-          `${LIST}: cannot read "${line}" (expected "<test>", "<test> ~<seconds>s" or "<test> run by <file>")`,
+          `${LIST}: cannot read "${line}" (expected "<test>", "<test> ~<seconds>s" or "<test> run by <file>", ` +
+            `each optionally ending in "ok lines")`,
+        );
+      // Only a Python test has two formats (countTests()): unittest unless it says "ok lines".
+      if (match[4] && !match[1].endsWith(".py"))
+        throw new Error(
+          `${LIST}: "${line}": only a Python test says "ok lines" (a shell test always prints them, a node test ` +
+            `never does)`,
         );
       return {
         file: match[1],
         // `./a/b` and `a//b` name the same file as `a/b`, so every reader compares one spelling.
         runBy: match[3] ? path.posix.normalize(match[3]) : null,
         weight: match[2] ? Number(match[2]) : null,
+        format: match[1].endsWith(".py") ? (match[4] ? "ok lines" : "unittest") : null,
       };
     });
 }
@@ -427,11 +437,23 @@ function expectedKeys(entries, present, read) {
 const OK_LINES_END = /^all passed: (\d+) ok, (\d+) skipped$/;
 const OK_LINES_FORM = '"all passed: <n> ok, <n> skipped"';
 
-// What a test ran, { format, tests, skipped, names (skipped, by name), failed, note }, or null (no count); tests null:
-// none known to have run (`note` says why). `lines`: its counter's lines (readCounts()). Python: fork-ci-unittest.py's
-// plan, then counts, per unittest run (a plan without counts: a hard exit). node: fork-ci-node-counts.cjs's one line.
-// Else stdout's `ok`, `FAIL` and `skip <name>` lines, which must end in OK_LINES_FORM with the same counts.
-function countTests(file, stdout, stderr, lines = []) {
+// The line fork-ci-unittest.py writes when the test file has ended: the tests its source defines that no run planned.
+const isEnd = (u) =>
+  Boolean(u) &&
+  Object.keys(u).length === 1 &&
+  Array.isArray(u.unloaded) &&
+  u.unloaded.every((n) => typeof n === "string" && TEST_NAME.test(n));
+
+// What a test ran, { format, tests, skipped, names (skipped, by name), unloaded, failed, note }, or null (no count);
+// tests null: none known to have run (`note` says why). `lines`: its counter's lines (readCounts()). `how`: the
+// Python test's format as the list declares it (readList(): unittest unless "ok lines") and its own run's class.
+// Python, unittest: fork-ci-unittest.py's plan, then counts, per unittest run (a plan without counts: a hard exit),
+// then its end line (none: a hard exit; no line at all: one before its first run, as it loads). A test the file
+// defines that no run planned (the end line's `unloaded`; in an own run of one class, that class's) counts as skipped,
+// by name. node: fork-ci-node-counts.cjs's one line. Else (sh; Python that says "ok lines", whose shim lines are only
+// its end line, naming no test) stdout's `ok`, `FAIL` and `skip <name>` lines, which must end in OK_LINES_FORM with
+// the same counts.
+function countTests(file, stdout, stderr, lines = [], how = {}) {
   const ext = file.match(TEST_FILE)?.[1];
   const whole = (n) => Number.isInteger(n) && n >= 0;
   const none = (format, note) => ({
@@ -439,13 +461,37 @@ function countTests(file, stdout, stderr, lines = []) {
     tests: null,
     skipped: null,
     names: [],
+    unloaded: [],
     failed: null,
     note,
   });
-  if (ext === "py" && lines.length) {
+  const format = ext === "py" ? (how.format ?? "unittest") : null;
+  const shimEnd = ext === "py" && isEnd(lines.at(-1)) ? lines.at(-1) : null;
+  if (format === "ok lines") {
+    if (lines.length !== 1 || !shimEnd)
+      return none(
+        "ok lines",
+        lines.length === 0
+          ? "it stopped before its end (a hard exit: fork-ci-unittest.py wrote no end line)"
+          : `${LIST} says it prints ok lines, but it ran unittest: remove "ok lines" there`,
+      );
+    if (shimEnd.unloaded.length)
+      return none(
+        "ok lines",
+        `${LIST} says it prints ok lines, but it defines unittest tests no run loaded ` +
+          `(${shimEnd.unloaded.slice(0, 5).join(", ")}): run them, or remove "ok lines" there`,
+      );
+  }
+  if (format === "unittest") {
+    if (lines.length === 0)
+      return none(
+        "unittest",
+        "fork-ci-unittest.py wrote no line: it stopped hard before its first unittest run (while it loads?) and " +
+          `never reached its end; a Python test that prints ok lines says "ok lines" in ${LIST}`,
+      );
     const runs = [];
     const open = [];
-    for (const u of lines) {
+    for (const u of shimEnd ? lines.slice(0, -1) : lines) {
       if (u && Object.keys(u).length === 1 && whole(u.plan)) open.push(u.plan);
       else if (
         u &&
@@ -464,12 +510,27 @@ function countTests(file, stdout, stderr, lines = []) {
         "unittest",
         `a unittest run of ${open.at(-1)} tests started but never ended (an exit before its end)`,
       );
-    const names = runs.flatMap((u) => u.skipped);
+    if (!shimEnd)
+      return none(
+        "unittest",
+        "its unittest runs ended, but the file never reached its end (a hard exit after them)",
+      );
+    if (runs.length === 0)
+      return none(
+        "unittest",
+        "it started no unittest run (an exit before unittest.main?); a Python test that prints ok lines says " +
+          `"ok lines" in ${LIST}`,
+      );
+    const unloaded = how.only
+      ? shimEnd.unloaded.filter((n) => n.startsWith(`${how.only}.`))
+      : shimEnd.unloaded;
+    const names = [...runs.flatMap((u) => u.skipped), ...unloaded];
     return {
       format: "unittest",
-      tests: runs.reduce((sum, u) => sum + u.tests, 0),
+      tests: runs.reduce((sum, u) => sum + u.tests, 0) + unloaded.length,
       skipped: names.length,
       names,
+      unloaded,
       failed: runs.reduce((sum, u) => sum + u.failed, 0),
       note: null,
     };
@@ -497,6 +558,7 @@ function countTests(file, stdout, stderr, lines = []) {
       tests: n.tests,
       skipped: n.skipped,
       names: [],
+      unloaded: [],
       failed: n.failed,
       note: null,
     };
@@ -522,6 +584,7 @@ function countTests(file, stdout, stderr, lines = []) {
     tests: note ? null : passed + failed + names.length,
     skipped: names.length,
     names,
+    unloaded: [],
     failed,
     note,
   };
@@ -550,9 +613,16 @@ function recordProblems(record) {
           `skip must name its test, once`,
       );
     const extra = [...new Set(skipped)].filter((test) => !allowed.includes(test));
+    const unloaded = extra.filter((test) => (record.unloaded ?? []).includes(test));
     if (extra.length)
       problems.push(
-        `${name} skipped ${extra.join(", ")}, which it does not declare: run ${extra.length > 1 ? "them" : "it"} ` +
+        `${name} skipped ${extra.join(", ")}, which it does not declare` +
+          (unloaded.length
+            ? ` (${unloaded.join(", ")}: defined in its source, but no unittest run loaded ` +
+              `${unloaded.length > 1 ? "them" : "it"}: a class defined only under a condition, or a load_tests ` +
+              `that leaves ${unloaded.length > 1 ? "them" : "it"} out?)`
+            : "") +
+          `: run ${extra.length > 1 ? "them" : "it"} ` +
           `(a switch the test declares in a ${RUN_FORM} line) or, if ${extra.length > 1 ? "they" : "it"} cannot ` +
           `run here, declare ${SKIP_FORM} for each (a part run only)`,
       );
@@ -567,8 +637,12 @@ function recordProblems(record) {
 }
 
 // `allowed`: the tests the run may and must skip, from the test's declarations (the plan), never from what ran.
-function record(key, file, run, result, allowed) {
-  const counts = countTests(file, result.stdout ?? "", result.stderr ?? "", result.unittest ?? []);
+// `format`: a Python test's, as the list declares it (readList(); none: unittest).
+function record(key, file, run, result, allowed, format = null) {
+  const counts = countTests(file, result.stdout ?? "", result.stderr ?? "", result.unittest ?? [], {
+    format,
+    only: run?.only ?? null,
+  });
   return {
     key,
     test: file,
@@ -582,6 +656,8 @@ function record(key, file, run, result, allowed) {
     tests: counts?.tests ?? null,
     skipped: counts?.skipped ?? null,
     skipped_tests: counts?.names ?? [],
+    // Of those, the tests the file defines that it never loaded (no run planned them).
+    unloaded: counts?.unloaded ?? [],
     failed: counts?.failed ?? null,
     note: counts?.note ?? null,
     allowed: [...allowed].toSorted(),
@@ -839,7 +915,7 @@ async function runOwn(args, { runTest: run = runTest } = {}) {
   const results = [];
   for (const how of own.runs) {
     const result = await run(file, how);
-    results.push(record(runKey(file, how), file, how, result, []));
+    results.push(record(runKey(file, how), file, how, result, [], entry.format));
   }
   let failed = results.filter((r) => r.status !== 0).length;
   if (to) {
@@ -914,8 +990,16 @@ async function main(
   const stale = judged.stale.map(({ note }) => note);
   failed += judged.failed.length + stale.length;
   if (to) {
+    const format = new Map(entries.map((entry) => [entry.file, entry.format]));
     const records = runs.map((r) =>
-      record(runKey(r.file), r.file, null, r, declared.get(r.file)?.skips ?? []),
+      record(
+        runKey(r.file),
+        r.file,
+        null,
+        r,
+        declared.get(r.file)?.skips ?? [],
+        format.get(r.file),
+      ),
     );
     // A failed test has its error already; the others' problems fail the part here, before fork-ci-result.
     for (const r of records.filter((each) => each.status === 0))

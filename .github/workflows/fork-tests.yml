@@ -428,6 +428,15 @@ jobs:
           if ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
+      # fork-fleet-refresh.test.py runs the refresh service's sandbox for real, as a transient unit of the runner
+      # user's systemd manager. Ubuntu 24.04's AppArmor keeps unprivileged user namespaces from that manager, so it
+      # would apply no sandbox and the test would skip (red: no test of it may skip). Allowed here, so the test runs
+      # whatever the runner image's default; a kernel without the switch has no such restriction.
+      - name: Let the user manager apply a services sandbox
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Fork script tests
         env:
           FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records

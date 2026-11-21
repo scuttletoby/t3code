@@ -207,11 +207,25 @@ test("the list ignores comments and blank lines and reads `run by` and weights",
   assert.deepEqual(
     readList("# head\n\na.test.sh  # from #2\n  b.test.py run by c.yml\nd.test.cjs ~120s\n"),
     [
-      { file: "a.test.sh", runBy: null, weight: null },
-      { file: "b.test.py", runBy: "c.yml", weight: null },
-      { file: "d.test.cjs", runBy: null, weight: 120 },
+      { file: "a.test.sh", runBy: null, weight: null, format: null },
+      { file: "b.test.py", runBy: "c.yml", weight: null, format: "unittest" },
+      { file: "d.test.cjs", runBy: null, weight: 120, format: null },
     ],
   );
+  // A Python test is a unittest test unless it says it prints ok lines, after any other word.
+  assert.deepEqual(
+    readList(
+      "e.test.py ok lines\nf.test.py ~40s ok lines\ng.test.py run by c.yml ok lines\nh.test.py ~40s\n",
+    ).map((e) => [e.file, e.weight, e.runBy, e.format]),
+    [
+      ["e.test.py", null, null, "ok lines"],
+      ["f.test.py", 40, null, "ok lines"],
+      ["g.test.py", null, "c.yml", "ok lines"],
+      ["h.test.py", 40, null, "unittest"],
+    ],
+  );
+  for (const other of ["a.test.sh ok lines", "a.test.cjs ~20s ok lines"])
+    assert.throws(() => readList(`${other}\n`), /only a Python test says "ok lines"/, other);
   // One spelling of a runner's path, so `./a/b` and `a//b` compare equal to `a/b` wherever the list is read.
   assert.deepEqual(
     readList(
@@ -225,6 +239,9 @@ test("the list ignores comments and blank lines and reads `run by` and weights",
     "a.test.sh ~12",
     "a.test.sh ~1.5s",
     "a.test.sh ~12s run by c.yml",
+    "a.test.py ok lines ~12s",
+    "a.test.py oklines",
+    "a.test.py ok lines ok lines",
   ])
     assert.throws(() => readList(`${bad}\n`), /cannot read/, bad);
 });
@@ -845,29 +862,73 @@ test("countTests reads fork-ci-unittest.py's plan and count lines, node's report
   const py = "fork-ci/a.test.py";
   const line = (tests, skipped = [], failed = 0) => ({ tests, skipped, failed });
   const plan = (n) => ({ plan: n });
-  assert.deepEqual(countTests(py, "", "", [plan(3), line(3, ["T.test_b"])]), {
+  // The shim's last line, when the file ended: the tests its source defines that no run planned.
+  const end = (...unloaded) => ({ unloaded });
+  assert.deepEqual(countTests(py, "", "", [plan(3), line(3, ["T.test_b"]), end()]), {
     format: "unittest",
     tests: 3,
     skipped: 1,
     names: ["T.test_b"],
+    unloaded: [],
     failed: 0,
     note: null,
   });
   // Two unittest runs in one test (two TextTestRunner runs, one after the other or one inside the other): summed.
   for (const lines of [
-    [plan(2), line(2, [], 1), plan(4), line(4, ["U.test_x", "U.test_y"], 2)],
-    [plan(4), plan(2), line(2, [], 1), line(4, ["U.test_x", "U.test_y"], 2)],
+    [plan(2), line(2, [], 1), plan(4), line(4, ["U.test_x", "U.test_y"], 2), end()],
+    [plan(4), plan(2), line(2, [], 1), line(4, ["U.test_x", "U.test_y"], 2), end()],
   ])
     assert.deepEqual(countTests(py, "", "", lines), {
       format: "unittest",
       tests: 6,
       skipped: 2,
       names: ["U.test_x", "U.test_y"],
+      unloaded: [],
       failed: 3,
       note: null,
     });
+  // A test its source defines that no run planned (a class only under a condition, a load_tests that drops it) is a
+  // skip by its name; an own run of one class counts only that class's.
+  assert.deepEqual(
+    countTests(py, "", "", [plan(2), line(2), end("Tool.test_a", "Tool.test_b")]),
+    {
+      format: "unittest",
+      tests: 4,
+      skipped: 2,
+      names: ["Tool.test_a", "Tool.test_b"],
+      unloaded: ["Tool.test_a", "Tool.test_b"],
+      failed: 0,
+      note: null,
+    },
+  );
+  const only = countTests(py, "", "", [plan(1), line(1), end("Tool.test_a", "L.test_b")], {
+    only: "L",
+  });
+  assert.deepEqual([only.tests, only.names, only.unloaded], [2, ["L.test_b"], ["L.test_b"]]);
+  // A hard stop before the first plan (at import, while it loads): no line at all, whatever its stdout says (a
+  // child's ok lines and end line). Not an ok-lines test unless the list says so.
+  for (const how of [{}, { format: "unittest" }]) {
+    const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", [], how);
+    assert.deepEqual([counted.format, counted.tests], ["unittest", null]);
+    assert.match(counted.note, /wrote no line: it stopped hard before its first unittest run/);
+  }
+  // Its runs ended, then a hard stop before the file's end; or the file ended without a run (sys.exit at import).
+  for (const [lines, note] of [
+    [[plan(2), line(2)], /runs ended, but the file never reached its end/],
+    [[end()], /started no unittest run/],
+    [[end("T.test_a")], /started no unittest run/],
+  ]) {
+    const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", lines);
+    assert.deepEqual([counted.format, counted.tests], ["unittest", null], JSON.stringify(lines));
+    assert.match(counted.note, note);
+  }
   // A hard exit (os._exit, a signal) after the plan: nothing counts, whatever ok lines its stdout has.
-  for (const lines of [[plan(4)], [plan(2), line(2), plan(3)], [plan(4), plan(2), line(2)]]) {
+  for (const lines of [
+    [plan(4)],
+    [plan(2), line(2), plan(3)],
+    [plan(4), plan(2), line(2)],
+    [plan(4), end()],
+  ]) {
     const counted = countTests(py, "ok child\nall passed: 1 ok, 0 skipped\n", "", lines);
     assert.equal(counted.format, "unittest");
     assert.equal(counted.tests, null);
@@ -879,8 +940,12 @@ test("countTests reads fork-ci-unittest.py's plan and count lines, node's report
   assert.equal(countTests(py, "", "", [plan(3), line(2)]), null);
   assert.equal(countTests(py, "", "", [plan(2), { tests: 2, skipped: 1, failed: 0 }]), null);
   assert.equal(countTests(py, "", "", [{ plan: 2, tests: 2 }, line(2)]), null);
+  assert.equal(countTests(py, "", "", [plan(2), line(2), end(), end()]), null);
+  assert.equal(countTests(py, "", "", [end(), plan(2), line(2)]), null);
+  assert.equal(countTests(py, "", "", [plan(2), line(2), { unloaded: [1] }]), null);
+  assert.equal(countTests(py, "", "", [plan(2), line(2), { unloaded: [], more: 1 }]), null);
   // unittest's own summary is never read (a class skip counts once there; stderr may go on after it).
-  assert.equal(countTests(py, "", "Ran 3 tests in 0.01s\n\nOK (skipped=1)\n", []), null);
+  assert.equal(countTests(py, "", "Ran 3 tests in 0.01s\n\nOK (skipped=1)\n", []).tests, null);
   const js = "fork-ci/a.test.cjs";
   const node = (tests, more = {}) => ({
     tests,
@@ -896,6 +961,7 @@ test("countTests reads fork-ci-unittest.py's plan and count lines, node's report
     tests: 4,
     skipped: 2,
     names: [],
+    unloaded: [],
     failed: 1,
     note: null,
   });
@@ -924,6 +990,7 @@ test("countTests reads fork-ci-unittest.py's plan and count lines, node's report
     tests: 2,
     skipped: 0,
     names: [],
+    unloaded: [],
     failed: 1,
     note: null,
   });
@@ -934,12 +1001,27 @@ test("countTests reads fork-ci-unittest.py's plan and count lines, node's report
       tests: 2,
       skipped: 1,
       names: ["net"],
+      unloaded: [],
       failed: 0,
       note: null,
     },
   );
-  // A Python test without unittest lines is read by its ok lines.
-  assert.equal(countTests(py, "ok one\nall passed: 1 ok, 0 skipped\n", "", []).tests, 1);
+  // A Python test the list says prints ok lines is read by them: its shim's only line is its end, naming no test.
+  const okLines = { format: "ok lines" };
+  assert.deepEqual(
+    countTests(py, "ok one\nall passed: 1 ok, 0 skipped\n", "", [end()], okLines),
+    { format: "ok lines", tests: 1, skipped: 0, names: [], unloaded: [], failed: 0, note: null },
+  );
+  for (const [lines, note] of [
+    [[], /stopped before its end \(a hard exit/],
+    [[plan(1), line(1), end()], /says it prints ok lines, but it ran unittest/],
+    [[plan(1), end()], /says it prints ok lines, but it ran unittest/],
+    [[end("T.test_a")], /defines unittest tests no run loaded \(T\.test_a\)/],
+  ]) {
+    const counted = countTests(py, "ok one\nall passed: 1 ok, 0 skipped\n", "", lines, okLines);
+    assert.deepEqual([counted.format, counted.tests], ["ok lines", null], JSON.stringify(lines));
+    assert.match(counted.note, note);
+  }
   // Stopped before its end (an `exit 0` half-way), its end line not last, or a count that is not its lines'.
   for (const [out, note] of [
     ["ok one\n", /does not end in "all passed: <n> ok, <n> skipped", so it may have stopped/],
@@ -1154,7 +1236,11 @@ test("record keeps what a run was, what its output counted and the skips its tes
         seconds: "1.5",
         stdout: "",
         stderr: "Ran 2 tests in 0.1s\n\nOK\n",
-        unittest: [{ plan: 2 }, { tests: 2, skipped: ["L.test_x"], failed: 0 }],
+        unittest: [
+          { plan: 2 },
+          { tests: 2, skipped: ["L.test_x"], failed: 0 },
+          { unloaded: ["M.test_z", "L.test_y"] },
+        ],
       },
       ["L.test_y", "L.test_x"],
     ),
@@ -1168,13 +1254,25 @@ test("record keeps what a run was, what its output counted and the skips its tes
       status: 0,
       seconds: 1.5,
       format: "unittest",
-      tests: 2,
-      skipped: 1,
-      skipped_tests: ["L.test_x"],
+      tests: 3,
+      skipped: 2,
+      skipped_tests: ["L.test_x", "L.test_y"],
+      unloaded: ["L.test_y"],
       failed: 0,
       note: null,
       allowed: ["L.test_x", "L.test_y"],
     },
+  );
+  // A Python test's format is the list's (none given: unittest), so a hard stop as it loads is never read as ok lines.
+  const printed = { status: 0, seconds: "1", stdout: "ok a\nall passed: 1 ok, 0 skipped\n", unittest: [] };
+  assert.deepEqual(
+    [
+      record("p", "fork-ci/p.test.py", null, printed, []).tests,
+      record("p", "fork-ci/p.test.py", null, printed, [], "unittest").tests,
+      record("p", "fork-ci/p.test.py", null, { ...printed, unittest: [{ unloaded: [] }] }, [], "ok lines")
+        .tests,
+    ],
+    [null, null, 1],
   );
   const none = record("f", "fork-ci/f.test.sh", null, { status: 0, seconds: "0.1" }, ["b", "a"]);
   assert.deepEqual(
@@ -1801,9 +1899,10 @@ test("a part's owed list is its plan (its shard's tests), not what came back fro
   ]);
 });
 
-// One test file run as a listed part test, recording: [exit status, its record, the part's stdout].
-function recordOf(file, text, more = {}) {
-  const { run, records, cleanup } = runRecording({ [file]: text, ...more }, [], file);
+// One test file run as a listed part test, recording: [exit status, its record, the part's stdout]. `line`: its line
+// in the list.
+function recordOf(file, text, more = {}, line = file) {
+  const { run, records, cleanup } = runRecording({ [file]: text, ...more }, [], line);
   try {
     return [run.status, Object.values(readRecords(records))[0].results[0], run.stdout + run.stderr];
   } finally {
@@ -1863,6 +1962,162 @@ test("a Python test that exits hard after its plan counts nothing, even with a c
   assert.equal(status, 1, out);
   assert.deepEqual([r.format, r.tests], ["unittest", null]);
   assert.match(r.note, /a unittest run of 2 tests started but never ended/);
+});
+
+// A unittest file that stops before unittest.main: a child prints ok lines and a matching end line on the shared stdout.
+const STOPS_AS_IT_LOADS = (exit) =>
+  "import os, subprocess, sys, unittest\n" +
+  "subprocess.run([sys.executable, '-c', \"print('ok child'); print('all passed: 1 ok, 0 skipped')\"])\n" +
+  `${exit}\n` +
+  "class T(unittest.TestCase):\n" +
+  "    def test_a(self): pass\n" +
+  "unittest.main()\n";
+// An ok-lines Python test: its own lines and end line, no unittest.
+const OK_LINES_PY =
+  "print('ok one')\nprint('skip net no network here')\nprint('all passed: 1 ok, 1 skipped')\n";
+
+test("a Python test that stops before its first unittest run counts nothing, whatever ok lines its stdout has", () => {
+  const file = "fork-ci/h.test.py";
+  // A hard stop as it loads leaves no shim line at all; a soft one (sys.exit) its end line, with no run before it.
+  for (const [exit, note] of [
+    ["os._exit(0)", /wrote no line: it stopped hard before its first unittest run/],
+    ["sys.exit(0)", /started no unittest run/],
+  ]) {
+    const [status, r, out] = recordOf(file, STOPS_AS_IT_LOADS(exit));
+    assert.equal(status, 1, exit + out);
+    assert.deepEqual([r.format, r.tests], ["unittest", null], exit);
+    assert.match(r.note, note, exit);
+    assert.match(out, /ok child/, exit); // the child's lines were there to be misread
+  }
+  // Said to print ok lines, a hard stop leaves no end line from the shim either: nothing counts.
+  const [status, r] = recordOf(file, STOPS_AS_IT_LOADS("os._exit(0)"), {}, `${file} ok lines`);
+  assert.equal(status, 1);
+  assert.deepEqual([r.format, r.tests], ["ok lines", null]);
+  assert.match(r.note, /stopped before its end \(a hard exit/);
+});
+
+test("a Python test that prints ok lines is read by them only where the list says so", () => {
+  const file = "fork-ci/o.test.py";
+  const [status, r, out] = recordOf(
+    file,
+    "# fork-ci: may skip net\n" + OK_LINES_PY,
+    {},
+    `${file} ok lines`,
+  );
+  assert.equal(status, 0, out);
+  assert.deepEqual(
+    [r.format, r.tests, r.skipped_tests, r.note],
+    ["ok lines", 2, ["net"], null],
+  );
+  const [status2, r2] = recordOf(file, "# fork-ci: may skip net\n" + OK_LINES_PY);
+  assert.equal(status2, 1);
+  assert.deepEqual([r2.format, r2.tests], ["unittest", null]);
+  assert.match(r2.note, /started no unittest run .* says "ok lines" in \.github\/fork-ci-tests\.txt/);
+  // A unittest test said to print ok lines is refused too, not read by its ok lines.
+  const [status3, r3] = recordOf(file, SKIPPING_PY, {}, `${file} ok lines`);
+  assert.equal(status3, 1);
+  assert.match(r3.note, /says it prints ok lines, but it ran unittest/);
+  // An own run (`--run`) reads the same list line: an ok-lines Python test run whole by fork-tests.yml.
+  const plain = "print('ok one')\nprint('all passed: 1 ok, 0 skipped')\n";
+  for (const [line, status4, format] of [
+    [`${file} run by .github/workflows/fork-tests.yml ok lines`, 0, "ok lines"],
+    [`${file} run by .github/workflows/fork-tests.yml`, 1, "unittest"],
+  ]) {
+    const { run, records, cleanup } = runRecording({ [file]: plain }, ["--run", file], line);
+    try {
+      assert.equal(run.status, status4, line + run.stdout + run.stderr);
+      const r = Object.values(readRecords(records))[0].results[0];
+      assert.deepEqual([r.key, r.format, r.tests], [`${file} --run`, format, status4 ? null : 1]);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test("a test the file defines that no unittest run loaded is a skip by name: a class under a condition, load_tests", () => {
+  const file = "fork-ci/u.test.py";
+  const conditional =
+    "import shutil, unittest\n" +
+    "class Basic(unittest.TestCase):\n" +
+    "    def test_a(self): pass\n" +
+    "if shutil.which('no-such-tool-here'):\n" +
+    "    class Tool(unittest.TestCase):\n" +
+    "        def test_b(self): pass\n" +
+    "        def test_c(self): pass\n" +
+    // A mixin's and a base's tests run under their subclasses, a function outside a class is no test, and a class
+    // made in a function is not seen: none of these is unloaded.
+    "class Mixin:\n" +
+    "    def test_m(self): pass\n" +
+    "class WithMixin(Mixin, unittest.TestCase): pass\n" +
+    "class Base(unittest.TestCase):\n" +
+    "    def test_base(self): pass\n" +
+    "class Sub(Base): pass\n" +
+    "del Base\n" +
+    "def test_helper(): pass\n" +
+    "def make():\n" +
+    "    class Made(unittest.TestCase):\n" +
+    "        def test_never(self): pass\n" +
+    "unittest.main()\n";
+  const [status, r, out] = recordOf(file, conditional);
+  assert.equal(status, 1, out);
+  assert.deepEqual(
+    [r.format, r.tests, r.skipped, r.skipped_tests, r.unloaded],
+    ["unittest", 5, 2, ["Tool.test_b", "Tool.test_c"], ["Tool.test_b", "Tool.test_c"]],
+  );
+  assert.match(
+    out,
+    /skipped Tool\.test_b, Tool\.test_c, which it does not declare \(Tool\.test_b, Tool\.test_c: defined in its source, but no unittest run loaded them/,
+  );
+  // Declared, as any test that cannot run here: then it must not load, exactly as a declared skip must skip.
+  const declared =
+    "# fork-ci: may skip Tool.test_b\n# fork-ci: may skip Tool.test_c\n" + conditional;
+  assert.equal(recordOf(file, declared)[0], 0);
+  assert.equal(
+    recordOf(file, declared.replace("no-such-tool-here", "python3"))[0],
+    1,
+    "the tool there: the declared tests ran",
+  );
+  // A load_tests that leaves a test out.
+  const [status2, r2] = recordOf(
+    file,
+    "import unittest\n" +
+      "class T(unittest.TestCase):\n" +
+      "    def test_a(self): pass\n" +
+      "    def test_b(self): pass\n" +
+      "def load_tests(loader, tests, pattern):\n" +
+      "    return unittest.TestSuite([T('test_a')])\n" +
+      "unittest.main()\n",
+  );
+  assert.equal(status2, 1);
+  assert.deepEqual([r2.tests, r2.skipped_tests, r2.unloaded], [2, ["T.test_b"], ["T.test_b"]]);
+});
+
+test("an own run of one class counts that class's unloaded tests only", () => {
+  const file = "fork-ci/c.test.py";
+  const text = (cond) =>
+    "# fork-ci: run only L\n" +
+    "import unittest\n" +
+    "class L(unittest.TestCase):\n" +
+    "    def test_a(self): pass\n" +
+    `    if ${cond}:\n` +
+    "        def test_b(self): pass\n" +
+    "class M(unittest.TestCase):\n" +
+    "    def test_m(self): pass\n" +
+    "unittest.main()\n";
+  const list = `${file} run by .github/workflows/fork-tests.yml`;
+  for (const [cond, status, skipped] of [
+    ["True", 0, []],
+    ["False", 1, ["L.test_b"]],
+  ]) {
+    const { run, records, cleanup } = runRecording({ [file]: text(cond) }, ["--run", file], list);
+    try {
+      assert.equal(run.status, status, run.stdout + run.stderr);
+      const r = Object.values(readRecords(records))[0].results[0];
+      assert.deepEqual([r.key, r.skipped_tests], [`${file} --run only L`, skipped]);
+    } finally {
+      cleanup();
+    }
+  }
 });
 
 test("the shim counts an expected failure that passed as a failure, and names a loaded module's tests by module", () => {
