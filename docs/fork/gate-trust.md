@@ -58,8 +58,9 @@ check runs (`head_check_app`, [pr-queue](../../fork-ci/actions/pr-queue/README.m
   ([issue 83](https://github.com/scuttletoby/t3code/issues/83)). The gate is not affected: it runs on
   a GitHub-hosted runner and fetches into a new bare repository each run.
 - **The host.** The gate keeps its own key off every machine. The agent Apps' keys, their token cache
-  and the `gh` tool on the agent machine are a separate part (the host install kit, not in the fork
-  yet). Until it lands, an agent can read those keys.
+  and the `gh` tool on the agent machine are a separate part: the host install kit,
+  [`fork-kit/gh-apps`](../../fork-kit/gh-apps/README.md). Until the owner installs it on the agent
+  machine and makes new keys (steps 4 and 5), an agent can read those keys.
 
 ## What an agent can still do
 
@@ -101,7 +102,7 @@ agent sees (not a terminal an agent can read).
 | `PATH_TO_DOWNLOADED_KEY`   | the `.pem` file the App's page downloaded                                                 |
 | `POLICY_ID`                | step 3 on an existing Environment: the id of a deployment rule to delete                  |
 | `FORK_OWNER/FORK`          | step 4: the fork that ships the host install kit                                          |
-| `RELEASE_SHA`, `KIT_PATH`  | step 4: the kit's release commit and its folder in the fork                               |
+| `RELEASE_SHA`              | step 4: a release commit of the kit (on the fork's protected `ci-release` branch)         |
 | `AGENT_USER`               | step 4: the system user the agents run as                                                 |
 | `APP_NAME`, `AGENT_APP_ID` | step 5: an agent App's name and its App ID                                                |
 
@@ -151,22 +152,26 @@ Then delete the downloaded `.pem`. Keep no repository or organisation secret nam
 `HEAD_GATE_APP_KEY`. Then add the caller workflow on the default branch and dispatch it once without a
 number (the backfill), as the README's setup says.
 
-**4. Host install** (as root; not available yet). The host install kit is not in the fork yet. Its
-planned shape, which the kit's pull request fixes exactly. The first line deletes a file an earlier
-try left, and `&&` stops the chain at the first failure, so a failed download never runs an older
-script:
+**4. Host install** (as root, in a shell no agent sees; Linux only for now). The kit is
+`fork-kit/gh-apps`; its [README](../../fork-kit/gh-apps/README.md) has the details and the upgrade
+and removal steps. `RELEASE_SHA` must be a commit on the fork's protected `ci-release` branch; the
+bootstrap refuses any other. The first line deletes a file an earlier try left, and `&&` stops the
+chain at the first failure, so a failed download never runs an older script:
 
 ```sh
 rm -f /root/gh-apps-bootstrap.sh &&
-curl -fsSL https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/KIT_PATH/bootstrap.sh -o /root/gh-apps-bootstrap.sh &&
+curl -fsSL https://raw.githubusercontent.com/FORK_OWNER/FORK/RELEASE_SHA/fork-kit/gh-apps/bootstrap.sh -o /root/gh-apps-bootstrap.sh &&
 sh /root/gh-apps-bootstrap.sh --repo FORK_OWNER/FORK --sha RELEASE_SHA --agent-user AGENT_USER
 ```
 
-It is to print the sha and file hashes it installed; compare the sha with the release page.
+It prints the sha, the hash of the download and of every installed file; compare the sha with the
+release. Add `--gh-path /path/to/gh` if `gh` is not `/usr/bin/gh`.
 
-**5. New agent App keys** (as root; not available yet, comes with step 4). Keys an agent could ever
-read count as leaked: per agent App, in the browser, generate a new key and delete the old one. Then
-once per App, with the key text on stdin, and delete the download:
+**5. New agent App keys** (as root, after step 4). Keys an agent could ever read count as leaked:
+per agent App, in the browser, generate a new key and delete the old one. The install does not
+import key files an agent kept in its own home folder; it only reports them (the kit's README, "Old
+copies"): delete them once the new keys work. Then once per App, with the key text on stdin, and
+delete the download:
 
 ```sh
 gh-apps-admin add-key APP_NAME --app-id AGENT_APP_ID --repo OWNER/REPO < PATH_TO_DOWNLOADED_KEY
