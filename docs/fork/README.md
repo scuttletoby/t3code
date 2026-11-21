@@ -345,7 +345,9 @@ effort, and one that holds no effort name (`{effort: true}`, which runs the driv
 refused. A pick that leaves the ultracode option out runs at the model's default for it, so a model
 whose catalog default is ultracode reads as ultracode. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
 own claim and is not read), every row naming the model must allow it (the refusal names the drivers
-whose rows refuse it), and every driver's effort option is read. In `enforce` a pick outside is refused with the rows; in
+whose rows refuse it), and every built-in driver's effort option is read, plus the reasoning control
+this machine's own catalog marks for the model, when it has the model (so an ACP model's own id is
+read; a model this machine does not have is read with the fixed ids only). In `enforce` a pick outside is refused with the rows; in
 `advise` it runs, and `delegate_task`'s reply says what `enforce` would refuse (the other routes
 only log it). A pick inside gets its row's `useFor` in `delegate_task`'s reply. Each checked pick is
 logged as "model policy pick" with its model as asked, so one model's picks can be counted; the
@@ -388,7 +390,9 @@ In the app: **Settings → Fork**, section Model policy (server only; a project 
 mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a save is. An unreadable
 value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
 then starts from the value's own rows and saves only once the person picks the mode, so a save never
-turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged. With no
+turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged, and so is
+a row whose model is an alias in its driver's model lists (`opus`): the driver resolves an alias
+through the catalog, so the row would follow it when a provider moves it to a new model (#127). With no
 rows saved, **Edit allowed models** starts from the fork's start rows (#126: `claude-opus-5-5` and
 `claude-fable-5-2`, each `medium`, `high` or `xhigh`, default `high`), saved only when the person
 saves them; they are not the setting's default, so a file without rows keeps meaning none.

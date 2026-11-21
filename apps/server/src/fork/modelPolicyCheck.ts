@@ -7,6 +7,7 @@
 import {
   checkModelPolicyPick,
   type ModelPolicy,
+  modelPolicyAliasTargets,
   type ModelPolicyPick,
   modelPolicyPickEfforts,
   modelPolicyRowsText,
@@ -127,17 +128,8 @@ const aliasTarget = (
   lists: ReadonlyArray<ServerProvider["models"]>,
   model: string,
 ): string | undefined => {
-  if (lists.some((list) => list.some((candidate) => candidate.slug === model))) return undefined;
-  const slugs = new Set(
-    lists.flatMap((list) =>
-      list
-        .filter((candidate) =>
-          candidate.aliases?.some((alias) => alias.toLowerCase() === model.toLowerCase()),
-        )
-        .map((candidate) => candidate.slug),
-    ),
-  );
-  return slugs.size === 1 ? [...slugs][0]! : undefined;
+  const targets = modelPolicyAliasTargets(lists, model);
+  return targets.length === 1 ? targets[0]! : undefined;
 };
 
 /**
@@ -201,23 +193,32 @@ export function pickOfSelection(
 }
 
 /**
- * A pick sent to a linked machine. Its driver is not known here: a `driverKind` the call names is
- * the agent's own claim, so it is not read. Every row naming the model must allow the pick, and
- * every built-in driver's own effort id is read as an effort.
+ * A pick sent to a linked machine. Its driver is unknown (a `driverKind` the call names is the
+ * agent's claim, not read): every row naming the model must allow it, and every built-in driver's
+ * effort id counts, plus the reasoning control this machine's catalog marks for the model, if any.
  */
 const pickOfRemote = (
+  providers: ReadonlyArray<ServerProvider>,
   selection:
     | { readonly model?: string | undefined; readonly options?: ModelPolicyPick["options"] }
     | undefined,
-): ModelPolicyPick => ({
-  driver: undefined,
-  model: selection?.model,
-  options: selection?.options,
-});
+): ModelPolicyPick => {
+  const model = selection?.model;
+  const lists = providers.flatMap(modelLists);
+  return {
+    driver: undefined,
+    model,
+    options: selection?.options,
+    effortOptionIds:
+      model === undefined ? [] : reasoningIds(lists, aliasTarget(lists, model) ?? model),
+  };
+};
 
 /** A `delegate_task` target sent to a linked machine ({@link pickOfRemote}). */
-export const pickOfRemoteTarget = (target: OrchestratorMcpTarget): ModelPolicyPick =>
-  pickOfRemote(target);
+export const pickOfRemoteTarget = (
+  providers: ReadonlyArray<ServerProvider>,
+  target: OrchestratorMcpTarget,
+): ModelPolicyPick => pickOfRemote(providers, target);
 
 const describePick = (pick: ModelPolicyPick) => ({
   driver: pick.driver ?? "(not known)",
@@ -377,5 +378,8 @@ export const checkForwarded = Effect.fn("ModelPolicyCheck.checkForwarded")(funct
   const { caller } = yield* loadCaller();
   if (caller === undefined) return;
   const check = yield* makePickCheck;
-  yield* check(tool, Effect.succeed(pickOfRemote(selection)));
+  yield* check(
+    tool,
+    Effect.map(currentProviders, (providers) => pickOfRemote(providers, selection)),
+  );
 });

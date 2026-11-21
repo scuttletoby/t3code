@@ -13,7 +13,12 @@ const state = vi.hoisted(() => ({
   settings: {} as Settings,
   environments: [] as Array<{
     environmentId: string;
-    providers: Array<{ instanceId: string; driver: string; displayName: string }>;
+    providers: Array<{
+      instanceId: string;
+      driver: string;
+      displayName: string;
+      models?: Array<{ slug: string; aliases?: Array<string> }>;
+    }>;
     managedPolicy?: ManagedPolicySummary;
   }>,
   update: vi.fn((_patch: unknown, _options?: UpdateOptions) => {}),
@@ -90,7 +95,12 @@ function setup(file: object, managedPolicy?: ManagedPolicySummary) {
     {
       environmentId: "env-a",
       providers: [
-        { instanceId: "claude-a", driver: "claudeAgent", displayName: "Claude A" },
+        {
+          instanceId: "claude-a",
+          driver: "claudeAgent",
+          displayName: "Claude A",
+          models: [{ slug: "claude-opus-5-5", aliases: ["opus"] }],
+        },
         { instanceId: "codex-b", driver: "codex", displayName: "Codex B" },
       ],
       ...(managedPolicy ? { managedPolicy } : {}),
@@ -312,5 +322,23 @@ describe("ModelPolicySettings", () => {
       .element(screen.getByRole("note"))
       .toMatchTextContent("No provider here uses the driver claudAgent");
     await expect.element(screen.getByText("gpt-mini")).toBeVisible();
+  });
+
+  it("flags a row whose model is an alias, and not one that names the full id", async () => {
+    setup({
+      modelPolicy: {
+        mode: "enforce",
+        allow: [
+          { driver: "claudeAgent", model: "opus", efforts: ["high"] },
+          { driver: "claudeAgent", model: "claude-opus-5-5", efforts: ["high"] },
+        ],
+      },
+    });
+    await using screen = await render(<ModelPolicySettings />);
+
+    await expect
+      .element(screen.getByRole("note"))
+      .toMatchTextContent("opus is an alias of claude-opus-5-5; name the full id.");
+    expect(screen.getByRole("note").elements()).toHaveLength(1);
   });
 });
