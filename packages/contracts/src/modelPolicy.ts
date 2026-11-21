@@ -148,10 +148,17 @@ export const MODEL_POLICY_EFFORT_OPTION_IDS: ReadonlyArray<string> = [
   "thinking_level",
 ];
 /**
- * The option id a built-in driver reads its reasoning level from, where it is not in the list
- * above: the model guard's `DRIVER_EFFORT_IDS` (the guard's own test keeps the two in step).
+ * The option id each built-in driver reads its effort from (an effort under another id runs its
+ * default): the model guard's `DRIVER_EFFORT_IDS`, kept in step by the guard's test. A driver not
+ * listed reads the control its catalog marks ({@link modelPolicyCatalogEffortIds}).
  */
 const MODEL_POLICY_DRIVER_EFFORT_IDS: Readonly<Record<string, string>> = {
+  claudeAgent: "effort",
+  codex: "reasoningEffort",
+  fx: "effort",
+  grok: "reasoningEffort",
+  kiro: "reasoningEffort",
+  muse: "reasoningEffort",
   opencode: "variant",
   pi: "thinking",
 };
@@ -173,6 +180,24 @@ export interface ModelPolicyPick {
   readonly options?: ReadonlyArray<{ readonly id: string; readonly value: unknown }> | undefined;
   /** More option ids read as the effort (a select the model marks as its reasoning control). */
   readonly effortOptionIds?: ReadonlyArray<string> | undefined;
+  /**
+   * Per driver, the option ids its instances on the checking machine read the model's effort from,
+   * as that machine's own catalog marks them ({@link modelPolicyCatalogEffortIds}). Used for a driver
+   * with no fixed id; a driver missing here reads none, so its row with efforts refuses.
+   */
+  readonly driverEffortIds?: Readonly<Record<string, ReadonlyArray<string>>> | undefined;
+  /**
+   * The pick leaves the ultracode option out, and a catalog here turns it on by default for the
+   * model, but the driver that runs it is not known (a pick for a linked machine): it may run either
+   * way, so both readings count, the one with ultracode and the one without.
+   */
+  readonly ultracodeMaybeDefault?: boolean | undefined;
+  /**
+   * The option ids the checking machine's model lists describe for the model. When set, any other
+   * option the policy does not read as an effort is refused: the driver may still apply it (Kiro's
+   * `effortLevel`, a hidden `_t3/session-mode`, a `model` option). Unset (Settings): not checked.
+   */
+  readonly describedOptionIds?: ReadonlyArray<string> | undefined;
 }
 
 /**
@@ -201,6 +226,10 @@ export function modelPolicyPickEfforts(pick: ModelPolicyPick): ReadonlyArray<str
   const efforts = [
     ...new Set(named.map((effort) => (effort === MODEL_POLICY_ULTRACODE ? "xhigh" : effort))),
   ];
+  if (!ultracode && ultracodeOption === undefined && pick.ultracodeMaybeDefault === true) {
+    // Either reading may run: the row must allow ultracode and every effort named, xhigh included.
+    return [MODEL_POLICY_ULTRACODE, ...efforts];
+  }
   if (!ultracode) return efforts;
   return [MODEL_POLICY_ULTRACODE, ...efforts.filter((effort) => effort !== "xhigh")];
 }
@@ -231,14 +260,78 @@ function pickEffortIds(pick: ModelPolicyPick, guess: boolean): ReadonlySet<strin
     ...MODEL_POLICY_EFFORT_OPTION_IDS,
     ...driverIds,
     ...(pick.effortOptionIds ?? []),
+    ...Object.values(pick.driverEffortIds ?? {}).flat(),
   ]);
 }
 
-/** A model as a provider's model list holds it: its id and the aliases that name it. */
+/**
+ * The option ids a driver reads a model's effort from: its fixed id for a built-in driver, else the
+ * effort control the checking machine's catalog marks for the model on that driver's instances.
+ * Empty when neither is known: the level it would run cannot be told.
+ */
+function driverReadIds(pick: ModelPolicyPick, driver: string): ReadonlyArray<string> {
+  return Object.hasOwn(MODEL_POLICY_DRIVER_EFFORT_IDS, driver)
+    ? [MODEL_POLICY_DRIVER_EFFORT_IDS[driver]!]
+    : [
+        ...new Set(
+          pick.driverEffortIds !== undefined && Object.hasOwn(pick.driverEffortIds, driver)
+            ? pick.driverEffortIds[driver]!
+            : [],
+        ),
+      ];
+}
+
+/** A model as a provider's model list holds it: its id, the aliases that name it, its options. */
 export interface ModelPolicyListedModel {
   readonly slug: string;
   readonly aliases?: ReadonlyArray<string> | undefined;
+  readonly capabilities?:
+    | {
+        readonly optionDescriptors?:
+          | ReadonlyArray<{
+              readonly id: string;
+              readonly type: string;
+              readonly role?: string | undefined;
+            }>
+          | undefined;
+      }
+    | null
+    | undefined;
 }
+
+/**
+ * The option ids these lists mark as the model's effort control: a select its agent marks
+ * `role: "reasoning"` (an ACP `thought_level`), or a select under a general effort id (a Cursor
+ * model's `effort`), as the usage pacing gate finds it. From every list that holds the model.
+ */
+export function modelPolicyCatalogEffortIds(
+  lists: ReadonlyArray<ReadonlyArray<ModelPolicyListedModel>>,
+  model: string,
+): ReadonlyArray<string> {
+  return [
+    ...new Set(
+      lists
+        .flatMap((list) => list.filter((candidate) => candidate.slug === model))
+        .flatMap((candidate) => candidate.capabilities?.optionDescriptors ?? [])
+        .filter(
+          (descriptor) =>
+            descriptor.role === "reasoning" ||
+            (descriptor.type === "select" &&
+              MODEL_POLICY_EFFORT_OPTION_IDS.includes(descriptor.id)),
+        )
+        .map((descriptor) => descriptor.id),
+    ),
+  ];
+}
+
+/**
+ * Model names a driver resolves by itself, without its catalog: Claude Code's own aliases
+ * (`apps/server/src/claudeModelOptions.ts` `CLAUDE_CODE_MODEL_ALIASES`; a server test keeps the two
+ * in step). Settings flags a row naming one even when no catalog lists it as an alias.
+ */
+export const MODEL_POLICY_DRIVER_ALIASES: Readonly<Record<string, ReadonlyArray<string>>> = {
+  claudeAgent: ["opus", "sonnet", "haiku", "fable"],
+};
 
 /**
  * The models an alias names in these lists (case does not matter), or none for a model's own id or
@@ -270,12 +363,37 @@ const rowAllows = (row: ModelPolicyRow, efforts: ReadonlyArray<string>) =>
 
 export type ModelPolicyVerdict =
   | { readonly inside: true; readonly row: ModelPolicyRow }
-  | { readonly inside: false; readonly why: string };
+  | {
+      readonly inside: false;
+      readonly why: string;
+      /**
+       * What fixes it, when it is not "name a model in the rows": `option`, leave out an option the
+       * policy cannot read; `model-option`, pick the model in the model field, not in the options;
+       * `effort-id`, the driver's effort id is not known on this machine.
+       */
+      readonly fix?: "option" | "model-option" | "effort-id";
+    };
 
 /**
- * Whether one pick is inside the rows. A pick that names no model is outside, and so are a
- * model in no row and an effort option that holds no effort name. A row with efforts needs the pick to name one of them; a row without
- * efforts allows none. Without a driver, every row that names the model must allow the pick.
+ * The first option of a pick that the policy cannot read: not described for the model by the
+ * checking machine's lists, and not an id it reads as an effort (or ultracode). `undefined` when
+ * the pick has no such option, or when no lists were given ({@link ModelPolicyPick.describedOptionIds}).
+ */
+function unreadableOption(pick: ModelPolicyPick): string | undefined {
+  if (pick.describedOptionIds === undefined) return undefined;
+  const readable = new Set([
+    ...pick.describedOptionIds,
+    ...pickEffortIds(pick, true),
+    MODEL_POLICY_ULTRACODE,
+  ]);
+  return pick.options?.find((option) => !readable.has(option.id))?.id;
+}
+
+/**
+ * Whether one pick is inside the rows: a named model in a row; for a row with efforts, one of them
+ * under the id its driver reads (an id not known here refuses), and none for a row without. With no
+ * driver, every row naming the model must allow it. An effort option with no effort name refuses,
+ * as does an option the policy cannot read ({@link ModelPolicyPick.describedOptionIds}).
  */
 export function checkModelPolicyPick(
   allow: ReadonlyArray<ModelPolicyRow>,
@@ -302,21 +420,66 @@ export function checkModelPolicyPick(
     };
   }
   const efforts = modelPolicyPickEfforts(pick);
-  const allowed = rows.filter((row) => rowAllows(row, efforts));
-  const row = allowed[0];
+  const options = pick.options ?? [];
+  /** Why one row refuses the pick, or `undefined` when it allows it. */
+  const refuses = (
+    row: ModelPolicyRow,
+  ): { readonly why: string; readonly fix?: "effort-id" } | undefined => {
+    if (!rowAllows(row, efforts)) {
+      return {
+        why:
+          efforts.length === 0
+            ? `${model} needs an effort from its row, and the pick names none`
+            : `${model} does not allow effort ${efforts.join(" + ")}`,
+      };
+    }
+    if (row.efforts === undefined) return undefined;
+    // The effort must be under the id the row's driver reads: under another, it runs its default.
+    const own = driverReadIds(pick, row.driver);
+    if (own.length === 0) {
+      return {
+        why: `the option id ${row.driver} reads ${model}'s effort from is not known here (no ${row.driver} model list here marks an effort control for ${model}), so the level it would run cannot be told`,
+        fix: "effort-id",
+      };
+    }
+    const missing = own.find(
+      (id) => !options.some((option) => option.id === id && typeof option.value === "string"),
+    );
+    return missing === undefined
+      ? undefined
+      : {
+          why: `${model} names no effort under ${missing}, the option ${row.driver} reads it from (left out, the driver runs its default level)`,
+        };
+  };
+  const verdicts = rows.map((row) => ({ row, refusal: refuses(row) }));
+  const allowed = verdicts.filter((verdict) => verdict.refusal === undefined);
+  const row = allowed[0]?.row;
   if (row !== undefined && (pick.driver !== undefined || allowed.length === rows.length)) {
-    return { inside: true, row };
+    // Inside by the rows; an option the policy cannot read may still be applied by the driver,
+    // after the checked ones (a second effort id, a hidden session mode, a `model` option).
+    const unreadable = unreadableOption(pick);
+    if (unreadable === undefined) return { inside: true, row };
+    return unreadable === "model"
+      ? {
+          inside: false,
+          why: `the option model (beside ${model}) would change the model after this check`,
+          fix: "model-option",
+        }
+      : {
+          inside: false,
+          why: `the option ${unreadable} is not described for ${model} in this machine's model list and is not an effort id the policy reads, so the driver could apply it unchecked`,
+          fix: "option",
+        };
   }
-  const why =
-    efforts.length === 0
-      ? `${model} needs an effort from its row, and the pick names none`
-      : `${model} does not allow effort ${efforts.join(" + ")}`;
-  if (row === undefined) return { inside: false, why };
+  const refusing = verdicts.filter((verdict) => verdict.refusal !== undefined);
+  const { why, fix } = refusing[0]!.refusal!;
+  const withFix = fix === undefined ? {} : { fix };
+  if (row === undefined) return { inside: false, why, ...withFix };
   // Some rows allow it: the driver there is not known, and these rows refuse it.
-  const refusing = rows.filter((candidate) => !allowed.includes(candidate));
   return {
     inside: false,
-    why: `${why} (its ${refusing.map((candidate) => candidate.driver).join(", ")} row refuses it: the driver there is not known here, so every row naming the model must allow it)`,
+    why: `${why} (its ${refusing.map((verdict) => verdict.row.driver).join(", ")} row refuses it: the driver there is not known here, so every row naming the model must allow it)`,
+    ...withFix,
   };
 }
 

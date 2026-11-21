@@ -340,14 +340,31 @@ the server without such a session counts as a person, so the model guard hook is
 names a model by its full id (#128; an alias such as `opus` is not read as its model, and the
 refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
 `efforts`, names one of them (`ultracode` counts as its own effort; a row without `efforts` allows
-none). Every effort option the pick names counts, so a second effort option cannot hide a higher
-effort, and one that holds no effort name (`{effort: true}`, which runs the driver's own default) is
-refused. A pick that leaves the ultracode option out runs at the model's default for it, so a model
+none) under the option id that driver reads it from (#780): a built-in driver's own id (`effort` for
+Claude and FX, `reasoningEffort` for Codex, Grok, Kiro and Muse, `variant` for OpenCode, `thinking`
+for Pi), else the effort control the machine's own catalog marks for the model on that driver's
+instances (an ACP agent's `thought_level`, a Cursor model's `effort`). Under another id the driver
+ignores it and runs its default level, so such a pick is refused (`reasoning: high` alone for
+Claude), and so is a pick for a driver whose id the catalog does not mark (not read from the agent
+yet, or the model not listed there): the level it would run cannot be told; the refusal says to
+start that agent on the machine once, or to pick a model whose driver has a fixed id. Every effort
+option the pick names counts, and one that holds no effort name (`{effort: true}`, which runs the
+driver's own default) is refused. Every other option must be one this machine's model list
+describes for the model (the instance's list; for a call sent to a linked machine, any list here),
+or `ultracode` (#793): a driver can still apply an option the policy does not read, after the
+checked ones (Kiro's `effortLevel`, Grok's native `thought_level`, an ACP agent's `_t3/session-mode`
+that the list hides because it repeats the thought levels, or a `model` option written after the
+model). Such a pick is refused in `enforce` (pick the model in the model field; the option is not
+allowed while the policy is on) and reported in `advise`, as the model guard does. So a second
+effort option cannot hide a higher effort, and an option cannot change the model. A pick that leaves the ultracode option out runs at the model's default for it, so a model
 whose catalog default is ultracode reads as ultracode. Without a known driver (a call for a linked machine; a `driverKind` the agent names is its
 own claim and is not read), every row naming the model must allow it (the refusal names the drivers
-whose rows refuse it), and every built-in driver's effort option is read, plus the reasoning control
-this machine's own catalog marks for the model, when it has the model (so an ACP model's own id is
-read; a model this machine does not have is read with the fixed ids only). In `enforce` a pick outside is refused with the rows; in
+whose rows refuse it), and each row's driver needs the effort under its own id as above (so a pick
+for an ACP model this machine's catalog does not describe is refused here), every built-in driver's
+effort option and every control this machine's catalog marks for the model is read too (a decoy
+cannot hide a higher effort), a model this machine's catalog turns ultracode on for by default is
+read both with and without it, and an alias gets the same "name the full id" hint as here. The
+machine there checks the pick again with its own catalog (#780). In `enforce` a pick outside is refused with the rows; in
 `advise` it runs, and `delegate_task`'s reply says what `enforce` would refuse (the other routes
 only log it). A pick inside gets its row's `useFor` in `delegate_task`'s reply. Each checked pick is
 logged as "model policy pick" with its model as asked, so one model's picks can be counted; the
@@ -391,8 +408,10 @@ mode, and **Edit allowed models** for the `allow` rows as JSON, checked as a sav
 value is shown with a warning and the kept text; a save there replaces it. **Edit allowed models**
 then starts from the value's own rows and saves only once the person picks the mode, so a save never
 turns it into the fail-closed Enforce. A row whose driver no provider here has is flagged, and so is
-a row whose model is an alias in its driver's model lists (`opus`): the driver resolves an alias
-through the catalog, so the row would follow it when a provider moves it to a new model (#127). With no
+a row whose model is an alias in its driver's model lists on a selected machine (`opus`; each
+machine is read on its own lists, as its server reads only its own, so a model's id on one machine
+does not hide an alias on another), or a name Claude Code resolves by itself (`opus`, `sonnet`,
+`haiku`, `fable`) that no list there holds as a model's id: the driver resolves an alias, so the row would follow it when a provider moves it to a new model (#127). With no
 rows saved, **Edit allowed models** starts from the fork's start rows (#126: `claude-opus-5-5` and
 `claude-fable-5-2`, each `medium`, `high` or `xhigh`, default `high`), saved only when the person
 saves them; they are not the setting's default, so a file without rows keeps meaning none.
