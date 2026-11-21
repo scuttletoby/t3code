@@ -554,6 +554,8 @@ class UpstreamSync(unittest.TestCase):
         self.assertEqual(kw['env']['GIT_CONFIG_NOSYSTEM'], '1')
         self.assertEqual(kw['env']['GIT_TERMINAL_PROMPT'], '0')
         self.assertFalse({k for k in kw['env'] if 'TOKEN' in k or k == 'HOME'})
+        # Not inside a checkout: git would read its .git/config, where actions/checkout keeps the job's token.
+        self.assertEqual(kw['cwd'], '/')
         self.assertTrue(0 < kw['timeout'] <= 60)
 
     def test_a_tagged_commit_and_any_doubt_are_refused(self):
