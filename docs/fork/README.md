@@ -357,10 +357,55 @@ turns it into the fail-closed Enforce. A row whose driver no provider here has i
 
 ### `server.agentSlots`
 
-Limits on running agents: `delegate_task` is refused above `maxPerMachine` agents on this server,
-above `maxPerAccount` per provider account, or below `minFreeMemoryMb` of free memory. Threads
-started in other ways are counted but never refused. With `waitFor` on, an agent can wait for a slot
-instead of retrying.
+Limits on running agents: a new agent is refused above `maxPerMachine` agents on this server,
+above `maxPerAccount` per provider account, or below `minFreeMemoryMb` of free memory. With
+`waitFor` on, an agent can wait for a slot instead of retrying.
+
+These routes start a new agent run and go through the same gate, with the same count
+(`apps/server/src/fork/agentSlotRoutes.ts`):
+
+- `delegate_task`, `create_threads` and `t3_thread_launch` are refused with `slots_full`. A thread
+  made without a prompt (or a launch without a message or attachment) starts no agent and is not
+  gated. A retry of an accepted call (same `clientRequestId`) that already started its run is let
+  through; one that stopped before its run is counted again. `create_threads` checks the whole
+  batch first: when the threads with a prompt need more free slots than there are, none is created.
+  If a slot is still taken between two threads, the refusal names the threads already created.
+- A scheduled task's run on its schedule (interval, once, fixed time) that is refused stays due: it
+  is tried again on each poll (every 5 s) and starts, once, when a slot is free. Its history shows
+  one note, `Waiting for an agent slot: ` and the current reason, until it runs (the note goes when
+  the task is paused or moved to a later time); its run count does not
+  move, and it is one run however long it waited. A fixed-time run that waits is not dropped as
+  missed while the server runs (its due time follows it); if the server is down more than 10
+  minutes while it waits, upstream's missed-run rule applies. "Run now" fails with `Not run, no agent slot: ` and the reason and changes
+  nothing; over MCP `run_scheduled_task_now` answers `slots_full`. A webhook delivery waits the
+  same way and starts once when a slot is free; it ends without a run only if its task is paused,
+  deleted, replaced or its trigger changed while it waits (other edits are not seen: it runs with
+  the task as it was when it began to wait). Every waiting delivery is in the store, so a restart
+  keeps it and it runs once: a direct one (no coalescing window) is moved there when it is first
+  refused. A scheduled run or a webhook takes a slot only when no agent that waits for one holds
+  it; there is no order between routes, so on a host kept full it can wait long.
+- A task bound to a thread whose run is active only queues its prompt there: no new run, so no slot
+  and no wait. A bound thread that is idle starts a run and is gated, counted on the thread's
+  current provider.
+- A call that asks another machine to start an agent (`delegate_task` or `t3_thread_launch` with an
+  `environmentId`) is decided by that machine's gate, the one that would run the agent; this
+  machine's gate is not asked. A machine on a build without this gate starts it as before.
+
+Only an agent caller is told it can wait for a slot (`wait_for`) and end its turn. A start with no
+caller here (another machine's call, a scheduled run) is told plainly what happened: the machine
+has no free slot, or could not count its agents.
+
+These start or wake a run and are not gated yet ([#711](https://github.com/scuttletoby/t3code/issues/711)):
+a message a person sends from the composer, `t3_thread_send` to an idle thread, a
+`t3_thread_transfer` fork, and a wait delivery that wakes an idle thread. A scheduled run bound
+to a running thread whose run ends in the few milliseconds between the check and the send starts
+one run without a slot.
+
+The calling thread is left out of the count (it waits on its child). A start no thread on this
+machine asks for (a scheduled run, the owner's client, a call from another machine) has no caller, so
+nothing is left out. An allowed start counts at once: until its run shows, for at most
+`startGraceSeconds` (default 30 s) once its thread is known. A start that fails before its thread
+is known gives its slot back at once; one that never ends holds it 10 minutes at most.
 
 A running agent is a thread whose shell shows an active run (settled or archived threads too), as
 upstream's own shell read decides (`apps/server/src/slots/ActiveRunShells.ts`); a test checks that

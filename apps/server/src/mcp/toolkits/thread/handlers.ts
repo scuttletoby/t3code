@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
 import { topOfPinnedRunOrderKey } from "@t3tools/shared/pinOrderKey";
 
+import * as AgentSlotRoutes from "../../../fork/agentSlotRoutes.ts"; // Fork: agent slots
 import * as LaunchMcpProfile from "../../../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -119,6 +120,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           message: "The scheduled task was not found.",
         });
       yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch
+      // prettier-ignore
       const { task, threadId } = yield* scheduler
         .runNow({ id: input.taskId })
         .pipe(
@@ -126,6 +128,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
             (error) =>
               new OrchestratorMcpFailure({ code: "orchestration_error", message: error.message }),
           ),
+          Effect.mapError(AgentSlotRoutes.runNowSlotRefusal), // Fork: agent slots
         );
       const scope = yield* McpInvocationContext.McpInvocationContext;
       return {

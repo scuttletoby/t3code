@@ -1708,3 +1708,52 @@ describe("SlotGate", () => {
     );
   });
 });
+
+/** Fork: `create_threads` asks for its whole batch before it creates any thread. */
+describe("SlotGate: a batch's later starts (alsoNeeds)", () => {
+  const acquireBatch = (alsoNeeds: ReadonlyArray<ProviderInstanceId>, target = MAIN) =>
+    SlotGate.SlotGate.pipe(
+      Effect.flatMap((gate) =>
+        gate.acquire({ callerThreadId: caller, targetInstanceId: target, alsoNeeds }),
+      ),
+    );
+
+  it.effect("too few free slots for the batch: refused, with what it needs and what is free", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "a", instanceId: MAIN }];
+      const outcome = yield* run(world, on({ maxPerMachine: 2 }), acquireBatch([MAIN]));
+      if (outcome.type !== "refuse") return assert.fail("expected a refusal");
+      assert.deepStrictEqual(outcome.refusal.type === "full" ? outcome.refusal.batch : undefined, {
+        needed: 2,
+        free: 1,
+      });
+    }),
+  );
+
+  it.effect("enough: allowed, and only its own start is held (the later ones take their own)", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "a", instanceId: MAIN }];
+      const outcomes = yield* run(
+        world,
+        on({ maxPerMachine: 3 }),
+        Effect.all([acquireBatch([MAIN]), acquire(), acquire()]),
+      );
+      assert.deepStrictEqual(
+        outcomes.map((outcome) => outcome.type),
+        ["allow", "allow", "refuse"],
+      );
+    }),
+  );
+
+  it.effect("later starts on another account are counted against that account", () =>
+    Effect.gen(function* () {
+      const settings = on({ maxPerAccount: { [SECOND]: 1 } });
+      const fits = yield* run(newWorld(), settings, acquireBatch([SECOND]));
+      assert.strictEqual(fits.type, "allow");
+      const over = yield* run(newWorld(), settings, acquireBatch([SECOND, SECOND]));
+      assert.strictEqual(over.type, "refuse");
+    }),
+  );
+});

@@ -98,11 +98,17 @@ describe("fork delegation checks: upstream seat calls", () => {
 });
 
 const callerThreadId = ThreadId.make("thread:seam-parent");
+/**
+ * A new thread without a prompt, as create_threads passes it: it starts no run, so it takes no
+ * agent slot (`OrchestratorMcpService.slotGate.test.ts` checks one that does).
+ */
+const child = { threadId: ThreadId.make("thread:seam-child"), index: 0, batch: [{}] };
 const parent = {
   thread: {
     id: callerThreadId,
     projectId: ProjectId.make("project:seam"),
     runtimeMode: "full-access",
+    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
     lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: callerThreadId },
   },
 } as unknown as Pick<OrchestrationV2ThreadProjection, "thread">;
@@ -172,7 +178,7 @@ describe("fork delegation checks: runs again", () => {
       // profile settings (launchMcpProfile.ts), once.
       const fresh = yield* checks.beforeCreateThread({
         isRetry: false,
-        callerThreadId,
+        child,
         parent,
         requested: { model: "gpt-5.4" },
         target,
@@ -181,7 +187,7 @@ describe("fork delegation checks: runs again", () => {
       assert.strictEqual(reads.count, 1);
       const result = yield* checks.beforeCreateThread({
         isRetry: true,
-        callerThreadId,
+        child,
         parent,
         requested: { model: "gpt-5.4" },
         target,
@@ -192,7 +198,7 @@ describe("fork delegation checks: runs again", () => {
       const withAgent = agentTarget([{ id: "agent", value: "build" }]);
       const retry = yield* checks.beforeCreateThread({
         isRetry: true,
-        callerThreadId,
+        child,
         parent,
         requested: { model: "big-pickle" },
         target: withAgent,
@@ -333,7 +339,7 @@ describe("fork delegation checks: a child's own options", () => {
     const checks = yield* DelegateChecks.make(host);
     // A refusal shows as its code.
     const created = yield* checks
-      .beforeCreateThread({ isRetry: false, callerThreadId, parent, requested, target: given })
+      .beforeCreateThread({ isRetry: false, child, parent, requested, target: given })
       .pipe(Effect.match({ onFailure: (refusal) => refusal.code, onSuccess: (r) => r.target }));
     const before = yield* checks.beforeWorkspace({
       isRetry: false,
@@ -382,7 +388,7 @@ describe("fork delegation checks: a child's own options", () => {
       for (const req of cases) {
         const created = yield* checks.beforeCreateThread({
           isRetry: false,
-          callerThreadId,
+          child,
           parent,
           requested: req,
           target: own,
