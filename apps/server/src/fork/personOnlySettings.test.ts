@@ -161,6 +161,8 @@ describe("person-only fork settings", () => {
         "mcpCarriedProfiles",
         "reviewRules",
         "modelPolicy",
+        "placement",
+        "placementNeeds",
       ]),
     );
     for (const key of FORK_AGENT_WRITABLE_KEYS) expect(FORK_PERSON_ONLY_KEYS).not.toContain(key);
@@ -223,6 +225,10 @@ describe("person-only fork settings", () => {
       ["MCP-PROFILE", "mcpProfile"],
       ["review_rules", "reviewRules"],
       ["model_policy", "modelPolicy"],
+      ["placement", "placement"],
+      ["Placement", "placement"],
+      ["placement_needs", "placementNeeds"],
+      ["PLACEMENT-NEEDS", "placementNeeds"],
     ] as const) {
       const tool = Tool.make("fake_settings_update", {
         parameters: Schema.Struct({
@@ -231,6 +237,74 @@ describe("person-only fork settings", () => {
         }),
       });
       expect(personOnlyKeysIn(tool), field).toEqual([key]);
+    }
+  });
+
+  it("catches a person-only key at the end of a settings patch path", () => {
+    // `settings.placement.mode` and `settings.projectSettingsOverrides.<id>.placementNeeds`: the key
+    // is found under a record of projects too, not only as a top-level name.
+    const tool = Tool.make("fake_patch", {
+      parameters: Schema.Struct({
+        settings: Schema.Struct({
+          placement: Schema.optionalKey(Schema.Struct({ mode: Schema.String })),
+          projectSettingsOverrides: Schema.optionalKey(
+            Schema.Record(
+              Schema.String,
+              Schema.Struct({ placementNeeds: Schema.optionalKey(Schema.Array(Schema.String)) }),
+            ),
+          ),
+        }),
+      }),
+    });
+    expect(personOnlyKeysIn(tool).toSorted()).toEqual(["placement", "placementNeeds"]);
+  });
+
+  it("drops a person-only key a settings tool's call sends unnamed, at any depth", () => {
+    // The tools that write settings, each with a call they take. The decode a call goes through
+    // (McpHttpServer) drops a key the input does not name, so `placement` sent anyway, at the top
+    // or inside one of the tool's own objects, never reaches the handler.
+    const calls: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+      [
+        "t3_environment_preferences_update",
+        { backgroundActivity: { profile: "balanced" }, newWorktreesStartFromOrigin: true },
+      ],
+      ["t3_project_update", { projectId: "project-1", title: "Renamed" }],
+      ["t3_thread_configure", { threadId: "thread-1" }],
+    ];
+    const sneaked = {
+      placement: { mode: "enforce", labels: ["owner-logins"] },
+      placementNeeds: ["gpu"],
+      projectSettingsOverrides: { "project-1": { placementNeeds: ["gpu"] } },
+    };
+    /** The call with `sneaked` added to it and to each object inside it. */
+    const withSneaked = (value: unknown): unknown =>
+      value !== null && typeof value === "object" && !Array.isArray(value)
+        ? {
+            ...Object.fromEntries(
+              Object.entries(value).map(([key, inner]) => [key, withSneaked(inner)]),
+            ),
+            ...sneaked,
+          }
+        : value;
+    const keysIn = (value: unknown): ReadonlyArray<string> =>
+      value !== null && typeof value === "object"
+        ? Object.entries(value).flatMap(([key, inner]) => [key, ...keysIn(inner)])
+        : [];
+    for (const [name, call] of calls) {
+      const tool = tools.get(name);
+      expect(tool, name).toBeDefined();
+      if (tool === undefined) continue;
+      // As McpHttpServer decodes a call.
+      const decode = Schema.decodeUnknownSync(
+        Schema.toCodecJson(tool.parametersSchema as Schema.Codec<unknown, unknown>),
+      );
+      // The call itself is one the tool takes.
+      expect(decode(call), name).toMatchObject(call);
+      const decoded = decode(withSneaked(call));
+      expect(
+        keysIn(decoded).filter((key) => PERSON_ONLY.has(normalize(key))),
+        name,
+      ).toEqual([]);
     }
   });
 

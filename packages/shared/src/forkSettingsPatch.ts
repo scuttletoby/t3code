@@ -81,6 +81,12 @@ function applyRule(rule: ForkPatchRule, stored: unknown, patch: unknown): unknow
   if (rule === "replace") return patch;
   if (rule === "merge-fields") {
     const next: Record<string, unknown> = isRecord(stored) ? { ...stored } : {};
+    // A value the file holds unreadable (kept as written, read as its fail-closed fields): the save
+    // replaces the kept text, so the named fields go over the fail-closed ones.
+    if (Object.hasOwn(next, "unreadable")) {
+      delete next.unreadable;
+      delete next.problem;
+    }
     for (const [field, value] of Object.entries(patch as Record<string, unknown>)) {
       if (value !== undefined) next[field] = value;
     }

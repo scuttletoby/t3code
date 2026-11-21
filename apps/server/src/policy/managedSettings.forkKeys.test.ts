@@ -169,3 +169,44 @@ it("refuses a user's change to any field of a whole-locked handoff or modelPolic
     assert.deepEqual(write, { _tag: "Locked", path: "modelPolicy" }, JSON.stringify(modelPolicy));
   }
 });
+
+// Placement (row P2): a policy locks it as a whole value, labels and never groups included, so no
+// one but the policy's owner relabels the machine or switches the mode. A bad value (`null` too)
+// reads as off, so the policy takes no lock of one field inside it, as for `modelPolicy`.
+const placementUser: ServerSettings = {
+  ...DEFAULT_SERVER_SETTINGS,
+  placement: {
+    ...DEFAULT_SERVER_SETTINGS.placement,
+    mode: "enforce",
+    labels: ["gpu"],
+    never: [["ci-runner", "owner-logins"]],
+  },
+};
+
+it("locks placement whole, so neither the mode nor a label can change", () => {
+  const value: ServerSettings["placement"] = {
+    mode: "advise",
+    labels: ["ci-runner"],
+    factsCommand: "",
+    never: [["ci-runner", "owner-logins"]],
+    weights: {},
+  };
+  const result = makeManagedSettings({ placement: { value, locked: true } });
+  if (result._tag !== "Valid") assert.fail(result.reason);
+  const applied = result.settings.applyLocks(placementUser);
+  assert.deepEqual(applied.placement, value);
+  for (const patch of [{ mode: "enforce" }, { labels: ["gpu"] }, { never: [] }] as const) {
+    const write = result.settings.vetWrite(
+      applied,
+      { ...applied, placement: { ...applied.placement, ...patch } },
+      { placement: patch },
+    );
+    assert.deepEqual(write, { _tag: "Locked", path: "placement" });
+  }
+});
+
+it("refuses a lock of one placement field, naming the whole setting to lock", () => {
+  const result = makeManagedSettings({ "placement.mode": { value: "off", locked: true } });
+  assert.strictEqual(result._tag, "Invalid");
+  if (result._tag === "Invalid") assert.match(result.reason, /manage "placement" as a whole/);
+});
