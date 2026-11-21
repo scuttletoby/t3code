@@ -11,8 +11,10 @@
 #                           runner's speed), fails its job, which says the weight to write.
 #   <test> run by <file>    run by <file>, which must name the test's path (not one
 #                           of upstream's workflows: they are disabled in the fork)
+#   ... ok lines            (after any of those, a Python test only) it prints ok lines, below;
+#                           a Python test without it is a unittest test
 # A test's own `fork-ci:` comment lines say more (the runner reads them):
-#   fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>]
+#   fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>[.<test_method>]]
 #                           an own run, by `fork-ci-tests.cjs --run <test>` in fork-tests.yml;
 #                           it may skip no test
 #   fork-ci: may skip <test>
@@ -25,17 +27,19 @@
 # Each run leaves a record that fork-ci-result checks: a listed test with no record, or
 # one that ran no test, skipped a test it does not name, or did not skip one it names, fails.
 # Every test is counted by its own outcome: Python through fork-ci-unittest.py (a class or
-# module skip counts each test in it), node through fork-ci-node-counts.cjs (a file that
-# reports no test of its own, or stops half-way, counts nothing); an ok-lines test (`ok <what>`, `FAIL <what>`,
-# `skip <name> [why]` on stdout) ends with "all passed: <n> ok, <n> skipped" (its own
-# count), else it counts nothing.
+# module skip counts each test in it, and a test its source defines that no run loaded is a
+# skip by name; a unittest test that never reaches its first run or its end counts nothing),
+# node through fork-ci-node-counts.cjs (a file that reports no test of its own, or stops
+# half-way, counts nothing); an ok-lines test (sh, or Python with "ok lines": `ok <what>`,
+# `FAIL <what>`, `skip <name> [why]` on stdout) ends with "all passed: <n> ok, <n> skipped"
+# (its own count), else it counts nothing.
 # A present test that is not listed fails. A listed file that is not present yet
 # is a note; one that was present and then deleted fails.
 .github/scripts/fork-ci-tests.test.cjs ~11s
 .github/scripts/fork-checks-ran.test.py
 .github/scripts/fork-ci-pressure.test.py
 .github/scripts/fork-ci-rerun.test.py
-.github/scripts/fork-contracts.test.py ~45s
+.github/scripts/fork-contracts.test.py ~45s ok lines
 .github/scripts/fork-fleet-desk-agent.test.py ~23s
 .github/scripts/fork-fleet-desk-key.test.py ~10s
 .github/scripts/fork-fleet-desk-seed.test.py ~34s
@@ -45,19 +49,19 @@
 .github/scripts/fork-fleet-walls.test.py ~71s
 .github/scripts/fork-fleet-walls-contract.test.py ~96s
 .github/scripts/fork-fleet-walls-wsl2.test.py ~40s
-.github/scripts/fork-gate-trust-docs.test.py
-.github/scripts/fork-head-gate-workflow.test.py
+.github/scripts/fork-gate-trust-docs.test.py ok lines
+.github/scripts/fork-head-gate-workflow.test.py ok lines
 .github/scripts/fork-follow.test.sh ~41s
 .github/scripts/fork-interaction-limit.test.sh
-.github/scripts/fork-owned-paths.test.py
-.github/scripts/fork-owned-reads.test.py run by .github/workflows/fork-tests.yml
-.github/scripts/fork-pr-queue-workflow.test.py
-.github/scripts/fork-ci-release.test.py
+.github/scripts/fork-owned-paths.test.py ok lines
+.github/scripts/fork-owned-reads.test.py run by .github/workflows/fork-tests.yml ok lines
+.github/scripts/fork-pr-queue-workflow.test.py ok lines
+.github/scripts/fork-ci-release.test.py ok lines
 .github/scripts/fork-changes-list.test.cjs
-.github/scripts/fork-release-workflow.test.py
+.github/scripts/fork-release-workflow.test.py ok lines
 .github/scripts/fork-release.test.sh ~5s
 .github/scripts/fork-run-alert.test.sh
-.github/scripts/fork-reusable-permissions.test.py
+.github/scripts/fork-reusable-permissions.test.py ok lines
 .github/scripts/fork-schema-check.test.cjs ~6s
 .github/scripts/fork-seam-check.test.cjs ~23s
 .github/scripts/fork-temp-files.test.sh
@@ -73,6 +77,7 @@ fork-ci/actions/fleet-route/fleet_route.test.py
 fork-ci/actions/fleet-watch/fleet_watch.test.py
 fork-ci/actions/git-clean/git_clean.test.py ~8s
 fork-ci/actions/gradle-cache/gradle_cache.test.py
+fork-ci/actions/handoff-put/handoff.test.py ~16s
 fork-ci/actions/head-check/head_check.test.py ~28s
 fork-ci/actions/head-check/head_gate.test.py
 fork-ci/actions/job-changed/job-changed.test.py ~21s
@@ -119,8 +124,9 @@ fork-kit/gh-apps/tests/wrapper.test.py
 # Real users and sudo on the throw-away runner, as root (it refuses anywhere else).
 fork-kit/gh-apps/tests/root.test.py run by .github/workflows/fork-tests.yml
 fork-kit/heavy/tests/install.test.py ~8s
+fork-kit/heavy/tests/measure.test.py ~10s
 fork-kit/heavy/tests/queue.test.py ~18s
-fork-kit/heavy/tests/sweep.test.py ~52s
+fork-kit/heavy/tests/sweep.test.py ~37s
 # A real systemd user manager (the step starts one for the runner user).
 fork-kit/heavy/tests/heavy.test.py run by .github/workflows/fork-tests.yml
 fork-kit/model-guard/tests/guard.test.py

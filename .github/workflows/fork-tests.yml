@@ -432,6 +432,15 @@ jobs:
           if ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml
           fi
+      # fork-fleet-refresh.test.py runs the refresh service's sandbox for real, as a transient unit of the runner
+      # user's systemd manager. Ubuntu 24.04's AppArmor keeps unprivileged user namespaces from that manager, so it
+      # would apply no sandbox and the test would skip (red: no test of it may skip). Allowed here, so the test runs
+      # whatever the runner image's default; a kernel without the switch has no such restriction.
+      - name: Let the user manager apply a services sandbox
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Fork script tests
         env:
           FORK_CI_TEST_RECORDS: ${{ runner.temp }}/fork-test-records
@@ -466,10 +475,12 @@ jobs:
 
       # Fork lines in upstream files stay the seam lines pinned in .github/fork-seams.json (a fork
       # setting goes in forkSettings.ts, not upstream's settings.ts). A pull request's run checks out
-      # its merge commit, whose first parent is the base: the lines the pull request adds.
+      # its merge commit, whose first parent is the base: the lines the pull request adds. Its two
+      # commits have no upstream base, so the seam entries it changes are counted from upstream by
+      # fork-checks (the pull request's head, full history), not here: --no-upstream.
       - name: Fork lines in upstream files
         if: ${{ github.event_name == 'pull_request' }}
-        run: node .github/scripts/fork-seam-check.cjs HEAD^1 HEAD
+        run: node .github/scripts/fork-seam-check.cjs --no-upstream HEAD^1 HEAD
 
   # The composite actions' tests (fork-ci/) and the fleet walls' (.github/scripts/fork-fleet-walls*),
   # split from `workflows`: together they were about two thirds of its script tests' time, which

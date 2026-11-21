@@ -9,7 +9,7 @@ import {
   type OrchestratorMcpCreateThreadRequest,
   OrchestratorMcpFailure,
   type ProviderInstanceId,
-  type ScheduledTask,
+  ScheduledTask,
   ScheduledTaskError,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -351,6 +351,13 @@ export const runNowSlotRefusal = (error: OrchestratorMcpFailure): OrchestratorMc
     ? slotsFull(error.message)
     : error;
 
+/**
+ * A direct webhook delivery waiting in memory (its store failed) whose task was saved meanwhile, and
+ * that could not be stored again: its prompt is the one from before the save, so it is not run.
+ */
+export const SAVED_WHILE_WAITING_NOT_STORED =
+  "Not run: this task was saved again while this delivery waited for an agent slot, and the delivery could not be stored to run on the task as it is now (the server log says why), so it was not started: it would have used the task as it was before. The next webhook delivery uses the task as it is now.";
+
 /** How often a webhook delivery that waits for a slot asks again (the scheduler's poll). */
 export const WEBHOOK_SLOT_RETRY = Duration.seconds(5);
 
@@ -384,6 +391,42 @@ const CurrentDirectDelivery = Context.Reference<DirectDelivery | undefined>(
  */
 const SCHEDULED_PLACE = "scheduled-run:";
 const DELIVERY_PLACE = "webhook-delivery:";
+
+/**
+ * What a run takes from its task's row, decoded as `ScheduledTaskService` decodes it (so a prompt
+ * or title with spaces at either end compares as the trimmed text a run uses). Not the run's
+ * bookkeeping (`updated_at`, due and last-run columns), the webhook token, or what `webhookGone`
+ * checks: writing those is not a save a run would see.
+ */
+const RunCopy = Schema.Struct({
+  title: ScheduledTask.fields.title,
+  prompt: ScheduledTask.fields.prompt,
+  schedule: ScheduledTask.fields.schedule,
+  projectId: ScheduledTask.fields.projectId,
+  threadId: ScheduledTask.fields.threadId,
+  threadMode: ScheduledTask.fields.threadMode,
+  workspaceStrategy: ScheduledTask.fields.workspaceStrategy,
+  modelSelection: ScheduledTask.fields.modelSelection,
+  runtimeMode: ScheduledTask.fields.runtimeMode,
+  interactionMode: ScheduledTask.fields.interactionMode,
+  createdBy: ScheduledTask.fields.createdBy,
+  creationSource: ScheduledTask.fields.creationSource,
+});
+/** The same fields as the row stores them (its JSON columns as text). */
+const decodeStoredCopy = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    ...RunCopy.fields,
+    schedule: Schema.fromJsonString(ScheduledTask.fields.schedule),
+    workspaceStrategy: Schema.fromJsonString(ScheduledTask.fields.workspaceStrategy),
+    modelSelection: Schema.fromJsonString(ScheduledTask.fields.modelSelection),
+  }),
+);
+/** One text for a copy, to compare two. */
+const runCopyText = Schema.encodeEffect(Schema.fromJsonString(RunCopy));
+const decodePrompt = Schema.decodeUnknownEffect(ScheduledTask.fields.prompt);
+
+/** Whether a webhook delivery's task changed since its run read it (`savedSince`). */
+type SinceRead = "same" | "saved" | "unknown";
 
 /** A stored delivery's request, in the shape the stored-delivery worker reads (`decodePendingRequest`). */
 const encodeStoredRequest = Schema.encodeEffect(
@@ -422,6 +465,12 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
    * `ended` frees it on a path that never reached the end (a failure before the dispatch).
    */
   const open = new Map<string, (threadId: ThreadId | null) => Effect.Effect<void>>();
+
+  /**
+   * Tasks whose stored webhook delivery was not started because the task was saved while it waited
+   * for a slot (`waitForWebhookSlot`): the stored-delivery worker keeps its row (`keepStored`).
+   */
+  const keep = new Set<string>();
 
   /**
    * Where a run starts: a bound task runs on its thread's current provider (a thread that cannot
@@ -605,6 +654,86 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   });
 
   /**
+   * A stored delivery whose prompt was rendered from another copy of the task than `task` (a save
+   * between the stored-delivery worker's read and `runTask`'s, `task`): the worker writes the prompt
+   * it rendered from into the row it takes (`task_json`), the first of the task's rows in its order.
+   * A `running` row was sent already and keeps its prompt; a direct delivery has no row yet.
+   */
+  const renderedFromOther = Effect.fnUntraced(function* (task: ScheduledTask) {
+    if ((yield* CurrentDirectDelivery) !== undefined) return false;
+    const [row] = yield* sql<{ state: string; prompt: unknown }>`
+      SELECT state, json_extract(task_json, '$.prompt') AS prompt
+      FROM scheduled_task_webhook_pending
+      WHERE task_id = ${task.id} AND state IN ('dispatching', 'running', 'completed', 'failed')
+      ORDER BY due_at, rowid LIMIT 1
+    `;
+    if (row?.state !== "dispatching") return false;
+    return (yield* decodePrompt(row.prompt)) !== task.prompt;
+  });
+
+  /**
+   * Whether `task`, the copy a waiting webhook run holds, is still the task as saved: `saved` when
+   * a field a run uses changed since it was read (a save in the same millisecond too), `unknown`
+   * when the row cannot be read. A bind writes the thread, but not during a wait: a webhook task's
+   * runs take turns. (A save before it was read is `renderedFromOther`'s, as the run starts.)
+   */
+  const savedSince = Effect.fn("AgentSlotRoutes.savedSince")(
+    function* (task: ScheduledTask) {
+      const [row] = yield* sql<{
+        title: string;
+        prompt: string;
+        schedule_json: string;
+        project_id: string;
+        thread_id: string | null;
+        thread_mode: string;
+        workspace_strategy_json: string;
+        model_selection_json: string;
+        runtime_mode: string;
+        interaction_mode: string;
+        created_by: string;
+        creation_source: string;
+      }>`
+        SELECT title, prompt, schedule_json, project_id, thread_id, thread_mode,
+          workspace_strategy_json, model_selection_json, runtime_mode, interaction_mode,
+          created_by, creation_source
+        FROM scheduled_tasks WHERE task_id = ${task.id}
+      `;
+      // Gone between `webhookGone` and here: that check ends it at the next retry.
+      if (row === undefined) return "unknown" as SinceRead;
+      const now = yield* decodeStoredCopy({
+        title: row.title,
+        prompt: row.prompt,
+        schedule: row.schedule_json,
+        projectId: row.project_id,
+        threadId: row.thread_id,
+        threadMode: row.thread_mode,
+        workspaceStrategy: row.workspace_strategy_json,
+        modelSelection: row.model_selection_json,
+        runtimeMode: row.runtime_mode,
+        interactionMode: row.interaction_mode,
+        createdBy: row.created_by,
+        creationSource: row.creation_source,
+      });
+      const [was, is] = yield* Effect.all([runCopyText(task), runCopyText(now)]);
+      return was === is ? "same" : "saved";
+    },
+    (effect) => effect.pipe(Effect.orElseSucceed((): SinceRead => "unknown")),
+  );
+
+  /** A webhook delivery the stored-delivery worker owns now: this run of it ends unstarted. */
+  const handedToWorker = (task: ScheduledTask): ScheduledSlot => ({
+    skipped: { task, threadId: null, dispatchFailed: false },
+    end: () => Effect.void,
+  });
+
+  /** A stored delivery handed back: the worker keeps its row and takes it again at once. */
+  const keepForWorker = (task: ScheduledTask) =>
+    Effect.sync(() => {
+      keep.add(task.id);
+      return handedToWorker(task);
+    });
+
+  /**
    * A direct delivery the gate refused is stored as a pending delivery the stored-delivery worker
    * owns (due now), so a restart keeps it; its in-memory copy then ends without running, and the
    * worker runs it once. `false` when there is nothing to store (a stored delivery already) or the
@@ -644,9 +773,9 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   );
 
   /**
-   * A stored webhook delivery waits for a slot: asked again every few seconds until one is free
-   * (its pending row stays as it is, so a restart picks it up again, once). It is dropped only for
-   * the reasons a queued delivery is (the task deleted, replaced, paused or no longer a webhook).
+   * A stored webhook delivery waits for a slot, asked again every few seconds (a restart picks its
+   * row up again, once). Dropped only as a queued delivery is (task deleted, replaced, paused, not a
+   * webhook). Saved while it waits, it is handed back to the worker to run on the task as saved.
    */
   const waitForWebhookSlot = Effect.fnUntraced(
     function* (task: ScheduledTask, first: Refused, place: SlotGate.SlotPlace | undefined) {
@@ -658,6 +787,18 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
         yield* Effect.sleep(WEBHOOK_SLOT_RETRY);
         const gone = yield* webhookGone(task).pipe(Effect.orElseSucceed(() => null));
         if (gone !== null) return yield* Effect.fail(new WebhookSkipped({ reason: gone }));
+        const since = yield* savedSince(task);
+        // Not known (the row cannot be read): asked again at the next retry, with no slot taken.
+        if (since === "unknown") continue;
+        // Handed back, its place goes on release; the worker's ask rejoins at the row's due time.
+        if (since === "saved") {
+          if ((yield* CurrentDirectDelivery) === undefined) return yield* keepForWorker(task);
+          if (!(yield* storeDirect(task, yield* DateTime.now)))
+            return yield* Effect.fail(
+              new WebhookSkipped({ reason: SAVED_WHILE_WAITING_NOT_STORED }),
+            );
+          return handedToWorker(task);
+        }
         // Checked again as it would start: the owner may have widened the project meanwhile.
         const refused = task.threadId === null ? yield* profiles.runRefusal(task) : null;
         if (refused !== null) return yield* Effect.fail(new WebhookSkipped({ reason: refused }));
@@ -667,7 +808,8 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
         if (slot.type === "allow") return allowed(task, slot.end);
       }
     },
-    // Skipped, failed or stopped: its place goes too (let through, the gate dropped it already).
+    // Skipped, failed, stopped or handed back: its place goes too (let through, the gate dropped
+    // it already).
     (effect, _task, _first, place) =>
       place === undefined
         ? effect
@@ -698,6 +840,13 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       runError: string,
     ) => Effect.Effect<void, E, R>,
   ) {
+    // A stored delivery rendered from a copy a save overtook runs again on the task as saved, wait
+    // or not. A read that fails here goes on, as upstream's run did.
+    if (
+      trigger === "webhook" &&
+      (yield* renderedFromOther(task).pipe(Effect.orElseSucceed(() => false)))
+    )
+      return yield* keepForWorker(task);
     // A new thread wider than the profile the task was saved with starts nothing: on its schedule
     // a failed run with the reason (moved to its next time), "run now" fails, a webhook skips.
     const profileRefusal = task.threadId === null ? yield* profiles.runRefusal(task) : null;
@@ -733,11 +882,7 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       });
     }
     if (trigger === "webhook") {
-      if (yield* storeDirect(task, now))
-        return {
-          skipped: { task, threadId: null, dispatchFailed: false },
-          end: () => Effect.void,
-        } as ScheduledSlot;
+      if (yield* storeDirect(task, now)) return handedToWorker(task);
       return yield* waitForWebhookSlot(task, slot, place);
     }
     yield* keepDue(task, now, slot.refusal).pipe(
@@ -753,6 +898,13 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       end: () => Effect.void,
     } as ScheduledSlot;
   });
+
+  /**
+   * The stored-delivery worker, after a delivery's run returned: `true` when that run was not
+   * started because its task was saved while it waited, so the worker keeps the row and runs it
+   * again on the task as it is now, instead of removing it. Read once.
+   */
+  const keepStored = (taskId: string) => Effect.sync(() => keep.delete(taskId));
 
   /** The task's run ended, any way: a slot its dispatch never ended is free again. */
   const ended = (taskId: string) => Effect.suspend(() => open.get(taskId)?.(null) ?? Effect.void);
@@ -795,6 +947,7 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
     admit: admitRun,
     ended,
     directDelivery,
+    keepStored,
     /** `ScheduledTaskService.upsert`, last before it writes the row (`scheduledTaskMcpProfile.ts`). */
     saving: profiles.saving,
   };
