@@ -228,27 +228,24 @@
     },
     "apps/server/src/mcp/McpToolAccess.ts": {
       "why": "A thread whose MCP profile is narrower than \"all\" cannot start a thread on another machine, which would get that machine's profile (#681). Upstream's caller check stays as it is: startsThreads' own path marks its caller (startsHere), and working out the modes refuses a narrowed caller nothing marked (refuseUnlessHere), so its remote check refuses; a forwarded fork, scheduled task change or run now from a narrowed caller is refused too (checkForwarded, #693); the logic is in fork/launchMcpProfile.ts.",
-      "added": [],
+      "added": [
+        "import * as LaunchMcpProfile from \"../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
+        "yield* LaunchMcpProfile.refuseUnlessHere(caller); // Fork: MCP profile launch",
+        "LaunchMcpProfile.startsHere(caller); // Fork: MCP profile launch"
+      ],
       "announced": {
-        "since": "2026-11-20",
+        "since": "2026-11-21",
         "added": [
-          "import * as LaunchMcpProfile from \"../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
-          "yield* LaunchMcpProfile.refuseUnlessHere(caller); // Fork: MCP profile launch",
-          "LaunchMcpProfile.startsHere(caller); // Fork: MCP profile launch",
           "yield* LaunchMcpProfile.checkForwarded(name, params); // Fork: MCP profile launch"
         ]
       }
     },
     "apps/server/src/mcp/toolkits/project/handlers.ts": {
       "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-20",
-        "added": [
-          "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
-          "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch"
-        ]
-      }
+      "added": [
+        "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
+        "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch"
+      ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693).",
