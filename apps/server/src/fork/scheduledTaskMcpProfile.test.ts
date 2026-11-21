@@ -978,7 +978,7 @@ it.effect("a webhook run is refused when it starts, and again after it waited fo
 );
 
 it.effect(
-  "a webhook delivery that waited while the task was saved again says so; the next one runs",
+  "a webhook delivery saved while it waited runs once on the task as saved, checked on it (#719)",
   () => {
     const logs: Array<Logger.Options<unknown>> = [];
     /** The stored-delivery worker's run is in its slot wait, on the copy of the task it took. */
@@ -1020,32 +1020,34 @@ it.effect(
               ...(yield* listed(service, "task:hook-saved")),
               prompt: "New words",
             });
-            yield* settleUntil(
-              deliveryOf(service, "task:hook-saved", stored.deliveryId).pipe(
-                Effect.map((delivery) => delivery.outcome !== "accepted"),
-                Effect.orDie,
-              ),
-              "the waiting delivery ended",
-              workerRounds(world, 1),
-            );
-            // It was asked for the old prompt, which the run would use: not started, and the
-            // reason says why (not "save the task again", which the owner just did).
-            slots.running = [];
-            yield* workerRounds(world, 2);
+            // The run it held was rendered from the old prompt: not started, and not dropped. The
+            // delivery stays stored and is read again, so the profile check is on the task as
+            // saved (its record matches), not on the old copy.
+            yield* workerRounds(world, 3);
             expect(world.launched).toHaveLength(0);
-            const waited = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
-            expect(waited.outcome).toBe("dispatch_failed");
-            expect(waited.error).toContain(STALE_COPY);
-            expect(waited.error).toContain("the next webhook delivery, uses the task as it is now");
-            expect(waited.error).not.toContain("Save the task again");
-            // The next delivery runs the task as it is now.
-            const next = yield* service.triggerWebhook(webhookRequest(hook, '{"n":2}'));
-            if (next._tag !== "accepted") return assert.fail(`not accepted: ${next._tag}`);
+            const waiting = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
+            expect(waiting.outcome).toBe("accepted");
+            expect(waiting.renderedPrompt).toContain("New words");
+            const sql = yield* SqlClient.SqlClient;
+            expect(
+              yield* sql`SELECT state FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-saved'`,
+            ).toEqual([{ state: "dispatching" }]);
+            // The slot frees: it runs once, with the new prompt.
+            slots.running = [];
             yield* settleUntil(
               Effect.sync(() => world.launched.length === 1),
-              "the next delivery ran",
+              "the waiting delivery ran",
+              workerRounds(world, 1),
             );
             expect(JSON.stringify(world.launched[0])).toContain("New words");
+            expect(JSON.stringify(world.launched[0])).not.toContain("Do the work");
+            yield* workerRounds(world, 3);
+            expect(world.launched).toHaveLength(1);
+            const ran = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
+            expect(ran.outcome).toBe("accepted");
+            expect(
+              yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-saved'`,
+            ).toHaveLength(0);
           }),
         );
       }),
