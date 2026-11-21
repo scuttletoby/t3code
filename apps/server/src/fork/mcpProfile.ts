@@ -1,7 +1,7 @@
 /**
  * Fork: which MCP profile a thread gets. Pure: the same settings and lineage give the same answer.
  * A missing or unreadable profile is never replaced by `all`: the result says it cannot apply.
- * Nothing calls it yet; the provider adapters and the T3 tool filter use it in later PRs.
+ * The provider adapters, the turn check and the T3 tool filter (mcpT3ToolFilter.ts) use it.
  */
 import {
   MCP_CARRIED_PROFILES_REFUSE,
@@ -103,8 +103,8 @@ export type McpProfileResolution = McpProfileResolved | McpProfileCannotApply;
 
 /**
  * Each T3 toolkit's group, by its folder under src/mcp/toolkits; `null` for a toolkit that holds
- * only tools of `MCP_T3_UNGROUPED_TOOLS`. The T3 tool filter (a later PR) uses it. The test in
- * personOnlySettings.test.ts fails when a toolkit or tool maps to nothing.
+ * only tools of `MCP_T3_UNGROUPED_TOOLS`. The T3 tool filter (mcpT3ToolFilter.ts) uses it. The test
+ * in personOnlySettings.test.ts fails when a toolkit or tool maps to nothing.
  */
 export const MCP_T3_TOOLKIT_GROUPS: Readonly<Record<string, McpT3ToolGroup | null>> = {
   orchestrator: "orchestration",
@@ -174,10 +174,9 @@ const PROFILE_FIELDS: ReadonlySet<string> = new Set(["servers", "t3Tools"]);
 const CARRIED_FIELDS: ReadonlySet<string> = new Set(["name", ...PROFILE_FIELDS]);
 
 /**
- * The drivers whose threads apply an MCP profile: Claude only (fork/claudeMcpProfile.ts). Any
- * other provider would give a thread every MCP server and T3 tool, so a turn there whose profile
- * is narrower than `all` is refused as it starts (fork/mcpProfileTurnCheck.ts), and a delegation
- * refuses to send a narrower profile to one on another machine (fork/remoteMcpProfile.ts).
+ * The drivers that apply a profile's outside servers: Claude only. Off Claude a turn whose profile
+ * leaves one out is refused (mcpProfileTurnCheck.ts); T3 tool groups apply everywhere. A delegation
+ * sends no narrower profile to another driver elsewhere: that machine may predate the T3 filter.
  */
 export const MCP_PROFILE_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set([
   ProviderDriverKind.make("claudeAgent"),

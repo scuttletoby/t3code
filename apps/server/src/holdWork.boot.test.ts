@@ -388,6 +388,8 @@ const FORK_LAYER_SPANS = [
   "HeadlessUsageRefresher.make",
   "cloud.auto_update.make",
   "McpProfileTurnCheck.make",
+  // The MCP profile's T3 tool filter on /mcp: `McpT3ToolFilter.layer` in McpHttpServer's `layer`.
+  "McpT3ToolFilter.make",
   // The agent slot gate on scheduled runs: `Layer.provide(SlotGate.layer)` in runtimeLayer.ts.
   "AgentSlotRoutes.scheduledRunsGated",
   // The record of who saved each scheduled task, which needs the server's state folder.

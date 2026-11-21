@@ -1,8 +1,7 @@
 /**
- * Fork: a turn on a provider outside `MCP_PROFILE_DRIVERS` would get every MCP server and T3 tool,
- * so it refuses at start when its thread's profile is narrower than `all` or cannot be worked out.
- * Checked where the turn runs, so every route is covered; so is compaction (a `/compact` prompt on
- * some providers). A steer joins a turn that was checked as it started.
+ * Fork: off Claude a turn would get every outside MCP server, so it refuses at start when its
+ * profile leaves one out or cannot be worked out; every such turn (also a resume or a compaction)
+ * fixes its thread's T3 tool groups (mcpT3ToolFilter.ts). Claude fixes them in claudeMcpProfile.ts.
  */
 import { MCP_PROFILE_ALL, type ProviderDriverKind } from "@t3tools/contracts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -18,7 +17,8 @@ import {
   type LineageThread,
   makeThreadMcpProfiles,
 } from "./claudeMcpProfile.ts";
-import { isEveryMcpTool, MCP_PROFILE_DRIVERS, type McpProfileResolved } from "./mcpProfile.ts";
+import { MCP_PROFILE_DRIVERS, type McpProfileResolved } from "./mcpProfile.ts";
+import { fixT3ToolSet, forgetT3ToolSet, refusedT3ToolSet, t3ToolSetOf } from "./mcpT3ToolSets.ts";
 
 type ProfileFor = Effect.Success<typeof makeThreadMcpProfiles>;
 /** What a turn start, and a resume, are given that the check reads. */
@@ -60,20 +60,28 @@ const refusalReason = (resolved: McpProfileResolved, instance: ProviderInstance)
   const profile = resolved.narrowedByParent
     ? `("${resolved.name}", cut down to its parent thread's)`
     : `"${resolved.name}"`;
-  return `This thread's MCP profile ${profile} is narrower than "${MCP_PROFILE_ALL}", and ${instance.driverKind} (provider instance ${instance.instanceId}) does not apply MCP profiles (only Claude does), so this turn was not started: it would get every MCP server and T3 tool. Switch the thread to a Claude instance, or pick "${MCP_PROFILE_ALL}" for this thread in Settings.`;
+  return `This thread's MCP profile ${profile} leaves out some outside MCP servers, and ${instance.driverKind} (provider instance ${instance.instanceId}) does not apply a profile's outside servers (only Claude does), so this turn was not started: it would get every outside MCP server. Switch the thread to a Claude instance, or pick "${MCP_PROFILE_ALL}" (or a profile whose servers are "all") for this thread in Settings.`;
 };
 
 /**
- * Nothing when the thread's profile is `all`; otherwise the refusal. A profile that cannot be
- * worked out refuses with the resolver's reason, as it does on Claude.
+ * Fixes the thread's T3 tool groups for this turn, then nothing when the profile keeps every
+ * outside server; otherwise the refusal. A profile that cannot be worked out refuses with the
+ * resolver's reason, as it does on Claude, and keeps only the tools every profile keeps.
  */
 const checkTurnProfile = Effect.fn("McpProfileTurnCheck.check")(function* (
   profileFor: ProfileFor,
   instance: ProviderInstance,
   thread: LineageThread,
 ) {
-  const resolved = yield* profileFor(thread);
-  if (isEveryMcpTool(resolved.profile)) return;
+  const resolved = yield* profileFor(thread).pipe(
+    Effect.tapError((refusal) =>
+      Effect.sync(() => fixT3ToolSet(thread.id, refusedT3ToolSet(refusal.reason))),
+    ),
+    // Stopped half-way: no set stands, so the next request works it out again.
+    Effect.onInterrupt(() => Effect.sync(() => forgetT3ToolSet(thread.id))),
+  );
+  fixT3ToolSet(thread.id, t3ToolSetOf(resolved));
+  if (resolved.profile.servers === "all") return;
   return yield* new ClaudeMcpProfileError({ reason: refusalReason(resolved, instance) });
 });
 
