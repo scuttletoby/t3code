@@ -15,10 +15,14 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ServerConfig from "./config.ts";
-import { SETTINGS_FILE_UNPARSEABLE } from "./fork/modelPolicyFile.ts";
+import {
+  SETTINGS_FILE_UNPARSEABLE,
+  SETTINGS_FILE_UNPARSEABLE_WARNING,
+} from "./fork/modelPolicyFile.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import * as ServerSettingsModule from "./serverSettings.ts";
@@ -97,6 +101,38 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork setting def
         assert.deepStrictEqual(yield* loadedForkSettings(contents), expected ?? PINNED);
       }).pipe(Effect.provide(layerServerSettings())),
   );
+
+  it.effect.each([
+    { state: "a file cut off half-way", contents: '{ "automaticUpdates": tr', warned: 1 },
+    { state: "an empty file", contents: "", warned: 1 },
+    {
+      state: "a file with a value of the wrong type",
+      contents: '{ "automaticUpdates": "yes" }',
+      warned: 0,
+    },
+    { state: "an empty settings object", contents: "{}", warned: 0 },
+  ])("the model policy warning for $state reaches the server's logger", ({ contents, warned }) => {
+    const logs: Array<{ readonly level: string; readonly message: unknown }> = [];
+    // The server's logger, under which the settings service is built and read.
+    const serverLogger = Logger.layer(
+      [Logger.make(({ logLevel, message }) => logs.push({ level: logLevel, message }))],
+      { mergeWithExisting: false },
+    );
+    const isWarning = (log: (typeof logs)[number]) =>
+      log.level === "Warn" &&
+      JSON.stringify(log.message).includes(SETTINGS_FILE_UNPARSEABLE_WARNING);
+    return Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(config.settingsPath, contents);
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* service.getSettings;
+      assert.lengthOf(logs.filter(isWarning), warned);
+      // Read again: the same answer, from the same load.
+      yield* service.getSettings;
+      assert.lengthOf(logs.filter(isWarning), warned);
+    }).pipe(Effect.provide(layerServerSettings().pipe(Layer.provideMerge(serverLogger))));
+  });
 
   it.effect("serves no settings at all when the file cannot be read", () =>
     Effect.gen(function* () {
