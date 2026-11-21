@@ -52,6 +52,7 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
+import * as ScheduledTaskMcpProfile from "./scheduledTaskMcpProfile.ts";
 import { type SlotWorld, slotGateOver, slotWorld } from "./slotWorld.testkit.ts";
 
 /** Written out, not imported, so these tests also run (and fail) on code without the record. */
@@ -978,8 +979,19 @@ it.effect("a webhook run is refused when it starts, and again after it waited fo
 
 it.effect(
   "a webhook delivery that waited while the task was saved again says so; the next one runs",
-  () =>
-    held(
+  () => {
+    const logs: Array<Logger.Options<unknown>> = [];
+    /** The stored-delivery worker's run is in its slot wait, on the copy of the task it took. */
+    const inSlotWait = Effect.sync(() =>
+      logs.some((entry) => {
+        const [text, fields] = entry.message as ReadonlyArray<unknown>;
+        return (
+          text === "Webhook delivery waits for an agent slot" &&
+          (fields as { readonly taskId?: unknown } | undefined)?.taskId === "task:hook-saved"
+        );
+      }),
+    );
+    return held(
       Effect.gen(function* () {
         const slots = slotWorld();
         const world = newWorld(slots);
@@ -992,8 +1004,17 @@ it.effect(
             slots.running = [ThreadId.make("thread:busy")];
             const stored = yield* service.triggerWebhook(webhookRequest(hook));
             if (stored._tag !== "accepted") return assert.fail(`not accepted: ${stored._tag}`);
-            yield* workerRounds(world, 3);
+            // The save must land after the worker took its copy (it takes the prompt saved at
+            // that moment), so wait for that state, not for a number of rounds.
+            yield* settleUntil(
+              inSlotWait,
+              "the delivery waits in its slot wait",
+              workerRounds(world, 1),
+            );
             expect(world.launched).toHaveLength(0);
+            expect(
+              (yield* deliveryOf(service, "task:hook-saved", stored.deliveryId)).renderedPrompt,
+            ).toContain("Do the work");
             // The owner saves a new prompt while it waits: recorded, so the task is fine to run.
             yield* service.upsert({
               ...(yield* listed(service, "task:hook-saved")),
@@ -1014,9 +1035,8 @@ it.effect(
             expect(world.launched).toHaveLength(0);
             const waited = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
             expect(waited.outcome).toBe("dispatch_failed");
-            expect(waited.error).toContain(
-              "this task was changed while this run waited (for an agent slot)",
-            );
+            expect(waited.error).toContain(STALE_COPY);
+            expect(waited.error).toContain("the next webhook delivery, uses the task as it is now");
             expect(waited.error).not.toContain("Save the task again");
             // The next delivery runs the task as it is now.
             const next = yield* service.triggerWebhook(webhookRequest(hook, '{"n":2}'));
@@ -1029,7 +1049,57 @@ it.effect(
           }),
         );
       }),
-    ),
+    ).pipe(
+      Effect.provide(
+        Logger.layer([Logger.make((entry) => logs.push(entry))], { mergeWithExisting: false }),
+      ),
+    );
+  },
+);
+
+const STALE_COPY =
+  "Not run: this task was saved again after this run read it, and the run would have used the task as it was before, so it was not started.";
+
+/**
+ * A run's copy of the task that a save overtook (a scheduled run or "run now" whose read a save
+ * beat, the way a waiting webhook delivery's is): the record's check, on that copy, as it starts.
+ */
+it.effect("a run's copy that a save overtook says so, with the one-time task's way on", () =>
+  held(
+    Effect.gen(function* () {
+      const world = newWorld();
+      const profiles = yield* withService(NARROWED, world, (service) =>
+        Effect.gen(function* () {
+          const once = { schedule: { type: "once", runAt: "1970-01-01T00:01:00.000Z" } } as const;
+          const { task: oneTime } = yield* service.upsert(task("task:once", once));
+          const { task: repeating } = yield* service.upsert(task("task:every"));
+          return [oneTime, repeating] as const;
+        }),
+      );
+      const [oneTime, repeating] = profiles;
+      const check = yield* ScheduledTaskMcpProfile.makeScheduledTaskMcpProfiles(
+        ThreadManagement.ThreadManagementService.of({ getThreadShell: findShell } as never),
+      ).pipe(Effect.provide(ServerSettings.layerTest(NARROWED as Settings)));
+      // Each copy as the run read it, before the owner's save wrote the row and its record.
+      const before = (stored: ScheduledTask) => ({ ...stored, prompt: "Words from before" });
+      const onceReason = yield* check.runRefusal(before(oneTime));
+      expect(onceReason).toContain(STALE_COPY);
+      expect(onceReason).toContain("run it now or give it a new time");
+      expect(onceReason).not.toContain("The next run");
+      const everyReason = yield* check.runRefusal(before(repeating));
+      expect(everyReason).toContain(STALE_COPY);
+      expect(everyReason).toContain("The next run, or the next webhook delivery");
+      expect(everyReason).not.toContain("waited");
+      // A copy of a task that was deleted and made again under its id is not "saved again": the
+      // writer of this row is not known.
+      const remade = yield* check.runRefusal({
+        ...before(repeating),
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      expect(remade).toContain("Save the task again");
+      expect(remade).not.toContain(STALE_COPY);
+    }),
+  ),
 );
 
 /** A call from another machine's thread, which says no MCP profile for it. */
@@ -1187,7 +1257,7 @@ it.effect("a record that cannot be read is logged once while it stays so, not at
     Effect.gen(function* () {
       const world = newWorld();
       yield* insertOldRow("task:owner-old", PROJECT, null, "user");
-      yield* withService(NARROWED, world, () =>
+      yield* withService(NARROWED, world, (service) =>
         Effect.gen(function* () {
           // Readable (no file): the owner's task runs, nothing is logged.
           yield* scheduledPass(world);
@@ -1209,13 +1279,21 @@ it.effect("a record that cannot be read is logged once while it stays so, not at
           yield* writeRecord("{ not json");
           for (let pass = 0; pass < 2; pass++) yield* scheduledPass(world);
           expect(warnings()).toBe(2);
+          // Fixed, and only a save reads it: that good read counts too, so the same breakage
+          // after it is logged again.
+          yield* fs.remove(yield* recordPath);
+          yield* service.upsert(task("task:saved-meanwhile"));
+          yield* writeRecord("{ not json");
+          yield* scheduledPass(world);
+          expect(warnings()).toBe(3);
+          expect(world.launched).toHaveLength(2);
         }),
       );
       // A start on the broken file: its clean-up and its runs log it once between them.
       yield* withService(NARROWED, world, () =>
         Effect.gen(function* () {
           for (let pass = 0; pass < 2; pass++) yield* scheduledPass(world);
-          expect(warnings()).toBe(3);
+          expect(warnings()).toBe(4);
           expect(world.launched).toHaveLength(2);
         }),
       );
@@ -1517,7 +1595,7 @@ it.effect("a change that races the owner's move of the task's thread is refused,
                 Effect.flip,
               );
             expect(messageOf(refused)).toContain(
-              "This task was moved to another project (with its thread) while this change was being made",
+              "This task was moved to another project (with its thread) while this save was being made",
             );
             expect(yield* row("task:moved")).toMatchObject({
               prompt: "Do the work",
@@ -1534,6 +1612,14 @@ it.effect("a change that races the owner's move of the task's thread is refused,
             prompt: "New words",
             project_id: NARROW_PROJECT,
             thread_id: WIDE,
+          });
+          // The app's save (no MCP call) keeps upstream's behaviour: the project the owner saves
+          // is the one they picked, so the stale read moves the task back, off its thread.
+          yield* service.upsert({ ...read, prompt: "Owner words" });
+          expect(yield* row("task:moved")).toMatchObject({
+            prompt: "Owner words",
+            project_id: PROJECT,
+            thread_id: null,
           });
         }),
       );

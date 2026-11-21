@@ -11,6 +11,7 @@ import {
   type ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
+import type { Tool } from "effect/ai";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
@@ -326,12 +327,17 @@ export const refuseUnlessHere = (caller: {
 }) => (startingHere.has(caller) ? Effect.void : refuseLaunchElsewhere(caller.caller));
 
 /**
- * The tools `checkForwarded` matches by name, typed against upstream's toolkits: a rename there
- * fails the typecheck here instead of dropping the check without a word.
+ * The tools and parameters `checkForwarded` matches by name, typed against upstream's toolkits: a
+ * rename there fails the typecheck here instead of dropping the check without a word.
  */
 const FORK_TOOL = "t3_thread_transfer" satisfies keyof (typeof ThreadToolkit)["tools"];
 const SCHEDULE_TOOL = "schedule_task" satisfies keyof (typeof OrchestratorToolkit)["tools"];
 const RUN_NOW_TOOL = "run_scheduled_task_now" satisfies keyof (typeof ThreadToolkit)["tools"];
+type ForkParams = Tool.Parameters<(typeof ThreadToolkit)["tools"][typeof FORK_TOOL]>;
+type ScheduleParams = Tool.Parameters<(typeof OrchestratorToolkit)["tools"][typeof SCHEDULE_TOOL]>;
+const ACTION = "action" satisfies keyof ForkParams;
+const FORK_ACTION = "fork" satisfies ForkParams[typeof ACTION];
+const TASK_ID = "scheduledTaskId" satisfies keyof ScheduleParams;
 
 /**
  * A call forwarded to another machine that may start a thread there outside `startsThreads`: a
@@ -342,11 +348,11 @@ export const checkForwarded = Effect.fn("LaunchMcpProfile.forwarded")(function* 
   tool: string,
   params: object,
 ) {
-  const input = params as { readonly action?: unknown; readonly scheduledTaskId?: unknown };
+  const input = params as { readonly [ACTION]?: unknown; readonly [TASK_ID]?: unknown };
   const done =
-    tool === FORK_TOOL && input.action === "fork"
+    tool === FORK_TOOL && input[ACTION] === FORK_ACTION
       ? "it was not forked"
-      : tool === SCHEDULE_TOOL && input.scheduledTaskId !== undefined
+      : tool === SCHEDULE_TOOL && input[TASK_ID] !== undefined
         ? "the task was not changed"
         : tool === RUN_NOW_TOOL
           ? "the task was not run"
