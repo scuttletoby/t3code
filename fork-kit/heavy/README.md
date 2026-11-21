@@ -41,7 +41,7 @@ scope (a command named `keep` gets `heavy-keep_-<random>.scope`), so the leftove
 both) or from heavy (when someone sent it to heavy alone; a signal sent to the whole process group, as `timeout`
 or a shell's `kill %1` do, reaches the command once). heavy then waits up to the grace time (30 s by default, so a
 command that handles Ctrl-C, a REPL or a server saving its data, has time) for the command, and stops the whole
-scope (TERM, then KILL after the grace time again). A second signal stops it at once. A command that handles the
+scope (TERM, then KILL after the grace time again) and removes its containers. A second signal stops it at once. A command that handles the
 signal and exits keeps its own exit code. USR1 and USR2 are passed on. If heavy is killed with
 `kill -9`, the command is killed with it (as before, when heavy and the command were one process), and heavy's
 **guard** stops the rest of the scope (below).
@@ -51,18 +51,24 @@ its scope: children, double-forked daemons (`setsid`, `nohup`, `( cmd & )`) and 
 all stay in the scope's cgroup. Then it removes the Docker containers the command labelled as its own
 (`heavy docker-label`, below) with their anonymous volumes, and says so: `heavy: removed 1 leftover container
 (test-db)`. Only a container whose owner label names this user and this exact scope is touched; others, and
-containers without the label, never. No Docker, or none this user can reach: nothing to do, nothing said. Docker
-down: one line (`could not remove the containers of ...`); the leftover sweep looks again. `HEAVY_KEEP=1` keeps
-the scope's containers with it, unless heavy was stopped by a signal.
+containers without the label, never. heavy asks Docker only after a run that labelled a container (`heavy
+docker-label` leaves a note for the scope in `/run/user/<uid>/heavy/labelled/`, a folder only this user can write;
+without that folder heavy asks after every run), so a run with no containers costs no `docker ps`. No Docker, or
+none this user can reach (a rootless Docker through `docker context use` counts as reachable): nothing to do,
+nothing said. Docker down: one line (`could not remove the containers of ...`); the leftover sweep looks again.
+`HEAVY_KEEP=1` keeps the scope's containers with it, unless heavy was stopped by a signal. When systemd cannot
+stop the scope, heavy stops what is left itself: TERM only to a process still in the scope (checked through a
+pidfd, so a pid that ended and was reused by another process is never hit), then the kernel's `cgroup.kill`.
 
 **The guard.** heavy starts a small helper (named `scope-guard`) in a session of its own, outside the scope, that
-waits for heavy. heavy tells it "done" after its own clean-up. When heavy goes away without that (`kill -9`, a
+waits for heavy. It is not heavy's child (a double fork), so a kill of heavy's process tree (`pkill -9 -P`, a tool
+that walks children) misses it, and it refuses to start when heavy is already gone. heavy tells it "done" after its own clean-up. When heavy goes away without that (`kill -9`, a
 crash, an out-of-memory kill), the guard does heavy's clean-up: it stops the scope and removes its containers, and
 prints `heavy: heavy was killed: stopped 2 leftover processes (sleeper)`. It ignores the signals heavy handles
 (a terminal's Ctrl-C, a service stop's TERM) and a kill of heavy's process group, holds no file of heavy's but
 stderr (so a pipe after heavy ends once it is done), and is never in the scope it cleans. Not for `HEAVY_KEEP=1`
 (a kept scope outlives heavy on purpose) or a nested heavy (the outer one has a guard). Only a kill of the guard
-too (`kill -9` on both) leaves the scope; the leftover sweep finds it then.
+too (`kill -9` on both, by pid) leaves the scope; the leftover sweep finds it then.
 
 **Never uncapped.** heavy refuses (exit 1, the reason on stderr, the command not run) when the systemd user
 manager cannot be reached, when the slice has no unit file (systemd would make an empty one up on the fly, with no
@@ -321,7 +327,10 @@ docker run -d --label "$(heavy docker-label)" mariadb:11
 `heavy docker-label` prints `fork-kit.heavy.owner=<owner>`; `--value` prints only the value (for an API such as
 Testcontainers' `withLabel("fork-kit.heavy.owner", value)`). The owner is the heavy scope when the test runs
 under heavy (heavy passes the scope name to the command as `HEAVY_SCOPE`), else the calling process with its
-start time. A container whose label names another user is never touched. Under heavy, heavy itself removes
+start time. The scope is the one `heavy docker-label` runs in (its own cgroup): a process that left heavy's scope
+(`systemd-run --scope` from inside the command) still has `HEAVY_SCOPE` but gets the process owner, since heavy
+would remove its container when the scope ends; `HEAVY_SCOPE` counts only when the cgroup cannot be read. A
+container whose label names another user is never touched. Under heavy, heavy itself removes
 the container when its command ends or heavy is killed (above); the sweep is for a label with an owner pid and for
 a scope whose heavy and guard are both gone.
 
@@ -459,7 +468,12 @@ with a memory limit, `HEAVY_TEST_SLICE`, default `heavy.slice`; it skips without
 the one-line wrapper from before: every leftover test fails (the red check). With `HEAVY_TEST_BIN` set to the
 `bin/heavy` of an older kit (`git archive <commit> fork-kit | tar -x -C <folder>`), the tests of what came later
 fail: a heavy killed with -9 (the guard stops a double-forked child and removes a container), a container a test
-started, a rerun of the same test after a kill (the same container name), and the guard's name. Container tests use
+started, a rerun of the same test after a kill (the same container name), the guard's name, a tree kill of heavy
+and its children (the guard is no child), a `kill -9` of heavy's process group (the guard's own session), the
+guard ignoring the signals heavy handles, a kept scope that gets no guard, a signal to heavy that removes the
+container of a command outliving it (after the grace time and at a second signal), a looser `docker ps` filter
+(heavy's own exact label check), Docker asked only after a run that labelled a container, a stop by hand that
+never signals a pid no longer in the scope, a heavy gone before its command starts, and a Docker context. Container tests use
 a fake `docker` (`HEAVY_DOCKER`, `tests/fake_tools.py`), never the machine's. Run `heavy.test.py` itself without
 heavy: inside a heavy scope the heavy under test would run nested, so it refuses there; every command it runs gets
 a heavy scope of its own.

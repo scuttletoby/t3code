@@ -400,31 +400,24 @@ describe("WaitService slot waits", () => {
     }),
   );
 
-  it.effect("a stopped waiter: granted, its message held, its slot freed after 60 s", () =>
+  it.effect("a stopped waiter: granted, its message held, its hold and wake-up freed at once", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(NOW);
       const world = newWorld();
-      world.running = ["busy-1"];
+      world.running = ["busy-1", "busy-2"];
       const store = disk();
       const send = fakeDelivery();
       yield* Effect.gen(function* () {
         const { register, delegate, service } = yield* startService(store.fs, send.delivery);
         waitingId(yield* register(T1));
         send.receivers.set(T1, { type: "stopped", parentThreadId: PARENT });
-        world.running = [];
+        world.running = ["busy-2"];
         yield* service.runDue();
         assert.deepStrictEqual(send.sent, []);
         assert.strictEqual(stored(store.files)[0]?.state, "delivering");
-        assert.strictEqual(yield* delegate(OUTSIDER), "refuse");
-        yield* TestClock.adjust(61_000);
-        yield* service.runDue();
-        const allowed = yield* SlotGate.SlotGate.pipe(
-          Effect.flatMap((gate) =>
-            gate.acquire({ callerThreadId: OUTSIDER, targetInstanceId: MAIN }),
-          ),
-        );
-        assert.strictEqual(allowed.type, "allow");
-      }).pipe(Effect.provide(serverLayer(world, slotsOn(1))));
+        // Not held for 60 s: its hold and its wake-up to come would take both free slots.
+        assert.strictEqual(yield* delegate(OUTSIDER), "allow");
+      }).pipe(Effect.provide(serverLayer(world, slotsOn(2))));
     }),
   );
 

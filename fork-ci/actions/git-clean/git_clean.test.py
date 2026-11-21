@@ -7,7 +7,7 @@ runner `prepare` empties the workspace, so a checkout after it runs nothing plan
 checkout, `check`) a config that actions/checkout does not write is refused. Every marker file is one the planted
 command would write: a test passes only when it is absent. Nothing here reaches the network.
 """
-import io, importlib.util, json, os, shutil, stat, subprocess, sys, tempfile, types, unittest, unittest.mock
+import io, importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile, types, unittest, unittest.mock
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1037,7 +1037,7 @@ class FixedGitConfig(Base):
         self.assertEqual(set(pr_queue.UNTRUSTED_FILES), {*G.UNTRUSTED_FILES, 'shallow'})   # git_clean: shallow apart
         for folder, name in (('job-changed', 'job_changed'), ('docs-scope', 'docs_scope'),
                              ('test-select', 'test_select'), ('pr-queue/tested-base', 'tested_base'),
-                             ('weakened-tests', 'weakened_tests')):
+                             ('weakened-tests', 'weakened_tests'), ('handoff-put', 'handoff')):
             with self.subTest(module=name):
                 mod = load(name, os.path.join(ACTIONS, folder, f'{name}.py'))
                 self.assertEqual(mod.GIT_ENV, G.GIT_ENV)
@@ -1060,22 +1060,29 @@ class Actions(unittest.TestCase):
     def test_actions_that_run_git_check_first(self):
         seen = []
         for root, path in self.action_files():
+            with open(path, encoding='utf-8') as fh:
+                text = fh.read()
+            # Its folder's scripts, and another action folder's script that it runs (handoff-get runs handoff-put's).
+            scripts = {os.path.join(root, f) for f in os.listdir(root)
+                       if f.endswith('.py') and not f.endswith('.test.py')}
+            for ref in re.findall(r'"\$GITHUB_ACTION_PATH/([^"]+\.py)"', text):
+                script = os.path.normpath(os.path.join(root, ref))
+                if os.path.commonpath([script, ACTIONS]) == ACTIONS and os.path.relpath(script, ACTIONS).split(
+                        os.sep)[0] != 'git-clean':
+                    scripts.add(script)
             code = ''
-            for f in os.listdir(root):
-                if f.endswith('.py') and not f.endswith('.test.py'):
-                    with open(os.path.join(root, f), encoding='utf-8') as fh:
-                        code += fh.read()
+            for script in sorted(scripts):
+                with open(script, encoding='utf-8') as fh:
+                    code += fh.read()
             if "['git'" not in code or os.path.relpath(root, ACTIONS) in self.OWN_REPOSITORY:
                 continue
             seen.append(os.path.relpath(root, ACTIONS))
-            with open(path, encoding='utf-8') as fh:
-                text = fh.read()
             steps = text.split('\n  steps:\n', 1)[1]
             first = ('\n' + steps).split('\n    - ')[1]
             self.assertIn('git-clean/git_clean.py" check --path', first, f'{path}: the first step must be the check')
             self.assertIn('--require', first, path)
-        self.assertEqual(sorted(seen), ['docs-scope', 'head-check', 'job-changed', 'pr-queue/tested-base',
-                                        'test-select', 'weakened-tests'])
+        self.assertEqual(sorted(seen), ['docs-scope', 'handoff-get', 'handoff-put', 'head-check', 'job-changed',
+                                        'pr-queue/tested-base', 'test-select', 'weakened-tests'])
 
     def test_git_clean_action_runs_prepare(self):
         with open(os.path.join(HERE, 'action.yml'), encoding='utf-8') as fh:
