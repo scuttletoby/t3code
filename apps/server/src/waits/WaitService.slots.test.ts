@@ -15,9 +15,11 @@ import {
 } from "@t3tools/contracts";
 import type { WaitForInput, WaitRecord } from "@t3tools/contracts/waitFor";
 import type { DeepPartial } from "@t3tools/shared/Struct";
+import { DISPATCH_SAFETY_MS } from "@t3tools/shared/agentSlots";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import { TestClock } from "effect/testing";
 
@@ -183,51 +185,55 @@ const waitingId = (result: { readonly state: string; readonly waitId?: string })
 };
 
 describe("WaitService slot waits", () => {
-  it.effect("T17: three waits, two slots free: the two oldest are woken and held for", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(NOW);
-      const world = newWorld();
-      world.running = ["busy-1", "busy-2"];
-      const store = disk();
-      const send = fakeDelivery();
-      yield* Effect.gen(function* () {
-        const { register, delegate, service } = yield* startService(store.fs, send.delivery);
-        const woken = () => send.sent.map((message) => message.threadId).sort();
-        const ids: Array<string> = [];
-        for (const thread of [T1, T2, T3]) {
-          ids.push(waitingId(yield* register(thread)));
-          yield* TestClock.adjust(1_000);
-        }
-        // Both agents end: one sweep wakes the two oldest, the third keeps waiting.
-        world.running = [];
-        yield* service.runDue();
-        // Woken together; their messages may go out in either order.
-        assert.deepStrictEqual(woken(), [T1, T2]);
-        assert.include(send.sent[0]!.text, "free");
-        assert.include(send.sent[0]!.text, "delegate_task");
-        const after = stored(store.files);
-        assert.deepStrictEqual(
-          after.map((wait) => [wait.threadId, wait.state, wait.reservedUntil !== undefined]),
-          [
-            [T1, "delivered", true],
-            [T2, "delivered", true],
-            [T3, "waiting", false],
-          ],
-        );
-        // Another thread finds no slot; the woken ones each start exactly one agent.
-        assert.strictEqual(yield* delegate(OUTSIDER), "refuse");
-        assert.strictEqual(yield* delegate(T1), "allow");
-        assert.strictEqual(yield* delegate(T1), "refuse");
-        assert.isUndefined(stored(store.files).find((wait) => wait.id === ids[0])?.reservedUntil);
-        // T2 never delegates: its slot ends after 60 s and goes to T3.
-        yield* TestClock.adjust(59_000);
-        yield* service.runDue();
-        assert.strictEqual(send.sent.length, 2);
-        yield* TestClock.adjust(2_000);
-        yield* service.runDue();
-        assert.deepStrictEqual(woken(), [T1, T2, T3]);
-      }).pipe(Effect.provide(serverLayer(world, slotsOn(2))));
-    }),
+  it.effect(
+    "T17: three idle waits, two slots free: the oldest is woken, as its wake-up and its agent take both",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const world = newWorld();
+        world.running = ["busy-1", "busy-2"];
+        const store = disk();
+        const send = fakeDelivery();
+        yield* Effect.gen(function* () {
+          const { register, delegate, service } = yield* startService(store.fs, send.delivery);
+          const woken = () => send.sent.map((message) => message.threadId).sort();
+          const ids: Array<string> = [];
+          for (const thread of [T1, T2, T3]) {
+            ids.push(waitingId(yield* register(thread)));
+            yield* TestClock.adjust(1_000);
+          }
+          // Both agents end: one sweep wakes the oldest; its wake-up is a run too.
+          world.running = [];
+          yield* service.runDue();
+          assert.deepStrictEqual(woken(), [T1]);
+          assert.include(send.sent[0]!.text, "free");
+          assert.include(send.sent[0]!.text, "delegate_task");
+          const after = stored(store.files);
+          assert.deepStrictEqual(
+            after.map((wait) => [wait.threadId, wait.state, wait.reservedUntil !== undefined]),
+            [
+              [T1, "delivered", true],
+              [T2, "waiting", false],
+              [T3, "waiting", false],
+            ],
+          );
+          // Its woken run shows: another thread finds no slot; T1 starts its agent in its slot.
+          world.running = [T1];
+          assert.strictEqual(yield* delegate(OUTSIDER), "refuse");
+          assert.strictEqual(yield* delegate(T1), "allow");
+          assert.strictEqual(yield* delegate(OUTSIDER), "refuse");
+          assert.isUndefined(stored(store.files).find((wait) => wait.id === ids[0])?.reservedUntil);
+          // Runs again once both are over: T2 is woken next, and T3 still waits behind it.
+          world.running = [];
+          yield* TestClock.adjust(DISPATCH_SAFETY_MS);
+          yield* service.runDue();
+          assert.deepStrictEqual(woken(), [T1, T2]);
+          assert.strictEqual(
+            stored(store.files).find((wait) => wait.id === ids[2])?.state,
+            "waiting",
+          );
+        }).pipe(Effect.provide(serverLayer(world, slotsOn(2))));
+      }),
   );
 
   it.effect("two waits for one free slot: only the oldest is woken; no double start", () =>
@@ -877,4 +883,120 @@ describe("WaitService slot waits", () => {
       }).pipe(Effect.provide(serverLayer(world, slotsOn(3))));
     }),
   );
+
+  describe("a wake-up refused for an agent slot (#711)", () => {
+    /** Refuses every wake-up for a slot while `full`; counts each try and each message sent. */
+    const slotFullDelivery = () => {
+      const state = { full: true, tries: 0 };
+      const inner = fakeDelivery();
+      const delivery: WaitDelivery = {
+        receiver: inner.delivery.receiver,
+        deliver: (message) => {
+          state.tries += 1;
+          return state.full
+            ? Effect.succeed({ type: "waitsForSlot", detail: "1 agent is running" } as const)
+            : inner.delivery.deliver(message);
+        },
+      };
+      return { state, sent: inner.sent, delivery };
+    };
+    const infoLines = (lines: Array<string>) =>
+      Logger.layer(
+        [
+          Logger.make(({ logLevel, message }) => {
+            if (logLevel === "Info") lines.push(JSON.stringify(message));
+          }),
+        ],
+        { mergeWithExisting: false },
+      );
+    /** A slot wait of T1, met once the busy agent ends, so its wake-up is `delivering`. */
+    const granted = (world: World, store: ReturnType<typeof disk>, delivery: WaitDelivery) =>
+      Effect.gen(function* () {
+        const { register, service } = yield* startService(store.fs, delivery);
+        const id = waitingId(yield* register(T1));
+        world.running = [];
+        return { id, service };
+      });
+
+    it.effect("asked again every 5 s, not backed off, and logged once while it waits", () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const world = newWorld();
+        world.running = ["busy-1"];
+        const store = disk();
+        const send = slotFullDelivery();
+        const lines: Array<string> = [];
+        yield* Effect.gen(function* () {
+          const { id, service } = yield* granted(world, store, send.delivery);
+          const first = yield* service.runDue();
+          assert.strictEqual(send.state.tries, 1);
+          assert.strictEqual(first.nextDueAt, NOW + WaitService.WAKE_SLOT_RETRY_MS);
+          assert.strictEqual(WaitService.WAKE_SLOT_RETRY_MS, 5_000);
+          // Not due before the 5 s: not tried.
+          yield* TestClock.adjust(4_000);
+          yield* service.runDue();
+          assert.strictEqual(send.state.tries, 1);
+          // Many tries, each 5 s after the last, however many: no back-off.
+          for (let step = 1; step <= 10; step++) {
+            yield* TestClock.adjust(step === 1 ? 1_000 : 5_000);
+            const next = yield* service.runDue();
+            assert.strictEqual(send.state.tries, step + 1);
+            assert.strictEqual(next.nextDueAt, NOW + (step + 1) * 5_000);
+          }
+          assert.deepStrictEqual(
+            stored(store.files).map((wait) => [wait.id, wait.state]),
+            [[id, "delivering"]],
+          );
+          assert.strictEqual(
+            lines.filter((line) => line.includes("waits for an agent slot")).length,
+            1,
+          );
+          send.state.full = false;
+          yield* TestClock.adjust(5_000);
+          yield* service.runDue();
+          assert.deepStrictEqual(
+            send.sent.map((message) => message.threadId),
+            [T1],
+          );
+        }).pipe(
+          Effect.provide(serverLayer(world, slotsOn(1)).pipe(Layer.provideMerge(infoLines(lines)))),
+        );
+      }),
+    );
+
+    it.effect("never late: 25 h past its deadline it still waits, then is sent once", () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(NOW);
+        const world = newWorld();
+        world.running = ["busy-1"];
+        const store = disk();
+        const send = slotFullDelivery();
+        yield* Effect.gen(function* () {
+          const { id, service } = yield* granted(world, store, send.delivery);
+          yield* service.runDue();
+          const deadline = Date.parse(stored(store.files)[0]!.deadlineAt);
+          // Past the deadline and the 24 h after it that a failing send is given (`retry`).
+          yield* TestClock.setTime(deadline + 25 * 3_600_000);
+          yield* service.runDue();
+          yield* TestClock.adjust(5_000);
+          yield* service.runDue();
+          assert.deepStrictEqual(
+            stored(store.files).map((wait) => [wait.id, wait.state]),
+            [[id, "delivering"]],
+          );
+          assert.deepStrictEqual(send.sent, []);
+          send.state.full = false;
+          yield* TestClock.adjust(5_000);
+          yield* service.runDue();
+          yield* TestClock.adjust(5_000);
+          yield* service.runDue();
+          assert.deepStrictEqual(
+            send.sent.map((message) => message.threadId),
+            [T1],
+          );
+          assert.strictEqual(stored(store.files)[0]?.state, "delivered");
+        }).pipe(Effect.provide(serverLayer(world, slotsOn(1))));
+      }),
+    );
+  });
 });
