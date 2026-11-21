@@ -218,6 +218,48 @@ describe("one pick against the rows", () => {
     expect(efforts([{ id: "thinking_level", value: true }])).toEqual([]);
   });
 
+  it("reads every effort option, so a second effort-like option cannot hide a higher effort", () => {
+    // [reasoning: high, effort: max]: Claude runs at max (it reads `effort`); the pick is refused.
+    // `null`: a pick whose driver is not known (a default parameter would swallow `undefined`).
+    const decoy = (first: string, second: string, driver: string | null = "claudeAgent") => ({
+      driver: driver ?? undefined,
+      model: "claude-opus-5-5",
+      options: [
+        { id: first, value: "high" },
+        { id: second, value: "max" },
+      ],
+    });
+    for (const [first, second] of [
+      ["reasoning", "effort"],
+      ["effort", "reasoning"],
+      ["effort", "reasoningEffort"],
+      ["reasoning_effort", "effort"],
+      ["thinking_level", "effort"],
+    ]) {
+      expect(modelPolicyPickEfforts(decoy(first!, second!))).toEqual(["high", "max"]);
+      expect(checkModelPolicyPick(rows, decoy(first!, second!))).toMatchObject({
+        inside: false,
+        why: "claude-opus-5-5 does not allow effort high + max",
+      });
+    }
+    // A driver's own id is read for that driver, and for a pick whose driver is not known.
+    expect(modelPolicyPickEfforts(decoy("effort", "variant", "opencode"))).toEqual(["high", "max"]);
+    expect(modelPolicyPickEfforts(decoy("effort", "variant", null))).toEqual(["high", "max"]);
+    expect(modelPolicyPickEfforts(decoy("effort", "thinking", null))).toEqual(["high", "max"]);
+    // Another driver's id is not that driver's effort: Claude ignores `variant`.
+    expect(modelPolicyPickEfforts(decoy("effort", "variant"))).toEqual(["high"]);
+    // The same effort twice is one effort; inside its row.
+    const twice = {
+      ...decoy("effort", "reasoning"),
+      options: [
+        { id: "effort", value: "high" },
+        { id: "reasoning", value: "high" },
+      ],
+    };
+    expect(modelPolicyPickEfforts(twice)).toEqual(["high"]);
+    expect(checkModelPolicyPick(rows, twice)).toMatchObject({ inside: true });
+  });
+
   it("is inside only with a named model in a row of its driver, at one of the row's efforts", () => {
     expect(
       checkModelPolicyPick(rows, pick("claude-opus-5-5", [{ id: "effort", value: "xhigh" }])),

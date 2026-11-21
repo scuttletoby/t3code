@@ -149,10 +149,9 @@ export const MODEL_POLICY_EFFORT_OPTION_IDS: ReadonlyArray<string> = [
 ];
 /**
  * The option id a built-in driver reads its reasoning level from, where it is not in the list
- * above: the model guard's `DRIVER_EFFORT_IDS` (`fork-kit/model-guard/lib/model_guard.py`; a server
- * test keeps the two in step).
+ * above: the model guard's `DRIVER_EFFORT_IDS` (the guard's own test keeps the two in step).
  */
-export const MODEL_POLICY_DRIVER_EFFORT_IDS: Readonly<Record<string, string>> = {
+const MODEL_POLICY_DRIVER_EFFORT_IDS: Readonly<Record<string, string>> = {
   opencode: "variant",
   pi: "thinking",
 };
@@ -171,33 +170,39 @@ export interface ModelPolicyPick {
 }
 
 /**
- * The efforts a pick runs at, as the policy names them: its effort option's value, and
- * `ultracode` while the ultracode option is on (any value but false). Ultracode runs at xhigh, so
- * `xhigh` with ultracode counts as `ultracode` alone; any other level with it needs both. The old
- * effort value `ultracode` means xhigh with the option on, unless the call gives the option.
+ * The efforts a pick runs at: the value of every option with an effort id (a decoy id must not hide
+ * the one the driver reads; without a known driver every driver's id counts), plus `ultracode` while
+ * that option is on. `xhigh` with ultracode reads as `ultracode` alone; the old effort value
+ * `ultracode` means xhigh with the option on, unless the call gives the option.
  */
 export function modelPolicyPickEfforts(pick: ModelPolicyPick): ReadonlyArray<string> {
   const options = pick.options ?? [];
-  const driverId =
-    pick.driver === undefined || !Object.hasOwn(MODEL_POLICY_DRIVER_EFFORT_IDS, pick.driver)
-      ? []
-      : [MODEL_POLICY_DRIVER_EFFORT_IDS[pick.driver]!];
+  const driverIds =
+    pick.driver === undefined
+      ? Object.values(MODEL_POLICY_DRIVER_EFFORT_IDS)
+      : Object.hasOwn(MODEL_POLICY_DRIVER_EFFORT_IDS, pick.driver)
+        ? [MODEL_POLICY_DRIVER_EFFORT_IDS[pick.driver]!]
+        : [];
   const effortIds = new Set([
     ...MODEL_POLICY_EFFORT_OPTION_IDS,
-    ...driverId,
+    ...driverIds,
     ...(pick.effortOptionIds ?? []),
   ]);
-  const named = options.find(
-    (option) => effortIds.has(option.id) && typeof option.value === "string",
-  )?.value as string | undefined;
+  const named = [
+    ...new Set(
+      options.flatMap((option) =>
+        effortIds.has(option.id) && typeof option.value === "string" ? [option.value] : [],
+      ),
+    ),
+  ];
   const ultracodeOption = options.find((option) => option.id === MODEL_POLICY_ULTRACODE);
-  const legacy = named === MODEL_POLICY_ULTRACODE;
+  const legacy = named.includes(MODEL_POLICY_ULTRACODE);
   const ultracode = ultracodeOption === undefined ? legacy : ultracodeOption.value !== false;
-  const effort = legacy ? "xhigh" : named;
-  if (!ultracode) return effort === undefined ? [] : [effort];
-  return effort === undefined || effort === "xhigh"
-    ? [MODEL_POLICY_ULTRACODE]
-    : [MODEL_POLICY_ULTRACODE, effort];
+  const efforts = [
+    ...new Set(named.map((effort) => (effort === MODEL_POLICY_ULTRACODE ? "xhigh" : effort))),
+  ];
+  if (!ultracode) return efforts;
+  return [MODEL_POLICY_ULTRACODE, ...efforts.filter((effort) => effort !== "xhigh")];
 }
 
 const rowAllows = (row: ModelPolicyRow, efforts: ReadonlyArray<string>) =>

@@ -13,7 +13,6 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
-  MODEL_POLICY_DRIVER_EFFORT_IDS,
   MODEL_POLICY_EFFORT_OPTION_IDS,
   MODEL_POLICY_START_ROWS,
   modelPolicyPickEfforts,
@@ -26,6 +25,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
+  OrchestratorMcpFailure,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -177,9 +177,10 @@ describe("the answer for a pick, per policy state", () => {
       const text = refusal(unreadable(raw), claude(OPUS, "high"));
       assert.include(
         text,
-        "the model policy in the settings file cannot be read, so every agent pick is refused",
+        "the model policy in the settings file cannot be read (",
         JSON.stringify(raw),
       );
+      assert.include(text, "so every agent pick is refused", JSON.stringify(raw));
       assert.include(text, "Settings → Fork → Model policy");
     }
     const advise = answer(unreadable({ mode: "advise", allow: [{ model: OPUS }] }), claude("x"));
@@ -238,10 +239,10 @@ describe("a selection as the policy reads it", () => {
     ],
   } as unknown as ServerProvider;
 
-  it("reads the driver from the instance, an alias as its model, and a reasoning select", () => {
+  it("reads the driver from the instance and a reasoning select", () => {
     const pick = ModelPolicyCheck.pickOfSelection(
       [provider],
-      { instanceId: INSTANCE, model: "Opus", options: [{ id: "level", value: "high" }] },
+      { instanceId: INSTANCE, model: OPUS, options: [{ id: "level", value: "high" }] },
       true,
     );
     assert.deepStrictEqual(pick, {
@@ -251,6 +252,69 @@ describe("a selection as the policy reads it", () => {
       effortOptionIds: ["level"],
     });
     assert.isUndefined(refusal(policy("enforce"), pick));
+  });
+
+  it("an alias is read as given, not as its model: refused with the full id to name", () => {
+    // Local and remote agree: an alias here is not widened to its model (a provider may move an
+    // alias to a new model), and a remote pick has no model list to look it up in.
+    for (const alias of ["Opus", "opus"]) {
+      const pick = ModelPolicyCheck.pickOfSelection(
+        [provider],
+        { instanceId: INSTANCE, model: alias, options: [{ id: "level", value: "high" }] },
+        true,
+      );
+      assert.strictEqual(pick.model, alias);
+      const text = refusal(policy("enforce"), pick);
+      assert.include(text, `${alias} is an alias of ${OPUS}`);
+      assert.include(text, "name the full id");
+      // Its effort control is still the model's, for a row that names the alias itself.
+      assert.deepStrictEqual(pick.effortOptionIds, ["level"]);
+      const remote = ModelPolicyCheck.pickOfRemoteTarget({
+        model: alias,
+        options: [{ id: "effort", value: "high" }],
+      } as never);
+      assert.include(refusal(policy("enforce"), remote), "is in no row");
+    }
+  });
+
+  it("a folder-only model's reasoning control is read from the folder's list", () => {
+    const folderOnly = {
+      ...provider,
+      workspaceSnapshots: [
+        {
+          cwd: "/projects/a",
+          checkedAt: "2026-11-21T00:00:00.000Z",
+          slashCommands: [],
+          skills: [],
+          models: [
+            {
+              slug: FABLE,
+              name: "Fable",
+              isCustom: false,
+              capabilities: {
+                optionDescriptors: [
+                  { id: "depth", label: "Depth", type: "select", role: "reasoning", options: [] },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    } as unknown as ServerProvider;
+    const pick = ModelPolicyCheck.pickOfSelection(
+      [folderOnly],
+      {
+        instanceId: INSTANCE,
+        model: FABLE,
+        options: [
+          { id: "effort", value: "high" },
+          { id: "depth", value: "max" },
+        ],
+      },
+      true,
+    );
+    assert.deepStrictEqual(pick.effortOptionIds, ["depth"]);
+    assert.include(refusal(policy("enforce"), pick), "does not allow effort high + max");
   });
 
   it("a call that named no model reads as none (#128), whatever it inherits", () => {
@@ -272,24 +336,9 @@ describe("a selection as the policy reads it", () => {
     assert.isUndefined(pick.driver);
   });
 
-  it("a driver's own effort id is the model guard's", () => {
-    const source = NodeFS.readFileSync(
-      new URL("../../../../fork-kit/model-guard/lib/model_guard.py", import.meta.url),
-      "utf8",
-    );
-    const table = /DRIVER_EFFORT_IDS = \{([^}]*)\}/.exec(source)?.[1] ?? "";
-    const guard: Record<string, string> = Object.fromEntries(
-      [...table.matchAll(/'([^']+)': '([^']+)'/g)].map((match) => [match[1]!, match[2]!]),
-    );
-    assert.isAbove(Object.keys(guard).length, 4);
-    for (const [driver, id] of Object.entries(guard)) {
-      const read =
-        MODEL_POLICY_EFFORT_OPTION_IDS.includes(id) ||
-        MODEL_POLICY_DRIVER_EFFORT_IDS[driver] === id;
-      assert.isTrue(read, `${driver} reads its effort from ${id}`);
-    }
-    // The guard's Claude row is under a name, not a quoted key: claudeAgent reads "effort".
+  it("a driver's own effort id is read for that driver (its sync with the model guard is the guard's own test)", () => {
     assert.include(MODEL_POLICY_EFFORT_OPTION_IDS, "effort");
+    assert.include(MODEL_POLICY_EFFORT_OPTION_IDS, "reasoningEffort");
     assert.deepStrictEqual(
       modelPolicyPickEfforts({
         driver: "opencode",
@@ -298,6 +347,37 @@ describe("a selection as the policy reads it", () => {
       }),
       ["low"],
     );
+  });
+
+  it("a remote pick's driverKind is the agent's claim: not read, every row and effort id counts", () => {
+    const rows: ReadonlyArray<ModelPolicyRow> = [
+      { driver: ProviderDriverKind.make("claudeAgent"), model: "shared", efforts: ["high"] },
+      { driver: ProviderDriverKind.make("codex"), model: "shared", efforts: ["high", "max"] },
+    ];
+    // Claims codex (whose row allows max), but sends to a machine where the model is Claude's.
+    const claim = ModelPolicyCheck.pickOfRemoteTarget({
+      driverKind: "codex",
+      model: "shared",
+      options: [{ id: "reasoningEffort", value: "max" }],
+    } as never);
+    assert.isUndefined(claim.driver);
+    assert.include(refusal(policy("enforce", rows), claim), "effort max");
+    // A driver's own effort id beside a general one: a decoy is read too.
+    const decoy = ModelPolicyCheck.pickOfRemoteTarget({
+      driverKind: "claudeAgent",
+      model: "shared",
+      options: [
+        { id: "effort", value: "high" },
+        { id: "variant", value: "max" },
+      ],
+    } as never);
+    assert.include(refusal(policy("enforce", rows), decoy), "does not allow effort high + max");
+    const inside = ModelPolicyCheck.pickOfRemoteTarget({
+      driverKind: "codex",
+      model: "shared",
+      options: [{ id: "reasoningEffort", value: "high" }],
+    } as never);
+    assert.isUndefined(refusal(policy("enforce", rows), inside));
   });
 
   it("the effort option ids are the usage pacing gate's", () => {
@@ -332,6 +412,7 @@ const configureHarness = (
   } = {},
 ) => {
   const dispatched: Array<unknown> = [];
+  const forwarded: Array<unknown> = [];
   const threadCaller = options.caller !== false;
   const shell = (id: ThreadId) =>
     ({
@@ -384,7 +465,14 @@ const configureHarness = (
     }),
     Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
     Layer.mock(ThreadSearch.ThreadSearch)({}),
-    Layer.mock(PeerForwarding.PeerForwarding)({}),
+    Layer.mock(PeerForwarding.PeerForwarding)({
+      call: (_scope, _tool, environmentId, params) => {
+        forwarded.push({ environmentId, params });
+        return Effect.fail(
+          new OrchestratorMcpFailure({ code: "orchestration_error", message: "sent there" }),
+        ) as never;
+      },
+    }),
   ).pipe(
     Layer.provideMerge(
       ServerConfig.layerTest(process.cwd(), { prefix: "t3-model-policy-configure-" }).pipe(
@@ -393,7 +481,11 @@ const configureHarness = (
     ),
     Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
-  const configure = (modelSelection: Omit<ModelSelection, "instanceId">) =>
+  /** With `environmentId`, the change is for a thread on that linked machine (sent there). */
+  const configure = (
+    modelSelection: Omit<ModelSelection, "instanceId"> | undefined,
+    environmentId?: EnvironmentId,
+  ) =>
     Effect.gen(function* () {
       const toolkit = yield* ThreadToolkit.pipe(
         Effect.provide(
@@ -403,7 +495,10 @@ const configureHarness = (
       const chunks = yield* toolkit
         .handle("t3_thread_configure", {
           threadId: TARGET,
-          modelSelection: { instanceId: INSTANCE, ...modelSelection },
+          ...(modelSelection === undefined
+            ? { title: "Renamed" }
+            : { modelSelection: { instanceId: INSTANCE, ...modelSelection } }),
+          ...(environmentId === undefined ? {} : { environmentId }),
         } as never)
         .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
       const last = [...chunks].at(-1) as
@@ -411,7 +506,7 @@ const configureHarness = (
         | undefined;
       return last?.isFailure === true ? `${last.result.code}: ${last.result.message}` : undefined;
     });
-  return { dispatched, configure };
+  return { dispatched, forwarded, configure };
 };
 
 describe("t3_thread_configure through upstream's handler", () => {
@@ -465,16 +560,50 @@ describe("t3_thread_configure through upstream's handler", () => {
       );
       assert.include(
         yield* configure({ model: OPUS, options: effort("high") }),
-        "cannot be read, so every agent pick is refused",
+        "does not parse), so every agent pick is refused",
       );
       assert.deepStrictEqual(dispatched, []);
     }),
   );
+
+  it.effect("a change for a thread on a linked machine is checked before it is sent", () =>
+    Effect.gen(function* () {
+      const THERE = EnvironmentId.make("environment-there");
+      const { dispatched, forwarded, configure } = configureHarness(enforce);
+      assert.include(
+        yield* configure({ model: "claude-haiku-5-5", options: effort("high") }, THERE),
+        "Model policy refused this pick: claude-haiku-5-5 is in no row",
+      );
+      // A decoy effort id beside the real one: the driver there is not known, all are read.
+      assert.include(
+        yield* configure(
+          { model: OPUS, options: [...effort("high"), { id: "reasoningEffort", value: "max" }] },
+          THERE,
+        ),
+        "does not allow effort high + max",
+      );
+      // Runs again: refused again; nothing sent, nothing changed here.
+      assert.include(yield* configure({ model: "claude-haiku-5-5" }, THERE), "is in no row");
+      assert.lengthOf(forwarded, 0);
+      // Inside the rows, or a change with no model (it only renames): sent.
+      assert.include(
+        yield* configure({ model: OPUS, options: effort("high") }, THERE),
+        "sent there",
+      );
+      assert.include(yield* configure(undefined, THERE), "sent there");
+      assert.lengthOf(forwarded, 2);
+      assert.deepStrictEqual(dispatched, []);
+      // The owner's client is not checked there either.
+      const owner = configureHarness(enforce, { caller: false });
+      assert.include(yield* owner.configure({ model: "claude-haiku-5-5" }, THERE), "sent there");
+      assert.lengthOf(owner.forwarded, 1);
+    }),
+  );
 });
 
-describe("t3_thread_launch: a replay is not checked again", () => {
+describe("t3_thread_launch: a replay is checked again only when it names a model", () => {
   it.effect(
-    "a replay of an accepted launch, and a launch with no calling thread, read nothing",
+    "a replay that names no model (it keeps its checked one), and a launch with no calling thread, read nothing",
     () =>
       Effect.gen(function* () {
         const selection = { instanceId: INSTANCE, model: "claude-haiku-5-5" } as ModelSelection;
@@ -490,9 +619,29 @@ describe("t3_thread_launch: a replay is not checked again", () => {
         yield* ModelPolicyCheck.checkLaunch({ id: CALLER }, selection, {}, true).pipe(
           Effect.provide(untouched),
         );
+        yield* ModelPolicyCheck.checkLaunch({ id: CALLER }, selection, {}, true).pipe(
+          Effect.provide(untouched),
+        );
         yield* ModelPolicyCheck.checkLaunch(undefined, selection, {}, false).pipe(
           Effect.provide(untouched),
         );
       }),
+  );
+
+  it.effect("a replay that names a model is checked like a new launch (its model wins)", () =>
+    Effect.gen(function* () {
+      const selection = { instanceId: INSTANCE, model: "claude-haiku-5-5" } as ModelSelection;
+      const settings = Layer.mergeAll(
+        ServerSettings.layerTest({ modelPolicy: { mode: "enforce", allow: ROWS } } as never),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+      );
+      const refused = yield* ModelPolicyCheck.checkLaunch(
+        { id: CALLER },
+        selection,
+        { modelSelection: selection },
+        true,
+      ).pipe(Effect.provide(settings), Effect.flip);
+      assert.include(refused.message, "claude-haiku-5-5 is in no row");
+    }),
   );
 });

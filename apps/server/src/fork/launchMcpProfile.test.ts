@@ -590,4 +590,122 @@ describe("the model policy on t3_thread_launch (#731)", () => {
       }
     }),
   );
+  it.effect("a decoy effort option is read too: [reasoning: high, effort: max] is refused", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce"));
+      const decoy = (first: string, second: string) => ({
+        instanceId: INSTANCE,
+        model: "claude-opus",
+        options: [
+          { id: first, value: "high" },
+          { id: second, value: "max" },
+        ],
+      });
+      for (const [first, second] of [
+        ["reasoning", "effort"],
+        ["effort", "reasoningEffort"],
+        ["reasoningEffort", "effort"],
+      ] as const) {
+        expect(refusal(yield* launch({ modelSelection: decoy(first, second) }))).toContain(
+          "claude-opus does not allow effort high + max",
+        );
+      }
+      expect(launched).toHaveLength(0);
+    }),
+  );
+
+  it.effect("a retry with the same key that names a new model is checked again", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce"));
+      // An idle launch (no message, so no run) with an allowed model.
+      expect(
+        refusal(
+          yield* launch({ clientRequestId: "same", message: null, modelSelection: opus("high") }),
+        ),
+      ).toBeUndefined();
+      expect(launched).toHaveLength(1);
+      // The retry adds a message (it would start the run) and names a model off the rows.
+      for (const modelSelection of [{ instanceId: INSTANCE, model: "claude-other" }, opus("max")]) {
+        expect(refusal(yield* launch({ clientRequestId: "same", modelSelection }))).toContain(
+          "Model policy refused this pick",
+        );
+      }
+      expect(launched).toHaveLength(1);
+      // Runs again with the allowed model, or naming none (it keeps the checked first one): starts.
+      expect(
+        refusal(yield* launch({ clientRequestId: "same", modelSelection: opus("high") })),
+      ).toBeUndefined();
+      expect(
+        refusal(yield* launch({ clientRequestId: "same", modelSelection: null })),
+      ).toBeUndefined();
+      expect(launched).toHaveLength(3);
+      expect(launched.every((launch) => launch.threadId === launched[0]!.threadId)).toBe(true);
+    }),
+  );
+});
+
+describe("the model policy on a launch sent to a linked machine (#731)", () => {
+  const ROW = { driver: "claudeAgent", model: "claude-opus", efforts: ["high"] };
+  const policy = (mode: string, allow: ReadonlyArray<unknown> = [ROW]) =>
+    ({ modelPolicy: { mode, allow } }) as Settings;
+  const opus = (effort: string) => ({
+    instanceId: INSTANCE,
+    model: "claude-opus",
+    options: [{ id: "effort", value: effort }],
+  });
+
+  it.effect("enforce: an agent's launch there off the rows, or naming no model, is not sent", () =>
+    Effect.gen(function* () {
+      const { forwarded, launched, launch } = harness(policy("enforce"));
+      for (const [modelSelection, why] of [
+        [null, "the call names no model"],
+        [{ instanceId: INSTANCE, model: "claude-other" }, "claude-other is in no row"],
+        [opus("max"), "does not allow effort max"],
+        // A decoy effort id there: the driver there is not known, so every effort id is read.
+        [
+          {
+            instanceId: INSTANCE,
+            model: "claude-opus",
+            options: [
+              { id: "effort", value: "high" },
+              { id: "variant", value: "max" },
+            ],
+          },
+          "does not allow effort high + max",
+        ],
+      ] as const) {
+        const message = refusal(yield* launch({ environmentId: THERE, modelSelection }));
+        expect(message).toContain("Model policy refused this pick: ");
+        expect(message).toContain(why);
+        // Runs again (same key): refused again, still nothing sent.
+        expect(
+          refusal(yield* launch({ environmentId: THERE, modelSelection, clientRequestId: "k" })),
+        ).toContain(why);
+      }
+      expect(forwarded).toHaveLength(0);
+      expect(launched).toHaveLength(0);
+      // Inside the rows: sent.
+      expect(
+        refusal(yield* launch({ environmentId: THERE, modelSelection: opus("high") })),
+      ).toContain("sent there");
+      expect(forwarded).toHaveLength(1);
+    }),
+  );
+
+  it.effect("the owner's client, advise and off: sent as asked", () =>
+    Effect.gen(function* () {
+      const owner = harness(policy("enforce", []), { caller: false });
+      expect(
+        refusal(yield* owner.launch({ environmentId: THERE, modelSelection: null })),
+      ).toContain("sent there");
+      expect(owner.forwarded).toHaveLength(1);
+      for (const mode of ["advise", "off"]) {
+        const { forwarded, launch } = harness(policy(mode));
+        expect(refusal(yield* launch({ environmentId: THERE, modelSelection: null }))).toContain(
+          "sent there",
+        );
+        expect(forwarded).toHaveLength(1);
+      }
+    }),
+  );
 });

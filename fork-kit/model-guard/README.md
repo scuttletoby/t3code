@@ -328,7 +328,8 @@ FORK=FORK_OWNER/FORK
 T3_HOME=/path/to/t3-home
 umask 022 && mkdir -p /etc/fork-kit
 # 1. The policy, in advise mode: every pick runs; one outside the rows gets a note and a log line.
-cat > /etc/fork-kit/model-policy.json <<'JSON'
+#    A policy file already there is kept (`set -C`: the write fails instead of replacing it).
+( set -C; cat > /etc/fork-kit/model-policy.json ) <<'JSON' || echo "kept the policy already in /etc/fork-kit/model-policy.json"
 {
   "mode": "advise",
   "allow": [
@@ -371,7 +372,8 @@ model-guard --self-check
 
 The self-check names anything left to do (for example `allowManagedHooksOnly`, step 4 below, an owner choice).
 Then set the same rows in T3 (step 7 below). Watch what advise mode would refuse with `journalctl -t model-guard`
-(and T3's server log, "model policy pick", which also counts each model's picks).
+(and T3's server log: "model policy pick" for each agent pick as asked, which also counts each model's picks, and
+"model policy paced pick" for the model a `delegate_task` ran on when the usage pacer moved it).
 
 **Later, enforce** (when advise mode has shown no surprises; steps 5 and 6 below say why each part is there):
 
@@ -483,11 +485,12 @@ mode Advise in T3; both count from the next call.
    and check that it runs. Make the delegate instructions name `"ultracode": false` (see
    [Rules](#rules)), then set `"mode": "enforce"`. The change counts from the next call; nothing needs restarting.
 7. In each T3 on the machine, set its own model policy with the same rows: **Settings → Fork → Model policy**, mode
-   `advise`, then **Edit allowed models** (with no rows saved it starts from the fork's start rows, the two below)
+   `advise`, then **Edit allowed models** (with no rows saved it starts from the fork's start rows, the two of step 1 in the short way above)
    and save. T3 then checks each agent pick on the server (a person's own pick is never refused; Settings marks one
    outside the rows), and a child whose pick names its model keeps only the options the pick names (see
    [Rules](#rules)). Off again: mode `off`. It counts from the next call. A T3 whose settings cannot be read refuses
-   every agent pick.
+   every agent pick, also with the mode `off` (it cannot see the mode), and so does one whose settings.json does not
+   parse (the server log says so).
 
 ## What `enforce` does not stop
 

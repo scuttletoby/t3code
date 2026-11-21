@@ -573,20 +573,24 @@ describe("a child's own options, remote delegate_task", () => {
       // Its row allows big-pickle with no effort; the linked machine's driver is not known here.
       assert.deepStrictEqual(yield* sentTarget({ model: "other-model" }, "enforce"), []);
       assert.deepStrictEqual(yield* sentTarget({ providerInstanceId: "opencode" }, "enforce"), []);
-      // Known gap: with no driver known here, OpenCode's own effort id (variant) is not read as
-      // an effort, so a row without efforts lets it through; a row with efforts would refuse it.
-      assert.lengthOf(
-        yield* sentTarget({ model: OPENCODE.model, options: { variant: "low" } }, "enforce"),
-        1,
-      );
+      // With no driver known here, every driver's own effort id is read: OpenCode's variant is an
+      // effort, which its row (no efforts) does not allow.
       assert.deepStrictEqual(
-        yield* sentTarget(
-          { driverKind: "opencode", model: OPENCODE.model, options: { variant: "low" } },
-          "enforce",
-        ),
+        yield* sentTarget({ model: OPENCODE.model, options: { variant: "low" } }, "enforce"),
         [],
-        "named with its driver, the variant is its effort, which its row does not allow",
       );
+      // A driverKind the agent names is its own claim, not read: a claim of a driver whose effort
+      // id is another does not hide the variant.
+      for (const driverKind of ["opencode", "claudeAgent", "codex"]) {
+        assert.deepStrictEqual(
+          yield* sentTarget(
+            { driverKind, model: OPENCODE.model, options: { variant: "low" } },
+            "enforce",
+          ),
+          [],
+          `claimed ${driverKind}`,
+        );
+      }
       assert.deepStrictEqual(yield* sentTarget({ model: OPENCODE.model }, "enforce"), [
         { environmentId: box, model: OPENCODE.model, options: [] },
       ]);

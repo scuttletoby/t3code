@@ -516,7 +516,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
               paced.target === target
                 ? undefined
                 : yield* policyCheck("delegate_task", paced.target, input.requested, {
-                    quiet: true,
+                    logAs: "model policy paced pick",
                   });
             const notes = [
               policyNote,
@@ -568,7 +568,8 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         ? Effect.succeed(target)
         : Effect.map(ownOptionsOn, (on) => (on ? remoteTarget(target) : target))
       ).pipe(
-        // The linked machine's driver is not known here: every row naming the model must allow it.
+        // The linked machine's driver is not known here (a driverKind the call names is the agent's
+        // claim, not read): every row naming the model must allow it.
         Effect.tap((sent) =>
           checkPick("delegate_task", Effect.succeed(ModelPolicyCheck.pickOfRemoteTarget(sent))),
         ),

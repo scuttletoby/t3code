@@ -16,10 +16,13 @@ import {
   type OrchestratorMcpTarget,
   type ServerProvider,
 } from "@t3tools/contracts";
+import type { Tool } from "effect/ai";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import { loadCaller } from "../mcp/threadAccess.ts";
+import type { ProjectToolkit } from "../mcp/toolkits/project/tools.ts";
+import type { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -39,6 +42,15 @@ const FIELDS: Record<PolicyRoute, string> = {
 
 const SETTINGS_PLACE = "Settings → Fork → Model policy";
 
+/**
+ * A pick as the server reads it: `aliasOf` is the model an alias names here. An alias is not read
+ * as its model (the rows name full ids, and a provider may move an alias to a new model, which must
+ * not widen the policy); the refusal names the full id to use instead.
+ */
+export interface ServerPick extends ModelPolicyPick {
+  readonly aliasOf?: string | undefined;
+}
+
 /** What the check answers: refuse with a text, or let the pick run (with a note for the agent). */
 export type PolicyAnswer =
   | { readonly refuse: string }
@@ -51,7 +63,7 @@ export type PolicyAnswer =
 export function answerPick(
   policy: ModelPolicy | undefined,
   route: PolicyRoute,
-  pick: ModelPolicyPick,
+  pick: ServerPick,
 ): PolicyAnswer {
   if (policy === undefined) {
     return {
@@ -64,7 +76,7 @@ export function answerPick(
   if (stance.unreadable) {
     return stance.mode === "enforce"
       ? {
-          refuse: `Model policy: the model policy in the settings file cannot be read, so every agent pick is refused until a person fixes it in ${SETTINGS_PLACE}.`,
+          refuse: `Model policy: the model policy in the settings file cannot be read (a bad modelPolicy value, or a settings file that does not parse), so every agent pick is refused until a person fixes the file or the policy in ${SETTINGS_PLACE}.`,
         }
       : {
           note: `Model policy (advise): the model policy in the settings file cannot be read, so this pick was not checked; it runs. A person fixes it in ${SETTINGS_PLACE}.`,
@@ -79,27 +91,42 @@ export function answerPick(
       : { note: `Model policy: ${verdict.row.model} is for ${useFor}.` };
   }
   const allowed = `Allowed: ${modelPolicyRowsText(stance.allow)}.`;
+  const why =
+    pick.aliasOf === undefined || pick.model === undefined
+      ? verdict.why
+      : `${verdict.why} (${pick.model} is an alias of ${pick.aliasOf}; an alias is not read as its model, so name the full id)`;
   if (stance.mode === "enforce") {
     return {
-      refuse: `Model policy refused this pick: ${verdict.why}. ${allowed} Name one of these models in ${FIELDS[route]}.`,
+      refuse: `Model policy refused this pick: ${why}. ${allowed} Name one of these models in ${FIELDS[route]}.`,
     };
   }
   return {
-    note: `Model policy (advise): this pick is outside the policy (${verdict.why}); it runs, and enforce would refuse it. ${allowed}`,
+    note: `Model policy (advise): this pick is outside the policy (${why}); it runs, and enforce would refuse it. ${allowed}`,
     warn: true,
   };
 }
 
-/** A model by its id or an alias, in the instance's list or in any folder's list it scanned. */
-const canonicalModel = (provider: ServerProvider | undefined, model: string): string => {
-  if (provider === undefined) return model;
-  const lists = [
-    provider.models,
-    ...(provider.workspaceSnapshots ?? []).flatMap((snapshot) =>
-      snapshot.models === undefined ? [] : [snapshot.models],
-    ),
-  ];
-  if (lists.some((list) => list.some((candidate) => candidate.slug === model))) return model;
+/** The instance's model list and every folder's list it scanned. */
+const modelLists = (provider: ServerProvider | undefined) =>
+  provider === undefined
+    ? []
+    : [
+        provider.models,
+        ...(provider.workspaceSnapshots ?? []).flatMap((snapshot) =>
+          snapshot.models === undefined ? [] : [snapshot.models],
+        ),
+      ];
+
+/**
+ * The model an alias names in these lists, when it names one model everywhere; `undefined` for a
+ * model's own id or a name that is no alias. Only for the refusal's hint: the check reads the name
+ * as given.
+ */
+const aliasTarget = (
+  lists: ReadonlyArray<ServerProvider["models"]>,
+  model: string,
+): string | undefined => {
+  if (lists.some((list) => list.some((candidate) => candidate.slug === model))) return undefined;
   const slugs = new Set(
     lists.flatMap((list) =>
       list
@@ -109,46 +136,64 @@ const canonicalModel = (provider: ServerProvider | undefined, model: string): st
         .map((candidate) => candidate.slug),
     ),
   );
-  // An alias that means one model everywhere is that model; anything else stays as given (and so
-  // is in no row unless a row names it as it is).
-  return slugs.size === 1 ? [...slugs][0]! : model;
+  return slugs.size === 1 ? [...slugs][0]! : undefined;
 };
 
-/** The option ids a model marks as its reasoning control, read as its effort. */
-const reasoningIds = (provider: ServerProvider | undefined, model: string) =>
-  (
-    provider?.models.find((candidate) => candidate.slug === model)?.capabilities
-      ?.optionDescriptors ?? []
-  )
-    .filter((descriptor) => "role" in descriptor && descriptor.role === "reasoning")
-    .map((descriptor) => descriptor.id);
+/**
+ * The option ids a model marks as its reasoning control, read as its effort: from every list that
+ * holds the model, a folder's own list included (a folder-only model has its control there).
+ */
+const reasoningIds = (lists: ReadonlyArray<ServerProvider["models"]>, model: string) => [
+  ...new Set(
+    lists
+      .flatMap((list) => list.filter((candidate) => candidate.slug === model))
+      .flatMap((candidate) => candidate.capabilities?.optionDescriptors ?? [])
+      .filter((descriptor) => "role" in descriptor && descriptor.role === "reasoning")
+      .map((descriptor) => descriptor.id),
+  ),
+];
 
 /**
- * A resolved selection as the policy reads it: its driver from the instance, the model's id (an
- * alias read as its model), its options. `named: false` (the call named no model, it inherits one)
- * reads as no model.
+ * A resolved selection as the policy reads it: its driver from the instance, the model as named
+ * (an alias is not read as its model), its options. `named: false` (the call named no model, it
+ * inherits one) reads as no model.
  */
 export function pickOfSelection(
   providers: ReadonlyArray<ServerProvider>,
   selection: Pick<ModelSelection, "instanceId" | "model" | "options">,
   named: boolean,
-): ModelPolicyPick {
+): ServerPick {
   const provider = providers.find((candidate) => candidate.instanceId === selection.instanceId);
-  const model = canonicalModel(provider, selection.model);
+  const lists = modelLists(provider);
+  const aliasOf = aliasTarget(lists, selection.model);
   return {
     driver: provider?.driver,
-    model: named ? model : undefined,
+    model: named ? selection.model : undefined,
     options: selection.options,
-    effortOptionIds: reasoningIds(provider, model),
+    // A row may name the alias itself: its effort control is still the model's.
+    effortOptionIds: reasoningIds(lists, aliasOf ?? selection.model),
+    ...(aliasOf === undefined ? {} : { aliasOf }),
   };
 }
 
-/** A target sent to a linked machine: no driver known here unless the call names it. */
-export const pickOfRemoteTarget = (target: OrchestratorMcpTarget): ModelPolicyPick => ({
-  driver: target.driverKind,
-  model: target.model,
-  options: target.options,
+/**
+ * A pick sent to a linked machine. Its driver is not known here: a `driverKind` the call names is
+ * the agent's own claim, so it is not read. Every row naming the model must allow the pick, and
+ * every built-in driver's own effort id is read as an effort.
+ */
+const pickOfRemote = (
+  selection:
+    | { readonly model?: string | undefined; readonly options?: ModelPolicyPick["options"] }
+    | undefined,
+): ModelPolicyPick => ({
+  driver: undefined,
+  model: selection?.model,
+  options: selection?.options,
 });
+
+/** A `delegate_task` target sent to a linked machine ({@link pickOfRemote}). */
+export const pickOfRemoteTarget = (target: OrchestratorMcpTarget): ModelPolicyPick =>
+  pickOfRemote(target);
 
 const describePick = (pick: ModelPolicyPick) => ({
   driver: pick.driver ?? "(not known)",
@@ -158,10 +203,11 @@ const describePick = (pick: ModelPolicyPick) => ({
 
 export interface PickCheckOptions {
   /**
-   * Not logged: a second check of the same call (the target the usage pacer moved it to), so the
-   * log keeps one line per agent pick.
+   * The log line's message, "model policy pick" unless named: a second check of the same call (the
+   * target the usage pacer moved it to) logs as "model policy paced pick", so "model policy pick"
+   * keeps one line per agent pick as asked, and the paced line says what ran instead.
    */
-  readonly quiet?: boolean;
+  readonly logAs?: string;
 }
 
 /**
@@ -176,7 +222,7 @@ export const makePickCheck = Effect.gen(function* () {
   return Effect.fn("ModelPolicyCheck.checkPick")(function* (
     route: PolicyRoute,
     /** The pick, read only while a policy is on (it may read the providers). */
-    readPick: Effect.Effect<ModelPolicyPick>,
+    readPick: Effect.Effect<ServerPick>,
     options: PickCheckOptions = {},
   ) {
     if (Option.isNone(settings)) return undefined;
@@ -195,7 +241,7 @@ export const makePickCheck = Effect.gen(function* () {
       mode: policy === undefined ? "(settings unreadable)" : modelPolicyStance(policy).mode,
     };
     if ("refuse" in answer) {
-      yield* Effect.logWarning("model policy pick refused").pipe(
+      yield* Effect.logWarning(`${options.logAs ?? "model policy pick"} refused`).pipe(
         Effect.annotateLogs({ ...annotations, verdict: "refused", reason: answer.refuse }),
       );
       return yield* new OrchestratorMcpFailure({
@@ -203,14 +249,14 @@ export const makePickCheck = Effect.gen(function* () {
         message: answer.refuse,
       });
     }
-    if (options.quiet !== true) {
-      yield* (answer.warn === true ? Effect.logWarning : Effect.logInfo)("model policy pick").pipe(
-        Effect.annotateLogs({
-          ...annotations,
-          verdict: answer.warn === true ? "outside or unchecked (advise)" : "inside",
-        }),
-      );
-    }
+    yield* (answer.warn === true ? Effect.logWarning : Effect.logInfo)(
+      options.logAs ?? "model policy pick",
+    ).pipe(
+      Effect.annotateLogs({
+        ...annotations,
+        verdict: answer.warn === true ? "outside or unchecked (advise)" : "inside",
+      }),
+    );
     return answer.note;
   });
 });
@@ -229,10 +275,9 @@ const currentProviders = Effect.serviceOption(ProviderRegistry.ProviderRegistry)
 );
 
 /**
- * `t3_thread_launch`, once the launch's model is known: an agent's launch (a calling thread) is
- * checked; the owner's client and a task from a linked machine have no calling thread and are not.
- * A replay of an accepted launch starts nothing new and is not checked. Advice goes to the log only
- * (the launch's reply has no place for a note).
+ * `t3_thread_launch` once its model is known: only an agent's launch (a calling thread) is checked;
+ * a linked machine's task was checked where it was sent ({@link checkForwarded}). A replay is checked
+ * again only when it names a model (that model wins and can start a run). Advice goes to the log.
  */
 export const checkLaunch = Effect.fn("ModelPolicyCheck.checkLaunch")(function* (
   caller: { readonly id: unknown } | undefined,
@@ -240,7 +285,7 @@ export const checkLaunch = Effect.fn("ModelPolicyCheck.checkLaunch")(function* (
   input: { readonly modelSelection?: ModelSelection | undefined },
   replaying: boolean,
 ) {
-  if (replaying || caller === undefined) return;
+  if (caller === undefined || (replaying && input.modelSelection === undefined)) return;
   const check = yield* makePickCheck;
   yield* check(
     "t3_thread_launch",
@@ -264,4 +309,35 @@ export const checkConfigure = Effect.fn("ModelPolicyCheck.checkConfigure")(funct
     "t3_thread_configure",
     Effect.map(currentProviders, (providers) => pickOfSelection(providers, modelSelection, true)),
   );
+});
+
+/**
+ * The tools `checkForwarded` matches by name, typed against upstream's toolkits: a rename there
+ * fails the typecheck here instead of dropping the check without a word.
+ */
+const LAUNCH_TOOL = "t3_thread_launch" satisfies keyof (typeof ProjectToolkit)["tools"];
+const CONFIGURE_TOOL = "t3_thread_configure" satisfies keyof (typeof ThreadToolkit)["tools"];
+const MODEL_SELECTION = "modelSelection" satisfies keyof Tool.Parameters<
+  (typeof ProjectToolkit)["tools"][typeof LAUNCH_TOOL]
+> &
+  keyof Tool.Parameters<(typeof ThreadToolkit)["tools"][typeof CONFIGURE_TOOL]>;
+
+/**
+ * An agent's `t3_thread_launch` or `t3_thread_configure` sent to a linked machine, checked before it
+ * is sent (the machine there sees no calling thread). The driver there is not known ({@link
+ * pickOfRemote}); a launch naming no model is refused in enforce; a configure without one only reads.
+ */
+export const checkForwarded = Effect.fn("ModelPolicyCheck.checkForwarded")(function* (
+  tool: string,
+  params: object,
+) {
+  if (tool !== LAUNCH_TOOL && tool !== CONFIGURE_TOOL) return;
+  const selection = (params as { readonly [MODEL_SELECTION]?: ModelSelection | undefined })[
+    MODEL_SELECTION
+  ];
+  if (tool === CONFIGURE_TOOL && selection === undefined) return;
+  const { caller } = yield* loadCaller();
+  if (caller === undefined) return;
+  const check = yield* makePickCheck;
+  yield* check(tool, Effect.succeed(pickOfRemote(selection)));
 });
