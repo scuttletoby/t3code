@@ -193,11 +193,12 @@ export const boundToWiderRefusal = Effect.fnUntraced(function* (input: {
 
 /**
  * A one-time task refused at its time has no next time, and a save that keeps its schedule keeps
- * that: after the save that allows it, it is run now or given a new time.
+ * that: after the step that allows it (a save, or a fixed file or setting), it is run now or given
+ * a new time.
  */
-const afterSave = (task: Pick<ScheduledTask, "schedule">) =>
+const afterSave = (task: Pick<ScheduledTask, "schedule">, after = "after that save") =>
   task.schedule.type === "once"
-    ? " If its time has passed, run it now or give it a new time after that save: a one-time task refused at its time does not come due again."
+    ? ` If its time has passed, run it now or give it a new time ${after}: a one-time task refused at its time does not come due again.`
     : "";
 
 /** What the owner does so a refused run can start. */
@@ -404,7 +405,8 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
     // A test of the service alone: nothing is recorded, so nothing is checked (see above).
     if (store === undefined) return null;
     const loaded = yield* load;
-    if (!loaded.ok) return `Not run: ${unreadable(loaded.issue)}`;
+    if (!loaded.ok)
+      return `Not run: ${unreadable(loaded.issue)}${afterSave(task, "once it is fixed")}`;
     const savedBy = loaded.tasks.get(task.id);
     if (savedBy === undefined) {
       if (task.createdBy !== "agent") return null;
@@ -424,7 +426,7 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
       Effect.result,
     );
     if (theirs._tag === "Failure") {
-      return `Not run: the MCP profile of the thread this run would start cannot be worked out. ${theirs.failure.reason}`;
+      return `Not run: the MCP profile of the thread this run would start cannot be worked out. ${theirs.failure.reason}${afterSave(task, "once that is fixed")}`;
     }
     if (isWithinMcpProfile(theirs.success.profile, recorded)) return null;
     return `Not run: this task was saved by a thread whose MCP profile is ${named(recorded.name)}, and the thread this run would start in its project gets ${named(theirs.success.name)}, which keeps MCP servers or T3 tools ${named(recorded.name)} does not. Bind the task to a thread, move it to a project whose MCP profile is within ${named(recorded.name)}, or save it in the T3 app to run it as the owner's.${afterSave(task)}`;

@@ -516,8 +516,12 @@ is recorded as failed with the reason and moves on to its next time; a one-time 
 next time, so after the owner's save it is run now or given a new time (the reason says so). A task
 whose row changed after its record (a save stopped half-way) is refused until it is saved again, and
 a record file that cannot be read refuses saves and runs that start a new thread until it is fixed
-or removed. Runs into a bound thread keep that thread's profile and are not held up. Entries of
-deleted tasks are dropped at each start.
+or removed. Runs into a bound thread keep that thread's profile and are not held up. That includes
+a task with `threadMode: "continue"` that has no thread yet: its first run is checked, later runs go
+into the thread that run made, and if the owner widens the project, that thread and those runs widen
+with it. A change saved from another machine is not checked against the thread a task is bound to
+here: a current sender refuses a narrowed thread's change first, but a T3 from before that check
+forwards it. Entries of deleted tasks are dropped at each start.
 `t3_thread_transfer`'s fork is refused when the fork would get more than the caller's profile: a
 fork gets its source's profile cut to the source's, so forking the caller itself always goes through, and a fork of a thread whose parent cannot be read is refused. On
 another machine, a fork, a change to a scheduled task and `run_scheduled_task_now` are refused for

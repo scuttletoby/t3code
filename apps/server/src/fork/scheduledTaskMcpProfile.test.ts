@@ -684,6 +684,79 @@ it.effect.each(SCHEDULES)(
     ),
 );
 
+const ONCE_CASES = [
+  {
+    name: "the record file cannot be read",
+    reason: "Not run: The MCP profiles",
+    hint: "run it now or give it a new time once it is fixed",
+    settings: NARROWED,
+    breaks: writeRecord("{ not json"),
+  },
+  {
+    name: "the new thread's MCP profile cannot be worked out",
+    reason: "Not run: the MCP profile of the thread this run would start cannot be worked out",
+    hint: "run it now or give it a new time once that is fixed",
+    // The project names a profile the settings do not have.
+    settings: {
+      ...NARROWED,
+      projectSettingsOverrides: { [NARROW_PROJECT]: { mcpProfile: "gone" } },
+    },
+    breaks: Effect.void,
+  },
+];
+
+it.effect.each(ONCE_CASES)(
+  "a one-time task refused because $name: the note says to run it now once that is fixed",
+  ({ reason, hint, settings, breaks }) =>
+    held(
+      Effect.gen(function* () {
+        const world = newWorld();
+        const id = "task:once";
+        const schedule = { type: "once", runAt: "1970-01-01T00:01:00.000Z" } as const;
+        yield* withService(NARROWED, world, (service) =>
+          asCaller(service.upsert(task(id, { schedule, createdBy: "agent" }))),
+        );
+        const saved = JSON.stringify(yield* readRecord);
+        yield* breaks;
+        yield* withService(settings, world, (service) =>
+          Effect.gen(function* () {
+            yield* passAtNextRun(world, id);
+            const refused = yield* row(id);
+            expect(refused).toMatchObject({ last_run_status: "failed", run_count: 0 });
+            expect(refused?.next_run_at).toBeNull();
+            expect(refused?.last_run_error).toContain(reason);
+            expect(refused?.last_run_error).toContain(hint);
+            // Runs again: it has no next time, so a later pass leaves it as it is.
+            yield* TestClock.adjust("1 second");
+            yield* passAtNextRun(world, id);
+            expect(yield* row(id)).toMatchObject({
+              last_run_error: refused?.last_run_error,
+              run_count: 0,
+            });
+            // Run now is refused the same way while it is not fixed.
+            const runNow = yield* service
+              .runNow({ id: ScheduledTaskId.make(id) })
+              .pipe(Effect.flip);
+            expect(messageOf(runNow)).toContain(reason);
+            expect(world.launched).toHaveLength(0);
+          }),
+        );
+        // Fixed (the file restored, the setting put back): it still does not come due, as the
+        // note says, and run now runs it.
+        yield* writeRecord(saved);
+        yield* withService(NARROWED, world, (service) =>
+          Effect.gen(function* () {
+            yield* passAtNextRun(world, id);
+            expect(world.launched).toHaveLength(0);
+            yield* service.runNow({ id: ScheduledTaskId.make(id) });
+            expect(world.launched).toHaveLength(1);
+            expect(yield* row(id)).toMatchObject({ last_run_status: "succeeded", run_count: 1 });
+          }),
+        );
+      }),
+    ),
+);
+
 it.effect("a run refused by the slot gate, then by its MCP profile: one note, the profile's", () =>
   held(
     Effect.gen(function* () {
@@ -764,11 +837,18 @@ const settle = Effect.forEach(
   { discard: true },
 );
 
-/** Settles until `done` holds (forked work on a loaded machine can take more than one settle). */
-const settleUntil = (done: Effect.Effect<boolean>, label: string) =>
+/**
+ * Runs `step` (a settle by default) until `done` holds: forked work on a loaded machine can take
+ * more than one settle, so a test waits for the state it needs instead of a fixed number of steps.
+ */
+const settleUntil = (
+  done: Effect.Effect<boolean>,
+  label: string,
+  step: Effect.Effect<void> = settle,
+) =>
   Effect.gen(function* () {
     for (let round = 0; round < 50; round++) {
-      yield* settle;
+      yield* step;
       if (yield* done) return;
     }
     assert.fail(`never: ${label}`);
@@ -839,15 +919,28 @@ it.effect("a webhook run is refused when it starts, and again after it waited fo
           if (stored._tag !== "accepted") return assert.fail(`not accepted: ${stored._tag}`);
           yield* workerRounds(world, 3);
           expect(world.launched).toHaveLength(0);
-          // The owner widens the project while it waits; then the slot frees.
+          expect((yield* deliveryOf(service, "task:hook-wait", stored.deliveryId)).outcome).toBe(
+            "accepted",
+          );
+          // The owner widens the project while it waits, the slot still full. Its next retry
+          // checks it again before it asks for the slot, and ends it refused.
           yield* serverSettings.updateSettings({
             projectSettingsOverrides: { [NARROW_PROJECT]: { mcpProfile: "wider" } },
           } as never);
+          yield* settleUntil(
+            deliveryOf(service, "task:hook-wait", stored.deliveryId).pipe(
+              Effect.map((delivery) => delivery.outcome !== "accepted"),
+              Effect.orDie,
+            ),
+            "the waiting delivery ended",
+            workerRounds(world, 1),
+          );
+          // Then the slot frees. Runs again: more rounds start nothing, and the delivery is not
+          // stored any more.
           slots.running = [];
-          // Runs again: more rounds start nothing, and the delivery is not stored any more.
           yield* workerRounds(world, 4);
           expect(world.launched).toHaveLength(0);
-          const waited = yield* endedDelivery(service, "task:hook-wait", stored.deliveryId);
+          const waited = yield* deliveryOf(service, "task:hook-wait", stored.deliveryId);
           expect(waited.outcome).toBe("dispatch_failed");
           expect(waited.error).toContain(
             'Not run: this task was saved by a thread whose MCP profile is "docs"',
