@@ -45,8 +45,13 @@ interface World {
   snapshotDies?: boolean;
   /** Set: the count read waits on it and cannot be interrupted (a busy reader). */
   snapshotStuck?: Deferred.Deferred<void> | undefined;
+  /** The count read interrupts itself (a reader pool that shuts down). */
+  snapshotInterrupts?: boolean;
   /** Hung reads the gate stopped. */
   readsStopped: number;
+  /** Count reads running now, and the most that ever ran at once. */
+  readsInFlight: number;
+  maxReadsInFlight: number;
   freeMemoryBytes: number;
 }
 
@@ -57,6 +62,8 @@ const newWorld = (): World => ({
   snapshotFails: false,
   snapshotHangs: false,
   readsStopped: 0,
+  readsInFlight: 0,
+  maxReadsInFlight: 0,
   freeMemoryBytes: 16_000 * MB,
 });
 
@@ -94,6 +101,9 @@ const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue> | "un
         Layer.mock(ActiveRunShells.ActiveRunShells)({
           read: Effect.gen(function* () {
             world.snapshotReads += 1;
+            world.readsInFlight += 1;
+            world.maxReadsInFlight = Math.max(world.maxReadsInFlight, world.readsInFlight);
+            if (world.snapshotInterrupts) return yield* Effect.interrupt;
             if (world.snapshotHangs) {
               return yield* Effect.never.pipe(
                 Effect.onInterrupt(() =>
@@ -112,7 +122,14 @@ const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue> | "un
               return yield* new OrchestratorV2.OrchestratorProjectionError({ threadId: caller });
             }
             return snapshotOf(world);
-          }),
+          }).pipe(
+            // Every ending: an answer, a failure, a defect or an interruption.
+            Effect.ensuring(
+              Effect.sync(() => {
+                world.readsInFlight -= 1;
+              }),
+            ),
+          ),
         }),
         Layer.mock(HostResources.HostResources)({
           read: Effect.gen(function* () {
@@ -137,6 +154,9 @@ const acquire = (targetInstanceId: ProviderInstanceId = MAIN) =>
   SlotGate.SlotGate.pipe(
     Effect.flatMap((gate) => gate.acquire({ callerThreadId: caller, targetInstanceId })),
   );
+
+/** Lets forked fibers run (scheduler turns, no clock moved). */
+const settle = Effect.forEach(Array.from({ length: 20 }), () => Effect.yieldNow, { discard: true });
 
 const run = <A, E>(
   world: World,
@@ -493,7 +513,7 @@ describe("SlotGate", () => {
             Effect.gen(function* () {
               const fiber = yield* Effect.forkChild(acquire());
               yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
-              for (let step = 0; step < 20; step += 1) yield* Effect.yieldNow;
+              yield* settle;
               const exit = fiber.pollUnsafe();
               if (exit === undefined) {
                 yield* Deferred.succeed(stuck, undefined);
@@ -503,16 +523,158 @@ describe("SlotGate", () => {
                 refusal(yield* Fiber.join(fiber)),
                 "the read took longer than 5 seconds",
               );
-              // The old read is still pending: the next call is not blocked by it.
+              assert.strictEqual(world.readsInFlight, 1, "the old read is still running");
+              // Its late answer ends it: the next call reads again and is allowed.
               world.snapshotStuck = undefined;
-              assert.strictEqual((yield* acquire()).type, "allow");
-              // Its late answer changes nothing: the agent just allowed still holds the one slot.
               yield* Deferred.succeed(stuck, undefined);
-              yield* Effect.yieldNow;
+              yield* settle;
+              assert.strictEqual(world.readsInFlight, 0);
+              assert.strictEqual((yield* acquire()).type, "allow");
+              assert.strictEqual(world.snapshotReads, 2);
+              // The agent just allowed holds the one slot.
               assert.strictEqual((yield* acquire()).type, "refuse");
             }),
           );
         }),
+    );
+
+    it.effect(
+      "a slow store: refused calls, at once or in a row, leave at most one read running",
+      () =>
+        Effect.gen(function* () {
+          const world = newWorld();
+          const stuck = yield* Deferred.make<void>();
+          world.snapshotStuck = stuck;
+          yield* run(
+            world,
+            settings,
+            Effect.gen(function* () {
+              const gate = yield* SlotGate.SlotGate;
+              // Three callers at once (queued on the gate), a wait_list read beside them (outside
+              // the gate's queue), then three more in a row: each joins the one read still running.
+              const together = yield* Effect.forkChild(
+                Effect.all([acquire(), acquire(), acquire(), gate.usage], {
+                  concurrency: "unbounded",
+                }),
+              );
+              for (let turn = 0; turn < 3; turn += 1) {
+                yield* settle;
+                yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
+              }
+              yield* settle;
+              const answers = yield* Fiber.join(together);
+              for (const answer of answers.slice(0, 3)) {
+                assert.strictEqual(
+                  refusal(answer as SlotGate.SlotAcquire),
+                  SlotGate.countUnreadRefusalText("timeout"),
+                );
+              }
+              assert.strictEqual(answers[3], null, "wait_list shows no usage while unread");
+              for (let call = 0; call < 3; call += 1) {
+                const fiber = yield* Effect.forkChild(acquire());
+                yield* settle;
+                yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
+                assert.strictEqual(
+                  refusal(yield* Fiber.join(fiber)),
+                  SlotGate.countUnreadRefusalText("timeout"),
+                );
+              }
+              assert.strictEqual(world.snapshotReads, 1, "one read for all seven callers");
+              assert.strictEqual(world.maxReadsInFlight, 1);
+              // After the slow read ends (a late answer), the next call reads again and is allowed.
+              world.snapshotStuck = undefined;
+              yield* Deferred.succeed(stuck, undefined);
+              yield* settle;
+              assert.strictEqual(world.readsInFlight, 0);
+              assert.strictEqual((yield* acquire()).type, "allow");
+              assert.strictEqual(world.snapshotReads, 2);
+              assert.strictEqual(world.maxReadsInFlight, 1);
+            }),
+          );
+        }),
+    );
+
+    it.effect("a caller cut off while it waits leaves at once; the read goes on for the next", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotHangs = true;
+        yield* run(
+          world,
+          settings,
+          Effect.gen(function* () {
+            const cut = yield* Effect.forkChild(acquire());
+            yield* settle;
+            cut.interruptUnsafe();
+            yield* settle;
+            // No clock moved: a caller that could not be cut off would still wait here.
+            assert.isDefined(cut.pollUnsafe(), "the cut-off caller ended at once");
+            assert.strictEqual(world.readsStopped, 0, "the read is left to the next caller");
+            const next = yield* Effect.forkChild(acquire());
+            yield* settle;
+            yield* TestClock.adjust(SlotGate.COUNT_READ_TIMEOUT);
+            assert.strictEqual(
+              refusal(yield* Fiber.join(next)),
+              SlotGate.countUnreadRefusalText("timeout"),
+            );
+            assert.strictEqual(world.snapshotReads, 1, "the next caller joined the same read");
+            assert.strictEqual(world.readsStopped, 1, "stopped at the timeout");
+            // A stopped read ends; nothing is sticky.
+            world.snapshotHangs = false;
+            assert.strictEqual((yield* acquire()).type, "allow");
+            assert.strictEqual(world.snapshotReads, 2);
+          }),
+        );
+      }),
+    );
+
+    it.effect("a read stopped at another caller's timeout refuses its joiner as a timeout", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotHangs = true;
+        yield* run(
+          world,
+          settings,
+          Effect.gen(function* () {
+            const gate = yield* SlotGate.SlotGate;
+            // wait_list starts the read; a delegation joins it 2 s later.
+            const usage = yield* Effect.forkChild(gate.usage);
+            yield* settle;
+            yield* TestClock.adjust("2 seconds");
+            const joiner = yield* Effect.forkChild(acquire());
+            yield* settle;
+            // wait_list gives up at 5 s and stops the read; the joiner's own limit is 2 s later.
+            yield* TestClock.adjust("3 seconds");
+            yield* settle;
+            assert.strictEqual(yield* Fiber.join(usage), null);
+            assert.strictEqual(world.readsStopped, 1);
+            assert.strictEqual(
+              refusal(yield* Fiber.join(joiner)),
+              SlotGate.countUnreadRefusalText("timeout"),
+            );
+            assert.strictEqual(world.snapshotReads, 1);
+          }),
+        );
+      }),
+    );
+
+    it.effect("a read that interrupts itself refuses in plain words, not as an interruption", () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotInterrupts = true;
+        yield* run(
+          world,
+          settings,
+          Effect.gen(function* () {
+            const exit = yield* Effect.exit(Effect.uninterruptible(acquire()));
+            if (exit._tag !== "Success") return assert.fail(`expected an answer, got ${exit}`);
+            assert.strictEqual(refusal(exit.value), SlotGate.countUnreadRefusalText("error"));
+            // The marker went with the read: the next call reads again.
+            world.snapshotInterrupts = false;
+            assert.strictEqual((yield* acquire()).type, "allow");
+            assert.strictEqual(world.snapshotReads, 2);
+          }),
+        );
+      }),
     );
 
     it.effect("an empty thread list is a good read, not a failure: allowed and counted", () =>

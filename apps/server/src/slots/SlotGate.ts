@@ -3,7 +3,11 @@
  * settings. `observe`: the capacity rule runs beside each decision (`SlotObserver.ts`). Its own state
  * is memory only; slots held by delivered slot waits come from the wait store (`attachReservations`).
  */
-import type { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import type {
+  OrchestrationV2ThreadShellSnapshot,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import type { SlotRuleStatus, WaitToolFailure } from "@t3tools/contracts/waitFor";
 import {
   accountOnlyThreads,
@@ -28,6 +32,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -216,39 +221,78 @@ const make = Effect.gen(function* () {
   let storeProblem: string | null = null;
 
   /**
-   * Threads with an active run (settled ones too), or why they cannot be read in time; an empty list
-   * is a good read. Its own fiber, stopped but not awaited at the timeout, so a read that cannot
-   * stop at once holds neither the caller nor the semaphore. The interruptible wait lets the
-   * timeout work inside the caller's uninterruptible acquire.
+   * The one count read in flight: callers that need the count while it runs join it, so a slow
+   * store never has two. `stopped`: stopped at a caller's timeout. Cleared when the read ends, any
+   * way (a late answer too), so an ended read never refuses anyone.
    */
-  const readCount: Effect.Effect<CountRead> = Effect.gen(function* () {
-    const reading = yield* Effect.forkDetach(Effect.interruptible(activeRunShells.read));
-    return yield* Effect.interruptible(Fiber.join(reading)).pipe(
-      Effect.timeout(COUNT_READ_TIMEOUT),
-      Effect.map((snapshot): CountRead => {
-        const threads = [...snapshot.threads, ...snapshot.archivedThreads];
+  let inFlight: {
+    readonly fiber: Fiber.Fiber<OrchestrationV2ThreadShellSnapshot, unknown>;
+    stopped: boolean;
+  } | null = null;
+
+  /** The read in flight, or a new one; no interruption in between, so one is never lost. */
+  const sharedRead = Effect.suspend(() => {
+    if (inFlight !== null) return Effect.succeed(inFlight);
+    return Effect.forkDetach(activeRunShells.read).pipe(
+      Effect.map((fiber) => {
+        const flight = { fiber, stopped: false };
+        inFlight = flight;
+        // Called at once if the read already ended.
+        fiber.addObserver(() => {
+          if (inFlight === flight) inFlight = null;
+        });
+        return flight;
+      }),
+    );
+  });
+
+  /**
+   * Threads with an active run, or why they cannot be read in time (an empty list is a good read).
+   * The shared read's fiber starts interruptible, so the timeout stops it even inside an
+   * uninterruptible acquire, without awaiting it. A caller cut off leaves the read to the others.
+   */
+  const readCount: Effect.Effect<CountRead> = Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      const flight = yield* sharedRead;
+      const exit = yield* restore(
+        Fiber.await(flight.fiber).pipe(Effect.timeout(COUNT_READ_TIMEOUT)),
+      ).pipe(
+        Effect.catch(() =>
+          Effect.sync(() => {
+            flight.stopped = true;
+            flight.fiber.interruptUnsafe();
+            return null;
+          }),
+        ),
+      );
+      if (exit === null) {
+        yield* Effect.logWarning("agent slots: running agents could not be counted", {
+          problem: "timeout",
+        });
+        return { type: "unread", problem: "timeout" } satisfies CountRead;
+      }
+      if (Exit.isSuccess(exit)) {
+        const threads = [...exit.value.threads, ...exit.value.archivedThreads];
         return {
           type: "read",
           running: runningAgents(threads, null),
           visible: visibleRunThreadIds(threads),
-        };
-      }),
-      Effect.catch((cause) => {
-        const problem: CountReadProblem = Cause.isTimeoutError(cause) ? "timeout" : "error";
-        return Effect.logWarning("agent slots: running agents could not be counted", {
-          problem,
-          cause,
-        }).pipe(Effect.as<CountRead>({ type: "unread", problem }));
-      }),
+        } satisfies CountRead;
+      }
+      // A read that ended by an interruption is a failed read too, never the caller's interruption:
+      // "timeout" when a caller stopped it at the timeout, "error" when it interrupted itself.
+      const problem: CountReadProblem =
+        Cause.hasInterruptsOnly(exit.cause) && flight.stopped ? "timeout" : "error";
       // A bug in the count read (a defect, not a failure) is a failed read too.
-      Effect.catchDefect((defect) =>
-        Effect.logWarning("agent slots: counting running agents crashed", { defect }).pipe(
-          Effect.as<CountRead>({ type: "unread", problem: "error" }),
-        ),
-      ),
-      Effect.ensuring(Effect.sync(() => reading.interruptUnsafe())),
-    );
-  });
+      yield* Cause.hasDies(exit.cause)
+        ? Effect.logWarning("agent slots: counting running agents crashed", { cause: exit.cause })
+        : Effect.logWarning("agent slots: running agents could not be counted", {
+            problem,
+            cause: exit.cause,
+          });
+      return { type: "unread", problem } satisfies CountRead;
+    }),
+  );
 
   /** The count, or `undefined` when it cannot be read (slot waits and `wait_list`: never "free"). */
   const readRunning = readCount.pipe(
@@ -500,7 +544,8 @@ const make = Effect.gen(function* () {
       const heldRead = yield* liveHeld(waitsOn, nowMs);
       const reservations = heldRead.held;
       const decision = slotDecision({
-        limits: running === undefined ? { ...limits, machine: null, account: () => null } : limits,
+        // Read only when a count limit applies (`counted`), so no count means none to check.
+        limits,
         running: running ?? [],
         starting: kept,
         reservations: onePerThread(
