@@ -3,12 +3,7 @@
  * rule hides a T3 tool outside the calling thread's groups from `tools/list`, refuses it on
  * `tools/call` and keeps it out of `tool_search`; like upstream's `requiresCapability` (open PR).
  */
-import {
-  MCP_PROFILE_ALL,
-  MCP_T3_UNGROUPED_TOOLS,
-  type McpT3ToolGroup,
-  type ThreadId,
-} from "@t3tools/contracts";
+import { MCP_T3_UNGROUPED_TOOLS, type McpT3ToolGroup, type ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -48,8 +43,9 @@ import {
 type ToolGroup = McpT3ToolGroup | "ungrouped" | typeof MCP_T3_TOOL_NOT_ALLOWED;
 
 /**
- * Each toolkit the server registers, by its folder under src/mcp/toolkits. `toolSearch` holds only
- * `tool_search`, which is ungrouped by name (importing it here would loop through McpToolExposure).
+ * Each toolkit the server registers, by its folder under src/mcp/toolkits (`toolSearch`'s one tool
+ * is ungrouped by name: importing it would loop through McpToolExposure). Kept by hand, so
+ * personOnlySettings.test.ts fails when the table differs from the folders' toolkits by one tool.
  */
 const TOOLKITS: ReadonlyArray<readonly [string, { readonly tools: object }]> = [
   ["attachment", AttachmentToolkit],
@@ -107,7 +103,9 @@ function t3ToolRefusal(set: T3ToolSet, name: string): string {
     return `T3 refused "${name}": this thread's MCP profile cannot be applied, so it keeps only the T3 tools every profile keeps (${MCP_T3_UNGROUPED_TOOLS.join(", ")}). The reason: ${set.reason}`;
   }
   if (group === undefined || group === "ungrouped" || group === MCP_T3_TOOL_NOT_ALLOWED) {
-    return `T3 refused "${name}": it is in no T3 tool group this version knows, so MCP profile "${set.name}" leaves it out. Ask the user to pick the "${MCP_PROFILE_ALL}" profile for this thread in Settings; it applies from the thread's next turn.`;
+    // Fail closed, but name the real cause: no profile setting can add a tool with no group. (A
+    // name the server does not have never gets here: upstream refuses it before this rule.)
+    return `T3 refused "${name}": this tool has no T3 tool group, so MCP profile "${set.name}" cannot keep it. This is a T3 bug, not a setting to change: report it.`;
   }
   return `T3 refused "${name}": it is in the "${group}" T3 tool group, which this thread's MCP profile "${set.name}" leaves out. Ask the user to add "${group}" to that profile's t3Tools in Settings, or to pick a profile that has it for this thread; it applies from the thread's next turn.`;
 }
@@ -126,10 +124,9 @@ const callerThread = (scope: Option.Option<McpInvocationContext.McpInvocationSco
 let installed = 0;
 
 /**
- * `tool_search`'s filter: false for a tool the calling thread's set leaves out. Reads the caller
- * from the request fiber, as upstream's `EnabledWhen` checks do. The rule ran for the `tool_search`
- * call first, so the set is there; a thread with none keeps only the ungrouped tools. A server
- * without the rule (upstream's tests) searches as upstream does.
+ * `tool_search`'s filter: false for a tool the calling thread's set leaves out (none set: only the
+ * ungrouped). Reads the caller from the request fiber, like upstream's `EnabledWhen`, so call it only
+ * inside a request: outside one, and on a server without the rule, it lets every tool through.
  */
 export const searchableT3Tool = (tool: { readonly name: string }): boolean => {
   if (installed === 0) return true;
@@ -187,3 +184,5 @@ export const layer = McpServer.visibility(
   }).pipe(Effect.withSpan("McpT3ToolFilter.make")),
   { global: true },
 );
+
+export const __testing = { t3ToolRefusal };
