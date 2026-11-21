@@ -324,6 +324,7 @@ const layerScratchThreadPromotionProvided = ScratchThreadPromotion.layer.pipe(
   ),
 );
 const layerProviderContinuationWorkerProvided = ProviderContinuationService.layer.pipe(
+  Layer.provide(WaitWorker.continuationSlot), // Fork: an idle thread's wake waits for an agent slot
   Layer.provide(
     Layer.mergeAll(
       ProviderContinuationRequests.layer,
@@ -420,7 +421,6 @@ export const layerProduction = Layer.mergeAll(
   ),
   // Fork (waits): off by default; the sweep reads and writes nothing until it is switched on.
   WaitWorker.layer.pipe(
-    Layer.provide(SlotGate.layer), // The server's one slot gate: layers memoize by reference.
     Layer.provide(
       Layer.mergeAll(
         layerThreadManagementProvided,
