@@ -61,11 +61,12 @@ does not match itself as a pattern, and the queue then refuses to start.
 
 The optional `review` block of the config says which changed paths need which
 lens reads and caps the review rounds. The head gate (`../head-check`) judges
-the required lenses by changed path with it (below, "How the gate judges"); the
-round cap, the approach lens and the `findings` / `state_line` lines are not
-enforced yet. `review.recommended.json` (next to this file) is a complete
-example with made-up paths; a test parses it. Real paths, lens names and prompt
-files belong in the project's own config.
+the required lenses by changed path with it (below, "How the gate judges"), and
+the findings, the approach lens and the round cap from the lens comments
+(below, "Findings and rounds"). The `state_line` key is parsed but not enforced
+yet. `review.recommended.json` (next to this file) is a complete example with
+made-up paths; a test parses it. Real paths, lens names and prompt files belong
+in the project's own config (below, "Turning it on").
 
 Every key is required and an unknown key is an error, as in the rest of the
 config. A wrong block makes the whole config invalid, naming every problem at
@@ -80,7 +81,7 @@ once.
 | `min_lenses` | `{"critical", "normal", "light"}`: the fewest different lenses a rule of that weight must list, 0-10, never falling with weight.                                                                                              |
 | `rounds`     | `{"approach_at", "max", "approach_lens"}`: from round `approach_at` the approach lens is required too; after round `max` a person must write an override comment or close the pull request. `max` is not below `approach_at`. |
 | `findings`   | `true` or `false`: lens comments carry `blocker:`, `major:` and `minor:` lines, and a blocker or major at the head fails the gate.                                                                                            |
-| `state_line` | `true` or `false`: a required lens comment needs a `state:` line to count.                                                                                                                                                    |
+| `state_line` | `true` or `false`: a required lens comment needs a `state:` line to count. Not enforced yet.                                                                                                                                  |
 
 The config is refused when:
 
@@ -187,6 +188,51 @@ merged config; everything else, the rules that judge the head too, the base's.
 It judges the merge with the base of its run: two pull requests that each pass
 alone can still merge into a bad config unless the ruleset requires branches to
 be up to date, which the queue needs anyway.
+
+**Findings and rounds.** The gate also judges the review itself, from the lens
+comments it reads anyway (section "Lens comments"; `review_judge.judge_rounds`).
+Owner decisions: issue #99 (findings), issue #100 (rounds).
+
+- **Findings** (`findings: true`): a lens report writes each finding on a line
+  of its own that starts `blocker:`, `major:` or `minor:` (any case; Markdown
+  list, quote and emphasis marks do not count; `Majors:`, `major 2:` and
+  `major (state):` are the same). A lens whose newest report that counts as a
+  read has a `blocker:` or `major:` line fails the head. Only an explicit
+  nothing after the colon is no finding (`major: none`, `nothing`, `no`, `0`,
+  `n/a`, `-`); any other text is one, also an empty one. Every line counts, in
+  code blocks and quotes too, so a report names an earlier finding it saw fixed
+  without that form (`fixed: the major of round 1 ...`). The ways out: fix it,
+  and the lens posts a new report (a later round: its newest comment counts)
+  without a blocker or major line; or a person posts an override comment for
+  the head (config `override`), which covers every lens whose report is older.
+  `minor:` lines never block.
+- **Rounds:** each different full sha that the counted lens headers name is a
+  fix-and-review round, and a round marker in a lens name (`code r3`) counts as
+  that round, whichever is higher. Hidden and edited lens comments count too
+  (hiding old rounds does not lower the count); a deleted one does not, so keep
+  the round marker in the names. From round `rounds.approach_at` the lens
+  `rounds.approach_lens` is required as well. Round `rounds.max` is the last:
+  a round past it fails the head, whatever the lenses said, with "no more
+  rounds; a person decides", until a person's override comment newer than every
+  lens comment covers the head; else the pull request is closed. At round
+  `rounds.max` a blocker or major says the same.
+- In `shadow` the summary adds a row "findings and rounds (shadow): they would
+  have said: ..." and nothing fails. Lens comments that cannot be judged fail
+  the head in both modes. Without the `review` key nothing of this runs.
+
+**Workflow, queue and lens files are critical** (owner decision, issue #82).
+The built-in protected paths (above) make every change to `.github/workflows/`,
+to the config itself and to a lens prompt need the critical lenses: the extra
+review. A project whose gate or queue code lives in its own repository (the
+fork's `fork-ci/`) adds a critical rule for those paths.
+
+**Turning it on.** A project opts in through its own config, never through
+the fork: add the `review` block to the queue config its head gate reads
+(`config` input), with its real paths, lens names and prompt files, in
+`shadow` first. Read a few gate summaries, fix every config warning, then set
+`mode` to `enforce` and dispatch the backfill (head-check README). The fork's
+own config is [`.github/fork-pr-queue.json`](../../../.github/fork-pr-queue.json),
+in `enforce`.
 
 **The empty input.** The gate refuses an empty `required-lenses` input (a head
 with no lens comment would pass), except when the config at the base tip has a

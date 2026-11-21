@@ -437,16 +437,23 @@ class Review:
         return [(when, i, post) for i, (when, post) in enumerate(posts) if not self.is_bot(post)]
 
     def lens_entries(self, pr):
-        """{lens key: ((when, index), sha or None, why or None)}: each lens's NEWEST header, from the posts that count
-        (counts). A comment that looks like a lens report but is not one valid read (lens_problem) is an entry of its
-        own, keyed by the comment, with no sha: a correct new post of that lens does not replace it, and hiding it
-        does not clear it. It reads nothing until it is deleted, its first line is edited to `not a lens: ...` with no
-        lens header line left in it, or a newer override covers it (NO_HEADER_WAY_OUT). A lens comment edited after
-        posting (includesCreatedEdit not false: GitHub records that it changed, not what) or hidden (minimized) reads
-        nothing until that lens posts a new comment; so does a review whose flags were not read (FLAGS_UNREAD). A
-        lens-looking post that does not count is logged (log only, never a comment), so a wrong lens_author_associations
-        shows in the run."""
-        found = {}
+        """{lens key: ((when, index), sha or None, why or None)}: lens_scan's entries without their posts."""
+        return {k: v[:3] for k, v in self.lens_scan(pr)[0].items()}
+
+    def lens_scan(self, pr):
+        """(entries, history). entries: {lens key: ((when, index), sha or None, why or None, post)}: each lens's NEWEST
+        header, from the posts that count (counts). A comment that looks like a lens report but is not one valid read
+        (lens_problem) is an entry of its own, keyed by the comment, with no sha: a correct new post of that lens does
+        not replace it, and hiding it does not clear it. It reads nothing until it is deleted, its first line is edited
+        to `not a lens: ...` with no lens header line left in it, or a newer override covers it (NO_HEADER_WAY_OUT). A
+        lens comment edited after posting (includesCreatedEdit not false: GitHub records that it changed, not what) or
+        hidden (minimized) reads nothing until that lens posts a new comment; so does a review whose flags were not read
+        (FLAGS_UNREAD). A lens-looking post that does not count is logged (log only, never a comment), so a wrong
+        lens_author_associations shows in the run. review_judge.judge_rounds reads the newest report's findings from the
+        entry's post. history: [(lens name, sha or None)] of EVERY counted post with a valid lens header, in list order,
+        older rounds and edited or hidden ones too (review_judge.judge_rounds counts the rounds by it: hiding an old
+        round must not lower the count)."""
+        found, history = {}, []
         for when, i, post in self.lens_posts(pr):
             where = post.get('url') or f'by {(post.get("author") or {}).get("login") or "?"} at {when or "?"}'
             if not self.counts(post):   # the author first: a stranger's text is only ever read in part, for the log
@@ -462,16 +469,17 @@ class Review:
             header = None if problem else lens_header(post.get('body') or '')
             if problem:
                 hidden = ', hidden' if self.hidden(post) else ''
-                found[f'{NO_HEADER} ({where}, {problem}{hidden})'] = ((when, i), None, None)
+                found[f'{NO_HEADER} ({where}, {problem}{hidden})'] = ((when, i), None, None, post)
                 continue
             if not header:
                 continue
+            history.append(header)
             key = lens_key(header[0])
             if key not in found or (when, i) >= found[key][0]:
                 why = FLAGS_UNREAD if post.get(UNREAD) else HIDDEN if self.hidden(post) \
                     else EDITED if post.get('includesCreatedEdit') is not False else None
-                found[key] = ((when, i), None, why) if why else ((when, i), header[1], None)
-        return found
+                found[key] = ((when, i), None, why, post) if why else ((when, i), header[1], None, post)
+        return found, history
 
     def lens_reads(self, pr):
         """{lens key: (sha, gap, override)}: what each lens of lens_entries counts as reading, the one rule reviewed_head

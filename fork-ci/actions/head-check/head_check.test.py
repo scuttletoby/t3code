@@ -1273,6 +1273,150 @@ class PathRulesBare(PathRules):
         self.assertEqual(self.check(base, head, EVERY_LENS)[0], 0)   # the same merge, given its time
 
 
+# --- findings and rounds (#99, #100): the lens comments' blocker and major lines and how many rounds they read -----
+OLD = ['d4' * 20, 'e5' * 20, 'f6' * 20, '07' * 20]   # heads earlier rounds read (gone from the branch now)
+
+
+class FindingsAndRounds(unittest.TestCase):
+    """The base's `review` block (the shared vectors' rules: findings true, approach lens from round 3, cap 4) judges
+    the lens comments' findings and rounds. Each test changes one normal path, so the path rules need the lens code."""
+    BARE = False
+    STORE = PathRules.STORE
+    setUp, base, head, check = PathRules.setUp, PathRules.base, PathRules.head, PathRules.check
+
+    def said(self, name, sha, *lines, **kw):
+        return self.p.post(f'{LENS}: {name} · reviewer: x · read at: {sha}\n' + '\n'.join(lines), **kw)
+
+    def pair(self, mode='enforce'):
+        b = self.base(mode)
+        return b, self.head(b, mode, **{'src/app.py': 'a\n'})
+
+    def test_a_major_in_the_newest_report_fails_the_head(self):
+        base, head = self.pair()
+        code, out = self.check(base, head, comments=[self.said('code', head, 'major: two writers race')])
+        self.assertEqual(code, 1, out)
+        self.assertIn("lens code reported a major that no later round cleared (issue #99): 'major: two writers race'",
+                      out)
+        self.assertIn('findings and rounds (enforce): round 1 of 4; lens code reported a major', out)
+
+    def test_shadow_only_says_what_it_would_have_said(self):
+        base, head = self.pair('shadow')
+        code, out = self.check(base, head, comments=[self.said('code', head, '**Blocker:** data lost on restart')])
+        self.assertEqual(code, 0, out)
+        self.assertIn('findings and rounds (shadow): they would have said: round 1 of 4; lens code reported a blocker',
+                      out)
+
+    def test_a_later_round_with_no_finding_clears_it(self):   # runs again on the same pull request after a fix
+        base, head = self.pair()
+        old = self.said('code', OLD[0], 'major: two writers race')
+        code, out = self.check(base, head, comments=[old, self.said('code r2', head, 'major: none')])
+        self.assertEqual(code, 0, out)
+        self.assertIn('findings and rounds (enforce): round 2 of 4; no blocker or major open', out)
+
+    def test_a_round_stopped_half_way_keeps_the_old_finding(self):   # the fix was pushed, the lens never read it
+        base, head = self.pair()
+        code, out = self.check(base, head, comments=[self.said('code', OLD[0], 'blocker: x')])
+        self.assertEqual(code, 1, out)
+        self.assertIn('lens code reported a blocker', out)
+
+    def test_a_deleted_newer_report_brings_the_old_finding_back(self):   # deleted later: GitHub no longer lists it
+        base, head = self.pair()
+        first, second = self.said('code', head, 'blocker: x'), self.said('code r2', head, 'blocker: none')
+        self.assertEqual(self.check(base, head, comments=[first, second])[0], 0)
+        code, out = self.check(base, head, comments=[first])
+        self.assertEqual(code, 1, out)
+        self.assertIn("lens code reported a blocker that no later round cleared (issue #99): 'blocker: x'", out)
+
+    def test_an_edited_report_reads_nothing_and_still_counts_as_a_round(self):   # edited later
+        base, head = self.pair()
+        comments = [self.said('code', OLD[0], edited=True), self.said('code', OLD[1], hidden=True),
+                    self.said('code', head, 'major: fixed later', edited=True)]
+        code, out = self.check(base, head, comments=comments)
+        self.assertEqual(code, 1, out)
+        self.assertIn('round 3 of 4', out)   # edited and hidden headers still count as rounds
+        self.assertNotIn('reported a major', out)   # it reads nothing: the edit itself fails it
+        self.assertIn('edited', out)
+
+    def test_the_approach_lens_is_required_from_round_three(self):
+        base, head = self.pair()
+        rounds = [self.said('code', OLD[0]), self.said('code', OLD[1])]
+        self.assertEqual(self.check(base, head, comments=rounds[:1] + [self.said('code', head)])[0], 0)
+        code, out = self.check(base, head, comments=rounds + [self.said('code', head)])
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: approach', out)
+        code, out = self.check(base, head, comments=rounds + [self.said('code', head), self.said('approach', head)])
+        self.assertEqual(code, 0, out)
+        self.assertIn('round 3 of 4, approach lens approach required from round 3', out)
+
+    def test_past_the_cap_it_stops_and_only_an_override_passes(self):
+        base, head = self.pair()
+        five = [self.said('code', sha) for sha in OLD] + [self.said('code', head), self.said('approach', head)]
+        code, out = self.check(base, head, comments=five)
+        self.assertEqual(code, 1, out)
+        self.assertIn('review round 5 is past the cap of 4 rounds (issue #100): no more rounds; a person decides', out)
+        code, out = self.check(base, head, comments=five + [self.p.override(head)])
+        self.assertEqual(code, 0, out)
+        stranger = self.p.override(head, assoc='CONTRIBUTOR', login='someone')   # not the owner's: counts for nothing
+        self.assertEqual(self.check(base, head, comments=five + [stranger])[0], 1)
+
+    def test_an_override_clears_a_wrong_finding(self):   # #99: a person's override comment
+        base, head = self.pair()
+        report = self.said('code', head, 'blocker: wrong, the lock is there')
+        self.assertEqual(self.check(base, head, comments=[report])[0], 1)
+        self.assertEqual(self.check(base, head, comments=[report, self.p.override(head)])[0], 0)
+        override = self.p.override(head)
+        later = self.said('code r2', head, 'blocker: wrong again')   # a report newer than the override counts again
+        self.assertEqual(self.check(base, head, comments=[report, override, later])[0], 1)
+
+    def test_a_strangers_finding_neither_blocks_nor_counts_a_round(self):   # anyone can comment on a public repo
+        base, head = self.pair()
+        noise = [self.said('code', sha, 'blocker: x', assoc='NONE', login='someone') for sha in OLD]
+        code, out = self.check(base, head, comments=noise + [self.said('code', head)])
+        self.assertEqual(code, 0, out)
+        self.assertIn('round 1 of 4', out)
+
+    def test_no_lens_comment_yet_is_round_zero(self):   # empty state: the path rules' lens is still required
+        base, head = self.pair()
+        code, out = self.check(base, head, comments=[])
+        self.assertEqual(code, 1, out)
+        self.assertIn('round 0 of 4; no blocker or major open', out)
+        self.assertIn('required lens without a read: code', out)
+
+    def test_the_same_comments_give_the_same_verdict(self):   # runs again
+        base, head = self.pair()
+        comments = [self.said('code', OLD[0], 'major: x'), self.said('code', head, 'major: y')]
+        self.assertEqual(self.check(base, head, comments=comments), self.check(base, head, comments=comments))
+
+    def test_no_review_block_judges_no_finding(self):   # old state: a base config from before the block
+        base = self.base(mode=None)
+        head = self.head(base, mode=None, **{'src/app.py': 'a\n'})
+        code, out = self.check(base, head, comments=[self.said('code', head, 'blocker: x')])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('findings and rounds', out)
+
+    def test_findings_false_judges_no_finding_but_still_counts_rounds(self):
+        b = self.w.commit(base_files(cfg_raw=review_cfg(findings=False), **{**PROMPTS, **self.STORE}), [self.m0])
+        head = self.w.commit(base_files(cfg_raw=review_cfg(findings=False),
+                                        **{**PROMPTS, **self.STORE, 'src/app.py': 'a\n'}), [b])
+        code, out = self.check(b, head, comments=[self.said('code', head, 'blocker: x')])
+        self.assertEqual(code, 0, out)
+        self.assertIn('findings are not judged', out)
+
+    def test_a_judge_that_fails_is_a_failed_head_in_either_mode(self):   # fail closed: never a silent pass
+        for mode in ('enforce', 'shadow'):
+            with self.subTest(mode):
+                base, head = self.pair(mode)
+                with unittest.mock.patch.object(H.review_judge, 'judge_rounds', side_effect=ValueError('boom')):
+                    code, out = self.check(base, head, comments=[self.said('code', head)])
+                self.assertEqual(code, 1, out)
+                self.assertIn('the review rounds and findings cannot be judged, so the head is not passed: '
+                              'ValueError: boom', out)
+
+
+class FindingsAndRoundsBare(FindingsAndRounds):
+    BARE = True
+
+
 class GitEnvironment(unittest.TestCase):   # #442 item 2: pr_queue.GIT_RUN
     """The gate's git calls get no program or transport of the job's environment where none can be needed: its local
     calls reach no remote, and its fetch from GitHub (https) needs git's own helpers only. The checkout mode fetches

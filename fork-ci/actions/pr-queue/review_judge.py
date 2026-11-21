@@ -16,9 +16,21 @@ every time, and the TypeScript side can be tested on the same vectors (review.ve
 Unknown never judges: a path no rule matches, a protected path with no critical rule (the parser refuses both, so
 only a hand-built rule set gets here) or a diff line this module cannot read raises JudgeError, which the gate turns
 into a failure.
+
+judge_rounds judges the review itself, from the lens comments (README.md, "Review rules", Findings and rounds):
+  - Findings (`findings: true`): a lens whose newest report that counts as a read has a `blocker:` or `major:` line
+    fails the head, until that lens reads a fixed head in a new comment without one (a later round clears it) or a
+    person's override comment newer than the report covers it. Owner decision: issue #99.
+  - Rounds: each different full sha the lens headers name is one fix-and-review round, and a header's round marker
+    (`r3`) counts as that round too, whichever is higher. From round `rounds.approach_at` the approach lens is
+    required; a round past `rounds.max` fails the head until a person's override covers every lens: no more rounds,
+    the person decides (override or close). Owner decision: issue #100.
+Pure as judge is: the lens comments come in (lens.Review.lens_scan), the verdict goes out.
 """
+import re
 from dataclasses import dataclass
 
+import lens
 import review_config
 import review_glob
 
@@ -152,3 +164,89 @@ def judge(review, changes, config_path):
     lenses = tuple(dict.fromkeys(n for r in review.rules if r.weight == weight
                                  and any(h.rule == r.name for h in hits) for n in r.lenses))
     return Judgement(weight, lenses, hits, tuple(protected), len(paths))
+
+
+# A finding line, as a lens report writes it (README.md, "Findings and rounds"): `blocker:` or `major:` at the start
+# of a line, after the Markdown lens.norm_line strips (quote and list markers, emphasis, headings), any case, a plural,
+# a number and a short note in brackets allowed (`Majors:`, `major 2:`, `major (state):`). Every line counts, in code
+# blocks and quotes too: fail closed, as for the lens header. Only an explicit nothing after the colon (NO_FINDING) is
+# no finding; any other text is one.
+FINDING_RE = re.compile(r'(blocker|major)s?(?:\s*#?\d{1,4})?(?:\s*\([^()]{0,80}\))?\s*:(.*)', re.I)
+NO_FINDING_RE = re.compile(r'(?:none|nothing|no|0|n/?a|-+|\u2014|\u2013)\s*\.?', re.I)
+ROUND_RE = re.compile(r'r(\d{1,9})')
+SHOW_FINDING = 120   # characters of a finding line named in the reason
+
+
+def findings(body):
+    """[(kind, line)] of the report's blocker and major lines, in order: kind is 'blocker' or 'major', line the line as
+    normalised (cut to SHOW_FINDING). Read both ways lens reads a line (clean_inline narrow or not): a line either way
+    reads as a finding is one."""
+    out = []
+    for raw in (body or '').splitlines():
+        for narrow in (False, True):
+            m = FINDING_RE.match(lens.norm_line(raw, narrow))
+            if m and not NO_FINDING_RE.fullmatch(m.group(2).strip()):
+                out.append((m.group(1).lower(), lens.norm_line(raw, narrow)[:SHOW_FINDING]))
+                break
+    return out
+
+
+def round_marker(name):
+    """The highest round marker (`r3`) among the words of a lens name after its first, or 0. Emphasis around a word
+    does not count (`data **r3**`)."""
+    words = [w.strip('*_`') for w in name.lower().split()[1:]]
+    return max((int(m.group(1)) for w in words for m in [ROUND_RE.fullmatch(w)] if m), default=0)
+
+
+def review_round(history):
+    """The fix-and-review round the lens headers say: how many different full 40-hex shas they read, or the highest
+    round marker, whichever is higher. history: [(lens name, sha or None)] of every lens header that counts
+    (lens.Review.lens_scan), old, edited and hidden ones too. 0: no lens header yet."""
+    shas = {sha for _, sha in history if sha and lens.FULL_SHA.fullmatch(sha)}
+    return max([len(shas)] + [round_marker(name) for name, _ in history])
+
+
+@dataclass(frozen=True)
+class Rounds:
+    round: int          # review_round of the lens headers
+    approach: bool      # the approach lens is required (round >= rounds.approach_at)
+    over_cap: bool      # round > rounds.max and no override covers every lens
+    findings: tuple     # (lens key, kind, line) of every blocker or major no later round or override cleared
+    problems: tuple     # why the head fails, plain text; empty: findings and rounds pass
+
+    def text(self, review):
+        """One line for the check summary."""
+        cap = review.rounds.max
+        said = f'round {self.round} of {cap}'
+        if self.approach:
+            said += f', approach lens {review.rounds.approach_lens} required from round {review.rounds.approach_at}'
+        if not review.findings:
+            said += '; findings are not judged (findings: false)'
+        return said + ('; ' + '; '.join(self.problems) if self.problems else '; no blocker or major open')
+
+
+def judge_rounds(review, history, newest, overridden):
+    """Rounds of a pull request's lens comments under the parsed `review` rules. history: [(lens name, sha)] of every
+    lens header that counts (lens.Review.lens_scan); newest: {lens key: body} of every lens (lens.Review.lens_reads),
+    the body of its newest report when that report counts as a read, else None (it reads nothing: the head fails for
+    it already, so it has no findings here); overridden: the lens keys a newer override covers (lens_reads)."""
+    n, cap = review_round(history), review.rounds.max
+    every = bool(newest) and set(newest) <= set(overridden)   # a person's override covers every lens
+    over = n > cap and not every
+    decides = 'a person decides: an override comment for the head, or close the pull request'
+    problems = []
+    if over:
+        problems.append(f'review round {n} is past the cap of {cap} rounds (issue #100): no more rounds; {decides}')
+    found = []
+    if review.findings:
+        for key in sorted(newest):
+            if key in overridden or newest[key] is None:
+                continue
+            for kind, line in findings(newest[key]):
+                found.append((key, kind, line))
+        for key, kind, line in found:
+            way = (f'this is round {n} of {cap}: no more rounds; {decides}' if n >= cap else
+                   'fix it and have that lens read the fixed head in a new comment with no blocker or major line, or a '
+                   'person posts an override comment for the head')
+            problems.append(f'lens {key} reported a {kind} that no later round cleared (issue #99): {line!r}; {way}')
+    return Rounds(n, n >= review.rounds.approach_at, over, tuple(found), tuple(problems))

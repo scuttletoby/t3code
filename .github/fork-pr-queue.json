@@ -1,0 +1,39 @@
+{
+  "required_checks": [
+    "fork-ci-result",
+    "No database schema changes",
+    "Outside pull request",
+    "head_check"
+  ],
+  "merge_method": "squash",
+  "bot_logins": [],
+  "lens_author_associations": ["OWNER"],
+  "override": { "prefix": "override for head", "author_association": "OWNER" },
+  "ready_command": "gh pr merge {pr} --auto --squash",
+  "push_command": "git push",
+  "lens_format_doc": "fork-ci/actions/pr-queue/README.md, section Lens comments",
+  "head_check": "head_check",
+  "review": {
+    "version": 1,
+    "mode": "enforce",
+    "rules": [
+      {
+        "name": "gate",
+        "weight": "critical",
+        "paths": [".github/**", "fork-ci/**"],
+        "lenses": ["merge-path", "state"]
+      },
+      { "name": "code", "weight": "normal", "paths": ["**"], "lenses": ["code"] }
+    ],
+    "lenses": {
+      "merge-path": { "prompt": ".github/fork-lens-merge-path.md" },
+      "state": { "prompt": ".github/fork-lens-state.md" },
+      "code": { "prompt": ".github/fork-lens-code.md" },
+      "approach": { "prompt": ".github/fork-lens-approach.md" }
+    },
+    "min_lenses": { "critical": 2, "normal": 1, "light": 0 },
+    "rounds": { "approach_at": 3, "max": 4, "approach_lens": "approach" },
+    "findings": true,
+    "state_line": false
+  }
+}

@@ -19,7 +19,11 @@ it would refuse every head after it.
 The config's optional `review` block (../pr-queue/README.md, "Review rules") names lenses by changed path: the paths
 are `git diff --name-status -M` from the merge base to the head (changed_paths), judged by review_judge.judge. In
 `enforce` its lenses are required too; in `shadow` the summary only says what they would have been. A change it cannot
-judge (no merge base, a failed diff) is refused, never passed. Without the block nothing of this runs.
+judge (no merge base, a failed diff) is refused, never passed. The same block judges the review itself
+(review_judge.judge_rounds, review_rounds): in `enforce` a lens's newest report with a `blocker:` or `major:` line that
+no later round or override cleared fails the head (`findings: true`), the approach lens is required from round
+`rounds.approach_at`, and a round past `rounds.max` fails the head until a person's override covers every lens; in
+`shadow` the summary only says so. Without the block nothing of this runs.
 
 Pass: every lens read the head (or a newer override vouches for it), and every required lens is there; a pull
 request with no lens comments and no required lens (nothing to compare); a draft, with --pass-drafts only. Fail,
@@ -344,10 +348,40 @@ def decide(repo, n, config_path, checkout, required, pass_drafts, gh, sleep, out
         return 1, False, f'could not read the pull request from GitHub after {ATTEMPTS} tries: {why}', []
     review = lens.Review(cfg.bot_logins, cfg.override_prefix, cfg.override_association, cfg.lens_author_associations,
                          log=lambda text: out(escape(text)))
+    rounds = None
+    if paths is not None and not (pr['isDraft'] and pass_drafts):
+        rounds, why = review_rounds(cfg.review, review, pr)
+        if rounds is None:   # fail closed, in shadow as in enforce, as for the path rules
+            return 1, False, f'the review rounds and findings cannot be judged, so the head is not passed: {why}', [row]
+        if enforced and rounds.approach:
+            required.setdefault(lens.lens_key(cfg.review.rounds.approach_lens), cfg.review.rounds.approach_lens)
     ok, reason, rows = verdict(pr, review, checkout, required, pass_drafts, enforced)
+    if rounds is not None:
+        mode = cfg.review.mode
+        rows = [(f'findings and rounds ({mode})', not (enforced and rounds.problems),
+                 ('' if enforced else 'they would have said: ') + rounds.text(cfg.review))] + rows
+        out(f'findings and rounds ({mode}): {escape(rows[0][2])}')
+        if enforced and rounds.problems:
+            reason = '; '.join(rounds.problems) + ('' if ok else f'; and: {reason}')
+            ok = False
     if paths is not None:
         rows = [row] + rows
     return (0 if ok else 1), ok, reason, rows
+
+
+def review_rounds(rules, review, pr):
+    """(review_judge.Rounds, None) of the pull request's lens comments under the base's `review` rules, or (None, why).
+    Findings come from each lens's newest report that counts as a read; the round from every lens header that counts.
+    Any error is a why, never a pass."""
+    try:
+        entries, history = review.lens_scan(pr)
+        reads = review.lens_reads(pr)
+        newest = {k: (entries[k][3].get('body') or '') if sha and not override else None
+                  for k, (sha, _, override) in reads.items()}
+        overridden = {k for k, (_, _, override) in reads.items() if override}
+        return review_judge.judge_rounds(rules, history, newest, overridden), None
+    except Exception as e:   # noqa: BLE001 - unknown never passes
+        return None, f'{type(e).__name__}: {review_judge.shown(str(e))[:300]}'
 
 
 def argument_problems(repo, n, required_text):
