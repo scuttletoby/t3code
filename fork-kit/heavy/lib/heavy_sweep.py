@@ -33,7 +33,7 @@ section, an unknown key or a newer version: nothing is checked or stopped, the r
 broken one like the sweep.
 """
 import contextlib, datetime, fcntl, fnmatch, importlib.machinery, importlib.util, json, os, re, shlex, signal, stat
-import subprocess, sys, tempfile, time
+import pwd, subprocess, sys, tempfile, time
 
 KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 LABEL = 'fork-kit.heavy.owner'
@@ -422,6 +422,7 @@ class Sweep:
     owner_uid = 0               # who must own the machine file
     sample_seconds = 1.0
     stop_grace = 5.0
+    note_dirs = None            # the folders of docker-label's notes; None = the user's own (note_bases)
 
     def __init__(self):
         self.uid = os.getuid()
@@ -690,6 +691,7 @@ class Sweep:
     def find(self, cfg):
         """Everything the sweep would act on: (procs, plan). plan is a list of dicts with 'kind' (process, scope,
         empty-scope, container), 'action' (stop, report, remove) and the reason."""
+        listed_at = self._now()
         listed = self.heavy_scope_units()
         procs = self.sample()
         manager = next((p.pid for p in procs.values() if p.comm == 'systemd'
@@ -707,6 +709,7 @@ class Sweep:
         for p in procs.values():
             if is_heavy_scope(p.unit):
                 members.setdefault(p.unit, []).append(p)
+        self.known_scopes = (listed_at, set(listed) | set(members))     # for prune_notes
         info = self.units({p.unit for p in procs.values() if p.ppid in orphan_parents and not is_heavy_scope(p.unit)})
 
         children = {}
@@ -915,7 +918,48 @@ class Sweep:
                     counts['problems'] += 1
                 lines.append(f'{result}: {head}')
                 self.log(f'result container {item["id"]}: {result}')
+        if act:
+            pruned = self.prune_notes(cfg)
+            if pruned:
+                self.log(f'removed {pruned} old notes of docker-label for scopes that are gone')
         return plan, counts, lines
+
+    def note_folders(self):
+        if self.note_dirs is not None:
+            return self.note_dirs
+        return tuple(os.path.join(b, 'heavy', 'labelled') for b in note_bases() if b)
+
+    def prune_notes(self, cfg):
+        """Remove the notes `heavy docker-label` left for scopes that are gone: heavy and its guard both killed with
+        -9, or a kept scope that ended. In /run/user they go at logout; in ~/.local/state they would stay for good.
+        Only an empty file named like a heavy scope that systemd did not list (and that held no process) when this
+        sweep began, and that was already minAgeSeconds old then: a live run's scope is listed, and a scope
+        started since is newer than its note could be old. A note heavy has not read yet (its scope ended a moment
+        before this sweep began) costs at most a container that this sweep or the next removes instead of heavy.
+        Returns how many were removed."""
+        listed_at, known = getattr(self, 'known_scopes', (None, None))
+        if known is None:
+            return 0
+        before = listed_at - cfg['minAgeSeconds']
+        removed = 0
+        for folder in self.note_folders():
+            try:
+                st = os.lstat(folder)
+                if not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid or st.st_mode & 0o022:
+                    continue
+                names = os.listdir(folder)
+            except OSError:
+                continue
+            for name in names:
+                if not is_heavy_scope(name) or name in known:
+                    continue
+                path = os.path.join(folder, name)
+                with contextlib.suppress(OSError):
+                    st = os.lstat(path)
+                    if stat.S_ISREG(st.st_mode) and st.st_size == 0 and st.st_mtime < before:
+                        os.unlink(path)
+                        removed += 1
+        return removed
 
 
 def leftovers_json(plan):
@@ -1186,9 +1230,37 @@ RUNTIME_ROOT = '/run/user'
 STATE_ROOT = ''         # '' = ~/.local/state (bin/heavy STATE_ROOT)
 
 
+def state_base():
+    """<home>/.local/state for the second notes folder (bin/heavy state_base, the same rule), or '' for none: $HOME,
+    else the password database's home; only an absolute folder this user owns."""
+    if STATE_ROOT:
+        return STATE_ROOT
+    homes = [os.environ.get('HOME') or '']
+    with contextlib.suppress(KeyError):
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    for home in homes:
+        if not home or not os.path.isabs(home):
+            continue
+        try:
+            st = os.stat(home)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid():
+            return os.path.join(home, '.local', 'state')
+    return ''
+
+
+def note_bases():
+    """The bases of the notes folders, as heavy reads them: <RUNTIME_ROOT>/<uid>, then state_base() ('' for none)."""
+    return os.path.join(RUNTIME_ROOT, str(os.getuid())), state_base()
+
+
 def note_in(base, scope):
     """Note the scope in <base>/heavy/labelled (bin/heavy own_folder, the same rule): (folder, '') or ('', why not).
-    The folders are made if missing (heavy has made its own already: one made here is never heavy's)."""
+    heavy/ and heavy/labelled are made if missing (heavy has made its own already: one made here is never heavy's),
+    but never base itself: unlike heavy, docker-label never makes ~/.local/state."""
+    if not base:
+        return '', 'no home folder this user owns'
     uid = os.getuid()
     folder = os.path.join(base, 'heavy', 'labelled')
     try:
@@ -1211,15 +1283,16 @@ def note_label(value, marks=None):
     when that note cannot reach heavy (not written: /run/user full or not allowed; or written into another folder
     than heavy's, a sandbox's own /run/user, told by HEAVY_MARKS, device:inode of the folders heavy reads), then
     ~/.local/state/heavy/labelled. '' or why it could not (heavy then leaves the container to the leftover sweep).
-    Without HEAVY_MARKS (an older heavy, or one without such a folder) heavy asks Docker after every run anyway."""
+    Without HEAVY_MARKS only the /run/user note is tried: a heavy with neither folder asks Docker after every run
+    anyway, and an older heavy (before HEAVY_MARKS) reads only that folder, so it asks Docker only when that note was
+    written; when it was not, the container is left to the leftover sweep."""
     scope = value.partition(',scope=')[2]
     if not scope:
         return ''
     marks = os.environ.get('HEAVY_MARKS') if marks is None else marks
     reads = set(filter(None, (marks or '').split(',')))
     whys = []
-    for base in (os.path.join(RUNTIME_ROOT, str(os.getuid())),
-                 STATE_ROOT or os.path.join(os.path.expanduser('~'), '.local', 'state')):
+    for base in note_bases():
         folder, why = note_in(base, scope)
         if folder and marks:
             try:
