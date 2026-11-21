@@ -838,7 +838,7 @@ const make = Effect.gen(function* () {
           continueThreadsAfterServerUpdate: false,
           automaticUpdates: false,
           usageHistoryRetentionDays: "unlimited",
-          modelPolicy: ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy
+          modelPolicy: yield* ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy
         };
         if (failure._tag === "Failure") {
           parseFailure = Option.some(Cause.squash(failure.cause));

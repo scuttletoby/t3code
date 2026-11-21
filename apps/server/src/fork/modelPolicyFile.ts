@@ -17,32 +17,31 @@ import { readSettingsFile } from "./settingsFileRead.ts";
 
 /** What `unreadable` holds for a file that does not parse: the policy in it cannot be seen. */
 export const SETTINGS_FILE_UNPARSEABLE = "the settings file does not parse";
+/** The server log's warning for a file that does not parse. */
+export const SETTINGS_FILE_UNPARSEABLE_WARNING =
+  "settings: settings.json does not parse, so the model policy cannot be read: every agent model pick is refused until the file is fixed";
 
 const decodePolicy = Schema.decodeUnknownExit(ModelPolicyFromSettingsFile);
 /** The load's lenient parse (comments, trailing commas), as upstream's load parses the file. */
 const parseFile = Schema.decodeUnknownExit(fromLenientJson(Schema.Unknown));
 
 /**
- * The policy after a failed load: the file's own decoded policy when only another part of the
- * file failed; its `modelPolicy` key read alone when the file parses (the policy it holds, read
- * as a bad value reads); the defaults' (the default, or an admin policy's) when the file names
- * none; and enforce with nothing allowed when the file does not parse, or is no object.
+ * The policy after a failed load: the file's own decoded policy when only another part failed;
+ * its `modelPolicy` key read alone when the file parses; the defaults' when the file names none;
+ * enforce with nothing allowed when it does not parse or is no object, warned through the load's
+ * own logger (the server's).
  */
-export function afterLoadFailure(
+export const afterLoadFailure = Effect.fn("ForkPolicy.afterLoadFailure")(function* (
   decoded: Exit.Exit<unknown, unknown>,
   raw: string,
   defaults: { readonly modelPolicy: ModelPolicy },
-): ModelPolicy {
+) {
   const policy = afterLoadFailureQuiet(decoded, parseFile(raw), defaults.modelPolicy);
   if (policy.unreadable === SETTINGS_FILE_UNPARSEABLE) {
-    Effect.runSync(
-      Effect.logWarning(
-        "settings: settings.json does not parse, so the model policy cannot be read: every agent model pick is refused until the file is fixed",
-      ),
-    );
+    yield* Effect.logWarning(SETTINGS_FILE_UNPARSEABLE_WARNING);
   }
   return policy;
-}
+});
 
 function afterLoadFailureQuiet(
   decoded: Exit.Exit<unknown, unknown>,
