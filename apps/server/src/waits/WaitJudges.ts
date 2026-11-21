@@ -349,7 +349,7 @@ const TIMEOUT_TEST_RETRY_MS = 10 * 60_000;
 
 /** The command line a check runs as: under `timeout` when there is one (Linux), else as it is. */
 export function checkCommandLine(
-  check: WaitCheck,
+  check: Pick<WaitCheck, "argv" | "timeoutSeconds">,
   args: ReadonlyArray<string>,
   timeoutProgram: string | null,
 ): { readonly command: string; readonly args: ReadonlyArray<string> } {
@@ -437,11 +437,95 @@ export const findTimeoutProgram = Effect.fnUntraced(function* (
   return { program: null, known };
 });
 
+/** A program from settings, run as {@link makeSettingsProgramRunner} runs it. */
+export interface SettingsProgram {
+  /** Program and arguments; never read by a shell. */
+  readonly argv: ReadonlyArray<string>;
+  readonly timeoutSeconds: number;
+  readonly cwd: string;
+  readonly maxOutputBytes: number;
+  /** Added to the server's environment. */
+  readonly env?: Readonly<Record<string, string>> | undefined;
+  /** Written to its stdin, which is then closed (none: stdin stays open, as wait checks run). */
+  readonly stdin?: string | undefined;
+}
+
+/** How a settings program ended; `needs-shell` was refused, never run. */
+export type SettingsProgramRun =
+  | { readonly type: "ran"; readonly result: ProcessRunner.ProcessRunOutput }
+  | { readonly type: "needs-shell" }
+  | { readonly type: "error"; readonly message: string };
+
+/**
+ * The runner of programs from the person's settings: wait checks, and the handoff's `command`
+ * source (fork/handoff/handoffCommand.ts). No shell, killed at its time limit (on Linux also under
+ * `timeout`, so it ends when the server is gone), output over the cap is an error. Test options:
+ * `timeoutProgram`, `timeoutPrograms` (tested on Linux) and `timeoutTest` timing.
+ */
+export const makeSettingsProgramRunner = Effect.fn("WaitJudges.makeSettingsProgramRunner")(
+  function* (
+    input: {
+      readonly timeoutProgram?: string | null;
+      readonly timeoutPrograms?: ReadonlyArray<string>;
+      readonly timeoutTest?: { readonly limitMs?: number; readonly retryMs?: number };
+    } = {},
+  ) {
+    const timing = input.timeoutTest ?? {};
+    const runner = yield* ProcessRunner.ProcessRunner;
+    const platform = yield* HostProcess.Platform;
+    // Looked for and tested at the first run, and kept once the answer is known. A test run that
+    // hung says nothing, so it is tested again at a later run; until then programs run without it.
+    let found: { readonly program: string | null } | null =
+      input.timeoutProgram !== undefined
+        ? { program: input.timeoutProgram }
+        : platform !== "linux"
+          ? { program: null }
+          : null;
+    let testAgainAt = 0;
+    const finding = yield* Semaphore.make(1);
+    const timeoutProgram = finding.withPermits(1)(
+      Effect.gen(function* () {
+        if (found !== null) return found.program;
+        const now = yield* Clock.currentTimeMillis;
+        if (now < testAgainAt) return null;
+        const result = yield* findTimeoutProgram(input.timeoutPrograms ?? TIMEOUT_PROGRAMS, timing);
+        if (result.known || result.program !== null) found = { program: result.program };
+        else testAgainAt = now + (timing.retryMs ?? TIMEOUT_TEST_RETRY_MS);
+        return result.program;
+      }),
+    );
+    return Effect.fn("WaitJudges.runSettingsProgram")(function* (program: SettingsProgram) {
+      // Windows runs a `.cmd` or `.bat` file only through a shell, which would read the arguments.
+      const resolved = yield* resolveSpawnCommand(program.argv[0]!, program.argv.slice(1));
+      if (resolved.shell) return { type: "needs-shell" } as const;
+      const line = checkCommandLine(program, [], yield* timeoutProgram);
+      return yield* runner
+        .run({
+          command: line.command,
+          args: [...line.args],
+          cwd: program.cwd,
+          ...(program.env === undefined ? {} : { env: { ...program.env } }),
+          ...(program.stdin === undefined ? {} : { stdin: program.stdin }),
+          timeout: Duration.seconds(program.timeoutSeconds),
+          maxOutputBytes: program.maxOutputBytes,
+          outputMode: "error",
+          timeoutBehavior: "timedOutResult",
+        })
+        .pipe(
+          Effect.map((result): SettingsProgramRun => ({ type: "ran", result })),
+          Effect.catch((error) =>
+            Effect.succeed<SettingsProgramRun>({ type: "error", message: runErrorText(error) }),
+          ),
+        );
+    });
+  },
+);
+
 /**
  * Runs a named check from settings without a shell, in the project's main workspace root, with a
  * timeout and an output cap. The check is looked up again on every run in the thread's current
  * project; a removed or narrowed check is a permanent error. A wait brings no command, cwd or env.
- * Test options: `timeoutProgram`, `timeoutPrograms` (tested on Linux) and `timeoutTest` timing.
+ * Test options: as {@link makeSettingsProgramRunner}.
  */
 export const makeCheckJudge = Effect.fn("WaitJudges.makeCheckJudge")(function* (input: {
   readonly placeOf: (context: WaitJudgeContext) => Effect.Effect<CheckPlace>;
@@ -449,72 +533,37 @@ export const makeCheckJudge = Effect.fn("WaitJudges.makeCheckJudge")(function* (
   readonly timeoutPrograms?: ReadonlyArray<string>;
   readonly timeoutTest?: { readonly limitMs?: number; readonly retryMs?: number };
 }) {
-  const timing = input.timeoutTest ?? {};
   const settingsService = yield* ServerSettingsService;
-  const runner = yield* ProcessRunner.ProcessRunner;
   const platform = yield* HostProcess.Platform;
-  // Looked for and tested at the first check, and kept once the answer is known. A test run that
-  // hung says nothing, so it is tested again at a later check; until then checks run without it.
-  let found: { readonly program: string | null } | null =
-    input.timeoutProgram !== undefined
-      ? { program: input.timeoutProgram }
-      : platform !== "linux"
-        ? { program: null }
-        : null;
-  let testAgainAt = 0;
-  const finding = yield* Semaphore.make(1);
-  const timeoutProgram = finding.withPermits(1)(
-    Effect.gen(function* () {
-      if (found !== null) return found.program;
-      const now = yield* Clock.currentTimeMillis;
-      if (now < testAgainAt) return null;
-      const result = yield* findTimeoutProgram(input.timeoutPrograms ?? TIMEOUT_PROGRAMS, timing);
-      if (result.known || result.program !== null) found = { program: result.program };
-      else testAgainAt = now + (timing.retryMs ?? TIMEOUT_TEST_RETRY_MS);
-      return result.program;
-    }),
-  );
+  const { placeOf, ...runnerOptions } = input;
+  const runProgram = yield* makeSettingsProgramRunner(runnerOptions);
   const judge: WaitJudge<"check"> = Effect.fn("WaitJudges.check")(function* ({ spec }, context) {
     const settings = yield* settingsService.getSettings.pipe(Effect.option);
     if (settings._tag === "None") return transient("The settings cannot be read.");
-    const place = context.place ?? (yield* input.placeOf(context));
+    const place = context.place ?? (yield* placeOf(context));
     if (place.type === "gone") return permanent(place.message);
     if (place.type === "unreadable") return transient(place.message);
     const found = yield* lookUpCheck(spec, place.projectId, settings.value, platform);
     if (!found.ok) return found.judgement;
     const check = found.check;
-    // Windows runs a `.cmd` or `.bat` file only through a shell, which would read the arguments.
-    const resolved = yield* resolveSpawnCommand(check.argv[0]!, [
-      ...check.argv.slice(1),
-      ...spec.args,
-    ]);
-    if (resolved.shell) {
+    const ran = yield* runProgram({
+      argv: [...check.argv, ...spec.args],
+      timeoutSeconds: check.timeoutSeconds,
+      cwd: place.cwd,
+      maxOutputBytes: CHECK_MAX_OUTPUT_BYTES,
+    });
+    if (ran.type === "needs-shell") {
       return permanent(
         `Check "${spec.name}" names a program that needs a shell (a .cmd or .bat file); checks run without one.`,
       );
     }
-    const line = checkCommandLine(check, spec.args, yield* timeoutProgram);
-    return yield* runner
-      .run({
-        command: line.command,
-        args: [...line.args],
-        cwd: place.cwd,
-        timeout: Duration.seconds(check.timeoutSeconds),
-        maxOutputBytes: CHECK_MAX_OUTPUT_BYTES,
-        outputMode: "error",
-        timeoutBehavior: "timedOutResult",
-      })
-      .pipe(
-        Effect.map((result) =>
-          judgeExit({
-            exitCode: result.code === null ? null : Number(result.code),
-            stdout: result.stdout,
-            stderr: result.stderr,
-            timedOut: result.timedOut,
-          }),
-        ),
-        Effect.catch((error) => Effect.succeed(transient(runErrorText(error)))),
-      );
+    if (ran.type === "error") return transient(ran.message);
+    return judgeExit({
+      exitCode: ran.result.code === null ? null : Number(ran.result.code),
+      stdout: ran.result.stdout,
+      stderr: ran.result.stderr,
+      timedOut: ran.result.timedOut,
+    });
   });
   return judge;
 });
