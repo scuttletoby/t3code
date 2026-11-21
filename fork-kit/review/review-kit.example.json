@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "queue_config": ".github/pr-queue.json",
+  "runner": { "model": "claude-opus-5-5", "effort": "high" },
+  "lens_runners": { "data-1": { "model": "claude-opus-5-5", "effort": "xhigh" } },
+  "audit_runner": { "model": "claude-fable-5-2", "effort": "high" },
+  "forbidden_efforts": ["low", "max"],
+  "lens_rounds": 2,
+  "minors": "issue"
+}
