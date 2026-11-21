@@ -73,7 +73,7 @@ class Install(unittest.TestCase):
         self.assertEqual(self.run_main('self-check')[0], 0)
         # the installed wrapper runs from its version folder
         r = subprocess.run([sys.executable, '-I', '-B', self.path(f'/usr/local/libexec/heavy/versions/{SHA1}/bin/heavy'),
-                            '--help'], capture_output=True, text=True)
+                            '--help'], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0)
         self.assertIn('heavy <command>', r.stdout)
 
@@ -216,11 +216,19 @@ class Install(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(version, 'lib', 'heavy_sweep.py')))
         moved = os.path.join(self.root, 'elsewhere')   # nothing of the repository next to it
         shutil.copytree(version, moved)
-        for args in (['sweep', '--help'], ['docker-label', '--value']):
+        # docker-label with a process owner: a scope owner (this test run under heavy) would leave a note for the
+        # heavy running it in /run/user/<uid>/heavy/labelled, which an installed heavy from before the notes keeps
+        with open('/proc/self/cgroup') as f:
+            leaf = ''.join(line[3:].strip() for line in f if line.startswith('0::')).rpartition('/')[2]
+        notes = [os.path.join(base, 'heavy', 'labelled', leaf) for base in
+                 (f'/run/user/{os.getuid()}', os.path.expanduser('~/.local/state'))] if leaf.endswith('.scope') else []
+        before = [n for n in notes if os.path.lexists(n)]
+        for args in (['sweep', '--help'], ['docker-label', '--value', '--owner-pid', str(os.getpid())]):
             r = subprocess.run([sys.executable, '-I', '-B', os.path.join(moved, 'bin', 'heavy'), *args],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertRegex(r.stdout, r'^uid=\d+,(pid=\d+,start=\d+|scope=heavy-.+\.scope)\n$')
+        self.assertRegex(r.stdout, rf'^uid=\d+,pid={os.getpid()},start=\d+\n$')
+        self.assertEqual([n for n in notes if os.path.lexists(n)], before, 'the test left a note behind')
 
     def test_sweep_timer_units_written_kept_and_removed(self):
         units = [self.path('/etc/systemd/user/heavy-sweep.service'), self.path('/etc/systemd/user/heavy-sweep.timer')]
