@@ -4,12 +4,14 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   agentSlotsMode,
+  countedStarting,
   DISPATCH_SAFETY_MS,
   effectiveSlotLimits,
   limitsCount,
   liveReservations,
   liveStarting,
   onePerThread,
+  pendingWakes,
   runningAgents,
   slotDecision,
   slotRefusalText,
@@ -157,6 +159,54 @@ describe("liveStarting", () => {
     ];
     const visible = new Set(["child-1", "child-2"]);
     expect(liveStarting(entries, visible, 1_000, 30_000).map((e) => e.token)).toEqual([3, 4]);
+  });
+});
+
+describe("countedStarting (#711)", () => {
+  const queued = (token: number, into: string, endedAtMs?: number): StartingEntry => ({
+    token,
+    instanceId: MAIN,
+    atMs: 0,
+    queuedInto: into,
+    ...(endedAtMs === undefined ? {} : { endedAtMs }),
+  });
+
+  it("counts a message queued into a thread only while that thread shows no run", () => {
+    const entries = [
+      queued(1, "busy"),
+      queued(2, "ended"),
+      { token: 3, instanceId: MAIN, atMs: 0 },
+    ];
+    // "busy" still runs: its run is counted, not its queued message too.
+    expect(countedStarting(entries, new Set(["busy"])).map((e) => e.token)).toEqual([2, 3]);
+    expect(countedStarting(entries, new Set()).map((e) => e.token)).toEqual([1, 2, 3]);
+  });
+
+  it("entries that name one thread count once: one run at a time there (B m1, A m4)", () => {
+    const named = (token: number, child: string): StartingEntry => ({
+      token,
+      instanceId: MAIN,
+      atMs: 0,
+      childThreadId: child,
+    });
+    // Three messages queued into P, and a delivery into Q tried twice: P once, Q once.
+    const entries = [queued(1, "p"), queued(2, "p"), queued(3, "p"), named(4, "q"), named(5, "q")];
+    expect(countedStarting(entries, new Set()).map((e) => e.token)).toEqual([1, 4]);
+    // A start in P (a send into it while idle) and a message queued into it: still one.
+    expect(countedStarting([named(6, "p"), queued(7, "p")], new Set()).map((e) => e.token)).toEqual(
+      [6],
+    );
+    // Unnamed starts (a delegation before its child is known) each count.
+    const unnamed = [1, 2].map((token) => ({ token, instanceId: MAIN, atMs: 0 }));
+    expect(countedStarting(unnamed, new Set())).toHaveLength(2);
+  });
+
+  it("a queued message never ends by its thread showing a run: only by time", () => {
+    const ended = [queued(1, "thread-1", 10_000)];
+    // Its thread shows a run: kept (not counted now), so it counts again if that run ends.
+    expect(liveStarting(ended, new Set(["thread-1"]), 20_000, 30_000)).toHaveLength(1);
+    expect(liveStarting(ended, new Set(), 39_999, 30_000)).toHaveLength(1);
+    expect(liveStarting(ended, new Set(), 40_000, 30_000)).toEqual([]);
   });
 });
 
@@ -352,5 +402,29 @@ describe("agentSlotsMode", () => {
     expect(agentSlotsMode({ enabled: false, mode: "dynamic" })).toBe("fixed");
     expect(agentSlotsMode({ enabled: true, mode: "" })).toBe("fixed");
     expect(agentSlotsMode(DEFAULT_SERVER_SETTINGS.agentSlots)).toBe("observe");
+  });
+});
+
+describe("pendingWakes", () => {
+  const hold = (key: string, threadId: string): SlotReservation => ({
+    key,
+    threadId,
+    untilMs: 60_000,
+  });
+
+  it("one per held thread that shows no run, is not woken yet and has no entry naming it", () => {
+    const holds = [hold("a", "idle"), hold("b", "busy"), hold("c", "woken"), hold("d", "sent")];
+    const sent: StartingEntry = { token: 1, instanceId: MAIN, atMs: 0, childThreadId: "sent" };
+    const wakes = pendingWakes(holds, new Set(["busy"]), [sent], new Set(["c"]));
+    expect(wakes).toHaveLength(1);
+    // Counted on the machine only: no account is named "".
+    expect(wakes[0]?.instanceId).toBe("");
+  });
+
+  it("empty or missing state: no holds, no wake-ups; two holds of one thread, one wake-up", () => {
+    expect(pendingWakes([], new Set(), [], new Set())).toEqual([]);
+    expect(pendingWakes([hold("a", "t"), hold("b", "t")], new Set(), [], new Set())).toHaveLength(
+      1,
+    );
   });
 });

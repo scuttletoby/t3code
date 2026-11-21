@@ -6,6 +6,7 @@
 import type { SlotRuleStatus } from "@t3tools/contracts/waitFor";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
+  countedStarting,
   DISPATCH_SAFETY_MS,
   liveReservations,
   liveStarting,
@@ -211,11 +212,9 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
       ownStarts = ownStarts.filter(
         (entry) => entry.childThreadId === undefined || !running.visible.has(entry.childThreadId),
       );
-      const starting = liveStarting(
-        [...input.starting, ...own],
+      const starting = countedStarting(
+        liveStarting([...input.starting, ...own], running.visible, input.atMs, input.startGraceMs),
         running.visible,
-        input.atMs,
-        input.startGraceMs,
       );
       const live = liveReservations(heldRead.value, input.atMs);
       if (!input.gateRecords) {
