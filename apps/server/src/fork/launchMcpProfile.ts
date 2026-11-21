@@ -1,7 +1,8 @@
 /**
  * Fork: a thread started by a narrower thread (`t3_thread_launch`, `create_threads`, a
  * `schedule_task` whose runs start new threads, a `t3_thread_transfer` fork) is refused unless its
- * profile is within the starter's; `delegate_task` cuts a child to its parent as before.
+ * profile is within the starter's; `delegate_task` cuts a child to its parent as before. The
+ * scheduled task service checks a save and a run again (`scheduledTaskMcpProfile.ts`).
  */
 import {
   OrchestratorMcpFailure,

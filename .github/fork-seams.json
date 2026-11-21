@@ -253,14 +253,9 @@
         "if (slot.skipped !== null) return slot.skipped; // Fork: a skipped run is recorded",
         "yield* slot.end(threadId); // Fork: the slot names the run's thread",
         "Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot",
-        "runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored"
-      ],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "yield* runSlots.saving(task, existingTask); // Fork: the saving thread's MCP profile"
-        ]
-      }
+        "runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored",
+        "yield* runSlots.saving(task, existingTask); // Fork: the saving thread's MCP profile"
+      ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693).",
