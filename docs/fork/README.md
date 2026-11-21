@@ -844,6 +844,21 @@ role as before, and the server log says so.
 { "mcpProfiles": { "lean": { "servers": [], "t3Tools": ["orchestration", "threads"] } } }
 ```
 
+In the app: **Settings → Fork**, section MCP profiles. It lists `all` and `t3-only` (read-only)
+and each named profile, and adds, edits and deletes named ones: `servers` is all or a list of
+names (the editor offers the names other profiles use and takes any other; no list of the
+machine's servers reaches the app yet), `t3Tools` all or a list of groups. `request_secret`,
+`send_to_user` and `tool_search` always stay. A built-in name cannot be taken, and a profile that
+the default, the sub-agent rule, a project or a thread pick names cannot be deleted: the panel
+says which, and offers to clear the thread picks that name it. An entry this version cannot read
+(fields from a newer build) shows as broken and cannot be edited there, only deleted; one that
+names T3 tool groups this version does not know shows as from a newer version, the same way. The
+default profile and the sub-agent rule have the usual project-override control, and each thread's
+pick is listed by title, changed or cleared. Every save sends only the entries it changes (a pick
+names one thread), so another profile or another thread's pick is never overwritten, and a change
+applies from the thread's next message. A client without permission to change settings sees the
+rows but cannot use them; the server refuses such a save anyway.
+
 Only the person can change MCP profile settings; agents cannot.
 
 ### `server.mcpProfile`

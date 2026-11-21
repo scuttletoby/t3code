@@ -1,0 +1,546 @@
+/**
+ * Fork: MCP profiles. The list and thread picks are the environment's; the default profile and
+ * the sub-agent rule may be a project's own. Each write is the person's settings patch naming only
+ * the keys it changes; opening the panel writes nothing.
+ */
+/* oxlint-disable t3code/no-untranslated-copy -- Fork: this panel is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
+import {
+  MCP_PROFILE_ALL,
+  MCP_SUBAGENT_INHERIT,
+  MCP_T3_TOOL_GROUPS,
+  type McpT3ToolGroup,
+  type ServerSettingsPatch,
+} from "@t3tools/contracts";
+import { useState } from "react";
+
+import { useProjects, useThreadShells } from "../../../state/entities";
+import { Button } from "../../ui/button";
+import { Checkbox } from "../../ui/checkbox";
+import { Input } from "../../ui/input";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
+import { SettingsSection } from "../settingsLayout";
+import { useSearchableSetting } from "../settingsSearch";
+import {
+  useClearScopedSettings,
+  useScopedSettingSource,
+  useScopedSettings,
+  useScopedSettingsMixed,
+  useUpdateScopedSettings,
+} from "../useScopedSettings";
+import { ForkRow } from "./ForkRow";
+import {
+  MCP_ALWAYS_KEPT_NOTE,
+  MCP_PICK_APPLIES_NOTE,
+  type McpProfileDraft,
+  type McpProfileLabels,
+  clearThreadPicksPatch,
+  deleteMcpProfilePatch,
+  describeMcpProfileSet,
+  draftOf,
+  emptyMcpProfileDraft,
+  mcpProfileChoices,
+  mcpProfileRows,
+  mcpServerSuggestions,
+  mcpThreadPickRows,
+  notSetUpNotes,
+  saveMcpProfilePatch,
+  shownProfileRef,
+  threadPickPatch,
+  threadPickProblem,
+} from "./mcpProfileSettings.logic";
+
+const MIXED =
+  "The selected environments or projects have different MCP profile settings. Select one to edit them.";
+
+/**
+ * The outside servers set up where the profiles apply. No server list reaches this client yet, so
+ * the editor offers the names other profiles use and takes any name.
+ */
+const KNOWN_SERVERS: ReadonlyArray<string> | null = null;
+
+const PROFILE_KEYS = [
+  "mcpProfiles",
+  "mcpProfile",
+  "mcpSubagentProfile",
+  "mcpThreadProfiles",
+] as const;
+
+function ProfileSelect({
+  value,
+  choices,
+  label,
+  extra,
+  onChange,
+}: {
+  readonly value: string;
+  readonly choices: ReadonlyArray<string>;
+  readonly label: string;
+  /** Values offered before the profiles, such as `inherit`. */
+  readonly extra?: ReadonlyArray<string>;
+  readonly onChange: (name: string) => void;
+}) {
+  // A value no readable profile has (a broken or missing one) is shown as it is, never as `all`.
+  const options = [...(extra ?? []), ...choices];
+  const shown = options.includes(value) ? options : [...options, value];
+  return (
+    <Select
+      value={value}
+      onValueChange={(next) => {
+        if (next !== null && next !== value) onChange(next as string);
+      }}
+    >
+      <SelectTrigger size="sm" className="w-full sm:w-40" aria-label={label}>
+        <SelectValue>{value}</SelectValue>
+      </SelectTrigger>
+      <SelectPopup align="end" alignItemWithTrigger={false}>
+        {shown.map((name) => (
+          <SelectItem hideIndicator key={name} value={name} disabled={!options.includes(name)}>
+            {options.includes(name) ? name : `${name} (cannot apply)`}
+          </SelectItem>
+        ))}
+      </SelectPopup>
+    </Select>
+  );
+}
+
+function ListOrAll<T extends string>({
+  legend,
+  allLabel,
+  value,
+  options,
+  onChange,
+}: {
+  readonly legend: string;
+  readonly allLabel: string;
+  readonly value: "all" | ReadonlyArray<T>;
+  readonly options: ReadonlyArray<T>;
+  readonly onChange: (next: "all" | ReadonlyArray<T>) => void;
+}) {
+  const list = value === "all" ? [] : value;
+  return (
+    <fieldset className="grid gap-1.5">
+      <legend className="mb-1 text-xs font-medium">{legend}</legend>
+      <label className="flex items-center gap-2 text-xs">
+        <Checkbox
+          checked={value === "all"}
+          aria-label={allLabel}
+          onCheckedChange={(checked) => onChange(checked === true ? "all" : [])}
+        />
+        {allLabel}
+      </label>
+      {value === "all" ? null : (
+        <div className="grid gap-1 pl-6 sm:grid-cols-3">
+          {options.map((option) => (
+            <label key={option} className="flex items-center gap-2 text-xs">
+              <Checkbox
+                checked={list.includes(option)}
+                aria-label={option}
+                onCheckedChange={(checked) =>
+                  onChange(
+                    checked === true ? [...list, option] : list.filter((entry) => entry !== option),
+                  )
+                }
+              />
+              {option}
+            </label>
+          ))}
+        </div>
+      )}
+    </fieldset>
+  );
+}
+
+function ProfileEditor({
+  editing,
+  initial,
+  suggestions,
+  onSave,
+  onCancel,
+}: {
+  readonly editing: string | null;
+  readonly initial: McpProfileDraft;
+  readonly suggestions: ReadonlyArray<string>;
+  readonly onSave: (draft: McpProfileDraft) => string | null;
+  readonly onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState(initial);
+  const [serverName, setServerName] = useState("");
+  const [problem, setProblem] = useState<string | null>(null);
+  const servers = draft.servers === "all" ? [] : draft.servers;
+  const serverOptions = [...new Set([...suggestions, ...servers])];
+  const addServer = () => {
+    const name = serverName.trim();
+    if (name === "") return;
+    setDraft({ ...draft, servers: [...new Set([...servers, name])] });
+    setServerName("");
+  };
+  const notes = notSetUpNotes(draft.name.trim() || "this profile", draft.servers, KNOWN_SERVERS);
+  return (
+    <div className="grid gap-3 rounded-lg border border-border/60 p-3">
+      {editing === null ? (
+        <Input
+          size="sm"
+          aria-label="Profile name"
+          placeholder="Profile name, such as lean"
+          value={draft.name}
+          onChange={(event) => {
+            setProblem(null);
+            setDraft({ ...draft, name: event.target.value });
+          }}
+        />
+      ) : (
+        <p className="text-xs font-medium">{editing}</p>
+      )}
+      <ListOrAll
+        legend="Outside MCP servers"
+        allLabel="All servers"
+        value={draft.servers}
+        options={serverOptions}
+        onChange={(next) => setDraft({ ...draft, servers: next })}
+      />
+      {draft.servers === "all" ? null : (
+        <div className="flex flex-wrap items-center gap-2 pl-6">
+          <Input
+            size="sm"
+            className="min-w-0 flex-1"
+            aria-label="Server name"
+            placeholder="Server name, as Claude lists it"
+            value={serverName}
+            onChange={(event) => setServerName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") addServer();
+            }}
+          />
+          <Button size="xs" variant="outline" onClick={addServer}>
+            Add server
+          </Button>
+        </div>
+      )}
+      <ListOrAll<McpT3ToolGroup>
+        legend="T3 tool groups"
+        allLabel="All T3 tools"
+        value={draft.t3Tools}
+        options={MCP_T3_TOOL_GROUPS}
+        onChange={(next) => setDraft({ ...draft, t3Tools: next })}
+      />
+      <p className="text-xs text-muted-foreground">{MCP_ALWAYS_KEPT_NOTE}</p>
+      {notes.map((note) => (
+        <p key={note} className="text-xs text-muted-foreground">
+          {note}
+        </p>
+      ))}
+      {problem !== null ? (
+        <p role="alert" className="text-xs text-destructive-foreground">
+          {problem}
+        </p>
+      ) : null}
+      <div className="flex gap-2">
+        <Button size="xs" onClick={() => setProblem(onSave(draft))}>
+          Save profile
+        </Button>
+        <Button size="xs" variant="outline" onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export function McpProfileSettings({ isProjectScope }: { readonly isProjectScope: boolean }) {
+  const searchableSetting = useSearchableSetting();
+  const updateSettings = useUpdateScopedSettings();
+  const clearScopedSettings = useClearScopedSettings();
+  const mixed = useScopedSettingsMixed([...PROFILE_KEYS]);
+  const defaultSource = useScopedSettingSource(["mcpProfile"]);
+  const ruleSource = useScopedSettingSource(["mcpSubagentProfile"]);
+  const mcpProfiles = useScopedSettings((settings) => settings.mcpProfiles);
+  const mcpProfile = useScopedSettings((settings) => settings.mcpProfile);
+  const mcpSubagentProfile = useScopedSettings((settings) => settings.mcpSubagentProfile);
+  const mcpThreadProfiles = useScopedSettings((settings) => settings.mcpThreadProfiles);
+  const projectSettingsOverrides = useScopedSettings(
+    (settings) => settings.projectSettingsOverrides,
+  );
+  const threadShells = useThreadShells();
+  const projects = useProjects();
+  const [editor, setEditor] = useState<{
+    readonly editing: string | null;
+    readonly draft: McpProfileDraft;
+  } | null>(null);
+  const [deleteProblem, setDeleteProblem] = useState<{
+    readonly problem: string;
+    readonly threadIds: ReadonlyArray<string>;
+  } | null>(null);
+  const [pickDraft, setPickDraft] = useState("");
+  const [pickError, setPickError] = useState<string | null>(null);
+
+  const settings = { mcpProfiles, mcpProfile, mcpSubagentProfile, mcpThreadProfiles };
+  const labels: McpProfileLabels = {
+    projects: new Map(projects.map((project) => [project.id as string, project.title])),
+    threads: new Map(threadShells.map((thread) => [thread.id as string, thread.title])),
+  };
+  const rows = mcpProfileRows(settings, KNOWN_SERVERS);
+  const choices = mcpProfileChoices(settings);
+  const save = (patch: ServerSettingsPatch | null, options?: { onSaved?: () => void }) => {
+    if (patch === null) options?.onSaved?.();
+    else updateSettings(patch, options);
+  };
+
+  if (mixed) {
+    return (
+      <SettingsSection id="mcp-profiles-section" title="MCP profiles">
+        <ForkRow
+          serverScoped
+          {...searchableSetting("mcp-profiles")}
+          lockPaths={[...PROFILE_KEYS]}
+          mixed
+          description={MIXED}
+        />
+      </SettingsSection>
+    );
+  }
+
+  const defaultRow = (
+    <ForkRow
+      serverScoped
+      {...searchableSetting("mcp-profile-default")}
+      settingKeys={["mcpProfile"]}
+      lockPaths={["mcpProfile"]}
+      onResetOverride={() => clearScopedSettings(["mcpProfile"])}
+      description={`The profile a top-level thread gets when nobody picked one for it. ${MCP_PROFILE_ALL}: every outside server and every T3 tool, as without profiles.${
+        isProjectScope && defaultSource === "project" ? " This project's own value." : ""
+      } ${MCP_PICK_APPLIES_NOTE}`}
+      control={
+        <ProfileSelect
+          value={shownProfileRef(mcpProfile, MCP_PROFILE_ALL)}
+          choices={choices}
+          label="Default MCP profile"
+          onChange={(name) => save({ mcpProfile: name })}
+        />
+      }
+    />
+  );
+  const ruleRow = (
+    <ForkRow
+      serverScoped
+      {...searchableSetting("mcp-subagent-profile")}
+      settingKeys={["mcpSubagentProfile"]}
+      lockPaths={["mcpSubagentProfile"]}
+      onResetOverride={() => clearScopedSettings(["mcpSubagentProfile"])}
+      description={`The profile a delegated child gets when nobody picked one for it. ${MCP_SUBAGENT_INHERIT}: the same as a top-level thread. A child never gets more than its parent.${
+        isProjectScope && ruleSource === "project" ? " This project's own value." : ""
+      }`}
+      control={
+        <ProfileSelect
+          value={shownProfileRef(mcpSubagentProfile, MCP_SUBAGENT_INHERIT)}
+          choices={choices}
+          extra={[MCP_SUBAGENT_INHERIT]}
+          label="Sub-agent MCP profile"
+          onChange={(name) => save({ mcpSubagentProfile: name })}
+        />
+      }
+    />
+  );
+
+  if (isProjectScope) {
+    return (
+      <SettingsSection id="mcp-profiles-section" title="MCP profiles">
+        {defaultRow}
+        {ruleRow}
+      </SettingsSection>
+    );
+  }
+
+  const pickRows = mcpThreadPickRows(mcpThreadProfiles, labels.threads);
+  const addPick = () => {
+    const problem = threadPickProblem(settings, pickDraft);
+    if (problem !== null) {
+      setPickError(problem);
+      return;
+    }
+    setPickError(null);
+    const id = pickDraft.trim();
+    save(threadPickPatch(mcpThreadProfiles, id, MCP_PROFILE_ALL), {
+      onSaved: () => setPickDraft((draft) => (draft.trim() === id ? "" : draft)),
+    });
+  };
+
+  return (
+    <SettingsSection id="mcp-profiles-section" title="MCP profiles">
+      <ForkRow
+        {...searchableSetting("mcp-profiles")}
+        settingKeys={["mcpProfiles"]}
+        lockPaths={["mcpProfiles"]}
+        description="Which outside MCP servers and T3 tool groups a thread gets. Only Claude threads apply a profile narrower than all; others refuse such a turn."
+      >
+        <div className="grid gap-2 pb-2">
+          {rows.map((row) => (
+            <div key={`${row.kind}:${row.name}`} className="grid gap-1 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-medium">{row.name}</span>
+                <span className="text-muted-foreground">
+                  {row.kind === "built-in" ? "built in" : null}
+                  {row.state === "broken" ? " broken" : null}
+                  {row.state === "foreign" ? " from a newer version" : null}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                  {row.state === "ok" ? describeMcpProfileSet(row.profile) : null}
+                </span>
+                {row.kind === "custom" && row.state === "ok" ? (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    aria-label={`Edit MCP profile ${row.name}`}
+                    onClick={() => {
+                      setDeleteProblem(null);
+                      setEditor({ editing: row.name, draft: draftOf(row.name, row.profile) });
+                    }}
+                  >
+                    Edit
+                  </Button>
+                ) : null}
+                {(row.state === "ok" ? row.kind === "custom" : row.removable) ? (
+                  <Button
+                    size="xs"
+                    variant="destructive-outline"
+                    aria-label={`Delete MCP profile ${row.name}`}
+                    onClick={() => {
+                      const result = deleteMcpProfilePatch(
+                        { ...settings, projectSettingsOverrides },
+                        row.name,
+                        labels,
+                      );
+                      if ("problem" in result) {
+                        setDeleteProblem(result);
+                        return;
+                      }
+                      setDeleteProblem(null);
+                      save(result.patch);
+                    }}
+                  >
+                    {row.kind === "built-in" ? "Remove the entry" : "Delete"}
+                  </Button>
+                ) : null}
+              </div>
+              {row.state === "ok" ? (
+                row.notes.map((note) => (
+                  <p key={note} className="text-muted-foreground">
+                    {note}
+                  </p>
+                ))
+              ) : (
+                <p className="text-destructive-foreground">{row.issue}</p>
+              )}
+            </div>
+          ))}
+          {deleteProblem !== null ? (
+            <div role="alert" className="grid gap-1 text-xs text-destructive-foreground">
+              <p>{deleteProblem.problem}</p>
+              {deleteProblem.threadIds.length > 0 ? (
+                <div>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() =>
+                      save(clearThreadPicksPatch(deleteProblem.threadIds), {
+                        onSaved: () => setDeleteProblem(null),
+                      })
+                    }
+                  >
+                    Clear the thread picks that use it
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {editor === null ? (
+            <div>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => {
+                  setDeleteProblem(null);
+                  setEditor({ editing: null, draft: emptyMcpProfileDraft() });
+                }}
+              >
+                Add profile
+              </Button>
+            </div>
+          ) : (
+            <ProfileEditor
+              key={editor.editing ?? ""}
+              editing={editor.editing}
+              initial={editor.draft}
+              suggestions={mcpServerSuggestions(settings, KNOWN_SERVERS)}
+              onCancel={() => setEditor(null)}
+              onSave={(draft) => {
+                const result = saveMcpProfilePatch(settings, editor.editing, draft);
+                if ("problem" in result) return result.problem;
+                save(result.patch, { onSaved: () => setEditor(null) });
+                return null;
+              }}
+            />
+          )}
+        </div>
+      </ForkRow>
+      {defaultRow}
+      {ruleRow}
+      <ForkRow
+        {...searchableSetting("mcp-thread-picks")}
+        settingKeys={["mcpThreadProfiles"]}
+        lockPaths={["mcpThreadProfiles"]}
+        description={`A thread's own pick wins over every default, also for a sub-agent. Pick one from the thread's menu, or here by thread id. ${MCP_PICK_APPLIES_NOTE}`}
+      >
+        <div className="grid gap-2 pb-2">
+          {pickRows.map((row) => (
+            <div key={row.threadId} className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
+                <span className={row.title ? "truncate" : "truncate text-muted-foreground"}>
+                  {row.title ?? "Unknown thread"}
+                </span>
+                <span className="shrink-0 text-muted-foreground">{row.threadId}</span>
+              </span>
+              <ProfileSelect
+                value={row.pick}
+                choices={choices}
+                label={`MCP profile for thread ${row.threadId}`}
+                onChange={(name) => save(threadPickPatch(mcpThreadProfiles, row.threadId, name))}
+              />
+              <Button
+                size="xs"
+                variant="destructive-outline"
+                aria-label={`Clear the MCP profile pick of thread ${row.threadId}`}
+                onClick={() => save(threadPickPatch(mcpThreadProfiles, row.threadId, null))}
+              >
+                Clear
+              </Button>
+            </div>
+          ))}
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              size="sm"
+              className="min-w-0 flex-1"
+              aria-label="Thread id for an MCP profile pick"
+              placeholder="Thread id"
+              value={pickDraft}
+              onChange={(event) => {
+                setPickError(null);
+                setPickDraft(event.target.value);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") addPick();
+              }}
+            />
+            <Button size="xs" variant="outline" onClick={addPick}>
+              Add thread
+            </Button>
+          </div>
+          {pickError !== null ? (
+            <p role="alert" className="text-xs text-destructive-foreground">
+              {pickError}
+            </p>
+          ) : null}
+        </div>
+      </ForkRow>
+    </SettingsSection>
+  );
+}

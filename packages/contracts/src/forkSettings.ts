@@ -54,6 +54,7 @@ import {
 export * from "./forkFeatures.ts";
 export * from "./handoff.ts";
 export * from "./mcpProfile.ts";
+export * from "./mcpProfileResolve.ts";
 export * from "./modelPolicy.ts";
 export * from "./playtest.ts";
 export * from "./reviewRules.ts";
