@@ -2238,6 +2238,35 @@ describe("SlotGate: one line for every waiting start (issue 738)", () => {
     }),
   );
 
+  it.effect(
+    "a waiter whose thread moved to a full account holds no slot from the others (each ask's account)",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [
+          { id: "busy", instanceId: SECOND },
+          { id: "other", instanceId: MAIN },
+        ];
+        yield* run(
+          world,
+          on({ maxPerMachine: 2, maxPerAccount: { [SECOND]: 1 } }),
+          Effect.gen(function* () {
+            assert.strictEqual((yield* wake("w", "w", MAIN)).type, "refuse");
+            // A machine slot frees; the waiter's thread now runs on SECOND, which is full.
+            world.threads = [{ id: "busy", instanceId: SECOND }];
+            const asks: Array<string> = [];
+            for (let round = 0; round < 12; round += 1) {
+              asks.push((yield* wake("w", "w", SECOND)).type);
+              asks.push((yield* start("a")).type);
+              if (asks.at(-1) === "allow") break;
+              yield* TestClock.adjust("5 seconds");
+            }
+            assert.deepStrictEqual(asks, ["refuse", "allow"]);
+          }),
+        );
+      }),
+  );
+
   it.effect("a slot held for a slot wait is its thread's: a waiter behind does not take it", () =>
     Effect.gen(function* () {
       const world = newWorld();

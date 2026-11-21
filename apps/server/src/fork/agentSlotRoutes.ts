@@ -391,6 +391,8 @@ const CurrentDirectDelivery = Context.Reference<DirectDelivery | undefined>(
  */
 const SCHEDULED_PLACE = "scheduled-run:";
 const DELIVERY_PLACE = "webhook-delivery:";
+/** A stored delivery whose row cannot be read: its task's (one stored delivery runs at a time). */
+const DELIVERY_TASK_PLACE = "webhook-task:";
 
 /**
  * What a run takes from its task's row, decoded as `ScheduledTaskService` decodes it (so a prompt
@@ -511,7 +513,8 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   /**
    * The run's place in line: a run on its schedule at its due time, a webhook delivery at the
    * time it was stored. "Run now" asks once and has none. A stored delivery is the one its task's
-   * worker runs now (one at a time per task, in the worker's order); unreadable, it asks with none.
+   * worker runs now (one at a time per task, in the worker's order); unreadable, it is logged and
+   * keeps its task's place from this ask (`waitForWebhookSlot` asks in it, and leaves it).
    */
   const placeOf = Effect.fnUntraced(function* (
     task: ScheduledTask,
@@ -531,9 +534,16 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       SELECT delivery_id, due_at FROM scheduled_task_webhook_pending
       WHERE task_id = ${task.id} AND state IN ('dispatching', 'running', 'completed', 'failed')
       ORDER BY due_at, rowid LIMIT 1
-    `.pipe(Effect.orElseSucceed(() => []));
+    `.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Could not read a waiting webhook delivery's place in line", {
+          taskId: task.id,
+          cause,
+        }).pipe(Effect.as([])),
+      ),
+    );
     return stored === undefined
-      ? undefined
+      ? ({ key: `${DELIVERY_TASK_PLACE}${task.id}` } satisfies SlotGate.SlotPlace)
       : ({
           key: `${DELIVERY_PLACE}${stored.delivery_id}`,
           sinceMs: Number(stored.due_at),

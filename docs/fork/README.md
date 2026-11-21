@@ -477,13 +477,16 @@ These routes start a new agent run and go through the same gate, with the same c
   goes to the oldest waiter that can use it: a start without a place (`delegate_task`, a send,
   "run now") and every younger waiter count the waiters ahead of them as starts. A thread with two
   places (a question wake and a continuation) counts from its oldest. A waiter whose own account is
-  full holds nothing from the others, a thread that shows a run only queues, and a thread with a
-  held slot starts on it. A free slot is kept for the oldest waiter for 15 s (a slot wait: 2
+  full (the account of its last ask: its thread may have moved) holds nothing from the others, a
+  thread that shows a run only queues, and a thread with a held slot starts on it. A free slot is kept for the oldest waiter for 15 s (a slot wait: 2
   sweeps) without it asking; if it does not come back by then, the waiters behind it go first until
   it asks again, still in its place. So a waiter that asks seldom (the PR-watch wake-up, at
   upstream's 2-minute sweep) or that died leaves a slot idle 15 s at most; the PR-watch wake-up
-  gets a slot only when one is free as it asks, as before the line. A waiter leaves the line when
-  it is let through, when its wake is no longer owed (its thread gone, its question answered, a
+  gets a slot only when one is free as it asks, as before the line. The fork could hold a refused
+  PR-watch wake-up and ask every 5 s itself (as it does for idle compaction); it does not, because
+  upstream's reactor waits for that dispatch, so holding it would delay the other watches' news,
+  and a retry of its own would race upstream's next sync for the thread. A waiter leaves the line
+  when it is let through, when its wake is no longer owed (its thread gone, its question answered, a
   handoff that is no longer due), or when it has not asked again for 30 s (a PR-watch wake-up: 5
   minutes; a slot wait: 3 sweeps); places that stopped asking are dropped at the next ask, under
   any limit. A refusal names the waiters in line ahead apart from the running agents ("2 agents

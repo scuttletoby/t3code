@@ -276,7 +276,8 @@ interface LineEntry {
   /** A route's wake-up, or a slot wait (granted only on a whole read of the held slots). */
   readonly kind: "wake" | "slotWait";
   readonly threadId: string;
-  readonly instanceId: string | null;
+  /** The account of its last ask: a thread moved to another account is modelled on that one. */
+  instanceId: string | null;
   readonly sinceMs: number;
   /** Joins at the same time keep their order. */
   readonly order: number;
@@ -367,6 +368,7 @@ const make = Effect.gen(function* () {
     const seen = line.get(entry.key);
     if (seen !== undefined) {
       seen.lastAskMs = entry.nowMs;
+      seen.instanceId = entry.instanceId;
       seen.staleMs = entry.staleMs;
       seen.holdMs = entry.holdMs;
       // It came back: a slot kept for it is its own ask's now.

@@ -23,6 +23,7 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as SqlError from "effect/sql/SqlError";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -1524,6 +1525,135 @@ describe("a scheduled run or webhook delivery that waits keeps its place in the 
       );
     },
   );
+
+  it.effect(
+    "a stored delivery is ahead of a waiter that joined after it was stored, though the worker asks after it",
+    () => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        ({ service, started, webhookWorker, gate }) =>
+          Effect.gen(function* () {
+            yield* TestClock.setTime(START);
+            const { task } = yield* service.upsert(
+              yield* taskInput({ schedule: { type: "webhook" } }),
+            );
+            const accepted = yield* service.triggerWebhook(webhookRequest(task));
+            if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+            yield* settle;
+            // A restart: the line is memory only; the stored row keeps its due time.
+            yield* Option.getOrThrow(gate).leave([`webhook-delivery:${accepted.deliveryId}`]);
+            yield* TestClock.adjust("1 second");
+            assert.equal((yield* laterWaiter(gate)).type, "refuse");
+            yield* TestClock.adjust("1 second");
+            yield* webhookWorker;
+            yield* settle;
+            assert.deepEqual(yield* lineOf(gate), [
+              `webhook-delivery:${accepted.deliveryId}`,
+              "later-waiter",
+            ]);
+            slots.running = [];
+            assert.equal((yield* laterWaiter(gate)).type, "refuse");
+            yield* until(() => started.length === 1, "the delivery started");
+          }),
+        { slots },
+      );
+    },
+  );
+
+  it.effect("a direct delivery waiting in memory keeps its place through the 5 s sweep", () => {
+    const slots = slotWorld([BUSY]);
+    return withService(
+      ({ service, sql, started, notesWorker, gate }) =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(START);
+          const { task } = yield* service.upsert(
+            yield* taskInput({ schedule: { type: "webhook" } }),
+          );
+          // A row with its id is there already, not pending: it is not stored, it waits in memory.
+          const deliveryId = "delivery:relay:held";
+          yield* sql`INSERT INTO scheduled_task_webhook_pending
+            (delivery_id, task_id, coalesce_key, due_at, state, task_json, request_json, delivery_ids_json)
+            VALUES (${deliveryId}, ${task.id}, '', ${START}, 'running', '{}', '{}', '[]')`;
+          const accepted = yield* service.triggerWebhook({
+            ...webhookRequest(task),
+            relayDeliveryId: "held",
+          });
+          if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+          assert.equal(accepted.deliveryId, deliveryId);
+          yield* settle;
+          yield* TestClock.adjust("1 second");
+          assert.equal((yield* laterWaiter(gate)).type, "refuse");
+          // The sweep finds no pending row for it, but it still waits: its place stays.
+          yield* notesWorker;
+          assert.deepEqual(yield* lineOf(gate), [`webhook-delivery:${deliveryId}`, "later-waiter"]);
+          slots.running = [];
+          assert.equal((yield* laterWaiter(gate)).type, "refuse");
+          yield* until(() => started.length === 1, "the delivery started");
+        }),
+      { slots },
+    );
+  });
+
+  it.effect("a stored delivery whose row cannot be read is logged and still keeps a place", () => {
+    const slots = slotWorld([BUSY]);
+    const readFails = { value: false };
+    const warnings: Array<string> = [];
+    const logger = Logger.make(({ message, logLevel }) => {
+      if (logLevel === "Warn") warnings.push(JSON.stringify(message));
+    });
+    return boot(
+      ({ service, started, webhookWorker, gate }) =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(START);
+          const { task } = yield* service.upsert(
+            yield* taskInput({ schedule: { type: "webhook" } }),
+          );
+          const accepted = yield* service.triggerWebhook(webhookRequest(task));
+          if (accepted._tag !== "accepted") return assert.fail(`not accepted: ${accepted._tag}`);
+          yield* settle;
+          // A restart, then the worker's read of the row's place fails: its task's place, now.
+          yield* Option.getOrThrow(gate).leave([`webhook-delivery:${accepted.deliveryId}`]);
+          readFails.value = true;
+          yield* TestClock.adjust("1 second");
+          yield* webhookWorker;
+          yield* settle;
+          assert.lengthOf(
+            warnings.filter((warning) => warning.includes("place in line")),
+            1,
+          );
+          assert.deepEqual(yield* lineOf(gate), [`webhook-task:${task.id}`]);
+          assert.equal((yield* laterWaiter(gate)).type, "refuse");
+          slots.running = [];
+          assert.equal((yield* laterWaiter(gate)).type, "refuse");
+          yield* until(() => started.length === 1, "the delivery started");
+          assert.deepEqual(yield* lineOf(gate), ["later-waiter"]);
+        }),
+      { slots },
+    ).pipe(
+      Effect.updateService(
+        SqlClient.SqlClient,
+        (sql) =>
+          new Proxy(sql, {
+            apply: (target, self, args: Array<unknown>) =>
+              readFails.value &&
+              Array.isArray(args[0]) &&
+              args[0].join("?").includes("SELECT delivery_id, due_at FROM")
+                ? Effect.fail(
+                    new SqlError.SqlError({
+                      reason: new SqlError.LockTimeoutError({ cause: null }),
+                    }),
+                  )
+                : Reflect.apply(target, self, args),
+          }),
+      ),
+      Effect.provide(
+        Layer.mergeAll(
+          SqlitePersistence.layerMemory,
+          Logger.layer([logger], { mergeWithExisting: true }),
+        ),
+      ),
+    );
+  });
 
   it.effect(
     "a waiting run's place goes when its task is deleted or paused (no slot kept for it)",
