@@ -1,7 +1,8 @@
 /**
  * Fork: a thread started by a narrower thread (`t3_thread_launch`, `create_threads`, a
  * `schedule_task` whose runs start new threads, a `t3_thread_transfer` fork) is refused unless its
- * profile is within the starter's; `delegate_task` cuts a child to its parent as before.
+ * profile is within the starter's; `delegate_task` cuts a child to its parent as before. The
+ * scheduled task service checks a save and a run again (`scheduledTaskMcpProfile.ts`).
  */
 import {
   OrchestratorMcpFailure,
@@ -22,6 +23,7 @@ import {
   makeThreadMcpProfiles,
 } from "./claudeMcpProfile.ts";
 import { isEveryMcpTool, isWithinMcpProfile, type McpProfileResolved } from "./mcpProfile.ts";
+import { boundToWiderRefusal } from "./scheduledTaskMcpProfile.ts";
 
 type Refusal = { readonly reason: string };
 
@@ -165,16 +167,19 @@ export const checkScheduleMcpProfile = Effect.fn("LaunchMcpProfile.schedule")(fu
 });
 
 /**
- * A task here whose runs, after a change (`bindToCurrentThread` as the call gives it), start a
- * thread wider than the caller's profile is refused, whoever made it; `done` ends the refusal.
+ * A task here whose runs, after a change (`bindToCurrentThread` and `prompt` as the call gives
+ * them), start a thread wider than the caller's profile is refused, whoever made it, and so is a
+ * change to the prompt or thread of a task bound to another, wider thread; `done` ends the refusal.
  */
 const checkTaskRuns = Effect.fn("LaunchMcpProfile.taskRuns")(function* (
   scheduledTaskId: ScheduledTaskId,
   bindToCurrentThread: boolean | undefined,
   done: string,
+  prompt?: string | undefined,
 ) {
-  const { caller } = yield* loadCaller();
-  if (caller === undefined || bindToCurrentThread === true) return;
+  const { caller, threads } = yield* loadCaller();
+  if (caller === undefined) return;
+  const changesBound = prompt !== undefined || bindToCurrentThread !== undefined;
   // Upstream's orchestrator toolkit does not name this service; the server provides it to every
   // toolkit, and without it the task cannot be read, so the call is refused.
   const service = yield* Effect.serviceOption(ScheduledTasks.ScheduledTaskService);
@@ -195,6 +200,33 @@ const checkTaskRuns = Effect.fn("LaunchMcpProfile.taskRuns")(function* (
   );
   const task = tasks.find((candidate) => candidate.id === scheduledTaskId);
   if (task === undefined) return;
+  // Bound to another thread: the service's rule (scheduledTaskMcpProfile.ts), here too so a refused
+  // change does not use up the webhook secretRef it carries (the service consumes it first).
+  if (task.threadId !== null && changesBound) {
+    const profileFor = yield* Effect.mapError(yield* makeThreadMcpProfileReads, launcherUnknown);
+    const own = yield* Effect.mapError(profileFor(caller), launcherUnknown);
+    const refusal = yield* boundToWiderRefusal({
+      profileFor,
+      threads,
+      own,
+      callerId: caller.id,
+      existing: task,
+      next: {
+        prompt: prompt ?? task.prompt,
+        projectId: task.projectId,
+        threadId:
+          bindToCurrentThread === true
+            ? caller.id
+            : bindToCurrentThread === false
+              ? null
+              : task.threadId,
+      },
+    });
+    if (refusal !== null) {
+      return yield* new OrchestratorMcpFailure({ code: "capability_denied", message: refusal });
+    }
+  }
+  if (bindToCurrentThread === true) return;
   // The service keeps the stored thread unless the call binds or unbinds it.
   const threadId = bindToCurrentThread === false ? null : task.threadId;
   if (threadId !== null) return;
@@ -207,13 +239,15 @@ const checkTaskRuns = Effect.fn("LaunchMcpProfile.taskRuns")(function* (
 });
 
 /**
- * `schedule_task` changing a task here (unbind, rewrite, re-enable, pause): refused by the rule
- * above. Deleting it or binding it to the caller is the way out; a missing task is the service's.
+ * `schedule_task` changing a scheduled task here (unbind, rewrite, re-enable, pause): refused by
+ * the rules above. Deleting it or binding it to the caller is the way out; a missing task is the
+ * service's.
  */
-export const checkScheduleEditMcpProfile = (
+export const checkEditMcpProfile = (
   scheduledTaskId: ScheduledTaskId,
   bindToCurrentThread: boolean | undefined,
-) => checkTaskRuns(scheduledTaskId, bindToCurrentThread, "the task was not changed");
+  prompt: string | undefined,
+) => checkTaskRuns(scheduledTaskId, bindToCurrentThread, "the task was not changed", prompt);
 
 /** `run_scheduled_task_now` here: the run starts the task's thread now, so the same rule holds. */
 export const checkScheduleRunMcpProfile = (scheduledTaskId: ScheduledTaskId) =>
