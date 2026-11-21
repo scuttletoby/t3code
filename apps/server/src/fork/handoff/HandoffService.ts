@@ -29,6 +29,7 @@ import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapter
 import { forkParked } from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SlotGate from "../../slots/SlotGate.ts";
+import * as HandoffCommand from "./handoffCommand.ts";
 import { type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
 import { leaveLine } from "../agentSlotRoutes.ts";
 import {
@@ -63,6 +64,7 @@ export const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const adapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
+  const commandSource = yield* HandoffCommand.HandoffCommand;
   // One per waiting thread; any event of that thread completes it, so the wait reads again.
   const wakes = new Map<ThreadId, Deferred.Deferred<void>>();
   // Completed by a request or run change of any thread (a child's request shows on its parent), so
@@ -105,6 +107,7 @@ export const make = Effect.gen(function* () {
     run: OrchestrationV2Run,
     ids: { readonly commandId: string; readonly messageId: string },
     read: NonNullable<Effect.Success<ReturnType<typeof readThread>>>,
+    command: HandoffCommand.HandoffCommandResult | undefined,
   ) {
     const firstSends = new Set(
       read.records.runs.flatMap((other) => {
@@ -137,6 +140,7 @@ export const make = Effect.gen(function* () {
             number: firstSends.size + 1,
             nowIso: DateTime.formatIso(yield* DateTime.now),
             modelSelection,
+            command,
           });
         }),
         attachments: [],
@@ -165,6 +169,10 @@ export const make = Effect.gen(function* () {
       let runId = sourceRunId;
       let trigger: HandoffTrigger = "turn-end";
       let slotWaitLogged = false;
+      // The `command` source's result for one handoff (its ids and command): a slot wait reuses it.
+      let commandRun:
+        | { readonly key: string; readonly result: HandoffCommand.HandoffCommandResult }
+        | undefined;
       // The settle under way: its fixed-length timer (a monotonic sleep, not wall-clock times) and
       // whether any check found the relay not showing the finish. Busy work or a sleep ends it.
       let settle: { readonly timer: Fiber.Fiber<void>; loud: boolean } | undefined;
@@ -262,6 +270,29 @@ export const make = Effect.gen(function* () {
         }
         const run = read.records.runs.find((candidate) => candidate.id === runId);
         if (run === undefined) return;
+        const { source, command } = read.settings;
+        let commandResult: HandoffCommand.HandoffCommandResult | undefined;
+        if (source === "command" && command !== undefined) {
+          const key = `${decision.commandId}\n${command.join("\n")}`;
+          if (commandRun?.key !== key) {
+            const result = yield* commandSource.run({
+              command,
+              threadId,
+              projectId: read.records.thread.projectId,
+            });
+            commandRun = { key, result };
+          }
+          commandResult = commandRun.result;
+          if (!commandResult.ok) {
+            yield* Effect.logWarning("handoff command failed", {
+              threadId,
+              reason: commandResult.reason,
+              trigger: decision.reason,
+            });
+            // At the idle trigger nothing is sent; at the size backstop parts 1, 3 and 4 are.
+            if (decision.reason === "idle") return;
+          }
+        }
         const outcome = yield* send(
           threadId,
           run,
@@ -272,6 +303,7 @@ export const make = Effect.gen(function* () {
               : decision.messageId,
           },
           read,
+          commandResult,
         );
         if (!waitsForSlot(outcome)) return;
         if (waiting.key !== handoffPlace(decision.commandId).key) yield* leavePlace(waiting);
@@ -436,6 +468,7 @@ export const make = Effect.gen(function* () {
 export const layer = Layer.effectDiscard(
   make.pipe(Effect.flatMap((service) => service.start())),
 ).pipe(
+  Layer.provide(HandoffCommand.layer),
   Layer.provide(ProjectionStore.layer),
   // Upstream's own lookup over the server's instance registry, as server.ts gives /mcp.
   Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),

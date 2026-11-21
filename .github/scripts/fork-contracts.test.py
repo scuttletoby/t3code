@@ -1004,14 +1004,15 @@ SCAN_RUN_LINE = 'bash "${RUNNER_TEMP:?}/scan-from-default-branch.sh"'
 # within hours (review B). The read step runs only for the sweep, holds only the job's read-only token
 # (no secret), takes the record only from a run of fork-secret-sweep.yml (that path, schedule or
 # workflow_dispatch, this branch, this repository and not a fork, ended success or failure, an ancestor
-# commit, not this run but for a re-run's own first attempt) and its one artifact of that name, never
-# unpacks the archive (one plain file read in memory, every line checked), and falls back to a first
-# run on any doubt; it reads nothing while a tag is named like the branch (#703); reset_record leaves
-# an empty record instead. Its output `read` (found, none, reset, failed) tells the scan step whether
-# a partial record may replace the last one (#703). Its behaviour: the reader e2e below. The keep step
-# uploads only on a branch, once the scan step has written the record whole (its output `record`) or
-# reset_record left the empty one, for 90 days (the repository's most). What the scan step trusts the
-# record for is in SCANNED_LOOKUP_TEXT.
+# commit, not this run but for a re-run's own first attempt, in a run of the sweep's workflow) and its
+# one artifact of that name, never unpacks the archive (one plain file read in memory, every line
+# checked), and falls back to a first run on any doubt; it reads nothing while a tag is named like the
+# branch (#703); reset_record leaves an empty record instead (a reset run's re-run: its own first
+# attempt's record, else the empty one). Its output `read` (found, none, reset, failed) tells the scan
+# step whether a partial record may replace the last one (#703). Its behaviour: the reader e2e below.
+# The keep step uploads only on a branch, once the scan step has written the record whole (its output
+# `record`) or reset_record left the empty one, for 90 days (the repository's most). What the scan step
+# trusts the record for is in SCANNED_LOOKUP_TEXT.
 UPLOAD_SHA = "cf430e030ddbb5b0abf93d22962f4752f3646cd9"
 READ_RECORD_NAME = "Read the sweep's record"
 READ_RECORD_TEXT = r'''set -euo pipefail
@@ -1029,14 +1030,25 @@ none() {
   exit 0
 }
 [[ "$GITHUB_REF" == refs/heads/* ]] || none failed "a run on a tag reads no record of the sweep"
+# A re-run (attempt 2 on) first takes its own earlier attempt's record (#703), and only in a run
+# of the sweep's own workflow: in another workflow's run, any of its jobs could have kept an
+# artifact of that name.
+self=""
+if [[ "${GITHUB_RUN_ATTEMPT:-1}" != 1 \
+    && "${GITHUB_WORKFLOW_REF:-}" == "$GITHUB_REPOSITORY/.github/workflows/fork-secret-sweep.yml@"* ]]; then
+  self="$GITHUB_RUN_ID $GITHUB_SHA"
+fi
 # reset_record: an empty record (the header only), which the last step keeps even when this
 # run fails before the scan step writes its own, so no later sweep reads the older one (#703).
-if [[ "$RESET" == true ]]; then
+# A re-run of a reset run (it keeps the input) first takes its own earlier attempt's record,
+# which was written after the reset, and no older run's; without one, the empty record.
+empty_record() {
   echo "fork secret sweep record 2" > "$dir/deleted-tips"
   echo "read=reset" >> "${GITHUB_OUTPUT:?}"
   echo "::warning title=Secret scan::the sweep's record is reset (input reset_record), so every listed tip is checked as on a first run, and an empty record is kept even if this run fails" >&2
   exit 0
-fi
+}
+[[ "$RESET" != true || -n "$self" ]] || empty_record
 export BRANCH="${GITHUB_REF#refs/heads/}"
 [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || none failed "this branch's name has characters the tag check does not take"
 if ! tag="$(gh api -X GET "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$BRANCH" \
@@ -1044,9 +1056,8 @@ if ! tag="$(gh api -X GET "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$BRAN
   none failed "whether a tag is named like this branch cannot be checked"
 fi
 [[ -z "$tag" ]] || none failed "a tag is named like this branch, and a sweep run on it would pass for one on the branch"
-self=""
-[[ "${GITHUB_RUN_ATTEMPT:-1}" == 1 ]] || self="$GITHUB_RUN_ID $GITHUB_SHA"
-if ! runs="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/fork-secret-sweep.yml/runs" \
+runs=""
+if [[ "$RESET" != true ]] && ! runs="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/fork-secret-sweep.yml/runs" \
     -f branch="$BRANCH" -f status=completed -f per_page=30 --jq '.workflow_runs[] |
       select(.path == ".github/workflows/fork-secret-sweep.yml" and (.event == "schedule" or .event == "workflow_dispatch")
         and .head_branch == env.BRANCH and .repository.full_name == env.GITHUB_REPOSITORY
@@ -1075,7 +1086,10 @@ while read -r id sha; do
   from="$id"
   break
 done <<< "$self"$'\n'"$runs"
-[[ -n "$from" ]] || none none "no earlier sweep on $BRANCH kept a record (or it expired)"
+if [[ -z "$from" ]]; then
+  [[ "$RESET" != true ]] || empty_record
+  none none "no earlier sweep on $BRANCH kept a record (or it expired)"
+fi
 # The archive's one file, never unpacked: exactly one member, named deleted-tips, a plain
 # file (no link, no folder, not encrypted), at most 4 MB; its lines exactly the sweep's own
 # (header, then "<commit id> scanned", each once: no other byte, so no NUL or CR).
@@ -1458,6 +1472,9 @@ def stripped_lines(run):
     return "".join(line.strip() + "\n" for line in run.splitlines())
 
 
+LOOKUP_LIMIT_MARGIN = 600
+
+
 def lookup_problems(scan):
     problems = []
     for j, job in (scan.get("jobs") or {}).items():
@@ -1489,6 +1506,12 @@ def lookup_problems(scan):
                 problems.append(f"{SCAN_FILE}/{j}: HEAD_REF is not the pull request's branch")
             if env.get("LOOKUP_TOKEN") != "${{ github.token }}":
                 problems.append(f"{SCAN_FILE}/{j}: LOOKUP_TOKEN is not the job's token")
+            # The lookups' time limit (#703) must leave the steps before this one, and the lookup under
+            # way when it is passed, inside the job's time-out (else the job is killed and keeps nothing).
+            limit, timeout = re.search(r"\(\(SECONDS > (\d+)\)\)", run), job.get("timeout-minutes")
+            if limit and not (type(timeout) is int and int(limit.group(1)) + LOOKUP_LIMIT_MARGIN <= timeout * 60):
+                problems.append(f"{SCAN_FILE}/{j}: the lookups' time limit ({limit.group(1)} s) is not at least "
+                                f"{LOOKUP_LIMIT_MARGIN} s inside the job's timeout-minutes ({timeout!r}), #703")
             if env.get("RECORD_READ") != "${{ steps.read.outputs.read }}":
                 problems.append(f"{SCAN_FILE}/{j}: RECORD_READ is not the read step's output `read` (whether a "
                                 "partial record may replace the last one, #703)")
@@ -1881,6 +1904,8 @@ for label, mutate in {
     # #703: the read step's output decides whether a partial record may replace the last one.
     "the read step without its id": lambda w: read_step(w).pop("id"),
     "the scan step without RECORD_READ": lambda w: scan_step(w)["env"].pop("RECORD_READ"),
+    "the scan job's time-out cut to 25 minutes (the lookups' 20-minute limit no longer well inside it)": lambda w: w[
+        SCAN_FILE]["jobs"]["scan"].__setitem__("timeout-minutes", 25),
     "the scan step with RECORD_READ fixed (a failed read taken as none)": lambda w: scan_step(w)["env"].__setitem__(
         "RECORD_READ", "none"),
     "the record kept from a run on a tag": lambda w: keep_step(w).__setitem__(
@@ -2277,6 +2302,24 @@ def failed_read_case(code):
             and s.output == ""), [s]
 
 
+# The same for the two other gates (#720 review B): a failed read, then the runs lookup fails, or the
+# time limit is reached (the clock set ahead).
+def failed_read_runs_case(code):
+    n = next(e2e_runs)
+    s = sweep_lookup(sweep_clone(f"failedruns{n}"), budget_heads, f"failedruns{n}", code, sweep_temp(f"failedruns{n}"),
+                     FAKE_RUNS_FAIL="1", RECORD_READ="failed", **budget_env)
+    return (s.r.returncode == 2 and "cannot list the runs of deleted tip" in s.r.stderr and s.record is None
+            and s.output == ""), [s]
+
+
+def failed_read_time_case(code):
+    n = next(e2e_runs)
+    s = sweep_lookup(sweep_clone(f"failedtime{n}"), budget_heads, f"failedtime{n}", "SECONDS=100000\n" + code,
+                     sweep_temp(f"failedtime{n}"), RECORD_READ="failed", **budget_env)
+    return (s.r.returncode == 2 and "passed 20 minutes" in s.r.stderr and "actions/runs" not in s.calls
+            and s.record is None and s.output == ""), [s]
+
+
 def rejected_case(code):
     n = next(e2e_runs)
     s = sweep_lookup(sweep_clone(f"rejected{n}"), budget_heads, f"rejected{n}", code,
@@ -2341,6 +2384,9 @@ E2E_CASES = {
             "warning, the tip fetched and looked up as on a first run, not trusted", nul_case),
     "failedread": ("(#703): the read step failed (RECORD_READ=failed) and a lookup fails: no partial record, nothing "
                    "marked for keeping, so the last record (perhaps bigger) stays the one in use", failed_read_case),
+    "failedruns": ("(#703): the read step failed and a runs lookup fails: no partial record", failed_read_runs_case),
+    "failedtime": ("(#703): the read step failed and the time limit is reached: no partial record",
+                   failed_read_time_case),
     "rejected": ("(#703): the scan step could not read the record the read step left, and a lookup fails: no partial "
                  "record", rejected_case),
     "reset": ("(#703): reset_record (an empty record read) and a lookup fails: the tips proven so far kept, the old "
@@ -2362,6 +2408,17 @@ for what, old, new, cases in (
      'whether a scan read it is unknown. Re-run the job." >&2\nexit 2\n', ("budget", "unreached")),
     ("the partial record's gate (#703)", '[[ -z "$partial" ]] || keep\nexit 2\n', "keep\nexit 2\n",
      ("failedread", "rejected")),
+    ("the partial record's gate at the jobs lookup alone (#703)",
+     'whether a scan read it is unknown. Re-run the job." >&2\n[[ -z "$partial" ]] || keep\nexit 2\nfi\nif [[ -n "$scanned" ]]',
+     'whether a scan read it is unknown. Re-run the job." >&2\nkeep\nexit 2\nfi\nif [[ -n "$scanned" ]]', ("failedread",)),
+    ("the partial record's gate at the runs lookup alone (#703)",
+     'cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Re-run the job." >&2\n'
+     '[[ -z "$partial" ]] || keep\n',
+     'cannot list the runs of deleted tip $tip, so whether a scan read it is unknown. Re-run the job." >&2\nkeep\n',
+     ("failedruns",)),
+    ("the partial record's gate at the time limit alone (#703)",
+     'before the job\'s time limit. Re-run the job." >&2\n[[ -z "$partial" ]] || keep\n',
+     'before the job\'s time limit. Re-run the job." >&2\nkeep\n', ("failedtime",)),
     ("a partial record when no earlier sweep kept one (#703)", "none) partial=1 ;;", "none) ;;", ("budget",)),
     ("a partial record after a read or reset record (#703)", 'found | reset) [[ ! -f "$record" ]] || partial=1 ;;',
      "found | reset) ;;", ("reset", "unreached", "timelimit")),
@@ -2613,6 +2670,7 @@ def read_record(code, runs=None, artifacts=None, zips=None, compare=None, temp=N
                        env={**base_env, "PATH": f"{read_stub}:{base_env['PATH']}", "GITHUB_REPOSITORY": "me/t3code",
                             "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ID": "900", "GITHUB_SHA": "f" * 40,
                             "GITHUB_RUN_ATTEMPT": "1", "RUNNER_TEMP": str(temp), "RESET": "false", "GH_TOKEN": "x",
+                            "GITHUB_WORKFLOW_REF": f"me/t3code/{SWEEP_PATH}@refs/heads/main",
                             "FAKE_DIR": str(fake), "GH_LOG": str(gh_log), "GITHUB_OUTPUT": str(output), **env},
                        capture_output=True, text=True)
     record = temp / "sweep-record" / "deleted-tips"
@@ -2698,6 +2756,25 @@ READ_CASES = {
     "a re-run whose first attempt kept none: the newest earlier run's": (
         {"GITHUB_RUN_ATTEMPT": "2", "runs": [a_run(802), a_run(801)]},
         lambda s: read_as(good_record)(s) and "runs/900/artifacts" in s.calls),
+    "a re-run of another workflow's run (fork-tests.yml, which may also call the scan): its own run never "
+    "asked about, though it has an artifact of that name (#703)": (
+        {"GITHUB_RUN_ATTEMPT": "2", "GITHUB_WORKFLOW_REF": "me/t3code/.github/workflows/fork-tests.yml@refs/heads/main",
+         "artifacts": {900: [an_artifact(903, 900)], 801: [an_artifact(901, 801)]},
+         "zips": {903: other_zip, 901: good_zip}},
+        lambda s: read_as(good_record)(s) and "runs/900/" not in s.calls),
+    "a re-run of a reset_record run: its own first attempt's record (written after the reset), no older run "
+    "listed (#703)": (
+        {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "artifacts": {900: [an_artifact(903, 900)], 801: [an_artifact(901, 801)]},
+         "zips": {903: a_zip([("deleted-tips", other_record)]), 901: good_zip}},
+        lambda s: read_as(other_record, 900)(s) and "actions/workflows" not in s.calls),
+    "a re-run of a reset_record run whose first attempt kept none: the empty record, no older run listed (#703)": (
+        {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2"},
+        lambda s: s.r.returncode == 0 and s.record == RECORD_HEAD and s.output == "read=reset\n"
+        and "runs/900/artifacts" in s.calls and "actions/workflows" not in s.calls and s.left == []),
+    "a re-run of a reset_record run whose own record cannot be listed: no record, read=failed, so its first "
+    "attempt's stays the one in use (#703)": (
+        {"RESET": "true", "GITHUB_RUN_ATTEMPT": "2", "FAKE_FAIL": "/artifacts -f",
+         "artifacts": {900: [an_artifact(903, 900)]}, "zips": {903: good_zip}}, read_as(None)),
     "a first attempt: its own run never asked about": (
         {}, lambda s: read_as(good_record)(s) and "runs/900/" not in s.calls),
     "no sweep run kept one yet (or it expired): a first run": ({"runs": []}, read_as(None, state="none")),
@@ -2824,7 +2901,13 @@ for what, old, new in (
     ("the conclusion check", '(.conclusion == "success" or .conclusion == "failure")', "true"),
     ("this run's own skip", '[[ "$id" != "$GITHUB_RUN_ID" || "$id $sha" == "$self" ]] || continue', ":"),
     ("a re-run's own first attempt first (#703)", 'done <<< "$self"$\'\\n\'"$runs"', 'done <<< "$runs"'),
-    ("the first attempt's check (#703)", '[[ "${GITHUB_RUN_ATTEMPT:-1}" == 1 ]] || self=', "self="),
+    ("the first attempt's check (#703)", '[[ "${GITHUB_RUN_ATTEMPT:-1}" != 1 \\', "[[ true \\"),
+    ("the sweep's own workflow check for a re-run (#703)",
+     '\n    && "${GITHUB_WORKFLOW_REF:-}" == "$GITHUB_REPOSITORY/.github/workflows/fork-secret-sweep.yml@"* ]]', " ]]"),
+    ("a reset run's re-run from its own record (#703)", '[[ "$RESET" != true || -n "$self" ]] || empty_record',
+     '[[ "$RESET" != true ]] || empty_record'),
+    ("the older runs left out for a reset run's re-run (#703)", 'if [[ "$RESET" != true ]] && ! runs=', "if ! runs="),
+    ("the empty record for a reset run's re-run without its own (#703)", '  [[ "$RESET" != true ]] || empty_record\n', ""),
     ("the tag named like the branch (#703)", '[[ -z "$tag" ]] ||', ": ||"),
     ("the failed tag check (#703)", 'none failed "whether a tag is named like this branch cannot be checked"', ":"),
     ("the branch name check (#703)", '[[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] ||', ": ||"),
@@ -2839,7 +2922,7 @@ for what, old, new in (
     ("the ancestor check", '[[ "$has" == ahead || "$has" == identical ]] || continue', ":"),
     ("the listed size check", ' && "$size" -le 4000000', ""),
     ("the archive's size check", '[[ "$(stat -c %s -- "$zip")" -le 4000000 ]] ||', ": ||"),
-    ("reset_record", 'if [[ "$RESET" == true ]]; then', "if false; then"),
+    ("reset_record", '[[ "$RESET" != true || -n "$self" ]] || empty_record\n', ""),
     ("reset_record's empty record (#703)", 'echo "fork secret sweep record 2" > "$dir/deleted-tips"\n', ""),
     ("the tag check", '[[ "$GITHUB_REF" == refs/heads/* ]] ||', ": ||"),
     ("the one-member check", "[m] = z.infolist()", "m = z.infolist()[0]"),
