@@ -137,12 +137,18 @@ The new session's first message has these parts:
 2. **The old session's own handoff**, from the setting's `source`:
    - **`command`:** T3 runs the program in `command` in the project folder, with the runner wait
      checks use (`makeSettingsProgramRunner` in `waits/WaitJudges.ts`): no shell, a 60-second
-     timeout (the process is killed; what it printed so far is not used), a 32 KB cap, and the
-     thread and project ids in its environment (`T3CODE_THREAD_ID`, `T3CODE_PROJECT_ID`). Its
-     output, trimmed, is the handoff. It must only read and be safe to run twice: a second trigger
-     for the same run, or a handoff that waited for an agent slot and is checked again, may run it
-     again. It runs once the settle is over, right before the send; a handoff waiting for a slot
-     keeps its output. A stale state file is caught by part 1, which T3 reads fresh.
+     timeout (the process is killed; what it printed so far is not used), a 32 KB cap on stdout
+     and on stderr each (warnings count too), its stdin closed, and the server's environment plus
+     the thread and project ids (`T3CODE_THREAD_ID`, `T3CODE_PROJECT_ID`). Its output, trimmed, is
+     the handoff, between begin and end lines that mark it as the command's notes. It must only
+     read and be safe to run twice: a second trigger for the same run may run it again. It runs
+     once the settle is over, right before the send; a handoff waiting for an agent slot keeps its
+     result, a failure too, and does not run it again. A stale state file is caught by part 1,
+     which T3 reads fresh. A program that is missing or cannot be run reads as "its program could
+     not start" (exit code 126 or 127, as `timeout` reports it on Linux).
+   - Point `command` at a program outside the repository: one inside it (`./scripts/x`, or a
+     script an interpreter is given) can be edited by an agent, and runs with the server's
+     environment.
    - **`agent`:** not built yet. Until it is, the message says that no handoff source is set up,
      and has parts 1, 3 and 4 only.
 

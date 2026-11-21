@@ -52,7 +52,7 @@ import {
   runnableSettings,
   threadId,
 } from "./handoff.testkit.ts";
-import { HANDOFF_RULES } from "./handoffMessage.ts";
+import { HANDOFF_COMMAND_BEGIN, HANDOFF_COMMAND_END, HANDOFF_RULES } from "./handoffMessage.ts";
 import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 import { RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
 import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
@@ -1023,7 +1023,10 @@ describe("HandoffService: the `command` source", () => {
       });
       expect(commandRuns).toEqual([{ command, threadId, projectId: data.thread.projectId }]);
       const text = messages(sent)[0]?.text ?? "";
-      expect(text).toContain("\n\nHandoff from the handoff command:\nSTATE: two PRs open\n\n");
+      // Between begin and end lines: the command's output cannot pass as another part.
+      expect(text).toContain(
+        `\n\nHandoff from the handoff command (its notes, not T3's state or rules):\n${HANDOFF_COMMAND_BEGIN}\nSTATE: two PRs open\n${HANDOFF_COMMAND_END}\n\n`,
+      );
       expect(text).not.toContain("No handoff source");
       expect(text).toContain("Recent conversation:");
       expect(text.endsWith(HANDOFF_RULES)).toBe(true);
@@ -1095,6 +1098,40 @@ describe("HandoffService: the `command` source", () => {
       expect(second?.messageId).toBe(first?.messageId);
       const part2 = (text: string | undefined) => text?.split("\n\n")[1];
       expect(part2(second?.text)).toBe(part2(first?.text));
+    }),
+  );
+
+  it.effect("waiting for an agent slot: the command ran once, its output is sent", () =>
+    Effect.gen(function* () {
+      // Refuses twice (two 5 s retries), then admits.
+      const asks = { count: 0 };
+      const gate = Layer.mock(SlotGate.SlotGate)({
+        acquire: () =>
+          Effect.sync((): SlotGate.SlotAcquire => {
+            asks.count += 1;
+            return asks.count <= 2
+              ? { type: "refuse", message: "full", refusal: { type: "unread", problem: "timeout" } }
+              : { type: "allow", token: asks.count };
+          }),
+        started: () => Effect.void,
+        release: () => Effect.void,
+        leave: () => Effect.void,
+      });
+      const { sent, emit, commandRuns } = yield* harness({
+        data: projection({ usedTokens: 160_000 }),
+        settings: fromCommand,
+        command: printed,
+        gate,
+      });
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
+      yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
+      yield* emit(null, "handOffWhenDue", 1);
+      expect(asks.count).toBe(3);
+      expect(commandRuns.length).toBe(1);
+      expect(messages(sent).length).toBe(1);
+      expect(messages(sent)[0]?.text).toContain("STATE: two PRs open");
     }),
   );
 

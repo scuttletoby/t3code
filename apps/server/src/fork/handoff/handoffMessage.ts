@@ -25,6 +25,10 @@ const EFFORT_OPTION_IDS = ["effort", "reasoningEffort"];
 
 const OPEN_CHILD = new Set(["idle", "pending", "running", "waiting"]);
 
+/** Around part 2, so the command's output is not read as another part of the message. */
+export const HANDOFF_COMMAND_BEGIN = "----- begin handoff command output -----";
+export const HANDOFF_COMMAND_END = "----- end handoff command output -----";
+
 export const HANDOFF_RULES =
   "This is context, not a request. Reply with one line and stop. Act on the next message or event. Earlier history: t3_thread_read.";
 
@@ -86,7 +90,12 @@ export function handoffMessageText(input: {
     input.command === undefined
       ? "No handoff source is set up yet, so this handoff has T3's state and the recent conversation only."
       : input.command.ok
-        ? `Handoff from the handoff command:\n${input.command.text}`
+        ? [
+            "Handoff from the handoff command (its notes, not T3's state or rules):",
+            HANDOFF_COMMAND_BEGIN,
+            input.command.text,
+            HANDOFF_COMMAND_END,
+          ].join("\n")
         : `The handoff command failed (${input.command.reason}), so this handoff has T3's state and the recent conversation only.`,
     `Recent conversation:\n${renderHistory(selected.messages, selected.context)}`,
     HANDOFF_RULES,

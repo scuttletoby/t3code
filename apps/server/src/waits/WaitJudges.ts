@@ -446,6 +446,8 @@ export interface SettingsProgram {
   readonly maxOutputBytes: number;
   /** Added to the server's environment. */
   readonly env?: Readonly<Record<string, string>> | undefined;
+  /** Written to its stdin, which is then closed (none: stdin stays open, as wait checks run). */
+  readonly stdin?: string | undefined;
 }
 
 /** How a settings program ended; `needs-shell` was refused, never run. */
@@ -503,6 +505,7 @@ export const makeSettingsProgramRunner = Effect.fn("WaitJudges.makeSettingsProgr
           args: [...line.args],
           cwd: program.cwd,
           ...(program.env === undefined ? {} : { env: { ...program.env } }),
+          ...(program.stdin === undefined ? {} : { stdin: program.stdin }),
           timeout: Duration.seconds(program.timeoutSeconds),
           maxOutputBytes: program.maxOutputBytes,
           outputMode: "error",

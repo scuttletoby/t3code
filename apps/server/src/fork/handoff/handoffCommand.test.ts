@@ -127,6 +127,16 @@ describe("handoffCommand", () => {
       }).pipe(Effect.scoped, Effect.provide(services)),
   );
 
+  it.live("its stdin is closed: a program that reads it ends instead of waiting", () =>
+    Effect.gen(function* () {
+      const { result } = yield* runIn(
+        node("console.log('read ' + require('fs').readFileSync(0, 'utf8').length)"),
+        { timeoutSeconds: 5 },
+      );
+      assert.deepStrictEqual(result, { ok: true, text: "read 0" });
+    }).pipe(Effect.scoped, Effect.provide(services)),
+  );
+
   it.live("empty output, or only blank lines, is a failure", () =>
     Effect.gen(function* () {
       failedWith((yield* runIn(node(""))).result, "printed nothing");
@@ -146,7 +156,16 @@ describe("handoffCommand", () => {
 
   it.live("a program that cannot start, or a project that is gone, is a failure", () =>
     Effect.gen(function* () {
+      // On Linux it runs under `timeout`, which exits 127 for a missing program; elsewhere the
+      // spawn itself fails. Either way the reason says it could not start.
       failedWith((yield* runIn(["/no/such/handoff-program"])).result, "could not start");
+      // 126 and 127, as a launcher reports them, read the same on every platform.
+      for (const code of [126, 127]) {
+        failedWith(
+          (yield* runIn(node(`process.exit(${code})`))).result,
+          `its program could not start (exit code ${code})`,
+        );
+      }
       failedWith((yield* runIn(node("console.log('x')"), { root: null })).result, "project");
     }).pipe(Effect.scoped, Effect.provide(services)),
   );

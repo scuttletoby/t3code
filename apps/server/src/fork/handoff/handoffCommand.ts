@@ -54,15 +54,20 @@ export const make = Effect.fn("HandoffCommand.make")(function* (
       cwd: project.value.value.workspaceRoot,
       maxOutputBytes: HANDOFF_COMMAND_MAX_BYTES,
       env: { [HANDOFF_THREAD_ENV]: input.threadId, [HANDOFF_PROJECT_ENV]: input.projectId },
+      // Its stdin is closed: a program that reads it when given no file ends instead of waiting.
+      stdin: "",
     });
     if (ran.type === "needs-shell")
       return failed("its program needs a shell (a .cmd or .bat file)");
     if (ran.type === "error") return failed(ran.message.replace(/\.$/u, "").toLowerCase());
     // Killed at its limit: what it printed so far is not a handoff.
     if (ran.result.timedOut) return failed(`timed out after ${timeoutSeconds}s`);
-    if (ran.result.code === null || Number(ran.result.code) !== 0) {
-      return failed(`exit code ${ran.result.code ?? "none"}`);
-    }
+    const code = ran.result.code === null ? null : Number(ran.result.code);
+    // 126 and 127 are how a launcher says the program could not start: on Linux the program runs
+    // under `timeout`, which starts fine and then exits 127 for a missing program.
+    if (code === 126 || code === 127)
+      return failed(`its program could not start (exit code ${code})`);
+    if (code !== 0) return failed(`exit code ${code ?? "none"}`);
     const text = ran.result.stdout.trim();
     return text === "" ? failed("it printed nothing") : ({ ok: true, text } as const);
   });
