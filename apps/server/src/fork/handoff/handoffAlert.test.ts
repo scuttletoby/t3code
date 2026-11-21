@@ -48,6 +48,7 @@ import * as ProjectService from "../../project/ProjectService.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as HandoffService from "./HandoffService.ts";
+import * as HandoffCommand from "./handoffCommand.ts";
 import {
   adapterRegistry,
   at,
@@ -195,6 +196,8 @@ const world = Effect.fnUntraced(function* (usage: {
           }),
         }),
         adapterRegistry(),
+        // The agent source: no command runs.
+        Layer.mock(HandoffCommand.HandoffCommand)({}),
       ),
     ),
   );

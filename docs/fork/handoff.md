@@ -134,8 +134,28 @@ The new session's first message has these parts:
 1. **T3's state**, read when it is sent: the handoff's number, the thread, the run it was made from,
    the model and effort of the new session, the open child tasks (and which wait for an approval or
    an answer), and the watched pull requests with their checks.
-2. **The old session's own handoff.** Not built yet: the `agent` and `command` sources come later.
-   Until then the message says that no handoff source is set up, and has parts 1, 3 and 4 only.
+2. **The old session's own handoff**, from the setting's `source`:
+   - **`command`:** T3 runs the program in `command` in the project folder, with the runner wait
+     checks use (`makeSettingsProgramRunner` in `waits/WaitJudges.ts`): no shell, a 60-second
+     timeout (the process is killed; what it printed so far is not used), a 32 KB cap, and the
+     thread and project ids in its environment (`T3CODE_THREAD_ID`, `T3CODE_PROJECT_ID`). Its
+     output, trimmed, is the handoff. It must only read and be safe to run twice: a second trigger
+     for the same run, or a handoff that waited for an agent slot and is checked again, may run it
+     again. It runs once the settle is over, right before the send; a handoff waiting for a slot
+     keeps its output. A stale state file is caught by part 1, which T3 reads fresh.
+   - **`agent`:** not built yet. Until it is, the message says that no handoff source is set up,
+     and has parts 1, 3 and 4 only.
+
+   **If the command fails** (an exit code other than 0, a timeout, empty output, output over the
+   cap, a program that cannot start, a project that cannot be read): at the idle trigger the
+   handoff is skipped, and the next turn end decides again. At the size backstop T3 hands off with
+   parts 1, 3 and 4 only, and the message says that the command failed and why. The server log says
+   so in both cases ("handoff command failed").
+
+   The command is code that T3 runs, so only the person's settings set it: `handoff` is a
+   person-only setting (no T3 tool's input may name it), and a repository's `t3.json` has no
+   `handoff`.
+
 3. **The recent conversation**, chosen by upstream's handoff budget with a smaller cap (8,000).
 4. **The rules**: this is context, not a request; reply with one line and act on the next message or
    event; older history is in the thread (`t3_thread_read`).
@@ -179,7 +199,7 @@ written out in full. The message says when no effort is set.
 ## For developers
 
 - Fork code: `apps/server/src/fork/handoff/` (`HandoffService.ts`, `handoffDispatch.ts`,
-  `handoffFacts.ts`, `handoffMessage.ts`, `handoffDecision.ts`, `handoffQuiet.ts`,
+  `handoffFacts.ts`, `handoffMessage.ts`, `handoffCommand.ts`, `handoffDecision.ts`, `handoffQuiet.ts`,
   `handoffShell.ts`, `handoffRelayView.ts`). Settings:
   `packages/contracts/src/handoff.ts`.
 - `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes
