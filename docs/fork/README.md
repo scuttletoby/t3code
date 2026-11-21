@@ -184,6 +184,11 @@ land), the parent gets one queued message naming those tasks. A result counts as
 owed, and also when it has no delivery state at all: an old row, or a `mode: "wait"` task whose
 acknowledgement failed. Each task is reminded once, also across restarts and when another result
 becomes owed later (the later message names only the new task); a message names at most ten tasks.
+A message the thread refuses holds back only its own tasks (until the set changes); the other
+messages of that check are still sent. A reminder sent before per-task ids (one id for the whole
+set) is split into its tasks from its text, so after an upgrade a task it named is not reminded
+again; only tasks past the first ten of such a message, which it never named, may be reminded once
+more. The check at start and a check after an event never run at once for one parent.
 It never goes to a stopped or archived thread, and never for results older than a day. A parent is busy, and
 waits for its own run end, while a run of it goes or a question of it is open (an open question
 holds the reminder until that run ends); background work it left running does not hold it. At
