@@ -48,6 +48,20 @@ export function parseHandoffMessageId(
   return runId === "" ? null : { runId, loud, retry };
 }
 
+/** The write turn's (agent source) message id: `handoff-write:<thread>:<run>`, fixed per source run. */
+const HANDOFF_WRITE_PREFIX = "handoff-write:";
+export const handoffWriteIds = (threadId: ThreadId, sourceRunId: string) => ({
+  commandId: `server:${HANDOFF_WRITE_PREFIX}${threadId}:${sourceRunId}`,
+  messageId: `${HANDOFF_WRITE_PREFIX}${threadId}:${sourceRunId}`,
+});
+
+/** The source run a write turn's message id names; null for any other id. */
+export function parseHandoffWriteMessageId(threadId: ThreadId, messageId: string): string | null {
+  const prefix = `${HANDOFF_WRITE_PREFIX}${threadId}:`;
+  const runId = messageId.startsWith(prefix) ? messageId.slice(prefix.length) : "";
+  return runId === "" ? null : runId;
+}
+
 /** The newest run that is part of the thread (a removed queued message leaves a cancelled one). */
 function latestStartedRun(runs: ReadonlyArray<OrchestrationV2Run>): OrchestrationV2Run | undefined {
   return runs
@@ -129,9 +143,11 @@ export function handoffThreadFacts(
             id: run.id,
             kind: run.userMessageId.startsWith(HANDOFF_MESSAGE_PREFIX)
               ? "handoff"
-              : text?.trim().toLowerCase() === "/compact"
-                ? "compact"
-                : "turn",
+              : parseHandoffWriteMessageId(thread.id, run.userMessageId) !== null
+                ? "handoff-write"
+                : text?.trim().toLowerCase() === "/compact"
+                  ? "compact"
+                  : "turn",
             state:
               run.status === "completed" || run.status === "failed" ? run.status : "interrupted",
           },
@@ -155,9 +171,12 @@ export function handoffDispatchDropped(
   projection: Omit<HandoffRecords, "providerTurns">,
 ): boolean {
   const handoff = parseHandoffMessageId(command.threadId, command.messageId);
-  if (handoff === null) return false;
+  const write = parseHandoffWriteMessageId(command.threadId, command.messageId);
+  if (handoff === null && write === null) return false;
   if (handoffBlockers(projection).length > 0) return true;
   const latest = latestStartedRun(projection.runs);
+  // A write turn starts only at its source run.
+  if (handoff === null) return latest?.id !== write;
   // The retry follows only its own failed first send: never a stopped one, and never a retry.
   if (handoff.retry) {
     return (
@@ -166,5 +185,10 @@ export function handoffDispatchDropped(
       latest.status !== "failed"
     );
   }
-  return latest?.id !== handoff.runId;
+  // After its source run, only that run's own write turn, completed (stopped or failed: no handoff).
+  const written =
+    latest !== undefined &&
+    latest.status === "completed" &&
+    parseHandoffWriteMessageId(command.threadId, latest.userMessageId) === handoff.runId;
+  return latest?.id !== handoff.runId && !written;
 }

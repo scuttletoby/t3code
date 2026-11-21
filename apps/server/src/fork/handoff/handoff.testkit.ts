@@ -2,6 +2,7 @@
 import {
   type OrchestrationV2Run,
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2TurnItem,
   MessageId,
   NodeId,
   ProjectId,
@@ -11,6 +12,7 @@ import {
   ProviderTurnId,
   RunId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -49,6 +51,50 @@ export const run = (patch: Partial<OrchestrationV2Run> = {}): OrchestrationV2Run
   contextHandoffId: null,
   ...patch,
 });
+
+/** A user message or a reply in run `runId` (the write turn's items). */
+export function turnItem(
+  forRun: RunId,
+  ordinal: number,
+  item:
+    | { readonly type: "user_message"; readonly messageId: string; readonly text: string }
+    | { readonly type: "assistant_message"; readonly text: string },
+): OrchestrationV2TurnItem {
+  const base = {
+    id: TurnItemId.make(`item:${forRun}:${ordinal}`),
+    threadId,
+    runId: forRun,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal,
+    status: "completed" as const,
+    title: null,
+    startedAt: null,
+    completedAt: null,
+    updatedAt: at(),
+  };
+  return item.type === "user_message"
+    ? {
+        ...base,
+        type: "user_message",
+        messageId: MessageId.make(item.messageId),
+        createdBy: "user",
+        creationSource: "web",
+        inputIntent: "turn_start",
+        text: item.text,
+        attachments: [],
+      }
+    : {
+        ...base,
+        type: "assistant_message",
+        messageId: MessageId.make(`reply:${forRun}:${ordinal}`),
+        text: item.text,
+        streaming: false,
+      };
+}
 
 export function projection(usage: {
   readonly usedTokens: number;

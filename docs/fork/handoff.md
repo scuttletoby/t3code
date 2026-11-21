@@ -149,14 +149,30 @@ The new session's first message has these parts:
    - Point `command` at a program outside the repository: one inside it (`./scripts/x`, or a
      script an interpreter is given) can be edited by an agent, and runs with the server's
      environment.
-   - **`agent`:** not built yet. Until it is, the message says that no handoff source is set up,
-     and has parts 1, 3 and 4 only.
+   - **`agent`:** once the settle is over, T3 sends the old session one normal turn, the write
+     turn: the setting's `instructions` (empty: a built-in text), then "start your reply with this
+     line, alone: `[T3 handoff notes]`" and the 32 KB cap. It runs on the old session as it is (no
+     model change, no fresh context), so its cache is still warm, with the same check before it as
+     the handoff (a thread that moved on drops it) and an agent slot when the server has a gate.
+     Its ids are fixed per source run (`server:handoff-write:<thread>:<run>`), so a second trigger
+     does not send a second one. The reply, after the marker line, is the handoff, between begin
+     and end lines that mark it as the old session's notes. The write turn is not in part 3.
+     - **No handoff at all** (the old session carries on with everything it had, and the next turn
+       end decides again): the write turn was stopped, failed, or did not end within 4 minutes
+       (the idle window it starts in), or another message joined it (steered in, so the old
+       session answered it there). The handoff's check also drops it when anything ran after the
+       write turn.
+     - **A reply that does not count** (no marker on the first line, over 32 KB in UTF-8, empty,
+       only the marker) fails as below.
+     - The write turn is not marked quiet, as the handoff run is: its finish alerts unless the
+       handoff run starts within the relay's 5 s hold (a run that starts in it drops the alert).
 
-   **If the command fails** (an exit code other than 0, a timeout, empty output, output over the
-   cap, a program that cannot start, a project that cannot be read): at the idle trigger the
-   handoff is skipped, and the next turn end decides again. At the size backstop T3 hands off with
-   parts 1, 3 and 4 only, and the message says that the command failed and why. The server log says
-   so in both cases ("handoff command failed").
+   **If the source fails** (for `command`: an exit code other than 0, a timeout, empty output,
+   output over the cap, a program that cannot start, a project that cannot be read; for `agent`: a
+   reply that does not count): at the idle trigger the handoff is skipped, and the next turn end
+   decides again. At the size backstop T3 hands off with parts 1, 3 and 4 only, and the message
+   says that the source failed and why. The server log says so in both cases ("handoff command
+   failed", "handoff write turn did not count").
 
    The command is code that T3 runs, so only the person's settings set it: `handoff` is a
    person-only setting (no T3 tool's input may name it), and a repository's `t3.json` has no
@@ -197,7 +213,8 @@ written out in full. The message says when no effort is set.
   queued; it runs after the newer run.
 - The same run never hands off twice: the check before the send drops a second trigger, and every
   trigger for one run uses the same ids, so one that got past would replay the first. A cancelled
-  handoff spends that run's ids; the next run's turn end decides.
+  handoff spends that run's ids; the next run's turn end decides. A write turn counts as a handoff
+  here: after a restart, a finished write turn is the latest run, so nothing more is sent for it.
 - A browser that is offline from before the person's turn ends until after the quiet handoff run
   completes (asleep, network drop) gets no notice for that turn when it reconnects: it sees only the
   quiet run. The relay's alert for the turn (phone and other devices) still goes out.
@@ -205,7 +222,8 @@ written out in full. The message says when no effort is set.
 ## For developers
 
 - Fork code: `apps/server/src/fork/handoff/` (`HandoffService.ts`, `handoffDispatch.ts`,
-  `handoffFacts.ts`, `handoffMessage.ts`, `handoffCommand.ts`, `handoffDecision.ts`, `handoffQuiet.ts`,
+  `handoffFacts.ts`, `handoffMessage.ts`, `handoffCommand.ts`, `handoffAgent.ts`, `handoffDecision.ts`,
+  `handoffQuiet.ts`,
   `handoffShell.ts`, `handoffRelayView.ts`). Settings:
   `packages/contracts/src/handoff.ts`.
 - `Orchestrator.ts` stays upstream's (the fork check refuses edits to it). Every handoff send goes

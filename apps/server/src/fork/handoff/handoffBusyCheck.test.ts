@@ -34,7 +34,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import { dispatchHandoff, type HandoffDispatchCommand } from "./handoffDispatch.ts";
-import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
+import { HANDOFF_LOUD_SUFFIX, handoffWriteIds } from "./handoffFacts.ts";
 
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "gpt-5.1-codex" };
@@ -163,8 +163,9 @@ it.effect(
         );
       const service = yield* read("./HandoffService.ts");
       const sends = service.match(/type: "message\.dispatch"/g)?.length ?? 0;
-      // The first send and its one retry, each inside `dispatchHandoff`.
-      assert.equal(sends, 2);
+      // The first send, its one retry and the `agent` source's write turn, each inside
+      // `dispatchHandoff`.
+      assert.equal(sends, 3);
       assert.equal(
         service.match(/dispatchHandoff\(\{\s*type: "message\.dispatch"/g)?.length,
         sends,
@@ -398,4 +399,64 @@ it.effect("a handoff sent as one that alerts lands, and so does its own retry; n
     assert.equal(yield* dispatchHandoff(handoffCommand(threadId, loud, "", ":retry1")), "sent");
     assert.equal(handoffRuns(yield* runs(threadId)).length, 2);
   }).pipe(Effect.provide(layerTest)),
+);
+
+/** The `agent` source's write turn, as the service sends it: on the old session, as it is. */
+const writeTurn = (threadId: ThreadId, sourceRunId: string, command = "") => {
+  const ids = handoffWriteIds(threadId, sourceRunId);
+  return dispatchHandoff({
+    type: "message.dispatch",
+    commandId: CommandId.make(`${ids.commandId}${command}`),
+    threadId,
+    messageId: MessageId.make(ids.messageId),
+    text: "Write the handoff.",
+    attachments: [],
+    createdBy: "agent",
+    creationSource: "server",
+    dispatchMode: { type: "start_immediately" },
+  });
+};
+
+it.effect("the write turn runs once, on the old session; its handoff lands only after it", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:handoff-write");
+    const first = yield* quietThread(threadId);
+    assert.equal(yield* writeTurn(threadId, first.id), "sent");
+    // Runs again (a second trigger, a restart): not a second write turn.
+    assert.equal(yield* writeTurn(threadId, first.id, ":again"), "dropped");
+    const write = (yield* runs(threadId)).at(-1)!;
+    assert.equal(write.userMessageId, handoffWriteIds(threadId, first.id).messageId);
+    assert.equal(write.providerThreadId, first.providerThreadId);
+    assert.notEqual(write.freshContext, true);
+    // Still running: no handoff yet.
+    assert.equal(yield* sendHandoff(threadId, first.id), "dropped");
+    yield* complete(write);
+    assert.equal(yield* sendHandoff(threadId, first.id), "sent");
+    assert.equal(handoffRuns(yield* runs(threadId)).length, 1);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each(["interrupted", "failed", "message"] as const)(
+  "after a write turn %s there is no handoff, and the old session carries on",
+  (ending) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make(`thread:handoff-write-${ending}`);
+      const first = yield* quietThread(threadId);
+      yield* writeTurn(threadId, first.id);
+      const write = (yield* runs(threadId)).at(-1)!;
+      if (ending === "message") {
+        // A message of the person's after the write turn ran: the thread moved on.
+        yield* complete(write);
+        yield* send(threadId, "second");
+        yield* complete((yield* runs(threadId)).at(-1)!);
+      } else yield* complete(write, { status: ending });
+      assert.equal(yield* sendHandoff(threadId, first.id), "dropped");
+      // A write turn made from an older run does not start either.
+      assert.equal(yield* writeTurn(threadId, first.id, ":late"), "dropped");
+      yield* send(threadId, "next");
+      const next = (yield* runs(threadId)).at(-1)!;
+      assert.equal(next.userMessageId, `message:${threadId}:next`);
+      assert.equal(next.providerThreadId, first.providerThreadId);
+      assert.deepEqual(handoffRuns(yield* runs(threadId)), []);
+    }).pipe(Effect.provide(layerTest)),
 );
