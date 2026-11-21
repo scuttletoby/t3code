@@ -565,7 +565,8 @@ function runScript(tests, jobs, args = [], list = Object.keys(tests).join("\n"),
     ".github/scripts/fork-ci-unittest.py",
     fs.readFileSync(path.join(__dirname, "fork-ci-unittest.py")),
   );
-  write(NODE_COUNTS, fs.readFileSync(path.join(__dirname, path.basename(NODE_COUNTS))));
+  // require.resolve with a literal also lets knip trace the reporter, which node --test loads by path.
+  write(NODE_COUNTS, fs.readFileSync(require.resolve("./fork-ci-node-counts.cjs")));
   write(".github/fork-ci-tests.txt", list + "\n");
   for (const [file, text] of Object.entries(tests)) write(file, text);
   const env = {
