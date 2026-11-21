@@ -111,6 +111,7 @@ import { FetchHttpClient, HttpClient } from "effect/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import { resolveAttachmentPath, resolveAttachmentPathById } from "../../attachmentStore.ts";
+import * as CodexMcpProfile from "../../fork/codexMcpProfile.ts"; // Fork: MCP profiles
 import * as PortScanner from "../../preview/PortScanner.ts";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import { ServerConfig } from "../../config.ts";
@@ -1956,6 +1957,7 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
     continuationRequests,
     watchCommandStops: portDiscovery.watchAgentCommandStops,
     ...hooks,
+    ...(yield* CodexMcpProfile.profiledClientFactory(clientFactory)), // Fork: MCP profiles
   });
 });
 

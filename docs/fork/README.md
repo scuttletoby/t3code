@@ -775,12 +775,30 @@ through, and a fork of a thread whose parent cannot be read is refused. On
 another machine, a fork, a change to a scheduled task and `run_scheduled_task_now` are refused for
 such a thread, as a thread started there gets that machine's profile.
 
-Only Claude threads apply profiles. A Codex thread, or one on any other provider, would get every
+A Codex thread applies the profile's `servers` too. Codex runs one app-server for all of an
+instance's threads, so T3 sets the servers per thread, as it sets its own `t3-code` entry: when it
+loads a thread (starts, resumes or forks it), it asks that app-server which MCP servers are set up
+for the thread's folder (Codex's `config.toml`, a project's `.codex/config.toml`, and servers added
+by `-c mcp_servers…` in the Codex launch arguments) and gives that thread
+`mcp_servers.<name>.enabled = false` for each one the profile leaves out. T3's own servers stay.
+Other threads on the same app-server keep their own sets. Before each turn (and before a goal is
+set running) T3 reads the thread's live servers from Codex and does not start the turn, saying why
+and how to go on (pick `all` for the thread, or fix the profile), when one the profile leaves out
+is still switched on. That happens when the profile was narrowed while Codex had the thread loaded
+(Codex reads a thread's config only as it loads it, so the change counts once it loads the thread
+again: after it has been idle a while, or after T3 restarts) and for a server a Codex plugin adds,
+which T3 cannot switch off this way. A turn is also refused when the profile is missing or broken,
+its `t3Tools` is not `"all"`, Codex's servers cannot be listed, a server's name cannot be written as
+a config key, the thread is not in T3's store, or (once any thread on that app-server has a narrower
+profile) Codex asks to load or run a thread T3 cannot match to one of its own. A thread on `all` is
+loaded as before, with no extra request to Codex.
+
+Only Claude and Codex threads apply profiles. A thread on any other provider would get every
 MCP server and every T3 tool whatever its profile says. So its turn is not started when its profile
 is narrower than `all` ([#672](https://github.com/scuttletoby/t3code/issues/672)): the machine that
 runs the turn checks the thread's profile as the turn starts (also a resumed turn, and a compaction,
 which some providers run as a `/compact` prompt) and refuses it, saying why and how to go on (switch
-the thread to a Claude instance, or pick `all` for it). That covers every way a thread gets there: a
+the thread to a Claude or Codex instance, or pick `all` for it). That covers every way a thread gets there: a
 thread switched to another provider (`t3_thread_configure`, or in the app), a thread made by
 `t3_thread_launch` in a project whose profile is narrower, a task delegated on this machine (a child
 gets its parent's profile, or `mcpSubagentProfile`), and a task another machine sent, also one from
