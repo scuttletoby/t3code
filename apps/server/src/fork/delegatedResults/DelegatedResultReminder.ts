@@ -28,6 +28,7 @@ import {
   isEndedTask,
   isRemindable,
   legacyReminderMessageIds,
+  makeRefusalLog,
   parentBusy,
   REMINDER_MAX_AGE_MS,
   parentGone,
@@ -87,6 +88,7 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
   // Parents that were busy (or could not be reached) while a result was owed: their next run end
   // checks again. In memory; a restart rebuilds it from the startup scan.
   const watched = new Set<ThreadId>();
+  const newRefusal = makeRefusalLog();
 
   const check = Effect.fn("DelegatedResultReminder.check")(function* (parentThreadId: ThreadId) {
     const enabled = yield* settings.getSettings.pipe(
@@ -161,11 +163,12 @@ export const make = Effect.fn("DelegatedResultReminder.make")(function* (
           return { type: "held", detail: "stopped" } satisfies CheckOutcome;
         case "rejected":
           // Its ids stay refused, so its tasks wait for the owed set to change; the next
-          // batches are other tasks, and are still sent. Logged when refused, not on each
-          // later check that finds its refused receipt.
-          if (result.earlier !== true) {
+          // batches are other tasks, and are still sent. Logged once per batch and process,
+          // not on each later check that finds its refused receipt.
+          if (newRefusal(ids.commandId, nowMs)) {
             yield* Effect.logWarning("delegated result reminder refused", {
               threadId: parentThreadId,
+              commandId: ids.commandId,
               detail: result.detail,
             });
           }

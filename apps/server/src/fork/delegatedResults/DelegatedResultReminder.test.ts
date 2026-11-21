@@ -474,9 +474,9 @@ describe("DelegatedResultReminder.check", () => {
       const reminder = yield* service(world);
       const check = reminder.check(PARENT).pipe(Effect.provide(warningLogs(warnings)));
       expect(yield* check).toMatchObject({ type: "held", taskIds: ["task-10", "task-11"] });
-      // Runs again, and after a restart: answered from its refused receipt, no new warning.
+      expect(refusals()).toHaveLength(1);
+      // Runs again: answered from its refused receipt, no new warning.
       expect(yield* check).toMatchObject({ type: "held", taskIds: [] });
-      yield* (yield* service(world)).check(PARENT).pipe(Effect.provide(warningLogs(warnings)));
       expect(refusals()).toHaveLength(1);
       // A task that sorts first ends: the refused tasks go in a new batch (new ids), refused too.
       const extra = delegatedTask({ id: "task-0" });
@@ -487,6 +487,54 @@ describe("DelegatedResultReminder.check", () => {
       expect(refusals()).toHaveLength(2);
       expect(yield* check).toEqual({ type: "held", detail: "refused", taskIds: [] });
       expect(refusals()).toHaveLength(2);
+    }),
+  );
+
+  it.effect("a refusal whose log line a stop cut off is logged once after the restart", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const ids = reminderIdsOf([delegatedTask()]);
+      // The server stopped after the thread refused the reminder, before its warning was logged:
+      // only the refused receipt is left.
+      world.refused.set(ids.commandId, PARENT);
+      const warnings: Array<string> = [];
+      const refusals = () => warnings.filter((log) => log.includes("reminder refused"));
+      const reminder = yield* service(world);
+      const check = reminder.check(PARENT).pipe(Effect.provide(warningLogs(warnings)));
+      expect(yield* check).toEqual({ type: "held", detail: "refused", taskIds: [] });
+      expect(refusals()).toHaveLength(1);
+      expect(refusals()[0]).toContain(ids.commandId);
+      // Runs again: not logged again. Another restart logs it once more (nothing is stored).
+      expect(yield* check).toEqual({ type: "held", detail: "refused", taskIds: [] });
+      expect(refusals()).toHaveLength(1);
+      yield* (yield* service(world)).check(PARENT).pipe(Effect.provide(warningLogs(warnings)));
+      expect(refusals()).toHaveLength(2);
+      expect(world.sent).toHaveLength(0);
+    }),
+  );
+
+  it.effect("a receipt another thread holds warns once, not on every check", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const ids = reminderIdsOf([delegatedTask()]);
+      // The reminder's command id is taken by another thread's accepted command.
+      world.receipts.set(ids.commandId, ThreadId.make("thread-other"));
+      const warnings: Array<string> = [];
+      const refusals = () => warnings.filter((log) => log.includes("reminder refused"));
+      const reminder = yield* service(world);
+      const check = reminder.check(PARENT).pipe(Effect.provide(warningLogs(warnings)));
+      const held = {
+        type: "held",
+        detail: `Command ${ids.commandId} belongs to thread thread-other.`,
+        taskIds: [],
+      };
+      expect(yield* check).toEqual(held);
+      expect(yield* check).toEqual(held);
+      expect(yield* check).toEqual(held);
+      expect(refusals()).toHaveLength(1);
+      expect(world.sent).toHaveLength(0);
     }),
   );
 
