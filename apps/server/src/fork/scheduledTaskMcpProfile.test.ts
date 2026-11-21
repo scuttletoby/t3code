@@ -23,6 +23,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
@@ -51,6 +52,7 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
+import * as ScheduledTaskMcpProfile from "./scheduledTaskMcpProfile.ts";
 import { type SlotWorld, slotGateOver, slotWorld } from "./slotWorld.testkit.ts";
 
 /** Written out, not imported, so these tests also run (and fail) on code without the record. */
@@ -342,12 +344,13 @@ const row = (id: string) =>
     const sql = yield* SqlClient.SqlClient;
     const [found] = yield* sql<{
       prompt: string;
+      project_id: string;
       thread_id: string | null;
       last_run_status: string;
       last_run_error: string | null;
       next_run_at: string | null;
       run_count: number;
-    }>`SELECT prompt, thread_id, last_run_status, last_run_error, next_run_at, run_count FROM scheduled_tasks WHERE task_id = ${id}`;
+    }>`SELECT prompt, project_id, thread_id, last_run_status, last_run_error, next_run_at, run_count FROM scheduled_tasks WHERE task_id = ${id}`;
     return found;
   });
 
@@ -612,6 +615,11 @@ const SCHEDULES = [
   { name: "interval", schedule: { type: "interval", everyMs: 60_000 } },
   { name: "once", schedule: { type: "once", runAt: "1970-01-01T00:01:00.000Z" } },
   { name: "fixed_time", schedule: { type: "fixed_time", timeOfDay: "00:01" } },
+  // Some weekdays only (Monday and Wednesday): its next time skips days.
+  {
+    name: "fixed_time_weekdays",
+    schedule: { type: "fixed_time", timeOfDay: "00:01", weekdays: [1, 3] },
+  },
 ] as const;
 
 /** Moves the clock to a second after the task's next run time and runs the scheduler's pass. */
@@ -969,6 +977,133 @@ it.effect("a webhook run is refused when it starts, and again after it waited fo
   ),
 );
 
+it.effect(
+  "a webhook delivery saved while it waited runs once on the task as saved, checked on it (#719)",
+  () => {
+    const logs: Array<Logger.Options<unknown>> = [];
+    /** The stored-delivery worker's run is in its slot wait, on the copy of the task it took. */
+    const inSlotWait = Effect.sync(() =>
+      logs.some((entry) => {
+        const [text, fields] = entry.message as ReadonlyArray<unknown>;
+        return (
+          text === "Webhook delivery waits for an agent slot" &&
+          (fields as { readonly taskId?: unknown } | undefined)?.taskId === "task:hook-saved"
+        );
+      }),
+    );
+    return held(
+      Effect.gen(function* () {
+        const slots = slotWorld();
+        const world = newWorld(slots);
+        yield* withService(NARROWED, world, (service) =>
+          Effect.gen(function* () {
+            // The owner's webhook task; the slot is full, so its delivery is stored and waits.
+            const { task: hook } = yield* service.upsert(
+              task("task:hook-saved", { schedule: { type: "webhook" } }),
+            );
+            slots.running = [ThreadId.make("thread:busy")];
+            const stored = yield* service.triggerWebhook(webhookRequest(hook));
+            if (stored._tag !== "accepted") return assert.fail(`not accepted: ${stored._tag}`);
+            // The save must land after the worker took its copy (it takes the prompt saved at
+            // that moment), so wait for that state, not for a number of rounds.
+            yield* settleUntil(
+              inSlotWait,
+              "the delivery waits in its slot wait",
+              workerRounds(world, 1),
+            );
+            expect(world.launched).toHaveLength(0);
+            expect(
+              (yield* deliveryOf(service, "task:hook-saved", stored.deliveryId)).renderedPrompt,
+            ).toContain("Do the work");
+            // The owner saves a new prompt while it waits: recorded, so the task is fine to run.
+            yield* service.upsert({
+              ...(yield* listed(service, "task:hook-saved")),
+              prompt: "New words",
+            });
+            // The run it held was rendered from the old prompt: not started, and not dropped. The
+            // delivery stays stored and is read again, so the profile check is on the task as
+            // saved (its record matches), not on the old copy.
+            yield* workerRounds(world, 3);
+            expect(world.launched).toHaveLength(0);
+            const waiting = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
+            expect(waiting.outcome).toBe("accepted");
+            expect(waiting.renderedPrompt).toContain("New words");
+            const sql = yield* SqlClient.SqlClient;
+            expect(
+              yield* sql`SELECT state FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-saved'`,
+            ).toEqual([{ state: "dispatching" }]);
+            // The slot frees: it runs once, with the new prompt.
+            slots.running = [];
+            yield* settleUntil(
+              Effect.sync(() => world.launched.length === 1),
+              "the waiting delivery ran",
+              workerRounds(world, 1),
+            );
+            expect(JSON.stringify(world.launched[0])).toContain("New words");
+            expect(JSON.stringify(world.launched[0])).not.toContain("Do the work");
+            yield* workerRounds(world, 3);
+            expect(world.launched).toHaveLength(1);
+            const ran = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
+            expect(ran.outcome).toBe("accepted");
+            expect(
+              yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-saved'`,
+            ).toHaveLength(0);
+          }),
+        );
+      }),
+    ).pipe(
+      Effect.provide(
+        Logger.layer([Logger.make((entry) => logs.push(entry))], { mergeWithExisting: false }),
+      ),
+    );
+  },
+);
+
+const STALE_COPY =
+  "Not run: this task was saved again after this run read it, and the run would have used the task as it was before, so it was not started.";
+
+/**
+ * A run's copy of the task that a save overtook (a scheduled run or "run now" whose read a save
+ * beat, the way a waiting webhook delivery's is): the record's check, on that copy, as it starts.
+ */
+it.effect("a run's copy that a save overtook says so, with the one-time task's way on", () =>
+  held(
+    Effect.gen(function* () {
+      const world = newWorld();
+      const profiles = yield* withService(NARROWED, world, (service) =>
+        Effect.gen(function* () {
+          const once = { schedule: { type: "once", runAt: "1970-01-01T00:01:00.000Z" } } as const;
+          const { task: oneTime } = yield* service.upsert(task("task:once", once));
+          const { task: repeating } = yield* service.upsert(task("task:every"));
+          return [oneTime, repeating] as const;
+        }),
+      );
+      const [oneTime, repeating] = profiles;
+      const check = yield* ScheduledTaskMcpProfile.makeScheduledTaskMcpProfiles(
+        ThreadManagement.ThreadManagementService.of({ getThreadShell: findShell } as never),
+      ).pipe(Effect.provide(ServerSettings.layerTest(NARROWED as Settings)));
+      // Each copy as the run read it, before the owner's save wrote the row and its record.
+      const before = (stored: ScheduledTask) => ({ ...stored, prompt: "Words from before" });
+      const onceReason = yield* check.runRefusal(before(oneTime));
+      expect(onceReason).toContain(STALE_COPY);
+      expect(onceReason).toContain("run it now or give it a new time");
+      expect(onceReason).not.toContain("The next run");
+      const everyReason = yield* check.runRefusal(before(repeating));
+      expect(everyReason).toContain(STALE_COPY);
+      expect(everyReason).toContain("The next run, or the next webhook delivery");
+      expect(everyReason).not.toContain("waited");
+      // A copy of a task that was deleted and made again under its id is not "saved again": the
+      // writer of this row is not known.
+      const remade = yield* check.runRefusal({
+        ...before(repeating),
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      expect(remade).toContain("Save the task again");
+      expect(remade).not.toContain(STALE_COPY);
+    }),
+  ),
+);
+
 /** A call from another machine's thread, which says no MCP profile for it. */
 const linkedScope = {
   environmentId: EnvironmentId.make("environment-here"),
@@ -1109,6 +1244,68 @@ it.effect("a record that cannot be read refuses saves and new-thread runs, never
     }),
   ),
 );
+
+it.effect("a record that cannot be read is logged once while it stays so, not at every run", () => {
+  const logs: Array<Logger.Options<unknown>> = [];
+  const warnings = () =>
+    logs.filter(
+      (entry) =>
+        entry.logLevel === "Warn" &&
+        /scheduled-task-mcp-profiles\.json in the server's state folder\) cannot be read/.test(
+          Logger.formatLogFmt.log(entry),
+        ),
+    ).length;
+  return held(
+    Effect.gen(function* () {
+      const world = newWorld();
+      yield* insertOldRow("task:owner-old", PROJECT, null, "user");
+      yield* withService(NARROWED, world, (service) =>
+        Effect.gen(function* () {
+          // Readable (no file): the owner's task runs, nothing is logged.
+          yield* scheduledPass(world);
+          expect(world.launched).toHaveLength(1);
+          // Broken while the server runs: each pass refuses the run, the file is logged once.
+          yield* writeRecord("{ not json");
+          for (let pass = 0; pass < 3; pass++) yield* scheduledPass(world);
+          expect(world.launched).toHaveLength(1);
+          expect((yield* row("task:owner-old"))?.last_run_error).toContain(
+            "Not run: The MCP profiles",
+          );
+          expect(warnings()).toBe(1);
+          // Removed, the way out the warning names: the task runs again.
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.remove(yield* recordPath);
+          yield* scheduledPass(world);
+          expect(world.launched).toHaveLength(2);
+          // Broken again: logged again, once.
+          yield* writeRecord("{ not json");
+          for (let pass = 0; pass < 2; pass++) yield* scheduledPass(world);
+          expect(warnings()).toBe(2);
+          // Fixed, and only a save reads it: that good read counts too, so the same breakage
+          // after it is logged again.
+          yield* fs.remove(yield* recordPath);
+          yield* service.upsert(task("task:saved-meanwhile"));
+          yield* writeRecord("{ not json");
+          yield* scheduledPass(world);
+          expect(warnings()).toBe(3);
+          expect(world.launched).toHaveLength(2);
+        }),
+      );
+      // A start on the broken file: its clean-up and its runs log it once between them.
+      yield* withService(NARROWED, world, () =>
+        Effect.gen(function* () {
+          for (let pass = 0; pass < 2; pass++) yield* scheduledPass(world);
+          expect(warnings()).toBe(4);
+          expect(world.launched).toHaveLength(2);
+        }),
+      );
+    }),
+  ).pipe(
+    Effect.provide(
+      Logger.layer([Logger.make((entry) => logs.push(entry))], { mergeWithExisting: false }),
+    ),
+  );
+});
 
 it.effect("records of deleted tasks are dropped at every start, and an empty table drops all", () =>
   held(
@@ -1372,4 +1569,62 @@ it.effect(
         );
       }),
     ),
+);
+
+/**
+ * What `schedule_task`'s change does (read the task, then save the change on it), with the owner
+ * moving the task's thread to another project in between (a scratch promotion moves its tasks).
+ * Saved on the project it read, the task would move back and lose its thread.
+ */
+it.effect("a change that races the owner's move of the task's thread is refused, not unbound", () =>
+  held(
+    Effect.gen(function* () {
+      const world = newWorld();
+      yield* withService(NARROWED, world, (service) =>
+        Effect.gen(function* () {
+          yield* service.upsert(
+            task("task:moved", { projectId: PROJECT, threadId: WIDE, threadMode: "continue" }),
+          );
+          const read = yield* listed(service, "task:moved");
+          yield* service.moveThreadTasks({ threadIds: [WIDE], projectId: NARROW_PROJECT });
+          // From a thread on all, and from the owner's own MCP client. Runs again: refused each
+          // time, the task as the move left it.
+          for (const scope of [scopeOf(WIDE), scopeOf(null), scopeOf(WIDE)]) {
+            const refused = yield* service
+              .upsert({ ...read, prompt: "New words" })
+              .pipe(
+                Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+                Effect.flip,
+              );
+            expect(messageOf(refused)).toContain(
+              "This task was moved to another project (with its thread) while this save was being made",
+            );
+            expect(yield* row("task:moved")).toMatchObject({
+              prompt: "Do the work",
+              project_id: NARROW_PROJECT,
+              thread_id: WIDE,
+            });
+          }
+          // Read again, the same change is saved where the task is now, still bound.
+          const again = yield* listed(service, "task:moved");
+          yield* service
+            .upsert({ ...again, prompt: "New words" })
+            .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, scopeOf(WIDE)));
+          expect(yield* row("task:moved")).toMatchObject({
+            prompt: "New words",
+            project_id: NARROW_PROJECT,
+            thread_id: WIDE,
+          });
+          // The app's save (no MCP call) keeps upstream's behaviour: the project the owner saves
+          // is the one they picked, so the stale read moves the task back, off its thread.
+          yield* service.upsert({ ...read, prompt: "Owner words" });
+          expect(yield* row("task:moved")).toMatchObject({
+            prompt: "Owner words",
+            project_id: PROJECT,
+            thread_id: null,
+          });
+        }),
+      );
+    }),
+  ),
 );

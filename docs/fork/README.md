@@ -184,6 +184,13 @@ land), the parent gets one queued message naming those tasks. A result counts as
 owed, and also when it has no delivery state at all: an old row, or a `mode: "wait"` task whose
 acknowledgement failed. Each task is reminded once, also across restarts and when another result
 becomes owed later (the later message names only the new task); a message names at most ten tasks.
+A message the thread refuses holds back only its own tasks (until the set changes); the other
+messages of that check are still sent. The refusal is logged once, when it happens, not on each
+later check. A reminder sent before per-task ids (one id for the whole set) is split into its tasks
+from its text, so after an upgrade a task it named is not reminded again; only tasks past the first
+ten of such a message, which it never named, may be reminded once more. Such a message whose text
+cannot be read is left out alone: its tasks may be reminded once more, and the parent's other
+reminders still go. The check at start and a check after an event never run at once for one parent.
 It never goes to a stopped or archived thread, and never for results older than a day. A parent is busy, and
 waits for its own run end, while a run of it goes or a question of it is open (an open question
 holds the reminder until that run ends); background work it left running does not hold it. At
@@ -379,11 +386,16 @@ These routes start a new agent run and go through the same gate, with the same c
   minutes while it waits, upstream's missed-run rule applies. "Run now" fails with `Not run, no agent slot: ` and the reason and changes
   nothing; over MCP `run_scheduled_task_now` answers `slots_full`. A webhook delivery waits the
   same way and starts once when a slot is free; it ends without a run only if its task is paused,
-  deleted, replaced or its trigger changed while it waits (other edits are not seen: it runs with
-  the task as it was when it began to wait). Every waiting delivery is in the store, so a restart
-  keeps it and it runs once: a direct one (no coalescing window) is moved there when it is first
-  refused. A scheduled run or a webhook takes a slot only when no agent that waits for one holds
-  it; there is no order between routes, so on a host kept full it can wait long.
+  deleted, replaced or its trigger changed while it waits. A save while it waits (any other edit)
+  is seen at its next retry: it is never run on the task as it was before the save, and not
+  dropped. It stays stored, and the stored-delivery worker reads the task again, renders the
+  prompt again and waits again if no slot is free
+  ([#719](https://github.com/scuttletoby/t3code/issues/719)). Every waiting delivery is in the
+  store, so a restart keeps it and it runs once: a direct one (no coalescing window) is moved there
+  when it is first refused. If that store fails, the delivery waits in memory; a save then stores
+  it, and if the store fails again it ends without a run, saying why. A scheduled run or a webhook
+  takes a slot only when no agent that waits for one holds it; there is no order between routes,
+  so on a host kept full it can wait long.
 - A task bound to a thread whose run is active only queues its prompt there: no new run, so no slot
   and no wait. A bound thread that is idle starts a run and is gated, counted on the thread's
   current provider.
@@ -414,12 +426,18 @@ These routes start a new agent run and go through the same gate, with the same c
   (`wait_cancel` stops `waiting` waits only), so a wake-up that waits for a slot is sent once a
   slot frees. A wake-up keeps the thread's own held slot (from a `slot` wait) for the agent it
   wakes up to start, and every other thread's held slot whose wake-up is still to come counts that
-  wake-up as an agent of its own, so slot waits met in one sweep are each woken.
+  wake-up as an agent of its own, so slot waits met in one sweep are each woken. That held slot
+  lives in the gate's memory only: a wake-up that itself waits for a slot keeps it for
+  `reserveSeconds` at most, and a restart drops it, so that wake-up then asks like any other start
+  (late, never over the limit). A receiver found stopped frees its held slot at once.
 - The fork's delegated-result reminder and its orphan scan (a parent that is idle and still owed a
   child's result is sent one reminder) take a slot the same way. Refused, nothing is sent: the
   reminder is asked again every 5 s, however long it takes, and a refusal is not counted as a
   failed try (logged once). Its message and command ids are fixed per result, so a restart's
-  startup scan finds the result still owed, waits again and sends it once.
+  startup scan finds the result still owed, waits again and sends it once. An orphan scan parent
+  that cannot be read is asked again every 10 minutes, logged once, at most as many times in a row
+  as the scan's own attempts, then left to the next start. Once a waiting parent's reminder goes,
+  its linked threads are listed again, so an orphan that showed meanwhile is named too.
 - Upstream's pull request watch wake-ups (checks passed or failed, a review, merged or closed,
   "stopped watching") into a thread that shows no run take a slot the same way
   (`apps/server/src/fork/pullRequestWatchSlot.ts`). Refused, the update fails and nothing is
@@ -427,7 +445,11 @@ These routes start a new agent run and go through the same gate, with the same c
   2 minutes), finds the same news against the stored watch and sends it then, once. A restart
   finds it again from the stored watch. A watch that ends because its pull request cannot be read
   keeps its "stopped watching" wake-up the same way, and is not ended without it. Into a thread
-  that shows a run a wake-up only queues: no slot.
+  that shows a run a wake-up only queues: no slot. While a wake-up waits, upstream's reactor logs a
+  warning and reads the pull request in full (its details and activity) on every sweep, so a host
+  kept full with several watched pull requests spends GitHub API calls and log lines every 2
+  minutes per watch until a slot frees. A watch that no refusal renews for 10 minutes (removed, or
+  its thread gone) is forgotten by the gate's wrapper.
 - Upstream's usage-limit resume ("Continue where you left off." into each thread that failed on a
   limit, at its reset) takes a slot the same way (`apps/server/src/fork/limitResumeSlot.ts`), so a
   reset does not start every failed thread at once. Refused, nothing is sent: the thread stays
@@ -461,15 +483,45 @@ These are not gated, on purpose:
   gives back. Restart recovery resumes runs that were running when the server stopped.
   `t3_worktree_handoff` continues the same agent's work after its own turn.
 
-These four are not gated yet. Each can **start a run in an idle thread with no slot**, so a full
-host can go over its limit through them. Gating them is follow-up #724:
+These start a run in an idle thread on their own, and take a slot the same way
+([#724](https://github.com/scuttletoby/t3code/issues/724)). Into a thread that shows a run each
+only queues: no slot.
 
-- The fork's context handoff (`apps/server/src/fork/handoff/HandoffService.ts`): the idle-timer
-  trigger starts a run with fresh context after the thread's turn ended. It is off by default.
-- Upstream's provider continuation ("Background task completed"): an agent that ended its turn
-  while its own background work ran starts again when that work ends.
-- Upstream's delegated question replies: a child's question answered back into an idle parent.
-- Upstream's idle compaction: a compaction run started in an idle thread.
+- The fork's context handoff, and its one resend of a failed handoff run
+  (`apps/server/src/fork/handoff/handoffDispatch.ts`, after its busy check). Refused, nothing is
+  sent: it asks again every 5 s or at the thread's next event (logged once), deciding again each
+  time without a new settle, and a thread that moved on drops it. Like every handoff timer it is
+  memory only: a restart drops a waiting handoff, and the thread's next turn end decides again. A
+  waiting resend of a failed handoff run is dropped too, with no log: the failed run's text stays
+  in the thread, and the next turn end decides again.
+- Upstream's provider continuation ("Background task completed": an agent that ended its turn
+  while its own background work ran starts again when that work ends;
+  `apps/server/src/fork/continuationSlot.ts`). The slot is asked when upstream's worker takes the
+  request from its queue, never inside an adapter's `dispatchIfCurrent`, which holds the
+  adapter's own lock. Refused, the request goes back on the queue and is asked again every 5 s
+  (logged once); the adapter offers no second one meanwhile, and other threads' continuations
+  pass. A delegated result is left as above. It waits in memory, as upstream's queue does: a
+  restart loses it, as the restart ends the provider session whose background work it reports
+  (Claude's buffered output lives in that process).
+- A delegated task's question to its idle parent (upstream's question reactor;
+  `apps/server/src/fork/workerWakeSlots.ts`). Refused, nothing is sent: the wake is kept in
+  `fork-held-wakes.json` in the server's state folder and asked again every 5 s (logged once). It
+  leaves the file once sent, or when the question is answered, its task ends or the parent is
+  archived or deleted. A restart reads the file and sends it once; upstream's fixed command id
+  keeps a send cut off before the file write from making a second message. Saves run one at a
+  time, each writing what is held then. A file that cannot be read is moved to
+  `fork-held-wakes.json.corrupt-<ms>` beside it and logged, so the next save does not write over
+  it; an entry that cannot be read is logged and left out. A held wake whose parent or question
+  cannot be read waits, logged once.
+- Upstream's idle compaction (same file), after the handoff owner's check. Refused, it is skipped
+  (logged), not held: it only pays off while the prompt cache is warm, minutes before it expires,
+  and a late one costs a full uncached read. The next completed run arms a new one, as after a
+  restart. It is asked once: a thread whose window always falls while the slots are full does not
+  compact.
+
+Like the wake-ups above, the handoff, the continuation and the question wake hold no place in
+line: each asks again on its own 5 s timer, so under steady load a slot that frees between two
+asks can go to another start, and one can wait without limit. Nothing is lost or sent twice.
 
 The calling thread is left out of the count (it waits on its child). A start no thread on this
 machine asks for (a scheduled run, the owner's client, a call from another machine) has no caller, so
@@ -555,7 +607,10 @@ the thread its own profile; `delegate_task` carries the launcher's profile inste
 made by the sending machine: a T3 from before this check sends a narrowed thread's launch to a
 machine of this version unchecked, and there it arrives with no calling thread and gets that
 machine's profile. Editing or running a scheduled task on another machine, and a fork there, are
-covered below. A thread on `all`, and the owner's own client, launch as before.
+covered below; a T3 from before those checks sends them unchecked too, and each arrives here with
+no calling thread: a fork gets its project's profile cut to its source's, a change to a task is
+recorded as saved from another machine, and a run now is checked against the task's record (both
+below). A thread on `all`, and the owner's own client, launch as before.
 
 The same rule holds for the other ways such a thread starts a thread on this machine
 ([#693](https://github.com/scuttletoby/t3code/issues/693)). `schedule_task` is refused when the
@@ -564,13 +619,21 @@ is not within the caller's; a task bound to the caller runs in it and keeps its 
 to a task whose runs start new threads (also one made before this check), and unbinding a task from
 the caller, are refused the same way: delete the task, bind it to the caller
 (`bindToCurrentThread: true`), or ask the owner. `run_scheduled_task_now` on such a task is refused
-too. These refusals are checked again by the scheduled task service on the task it reads as it
-saves, so a change another caller makes in between is seen
-([#699](https://github.com/scuttletoby/t3code/issues/699)). Such a thread also cannot change the
-prompt, project or thread of a task bound to another thread whose profile is not within its own
-(that thread would run its words); reading, renaming, pausing it and changing its schedule still
-work. The `schedule_task` handler checks that before the service is called, so a refused change
-does not use up the webhook secretRef it carries.
+too. A retry of a `schedule_task` create that was accepted before is checked again, so it is
+refused when the profiles no longer allow it, though the task exists. These refusals are checked
+again by the scheduled task service on the task it reads as it saves, so a change another caller
+makes in between is seen ([#699](https://github.com/scuttletoby/t3code/issues/699)). A change that
+races the owner's move of the task's thread to another project (which moves the task with it) is
+refused when the move lands before the service reads the task, so it cannot put the task back in its
+old project without its thread; the task stays as the move left it, and is read and changed again
+([#704](https://github.com/scuttletoby/t3code/issues/704)). A move that lands after that read, in
+the short window before the row is written, is not seen: the task goes back to its old project and
+keeps its thread (a bound task stays bound, so its runs get no wider). The app's own save is not
+checked this way: the project the owner saves is the one they picked. A narrowed thread also
+cannot change the prompt, project or thread of a task bound to another thread whose profile is not
+within its own (that thread would run its words); reading, renaming, pausing it and changing its
+schedule still work. The `schedule_task` handler checks that before the service is called, so a
+refused change does not use up the webhook secretRef it carries.
 
 Each save records who made it: the owner (the app, or an MCP client of this machine with no
 thread), a thread here and its profile then, or another machine. Another machine does not say the
@@ -581,19 +644,35 @@ get more than the recorded profile, for example after the owner widened the proj
 is also refused when the task was saved from another machine, and when an agent made it and it has no
 entry (saved before this record, or the file was lost or an older copy put back). The owner saves
 the task once in the app to allow it; a task the owner made with no entry runs as before. A
-webhook delivery that waited for an agent slot is checked again as it starts. A refused scheduled run
-is recorded as failed with the reason and moves on to its next time; a one-time task then has no
-next time, so after the owner's save it is run now or given a new time (the reason says so). A task
-whose row changed after its record (a save stopped half-way) is refused until it is saved again, and
-a record file that cannot be read refuses saves and runs that start a new thread until it is fixed
-or removed. Runs into a bound thread keep that thread's profile and are not held up. That includes
-a task with `threadMode: "continue"` that has no thread yet: its first run is checked, later runs go
-into the thread that run made, and if the owner widens the project, that thread and those runs widen
-with it. A change saved from another machine is not checked against the thread a task is bound to
+webhook delivery that waited for an agent slot is checked again as it starts. If the task was saved
+again while it waited, it is read again and checked on the task as saved
+([#719](https://github.com/scuttletoby/t3code/issues/719)): a save the record allows runs it, once,
+with the new prompt. A scheduled run or `run_scheduled_task_now` whose read a save overtook (a
+short window as it starts) is refused, saying so; the next run uses the task as it is now. A
+refused scheduled run is recorded as failed with the reason and moves on to its next time; a
+one-time task then has no next time, so after the owner's save it is run now or given a new time
+(the reason says so). A task whose row changed after its record (a save
+stopped half-way) is refused until it is saved again, and a record file that cannot be read refuses
+saves and runs that start a new thread until it is fixed or removed (the server log warns once while
+it stays so, and again if it breaks again after a good read). Runs into a bound thread keep that
+thread's profile and are not held up. That includes a task with `threadMode: "continue"` that has
+no thread yet: its first run is checked, later runs go into the thread that run made, and if the
+owner widens the project, that thread and those runs widen with it.
+A change saved from another machine is not checked against the thread a task is bound to
 here: a current sender refuses a narrowed thread's change first, but a T3 from before that check
-forwards it. Entries of deleted tasks are dropped at each start.
+forwards it. A thread bound while a save is being made (the task's first run binding the thread it
+made, or another thread binding the task to itself) is kept by that save and not checked against
+it ([#719](https://github.com/scuttletoby/t3code/issues/719)): the first run's thread gets the
+project's profile the save was checked on, and a thread that binds the task to itself is one a
+narrowed thread can already send words to (`t3_thread_send`, as T3's own tools cannot be cut yet).
+A change that lets profiles cut T3's own tools (today `claudeMcpProfile.ts` refuses `t3Tools`
+other than `all`) must revisit this: then such a bind is a way to a wider run.
+An owner-made task that a narrowed thread changed runs as the owner's again if its entry is dropped
+from the file, which takes owner-level access to the state folder. Entries of deleted tasks are
+dropped at each start.
 `t3_thread_transfer`'s fork is refused when the fork would get more than the caller's profile: a
-fork gets its source's profile cut to the source's, so forking the caller itself always goes through, and a fork of a thread whose parent cannot be read is refused. On
+fork gets its project's profile cut to its source's, so forking the caller itself always goes
+through, and a fork of a thread whose parent cannot be read is refused. On
 another machine, a fork, a change to a scheduled task and `run_scheduled_task_now` are refused for
 such a thread, as a thread started there gets that machine's profile.
 

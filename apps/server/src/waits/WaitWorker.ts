@@ -14,6 +14,7 @@ import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 
 import { ServerConfig } from "../config.ts";
+import * as ContinuationSlot from "../fork/continuationSlot.ts";
 import * as LimitResumeSlot from "../fork/limitResumeSlot.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -119,7 +120,11 @@ export const layer = Layer.effect(
     );
     return waits;
   }),
-).pipe(Layer.provide(ProcessRunner.layer));
+).pipe(
+  Layer.provide(ProcessRunner.layer),
+  // The server's one slot gate: layers memoize by reference.
+  Layer.provide(SlotGate.layer),
+);
 
 /**
  * Upstream's usage-limit resume, which waits for a slot as a wait's wake-up does
@@ -127,3 +132,10 @@ export const layer = Layer.effect(
  * that file needs no import of a fork module more than it has.
  */
 export const limitResumeSlot = LimitResumeSlot.layer;
+
+/**
+ * Upstream's provider continuation, which waits for a slot as a wait's wake-up does
+ * (fork/continuationSlot.ts). runtimeLayer.ts gives it to upstream's continuation worker from
+ * here, so that file needs no import of a fork module more than it has.
+ */
+export const continuationSlot = ContinuationSlot.layer;

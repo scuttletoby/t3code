@@ -19,6 +19,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -66,7 +67,7 @@ const ENTRY_FIELDS: ReadonlySet<string> = new Set([
 const WHOM: ReadonlySet<string> = new Set<SavedByWhom>(["owner", "thread", "linked"]);
 
 /** What a run that starts a new thread does with: its prompt, in its project. */
-const savedDigest = (task: Pick<ScheduledTask, "prompt" | "projectId">): string =>
+const savedDigest = (task: { readonly prompt: string; readonly projectId: string }): string =>
   NodeCrypto.createHash("sha256")
     .update(JSON.stringify([task.prompt, task.projectId]))
     .digest("hex");
@@ -219,6 +220,12 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
   const sql = yield* SqlClient.SqlClient;
   const reads = yield* makeThreadMcpProfileReads;
   const lock = yield* Semaphore.make(1);
+  /** The unreadable file's text last logged, so a broken file is logged once, not at every run. */
+  const warned = yield* Ref.make<string | null>(null);
+  const warnOnce = (text: string) =>
+    Ref.getAndSet(warned, text).pipe(
+      Effect.flatMap((before) => (before === text ? Effect.void : Effect.logWarning(text))),
+    );
 
   const store =
     Option.isSome(config) && Option.isSome(fileSystem) && Option.isSome(paths)
@@ -257,6 +264,9 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
           ),
         );
 
+  // A good read (a save's, the start-up clean-up's or a run's): a later breakage is logged again.
+  const read = load.pipe(Effect.tap((loaded) => (loaded.ok ? Ref.set(warned, null) : Effect.void)));
+
   const unreadable = (issue: string) =>
     `The MCP profiles scheduled tasks were saved with (${where}) cannot be read: ${issue}. Fix that file (removing it lets the owner's tasks run; a task an agent made then waits until the owner saves it once in the T3 app).`;
 
@@ -265,7 +275,7 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
     lock.withPermits(1)(
       Effect.gen(function* () {
         if (store === undefined) return { ok: true as const };
-        const loaded = yield* load;
+        const loaded = yield* read;
         if (!loaded.ok) return { ok: false as const, issue: unreadable(loaded.issue) };
         const tasks = new Map(loaded.tasks);
         if (!change(tasks)) return { ok: true as const };
@@ -300,7 +310,7 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
         }
         return changed;
       });
-      if (!pruned.ok) yield* Effect.logWarning(pruned.issue);
+      if (!pruned.ok) yield* warnOnce(pruned.issue);
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("Scheduled task MCP profiles: could not drop deleted tasks", { cause }),
@@ -331,6 +341,16 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
     // task's runs that start a new thread wait for an owner save (never taken as the owner's).
     const linked =
       callerId === undefined && Option.isSome(scope) && scope.value.client?.linked === true;
+    // An MCP call never moves a task (`schedule_task` cannot change a task's project), so a project
+    // that differs from the row the service read means the owner moved the task's thread, and the
+    // task with it, after the call read the task. Saved, it would move the task back and unbind it
+    // (upstream's `movedOffThread`), turning a bound task into one that starts new threads.
+    if (Option.isSome(scope) && existing !== null && existing.projectId !== task.projectId) {
+      return yield* refuse(
+        task,
+        "This task was moved to another project (with its thread) while this save was being made, so it was not saved and the task is as it was. Read it again and save it again.",
+      );
+    }
     const recordedAt = DateTime.formatIso(DateTime.toUtc(yield* DateTime.now));
     const record = (savedBy: Omit<SavedBy, "digest" | "recordedAt">) =>
       update((tasks) => {
@@ -404,9 +424,11 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
   ) {
     // A test of the service alone: nothing is recorded, so nothing is checked (see above).
     if (store === undefined) return null;
-    const loaded = yield* load;
-    if (!loaded.ok)
+    const loaded = yield* read;
+    if (!loaded.ok) {
+      yield* warnOnce(unreadable(loaded.issue));
       return `Not run: ${unreadable(loaded.issue)}${afterSave(task, "once it is fixed")}`;
+    }
     const savedBy = loaded.tasks.get(task.id);
     if (savedBy === undefined) {
       if (task.createdBy !== "agent") return null;
@@ -414,6 +436,20 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
     }
     // Changed since its record (a save stopped half-way, two saves at once): writer not known.
     if (savedBy.digest !== savedDigest(task)) {
+      // Unless this copy is the stale one: a run holds the task as it read it (a run whose read a
+      // save overtook; a webhook delivery that waited for a slot is read again after a save, in
+      // `agentSlotRoutes.ts`), and a save since then wrote the row and its record. That run would use the old copy, so it is not started. Only
+      // for this same task (`created_at`): one deleted and made again under its id is not "saved".
+      const [current] = yield* sql<{ prompt: string; project_id: string; created_at: string }>`
+        SELECT prompt, project_id, created_at FROM scheduled_tasks WHERE task_id = ${task.id}
+      `.pipe(Effect.orElseSucceed(() => []));
+      if (
+        current !== undefined &&
+        current.created_at === task.createdAt &&
+        savedDigest({ prompt: current.prompt, projectId: current.project_id }) === savedBy.digest
+      ) {
+        return `Not run: this task was saved again after this run read it, and the run would have used the task as it was before, so it was not started.${task.schedule.type === "once" ? afterSave(task) : " The next run, or the next webhook delivery, uses the task as it is now."}`;
+      }
       return `Not run: this task changed after the MCP profile it was saved with was recorded, so who wrote it is not known. Save the task again (in the T3 app, or from the thread that should own it) to run it.${afterSave(task)}`;
     }
     if (savedBy.by === "linked") {

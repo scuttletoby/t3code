@@ -4085,8 +4085,6 @@ MAY_SKIP = {
         "test_refresh_net_takes_only_roots_lookup_stamp", "test_root_deletes_nothing_in_dev_shm",
         "test_the_real_job_unit_writes_its_copy_and_nothing_else", "test_the_walls_hold_in_a_real_systemd_unit",
         "test_the_walls_proof_refuses_a_host_with_a_pools_users")],
-    # A real systemd services sandbox, which a hosted runner does not give.
-    ".github/scripts/fork-fleet-refresh.test.py": ["Refresh.test_a_real_run_in_the_services_sandbox"],
     # Needs a checkout that is not a merge commit; CI's pull request checkout is one.
     "fork-ci/actions/head-check/head_check.test.py": [
         "SameChangeBare.test_a_checkout_that_is_not_a_merge_commit_is_refused"],
@@ -4136,10 +4134,12 @@ CHECK_SCRIPT = check_script(CHECK_STEP["run"])
 REAL_RECORD_JOBS = json.loads(CHECK_STEP["env"]["RECORD_JOBS"])
 FIX_RUN, FIX_SHA = "4242", "c0ffee" + "0" * 34
 # A Python test's result as the runner reads it: the lines fork-ci-unittest.py wrote (`unittest`: a plan, then its
-# counts), each test by name; a node test's, the line fork-ci-node-counts.cjs wrote.
-def py(tests, skipped=()):
+# counts, each test by name, then its end line: the tests the file defines that no run loaded); a node test's, the
+# line fork-ci-node-counts.cjs wrote.
+def py(tests, skipped=(), unloaded=()):
     return {"status": 0, "seconds": "1.0", "stdout": "", "stderr": f"Ran {tests} tests in 0.1s\n\nOK\n",
-            "unittest": [{"plan": tests}, {"tests": tests, "skipped": list(skipped), "failed": 0}]}
+            "unittest": [{"plan": tests}, {"tests": tests, "skipped": list(skipped), "failed": 0},
+                         {"unloaded": list(unloaded)}]}
 
 
 def js(tests, skipped=0, **more):
@@ -4431,6 +4431,16 @@ RECORDS_REFUSED = {
     "a Python test that exited hard half-way (a plan, no counts), its stdout a child's ok lines": (set_row(
         "fork-kit/k1.test.py", {**PY_OK, "stdout": "ok child\nall passed: 1 ok, 0 skipped\n",
                                 "unittest": [{"plan": 4}]}), {}, "fork-kit/k1.test.py: no test count"),
+    # A hard stop before the first plan (as the file loads) leaves no shim line: not read as ok lines (#702).
+    "a Python test that stopped hard before its first plan (no shim line), its stdout a child's ok and end lines": (
+        set_row("fork-kit/k1.test.py", {**PY_OK, "stdout": "ok child\nall passed: 1 ok, 0 skipped\n",
+                                        "unittest": []}), {}, "fork-kit/k1.test.py: no test count"),
+    "a Python test whose runs ended but the file did not (no end line)": (set_row(
+        "fork-kit/k1.test.py", {**PY_OK, "unittest": PY_OK["unittest"][:-1]}), {}, "fork-kit/k1.test.py: no test count"),
+    # A test the file defines that no run loaded is a skip by its name, held to the declarations like any (#702).
+    "a Python test that never loaded a test its source defines (not declared)": (set_row(
+        "fork-kit/k1.test.py", py(4, unloaded=["Tool.test_b"])), {},
+        "fork-kit/k1.test.py skipped ['Tool.test_b'], but may and must skip []"),
     "a node test whose only test was the file itself (empty, a top-level return, an early exit)": (set_row(
         "fork-ci/b.test.cjs", js(0, file_test=True)), {}, "fork-ci/b.test.cjs: no test count"),
     "a node test that exited half-way (tests started that never ended)": (set_row(

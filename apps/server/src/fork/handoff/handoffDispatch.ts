@@ -8,6 +8,8 @@ import * as Effect from "effect/Effect";
 
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as SlotGate from "../../slots/SlotGate.ts";
+import { admitSend, reasonHere } from "../agentSlotRoutes.ts";
 import { type HandoffRecords, handoffDispatchDropped } from "./handoffFacts.ts";
 
 export type HandoffDispatchCommand = Extract<
@@ -51,19 +53,35 @@ export const readHandoffRecords = Effect.fn("HandoffDispatch.readRecords")(funct
   return { ...records, thread, messages } satisfies HandoffRecords;
 });
 
+/** Nothing was sent: the gate refused the run the handoff would start (`detail` says why). */
+export interface HandoffWaitsForSlot {
+  readonly type: "waitsForSlot";
+  readonly detail: string;
+}
+
 /**
- * Sends a handoff message only to a quiet thread at its source run (see the file comment). One
- * uninterruptible step: a replaced timer or a shutdown cannot stop it between the send and the cancel.
+ * Sends a handoff message only to a quiet thread at its source run (see the file comment), with an
+ * agent slot when the server has a gate. One uninterruptible step: a replaced timer or a shutdown
+ * cannot stop it between the send and the cancel.
  */
 export const dispatchHandoff = Effect.fn("HandoffDispatch.dispatch")(function* (
   command: HandoffDispatchCommand,
 ) {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
-  if (handoffDispatchDropped(command, yield* readHandoffRecords(command.threadId))) {
+  const records = yield* readHandoffRecords(command.threadId);
+  if (handoffDispatchDropped(command, records)) {
     yield* Effect.logInfo("handoff dropped: the thread moved on", { threadId: command.threadId });
     return "dropped" as const;
   }
+  const slot = yield* admitSend(yield* Effect.serviceOption(SlotGate.SlotGate), {
+    callerThreadId: command.threadId,
+    threadId: command.threadId,
+    instanceId: (command.modelSelection ?? records.thread.modelSelection).instanceId,
+    keepsHeld: true,
+  });
+  if (slot.type === "refuse")
+    return { type: "waitsForSlot", detail: reasonHere(slot.refusal) } satisfies HandoffWaitsForSlot;
   yield* orchestrator.dispatch(command);
   const { runs } = yield* projections.getThreadRecords(command.threadId, ["runs"], {
     runStatuses: ["queued"],

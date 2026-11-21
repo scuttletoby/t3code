@@ -34,6 +34,16 @@ export class DelegatedResultsStore extends Context.Service<
       threadId: ThreadId,
       prefix: string,
     ) => Effect.Effect<ReadonlyArray<string> | null>;
+    /**
+     * The text of each of these messages of this thread, by message id. Read from each row alone
+     * (the table's search triggers keep every payload JSON), so a row whose payload has no text
+     * string (an old or broken one) is left out and the others still count. Null: the table
+     * cannot be read now.
+     */
+    readonly messageTexts: (
+      threadId: ThreadId,
+      messageIds: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyMap<string, string> | null>;
   }
 >()("t3/fork/delegatedResults/DelegatedResultsStore") {}
 
@@ -111,7 +121,37 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  return DelegatedResultsStore.of({ parentsWithUnreadResults, remoteChildrenOf, sentIds });
+  const messageTexts: DelegatedResultsStore["Service"]["messageTexts"] = (threadId, messageIds) =>
+    messageIds.length === 0
+      ? Effect.succeed(new Map())
+      : sql<{ readonly id: string; readonly text: unknown }>`
+          SELECT
+            message_id AS id,
+            json_extract(payload_json, '$.text') AS text
+          FROM orchestration_v2_projection_messages
+          WHERE thread_id = ${threadId}
+            AND message_id IN (SELECT value FROM json_each(${JSON.stringify([...new Set(messageIds)])}))
+        `.pipe(
+          Effect.map(
+            (rows) =>
+              new Map(
+                rows.flatMap((row) => (typeof row.text === "string" ? [[row.id, row.text]] : [])),
+              ),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("delegated result reminder: a thread's messages cannot be read", {
+              threadId,
+              cause,
+            }).pipe(Effect.as(null)),
+          ),
+        );
+
+  return DelegatedResultsStore.of({
+    parentsWithUnreadResults,
+    remoteChildrenOf,
+    sentIds,
+    messageTexts,
+  });
 });
 
 export const layer = Layer.effect(DelegatedResultsStore, make);

@@ -4,9 +4,11 @@
 
 State: {"proc": fake /proc folder, "units": {name: {MainPID, ControlPID, Description, ActiveState}},
 "systemdDown": bool, "stuckUnits": [names], "containers": [docker inspect objects], "dockerDown": bool,
-"vanishOnRm": [ids], "calls": [[tool, args...]]}. Stopping a unit removes the fake processes in it.
-docker also takes `run [-d] [--label K=V]... [--name N] IMAGE ...` (tests/heavy.test.py: a container a test starts),
-and `ps --filter label=K` or `label=K=V` as Docker reads it (split at the first "=").
+"vanishOnRm": [ids], "psMatchesKeyOnly": bool, "calls": [[tool, args...]]}. Stopping a unit removes the fake
+processes in it. docker also takes `run [-d] [--label K=V]... [--name N] IMAGE ...` (tests/heavy.test.py: a container
+a test starts), and `ps --filter label=K` or `label=K=V` as Docker reads it (split at the first "="); with
+psMatchesKeyOnly, `label=K=V` matches every container with the key K (a looser filter than Docker's: the caller's
+own exact check must then keep the others out).
 """
 import fcntl, fnmatch, json, os, secrets, shutil, sys, time
 
@@ -87,7 +89,8 @@ def docker(state, args):
             if c.get('hideFromPs'):
                 continue
             labels = c['Config'].get('Labels') or {}
-            if label is not None and (key not in labels or (has_value and labels[key] != value)):
+            exact = has_value and not state.get('psMatchesKeyOnly')
+            if label is not None and (key not in labels or (exact and labels[key] != value)):
                 continue
             if '-a' not in args and not c['State']['Running']:
                 continue

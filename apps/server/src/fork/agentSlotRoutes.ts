@@ -335,6 +335,13 @@ export const runNowSlotRefusal = (error: OrchestratorMcpFailure): OrchestratorMc
     ? slotsFull(error.message)
     : error;
 
+/**
+ * A direct webhook delivery waiting in memory (its store failed) whose task was saved meanwhile, and
+ * that could not be stored again: its prompt is the one from before the save, so it is not run.
+ */
+export const SAVED_WHILE_WAITING_NOT_STORED =
+  "Not run: this task was saved again while this delivery waited for an agent slot, and the delivery could not be stored to run on the task as it is now (the server log says why), so it was not started: it would have used the task as it was before. The next webhook delivery uses the task as it is now.";
+
 /** How often a webhook delivery that waits for a slot asks again (the scheduler's poll). */
 export const WEBHOOK_SLOT_RETRY = Duration.seconds(5);
 
@@ -397,6 +404,12 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
    * `ended` frees it on a path that never reached the end (a failure before the dispatch).
    */
   const open = new Map<string, (threadId: ThreadId | null) => Effect.Effect<void>>();
+
+  /**
+   * Tasks whose stored webhook delivery was not started because the task was saved while it waited
+   * for a slot (`waitForWebhookSlot`): the stored-delivery worker keeps its row (`keepStored`).
+   */
+  const keep = new Set<string>();
 
   /**
    * Where a run starts: a bound task runs on its thread's current provider (a thread that cannot
@@ -497,6 +510,28 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   });
 
   /**
+   * The row was written since `task` was read (a save while a delivery waited; the prompt too, as a
+   * save in the same millisecond keeps `updated_at`), or cannot be read: never run on this copy. A
+   * bind writes only the thread, but not during a wait: a webhook task's runs take turns.
+   */
+  const writtenSince = (task: ScheduledTask) =>
+    sql<{ updated_at: string; prompt: string }>`
+      SELECT updated_at, prompt FROM scheduled_tasks WHERE task_id = ${task.id}
+    `.pipe(
+      Effect.map(
+        ([row]) =>
+          row === undefined || row.updated_at !== task.updatedAt || row.prompt !== task.prompt,
+      ),
+      Effect.orElseSucceed(() => true),
+    );
+
+  /** A webhook delivery the stored-delivery worker owns now: this run of it ends unstarted. */
+  const handedToWorker = (task: ScheduledTask): ScheduledSlot => ({
+    skipped: { task, threadId: null, dispatchFailed: false },
+    end: () => Effect.void,
+  });
+
+  /**
    * A direct delivery the gate refused is stored as a pending delivery the stored-delivery worker
    * owns (due now), so a restart keeps it; its in-memory copy then ends without running, and the
    * worker runs it once. `false` when there is nothing to store (a stored delivery already) or the
@@ -536,9 +571,9 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   );
 
   /**
-   * A stored webhook delivery waits for a slot: asked again every few seconds until one is free
-   * (its pending row stays as it is, so a restart picks it up again, once). It is dropped only for
-   * the reasons a queued delivery is (the task deleted, replaced, paused or no longer a webhook).
+   * A stored webhook delivery waits for a slot, asked again every few seconds (a restart picks its
+   * row up again, once). Dropped only as a queued delivery is (task deleted, replaced, paused, not a
+   * webhook). Saved while it waits, it is handed back to the worker to run on the task as saved.
    */
   const waitForWebhookSlot = Effect.fnUntraced(function* (task: ScheduledTask, first: Refused) {
     yield* Effect.logInfo("Webhook delivery waits for an agent slot", {
@@ -549,6 +584,12 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       yield* Effect.sleep(WEBHOOK_SLOT_RETRY);
       const gone = yield* webhookGone(task).pipe(Effect.orElseSucceed(() => null));
       if (gone !== null) return yield* Effect.fail(new WebhookSkipped({ reason: gone }));
+      if (yield* writtenSince(task)) {
+        if ((yield* CurrentDirectDelivery) === undefined) keep.add(task.id);
+        else if (!(yield* storeDirect(task, yield* DateTime.now)))
+          return yield* Effect.fail(new WebhookSkipped({ reason: SAVED_WHILE_WAITING_NOT_STORED }));
+        return handedToWorker(task);
+      }
       // Checked again as it would start: the owner may have widened the project meanwhile.
       const refused = task.threadId === null ? yield* profiles.runRefusal(task) : null;
       if (refused !== null) return yield* Effect.fail(new WebhookSkipped({ reason: refused }));
@@ -607,11 +648,7 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       });
     }
     if (trigger === "webhook") {
-      if (yield* storeDirect(task, now))
-        return {
-          skipped: { task, threadId: null, dispatchFailed: false },
-          end: () => Effect.void,
-        } as ScheduledSlot;
+      if (yield* storeDirect(task, now)) return handedToWorker(task);
       return yield* waitForWebhookSlot(task, slot);
     }
     yield* keepDue(task, now, slot.refusal).pipe(
@@ -627,6 +664,13 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       end: () => Effect.void,
     } as ScheduledSlot;
   });
+
+  /**
+   * The stored-delivery worker, after a delivery's run returned: `true` when that run was not
+   * started because its task was saved while it waited, so the worker keeps the row and runs it
+   * again on the task as it is now, instead of removing it. Read once.
+   */
+  const keepStored = (taskId: string) => Effect.sync(() => keep.delete(taskId));
 
   /** The task's run ended, any way: a slot its dispatch never ended is free again. */
   const ended = (taskId: string) => Effect.suspend(() => open.get(taskId)?.(null) ?? Effect.void);
@@ -659,6 +703,7 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
     admit: admitRun,
     ended,
     directDelivery,
+    keepStored,
     /** `ScheduledTaskService.upsert`, last before it writes the row (`scheduledTaskMcpProfile.ts`). */
     saving: profiles.saving,
   };
