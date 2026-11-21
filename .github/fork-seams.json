@@ -243,11 +243,32 @@
       ]
     },
     "apps/server/src/mcp/toolkits/project/handlers.ts": {
-      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681).",
+      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import { checkLaunchSlot } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+          "yield* checkLaunchSlot(caller, { threadId, modelSelection, replaying, input, attachments }); // Fork: agent slots"
+        ]
+      }
+    },
+    "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
+      "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule is recorded as skipped with the reason and its next time, run now fails, a webhook delivery is marked failed (fork/agentSlotRoutes.ts, #706).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import { makeScheduledRunSlots } from \"../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+          "const runSlots = yield* makeScheduledRunSlots(WebhookDeliverySkipped); // Fork: agent slots",
+          "const slot = yield* runSlots.admit(active, trigger, startedAt, rescheduleMissedRun); // Fork: agent slots",
+          "if (slot.skipped !== null) return slot.skipped; // Fork: a skipped run is recorded",
+          "yield* slot.end(threadId); // Fork: the slot names the run's thread"
+        ]
+      }
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693).",
