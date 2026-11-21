@@ -42,7 +42,8 @@ heavy never runs a command uncapped: it refuses (exit 1) when the systemd user m
 slice has no unit or no memory limit. Inside another heavy command it runs the command in the outer scope, which
 the outer heavy cleans up (HEAVY_KEEP=1 still gets a scope of its own).
 
-The command's environment is exactly heavy's, plus HEAVY_SCOPE (the scope's unit name). Kept scopes are named
+The command's environment is exactly heavy's, plus HEAVY_SCOPE (the scope's unit name) and HEAVY_MARKS (which
+folders heavy reads the notes of `heavy docker-label` from, as device:inode). Kept scopes are named
 heavy-keep-<name>-<random>.scope, all others heavy-<name>-<random>.scope (never heavy-keep-...).
 
 Settings: /etc/heavy/config.json ({"slice": "heavy.slice", "grace_seconds": 30}), or the file HEAVY_CONFIG names;
@@ -71,6 +72,7 @@ LABEL = 'fork-kit.heavy.owner'  # the container owner label (lib/heavy_sweep.py 
 DOCKER_SOCKET = '/var/run/docker.sock'
 DOCKER_DIRS = ('/usr/bin', '/bin', '/usr/local/bin')
 RUNTIME_ROOT = '/run/user'      # <root>/<uid>/heavy/labelled: the scopes `heavy docker-label` labelled a container for
+STATE_ROOT = ''                 # <root>/heavy/labelled: the same, where /run/user is out of reach ('' = ~/.local/state)
 DOCKER_TIMEOUT = 20
 MAX_NAMES = 5
 # Python sets these to SIG_IGN at startup, and SIG_IGN survives exec: put them back before the command starts
@@ -278,23 +280,24 @@ def in_cgroup(pid, cg):
 def signal_in(pids, cg, sig):
     """Send sig to each of the pids that is still in the cgroup. A pid read from cgroup.procs can be another
     process by now (the first one ended, the pid was reused): a pidfd pins the process before its cgroup is checked,
-    so such a pid is never signalled."""
+    so such a pid is never signalled. Without pidfds (Linux before 5.3, Python before 3.9) nothing is sent: between
+    the check and a kill by pid the pid could go to another process. The KILL then goes to cgroup.kill alone, or
+    the processes are reported as still running (and the leftover sweep looks again)."""
     pidfd_open = getattr(os, 'pidfd_open', None)
+    if pidfd_open is None:
+        return
     for pid in pids:
         try:
-            fd = pidfd_open(pid) if pidfd_open else None
-        except ProcessLookupError:
+            fd = pidfd_open(pid)
+        except OSError:         # gone (ProcessLookupError), or no pidfds in this kernel: never by pid
             continue
-        except OSError:         # no pidfds (Linux before 5.3): only the check, a tiny window is left
-            fd = None
         try:
             if in_cgroup(pid, cg):
-                signal.pidfd_send_signal(fd, sig) if fd is not None else os.kill(pid, sig)
+                signal.pidfd_send_signal(fd, sig)
         except OSError:
             pass
         finally:
-            if fd is not None:
-                os.close(fd)
+            os.close(fd)
 
 
 def kill_cgroup(cg):
@@ -365,15 +368,14 @@ def docker_context():
     return name if isinstance(name, str) and name not in ('', 'default') else ''
 
 
-def marks_dir():
-    """The folder in which `heavy docker-label` notes each scope it labelled a container for (lib/heavy_sweep.py
-    note_label, the same rule), made if missing: heavy asks Docker after a run only when the run's scope is noted
-    there, so a run that never labelled a container never starts or waits for the Docker daemon. '' when there is
-    no such folder this user alone owns: then heavy asks Docker after every run."""
+def own_folder(base, make_base=False):
+    """<base>/heavy/labelled, made if missing: '' unless it, its parent and base are folders this user owns and
+    only this user can write."""
     uid = os.getuid()
-    base = os.path.join(RUNTIME_ROOT, str(uid))
     path = os.path.join(base, 'heavy', 'labelled')
     try:
+        if make_base:
+            os.makedirs(base, 0o700, exist_ok=True)
         for folder in (base, os.path.dirname(path), path):
             if folder != base:
                 try:
@@ -388,15 +390,57 @@ def marks_dir():
     return path
 
 
+def marks_dir():
+    """The folder in which `heavy docker-label` notes each scope it labelled a container for (lib/heavy_sweep.py
+    note_label, the same rule), made if missing: heavy asks Docker after a run only when the run's scope is noted
+    there, so a run that never labelled a container never starts or waits for the Docker daemon. '' when there is
+    no such folder this user alone owns."""
+    return own_folder(os.path.join(RUNTIME_ROOT, str(os.getuid())))
+
+
+def state_marks_dir():
+    """The second folder for those notes, in the user's state folder: `heavy docker-label` writes there when its
+    note in marks_dir() cannot reach heavy (/run/user full, or another one in a sandbox's own mount namespace)."""
+    return own_folder(STATE_ROOT or os.path.join(os.path.expanduser('~'), '.local', 'state'), make_base=True)
+
+
+def marks_dirs():
+    """The folders heavy reads notes from: none when it has neither (then it asks Docker after every run)."""
+    return tuple(m for m in (marks_dir(), state_marks_dir()) if m)
+
+
+def marks_ids(marks):
+    """HEAVY_MARKS for the command: device:inode of each folder, so `heavy docker-label` can tell whether the folder
+    it wrote its note into is one heavy reads (the same path in another mount namespace is another folder)."""
+    ids = []
+    for m in marks:
+        try:
+            st = os.stat(m)
+        except OSError:
+            continue
+        ids.append(f'{st.st_dev}:{st.st_ino}')
+    return ','.join(ids)
+
+
+def give_marks(env, marks):
+    """HEAVY_MARKS in the command's environment: this heavy's folders, or none (then heavy asks Docker after every
+    run); never an outer heavy's value or one left in a shell, which docker-label would trust."""
+    ids = marks_ids(marks)
+    if ids:
+        env[b'HEAVY_MARKS'] = ids.encode()
+    else:
+        env.pop(b'HEAVY_MARKS', None)
+
+
 def labelled(marks, unit):
-    """True when the scope labelled a container, or when heavy cannot tell (no marks folder)."""
-    return not marks or os.path.exists(os.path.join(marks, unit))
+    """True when the scope labelled a container (a note in one of the folders), or when heavy cannot tell (none)."""
+    return not marks or any(os.path.exists(os.path.join(m, unit)) for m in marks)
 
 
 def forget(marks, unit):
-    if marks:
+    for m in marks:
         try:
-            os.unlink(os.path.join(marks, unit))
+            os.unlink(os.path.join(m, unit))
         except OSError:
             pass
 
@@ -475,7 +519,7 @@ class ScopeGuard:
     forwards or handles (a terminal's, a service stop's TERM): it waits for heavy. It holds no open file of heavy's
     but stderr, and keeps nothing of the scope: a queued job's ticket ends with it."""
 
-    def __init__(self, systemctl, docker, unit, grace, marks=''):
+    def __init__(self, systemctl, docker, unit, grace, marks=()):
         self.w = self.alive = None
         try:
             r, w = os.pipe()                # heavy -> guard: "d", or end of file when heavy is gone
@@ -532,7 +576,7 @@ class ScopeGuard:
         self.w, self.alive = w, alive_r
 
     @staticmethod
-    def clean(systemctl, docker, unit, grace, marks=''):
+    def clean(systemctl, docker, unit, grace, marks=()):
         cg, pids = scope_state(systemctl, unit)
         text = describe(pids) if pids else ''
         left = stop_scope(systemctl, unit, cg, grace) if cg else []
@@ -802,7 +846,8 @@ def run_scope(argv, cfg, env, systemctl, systemd_run, keep, unit, grace, sampler
     cmd = [systemd_run, '--user', '--scope', '--quiet', '--collect', f'--slice={cfg["slice"]}', f'--unit={unit}',
            '-p', f'TimeoutStopSec={grace:g}s', '--', *argv]
     docker = docker_tool()
-    marks = marks_dir()     # also without Docker: a note `heavy docker-label` leaves is forgotten at the end
+    marks = marks_dirs()    # also without Docker: a note `heavy docker-label` leaves is forgotten at the end
+    give_marks(env, marks)
     # a kept scope outlives heavy on purpose: no guard for it (the command still dies with heavy)
     guard = None if keep else ScopeGuard(systemctl, docker, unit, grace, marks)
     probe = GroupProbe(list(WATCH + FORWARD))
@@ -830,7 +875,7 @@ def unchecked(why, unit):
 
 
 def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, sampler=None, docker=None, guard=None,
-                   marks=''):
+                   marks=()):
 
     # The first INT/TERM/HUP/QUIT reaches the command (heavy passes it on when it was sent to heavy alone); heavy
     # gives the command the grace time to end, then stops the whole scope. A second one stops the scope at once.
