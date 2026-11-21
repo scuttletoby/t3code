@@ -22,6 +22,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { TestClock } from "effect/testing";
 
+import * as OrchestratorV2 from "../orchestration-v2/Orchestrator.ts";
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ActiveRunShells from "./ActiveRunShells.ts";
@@ -49,6 +50,8 @@ interface World {
   /** Threads the projection shows with an active run; `unit`: their own agent scope. */
   threads: Array<{ id: string; unit?: string }>;
   snapshotReads: number;
+  /** The thread list cannot be read (the count read fails). */
+  snapshotFails?: boolean;
   /** The machine: files by path; a path not listed is missing. */
   files: Map<string, string>;
   hostReads: number;
@@ -118,8 +121,13 @@ const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue>) =>
       Layer.mergeAll(
         ServerSettings.layerTest(settings),
         Layer.mock(ActiveRunShells.ActiveRunShells)({
-          read: Effect.sync(() => {
+          read: Effect.suspend(() => {
             world.snapshotReads += 1;
+            if (world.snapshotFails) {
+              return Effect.fail(
+                new OrchestratorV2.OrchestratorProjectionError({ threadId: caller }),
+              );
+            }
             const shells = world.threads.map(
               (thread) =>
                 ({
@@ -128,12 +136,13 @@ const layerFor = (world: World, settings: DeepPartial<ServerSettingsValue>) =>
                   activeRunId: `run:${thread.id}`,
                 }) as unknown as OrchestrationV2ThreadShell,
             );
-            return {
+            const snapshot = {
               schemaVersion: 1,
               snapshotSequence: 1,
               threads: shells,
               archivedThreads: [],
             } satisfies OrchestrationV2ThreadShellSnapshot;
+            return Effect.succeed(snapshot);
           }),
         }),
         Layer.mock(HostResources.HostResources)({
@@ -269,6 +278,38 @@ describe("SlotGate observe mode", () => {
       assert.strictEqual(status.last?.today, "allow");
       assert.isAbove(world.hostReads, 0);
     }),
+  );
+
+  it.effect(
+    "a thread list that cannot be read: refused in observe mode too; the rule sees it",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.snapshotFails = true;
+        const [refused, first, allowed, second] = yield* run(
+          world,
+          {
+            agentSlots: { enabled: true, mode: "observe", maxPerMachine: 5, minFreeMemoryMb: 100 },
+          },
+          Effect.gen(function* () {
+            const refused = yield* acquire;
+            const first = yield* statusAfter(1);
+            // Runs again: the list reads now, and the refusal left no record behind.
+            world.snapshotFails = false;
+            const allowed = yield* acquire;
+            return [refused, first, allowed, yield* statusAfter(2)] as const;
+          }),
+        );
+        assert.deepStrictEqual(refused, {
+          type: "refuse",
+          message: SlotGate.countUnreadRefusalText("error"),
+        });
+        // The rule beside it got today's refusal and could not read the pieces either.
+        assert.deepInclude(first.last, { today: "refuse", readings: "failed", pieces: null });
+        assert.strictEqual(allowed.type, "allow");
+        // The refusal left no start in the gate's records: the allowed call sees none before it.
+        assert.deepInclude(second.last, { today: "allow", pieces: 0 });
+      }),
   );
 
   it.effect("the observation starts after the decision returns, never on the caller's stack", () =>
