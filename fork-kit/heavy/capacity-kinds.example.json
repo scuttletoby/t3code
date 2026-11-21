@@ -1,17 +1,16 @@
 {
   "version": 1,
-  "percentile": 95,
   "marginPercent": 20,
   "minRuns": 5,
   "recentRuns": 50,
   "roundMb": 128,
-  "minMb": 256,
+  "measure": "need",
   "kinds": {
-    "review": { "fallbackMb": 1024, "note": "a read-only reviewer" },
-    "node-tests": { "fallbackMb": 1536, "note": "a writer that runs Node tests only" },
-    "python-tests": { "fallbackMb": 1536, "note": "a writer that runs Python tests only" },
-    "test-run": { "fallbackMb": 2048, "note": "a test run of a built project" },
-    "gradle-build": { "fallbackMb": 3072, "maxMb": 6144, "note": "a Gradle build" },
-    "test-server": { "fallbackMb": 3072, "maxMb": 6144, "note": "a private test server" }
+    "review": { "fallbackMb": 1024, "agent": true, "measured": false, "note": "starts a read-only reviewer; it runs nothing under heavy, so it is never measured" },
+    "node-tests": { "fallbackMb": 1536, "agent": true, "note": "starts a writer that runs Node tests only (heavy --measure node-tests npm test): never below the fallback" },
+    "python-tests": { "fallbackMb": 1536, "agent": true, "note": "starts a writer that runs Python tests only: never below the fallback" },
+    "test-run": { "fallbackMb": 2048, "note": "right before exactly the command run as heavy --measure test-run ..." },
+    "gradle-build": { "fallbackMb": 3072, "minMb": 2048, "maxMb": 6144, "note": "right before heavy --measure gradle-build ./gradlew ...; never below 2048" },
+    "test-server": { "fallbackMb": 3072, "maxMb": 6144, "note": "right before heavy --measure test-server ..." }
   }
 }

@@ -769,6 +769,7 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, s
     if sampler is not None:             # one more look before the leftovers stop; every run teaches the queue,
         sampler.sample()                # failed and killed ones too (the reservation only ever goes up)
         if status is not None:          # after a signal to heavy only a short try for the lock: it wants out
+            sampler.status = status     # the exit code goes into the measured record
             sampler.record() if got is None else sampler.record_soon()
 
     if status is None:                              # a signal to heavy, and the command is still running
@@ -783,6 +784,7 @@ def wait_and_clean(child, probe, systemctl, unit, keep, grace, watch, forward, s
             pass
         _, status = os.waitpid(child.pid, 0)
         if sampler is not None:         # stop now: after the scope stop, and only a short try for the queue lock
+            sampler.status = status
             sampler.record_soon()
         name = signal.Signals(got).name
         if text:

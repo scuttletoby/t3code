@@ -34,16 +34,16 @@ def hm():
 
 
 KINDS = {
-    'version': 1, 'percentile': 90, 'marginPercent': 25, 'minRuns': 3, 'recentRuns': 10, 'roundMb': 128,
-    'minMb': 256,
-    'kinds': {'node-tests': {'fallbackMb': 1536}, 'gradle-build': {'fallbackMb': 3072, 'maxMb': 8192},
-              'review': {'fallbackMb': 1024}},
+    'version': 1, 'marginPercent': 25, 'minRuns': 3, 'recentRuns': 10, 'roundMb': 128,
+    'kinds': {'node-tests': {'fallbackMb': 1536, 'agent': True},
+              'gradle-build': {'fallbackMb': 3072, 'minMb': 256, 'maxMb': 8192},
+              'review': {'fallbackMb': 1024, 'agent': True, 'measured': False}},
 }
 
 
-def rec(kind, used=None, peak=None, end='exited'):
+def rec(kind, used=None, peak=None, end='exited', need=None, code=0):
     return {'v': 1, 'at': '2026-11-21T00:00:00Z', 'kind': kind, 'end': end, 'seconds': 1.0, 'usedMb': used,
-            'peakMb': peak}
+            'peakMb': peak, 'needMb': need, 'code': code}
 
 
 class Base(unittest.TestCase):
@@ -77,7 +77,8 @@ class Base(unittest.TestCase):
         e.pop('HEAVY_CAPACITY_FRONT', None)
         e.update(env or {})
         return subprocess.run([sys.executable, '-I', '-B', HEAVY, 'capacity', '--kinds', kinds or self.kinds,
-                               '--check', self.check, *args], capture_output=True, text=True, env=e, timeout=60)
+                               '--check', self.check, '--state-dir', self.state, *args], capture_output=True,
+                              text=True, env=e, timeout=60)
 
     def read_bytes(self):
         with open(self.history, 'rb') as f:
@@ -193,6 +194,58 @@ class History(Base):
         self.assertEqual(used[-1], 400)
         self.assertEqual(used, sorted(used))       # oldest first, across the two files
 
+    def test_a_rotation_rechecks_the_size_under_its_lock(self):
+        # two writers both saw a big file; the first rotated it. The second must not rotate the new small file over
+        # the full .1 (that would drop the whole older history)
+        self.m.MAX_BYTES = 4096
+        for i in range(200):
+            self.add(rec('node-tests', i + 1))
+        before = os.path.getsize(self.history + '.1')
+        self.assertLess(os.path.getsize(self.history), 4096)
+        self.m.rotate(self.state)
+        self.assertEqual(os.path.getsize(self.history + '.1'), before)
+        self.assertEqual(self.m.read_history(self.state)[0][-1]['usedMb'], 200)
+
+    def test_a_lock_that_cannot_be_opened_still_rotates_and_records(self):
+        self.m.MAX_BYTES = 4096
+        os.makedirs(os.path.join(self.state, 'measured.lock'))      # a folder where the lock should be
+        notes = [self.m.append(self.state, rec('node-tests', i + 1)) for i in range(400)]
+        self.assertEqual([n for n in notes if n], [])               # every line written, no "could not" note
+        self.assertLessEqual(os.path.getsize(self.history), 4096 + 200)
+        self.assertLessEqual(os.path.getsize(self.history + '.1'), 4096 + 200)
+        self.assertEqual(self.m.read_history(self.state)[0][-1]['usedMb'], 400)
+
+    def test_a_rotation_that_fails_is_a_note_not_a_lost_record(self):
+        self.m.MAX_BYTES = 1024
+        real = self.m._rotate_if_big
+        self.m._rotate_if_big = lambda path: (_ for _ in ()).throw(PermissionError(13, 'Permission denied'))
+        self.addCleanup(setattr, self.m, '_rotate_if_big', real)
+        notes = [self.m.append(self.state, rec('node-tests', i + 1)) for i in range(30)]
+        self.assertIn('could not be rotated', notes[-1])
+        self.assertEqual(len(self.m.read_history(self.state)[0]), 30)
+
+    def test_a_read_during_a_rotation_never_sees_a_file_twice(self):
+        self.m.MAX_BYTES = 4096
+        for i in range(200):
+            self.add(rec('node-tests', i + 1))
+        real, calls = self.m._open_ro, []
+
+        def open_then_rotate(path):         # a writer rotates right after the reader opened the current file
+            fd = real(path)
+            calls.append(path)
+            if len(calls) == 1:
+                os.replace(self.history, self.history + '.1')
+            return fd
+        self.m._open_ro = open_then_rotate
+        self.addCleanup(setattr, self.m, '_open_ro', real)
+        records, note = self.m.read_history(self.state)
+        self.m._open_ro = real
+        used = [r['usedMb'] for r in records]
+        self.assertEqual(used, sorted(set(used)))           # no file read twice
+        self.assertEqual(used, [r['usedMb'] for r in self.m.read_history(self.state)[0]])
+        self.assertEqual(used[-1], 200)
+        self.assertGreater(len(calls), 2)                   # it started again
+
     def test_a_rotation_held_by_another_writer_is_skipped_not_waited_for(self):
         import fcntl
         self.m.MAX_BYTES = 1024
@@ -214,54 +267,100 @@ class Amount(Base):
     def cfg(self, **over):
         return dict(self.m.load_kinds(self.kinds), **over)
 
-    def test_percentile_plus_margin_rounded_up(self):
-        runs = [rec('node-tests', u) for u in (400, 420, 450, 500, 520, 530, 560, 600, 610, 900)]
-        mb, how = self.m.amount('node-tests', self.cfg(), runs)
-        self.assertEqual(mb, 768)                  # p90 of 10 = 610; x 1.25 = 762.5; up to 128 -> 768
-        self.assertIn('p90 used 610 MB of 10 runs + 25%', how)
+    def test_the_highest_run_plus_margin_rounded_up(self):
+        runs = [rec('gradle-build', u) for u in (400, 420, 450, 500, 520, 530, 560, 600, 610, 900)]
+        mb, how = self.m.amount('gradle-build', self.cfg(), runs)
+        self.assertEqual(mb, 1152)                 # highest 900; x 1.25 = 1125; up to 128 -> 1152
+        self.assertIn('highest need 900 MB of 10 runs (0 stopped) + 25%', how)
 
-    def test_a_measured_kind_can_ask_for_less_than_its_fallback(self):
-        mb, _ = self.m.amount('gradle-build', self.cfg(), [rec('gradle-build', 1100)] * 5)
-        self.assertEqual(mb, 1408)
-        self.assertLess(mb, 3072)
+    def test_the_floor_is_the_fallback_unless_the_kinds_file_lowers_it(self):
+        self.assertEqual(self.m.amount('node-tests', self.cfg(), [rec('node-tests', 300)] * 5)[0], 1536)
+        mb, how = self.m.amount('gradle-build', self.cfg(), [rec('gradle-build', 1100)] * 5)
+        self.assertEqual(mb, 1408)                 # minMb 256 in the kinds file: below its fallback 3072
+        self.assertIn('floor 256 MB', how)
+        self.assertEqual(self.m.amount('gradle-build', self.cfg(), [rec('gradle-build', 1)] * 5)[0], 256)
 
-    def test_too_few_runs_use_the_fallback(self):
-        mb, how = self.m.amount('node-tests', self.cfg(), [rec('node-tests', 300)] * 2)
-        self.assertEqual(mb, 1536)
-        self.assertIn('2 measured runs, 3 needed', how)
+    def test_a_few_tiny_or_mis_tagged_runs_never_pull_a_kind_below_its_floor(self):
+        cfg = self.write_kinds(dict(KINDS, kinds={'gradle-build': {'fallbackMb': 3072, 'minMb': 2048},
+                                                  'test-run': {'fallbackMb': 2048}}), 'f.json')
+        cfg = self.m.load_kinds(cfg)
+        self.assertEqual(self.m.amount('gradle-build', cfg, [rec('gradle-build', 1)] * 10)[0], 2048)
+        mb, how = self.m.amount('test-run', cfg, [rec('test-run', 1)] * 10)     # no minMb: the floor is the fallback
+        self.assertEqual(mb, 2048)
+        self.assertIn('floor 2048 MB', how)
 
-    def test_stopped_runs_and_other_kinds_do_not_count(self):
-        runs = [rec('node-tests', 300)] * 2 + [rec('node-tests', 50, end='stopped')] * 5 + [rec('review', 300)] * 5
-        mb, _ = self.m.amount('node-tests', self.cfg(), runs)
-        self.assertEqual(mb, 1536)
+    def test_stopped_runs_count_and_are_often_the_biggest(self):
+        runs = [rec('gradle-build', 5000, end='stopped')] * 4 + [rec('gradle-build', 100)] * 5
+        for order in (runs, runs[::-1]):
+            mb, how = self.m.amount('gradle-build', self.cfg(), order)
+            self.assertGreaterEqual(mb, 5000 * 1.25)
+            self.assertEqual(mb, 6272)
+            self.assertIn('(4 stopped)', how)
+
+    def test_fifty_runs_with_two_big_ones_never_drop_the_big_ones(self):
+        runs = [rec('gradle-build', 300)] * 48 + [rec('gradle-build', 4000)] * 2
+        for order in (runs, runs[::-1], runs[:20] + runs[-2:] + runs[20:48]):
+            self.assertEqual(self.m.amount('gradle-build', self.cfg(recentRuns=50), order)[0], 5120)
+
+    def test_too_few_runs_never_ask_below_the_fallback_but_a_big_run_raises_it(self):
+        mb, how = self.m.amount('gradle-build', self.cfg(), [rec('gradle-build', 300)] * 2)
+        self.assertEqual(mb, 3072)
+        self.assertIn('fallback 3072 MB until 3 runs', how)
+        self.assertEqual(self.m.amount('gradle-build', self.cfg(), [rec('gradle-build', 5000, end='stopped')])[0],
+                         6272)
+        self.assertEqual(self.m.amount('gradle-build', self.cfg(), [])[0], 3072)
+
+    def test_other_kinds_do_not_count(self):
+        runs = [rec('node-tests', 300)] * 2 + [rec('gradle-build', 9000)] * 5
+        self.assertEqual(self.m.amount('node-tests', self.cfg(), runs)[0], 1536)
 
     def test_only_the_recent_runs_count(self):
-        runs = [rec('node-tests', 5000)] * 20 + [rec('node-tests', 400)] * 10
-        mb, _ = self.m.amount('node-tests', self.cfg(), runs)
-        self.assertEqual(mb, 512)
+        runs = [rec('gradle-build', 5000)] * 20 + [rec('gradle-build', 400)] * 10
+        self.assertEqual(self.m.amount('gradle-build', self.cfg(), runs)[0], 512)
 
-    def test_never_below_min_mb_and_capped_at_max_mb(self):
-        self.assertEqual(self.m.amount('node-tests', self.cfg(), [rec('node-tests', 1)] * 5)[0], 256)
+    def test_capped_at_max_mb(self):
         mb, how = self.m.amount('node-tests', self.cfg(), [rec('node-tests', 99999)] * 5)
         self.assertEqual(mb, 3072)                 # default cap: 2 x fallbackMb
         self.assertIn('capped', how)
         self.assertEqual(self.m.amount('gradle-build', self.cfg(), [rec('gradle-build', 99999)] * 5)[0], 8192)
 
-    def test_measure_peak_uses_the_kernel_peak(self):
-        runs = [rec('node-tests', 300, 2000)] * 5
-        self.assertEqual(self.m.amount('node-tests', self.cfg(measure='peak'), runs)[0], 2560)
-        self.assertEqual(self.m.amount('node-tests', self.cfg(), runs)[0], 384)
+    def test_an_agent_kind_never_asks_below_its_fallback(self):
+        mb, how = self.m.amount('node-tests', self.cfg(), [rec('node-tests', 10)] * 10)
+        self.assertEqual(mb, 1536)
+        self.assertIn('an agent start', how)
+        self.assertEqual(self.m.amount('node-tests', self.cfg(), [rec('node-tests', 2000)] * 10)[0], 2560)
+        bad = self.write_kinds(dict(KINDS, kinds={'x': {'fallbackMb': 1536, 'agent': True, 'minMb': 512}}), 'a.json')
+        with self.assertRaisesRegex(self.m.Refused, 'agent kind'):
+            self.m.load_kinds(bad)
+
+    def test_a_kind_that_is_never_measured_says_so(self):
+        mb, how = self.m.amount('review', self.cfg(), [rec('review', 9000)] * 10)
+        self.assertEqual(mb, 1024)
+        self.assertIn('not measured', how)
+
+    def test_the_default_figure_is_the_need_that_counts_spikes(self):
+        runs = [rec('gradle-build', used=300, peak=2500, need=1800)] * 5
+        self.assertEqual(self.m.amount('gradle-build', self.cfg(), runs)[0], 2304)      # need 1800 x 1.25
+        self.assertEqual(self.m.amount('gradle-build', self.cfg(measure='used'), runs)[0], 384)
+        self.assertEqual(self.m.amount('gradle-build', self.cfg(measure='peak'), runs)[0], 3200)
+        old = [rec('gradle-build', used=300, peak=2500, need=None)] * 5       # no needMb: the higher of the two
+        self.assertEqual(self.m.amount('gradle-build', self.cfg(), old)[0], 3200)
 
     def test_kinds_file_rules(self):
         bad = [
             ('missing', None),
             ('not json', '{'),
             ('unknown top key', dict(KINDS, persentile=90)),
+            ('percentile is gone', dict(KINDS, percentile=95)),
             ('unknown kind key', dict(KINDS, kinds={'x': {'fallbackMb': 512, 'fallback': 1}})),
             ('no fallback', dict(KINDS, kinds={'x': {}})),
             ('fallback 0', dict(KINDS, kinds={'x': {'fallbackMb': 0}})),
             ('kind of digits', dict(KINDS, kinds={'1536': {'fallbackMb': 512}})),
             ('max below fallback', dict(KINDS, kinds={'x': {'fallbackMb': 512, 'maxMb': 256}})),
+            ('floor above fallback', dict(KINDS, kinds={'x': {'fallbackMb': 512, 'minMb': 1024}})),
+            ('floor too low', dict(KINDS, kinds={'x': {'fallbackMb': 512, 'minMb': 1}})),
+            ('agent not a bool', dict(KINDS, kinds={'x': {'fallbackMb': 512, 'agent': 1}})),
+            ('window too big', dict(KINDS, recentRuns=100000)),
             ('newer version', dict(KINDS, version=2)),
             ('bool for int', dict(KINDS, minRuns=True)),
             ('measure', dict(KINDS, measure='rss')),
@@ -277,22 +376,50 @@ class Amount(Base):
         path = self.write_kinds({'repository': 'x/y', 'capacity': KINDS}, 'project.json')
         self.assertEqual(sorted(self.m.load_kinds(path)['kinds']), ['gradle-build', 'node-tests', 'review'])
 
+    def test_the_example_kinds_file_loads(self):
+        cfg = self.m.load_kinds(os.path.join(KIT, 'capacity-kinds.example.json'))
+        for name, k in cfg['kinds'].items():
+            with self.subTest(name):
+                self.assertEqual(k['minMb'] if k['agent'] else k['fallbackMb'], k['fallbackMb'])
+
 
 class Capacity(Base):
-    def test_a_plain_number_and_no_argument_are_passed_on_unchanged(self):
+    def test_a_plain_number_no_argument_or_an_empty_one_are_passed_on_unchanged(self):
         self.write_kinds('{ broken')            # a whole number never needs the kinds file
-        for args in (['1536'], [], ['3072', 'extra'], ['0']):
+        for args in (['1536'], [], ['3072', 'extra'], ['0'], ['']):
             r = self.capacity(*args)
             self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.calls_made(), ['1536|front=1 kind=', '|front=1 kind=', '3072|extra|front=1 kind=',
-                                             '0|front=1 kind='])
+                                             '0|front=1 kind=', '|front=1 kind='])
+        # '' reaches the check as one empty argument, so a check's own default (`${1:-3072}`) still applies
+        with open(self.check, 'w') as f:
+            f.write('#!/bin/sh\necho "args=$# need=${1:-3072}"\n')
+        self.assertEqual([self.capacity(*a).stdout for a in ([''], [])], ['args=1 need=3072\n', 'args=0 need=3072\n'])
+
+    def test_heavy_state_dir_in_the_callers_environment_never_picks_the_history(self):
+        fake_home = os.path.join(self.dir, 'home')
+        real_dir = os.path.join(fake_home, '.local', 'state', 'heavy')
+        for _ in range(5):
+            self.m.append(real_dir, rec('gradle-build', 5000))
+            self.m.append(self.state, rec('gradle-build', 10))          # a test history that leaked
+        real_home = self.m.home
+        self.m.home = lambda: fake_home
+        self.addCleanup(setattr, self.m, 'home', real_home)
+        got = []
+        os.environ['HEAVY_STATE_DIR'] = self.state          # in heavy's own environment too, as a leak would be
+        self.addCleanup(os.environ.pop, 'HEAVY_STATE_DIR', None)
+        rc = self.m.capacity_main(['--kinds', self.kinds, '--check', self.check, '--', 'gradle-build'],
+                                  environ={'HEAVY_STATE_DIR': self.state},
+                                  execv=lambda path, argv, env: got.append(argv[1:]))
+        self.assertEqual((rc, got), (0, [['6272']]))
+        self.assertEqual(self.m.front_dir({}), real_dir)
 
     def test_a_kind_becomes_its_measured_amount(self):
-        self.add(*[rec('node-tests', 700)] * 5)
-        r = self.capacity('node-tests')
+        self.add(*[rec('gradle-build', 700)] * 5)
+        r = self.capacity('gradle-build')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, 'available=9999MB need=896MB\n')      # stdout is the check's alone
-        self.assertEqual(self.calls_made(), ['896|front=1 kind=node-tests'])
+        self.assertEqual(self.calls_made(), ['896|front=1 kind=gradle-build'])
 
     def test_a_kind_without_history_gets_its_fallback(self):
         r = self.capacity('--', 'gradle-build')
@@ -310,7 +437,7 @@ class Capacity(Base):
             (['Node-Tests'], {}, None),                      # neither a number nor a kind
             (['node-tests'], {}, self.write_kinds('{', 'broken.json')),
             (['node-tests'], {'HEAVY_CAPACITY_FRONT': '1'}, None),     # the check calls the front again
-            (['node-tests'], {'HEAVY_STATE_DIR': 'relative'}, None),
+            (['--state-dir', 'relative', '--', 'node-tests'], {}, None),
         ]
         for args, env, kinds in cases:
             with self.subTest(args=args, env=env, kinds=kinds):
@@ -324,22 +451,19 @@ class Capacity(Base):
         for check in ('check', os.path.join(self.dir, 'missing'), self.kinds):
             with self.subTest(check=check):
                 r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'capacity', '--kinds', self.kinds, '--check',
-                                    check, '1536'], capture_output=True, text=True, timeout=60,
-                                   env=dict(os.environ, HEAVY_STATE_DIR=self.state))
+                                    check, '1536'], capture_output=True, text=True, timeout=60)
                 self.assertEqual(r.returncode, 2)
 
     def test_show_lists_each_kind_and_how(self):
-        self.add(*[rec('node-tests', 700)] * 5)
-        e = dict(os.environ, HEAVY_STATE_DIR=self.state)
-        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'capacity', '--kinds', self.kinds, '--show', '--json'],
-                           capture_output=True, text=True, env=e, timeout=60)
+        self.add(*[rec('gradle-build', 700)] * 5)
+        base = [sys.executable, '-I', '-B', HEAVY, 'capacity', '--kinds', self.kinds, '--state-dir', self.state, '--show']
+        r = subprocess.run(base + ['--json'], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         kinds = json.loads(r.stdout)['kinds']
         self.assertEqual({k: v['mb'] for k, v in kinds.items()},
-                         {'node-tests': 896, 'gradle-build': 3072, 'review': 1024})
-        r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'capacity', '--kinds', self.kinds, '--show',
-                            'node-tests'], capture_output=True, text=True, env=e, timeout=60)
-        self.assertRegex(r.stdout, r'^node-tests +896 MB  p90 used 700 MB of 5 runs')
+                         {'node-tests': 1536, 'gradle-build': 896, 'review': 1024})
+        r = subprocess.run(base + ['gradle-build'], capture_output=True, text=True, timeout=60)
+        self.assertRegex(r.stdout, r'^gradle-build +896 MB  highest need 700 MB of 5 runs')
         self.assertEqual(self.calls_made(), [])
 
     def test_help(self):
@@ -379,13 +503,13 @@ class FakeInner:
 class Recording(Base):
     """The Measurer heavy runs while a job runs, on a fake scope folder."""
 
-    def scope(self, used_mb, peak_mb):
+    def scope(self, used_mb, peak_mb, current_mb=None):
         folder = os.path.join(self.dir, 'cg', 'heavy-job-1.scope')
         os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, 'memory.peak'), 'w') as f:
-            f.write(f'{peak_mb * MB}\n')
-        with open(os.path.join(folder, 'used'), 'w') as f:
-            f.write(str(used_mb * MB))
+        for name, value in (('memory.peak', peak_mb), ('memory.current', used_mb if current_mb is None else
+                                                                          current_mb), ('used', used_mb)):
+            with open(os.path.join(folder, name), 'w') as f:
+                f.write(f'{value * MB}\n')
         return folder
 
     def measurer(self, inner=None, kind='node-tests'):
@@ -418,15 +542,13 @@ class Recording(Base):
         records, _ = self.m.read_history(self.state)
         self.assertEqual([(r['kind'], r['usedMb'], r['peakMb'], r['end']) for r in records],
                          [('node-tests', 400, 450, 'exited')])
+        self.assertEqual(records[0]['needMb'], 450)         # at the last look: used 200 + (peak 450 - current 200)
 
     def test_the_peak_seen_while_the_scope_lived_is_kept_after_it_is_gone(self):
         m = self.measurer()
         folder = self.scope(100, 300)
         m.sample()
-        with open(os.path.join(folder, 'memory.peak'), 'w') as f:     # a spike between two looks: the kernel's
-            f.write(f'{900 * MB}\n')                                  # high-water mark keeps it
-        with open(os.path.join(folder, 'used'), 'w') as f:
-            f.write(str(150 * MB))
+        self.scope(150, 900, current_mb=250)    # a spike between two looks: the kernel's high-water mark keeps it
         m.sample()
         shutil.rmtree(folder)                   # the scope is gone when heavy records: its files fail (ENODEV)
         real = self.m._read_int
@@ -436,15 +558,32 @@ class Recording(Base):
         m.record()
         records, _ = self.m.read_history(self.state)
         self.assertEqual([(r['usedMb'], r['peakMb']) for r in records], [(150, 900)])
+        # the need counts the spike, less only the file cache it holds now: used 150 + (peak 900 - current 250)
+        self.assertEqual(records[0]['needMb'], 800)
+        self.assertEqual(self.m.amount('gradle-build', self.m.load_kinds(self.kinds),
+                                       [dict(r, kind='gradle-build') for r in records] * 5)[0], 1024)
 
-    def test_a_stopped_run_is_recorded_as_stopped_and_not_counted(self):
-        m = self.measurer()
+    def test_a_stopped_run_is_recorded_as_stopped_and_counts(self):
+        m = self.measurer(kind='gradle-build')
         self.scope(5000, 5000)
         m.sample()
+        m.status = signal.SIGTERM               # the wait status of a command that died of TERM
         m.record_soon()
+        self.add(*[rec('gradle-build', 100)] * 5)
         records, _ = self.m.read_history(self.state)
-        self.assertEqual([r['end'] for r in records], ['stopped'])
-        self.assertEqual(self.m.amount('node-tests', self.m.load_kinds(self.kinds), records * 9)[0], 1536)
+        self.assertEqual([(r['end'], r['code']) for r in records[:1]], [('stopped', -signal.SIGTERM)])
+        self.assertEqual(self.m.amount('gradle-build', self.m.load_kinds(self.kinds), records)[0], 6272)
+
+    def test_the_exit_code_is_recorded(self):
+        for status, code in ((0, 0), (3 << 8, 3), (signal.SIGKILL, -signal.SIGKILL), (None, None)):
+            with self.subTest(code=code):
+                shutil.rmtree(self.state, True)
+                m = self.measurer()
+                self.scope(100, 100)
+                m.sample()
+                m.status = status
+                m.record()
+                self.assertEqual([r['code'] for r in self.m.read_history(self.state)[0]], [code])
 
     def test_a_job_never_seen_records_nothing(self):
         m = self.measurer()
@@ -465,8 +604,7 @@ class Recording(Base):
         p = subprocess.run([sys.executable, '-I', '-c', code], timeout=30)
         self.assertEqual(p.returncode, -signal.SIGKILL)
         self.assertEqual(self.read_bytes(), before)
-        self.assertEqual(self.m.amount('node-tests', self.m.load_kinds(self.kinds),
-                                       self.m.read_history(self.state)[0])[0], 640)
+        self.assertEqual(len(self.m.read_history(self.state)[0]), 5)
 
     def test_a_failed_write_is_a_note_not_a_failed_job(self):
         os.makedirs(self.history)               # cannot append

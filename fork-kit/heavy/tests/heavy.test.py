@@ -119,6 +119,13 @@ class Heavy(unittest.TestCase):
         """Shell text that starts a sleeper which leaves its parent and its session (a daemon's double fork)."""
         return f'(setsid {self.sleeper} &)'
 
+    def settled(self, n):
+        """Shell text that waits (at most 10 s) until n processes of the command's own scope are sleepers: a forked
+        `sh` that has not exec'd yet would otherwise be named as a leftover `sh`."""
+        return ('cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup); i=0; while [ $i -lt 200 ]; do c=0; '
+                'for p in $(cat "$cg/cgroup.procs"); do [ "$(cat /proc/$p/comm 2>/dev/null)" = sleeper ] && '
+                f'c=$((c + 1)); done; [ $c -ge {n} ] && break; i=$((i + 1)); sleep 0.05; done')
+
     def script(self, name, body):
         path = os.path.join(self.dir, name)
         with open(path, 'w') as f:
@@ -250,7 +257,7 @@ class Heavy(unittest.TestCase):
         self.assertFalse(leaf.startswith('heavy-keep-'), leaf)
 
     def test_a_double_forked_child_is_stopped_too(self):
-        r = self.heavy('sh', '-c', f'{self.double_fork()}; {self.sleeper} & exit 0')
+        r = self.heavy('sh', '-c', f'{self.double_fork()}; {self.sleeper} & {self.settled(2)}; exit 0')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ours(), [])
         self.assertEqual(self.heavy_lines(r.stderr), ['heavy: stopped 2 leftover processes (sleeper)'])
@@ -670,6 +677,23 @@ class Heavy(unittest.TestCase):
         self.assertGreaterEqual(records[0]['peakMb'], 120)         # the kernel's high-water mark, seen every second
         self.assertGreaterEqual(records[0]['usedMb'], 100)
         self.assertLess(records[0]['usedMb'], 1024)
+        self.assertGreaterEqual(records[0]['needMb'], records[0]['usedMb'])
+        self.assertEqual(records[0]['code'], 0)
+
+    def test_a_measured_job_records_its_exit_code_and_a_stopped_one_counts_as_stopped(self):
+        state = os.path.join(self.dir, 'state')
+        env = dict(self.env, HEAVY_STATE_DIR=state)
+        fails = f'"{sys.executable}" -I -c "import time; b = bytes(60 << 20).replace(bytes(1), bytes([1])); ' \
+                f'time.sleep(1)"; exit 3  # {self.dir}'
+        r = self.heavy('--measure', 'heavy-test', '--', 'sh', '-c', fails, env=env)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        p = self.start('--measure', 'heavy-test', '--', *self.grow(60, 300), env=env)
+        wait_for(lambda: len(self.ours()) == 1, what='the command')
+        time.sleep(1.5)                             # the measurer has seen the scope
+        p.send_signal(signal.SIGTERM)
+        p.communicate(timeout=60)
+        self.assertEqual([(x['end'], x['code']) for x in self.measured(state)],
+                         [('exited', 3), ('stopped', -signal.SIGTERM)])
 
     def test_a_queued_job_records_under_its_queue_kind(self):
         state = os.path.join(self.dir, 'state')
