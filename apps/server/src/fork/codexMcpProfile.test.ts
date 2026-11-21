@@ -105,9 +105,10 @@ interface FakeThread {
 }
 
 /**
- * A Codex app-server as far as profiles see it. `servers` is config.toml, `launchArgs` the
- * servers `-c mcp_servers.<name>...` adds, `project` each workspace's `.codex/config.toml`, and
- * `plugins` servers a plugin adds, which no config entry switches off.
+ * A Codex app-server as far as profiles see it: `servers` config.toml, `launchArgs` `-c` servers,
+ * `project` each workspace's `.codex/config.toml`, `plugins` servers no config entry switches off,
+ * `apps` ChatGPT sign-in (adds `codex_apps`, unlisted by config/read, while `features.apps` is on).
+ * Statuses use Codex's own words.
  */
 const makeFakeCodex = (
   setup: {
@@ -115,6 +116,7 @@ const makeFakeCodex = (
     readonly launchArgs?: ReadonlyArray<string>;
     readonly project?: Readonly<Record<string, ReadonlyArray<string>>>;
     readonly plugins?: ReadonlyArray<string>;
+    readonly apps?: boolean;
   } = {},
 ) => {
   const threads = new Map<string, FakeThread>();
@@ -188,6 +190,7 @@ const makeFakeCodex = (
         const names = [
           ...configured(found.cwd),
           ...(setup.plugins ?? []),
+          ...(setup.apps === true && found.config["features.apps"] !== false ? ["codex_apps"] : []),
           ...Object.keys(found.config)
             .filter((key) => /^mcp_servers\.[^.]+$/.test(key))
             .map((key) => key.slice("mcp_servers.".length)),
@@ -197,7 +200,7 @@ const makeFakeCodex = (
           runtimeStatus:
             found.config[`mcp_servers.${name}.enabled`] === false && !setup.plugins?.includes(name)
               ? "disabled"
-              : "ready",
+              : "connected",
           tools: {},
         }));
         const start = typeof params.cursor === "string" ? Number(params.cursor) : 0;
@@ -211,9 +214,24 @@ const makeFakeCodex = (
         return Effect.succeed({ turn: { id: `turn-${++next}` } });
     }
   };
+  /** Waiters for the `count`-th request of a method (a forked check reaching a milestone). */
+  const waiters: Array<{
+    readonly method: string;
+    readonly count: number;
+    readonly done: Deferred.Deferred<void>;
+  }> = [];
+  const wake = Effect.forEach(
+    waiters,
+    (waiter) =>
+      calls.filter((call) => call.method === waiter.method).length >= waiter.count
+        ? Deferred.succeed(waiter.done, undefined)
+        : Effect.void,
+    { discard: true },
+  );
   const request = (method: string, params: unknown) =>
     Effect.gen(function* () {
       calls.push({ method, params: (params ?? {}) as Json });
+      yield* wake;
       const gate = gates.get(method);
       if (gate !== undefined) {
         yield* Deferred.succeed(gate.reached, undefined);
@@ -221,13 +239,21 @@ const makeFakeCodex = (
       }
       return yield* reply(method, (params ?? {}) as Json);
     });
+  /** Notification handlers, in the order they were added, as the real client keeps them. */
+  const handlers = new Map<
+    string,
+    Array<(payload: unknown) => Effect.Effect<void, CodexError.CodexAppServerError>>
+  >();
   const client = {
     request,
     raw: { request, requests: undefined as never },
     notify: () => Effect.void,
     awaitTermination: Effect.never,
     handleServerRequest: () => Effect.void,
-    handleServerNotification: () => Effect.void,
+    handleServerNotification: (
+      method: string,
+      handler: (payload: unknown) => Effect.Effect<void, CodexError.CodexAppServerError>,
+    ) => Effect.sync(() => void handlers.set(method, [...(handlers.get(method) ?? []), handler])),
     handleUnknownServerRequest: () => Effect.void,
     handleUnknownServerNotification: () => Effect.void,
   } as unknown as Client;
@@ -238,8 +264,31 @@ const makeFakeCodex = (
     failing,
     answers,
     gates,
+    /** Waits until `method` has been requested `count` times in all (it may already have been). */
+    reached: (method: string, count: number) =>
+      Effect.gen(function* () {
+        const done = yield* Deferred.make<void>();
+        waiters.push({ method, count, done });
+        yield* wake;
+        yield* Deferred.await(done);
+      }),
+    /** Codex sends a notification: every handler for it runs, in order. */
+    emit: (method: string, payload: unknown) =>
+      Effect.forEach(handlers.get(method) ?? [], (handler) => handler(payload), {
+        discard: true,
+      }).pipe(Effect.orDie),
     setPageSize: (size: number) => void (pageSize = size),
     setEndlessPages: () => void (endlessPages = true),
+    /**
+     * Codex spawns a sub-agent of a loaded thread: the child copies the parent's loaded config,
+     * servers switched off included (codex-rs core/src/agent/child_config.rs).
+     */
+    spawnChild: (parent: string) => {
+      const source = threads.get(parent)!;
+      const id = `native-${++next}`;
+      threads.set(id, { id, cwd: source.cwd, config: { ...source.config }, loaded: true });
+      return id;
+    },
     /** Codex lets the thread go (idle): its next resume loads it with the config sent then. */
     unload: (id: string) => void (threads.get(id)!.loaded = false),
     sent: (method: string) => calls.filter((call) => call.method === method),
@@ -310,6 +359,52 @@ const offKeys = (config: Json) =>
     .filter((key) => key.startsWith("mcp_servers.") && key.endsWith(".enabled"))
     .sort();
 
+/** What the adapter's own turn/completed handler is given, through the wrapped client. */
+const completions = (client: Client) =>
+  Effect.gen(function* () {
+    const seen: Array<{ readonly id: string; readonly status: string; readonly error?: unknown }> =
+      [];
+    yield* client.handleServerNotification("turn/completed", (payload) =>
+      Effect.sync(() => void seen.push(payload.turn as never)),
+    );
+    return seen;
+  });
+const turnStarted = (threadId: string, turnId: string) => ({
+  threadId,
+  turn: { id: turnId, items: [], status: "inProgress", error: null },
+});
+const turnCompleted = (threadId: string, turnId: string, status = "interrupted") => ({
+  threadId,
+  turn: { id: turnId, items: [], status, error: null },
+});
+const STOPPED = "T3 stopped this turn, which Codex started on its own for the thread's goal";
+/** The item Codex reports when a thread spawns sub-agents (collab tools, multi-agent v1). */
+const spawned = (threadId: string, children: ReadonlyArray<string>) => ({
+  threadId,
+  turnId: "parent-turn",
+  item: {
+    type: "collabAgentToolCall",
+    id: "call-1",
+    tool: "spawnAgent",
+    status: "completed",
+    senderThreadId: threadId,
+    receiverThreadIds: children,
+    agentsStates: {},
+  },
+});
+/** The item Codex reports for a sub-agent's life (multi-agent v2). */
+const subAgentActivity = (threadId: string, child: string) => ({
+  threadId,
+  turnId: "parent-turn",
+  item: {
+    type: "subAgentActivity",
+    id: "act-1",
+    kind: "started",
+    agentPath: "/a",
+    agentThreadId: child,
+  },
+});
+
 describe("codexMcpProfile helpers", () => {
   it("turns off every configured server the profile leaves out, never T3's own", () => {
     assert.deepStrictEqual(
@@ -319,7 +414,7 @@ describe("codexMcpProfile helpers", () => {
         "t3-code",
         "t3-code-direct",
       ]),
-      { "mcp_servers.beta.enabled": false },
+      { "mcp_servers.beta.enabled": false, "features.apps": false },
     );
     assert.deepStrictEqual(
       codexMcpProfileConfig("all", { servers: "all", t3Tools: "all" }, ["alpha"]),
@@ -328,7 +423,12 @@ describe("codexMcpProfile helpers", () => {
     // A kept name that is not set up keeps nothing and is not an error (design §9).
     assert.deepStrictEqual(
       codexMcpProfileConfig("mine", { servers: ["nowhere"], t3Tools: "all" }, []),
-      {},
+      { "features.apps": false },
+    );
+    // Codex's connectors server is never listed by config/read: kept only by name.
+    assert.deepStrictEqual(
+      codexMcpProfileConfig("apps", { servers: ["codex_apps"], t3Tools: "all" }, ["beta"]),
+      { "mcp_servers.beta.enabled": false },
     );
   });
 
@@ -355,13 +455,39 @@ describe("codexMcpProfile helpers", () => {
 
   it("finds live servers outside the profile that Codex did not disable", () => {
     const statuses = [
-      { name: "alpha", runtimeStatus: "ready" },
+      { name: "alpha", runtimeStatus: "connected" },
       { name: "beta", runtimeStatus: "disabled" },
       { name: "gamma", runtimeStatus: "starting" },
-      { name: "t3-code", runtimeStatus: "ready" },
+      { name: "t3-code", runtimeStatus: "connected" },
     ];
     assert.deepStrictEqual(codexMcpServersOutsideProfile(["alpha"], statuses), ["gamma"]);
     assert.deepStrictEqual(codexMcpServersOutsideProfile("all", statuses), []);
+  });
+
+  it("only Codex's own word for a switched-off server counts as off", () => {
+    // codex-rs 0.171.0 McpServerRuntimeStatus, as the app-server sends it (camelCase): a server
+    // with enabled = false reports "disabled"; every other word, none, or an unknown one is on.
+    const words = [
+      "notStarted",
+      "starting",
+      "connected",
+      "authenticationRequired",
+      "failed",
+      "cancelled",
+      "unknown",
+      "Disabled",
+    ];
+    const statuses = [
+      ...words.map((word) => ({ name: word, runtimeStatus: word })),
+      { name: "none", runtimeStatus: null },
+      { name: "missing" },
+      { name: "off", runtimeStatus: "disabled" },
+    ];
+    assert.deepStrictEqual(codexMcpServersOutsideProfile([], statuses), [
+      ...words,
+      "none",
+      "missing",
+    ]);
   });
 });
 
@@ -372,7 +498,7 @@ describe("withCodexMcpProfiles", () => {
       Effect.gen(function* () {
         const fake = makeFakeCodex({ servers: ["alpha", "beta"], launchArgs: ["gamma"] });
         const { profileFor } = makeProfiles({ narrow: resolved("alpha-only", ["alpha"]) });
-        const client = withCodexMcpProfiles(fake.client, profileFor);
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
         const narrow = (yield* start(client, "narrow")).thread.id;
         const wide = (yield* start(client, "wide")).thread.id;
         const [narrowSent, wideSent] = fake
@@ -407,7 +533,7 @@ describe("withCodexMcpProfiles", () => {
         a: resolved("alpha-only", ["alpha"]),
         b: resolved("beta-gamma", ["beta", "gamma"]),
       });
-      const client = withCodexMcpProfiles(fake.client, profileFor);
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
       const ids: Record<string, string> = {};
       ids[first] = (yield* start(client, first)).thread.id;
       ids[second] = (yield* start(client, second)).thread.id;
@@ -438,7 +564,7 @@ describe("withCodexMcpProfiles", () => {
         p: resolved("none", []),
         forked: resolved("none", []),
       });
-      const client = withCodexMcpProfiles(fake.client, profileFor);
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
       const p = (yield* start(client, "p", "/proj")).thread.id;
       assert.deepStrictEqual(offKeys(fake.threads.get(p)!.config), [
         "mcp_servers.alpha.enabled",
@@ -470,7 +596,7 @@ describe("withCodexMcpProfiles", () => {
           reason: `MCP profile "gone" is not in Settings, so this thread cannot start: ${FIX}.`,
         }),
       });
-      const client = withCodexMcpProfiles(fake.client, profileFor);
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
       const message = yield* outcome(start(client, "missing"));
       assert.include(message, 'MCP profile "gone" is not in Settings');
       assert.include(message, FIX);
@@ -485,7 +611,7 @@ describe("withCodexMcpProfiles", () => {
         tools: resolved("lean", "all", ["threads"]),
         named: resolved("none", []),
       });
-      const client = withCodexMcpProfiles(fake.client, profileFor);
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
       assert.include(yield* outcome(start(client, "tools")), 'set its t3Tools to "all"');
       const named = yield* outcome(start(client, "named"));
       assert.include(named, '"my server"');
@@ -508,7 +634,7 @@ describe("withCodexMcpProfiles", () => {
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha"] });
       set(fake);
-      const client = withCodexMcpProfiles(
+      const client = yield* withCodexMcpProfiles(
         fake.client,
         makeProfiles({ t: resolved("none", []) }).profileFor,
       );
@@ -522,7 +648,7 @@ describe("withCodexMcpProfiles", () => {
   it.effect("a thread with no profile (all) costs no extra request, as before profiles", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha"] });
-      const client = withCodexMcpProfiles(fake.client, makeProfiles().profileFor);
+      const client = yield* withCodexMcpProfiles(fake.client, makeProfiles().profileFor);
       const id = (yield* start(client, "old")).thread.id;
       yield* turn(client, id);
       // Requests without a T3 thread (no profile anywhere on this app-server) pass as before.
@@ -536,15 +662,18 @@ describe("withCodexMcpProfiles", () => {
     }),
   );
 
-  it.effect("an empty server list turns nothing off and the thread runs", () =>
+  it.effect("an empty server list turns off only Codex's connectors, and the thread runs", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex();
-      const client = withCodexMcpProfiles(
+      const client = yield* withCodexMcpProfiles(
         fake.client,
         makeProfiles({ t: resolved("none", []) }).profileFor,
       );
       const id = (yield* start(client, "t")).thread.id;
-      assert.deepStrictEqual(fake.threads.get(id)!.config, threadConfig("t"));
+      assert.deepStrictEqual(fake.threads.get(id)!.config, {
+        ...threadConfig("t"),
+        "features.apps": false,
+      });
       assert.strictEqual(yield* outcome(turn(client, id)), "ok");
     }),
   );
@@ -552,7 +681,7 @@ describe("withCodexMcpProfiles", () => {
   it.effect("runs again: starting or resuming twice sends the same set", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
-      const client = withCodexMcpProfiles(
+      const client = yield* withCodexMcpProfiles(
         fake.client,
         makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
       );
@@ -577,7 +706,7 @@ describe("withCodexMcpProfiles", () => {
       Effect.gen(function* () {
         const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
         const { profiles, profileFor } = makeProfiles();
-        const client = withCodexMcpProfiles(fake.client, profileFor);
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
         const id = (yield* start(client, "t")).thread.id;
         profiles.set("t", resolved("a", ["alpha"]));
         // Codex keeps the loaded thread's servers, so this resume changes nothing there.
@@ -606,11 +735,264 @@ describe("withCodexMcpProfiles", () => {
       }),
   );
 
+  it.effect(
+    "a profile narrowed during a running goal: the next turn Codex starts is stopped, with why",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+        const { profiles, profileFor } = makeProfiles();
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+        const seen = yield* completions(client);
+        const id = (yield* start(client, "t")).thread.id;
+        assert.strictEqual(
+          yield* outcome(
+            client.request("thread/goal/set", { threadId: id, status: "active" } as never),
+          ),
+          "ok",
+        );
+        // The goal runs; the profile is narrowed while Codex has the thread loaded.
+        profiles.set("t", resolved("a", ["alpha"]));
+        yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+        yield* fake.reached("turn/interrupt", 1);
+        // The goal is paused before the turn is interrupted, so Codex starts no next one.
+        const stops = fake.calls.filter(
+          (call) => call.method === "thread/goal/set" || call.method === "turn/interrupt",
+        );
+        assert.deepStrictEqual(stops.slice(-2), [
+          { method: "thread/goal/set", params: { threadId: id, status: "paused" } },
+          { method: "turn/interrupt", params: { threadId: id, turnId: "goal-2" } },
+        ]);
+        yield* fake.emit("turn/completed", turnCompleted(id, "goal-2"));
+        assert.strictEqual(seen.length, 1);
+        assert.strictEqual(seen[0]!.status, "failed");
+        const message = (seen[0]!.error as { readonly message: string }).message;
+        assert.include(message, STOPPED);
+        assert.include(message, "paused the goal");
+        assert.include(message, "Codex still has beta switched on for this thread");
+        assert.include(message, FIX);
+        // Another turn's end is passed on as Codex sent it.
+        yield* fake.emit("turn/completed", turnCompleted(id, "other", "completed"));
+        assert.deepStrictEqual(seen[1], turnCompleted(id, "other", "completed").turn as never);
+      }),
+  );
+
+  it.effect("an unchanged profile: a turn Codex starts for the goal runs untouched", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+      const client = yield* withCodexMcpProfiles(
+        fake.client,
+        makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
+      );
+      const seen = yield* completions(client);
+      const id = (yield* start(client, "t")).thread.id;
+      const reads = fake.sent("mcpServerStatus/list").length;
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      yield* fake.reached("mcpServerStatus/list", reads + 1);
+      yield* fake.emit("turn/completed", turnCompleted(id, "goal-2", "completed"));
+      assert.deepStrictEqual(fake.sent("turn/interrupt"), []);
+      assert.deepStrictEqual(fake.sent("thread/goal/set"), []);
+      assert.deepStrictEqual(seen, [turnCompleted(id, "goal-2", "completed").turn as never]);
+    }),
+  );
+
+  it.effect(
+    "a profile that breaks during a goal stops its next turn with the profile's reason",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+        const { profiles, profileFor } = makeProfiles({ t: resolved("a", ["alpha"]) });
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+        const seen = yield* completions(client);
+        const id = (yield* start(client, "t")).thread.id;
+        profiles.set(
+          "t",
+          new ClaudeMcpProfileError({ reason: `MCP profile "a" is not in Settings: ${FIX}.` }),
+        );
+        yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+        yield* fake.reached("turn/interrupt", 1);
+        yield* fake.emit("turn/completed", turnCompleted(id, "goal-2", "completed"));
+        assert.strictEqual(seen[0]!.status, "failed");
+        assert.include(
+          (seen[0]!.error as { readonly message: string }).message,
+          "is not in Settings",
+        );
+      }),
+  );
+
+  it.effect(
+    "runs again and restarts mid-goal: each Codex-started turn is checked; a reload applies the profile",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+        const { profiles, profileFor } = makeProfiles();
+        const before = yield* withCodexMcpProfiles(fake.client, profileFor);
+        const id = (yield* start(before, "t")).thread.id;
+        profiles.set("t", resolved("a", ["alpha"]));
+        // Codex starts goal turns again and again: each one is stopped, none slips through.
+        yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+        yield* fake.reached("turn/interrupt", 1);
+        yield* fake.emit("turn/started", turnStarted(id, "goal-3"));
+        yield* fake.reached("turn/interrupt", 2);
+        // The app-server restarts mid-goal: T3 loads the thread again, now with beta off, and
+        // the goal's next turn runs.
+        fake.unload(id);
+        const after = yield* withCodexMcpProfiles(fake.client, profileFor);
+        yield* resume(after, id, "t");
+        assert.deepStrictEqual(offKeys(fake.threads.get(id)!.config), ["mcp_servers.beta.enabled"]);
+        const reads = fake.sent("mcpServerStatus/list").length;
+        yield* fake.emit("turn/started", turnStarted(id, "goal-4"));
+        // Both wrappers listen on this fake; the old one's check sees the new config too.
+        yield* fake.reached("mcpServerStatus/list", reads + 2);
+        assert.strictEqual(fake.sent("turn/interrupt").length, 2);
+      }),
+  );
+
+  it.effect("T3's tools narrowed after the thread loaded on all: its next turn is refused", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const { profiles, profileFor } = makeProfiles();
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+      const id = (yield* start(client, "t")).thread.id;
+      // Every server kept, only T3's tools limited: no server is outside the profile.
+      profiles.set("t", resolved("lean", "all", ["threads"]));
+      const message = yield* outcome(turn(client, id));
+      assert.include(message, 'MCP profile "lean" limits T3\'s own tools');
+      assert.include(message, 'set its t3Tools to "all"');
+      assert.deepStrictEqual(fake.sent("turn/start"), []);
+    }),
+  );
+
+  it.effect(
+    "a refused resume is not swapped for a fresh session: the next start of that thread refuses once",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+        const client = yield* withCodexMcpProfiles(
+          fake.client,
+          makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
+        );
+        const id = (yield* start(client, "t")).thread.id;
+        fake.unload(id);
+        // One failed read refuses the resume...
+        fake.failing.add("config/read");
+        assert.include(yield* outcome(resume(client, id, "t")), "could not read which MCP servers");
+        fake.failing.delete("config/read");
+        // ...and T3's fallback, a new Codex session for the same thread, is refused with it.
+        const fresh = yield* outcome(start(client, "t"));
+        assert.include(fresh, "could not read which MCP servers");
+        assert.include(fresh, "did not move the thread to a new Codex session");
+        assert.strictEqual(fake.sent("thread/start").length, 1);
+        // Retrying the turn resumes the same Codex thread; later starts are not held.
+        yield* resume(client, id, "t");
+        assert.deepStrictEqual(offKeys(fake.threads.get(id)!.config), ["mcp_servers.beta.enabled"]);
+        assert.strictEqual(yield* outcome(start(client, "t")), "ok");
+        // Stopped half-way: a refused resume followed by no start leaves one refusal, not more.
+        fake.unload(id);
+        fake.failing.add("config/read");
+        yield* outcome(resume(client, id, "t"));
+        fake.failing.delete("config/read");
+        assert.include(yield* outcome(start(client, "t")), "new Codex session");
+        assert.strictEqual(yield* outcome(start(client, "t")), "ok");
+      }),
+  );
+
+  it.effect("Codex's connectors server is switched off unless the profile keeps it by name", () =>
+    Effect.gen(function* () {
+      // With ChatGPT sign-in Codex adds codex_apps, which config/read never lists.
+      const fake = makeFakeCodex({ servers: ["alpha"], apps: true });
+      const client = yield* withCodexMcpProfiles(
+        fake.client,
+        makeProfiles({ a: resolved("a", ["alpha"]), apps: resolved("apps", ["codex_apps"]) })
+          .profileFor,
+      );
+      const narrow = (yield* start(client, "a")).thread.id;
+      assert.isFalse(fake.threads.get(narrow)!.config["features.apps"]);
+      assert.strictEqual(yield* outcome(turn(client, narrow)), "ok");
+      const kept = (yield* start(client, "apps")).thread.id;
+      assert.notProperty(fake.threads.get(kept)!.config, "features.apps");
+      assert.strictEqual(yield* outcome(turn(client, kept)), "ok");
+      // A thread on all keeps it too.
+      const all = (yield* start(client, "wide")).thread.id;
+      assert.notProperty(fake.threads.get(all)!.config, "features.apps");
+    }),
+  );
+
+  it.effect(
+    "a Codex sub-agent copies the servers T3 switched off in its parent's own thread config",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCodex({ servers: ["alpha", "beta"], apps: true });
+        const client = yield* withCodexMcpProfiles(
+          fake.client,
+          makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
+        );
+        const seen = yield* completions(client);
+        const id = (yield* start(client, "t")).thread.id;
+        // What T3 sends at load is what a child copies: the off keys sit in the thread's config.
+        assert.deepStrictEqual(fake.sent("thread/start")[0]!.params.config, {
+          ...threadConfig("t"),
+          "mcp_servers.beta.enabled": false,
+          "features.apps": false,
+        });
+        const child = fake.spawnChild(id);
+        // Seen twice (started and completed): runs again, adopted once.
+        yield* fake.emit("item/started", spawned(id, []));
+        yield* fake.emit("item/completed", spawned(id, [child]));
+        yield* fake.emit("item/completed", spawned(id, [child]));
+        const reads = fake.sent("mcpServerStatus/list").length;
+        yield* fake.emit("turn/started", turnStarted(child, "child-1"));
+        yield* fake.reached("mcpServerStatus/list", reads + 1);
+        assert.strictEqual(fake.sent("mcpServerStatus/list")[reads]!.params.threadId, child);
+        yield* fake.emit("turn/completed", turnCompleted(child, "child-1", "completed"));
+        assert.deepStrictEqual(fake.sent("turn/interrupt"), []);
+        assert.deepStrictEqual(seen, [turnCompleted(child, "child-1", "completed").turn as never]);
+      }),
+  );
+
+  type Spawn = (parent: string, child: string) => readonly [string, unknown];
+  const spawns: ReadonlyArray<readonly [string, Spawn]> = [
+    ["spawnAgent", (parent, child) => ["item/completed", spawned(parent, [child])]],
+    ["subAgentActivity", (parent, child) => ["item/started", subAgentActivity(parent, child)]],
+  ];
+  it.effect.each(spawns)(
+    "a profile narrowed while a Codex sub-agent runs (%s): its next turn is stopped, with why",
+    ([, spawn]) =>
+      Effect.gen(function* () {
+        const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
+        const { profiles, profileFor } = makeProfiles();
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+        const seen = yield* completions(client);
+        const id = (yield* start(client, "t")).thread.id;
+        const child = fake.spawnChild(id);
+        const [method, payload] = spawn(id, child);
+        yield* fake.emit(method, payload);
+        profiles.set("t", resolved("a", ["alpha"]));
+        yield* fake.emit("turn/started", turnStarted(child, "child-2"));
+        yield* fake.reached("turn/interrupt", 1);
+        assert.deepStrictEqual(fake.sent("turn/interrupt")[0]!.params, {
+          threadId: child,
+          turnId: "child-2",
+        });
+        yield* fake.emit("turn/completed", turnCompleted(child, "child-2"));
+        assert.strictEqual(seen[0]!.status, "failed");
+        assert.include(
+          (seen[0]!.error as { readonly message: string }).message,
+          "Codex still has beta switched on for this thread",
+        );
+        // A sub-agent T3 later resumes (to read its model) loads under its parent's profile.
+        fake.unload(child);
+        yield* resume(client, child);
+        assert.deepStrictEqual(offKeys(fake.threads.get(child)!.config), [
+          "mcp_servers.beta.enabled",
+        ]);
+      }),
+  );
+
   it.effect("a widened profile runs at once: the thread keeps fewer servers until reloaded", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
       const { profiles, profileFor } = makeProfiles({ t: resolved("a", ["alpha"]) });
-      const client = withCodexMcpProfiles(fake.client, profileFor);
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
       const id = (yield* start(client, "t")).thread.id;
       profiles.set("t", ALL);
       assert.strictEqual(yield* outcome(turn(client, id)), "ok");
@@ -622,7 +1004,7 @@ describe("withCodexMcpProfiles", () => {
   it.effect("a plugin server Codex will not switch off refuses the turn", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha"], plugins: ["plug"] });
-      const client = withCodexMcpProfiles(
+      const client = yield* withCodexMcpProfiles(
         fake.client,
         makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
       );
@@ -636,7 +1018,7 @@ describe("withCodexMcpProfiles", () => {
   it.effect("the server list is read across pages, and refuses when it cannot be read", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["a1", "a2", "a3", "a4", "a5"] });
-      const client = withCodexMcpProfiles(
+      const client = yield* withCodexMcpProfiles(
         fake.client,
         makeProfiles({ t: resolved("a", ["a1"]) }).profileFor,
       );
@@ -655,11 +1037,11 @@ describe("withCodexMcpProfiles", () => {
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
       const { profileFor } = makeProfiles({ t: resolved("a", ["alpha"]) });
-      const before = withCodexMcpProfiles(fake.client, profileFor);
+      const before = yield* withCodexMcpProfiles(fake.client, profileFor);
       const id = (yield* start(before, "t")).thread.id;
       // The new process: same threads on disk, none loaded, and a new wrapped client.
       fake.unload(id);
-      const after = withCodexMcpProfiles(fake.client, profileFor);
+      const after = yield* withCodexMcpProfiles(fake.client, profileFor);
       // Nothing narrowed on it yet, so a turn on a thread it never loaded is left to Codex.
       yield* resume(after, id, "t");
       assert.deepStrictEqual(offKeys(fake.threads.get(id)!.config), ["mcp_servers.beta.enabled"]);
@@ -670,7 +1052,7 @@ describe("withCodexMcpProfiles", () => {
   it.effect("with a profile in use, a thread T3 did not load itself is refused", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
-      const client = withCodexMcpProfiles(
+      const client = yield* withCodexMcpProfiles(
         fake.client,
         makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
       );
@@ -696,7 +1078,7 @@ describe("withCodexMcpProfiles", () => {
   it.effect("stopped half-way: a turn interrupted in its check never starts; a retry runs", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
-      const client = withCodexMcpProfiles(
+      const client = yield* withCodexMcpProfiles(
         fake.client,
         makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
       );
@@ -716,7 +1098,7 @@ describe("withCodexMcpProfiles", () => {
   it.effect("stopped half-way: a load interrupted while servers are read sends nothing", () =>
     Effect.gen(function* () {
       const fake = makeFakeCodex({ servers: ["alpha", "beta"] });
-      const client = withCodexMcpProfiles(
+      const client = yield* withCodexMcpProfiles(
         fake.client,
         makeProfiles({ t: resolved("a", ["alpha"]) }).profileFor,
       );
