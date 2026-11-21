@@ -12,6 +12,7 @@ import {
   type Project as ProjectRecord,
   ProjectId,
   ProviderInstanceId,
+  type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -41,6 +42,11 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import {
+  OPTION_CASE_PROVIDERS,
+  OPTION_CASE_ROWS,
+  OPTION_CASES,
+} from "./modelPolicyOptions.testkit.ts";
 import { type SlotWorld, slotGateOver, slotWorld } from "./slotWorld.testkit.ts";
 
 const PROJECT = ProjectId.make("project:wide");
@@ -83,6 +89,8 @@ const harness = (
   options: {
     readonly caller?: boolean | "linked agent" | "linked owner";
     readonly slots?: SlotWorld;
+    /** This machine's providers (none unless named). */
+    readonly providers?: ReadonlyArray<ServerProvider>;
   } = {},
 ) => {
   const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
@@ -91,7 +99,7 @@ const harness = (
   const linkSender = { environmentId: THERE, threadId: "thread:sender", title: "Sender" };
   const base = Layer.mergeAll(
     Layer.mock(ProviderRegistry.ProviderRegistry)({
-      getProviders: Effect.succeed([]),
+      getProviders: Effect.succeed(options.providers ?? []),
       refreshWorkspaceSnapshot: () => Effect.succeed([]),
     }),
     ServerSettings.layerTest({
@@ -196,7 +204,7 @@ const harness = (
       : slotGateOver(options.slots, INSTANCE).pipe(Layer.provideMerge(base));
   const launch = (input: {
     readonly projectId?: ProjectId;
-    readonly environmentId?: EnvironmentId;
+    readonly environmentId?: EnvironmentId | undefined;
     readonly clientRequestId?: string | undefined;
     /** `null`: a launch without a message, which starts no run. */
     readonly message?: string | null;
@@ -742,6 +750,91 @@ describe("the model policy on a launch sent to a linked machine (#731)", () => {
           "sent there",
         );
         expect(forwarded).toHaveLength(1);
+      }
+    }),
+  );
+});
+
+describe("the model policy on t3_thread_launch: an option the policy cannot read (#793 review)", () => {
+  const policy = (mode: string) =>
+    ({ modelPolicy: { mode, allow: OPTION_CASE_ROWS } }) as unknown as Settings;
+  const routes = [
+    { route: "an agent's launch here", caller: true, environmentId: undefined },
+    {
+      route: "a linked agent's launch received here",
+      caller: "linked agent",
+      environmentId: undefined,
+    },
+    { route: "an agent's launch sent to a linked machine", caller: true, environmentId: THERE },
+  ] as const;
+
+  it.effect("enforce: refused on each route, nothing started or sent; without it, it goes", () =>
+    Effect.gen(function* () {
+      for (const { route, caller, environmentId } of routes) {
+        for (const testCase of OPTION_CASES) {
+          const name = `${route}: ${testCase.name}`;
+          const { forwarded, launched, launch } = harness(policy("enforce"), {
+            caller,
+            providers: OPTION_CASE_PROVIDERS,
+          });
+          const modelSelection = (withExtra: boolean) => ({
+            instanceId: testCase.instanceId,
+            model: testCase.model,
+            options: withExtra ? [testCase.allowed, testCase.extra] : [testCase.allowed],
+          });
+          // Runs again (same key): refused each time.
+          for (const clientRequestId of ["k", "k"]) {
+            const message = refusal(
+              yield* launch({
+                environmentId,
+                modelSelection: modelSelection(true),
+                clientRequestId,
+              }),
+            );
+            expect(message, name).toContain(`Model policy refused this pick: ${testCase.why}`);
+            expect(message, name).toContain(testCase.fix);
+          }
+          expect([launched.length, forwarded.length], name).toEqual([0, 0]);
+          const allowed = refusal(
+            yield* launch({ environmentId, modelSelection: modelSelection(false) }),
+          );
+          if (environmentId === undefined) {
+            expect(allowed, name).toBeUndefined();
+            expect(launched, name).toHaveLength(1);
+          } else {
+            expect(allowed, name).toContain("sent there");
+            expect(forwarded, name).toHaveLength(1);
+          }
+        }
+      }
+    }),
+  );
+
+  it.effect("advise: the launch goes as today", () =>
+    Effect.gen(function* () {
+      for (const { route, caller, environmentId } of routes) {
+        const { forwarded, launched, launch } = harness(policy("advise"), {
+          caller,
+          providers: OPTION_CASE_PROVIDERS,
+        });
+        for (const testCase of OPTION_CASES) {
+          const message = refusal(
+            yield* launch({
+              environmentId,
+              modelSelection: {
+                instanceId: testCase.instanceId,
+                model: testCase.model,
+                options: [testCase.allowed, testCase.extra],
+              },
+              clientRequestId: testCase.name,
+            }),
+          );
+          if (environmentId === undefined) expect(message, route).toBeUndefined();
+          else expect(message, route).toContain("sent there");
+        }
+        expect((environmentId === undefined ? launched : forwarded).length, route).toBe(
+          OPTION_CASES.length,
+        );
       }
     }),
   );
