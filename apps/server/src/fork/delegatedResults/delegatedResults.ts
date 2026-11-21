@@ -112,16 +112,18 @@ export const isRemindable = (task: OrchestrationV2Subagent, nowMs: number): bool
 };
 
 /**
- * Whether a refusal is new to this process, so each refused batch is logged once per process: every
- * later check finds its refused receipt (or another thread's receipt) again. Not stored, so a
- * restart logs a batch still refused once more, also one whose log line a stop cut off. A refusal
- * is forgotten after `REMINDER_MAX_AGE_MS`: its tasks ended before it, so none is reminded then.
+ * Whether a refusal is new to this process (each later check finds its receipt again); a restart
+ * logs a batch still refused once more. `forgetAfterMs`: when a logged id can no longer come back
+ * (the reminder's tasks ended before the refusal, so none is reminded a day later); `null` keeps
+ * every id for the process.
  */
-export const makeRefusalLog = () => {
+export const makeRefusalLog = (forgetAfterMs: number | null = REMINDER_MAX_AGE_MS) => {
   const logged = new Map<string, number>();
   return (commandId: string, nowMs: number): boolean => {
-    for (const [id, atMs] of logged) {
-      if (nowMs - atMs > REMINDER_MAX_AGE_MS) logged.delete(id);
+    if (forgetAfterMs !== null) {
+      for (const [id, atMs] of logged) {
+        if (nowMs - atMs > forgetAfterMs) logged.delete(id);
+      }
     }
     if (logged.has(commandId)) return false;
     logged.set(commandId, nowMs);
