@@ -1,8 +1,11 @@
+// @effect-diagnostics nodeBuiltinImport:off - the service's record reads are made synchronous here.
 /**
  * Fork: the MCP profile a scheduled task was saved with, through upstream's real service over a
  * real task table (SQLite in memory) and state folder: saves, scheduled runs, and missing, old,
  * half-written, corrupt and pruned records.
  */
+import * as NodeFS from "node:fs";
+
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, expect, it } from "@effect/vitest";
@@ -25,6 +28,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -273,6 +277,43 @@ const threadManagement = (world: World) =>
   });
 
 /**
+ * Whole-file reads at once, not on Node's thread pool: a forked run reads the record file, and the
+ * tests give forked work a fixed number of turns (`settle`), which a thread-pool read on a loaded
+ * machine can outlast. Read at once, a run takes the same number of turns on any machine.
+ */
+const readsAtOnce = Layer.effect(
+  FileSystem.FileSystem,
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    return {
+      ...fs,
+      readFileString: (path: string, encoding?: string) =>
+        Effect.suspend(() => {
+          try {
+            return Effect.succeed(
+              NodeFS.readFileSync(path, { encoding: (encoding ?? "utf8") as BufferEncoding }),
+            );
+          } catch (cause) {
+            // A missing file, as the real one reports it; any other failure from the real one.
+            return (cause as NodeJS.ErrnoException).code === "ENOENT"
+              ? Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "NotFound",
+                    module: "FileSystem",
+                    method: "readFileString",
+                    syscall: "open",
+                    pathOrDescriptor: path,
+                    cause,
+                  }),
+                )
+              : fs.readFileString(path, encoding);
+          }
+        }),
+    };
+  }),
+);
+
+/**
  * Starts the service (a server start) over the task table and state folder the test holds, runs
  * `body` with it (and the settings service, which the owner changes with), and stops it. Called
  * again on the same table and folder, it is a restart.
@@ -292,6 +333,7 @@ const withService = <A, E, R>(
           Layer.provideMerge(
             Layer.mergeAll(serviceDependencies(settings, world), threadManagement(world)),
           ),
+          Layer.provide(readsAtOnce),
         ),
       );
       return yield* body(
