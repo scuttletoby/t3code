@@ -197,6 +197,52 @@ class SweepTests(unittest.TestCase):
         s._pidfd_open, s._pidfd_send, s._close = pidfd_open, pidfd_send, lambda fd: None
         return s
 
+    def label_proc(self, cgroup):
+        """A fake /proc for owner_value: its own cgroup (None: no cgroup v2 line) and its parent, a python3."""
+        proc = os.path.join(self.root, 'label-proc')
+        shutil.rmtree(proc, ignore_errors=True)
+        os.makedirs(os.path.join(proc, 'self'))
+        with open(os.path.join(proc, 'self', 'cgroup'), 'w') as f:
+            f.write(f'0::{cgroup}\n' if cgroup is not None else '1:name=systemd:/\n')
+        parent = os.path.join(proc, str(os.getppid()))
+        os.makedirs(parent)
+        with open(os.path.join(parent, 'stat'), 'w') as f:
+            f.write(f'{os.getppid()} (python3) S 1 ' + ' '.join(['0'] * 17) + ' 4321 ' + ' '.join(['0'] * 20) + '\n')
+        with open(os.path.join(parent, 'status'), 'w') as f:
+            f.write(f'Name:\tpython3\nUid:\t{UID}\t{UID}\t{UID}\t{UID}\n')
+        return proc
+
+    def test_docker_label_names_the_scope_the_process_is_in(self):
+        # HEAVY_SCOPE is only inherited: a process that left heavy's scope (systemd-run --scope from inside the
+        # command) keeps it, yet heavy would remove its container while it still runs. Its own cgroup decides
+        old = os.environ.get('HEAVY_SCOPE')
+        self.addCleanup(lambda: os.environ.__setitem__('HEAVY_SCOPE', old) if old is not None
+                        else os.environ.pop('HEAVY_SCOPE', None))
+        os.environ['HEAVY_SCOPE'] = 'heavy-a-0a1b2c3d.scope'
+        value = self.mod.owner_value(proc=self.label_proc(f'{CG}/heavy.slice/heavy-b-0a1b2c3d.scope'))
+        self.assertEqual(value, f'uid={UID},scope=heavy-b-0a1b2c3d.scope')
+        value = self.mod.owner_value(proc=self.label_proc(f'{CG}/app.slice/run-r0a1b2c3d.scope'))
+        self.assertEqual(value, f'uid={UID},pid={os.getppid()},start=4321')
+        value = self.mod.owner_value(proc=self.label_proc(None))      # the cgroup cannot be told: HEAVY_SCOPE then
+        self.assertEqual(value, f'uid={UID},scope=heavy-a-0a1b2c3d.scope')
+
+    def test_heavy_docker_must_be_an_absolute_path(self):
+        # as bin/heavy: a relative HEAVY_DOCKER left in a shell would run ./<it> from whatever folder the sweep runs in
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(self.root)
+        with open('docker-here', 'w') as f:
+            f.write('#!/bin/sh\nexit 0\n')
+        os.chmod('docker-here', 0o755)
+        old = os.environ.get('HEAVY_DOCKER')
+        self.addCleanup(lambda: os.environ.__setitem__('HEAVY_DOCKER', old) if old is not None
+                        else os.environ.pop('HEAVY_DOCKER', None))
+        for value, want in (('docker-here', ''), (os.path.join(self.root, 'docker-here'),
+                                                  os.path.join(self.root, 'docker-here'))):
+            with self.subTest(value=value):
+                os.environ['HEAVY_DOCKER'] = value
+                self.assertEqual(self.mod.Sweep().docker_path(), want)
+
     def run_sweep(self, *argv, docker=True, sweep=None):
         out, err = io.StringIO(), io.StringIO()
         code = self.mod.sweep_main(list(argv), sweep=sweep or self.sweep(docker), out=out, err=err)
@@ -1279,6 +1325,14 @@ class Label(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.proc, True)
         self.fake(os.getppid(), 'python3')
         self.cgroup('/user.slice/app.slice/t3code.service')
+        # under heavy, the real `heavy docker-label` below notes this test's scope for the heavy running it; an
+        # installed heavy from before the notes would leave it, so a note this test made goes again
+        with open('/proc/self/cgroup') as f:
+            leaf = REAL.unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
+        if REAL.is_heavy_scope(leaf):
+            note = os.path.join(REAL.RUNTIME_ROOT, str(UID), 'heavy', 'labelled', leaf)
+            if not os.path.lexists(note):
+                self.addCleanup(lambda: os.path.lexists(note) and os.unlink(note))
 
     def fake(self, pid, comm, uid=UID, start=4321):
         d = os.path.join(self.proc, str(pid))
@@ -1295,6 +1349,9 @@ class Label(unittest.TestCase):
 
     def test_owner_value_heavy_scope_first_then_the_parent_process(self):
         os.environ['HEAVY_SCOPE'] = 'heavy-pytest-0a1b2c3d.scope'
+        # in another unit's cgroup (it left heavy's scope): the variable is only inherited, the parent owns it
+        self.assertEqual(REAL.owner_value(proc=self.proc), f'uid={UID},pid={os.getppid()},start=4321')
+        self.cgroup('/')                # a cgroup namespace's root: the cgroup cannot be told, HEAVY_SCOPE then
         self.assertEqual(REAL.owner_value(proc=self.proc), f'uid={UID},scope=heavy-pytest-0a1b2c3d.scope')
         os.environ['HEAVY_SCOPE'] = 'not-a-heavy-scope; rm -rf'
         self.assertEqual(REAL.owner_value(proc=self.proc), f'uid={UID},pid={os.getppid()},start=4321')
@@ -1341,9 +1398,13 @@ class Label(unittest.TestCase):
             self.assertEqual(key, LABEL)
             owner = REAL.parse_owner(value)
             self.assertEqual((owner['uid'], owner['pid']), (UID, os.getpid()))
+        # HEAVY_SCOPE names a scope this test is not in: its own cgroup decides (its own heavy scope, else its parent)
         r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', '--value'], capture_output=True,
                            text=True, env=dict(env, HEAVY_SCOPE='heavy-a-0a1b2c3d.scope'))
-        self.assertEqual(r.stdout, f'uid={UID},scope=heavy-a-0a1b2c3d.scope\n')
+        with open('/proc/self/cgroup') as f:
+            leaf = REAL.unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
+        self.assertEqual(r.stdout, f'uid={UID},scope={leaf}\n' if REAL.is_heavy_scope(leaf) else
+                         f'uid={UID},pid={os.getpid()},start={REAL.read_owner(os.getpid())[1]}\n', r.stderr)
         r = subprocess.run([sys.executable, '-I', '-B', HEAVY, 'docker-label', '--pid'], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
 
@@ -1594,6 +1655,10 @@ MUTATIONS = {
         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
     "python's --check-hash-based-pycs takes a word": ("'-Q', '--check-hash-based-pycs'}", "'-Q'}",
                                                       'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
+    'docker-label: own cgroup first': ("if not leaf and is_heavy_scope(scope)", "if is_heavy_scope(scope)",
+                                       'test_docker_label_names_the_scope_the_process_is_in'),
+    'HEAVY_DOCKER absolute': ("self.docker = path if os.path.isabs(path) else ''", 'self.docker = path',
+                              'test_heavy_docker_must_be_an_absolute_path'),
     "node's long options take a word": ("'--env-file', '--env-file-if-exists', '--title',", "'--env-file-if-exists',",
                                         'test_short_option_clusters_and_other_interpreters_never_show_their_inline_code'),
 }

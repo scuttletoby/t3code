@@ -324,6 +324,7 @@ const layerScratchThreadPromotionProvided = ScratchThreadPromotion.layer.pipe(
   ),
 );
 const layerProviderContinuationWorkerProvided = ProviderContinuationService.layer.pipe(
+  Layer.provide(WaitWorker.continuationSlot), // Fork: an idle thread's wake waits for an agent slot
   Layer.provide(
     Layer.mergeAll(
       ProviderContinuationRequests.layer,
@@ -409,6 +410,7 @@ export const layerProduction = Layer.mergeAll(
     Layer.provide(Layer.merge(layerOrchestratorProvided, layerCommandOutputHubProvided)),
   ),
   UsageLimitRecoveryWorker.layer.pipe(
+    Layer.provide(WaitWorker.limitResumeSlot), // Fork: a resume waits for an agent slot
     Layer.provide(
       Layer.mergeAll(
         ProjectionStore.layer,
@@ -419,8 +421,6 @@ export const layerProduction = Layer.mergeAll(
   ),
   // Fork (waits): off by default; the sweep reads and writes nothing until it is switched on.
   WaitWorker.layer.pipe(
-    // One slot gate for /mcp, waits and scheduled runs: layers memoize by reference (server.ts).
-    Layer.provide(SlotGate.layer),
     Layer.provide(
       Layer.mergeAll(
         layerThreadManagementProvided,
