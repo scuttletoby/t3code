@@ -246,31 +246,22 @@
       "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
-        "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch"
-      ],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "import { checkLaunchSlot } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
-          "yield* checkLaunchSlot(caller, { threadId, modelSelection, replaying, input, attachments }); // Fork: agent slots"
-        ]
-      }
+        "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch",
+        "import { checkLaunchSlot } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+        "yield* checkLaunchSlot(caller, { threadId, modelSelection, replaying, input, attachments }); // Fork: agent slots"
+      ]
     },
     "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
       "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706).",
-      "added": [],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "import { makeScheduledRunSlots } from \"../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
-          "const runSlots = yield* makeScheduledRunSlots(WebhookDeliverySkipped); // Fork: agent slots",
-          "const slot = yield* runSlots.admit(active, trigger, startedAt, rescheduleMissedRun); // Fork: agent slots",
-          "if (slot.skipped !== null) return slot.skipped; // Fork: a skipped run is recorded",
-          "yield* slot.end(threadId); // Fork: the slot names the run's thread",
-          "Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot",
-          "runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored"
-        ]
-      }
+      "added": [
+        "import { makeScheduledRunSlots } from \"../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+        "const runSlots = yield* makeScheduledRunSlots(WebhookDeliverySkipped); // Fork: agent slots",
+        "const slot = yield* runSlots.admit(active, trigger, startedAt, rescheduleMissedRun); // Fork: agent slots",
+        "if (slot.skipped !== null) return slot.skipped; // Fork: a skipped run is recorded",
+        "yield* slot.end(threadId); // Fork: the slot names the run's thread",
+        "Effect.ensuring(runSlots.ended(task.id)), // Fork: a failed run frees its slot",
+        "runSlots.directDelivery(deliveryId, request, pendingWebhooks.invalidate), // Fork: a waiting direct delivery is stored"
+      ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
       "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693).",
@@ -285,16 +276,11 @@
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch",
-        "yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch"
-      ],
-      "announced": {
-        "since": "2026-11-21",
-        "added": [
-          "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
-          "// prettier-ignore",
-          "Effect.mapError(AgentSlotRoutes.runNowSlotRefusal), // Fork: agent slots"
-        ]
-      }
+        "yield* LaunchMcpProfile.checkScheduleRunMcpProfile(input.taskId); // Fork: MCP profile launch",
+        "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
+        "// prettier-ignore",
+        "Effect.mapError(AgentSlotRoutes.runNowSlotRefusal), // Fork: agent slots"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",

@@ -9,6 +9,7 @@ import {
   type ModelSelection,
   type OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpFailure,
+  type OrchestratorMcpCreateThreadRequest,
   type OrchestratorMcpTarget,
   PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
   type OrchestrationV2ThreadProjection,
@@ -31,6 +32,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as SlotGate from "../slots/SlotGate.ts";
 import * as UsagePacer from "../usage/UsagePacer.ts";
 import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
+import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
 import * as LaunchMcpProfile from "./launchMcpProfile.ts";
 
 /** A checked delegation target (the same shape as the service's resolved target). */
@@ -95,7 +97,15 @@ export interface DelegateHold {
 
 export interface BeforeCreateThreadInput {
   readonly isRetry: boolean;
-  readonly callerThreadId: ThreadId;
+  /**
+   * The thread to be created: its place in the call's batch. A thread with a prompt starts a run
+   * and takes an agent slot; the first one checks the whole batch fits. The caller is the parent.
+   */
+  readonly child: {
+    readonly threadId: ThreadId;
+    readonly index: number;
+    readonly batch: ReadonlyArray<OrchestratorMcpCreateThreadRequest>;
+  };
   readonly parent: Parent;
   /** The target the caller asked for, before the parent's options were laid under it. */
   readonly requested: OrchestratorMcpTarget | undefined;
@@ -121,7 +131,9 @@ export interface DelegateChecks {
   ) => Effect.Effect<DelegateHold, OrchestratorMcpFailure, Scope.Scope>;
   /**
    * `create_threads`, per thread before its dispatch. A caller with a narrower MCP profile than
-   * `all` is refused a thread that would get more (`launchMcpProfile.ts`): it has no parent.
+   * `all` is refused a thread that would get more (`launchMcpProfile.ts`): it has no parent. A
+   * thread that starts a run takes an agent slot last, on the final target, or is refused
+   * `slots_full` (`agentSlotRoutes.ts`).
    */
   readonly beforeCreateThread: (
     input: BeforeCreateThreadInput,
@@ -476,17 +488,36 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         ? Effect.succeed(NO_HOLD)
         : acquireSlot(slotGate.value, input),
     // Placement (P1) adds its check here. The MCP profile check is first: a refusal starts nothing.
-    beforeCreateThread: (input) =>
-      input.isRetry
-        ? Effect.succeed({ target: input.target })
+    // The slot is last, on the final target; a retry of an accepted creation starts nothing new.
+    beforeCreateThread: (input) => {
+      const slot = (target: DelegateTarget, retry: AgentSlotRoutes.CreateThreadSlot["retry"]) =>
+        AgentSlotRoutes.admitCreateThread(slotGate, {
+          callerThreadId: input.parent.thread.id,
+          threadId: input.child.threadId,
+          index: input.child.index,
+          batch: input.child.batch,
+          targetInstanceId: target.modelSelection.instanceId,
+          defaultInstanceId: input.parent.thread.modelSelection.instanceId,
+          retry,
+        });
+      // A retry starts the run its first try did not (the dispatch after the creation failed).
+      const hasRun = Effect.suspend(() =>
+        threadManagement.getThreadRecords(input.child.threadId, ["runs"]),
+      ).pipe(
+        Effect.map((records) => records.runs.length > 0),
+        Effect.orElseSucceed(() => false),
+      );
+      return input.isRetry
+        ? slot(input.target, { hasRun }).pipe(Effect.as({ target: input.target }))
         : launchMcpProfile(input.parent.thread, {
             projectId: input.parent.thread.projectId,
             route: "create_threads",
           }).pipe(
-            Effect.andThen(
-              Effect.map(ownTarget(input.target, input.requested), (target) => ({ target })),
-            ),
-          ),
+            Effect.andThen(ownTarget(input.target, input.requested)),
+            Effect.tap((target) => slot(target, null)),
+            Effect.map((target) => ({ target })),
+          );
+    },
     remoteTarget: (target) =>
       remoteTarget(target) === target
         ? Effect.succeed(target)
