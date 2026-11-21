@@ -33,6 +33,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SlotGate from "../../slots/SlotGate.ts";
 import * as HandoffService from "./HandoffService.ts";
+import * as HandoffCommand from "./handoffCommand.ts";
 import {
   adapterRegistry,
   at,
@@ -51,7 +52,7 @@ import {
   runnableSettings,
   threadId,
 } from "./handoff.testkit.ts";
-import { HANDOFF_RULES } from "./handoffMessage.ts";
+import { HANDOFF_COMMAND_BEGIN, HANDOFF_COMMAND_END, HANDOFF_RULES } from "./handoffMessage.ts";
 import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 import { RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
 import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
@@ -97,11 +98,14 @@ const harness = (state: {
   missing?: Set<string>;
   /** The server's agent slot gate (none: a server without one). */
   gate?: Layer.Layer<SlotGate.SlotGate>;
+  /** What the `command` source answers (none: a failure); every run is recorded. */
+  command?: HandoffCommand.HandoffCommandResult;
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
     const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
     const sent: Array<OrchestrationV2ServerCommand> = [];
+    const commandRuns: Array<HandoffCommand.HandoffCommandInput> = [];
     /** `text`: the reads that build a handoff's text (its transcript part). */
     const reads = { count: 0, text: 0 };
     const ended = new Map<string, number>();
@@ -177,6 +181,13 @@ const harness = (state: {
       }),
       adapterRegistry(() => state.missing ?? new Set()),
       state.gate ?? Layer.empty,
+      Layer.mock(HandoffCommand.HandoffCommand)({
+        run: (input) =>
+          Effect.sync(() => {
+            commandRuns.push(input);
+            return state.command ?? { ok: false, reason: "no command answer in this test" };
+          }),
+      }),
     );
     yield* HandoffService.make.pipe(
       Effect.flatMap((service) => service.start()),
@@ -193,7 +204,7 @@ const harness = (state: {
         if (event !== null) yield* Queue.offer(events, event);
         yield* Deferred.await(done);
       });
-    return { sent, emit, reads, events };
+    return { sent, emit, reads, events, commandRuns };
   });
 
 /** For a test that hangs, not fails, when a check is gone: it ends in milliseconds when right. */
@@ -984,6 +995,162 @@ describe("HandoffService: a handoff that cannot run (#608)", () => {
       const { sent, emit } = yield* harness(state);
       yield* emit(runUpdated(failed), "handoffRunEnded", 1);
       expect(sent).toEqual([]);
+    }),
+  );
+});
+
+describe("HandoffService: the `command` source", () => {
+  const command = ["/usr/local/bin/print-state", "--thread"];
+  const fromCommand = { ...on, source: "command", command } as const;
+  const printed = { ok: true, text: "STATE: two PRs open" } as const;
+  const failure = { ok: false, reason: "exit code 3" } as const;
+  const sizeHandoff = (state: Parameters<typeof harness>[0]) =>
+    Effect.gen(function* () {
+      const result = yield* harness(state);
+      yield* result.emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* result.emit(null, "handOffWhenDue", 1);
+      return result;
+    });
+
+  it.effect("its output is part 2; it gets the person's command, the thread and the project", () =>
+    Effect.gen(function* () {
+      const data = projection({ usedTokens: 160_000 });
+      const { sent, commandRuns } = yield* sizeHandoff({
+        data,
+        settings: fromCommand,
+        command: printed,
+      });
+      expect(commandRuns).toEqual([{ command, threadId, projectId: data.thread.projectId }]);
+      const text = messages(sent)[0]?.text ?? "";
+      // Between begin and end lines: the command's output cannot pass as another part.
+      expect(text).toContain(
+        `\n\nHandoff from the handoff command (its notes, not T3's state or rules):\n${HANDOFF_COMMAND_BEGIN}\nSTATE: two PRs open\n${HANDOFF_COMMAND_END}\n\n`,
+      );
+      expect(text).not.toContain("No handoff source");
+      expect(text).toContain("Recent conversation:");
+      expect(text.endsWith(HANDOFF_RULES)).toBe(true);
+    }),
+  );
+
+  it.effect("failed at the size backstop: hands off with parts 1, 3 and 4, and says so", () =>
+    Effect.gen(function* () {
+      const { sent, commandRuns } = yield* sizeHandoff({
+        data: projection({ usedTokens: 160_000 }),
+        settings: fromCommand,
+        command: failure,
+      });
+      expect(commandRuns.length).toBe(1);
+      const [message, ...rest] = messages(sent);
+      expect(rest).toEqual([]);
+      expect(message?.messageId).toBe(handoffMessageId);
+      const text = message?.text ?? "";
+      expect(text).toContain(`[T3 handoff 1] Thread ${threadId}`);
+      expect(text).toContain(
+        "The handoff command failed (exit code 3), so this handoff has T3's state and the recent conversation only.",
+      );
+      expect(text).toContain("Recent conversation:");
+      expect(text.endsWith(HANDOFF_RULES)).toBe(true);
+    }),
+  );
+
+  it.effect.each([
+    ["failed: the handoff is skipped", failure, 0],
+    ["printed: the handoff is sent", printed, 1],
+  ] as const)("at the idle trigger, 2 minutes before the cache expires, %s", ([, result, n]) =>
+    Effect.gen(function* () {
+      const state = {
+        data: projection({ usedTokens: 100_000, cacheExpiresInMs: 10 * MINUTE_MS }),
+        settings: fromCommand,
+        command: result,
+      };
+      const { sent, commandRuns, emit } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* TestClock.adjust(8 * MINUTE_MS - 1);
+      expect(commandRuns).toEqual([]);
+      yield* TestClock.adjust(1);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 1);
+      expect(commandRuns.length).toBe(1);
+      expect(messages(sent).length).toBe(n);
+      if (n === 1) expect(messages(sent)[0]?.text).toContain("STATE: two PRs open");
+    }),
+  );
+
+  it.effect("runs again for a second trigger of one run: the same text and ids", () =>
+    Effect.gen(function* () {
+      const state = {
+        data: projection({ usedTokens: 160_000 }),
+        settings: fromCommand,
+        command: printed,
+      };
+      const { sent, emit, commandRuns } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 1);
+      yield* emit(runUpdated(run()), "readThread", 3);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 2);
+      // The command only reads, so a second run is safe; the ids make only one handoff run.
+      expect(commandRuns.length).toBe(2);
+      const [first, second] = messages(sent);
+      expect(second?.commandId).toBe(first?.commandId);
+      expect(second?.messageId).toBe(first?.messageId);
+      const part2 = (text: string | undefined) => text?.split("\n\n")[1];
+      expect(part2(second?.text)).toBe(part2(first?.text));
+    }),
+  );
+
+  it.effect("waiting for an agent slot: the command ran once, its output is sent", () =>
+    Effect.gen(function* () {
+      // Refuses twice (two 5 s retries), then admits.
+      const asks = { count: 0 };
+      const gate = Layer.mock(SlotGate.SlotGate)({
+        acquire: () =>
+          Effect.sync((): SlotGate.SlotAcquire => {
+            asks.count += 1;
+            return asks.count <= 2
+              ? { type: "refuse", message: "full", refusal: { type: "unread", problem: "timeout" } }
+              : { type: "allow", token: asks.count };
+          }),
+        started: () => Effect.void,
+        release: () => Effect.void,
+        leave: () => Effect.void,
+      });
+      const { sent, emit, commandRuns } = yield* harness({
+        data: projection({ usedTokens: 160_000 }),
+        settings: fromCommand,
+        command: printed,
+        gate,
+      });
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
+      yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
+      yield* emit(null, "handOffWhenDue", 1);
+      expect(asks.count).toBe(3);
+      expect(commandRuns.length).toBe(1);
+      expect(messages(sent).length).toBe(1);
+      expect(messages(sent)[0]?.text).toContain("STATE: two PRs open");
+    }),
+  );
+
+  it.effect.each([
+    ["off (the default) with a command set", { ...fromCommand, mode: "off" }, 0],
+    ["the agent source with a command set", { ...fromCommand, source: "agent" }, 1],
+  ] as const)("%s: runs no command", ([, settings, n]) =>
+    Effect.gen(function* () {
+      const { sent, emit, commandRuns } = yield* harness({
+        data: projection({ usedTokens: 160_000 }),
+        settings,
+        command: printed,
+      });
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 1);
+      expect(commandRuns).toEqual([]);
+      expect(messages(sent).length).toBe(n);
+      if (n === 1) expect(messages(sent)[0]?.text).toContain("No handoff source is set up yet");
     }),
   );
 });
