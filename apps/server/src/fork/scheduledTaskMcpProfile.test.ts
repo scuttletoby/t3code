@@ -978,7 +978,7 @@ it.effect("a webhook run is refused when it starts, and again after it waited fo
 );
 
 it.effect(
-  "a webhook delivery that waited while the task was saved again says so; the next one runs",
+  "a webhook delivery saved while it waited runs once on the task as saved, checked on it (#719)",
   () => {
     const logs: Array<Logger.Options<unknown>> = [];
     /** The stored-delivery worker's run is in its slot wait, on the copy of the task it took. */
@@ -1020,32 +1020,34 @@ it.effect(
               ...(yield* listed(service, "task:hook-saved")),
               prompt: "New words",
             });
-            yield* settleUntil(
-              deliveryOf(service, "task:hook-saved", stored.deliveryId).pipe(
-                Effect.map((delivery) => delivery.outcome !== "accepted"),
-                Effect.orDie,
-              ),
-              "the waiting delivery ended",
-              workerRounds(world, 1),
-            );
-            // It was asked for the old prompt, which the run would use: not started, and the
-            // reason says why (not "save the task again", which the owner just did).
-            slots.running = [];
-            yield* workerRounds(world, 2);
+            // The run it held was rendered from the old prompt: not started, and not dropped. The
+            // delivery stays stored and is read again, so the profile check is on the task as
+            // saved (its record matches), not on the old copy.
+            yield* workerRounds(world, 3);
             expect(world.launched).toHaveLength(0);
-            const waited = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
-            expect(waited.outcome).toBe("dispatch_failed");
-            expect(waited.error).toContain(STALE_COPY);
-            expect(waited.error).toContain("the next webhook delivery, uses the task as it is now");
-            expect(waited.error).not.toContain("Save the task again");
-            // The next delivery runs the task as it is now.
-            const next = yield* service.triggerWebhook(webhookRequest(hook, '{"n":2}'));
-            if (next._tag !== "accepted") return assert.fail(`not accepted: ${next._tag}`);
+            const waiting = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
+            expect(waiting.outcome).toBe("accepted");
+            expect(waiting.renderedPrompt).toContain("New words");
+            const sql = yield* SqlClient.SqlClient;
+            expect(
+              yield* sql`SELECT state FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-saved'`,
+            ).toEqual([{ state: "dispatching" }]);
+            // The slot frees: it runs once, with the new prompt.
+            slots.running = [];
             yield* settleUntil(
               Effect.sync(() => world.launched.length === 1),
-              "the next delivery ran",
+              "the waiting delivery ran",
+              workerRounds(world, 1),
             );
             expect(JSON.stringify(world.launched[0])).toContain("New words");
+            expect(JSON.stringify(world.launched[0])).not.toContain("Do the work");
+            yield* workerRounds(world, 3);
+            expect(world.launched).toHaveLength(1);
+            const ran = yield* deliveryOf(service, "task:hook-saved", stored.deliveryId);
+            expect(ran.outcome).toBe("accepted");
+            expect(
+              yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-saved'`,
+            ).toHaveLength(0);
           }),
         );
       }),
@@ -1059,6 +1061,72 @@ it.effect(
 
 const STALE_COPY =
   "Not run: this task was saved again after this run read it, and the run would have used the task as it was before, so it was not started.";
+
+it.effect(
+  "a delivery handed back after a save while it waits is refused on the task as saved (#750)",
+  () =>
+    held(
+      Effect.gen(function* () {
+        const slots = slotWorld();
+        const world = newWorld(slots);
+        yield* withService(NARROWED, world, (service, serverSettings) =>
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            // The narrowed thread's webhook task; the slot is full, so its delivery waits.
+            const { task: hook } = yield* asCaller(
+              service.upsert(
+                task("task:hook-back", { schedule: { type: "webhook" }, createdBy: "agent" }),
+              ),
+            );
+            slots.running = [ThreadId.make("thread:busy")];
+            const stored = yield* service.triggerWebhook(webhookRequest(hook));
+            if (stored._tag !== "accepted") return assert.fail(`not accepted: ${stored._tag}`);
+            yield* workerRounds(world, 3);
+            expect(world.launched).toHaveLength(0);
+            // The thread saves a new prompt while it waits (within its profile, so recorded):
+            // the delivery is handed back and read again, still waiting.
+            yield* asCaller(
+              service.upsert({
+                ...(yield* listed(service, "task:hook-back")),
+                prompt: "New words",
+              }),
+            );
+            yield* workerRounds(world, 3);
+            expect(world.launched).toHaveLength(0);
+            const waiting = yield* deliveryOf(service, "task:hook-back", stored.deliveryId);
+            expect(waiting.outcome).toBe("accepted");
+            expect(waiting.renderedPrompt).toContain("New words");
+            // Then the owner widens the project before it runs: the next retry checks the task as
+            // saved against the thread's record and refuses it, as a profile refusal (not a stale
+            // copy), and nothing starts once the slot frees.
+            yield* serverSettings.updateSettings({
+              projectSettingsOverrides: { [NARROW_PROJECT]: { mcpProfile: "wider" } },
+            } as never);
+            yield* settleUntil(
+              deliveryOf(service, "task:hook-back", stored.deliveryId).pipe(
+                Effect.map((delivery) => delivery.outcome !== "accepted"),
+                Effect.orDie,
+              ),
+              "the waiting delivery ended",
+              workerRounds(world, 1),
+            );
+            slots.running = [];
+            yield* workerRounds(world, 4);
+            expect(world.launched).toHaveLength(0);
+            const refused = yield* deliveryOf(service, "task:hook-back", stored.deliveryId);
+            expect(refused.outcome).toBe("dispatch_failed");
+            expect(refused.error).toContain(
+              'Not run: this task was saved by a thread whose MCP profile is "docs"',
+            );
+            expect(refused.error).not.toContain(STALE_COPY);
+            expect(
+              yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-back'`,
+            ).toHaveLength(0);
+          }),
+        );
+      }),
+    ),
+);
 
 /**
  * A run's copy of the task that a save overtook (a scheduled run or "run now" whose read a save

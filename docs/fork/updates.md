@@ -68,19 +68,35 @@ watches; it changes nothing on the machine, and `0` turns it off.
   declared seam only in a list-only change to that file (its text unchanged), when the new entry's
   `added` lists exactly as many copies as are left, each one the file has, and its `announced`
   none the file has; the run from upstream then holds every one of them to that entry. Which
-  lines are the fork's only upstream can tell, so for such a move the pull request's run
-  fetches upstream's default branch from the URL in main's `.github/fork-upstream.json` (never
-  the pull request's copy; `--upstream <url>` by hand) read-only (commits and trees only, into
-  `refs/fork-seam-check/upstream`, deleted before each fetch) and holds the entry's `added` to
-  exactly the head's fork lines counted from the merge-base of main and upstream's head: a line
-  upstream has, or a fork line left out, is refused. A change that moves no pending file fetches
-  nothing; a malformed upstream file refuses only such a move. With no upstream file on main the
-  run notes that and checks as before; when upstream cannot be fetched (twice) or shares no
-  commit with main, it warns, naming why, and checks as before; check the entry by hand then with
+  lines are the fork's only upstream can tell, so for such a move, and for every seam entry whose
+  `added` the pull request's own list changes (a line listed more or less often, or an entry with
+  lines added or dropped; a change to `announced` only, or an entry that lists nothing, is not
+  one), fork-checks' run fetches upstream's default branch from the URL in main's
+  `.github/fork-upstream.json` (never the pull request's copy; `--upstream <url>` by hand; only
+  `https://`) read-only (commits only, filter `tree:0`, into
+  `refs/fork-seam-check/upstream`, which each fetch overwrites and each run deletes) and holds each such entry's
+  `added` to exactly the head's fork lines counted from the merge-base of main and upstream's
+  head, both ways: a line listed more often than the fork adds it (a raised count with no copy
+  added, or a line upstream has) is spare room, and a line listed less often (dropped while still
+  in use) would stop the next fork-follow; both are refused in the pull request's own run. The same
+  run holds every `pending` ceiling the own list sets, raises, lowers or drops to the fork lines
+  counted from there, every `lost` entry it changes to the lines lost from there (both as
+  fork-follow counts them), and a changed `forkFiles` to taking no upstream file the merge-base's
+  list did not: raised with no line changed, a ceiling or `lost` count is room for a later change to
+  swap upstream lines for fork lines within it. An entry for a file the head does not have is
+  refused too. A list-only change that fixes main's list is counted the same way, so it passes. A
+  change that changes no such entry fetches nothing. Every way the count cannot run is refused, naming why, never
+  skipped: no upstream file on main, a malformed one (or one not `https://`), a shallow clone, an
+  upstream that cannot be fetched within two minutes (two tries), one that shares no commit with
+  main or holds main itself (the URL names the fork), or a branch without the upstream commit main
+  sits on (update the branch). That refusal says it is an upstream, fetch or branch problem, not a
+  wrong list: run it again once the cause is fixed ("Re-run failed jobs" on the Fork checks run,
+  which runs main's script on the same commits, or push to the branch); to check an entry by hand,
   `node .github/scripts/fork-seam-check.cjs --from-upstream "$(git merge-base origin/main
-  upstream/main)" <pull request head>` (upstream's main fetched as `upstream/main`). Left
-  higher, the next run from upstream refuses main for the spare room; set lower or dropped, for
-  the lines still there. Neither in `pending` nor moved may a change gain a fork line (an upstream
+  upstream/main)" <pull request head>` (upstream's main fetched as `upstream/main`). Fork tests'
+  run on the merge commit has only two commits, so it passes `--no-upstream` and leaves the count
+  to fork-checks. Left higher, the next run from upstream refuses main for the spare room; set
+  lower or dropped, for the lines still there. Neither in `pending` nor moved may a change gain a fork line (an upstream
   line swapped for one is one more), whatever its list says. It reads its own list only to
   refuse, never to widen the gate, and does not hold a list-only change (the file's text
   unchanged), which may correct main. Right after a rebase, below the ceiling is not refused: when upstream takes a fork line word for word, the rebase drops
@@ -110,7 +126,16 @@ watches; it changes nothing on the machine, and `0` turns it off.
   unannounced), and right after a rebase that took the line word for word fork-follow drops it in
   its lowering commit instead. So a pull request that drops listed seam lines drops them from its
   own list in the same change, exactly: its run refuses it unless its own `added` lists, for each
-  such line, main's copies less the ones it drops.
+  such line, main's copies less the ones it drops (when main's list changed since the branch's
+  merge-base, the refusal says to update the branch from main).
+  A fork that adopts this checker (or updates an older copy) runs
+  `node .github/scripts/fork-seam-check.cjs --from-upstream <upstream base> HEAD` once and fixes
+  its list (each spare `added` copy it names) with a list-only pull request before the checker
+  lands: fork-follow's run before the rebase refuses a spare copy and never lowers it, so an old
+  list with spare copies stops one fork-follow run otherwise. It also adds
+  `.github/fork-upstream.json` naming upstream's `https://` git URL: without it, every pull request
+  that moves a pending file or changes a seam's `added`, a ceiling, a `lost` entry or `forkFiles`
+  is refused.
   Dropped lines are counted by text, so where upstream has a listed line too (`}`), a pull request
   may drop upstream's copy instead of the fork's and its run passes it; fork-follow, which counts
   from upstream, refuses it unless the lines left read the same as with the fork's copy dropped. In a pending file it cannot tell
@@ -239,14 +264,15 @@ A new `forkFiles` pattern needs no announcement: a list-only pull request adds i
 request that edits those files follows. A `pending` file is not for new fork lines: its lines
 predate the rule and only move out. So only the operator adds a `pending` file or raises a ceiling
 or a `lost` count, after upstream's own change made the count rise: in the rebased series, or with
-a list-only pull request to main once it is pushed (fork-follow's refusal says how). This rule
-rests on the owner's review, not on code: a pull request's own list is only parsed, so no check
-refuses one that adds a `pending` file or raises a ceiling or count. What the code does hold:
+a list-only pull request to main once it is pushed (fork-follow's refusal says how). The code
+holds this: a pull request's run counts every ceiling and `lost` entry its own list changes from
+upstream (above), so a new or raised one passes only when the tree already has those lines, as
+after upstream's own change. What else it holds:
 
-- A pull request's run is judged by main's list and reads no `lost` count, and a ceiling only to
-  refuse a change that shrinks a pending file without lowering it in its own list: a pending file
-  may change but not grow, so a raised ceiling or count gives no pull request a line. A new
-  `pending` entry does loosen it: that file's lines may then change, though not grow in number.
+- A pull request's run is judged by main's list. Main's `lost` counts are fork-follow's to check,
+  and main's ceilings refuse a change that shrinks a pending file without lowering it in its own
+  list: a pending file may change but not grow. A new `pending` entry (counted, so only for lines
+  the tree already has) does loosen it: that file's lines may then change, though not grow.
 - From upstream, fork-follow refuses a ceiling or count above the real count ("lower it", or
   "remove it" when none is left), so room nobody uses does not stay. Right after a rebase it lowers
   it in a commit of its own on the rebased series instead (only lowers: a rise is refused).

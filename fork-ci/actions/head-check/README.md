@@ -50,11 +50,28 @@ All of them are the queue's, imported from `../pr-queue`, never copied:
   summary only adds a row "the path rules would have said: ...". A change the
   rules cannot judge (no merge base, a failed diff) refuses, in either mode.
   Without the block, nothing of this runs.
+- **Findings and rounds** (`review_judge.judge_rounds`, the pr-queue README,
+  "Findings and rounds"): with a `review` block in `enforce`, a lens whose
+  newest report has a blocker or major finding (a `blocker:` or `major:` line,
+  a `### Blocking` or `### Major` heading with items, a table row ...) fails
+  the head until a later round of that lens clears it or a person's override
+  newer than the report covers it (`findings: true`); a report with no findings
+  section (a blocker label and a major label, `none` allowed) fails too. A person is a login in `override_authors`; none
+  listed (the default) means no override clears a finding or passes the cap
+  (issue #78). A round is a read of a different own change (`own_change`: a
+  head that only merges the base in is no new round); from round
+  `rounds.approach_at` the approach lens is required; a round past
+  `rounds.max` fails the head until a person's override for it, newer than
+  every lens comment, lets it through on its own. In `shadow` the summary only
+  adds a row "they would have said: ...". Comments that cannot be judged fail
+  the head, in either mode.
 
 It passes when:
 
 - every lens read the head, or a newer override vouches for it, and every
-  required lens (`required-lenses`) is among them;
+  required lens (`required-lenses`, and in `enforce` the path rules' and the
+  approach lens) is among them, with no open blocker or major and no round past
+  the cap (`enforce` only);
 - the pull request has no lens comments and no lens is required: there is
   nothing to compare (the queue then vouches only for the head it found);
 - it is a draft and `pass-drafts` is `true`.

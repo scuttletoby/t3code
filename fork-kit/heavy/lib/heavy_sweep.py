@@ -622,7 +622,9 @@ class Sweep:
 
     def docker_path(self):
         if self.docker is None and os.environ.get('HEAVY_DOCKER'):     # tests: a fake docker (also bin/heavy's)
-            self.docker = os.environ['HEAVY_DOCKER']
+            # only an absolute path, as bin/heavy: a relative one left in a shell would run ./<it> from any folder
+            path = os.environ['HEAVY_DOCKER']
+            self.docker = path if os.path.isabs(path) else ''
         if self.docker is not None:
             return self.docker if self.docker and os.access(self.docker, os.X_OK) else ''
         for folder in ('/usr/bin', '/bin', '/usr/local/bin'):
@@ -1139,17 +1141,17 @@ def read_owner(pid, proc='/proc'):
 
 
 def owner_value(pid=None, proc='/proc'):
-    """The fork-kit.heavy.owner label value for a container: the heavy scope this runs in (HEAVY_SCOPE, which heavy
-    gives its command, or else the own cgroup), or a process with its start time, so a reused pid never counts as
-    the owner. The process is `pid` (--owner-pid), which must be the caller's own user's; without it, the caller's
-    parent, refused when that is a shell or a script runner (make, env, npm, ...): those usually exit while the
-    container is still in use (`docker run --label "$(heavy docker-label)"` in a setup script), and the sweep
-    would then remove the container under the running test."""
+    """The fork-kit.heavy.owner label value for a container: the heavy scope this runs in (its own cgroup; HEAVY_SCOPE,
+    which heavy gives its command, only when the cgroup cannot be read), or a process with its start time, so a
+    reused pid never counts as the owner. A process that left heavy's scope (systemd-run --scope from inside the
+    command) keeps HEAVY_SCOPE but is not in the scope: it gets the process owner, since heavy would otherwise
+    remove its container when the scope ends, while the process goes on. The process is `pid` (--owner-pid), which
+    must be the caller's own user's; without it, the caller's parent, refused when that is a shell or a script
+    runner (make, env, npm, ...): those usually exit while the container is still in use (`docker run --label
+    "$(heavy docker-label)"` in a setup script), and the sweep would then remove the container under the running
+    test."""
     uid = os.getuid()
     if pid is None:
-        scope = os.environ.get('HEAVY_SCOPE', '')
-        if is_heavy_scope(scope) and re.fullmatch(r'[A-Za-z0-9_.:-]+', scope):
-            return f'uid={uid},scope={scope}'
         try:
             with open(f'{proc}/self/cgroup', encoding='utf-8') as f:
                 leaf = unit_of(''.join(line[3:].strip() for line in f if line.startswith('0::')))
@@ -1157,18 +1159,84 @@ def owner_value(pid=None, proc='/proc'):
             leaf = ''
         if is_heavy_scope(leaf):
             return f'uid={uid},scope={leaf}'
+        scope = os.environ.get('HEAVY_SCOPE', '')
+        if not leaf and is_heavy_scope(scope) and re.fullmatch(r'[A-Za-z0-9_.:-]+', scope):
+            return f'uid={uid},scope={scope}'
         pid = os.getppid()
         owner_uid, start, comm = read_owner(pid, proc)
         if comm in SHORT_LIVED:
+            # nothing on stdout: `--label "$(heavy docker-label)"` is then an empty label, which docker run refuses,
+            # so no container starts that nobody owns
+            fix = 'run the test under heavy, or pass --owner-pid PID of the long-lived test process'
+            if is_heavy_scope(scope):
+                fix = (f'this process left heavy\'s scope {scope} (it runs in {leaf or "an unknown cgroup"}), so '
+                       f'heavy would remove the container under it: pass --owner-pid PID of the long-lived process '
+                       f'that uses the container')
             raise LabelRefused(f'the caller (pid {pid}, {comm}) is a shell or a script runner, which usually exits '
-                               f'before the container is done, and the sweep would then remove it. Run the test '
-                               f'under heavy, or pass --owner-pid PID of the long-lived test process')
+                               f'before the container is done, and the sweep would then remove it; {fix}')
     else:
         owner_uid, start, comm = read_owner(pid, proc)
     if owner_uid != uid:
         raise LabelRefused(f'pid {pid} belongs to uid {owner_uid}, not {uid}: the sweep sees only its own '
                            f"user's processes and would remove the container")
     return f'uid={uid},pid={pid},start={start}'
+
+
+RUNTIME_ROOT = '/run/user'
+STATE_ROOT = ''         # '' = ~/.local/state (bin/heavy STATE_ROOT)
+
+
+def note_in(base, scope):
+    """Note the scope in <base>/heavy/labelled (bin/heavy own_folder, the same rule): (folder, '') or ('', why not).
+    The folders are made if missing (heavy has made its own already: one made here is never heavy's)."""
+    uid = os.getuid()
+    folder = os.path.join(base, 'heavy', 'labelled')
+    try:
+        for d in (base, os.path.dirname(folder), folder):
+            if d != base:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(d, 0o700)
+            st = os.lstat(d)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
+                return '', f'{d} is not a folder only this user can write'
+        os.close(os.open(os.path.join(folder, scope), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+    except OSError as e:
+        return '', str(e)
+    return folder, ''
+
+
+def note_label(value, marks=None):
+    """For a scope owner: note the scope where heavy reads it (bin/heavy marks_dirs), so heavy asks Docker for the
+    scope's containers when it ends; a run that labelled none never asks. First <RUNTIME_ROOT>/<uid>/heavy/labelled;
+    when that note cannot reach heavy (not written: /run/user full or not allowed; or written into another folder
+    than heavy's, a sandbox's own /run/user, told by HEAVY_MARKS, device:inode of the folders heavy reads), then
+    ~/.local/state/heavy/labelled. '' or why it could not (heavy then leaves the container to the leftover sweep).
+    Without HEAVY_MARKS (an older heavy, or one without such a folder) heavy asks Docker after every run anyway."""
+    scope = value.partition(',scope=')[2]
+    if not scope:
+        return ''
+    marks = os.environ.get('HEAVY_MARKS') if marks is None else marks
+    reads = set(filter(None, (marks or '').split(',')))
+    whys = []
+    for base in (os.path.join(RUNTIME_ROOT, str(os.getuid())),
+                 STATE_ROOT or os.path.join(os.path.expanduser('~'), '.local', 'state')):
+        folder, why = note_in(base, scope)
+        if folder and marks:
+            try:
+                st = os.stat(folder)
+                if f'{st.st_dev}:{st.st_ino}' not in reads:
+                    why = f'{folder} is not the folder heavy reads (another mount namespace?)'
+            except OSError as e:
+                why = str(e)
+            if why:     # a note heavy never reads: none at all
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(folder, scope))
+        if not why:
+            return ''
+        whys.append(why)
+        if not marks:   # heavy asks Docker anyway: no second folder needed
+            break
+    return '; '.join(whys)
 
 
 def label_main(argv, out=None, err=None):
@@ -1191,6 +1259,10 @@ def label_main(argv, out=None, err=None):
     except (OSError, ValueError, IndexError, StopIteration) as e:
         print(f'heavy docker-label: cannot read the owner process ({e})', file=err)
         return 1
+    problem = note_label(value)
+    if problem:
+        print(f'heavy docker-label: cannot note the scope for heavy ({problem}); the leftover sweep removes the '
+              f'container later', file=err)
     print(value if value_only else f'{LABEL}={value}', file=out)
     return 0
 

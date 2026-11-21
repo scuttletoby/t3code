@@ -9,11 +9,13 @@ import {
   type OrchestratorMcpCreateThreadRequest,
   OrchestratorMcpFailure,
   type ProviderInstanceId,
-  type ScheduledTask,
+  ScheduledTask,
   ScheduledTaskError,
   type ThreadId,
 } from "@t3tools/contracts";
-import { slotRefusalReason, type SlotDecision } from "@t3tools/shared/agentSlots";
+import { slotRefusalReason, slotRunningText, type SlotDecision } from "@t3tools/shared/agentSlots";
+import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -59,6 +61,8 @@ export interface RouteStart {
   readonly intoThreadId?: ThreadId | undefined;
   /** The caller is the woken thread itself: its held slot stays held (`SlotGate.acquire`). */
   readonly keepsHeld?: boolean | undefined;
+  /** Its place in the gate's one line: a start that asks again while refused. */
+  readonly place?: SlotGate.SlotPlace | undefined;
 }
 
 const ENDED: RouteSlot = { type: "allow", end: () => Effect.void };
@@ -83,6 +87,7 @@ const admit = (
             ...(start.alsoNeeds === undefined ? {} : { alsoNeeds: start.alsoNeeds }),
             ...(start.intoThreadId === undefined ? {} : { intoThreadId: start.intoThreadId }),
             ...(start.keepsHeld === undefined ? {} : { keepsHeld: start.keepsHeld }),
+            ...(start.place === undefined ? {} : { place: start.place }),
           });
           if (outcome.type === "refuse") return outcome;
           const token = outcome.token;
@@ -99,8 +104,6 @@ const admit = (
 
 const slotsFull = (message: string) => new OrchestratorMcpFailure({ code: "slots_full", message });
 
-const agents = (count: number) => (count === 1 ? "1 agent is" : `${count} agents are`);
-
 const unreadReason = (problem: SlotGate.CountReadProblem) =>
   problem === "timeout"
     ? `the read took longer than ${Duration.toSeconds(SlotGate.COUNT_READ_TIMEOUT)} seconds`
@@ -109,9 +112,9 @@ const unreadReason = (problem: SlotGate.CountReadProblem) =>
 /** {@link slotRefusalReason}, for a reader on another machine ("there", not "this machine"). */
 const reasonThere = (decision: FullDecision) =>
   decision.rule === "machine"
-    ? `${agents(decision.used)} running there, and the limit is ${decision.max}`
+    ? `${slotRunningText(decision, " there")}, and the limit is ${decision.max}`
     : decision.rule === "account"
-      ? `${agents(decision.used)} running there on account ${decision.instanceId}, and the limit is ${decision.max}`
+      ? `${slotRunningText(decision, ` there on account ${decision.instanceId}`)}, and the limit is ${decision.max}`
       : `only ${decision.used} MB of memory is free there, and a new agent needs at least ${decision.max} MB`;
 
 /** Why, in one clause, for a reader on this machine (a scheduled task's history, run now, logs). */
@@ -181,7 +184,21 @@ export interface SendSlot {
   readonly instanceId: ProviderInstanceId;
   /** The receiver is the caller (a wait's message): its held slot stays held. */
   readonly keepsHeld?: boolean | undefined;
+  /** A wake-up that asks again while refused: its place in the gate's one line. */
+  readonly place?: SlotGate.SlotPlace | undefined;
+  /**
+   * The caller ends the slot (`end`) when its dispatch ended. Until then the start counts whatever
+   * the start grace, so a send that waits after the gate step still has its slot when it starts.
+   */
+  readonly endsItself?: boolean | undefined;
 }
+
+/** Waiters that no longer need a slot leave the gate's line (nothing without a gate). */
+export const leaveLine = (
+  gate: Option.Option<SlotGate.SlotGate["Service"]>,
+  keys: ReadonlyArray<string>,
+): Effect.Effect<void> =>
+  Option.match(gate, { onNone: () => Effect.void, onSome: (slots) => slots.leave(keys) });
 
 /**
  * A message into an existing thread: into one that shows a run it only queues; into one that
@@ -196,8 +213,9 @@ export const admitSend = (
     callerThreadId: send.callerThreadId,
     targetInstanceId: send.instanceId,
     intoThreadId: send.threadId,
-    childThreadId: send.threadId,
+    ...(send.endsItself === true ? {} : { childThreadId: send.threadId }),
     ...(send.keepsHeld === undefined ? {} : { keepsHeld: send.keepsHeld }),
+    ...(send.place === undefined ? {} : { place: send.place }),
   });
 
 /**
@@ -335,8 +353,26 @@ export const runNowSlotRefusal = (error: OrchestratorMcpFailure): OrchestratorMc
     ? slotsFull(error.message)
     : error;
 
+/**
+ * A direct webhook delivery waiting in memory (its store failed) whose task was saved meanwhile, and
+ * that could not be stored again: its prompt is the one from before the save, so it is not run.
+ */
+export const SAVED_WHILE_WAITING_NOT_STORED =
+  "Not run: this task was saved again while this delivery waited for an agent slot, and the delivery could not be stored to run on the task as it is now (the server log says why), so it was not started: it would have used the task as it was before. The next webhook delivery uses the task as it is now.";
+
 /** How often a webhook delivery that waits for a slot asks again (the scheduler's poll). */
 export const WEBHOOK_SLOT_RETRY = Duration.seconds(5);
+
+/**
+ * How long a waiting webhook delivery's task may stay unreadable before it is skipped: it holds the
+ * task's webhook permit, so later deliveries wait behind it. A brief failure ends well within it;
+ * a row broken for good is dropped after a restart anyway ("could not be prepared").
+ */
+export const WEBHOOK_UNREADABLE_LIMIT = Duration.minutes(5);
+
+/** Why a waiting webhook delivery whose task stayed unreadable was skipped. */
+export const UNREADABLE_WHILE_WAITING =
+  "Not run: this task could not be read for 5 minutes while this delivery waited for an agent slot (the server log says why), so it was not started on a copy that could not be checked. The next webhook delivery reads the task again.";
 
 /**
  * A fixed-time run is dropped as missed once it is 10 minutes late (`isMissedFixedTimeRun`); one
@@ -359,6 +395,55 @@ const CurrentDirectDelivery = Context.Reference<DirectDelivery | undefined>(
   "t3/fork/agentSlotRoutes/CurrentDirectDelivery",
   { defaultValue: () => undefined },
 );
+
+/**
+ * Places in the gate's line (`SlotGate.SlotPlace`): a scheduled run that waits keeps one per task,
+ * at its due time; a webhook delivery one per delivery, at the time it was stored (direct: its
+ * first ask). Each leaves when its run starts (the gate), when it is given up or its task deleted
+ * (`waitForWebhookSlot`, and `leaveEndedPlaces` every 5 s).
+ */
+const SCHEDULED_PLACE = "scheduled-run:";
+const DELIVERY_PLACE = "webhook-delivery:";
+/** A stored delivery whose row cannot be read: its task's (one stored delivery runs at a time). */
+const DELIVERY_TASK_PLACE = "webhook-task:";
+
+/**
+ * What a run takes from its task's row, decoded as `ScheduledTaskService` decodes it (edge spaces
+ * trimmed). Not run bookkeeping, the webhook token or what `webhookGone` checks: writing those is
+ * not a save. A test holds this to the task's fields minus a named list left out.
+ */
+export const RunCopy = Schema.Struct({
+  title: ScheduledTask.fields.title,
+  prompt: ScheduledTask.fields.prompt,
+  schedule: ScheduledTask.fields.schedule,
+  projectId: ScheduledTask.fields.projectId,
+  threadId: ScheduledTask.fields.threadId,
+  threadMode: ScheduledTask.fields.threadMode,
+  workspaceStrategy: ScheduledTask.fields.workspaceStrategy,
+  modelSelection: ScheduledTask.fields.modelSelection,
+  runtimeMode: ScheduledTask.fields.runtimeMode,
+  interactionMode: ScheduledTask.fields.interactionMode,
+  createdBy: ScheduledTask.fields.createdBy,
+  creationSource: ScheduledTask.fields.creationSource,
+});
+/** The same fields as the row stores them (its JSON columns as text). */
+const decodeStoredCopy = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    ...RunCopy.fields,
+    schedule: Schema.fromJsonString(ScheduledTask.fields.schedule),
+    workspaceStrategy: Schema.fromJsonString(ScheduledTask.fields.workspaceStrategy),
+    modelSelection: Schema.fromJsonString(ScheduledTask.fields.modelSelection),
+  }),
+);
+/** One text for a copy, to compare two. */
+const runCopyText = Schema.encodeEffect(Schema.fromJsonString(RunCopy));
+const decodePrompt = Schema.decodeUnknownEffect(ScheduledTask.fields.prompt);
+
+/**
+ * Whether a webhook delivery's task changed since its run read it (`savedSince`), or `unknown`
+ * (why) when its row cannot be read.
+ */
+type SinceRead = "same" | "saved" | { readonly unknown: Cause.Cause<unknown> | string };
 
 /** A stored delivery's request, in the shape the stored-delivery worker reads (`decodePendingRequest`). */
 const encodeStoredRequest = Schema.encodeEffect(
@@ -399,6 +484,12 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   const open = new Map<string, (threadId: ThreadId | null) => Effect.Effect<void>>();
 
   /**
+   * Tasks whose stored webhook delivery was not started because the task was saved while it waited
+   * for a slot (`waitForWebhookSlot`): the stored-delivery worker keeps its row (`keepStored`).
+   */
+  const keep = new Set<string>();
+
+  /**
    * Where a run starts: a bound task runs on its thread's current provider (a thread that cannot
    * be read: the task's stored provider). Whether a bound run starts one is the gate's to say,
    * from the same count it decides on (`intoThreadId`): into a thread that shows a run the prompt
@@ -417,15 +508,106 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
    * The slot is named for the run's thread when its dispatch ends (`end`), bound or new, so a
    * dispatch that failed frees it at once; `ended` frees it on a path that never got there.
    */
-  const take = (target: {
-    readonly instanceId: ProviderInstanceId;
-    readonly intoThreadId: ThreadId | undefined;
-  }) =>
+  const take = (
+    target: {
+      readonly instanceId: ProviderInstanceId;
+      readonly intoThreadId: ThreadId | undefined;
+    },
+    place: SlotGate.SlotPlace | undefined,
+  ) =>
     admit(gate, {
       callerThreadId: null,
       targetInstanceId: target.instanceId,
       intoThreadId: target.intoThreadId,
+      ...(place === undefined ? {} : { place }),
     });
+
+  /** Webhook deliveries waiting in `waitForWebhookSlot` now: their wait leaves the line itself. */
+  const waitingDeliveries = new Set<string>();
+
+  /**
+   * The run's place in line: a run on its schedule at its due time, a webhook delivery at the
+   * time it was stored. "Run now" asks once and has none. A stored delivery is the one its task's
+   * worker runs now (one at a time per task, in the worker's order); unreadable, it is logged and
+   * keeps its task's place from this ask (`waitForWebhookSlot` asks in it, and leaves it).
+   */
+  const placeOf = Effect.fnUntraced(function* (
+    task: ScheduledTask,
+    trigger: "scheduled" | "manual" | "webhook",
+  ) {
+    if (trigger === "manual") return undefined;
+    if (trigger === "scheduled") {
+      const dueMs = task.nextRunAt === null ? Number.NaN : Date.parse(task.nextRunAt);
+      return {
+        key: `${SCHEDULED_PLACE}${task.id}`,
+        ...(Number.isFinite(dueMs) ? { sinceMs: dueMs } : {}),
+      } satisfies SlotGate.SlotPlace;
+    }
+    const direct = yield* CurrentDirectDelivery;
+    if (direct !== undefined) return { key: `${DELIVERY_PLACE}${direct.deliveryId}` };
+    const [stored] = yield* sql<{ delivery_id: string; due_at: number }>`
+      SELECT delivery_id, due_at FROM scheduled_task_webhook_pending
+      WHERE task_id = ${task.id} AND state IN ('dispatching', 'running', 'completed', 'failed')
+      ORDER BY due_at, rowid LIMIT 1
+    `.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Could not read a waiting webhook delivery's place in line", {
+          taskId: task.id,
+          cause,
+        }).pipe(Effect.as([])),
+      ),
+    );
+    return stored === undefined
+      ? ({ key: `${DELIVERY_TASK_PLACE}${task.id}` } satisfies SlotGate.SlotPlace)
+      : ({
+          key: `${DELIVERY_PLACE}${stored.delivery_id}`,
+          sinceMs: Number(stored.due_at),
+        } satisfies SlotGate.SlotPlace);
+  });
+
+  const leave = (place: SlotGate.SlotPlace | undefined) =>
+    place === undefined ? Effect.void : leaveLine(gate, [place.key]);
+
+  /**
+   * Places whose wait ended without the gate seeing it: a run on its schedule no longer due
+   * (paused, deleted, edited, rescheduled), a stored delivery no longer pending (its task deleted).
+   */
+  const leaveEndedPlaces = Effect.gen(function* () {
+    if (Option.isNone(gate)) return;
+    const keys = yield* gate.value.line;
+    const taskIds = keys.flatMap((key) =>
+      key.startsWith(SCHEDULED_PLACE) ? [key.slice(SCHEDULED_PLACE.length)] : [],
+    );
+    const deliveryIds = keys.flatMap((key) =>
+      key.startsWith(DELIVERY_PLACE) && !waitingDeliveries.has(key)
+        ? [key.slice(DELIVERY_PLACE.length)]
+        : [],
+    );
+    if (taskIds.length === 0 && deliveryIds.length === 0) return;
+    const nowIso = DateTime.formatIso(DateTime.toUtc(yield* DateTime.now));
+    const due = new Set(
+      taskIds.length === 0
+        ? []
+        : (yield* sql<{ task_id: string }>`
+            SELECT task_id FROM scheduled_tasks
+            WHERE task_id IN ${sql.in(taskIds)} AND enabled = 1 AND next_run_at IS NOT NULL
+              AND next_run_at <= ${nowIso} AND last_run_status <> 'running'
+          `).map((row) => row.task_id),
+    );
+    const pending = new Set(
+      deliveryIds.length === 0
+        ? []
+        : (yield* sql<{ delivery_id: string }>`
+            SELECT delivery_id FROM scheduled_task_webhook_pending
+            WHERE delivery_id IN ${sql.in(deliveryIds)} AND state IN ('pending', 'dispatching')
+          `).map((row) => row.delivery_id),
+    );
+    const ended = [
+      ...taskIds.filter((id) => !due.has(id)).map((id) => `${SCHEDULED_PLACE}${id}`),
+      ...deliveryIds.filter((id) => !pending.has(id)).map((id) => `${DELIVERY_PLACE}${id}`),
+    ];
+    if (ended.length > 0) yield* gate.value.leave(ended);
+  });
 
   const allowed = (
     task: ScheduledTask,
@@ -497,6 +679,88 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   });
 
   /**
+   * A stored delivery whose prompt was rendered from another copy of the task than `task` (a save
+   * between the stored-delivery worker's read and `runTask`'s, `task`): the worker writes the prompt
+   * it rendered from into the row it takes (`task_json`), the first of the task's rows in its order.
+   * A `running` row was sent already and keeps its prompt; a direct delivery has no row yet.
+   */
+  const renderedFromOther = Effect.fnUntraced(function* (task: ScheduledTask) {
+    if ((yield* CurrentDirectDelivery) !== undefined) return false;
+    const [row] = yield* sql<{ state: string; prompt: unknown }>`
+      SELECT state, json_extract(task_json, '$.prompt') AS prompt
+      FROM scheduled_task_webhook_pending
+      WHERE task_id = ${task.id} AND state IN ('dispatching', 'running', 'completed', 'failed')
+      ORDER BY due_at, rowid LIMIT 1
+    `;
+    if (row?.state !== "dispatching") return false;
+    return (yield* decodePrompt(row.prompt)) !== task.prompt;
+  });
+
+  /**
+   * Whether `task`, the copy a waiting webhook run holds, is still the task as saved: `saved` when
+   * a field a run uses changed since it was read (a save in the same millisecond too), `unknown`
+   * when the row cannot be read. A bind writes the thread, but not during a wait: a webhook task's
+   * runs take turns. (A save before it was read is `renderedFromOther`'s, as the run starts.)
+   */
+  const savedSince = Effect.fn("AgentSlotRoutes.savedSince")(
+    function* (task: ScheduledTask) {
+      const [row] = yield* sql<{
+        title: string;
+        prompt: string;
+        schedule_json: string;
+        project_id: string;
+        thread_id: string | null;
+        thread_mode: string;
+        workspace_strategy_json: string;
+        model_selection_json: string;
+        runtime_mode: string;
+        interaction_mode: string;
+        created_by: string;
+        creation_source: string;
+      }>`
+        SELECT title, prompt, schedule_json, project_id, thread_id, thread_mode,
+          workspace_strategy_json, model_selection_json, runtime_mode, interaction_mode,
+          created_by, creation_source
+        FROM scheduled_tasks WHERE task_id = ${task.id}
+      `;
+      // Gone between `webhookGone` and here: that check ends it at the next retry (one that cannot
+      // read the row either is capped as an unreadable one is).
+      if (row === undefined) return { unknown: "the task's row is gone" } as SinceRead;
+      const now = yield* decodeStoredCopy({
+        title: row.title,
+        prompt: row.prompt,
+        schedule: row.schedule_json,
+        projectId: row.project_id,
+        threadId: row.thread_id,
+        threadMode: row.thread_mode,
+        workspaceStrategy: row.workspace_strategy_json,
+        modelSelection: row.model_selection_json,
+        runtimeMode: row.runtime_mode,
+        interactionMode: row.interaction_mode,
+        createdBy: row.created_by,
+        creationSource: row.creation_source,
+      });
+      const [was, is] = yield* Effect.all([runCopyText(task), runCopyText(now)]);
+      return was === is ? "same" : "saved";
+    },
+    (effect) =>
+      effect.pipe(Effect.catchCause((cause) => Effect.succeed<SinceRead>({ unknown: cause }))),
+  );
+
+  /** A webhook delivery the stored-delivery worker owns now: this run of it ends unstarted. */
+  const handedToWorker = (task: ScheduledTask): ScheduledSlot => ({
+    skipped: { task, threadId: null, dispatchFailed: false },
+    end: () => Effect.void,
+  });
+
+  /** A stored delivery handed back: the worker keeps its row and takes it again at once. */
+  const keepForWorker = (task: ScheduledTask) =>
+    Effect.sync(() => {
+      keep.add(task.id);
+      return handedToWorker(task);
+    });
+
+  /**
    * A direct delivery the gate refused is stored as a pending delivery the stored-delivery worker
    * owns (due now), so a restart keeps it; its in-memory copy then ends without running, and the
    * worker runs it once. `false` when there is nothing to store (a stored delivery already) or the
@@ -536,27 +800,76 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   );
 
   /**
-   * A stored webhook delivery waits for a slot: asked again every few seconds until one is free
-   * (its pending row stays as it is, so a restart picks it up again, once). It is dropped only for
-   * the reasons a queued delivery is (the task deleted, replaced, paused or no longer a webhook).
+   * A stored webhook delivery waits for a slot, asked again every few seconds (a restart picks its
+   * row up again, once). Dropped only as a queued delivery is (task deleted, replaced, paused, not a
+   * webhook), or when its task's row stays unreadable (`WEBHOOK_UNREADABLE_LIMIT`). Saved while it waits, it is handed back to the worker to run on the task as saved.
    */
-  const waitForWebhookSlot = Effect.fnUntraced(function* (task: ScheduledTask, first: Refused) {
-    yield* Effect.logInfo("Webhook delivery waits for an agent slot", {
-      taskId: task.id,
-      reason: reasonHere(first.refusal),
-    });
-    while (true) {
-      yield* Effect.sleep(WEBHOOK_SLOT_RETRY);
-      const gone = yield* webhookGone(task).pipe(Effect.orElseSucceed(() => null));
-      if (gone !== null) return yield* Effect.fail(new WebhookSkipped({ reason: gone }));
-      // Checked again as it would start: the owner may have widened the project meanwhile.
-      const refused = task.threadId === null ? yield* profiles.runRefusal(task) : null;
-      if (refused !== null) return yield* Effect.fail(new WebhookSkipped({ reason: refused }));
-      // A bound thread that shows a run only queues: the gate lets it pass (`intoThreadId`).
-      const slot = yield* take(yield* targetOf(task));
-      if (slot.type === "allow") return allowed(task, slot.end);
-    }
-  });
+  const waitForWebhookSlot = Effect.fnUntraced(
+    function* (task: ScheduledTask, first: Refused, place: SlotGate.SlotPlace | undefined) {
+      yield* Effect.logInfo("Webhook delivery waits for an agent slot", {
+        taskId: task.id,
+        reason: reasonHere(first.refusal),
+      });
+      // Since when its task's row could not be read, retry after retry (`undefined`: it could).
+      let unreadableSinceMs: number | undefined;
+      while (true) {
+        yield* Effect.sleep(WEBHOOK_SLOT_RETRY);
+        const gone = yield* webhookGone(task).pipe(Effect.orElseSucceed(() => null));
+        if (gone !== null) return yield* Effect.fail(new WebhookSkipped({ reason: gone }));
+        const since = yield* savedSince(task);
+        // Not known: asked again at the next retry, with no slot taken. A row that cannot be read
+        // is logged once (again only after a good read), and skipped once it stays so too long.
+        if (typeof since === "object") {
+          const nowMs = yield* Clock.currentTimeMillis;
+          if (unreadableSinceMs === undefined) {
+            unreadableSinceMs = nowMs;
+            yield* Effect.logWarning(
+              "A webhook delivery waiting for a slot cannot read its task; it asks again at each retry",
+              { taskId: task.id, cause: since.unknown },
+            );
+          }
+          if (nowMs - unreadableSinceMs >= Duration.toMillis(WEBHOOK_UNREADABLE_LIMIT))
+            return yield* Effect.fail(new WebhookSkipped({ reason: UNREADABLE_WHILE_WAITING }));
+          continue;
+        }
+        if (unreadableSinceMs !== undefined) {
+          unreadableSinceMs = undefined;
+          yield* Effect.logInfo("A waiting webhook delivery can read its task again", {
+            taskId: task.id,
+          });
+        }
+        // Handed back, its place goes on release; the worker's ask rejoins at the row's due time.
+        if (since === "saved") {
+          if ((yield* CurrentDirectDelivery) === undefined) return yield* keepForWorker(task);
+          if (!(yield* storeDirect(task, yield* DateTime.now)))
+            return yield* Effect.fail(
+              new WebhookSkipped({ reason: SAVED_WHILE_WAITING_NOT_STORED }),
+            );
+          return handedToWorker(task);
+        }
+        // Checked again as it would start: the owner may have widened the project meanwhile.
+        const refused = task.threadId === null ? yield* profiles.runRefusal(task) : null;
+        if (refused !== null) return yield* Effect.fail(new WebhookSkipped({ reason: refused }));
+        // A bound thread that shows a run only queues: the gate lets it pass (`intoThreadId`).
+        // Asked in its place, so a waiter that joined later never passes it.
+        const slot = yield* take(yield* targetOf(task), place);
+        if (slot.type === "allow") return allowed(task, slot.end);
+      }
+    },
+    // Skipped, failed, stopped or handed back: its place goes too (let through, the gate dropped
+    // it already).
+    (effect, _task, _first, place) =>
+      place === undefined
+        ? effect
+        : Effect.acquireUseRelease(
+            Effect.sync(() => waitingDeliveries.add(place.key)),
+            () => effect,
+            () =>
+              Effect.sync(() => waitingDeliveries.delete(place.key)).pipe(
+                Effect.andThen(leave(place)),
+              ),
+          ),
+  );
 
   /**
    * Last before the run is marked running. Refused, a run on its schedule stays due (asked again
@@ -575,9 +888,18 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       runError: string,
     ) => Effect.Effect<void, E, R>,
   ) {
+    // A stored delivery rendered from a copy a save overtook runs again on the task as saved, wait
+    // or not. A read that fails here goes on, as upstream's run did.
+    if (
+      trigger === "webhook" &&
+      (yield* renderedFromOther(task).pipe(Effect.orElseSucceed(() => false)))
+    )
+      return yield* keepForWorker(task);
     // A new thread wider than the profile the task was saved with starts nothing: on its schedule
     // a failed run with the reason (moved to its next time), "run now" fails, a webhook skips.
     const profileRefusal = task.threadId === null ? yield* profiles.runRefusal(task) : null;
+    // Refused for its profile, a place it had from an earlier ask goes at the next sweep (its task
+    // is no longer due, its delivery no longer pending: `leaveEndedPlaces`).
     if (profileRefusal !== null) {
       if (trigger === "manual") {
         return yield* new ScheduledTaskError({ message: profileRefusal, taskId: task.id });
@@ -598,7 +920,8 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       } as ScheduledSlot;
     }
     if (Option.isNone(gate)) return { skipped: null, end: () => Effect.void } as ScheduledSlot;
-    const slot = yield* take(yield* targetOf(task));
+    const place = yield* placeOf(task, trigger);
+    const slot = yield* take(yield* targetOf(task), place);
     if (slot.type === "allow") return allowed(task, slot.end);
     if (trigger === "manual") {
       return yield* new ScheduledTaskError({
@@ -607,12 +930,8 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       });
     }
     if (trigger === "webhook") {
-      if (yield* storeDirect(task, now))
-        return {
-          skipped: { task, threadId: null, dispatchFailed: false },
-          end: () => Effect.void,
-        } as ScheduledSlot;
-      return yield* waitForWebhookSlot(task, slot);
+      if (yield* storeDirect(task, now)) return handedToWorker(task);
+      return yield* waitForWebhookSlot(task, slot, place);
     }
     yield* keepDue(task, now, slot.refusal).pipe(
       Effect.catchCause((cause) =>
@@ -627,6 +946,13 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       end: () => Effect.void,
     } as ScheduledSlot;
   });
+
+  /**
+   * The stored-delivery worker, after a delivery's run returned: `true` when that run was not
+   * started because its task was saved while it waited, so the worker keeps the row and runs it
+   * again on the task as it is now, instead of removing it. Read once.
+   */
+  const keepStored = (taskId: string) => Effect.sync(() => keep.delete(taskId));
 
   /** The task's run ended, any way: a slot its dispatch never ended is free again. */
   const ended = (taskId: string) => Effect.suspend(() => open.get(taskId)?.(null) ?? Effect.void);
@@ -653,12 +979,23 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
         AND (enabled = 0 OR next_run_at IS NULL OR next_run_at > ${nowIso})
     `;
   });
-  yield* scheduler.register("agent-slot-notes", clearStaleNotes);
+  yield* scheduler.register(
+    "agent-slot-notes",
+    Effect.andThen(
+      leaveEndedPlaces.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Could not check the line places of waiting scheduled runs", { cause }),
+        ),
+      ),
+      clearStaleNotes,
+    ),
+  );
 
   return {
     admit: admitRun,
     ended,
     directDelivery,
+    keepStored,
     /** `ScheduledTaskService.upsert`, last before it writes the row (`scheduledTaskMcpProfile.ts`). */
     saving: profiles.saving,
   };
