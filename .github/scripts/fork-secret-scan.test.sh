@@ -25,7 +25,7 @@ git config --global user.name test
 git config --global user.email test@example.invalid
 git config --global init.defaultBranch main
 git config --global advice.detachedHead false
-unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML OLD_HEADS SCANNED_GONE OLD_HEADS_FILE SCANNED_GONE_FILE PUSH_REF
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT UPSTREAM UPSTREAM_URL RUNNER_TEMP GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML OLD_HEADS SCANNED_GONE OLD_HEADS_FILE SCANNED_GONE_FILE DELETED_TIPS DELETED_TIPS_FILE PUSH_REF
 export CONFIG_BRANCH=main
 
 if [[ -n "${GITLEAKS_BIN:-}" ]]; then
@@ -743,6 +743,54 @@ SCANNED_GONE="$gone4" SCANNED_GONE_FILE="$root/no-such-list" OLD_HEADS="$gone4" 
 OLD_HEADS="" OLD_HEADS_FILE="$root/no-such-list" EVENT_NAME=pull_request BEFORE="" HEAD_SHA="$main_tip" \
   check "pull request: an OLD_HEADS_FILE that cannot be read fails the job too" 2 \
   "::error::Secret scan: cannot read OLD_HEADS_FILE"
+# #691: the tips the workflow found deleted (DELETED_TIPS_FILE: GitHub's API has no commit for
+# them, and origin did not serve them) are gone without a fetch: one by one, the fetches of over a
+# hundred of them made every sweep slower. Each is still a gone tip: a warning only when SCANNED_GONE
+# (or the reviewed list) names it. One this clone has is scanned all the same.
+deleted_fetches() { grep -cE "built-in: git fetch .*$1" "$root/deleted-trace" || true; }
+upper_id=ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD
+printf '%s\n' "$gone4" > "$root/deleted-four"
+rm -f "$root/deleted-trace"
+GIT_TRACE="$root/deleted-trace" DELETED_TIPS_FILE="$root/deleted-four" SCANNED_GONE_FILE="$root/gone-four" \
+  OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: a deleted tip a scan read (DELETED_TIPS_FILE, SCANNED_GONE_FILE) warns, and passes" 0 \
+  "$gone_scanned_warning.*444444444444" "::error"
+if [[ "$(deleted_fetches "$gone4")" == 0 ]]; then
+  echo "ok   daily sweep: a deleted tip DELETED_TIPS_FILE names is not fetched (#691)"
+else
+  echo "FAIL daily sweep: a deleted tip DELETED_TIPS_FILE names is fetched ($(deleted_fetches "$gone4") time(s))"
+  failures=$((failures + 1))
+fi
+# The state question: the same run again in the same clone passes the same way, still unfetched.
+rm -f "$root/deleted-trace"
+GIT_TRACE="$root/deleted-trace" DELETED_TIPS_FILE="$root/deleted-four" SCANNED_GONE_FILE="$root/gone-four" \
+  OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: the same run again (a deleted tip a scan read) passes the same way" 0 "$gone_scanned_warning" "::error"
+if [[ "$(deleted_fetches "$gone4")" != 0 ]]; then
+  echo "FAIL daily sweep: run again, the deleted tip DELETED_TIPS_FILE names is fetched"
+  failures=$((failures + 1))
+fi
+DELETED_TIPS_FILE="$root/deleted-four" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: a deleted tip no scan is known to have read (DELETED_TIPS_FILE only) still fails" 2 \
+  "$gone_error: origin no longer has them \\($gone4\\)"
+# A deleted tip this clone has (fetched by an earlier run here) is scanned: the list only skips a fetch.
+printf '%s\n' "$vanished" > "$root/deleted-vanished"
+DELETED_TIPS_FILE="$root/deleted-vanished" SCANNED_GONE="$vanished" OLD_HEADS="$vanished" EVENT_NAME=schedule \
+  check "daily sweep: a tip DELETED_TIPS_FILE names that this clone has is still scanned (its key found)" 1 \
+  "1 tip\\(s\\) no ref holds" "GitHub has deleted them" "leaks found: [1-9]"
+: > "$root/deleted-empty"
+DELETED_TIPS_FILE="$root/deleted-empty" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: an empty DELETED_TIPS_FILE (a first run, or none deleted): the gone tip is fetched, and fails" 2 \
+  "$gone_error.*$gone4"
+DELETED_TIPS_FILE="$root/no-such-list" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+  check "daily sweep: a DELETED_TIPS_FILE that cannot be read fails the job" 2 \
+  "::error::Secret scan: cannot read DELETED_TIPS_FILE"
+for bad in "--all" "$zeros" "${gone4:0:12}" "$upper_id"; do
+  printf '%s %s\n' "$bad" "$gone4" > "$root/deleted-bad"
+  DELETED_TIPS_FILE="$root/deleted-bad" OLD_HEADS="$gone4" EVENT_NAME=schedule \
+    check "daily sweep: a word in DELETED_TIPS_FILE that is not a commit id fails ($bad)" 2 \
+    "::error::Secret scan: '.*' in DELETED_TIPS is not a commit id"
+done
 set_gone_list "$gone3 checked by hand: GitHub serves it nowhere (test)" # the list as the tests below expect it
 
 # #317 item 2: "one batch fetch first, then one by one" from a fresh blob-less clone, which holds
