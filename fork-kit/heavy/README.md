@@ -57,15 +57,19 @@ whose owner label names this user and this exact scope is touched; others, and c
 heavy asks Docker only after a run that labelled a container (`heavy docker-label` leaves a note for the scope in
 `/run/user/<uid>/heavy/labelled/`, a folder only this user can write; when that note cannot reach heavy, because
 `/run/user` is full or a sandbox has a `/run/user` of its own, in `~/.local/state/heavy/labelled/`, which heavy
-reads too; the home is `$HOME`, else the password database's, and only one this user owns, so heavy run as root
-with a user's `HOME` (`sudo -E heavy ...`) uses root's own home and never makes a root-owned folder in the user's;
+reads too; the home is `$HOME`, else the password database's, and only one this user owns and no one else can
+write (not `/`), so heavy run as root with a user's `HOME` (`sudo -E heavy ...`) or `HOME=/tmp` uses root's own home
+and never makes a root-owned folder in the user's; `~/.local` must be a real folder (not a link) of the user's;
+an older heavy run as root with your `HOME` may have left a root-owned `~/.local/state` (heavy then skips it):
+`sudo chown -R "$USER:" ~/.local/state` gives it back;
 heavy tells `docker-label` which folders it reads in `HEAVY_MARKS`; without either folder heavy asks after every
 run), so a run with no containers costs no `docker ps`. No Docker, or none this user can reach (a
 rootless Docker through `docker context use` counts as reachable): nothing to do, nothing said. Docker down: one
 line (`could not remove the containers of ...`); the leftover sweep looks again. `HEAVY_KEEP=1` keeps the scope's
 containers with it, unless heavy was stopped by a signal. When systemd cannot stop the scope, heavy stops what is
 left itself: TERM only to a process still in the scope (checked through a pidfd, so a pid that ended and was reused
-by another process is never hit; without pidfds, before Linux 5.3 or Python 3.9, no TERM and no grace wait), then
+by another process is never hit; without pidfds, before Linux 5.3 or Python 3.9, no TERM and no grace wait, only
+a 1 s look for processes that end anyway), then
 the kernel's `cgroup.kill` (it also kills a `sudo` or setuid process the command started in its scope, which a plain
 kill could not reach: the scope is the job's own). Without `cgroup.kill` (before Linux 5.14) the KILL goes through a
 pidfd too; what is still running then is named, and the leftover sweep looks again.
@@ -395,7 +399,8 @@ pidfd), so a reused pid is never hit. It never touches itself or the processes t
 It also removes the old notes of `heavy docker-label` (above) whose scope is gone, which heavy and its guard both
 killed with -9, or a kept scope that ended, leave behind (in `~/.local/state/heavy/labelled/` they would stay for
 good): only an empty file named like a heavy scope that systemd did not list when the sweep began, and that was
-already `minAgeSeconds` old then. A live run's note stays.
+already `minAgeSeconds` old then, in a folder heavy itself would use (`labelled/`, `heavy/` and the base each a
+real folder of the user's that no one else can write). A live run's note stays.
 
 Each sweep appends to `<report>/sweep.log` (rotated at 1 MiB) and writes a short `<report>/last-report.txt`.
 The report folder must be a folder of the sweep's user that no group or other user can write (not a link); else
