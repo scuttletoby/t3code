@@ -1,11 +1,12 @@
 name: Fork release
 
 # Builds this fork's release `v<upstream>.fork.<n>` (nightly) or `v<upstream>-fork.<n>` (stable):
-# upstream's tests, the Linux x64 server archive with SHA256SUMS, and the desktop apps (Linux x64,
-# Windows x64, macOS arm64 and x64), all on GitHub-hosted runners and unsigned unless signing
-# secrets exist. <upstream> is the newest upstream tag of the channel (variable
-# FORK_FOLLOW_CHANNEL, default nightly) the commit contains; <n> counts the fork's earlier builds
-# of it. Both names read as the app's stable track, so the builds use the stable feed and branding.
+# upstream's tests, the Linux x64 server archive, and the desktop apps (Linux x64, Windows x64,
+# macOS arm64 and x64), with SHA256SUMS over all of them, on GitHub-hosted runners and unsigned
+# (macOS: ad hoc) unless signing secrets exist. <upstream> is the newest upstream tag of the
+# channel (variable FORK_FOLLOW_CHANNEL, default nightly) the commit contains; <n> counts the
+# fork's earlier builds of it. Both names read as the app's stable track, so the builds use the
+# stable feed and branding.
 #
 # Builds name this repository as their release repository (scripts/lib/release-repository.ts reads
 # T3CODE_DESKTOP_UPDATE_REPOSITORY, else GITHUB_REPOSITORY in Actions), so the server's update and
@@ -393,11 +394,66 @@ jobs:
       cli_archive: false
       launch_check: false
 
+  # The shipped macOS apps, as a person unpacks them: each zip and dmg holds an app whose signature
+  # (ad hoc without signing secrets, scripts/fork-codesign.cjs) seals the whole bundle. A bundle
+  # changed after signing, or never signed, fails `codesign --verify --deep --strict` (#822).
+  verify_mac_signature:
+    name: Verify macOS signatures
+    needs: [desktop_mac_arm64, desktop_mac_x64]
+    runs-on: ${{ vars.FORK_MACOS_RUNNER || 'macos-26' }}
+    timeout-minutes: 15
+    steps:
+      - name: Download macOS builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: desktop-mac-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Verify the app in each zip and dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          verify() {
+            local apps=("$1"/*.app)
+            if (( ${#apps[@]} != 1 )); then
+              echo "::error::$2 holds ${#apps[@]} apps, not one." >&2
+              exit 1
+            fi
+            codesign --verify --deep --strict --verbose=2 "${apps[0]}"
+          }
+          zips=(release-assets/T3-Code-*.zip)
+          dmgs=(release-assets/*.dmg)
+          if (( ${#zips[@]} != 2 || ${#dmgs[@]} != 2 )); then
+            echo "::error::Expected the arm64 and x64 zip and dmg, found: ${zips[*]} ${dmgs[*]}" >&2
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            dir="$(mktemp -d "$RUNNER_TEMP/zip.XXXXXX")"
+            ditto -x -k "$zip" "$dir"
+            verify "$dir" "$zip"
+          done
+          for dmg in "${dmgs[@]}"; do
+            mount="$(mktemp -d "$RUNNER_TEMP/dmg.XXXXXX")"
+            hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg" > /dev/null
+            verify "$mount" "$dmg"
+            hdiutil detach "$mount" -force > /dev/null
+          done
+
   # Collects and checks every release file with a read-only token; package code runs here only.
   assemble:
     name: Assemble release files
     needs:
-      [preflight, tests, desktop_linux_x64, desktop_win_x64, desktop_mac_arm64, desktop_mac_x64]
+      [
+        preflight,
+        tests,
+        desktop_linux_x64,
+        desktop_win_x64,
+        desktop_mac_arm64,
+        desktop_mac_x64,
+        verify_mac_signature,
+      ]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -449,7 +505,10 @@ jobs:
           merge-multiple: true
           path: release-assets
 
-      - name: Write CLI archive checksums
+      # Every file a person downloads to install: the server archives and the desktop apps (macOS
+      # dmg and zip, Windows exe, Linux AppImage), so a command-line install checks any of them
+      # against this one file. Updater manifests and blockmaps are read by the apps, not people.
+      - name: Write release checksums
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -457,12 +516,18 @@ jobs:
           set -euo pipefail
           cd release-assets
           shopt -s nullglob
-          archives=(t3-*.tar.gz t3-*.zip)
           if [[ ! -f "t3-$VERSION-linux-x64.tar.gz" ]]; then
             echo "::error::The Linux x64 server archive is missing." >&2
             exit 1
           fi
-          sha256sum "${archives[@]}" > SHA256SUMS
+          for desktop in "*.dmg" "*.exe" "*.AppImage" "T3-Code-*.zip"; do
+            files=($desktop)
+            if (( ${#files[@]} == 0 )); then
+              echo "::error::No desktop file matches $desktop." >&2
+              exit 1
+            fi
+          done
+          sha256sum t3-*.tar.gz *.zip *.dmg *.exe *.AppImage > SHA256SUMS
           cat SHA256SUMS
 
       # The `t3` executable in each archive bundles the server again (release-desktop.yml build-exe).

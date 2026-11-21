@@ -156,6 +156,25 @@ check("the CLI archives are checked for the release repository", "fork-release.s
 check("preflight runs this shape test", "fork-release-workflow.test.py" in
       "\n".join(str(s.get("run", "")) for s in steps(jobs["preflight"])))
 
+# SHA256SUMS lists every file a person downloads, desktop apps included (#822), and is written in
+# assemble, which runs after every desktop build.
+sums = [s for s in steps(jobs["assemble"]) if "> SHA256SUMS" in str(s.get("run", ""))]
+sums_run = str(sums[0].get("run", "")) if len(sums) == 1 else ""
+check("assemble writes one SHA256SUMS over the server archives and the desktop files",
+      len(sums) == 1 and "sha256sum t3-*.tar.gz *.zip *.dmg *.exe *.AppImage > SHA256SUMS" in sums_run
+      and {"desktop_linux_x64", "desktop_win_x64", "desktop_mac_arm64", "desktop_mac_x64"}
+      <= set(jobs["assemble"].get("needs", [])))
+
+# The shipped macOS apps verify as a person unpacks them; assemble waits for it (#822).
+verify_mac = jobs.get("verify_mac_signature", {})
+verify_runs = "\n".join(str(s.get("run", "")) for s in steps(verify_mac))
+check("verify_mac_signature unpacks each macOS zip and dmg and runs codesign --verify --deep --strict",
+      "verify_mac_signature" in jobs["assemble"].get("needs", [])
+      and {"desktop_mac_arm64", "desktop_mac_x64"} <= set(verify_mac.get("needs", []))
+      and "macos" in str(verify_mac.get("runs-on", ""))
+      and "ditto -x -k" in verify_runs and "hdiutil attach" in verify_runs
+      and "codesign --verify --deep --strict" in verify_runs)
+
 # The server bundle check skips dist/client, which names this repository on every Actions build.
 bundle_steps = [s for s in steps(jobs["build_bundle"]) if "apps/server/dist" in str(s.get("run", ""))]
 check("the server bundle is checked through check-bundle (without dist/client)",

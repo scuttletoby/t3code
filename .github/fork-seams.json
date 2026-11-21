@@ -169,6 +169,12 @@
         "const spawnSync = forkSpawnSync; // Fork: the Rosetta limit above"
       ]
     },
+    "scripts/build-desktop-artifact.ts": {
+      "why": "#822: without signing secrets electron-builder finds no identity and signs nothing, so the shipped macOS app keeps only the linker signature of Electron's own executable, which seals none of the renamed bundle, and `codesign --verify --deep --strict` fails on it (\"code has no resources but signature indicates they must be present\"). For an unsigned build the fork's line sets identity \"-\" and the sign hook scripts/fork-codesign.cjs, which runs `codesign --force --deep --sign -` as electron-builder's last change to the bundle, before the zip and dmg are made from it. Signed builds keep upstream's line and scripts/sign-macos.ts. fork-release.yml's verify_mac_signature job checks the app in each shipped zip and dmg. Drop this seam when upstream ad-hoc signs unsigned macOS builds, or when the fork signs with a Developer ID (#803).",
+      "added": [
+        "...(signed ? {} : { identity: \"-\", sign: path.join(repoRoot, \"scripts/fork-codesign.cjs\") }),"
+      ]
+    },
     "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": {
       "why": "MCP profiles part 2: a Claude thread's MCP profile is applied to its session (strict MCP mode or an allowlist of outside servers, from apps/server/src/fork/claudeMcpProfile.ts), is part of the live-query key, refuses the turn when it cannot be applied, and adds a PreToolUse hook (merged into the adapter's hooks) that refuses a call to a server outside the profile. Additions only; tested in apps/server/src/fork/claudeMcpProfile.adapter.test.ts.",
       "added": [
