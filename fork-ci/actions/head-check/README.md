@@ -56,7 +56,7 @@ All of them are the queue's, imported from `../pr-queue`, never copied:
   a `### Blocking` or `### Major` heading with items, a table row ...) fails
   the head until a later round of that lens clears it or a person's override
   newer than the report covers it (`findings: true`); a report with no findings
-  section at all fails too. A person is a login in `override_authors`; none
+  section (a blocker label and a major label, `none` allowed) fails too. A person is a login in `override_authors`; none
   listed (the default) means no override clears a finding or passes the cap
   (issue #78). A round is a read of a different own change (`own_change`: a
   head that only merges the base in is no new round); from round

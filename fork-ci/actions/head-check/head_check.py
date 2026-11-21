@@ -55,6 +55,7 @@ import review_config  # noqa: E402
 import review_judge  # noqa: E402
 
 ATTEMPTS, RETRY_SECONDS = 3, 10
+FETCH_SECONDS = 120   # a fetch of a read commit that takes longer counts as failed (the job has 15 minutes in all)
 FIELDS = 'isDraft,headRefOid,comments,reviews'
 SHA = pr_queue.SHA
 REFUSED = pr_queue.REFUSED
@@ -125,10 +126,14 @@ class Checkout:
 
     def fetch(self, sha):
         """A read commit no ref of the repository reaches (a force-push dropped it; GitHub keeps it), from origin with the
-        credentials the checkout stored or the gate's environment gives (none: a private repository then fails)."""
-        return self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha,
-                        fetch=True).returncode == 0 \
-            and self.has(sha)
+        credentials the checkout stored or the gate's environment gives (none: a private repository then fails). A fetch
+        that takes over FETCH_SECONDS failed."""
+        try:
+            done = self.git('fetch', '-q', '--no-tags', '--no-recurse-submodules', self.remote, sha, fetch=True,
+                            timeout=FETCH_SECONDS).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+        return done and self.has(sha)
 
 
 def required_names(text):
@@ -375,9 +380,11 @@ def own_change(checkout, base):
     """change_of for review_judge.review_round: what the pull request itself changes at a read commit, so two reads of
     the same change are one round. The key is a hash of `git diff -U0` from the commit's merge base with `base` to it,
     hunk line numbers dropped: a head that only merges the base in (a queue or branch update) has the same own change
-    as the head it updates, and is no new round. A short sha is resolved when it names one commit. A commit that is not
-    in the repository and cannot be fetched, more than one merge base or a failed diff: a round of its own (unknown
-    counts more rounds, never fewer)."""
+    as the head it updates, and is no new round. The `index <blob>..<blob>` lines and the whole hunk header (line
+    numbers, and the function name git shows) are dropped too: they move when the base edits other lines of a file the
+    pull request changes; --binary keeps a binary file's content in the key. A short sha is resolved when it names one
+    commit. A commit that is not in the repository and cannot be fetched, more than one merge base or a failed diff: a
+    round of its own (unknown counts more rounds, never fewer)."""
     cache = {}
 
     def of(sha):
@@ -402,11 +409,11 @@ def diff_key(checkout, base, sha):
     if len(bases) != 1 or not SHA.fullmatch(bases[0]):
         return None
     d = checkout.git('diff', '--no-ext-diff', '--no-textconv', '--no-relative', '--ignore-submodules=none',
-                     '--no-color', '--no-renames', '--full-index', '-U0', bases[0], full, '--',
+                     '--no-color', '--no-renames', '--binary', '-U0', bases[0], full, '--',
                      errors='surrogateescape')
     if d.returncode != 0:
         return None
-    text = re.sub(r'^@@ [^@]* @@', '@@', d.stdout, flags=re.M)
+    text = re.sub(r'^index .*\n', '', re.sub(r'^@@ .*', '@@', d.stdout, flags=re.M), flags=re.M)
     return ('change', hashlib.sha256(text.encode('utf-8', 'surrogateescape')).hexdigest())
 
 
@@ -425,6 +432,14 @@ def review_rounds(rules, review, pr, checkout, prefix):
             return None, "HEAD is not GitHub's two-parent merge commit, so the rounds are unknown"
         entries, history = review.lens_scan(pr)
         people = {a.lower() for a in rules.override_authors}
+        for _, _, post in review.lens_posts(pr):   # listed, but GitHub records another association: it never counts
+            login = (post.get('author') or {}).get('login') or ''
+            if login.lower() in people and review.override_re.match(post.get('body') or '') \
+                    and post.get('authorAssociation') != review.override_association:
+                review.log(f'warning: the override comment by {login} does not count: GitHub records its author '
+                           f'association as {post.get("authorAssociation") or "none"}, and an override counts only '
+                           f'with {review.override_association} (override.author_association); being listed in '
+                           f'review.override_authors does not change that')
         overrides = [((when, i), sha, post) for when, i, post in review.lens_posts(pr)
                      for sha in [review.override_sha(post)] if sha]
         newest = max((at for at, _, _ in overrides), default=None)

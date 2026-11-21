@@ -205,21 +205,35 @@ Owner decisions: issue #99 (findings), issue #100 (rounds).
   `| major | x |` or a table column headed `major`), or, for a bare label, the
   first line under it (a heading or nothing under it is a finding too). Every
   label of a line counts (`blocker: none, major: x`). Only an explicit nothing
-  is no finding (`none`, `None found`, `none (only minors)`, `nothing`, `no`,
-  `0`, `n/a`, `-`). Before reading, the text is folded: NFKC, zero-width and
-  other format characters removed, Cyrillic and Greek look-alike letters read
-  as Latin, `0` for `o` in a label. Lines inside a fenced code block are never
-  labels, so quote code and example findings in one; quotes and indented
-  blocks are read (fail closed). A title line or `verdict:` line that says
+  is no finding (`none`, `None found`, `none (only minors)`, `(none)`,
+  `none — two minors below`, `nothing`, `no`, `0`, `n/a`, `-`). A recap of an
+  earlier round with a label (`Major 1: fixed`) is read as an open finding:
+  write it without one (`round 1, fixed: x`). The format of one line per
+  finding, `finding: <blocker|major|minor> ...`, is read too (with
+  `findings: none` when there is none); only its minors pass. Before reading,
+  the text is folded: NFKC, zero-width and other format characters removed,
+  Cyrillic and Greek look-alike letters read as Latin, `0` for `o` in a label,
+  HTML entities decoded (`ma&#106;or`) and backslash escapes dropped
+  (`major\:`). Lines inside a fenced code block are never labels, so quote
+  code and example findings in one; quotes and indented blocks are read (fail
+  closed). A title line or `verdict:` line that says
   NOT SAFE is a blocker. `minor:` and `nit:` never block.
   A lens whose newest report has a blocker or major fails the head. A report
-  with no findings section at all (not even `major: none`) cannot be judged and
-  fails that lens. Findings go in the report body: findings in inline review
-  comments (on a line of the diff) are not read, so a lens posted as a PR review
-  whose body has no findings section fails. The ways out: fix it, and the lens
+  without a findings section cannot be judged and fails that lens: it needs a
+  blocker label and a major label (`blocker: none` and `major: none` too), or
+  `findings: none`, or `finding:` lines. One of the two labels is not enough:
+  `blocker: none` with the major written another way (`F1 (major): x`) would
+  read as clean. A report that writes `major: none` and then a major in a form
+  not read here contradicts itself, and is read by its `major: none`. Findings
+  go in the report body: findings in inline review comments (on a line of the
+  diff) are not read, so a lens posted as a PR review whose body has no
+  findings section fails. The ways out: fix it, and the lens
   posts a new report on the fixed head without a blocker or major; or a person
   posts an override comment for the head (config `override`) newer than the
-  report. A person is a login listed in `override_authors`; an override by any
+  report. A person is a login listed in `override_authors` whose override
+  comment GitHub also records with the override association
+  (`override.author_association`); an override by a listed login with another
+  association does not count, and the check output warns about it. An override by any
   other author of the override association covers a lens's read as before, but
   clears no finding and passes no cap. While agents still post as the owner's
   login (issue #78) an override from it proves no person, so keep the list
@@ -227,8 +241,10 @@ Owner decisions: issue #99 (findings), issue #100 (rounds).
   finding is fixed or the pull request closed.
 - **Rounds:** a round is a lens read of a fixed change, not of a new sha. The
   gate counts the different own changes the counted lens headers read: for each
-  read sha, `git diff -U0` from its merge base with the base to it, line numbers
-  dropped (`head_check.own_change`). A head that only merges the base in (a
+  read sha, `git diff -U0 --binary` from its merge base with the base to it,
+  the hunk headers (line numbers, function names) and `index` lines dropped
+  (`head_check.own_change`), so a base that edits other lines of a file the
+  pull request changes moves nothing. A head that only merges the base in (a
   queue update, `gh pr update-branch`) or the same change rebased onto a newer
   base is the same change, so the same round; a merge that also changes the pull
   request's own diff is a new one. A short sha counts as well, and a sha the

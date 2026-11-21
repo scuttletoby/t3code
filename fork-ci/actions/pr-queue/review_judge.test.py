@@ -4,7 +4,7 @@ Which lens reads a change needs by the `review` block's path rules. The shared v
 are the contract both sides test; the rest here: reading git's name-status output, and that a rule set the parser
 would refuse, or a diff line nobody knows, never judges.
 """
-import dataclasses, json, os, sys, unittest
+import dataclasses, json, os, sys, time, unittest
 
 sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
 
@@ -168,6 +168,7 @@ H1, H2, H3, H4, H5 = (c * 40 for c in 'abcde')
 BASIC = CONFIGS['basic']   # findings true, rounds approach_at 3, max 4, approach lens `approach`, no override_authors
 PEOPLE = dataclasses.replace(BASIC, override_authors=('a-person',))
 HEAD = 'lens: code · reviewer: x · read at: ' + H1 + '\n'
+NONE = 'blocker: none\nmajor: none'   # the clean findings section the lens prompts ask for
 
 
 def rounds(history, reports, decided=False, review=BASIC, change_of=None):
@@ -226,6 +227,16 @@ FINDING = [
     ('narrow read only', 'major (see <b ): x <i>'),   # the wide tag eats the colon
     ('NOT SAFE header', '## Review lens A, head 0123abc: **NOT SAFE**\nblocker: none\nmajor: none'),
     ('NOT SAFE verdict', 'verdict: NOT SAFE\nblocker: none\nmajor: none'),
+    ('finding line', 'finding: major src/a.py:3 loses data'),   # another project's lens format
+    ('finding line, blocker', '- finding: blocker the lock is gone'),
+    ('finding line after blocker: none', 'blocker: none\nfinding: major src/a.py:3 loses data'),
+    ('finding line after findings: none', 'findings: none\nfinding: major x'),
+    ('recap of a fixed major', NONE + '\n- Major 1 (cap): fixed at the root.'),   # labelled: read as open
+    ('recap of a fixed blocker', NONE + '\n**Blocking 1:** fixed.'),
+    ('HTML entity', NONE + '\nma&#106;or: x'),
+    ('Markdown escape', NONE + '\nmajor\\: x'),
+    ('ratio sign for a colon', NONE + '\nmajor\u2236 x'),
+    ('a dash glued to none', 'major: none-critical race'),
 ]
 # Lines a clean report writes: no finding, and a findings section.
 CLEAN = [
@@ -238,6 +249,7 @@ CLEAN = [
     ('bold inline', '**Blocking:** none.\n**Major:** none.'),
     ('a rule between', '### Major\n\n---\n\nNone.'),
     ('table columns', '| blocker | major |\n|---|---|\n| none | none |'),
+    ('table columns, blanks round the rule', '| blocker | major |\n  |---|---|  \n| none | none |'),
     ('table row', '| severity | finding |\n|---|---|\n| major | none |'),
     ('n/a', 'major: n/a'), ('zero', 'major: 0'), ('em dash', 'major: —'), ('list', '- majors: none'),
     ('bold no', '**blockers:** no'), ('nothing', 'blocker: nothing'), ('NA', 'major: NA'),
@@ -251,7 +263,24 @@ CLEAN = [
     ('nothing found', 'major: nothing found'),
     ('a minor after it', 'major: none; minor: x'),
     ('prose that says not safe', 'major: none\nThe old code was not safe to run twice; this fixes it.'),
+    ('none, a dash, a note', 'major: none — two minors below'),
+    ('none, a hyphen, a note', 'major: none - two minors below'),
+    ('none in parentheses', 'Major: (none)'),
+    ('none and an emoji', 'major: None \u2705'),
+    ('only minor finding lines', 'finding: minor src/a.py:3 a typo\nfinding: nit y'),
+    ('a recap without a label', NONE + '\nround 1, fixed: the race'),
 ]
+# Each makes a findings section on its own: a blocker and a major label, `findings: none` or `finding:` lines.
+SECTION = ['Blocker: none, major: none', '### Blocking\nNone.\n\n### Major\nNone.',
+           '**Blocking:** none.\n**Major:** none.', '| blocker | major |\n|---|---|\n| none | none |', 'findings: none',
+           'Blocker: none. Major: none.',
+           'finding: minor a typo', NONE, '| severity | finding |\n|---|---|\n| blocker | none |\n| major | none |']
+# Review A and B of #740 round 2: `blocker: none` kept from the prompt, the major written in a form not read as a label.
+# With one label kind only there is no findings section, so each fails closed (no section), never clean.
+ONE_KIND = ['F1 (major): x', '1. **Retry drops rows** (major): x', '- F1. Severity: major. x',
+            '- F1 — **Severity:** Major — x', '- F1 — major: x', 'F1: major: x', 'One major: x', 'Major 1. x',
+            'minor: typo. Also major: x']
+ONE_LABEL = ['major: none', 'blocker: none', '### Major\nNone.', '| severity | finding |\n|---|---|\n| major | none |']
 # Lines that only mention a label: no finding, and no findings section either.
 MENTION = ['fixed: the major of round 1', 'no major found', 'majority: x', 'Major version: 2', 'blockerx: y',
            'major 12345: too long a number', 'the blocking call in x']
@@ -265,10 +294,40 @@ class Findings(unittest.TestCase):
                 self.assertTrue(said, body)
                 self.assertTrue(said[0][0] in ('blocker', 'major'))
 
-    def test_each_clean_format_is_no_finding_and_a_section(self):
+    def test_each_clean_format_is_no_finding(self):
         for what, body in CLEAN:
             with self.subTest(what):
-                self.assertEqual(rj.read_findings(HEAD + body), ([], True), body)
+                self.assertEqual(rj.read_findings(HEAD + body)[0], [], body)
+                self.assertEqual(rj.read_findings(HEAD + NONE + '\n\n' + body), ([], True), body)
+
+    def test_a_section_needs_a_blocker_and_a_major_label(self):   # #740 round 2, A major 1
+        for body in SECTION:
+            with self.subTest(body):
+                self.assertEqual(rj.read_findings(HEAD + body), ([], True))
+        for body in ONE_LABEL:
+            with self.subTest(body):
+                self.assertEqual(rj.read_findings(HEAD + body), ([], False))
+        for body in ONE_KIND:
+            with self.subTest(body):
+                self.assertEqual(rj.read_findings(HEAD + 'blocker: none\n' + body), ([], False))
+                r = rounds([('code', H1)], {'code': HEAD + 'blocker: none\n' + body})
+                self.assertEqual(len(r.problems), 1)
+                self.assertIn('lens code: its newest report has no findings section', r.problems[0])
+
+    def test_a_long_run_of_spaces_takes_linear_time(self):   # #740 round 2: 81-91 s for one 65,000-character line
+        n = 200_000
+        for line in ('major' + ' ' * n + 'x', 'blocker: none' + ' ' * n + 'x', '| a | b |\n' + ' ' * n + 'x',
+                     '| a | b |\n|' + ' ' * n + 'x', '| a | b |\n|-' + ' ' * n + 'x',
+                     'not' + ' ' * n + 'safe', 'finding:' + ' ' * n + 'x', 'major: none' + ' \t' * (n // 2) + 'x'):
+            with self.subTest(line[:12]):
+                start = time.monotonic()
+                rj.read_findings(HEAD + line)
+                self.assertLess(time.monotonic() - start, 2)
+
+    def test_a_table_does_not_go_on_past_a_fence(self):   # a fence ends the table, as GitHub renders it
+        table = '| blocker | major |\n|---|---|\n| none | none |\n'
+        self.assertEqual(rj.read_findings(table + '```\ncode\n```\n| a | b |'), ([], True))
+        self.assertEqual(len(rj.findings(table + '| a | b |')), 1)   # without the fence: a row of the table
 
     def test_a_line_that_only_mentions_a_label_is_neither(self):
         for line in MENTION:
@@ -282,7 +341,7 @@ class Findings(unittest.TestCase):
         self.assertEqual(rj.findings('### Major')[0], ('major', 'Major (nothing under it)'))
 
     def test_an_unclosed_fence_runs_to_the_end(self):   # GitHub shows the rest as code
-        self.assertEqual(rj.read_findings('major: none\n```\nmajor: x'), ([], True))
+        self.assertEqual(rj.read_findings(NONE + '\n```\nmajor: x'), ([], True))
 
     def test_fold(self):
         self.assertEqual(rj.fold('\uff2da\u200bj\u043er'), 'Major')
@@ -323,7 +382,7 @@ class Rounds(unittest.TestCase):
         self.assertEqual(r.findings, (('code', 'major', 'major: two writers race'),))
         self.assertIn('lens code reported a major that no later round cleared', r.problems[0])
         self.assertIn('lens code posts a new report on the fixed head', r.problems[0])
-        r = rounds([('code', H1), ('code r2', H2)], {'code': 'major: none'})   # round 2 cleared it
+        r = rounds([('code', H1), ('code r2', H2)], {'code': NONE})   # round 2 cleared it
         self.assertEqual((r.round, r.problems), (2, ()))
 
     def test_a_report_with_no_findings_section_fails_that_lens(self):   # #99: never passes as clean
@@ -332,7 +391,8 @@ class Rounds(unittest.TestCase):
         self.assertIn('lens code: its newest report has no findings section', r.problems[0])
         self.assertIn('findings in inline review comments are not read', r.problems[0])
         self.assertEqual(rounds([('code', H1)], {'code': HEAD}).problems, r.problems)   # empty body: the same
-        self.assertEqual(rounds([('code', H1)], {'code': HEAD + 'major: none'}).problems, ())
+        self.assertEqual(rounds([('code', H1)], {'code': HEAD + NONE}).problems, ())
+        self.assertEqual(rounds([('code', H1)], {'code': HEAD + 'major: none'}).problems, r.problems)   # one kind
 
     def test_an_entry_that_reads_nothing_under_an_agents_override_cannot_be_judged(self):
         r = rounds([('code', H1)], {'code': (rj.UNREAD, HEAD + 'major: none')})
@@ -353,16 +413,16 @@ class Rounds(unittest.TestCase):
         self.assertIn('findings are not judged', r.text(dataclasses.replace(BASIC, findings=False)))
 
     def test_the_approach_lens_is_required_from_round_approach_at(self):
-        self.assertFalse(rounds([('code', H1), ('code', H2)], {'code': 'major: none'}).approach)
-        r = rounds([('code', H1), ('code', H2), ('code', H3)], {'code': 'major: none'})
+        self.assertFalse(rounds([('code', H1), ('code', H2)], {'code': NONE}).approach)
+        r = rounds([('code', H1), ('code', H2), ('code', H3)], {'code': NONE})
         self.assertTrue(r.approach)
         self.assertIn('approach lens approach required from round 3', r.text(BASIC))
         self.assertFalse(rounds([('code', H1), ('code', H2), ('code', H3)], {}, decided=True).approach)
 
     def test_a_round_past_the_cap_stops_and_says_what_a_person_does(self):   # #100
         four = [('code', h) for h in (H1, H2, H3, H4)]
-        self.assertEqual(rounds(four, {'code': 'major: none'}).problems, ())   # round 4 of 4 may pass
-        r = rounds(four + [('code', H5)], {'code': 'major: none'})
+        self.assertEqual(rounds(four, {'code': NONE}).problems, ())   # round 4 of 4 may pass
+        r = rounds(four + [('code', H5)], {'code': NONE})
         self.assertTrue(r.over_cap)
         self.assertEqual(r.problems, (
             'review round 5 is past the cap of 4 rounds (issue #100): no more rounds; a person decides: close the pull '
@@ -370,10 +430,10 @@ class Rounds(unittest.TestCase):
             'override is accepted (issue #78: until agents no longer post as the person\'s login, an override is not '
             'proof of a person). A person\'s override alone is enough, also for a required approach lens that never '
             'posted',))
-        r = rounds(four + [('code', H5)], {'code': 'major: none'}, review=PEOPLE)
+        r = rounds(four + [('code', H5)], {'code': NONE}, review=PEOPLE)
         self.assertIn('an override comment `override for head <head sha>: <why>` for this head by a-person, newer '
                       'than every lens comment', r.problems[0])
-        self.assertEqual(rounds([('code r5', H1)], {'code': 'major: none'}).round, 5)
+        self.assertEqual(rounds([('code r5', H1)], {'code': NONE}).round, 5)
 
     def test_a_persons_decision_passes_the_cap_and_waives_the_approach_lens(self):
         five = [('code', h) for h in (H1, H2, H3, H4, H5)]
@@ -399,10 +459,12 @@ class OverrideAuthors(unittest.TestCase):
 
     def test_a_wrong_list_is_refused(self):
         block = VECTORS['configs']['basic']
-        for bad in ('a-person', [''], ['-x'], ['a b'], ['x', 'X'], [1], ['x'] * 21, None):
+        for bad in ('a-person', [''], ['-x'], ['a b'], ['x', 'X'], [1], ['x'] * 21, [f'p{i}' for i in range(21)], None):
             with self.subTest(bad), self.assertRaises(config.ConfigError) as e:
                 rc.parse_review({**block, 'override_authors': bad})
             self.assertIn('override_authors', str(e.exception))
+        self.assertEqual(len(rc.parse_review({**block, 'override_authors': [f'p{i}' for i in range(20)]})
+                             .override_authors), 20)
 
 
 # --- the fork's own config (issue #730): in shadow, workflow, queue and lens files critical (#82) ----------------

@@ -22,7 +22,8 @@ judge_rounds judges the review itself, from the lens comments (README.md, "Revie
     headings, bold, tables, folded Unicode; never inside a fenced code block) fails the head, until that lens posts a
     new report on a fixed head without one (a later round clears it) or a person's override newer than the report
     covers it. A person is a login listed in `override_authors`; none listed (the default) means no override clears
-    anything. A report with no findings section at all (not even `major: none`) cannot be judged and fails that lens.
+    anything. A report with no findings section (a blocker label and a major label, `none` allowed) cannot be judged
+    and fails that lens.
     Owner decision: issue #99.
   - Rounds: a round is a lens read of a different change, not of a different sha: review_round counts the different
     own changes (head_check.own_change: the diff from the merge base, so a head that only merges the base in is the
@@ -32,6 +33,7 @@ judge_rounds judges the review itself, from the lens comments (README.md, "Revie
     also waives the approach lens). Owner decision: issue #100.
 Pure as judge is: the lens comments come in (lens.Review.lens_scan), the verdict goes out.
 """
+import html
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -182,18 +184,23 @@ def judge(review, changes, config_path):
 # Text that says nothing (NONE_RE: `none`, `None found.`, `none (only minors)`, `n/a`, `-` ...) is no finding, and every
 # label of a line is judged (`Blocker: none, major: none`). `minor` and `nit` labels never block; they only end the
 # text of the label before them. Lines inside a fenced code block hold no label (a report quotes code and test vectors
-# there); the line under a bare label is its content even when it opens a fence. A report with no blocker or major
-# label at all, not even `major: none`, has no findings section: it cannot be judged (judge_rounds fails it).
+# there); the line under a bare label is its content even when it opens a fence. A report has a findings section only
+# when it has a blocker label AND a major label (`blocker: none` and `major: none` too), or `findings: none`, or
+# `finding: <kind> ...` lines: with one of the two labels only, a major written in a form not read here
+# (`F1 (major): x`) would pass as clean, so such a report cannot be judged (judge_rounds fails it). Each finding is one
+# line `finding: <blocker|major|minor> ...` in that format (FINDING_LINE_RE). A recap of an earlier round with a label
+# (`Major 1: fixed`) is read as a finding like any other; write it without one (`round 1, fixed: x`).
 # Before any of this the text is folded (fold): NFKC (`Ｍajor` -> Major), format characters removed (zero-width space and
 # joiner, soft hyphen, bidi marks: category Cf), and Cyrillic and Greek letters that look like Latin ones read as Latin
-# (`majоr` with a Cyrillic о); a 0 for an o in a label is read too (`maj0r`).
+# (`majоr` with a Cyrillic о); a 0 for an o in a label is read too (`maj0r`); HTML entities decoded (`ma&#106;or`) and
+# Markdown backslash escapes dropped (`major\: x`), as GitHub renders them.
 CONFUSABLES = str.maketrans({
     'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'Х': 'X',
     'І': 'I', 'Ј': 'J', 'Ѕ': 'S', 'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'х': 'x', 'у': 'y', 'і': 'i',
     'ј': 'j', 'ѕ': 's', 'к': 'k', 'ԁ': 'd', 'ӏ': 'l', 'һ': 'h', 'ԛ': 'q', 'ԝ': 'w',
     'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Ζ': 'Z', 'Η': 'H', 'Ι': 'I', 'Κ': 'K', 'Μ': 'M', 'Ν': 'N', 'Ο': 'O', 'Ρ': 'P',
     'Τ': 'T', 'Υ': 'Y', 'Χ': 'X', 'ο': 'o', 'ι': 'i', 'κ': 'k', 'ν': 'v', 'α': 'a', 'ρ': 'p',
-    'ı': 'i', 'ℓ': 'l', 'ǀ': 'l',
+    'ı': 'i', 'ℓ': 'l', 'ǀ': 'l', '∶': ':',
 })
 _KW = r'(?P<kw>bl[o0]ck(?:ers?|ing)|ma[j][o0]rs?|m[i1]n[o0]rs?|nits?)'
 _LABEL = (_KW + r'(?![^\W_])(?:\s+(?:findings?|issues?|problems?|items?|points?|bugs?|ones?)(?![^\W_]))?'
@@ -206,16 +213,17 @@ LABEL_RE = re.compile(r'(?:^|(?<=[,;.!?|/])\s*|\s+(?:and|but)\s+)(?:\[' + _LABEL
 BARE_RE = re.compile(r'[\[(]?' + _LABEL + r'[\])]?' + _SEP + r'?\s*', re.I)
 CELL_RE = re.compile(_LABEL + r'\s*:?\s*', re.I)
 NONE_RE = re.compile(
-    r'(?:none|nothing|nil|no|zero|0|n/?a|-+|—|–)'
+    r'[(\[]?\s*(?:none|nothing|nil|no|zero|0|n/?a|-+|—|–)'
     r'(?:\s+(?:found|open|left|remaining|seen|here|known|so\s+far|at\s+all|this\s+round|blocking|blockers?|majors?|'
-    r'findings?|issues?|problems?))*\s*(?:$|[.,;:!?)(\[])', re.I)
+    r'findings?|issues?|problems?))*\s*(?:$|[.,;:!?)(\[]|[^\w\s\x00-\x7f]|-(?=\s|$))', re.I)
+FINDING_LINE_RE = re.compile(r'findings?\s*:\s*[\[(]?' + _KW + r'(?![^\W_])', re.I)   # `finding: major x`
 FINDINGS_NONE_RE = re.compile(r'(?:findings|issues|problems)\s*:\s*(?:none|nothing|no|0|n/?a)\s*\.?\s*$', re.I)
 NOT_SAFE_RE = re.compile(r'\bnot\s+safe\b', re.I)
 VERDICT_NOT_SAFE_RE = re.compile(r'verdict\s*[:—–-]?\s*not\s+safe\b', re.I)
 RULE_LINE_RE = re.compile(r'\s*(?:[-*_]\s*){3,}')   # a thematic break: no content
 HEADING_RE = re.compile(r' {0,3}#{1,6}(?:\s|$)')
 TABLE_RE = re.compile(r'\s*\|')
-TABLE_RULE_RE = re.compile(r'\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*')
+TABLE_RULE_RE = re.compile(r'\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?')   # on a stripped line: linear time
 ROUND_RE = re.compile(r'r(\d{1,9})')
 SHOW_FINDING = 120   # characters of a finding line named in the reason
 BLOCKING = ('blocker', 'major')
@@ -223,7 +231,7 @@ BLOCKING = ('blocker', 'major')
 
 def fold(text):
     """The text as the findings rules read it: NFKC, format characters (category Cf) gone, look-alike letters Latin."""
-    text = unicodedata.normalize('NFKC', text or '')
+    text = re.sub(r'\\([!-/:-@\[-`{-~])', r'\1', html.unescape(unicodedata.normalize('NFKC', text or '')))
     return ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf').translate(CONFUSABLES)
 
 
@@ -233,8 +241,9 @@ def _kind(kw):
 
 
 def _plain(line, narrow):
-    """One line normalised (lens.norm_line), folded, with leading symbols (emoji, arrows, bullets) gone."""
-    return re.sub(r'^[^\w\[(]+', '', lens.norm_line(fold(line), narrow)).strip()
+    """One line normalised (lens.norm_line), folded, with leading symbols (emoji, arrows, bullets) gone and each run of
+    whitespace one space (the label patterns then take linear time on a long run of spaces)."""
+    return re.sub(r'\s+', ' ', re.sub(r'^[^\w\[(]+', '', lens.norm_line(fold(line), narrow))).strip()
 
 
 def _says_nothing(text):
@@ -246,9 +255,9 @@ def _cells(raw):
 
 
 def _read(body, narrow):
-    """(findings [(line index, kind, text)], whether a blocker or major label was seen at all), one way of reading."""
+    """(findings [(line index, kind, text)], the set of label kinds seen), one way of reading."""
     lines = (body or '').splitlines()
-    out, seen, fence, columns = [], False, None, None
+    out, seen, fence, columns = [], set(), None, None
     for i, raw in enumerate(lines):
         fence, fenced = lens.fence_step(fence, raw)
         if fenced:
@@ -256,16 +265,16 @@ def _read(body, narrow):
             continue
         if TABLE_RE.match(raw):
             cells = [_plain(c, narrow) for c in _cells(raw)]
-            if i + 1 < len(lines) and TABLE_RULE_RE.fullmatch(lines[i + 1]):   # a header row: its label columns
+            if i + 1 < len(lines) and TABLE_RULE_RE.fullmatch(lines[i + 1].strip()):   # a header row: its label columns
                 columns = {j: _kind(m.group('kw')) for j, c in enumerate(cells) for m in [CELL_RE.fullmatch(c)] if m}
-                seen |= any(k in BLOCKING for k in columns.values())
+                seen |= set(columns.values())
                 continue
-            if TABLE_RULE_RE.fullmatch(raw):
+            if TABLE_RULE_RE.fullmatch(raw.strip()):
                 continue
             for j, c in enumerate(cells):   # a label cell: the next cell says what it found
                 m = CELL_RE.fullmatch(c)
                 if m and _kind(m.group('kw')) in BLOCKING:
-                    seen = True
+                    seen.add(_kind(m.group('kw')))
                     said = next((x for x in cells[j + 1:] if x), '')
                     if not _says_nothing(said):
                         out.append((i, _kind(m.group('kw')), _plain(raw, narrow)))
@@ -277,13 +286,19 @@ def _read(body, narrow):
         columns = None
         line = _plain(raw, narrow)
         if FINDINGS_NONE_RE.match(line):
-            seen = True
+            seen |= set(BLOCKING)
+            continue
+        m = FINDING_LINE_RE.match(line)
+        if m:   # `finding: major x`: that format's section, and a finding of its kind
+            seen |= set(BLOCKING)
+            if _kind(m.group('kw')) in BLOCKING:
+                out.append((i, _kind(m.group('kw')), line))
             continue
         if BARE_RE.fullmatch(line):   # `### Major`: the first line under it says what it found
             kind = _kind(BARE_RE.fullmatch(line).group('kw'))
             if kind not in BLOCKING:
                 continue
-            seen = True
+            seen.add(kind)
             under = _under(lines, i + 1, narrow)
             if under is None or not _says_nothing(under):
                 out.append((i, kind, f'{line} (nothing under it)' if under is None else f'{line} {under}'))
@@ -293,7 +308,7 @@ def _read(body, narrow):
             kind = _kind(m.group('kw') or m.group('kw2') or m.group('kw3'))
             if kind not in BLOCKING:
                 continue
-            seen = True
+            seen.add(kind)
             said = line[m.end():marks[n + 1].start() if n + 1 < len(marks) else len(line)]
             if not _says_nothing(said):
                 out.append((i, kind, line))
@@ -319,11 +334,12 @@ def _under(lines, start, narrow):
 def read_findings(body):
     """(findings, has_section). findings: [(kind, line)] of the report's blocker and major findings in line order, kind
     'blocker' or 'major', line as normalised (cut to SHOW_FINDING). Read both ways lens reads a line (clean_inline
-    narrow or not): a line either way reads as a finding is one. has_section: the report has a blocker or major label
-    at all (`major: none` too), or `findings: none`. A first line (the lens header, or the title line under it) or a
-    `verdict:` line that says NOT SAFE is a blocker whatever the labels say."""
+    narrow or not): a line either way reads as a finding is one. has_section: the report has a blocker label and a major
+    label (`blocker: none` and `major: none` too), or `findings: none`, or `finding: <kind>` lines. A first line (the
+    lens header, or the title line under it) or a `verdict:` line that says NOT SAFE is a blocker whatever the labels
+    say."""
     found = {}
-    seen = False
+    seen = set()
     for narrow in (False, True):
         out, saw = _read(body, narrow)
         seen |= saw
@@ -340,7 +356,7 @@ def read_findings(body):
         line = _plain(raw, False)
         if (i in first and NOT_SAFE_RE.search(line)) or VERDICT_NOT_SAFE_RE.match(line):
             found[i] = ('blocker', f'the report says NOT SAFE: {line}'[:SHOW_FINDING])
-    return [found[i] for i in sorted(found)], seen
+    return [found[i] for i in sorted(found)], seen >= set(BLOCKING)
 
 
 def findings(body):

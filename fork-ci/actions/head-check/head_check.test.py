@@ -1313,7 +1313,7 @@ class FindingsAndRounds(unittest.TestCase):
     def test_a_later_round_with_no_finding_clears_it(self):   # runs again on the same pull request after a fix
         base, head = self.pair()
         old = self.said('code', OLD[0], 'major: two writers race')
-        code, out = self.check(base, head, comments=[old, self.said('code r2', head, 'major: none')])
+        code, out = self.check(base, head, comments=[old, self.said('code r2', head)])
         self.assertEqual(code, 0, out)
         self.assertIn('findings and rounds (enforce): round 2 of 4; no blocker or major open', out)
 
@@ -1325,7 +1325,7 @@ class FindingsAndRounds(unittest.TestCase):
 
     def test_a_deleted_newer_report_brings_the_old_finding_back(self):   # deleted later: GitHub no longer lists it
         base, head = self.pair()
-        first, second = self.said('code', head, 'blocker: x'), self.said('code r2', head, 'blocker: none')
+        first, second = self.said('code', head, 'blocker: x'), self.said('code r2', head)
         self.assertEqual(self.check(base, head, comments=[first, second])[0], 0)
         code, out = self.check(base, head, comments=[first])
         self.assertEqual(code, 1, out)
@@ -1405,7 +1405,12 @@ class FindingsAndRounds(unittest.TestCase):
         code, out = self.check(base, head, comments=[self.said('code', head, 'Looks good to me.')])
         self.assertEqual(code, 1, out)
         self.assertIn('lens code: its newest report has no findings section, so it cannot be judged (issue #99)', out)
-        self.assertEqual(self.check(base, head, comments=[self.said('code', head, '### Major', 'None.')])[0], 0)
+        self.assertEqual(self.check(base, head, comments=[self.said('code', head, '### Major', 'None.')])[0], 1)
+        code, out = self.check(base, head, comments=[self.said('code', head, 'blocker: none', 'F1 (major): x')])
+        self.assertEqual(code, 1, out)   # #740 round 2: one label kind and a major in a form not read: no section
+        self.assertIn('lens code: its newest report has no findings section', out)
+        clean = ('### Blocking', 'None.', '### Major', 'None.')
+        self.assertEqual(self.check(base, head, comments=[self.said('code', head, *clean)])[0], 0)
 
     def test_a_finding_in_a_heading_or_table_or_lookalike_fails_the_head(self):   # #99, both ways
         base, head = self.pair()
@@ -1435,6 +1440,47 @@ class FindingsAndRounds(unittest.TestCase):
         code, out = self.check(base2, fixed, comments=reads[:2] + [self.said('code', fixed)])
         self.assertEqual(code, 1, out)
         self.assertIn('round 3 of 4, approach lens approach required from round 3', out)
+
+    def test_a_base_edit_to_a_file_the_pull_request_changes_is_no_new_round(self):   # #740 round 2, B major 1
+        cfg = review_cfg('enforce')
+        app = ['top', 'mid', '.', '.', ' 1', ' 2', '.', 'end']
+
+        def tree(*lines):
+            return base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE, 'src/app.py': '\n'.join(lines) + '\n'})
+        base = self.w.commit(tree(*app), [self.m0])
+        h1 = self.w.commit(tree(*app[:7], 'END'), [base])
+        h2 = self.w.commit(tree(*app[:4], ' 1x', *app[5:7], 'END'), [h1])   # the fix: round 2
+        base2 = self.w.commit(tree('new', 'top', 'MID', *app[2:]), [base])   # other lines of the same file
+        h3 = self.w.merge(h2, base2)   # line numbers, `index` blobs and the hunk's function name (MID) all move
+        reads = [self.said('code', h1), self.said('code r2', h2), self.said('code', h3)]
+        code, out = self.check(base2, h3, comments=reads)
+        self.assertEqual(code, 0, out)
+        self.assertIn('round 2 of 4; no blocker or major open', out)
+        fixed = self.w.commit(tree('new', 'top', 'MID', *app[2:4], ' 1y', *app[5:7], 'END'), [h3])   # its own change
+        code, out = self.check(base2, fixed, comments=reads + [self.said('code', fixed)])
+        self.assertEqual(code, 1, out)
+        self.assertIn('round 3 of 4, approach lens approach required from round 3', out)
+
+    def test_a_binary_file_changed_again_is_a_new_round(self):   # --binary: its content is in the key
+        base, _ = self.pair()
+        cfg = review_cfg('enforce')
+        h1, h2 = (self.w.commit(base_files(cfg_raw=cfg, **{**PROMPTS, **self.STORE, 'src/app.bin': blob}), [base])
+                  for blob in ('\0one\n', '\0two\n'))
+        code, out = self.check(base, h2, comments=[self.said('code', h1), self.said('code', h2)])
+        self.assertEqual(code, 0, out)
+        self.assertIn('round 2 of 4', out)
+
+    def test_a_listed_login_without_the_override_association_is_warned_about(self):   # #740 round 2, B minor 3
+        base, head = self.pair(override_authors=['a-collaborator', 'owner'])
+        report = self.said('code', head, 'blocker: x', assoc='COLLABORATOR', login='a-collaborator')   # no override
+        listed = self.p.override(head, assoc='COLLABORATOR', login='a-collaborator')
+        code, out = self.check(base, head, comments=[report, listed, self.p.override(OLD[0])])   # owner's: counts
+        self.assertEqual(code, 1, out)
+        self.assertIn('warning: the override comment by a-collaborator does not count: GitHub records its author '
+                      'association as COLLABORATOR, and an override counts only with OWNER', out)
+        self.assertEqual(out.count('warning: the override comment'), 1, out)
+        other = self.p.override(head, assoc='COLLABORATOR', login='someone')   # not listed: no warning
+        self.assertNotIn('warning: the override comment', self.check(base, head, comments=[report, other])[1])
 
     def test_a_short_sha_read_still_counts_a_round(self):   # old state: a lens that wrote 12 characters
         base, head = self.pair()
@@ -1490,6 +1536,18 @@ class FindingsAndRounds(unittest.TestCase):
 
 class FindingsAndRoundsBare(FindingsAndRounds):
     BARE = True
+
+
+class FetchTimeout(unittest.TestCase):   # #740 round 2, B minor 4: a hung fetch of a read commit never hangs the check
+    def test_a_fetch_that_takes_too_long_failed(self):
+        timeouts = []
+
+        def run(cmd, **kw):
+            timeouts.append(kw.get('timeout'))
+            raise subprocess.TimeoutExpired(cmd, kw.get('timeout'))
+        with tempfile.TemporaryDirectory() as d, unittest.mock.patch.object(H.subprocess, 'run', run):
+            self.assertFalse(H.Checkout(d, bare=(A, A)).fetch(A))
+        self.assertEqual(timeouts, [H.FETCH_SECONDS])
 
 
 class GitEnvironment(unittest.TestCase):   # #442 item 2: pr_queue.GIT_RUN
