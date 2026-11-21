@@ -449,9 +449,17 @@ These routes start a new agent run and go through the same gate, with the same c
   failed and armed, and upstream's recovery worker asks again on its next tick (every 5 s; logged
   once per resume). An armed resume has no time limit, a restart finds it from the stored thread,
   and its id is fixed per failed run and reset, so it is sent once.
-- There is no order between wake-ups, and none between them and other routes: a wake-up holds no
-  place in line and asks again on its own timer, so a busy host can pass one over again and again
-  while other starts take the slots that free.
+- One line, oldest first ([#738](https://github.com/scuttletoby/t3code/issues/738)): every
+  wake-up that asks again while refused keeps a place in the gate's line from its first ask (the
+  PR-watch wake-up, the usage-limit resume, a wait's message and the four below), and so does
+  every slot wait, at its own age. A slot that frees goes to the oldest waiter that can use it: a
+  start without a place (`delegate_task`, a send, a scheduled run) and every younger waiter count
+  the waiters ahead of them as starts. A waiter whose own account is full holds nothing from the
+  others, a thread that shows a run only queues, and a thread with a held slot starts on it. A
+  waiter leaves the line when it is let through, when its wake is no longer owed (its thread gone,
+  its question answered, a handoff that is no longer due), or when it has not asked again for 30 s
+  (a PR-watch wake-up: 5 minutes; a slot wait: 3 sweeps). The line is memory only: after a restart
+  each waiter joins again at its next ask, held question wakes first, in their file's order.
 - The bound-thread and message routes decide "running or idle" from the gate's own count in the
   same step that takes the slot. When the thread's run ends between that check and the send, the
   queued message starts the next run: the call then holds a slot until that run shows, for the
@@ -483,17 +491,20 @@ only queues: no slot.
 - The fork's context handoff, and its one resend of a failed handoff run
   (`apps/server/src/fork/handoff/handoffDispatch.ts`, after its busy check). Refused, nothing is
   sent: it asks again every 5 s or at the thread's next event (logged once), deciding again each
-  time without a new settle, and a thread that moved on drops it. Like every handoff timer it is
+  time without a new settle, and a thread that moved on drops it. Its text (a read of the last
+  runs' turns) is built only once it has a slot. Like every handoff timer it is
   memory only: a restart drops a waiting handoff, and the thread's next turn end decides again. A
   waiting resend of a failed handoff run is dropped too, with no log: the failed run's text stays
   in the thread, and the next turn end decides again.
 - Upstream's provider continuation ("Background task completed": an agent that ended its turn
   while its own background work ran starts again when that work ends;
-  `apps/server/src/fork/continuationSlot.ts`). The slot is asked when upstream's worker takes the
-  request from its queue, never inside an adapter's `dispatchIfCurrent`, which holds the
-  adapter's own lock. Refused, the request goes back on the queue and is asked again every 5 s
-  (logged once); the adapter offers no second one meanwhile, and other threads' continuations
-  pass. A delegated result is left as above. It waits in memory, as upstream's queue does: a
+  `apps/server/src/fork/continuationSlot.ts`). The slot is asked off upstream's queue, each
+  request in a fiber of its own, never inside an adapter's `dispatchIfCurrent`, which holds the
+  adapter's own lock: a slow count read delays only that request, never upstream's queue. Refused,
+  it is asked again every 5 s (logged once); the adapter offers no second one meanwhile. A granted
+  slot is held until upstream's dispatch of that request ends (it may wait behind its own thread's
+  earlier dispatch), then counts until its run shows, for the start grace at most; a request
+  upstream never dispatches holds it 10 minutes at most. A delegated result is left as above. It waits in memory, as upstream's queue does: a
   restart loses it, as the restart ends the provider session whose background work it reports
   (Claude's buffered output lives in that process).
 - A delegated task's question to its idle parent (upstream's question reactor;
@@ -502,19 +513,18 @@ only queues: no slot.
   leaves the file once sent, or when the question is answered, its task ends or the parent is
   archived or deleted. A restart reads the file and sends it once; upstream's fixed command id
   keeps a send cut off before the file write from making a second message. Saves run one at a
-  time, each writing what is held then. A file that cannot be read is moved to
-  `fork-held-wakes.json.corrupt-<ms>` beside it and logged, so the next save does not write over
-  it; an entry that cannot be read is logged and left out. A held wake whose parent or question
-  cannot be read waits, logged once.
-- Upstream's idle compaction (same file), after the handoff owner's check. Refused, it is skipped
-  (logged), not held: it only pays off while the prompt cache is warm, minutes before it expires,
-  and a late one costs a full uncached read. The next completed run arms a new one, as after a
-  restart. It is asked once: a thread whose window always falls while the slots are full does not
-  compact.
-
-Like the wake-ups above, the handoff, the continuation and the question wake hold no place in
-line: each asks again on its own 5 s timer, so under steady load a slot that frees between two
-asks can go to another start, and one can wait without limit. Nothing is lost or sent twice.
+  time, each writing what is held then, synced to disk before the rename and the folder after it.
+  A file that does not decode is moved to `fork-held-wakes.json.corrupt-<ms>` beside it and
+  logged, so the next save does not write over it; an entry that does not decode is logged and
+  left out. A file that cannot be checked or read (an I/O error, not "missing") is logged once and
+  never written over: new holds stay in memory, and every 5 s it is read again, its wakes then
+  going first. A held wake whose parent or question cannot be read waits, logged once.
+- Upstream's idle compaction (same file), after the handoff owner's check. Refused, it is held in
+  upstream's own timer and asked again every 5 s in its place in line (logged once), while the
+  fork reads again that the thread is still idle at that run and its prompt cache window is still
+  open (upstream's `idleCompactionWindow`). Once not, it is skipped (logged): a late compaction
+  costs a full uncached read. A newer completed run replaces it, as upstream's timer does; a
+  restart drops it (upstream).
 
 The calling thread is left out of the count (it waits on its child). A start no thread on this
 machine asks for (a scheduled run, the owner's client, a call from another machine) has no caller, so

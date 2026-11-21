@@ -10,6 +10,7 @@ import type {
   ThreadPullRequestKey,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -37,6 +38,9 @@ export class PullRequestWatchWakeWaitsForSlot extends Schema.TaggedError<PullReq
 
 /** A key no refusal renewed this long is a watch that ended or whose thread went (sweeps: 2 min). */
 export const FORGET_WATCH_KEY_MS = 10 * 60_000;
+
+/** A refused wake-up keeps its place in the gate's line over 2 missed sweeps (2 min each). */
+const WATCH_PLACE_STALE = Duration.minutes(5);
 
 const watchKey = (
   threadId: ThreadId,
@@ -97,6 +101,8 @@ export const gatePullRequestWatchWakes = <E>(
       threadId: command.threadId,
       instanceId,
       keepsHeld: true,
+      // Asked again at upstream's next sweep (2 min) while refused: it keeps its place in line.
+      place: { key: `pull-request-watch:${command.threadId}`, staleAfter: WATCH_PLACE_STALE },
     });
     const keys = watchesOf(command).map((watch) => watchKey(command.threadId, watch));
     if (slot.type === "refuse") {

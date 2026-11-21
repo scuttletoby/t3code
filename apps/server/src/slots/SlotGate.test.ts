@@ -15,6 +15,7 @@ import {
 import { type AgentSlotsSettings, WaitToolFailure } from "@t3tools/contracts/waitFor";
 import type { DeepPartial } from "@t3tools/shared/Struct";
 import { DISPATCH_SAFETY_MS, type SlotReservation } from "@t3tools/shared/agentSlots";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -2155,6 +2156,205 @@ describe("slot waits granted in one sweep: every wake-up granted is let through"
           // Dropped (or ended): nothing of it is kept.
           yield* gate.drop(["m"]);
           assert.deepStrictEqual((yield* gate.usage)?.machine, { used: 1, max: 2 });
+        }),
+      );
+    }),
+  );
+});
+
+describe("SlotGate: one line for every waiting start (issue 738)", () => {
+  const waitsOn = (patch: Partial<AgentSlotsSettings>) => ({
+    ...on(patch),
+    waitFor: { enabled: true },
+  });
+  /** A wake-up of `thread` that asks again while refused, in its place `key` (or none). */
+  const wake = (thread: string, key: string | null, targetInstanceId = MAIN) =>
+    SlotGate.SlotGate.pipe(
+      Effect.flatMap((gate) =>
+        gate.acquire({
+          callerThreadId: ThreadId.make(thread),
+          targetInstanceId,
+          intoThreadId: ThreadId.make(thread),
+          keepsHeld: true,
+          ...(key === null ? {} : { place: { key } }),
+        }),
+      ),
+    );
+  /** A start without a place (`delegate_task` from `thread`). */
+  const start = (thread: string, targetInstanceId = MAIN) =>
+    SlotGate.SlotGate.pipe(
+      Effect.flatMap((gate) =>
+        gate.acquire({ callerThreadId: ThreadId.make(thread), targetInstanceId }),
+      ),
+    );
+  const line = SlotGate.SlotGate.pipe(Effect.flatMap((gate) => gate.line));
+
+  it.effect("steady load: the oldest waiter starts first, never one that asks first", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "busy", instanceId: MAIN }];
+      yield* run(
+        world,
+        on({ maxPerMachine: 1 }),
+        Effect.gen(function* () {
+          for (const name of ["w0", "w1", "w2"])
+            assert.strictEqual((yield* wake(name, name)).type, "refuse");
+          const started: Array<string> = [];
+          for (let round = 0; round < 6; round += 1) {
+            // The last run ends; a new waiter joins every round (steady load).
+            world.threads = [];
+            const waiting = yield* line;
+            // Everyone else asks first: a plain start, then the younger waiters, newest first.
+            assert.strictEqual((yield* start("newcomer")).type, "refuse");
+            for (const name of waiting.slice(1).toReversed())
+              assert.strictEqual((yield* wake(name, name)).type, "refuse");
+            const oldest = waiting[0]!;
+            assert.strictEqual((yield* wake(oldest, oldest)).type, "allow");
+            started.push(oldest);
+            world.threads = [{ id: oldest, instanceId: MAIN }];
+            assert.strictEqual((yield* wake(`w${round + 3}`, `w${round + 3}`)).type, "refuse");
+          }
+          assert.deepStrictEqual(started, ["w0", "w1", "w2", "w3", "w4", "w5"]);
+        }),
+      );
+    }),
+  );
+
+  it.effect("a waiter whose own account is full holds no slot from the others", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "busy", instanceId: SECOND }];
+      yield* run(
+        world,
+        on({ maxPerMachine: 3, maxPerAccount: { [SECOND]: 1 } }),
+        Effect.gen(function* () {
+          assert.strictEqual((yield* wake("w", "w", SECOND)).type, "refuse");
+          // Two machine slots are free; the waiter can take neither, so both stay free.
+          assert.strictEqual((yield* start("a")).type, "allow");
+          assert.strictEqual((yield* start("b")).type, "allow");
+          assert.strictEqual((yield* start("c")).type, "refuse");
+        }),
+      );
+    }),
+  );
+
+  it.effect("a slot held for a slot wait is its thread's: a waiter behind does not take it", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "busy", instanceId: MAIN }];
+      const holder = ThreadId.make("thread:holder");
+      yield* run(
+        world,
+        waitsOn({ maxPerMachine: 2, reserveSeconds: 120 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const [held] = yield* gate.grant([{ key: "hold", threadId: holder }]);
+          assert.strictEqual(held?.type, "granted");
+          yield* gate.keep(["hold"]);
+          assert.strictEqual((yield* wake("w", "w")).type, "refuse");
+          // The holder's agent starts on its own slot, though a waiter is in line.
+          assert.strictEqual((yield* start(holder)).type, "allow");
+        }),
+      );
+    }),
+  );
+
+  it.effect("slot waits share the line, each at its own age", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "busy", instanceId: MAIN }];
+      yield* run(
+        world,
+        waitsOn({ maxPerMachine: 1, reserveSeconds: 120 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          const nowMs = yield* Clock.currentTimeMillis;
+          assert.strictEqual((yield* wake("w", "w")).type, "refuse");
+          const younger = { key: "young", threadId: ThreadId.make("young"), sinceMs: nowMs + 1 };
+          const older = { key: "old", threadId: ThreadId.make("old"), sinceMs: nowMs - 1 };
+          assert.deepStrictEqual(
+            (yield* gate.grant([older, younger])).map((grant) => grant.type),
+            ["full", "full"],
+          );
+          assert.deepStrictEqual(yield* line, ["old", "w", "young"]);
+          world.threads = [];
+          // The waiter asks first, but an older slot wait is in line: it waits.
+          assert.strictEqual((yield* wake("w", "w")).type, "refuse");
+          assert.deepStrictEqual(
+            (yield* gate.grant([older])).map((grant) => grant.type),
+            ["granted"],
+          );
+          assert.deepStrictEqual(yield* line, ["w", "young"]);
+        }),
+      );
+    }),
+  );
+
+  it.effect("a waiter that left, or stopped asking, or shows a run, holds nothing", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      world.threads = [{ id: "busy", instanceId: MAIN }];
+      yield* run(
+        world,
+        on({ maxPerMachine: 1 }),
+        Effect.gen(function* () {
+          const gate = yield* SlotGate.SlotGate;
+          // Left: its wake is gone (its thread deleted, its question answered).
+          assert.strictEqual((yield* wake("gone", "gone")).type, "refuse");
+          yield* gate.leave(["gone"]);
+          assert.deepStrictEqual(yield* line, []);
+          // Stopped asking (a route that died): it leaves after LINE_STALE.
+          assert.strictEqual((yield* wake("quiet", "quiet")).type, "refuse");
+          world.threads = [];
+          yield* TestClock.adjust("29 seconds");
+          assert.strictEqual((yield* start("a")).type, "refuse");
+          yield* TestClock.adjust("2 seconds");
+          assert.deepStrictEqual(yield* line, []);
+          // Shows a run: its message only queues, so it needs no slot.
+          world.threads = [{ id: "busy", instanceId: MAIN }];
+          assert.strictEqual((yield* wake("running", "running")).type, "refuse");
+          world.threads = [{ id: "running", instanceId: MAIN }];
+          assert.deepStrictEqual(yield* line, ["running"]);
+          world.threads = [];
+          assert.strictEqual((yield* start("b")).type, "refuse");
+          world.threads = [{ id: "running", instanceId: MAIN }];
+          yield* TestClock.adjust("31 seconds");
+          world.threads = [];
+          assert.strictEqual((yield* start("b")).type, "allow");
+        }),
+      );
+    }),
+  );
+
+  it.effect(
+    "restart: the line is memory only; a new gate has none, and a waiter joins at its next ask",
+    () =>
+      Effect.gen(function* () {
+        const world = newWorld();
+        world.threads = [{ id: "busy", instanceId: MAIN }];
+        yield* run(world, on({ maxPerMachine: 1 }), wake("w", "w"));
+        world.threads = [];
+        yield* run(
+          world,
+          on({ maxPerMachine: 1 }),
+          Effect.gen(function* () {
+            assert.deepStrictEqual(yield* line, []);
+            assert.strictEqual((yield* wake("w", "w")).type, "allow");
+            assert.deepStrictEqual(yield* line, []);
+          }),
+        );
+      }),
+  );
+
+  it.effect("off or no limit: a waiter is let through and leaves the line", () =>
+    Effect.gen(function* () {
+      const world = newWorld();
+      yield* run(
+        world,
+        on({}),
+        Effect.gen(function* () {
+          assert.deepStrictEqual(yield* wake("w", "w"), { type: "allow", token: null });
+          assert.deepStrictEqual(yield* line, []);
         }),
       );
     }),

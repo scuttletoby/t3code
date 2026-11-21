@@ -26,6 +26,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -164,6 +165,8 @@ describe("pull request watch wake-ups take an agent slot", () => {
           targetInstanceId: INSTANCE,
           intoThreadId: THREAD,
           keepsHeld: true,
+          // Its place in the gate's line, kept over 2 missed sweeps (2 min each).
+          place: { key: `pull-request-watch:${THREAD}`, staleAfter: Duration.minutes(5) },
         },
       ]);
     }),

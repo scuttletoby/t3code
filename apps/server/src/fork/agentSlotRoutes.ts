@@ -59,6 +59,8 @@ export interface RouteStart {
   readonly intoThreadId?: ThreadId | undefined;
   /** The caller is the woken thread itself: its held slot stays held (`SlotGate.acquire`). */
   readonly keepsHeld?: boolean | undefined;
+  /** Its place in the gate's one line: a start that asks again while refused. */
+  readonly place?: SlotGate.SlotPlace | undefined;
 }
 
 const ENDED: RouteSlot = { type: "allow", end: () => Effect.void };
@@ -83,6 +85,7 @@ const admit = (
             ...(start.alsoNeeds === undefined ? {} : { alsoNeeds: start.alsoNeeds }),
             ...(start.intoThreadId === undefined ? {} : { intoThreadId: start.intoThreadId }),
             ...(start.keepsHeld === undefined ? {} : { keepsHeld: start.keepsHeld }),
+            ...(start.place === undefined ? {} : { place: start.place }),
           });
           if (outcome.type === "refuse") return outcome;
           const token = outcome.token;
@@ -181,7 +184,21 @@ export interface SendSlot {
   readonly instanceId: ProviderInstanceId;
   /** The receiver is the caller (a wait's message): its held slot stays held. */
   readonly keepsHeld?: boolean | undefined;
+  /** A wake-up that asks again while refused: its place in the gate's one line. */
+  readonly place?: SlotGate.SlotPlace | undefined;
+  /**
+   * The caller ends the slot (`end`) when its dispatch ended. Until then the start counts whatever
+   * the start grace, so a send that waits after the gate step still has its slot when it starts.
+   */
+  readonly endsItself?: boolean | undefined;
 }
+
+/** Waiters that no longer need a slot leave the gate's line (nothing without a gate). */
+export const leaveLine = (
+  gate: Option.Option<SlotGate.SlotGate["Service"]>,
+  keys: ReadonlyArray<string>,
+): Effect.Effect<void> =>
+  Option.match(gate, { onNone: () => Effect.void, onSome: (slots) => slots.leave(keys) });
 
 /**
  * A message into an existing thread: into one that shows a run it only queues; into one that
@@ -196,8 +213,9 @@ export const admitSend = (
     callerThreadId: send.callerThreadId,
     targetInstanceId: send.instanceId,
     intoThreadId: send.threadId,
-    childThreadId: send.threadId,
+    ...(send.endsItself === true ? {} : { childThreadId: send.threadId }),
     ...(send.keepsHeld === undefined ? {} : { keepsHeld: send.keepsHeld }),
+    ...(send.place === undefined ? {} : { place: send.place }),
   });
 
 /**

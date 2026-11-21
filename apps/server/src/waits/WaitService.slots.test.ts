@@ -543,6 +543,9 @@ describe("WaitService slot waits", () => {
             }),
           );
           yield* gate.release(allowed.type === "allow" ? allowed.token : null);
+          // The probe for T2 above is no stored wait: the sweep's list says so, and it leaves
+          // the gate's line (a real waiting slot wait would go first, issue 738).
+          yield* gate.slotWaitsWaiting([]);
           // T1's start used its slot up: the slot is free for another thread, not held twice.
           assert.strictEqual(yield* delegate(OUTSIDER), "allow");
           // Cleared in the file too, not only hidden in this gate's memory.

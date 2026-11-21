@@ -102,7 +102,8 @@ const harness = (state: {
     yield* TestClock.setTime(NOW_MS);
     const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
     const sent: Array<OrchestrationV2ServerCommand> = [];
-    const reads = { count: 0 };
+    /** `text`: the reads that build a handoff's text (its transcript part). */
+    const reads = { count: 0, text: 0 };
     const ended = new Map<string, number>();
     const milestones: Array<{
       readonly name: string;
@@ -147,9 +148,10 @@ const harness = (state: {
       }),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({
         getThread: () => Effect.succeed(state.data.thread),
-        getThreadRecords: () =>
+        getThreadRecords: (_threadId, fields) =>
           Effect.sync(() => {
             reads.count++;
+            if ((fields as ReadonlyArray<string>).includes("attempts")) reads.text++;
             return state.data;
           }),
       }),
@@ -529,7 +531,11 @@ describe("HandoffService", () => {
 
   /** A gate with `free` slots: each allowed start takes one; the test frees them. */
   const countingGate = (free: number) => {
-    const slots = { free, asks: [] as Array<SlotGate.SlotAcquireInput> };
+    const slots = {
+      free,
+      asks: [] as Array<SlotGate.SlotAcquireInput>,
+      left: [] as Array<string>,
+    };
     const layer = Layer.mock(SlotGate.SlotGate)({
       acquire: (input) =>
         Effect.sync((): SlotGate.SlotAcquire => {
@@ -545,6 +551,7 @@ describe("HandoffService", () => {
         }),
       started: () => Effect.void,
       release: () => Effect.void,
+      leave: (keys) => Effect.sync(() => slots.left.push(...keys)),
     });
     return { slots, layer };
   };
@@ -553,25 +560,53 @@ describe("HandoffService", () => {
     Effect.gen(function* () {
       const gate = countingGate(0);
       const state = { data: projection({ usedTokens: 160_000 }), settings: on, gate: gate.layer };
-      const { sent, emit } = yield* harness(state);
+      const { sent, emit, reads } = yield* harness(state);
       yield* emit(runUpdated(run()), "readThread", 1);
       yield* settle;
       yield* TestClock.adjust(MINUTE_MS);
       expect(sent).toEqual([]);
-      // Asked again every 5 s, each time after the busy check, as the thread's own start.
+      // Asked again every 5 s, each time after the busy check, as the thread's own start, in
+      // its one place in the gate's line.
       expect(gate.slots.asks.length).toBeGreaterThanOrEqual(12);
+      const place = { key: `handoff:server:handoff:${threadId}:${runId}` };
       expect(gate.slots.asks[0]).toEqual({
         callerThreadId: threadId,
         targetInstanceId: modelSelection.instanceId,
         intoThreadId: threadId,
         keepsHeld: true,
+        place,
       });
+      expect(gate.slots.asks.every((asked) => asked.place?.key === place.key)).toBe(true);
+      // Refused: its text (the transcript read) is not built at all.
+      expect(reads.text).toBe(0);
       gate.slots.free = 1;
       yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
       yield* emit(null, "handOffWhenDue", 1);
       expect(messages(sent).map((message) => message.commandId)).toEqual([
         `server:handoff:${threadId}:${runId}`,
       ]);
+      // Built once, with the slot.
+      expect(reads.text).toBe(1);
+    }),
+  );
+
+  it.effect("a waiting handoff whose thread gets busy, or a newer run, leaves its place", () =>
+    Effect.gen(function* () {
+      const gate = countingGate(0);
+      const data = projection({ usedTokens: 160_000 });
+      const state = { data, settings: on, gate: gate.layer };
+      const { sent, emit, events } = yield* harness(state);
+      yield* emit(runUpdated(run()), "readThread", 1);
+      yield* settle;
+      yield* TestClock.adjust(MINUTE_MS);
+      expect(gate.slots.left).toEqual([]);
+      // A newer run completes: its own timer replaces the waiting one, which leaves the line.
+      const newer = run({ id: RunId.make("run-2"), ordinal: 2 });
+      state.data = { ...data, runs: [...data.runs, newer] };
+      yield* Queue.offer(events, runUpdated(newer));
+      yield* settle;
+      expect(gate.slots.left).toContain(`handoff:server:handoff:${threadId}:${runId}`);
+      expect(sent).toEqual([]);
     }),
   );
 
