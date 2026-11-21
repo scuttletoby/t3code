@@ -2,6 +2,7 @@ import { DEFAULT_SERVER_SETTINGS, ProjectId, type ServerSettings } from "@t3tool
 import { describe, expect, it } from "@effect/vitest";
 
 import {
+  isWholeObjectText,
   mcpProfileFileKeysOf,
   readMcpProfileKeysFromText,
   withMcpProfileFileKeys,
@@ -32,6 +33,62 @@ describe("readMcpProfileKeysFromText (#681)", () => {
       ["5", "it holds number, not an object"],
     ];
     for (const [raw, issue] of cases) expect(read(raw)).toEqual({ _tag: "unknown", issue });
+  });
+
+  it("a whole file with a JSON typo and no key sets none, as upstream gives it all", () => {
+    // Braces balance and it ends with `}`: nothing was cut off, so nothing is hidden.
+    const typos = [
+      '{ "theme": "dark" "defaultRuntimeMode": "full-access" }',
+      "{ theme: 'dark' }",
+      '{ "theme": "da}rk", "x": [1 2] }',
+      '// note {\n{ "theme": "dark" /* } */ "x": 1 }\n',
+      '{ "a": { "b": "\\"}" } "c": 1 }',
+    ];
+    const withDefaults = (persisted: unknown) => ({
+      mcpProfile: "t3-only",
+      ...(persisted as object),
+    });
+    for (const raw of typos) {
+      expect(isWholeObjectText(raw), raw).toBe(true);
+      expect(read(raw), raw).toEqual(read("{}"));
+      // The managed policy's defaults apply to it as to `{}`.
+      expect(read(raw, withDefaults), raw).toMatchObject({
+        _tag: "keys",
+        keys: { mcpProfile: "t3-only" },
+      });
+    }
+    // Whole but naming a key still refuses: its key cannot be read.
+    expect(read('{ "theme": "dark" "mcpProfile": "t3-only" }')).toEqual({
+      _tag: "unreadable",
+      issue: "it is not valid JSON",
+    });
+  });
+
+  it("no strict prefix of a file is whole, so a cut-off file still cannot say", () => {
+    const files = [
+      JSON.stringify({ theme: "dark", mcpProfile: "t3-only" }, null, 2),
+      JSON.stringify({ a: { b: "}" }, c: ["{", "}"], d: '\\"}' }),
+      '{ "theme": "dark" "x": { "y": "}" } } ',
+      '{ /* } */ "a": 1, // }\n "b": { "c": 2 } }',
+    ];
+    for (const file of files) {
+      expect(isWholeObjectText(file), file).toBe(true);
+      for (let end = 0; end < file.trimEnd().length; end += 1) {
+        expect(isWholeObjectText(file.slice(0, end)), file.slice(0, end)).toBe(false);
+      }
+    }
+    // Not one object: a list, two objects, text before or after, an unclosed string or comment.
+    for (const raw of [
+      "[1, 2]",
+      "{} }",
+      "{ } { }",
+      'x { "a": 1 }',
+      '"a" {}',
+      '{ "a": "}',
+      "{ /* }",
+    ]) {
+      expect(isWholeObjectText(raw), raw).toBe(false);
+    }
   });
 
   it("a JSON object that names no key sets none: the defaults, as a full decode reads it", () => {

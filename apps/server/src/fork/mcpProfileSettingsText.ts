@@ -1,7 +1,8 @@
 /**
  * Fork: the MCP profile keys of a settings.json that does not decode (upstream's load then gives
- * defaults, so `all`), read from its text. Text naming a key but not an object is unreadable; text
- * that is not an object and names no key (empty, cut off, garbage) is unknown: the caller decides.
+ * defaults, so `all`), read from its text. Text naming a key but not an object is unreadable. Text
+ * that is not an object and names no key is unknown (the caller decides) when it may be cut off
+ * (empty, cut off, garbage); a whole object with a typo (braces balance, ends with `}`) sets none.
  */
 import {
   ForkProjectOverrideFields,
@@ -28,8 +29,8 @@ export type McpProfileFileKeysRead =
   /** A JSON object: the keys it sets (none named: the defaults, so a valid file sets none). */
   | { readonly _tag: "keys"; readonly keys: McpProfileFileKeys }
   /**
-   * Not a JSON object, naming no key: empty, cut off before its keys, or garbage. It may have
-   * held a profile, so it says nothing either way; `issue` says what it is.
+   * Not a JSON object, naming no key, and maybe cut off: empty, cut off before its keys, or
+   * garbage. It may have held a profile, so it says nothing either way; `issue` says what it is.
    */
   | { readonly _tag: "unknown"; readonly issue: string }
   /** Names a key but cannot be read: refuse, never `all` on a guess. */
@@ -69,6 +70,47 @@ const unreadableProject = (value: unknown) => {
 };
 
 /**
+ * Whether text is one whole JSON object, typo or not: outside strings and comments it starts with
+ * `{` and its braces first close back to depth 0 at its last character. A cut-off object never
+ * does: its outermost `}` is its last character, so a prefix stays open or ends in a string.
+ */
+export function isWholeObjectText(raw: string): boolean {
+  const text = raw.trim();
+  if (!text.endsWith("}")) return false;
+  let depth = 0;
+  let started = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === '"') {
+      if (!started) return false;
+      index += 1;
+      while (index < text.length && text[index] !== '"') {
+        if (text[index] === "\\") index += 1;
+        index += 1;
+      }
+      if (index >= text.length) return false;
+    } else if (char === "/" && text[index + 1] === "/") {
+      const end = text.indexOf("\n", index);
+      if (end < 0) return false;
+      index = end;
+    } else if (char === "/" && text[index + 1] === "*") {
+      const end = text.indexOf("*/", index + 2);
+      if (end < 0) return false;
+      index = end + 1;
+    } else if (char === "{") {
+      started = true;
+      depth += 1;
+    } else if (!started && !/\s/.test(char ?? "")) {
+      return false;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index === text.length - 1;
+    }
+  }
+  return false;
+}
+
+/**
  * The MCP profile keys of settings.json's text, with the policy's defaults filled in as a load
  * fills them (`withDefaults`); the policy's locks are the caller's to lay over. Pure.
  */
@@ -83,9 +125,13 @@ export function readMcpProfileKeysFromText(
       : raw.trim() === ""
         ? "it is empty"
         : "it is not valid JSON";
-    return NAMES_A_PROFILE_KEY.test(raw)
-      ? { _tag: "unreadable", issue }
-      : { _tag: "unknown", issue };
+    if (NAMES_A_PROFILE_KEY.test(raw)) return { _tag: "unreadable", issue };
+    // A whole object with a typo names no key, so it sets none, as `{}` does: T3 keeps working,
+    // as upstream does. Only text that may be cut off before its keys cannot say.
+    if (Exit.isFailure(parsed) && isWholeObjectText(raw)) {
+      return readMcpProfileKeysFromText("{}", withDefaults);
+    }
+    return { _tag: "unknown", issue };
   }
   const filled = withDefaults(parsed.value);
   if (!isRecord(filled)) {
