@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """Tests of fork-fleet.py, fork-fleet-launch.sh and fork-fleet-hook.sh, and of their wiring in fork-tests.yml,
 fork-fleet.yml and fork-release.yml. Run: python3 <this>. Linux only (the gate and launcher tests run real processes)."""
+# How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
+# with the other script tests, where LauncherAsRoot's tests skip (each named below: a new one there needs its line),
+# and that class again as root, where none may.
+# fork-ci: may skip LauncherAsRoot.test_one_slots_user_cannot_read_or_change_the_others
+# fork-ci: may skip LauncherAsRoot.test_nothing_a_job_leaves_reaches_the_next_job_of_its_user
+# fork-ci: may skip LauncherAsRoot.test_root_deletes_nothing_in_dev_shm
+# fork-ci: may skip LauncherAsRoot.test_check_nets_probe_names_drives_and_sockets
+# fork-ci: may skip LauncherAsRoot.test_check_net_proves_a_runners_network
+# fork-ci: may skip LauncherAsRoot.test_refresh_net_takes_only_roots_lookup_stamp
+# fork-ci: may skip LauncherAsRoot.test_the_walls_proof_refuses_a_host_with_a_pools_users
+# fork-ci: may skip LauncherAsRoot.test_the_walls_hold_in_a_real_systemd_unit
+# fork-ci: may skip LauncherAsRoot.test_the_real_job_unit_writes_its_copy_and_nothing_else
+# fork-ci: run as root with FORK_FLEET_ROOT_TESTS=1 only LauncherAsRoot
 import ast, copy, datetime, glob, grp, http.client, importlib.util, io, json, os, pwd, re, shutil, signal, socket, stat
 import shlex, subprocess, sys, tempfile, textwrap, time
 import unittest, urllib.error, urllib.parse
@@ -4885,8 +4898,11 @@ class Wiring(unittest.TestCase):
         job = self.tests['jobs']['workflows']
         self.assertEqual(job['runs-on'], HOSTED)
         runs = [st.get('run') for st in job['steps']]
-        # -v: the log names every test, a skipped one with its reason.
-        root = runs.index('sudo env FORK_FLEET_ROOT_TESTS=1 python3 -B .github/scripts/fork-fleet.test.py -v LauncherAsRoot')
+        # The runner makes this file's own run (its `fork-ci: run` line: as root, the switch, only this class, with -v,
+        # so the log names every test) and records that none skipped (#664).
+        root = runs.index('node .github/scripts/fork-ci-tests.cjs --run .github/scripts/fork-fleet.test.py')
+        with open(__file__) as f:
+            self.assertIn('\n# fork-ci: run as root with FORK_FLEET_ROOT_TESTS=1 only LauncherAsRoot\n', f.read())
         # check-net's test needs the real nft, which the hosted image may lack: installed in a step before it.
         self.assertTrue(any('apt-get install -y -qq nftables' in (r or '') for r in runs[:root]), runs)
 

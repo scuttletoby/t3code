@@ -8,6 +8,9 @@ Real commits in a temporary World: a local bare repository stands in for GitHub,
 of the pull request, `gh` is a fake, and nothing here can reach the network or a real gh login (the guard below fails
 the whole run if anything starts the real `gh`).
 """
+# The bare-checkout variant skips the merge-commit test (it has no checkout to detach). The CI runner records each
+# skipped test by name and it must be exactly this one (.github/scripts/fork-ci-tests.cjs).
+# fork-ci: may skip SameChangeBare.test_a_checkout_that_is_not_a_merge_commit_is_refused
 import atexit, os, shlex, shutil, sys, tempfile
 
 # --- guard: first, before anything can start gh or git ------------------------------------------------------------

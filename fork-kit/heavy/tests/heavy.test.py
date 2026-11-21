@@ -8,6 +8,8 @@ HEAVY_TEST_BIN runs the suite against another wrapper: with tests/old-heavy.sh (
 leftover test fails, which is the red check. Every test stops what it started: processes are found by their
 temporary folder in the command line, scopes by those processes.
 """
+# How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
+# fork-ci: run with HEAVY_REAL_TESTS=1
 import json, os, re, shutil, signal, subprocess, sys, tempfile, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

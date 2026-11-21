@@ -1,6 +1,6 @@
 // Fork only: every `*.test.*` under .github/scripts, fork-ci and fork-kit is listed in .github/fork-ci-tests.txt and
-// runs here by extension (RUNNER), FORK_CI_TEST_JOBS at once (default: CPU count), or `run by <file>` (not an upstream
-// workflow; it names the test). Unlisted or runner-less tests fail; a listed one that is gone fails once history had it.
+// runs here by extension (RUNNER, Python through fork-ci-unittest.py), FORK_CI_TEST_JOBS at once, or `run by <file>`
+// (only fork-tests.yml, or as RUN_ELSEWHERE says). Unlisted, runner-less, or gone-once-listed tests fail.
 // Arguments pick a part by path prefix (`fork-kit/`, `!fork-kit/`; none: all), FORK_CI_TEST_SHARD one shard of it.
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
@@ -123,8 +123,8 @@ function codeLines(text, file = "") {
 
 // `entries`: [{ file, runBy, weight }]; `present`: test files in the tree;
 // `ever(file)` says whether the file is in the tested commit's history;
-// `read(file)` returns a runner file's text, or null when it does not exist.
-function plan(entries, present, ever, read = () => null) {
+// `read(file)` returns a runner file's text, or null when it does not exist; `allowed`: RUN_ELSEWHERE.
+function plan(entries, present, ever, read = () => null, allowed = RUN_ELSEWHERE) {
   const listed = entries.map((entry) => entry.file);
   const unlisted = present.filter((file) => !listed.includes(file));
   const missing = listed.filter((file) => !present.includes(file));
@@ -141,6 +141,10 @@ function plan(entries, present, ever, read = () => null) {
     let why = null;
     if (UPSTREAM_WORKFLOW.test(runBy))
       why = `${runBy} is an upstream workflow, disabled in the fork`;
+    else if (!elsewhereAllowed({ file, runBy }, allowed))
+      why =
+        `a listed test is run by ${THIS_WORKFLOW} (a fork test: a part, or its own runs, which it records), or ` +
+        `by another runner only where RUN_ELSEWHERE in .github/scripts/fork-ci-tests.cjs names it`;
     else {
       const text = read(runBy);
       if (text === null) why = `${runBy} does not exist`;
@@ -308,6 +312,324 @@ function presentTests(root = ROOT) {
   );
 }
 
+// `--run <test>` runs a test's declared own runs; with FORK_CI_TEST_RECORDS set (CI) each call records what ran.
+// FORK_OWN: the fork's own tests (upstream's, in fork-tests.yml's `test` job, are not recorded).
+const FORK_OWN = /^(?:fork-kit\/|fork-ci\/|\.github\/scripts\/fork-)\S*\.test\.\w+$/;
+const THIS_WORKFLOW = ".github/workflows/fork-tests.yml";
+const UNITTEST_SHIM = ".github/scripts/fork-ci-unittest.py";
+// The node --test reporter each node test also reports to, which counts its tests (countTests()).
+const NODE_COUNTS = ".github/scripts/fork-ci-node-counts.cjs";
+// The listed tests another workflow or script runs (`run by` it in the list). Any other `run by` names fork-tests.yml:
+// a fork test's own runs (recorded) or upstream's tests in its `test` job. This table, not a test's name, decides where
+// a test may run, so a fork test named like upstream's cannot leave the records either. fork-contracts.test.py pins it.
+const RUN_ELSEWHERE = {
+  ".github/scripts/fork-secret-scan.test.sh": ".github/workflows/fork-secret-scan.yml",
+  ".github/scripts/relay-state-output.test.cjs": "scripts/release-smoke.ts",
+};
+const DECLARATION = /^\s*(?:#|\/\/)\s*fork-ci:(.*)$/;
+// Only a test's own switches: a declaration cannot set PATH, NODE_OPTIONS, PYTHON* or LD_*.
+const SWITCH = /^[A-Z][A-Z0-9_]*_TESTS=[\w./:-]*$/;
+const RUN_FORM = '"fork-ci: run [as root] [with <NAME>_TESTS=value ...] [only <TestClass>]"';
+const SKIP_FORM = '"fork-ci: may skip <test>"';
+// A test's name as a record holds it: `Class.test_method` (Python; `module.Class.test_method` for a test of a module it
+// loads), or the word after `skip ` (an ok-lines test).
+const TEST_NAME = /^[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*$/;
+
+// Whether the list's `run by` for a listed test is allowed: fork-tests.yml (plan() checks it names an upstream test),
+// or as RUN_ELSEWHERE says.
+function elsewhereAllowed({ file, runBy }, elsewhere = RUN_ELSEWHERE) {
+  return runBy === THIS_WORKFLOW || elsewhere[file] === runBy;
+}
+
+// A test's whole-line `fork-ci:` comments: RUN_FORM is an own run (made by `--run <test>`, it may skip no test);
+// SKIP_FORM, one line per test, names a test its run in a part skips (it must skip exactly those). The forms are in
+// .github/fork-ci-tests.txt. Returns { runs: [{ root, vars, only }], skips: [<test>], problems }.
+function declarations(text, file = "") {
+  const out = { runs: [], skips: [], problems: [] };
+  for (const line of text.split("\n")) {
+    const match = line.match(DECLARATION);
+    if (!match) continue;
+    const words = match[1].trim().split(/\s+/).filter(Boolean);
+    const said = `${file}: "fork-ci:${match[1]}"`;
+    if (words[0] === "may" || words[0] === "skips") {
+      const ok = words.length === 3 && words[1] === "skip" && TEST_NAME.test(words[2]);
+      if (!ok)
+        out.problems.push(
+          `${said}: expected ${SKIP_FORM} (one test: Class.test_method, or an ok-lines name)`,
+        );
+      else if (out.skips.includes(words[2]))
+        out.problems.push(`${said}: ${words[2]} is named twice`);
+      else out.skips.push(words[2]);
+      continue;
+    }
+    if (words[0] !== "run") {
+      out.problems.push(`${said}: expected ${RUN_FORM} or ${SKIP_FORM}`);
+      continue;
+    }
+    const run = { root: false, vars: [], only: null };
+    let i = 1;
+    let bad = null;
+    if (words[i] === "as" && words[i + 1] === "root") {
+      run.root = true;
+      i += 2;
+    }
+    if (words[i] === "with") {
+      i += 1;
+      while (i < words.length && SWITCH.test(words[i])) run.vars.push(words[i++]);
+      if (run.vars.length === 0) bad = "`with` takes <NAME>_TESTS=value words";
+    }
+    if (!bad && words[i] === "only") {
+      if (file.endsWith(".py") && /^[A-Z]\w*$/.test(words[i + 1] ?? "")) {
+        run.only = words[i + 1];
+        i += 2;
+      } else bad = "`only` takes one test class, in a Python test";
+    }
+    if (!bad && i < words.length) bad = `\`${words.slice(i).join(" ")}\` is not understood`;
+    const names = run.vars.map((v) => v.split("=")[0]);
+    if (!bad && new Set(names).size !== names.length) bad = "a switch comes twice";
+    if (!bad && out.runs.some((other) => other.only === run.only))
+      bad = "two own runs of the same tests";
+    if (bad) out.problems.push(`${said}: ${bad}; expected ${RUN_FORM}`);
+    else out.runs.push(run);
+  }
+  return out;
+}
+
+// A listed test's own runs: those it declares, or, for a fork test the list says fork-tests.yml runs (so no part
+// does), one plain run.
+function ownRuns(entry, text) {
+  const declared = declarations(text ?? "", entry.file);
+  if (declared.runs.length === 0 && entry.runBy === THIS_WORKFLOW && FORK_OWN.test(entry.file))
+    declared.runs.push({ root: false, vars: [], only: null });
+  return declared;
+}
+
+// The name of a test's record: the test for its run in a part, `<test> --run [only <TestClass>]` for an own run.
+function runKey(file, run = null) {
+  return run ? `${file} --run${run.only ? ` only ${run.only}` : ""}` : file;
+}
+
+// Every record a run of fork-tests.yml must leave (fork-ci-result checks each): one for each listed present test a
+// part runs (or should: a fork test with a `run by` elsewhereAllowed() refuses), and one for each own run of a test a
+// part or fork-tests.yml runs.
+function expectedKeys(entries, present, read) {
+  const keys = [];
+  for (const entry of entries) {
+    if (!present.includes(entry.file)) continue;
+    if (!entry.runBy || !elsewhereAllowed(entry)) keys.push(runKey(entry.file));
+    if (!entry.runBy || entry.runBy === THIS_WORKFLOW)
+      for (const run of ownRuns(entry, read(entry.file)).runs) keys.push(runKey(entry.file, run));
+  }
+  return keys.toSorted();
+}
+
+// The last line an ok-lines test prints on stdout when it reached its end: its own count of ok and skip lines.
+const OK_LINES_END = /^all passed: (\d+) ok, (\d+) skipped$/;
+const OK_LINES_FORM = '"all passed: <n> ok, <n> skipped"';
+
+// What a test ran, { format, tests, skipped, names (skipped, by name), failed, note }, or null (no count); tests null:
+// none known to have run (`note` says why). `lines`: its counter's lines (readCounts()). Python: fork-ci-unittest.py's
+// plan, then counts, per unittest run (a plan without counts: a hard exit). node: fork-ci-node-counts.cjs's one line.
+// Else stdout's `ok`, `FAIL` and `skip <name>` lines, which must end in OK_LINES_FORM with the same counts.
+function countTests(file, stdout, stderr, lines = []) {
+  const ext = file.match(TEST_FILE)?.[1];
+  const whole = (n) => Number.isInteger(n) && n >= 0;
+  const none = (format, note) => ({
+    format,
+    tests: null,
+    skipped: null,
+    names: [],
+    failed: null,
+    note,
+  });
+  if (ext === "py" && lines.length) {
+    const runs = [];
+    const open = [];
+    for (const u of lines) {
+      if (u && Object.keys(u).length === 1 && whole(u.plan)) open.push(u.plan);
+      else if (
+        u &&
+        whole(u.tests) &&
+        whole(u.failed) &&
+        Array.isArray(u.skipped) &&
+        u.skipped.every((n) => typeof n === "string") &&
+        open.length &&
+        open.pop() === u.tests
+      )
+        runs.push(u);
+      else return null;
+    }
+    if (open.length)
+      return none(
+        "unittest",
+        `a unittest run of ${open.at(-1)} tests started but never ended (an exit before its end)`,
+      );
+    const names = runs.flatMap((u) => u.skipped);
+    return {
+      format: "unittest",
+      tests: runs.reduce((sum, u) => sum + u.tests, 0),
+      skipped: names.length,
+      names,
+      failed: runs.reduce((sum, u) => sum + u.failed, 0),
+      note: null,
+    };
+  }
+  if (ext === "cjs" || ext === "mjs" || ext === "js") {
+    const [n, ...more] = lines;
+    const keys = ["tests", "skipped", "failed", "started", "stopped"];
+    if (
+      more.length ||
+      !n ||
+      !keys.every((key) => whole(n[key])) ||
+      typeof n.file_test !== "boolean"
+    )
+      return null;
+    if (n.file_test)
+      return none(
+        "node",
+        "node reported only the file itself as a test (no test of its own: none, a return at its top, or an exit " +
+          "before its tests reported)",
+      );
+    if (n.stopped || n.started !== n.tests)
+      return none("node", `${n.started} tests started and ${n.tests} ended (an exit half-way)`);
+    return {
+      format: "node",
+      tests: n.tests,
+      skipped: n.skipped,
+      names: [],
+      failed: n.failed,
+      note: null,
+    };
+  }
+  const passed = stdout.match(/^ok\s/gm)?.length ?? 0;
+  const failed = stdout.match(/^FAIL\s/gm)?.length ?? 0;
+  const names = [...stdout.matchAll(/^skip\s+(\S+)/gm)].map((m) => m[1]);
+  if (passed + failed + names.length === 0) return null;
+  const end = stdout
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .at(-1)
+    ?.match(OK_LINES_END);
+  let note = null;
+  if (failed === 0 && !end)
+    note = `its stdout does not end in ${OK_LINES_FORM}, so it may have stopped before its end`;
+  else if (failed === 0 && (Number(end[1]) !== passed || Number(end[2]) !== names.length))
+    note =
+      `it says ${end[1]} ok, ${end[2]} skipped, but its stdout has ${passed} ok and ${names.length} skip lines ` +
+      `(a child's lines in its output?)`;
+  return {
+    format: "ok lines",
+    tests: note ? null : passed + failed + names.length,
+    skipped: names.length,
+    names,
+    failed,
+    note,
+  };
+}
+
+// Why one record does not prove its tests ran ([]: it does): a failure, no count, no test run that was not skipped, a
+// skip without a name, or skips other than exactly those `allowed` names (an own run: none). Tight both ways: a skip
+// not declared is red, and so is a declared one that ran (remove its line), so a declaration never covers another.
+function recordProblems(record) {
+  const problems = [];
+  const name = record.key;
+  if (record.status !== 0) problems.push(`${name} failed (exit ${record.status})`);
+  if (record.tests === null)
+    problems.push(
+      `${name}: its output shows no test count${record.note ? ` (${record.note})` : ""}, so no test is known to ` +
+        `have run`,
+    );
+  else {
+    const skipped = record.skipped_tests ?? [];
+    const allowed = record.allowed ?? [];
+    if (record.tests - record.skipped <= 0)
+      problems.push(`${name} ran no test (${record.tests} found, ${record.skipped} skipped)`);
+    if (skipped.length !== record.skipped || new Set(skipped).size !== skipped.length)
+      problems.push(
+        `${name} skipped ${record.skipped} tests, ${new Set(skipped).size} of them by a name of their own: every ` +
+          `skip must name its test, once`,
+      );
+    const extra = [...new Set(skipped)].filter((test) => !allowed.includes(test));
+    if (extra.length)
+      problems.push(
+        `${name} skipped ${extra.join(", ")}, which it does not declare: run ${extra.length > 1 ? "them" : "it"} ` +
+          `(a switch the test declares in a ${RUN_FORM} line) or, if ${extra.length > 1 ? "they" : "it"} cannot ` +
+          `run here, declare ${SKIP_FORM} for each (a part run only)`,
+      );
+    const ran = allowed.filter((test) => !skipped.includes(test));
+    if (ran.length)
+      problems.push(
+        `${name} declares ${SKIP_FORM} for ${ran.join(", ")}, which did not skip: remove ${ran.length > 1 ? "those lines" : "that line"}`,
+      );
+    if (record.failed > 0) problems.push(`${name}: ${record.failed} failed`);
+  }
+  return problems;
+}
+
+// `allowed`: the tests the run may and must skip, from the test's declarations (the plan), never from what ran.
+function record(key, file, run, result, allowed) {
+  const counts = countTests(file, result.stdout ?? "", result.stderr ?? "", result.unittest ?? []);
+  return {
+    key,
+    test: file,
+    own: run !== null,
+    root: run?.root ?? false,
+    vars: run?.vars ?? [],
+    only: run?.only ?? null,
+    status: result.status,
+    seconds: Number(result.seconds),
+    format: counts?.format ?? null,
+    tests: counts?.tests ?? null,
+    skipped: counts?.skipped ?? null,
+    skipped_tests: counts?.names ?? [],
+    failed: counts?.failed ?? null,
+    note: counts?.note ?? null,
+    allowed: [...allowed].toSorted(),
+  };
+}
+
+// The records folder of this call (null: none written), from FORK_CI_TEST_RECORDS, with the run and job they belong
+// to; with the folder set, a missing GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT or GITHUB_JOB throws.
+function recordsTo(env = process.env) {
+  const dir = env.FORK_CI_TEST_RECORDS ?? "";
+  if (dir === "") return null;
+  for (const name of ["GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB"])
+    if (!/^[\w-]+$/.test(env[name] ?? ""))
+      throw new Error(
+        `FORK_CI_TEST_RECORDS is set but ${name} is not: the records cannot be keyed`,
+      );
+  return {
+    dir,
+    run_id: env.GITHUB_RUN_ID,
+    run_attempt: Number(env.GITHUB_RUN_ATTEMPT),
+    job: env.GITHUB_JOB,
+  };
+}
+
+// Writes one call's records file; never over an existing one (a second call of the same part in a job fails).
+function writeRecords(to, name, body) {
+  fs.mkdirSync(to.dir, { recursive: true });
+  const file = path.join(to.dir, `${name.replace(/[^\w.-]+/g, "_")}.json`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify(
+      { v: 1, run_id: to.run_id, run_attempt: to.run_attempt, job: to.job, ...body },
+      null,
+      1,
+    ) + "\n",
+    { flag: "wx" },
+  );
+  return file;
+}
+
+function headSha() {
+  try {
+    return git(["rev-parse", "HEAD"]);
+  } catch {
+    return null;
+  }
+}
+
 function git(args) {
   return childProcess.execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
 }
@@ -356,18 +678,105 @@ function jobCount(env = process.env) {
   return Number.isInteger(jobs) && jobs > 0 ? jobs : os.availableParallelism();
 }
 
-// Runs one test file, its stdout and stderr kept together, and prints them as one group when it ends.
-function runTest(file) {
-  const [command, ...args] = RUNNER[file.match(TEST_FILE)[1]];
+// A test's command: by extension (RUNNER), Python through UNITTEST_SHIM writing to `counts`; an own run (ownRuns())
+// with -I -B and its class, as root under `sudo -n env` (which keeps no environment, so switches, GITHUB_ACTIONS and
+// the counts file go on its line). The caller's records folder and counts file never reach the test: a test of this
+// runner must not write into them.
+function command(file, run = null, env = process.env, counts = null) {
+  const childEnv = { ...env };
+  delete childEnv.FORK_CI_TEST_RECORDS;
+  delete childEnv.FORK_CI_TEST_COUNTS;
+  // A runner run by node --test (its own tests) must not hand that on: node would report to it, not to the reporters.
+  delete childEnv.NODE_TEST_CONTEXT;
+  const py = file.endsWith(".py");
+  // A Python test runs through fork-ci-unittest.py, which counts each of its tests (countTests()) into `counts`.
+  // A node test also reports to fork-ci-node-counts.cjs, which counts its tests into `counts`; its log shows spec.
+  const node = RUNNER[file.match(TEST_FILE)[1]][0] === "node";
+  const shim = py
+    ? [UNITTEST_SHIM]
+    : node && counts
+      ? [
+          "--test-reporter=spec",
+          "--test-reporter-destination=stdout",
+          `--test-reporter=./${NODE_COUNTS}`,
+          `--test-reporter-destination=${counts}`,
+        ]
+      : [];
+  const count = py && counts ? [`FORK_CI_TEST_COUNTS=${counts}`] : [];
+  if (py && counts) childEnv.FORK_CI_TEST_COUNTS = counts;
+  if (!run) return { argv: [...RUNNER[file.match(TEST_FILE)[1]], ...shim, file], env: childEnv };
+  const base = py ? ["python3", "-I", "-B"] : RUNNER[file.match(TEST_FILE)[1]];
+  const argv = [...base, ...shim, file, ...(run.only ? ["-v", run.only] : [])];
+  if (run.root) {
+    const pass = env.GITHUB_ACTIONS === undefined ? [] : [`GITHUB_ACTIONS=${env.GITHUB_ACTIONS}`];
+    return { argv: ["sudo", "-n", "env", ...run.vars, ...pass, ...count, ...argv], env: childEnv };
+  }
+  for (const word of run.vars) {
+    const at = word.indexOf("=");
+    childEnv[word.slice(0, at)] = word.slice(at + 1);
+  }
+  return { argv, env: childEnv };
+}
+
+// How an own run is named in the log.
+function runLabel(run) {
+  return [
+    run.root && "as root",
+    run.vars.length && `with ${run.vars.join(" ")}`,
+    run.only && `only ${run.only}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+// The lines a test's counter (fork-ci-unittest.py, fork-ci-node-counts.cjs) wrote to `file` (a line that is not JSON
+// is null: countTests() then counts nothing).
+function readCounts(file) {
+  let text = "";
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    });
+}
+
+// Runs one test file (`run`: one of its own runs), its stdout and stderr shown together as one group when it ends, and
+// each also kept on its own (countTests()), with a Python or node test's counts (`unittest`, readCounts()) from a file
+// of this run only: a new folder each time, made here (so a run as root adds to a file this user owns), then removed.
+function runTest(file, run = null) {
+  const countsDir = fs.mkdtempSync(path.join(os.tmpdir(), "fork-ci-counts-"));
+  const counts = path.join(countsDir, "counts.jsonl");
+  fs.writeFileSync(counts, "", { flag: "wx", mode: 0o644 });
+  const { argv, env } = command(file, run, process.env, counts);
+  const [cmd, ...args] = argv;
   const started = Date.now();
   return new Promise((resolve) => {
-    const child = childProcess.spawn(command, [...args, file], {
+    const child = childProcess.spawn(cmd, args, {
       cwd: ROOT,
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const output = [];
-    child.stdout.on("data", (chunk) => output.push(chunk));
-    child.stderr.on("data", (chunk) => output.push(chunk));
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => {
+      output.push(chunk);
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      output.push(chunk);
+      stderr.push(chunk);
+    });
     let ended = false;
     const done = (status, signal) => {
       if (ended) return;
@@ -376,15 +785,25 @@ function runTest(file) {
       child.stdout.destroy();
       child.stderr.destroy();
       const seconds = ((Date.now() - started) / 1000).toFixed(1);
-      process.stdout.write(`::group::${file} (${seconds} s)\n`);
+      const label = run ? ` --run ${runLabel(run)}`.trimEnd() : "";
+      process.stdout.write(`::group::${file}${label} (${seconds} s)\n`);
       process.stdout.write(Buffer.concat(output));
       process.stdout.write("\n::endgroup::\n");
       if (status !== 0)
-        console.log(`::error file=${file}::${file} failed (exit ${status ?? signal})`);
-      resolve({ file, status, seconds });
+        console.log(`::error file=${file}::${file}${label} failed (exit ${status ?? signal})`);
+      const unittest = readCounts(counts);
+      fs.rmSync(countsDir, { recursive: true, force: true });
+      resolve({
+        file,
+        status,
+        seconds,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        unittest,
+      });
     };
     child.on("error", (error) => {
-      output.push(Buffer.from(`cannot start ${command}: ${error.message}\n`));
+      output.push(Buffer.from(`cannot start ${cmd}: ${error.message}\n`));
       done(null, "spawn error");
     });
     child.on("close", done);
@@ -393,30 +812,125 @@ function runTest(file) {
   });
 }
 
+// `--run <test>`: the test's own runs (ownRuns()), one after another, each recorded. Only a listed, present test the
+// list says a part or fork-tests.yml runs, with at least one own run, and no `fork-ci:` line it cannot read.
+async function runOwn(args, { runTest: run = runTest } = {}) {
+  const to = recordsTo();
+  const [file, ...extra] = args;
+  const entry = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8")).find(
+    (e) => e.file === file,
+  );
+  const text = file ? readFile(file) : null;
+  let why = null;
+  if (!file || extra.length) why = "--run takes one listed test";
+  else if (!entry) why = `${file} is not in ${LIST}`;
+  else if (text === null) why = `${file} is not present`;
+  else if (entry.runBy && entry.runBy !== THIS_WORKFLOW)
+    why = `${LIST} says ${entry.runBy} runs ${file}`;
+  const own = why ? null : ownRuns(entry, text);
+  if (own && own.problems.length) why = own.problems.join("; ");
+  else if (own && own.runs.length === 0)
+    why = `${file} declares no own run (${RUN_FORM}); a part runs it`;
+  if (why) {
+    console.log(`::error::${why}`);
+    process.exitCode = 1;
+    return;
+  }
+  const results = [];
+  for (const how of own.runs) {
+    const result = await run(file, how);
+    results.push(record(runKey(file, how), file, how, result, []));
+  }
+  let failed = results.filter((r) => r.status !== 0).length;
+  if (to) {
+    // A failed run has its error already; the others' problems fail the call here, before fork-ci-result.
+    for (const r of results.filter((each) => each.status === 0))
+      for (const problem of recordProblems(r)) {
+        failed += 1;
+        console.log(`::error file=${file}::${problem}`);
+      }
+    writeRecords(to, `run-${file}`, {
+      sha: headSha(),
+      call: { run: file },
+      all: null,
+      owed: results.map((r) => r.key),
+      results,
+    });
+  }
+  const summary = process.env.GITHUB_STEP_SUMMARY;
+  if (summary)
+    fs.appendFileSync(
+      summary,
+      [
+        `### Fork test own runs (${file})`,
+        "",
+        "| Run | Result | Tests | Skipped | Time |",
+        "| --- | --- | --- | --- | --- |",
+        ...results.map(
+          (r) =>
+            `| \`${r.key}\` | ${r.status === 0 ? "passed" : "**failed**"} | ${r.tests ?? "?"} | ${r.skipped ?? "?"} | ${r.seconds} s |`,
+        ),
+        "",
+      ].join("\n") + "\n",
+    );
+  if (failed) process.exitCode = 1;
+}
+
 // `runTest` and `now` are the real ones unless a test hands in fakes (a shard's time, its slow warning).
 async function main(
   parts = process.argv.slice(2),
   { runTest: run = runTest, now = Date.now } = {},
 ) {
+  if (parts[0] === "--run") return runOwn(parts.slice(1), { runTest: run });
+  const to = recordsTo();
   const { index, count } = readShard();
-  const entries = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8")).filter((entry) =>
-    inPart(entry.file, parts),
-  );
-  const present = presentTests().filter((file) => inPart(file, parts));
+  const listed = readList(fs.readFileSync(path.join(ROOT, LIST), "utf8"));
+  const entries = listed.filter((entry) => inPart(entry.file, parts));
+  const everyPresent = presentTests();
+  const present = everyPresent.filter((file) => inPart(file, parts));
   const result = plan(entries, present, everInHistory, readFile);
   const weight = new Map(entries.map((entry) => [entry.file, entry.weight]));
   const rows = [];
   let failed =
     result.unlisted.length + result.deleted.length + result.noRunner.length + result.notRun.length;
+  // A `fork-ci:` line that cannot be read fails the part the test is in (every shard of it).
+  const declared = new Map(
+    entries
+      .filter((entry) => present.includes(entry.file))
+      .map((entry) => [entry.file, declarations(readFile(entry.file) ?? "", entry.file)]),
+  );
+  for (const [file, { problems }] of declared)
+    for (const problem of problems) {
+      failed += 1;
+      console.log(`::error file=${file}::${problem}`);
+    }
   const mine = shard(result.run, entries, index, count);
   const jobs = jobCount();
   const started = now();
-  const runs = await runAll(order(mine, entries), jobs, run);
+  const runs = await runAll(order(mine, entries), jobs, (file) => run(file));
   const seconds = (now() - started) / 1000;
   const judged = judge(runs, weight);
   const { speed } = judged;
   const stale = judged.stale.map(({ note }) => note);
   failed += judged.failed.length + stale.length;
+  if (to) {
+    const records = runs.map((r) =>
+      record(runKey(r.file), r.file, null, r, declared.get(r.file)?.skips ?? []),
+    );
+    // A failed test has its error already; the others' problems fail the part here, before fork-ci-result.
+    for (const r of records.filter((each) => each.status === 0))
+      for (const problem of recordProblems(r)) {
+        failed += 1;
+        console.log(`::error file=${r.test}::${problem}`);
+      }
+    writeRecords(to, `part-${index}of${count}-${parts.join("_") || "all"}`, {
+      sha: headSha(),
+      call: { parts, shard: `${index}/${count}` },
+      all: expectedKeys(listed, everyPresent, readFile),
+      owed: mine.map((file) => runKey(file)).toSorted(),
+      results: records,
+    });
+  }
   for (const { file, note } of judged.stale)
     console.log(`::error file=${file}::${note} in ${LIST}`);
   const slow = slowNote(mine, weight, jobs, seconds);
@@ -500,6 +1014,22 @@ module.exports = {
   presentTests,
   runAll,
   jobCount,
+  declarations,
+  elsewhereAllowed,
+  RUN_ELSEWHERE,
+  UNITTEST_SHIM,
+  NODE_COUNTS,
+  ownRuns,
+  runKey,
+  expectedKeys,
+  countTests,
+  readCounts,
+  recordProblems,
+  record,
+  recordsTo,
+  writeRecords,
+  command,
+  runOwn,
   main,
 };
 
