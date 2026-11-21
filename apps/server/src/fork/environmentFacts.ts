@@ -1,0 +1,116 @@
+/**
+ * Fork (placement row P3): the facts `t3_environment_read` returns beside upstream's fields, both
+ * optional ("Machine facts on t3_environment_read" in docs/fork/README.md). Slot facts come only
+ * from the gate's status read; a gate that cannot be read gives a reason, never a count.
+ */
+import { HostResourcesSnapshot, NonNegativeInt } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+
+import * as HostResources from "../resourceTelemetry/HostResources.ts";
+import * as Settings from "../serverSettings.ts";
+import * as SlotGate from "../slots/SlotGate.ts";
+
+/**
+ * Placement facts. Every field but `labels`, `available` and `factsAt` is optional, so a machine on
+ * a newer or older fork build that adds or drops one still decodes here.
+ */
+export const Placement = Schema.Struct({
+  /** Declared facts, typed once in that machine's Settings. Empty until that setting exists (P2). */
+  labels: Schema.Array(Schema.String),
+  /**
+   * Whether the slot gate would take one more agent on this machine now. `false` also when the
+   * gate cannot be read: then no count is given, only `reason`.
+   */
+  available: Schema.Boolean,
+  /** Why `available` is what it is, when the counts alone do not say it. */
+  reason: Schema.optionalKey(Schema.String),
+  /** Agents running, starting or holding a slot here, as the slot gate counts them. */
+  runningAgents: Schema.optionalKey(NonNegativeInt),
+  /** Machine slots left before the gate refuses; `null`: no machine limit is set. */
+  slotsFree: Schema.optionalKey(Schema.NullOr(NonNegativeInt)),
+  /** The free memory the gate keeps (`agentSlots.minFreeMemoryMb`); `null`: none set. */
+  memoryFloorMb: Schema.optionalKey(Schema.NullOr(NonNegativeInt)),
+  /** Free memory the gate measured with the counts, in MB. */
+  freeMemoryMb: Schema.optionalKey(Schema.NullOr(NonNegativeInt)),
+  /** When these facts were read (ms since the epoch). */
+  factsAt: NonNegativeInt,
+});
+export type Placement = typeof Placement.Type;
+
+/** Spread into `t3_environment_read`'s success struct. */
+export const ResultFields = {
+  hostResources: Schema.optionalKey(HostResourcesSnapshot),
+  placement: Schema.optionalKey(Placement),
+};
+
+/** The gate's own read waits up to `COUNT_READ_TIMEOUT`; one second more, then it is unread. */
+const USAGE_READ_TIMEOUT = Duration.sum(SlotGate.COUNT_READ_TIMEOUT, Duration.seconds(1));
+
+export const REASON_GATE_MISSING = "The agent slot gate is not running on this machine.";
+export const REASON_GATE_UNREAD =
+  "The agent slot gate could not count the agents here now, so no slot count is given.";
+export const REASON_SETTINGS_UNREAD =
+  "This machine's settings could not be read, so no slot count is given.";
+export const REASON_SLOTS_OFF =
+  "Agent slots are off on this machine: it sets no limit and does not count its agents.";
+export const REASON_FULL = "Every machine slot is in use.";
+export const REASON_LOW_MEMORY = "Free memory is below the floor the slot gate keeps.";
+
+const unavailable = (reason: string) => ({ available: false, reason }) as const;
+
+/** The slot facts, read once; never fails, never dies. */
+const slotFacts = Effect.gen(function* () {
+  const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
+  if (Option.isNone(gate)) return unavailable(REASON_GATE_MISSING);
+  const settingsService = yield* Effect.serviceOption(Settings.ServerSettingsService);
+  const settings = Option.isNone(settingsService)
+    ? Option.none()
+    : yield* settingsService.value.getSettings.pipe(Effect.option);
+  if (Option.isNone(settings)) return unavailable(REASON_SETTINGS_UNREAD);
+  const agentSlots = settings.value.agentSlots;
+  if (!agentSlots.enabled) return { available: true, reason: REASON_SLOTS_OFF } as const;
+  const usage = yield* gate.value.usage.pipe(Effect.timeoutOption(USAGE_READ_TIMEOUT));
+  // `usage` is null while slots are off (checked above) or when its counts cannot be read.
+  if (Option.isNone(usage) || usage.value === null) return unavailable(REASON_GATE_UNREAD);
+  const { machine, freeMemoryMb } = usage.value;
+  const slotsFree = machine.max === null ? null : Math.max(0, machine.max - machine.used);
+  const memoryFloorMb = agentSlots.minFreeMemoryMb > 0 ? agentSlots.minFreeMemoryMb : null;
+  const lowMemory = memoryFloorMb !== null && freeMemoryMb !== null && freeMemoryMb < memoryFloorMb;
+  const reason = slotsFree === 0 ? REASON_FULL : lowMemory ? REASON_LOW_MEMORY : undefined;
+  return {
+    available: reason === undefined,
+    ...(reason === undefined ? {} : { reason }),
+    runningAgents: machine.used,
+    slotsFree,
+    memoryFloorMb,
+    freeMemoryMb,
+  };
+}).pipe(Effect.catchCause(() => Effect.succeed(unavailable(REASON_GATE_UNREAD))));
+
+/**
+ * The facts for this machine's `t3_environment_read`. `hostResources` is left out when the host
+ * sampler is not there or its read fails; `placement` is always given.
+ */
+export const read = Effect.gen(function* () {
+  const host = yield* Effect.serviceOption(HostResources.HostResources);
+  const hostResources = Option.isNone(host)
+    ? Option.none()
+    : yield* host.value.read.pipe(
+        Effect.asSome,
+        Effect.catchCause(() => Effect.succeedNone),
+      );
+  const slots = yield* slotFacts;
+  const placement: Placement = {
+    labels: [],
+    ...slots,
+    factsAt: yield* Clock.currentTimeMillis,
+  };
+  return {
+    ...(Option.isSome(hostResources) ? { hostResources: hostResources.value } : {}),
+    placement,
+  };
+}).pipe(Effect.withSpan("EnvironmentFacts.read"));
