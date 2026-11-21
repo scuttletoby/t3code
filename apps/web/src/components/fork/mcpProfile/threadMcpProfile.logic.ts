@@ -9,15 +9,19 @@ import {
   type ContextMenuItem,
   MCP_PROFILE_MAX_LINEAGE,
   type McpProfileResolution,
+  type McpProfileSet,
   type McpProfileSettings,
   type OrchestrationV2ThreadShell,
   type ServerSettings,
   isDelegatedAppThread,
+  isWithinMcpProfile,
+  readCarried,
   resolveMcpProfile,
 } from "@t3tools/contracts";
 
 import {
   MCP_PICK_APPLIES_NOTE,
+  describeMcpProfileSet,
   effectiveMcpProfileText,
   mcpProfileChoices,
   threadPickPatch,
@@ -93,6 +97,97 @@ export function threadMcpProfile(
   return resolved;
 }
 
+/** What a pick of `name` gives the thread, and whether that is more than its parent has. */
+export interface ThreadPickEffect {
+  /** One line: the set the thread gets with the pick, or why the pick cannot apply. */
+  readonly text: string;
+  /**
+   * The pick keeps something the thread's parent (or the machine that delegated it) does not: a
+   * pick is never cut down to the parent's, so the thread gets more than it would without it.
+   */
+  readonly widerThanParent: boolean;
+}
+
+/** The limit the thread has without a pick of its own, or why this client cannot tell. */
+function parentLimit(
+  settings: McpProfileSettingsForThread,
+  self: McpProfileShell,
+  shells: ReadonlyArray<McpProfileShell>,
+):
+  | { readonly kind: "none" }
+  | { readonly kind: "set"; readonly name: string; readonly profile: McpProfileSet }
+  | { readonly kind: "unknown"; readonly why: string } {
+  const parentId = self.lineage.parentThreadId;
+  if (parentId === null) {
+    const carried = self.delegatedFrom?.mcpProfile ?? undefined;
+    if (carried === undefined) return { kind: "none" };
+    const sent = readCarried(carried);
+    return sent.ok
+      ? {
+          kind: "set",
+          name: `${sent.name} (sent by the machine that delegated it)`,
+          profile: sent.profile,
+        }
+      : { kind: "unknown", why: "the profile the delegating machine sent cannot be read here" };
+  }
+  const parent = threadMcpProfile(settings, parentId, shells);
+  if (parent._tag === "Resolved") {
+    return { kind: "set", name: `the parent's ${parent.name}`, profile: parent.profile };
+  }
+  return {
+    kind: "unknown",
+    why:
+      parent._tag === "Unknown"
+        ? "its parent's profile cannot be worked out here"
+        : "its parent's profile cannot apply",
+  };
+}
+
+/**
+ * The real effect of picking `name` for `threadId`: a pick is final, never cut down to the parent's
+ * (the resolver's rule), so a pick wider than a limited child's parent widens that child. Says so.
+ */
+export function threadPickEffect(
+  settings: McpProfileSettingsForThread,
+  threadId: string,
+  name: string,
+  shells: ReadonlyArray<McpProfileShell>,
+): ThreadPickEffect {
+  // The pick is final, so the thread alone decides; its lineage plays no part.
+  const picked = resolveMcpProfile(
+    { ...settings, mcpThreadProfiles: { ...settings.mcpThreadProfiles, [threadId]: name } },
+    [{ threadId, delegated: false }],
+  );
+  if (picked._tag === "CannotApply") {
+    return {
+      text: `With this pick the thread cannot start: ${picked.message}`,
+      widerThanParent: false,
+    };
+  }
+  const gets = `With this pick the thread gets ${describeMcpProfileSet(picked.profile)}.`;
+  const self = shells.find((shell) => shell.id === threadId);
+  if (self === undefined) {
+    return {
+      text: `${gets} This thread is not loaded here, so whether that is more than its parent has cannot be told; a pick is never cut down to the parent's.`,
+      widerThanParent: false,
+    };
+  }
+  const limit = parentLimit(settings, self, shells);
+  if (limit.kind === "none") return { text: gets, widerThanParent: false };
+  if (limit.kind === "unknown") {
+    return {
+      text: `${gets} Whether that is more than its parent has cannot be told (${limit.why}); a pick is never cut down to the parent's.`,
+      widerThanParent: false,
+    };
+  }
+  if (isWithinMcpProfile(picked.profile, limit.profile))
+    return { text: gets, widerThanParent: false };
+  return {
+    text: `${gets} That is more than ${limit.name} (${describeMcpProfileSet(limit.profile)}): a pick is never cut down to the parent's, so this thread gets the wider set.`,
+    widerThanParent: true,
+  };
+}
+
 /** One line on the thread's profile. */
 export const threadMcpProfileText = (profile: ThreadMcpProfile): string =>
   profile._tag === "Unknown" ? profile.message : effectiveMcpProfileText(profile);
@@ -110,8 +205,10 @@ export type McpProfileMenuId =
 export interface McpProfileMenuState {
   readonly threadId: string;
   readonly profile: ThreadMcpProfile;
-  /** The owner's pick for this thread, or null. */
+  /** The owner's pick for this thread, or null (a blank pick is ignored, as the resolver does). */
   readonly pick: string | null;
+  /** settings.json has a blank pick for this thread (a hand edit): ignored, and clearable. */
+  readonly blankPick: boolean;
   readonly choices: ReadonlyArray<string>;
   /** False for a client that may not change settings: the entry then only shows the profile. */
   readonly canWrite: boolean;
@@ -123,13 +220,15 @@ export function mcpProfileMenuState(
   shells: ReadonlyArray<McpProfileShell>,
   canWrite: boolean,
 ): McpProfileMenuState {
-  const pick = Object.hasOwn(settings.mcpThreadProfiles, threadId)
-    ? (settings.mcpThreadProfiles[threadId] ?? null)
-    : null;
+  const stored = Object.hasOwn(settings.mcpThreadProfiles, threadId)
+    ? settings.mcpThreadProfiles[threadId]
+    : undefined;
+  const pick = stored?.trim() || null;
   return {
     threadId,
     profile: threadMcpProfile(settings, threadId, shells),
     pick,
+    blankPick: stored !== undefined && pick === null,
     choices: mcpProfileChoices(settings),
     canWrite,
   };
@@ -168,8 +267,10 @@ export function mcpProfileMenuItems(
         {
           id: MCP_PROFILE_MENU_CLEAR,
           label: "Clear this thread's pick",
-          detail: MCP_PICK_APPLIES_NOTE,
-          disabled: state.pick === null,
+          detail: state.blankPick
+            ? `Its pick in settings.json is blank, so it is ignored. ${MCP_PICK_APPLIES_NOTE}`
+            : MCP_PICK_APPLIES_NOTE,
+          disabled: state.pick === null && !state.blankPick,
           separatorBefore: true,
         },
       ],

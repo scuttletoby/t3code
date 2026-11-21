@@ -31,7 +31,7 @@ export function useSelectedProviders() {
 }
 
 /** Why the row's setting cannot be changed here: an administrator's lock or no write permission. */
-function useForkRowLock(paths: ReadonlyArray<string>): string | undefined {
+export function useForkRowLock(paths: ReadonlyArray<string>): string | undefined {
   const { connectedEnvironments } = useSettingsScope();
   const writeAllowed = useScopedSettingsWriteAllowed();
   const organization = connectedEnvironments

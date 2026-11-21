@@ -20,6 +20,7 @@ import {
   isDefinableMcpProfileName,
   readMcpProfileEntry,
 } from "@t3tools/contracts";
+import { mcpProfileUses } from "@t3tools/shared/forkSettingsPatch";
 
 /** The settings this panel reads: the resolver's keys and the projects' overrides. */
 export type McpProfilePanelSettings = Pick<
@@ -256,31 +257,24 @@ export interface McpProfileUsers {
   readonly threadIds: ReadonlyArray<string>;
 }
 
-const sameRef = (value: unknown, name: string) =>
-  typeof value === "string" && value.trim() === name;
-
-/** Every setting that names `name`. */
+/** Every setting that names `name`, by the server's own rule (`mcpProfileUses`). */
 export function mcpProfileUsers(
   settings: McpProfilePanelSettings,
   name: string,
   labels: McpProfileLabels,
 ): McpProfileUsers {
   const descriptions: Array<string> = [];
-  if (sameRef(settings.mcpProfile, name)) descriptions.push("the default profile");
-  if (sameRef(settings.mcpSubagentProfile, name)) descriptions.push("the sub-agent rule");
-  for (const [projectId, overrides] of Object.entries(settings.projectSettingsOverrides)) {
-    const project = labels.projects.get(projectId) ?? projectId;
-    if (sameRef(overrides?.mcpProfile, name)) {
+  const threadIds: Array<string> = [];
+  for (const use of mcpProfileUses(settings, name)) {
+    const project = "projectId" in use ? (labels.projects.get(use.projectId) ?? use.projectId) : "";
+    if (use.kind === "default") descriptions.push("the default profile");
+    else if (use.kind === "subagent-rule") descriptions.push("the sub-agent rule");
+    else if (use.kind === "project-default") {
       descriptions.push(`project ${project}'s default profile`);
-    }
-    if (sameRef(overrides?.mcpSubagentProfile, name)) {
+    } else if (use.kind === "project-subagent-rule") {
       descriptions.push(`project ${project}'s sub-agent rule`);
-    }
+    } else threadIds.push(use.threadId);
   }
-  const threadIds = Object.entries(settings.mcpThreadProfiles)
-    .filter(([, pick]) => sameRef(pick, name))
-    .map(([threadId]) => threadId)
-    .toSorted();
   if (threadIds.length > 0) {
     const titles = threadIds.map((threadId) => labels.threads.get(threadId) ?? threadId);
     descriptions.push(
@@ -334,13 +328,18 @@ export function clearThreadPicksPatch(threadIds: ReadonlyArray<string>): ServerS
   return { mcpThreadProfiles: Object.fromEntries(threadIds.map((threadId) => [threadId, null])) };
 }
 
-/** Why a new pick for `threadId` cannot be saved, or null. */
+/**
+ * Why a new pick (thread id and chosen profile) cannot be saved, or null. Nothing is saved until
+ * the owner has chosen a profile: a typed id alone never falls back to `all`.
+ */
 export function threadPickProblem(
   settings: Pick<McpProfileSettings, "mcpThreadProfiles">,
   threadId: string,
+  profile: string | null,
 ): string | null {
   const id = threadId.trim();
   if (id === "") return "Enter a thread id.";
+  if (profile === null || profile.trim() === "") return "Choose a profile for this thread.";
   if (Object.hasOwn(settings.mcpThreadProfiles, id)) return null;
   return Object.keys(settings.mcpThreadProfiles).length >= MCP_THREAD_PROFILES_MAX
     ? `At most ${MCP_THREAD_PROFILES_MAX} threads can have their own pick. Clear one first.`
@@ -350,8 +349,13 @@ export function threadPickProblem(
 export interface McpThreadPickRow {
   readonly threadId: string;
   readonly title: string | null;
-  readonly pick: string;
+  /** The pick, or null for a blank one (a hand edit), which the resolver ignores. */
+  readonly pick: string | null;
 }
+
+/** What a blank pick row says: it is broken (ignored), and how to fix it. */
+export const MCP_BLANK_PICK_ISSUE =
+  "Its pick in settings.json is blank, so it is ignored and the thread's defaults apply. Pick a profile, or clear it.";
 
 /** The thread picks, titled where this client knows the thread, by title then id. */
 export function mcpThreadPickRows(
@@ -359,7 +363,11 @@ export function mcpThreadPickRows(
   titles: ReadonlyMap<string, string>,
 ): ReadonlyArray<McpThreadPickRow> {
   return Object.entries(picks)
-    .map(([threadId, pick]) => ({ threadId, title: titles.get(threadId) ?? null, pick }))
+    .map(([threadId, pick]) => ({
+      threadId,
+      title: titles.get(threadId) ?? null,
+      pick: pick.trim() || null,
+    }))
     .toSorted(
       (a, b) =>
         Number(a.title === null) - Number(b.title === null) ||

@@ -10,10 +10,12 @@ import {
   mcpProfileChoices,
   mcpProfileRows,
   mcpProfileUsers,
+  mcpThreadPickRows,
   notSetUpNotes,
   saveMcpProfilePatch,
   shownProfileRef,
   threadPickPatch,
+  threadPickProblem,
 } from "./mcpProfileSettings.logic";
 
 const fromFile = Schema.decodeUnknownSync(ServerSettings);
@@ -199,5 +201,23 @@ describe("thread picks", () => {
     // Runs again: the pick is gone, so a second clear (or the same pick again) writes nothing.
     expect(threadPickPatch(cleared.mcpThreadProfiles, "thread-a", null)).toBeNull();
     expect(threadPickPatch(cleared.mcpThreadProfiles, "thread-b", "lean")).toBeNull();
+  });
+});
+
+describe("adding a thread pick", () => {
+  const settings = fromFile({ mcpProfiles: { lean: LEAN } });
+
+  it("saves nothing until a profile is chosen: a typed id alone never falls back to all", () => {
+    expect(threadPickProblem(settings, "thread-1", null)).toBe("Choose a profile for this thread.");
+    expect(threadPickProblem(settings, "  ", "lean")).toBe("Enter a thread id.");
+    expect(threadPickProblem(settings, " thread-1 ", "lean")).toBeNull();
+  });
+
+  it("shows a blank pick from a hand edit as broken, not as a profile", () => {
+    const blank = fromFile({ mcpThreadProfiles: { "thread-1": "  ", "thread-2": "lean" } });
+    expect(mcpThreadPickRows(blank.mcpThreadProfiles, new Map())).toEqual([
+      { threadId: "thread-1", title: null, pick: null },
+      { threadId: "thread-2", title: null, pick: "lean" },
+    ]);
   });
 });

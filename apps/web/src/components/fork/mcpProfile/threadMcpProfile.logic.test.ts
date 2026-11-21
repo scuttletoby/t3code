@@ -10,6 +10,7 @@ import {
   mcpProfileMenuState,
   threadMcpProfile,
   threadMcpProfileText,
+  threadPickEffect,
 } from "./threadMcpProfile.logic";
 
 const fromFile = Schema.decodeUnknownSync(ServerSettings);
@@ -148,5 +149,90 @@ describe("the thread menu's MCP profile entry", () => {
     ]);
     expect(items[0]!.children).toBeUndefined();
     expect(mcpProfileMenuItems(undefined)).toEqual([]);
+  });
+});
+
+describe("what a pick gives a thread", () => {
+  // A delegated child that runs cut down to its parent's `narrow` (docs only).
+  const settings = fromFile({
+    mcpProfiles: PROFILES,
+    mcpSubagentProfile: "docs",
+    mcpThreadProfiles: { parent: "narrow" },
+  });
+  const shells = [shell("parent"), shell("child", "parent")];
+
+  it("says when a pick gives a limited child more than its parent has", () => {
+    const wide = threadPickEffect(settings, "child", "all", shells);
+    expect(wide).toEqual({
+      text: "With this pick the thread gets Servers: all · T3 tools: all. That is more than the parent's narrow (Servers: docs · T3 tools: all): a pick is never cut down to the parent's, so this thread gets the wider set.",
+      widerThanParent: true,
+    });
+    // The text matches what the resolver then gives the thread: the pick, not cut down.
+    const picked = fromFile({
+      mcpProfiles: PROFILES,
+      mcpSubagentProfile: "docs",
+      mcpThreadProfiles: { parent: "narrow", child: "all" },
+    });
+    expect(threadMcpProfile(picked, "child", shells)).toMatchObject({
+      source: "thread-pick",
+      narrowedByParent: false,
+      profile: { servers: "all", t3Tools: "all" },
+    });
+  });
+
+  it("says nothing more for a pick within the parent's set, or for a top thread", () => {
+    expect(threadPickEffect(settings, "child", "narrow", shells)).toEqual({
+      text: "With this pick the thread gets Servers: docs · T3 tools: all.",
+      widerThanParent: false,
+    });
+    expect(threadPickEffect(settings, "parent", "all", shells).widerThanParent).toBe(false);
+  });
+
+  it("cuts a carried profile's task the same way", () => {
+    const carried = { name: "narrow", servers: ["docs"], t3Tools: "all" };
+    const task = shell("task", null, {
+      delegatedFrom: { environmentId: "env-b", threadId: "far", title: "Far", mcpProfile: carried },
+    } as unknown as Partial<McpProfileShell>);
+    expect(threadPickEffect(settings, "task", "docs", [task])).toMatchObject({
+      widerThanParent: true,
+      text: expect.stringContaining(
+        "more than narrow (sent by the machine that delegated it) (Servers: docs · T3 tools: all)",
+      ),
+    });
+  });
+
+  it("does not guess for a thread or parent not loaded here, or a pick that cannot apply", () => {
+    expect(threadPickEffect(settings, "elsewhere", "all", shells)).toEqual({
+      text: "With this pick the thread gets Servers: all · T3 tools: all. This thread is not loaded here, so whether that is more than its parent has cannot be told; a pick is never cut down to the parent's.",
+      widerThanParent: false,
+    });
+    expect(threadPickEffect(settings, "child", "all", [shell("child", "gone")]).text).toMatch(
+      /cannot be told \(its parent's profile cannot be worked out here\)/,
+    );
+    const missing = threadPickEffect(settings, "child", "lean", shells);
+    expect(missing.text).toMatch(
+      /^With this pick the thread cannot start: MCP profile "lean" is not set up/,
+    );
+  });
+});
+
+describe("a blank pick from a hand edit", () => {
+  it("shows as no pick, as the resolver ignores it, and can be cleared", () => {
+    const settings = fromFile({ mcpProfiles: PROFILES, mcpThreadProfiles: { t1: "  " } });
+    const state = mcpProfileMenuState(settings, "t1", [shell("t1")], true);
+    expect(state).toMatchObject({ pick: null, blankPick: true });
+    expect(state.profile).toMatchObject({ name: "all", source: "environment" });
+    const [item] = mcpProfileMenuItems(state);
+    expect(item!.children!.filter((child) => child.checked)).toEqual([]);
+    const clear = item!.children!.at(-1)!;
+    expect(clear.disabled).toBe(false);
+    expect(clear.detail).toMatch(/^Its pick in settings.json is blank, so it is ignored\./);
+    expect(mcpProfileMenuPatch(settings.mcpThreadProfiles, "t1", "mcp-profile:clear")).toEqual({
+      mcpThreadProfiles: { t1: null },
+    });
+    // A thread with no entry at all: nothing to clear.
+    const none = mcpProfileMenuState(settings, "t2", [shell("t2")], true);
+    expect(none.blankPick).toBe(false);
+    expect(mcpProfileMenuItems(none)[0]!.children!.at(-1)!.disabled).toBe(true);
   });
 });
