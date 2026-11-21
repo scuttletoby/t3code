@@ -11,10 +11,12 @@ import {
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import { TestClock } from "effect/testing";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+import { type SlotWorld, slotGateOver, slotWorld } from "../fork/slotWorld.testkit.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
@@ -26,6 +28,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
+import * as SlotGate from "../slots/SlotGate.ts";
 import * as WaitDelivery from "./WaitDelivery.ts";
 import * as WaitService from "./WaitService.ts";
 import { WAIT_STORE_FILE } from "./WaitStore.ts";
@@ -409,4 +412,257 @@ it.effect(
         ["delivered", "delivered", "delivered", "delivered"],
       );
     }).pipe(Effect.scoped, Effect.provide(layerWaitsOn)),
+);
+
+/** Waits on and one agent slot per machine, over the real send path. */
+const layerOneSlot = (settings: object = { agentSlots: { enabled: true, maxPerMachine: 1 } }) =>
+  ThreadManagementService.layer.pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(
+        layerDatabase,
+        ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
+        EventStore.layer.pipe(Layer.provide(layerDatabase)),
+        EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
+        ProviderReplayHarness.layerWithRegistry(
+          { name: "wait-delivery-slots" },
+          ProviderAdapterRegistry.layerFromAdapters([adapter]),
+          { databaseLayer: layerDatabase, runEffectWorker: false },
+        ),
+      ),
+    ),
+    Layer.provideMerge(
+      ServerSettings.layerTest({ waitFor: { enabled: true }, ...settings } as never),
+    ),
+    Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+    Layer.provideMerge(NodeServices.layer),
+  );
+
+/** A delivery gated by the server's real slot gate over `world`. */
+const gatedDelivery = (world: SlotWorld) =>
+  Effect.gen(function* () {
+    const gate = yield* SlotGate.SlotGate.pipe(Effect.provide(slotGateOver(world, instanceId)));
+    return yield* WaitDelivery.make(Option.some(gate));
+  });
+
+const BUSY = ThreadId.make("thread:busy-elsewhere");
+
+it.effect(
+  "#711: a wake-up of an idle thread without a free slot waits, then is sent once when one frees",
+  () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread:wake-full");
+      yield* createThread(threadId);
+      const world = slotWorld([BUSY]);
+      const delivery = yield* gatedDelivery(world);
+      const message = wake(threadId, "wait:w_slotfullaa");
+      const refused = yield* delivery.deliver(message);
+      assert.deepStrictEqual(refused, {
+        type: "waitsForSlot",
+        detail: "1 agent is running on this machine, and the limit is 1",
+      });
+      // Runs again: still waiting, still nothing sent.
+      assert.deepStrictEqual(yield* delivery.deliver(message), refused);
+      assert.strictEqual(yield* copies(threadId, "wait:w_slotfullaa"), 0);
+      world.running = [];
+      assert.deepStrictEqual(yield* delivery.deliver(message), { type: "delivered" });
+      // The slot is taken by the run it starts; a retry finds the message, never sends twice.
+      world.running = [BUSY];
+      assert.deepStrictEqual(yield* delivery.deliver(message), { type: "delivered" });
+      assert.strictEqual(yield* copies(threadId, "wait:w_slotfullaa"), 1);
+    }).pipe(Effect.provide(layerOneSlot())),
+);
+
+it.effect(
+  "#711: a woken slot waiter is woken as itself: its own held slot does not refuse its wake-up",
+  () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread:wake-holder");
+      yield* createThread(threadId);
+      const world = slotWorld();
+      const gate = yield* SlotGate.SlotGate.pipe(Effect.provide(slotGateOver(world, instanceId)));
+      // Its slot wait is met (2 slots, none running) and its slot held.
+      const grants = yield* gate.grant([{ key: "w_holderaaaa", threadId }]);
+      assert.deepStrictEqual(
+        grants.map((grant) => grant.type),
+        ["granted"],
+      );
+      yield* gate.keep(["w_holderaaaa"]);
+      const delivery = yield* WaitDelivery.make(Option.some(gate));
+      // Asked as the woken thread, its own hold is left out: the wake-up is sent. Asked as no one
+      // (or another thread), its hold and its own wake-up would fill both slots: never sent.
+      assert.deepStrictEqual(yield* delivery.deliver(wake(threadId, "wait:w_holderaaaa")), {
+        type: "delivered",
+      });
+      assert.strictEqual(yield* copies(threadId, "wait:w_holderaaaa"), 1);
+    }).pipe(
+      Effect.provide(
+        layerOneSlot({ agentSlots: { enabled: true, maxPerMachine: 2, reserveSeconds: 60 } }),
+      ),
+    ),
+);
+
+it.effect("#711: a wake-up of a thread that shows a run only queues: sent when full", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:wake-busy");
+    yield* createThread(threadId);
+    yield* userSend(threadId, "working");
+    const delivery = yield* gatedDelivery(slotWorld([BUSY, threadId]));
+    assert.deepStrictEqual(yield* delivery.deliver(wake(threadId, "wait:w_slotbusyaa")), {
+      type: "delivered",
+    });
+    assert.strictEqual(yield* copies(threadId, "wait:w_slotbusyaa"), 1);
+  }).pipe(Effect.provide(layerOneSlot())),
+);
+
+it.effect("#711: slots off: a wake-up is sent as before, the count never read", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:wake-off");
+    yield* createThread(threadId);
+    const world = slotWorld([BUSY]);
+    const delivery = yield* gatedDelivery(world);
+    assert.deepStrictEqual(yield* delivery.deliver(wake(threadId, "wait:w_slotoffaaa")), {
+      type: "delivered",
+    });
+    assert.strictEqual(world.reads, 0);
+  }).pipe(Effect.provide(layerOneSlot({ agentSlots: { mode: "fixed" } }))),
+);
+
+it.effect("#711: a count that cannot be read holds the wake-up; nothing is sent", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:wake-unread");
+    yield* createThread(threadId);
+    const world = slotWorld();
+    world.fails = true;
+    const delivery = yield* gatedDelivery(world);
+    const message = wake(threadId, "wait:w_slotunread");
+    const refused = yield* delivery.deliver(message);
+    assert.strictEqual(refused.type, "waitsForSlot");
+    assert.strictEqual(yield* copies(threadId, "wait:w_slotunread"), 0);
+    world.fails = false;
+    assert.deepStrictEqual(yield* delivery.deliver(message), { type: "delivered" });
+    assert.strictEqual(yield* copies(threadId, "wait:w_slotunread"), 1);
+  }).pipe(Effect.provide(layerOneSlot())),
+);
+
+it.effect(
+  "#711: a wake-up waiting for a slot survives a restart and is sent once; a missing store is empty",
+  () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-14T12:00:00.000Z"));
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "wait-slot-" });
+      const filePath = path.join(root, WAIT_STORE_FILE);
+      // Judged, its message id not written yet; and one stopped after the id was written.
+      const fresh = ThreadId.make("thread:wake-restart-fresh");
+      const named = ThreadId.make("thread:wake-restart-named");
+      yield* createThread(fresh);
+      yield* createThread(named);
+      const wait = (id: string, threadId: ThreadId, extra: Record<string, unknown>) => ({
+        id,
+        threadId,
+        projectId: PROJECT,
+        key: "0123456789abcdef",
+        createdAt: "2026-11-14T11:00:00.000Z",
+        deadlineAt: "2026-11-14T11:10:00.000Z",
+        attempt: 0,
+        kind: "file",
+        spec: { path: "/nowhere/ready", until: "exists" },
+        result: { outcome: "exists", detail: "Exists.", at: "2026-11-14T11:05:00.000Z" },
+        state: "delivering",
+        ...extra,
+      });
+      yield* fs.writeFileString(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          waits: [
+            wait("w_slotfresha", fresh, {}),
+            wait("w_slotnameda", named, { messageId: "wait:w_slotnameda" }),
+          ],
+        }),
+      );
+      const states = Effect.gen(function* () {
+        const stored = JSON.parse(yield* fs.readFileString(filePath)).waits as ReadonlyArray<{
+          readonly state: string;
+          readonly messageId?: string;
+        }>;
+        return stored.map((record) => `${record.state}:${record.messageId ?? "-"}`);
+      });
+      const sentCopies = Effect.all([
+        copies(fresh, "wait:w_slotfresha"),
+        copies(named, "wait:w_slotnameda"),
+      ]);
+
+      // Full: nothing is sent; past its deadline it still waits (never marked late).
+      const world = slotWorld([BUSY]);
+      const first = yield* WaitService.make({ filePath, delivery: yield* gatedDelivery(world) });
+      yield* first.runDue();
+      yield* TestClock.adjust(WaitService.WAKE_SLOT_RETRY_MS);
+      yield* first.runDue();
+      assert.deepStrictEqual(yield* sentCopies, [0, 0]);
+      // Stored with its message id, so a restart sends that same message.
+      assert.deepStrictEqual(yield* states, [
+        "delivering:wait:w_slotfresha",
+        "delivering:wait:w_slotnameda",
+      ]);
+
+      // A restart, still full: asked again at once, still waits.
+      const second = yield* WaitService.make({ filePath, delivery: yield* gatedDelivery(world) });
+      yield* second.runDue();
+      assert.deepStrictEqual(yield* sentCopies, [0, 0]);
+
+      // The slot frees: one thread is woken, in it; the other waits for the next slot.
+      world.running = [];
+      const third = yield* WaitService.make({ filePath, delivery: yield* gatedDelivery(world) });
+      yield* third.runDue();
+      assert.deepStrictEqual((yield* sentCopies).toSorted(), [0, 1]);
+      // That run never shows within the start grace: the slot frees for the other, once.
+      yield* TestClock.adjust("31 seconds");
+      yield* third.runDue();
+      // Runs again after a restart: nothing is sent twice.
+      const restarted = yield* WaitService.make({
+        filePath,
+        delivery: yield* gatedDelivery(world),
+      });
+      yield* restarted.runDue();
+      assert.deepStrictEqual(yield* sentCopies, [1, 1]);
+      assert.deepStrictEqual(yield* states, [
+        "delivered:wait:w_slotfresha",
+        "delivered:wait:w_slotnameda",
+      ]);
+
+      // A store that is missing, or holds no waits: nothing to send, nothing breaks.
+      const missing = path.join(root, "missing", WAIT_STORE_FILE);
+      const none = yield* WaitService.make({
+        filePath: missing,
+        delivery: yield* gatedDelivery(world),
+      });
+      yield* none.runDue();
+      const emptyPath = path.join(root, "empty.json");
+      yield* fs.writeFileString(emptyPath, JSON.stringify({ version: 1, waits: [] }));
+      const empty = yield* WaitService.make({
+        filePath: emptyPath,
+        delivery: yield* gatedDelivery(world),
+      });
+      yield* empty.runDue();
+      assert.deepStrictEqual(yield* sentCopies, [1, 1]);
+    }).pipe(Effect.scoped, Effect.provide(layerOneSlot())),
+);
+
+it.effect("#711: the server's wait worker sends wake-ups through the server's one slot gate", () =>
+  Effect.gen(function* () {
+    // Built only in the running server (its services are many): its source says what it uses.
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const worker = yield* fs.readFileString(
+      yield* path.fromFileUrl(new URL("./WaitWorker.ts", import.meta.url)),
+    );
+    assert.include(
+      worker,
+      "delivery: yield* WaitDelivery.make(Option.some(yield* SlotGate.SlotGate)),",
+    );
+    assert.include(worker, "slots: yield* SlotGate.SlotGate,");
+    assert.strictEqual(worker.split("WaitDelivery.make(").length, 2);
+  }).pipe(Effect.provide(NodeServices.layer)),
 );

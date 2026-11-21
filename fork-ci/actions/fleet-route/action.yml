@@ -49,7 +49,9 @@ outputs:
       starts (the job's runs-on adds -a<attempt> to its label); {} when re-runs take "fallback".
     value: ${{ steps.route.outputs.rerun }}
   watch:
-    description: true when a job went to a dispatcher or static pool (a job that bounds its wait can then start).
+    description: >-
+      true when at least one job went to a dispatcher or static pool, else false. Nothing starts by itself on it: a
+      project that runs its own job to watch its fleet jobs can start that job only when this is true.
     value: ${{ steps.route.outputs.watch }}
 runs:
   using: composite

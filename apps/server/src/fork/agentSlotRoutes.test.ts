@@ -621,8 +621,34 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
           assert.equal(row.run_count, 1);
           assert.equal(row.last_run_error, null);
         }),
-      { slots: slotWorld([BUSY]), bound: { instanceId: INSTANCE, running: true } },
+      { slots: slotWorld([BUSY, BOUND]), bound: { instanceId: INSTANCE, running: true } },
     ),
+  );
+
+  it.effect(
+    "a bound task whose thread's run ends just after the check holds the slot it starts (#711)",
+    () => {
+      const slots = slotWorld([BOUND]);
+      return withService(
+        ({ service, poll, started }) =>
+          Effect.gen(function* () {
+            yield* dueTask(service, { threadId: BOUND });
+            yield* poll;
+            assert.deepEqual(started, [`send:${BOUND}`]);
+            // The run ended before the prompt landed: the prompt starts the next run, in the slot.
+            slots.running = [];
+            const { task } = yield* service.upsert(yield* taskInput());
+            const refused = yield* service.runNow({ id: task.id }).pipe(Effect.flip);
+            assert.include(refused.message, "no agent slot");
+            assert.deepEqual(launches(started), []);
+            // That run never showed within the start grace: the slot frees, once.
+            yield* TestClock.adjust("30 seconds");
+            yield* service.runNow({ id: task.id });
+            assert.equal(launches(started).length, 1);
+          }),
+        { slots, bound: { instanceId: INSTANCE, running: true } },
+      );
+    },
   );
 
   it.effect(

@@ -1,0 +1,73 @@
+# An example of the hand-off pair (README.md): a build job that runs anyway hands a file to a light check job, which
+# then needs no build runner. Fill in the CAPITALS and the pins; the job ids, names and commands are the project's.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The project's own runs-on for this job, unchanged (BUILD RUNNER LABELS). A self-hosted runner only for a push or
+    # a pull request whose head is this repository; a fork's pull request may run another repository's code and goes
+    # GitHub-hosted (fleet-route's rule, ../fleet-route/README.md). With fleet-route, keep its expression here.
+    runs-on: >-
+      ${{ (github.event_name == 'push'
+           || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+          && fromJSON('["self-hosted","build"]') || 'ubuntu-latest' }}
+    outputs:
+      # 'true' only when the hand-off was uploaded. Empty when this job failed, was cut off or skipped the step.
+      handoff: ${{ steps.handoff.outputs.ok }}
+    steps:
+      - uses: scuttletoby/t3code/fork-ci/actions/git-clean@<release sha> # ci/vN
+      - uses: actions/checkout@<sha> # pin by full SHA
+      - run: ./BUILD-AND-WRITE-THE-FILE out/handoff.txt
+      # continue-on-error: a hand-off that could not be made never fails the build.
+      - id: handoff
+        continue-on-error: true
+        uses: scuttletoby/t3code/fork-ci/actions/handoff-put@<release sha> # ci/vN
+        with:
+          name: HANDOFF-NAME
+          path: out/handoff.txt
+
+  # The required check. Its job id and name stay the same on both runners (the runner is not in the name).
+  check:
+    needs: build
+    # Runs when build failed or was cut off too: GitHub counts a skipped required job as passing.
+    if: ${{ !cancelled() }}
+    # The light runner only on 'true'. Anything else (empty included) is this job's old runs-on, unchanged, which
+    # makes the file itself: the same fork guard as build's, so a fork's pull request never reaches a self-hosted
+    # runner through the fallback (there the old rule was GitHub-hosted, which builds the file as before).
+    runs-on: >-
+      ${{ needs.build.outputs.handoff == 'true' && 'ubuntu-latest'
+          || (github.event_name == 'push'
+              || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+             && fromJSON('["self-hosted","build"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: scuttletoby/t3code/fork-ci/actions/git-clean@<release sha> # ci/vN
+      - uses: actions/checkout@<sha> # pin by full SHA
+      - id: handoff
+        if: needs.build.outputs.handoff == 'true'
+        uses: scuttletoby/t3code/fork-ci/actions/handoff-get@<release sha> # ci/vN
+        with:
+          name: HANDOFF-NAME
+          path: out/handoff.txt
+      - name: Make the file here (no hand-off)
+        if: steps.handoff.outputs.ok != 'true'
+        env:
+          HANDED_OFF: ${{ needs.build.outputs.handoff }}
+          WHY: ${{ steps.handoff.outputs.reason }}
+        run: |
+          if [ "$HANDED_OFF" = true ]; then
+            # On the light runner, which cannot build: the producer said ok but the file is gone (expired) or was
+            # refused (not this commit's or name's). The reason says which. Re-run all jobs so the producer runs again.
+            echo "::error::no hand-off for this commit ($WHY); re-run all jobs"
+            exit 1
+          fi
+          ./BUILD-AND-WRITE-THE-FILE out/handoff.txt
+      # The project checks the payload itself (its keys and shape); the action checked only commit and format.
+      - run: ./CHECK-THE-FILE out/handoff.txt

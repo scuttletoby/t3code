@@ -14,6 +14,8 @@ import {
   ORPHANS_PER_MESSAGE,
   orphansOf,
   parentBusy,
+  legacyReminderKeys,
+  legacyReminderMessageIds,
   legacyReminderSetId,
   REMINDER_MAX_AGE_MS,
   reminderBatches,
@@ -26,7 +28,7 @@ import {
   toldOrphanKeys,
   toldReminderKeys,
 } from "./delegatedResults.ts";
-import { at, delegatedTask, NOW, PARENT } from "./delegatedResults.testkit.ts";
+import { at, delegatedTask, firstFormatReminder, NOW, PARENT } from "./delegatedResults.testkit.ts";
 
 describe("resultDelivery", () => {
   it("is null while the task runs", () => {
@@ -163,6 +165,86 @@ describe("reminder ids", () => {
     // One task told the old way: a grown set names only the new task.
     const legacyA = legacyReminderSetId(PARENT, ids("a"));
     expect(named(reminderBatches(PARENT, tasks("a", "b"), [legacyA]))).toEqual([["b"]]);
+  });
+
+  it("splits a first-format reminder into its tasks from its text (issue 695)", () => {
+    // Told {a, b} the old way; b was read since, and c ended after the upgrade.
+    const old = firstFormatReminder(PARENT, ["a", "b"]);
+    const texts = new Map([[old.messageId, old.text]]);
+    expect(legacyReminderKeys(PARENT, old.messageId, old.text)).toEqual([
+      reminderKey(NodeId.make("a")),
+      reminderKey(NodeId.make("b")),
+    ]);
+    expect(named(reminderBatches(PARENT, tasks("a", "c"), [old.commandId], texts))).toEqual([
+      ["c"],
+    ]);
+    expect(named(reminderBatches(PARENT, tasks("a", "b", "c"), [old.messageId], texts))).toEqual([
+      ["c"],
+    ]);
+    // Without its text (only the receipt is left) the set no longer matches: all are reminded.
+    expect(named(reminderBatches(PARENT, tasks("a", "c"), [old.commandId]))).toEqual([["a", "c"]]);
+    // The first wording ("never reached") reads the same.
+    const first = firstFormatReminder(PARENT, ["a"], "never");
+    expect(legacyReminderKeys(PARENT, first.messageId, first.text)).toEqual([
+      reminderKey(NodeId.make("a")),
+    ]);
+  });
+
+  it("trusts a first-format text only when it reads back exactly", () => {
+    const old = firstFormatReminder(PARENT, ["a", "b"]);
+    // Another parent's id, or a text that names another set: the digest does not match.
+    expect(legacyReminderKeys(ThreadId.make("other"), old.messageId, old.text)).toEqual([]);
+    const other = firstFormatReminder(PARENT, ["a", "c"]);
+    expect(legacyReminderKeys(PARENT, old.messageId, other.text)).toEqual([]);
+    // A title that broke its line adds a task line: the count no longer matches.
+    const injected = old.text.replace('- b "a task"', '- b "x"\n- c "y"');
+    expect(legacyReminderKeys(PARENT, old.messageId, injected)).toEqual([]);
+    // Unsorted, duplicated, or another kind of message.
+    const swapped = old.text
+      .replace("- a ", "- tmp ")
+      .replace("- b ", "- a ")
+      .replace("- tmp ", "- b ");
+    expect(legacyReminderKeys(PARENT, old.messageId, swapped)).toEqual([]);
+    expect(legacyReminderKeys(PARENT, old.messageId, old.text.replace("- b ", "- a "))).toEqual([]);
+    expect(legacyReminderKeys(PARENT, old.messageId, "hello")).toEqual([]);
+    expect(legacyReminderKeys(PARENT, old.messageId, `${old.text}\n- and 2 more`)).toEqual([]);
+  });
+
+  it("over ten tasks, takes the ten a first-format text listed; the rest are reminded once", () => {
+    const names = Array.from({ length: 12 }, (_, index) => `t-${String(index).padStart(2, "0")}`);
+    const old = firstFormatReminder(PARENT, names);
+    expect(old.text).toContain("- and 2 more");
+    const listed = names.slice(0, 10).map((name) => reminderKey(NodeId.make(name)));
+    expect(legacyReminderKeys(PARENT, old.messageId, old.text)).toEqual(listed);
+    const texts = new Map([[old.messageId, old.text]]);
+    // A new task ends: the set changed, so the exact match is gone; the two unlisted and the
+    // new one are reminded, the ten listed are not.
+    expect(named(reminderBatches(PARENT, tasks(...names, "t-12"), [old.messageId], texts))).toEqual(
+      [["t-10", "t-11", "t-12"]],
+    );
+    // A count that does not match the listed ones gives nothing.
+    expect(
+      legacyReminderKeys(PARENT, old.messageId, old.text.replace("and 2 more", "and 3 more")),
+    ).toEqual([]);
+    expect(
+      legacyReminderKeys(PARENT, old.messageId, old.text.replace(/\n- t-09 [^\n]*/, "")),
+    ).toEqual([]);
+  });
+
+  it("finds this parent's first-format ids, from messages and receipts", () => {
+    const old = firstFormatReminder(PARENT, ["a", "b"]);
+    const otherParent = firstFormatReminder(ThreadId.make("other"), ["a"]);
+    const perTask = reminderBatchIds(PARENT, ids("c"));
+    expect(
+      legacyReminderMessageIds(PARENT, [
+        old.commandId,
+        old.messageId,
+        otherParent.messageId,
+        perTask.messageId,
+        perTask.commandId,
+      ]),
+    ).toEqual([old.messageId]);
+    expect(legacyReminderMessageIds(PARENT, [])).toEqual([]);
   });
 });
 
