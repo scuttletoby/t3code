@@ -1,0 +1,62 @@
+{
+  "_doc": [
+    "Fork only: when a failed Fork tests run gets its one automatic re-run. Read by .github/scripts/fork-ci-rerun.py",
+    "(.github/workflows/fork-ci-rerun.yml every 10 minutes); the script has no fact about this repository, these are",
+    "all of them. Runbook: .github/fork-ci-rerun.md.",
+    "trust: the fleet config beside this one; its repository, trusted workflows, actors and branches, and its rule",
+    "  (fork-fleet.py run_refused), decide which runs are trusted. workflow must be one of its trusted workflows.",
+    "list_hours: how far back runs are listed (by creation; every page is read); catch_up_minutes: of those, the",
+    "  runs that ended (updated) this recently. window_hours: the re-run count read from the tracking issue.",
+    "hosted_runner_groups: GitHub-hosted runners' group; an OOM kill there is the job's own (no box of ours).",
+    "probe_end_step: the step fork-ci-pressure.py writes the note in (fork-tests.yml); only a job that completed it",
+    "  has a note of its own, and a job that never reached it lost its runner or was stopped.",
+    "limit_slack_seconds: a time-limit message counts only when the job (or the step) ran its minutes less this.",
+    "signs: GitHub's own runner messages, each pattern a whole message (re.fullmatch), only on an annotation in the",
+    "  runner's form (failure, no title, .github), and only together with the job's step record (the script's rules).",
+    "  lost: the runner went away. limit: the job or a step ran past its time limit; only with `stalled`, and only",
+    "  when its minutes are that job's or step's own timeout-minutes in `workflow` at the run's commit.",
+    "  cancelled_by: a person cancelled it; the run stays red.",
+    "stalled: the job's memory pressure note shows the machine or a box stalled: some-or-all-tasks-waiting (full) share",
+    "  of the job's time, or the 5-minute full average at its end.",
+    "memory_full: on a runner that is not GitHub-hosted, a box with a memory limit stalled (full) at least",
+    "  box_full_share_percent of the job, AND in that box OOM kills, memory.max hits or memory.high throttling.",
+    "skip_when: with this environment variable (the workflow sets it from a repository variable) at one of these",
+    "  values, a run that qualifies is only reported, once, not re-run (fleet mode: a re-run of failed jobs would wait",
+    "  for fleet runners that refuse it, .github/fork-fleet.md).",
+    "notice: the one tracking issue every re-run (and report) is a comment on; opened by `author` when none is open.",
+    "  labels: given when it is opened (each must exist in the repository)."
+  ],
+  "trust": "fork-fleet.json",
+  "workflow": "fork-tests.yml",
+  "followers": ["fork-ci-result"],
+  "list_hours": 6,
+  "catch_up_minutes": 60,
+  "window_hours": 24,
+  "skip_when": { "variable": "CI_RUNNERS", "is": ["fleet"] },
+  "hosted_runner_groups": ["GitHub Actions"],
+  "probe_end_step": "Note memory pressure at the end",
+  "limit_slack_seconds": 60,
+  "signs": {
+    "lost": [
+      "The (?:self-hosted|hosted) runner: (?P<runner>.+?) lost communication with the server\\..*",
+      "The runner has received a shutdown signal\\..*"
+    ],
+    "limit": [
+      "The job running on runner (?P<runner>.+) has exceeded the maximum execution time of (?P<minutes>[0-9]+) minutes\\.",
+      "The action '(?P<step>[^']+)' has timed out after (?P<minutes>[0-9]+) minutes\\."
+    ],
+    "cancelled_by": ["The run was canceled by @[^ ]+\\."]
+  },
+  "stalled": { "full_share_percent": 10, "full_avg300_percent": 10 },
+  "memory_full": {
+    "box_full_share_percent": 10,
+    "oom_kills": 1,
+    "max_events": 1,
+    "high_events": 1
+  },
+  "notice": {
+    "title": "Fork CI: automatic re-runs (infrastructure)",
+    "labels": [],
+    "author": "github-actions[bot]"
+  }
+}
