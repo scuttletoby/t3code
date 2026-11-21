@@ -819,11 +819,12 @@ class Desktop(Base):
         self.assertIsNone(self.files('m2'))
         self.assertEqual(os.listdir(os.path.join(self.root, '.new')), ['.lock'])
 
-    def raw(self, name, blob):
-        """FILES/POOL/NAME.tar holding BLOB (tar blocks made by hand), newer than any made before."""
+    def raw(self, name, blob, end=b'\0' * 1024):
+        """FILES/POOL/NAME.tar holding BLOB (tar blocks made by hand) and END (the end blocks), newer than any made
+        before."""
         tmp = os.path.join(self.t, 'files', POOL, f'.{name}.tmp')
         with open(tmp, 'wb') as f:
-            f.write(blob + b'\0' * 1024)
+            f.write(blob + end)
         os.chmod(tmp, 0o644)
         os.utime(tmp, (time.time() + 5,) * 2)
         os.replace(tmp, self.tar(name))
@@ -1078,6 +1079,55 @@ class Desktop(Base):
         self.assertEqual(self.run_seed(), 0)
         self.assertEqual(self.files('m2'), {'a': b'one'})
 
+    def test_a_sparse_form_a_later_tarfile_adds_is_refused_too(self):   # #258 item 3 (lens237sr5 nit 2)
+        with mock.patch.object(tarfile.TarInfo, '_proc_gnusparse_11', lambda self_, next_, pax: None, create=True):
+            later = load('fork_fleet_desk_seed_later', 'fork-fleet-desk-seed.py')
+        with self.assertRaisesRegex(later.Torn, 'sparse member'):
+            later.Info('x')._proc_gnusparse_11(tarfile.TarInfo('s'), {})
+
+    def test_a_python_that_reads_a_sparse_member_past_info_fetches_nothing(self):   # #258 item 3: tarfile still
+        self.make('m2', {'a': b'one'})                                                # calls what Info refuses in
+        self.assertEqual(seed.sparse_read(), [])
+        for k, form in (('_proc_gnusparse_00', '0.0'), ('_proc_gnusparse_01', '0.1'), ('_proc_gnusparse_10', '1.0')):
+            with self.subTest(form), mock.patch.object(seed.Info, k, getattr(tarfile.TarInfo, k)):
+                with self.assertRaisesRegex(agent.Bad, f'sparse members \\({form}\\)'):
+                    self.run_seed()
+                self.assertEqual(self.fetches(), [])
+        self.assertEqual(self.run_seed(), 0)
+        self.assertEqual(self.files('m2'), {'a': b'one'})
+
+    def test_only_a_block_of_zeros_ends_the_tar_and_only_zeros_follow(self):   # #258 item 4 (lens237sr5 nit 3)
+        bad = bytearray(tarfile.TarInfo('b').tobuf(format=tarfile.GNU_FORMAT))
+        bad[148:156] = b'0000001\0'   # a checksum that does not match
+        neg = tarfile.TarInfo('pax')
+        neg.type = tarfile.XHDTYPE
+        first = self.block(tarfile.TarInfo('a'), b'two')
+        cases = {   # before #258 each swapped in a seed holding only a (or a and b): the trailer matched
+            'a bad checksum after the first header, then end blocks': (first + bytes(bad), b'\0' * 1024),
+            'a bad header as the last block': (first + bytes(bad), b''),
+            'a bad checksum, then more members': (first + bytes(bad) + self.block(tarfile.TarInfo('c'), b'x'),
+                                                  b'\0' * 1024),
+            'a pax size below 0 after the first header': (
+                first + self.block(neg, self.pax(size=-1)) + self.block(tarfile.TarInfo('b'), b'x'), b'\0' * 1024),
+            'no end blocks (the stream ends after a member)': (first, b''),
+            'bytes after the end blocks': (first, b'\0' * 1024 + b'more'),
+            'bytes after the padding': (first, b'\0' * 30000 + b'\1'),
+        }
+        self.make('m2', {'a': b'one'})
+        self.run_seed()
+        for i, (what, (blob, end)) in enumerate(cases.items(), 1):
+            with self.subTest(what):
+                self.raw('m2', blob, end)
+                self.run_seed(now=lambda i=i: time.time() + i * 7 * 3600)
+                self.assertEqual(self.files('m2'), {'a': b'one'})
+                self.assertTrue(any('m2: keeps the old one' in x and ('bad tar header' in x or 'after the tar' in x
+                                                                     or 'below 0' in x) for x in self.said), self.said)
+                with contextlib.suppress(FileNotFoundError):   # each case tried at once, not after a wait
+                    os.unlink(os.path.join(self.root, '.torn.json'))
+        self.raw('m2', first, b'\0' * 30000)   # end blocks and any zero padding: a whole tar
+        self.run_seed(now=lambda: time.time() + 99 * 3600)
+        self.assertEqual(self.files('m2'), {'a': b'two'})
+
     def test_a_host_that_remakes_each_hour_never_meets_the_back_off(self):   # lens237cr4 + sr4: the MUST
         start, tried = int(time.time()) - 13 * 3600, []
 
@@ -1090,11 +1140,45 @@ class Desktop(Base):
                 self.make('m2', {'a': b'%d' % h}, mtime=start + h * 3600 - 60)
                 self.run_seed(now=lambda h=h: start + h * 3600)
                 said += self.said
-        self.assertEqual(tried, [0, 1, 2, 6, 7])   # a new copy skips a wait once per step; before round 5: 0..11
-        fails = [x for x in said if 'keeps' in x]
+        self.assertEqual(tried, [0, 1, 2, 5, 6])   # a new copy skips a wait once per step; before round 5: 0..11;
+        fails = [x for x in said if 'keeps' in x]   # before #258: [0, 1, 2, 6, 7] (each early try moved the step)
         self.assertEqual(len(fails), 5, said)
-        self.assertTrue(all('tried again in about' in x for x in fails), fails)
+        self.assertEqual([int(x.split('tried again in about ')[1].split(' h')[0]) for x in fails], [1, 2, 3, 8, 15])
         self.assertEqual(['at once if' in x for x in fails], [True, True, False, True, False])
+
+    def test_an_early_try_never_moves_the_next_try_later(self):   # #258 item 2 (lens237cr5 nit 2)
+        start, tried, saved, said = int(time.time()) - 12 * 3600, [], [], {}
+
+        def torn(agent_, conf, item, root, now, **kw):
+            tried.append((now() - start) / 3600)
+            with open(os.path.join(root, '.torn.json')) as f:   # saved before the fetch: what a run killed in it leaves
+                saved.append(json.load(f)['m2'])
+            raise seed.Torn('cut off')
+        with mock.patch.object(seed, 'fetch', torn):
+            for h, copy in ((0, 0), (1, 1), (1.5, 2), (2, 3), (4.5, 3), (5, 3)):   # copy: the host's, by its date
+                self.make('m2', {'a': b'x'}, mtime=start - 60 + copy)
+                self.run_seed(now=lambda h=h: start + h * 3600)
+                said[h] = self.said
+        self.assertEqual(tried, [0, 1, 1.5, 5])   # before #258: [0, 1, 1.5] (the early try moved the step to h 5.4)
+        self.assertEqual([(r['last'] - start, r['tries'], r['early']) for r in saved],
+                         [(0, 1, False), (3600, 2, False), (3600, 3, True), (5 * 3600, 4, False)])
+        self.assertTrue(any('torn 3 times' in x and 'about 3 h' in x for x in said[2]), said[2])   # before: 4 h
+
+    def test_an_old_record_whose_early_try_moved_last_still_waits(self):   # #258: a record #237 wrote
+        start, tried = int(time.time()) - 12 * 3600, []
+        self.make('m2', {'a': b'x'}, mtime=start - 60)
+        os.makedirs(self.root)
+        with open(os.path.join(self.root, '.torn.json'), 'w') as f:   # its early try at h 1.5 moved `last` there
+            json.dump({'m2': {'first': start, 'last': start + 5400, 'tries': 3, 'early': True, 'why': 'cut off',
+                              'copy': [1, 1]}}, f)
+
+        def torn(agent_, conf, item, root, now, **kw):
+            tried.append((now() - start) / 3600)
+            raise seed.Torn('cut off')
+        with mock.patch.object(seed, 'fetch', torn):
+            for h in (5, 6):
+                self.run_seed(now=lambda h=h: start + h * 3600)
+        self.assertEqual(tried, [6])   # its step runs from h 1.5 (to h 5.4), the new copy already had its early try
 
     def test_one_lost_list_does_not_reset_the_torn_record(self):   # lens237cr3
         self.make('m2', {'a': b'one'})

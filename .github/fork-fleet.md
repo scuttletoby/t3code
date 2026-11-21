@@ -906,7 +906,9 @@ the global ones of the whole tar, at most 1 MiB; sparse members are refused, so
 make a seed without `--sparse`; a hard link must name a file unpacked before
 it, and a link whose path is already there, or that cannot be made, is refused,
 never copied from its target, which tarfile would look for in the rest of the
-stream), checked against the trailer (its size
+stream); only a block of zeros ends the tar and only zeros may follow it (tarfile
+would end it quietly at a bad header after the first, and a short seed would be
+swapped in), checked against the trailer (its size
 and date must be the list's too), checked again for links that lead out of
 it, made readable by every job (a cache's 0600 files too), and swapped in by a
 rename; ssh's stderr and the list are read with a limit. A seed that fails in
@@ -919,7 +921,9 @@ link too slow for it does not spend every hour on it; a fetch that kills the
 run counts as torn; the times are approximate: the timer's 10 minute random
 delay and a 5 minute margin can make a wait up to an hour longer); another
 copy on the host is tried at once, but only once per wait (the try counts, so a
-host that remakes the seed every hour still meets the back-off). One torn on
+host that remakes the seed every hour still meets the back-off; it never moves
+the end of the wait, which runs from the last try that waited). So a fix made
+right after another new copy waits for the end of that wait, up to 24 hours. One torn on
 every try for more than a day makes the run exit 1, so `desk-install check` shows FAIL until it is
 fetched (`/var/lib/fork-fleet/seeds/.torn.json` names it and why); so does a
 run that cannot write that file (a full disk). A host that gives no list (down,
@@ -927,7 +931,9 @@ an older kit, a half-done install) means no new seeds: each one here stays until
 its age drops it, the torn record is left as it is, and the run exits 0 (a host
 down for good shows in `desk-install check` only as seeds that age out). A
 desktop whose own fleet config is broken or lacks its pool, or whose Python's
-tarfile lacks the private parts the limits above rely on, fetches nothing and
+tarfile lacks the private parts the limits above rely on (or reads a sparse
+member past the refusal: checked with a small sparse tar of each form at every
+run), fetches nothing and
 exits 2 (`desk-install check` shows the seed service's last result), but still
 drops each seed past the `max_age_hours` it was fetched with. Jobs see
 `/var/lib/fork-fleet/seeds/NAME` read-only (the launcher's `ALLOW_PATHS`;
