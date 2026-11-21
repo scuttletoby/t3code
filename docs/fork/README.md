@@ -328,7 +328,8 @@ row's `efforts`; `useFor` is a short note shown to agents when they pick.
 The server checks each agent pick (#731; agents only, #125): `delegate_task`, `create_threads`,
 `t3_thread_launch` and `t3_thread_configure` from an agent's thread, here and before a call is sent
 to a linked machine (the machine there sees no calling thread, so it does not check it). An agent is
-a caller whose session is bound to a thread; the owner's client has none. A pick is inside when it
+a caller whose session is bound to a thread; the owner's client has none, and anything that reaches
+the server without such a session counts as a person, so the model guard hook is the backstop. A pick is inside when it
 names a model by its full id (#128; an alias such as `opus` is not read as its model, and the
 refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
 `efforts`, names one of them (`ultracode` counts as its own effort; a row without `efforts` allows
@@ -342,7 +343,9 @@ logged as "model policy pick" with its model as asked, so one model's picks can 
 target the usage pacer moves a task to is checked too and logged as "model policy paced pick", the
 model it ran on. A retry of an accepted call is not checked again (it starts nothing new), except a
 `t3_thread_launch` retry that names a model: that model wins over the first one, so it is checked
-like a new launch. Not checked by the server: a project's default model (`t3_project_create`,
+like a new launch. A call sent to a linked machine is checked each time it is sent, a retry too: after
+a policy change a retry is refused even when the first call already started its task there (that
+task runs on, with no record here). Not checked by the server: a project's default model (`t3_project_create`,
 `t3_project_update`) and `schedule_task`'s model, which a later run uses; the model guard hook
 (`fork-kit/model-guard`) refuses an agent's such call in `enforce`. The owner's own picks (in the app, or `t3_thread_launch` from the owner's client)
 are never refused; Settings marks the server's model picks outside the rows ("outside policy").
