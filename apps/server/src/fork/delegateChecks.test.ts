@@ -103,8 +103,9 @@ describe("fork delegation checks: upstream seat calls", () => {
 
   it("the fork lines in the upstream file stay pinned", () => {
     // A new fork line here goes through fork/delegateChecks.ts. If one truly must sit in the
-    // upstream file, raise this number and say why in the PR.
-    assert.strictEqual(count(source, "// Fork:"), 6);
+    // upstream file, raise this number and say why in the PR. 7: the remote read's spread line
+    // (fork/remoteTaskPrompts.ts) carries its marker on the same line, so no line was added.
+    assert.strictEqual(count(source, "// Fork:"), 7);
   });
 });
 

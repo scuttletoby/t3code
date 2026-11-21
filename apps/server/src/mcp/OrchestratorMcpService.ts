@@ -2189,7 +2189,7 @@ const make = Effect.gen(function* () {
       // Its questions and approvals are answered in the environment it runs in.
       hasPendingQuestion: false,
       pendingApproval: null,
-      ...(yield* delegateChecks.remotePrompts(task, status)),
+      ...(yield* delegateChecks.remotePrompts(task, status)), // Fork: reported here (fork/remoteTaskPrompts.ts)
       waitTimedOut,
     } satisfies OrchestratorMcpDelegateTaskResult;
   });

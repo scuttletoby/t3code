@@ -1,7 +1,8 @@
 /**
  * Fork: wakes a parent here once per prompt its task's thread on a linked machine waits on, as
  * upstream's DelegatedTaskQuestionReactor does for a local question: a blocking wait is ended (its
- * wake set to `always`), else one queued message, cancelled while queued once answered there.
+ * wake set to `always`, for a question or approval only, and only while its run lasts), else one
+ * queued message, cancelled while queued once answered there.
  */
 import {
   CommandId,
@@ -44,6 +45,8 @@ const WAIT_COMMAND = "server:remote-task-prompt-wait:";
 
 /** One prompt there: its kind and id, as the machine there names it. */
 interface Prompt {
+  /** A secret cannot end upstream's blocking wait (`endsTaskWait` sees questions and approvals). */
+  readonly kind: "question" | "approval" | "secret";
   readonly key: string;
   readonly text: (task: OrchestrationV2Subagent) => string;
   readonly summary: string;
@@ -54,6 +57,7 @@ const SETTLED_TASK = new Set(["completed", "failed", "cancelled", "interrupted"]
 
 const promptsIn = (prompts: RemoteTaskPrompts.TaskPrompts): ReadonlyArray<Prompt> => [
   ...prompts.questions.map((question): Prompt => ({
+    kind: "question",
     key: `question:${question.requestId}`,
     summary: "has a question",
     text: (task) =>
@@ -63,6 +67,7 @@ const promptsIn = (prompts: RemoteTaskPrompts.TaskPrompts): ReadonlyArray<Prompt
     ? []
     : [
         {
+          kind: "approval",
           key: `approval:${prompts.approval.requestId}`,
           summary: "waits for an approval",
           text: (task: OrchestrationV2Subagent) =>
@@ -70,10 +75,11 @@ const promptsIn = (prompts: RemoteTaskPrompts.TaskPrompts): ReadonlyArray<Prompt
         } satisfies Prompt,
       ]),
   ...prompts.secrets.map((secret): Prompt => ({
+    kind: "secret",
     key: `secret:${secret.itemId}`,
     summary: "asks for a secret",
     text: (task) =>
-      `Delegated task ${task.id} on ${task.remoteChild!.label} asks for the secret "${secret.label}"${secret.reason === "" ? "" : ` (${secret.reason})`} and waits until the user gives it on ${task.remoteChild!.label}. Tell the user if they need to act there.`,
+      `Delegated task ${task.id} on ${task.remoteChild!.label} asks for a secret (${RemoteTaskPrompts.secretWords(secret)}) and waits until the user gives it on ${task.remoteChild!.label}. Tell the user if they need to act there.`,
   })),
 ];
 
@@ -94,7 +100,7 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
   const threads = yield* ThreadManagement.ThreadManagementService;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
   const gate = yield* Effect.serviceOption(SlotGate.SlotGate);
-  /** Per open task (parent:task): its machine, and the prompts woken or delivered by a wait. */
+  /** Per open task (parent:task): its machine, and the prompts a message was sent for. */
   const handled = new Map<
     string,
     { readonly parentThreadId: ThreadId; readonly environmentId: EnvironmentId; keys: Set<string> }
@@ -125,12 +131,19 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
     }
   });
 
-  /** A blocking wait on this task is live: it reports the prompt itself once it reads the task. */
-  const waitIsLive = (task: OrchestrationV2Subagent, runs: ReadonlyArray<OrchestrationV2Run>) =>
-    task.completionWake === "settled_only" &&
+  /** The parent's run a blocking wait on this task runs in is still going. */
+  const runIsActive = (task: OrchestrationV2Subagent, runs: ReadonlyArray<OrchestrationV2Run>) =>
     runs.some((run) => run.id === task.runId && ACTIVE_RUN.has(run.status));
 
-  /** True when the prompt is handled (a wait or a message has it); false: try again next poll. */
+  /** A blocking wait on this task is live: it reports the prompt itself once it reads the task. */
+  const waitIsLive = (task: OrchestrationV2Subagent, runs: ReadonlyArray<OrchestrationV2Run>) =>
+    task.completionWake === "settled_only" && runIsActive(task, runs);
+
+  /**
+   * `sent`: a message has it, for good. `wait`: a blocking wait has it, only while the parent's run
+   * it runs in is active (its read may be unknown, or the server may stop before it reads), so it
+   * is asked again next poll. `retry`: no slot now, next poll.
+   */
   const wake = Effect.fn("RemoteTaskPromptWakes.wake")(function* (
     task: OrchestrationV2Subagent,
     parent: { readonly instanceId: OrchestrationV2Subagent["providerInstanceId"] },
@@ -140,7 +153,11 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
     const remote = task.remoteChild!;
     const id = idOf(task.threadId, remote.environmentId, prompt.key);
     const waitCommand = CommandId.make(`${WAIT_COMMAND}${id}`);
-    if (waitIsLive(task, runs)) {
+    const wakeCommand = CommandId.make(`${WAKE_COMMAND}${id}`);
+    // A secret always goes as a message: a wait cannot end on it and would hold it to its timeout.
+    if (prompt.kind !== "secret" && waitIsLive(task, runs)) {
+      // Fork note: the wait's own exit then sets the same policy again, which the engine refuses
+      // as unchanged; upstream logs that as `wake-policy-failed`. Harmless noise.
       const ended = yield* threads
         .dispatch({
           type: "delegated_task.wake-policy",
@@ -154,11 +171,17 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
           // The wait ended in between and set it itself: the prompt goes as a message.
           Effect.orElseSucceed(() => false),
         );
-      if (ended) return true;
+      if (ended) return "wait" as const;
     }
-    // A wait this prompt ended already delivered it (also before a restart).
-    const byWait = yield* receipts.getByCommandId(waitCommand);
-    if (Option.isSome(byWait) && byWait.value.status !== "rejected") return true;
+    // A wait this prompt ended (also before a restart) has it while its run is active; once that
+    // run ended with the prompt still open there, the prompt goes as a message after all.
+    if (runIsActive(task, runs)) {
+      const byWait = yield* receipts.getByCommandId(waitCommand);
+      if (Option.isSome(byWait) && byWait.value.status !== "rejected") return "wait" as const;
+    }
+    // Sent before a restart: no slot is taken for a send the engine would drop.
+    const sent = yield* receipts.getByCommandId(wakeCommand);
+    if (Option.isSome(sent) && sent.value.status !== "rejected") return "sent" as const;
     const slot = yield* admitSend(gate, {
       callerThreadId: task.threadId,
       threadId: task.threadId,
@@ -166,11 +189,11 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
       keepsHeld: true,
       place: { key: placeOf(id) },
     });
-    if (slot.type === "refuse") return false;
+    if (slot.type === "refuse") return "retry" as const;
     const label = reportLabel(task.title?.trim() || task.prompt);
     yield* threads.dispatch({
       type: "message.dispatch",
-      commandId: CommandId.make(`${WAKE_COMMAND}${id}`),
+      commandId: wakeCommand,
       threadId: task.threadId,
       messageId: MessageId.make(`${WAKE_MESSAGE}${id}`),
       text: prompt.text(task),
@@ -184,7 +207,7 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
       createdBy: "agent",
       creationSource: "server",
     });
-    return true;
+    return "sent" as const;
   });
 
   /** One open task: wakes its new prompts, cancels the wakes of answered ones. */
@@ -192,6 +215,8 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
     parentThreadId: ThreadId,
     taskId: NodeId,
     open: Set<string>,
+    /** Machines that did not answer this round: not asked again until the next one. */
+    down: Set<EnvironmentId>,
   ) {
     const parent = yield* threads.getThreadRecords(parentThreadId, ["subagents", "runs"]);
     if (parent.thread.archivedAt !== null || parent.thread.deletedAt !== null) return;
@@ -209,7 +234,11 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
     }
     const taskKey = `${parentThreadId}:${taskId}`;
     open.add(taskKey);
+    if (down.has(task.remoteChild.environmentId)) return;
     const result = yield* read(task.remoteChild);
+    if (result.type === "unknown" && result.reason === "unreachable") {
+      down.add(task.remoteChild.environmentId);
+    }
     // Not known: nothing is woken or cleared on a guess.
     if (result.type === "unknown" || !result.prompts.found) return;
     const prompts = promptsIn(result.prompts);
@@ -225,7 +254,7 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
     yield* cancelQueued(parentThreadId, entry.environmentId, answered);
     for (const prompt of prompts) {
       if (entry.keys.has(prompt.key)) continue;
-      if (yield* wake(task, parent.thread.modelSelection, parent.runs, prompt)) {
+      if ((yield* wake(task, parent.thread.modelSelection, parent.runs, prompt)) === "sent") {
         entry.keys.add(prompt.key);
       }
     }
@@ -233,11 +262,12 @@ export const make = Effect.fn("RemoteTaskPromptWakes.make")(function* (
 
   const tick = Effect.gen(function* () {
     const open = new Set<string>();
+    const down = new Set<EnvironmentId>();
     const tasks = yield* projections.getOpenRemoteDelegatedTasks;
     yield* Effect.forEach(
       tasks,
       ({ parentThreadId, taskId }) =>
-        checkTask(parentThreadId, taskId, open).pipe(
+        checkTask(parentThreadId, taskId, open, down).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("a remote task's prompts could not be checked", {
               threadId: parentThreadId,
