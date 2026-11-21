@@ -10,7 +10,7 @@ temporary folder in the command line, scopes by those processes.
 """
 # How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
 # fork-ci: run with HEAVY_REAL_TESTS=1
-import json, os, re, shutil, signal, subprocess, sys, tempfile, time, unittest
+import json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAKE_TOOLS = os.path.join(KIT, 'tests', 'fake_tools.py')
@@ -59,6 +59,20 @@ def comm(pid):
             return f.read().strip()
     except OSError:
         return None
+
+
+def read_line(p, timeout=60.0):
+    """The next line of p's stdout, or a failure after the timeout (p is killed then): a heavy that hangs before
+    its command prints fails the test instead of hanging it. Every read of heavy's output goes through here or
+    through a call with a timeout (communicate, run)."""
+    got = []
+    reader = threading.Thread(target=lambda: got.append(p.stdout.readline()), daemon=True)
+    reader.start()
+    reader.join(timeout)
+    if reader.is_alive():
+        p.kill()
+        raise AssertionError(f'no line from pid {p.pid} in {timeout:g} s')
+    return got[0]
 
 
 def wait_for(cond, timeout=15.0, what='condition'):
@@ -321,6 +335,45 @@ class Heavy(unittest.TestCase):
         self.assertEqual(len(self.docker_calls('ps')), 1)
         self.assertFalse(os.path.exists(self.mark(r.stdout.strip())), 'the note outlived the run')
 
+    def test_a_note_that_cannot_reach_heavy_in_run_user_goes_to_the_state_folder(self):
+        # docker-label in a sandbox with its own /run/user (here: HEAVY_MARKS without heavy's /run/user folder, as
+        # docker-label sees it there): its note goes to ~/.local/state/heavy/labelled, which heavy reads too, so heavy
+        # still asks Docker at the end and removes the container (#744 item 8)
+        env = dict(self.env, HOME=self.dir)
+        state = os.path.join(self.dir, '.local', 'state', 'heavy', 'labelled')
+        label = f'"$("{HEAVY}" docker-label)"'
+        r = self.heavy('sh', '-c', f'case "$HEAVY_MARKS" in *,*) ;; *) exit 8;; esac; '
+                                   f'export HEAVY_MARKS="${{HEAVY_MARKS#*,}}"; '
+                                   f'"$HEAVY_DOCKER" run -d --label {label} --name test-db mariadb >/dev/null '
+                                   f'|| exit 9; '
+                                   f'test -e "{state}/$HEAVY_SCOPE" || exit 10; '
+                                   f'test ! -e "{self.mark("$HEAVY_SCOPE")}" || exit 11', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.heavy_lines(r.stderr), ['heavy: removed 1 leftover container (test-db)'])
+        self.assertEqual(self.containers(), {})
+        self.assertEqual(os.listdir(state), [], 'the note outlived the run')
+
+    def test_heavy_ends_only_after_its_guard(self):
+        # done() waits for the guard to end: a script that waits for heavy (without reading its stderr) never finds
+        # heavy's guard still running. A stopped guard holds heavy until it goes on
+        err = open(os.path.join(self.dir, 'stderr'), 'w')
+        self.addCleanup(err.close)
+        go = os.path.join(self.dir, 'go')
+        p = subprocess.Popen([HEAVY, 'sh', '-c', f'echo up; while [ ! -e {go} ]; do sleep 0.05; done'],
+                             stdout=subprocess.PIPE, stderr=err, text=True, env=self.env, cwd=self.dir,
+                             start_new_session=True)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        self.assertEqual(read_line(p), 'up\n')
+        [guard] = self.guards()
+        os.kill(guard, signal.SIGSTOP)
+        self.addCleanup(lambda: guard in self.guards() and os.kill(guard, signal.SIGCONT))
+        open(go, 'w').close()
+        with self.assertRaises(subprocess.TimeoutExpired, msg='heavy ended while its guard still ran'):
+            p.wait(timeout=2)
+        os.kill(guard, signal.SIGCONT)
+        self.assertEqual(p.wait(timeout=60), 0)
+        self.assertEqual(self.guards(), [])
+
     def test_a_container_and_a_double_forked_child_go_when_heavy_is_killed_with_9(self):
         # kill -9 leaves heavy no chance to clean up: its guard does it (the command itself dies with heavy)
         p = self.start('sh', '-c', f'echo "$HEAVY_SCOPE"; {self.db_up()}; {self.double_fork()}; {self.sleeper} & '
@@ -343,7 +396,7 @@ class Heavy(unittest.TestCase):
         # how timeout(1) -s KILL, a harness or a shell job kill ends a run: -9 to heavy's process group (heavy, its
         # signal probe and the command). The guard is in a session of its own, so it lives on and cleans up
         p = self.start('sh', '-c', f'{self.db_up()}; {self.double_fork()}; echo up; exec {self.sleeper}')
-        self.assertEqual(p.stdout.readline(), 'up\n')
+        self.assertEqual(read_line(p), 'up\n')
         wait_for(lambda: [comm(pid) for pid in self.ours()].count('sleeper') == 2, what='the command and its daemon')
         os.killpg(p.pid, signal.SIGKILL)
         _, err = p.communicate(timeout=60)       # stderr ends when the guard is done with it
@@ -356,7 +409,7 @@ class Heavy(unittest.TestCase):
         # pkill -9 -P / npm tree-kill: KILL to heavy and every process below it by parent pid. The guard is nobody's
         # child of heavy's (a double fork), so the walk never finds it, and it cleans up
         p = self.start('sh', '-c', f'{self.db_up()}; {self.double_fork()}; echo up; exec {self.sleeper}')
-        self.assertEqual(p.stdout.readline(), 'up\n')
+        self.assertEqual(read_line(p), 'up\n')
         wait_for(lambda: [comm(pid) for pid in self.ours()].count('sleeper') == 2, what='the command and its daemon')
         tree, todo = [], [p.pid]
         while todo:
@@ -379,7 +432,7 @@ class Heavy(unittest.TestCase):
         # kill -9 of heavy afterwards is still cleaned up (QUIT is left out here: without the guard ignoring it, it
         # would dump a core)
         p = self.start('sh', '-c', f'{self.double_fork()}; echo up; exec {self.sleeper}')
-        self.assertEqual(p.stdout.readline(), 'up\n')
+        self.assertEqual(read_line(p), 'up\n')
         [guard] = self.guards()
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2):
             os.kill(guard, sig)
@@ -392,7 +445,7 @@ class Heavy(unittest.TestCase):
         # HEAVY_KEEP=1: the scope outlives heavy on purpose, so it has no guard, and kill -9 of heavy leaves the daemon
         env = dict(self.env, HEAVY_KEEP='1')
         p = self.start('sh', '-c', f'{self.double_fork()}; echo up; exec {self.sleeper}', env=env)
-        self.assertEqual(p.stdout.readline(), 'up\n')
+        self.assertEqual(read_line(p), 'up\n')
         self.assertEqual(self.guards(), [])
         p.kill()
         _, err = p.communicate(timeout=60)       # a guard would hold stderr till its clean-up was done
@@ -408,7 +461,7 @@ class Heavy(unittest.TestCase):
         # the same test again (the same container name, as a test suite has): the first run left nothing behind
         cmd = f'{self.db_up()}; echo up; exec {self.sleeper}'
         p = self.start('sh', '-c', cmd)
-        self.assertEqual(p.stdout.readline(), 'up\n')
+        self.assertEqual(read_line(p), 'up\n')
         p.kill()
         p.communicate(timeout=60)
         wait_for(lambda: not self.ours(), what='the first run to be cleaned up')
@@ -501,6 +554,8 @@ class Heavy(unittest.TestCase):
         got = dict(item.split('=', 1) for item in r.stdout.split('\0') if item)
         self.assertRegex(got.pop('HEAVY_SCOPE', ''), r'^heavy-env-[0-9a-f]{8}\.scope$')
         got.pop('INVOCATION_ID', None)      # systemd-run --scope sets it (the old wrapper too)
+        # the folders heavy reads the notes of `heavy docker-label` from (device:inode; the old wrapper has none)
+        self.assertRegex(got.pop('HEAVY_MARKS', '1:1'), r'^\d+:\d+(,\d+:\d+)?$')
         self.assertEqual(got, env)
 
     def test_scope_name_is_in_the_environment_nested_too(self):
@@ -551,7 +606,7 @@ class Heavy(unittest.TestCase):
 
     def test_term_to_heavy_removes_the_commands_container(self):
         p = self.start('sh', '-c', f'{self.db_up()}; echo up; exec {self.sleeper}')
-        self.assertEqual(p.stdout.readline(), 'up\n')
+        self.assertEqual(read_line(p), 'up\n')
         p.send_signal(signal.SIGTERM)
         _, err = p.communicate(timeout=30)
         self.assertEqual(p.returncode, -signal.SIGTERM)
@@ -567,7 +622,7 @@ class Heavy(unittest.TestCase):
                     json.dump({'containers': []}, f)
                 p = self.start('sh', '-c', f'{self.db_up()}; echo up; exec {self.stubborn}',
                                env=dict(self.env, HEAVY_GRACE=grace))
-                self.assertEqual(p.stdout.readline(), 'up\n')
+                self.assertEqual(read_line(p), 'up\n')
                 for sig in sigs:
                     p.send_signal(sig)
                     time.sleep(0.5)
@@ -615,7 +670,7 @@ class Heavy(unittest.TestCase):
         return path
 
     def wait_ready(self, p):
-        self.assertEqual(p.stdout.readline(), 'ready\n')
+        self.assertEqual(read_line(p), 'ready\n')
 
     def test_default_grace_lets_a_command_that_handles_int_finish(self):
         # Ctrl-C to a command that handles it (a REPL, a server saving its world): 30 s by default before heavy stops it
@@ -919,7 +974,7 @@ class Parts(unittest.TestCase):
 
     def child(self):
         c = subprocess.Popen(['sleep', '60'])
-        self.addCleanup(lambda: (c.kill(), c.wait()))
+        self.addCleanup(lambda: (c.kill(), c.wait(timeout=60)))
         return c
 
     def test_a_stop_by_hand_never_signals_a_pid_that_is_no_longer_in_the_scope(self):
@@ -945,6 +1000,22 @@ class Parts(unittest.TestCase):
         self.mod.signal_in([c.pid], cg, signal.SIGTERM)
         self.assertEqual(c.wait(timeout=10), -signal.SIGTERM)
         self.mod.signal_in([c.pid], cg, signal.SIGTERM)      # gone: nothing, no error
+
+    def test_without_pidfds_nothing_is_signalled_by_pid(self):
+        # Linux before 5.3 or Python before 3.9: between the cgroup check and kill(pid) the pid could go to another
+        # process, so no signal goes by pid at all (the KILL goes to cgroup.kill; the rest is reported as left)
+        import errno
+        from unittest import mock
+        c = self.child()
+        with open(f'/proc/{c.pid}/cgroup') as f:
+            cg = next(line[3:].strip() for line in f if line.startswith('0::'))
+        for how in ('missing', 'ENOSYS'):
+            with self.subTest(pidfd_open=how):
+                with mock.patch.object(os, 'pidfd_open', **({'new': None} if how == 'missing' else
+                                                            {'side_effect': OSError(errno.ENOSYS, 'no pidfds')})):
+                    with mock.patch.object(os, 'kill', side_effect=AssertionError('signalled by pid')):
+                        self.mod.signal_in([c.pid], cg, signal.SIGTERM)
+                self.assertIsNone(c.poll())
 
     def test_the_command_never_starts_when_heavy_died_before_it_could(self):
         # child_setup runs in the forked command before exec: its parent must still be the heavy that forked it.
@@ -1005,26 +1076,91 @@ class Parts(unittest.TestCase):
         root = os.path.join(self.dir, 'run')
         base = os.path.join(root, str(os.getuid()))
         os.makedirs(base, 0o700)
+        state_root = os.path.join(self.dir, 'home', '.local', 'state')           # missing: heavy makes it
         self.mod.RUNTIME_ROOT = sweep.RUNTIME_ROOT = root
+        self.mod.STATE_ROOT = sweep.STATE_ROOT = state_root
         unit = 'heavy-sh-0a1b2c3d.scope'
-        marks = self.mod.marks_dir()                           # made by heavy before the command runs
-        self.assertEqual(marks, os.path.join(base, 'heavy', 'labelled'))
+        marks = self.mod.marks_dirs()                          # made by heavy before the command runs
+        run, state = os.path.join(base, 'heavy', 'labelled'), os.path.join(state_root, 'heavy', 'labelled')
+        self.assertEqual(marks, (run, state))
+        ids = self.mod.marks_ids(marks)
+        self.assertEqual(ids, ','.join(f'{os.stat(m).st_dev}:{os.stat(m).st_ino}' for m in marks))
         self.assertFalse(self.mod.labelled(marks, unit))
-        self.assertEqual(sweep.note_label(f'uid={os.getuid()},scope={unit}'), '')
+        self.assertEqual(sweep.note_label(f'uid={os.getuid()},scope={unit}', ids), '')
         self.assertTrue(self.mod.labelled(marks, unit))
-        self.assertEqual(sweep.note_label(f'uid={os.getuid()},pid=1,start=2'), '')    # a process owner: no note
-        self.assertEqual(os.listdir(marks), [unit])
+        self.assertEqual(sweep.note_label(f'uid={os.getuid()},pid=1,start=2', ids), '')    # a process owner: no note
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([unit], []))
         self.mod.forget(marks, unit)
-        self.assertEqual(os.listdir(marks), [])
+        self.assertEqual(os.listdir(run), [])
         self.mod.forget(marks, unit)                           # again: nothing, no error
-        # a folder others can write: no marks, so heavy asks Docker after every run (never skips a container)
-        os.chmod(marks, 0o777)
+        # a note in the state folder counts the same, and goes the same (heavy stopped half-way: its guard forgets)
+        open(os.path.join(state, unit), 'w').close()
+        self.assertTrue(self.mod.labelled(marks, unit))
+        self.mod.forget(marks, unit)
+        self.assertEqual((os.listdir(run), os.listdir(state)), ([], []))
+        # a folder others can write: not one of heavy's
+        os.chmod(run, 0o777)
         self.assertEqual(self.mod.marks_dir(), '')
-        self.assertTrue(self.mod.labelled('', unit))
-        self.assertIn('not a folder only this user can write', sweep.note_label(f'uid={os.getuid()},scope={unit}'))
-        os.chmod(marks, 0o700)
+        self.assertEqual(self.mod.marks_dirs(), (state,))
+        self.assertIn('not a folder only this user can write',
+                      sweep.note_label(f'uid={os.getuid()},scope={unit}', ''))
+        os.chmod(run, 0o700)
         shutil.rmtree(base)                                    # no runtime folder at all: the same
         self.assertEqual(self.mod.marks_dir(), '')
+        os.chmod(os.path.dirname(state), 0o777)                # and no usable state folder: heavy cannot tell, so it
+        self.assertEqual(self.mod.marks_dirs(), ())            # asks Docker after every run
+        self.assertTrue(self.mod.labelled((), unit))
+        self.assertEqual(self.mod.marks_ids(()), '')
+        os.chmod(os.path.dirname(state), 0o700)
+
+    def test_the_command_gets_heavy_marks_only_from_its_own_heavy(self):
+        # HEAVY_MARKS names the folders this heavy reads; an outer heavy's value, or one a user left in a shell, never
+        # reaches a command whose heavy has none (docker-label would trust it and skip the second folder)
+        env = {b'HEAVY_MARKS': b'1:1', b'PATH': b'/bin'}
+        self.mod.give_marks(env, ())
+        self.assertEqual(env, {b'PATH': b'/bin'})
+        self.mod.give_marks(env, (self.dir,))
+        st = os.stat(self.dir)
+        self.assertEqual(env[b'HEAVY_MARKS'], f'{st.st_dev}:{st.st_ino}'.encode())
+
+
+class Hygiene(unittest.TestCase):
+    """#744 item 7: a test of heavy that waits for a process without a time limit hangs (once 19 minutes) where it
+    should fail."""
+    FILES = ('heavy.test.py', 'queue.test.py', 'sweep.test.py', 'install.test.py')
+
+    def test_every_wait_for_a_test_process_has_a_timeout(self):
+        import ast
+        here = os.path.dirname(os.path.abspath(__file__))
+        found = []
+        for name in self.FILES:
+            with open(os.path.join(here, name), encoding='utf-8') as f:
+                tree = ast.parse(f.read())
+            helpers = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'read_line']
+            inside = {id(x) for h in helpers for x in ast.walk(h)}
+            for n in ast.walk(tree):
+                if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+                    continue
+                a, base = n.func.attr, n.func.value
+                timed = any(k.arg == 'timeout' for k in n.keywords)
+                if a in ('run', 'check_output', 'check_call', 'call') and isinstance(base, ast.Name) and \
+                        base.id == 'subprocess' and not timed:
+                    found.append(f'{name}:{n.lineno} subprocess.{a}')
+                elif a in ('wait', 'communicate') and not n.args and not timed:
+                    found.append(f'{name}:{n.lineno} {a}()')
+                elif a in ('readline', 'read') and isinstance(base, ast.Attribute) and base.attr == 'stdout' and \
+                        id(n) not in inside:
+                    found.append(f'{name}:{n.lineno} stdout.{a}() (use read_line)')
+        self.assertEqual(found, [])
+
+    def test_read_line_fails_instead_of_hanging(self):
+        p = subprocess.Popen(['sleep', '60'], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (p.kill(), p.wait(timeout=60), p.stdout.close()))
+        start = time.monotonic()
+        with self.assertRaisesRegex(AssertionError, 'no line'):
+            read_line(p, timeout=0.5)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(p.wait(timeout=10), -signal.SIGKILL)       # and the silent process is stopped
 
 
 if __name__ == '__main__':
