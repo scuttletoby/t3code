@@ -22,9 +22,13 @@ WORKFLOW = root / ".github/workflows/fork-pr-queue.yml"
 text = WORKFLOW.read_text()
 wf = yaml.safe_load(text)
 failures = []
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks = []
 
 
 def check(name, ok, detail=""):
+    if ok:
+        oks.append(1)
     print(("ok   " if ok else "FAIL ") + name + ("" if ok or not detail else f"\n     | {detail}"))
     if not ok:
         failures.append(name)
@@ -337,4 +341,4 @@ for label, kw in (("the run's GITHUB_TOKEN as the token", {"token": "t-run"}), (
 if failures:
     print(f"\n{len(failures)} failed")
     sys.exit(1)
-print("\nall passed")
+print(f"\nall passed: {len(oks)} ok, 0 skipped")

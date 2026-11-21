@@ -1,12 +1,16 @@
 """gh-apps with real users, real sudo and the real installer. CI ONLY: a throw-away GitHub Actions runner, as root:
 
-    sudo env GH_APPS_ROOT_TESTS=1 GITHUB_ACTIONS=true python3 -I -B fork-kit/gh-apps/tests/root.test.py
+    node .github/scripts/fork-ci-tests.cjs --run fork-kit/gh-apps/tests/root.test.py
+
+(its `fork-ci: run` line below: as root under `sudo -n env`, with GH_APPS_ROOT_TESTS=1 and GITHUB_ACTIONS).
 
 It refuses to run anywhere else (it adds users, writes /etc/sudoers.d and removes them again). A fake gh in
 /usr/lib/gh-apps-fake prints its arguments, environment and stdin; no request reaches GitHub except one test token
 for a made-up App, which GitHub refuses. As the agent: reading keys or cache fails, writing tool or guard files
 fails, gh-mint fails, sudo -l shows one command, LD_PRELOAD, GH_*, GIT_* and PYTHON* do not pass, stdin through
 the wrapper works. The installer: zero Apps, run twice, bad sudoers never placed, uninstall leaves nothing."""
+# How CI runs it (.github/scripts/fork-ci-tests.cjs, which records what it ran; fork-ci-result checks that):
+# fork-ci: run as root with GH_APPS_ROOT_TESTS=1
 import grp, json, os, pwd, shutil, subprocess, sys, time, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
