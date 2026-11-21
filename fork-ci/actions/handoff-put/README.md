@@ -129,6 +129,9 @@ actions that run git, each first refuses a `.git` config that `actions/checkout`
 
 Each download goes to a new empty folder under `RUNNER_TEMP`, so nothing an earlier step or job left is read.
 
+When there is no artifact, download-artifact still writes its own error line ("Artifact not found for name: ...") to
+the log and the run's annotations; its step has `continue-on-error`, so neither the step nor the job fails.
+
 ## Trust
 
 The artifact is the producer job's output, and the producer job runs the code of the commit under test (on a pull
