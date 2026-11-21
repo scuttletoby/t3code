@@ -527,6 +527,39 @@ describe("DelegatedOrphanScan.scan", () => {
     }),
   );
 
+  it.effect("a receipt another thread holds warns once per run, not on every pass", () =>
+    Effect.gen(function* () {
+      yield* setClock;
+      const world = makeWorld();
+      const lost1 = [{ environmentId: ENV_B, threadId: ThreadId.make("lost-1") }];
+      const { commandId } = orphanBatchIds(PARENT, lost1);
+      // The message's command id is taken by another thread's accepted command.
+      world.receipts.set(commandId, ThreadId.make("thread-other"));
+      const warnings: Array<string> = [];
+      const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
+      const held = {
+        type: "held",
+        detail: `Command ${commandId} belongs to thread thread-other.`,
+      };
+      const once = scanned((yield* service(world)).scan()).pipe(
+        Effect.provide(warningLogs(warnings)),
+      );
+      expect((yield* once).parents.get(PARENT)).toEqual(held);
+      expect((yield* once).parents.get(PARENT)).toEqual(held);
+      expect((yield* once).parents.get(PARENT)).toEqual(held);
+      expect(refusals()).toHaveLength(1);
+      expect(refusals()[0]).toContain(commandId);
+      // After a restart: once more, then not again.
+      const restarted = scanned((yield* service(world)).scan()).pipe(
+        Effect.provide(warningLogs(warnings)),
+      );
+      expect((yield* restarted).parents.get(PARENT)).toEqual(held);
+      expect((yield* restarted).parents.get(PARENT)).toEqual(held);
+      expect(refusals()).toHaveLength(2);
+      expect(world.sent).toHaveLength(0);
+    }),
+  );
+
   it.effect("takes the first scan's message for the same orphans as sent", () =>
     Effect.gen(function* () {
       yield* setClock;
@@ -893,6 +926,52 @@ describe("DelegatedOrphanScan and agent slots", () => {
         yield* settle;
         yield* Fiber.join(again);
         expect(world.sent).toHaveLength(1);
+      }),
+  );
+
+  it.effect(
+    "a refused message before one that waits for a slot is logged once, also past a day",
+    () =>
+      Effect.gen(function* () {
+        yield* setClock;
+        const world = makeWorld();
+        // Eleven orphans: two messages, the first (ten) refused before this start, the second
+        // (one) waits for a slot. Each pass of the wait finds the first one's refused receipt.
+        const lost = Array.from({ length: 11 }, (_, index) => ({
+          threadId: `lost-${String(index).padStart(2, "0")}`,
+        }));
+        world.there.set(ENV_B, [...lost, { threadId: "known-1" }]);
+        const first = lost
+          .slice(0, 10)
+          .map((thread) => ({ environmentId: ENV_B, threadId: ThreadId.make(thread.threadId) }));
+        world.refused.add(orphanBatchIds(PARENT, first).commandId);
+        world.slots.state.all = true;
+        const warnings: Array<string> = [];
+        const refusals = () => warnings.filter((log) => log.includes("orphan reminder refused"));
+        const scan = yield* service(world, { maxPages: 10, slotRetryDelay: Duration.hours(1) });
+        const fiber = yield* scan
+          .run()
+          .pipe(Effect.provide(warningLogs(warnings)), Effect.forkChild);
+        yield* settle;
+        yield* TestClock.adjust(OPTIONS.delay);
+        yield* settle;
+        expect(refusals()).toHaveLength(1);
+        // The slot stays taken for more than a day (the one-day window is from the start).
+        for (let step = 0; step < 26; step++) {
+          yield* TestClock.adjust(Duration.hours(1));
+          yield* settle;
+        }
+        expect(world.slots.asks).toHaveLength(27);
+        expect(refusals()).toHaveLength(1);
+        expect(world.sent).toHaveLength(0);
+        // A slot frees: the second message goes, the first stays refused and is not logged again.
+        world.slots.state.all = false;
+        yield* TestClock.adjust(Duration.hours(1));
+        yield* settle;
+        yield* Fiber.join(fiber);
+        expect(world.sent).toHaveLength(1);
+        expect(world.sent[0]!.text).toContain("lost-10");
+        expect(refusals()).toHaveLength(1);
       }),
   );
 
