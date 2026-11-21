@@ -369,8 +369,9 @@ def made_by_the_sync(cfg, sha, run=subprocess.run):
     <upstream_sync.tag_prefix><sha> in this repository and moves main only when that push worked. A tag here can only
     be made by a holder of push rights (the owner, the sync's token): nothing an upstream commit holds (its message,
     author, files, a branch or pull request upstream) makes or removes one. And a tag only ever sends a run to
-    GitHub-hosted runners, so the worst a stray tag does is that. Read anonymously (the job hook has no token); any
-    doubt (no full sha, git failing, a timeout) refuses."""
+    GitHub-hosted runners, so the worst a stray tag does is that. Read anonymously (the job hook has no token), from
+    / so git never reads a checkout's .git/config (actions/checkout keeps the job's token there); any doubt (no full
+    sha, git failing, a timeout) refuses."""
     if 'upstream_sync' not in cfg:
         return None   # this repository has no upstream sync
     if not (isinstance(sha, str) and SHA.fullmatch(sha)):
@@ -380,8 +381,8 @@ def made_by_the_sync(cfg, sha, run=subprocess.run):
              'GIT_CONFIG_GLOBAL': '/dev/null'}   # no git config of whoever runs this (the job hook: a runner user)
     try:
         got = run(['git', '-c', 'protocol.version=2', 'ls-remote', '--exit-code', SYNC_REMOTE.format(cfg['repository']),
-                   ref], env=plain, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                  timeout=SYNC_CHECK_SECONDS, check=False)
+                   ref], env=plain, cwd='/', stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                  timeout=SYNC_CHECK_SECONDS, check=False)   # cwd: never a checkout, whose .git/config holds a token
     except (OSError, subprocess.SubprocessError) as e:
         return f'whether the upstream sync made {sha[:12]} cannot be told ({e.__class__.__name__})'
     if got.returncode == 2:   # --exit-code: the remote has no such ref
