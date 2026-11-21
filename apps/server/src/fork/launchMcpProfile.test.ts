@@ -68,20 +68,27 @@ const callerShell = (): OrchestrationV2ThreadShell =>
     archivedAt: null,
     activeRunId: "run:1",
     providerInstanceId: INSTANCE,
+    // What a launch that names no model inherits (the model policy's no-model test).
+    modelSelection: { instanceId: INSTANCE, model: "claude-opus" },
   }) as unknown as OrchestrationV2ThreadShell;
 
 /**
- * Upstream's launch handler with a thread caller (or the owner's client with `caller: false`),
- * the settings given, and every launch and forwarded call recorded. With `slots`, the server's
- * slot gate runs over that world; without, the host runs none.
+ * Upstream's launch handler with a thread caller (or the owner's client with `caller: false`, a
+ * linked machine's link with `"linked agent"` (its agent's call, naming the thread) or `"linked
+ * owner"`), the settings given, and every launch and forwarded call recorded. With `slots`, the
+ * server's slot gate runs over that world; without, the host runs none.
  */
 const harness = (
   settings: Settings,
-  options: { readonly caller?: boolean; readonly slots?: SlotWorld } = {},
+  options: {
+    readonly caller?: boolean | "linked agent" | "linked owner";
+    readonly slots?: SlotWorld;
+  } = {},
 ) => {
   const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
   const forwarded: Array<unknown> = [];
-  const threadCaller = options.caller !== false;
+  const threadCaller = options.caller === undefined || options.caller === true;
+  const linkSender = { environmentId: THERE, threadId: "thread:sender", title: "Sender" };
   const base = Layer.mergeAll(
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed([]),
@@ -99,7 +106,15 @@ const harness = (
         : undefined,
       client: threadCaller
         ? undefined
-        : { sessionId: "session-1", label: "Owner", access: "full-access" },
+        : options.caller === false
+          ? { sessionId: "session-1", label: "Owner", access: "full-access" }
+          : {
+              sessionId: "link-1",
+              label: "Laptop",
+              access: "full-access",
+              linked: true,
+              ...(options.caller === "linked agent" ? { senderThread: linkSender as never } : {}),
+            },
       issuedAt: 0,
       capabilities: new Set(["orchestration" as const]),
     }),
@@ -185,6 +200,8 @@ const harness = (
     readonly clientRequestId?: string | undefined;
     /** `null`: a launch without a message, which starts no run. */
     readonly message?: string | null;
+    /** The launch's model; `null` names none (it inherits the caller's). */
+    readonly modelSelection?: Record<string, unknown> | null;
   }) =>
     Effect.gen(function* () {
       const toolkit = yield* ProjectToolkit.pipe(
@@ -199,7 +216,14 @@ const harness = (
           title: "Launched",
           projectId: input.projectId ?? PROJECT,
           ...(input.message === null ? {} : { message: input.message ?? "Do the work" }),
-          modelSelection: { instanceId: INSTANCE, model: "claude-opus" },
+          ...(input.modelSelection === null
+            ? {}
+            : {
+                modelSelection: input.modelSelection ?? {
+                  instanceId: INSTANCE,
+                  model: "claude-opus",
+                },
+              }),
           ...(input.environmentId === undefined ? {} : { environmentId: input.environmentId }),
           ...(input.clientRequestId === undefined
             ? {}
@@ -511,6 +535,214 @@ describe("t3_thread_launch through the agent slot gate (#706)", () => {
       expect(forwarded).toHaveLength(1);
       expect(launched).toHaveLength(0);
       expect(slots.reads).toBe(0);
+    }),
+  );
+});
+
+describe("the model policy on t3_thread_launch (#731)", () => {
+  const ROW = {
+    driver: "claudeAgent",
+    model: "claude-opus",
+    efforts: ["high"],
+    defaultEffort: "high",
+  };
+  const policy = (mode: string, allow: ReadonlyArray<unknown> = [ROW]) =>
+    ({ modelPolicy: { mode, allow } }) as Settings;
+  const opus = (effort?: string) => ({
+    instanceId: INSTANCE,
+    model: "claude-opus",
+    ...(effort === undefined ? {} : { options: [{ id: "effort", value: effort }] }),
+  });
+
+  it.effect("enforce: an agent's launch off the rows, or naming no model, starts nothing", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce"));
+      const cases = [
+        [null, "the call names no model"],
+        [{ instanceId: INSTANCE, model: "claude-other" }, "claude-other is in no row"],
+        [opus("max"), "claude-opus does not allow effort max"],
+        [opus(), "claude-opus needs an effort from its row"],
+      ] as const;
+      for (const [modelSelection, why] of cases) {
+        const message = refusal(yield* launch({ modelSelection }));
+        expect(message).toContain(`model_unavailable: Model policy refused this pick: ${why}`);
+        expect(message).toContain("modelSelection.model");
+        // Runs again: refused again.
+        expect(refusal(yield* launch({ modelSelection, clientRequestId: "again" }))).toContain(why);
+      }
+      expect(launched).toHaveLength(0);
+      expect(refusal(yield* launch({ modelSelection: opus("high") }))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("empty state: enforce with no rows refuses every agent launch", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce", []));
+      expect(refusal(yield* launch({ modelSelection: opus("high") }))).toContain(
+        "the policy has no rows",
+      );
+      expect(launched).toHaveLength(0);
+    }),
+  );
+
+  it.effect("agents only: the owner's client launches any model (#125)", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce", []), { caller: false });
+      expect(refusal(yield* launch({ modelSelection: opus("max") }))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("advise and off: the launch starts as asked", () =>
+    Effect.gen(function* () {
+      for (const mode of ["advise", "off"]) {
+        const { launched, launch } = harness(policy(mode));
+        expect(refusal(yield* launch({ modelSelection: null }))).toBeUndefined();
+        expect(launched).toHaveLength(1);
+      }
+    }),
+  );
+  it.effect("a decoy effort option is read too: [reasoning: high, effort: max] is refused", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce"));
+      const decoy = (first: string, second: string) => ({
+        instanceId: INSTANCE,
+        model: "claude-opus",
+        options: [
+          { id: first, value: "high" },
+          { id: second, value: "max" },
+        ],
+      });
+      for (const [first, second] of [
+        ["reasoning", "effort"],
+        ["effort", "reasoningEffort"],
+        ["reasoningEffort", "effort"],
+      ] as const) {
+        expect(refusal(yield* launch({ modelSelection: decoy(first, second) }))).toContain(
+          "claude-opus does not allow effort high + max",
+        );
+      }
+      expect(launched).toHaveLength(0);
+    }),
+  );
+
+  it.effect("a retry with the same key that names a new model is checked again", () =>
+    Effect.gen(function* () {
+      const { launched, launch } = harness(policy("enforce"));
+      // An idle launch (no message, so no run) with an allowed model.
+      expect(
+        refusal(
+          yield* launch({ clientRequestId: "same", message: null, modelSelection: opus("high") }),
+        ),
+      ).toBeUndefined();
+      expect(launched).toHaveLength(1);
+      // The retry adds a message (it would start the run) and names a model off the rows.
+      for (const modelSelection of [{ instanceId: INSTANCE, model: "claude-other" }, opus("max")]) {
+        expect(refusal(yield* launch({ clientRequestId: "same", modelSelection }))).toContain(
+          "Model policy refused this pick",
+        );
+      }
+      expect(launched).toHaveLength(1);
+      // Runs again with the allowed model, or naming none (it keeps the checked first one): starts.
+      expect(
+        refusal(yield* launch({ clientRequestId: "same", modelSelection: opus("high") })),
+      ).toBeUndefined();
+      expect(
+        refusal(yield* launch({ clientRequestId: "same", modelSelection: null })),
+      ).toBeUndefined();
+      expect(launched).toHaveLength(3);
+      expect(launched.every((launch) => launch.threadId === launched[0]!.threadId)).toBe(true);
+    }),
+  );
+});
+
+describe("the model policy on a launch sent to a linked machine (#731)", () => {
+  const ROW = { driver: "claudeAgent", model: "claude-opus", efforts: ["high"] };
+  const policy = (mode: string, allow: ReadonlyArray<unknown> = [ROW]) =>
+    ({ modelPolicy: { mode, allow } }) as Settings;
+  const opus = (effort: string) => ({
+    instanceId: INSTANCE,
+    model: "claude-opus",
+    options: [{ id: "effort", value: effort }],
+  });
+
+  it.effect("enforce: an agent's launch there off the rows, or naming no model, is not sent", () =>
+    Effect.gen(function* () {
+      const { forwarded, launched, launch } = harness(policy("enforce"));
+      for (const [modelSelection, why] of [
+        [null, "the call names no model"],
+        [{ instanceId: INSTANCE, model: "claude-other" }, "claude-other is in no row"],
+        [opus("max"), "does not allow effort max"],
+        // A decoy effort id there: the driver there is not known, so every effort id is read.
+        [
+          {
+            instanceId: INSTANCE,
+            model: "claude-opus",
+            options: [
+              { id: "effort", value: "high" },
+              { id: "variant", value: "max" },
+            ],
+          },
+          "does not allow effort high + max",
+        ],
+      ] as const) {
+        const message = refusal(yield* launch({ environmentId: THERE, modelSelection }));
+        expect(message).toContain("Model policy refused this pick: ");
+        expect(message).toContain(why);
+        // Runs again (same key): refused again, still nothing sent.
+        expect(
+          refusal(yield* launch({ environmentId: THERE, modelSelection, clientRequestId: "k" })),
+        ).toContain(why);
+      }
+      expect(forwarded).toHaveLength(0);
+      expect(launched).toHaveLength(0);
+      // Inside the rows: sent.
+      expect(
+        refusal(yield* launch({ environmentId: THERE, modelSelection: opus("high") })),
+      ).toContain("sent there");
+      expect(forwarded).toHaveLength(1);
+    }),
+  );
+
+  it.effect("sender off, this machine enforce: an agent's launch sent here is refused here", () =>
+    Effect.gen(function* () {
+      // The agent's machine has the policy off: it sends the launch.
+      const sender = harness(policy("off"));
+      expect(
+        refusal(yield* sender.launch({ environmentId: THERE, modelSelection: opus("max") })),
+      ).toContain("sent there");
+      // This machine (enforce) gets it from the link, naming the agent's thread: checked, refused.
+      const { launched, launch } = harness(policy("enforce"), { caller: "linked agent" });
+      for (const clientRequestId of ["k", "k"]) {
+        expect(refusal(yield* launch({ modelSelection: opus("max"), clientRequestId }))).toContain(
+          "Model policy refused this pick: claude-opus does not allow effort max",
+        );
+      }
+      expect(launched).toHaveLength(0);
+      expect(refusal(yield* launch({ modelSelection: opus("high") }))).toBeUndefined();
+      expect(launched).toHaveLength(1);
+      // A call the link sends for no thread (the owner's client there) stays unchecked.
+      const owner = harness(policy("enforce"), { caller: "linked owner" });
+      expect(refusal(yield* owner.launch({ modelSelection: opus("max") }))).toBeUndefined();
+      expect(owner.launched).toHaveLength(1);
+    }),
+  );
+
+  it.effect("the owner's client, advise and off: sent as asked", () =>
+    Effect.gen(function* () {
+      const owner = harness(policy("enforce", []), { caller: false });
+      expect(
+        refusal(yield* owner.launch({ environmentId: THERE, modelSelection: null })),
+      ).toContain("sent there");
+      expect(owner.forwarded).toHaveLength(1);
+      for (const mode of ["advise", "off"]) {
+        const { forwarded, launch } = harness(policy(mode));
+        expect(refusal(yield* launch({ environmentId: THERE, modelSelection: null }))).toContain(
+          "sent there",
+        );
+        expect(forwarded).toHaveLength(1);
+      }
     }),
   );
 });

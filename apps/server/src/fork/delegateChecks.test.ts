@@ -174,8 +174,8 @@ describe("fork delegation checks: runs again", () => {
   it.effect("create_threads' seat on a retry reads nothing and keeps the target", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
-      // A target without options reads nothing on a retry; a new thread reads only the MCP
-      // profile settings (launchMcpProfile.ts), once.
+      // A target without options reads nothing on a retry; a new thread reads the settings for
+      // its MCP profile (launchMcpProfile.ts) and for the model policy (off: nothing more).
       const fresh = yield* checks.beforeCreateThread({
         isRetry: false,
         child,
@@ -184,7 +184,7 @@ describe("fork delegation checks: runs again", () => {
         target,
       });
       assert.deepStrictEqual(fresh, { target });
-      assert.strictEqual(reads.count, 1);
+      assert.strictEqual(reads.count, 2);
       const result = yield* checks.beforeCreateThread({
         isRetry: true,
         child,
@@ -213,7 +213,7 @@ describe("fork delegation checks: runs again", () => {
         target: withAgent,
       });
       assert.deepStrictEqual(before, { target: withAgent });
-      assert.strictEqual(reads.count, 1, "the retries read nothing");
+      assert.strictEqual(reads.count, 2, "the retries read nothing");
     }).pipe(Effect.provide(settingsCounted(reads))),
   );
 });
@@ -224,7 +224,11 @@ const agentTarget = (
   modelSelection: { instanceId: ProviderInstanceId.make("opencode"), model: "big-pickle", options },
   supportedRuntimeModes: undefined,
 });
-/** Pacing off, a model policy in `mode` (a failed read for `unreadable`). */
+/**
+ * Pacing off, a model policy in `mode` (a failed read for `unreadable`) whose one row allows the
+ * pick: `big-pickle` at `high` (no provider is listed, so the pick has no driver and every
+ * driver's effort id counts, `variant` too).
+ */
 const pacingOff = (mode: "off" | "advise" | "enforce" | "unreadable") =>
   Layer.mergeAll(
     Layer.mock(ServerSettings.ServerSettingsService)({
@@ -234,7 +238,10 @@ const pacingOff = (mode: "off" | "advise" | "enforce" | "unreadable") =>
           : Effect.succeed({
               ...DEFAULT_SERVER_SETTINGS,
               usagePacingGate: "off",
-              modelPolicy: { mode, allow: [] },
+              modelPolicy: {
+                mode,
+                allow: [{ driver: "opencode", model: "big-pickle", efforts: ["high"] }],
+              },
             } as never),
     }),
     Layer.mock(ThreadManagementService.ThreadManagementService)({}),
@@ -341,31 +348,45 @@ describe("fork delegation checks: a child's own options", () => {
     const created = yield* checks
       .beforeCreateThread({ isRetry: false, child, parent, requested, target: given })
       .pipe(Effect.match({ onFailure: (refusal) => refusal.code, onSuccess: (r) => r.target }));
-    const before = yield* checks.beforeWorkspace({
-      isRetry: false,
-      parent,
-      requested,
-      runtimeMode: undefined,
-      cwd: undefined,
-      target: given,
-    });
-    const remote = yield* checks.remoteTarget<Target>({ model: "big-pickle" });
-    return { created, before: before.target, remote };
+    const before = yield* checks
+      .beforeWorkspace({
+        isRetry: false,
+        parent,
+        requested,
+        runtimeMode: undefined,
+        cwd: undefined,
+        target: given,
+      })
+      .pipe(Effect.match({ onFailure: (refusal) => refusal.code, onSuccess: (r) => r.target }));
+    const remote = yield* checks
+      .remoteTarget<Target>({ model: "big-pickle", options: [effort] })
+      .pipe(Effect.match({ onFailure: (refusal) => refusal.code, onSuccess: (r) => r }));
+    return { created, before, remote };
   });
 
-  // An unreadable setting counts as on: a policy that cannot be read is enforced.
-  it.effect.each(["advise", "enforce", "unreadable"] as const)(
+  it.effect.each(["advise", "enforce"] as const)(
     "with the model policy %s, every path applies it to the final target",
     (mode) =>
       Effect.gen(function* () {
         assert.deepStrictEqual(yield* seats, {
-          // Settings that cannot be read leave the caller's MCP profile unknown: refused, never
-          // a thread on `all` (launchMcpProfile.ts).
-          created: mode === "unreadable" ? "invalid_request" : agentTarget([effort]),
+          created: agentTarget([effort]),
           before: agentTarget([effort]),
-          remote: { model: "big-pickle", options: [] },
+          remote: { model: "big-pickle", options: [effort] },
         });
       }).pipe(Effect.provide(pacingOff(mode))),
+  );
+
+  // Settings that cannot be read: the caller's MCP profile is unknown (refused, never a thread on
+  // `all`, launchMcpProfile.ts), and the model policy cannot be checked (refused, fail closed,
+  // modelPolicyCheck.ts). Nothing starts on any path.
+  it.effect("with settings that cannot be read, every path refuses", () =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual(yield* seats, {
+        created: "invalid_request",
+        before: "model_unavailable",
+        remote: "model_unavailable",
+      });
+    }).pipe(Effect.provide(pacingOff("unreadable"))),
   );
 
   it.effect("with the model policy off, every path keeps upstream's inheritance", () =>
@@ -373,17 +394,18 @@ describe("fork delegation checks: a child's own options", () => {
       assert.deepStrictEqual(yield* seats, {
         created: given,
         before: given,
-        remote: { model: "big-pickle" },
+        remote: { model: "big-pickle", options: [effort] },
       });
     }).pipe(Effect.provide(pacingOff("off"))),
   );
 
   const reads = { count: 0 };
-  it.effect("a call with nothing to drop reads no setting for it, on any path", () =>
+  it.effect("a call with nothing to drop reads settings only for its checks, on any path", () =>
     Effect.gen(function* () {
       const checks = yield* DelegateChecks.make(host);
       const own = agentTarget([effort]);
-      // create_threads reads settings once per thread, for its MCP profile check alone.
+      // create_threads reads settings twice per thread: its MCP profile check and the model policy
+      // (off here, so no provider is read).
       const cases = [requested, undefined, { options: [effort] }];
       for (const req of cases) {
         const created = yield* checks.beforeCreateThread({
@@ -395,12 +417,16 @@ describe("fork delegation checks: a child's own options", () => {
         });
         assert.strictEqual(created.target, own);
       }
-      assert.strictEqual(reads.count, cases.length);
+      assert.strictEqual(reads.count, 2 * cases.length);
       const named = { model: "m", options: [agent] };
       assert.strictEqual(yield* checks.remoteTarget(named), named);
       const unnamed = { options: [agent] };
       assert.strictEqual(yield* checks.remoteTarget(unnamed), unnamed);
-      assert.strictEqual(reads.count, cases.length, "the remote targets read nothing");
+      assert.strictEqual(
+        reads.count,
+        2 * cases.length + 2,
+        "a remote target reads settings once, for the model policy alone",
+      );
     }).pipe(Effect.provide(settingsCounted(reads))),
   );
 });

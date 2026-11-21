@@ -4,7 +4,14 @@
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProjectId, ServerSettingsError, ServerSettingsPatch } from "@t3tools/contracts";
+import {
+  DEFAULT_MODEL_POLICY,
+  type ModelPolicy,
+  modelPolicyStance,
+  ProjectId,
+  ServerSettingsError,
+  ServerSettingsPatch,
+} from "@t3tools/contracts";
 import {
   clearProjectSettingsOverridesWithForkKeys,
   ForkSettingsWriteError,
@@ -19,6 +26,8 @@ import * as Schema from "effect/Schema";
 
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ServerConfig from "./config.ts";
+import * as ForkModelPolicyCheck from "./fork/modelPolicyCheck.ts";
+import * as ForkModelPolicyFile from "./fork/modelPolicyFile.ts";
 import * as SqlitePersistence from "./persistence/Sqlite.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import * as PlaytestKit from "./playtest/PlaytestService.testkit.ts";
@@ -63,6 +72,16 @@ const FULL_FILE = {
 };
 
 const decodePatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+
+/** The model policy check's refusal of an allowed-looking agent pick under this policy. */
+const refusalOf = (policy: ModelPolicy) => {
+  const answer = ForkModelPolicyCheck.answerPick(policy, "delegate_task", {
+    driver: "claudeAgent",
+    model: "m",
+    options: [{ id: "effort", value: "high" }],
+  });
+  return "refuse" in answer ? answer.refuse : "";
+};
 
 const readFile = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
@@ -685,6 +704,81 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("fork model polic
     Effect.gen(function* () {
       const file = yield* loadThenPatch({}, { enableAgentBrowserAccess: false });
       assert.isFalse("modelPolicy" in (file as Record<string, unknown>));
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+  /** The policy a load gives for this file text, read twice (runs again: the same answer). */
+  const loadPolicy = (text: string | undefined) =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      if (text !== undefined) yield* fs.writeFileString(config.settingsPath, text);
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const first = (yield* service.getSettings).modelPolicy;
+      assert.deepStrictEqual((yield* service.getSettings).modelPolicy, first);
+      return first;
+    });
+
+  it.effect.each([
+    { name: "broken JSON", text: `{ "modelPolicy": { "mode": "off", "allow": [] }, ` },
+    { name: "an empty file", text: "" },
+    { name: "a file that is no object", text: `["advise"]` },
+  ])("$name: the policy cannot be read, so it fails closed (never off)", ({ text }) =>
+    Effect.gen(function* () {
+      const policy = yield* loadPolicy(text);
+      assert.deepStrictEqual(policy, {
+        mode: "enforce",
+        allow: [],
+        unreadable: ForkModelPolicyFile.SETTINGS_FILE_UNPARSEABLE,
+      });
+      assert.strictEqual(modelPolicyStance(policy).mode, "enforce");
+      assert.include(
+        refusalOf(policy),
+        "a settings file that does not parse), so every agent pick is refused",
+      );
+      // Nothing is written back: the save is refused while the file does not load.
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* service
+        .updateSettings(decodePatch({ enableAgentBrowserAccess: true }))
+        .pipe(Effect.flip);
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      assert.strictEqual(yield* fs.readFileString(config.settingsPath), text);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("a file that parses but fails elsewhere keeps its own policy", () =>
+    Effect.gen(function* () {
+      const policy = { mode: "advise", allow: [ROW] };
+      const bad = { enableAgentBrowserAccess: "yes" };
+      assert.deepStrictEqual(
+        (yield* loadPolicy(JSON.stringify({ ...bad, modelPolicy: policy }))) as unknown,
+        policy,
+      );
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("a file that fails elsewhere with a bad policy reads it as a bad value reads", () =>
+    Effect.gen(function* () {
+      const raw = { mode: "Enforce", allow: [ROW] };
+      const policy = yield* loadPolicy(
+        JSON.stringify({ enableAgentBrowserAccess: "yes", modelPolicy: raw }),
+      );
+      assert.deepStrictEqual(policy, { mode: "enforce", allow: [], unreadable: raw });
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("old and missing state: a failing file with no policy, or no file, is off", () =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual(
+        yield* loadPolicy(JSON.stringify({ enableAgentBrowserAccess: "yes" })),
+        DEFAULT_MODEL_POLICY,
+      );
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("missing state: no settings file at all is off", () =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual(yield* loadPolicy(undefined), DEFAULT_MODEL_POLICY);
     }).pipe(Effect.provide(layerServerSettings())),
   );
 });

@@ -35,6 +35,8 @@ import {
   MODEL_POLICY_MODE_OPTIONS,
   modelPolicyEditorText,
   modelPolicyRowLine,
+  modelPolicyStartsFromStartRows,
+  personModelPickMarks,
   unknownModelPolicyDrivers,
   unreadableModelPolicyMode,
   unreadableModelPolicyText,
@@ -54,7 +56,8 @@ function UnreadableWarning({
   return (
     <div className="text-xs text-destructive-foreground">
       The settings file&apos;s model policy cannot be read, so it reads as Enforce with nothing
-      allowed: every pick is refused. It is kept as written until you save here. {children}
+      allowed: every agent pick is refused (when the file&apos;s text says advise, agents are only
+      warned). It is kept as written until you save here. {children}
       <code className="mt-1 block break-all text-muted-foreground">{text}</code>
     </div>
   );
@@ -114,6 +117,12 @@ function AllowDialog({
         </DialogHeader>
         <DialogPanel>
           <div className="grid gap-3">
+            {modelPolicyStartsFromStartRows(value) ? (
+              <p className="text-xs text-muted-foreground">
+                No rows are saved, so this starts from the fork&apos;s start rows (Opus 5.5 and
+                Fable 5.2). Save them as they are, or change them first.
+              </p>
+            ) : null}
             {unreadableText !== null ? (
               <>
                 <UnreadableWarning text={unreadableText}>
@@ -190,6 +199,21 @@ export function ModelPolicySettings() {
   const unreadableText = mixed ? null : unreadableModelPolicyText(shown);
   const option = MODEL_POLICY_MODE_OPTIONS.find((candidate) => candidate.value === shown.mode);
   const providers = useSelectedProviders();
+  // One read per pick, each a stored value: a selector building a new object would never settle.
+  const picks = {
+    defaultModelSelection: useScopedSettings((settings) => settings.defaultModelSelection),
+    fallbackModelSelection: useScopedSettings((settings) => settings.fallbackModelSelection),
+    textGenerationModelSelection: useScopedSettings(
+      (settings) => settings.textGenerationModelSelection,
+    ),
+    sourceControlWriterModelSelection: useScopedSettings(
+      (settings) => settings.sourceControlWriterModelSelection,
+    ),
+    reviewGuideModelSelection: useScopedSettings((settings) => settings.reviewGuideModelSelection),
+    speechPostProcessingModelSelection: useScopedSettings(
+      (settings) => settings.speechPostProcessingModelSelection,
+    ),
+  };
 
   const save = (
     next: ModelPolicyPatch,
@@ -216,6 +240,7 @@ export function ModelPolicySettings() {
   const unknownDrivers = new Set(
     unknownModelPolicyDrivers(shown.allow, new Set(providers.map((provider) => provider.driver))),
   );
+  const marks = personModelPickMarks(shown, picks, providers);
   const byDriver = new Map<string, Array<ModelPolicy["allow"][number]>>();
   for (const row of shown.allow)
     byDriver.set(row.driver, [...(byDriver.get(row.driver) ?? []), row]);
@@ -226,7 +251,7 @@ export function ModelPolicySettings() {
         {...searchableSetting("model-policy")}
         settingKeys={["modelPolicy"]}
         lockPaths={["modelPolicy"]}
-        description={`Which models agents may pick with delegate_task. ${option?.description ?? ""} Nothing checks a pick yet. While it is on, a child that names its model keeps only the options it names.`}
+        description={`Which models agents may pick (delegate_task, create_threads, t3_thread_launch, t3_thread_configure). ${option?.description ?? ""} Your own picks are never refused; below, one outside the rows is marked. While it is on, a child that names its model keeps only the options it names.`}
         resetAction={
           isDefault ? null : (
             <SettingResetButton
@@ -269,7 +294,7 @@ export function ModelPolicySettings() {
         lockPaths={["modelPolicy"]}
         description={
           shown.allow.length === 0
-            ? "No model is allowed yet. With Enforce, every pick is refused."
+            ? "No model is allowed yet. With Enforce, every agent pick is refused. Edit allowed models starts from the fork's start rows."
             : "The models agents may pick, per provider driver."
         }
         control={
@@ -299,6 +324,30 @@ export function ModelPolicySettings() {
           </dl>
         ) : null}
       </ForkRow>
+      {marks.length > 0 ? (
+        <ForkRow
+          {...searchableSetting("model-policy-picks")}
+          // Nothing to change here: the picks are set where they are made.
+          lockPaths={[]}
+          description="Your own model picks. They are never refused; the mark shows a pick an agent could not make."
+        >
+          <ul className="grid gap-1 pb-2 text-xs">
+            {marks.map((mark) => (
+              <li key={mark.key} className="grid gap-0.5 sm:grid-cols-[14rem_1fr]">
+                <span className="text-muted-foreground">{mark.label}</span>
+                <span className="break-all">
+                  <code>{mark.pick}</code>
+                  {mark.outside === null ? null : (
+                    <span className="ms-2 text-warning-foreground">
+                      outside policy ({mark.outside})
+                    </span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </ForkRow>
+      ) : null}
       {editing ? (
         <AllowDialog
           value={shown}

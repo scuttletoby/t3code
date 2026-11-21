@@ -13,6 +13,7 @@ import { topOfPinnedRunOrderKey } from "@t3tools/shared/pinOrderKey";
 
 import * as AgentSlotRoutes from "../../../fork/agentSlotRoutes.ts"; // Fork: agent slots
 import * as LaunchMcpProfile from "../../../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
+import * as ModelPolicyCheck from "../../../fork/modelPolicyCheck.ts"; // Fork: model policy
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
@@ -243,6 +244,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           threads,
           projection: { thread },
         } = yield* readThread(input.threadId);
+        yield* ModelPolicyCheck.checkConfigure(modelSelection); // Fork: model policy
         const type = modelSelectionCommandType(thread.providerInstanceId, modelSelection);
         const result = yield* threads
           .dispatch({ type, threadId: thread.id, commandId: yield* newCommandId(), modelSelection })

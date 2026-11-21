@@ -35,6 +35,7 @@ import {
 } from "@t3tools/shared/projectSettings";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import * as LaunchMcpProfile from "../../../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
+import * as ModelPolicyCheck from "../../../fork/modelPolicyCheck.ts"; // Fork: model policy
 import { checkLaunchSlot } from "../../../fork/agentSlotRoutes.ts"; // Fork: agent slots
 import { resolveRuntimeMode } from "../../delegatedTaskModes.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -406,6 +407,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             )?.supportedRuntimeModes,
           });
         }
+        yield* ModelPolicyCheck.checkLaunch(caller, modelSelection, input, replaying); // Fork: model policy
         yield* checkLaunchSlot(caller, { threadId, modelSelection, replaying, input, attachments }); // Fork: agent slots
         const result = yield* ThreadMessageIntake.launchThread({
           commandId,

@@ -50,6 +50,7 @@ import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { renameRetiredAutoUpdateKeys } from "./cloud/autoUpdateSettings.ts";
 import { prepareSettingsFile } from "./fork/settingsFileRead.ts"; // Fork: renames, bad intervals
+import * as ForkPolicy from "./fork/modelPolicyFile.ts"; // Fork: model policy
 import {
   deriveLegacyProjectOverrides,
   fallbackTextGenerationModelSelection,
@@ -837,6 +838,7 @@ const make = Effect.gen(function* () {
           continueThreadsAfterServerUpdate: false,
           automaticUpdates: false,
           usageHistoryRetentionDays: "unlimited",
+          modelPolicy: ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy
         };
         if (failure._tag === "Failure") {
           parseFailure = Option.some(Cause.squash(failure.cause));

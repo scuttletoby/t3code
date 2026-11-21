@@ -1,7 +1,8 @@
 /**
- * Fork: the model policy, which models (and efforts) agents may pick, per provider driver. Only the
- * setting lives here; nothing reads it yet. Wired into the server settings only through
- * forkSettings.ts.
+ * Fork: the model policy, which models (and efforts) agents may pick, per provider driver: the
+ * setting, the fork's start rows, and the one check of a pick that the server (agents' picks,
+ * `apps/server/src/fork/modelPolicyCheck.ts`) and Settings (the "outside policy" mark) share.
+ * Wired into the server settings only through forkSettings.ts.
  */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -111,3 +112,207 @@ export const ModelPolicyPatch = Schema.Unknown.pipe(
   ),
 );
 export type ModelPolicyPatch = typeof ModelPolicyPatch.Type;
+
+/**
+ * The fork's start rows: the rows Settings offers while none are saved, for the owner to
+ * change. Not the setting's default: a file without rows keeps meaning no rows, as the writer saves
+ * `allow: []` by leaving it out (a default here would widen such a file on update).
+ */
+export const MODEL_POLICY_START_ROWS: ReadonlyArray<ModelPolicyRow> = [
+  {
+    driver: ProviderDriverKind.make("claudeAgent"),
+    model: "claude-opus-5-5",
+    efforts: ["medium", "high", "xhigh"],
+    defaultEffort: "high",
+    useFor: "most work: building, routine work, review lenses",
+  },
+  {
+    driver: ProviderDriverKind.make("claudeAgent"),
+    model: "claude-fable-5-2",
+    efforts: ["medium", "high", "xhigh"],
+    defaultEffort: "high",
+    useFor:
+      "creative solutions and direction checks: design options, stuck audits, root causes others missed; it costs more, so not routine work",
+  },
+];
+
+/**
+ * The option ids a model's effort control goes by: the same list as the usage pacing gate
+ * (`apps/server/src/usage/UsagePacingGate.ts`; a server test keeps the two in step).
+ */
+export const MODEL_POLICY_EFFORT_OPTION_IDS: ReadonlyArray<string> = [
+  "effort",
+  "reasoningEffort",
+  "reasoning_effort",
+  "reasoning",
+  "thinking_level",
+];
+/**
+ * The option id a built-in driver reads its reasoning level from, where it is not in the list
+ * above: the model guard's `DRIVER_EFFORT_IDS` (the guard's own test keeps the two in step).
+ */
+const MODEL_POLICY_DRIVER_EFFORT_IDS: Readonly<Record<string, string>> = {
+  opencode: "variant",
+  pi: "thinking",
+};
+/** The ultracode option, and the effort name the policy gives it: it runs at xhigh in ultracode. */
+const MODEL_POLICY_ULTRACODE = "ultracode";
+
+/** One pick of a model, as a call or a setting names it. */
+export interface ModelPolicyPick {
+  /** The provider driver; `undefined` when it is not known (a task sent to a linked machine). */
+  readonly driver?: string | undefined;
+  /** The model id; `undefined` when the call names none. */
+  readonly model: string | undefined;
+  readonly options?: ReadonlyArray<{ readonly id: string; readonly value: unknown }> | undefined;
+  /** More option ids read as the effort (a select the model marks as its reasoning control). */
+  readonly effortOptionIds?: ReadonlyArray<string> | undefined;
+}
+
+/**
+ * The efforts a pick runs at: the value of every option with an effort id (a decoy id must not hide
+ * the one the driver reads; without a known driver every driver's id counts), plus `ultracode` while
+ * that option is on. `xhigh` with ultracode reads as `ultracode` alone; the old effort value
+ * `ultracode` means xhigh with the option on, unless the call gives the option.
+ */
+export function modelPolicyPickEfforts(pick: ModelPolicyPick): ReadonlyArray<string> {
+  const options = pick.options ?? [];
+  const effortIds = pickEffortIds(pick, true);
+  const named = [
+    ...new Set(
+      options.flatMap((option) =>
+        effortIds.has(option.id) && typeof option.value === "string" ? [option.value] : [],
+      ),
+    ),
+  ];
+  const ultracodeOption = options.find((option) => option.id === MODEL_POLICY_ULTRACODE);
+  const legacy = named.includes(MODEL_POLICY_ULTRACODE);
+  const ultracode = ultracodeOption === undefined ? legacy : ultracodeOption.value !== false;
+  const efforts = [
+    ...new Set(named.map((effort) => (effort === MODEL_POLICY_ULTRACODE ? "xhigh" : effort))),
+  ];
+  if (!ultracode) return efforts;
+  return [MODEL_POLICY_ULTRACODE, ...efforts.filter((effort) => effort !== "xhigh")];
+}
+
+/**
+ * The option ids read as a pick's effort. `guess`: without a known driver, every driver's own id
+ * counts too (another driver's id may hold a toggle there, such as Claude's `thinking: true`).
+ */
+function pickEffortIds(pick: ModelPolicyPick, guess: boolean): ReadonlySet<string> {
+  const driverIds =
+    pick.driver === undefined
+      ? guess
+        ? Object.values(MODEL_POLICY_DRIVER_EFFORT_IDS)
+        : []
+      : Object.hasOwn(MODEL_POLICY_DRIVER_EFFORT_IDS, pick.driver)
+        ? [MODEL_POLICY_DRIVER_EFFORT_IDS[pick.driver]!]
+        : [];
+  return new Set([
+    ...MODEL_POLICY_EFFORT_OPTION_IDS,
+    ...driverIds,
+    ...(pick.effortOptionIds ?? []),
+  ]);
+}
+
+const rowAllows = (row: ModelPolicyRow, efforts: ReadonlyArray<string>) =>
+  row.efforts === undefined
+    ? efforts.length === 0
+    : efforts.length > 0 && efforts.every((effort) => row.efforts!.includes(effort));
+
+export type ModelPolicyVerdict =
+  | { readonly inside: true; readonly row: ModelPolicyRow }
+  | { readonly inside: false; readonly why: string };
+
+/**
+ * Whether one pick is inside the rows. A pick that names no model is outside, and so are a
+ * model in no row and an effort option that holds no effort name. A row with efforts needs the pick to name one of them; a row without
+ * efforts allows none. Without a driver, every row that names the model must allow the pick.
+ */
+export function checkModelPolicyPick(
+  allow: ReadonlyArray<ModelPolicyRow>,
+  pick: ModelPolicyPick,
+): ModelPolicyVerdict {
+  if (pick.model === undefined) {
+    return { inside: false, why: "the call names no model" };
+  }
+  const model = pick.model;
+  // `{effort: true}`: the driver runs its own default effort, which the pick does not show.
+  const unnamed = pick.options?.find(
+    (option) => pickEffortIds(pick, false).has(option.id) && typeof option.value !== "string",
+  );
+  if (unnamed !== undefined) {
+    return { inside: false, why: `${model}'s effort option ${unnamed.id} holds no effort name` };
+  }
+  const rows = allow.filter(
+    (row) => row.model === model && (pick.driver === undefined || row.driver === pick.driver),
+  );
+  if (rows.length === 0) {
+    return {
+      inside: false,
+      why: `${model}${pick.driver === undefined ? "" : ` (${pick.driver})`} is in no row`,
+    };
+  }
+  const efforts = modelPolicyPickEfforts(pick);
+  const allowed = rows.filter((row) => rowAllows(row, efforts));
+  const row = allowed[0];
+  if (row !== undefined && (pick.driver !== undefined || allowed.length === rows.length)) {
+    return { inside: true, row };
+  }
+  const why =
+    efforts.length === 0
+      ? `${model} needs an effort from its row, and the pick names none`
+      : `${model} does not allow effort ${efforts.join(" + ")}`;
+  if (row === undefined) return { inside: false, why };
+  // Some rows allow it: the driver there is not known, and these rows refuse it.
+  const refusing = rows.filter((candidate) => !allowed.includes(candidate));
+  return {
+    inside: false,
+    why: `${why} (its ${refusing.map((candidate) => candidate.driver).join(", ")} row refuses it: the driver there is not known here, so every row naming the model must allow it)`,
+  };
+}
+
+/** One row as the refusal lists it. */
+function modelPolicyRowText(row: ModelPolicyRow): string {
+  const efforts =
+    row.efforts === undefined
+      ? "no effort"
+      : `efforts ${row.efforts.join(", ")}${
+          row.defaultEffort === undefined ? "" : `; default ${row.defaultEffort}`
+        }`;
+  return `${row.driver} ${row.model} (${efforts})`;
+}
+
+/** The allowed rows as one line, for a refusal or a note. */
+export function modelPolicyRowsText(allow: ReadonlyArray<ModelPolicyRow>): string {
+  return allow.length === 0
+    ? "none: the policy has no rows, so every agent pick is outside it"
+    : allow.map(modelPolicyRowText).join("; ");
+}
+
+/**
+ * How the policy reads for a check: its mode, or, for a value the settings file holds that cannot
+ * be read, `unreadable`. That one is Enforce (every agent pick refused), unless the file's own text
+ * names the mode `advise`: then it is only a warning.
+ */
+export type ModelPolicyStance =
+  | { readonly mode: "off" }
+  | {
+      readonly mode: "advise" | "enforce";
+      readonly allow: ReadonlyArray<ModelPolicyRow>;
+      readonly unreadable: false;
+    }
+  | { readonly mode: "advise" | "enforce"; readonly unreadable: true };
+
+export function modelPolicyStance(policy: ModelPolicy): ModelPolicyStance {
+  if ("unreadable" in policy) {
+    const raw = policy.unreadable;
+    const fileMode =
+      typeof raw === "object" && raw !== null && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>).mode
+        : undefined;
+    return { mode: fileMode === "advise" ? "advise" : "enforce", unreadable: true };
+  }
+  if (policy.mode === "off") return { mode: "off" };
+  return { mode: policy.mode, allow: policy.allow, unreadable: false };
+}
