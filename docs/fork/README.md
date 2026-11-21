@@ -56,6 +56,8 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.playtest`](#serverplaytest)                                         | `{"enabled":false}`         | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`server.reviewRules`](#serverreviewrules)                                   | `{"preset":"off"}`          | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
 | [`server.modelPolicy`](#servermodelpolicy)                                   | `{"mode":"off","allow":[]}` | yes | [#268](https://github.com/scuttletoby/t3code/issues/268) |
+| [`server.placement`](#serverplacement)                                       | `{"mode":"off"}`            | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
+| [`server.placementNeeds`](#serverplacementneeds)                             | `[]`                        | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 | [`server.agentSlots`](#serveragentslots)                                     | `{"enabled":false}`         | no  | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`server.headlessUsageRefreshInterval`](#serverheadlessusagerefreshinterval) | `600000`                    | no  | [#42](https://github.com/scuttletoby/t3code/issues/42)   |
 | [`server.mcpProfiles`](#servermcpprofiles)                                   | `{}`                        | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
@@ -70,9 +72,10 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`projectOverride.mcpProfile`](#projectoverridemcpprofile)                   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.mcpSubagentProfile`](#projectoverridemcpsubagentprofile)   | not set                     | yes | [#145](https://github.com/scuttletoby/t3code/issues/145) |
 | [`projectOverride.handoff`](#projectoverridehandoff)                         | not set                     | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
+| [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                     | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 
 For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
-only `mode`; their other fields are tuning that does nothing while the switch is off.
+and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
 
 ## Each setting
 
@@ -414,6 +417,61 @@ saves them; they are not the setting's default, so a file without rows keeps mea
   }
 }
 ```
+
+### `server.placement`
+
+What this machine has, and how it places delegated work on linked machines. Only the settings are in
+the fork so far; nothing reads them yet (later placement rows add the facts, the rules and the
+wiring). Fields, each with its default:
+
+- `mode`: `off` (an agent picks a machine as upstream's do), `advise` or `enforce`.
+- `labels`: `[]`. What this machine has, as free words (`"gpu"`, `"ci-runner"`, `"owner-logins"`):
+  each is one word of at most 64 characters, at most 64 labels. They are stored trimmed and
+  lower-cased (`"GPU"` is `"gpu"`), a repeat dropped. There is no Unicode normalisation: `café`
+  written with a combining accent and without one are two labels.
+- `factsCommand`: `""`. Empty, or the absolute path of one program on this server's OS (`/…` on
+  Linux and macOS; `C:\…` or `\\server\…` on Windows). It is a path, never a command line: a
+  space is part of the path, and no shell runs it. A relative path or a control character is not
+  valid; a save that sets another OS's path is refused, and placing reads one in the file as `off` (below).
+  Exit 0 means free for work, and each line it prints is one more label; any other exit or a timeout
+  means not available.
+- `never`: `[]`. Label groups that must not meet on one machine, such as
+  `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
+  lower-casing (`["GPU", "gpu"]` is one label, so not a group).
+- `weights`: `{}`. Linked machine id (one word, no spaces) to `prefer`, `normal`, `less` or
+  `manual` (upstream's load-balancing words); a machine without one is `normal`.
+
+A value that is not valid (a bad field, a wrong type, a field this build does not know) reads as
+`off`, with a warning in the log and the reason kept beside it for Settings to show; the rest of the
+file still loads. The person's text is kept as written until the key is saved. A `factsCommand`
+that is not a full path on this server's OS (a hand edit) is not converted by the load: Settings
+shows it as written. Placing work reads `placement` only through the server's
+`readPlacementForThisOs` (`apps/server/src/fork/placementRead.ts`), which reads it as `off`, kept
+as written with the reason, each time; the machine that runs `factsCommand` checks the path again
+before it runs it. A save that names only some fields keeps
+the others; over a kept unreadable value only a save of every field is taken (it replaces the text),
+and a partial one is refused ("placement is not valid; save the whole setting"), so it cannot drop a
+`never` group. A newer build's field reads as `off` here and is kept through saves of other keys; a
+save of `placement` on this build drops it. Only a person changes it: no agent tool can, and a
+managed policy can lock it as a whole value (not one field inside it, as for `modelPolicy`).
+"Person-only" means no T3 tool takes it; an agent with a shell can still edit the settings file or
+call the settings RPC, as for `modelPolicy`.
+
+```json
+{
+  "placement": { "mode": "advise", "labels": ["gpu"], "never": [["ci-runner", "owner-logins"]] }
+}
+```
+
+### `server.placementNeeds`
+
+Labels a machine must have to take a project's work, for each project without its own
+(`projectOverride.placementNeeds`). Same label rules as `placement.labels`. Default `[]`: no needs.
+A value that is not valid fails closed: that work goes to no machine ("this project's
+placementNeeds setting is not valid: …; fix it in Settings"), never to any machine as `[]` would.
+The reason is kept beside it and logged, and the person's text is written back unchanged by saves
+of other settings until this key is saved, which replaces it. A managed policy can lock it as a
+whole list; the lock also holds each project's own needs.
 
 ### `server.agentSlots`
 
@@ -1004,6 +1062,15 @@ to the server's value. A thread's own mode in the project's or the server's `thr
 either `mode`, the project's entry first. A project save that leaves this key out (an
 older client) keeps the stored value; only `null` clears it (also when written by hand, as for
 `playtest`, including the change for old files).
+
+### `projectOverride.placementNeeds`
+
+A project's own needs, for example `["gpu"]`. It replaces the server's `placementNeeds` for that
+project as a whole; `[]` says the project needs nothing. Not set: the server's. A project value that
+is not valid fails closed as the server's does: that project's work goes to no machine (never the
+server's needs, never none), and its text is kept. A project save that leaves this key out (an older
+client) keeps the stored value, and one that sends back the kept text unchanged keeps it too (other
+text is refused); only `null` clears it, as for `playtest`.
 
 ### A setting the fork removed
 
