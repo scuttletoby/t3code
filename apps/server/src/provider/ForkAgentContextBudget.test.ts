@@ -13,6 +13,7 @@ import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import { ThreadManagementService } from "../orchestration-v2/ThreadManagementService.ts";
 import { PeerForwarding } from "../peer/PeerForwarding.ts";
 import { RemoteDelegation } from "../peer/RemoteDelegation.ts";
+import { Playtest } from "../playtest/PlaytestLayer.ts";
 import { Waits } from "../waits/WaitWorker.ts";
 import budget from "./forkAgentContextBudget.json" with { type: "json" };
 
@@ -22,6 +23,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(Waits)({}),
   Layer.mock(RemoteDelegation)({}),
   Layer.mock(PeerForwarding)({}),
+  Layer.mock(Playtest)({ filePath: "unused" }),
 ).pipe(Layer.provideMerge(NodeServices.layer));
 
 const utf8Bytes = (text: string) => Buffer.byteLength(text, "utf8");

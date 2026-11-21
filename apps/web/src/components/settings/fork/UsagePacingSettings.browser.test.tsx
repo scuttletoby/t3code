@@ -341,4 +341,18 @@ describe("ModelPolicySettings", () => {
       .toMatchTextContent("opus is an alias of claude-opus-5-5; name the full id.");
     expect(screen.getByRole("note").elements()).toHaveLength(1);
   });
+
+  it("flags a name Claude Code resolves by itself that no model list holds (#780)", async () => {
+    setup({
+      modelPolicy: {
+        mode: "enforce",
+        allow: [{ driver: "claudeAgent", model: "sonnet", efforts: ["high"] }],
+      },
+    });
+    await using screen = await render(<ModelPolicySettings />);
+
+    await expect
+      .element(screen.getByRole("note"))
+      .toMatchTextContent("sonnet is an alias claudeAgent resolves by itself; name the full id.");
+  });
 });
