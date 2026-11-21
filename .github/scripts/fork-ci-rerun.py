@@ -24,9 +24,10 @@ THE rules, in one place (the facts, patterns and numbers are CONFIG's, .github/f
                  the job's own), and its own pressure note shows a box with a memory limit stalled (full) at least
                  memory_full.box_full_share_percent of the job AND OOM kills, memory.max hits or memory.high
                  throttling in it. A machine-wide OOM kill, or one event without the stall, is no sign;
-    limit        GitHub says the job or a step ran past its time limit (signs.limit, with the minutes), the job (or
-                 that step) really ran that long, no other step failed, and the note shows the machine or the box
-                 stalled (CONFIG stalled).
+    limit        GitHub says the job or a step ran past its time limit (signs.limit, with the minutes), those minutes
+                 are that job's (or step's) own timeout-minutes in the workflow file at the run's commit (never the
+                 message's word alone: a step can print any number), the job (or that step) really ran that long, no
+                 other step failed, and the note shows the machine or the box stalled (CONFIG stalled).
   The note counts only when the probe's end step completed (so the job wrote its own) and is the job's only one.
   One failed job without a sign (a test failure, no note, a garbled note, two notes) leaves the run red: fail
   closed. GitHub's "canceled by" (signs.cancelled_by) on any failed job leaves it red: a person's cancel stands.
@@ -40,7 +41,7 @@ else is kept between passes: each reads GitHub, so a pass that stopped half-way 
 runs again finds the bot's attempt (and the issue's marker) and does nothing.
 Runbook: .github/fork-ci-rerun.md. Standard library only.
 """
-import argparse, calendar, http.client, importlib.util, json, os, re, sys, time
+import argparse, base64, calendar, http.client, importlib.util, json, os, re, sys, time
 import urllib.error, urllib.parse, urllib.request
 
 sys.dont_write_bytecode = True   # loading fork-fleet.py must not leave __pycache__ in the tree
@@ -312,9 +313,95 @@ def memory_full(cfg, job, note):
     return None
 
 
-def limit_hit(cfg, job, annotations):
-    """GitHub's time-limit message, when the job's record agrees: the job (or the step it names) ran at least that
-    long and no other step failed. (message, None), or (None, why) when there is no such message."""
+def scalar(v):
+    """A one-line YAML scalar as the workflow writes it (plain, '...' or "..."), or None for anything else."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        return None if '\\' in v else v[1:-1]
+    v = re.sub(r'\s+#.*$', '', v)
+    return v if v and v[0] not in '|>&*!{["\'' else None
+
+
+def workflow_limits(text):
+    """{job key: {'name', 'minutes', 'steps': [{'name', 'minutes'}]}} of a workflow file's timeout-minutes, read
+    strictly in the layout CONFIG workflow is written in (jobs at 2 spaces, their keys at 4, a step's `- ` at 6 and
+    its keys at 8). Whatever it cannot read gives no minutes, and a limit it cannot confirm leaves the run red."""
+    jobs, job, section, cur, inside = {}, None, None, None, False
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        if not line.startswith(' '):
+            inside, job = line.rstrip() == 'jobs:', None
+            continue
+        m = re.fullmatch(r'  ([A-Za-z_][A-Za-z0-9_-]*):\s*', line) if inside else None
+        if m:
+            job = jobs[m[1]] = {'name': None, 'minutes': None, 'steps': []}
+            section = cur = None
+            continue
+        m = re.fullmatch(r'    ([A-Za-z_-]+):(?:\s+(.*))?', line) if job else None
+        if m:
+            section, cur = m[1], None
+            if section in ('name', 'timeout-minutes'):
+                job['name' if section == 'name' else 'minutes'] = scalar(m[2] or '')
+            continue
+        m = re.fullmatch(r'      (- |  )([A-Za-z_-]+):(?:\s+(.*))?', line) if job and section == 'steps' else None
+        if not m:
+            continue
+        if m[1] == '- ':
+            cur = {'name': None, 'minutes': None}
+            job['steps'].append(cur)
+        if cur is not None and m[2] in ('name', 'timeout-minutes'):
+            cur['name' if m[2] == 'name' else 'minutes'] = scalar(m[3] or '')
+    for j in jobs.values():
+        for x in [j] + j['steps']:
+            x['minutes'] = int(x['minutes']) if re.fullmatch(r'[0-9]{1,5}', x['minutes'] or '') else None
+    return jobs
+
+
+def shown(template, text, matrix=False):
+    """Is `text` the name GitHub shows for this name template (each ${{ }} any text; a job whose name has none may
+    carry its matrix values in parentheses)?"""
+    parts = re.split(r'\$\{\{.*?\}\}', template)
+    tail = r'(?: \(.*\))?' if matrix and len(parts) == 1 else ''
+    return bool(re.fullmatch('.*'.join(map(re.escape, parts)) + tail, text, re.S))
+
+
+def limit_of(workflow, job_name, step=None):
+    """The timeout-minutes the workflow gives the job shown as job_name (or its step named `step`), or None when it
+    gives none, or when the name matches no job or more than one, or names steps with different limits."""
+    keys = [k for k, j in workflow.items() if shown(j['name'] or k, job_name, matrix=True)]
+    if len(keys) != 1:
+        return None
+    j = workflow[keys[0]]
+    if step is None:
+        return j['minutes']
+    got = {s['minutes'] for s in j['steps'] if s['name'] is not None and shown(s['name'], step)}
+    return got.pop() if len(got) == 1 else None
+
+
+def workflow_reader(cfg, gh, run):
+    """limits(job name, step) from CONFIG workflow's file at the run's own commit, read once and only when asked."""
+    got = []
+
+    def limits(job_name, step=None):
+        if not got:
+            sha = str(run.get('head_sha') or '')
+            if not re.fullmatch(r'[0-9a-f]{40}', sha):
+                raise ValueError(f'run {run.get("id")}: no commit to read the workflow at')
+            reply = gh.call(f'contents/.github/workflows/{cfg["workflow"]}?ref={sha}')
+            if reply.get('encoding') != 'base64':
+                raise ValueError(f'{cfg["workflow"]} at {sha[:12]}: not readable through the contents API')
+            got.append(workflow_limits(base64.b64decode(reply['content']).decode('utf-8')))
+        return limit_of(got[0], job_name, step)
+    return limits
+
+
+def limit_hit(cfg, job, annotations, limits=None):
+    """GitHub's time-limit message, when the job's record agrees: its minutes are the job's (or the step's)
+    timeout-minutes in the workflow (limits), the job (or the step it names) ran at least that long and no other
+    step failed. (message, None), or (None, why) when there is no such message."""
     why = None
     for a in annotations:
         if not from_runner(a):
@@ -329,6 +416,11 @@ def limit_hit(cfg, job, annotations):
             others = [s for s in failed_steps(job) if s != step]
             if others:
                 why = f'GitHub\'s time-limit text, but step {others[0]!r} failed'
+                continue
+            own = limits(job.get('name') or '', step) if limits else None
+            if own != int(m['minutes']):
+                why = (f'GitHub\'s time-limit text says {m["minutes"]} min, but the workflow gives '
+                       f'{"step " + repr(step) if step is not None else "the job"} {own} min: not GitHub\'s own')
                 continue
             if step is not None:
                 ran = [took(s) or 0 for s in job.get('steps') or [] if s.get('name') == step
@@ -355,7 +447,7 @@ def numbers(note):
     return '; '.join(out)
 
 
-def job_sign(cfg, job, annotations):
+def job_sign(cfg, job, annotations, limits=None):
     """(sign, evidence) when a failed job shows an infrastructure sign, else (None, why not)."""
     cancel = github_says(cfg, 'cancelled_by', annotations)
     if cancel:
@@ -379,7 +471,7 @@ def job_sign(cfg, job, annotations):
     full = memory_full(cfg, job, note) if note else None
     if full:
         return 'memory full', f'{full} ({numbers(note)})'
-    hit, not_hit = limit_hit(cfg, job, annotations)
+    hit, not_hit = limit_hit(cfg, job, annotations, limits)
     if hit and note:
         stall = stalled(cfg, note)
         if stall:
@@ -427,9 +519,9 @@ def decide(cfg, gh, run, env):
     red = [j for j in jobs if j.get('conclusion') in RED and j.get('name') not in cfg['followers']]
     if not red:
         return 'leave', 'no failed job of its own (only followers failed, or nothing did)'
-    evidence = []
+    evidence, limits = [], workflow_reader(cfg, gh, run)
     for j in red:
-        sign, why = job_sign(cfg, j, annotations_of(gh, j))
+        sign, why = job_sign(cfg, j, annotations_of(gh, j), limits)
         if not sign:
             return 'leave', f'{j.get("name")} ended {j.get("conclusion")}: {why}'
         evidence.append(f'{j.get("name")} ({j.get("conclusion")}): {sign}: {why}')
@@ -473,7 +565,8 @@ class Notice:
     def marks(self):
         out = {}
         for c in self.comments or []:
-            for m in MARK.finditer(str(c.get('body') or '')):
+            m = MARK.match(str(c.get('body') or ''))   # only a comment's first line: quoted text is never one
+            if m:
                 out.setdefault((int(m[1]), int(m[2]), m[3]), c.get('created_at'))
         return out
 
@@ -520,14 +613,21 @@ class Notice:
                 f'**Not re-run (fleet mode)**: [run {rid}]({url}) attempt {attempt} qualifies for its one automatic '
                 're-run; re-run it by hand.')
         body = (f'<!-- fork-ci-rerun run={rid} attempt={attempt} what={what} -->\n{head}\n\n'
-                f'{run.get("event")} `{run.get("head_branch")}` `{str(run.get("head_sha"))[:12]}`\n\n'
-                + ''.join(f'- {part.strip()}\n' for part in text.split(' | ')))[:LONGEST]
+                f'{quoted(run.get("event"))} `{quoted(run.get("head_branch"))}` `{str(run.get("head_sha"))[:12]}`\n\n'
+                + ''.join(f'- {quoted(part.strip())}\n' for part in text.split(' | ')))[:LONGEST]
         if self.issue is None:
             self.issue = self._open()
         got = self.gh.call(f'issues/{self.issue}/comments', method='POST', data={'body': body})
         self.comments.append(dict(got if isinstance(got, dict) else {}, body=body,
                                   created_at=(got or {}).get('created_at') or iso(self.now())))
         return self.issue
+
+
+def quoted(text):
+    """Text from annotations and notes, safe in the public comment: one line, no @mention (a zero-width joiner after
+    each @), and no HTML (so never a marker line, MARK, of another run's record)."""
+    return (str(text).replace('\r', ' ').replace('\n', ' ').replace('@', '@\u200d').replace('&', '&amp;')
+            .replace('<', '&lt;').replace('>', '&gt;'))
 
 
 def rerun(gh, run, record):
@@ -622,7 +722,8 @@ def sweep(cfg, env, gh, now=time.time, run_id=None, out=None):
                  f'{cfg["window_hours"]} h ({notice.where()})')
     except TROUBLE as e:
         trouble += 1
-        count = f'{asked} run(s) re-run by this pass; the tracking issue could not be read ({e.__class__.__name__})'
+        count = (f'{asked} run(s) re-run by this pass; the tracking issue could not be read for the '
+                 f'{cfg["window_hours"]} h count ({e.__class__.__name__}: {e}): red, the next pass tries again')
     say(f'fork-ci re-run: {count}', out)
     lines = ['### fork-ci re-run', '', count, '']
     if rows:

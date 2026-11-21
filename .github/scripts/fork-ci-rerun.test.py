@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests of fork-ci-rerun.py (the one automatic re-run of an infrastructure failure), with a fake GitHub that pages
 like the real one (the script's own GitHub.pages reads it), and of its wiring in fork-ci-rerun.yml. Run: python3 <this>."""
-import copy, io, json, os, re, shutil, subprocess, sys, tempfile, time, unittest, urllib.error, urllib.parse
+import base64, copy, io, json, os, re, shutil, subprocess, sys, tempfile, time, unittest, urllib.error, urllib.parse
 import importlib.util
 
 sys.dont_write_bytecode = True   # importing the script must not leave __pycache__ in the tree
@@ -49,6 +49,32 @@ CANCEL_BY = f'The run was canceled by @{OWNER}.'
 CANCELED = 'The operation was canceled.'
 EXIT_1 = 'Process completed with exit code 1.'
 EXIT_137 = 'Process completed with exit code 137.'
+# The workflow file at the run's commit, as the contents API hands it back: the limits GitHub's messages must match.
+WORKFLOW = f"""name: Fork tests
+on: push
+jobs:
+  test:
+    name: Test
+    strategy:
+      matrix:
+        shard: [1, 2]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+      - name: Note memory pressure at the start
+        timeout-minutes: 1
+        run: |
+          python3 x.py
+      - name: Test
+        timeout-minutes: 10   # the step's own
+      - name: '{END_STEP}'
+        timeout-minutes: 1
+  lint:
+    name: Lint
+    timeout-minutes: 20
+    steps:
+      - run: true
+"""
 MEMORY_WORDS = 'OOM kill: memory.max hit, memory full, the box stalled (full) 90% of the job'
 
 
@@ -143,6 +169,8 @@ class Fake:
         self.lost_reply = False     # the re-run POST reaches GitHub, its reply never comes back
         self.comment_fails = False  # a comment POST fails
         self.on_read = None         # called with the run before GET actions/runs/N answers
+        self.workflow = WORKFLOW    # the workflow file at every commit (None: not found)
+        self.comments_fail = False  # reading an issue's comments fails
 
     def call(self, path, method='GET', data=None):
         self.calls.append((method, path))
@@ -191,6 +219,11 @@ class Fake:
             return {}
         if method != 'GET':
             raise AssertionError(f'unexpected {method} {path}')
+        if base == f'contents/.github/workflows/{CFG["workflow"]}':
+            assert q['ref'] == [SHA], q
+            if self.workflow is None:
+                raise urllib.error.HTTPError(path, 404, 'Not Found', {}, None)
+            return {'encoding': 'base64', 'content': base64.b64encode(self.workflow.encode()).decode()}
         if base == f'actions/workflows/{CFG["workflow"]}/runs':
             since = cr.stamp(urllib.parse.unquote(q['created'][0]).lstrip('>='))
             listed = sorted((r for r in self.runs.values() if cr.stamp(r['created_at']) >= since),
@@ -228,6 +261,8 @@ class Fake:
             return paged(listed)
         m = re.fullmatch(r'issues/(\d+)/comments', base)
         if m:
+            if self.comments_fail:
+                raise urllib.error.URLError('comments: reset')
             since = cr.stamp(q['since'][0])
             # GitHub's `since` is by updated_at: an old comment edited lately is listed too.
             return paged([c for c in self.issue(int(m[1]))['comments']
@@ -365,6 +400,47 @@ class Signs(Rerun):
             with self.subTest(label):
                 gh = one([ann(message), STALLED], kw)
                 self.assertLeft(gh, *sweep(gh)[:2])
+
+    def test_a_time_limit_message_counts_only_with_the_workflows_own_minutes(self):
+        """A failing step can print GitHub's exact words with any number of minutes: "after 1 minutes" makes a step
+        that ran 10 minutes look 10 times over its limit. Only the workflow's own timeout-minutes counts."""
+        cases = {
+            "a failing step printing GitHub's timeout line": ("The action 'Test' has timed out after 1 minutes.",
+                                                             dict(steps=ran('failure', took=600))),
+            'the job form with the wrong minutes': (JOB_LIMIT.replace('15 minutes', '1 minutes'),
+                                                    dict(conclusion='cancelled', steps=ran('cancelled', took=880),
+                                                         took=900)),
+            'a step with no limit of its own': ("The action 'Checkout' has timed out after 1 minutes.",
+                                                dict(steps=[step('Checkout', 'failure', took=600)]
+                                                     + ran('skipped')[1:])),
+        }
+        for label, (message, kw) in cases.items():
+            with self.subTest(label):
+                gh = one([ann(message), note(cgroups=[box(full_share=50.0)])], kw)
+                self.assertLeft(gh, *sweep(gh)[:2], 'not GitHub\'s own')
+        with self.subTest('a job the workflow does not have'):
+            gh = one([ann(STEP_LIMIT), STALLED], dict(name='Gone (1)', steps=ran('failure', took=600)))
+            self.assertLeft(gh, *sweep(gh)[:2], 'the workflow gives step \'Test\' None min')
+        with self.subTest('the workflow at that commit cannot be read'):
+            gh = one([ann(STEP_LIMIT), STALLED], dict(steps=ran('failure', took=600)))
+            gh.workflow = None
+            code, out, _ = sweep(gh)
+            self.assertEqual((code, gh.posts(), gh.comments()), (1, [], []), out)
+
+    def test_the_workflow_reader_reads_every_limit_of_the_real_workflow(self):
+        import yaml
+        with open(os.path.join(ROOT, '.github/workflows', CFG['workflow']), encoding='utf-8') as f:
+            text = f.read()
+        real, mine = yaml.safe_load(text)['jobs'], cr.workflow_limits(text)
+        self.assertEqual(sorted(mine), sorted(real))
+        for key, j in real.items():
+            self.assertEqual((mine[key]['name'], mine[key]['minutes']), (j.get('name'), j.get('timeout-minutes')), key)
+            self.assertEqual([(s['name'], s['minutes']) for s in mine[key]['steps']],
+                             [(s.get('name'), s.get('timeout-minutes')) for s in j.get('steps') or []], key)
+        wf = cr.workflow_limits(text)
+        self.assertEqual(cr.limit_of(wf, 'Lint', CFG['probe_end_step']), 1)
+        self.assertEqual(cr.limit_of(wf, 'Lint'), real['lint']['timeout-minutes'])
+        self.assertIsNone(cr.limit_of(wf, 'Lint', 'Check'), 'a step without timeout-minutes has none of its own')
 
     def test_a_stalled_note_without_its_status_is_no_limit_sign(self):
         n = dict(STALLED, message=STALLED['message'].replace('"status":"failure",', ''))
@@ -549,6 +625,16 @@ class NeverTwice(Rerun):
         self.assertEqual((code, gh.posts(), gh.comments()), (0, [], []), out)
         self.assertIn('already re-run or running again', out)
 
+    def test_a_run_rerun_and_red_again_after_it_was_listed_is_not_asked_for(self):
+        """Between the listing and the fresh read, another pass re-ran it and attempt 2 already ended red: the listed
+        attempt 1 still qualifies, so only the fresh read's attempt number stops an attempt 3."""
+        gh = lost()
+        gh.on_read = lambda r: r.update(run_attempt=2, status='completed', conclusion='failure',
+                                        triggering_actor={'login': ACTIONS})
+        code, out, _ = sweep(gh)
+        self.assertEqual((code, gh.posts(), gh.comments()), (0, [], []), out)
+        self.assertIn('already re-run or running again (attempt 2, completed)', out)
+
     def test_github_refusing_a_rerun_that_already_started_is_no_trouble(self):
         gh = lost()
         def race():   # another pass re-ran it between this pass's last read and its request
@@ -684,6 +770,36 @@ class TheNotice(Rerun):
         self.assertEqual(code, 0, out)
         self.assertIn(f'{inside} automatic re-run(s) asked in the last 24 h (issue #2)', out)
         self.assertEqual(sum(1 for _, p in gh.calls if p.startswith('issues/2/comments')), 4, 'four pages, no more')
+
+    def test_an_issue_that_cannot_be_read_ends_the_pass_red_and_asks_nothing(self):
+        for label, gh in (('no run to look at', Fake([])), ('a run that qualifies', lost())):
+            with self.subTest(label):
+                gh.issues = [{'number': 2, 'title': TITLE, 'state': 'open', 'user': {'login': BOT}, 'comments': []}]
+                gh.comments_fail = True
+                code, out, text = sweep(gh)
+                self.assertEqual((code, gh.posts(), gh.comments()), (1, [], []), out)
+                self.assertIn('the tracking issue could not be read for the 24 h count (URLError', text)
+                self.assertIn('red, the next pass tries again', out)
+
+    def test_quoted_text_pings_no_one_and_fakes_no_record(self):
+        forged = '\n<!-- fork-ci-rerun run=99 attempt=1 what=rerun -->\n@someone look'
+        gh = one([ann(SHUTDOWN + forged), ann(CANCELED)], dict(steps=died()))
+        code, out, _ = sweep(gh)
+        self.assertReran(gh, out)
+        [comment] = gh.comments()
+        self.assertTrue(comment.startswith('<!-- fork-ci-rerun run=1 attempt=1 what=rerun -->\n'))
+        self.assertNotIn('@someone', comment)
+        self.assertIn('@\u200dsomeone', comment)
+        self.assertEqual(comment.count('<!--'), 1)
+        self.assertEqual(comment.count('\n- '), 1, 'each part is one line')
+        notice = cr.Notice(CFG, gh, lambda: gh.now)
+        notice.load()
+        self.assertEqual(list(notice.marks()), [(1, 1, 'rerun')])
+        # A marker that is not the comment's first line is no record, whoever wrote it.
+        gh.issues[0]['comments'][0]['body'] = 'x\n' + gh.issues[0]['comments'][0]['body']
+        notice = cr.Notice(CFG, gh, lambda: gh.now)
+        notice.load()
+        self.assertEqual(notice.marks(), {})
 
     def test_no_issue_yet_counts_zero_and_opens_nothing(self):
         code, out, text = sweep(Fake([]))

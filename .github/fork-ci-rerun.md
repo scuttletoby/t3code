@@ -66,7 +66,11 @@ start sample, a reboot in between, a file the runner cannot see.
      `memory.max` hits or `memory.high` throttling. One event without the
      stall, or a machine-wide OOM kill, is no sign.
    - **limit while stalled**: GitHub says the job or a step ran past its time
-     limit; the job (or that step) really ran that long (less
+     limit; its minutes are that job's (or step's) own `timeout-minutes` in the
+     workflow file at the run's commit (read through the contents API; a step
+     can print GitHub's words with any number, so the message's number alone
+     never counts, and a job or step the reader cannot match stays red); the
+     job (or that step) really ran that long (less
      `limit_slack_seconds`); no other step failed; and the note shows the
      machine or a box stalled (full) at least `full_share_percent` of the job,
      or a 5-minute full average at least `full_avg300_percent` at the end.
@@ -110,6 +114,7 @@ Nothing is kept between passes: each one reads GitHub (the runs and the issue).
 | A pass stops before its request reached GitHub          | The comment is there, the run unchanged; the next pass (within `catch_up_minutes`) sends the request once and adds no second comment.                                  |
 | A pass stops after GitHub took the request (reply lost) | The comment, written first, says why. The new attempt exists: the next passes see it queued or running, or later red with an attempt by `github-actions`. Never twice. |
 | The comment cannot be written                           | No re-run (it would be hidden): a warning, the pass ends red, the next pass tries both.                                                                                |
+| The tracking issue cannot be read                       | No re-run (its record cannot be checked) and no count: the pass ends red and says so; the next pass tries again.                                                       |
 | A dispatch with `run_id` while a scheduled pass waits   | Its own concurrency group: it is never replaced by a scheduled pass.                                                                                                   |
 | An old run, from before the probe steps                 | No note: only a lost runner can qualify. A time limit or a failure without the note is left red.                                                                       |
 | A run that ended more than `catch_up_minutes` ago       | Not looked at (except with `run_id`). Runs are listed by creation over `list_hours`, every page read; a listing past 10 pages ends the pass red, nothing re-run.       |
@@ -142,5 +147,8 @@ them); that is `fork-fleet.py`'s to change.
 - GitHub keeps at most 10 notices per step and 50 annotations per job: on a
   job with very many annotations the note can be dropped. The job then reads
   as "no note" and stays red (fail closed).
+- Text quoted into the public tracking issue (annotation messages, note
+  paths) is made one line with no `@` mention and no HTML, and only a
+  comment's first line is read as its marker.
 - A job a step's own time limit failed counts as `limit` only with a stall; a
   slow test on a calm machine stays red.
