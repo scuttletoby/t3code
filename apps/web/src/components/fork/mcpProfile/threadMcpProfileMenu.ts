@@ -1,7 +1,8 @@
 /**
  * Fork: what upstream's thread menus call for the MCP profile entry. The settings and thread state
- * it reads load in the background when this file loads, so the menus' own imports stay as they
- * were and a menu still opens at once; until then (or if they cannot load) there is no entry.
+ * it reads (threadMcpProfileMenu.runtime) load in the background when this file loads, so a menu
+ * still opens at once; until then (or if they cannot load) there is no entry. The menus import
+ * only this file and threadMcpProfile.logic (plain functions over settings, no stores) statically.
  */
 import type { ScopedThreadRef } from "@t3tools/contracts";
 
