@@ -13,6 +13,8 @@ const WHOLE_ONLY = [
   "mcpSubagentProfile",
   "mcpThreadProfiles",
   "modelPolicy",
+  "placement",
+  "placementNeeds",
   "playtest",
   "reviewRules",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;

@@ -169,6 +169,16 @@
         "const spawnSync = forkSpawnSync; // Fork: the Rosetta limit above"
       ]
     },
+    "scripts/build-desktop-artifact.ts": {
+      "why": "#822: without signing secrets electron-builder finds no identity and signs nothing, so the shipped macOS app keeps only the linker signature of Electron's own executable, which seals none of the renamed bundle, and `codesign --verify --deep --strict` fails on it (\"code has no resources but signature indicates they must be present\"). For an unsigned build the fork's line sets identity \"-\" and the sign hook scripts/fork-codesign.cjs, which runs `codesign --force --deep --sign -` as electron-builder's last change to the bundle, before the zip and dmg are made from it. Signed builds keep upstream's line and scripts/sign-macos.ts. fork-release.yml's verify_mac_signature job checks the app in each shipped zip and dmg. Drop this seam when upstream ad-hoc signs unsigned macOS builds, or when the fork signs with a Developer ID (#803).",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "...(signed ? {} : { identity: \"-\", sign: path.join(repoRoot, \"scripts/fork-codesign.cjs\") }),"
+        ]
+      }
+    },
     "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": {
       "why": "MCP profiles part 2: a Claude thread's MCP profile is applied to its session (strict MCP mode or an allowlist of outside servers, from apps/server/src/fork/claudeMcpProfile.ts), is part of the live-query key, refuses the turn when it cannot be applied, and adds a PreToolUse hook (merged into the adapter's hooks) that refuses a call to a server outside the profile. Additions only; tested in apps/server/src/fork/claudeMcpProfile.adapter.test.ts.",
       "added": [
@@ -184,6 +194,17 @@
         "Effect.tap(checkMcpProfile),",
         "...input.mcpProfileOptions?.hooks,"
       ]
+    },
+    "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": {
+      "why": "MCP profiles part 5: each Codex thread gets its profile's outside MCP servers switched off in its own per-thread config (mcp_servers.<name>.enabled = false for every server Codex's config/read lists for the thread's folder that the profile leaves out, launch-argument servers included; T3's own entries stay), and a turn is refused, saying why and the fix, when the thread's live servers (mcpServerStatus/list) still include one outside its profile. The adapter's app-server client factory is wrapped by apps/server/src/fork/codexMcpProfile.ts; the overrides travel per request, so other threads on the shared app-server keep their own sets. Additions only; tested in apps/server/src/fork/codexMcpProfile.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as CodexMcpProfile from \"../../fork/codexMcpProfile.ts\"; // Fork: MCP profiles",
+          "...(yield* CodexMcpProfile.profiledClientFactory(clientFactory)), // Fork: MCP profiles"
+        ]
+      }
     },
     "apps/server/src/orchestration-v2/ProviderTurnStartService.ts": {
       "why": "MCP profiles part 2: a Claude turn its MCP profile refuses never reached Claude, like the other refusals in this list.",
@@ -244,6 +265,17 @@
         "yield* LaunchMcpProfile.checkForwarded(name, params); // Fork: MCP profile launch"
       ]
     },
+    "apps/server/src/mcp/McpToolExposure.ts": {
+      "why": "MCP profile design PR 4 (T3 tool groups): tool_search leaves out the T3 tools the calling thread's MCP profile leaves out (its t3Tools groups), before it ranks them, so a search never finds or loads a tool the thread cannot call. The filter and the global rule that hides those tools from tools/list and refuses them on tools/call are in fork/mcpT3ToolFilter.ts; the rule is installed in McpHttpServer's production `layer` (a pending file, no new line). A server without the rule (upstream's tests) searches as upstream does. Tested in apps/server/src/fork/mcpT3ToolFilter.test.ts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import { searchableT3Tool } from \"../fork/mcpT3ToolFilter.ts\"; // Fork: MCP profile T3 tool groups",
+          ".filter(searchableT3Tool) // Fork: MCP profile T3 tool groups"
+        ]
+      }
+    },
     "apps/server/src/mcp/toolkits/project/handlers.ts": {
       "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706). An agent's t3_thread_launch (from a calling thread) is checked against the model policy once its model is known, before the slot gate: refused in enforce when the launch names no model, a model in no row, or an effort off its row (fork/modelPolicyCheck.ts, #731).",
       "added": [
@@ -298,6 +330,28 @@
         "import * as ModelPolicyCheck from \"../../../fork/modelPolicyCheck.ts\"; // Fork: model policy",
         "yield* ModelPolicyCheck.checkConfigure(modelSelection); // Fork: model policy"
       ]
+    },
+    "apps/server/src/mcp/toolkits/environment/handlers.ts": {
+      "why": "t3_environment_read returns this machine's facts beside upstream's fields, for an agent choosing a machine (placement design row P3, facts out): hostResources (CPU, cores, memory; the result field of upstream PR #34293, closed there unmerged) and the fork's placement (declared labels, and running agents, slots free and the memory floor read from the agent slot gate's status, or available false with a reason when the gate cannot be read), all from fork/environmentFacts.ts. A linked machine's read is forwarded as before and returns that machine's facts.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as EnvironmentFacts from \"../../../fork/environmentFacts.ts\"; // Fork (P3): facts out",
+          "...(yield* EnvironmentFacts.read), // Fork (P3): facts out"
+        ]
+      }
+    },
+    "apps/server/src/mcp/toolkits/environment/tools.ts": {
+      "why": "t3_environment_read's result schema takes the two optional fork fields hostResources and placement (fork/environmentFacts.ts, placement design row P3), so a linked machine's facts decode here and a machine on an older T3 that leaves them out still decodes (no facts). Result fields are not in the advertised tool list the context budget measures, so the budget is unchanged.",
+      "added": [],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as EnvironmentFacts from \"../../../fork/environmentFacts.ts\"; // Fork (P3): facts out",
+          "...EnvironmentFacts.ResultFields, // Fork (P3): facts out"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -323,7 +377,7 @@
     "apps/server/src/orchestration-v2/ThreadLaunchService.ts": 13,
     "apps/server/src/orchestration-v2/runtimeLayer.test.ts": 259,
     "apps/server/src/orchestration-v2/runtimeLayer.ts": 28,
-    "apps/server/src/processRunner.ts": 35,
+    "apps/server/src/processRunner.ts": 8,
     "apps/server/src/provider/ProviderRegistry.test.ts": 14,
     "apps/server/src/provider/ProviderRegistry.ts": 10,
     "apps/server/src/provider/providerMaintenanceRunner.test.ts": 1,
@@ -406,6 +460,7 @@
     "packages/shared/src/agentSlots*",
     "packages/shared/src/capacity/",
     "packages/shared/src/capacity*",
+    "packages/shared/src/slotObserve*",
     "packages/shared/src/waitFor*",
     "scripts/lib/release-repository.ts",
     "scripts/release-repository.test.ts",
