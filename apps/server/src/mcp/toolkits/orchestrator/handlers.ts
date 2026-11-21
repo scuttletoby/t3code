@@ -2,6 +2,7 @@ import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import { OrchestratorToolkit } from "./tools.ts";
 import * as Effect from "effect/Effect";
 
+import * as AgentSlotRoutes from "../../../fork/agentSlotRoutes.ts"; // Fork: agent slots
 import * as LaunchMcpProfile from "../../../fork/launchMcpProfile.ts"; // Fork: MCP profile launch
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../../../peer/PeerLinkRequests.ts";
@@ -184,6 +185,7 @@ const handlers = {
         Effect.gen(function* () {
           const scope = yield* McpInvocationContext.McpInvocationContext;
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          yield* AgentSlotRoutes.checkSendSlot(scope.thread?.threadId, input.threadId); // Fork: agent slots
           return yield* service.sendToThread(scope, input);
         }),
     ),

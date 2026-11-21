@@ -1,12 +1,13 @@
 /**
- * Fork (issue 625, part of 386): names each thread there that no task here follows, made before the
- * start, to its parent once (ids carry one key per orphan, so reruns and restarts never repeat one).
- * Upstream's fix (record before launch) is not merged; slim or drop this scan once a sync brings it.
+ * Fork: names each thread there that no task here follows, made before the start, to its parent
+ * once (one id key per orphan, so reruns and restarts never repeat one); drop once upstream records
+ * before launch. A reminder takes an agent slot; refused, it is asked again and never given up.
  */
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 
 import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
@@ -17,7 +18,9 @@ import * as ThreadManagement from "../../orchestration-v2/ThreadManagementServic
 import * as PeerForwarding from "../../peer/PeerForwarding.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import * as SlotGate from "../../slots/SlotGate.ts";
 import * as WaitDelivery from "../../waits/WaitDelivery.ts";
+import { WAKE_SLOT_RETRY_MS } from "../../waits/WaitService.ts";
 import * as WorkAdmission from "../../workAdmission.ts";
 import {
   type LinkedThread,
@@ -43,6 +46,12 @@ export interface OrphanScanOptions {
   readonly maxPages: number;
   /** The longest one page may take before the environment counts as not answering. */
   readonly pageTimeout: Duration.Input;
+  /**
+   * Between tries of one parent while the agent slot gate refuses (the wait service's
+   * `WAKE_SLOT_RETRY_MS` by default). Not counted in `attempts`, and no rescan: only that
+   * parent's check runs again.
+   */
+  readonly slotRetryDelay?: Duration.Input;
 }
 
 /**
@@ -67,6 +76,15 @@ export type ParentOutcome =
   | { readonly type: "none" }
   | { readonly type: "gone" }
   | { readonly type: "unreadable" }
+  /**
+   * The agent slot gate refused (nothing of that message was sent): `run` asks again for this
+   * parent alone, with the threads this scan found.
+   */
+  | {
+      readonly type: "waitsForSlot";
+      readonly detail: string;
+      readonly linked: ReadonlyArray<LinkedThread>;
+    }
   /** Named now; a busy parent reads it after its current run (an open question included). */
   | { readonly type: "sent"; readonly threadIds: ReadonlyArray<ThreadId> }
   | { readonly type: "held"; readonly detail: string };
@@ -95,7 +113,11 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
   options: OrphanScanOptions = DEFAULT_OPTIONS,
 ) {
   const threads = yield* ThreadManagement.ThreadManagementService;
-  const delivery = yield* WaitDelivery.make();
+  // The server's one gate (`SlotGate.layer` memoizes): none in a test that gives none.
+  const delivery = yield* WaitDelivery.make(yield* Effect.serviceOption(SlotGate.SlotGate));
+  const slotRetryDelay = options.slotRetryDelay ?? Duration.millis(WAKE_SLOT_RETRY_MS);
+  /** Parents whose own retry runs (`run`): a later scan leaves them to it. */
+  const waitingForSlot = new Map<ThreadId, ParentOutcome>();
   const settings = yield* ServerSettingsService;
   const store = yield* DelegatedResultsStore.DelegatedResultsStore;
   const forwarding = yield* PeerForwarding.PeerForwarding;
@@ -165,6 +187,9 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
         case "retry":
           retry = true;
           break;
+        case "waitsForSlot":
+          // The next batches go to the same idle thread: they wait too. Sent ones are recorded.
+          return { type: "waitsForSlot", detail: result.detail, linked } satisfies ParentOutcome;
       }
     }
     if (retry) return { type: "unreadable" } satisfies ParentOutcome;
@@ -220,7 +245,8 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
     );
     const parents = new Map<ThreadId, ParentOutcome>();
     for (const [parentThreadId, linked] of byParent) {
-      parents.set(parentThreadId, yield* checkParent(parentThreadId, linked));
+      const waiting = waitingForSlot.get(parentThreadId);
+      parents.set(parentThreadId, waiting ?? (yield* checkParent(parentThreadId, linked)));
     }
     if (partial.length > 0) {
       yield* Effect.logWarning(
@@ -244,15 +270,51 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
       unreadableParents(outcome).length > 0);
 
   /**
+   * One parent refused a slot: its check runs again every `slotRetryDelay` while the gate refuses
+   * (logged once), and every `retryDelay` while it cannot be read, until it is done. A restart
+   * meanwhile loses nothing: the next start's scan finds the same orphans unnamed.
+   */
+  const untilSlot = Effect.fn("DelegatedOrphanScan.untilSlot")(
+    function* (parentThreadId: ThreadId, first: ParentOutcome & { type: "waitsForSlot" }) {
+      yield* Effect.logInfo("delegated orphan reminder waits for an agent slot", {
+        threadId: parentThreadId,
+        detail: first.detail,
+      });
+      let outcome: ParentOutcome = first;
+      while (outcome.type === "waitsForSlot" || outcome.type === "unreadable") {
+        yield* Effect.sleep(outcome.type === "waitsForSlot" ? slotRetryDelay : options.retryDelay);
+        outcome = yield* checkParent(parentThreadId, first.linked);
+      }
+    },
+    (effect, parentThreadId) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("delegated orphan reminder failed", {
+            threadId: parentThreadId,
+            cause,
+          }),
+        ),
+        Effect.ensuring(Effect.sync(() => waitingForSlot.delete(parentThreadId))),
+      ),
+  );
+
+  /**
    * Scans after the delay, and again while `needsAnother`, at most `attempts` times. What is still
    * unchecked then is logged by name; the next start scans it again (within its one-day window).
+   * A parent refused a slot gets its own retry (`untilSlot`); `run` ends when those end.
    */
   const run = Effect.fn("DelegatedOrphanScan.run")(
     function* () {
+      const slotWaits: Array<Fiber.Fiber<void>> = [];
       yield* Effect.sleep(options.delay);
       for (let attempt = 1; attempt <= options.attempts; attempt += 1) {
         const outcome = yield* scan();
-        if (!needsAnother(outcome)) return;
+        for (const [parentThreadId, parent] of outcome.parents) {
+          if (parent.type !== "waitsForSlot" || waitingForSlot.has(parentThreadId)) continue;
+          waitingForSlot.set(parentThreadId, parent);
+          slotWaits.push(yield* Effect.forkChild(untilSlot(parentThreadId, parent)));
+        }
+        if (!needsAnother(outcome)) break;
         if (attempt < options.attempts) {
           yield* Effect.sleep(options.retryDelay);
           continue;
@@ -267,6 +329,7 @@ export const make = Effect.fn("DelegatedOrphanScan.make")(function* (
           },
         );
       }
+      yield* Fiber.joinAll(slotWaits);
     },
     (effect) =>
       effect.pipe(
@@ -293,6 +356,11 @@ export const layerWith = (options: OrphanScanOptions = DEFAULT_OPTIONS) =>
  */
 export const layer = layerWith().pipe(
   Layer.provide(
-    Layer.merge(CommandReceiptStore.layerFromApplicationReceipts, DelegatedResultsStore.layer),
+    Layer.mergeAll(
+      // The server's one gate: layers memoize by reference.
+      SlotGate.layer,
+      CommandReceiptStore.layerFromApplicationReceipts,
+      DelegatedResultsStore.layer,
+    ),
   ),
 );
