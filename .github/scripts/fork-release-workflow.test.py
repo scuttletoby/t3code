@@ -18,9 +18,13 @@ wf = yaml.safe_load(text)
 desktop = yaml.safe_load((root / ".github/workflows/release-desktop.yml").read_text())
 jobs = wf["jobs"]
 failures = []
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks = []
 
 
 def check(name, ok, detail=""):
+    if ok:
+        oks.append(1)
     print(("ok   " if ok else "FAIL ") + name + ("" if ok or not detail else f"\n     | {detail}"))
     if not ok:
         failures.append(name)
@@ -173,4 +177,4 @@ check("publish checks out only its guard scripts, at github.workflow_sha",
 if failures:
     print(f"{len(failures)} failed")
     sys.exit(1)
-print("all passed")
+print(f"all passed: {len(oks)} ok, 0 skipped")

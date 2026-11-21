@@ -99,9 +99,12 @@ stranger_issue() { # an open issue someone else opened, with the very same title
     > "$root/state/issues.json"
 }
 calls() { cat "$root/state/calls" 2> /dev/null || true; }
+# The ok lines printed, for the end line: fork-ci-tests.cjs checks its count against them (#664).
+oks=0
 expect() { # expect LABEL 'CONDITION' (shell, evaluated)
   local label="$1"
   if eval "$2"; then
+    oks=$((oks + 1))
     echo "ok   $label"
   else
     echo "FAIL $label (rc=$rc)"
@@ -326,4 +329,4 @@ if (( fails )); then
   echo "$fails failed"
   exit 1
 fi
-echo "all passed"
+echo "all passed: $oks ok, 0 skipped"
