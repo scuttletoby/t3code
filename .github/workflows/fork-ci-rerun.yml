@@ -1,24 +1,24 @@
 name: Fork CI re-run
 
 # Fork only. A failed Fork tests run gets ONE automatic "re-run failed jobs"
-# (GitHub's own), only when every failed job shows a known infrastructure sign:
-# its runner lost communication, its box was full (OOM kills, memory.max hits,
-# memory.high throttling while stalled), or it ran past its time limit while the
-# machine was stalled. Never for a test failure (no sign: left red, fail closed)
-# and never twice: the re-run is triggered by github-actions, and a run with an
-# attempt by anyone but CONFIG's actors is left red. Every rule, and the numbers
-# that decide it, are in .github/scripts/fork-ci-rerun.py and
-# .github/fork-ci-rerun.json; each job's numbers come from its own
-# fork-ci-pressure.py steps (fork-tests.yml). Each re-run is a warning
-# annotation with its signs and numbers and a row in this job's summary, and
-# every pass counts the automatic re-runs of the last 24 hours.
-# On a schedule, not on workflow_run (fork-contracts.test.py refuses events a
-# pull request from another fork can cause): nothing is kept between passes,
-# each reads the runs of the last hour from GitHub, so a pass that stopped
-# half-way is finished by the next. Offset from fork-fleet.yml's sweep, which
-# re-runs a lost fleet runner's run too: whichever comes first re-runs it, the
-# other finds an attempt by github-actions and leaves it. Runbook:
-# .github/fork-ci-rerun.md.
+# (GitHub's own), only when every failed job shows a known infrastructure sign
+# that GitHub's own runner message AND the job's own step record agree on: its
+# runner was lost, its box was full and stalled (from the job's own pressure
+# note, never on a GitHub-hosted runner), or it ran past its time limit while
+# the machine was stalled. Never for a test failure (no sign: left red, fail
+# closed), never for a person's cancel, never for a run the fleet would not
+# trust, and never twice: the re-run is triggered by github-actions, and a run
+# with an attempt by anyone else is left red. Every rule, and the numbers that
+# decide it, are in .github/scripts/fork-ci-rerun.py and
+# .github/fork-ci-rerun.json. Each re-run is first a comment on one tracking
+# issue (opened once; the run, its signs and numbers), then a warning
+# annotation and a row in this job's summary; the 24 h count is read from that
+# issue. On a schedule, not on workflow_run (fork-contracts.test.py refuses
+# events a pull request from another fork can cause): nothing is kept between
+# passes, each reads GitHub, so a pass that stopped half-way is finished by the
+# next. Offset from fork-fleet.yml's sweep, which re-runs a lost fleet runner's
+# run too: whichever comes first re-runs it, the other finds an attempt by
+# github-actions and leaves it. Runbook: .github/fork-ci-rerun.md.
 on:
   schedule:
     - cron: "5-55/10 * * * *"
@@ -31,8 +31,10 @@ on:
 
 permissions: {}
 
+# Scheduled passes queue behind each other; a dispatch (one run id) has a group
+# of its own, so a scheduled pass never replaces it while it waits.
 concurrency:
-  group: fork-ci-rerun
+  group: fork-ci-rerun-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'schedule' }}
   cancel-in-progress: false
 
 jobs:
@@ -44,13 +46,16 @@ jobs:
       actions: write
       checks: read
       contents: read
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           sparse-checkout: |
             /.github/fork-ci-rerun.json
+            /.github/fork-fleet.json
             /.github/scripts/fork-ci-rerun.py
+            /.github/scripts/fork-fleet.py
           sparse-checkout-cone-mode: false
 
       - name: Re-run a run that failed for infrastructure only, once

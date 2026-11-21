@@ -749,6 +749,7 @@ jobs:
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
       # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
       - name: Note memory pressure at the start
+        timeout-minutes: 1
         run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       - name: Reject repository-owned PR assets
@@ -807,6 +808,7 @@ jobs:
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
+        timeout-minutes: 1
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
@@ -833,6 +835,7 @@ jobs:
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
       # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
       - name: Note memory pressure at the start
+        timeout-minutes: 1
         run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       # Runs in the background while Vite+ installs; the step before the build waits for it.
@@ -975,6 +978,7 @@ jobs:
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
+        timeout-minutes: 1
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
@@ -1009,6 +1013,7 @@ jobs:
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
       # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
       - name: Note memory pressure at the start
+        timeout-minutes: 1
         run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       # A shard with nothing to run says so in the summary and stops here.
@@ -1117,6 +1122,7 @@ jobs:
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
+        timeout-minutes: 1
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
@@ -1152,6 +1158,7 @@ jobs:
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
       # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
       - name: Note memory pressure at the start
+        timeout-minutes: 1
         run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       - name: Setup Vite+
@@ -1206,6 +1213,7 @@ jobs:
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
+        timeout-minutes: 1
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
@@ -1243,6 +1251,7 @@ jobs:
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
       # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
       - name: Note memory pressure at the start
+        timeout-minutes: 1
         run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       - name: Detect affected jobs
@@ -1366,6 +1375,7 @@ jobs:
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
+        timeout-minutes: 1
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
@@ -1392,6 +1402,7 @@ jobs:
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
       # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
       - name: Note memory pressure at the start
+        timeout-minutes: 1
         run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       - name: Setup Rust
@@ -1414,6 +1425,7 @@ jobs:
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
+        timeout-minutes: 1
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
@@ -1473,6 +1485,7 @@ jobs:
       # Memory pressure from here on, for the one automatic re-run of an infrastructure failure
       # (fork-ci-rerun.yml reads the note the end step leaves; fork-ci-pressure.py never fails the job).
       - name: Note memory pressure at the start
+        timeout-minutes: 1
         run: python3 -I .github/scripts/fork-ci-pressure.py start
 
       - name: Setup Vite+
@@ -1486,6 +1499,7 @@ jobs:
 
       # Last: the numbers since the start step in the log, and as a notice when the job did not succeed.
       - name: Note memory pressure at the end
+        timeout-minutes: 1
         if: ${{ always() && hashFiles('.github/scripts/fork-ci-pressure.py') != '' }}
         env:
           JOB_STATUS: ${{ job.status }}

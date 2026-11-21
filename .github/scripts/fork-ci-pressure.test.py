@@ -210,6 +210,13 @@ class Steps(unittest.TestCase):
                                              r"\.py'\) != '' \}\}", end['if']), end['if'])
                 self.assertEqual(end['env'], {'JOB_STATUS': '${{ job.status }}'})
                 self.assertEqual(sum('fork-ci-pressure' in str(s.get('run')) for s in steps), 2)
+                for probe in (steps[1], end):
+                    # A hung probe never holds the job up to its own limit. No continue-on-error: nothing in
+                    # fork-tests.yml may fail quietly (fork-contracts.test.py); the probe itself never fails.
+                    self.assertIn(probe.get('timeout-minutes'), (1, 2), probe['name'])
+                    self.assertNotIn('continue-on-error', probe)
+                with open(os.path.join(ROOT, '.github/fork-ci-rerun.json'), encoding='utf-8') as f:
+                    self.assertEqual(end['name'], json.load(f)['probe_end_step'])   # the re-run reads its record
 
     def test_the_probe_is_not_fork_owned_app_jobs_read_it(self):
         with open(os.path.join(ROOT, '.github/fork-owned-paths.txt'), encoding='utf-8') as f:
