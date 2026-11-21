@@ -66,7 +66,8 @@ the findings, the approach lens and the round cap from the lens comments
 (below, "Findings and rounds"). The `state_line` key is parsed but not enforced
 yet. `review.recommended.json` (next to this file) is a complete example with
 made-up paths; a test parses it. Real paths, lens names and prompt files belong
-in the project's own config (below, "Turning it on").
+in the project's own config (below, "Turning it on: release, pin, then
+config").
 
 Every key is required except `override_authors`, and an unknown key is an
 error, as in the rest of the config. A wrong block makes the whole config invalid, naming every problem at
@@ -284,16 +285,6 @@ to the config itself and to a lens prompt need the critical lenses: the extra
 review. A project whose gate or queue code lives in its own repository (the
 fork's `fork-ci/`) adds a critical rule for those paths.
 
-**Turning it on.** A project opts in through its own config, never through
-the fork: add the `review` block to the queue config its head gate reads
-(`config` input), with its real paths, lens names and prompt files, in
-`shadow` first. Read a few gate summaries, fix every config warning, then set
-`mode` to `enforce` and dispatch the backfill (head-check README). The fork's
-own config is [`.github/fork-pr-queue.json`](../../../.github/fork-pr-queue.json),
-in `shadow`, without `override_authors` (no person yet) until issue #78 is done; its lens
-prompts (`.github/fork-lens-*.md`) tell each lens the exact header and findings
-lines, so a switch to `enforce` does not fail every pull request.
-
 **The empty input.** The gate refuses an empty `required-lenses` input (a head
 with no lens comment would pass), except when the config at the base tip has a
 `review` block in `enforce`: then the path rules name the lenses. A name that
@@ -301,16 +292,151 @@ names no lens (`<LENS_NAME>`, `r4`) is refused in every mode.
 
 **Fail closed.** No merge base (the base was force-pushed, or the histories are
 unrelated), a failed `git diff`, a diff line the judge cannot read, a base or
-head that cannot be fetched, or a `review` block that does not parse: the gate
+head that cannot be fetched, a `review` block that does not parse, or lens
+comments that cannot be read (the rounds cannot be judged): the gate
 posts a failure that says why, in `shadow` as in `enforce`. Never a pass, never
 "no lenses needed", and never today's rule instead. A config without the
 `review` key gives exactly the gate of before this block.
 
-**Adding the block.** A release that does not know the `review` key refuses the
-whole config (an unknown key), so: release first, then pin that release in every
-caller of the queue and the gate, then add the key. Roll back in the reverse order:
-remove the key, then the pin. The same holds for `override_authors`: a
-release from before it refuses a config that has it.
+### Turning it on: release, pin, then config
+
+A project opts in through its own config, never through the fork. The order
+matters: a release that does not know a key refuses the whole config (an
+unknown key), and a refused config stops the queue and makes the gate refuse
+every head, the pull request that would fix it too. So: release first, then pin
+that release in every caller, then the config. Each step after the release is a
+pull request of its own on the default branch.
+
+1. **Release.** The fork makes the releases
+   ([fork-ci README, "How a release is made"](../../README.md#how-a-release-is-made));
+   a project never makes one. The path rules (`review`, `shadow` and `enforce`)
+   are in `ci/v15` and later. Findings, rounds and `override_authors` are in
+   the first release after `ci/v20`
+   ([RELEASE-NOTES.md](../../RELEASE-NOTES.md), #740). Take the newest
+   `ci/vN` and its release sha as in
+   [Pinning](../../README.md#pinning).
+2. **Pin.** In one pull request, move every `uses:` of fork-ci in the
+   project to that sha, with the tag as the comment: the queue's caller
+   (`fork-pr-queue.yml` or the `pr-queue` action), the gate's caller
+   ([`gate-caller.example.yml`](../head-check/gate-caller.example.yml)) and
+   any job that runs the `head-check` action. Move the `sha` of the pin
+   config of every tool outside a workflow that runs the queue's code too
+   ([`actions/pinned`](../pinned/README.md), fork-ci README,
+   ["Outside a workflow"](../../README.md#outside-a-workflow)): on an older
+   release it refuses the new key the same way. Read the release notes between
+   the old and the new tag first. After it merges, dispatch the gate's
+   backfill (head-check README, "After a change to the caller, a new pin").
+   The config does not change yet, so the gate judges as before. A project
+   without the gate sets it up first (head-check README, "The gate", setup
+   steps). In a public repository the caller needs a repository Actions
+   policy that allows `pull_request_target` for exactly its file: keep the
+   file name the policy names.
+3. **Config in `shadow`.** Add the `review` block to the queue config the
+   gate reads (its `config` input) with `"mode": "shadow"`. Start from
+   `review.recommended.json` and put in the real paths, lens names and prompt
+   files. Leave `override_authors` out until a person, not an agent, posts
+   overrides from a login of their own (issue #78). The lens prompts ask for
+   the lens header and the findings section (sections "Lens comments" and
+   "Findings and rounds"; the fork's own prompts, `.github/fork-lens-*.md`,
+   are an example), so a later switch to `enforce` does not fail every pull
+   request. Keep the caller's `required-lenses` as it is: in `shadow` it
+   still decides. This pull request is judged by the old rules (the gate
+   reads the config from the base tip), and its merged config must parse, or
+   the gate refuses it. The fork's own config,
+   [`.github/fork-pr-queue.json`](../../../.github/fork-pr-queue.json), is at
+   this step.
+4. **Read the results.** From now on every gate run adds rows to the
+   summary of the gate App's check run on the head ("Details" on the pull
+   request, or
+   `gh api "repos/OWNER/REPO/commits/HEAD_SHA/check-runs?check_name=CHECK_NAME&filter=latest" --jq '.check_runs[0].output.summary'`):
+   - `path rules (shadow)`:
+     `the path rules would have said: <weight>, lenses <...> (...); the required-lenses input decides (mode shadow)`,
+     and `; config warning: ...` for each problem `enforce` would refuse (the
+     run log has it as a warning too);
+   - `findings and rounds (shadow)`: `they would have said: round N of M`,
+     then `, approach lens <name> required from round <N>` once the round
+     reaches `rounds.approach_at`, then
+     `; findings are not judged (findings: false)` with `findings: false`,
+     then the blockers and majors still open, a lens report with no findings
+     section or the round cap, or `; no blocker or major open`.
+
+   Compare them with the real verdict of each pull request that merges. A
+   difference means `enforce` would have failed a head that passed (a lens
+   the input does not name, an open finding, a report without a findings
+   section) or the rules are wrong: fix the config or the lens prompts. The
+   rows never fail a head in `shadow`; a change the rules cannot judge (no
+   merge base, a failed diff, a config that does not parse, lens comments
+   that cannot be read) fails it in both modes.
+
+5. **Enforce.** When the rows have matched the real verdicts over the
+   number of merged pull requests the project picked, and no row shows a
+   config warning, one pull request sets `"mode": "enforce"`. It changes the
+   config, so ask for the critical lenses: the gate does not require them yet
+   (the base is still in `shadow`, where only the input decides). Dispatch
+   the backfill right after it merges, and arm no pull request before the
+   backfill has run: each open pull request is judged by the new rules only at
+   its next run, so until then the queue can merge one on a pass it got under
+   `shadow`. Nothing checks that gap. Now the path rules' lenses are required,
+   and the `required-lenses` input is required as well (it can add lenses,
+   never remove them).
+
+   A later pull request may empty the input (the path rules name the
+   lenses), but only once the base's config is in `enforce`: an empty input
+   fails every head under `shadow` or without the block (above, "The empty
+   input"). Emptying it also drops a floor: while the input names a lens,
+   every change needs at least that lens; once it is empty, a change that only
+   rules with `"lenses": []` match needs no lens at all. In
+   `review.recommended.json` that is the `docs` rule (`docs/**`, `**/*.md`),
+   which also matches agent instruction files such as `AGENTS.md` and
+   `CLAUDE.md`: an edit to them would merge unread. A project that wants a
+   lens on every change keeps the input, or gives no rule zero lenses. At
+   least, put a rule for the agent instruction files above the `docs` rule:
+
+   ```json
+   {
+     "name": "agent-instructions",
+     "weight": "normal",
+     "paths": ["**/AGENTS.md", "**/CLAUDE.md"],
+     "lenses": ["code"]
+   }
+   ```
+
+6. **Roll back** in the reverse order: lens names back into an emptied
+   input, then `mode` back to `shadow` (or the block out), and only then a
+   pin back. Never pin a release that does not know a key the config still
+   has (`ci/v14` or older for `review`, `ci/v20` or older for
+   `override_authors`). The gate does not check this; it is a review rule.
+   The pin-back pull request is judged by the current gate, which knows the
+   key, so it can merge; after it, the old release refuses the config, every
+   head fails, and only the owner step below gets out.
+
+**Stopped half-way, or run again.** Every step leaves a state that works or
+fails closed:
+
+- Pins moved, no config change yet: the gate judges exactly as before (no
+  `review` key is the gate of before).
+- The block added while one caller still pins an older release: a gate on
+  `ci/v15` or later refuses the block pull request itself (the config it would
+  merge does not parse), so this happens only when the old caller is the
+  queue or a `ci/v14` gate, or the block was merged by hand. That caller
+  refuses the whole config. The queue stops: the gate still passes the pull
+  request that moves the queue's pin, so merge that one by hand. A `ci/v14`
+  gate fails every head, the pull request that moves its pin too: the owner
+  step below. That is why step 2 moves every caller.
+- `enforce` merged, backfill not yet dispatched: a pass posted under
+  `shadow` stays on its head until the next event on it, and the queue can
+  merge on it. Dispatch the backfill and arm nothing before it has run; a
+  second dispatch judges the same heads again and changes nothing else.
+- The input emptied while the base is not in `enforce`: every head fails,
+  the pull request that puts a lens name back too (the base's caller judges
+  it, with the empty input). The owner step below.
+
+**The owner step.** When every head fails, the pull request that would fix it
+too, no pull request gets out; nobody waits for one. An owner pushes the fix
+straight to the default branch, past the branch ruleset (as for a base config
+that does not parse, "Shadow and enforce" above): the revert of the commit that
+broke it (a lens name back into the input, the pin moved forward, or the block
+taken out), nothing else. Then dispatch the backfill.
 
 ## Lens comments
 

@@ -3,6 +3,10 @@
 # the pull request to the gate as a number, nothing more. Reviews and inline review comments start it through the
 # review trigger (review-trigger.example.yml, copied next to this file; README.md, "Run again after a review"): on its
 # finished run the gate looks the pull request up by that run's head.
+# In a public repository GitHub blocks pull_request_target (from 2026-12-02) unless a repository Actions policy allows
+# it for exactly this file (README.md, "The gate", setup step 4): keep the file name the policy names.
+# Review rules (a `review` block in the config): release, pin, then config, as in ../pr-queue/README.md, "Turning it on:
+# release, pin, then config". Pin the release first: an older one refuses the whole config.
 name: Head gate
 
 on:
@@ -50,5 +54,9 @@ jobs:
       pr: ${{ format('{0}', github.event.pull_request.number || github.event.issue.number || inputs.pr) }}
       config: .github/pr-queue.json
       check-name: CHECK_NAME
+      # In shadow (or with no review block) these names decide. In enforce the config's path rules name the lenses and
+      # these are required as well; empty this only after the base's config is in enforce. Empty, it is no floor: a
+      # change only zero-lens rules match (`**/*.md` in review.recommended.json, AGENTS.md too) merges with no lens
+      # (the guide, step 5).
       required-lenses: | # one lens name per line; none = the gate refuses, unless the config's review block is in enforce
         LENS_NAME

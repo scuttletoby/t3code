@@ -80,6 +80,13 @@ Two habits every action expects:
 To move to a new release, change the SHA and the comment together; read the new tag's release notes first
 ([RELEASE-NOTES.md](RELEASE-NOTES.md): what changed, and what to do before or after the move).
 
+### Review rules
+
+The queue and the head gate can also judge which lenses a change needs, its findings and its review rounds, from a
+`review` block in the project's queue config. Turn it on in this order: release, pin, then config
+([pr-queue README](actions/pr-queue/README.md#turning-it-on-release-pin-then-config)), in `shadow` first: a release
+that does not know the key refuses the whole config.
+
 ### Outside a workflow
 
 A project's tools that run outside a workflow (a deploy script, a local check) use the same code from the same
