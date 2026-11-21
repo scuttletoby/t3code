@@ -13,9 +13,12 @@ import {
   OrchestratorMcpFailure,
   ProviderInstanceId,
   RunId,
+  ScheduledTask,
   ScheduledTaskUpsertInput,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -997,6 +1000,34 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
     },
   );
 
+  /**
+   * The task's fields a waiting delivery does not compare (`RunCopy`), each with why: writing one
+   * is not a save a run would see. A new task field must be added here or to `RunCopy`.
+   */
+  const NOT_COMPARED: Record<string, string> = {
+    id: "the row is read by it",
+    enabled: "`webhookGone` checks it (a pause ends the delivery)",
+    createdAt: "`webhookGone` checks it (a replaced task ends the delivery)",
+    updatedAt: "bookkeeping: a token rotation or a pause undone writes it",
+    nextRunAt: "bookkeeping of runs on a schedule",
+    lastRunAt: "bookkeeping of runs",
+    lastRunStatus: "bookkeeping of runs",
+    lastRunError: "bookkeeping of runs (a waiting note)",
+    runCount: "bookkeeping of runs",
+    webhook: "the endpoint and its token: a delivery already came in",
+    blockedByPolicy: "derived from the managed policy, not stored on the row",
+  };
+
+  it("the wait compares every task field but a named list left out (#756)", () => {
+    const compared = Object.keys(AgentSlotRoutes.RunCopy.fields).toSorted();
+    const expected = Object.keys(ScheduledTask.fields)
+      .filter((field) => !(field in NOT_COMPARED))
+      .toSorted();
+    assert.deepEqual(compared, expected);
+    // Every name left out is a task field (none stale).
+    for (const field of Object.keys(NOT_COMPARED)) assert.property(ScheduledTask.fields, field);
+  });
+
   /** How many webhook runs ended as `outcome` (`webhookRunsTotal`), so far. */
   const webhookRuns = (outcome: string) =>
     Metric.snapshot.pipe(
@@ -1115,6 +1146,221 @@ describe("scheduled runs through the agent slot gate (#706)", () => {
             assert.deepEqual(yield* pendingStates(sql, task.id), []);
           }),
         { slots },
+      );
+    },
+  );
+
+  /** A delivery's log row, read without the task (whose row may not be readable). */
+  const deliveryRow = (sql: SqlClient.SqlClient, deliveryId: string) =>
+    sql<{ outcome: string; error: string | null }>`
+      SELECT outcome, error FROM scheduled_task_webhook_deliveries WHERE delivery_id = ${deliveryId}
+    `.pipe(Effect.map((rows) => rows[0]!));
+
+  /** Moves the clock `count` slot retries, settling after each. */
+  const retries = (count: number) =>
+    Effect.forEach(
+      Array.from({ length: count }),
+      () => TestClock.adjust(AgentSlotRoutes.WEBHOOK_SLOT_RETRY).pipe(Effect.andThen(settle)),
+      { discard: true },
+    );
+
+  /** Slot retries in the unreadable limit. */
+  const LIMIT_RETRIES = AgentSlotRoutes.WEBHOOK_UNREADABLE_RETRIES;
+
+  const UNREADABLE_WARNING = /waiting for a slot cannot read its task/;
+  const SKIPPED_WARNING = /waiting for a slot is skipped: its task stayed unreadable/;
+
+  /**
+   * Runs `body` on a clock whose wall time `sleep` moves ahead with no timer woken, as when the
+   * host sleeps between two retries (its timers count awake time only).
+   */
+  const withHostSleep = <A, E>(body: (sleep: (ms: number) => void) => Effect.Effect<A, E>) =>
+    Clock.clockWith((clock) => {
+      let asleepMs = 0;
+      const wallMs = () => clock.currentTimeMillisUnsafe() + asleepMs;
+      const host: Clock.Clock = Object.assign(Object.create(clock), {
+        currentTimeMillisUnsafe: wallMs,
+        currentTimeMillis: Effect.sync(wallMs),
+        currentTimeNanosUnsafe: () => BigInt(wallMs()) * 1_000_000n,
+        currentTimeNanos: Effect.sync(() => BigInt(wallMs()) * 1_000_000n),
+      });
+      return body((ms) => {
+        asleepMs += ms;
+      }).pipe(Effect.provideService(Clock.Clock, host));
+    });
+
+  it.effect(
+    "a waiting delivery whose task stays unreadable is skipped after the limit, warned once, and the next delivery is not stuck (#756)",
+    () => {
+      const slots = slotWorld([BUSY]);
+      const logs: Array<Logger.Options<unknown>> = [];
+      const lines = (pattern: RegExp) =>
+        logs.filter((entry) => pattern.test(Logger.formatLogFmt.log(entry))).length;
+      return withService(
+        (harness) =>
+          Effect.gen(function* () {
+            const { service, sql, started, prompts } = harness;
+            const { task, deliveryId } = yield* waitingDelivery(harness);
+            // A later delivery of the same task waits behind it (its task's webhook permit).
+            const next = yield* service.triggerWebhook(webhookRequest(task));
+            if (next._tag !== "accepted") return assert.fail(`not accepted: ${next._tag}`);
+            yield* settle;
+            // The row stays unreadable (a column the service reads is gone), and a slot is free.
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt TO prompt_away`;
+            slots.running = [];
+            // Its cause changes within the stretch (another column gone instead): still one
+            // stretch, warned once, with the first cause.
+            yield* retries(10);
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt_away TO prompt`;
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN title TO title_away`;
+            // Just short of the limit: nothing starts, nothing is dropped, one warning so far.
+            yield* retries(LIMIT_RETRIES - 11);
+            assert.deepEqual(started, []);
+            assert.deepEqual(yield* pendingStates(sql, task.id), [
+              { delivery_id: deliveryId, state: "dispatching" },
+            ]);
+            assert.equal((yield* deliveryRow(sql, deliveryId)).outcome, "accepted");
+            assert.equal((yield* deliveryRow(sql, next.deliveryId)).outcome, "accepted");
+            assert.equal(lines(UNREADABLE_WARNING), 1);
+            assert.equal(lines(SKIPPED_WARNING), 0);
+            // At the limit: skipped with its reason, its row gone; nothing started on it. The
+            // skip logs the cause it ended on (the last one), not only the first.
+            yield* retries(1);
+            assert.deepEqual(started, []);
+            assert.deepEqual(yield* deliveryRow(sql, deliveryId), {
+              outcome: "dispatch_failed",
+              error: AgentSlotRoutes.UNREADABLE_WHILE_WAITING,
+            });
+            assert.deepEqual(yield* pendingStates(sql, task.id), []);
+            // The delivery behind it is no longer held: it ends as upstream ends a delivery
+            // whose task cannot be read, not left waiting.
+            assert.equal((yield* deliveryRow(sql, next.deliveryId)).outcome, "dispatch_failed");
+            assert.equal(lines(UNREADABLE_WARNING), 1);
+            const skipped = logs
+              .map((entry) => Logger.formatLogFmt.log(entry))
+              .filter((line) => SKIPPED_WARNING.test(line));
+            assert.equal(skipped.length, 1);
+            assert.include(skipped[0], "title");
+            assert.notInclude(skipped[0], "prompt");
+            // Readable again: the next delivery runs, once.
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN title_away TO title`;
+            const after = yield* service.triggerWebhook(webhookRequest(task));
+            if (after._tag !== "accepted") return assert.fail(`not accepted: ${after._tag}`);
+            yield* until(() => started.length === 1, "the next delivery started");
+            yield* retries(3);
+            assert.equal(started.length, 1);
+            assert.include(prompts[0]!.text, "Review the open pull requests.");
+            assert.equal((yield* rowOf(sql, task.id)).run_count, 1);
+          }),
+        { slots },
+      ).pipe(
+        Effect.provide(
+          Logger.layer([Logger.make((entry) => logs.push(entry))], { mergeWithExisting: false }),
+        ),
+      );
+    },
+  );
+
+  it.effect(
+    "a waiting delivery whose task's row is gone while its pause check cannot read ends at the next retry as deleted (#763)",
+    () => {
+      const slots = slotWorld([BUSY]);
+      return withService(
+        (harness) =>
+          Effect.gen(function* () {
+            const { sql, started } = harness;
+            const { task, deliveryId } = yield* waitingDelivery(harness);
+            // `webhookGone` cannot read (a column it reads is gone), and the row is gone: the
+            // compare's read finds no row, so it ends as deleted, not as unreadable.
+            yield* sql`DELETE FROM scheduled_tasks WHERE task_id = ${task.id}`;
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN enabled TO enabled_away`;
+            slots.running = [];
+            yield* retries(1);
+            assert.deepEqual(started, []);
+            assert.deepEqual(yield* deliveryRow(sql, deliveryId), {
+              outcome: "dispatch_failed",
+              error: AgentSlotRoutes.DELETED_WHILE_WAITING,
+            });
+          }),
+        { slots },
+      );
+    },
+  );
+
+  it.effect(
+    "a host asleep between two unreadable retries does not use up the limit: it counts retries (#763)",
+    () => {
+      const slots = slotWorld([BUSY]);
+      return withHostSleep((sleep) =>
+        withService(
+          (harness) =>
+            Effect.gen(function* () {
+              const { sql, started, webhookWorker } = harness;
+              const { task, deliveryId } = yield* waitingDelivery(harness);
+              yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt TO prompt_away`;
+              yield* retries(1);
+              // The host sleeps longer than the limit's 5 minutes, then the next retry fails too.
+              sleep(Duration.toMillis(Duration.minutes(10)));
+              yield* retries(LIMIT_RETRIES - 2);
+              assert.deepEqual(started, []);
+              assert.equal((yield* deliveryRow(sql, deliveryId)).outcome, "accepted");
+              // Readable with a slot free: it runs, once.
+              yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt_away TO prompt`;
+              slots.running = [];
+              yield* until(() => started.length === 1, "the delivery started");
+              yield* workerRounds(webhookWorker, 3);
+              assert.equal(started.length, 1);
+              assert.equal((yield* rowOf(sql, task.id)).run_count, 1);
+              assert.deepEqual(yield* pendingStates(sql, task.id), []);
+            }),
+          { slots },
+        ),
+      );
+    },
+  );
+
+  it.effect(
+    "a task unreadable twice, with a good read between, waits on: the limit counts one stretch, each warned (#756)",
+    () => {
+      const slots = slotWorld([BUSY]);
+      const logs: Array<Logger.Options<unknown>> = [];
+      const lines = (pattern: RegExp) =>
+        logs.filter((entry) => pattern.test(Logger.formatLogFmt.log(entry))).length;
+      return withService(
+        (harness) =>
+          Effect.gen(function* () {
+            const { sql, started, webhookWorker } = harness;
+            const { task, deliveryId } = yield* waitingDelivery(harness);
+            const stretch = LIMIT_RETRIES - 4;
+            // Unreadable most of the limit, readable for one retry (the slot still full), then
+            // unreadable most of the limit again: more than the limit in all, never in one go.
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt TO prompt_away`;
+            yield* retries(stretch);
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt_away TO prompt`;
+            yield* retries(1);
+            assert.equal(lines(/can read its task again/), 1);
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt TO prompt_away`;
+            yield* retries(stretch);
+            assert.equal(lines(UNREADABLE_WARNING), 2);
+            assert.deepEqual(started, []);
+            assert.deepEqual(yield* pendingStates(sql, task.id), [
+              { delivery_id: deliveryId, state: "dispatching" },
+            ]);
+            assert.equal((yield* deliveryRow(sql, deliveryId)).outcome, "accepted");
+            // Readable and a slot free: it runs, once.
+            yield* sql`ALTER TABLE scheduled_tasks RENAME COLUMN prompt_away TO prompt`;
+            slots.running = [];
+            yield* until(() => started.length === 1, "the delivery started");
+            yield* workerRounds(webhookWorker, 3);
+            assert.equal(started.length, 1);
+            assert.equal((yield* rowOf(sql, task.id)).run_count, 1);
+            assert.deepEqual(yield* pendingStates(sql, task.id), []);
+          }),
+        { slots },
+      ).pipe(
+        Effect.provide(
+          Logger.layer([Logger.make((entry) => logs.push(entry))], { mergeWithExisting: false }),
+        ),
       );
     },
   );

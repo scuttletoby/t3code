@@ -385,31 +385,39 @@ These routes start a new agent run and go through the same gate, with the same c
   the task is paused or moved to a later time); its run count does not
   move, and it is one run however long it waited. A fixed-time run that waits is not dropped as
   missed while the server runs (its due time follows it); if the server is down more than 10
-  minutes while it waits, upstream's missed-run rule applies. "Run now" fails with `Not run, no agent slot: ` and the reason and changes
-  nothing; over MCP `run_scheduled_task_now` answers `slots_full`. A webhook delivery waits the
-  same way and starts once when a slot is free; it ends without a run only if its task is paused,
-  deleted, replaced or its trigger changed while it waits. A save while it waits that changes
-  what a run uses (prompt, title, project, thread, mode, model, workspace, schedule; a save in the
-  same millisecond too) is seen at its next retry, and so is a save between the stored-delivery
-  worker's read of the task and the run's own read, wait or not: it is not run on the task or
-  prompt from before the save, and not dropped. It stays stored, and the stored-delivery worker
-  reads the task again, renders the prompt again and waits again if no slot is free
-  ([#719](https://github.com/scuttletoby/t3code/issues/719),
+  minutes while it waits, upstream's missed-run rule applies. "Run now" fails with
+  `Not run, no agent slot: ` and the reason and changes nothing; over MCP `run_scheduled_task_now`
+  answers `slots_full`. A webhook delivery waits the same way and starts once when a slot is free;
+  it ends without a run only if its task is paused, deleted, replaced or its trigger changed while
+  it waits. A save while it waits that changes what a run uses (prompt, title, project, thread,
+  mode, model, workspace, schedule; a save in the same millisecond too) is seen at its next retry,
+  and so is a save between the stored-delivery worker's read of the task and the run's own read,
+  wait or not: it is not run on the task or prompt from before the save, and not dropped. It stays
+  stored, and the stored-delivery worker reads the task again, renders the prompt again and waits
+  again if no slot is free ([#719](https://github.com/scuttletoby/t3code/issues/719),
   [#750](https://github.com/scuttletoby/t3code/issues/750)). A write that changes none of that (a
-  new webhook token, a pause undone before the next retry) does not hand it back, and a retry
-  that cannot read the task asks again at the next one. Not covered: a save in the instant
-  between the last check and the start, or between a direct delivery's read (no coalescing
-  window) and its first try for a slot: upstream's read-then-run window, as for any run. Every
-  waiting delivery is in the store, so a restart keeps it and it runs once: a direct one is moved
-  there when it is first refused. If that store fails, the delivery waits in memory; a save then stores
-  it, and if the store fails again it ends without a run, saying why. A scheduled run or a webhook
-  takes a slot only when no agent that waits for one holds it. A run on its schedule and a webhook
-  delivery that wait keep a place in the gate's one line (below), a run at its due time and a
-  delivery at the time it was stored, so a waiter that joins later never passes them. The place
-  goes when the run starts, when the delivery is given up (task paused, deleted, replaced or
-  retriggered) or handed back to the stored-delivery worker (which asks again at the row's due
-  time), and within 5 s of its task being paused, deleted or no longer due (moved to a later
-  time). "Run now" asks once, from the back of the line.
+  new webhook token, a pause undone before the next retry) does not hand it back, and a retry that
+  cannot read the task asks again at the next one. The first such retry logs a warning (again only
+  after a good read); a delivery whose task stays unreadable for 60 retries in a row (5 minutes,
+  counted in retries so a sleeping host does not end it early) ends without a run, saying why and
+  logging the last cause, so later deliveries of the task do not wait behind it
+  ([#756](https://github.com/scuttletoby/t3code/issues/756),
+  [#763](https://github.com/scuttletoby/t3code/issues/763)). Not covered: a save in the instant
+  between the last check and the start, or between a direct delivery's read (no coalescing window)
+  and its first try for a slot: upstream's read-then-run window, as for any run. Closing the direct
+  one needs no new upstream line: it would change the existing fork seam line on upstream's
+  direct-delivery call (`runSlots.directDelivery(...)` in `ScheduledTaskService.ts`) and its entry
+  in `.github/fork-seams.json`, to pass in the template the delivery was rendered from. It is left,
+  as the window is milliseconds wide. Every waiting delivery is in the store, so a restart keeps it
+  and it runs once: a direct one is moved there when it is first refused. If that store fails, the
+  delivery waits in memory; a save then stores it, and if the store fails again it ends without a
+  run, saying why. A scheduled run or a webhook takes a slot only when no agent that waits for one
+  holds it. A run on its schedule and a webhook delivery that wait keep a place in the gate's one
+  line (below), a run at its due time and a delivery at the time it was stored, so a waiter that
+  joins later never passes them. The place goes when the run starts, when the delivery is given up
+  (task paused, deleted, replaced or retriggered) or handed back to the stored-delivery worker
+  (which asks again at the row's due time), and within 5 s of its task being paused, deleted or no
+  longer due (moved to a later time). "Run now" asks once, from the back of the line.
 - A task bound to a thread whose run is active only queues its prompt there: no new run, so no slot
   and no wait. A bound thread that is idle starts a run and is gated, counted on the thread's
   current provider.

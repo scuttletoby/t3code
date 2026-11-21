@@ -1,0 +1,15 @@
+# schedule-kick kit: written by schedule-kick-install. Do not edit: run the installer again.
+[Unit]
+Description=schedule-kick tick: start listed workflows at their cron times (fork-kit/schedule-kick)
+# runs the release in use; without one (an uninstall half-way) it does nothing
+ConditionPathExists=/usr/local/libexec/schedule-kick/current/bin/schedule-kick
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/schedule-kick/current/bin/schedule-kick tick
+Nice=5
+TimeoutStartSec=10min
+# files it makes are this user's only. NoNewPrivileges=, PrivateTmp=, ProtectSystem= and the like are left out on
+# purpose: gh-as reaches the App token through sudo, which NoNewPrivileges= blocks, and in a user unit the others
+# turn on PrivateUsers=, where sudo cannot become root either (README, Install).
+UMask=0077

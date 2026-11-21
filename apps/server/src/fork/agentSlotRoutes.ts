@@ -14,6 +14,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import { slotRefusalReason, slotRunningText, type SlotDecision } from "@t3tools/shared/agentSlots";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -362,6 +363,19 @@ export const SAVED_WHILE_WAITING_NOT_STORED =
 export const WEBHOOK_SLOT_RETRY = Duration.seconds(5);
 
 /**
+ * Retries in a row (5 minutes) a waiting webhook delivery's task may stay unreadable before it is
+ * skipped: it holds the task's webhook permit. Counted in retries, not clock time, so a host
+ * asleep between two retries does not use it up.
+ */
+export const WEBHOOK_UNREADABLE_RETRIES = 60;
+
+/** Why a waiting webhook delivery whose task stayed unreadable was skipped. */
+export const UNREADABLE_WHILE_WAITING = `Not run: this task could not be read at ${WEBHOOK_UNREADABLE_RETRIES} retries in a row (${Duration.toMinutes(Duration.times(WEBHOOK_SLOT_RETRY, WEBHOOK_UNREADABLE_RETRIES))} minutes) while this delivery waited for an agent slot (the server log says why), so it was not started on a copy that could not be checked. The next webhook delivery reads the task again.`;
+
+/** Why a waiting webhook delivery whose task's row is gone was skipped (as upstream says it). */
+export const DELETED_WHILE_WAITING = "The task was deleted before this delivery ran.";
+
+/**
  * A fixed-time run is dropped as missed once it is 10 minutes late (`isMissedFixedTimeRun`); one
  * that waits for a slot moves its due time up to now after half of that, so it stays due.
  */
@@ -395,12 +409,11 @@ const DELIVERY_PLACE = "webhook-delivery:";
 const DELIVERY_TASK_PLACE = "webhook-task:";
 
 /**
- * What a run takes from its task's row, decoded as `ScheduledTaskService` decodes it (so a prompt
- * or title with spaces at either end compares as the trimmed text a run uses). Not the run's
- * bookkeeping (`updated_at`, due and last-run columns), the webhook token, or what `webhookGone`
- * checks: writing those is not a save a run would see.
+ * What a run takes from its task's row, decoded as `ScheduledTaskService` decodes it (edge spaces
+ * trimmed). Not run bookkeeping, the webhook token or what `webhookGone` checks: writing those is
+ * not a save. A test holds this to the task's fields minus a named list left out.
  */
-const RunCopy = Schema.Struct({
+export const RunCopy = Schema.Struct({
   title: ScheduledTask.fields.title,
   prompt: ScheduledTask.fields.prompt,
   schedule: ScheduledTask.fields.schedule,
@@ -414,6 +427,21 @@ const RunCopy = Schema.Struct({
   createdBy: ScheduledTask.fields.createdBy,
   creationSource: ScheduledTask.fields.creationSource,
 });
+/** The row's column for each `RunCopy` field: `savedSince` reads exactly these. */
+const RUN_COPY_COLUMNS = {
+  title: "title",
+  prompt: "prompt",
+  schedule: "schedule_json",
+  projectId: "project_id",
+  threadId: "thread_id",
+  threadMode: "thread_mode",
+  workspaceStrategy: "workspace_strategy_json",
+  modelSelection: "model_selection_json",
+  runtimeMode: "runtime_mode",
+  interactionMode: "interaction_mode",
+  createdBy: "created_by",
+  creationSource: "creation_source",
+} as const satisfies Record<keyof typeof RunCopy.fields, string>;
 /** The same fields as the row stores them (its JSON columns as text). */
 const decodeStoredCopy = Schema.decodeUnknownEffect(
   Schema.Struct({
@@ -427,8 +455,11 @@ const decodeStoredCopy = Schema.decodeUnknownEffect(
 const runCopyText = Schema.encodeEffect(Schema.fromJsonString(RunCopy));
 const decodePrompt = Schema.decodeUnknownEffect(ScheduledTask.fields.prompt);
 
-/** Whether a webhook delivery's task changed since its run read it (`savedSince`). */
-type SinceRead = "same" | "saved" | "unknown";
+/**
+ * Whether a webhook delivery's task changed since its run read it (`savedSince`), `gone` when its
+ * row is deleted, or `unknown` (why) when its row cannot be read.
+ */
+type SinceRead = "same" | "saved" | "gone" | { readonly unknown: Cause.Cause<unknown> };
 
 /** A stored delivery's request, in the shape the stored-delivery worker reads (`decodePendingRequest`). */
 const encodeStoredRequest = Schema.encodeEffect(
@@ -653,7 +684,7 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       FROM scheduled_tasks WHERE task_id = ${task.id}
     `;
     return row === undefined
-      ? "The task was deleted before this delivery ran."
+      ? DELETED_WHILE_WAITING
       : row.created_at !== task.createdAt
         ? "The task was replaced before this delivery ran."
         : row.trigger !== "webhook"
@@ -683,51 +714,28 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
 
   /**
    * Whether `task`, the copy a waiting webhook run holds, is still the task as saved: `saved` when
-   * a field a run uses changed since it was read (a save in the same millisecond too), `unknown`
-   * when the row cannot be read. A bind writes the thread, but not during a wait: a webhook task's
+   * a field a run uses changed since it was read (a save in the same millisecond too), `gone`
+   * when the row is deleted, `unknown` when it cannot be read. A bind writes the thread, but not during a wait: a webhook task's
    * runs take turns. (A save before it was read is `renderedFromOther`'s, as the run starts.)
    */
   const savedSince = Effect.fn("AgentSlotRoutes.savedSince")(
     function* (task: ScheduledTask) {
-      const [row] = yield* sql<{
-        title: string;
-        prompt: string;
-        schedule_json: string;
-        project_id: string;
-        thread_id: string | null;
-        thread_mode: string;
-        workspace_strategy_json: string;
-        model_selection_json: string;
-        runtime_mode: string;
-        interaction_mode: string;
-        created_by: string;
-        creation_source: string;
-      }>`
-        SELECT title, prompt, schedule_json, project_id, thread_id, thread_mode,
-          workspace_strategy_json, model_selection_json, runtime_mode, interaction_mode,
-          created_by, creation_source
+      const [row] = yield* sql<Record<string, unknown>>`
+        SELECT ${sql.literal(Object.values(RUN_COPY_COLUMNS).join(", "))}
         FROM scheduled_tasks WHERE task_id = ${task.id}
       `;
-      // Gone between `webhookGone` and here: that check ends it at the next retry.
-      if (row === undefined) return "unknown" as SinceRead;
-      const now = yield* decodeStoredCopy({
-        title: row.title,
-        prompt: row.prompt,
-        schedule: row.schedule_json,
-        projectId: row.project_id,
-        threadId: row.thread_id,
-        threadMode: row.thread_mode,
-        workspaceStrategy: row.workspace_strategy_json,
-        modelSelection: row.model_selection_json,
-        runtimeMode: row.runtime_mode,
-        interactionMode: row.interaction_mode,
-        createdBy: row.created_by,
-        creationSource: row.creation_source,
-      });
+      // Gone between `webhookGone` and here (or that check could not read): ended as deleted.
+      if (row === undefined) return "gone" as SinceRead;
+      const now = yield* decodeStoredCopy(
+        Object.fromEntries(
+          Object.entries(RUN_COPY_COLUMNS).map(([field, column]) => [field, row[column]]),
+        ),
+      );
       const [was, is] = yield* Effect.all([runCopyText(task), runCopyText(now)]);
       return was === is ? "same" : "saved";
     },
-    (effect) => effect.pipe(Effect.orElseSucceed((): SinceRead => "unknown")),
+    (effect) =>
+      effect.pipe(Effect.catchCause((cause) => Effect.succeed<SinceRead>({ unknown: cause }))),
   );
 
   /** A webhook delivery the stored-delivery worker owns now: this run of it ends unstarted. */
@@ -785,7 +793,8 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
   /**
    * A stored webhook delivery waits for a slot, asked again every few seconds (a restart picks its
    * row up again, once). Dropped only as a queued delivery is (task deleted, replaced, paused, not a
-   * webhook). Saved while it waits, it is handed back to the worker to run on the task as saved.
+   * webhook), or when its task's row stays unreadable (`WEBHOOK_UNREADABLE_RETRIES`). Saved while
+   * it waits, it is handed back to the worker to run on the task as saved.
    */
   const waitForWebhookSlot = Effect.fnUntraced(
     function* (task: ScheduledTask, first: Refused, place: SlotGate.SlotPlace | undefined) {
@@ -793,13 +802,41 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
         taskId: task.id,
         reason: reasonHere(first.refusal),
       });
+      // Retries in a row that could not read its task's row (0: the last one could).
+      let failedReads = 0;
       while (true) {
         yield* Effect.sleep(WEBHOOK_SLOT_RETRY);
         const gone = yield* webhookGone(task).pipe(Effect.orElseSucceed(() => null));
         if (gone !== null) return yield* Effect.fail(new WebhookSkipped({ reason: gone }));
         const since = yield* savedSince(task);
-        // Not known (the row cannot be read): asked again at the next retry, with no slot taken.
-        if (since === "unknown") continue;
+        if (since === "gone")
+          return yield* Effect.fail(new WebhookSkipped({ reason: DELETED_WHILE_WAITING }));
+        // Not known: asked again at the next retry, with no slot taken. A row that cannot be read
+        // is logged once (again only after a good read), and skipped once it stays so too long,
+        // logging the last cause.
+        if (typeof since === "object") {
+          failedReads += 1;
+          if (failedReads === 1) {
+            yield* Effect.logWarning(
+              "A webhook delivery waiting for a slot cannot read its task; it asks again at each retry",
+              { taskId: task.id, cause: since.unknown },
+            );
+          }
+          if (failedReads >= WEBHOOK_UNREADABLE_RETRIES) {
+            yield* Effect.logWarning(
+              "A webhook delivery waiting for a slot is skipped: its task stayed unreadable",
+              { taskId: task.id, failedReads, cause: since.unknown },
+            );
+            return yield* Effect.fail(new WebhookSkipped({ reason: UNREADABLE_WHILE_WAITING }));
+          }
+          continue;
+        }
+        if (failedReads > 0) {
+          failedReads = 0;
+          yield* Effect.logInfo("A waiting webhook delivery can read its task again", {
+            taskId: task.id,
+          });
+        }
         // Handed back, its place goes on release; the worker's ask rejoins at the row's due time.
         if (since === "saved") {
           if ((yield* CurrentDirectDelivery) === undefined) return yield* keepForWorker(task);
