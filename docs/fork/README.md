@@ -499,19 +499,25 @@ saves, so a change another caller makes in between is seen
 ([#699](https://github.com/scuttletoby/t3code/issues/699)). Such a thread also cannot change the
 prompt, project or thread of a task bound to another thread whose profile is not within its own
 (that thread would run its words); reading, renaming, pausing it and changing its schedule still
-work.
+work. The `schedule_task` handler checks that before the service is called, so a refused change
+does not use up the webhook secretRef it carries.
 
-Each save records who made it: the owner, or the thread and its profile then. The record is
-`scheduled-task-mcp-profiles.json` in the server's state folder (the fork changes no database
-schema). A scheduled run, `run_scheduled_task_now` or a webhook run that starts a new thread is
-refused when that thread would get more than the recorded profile, for example after the owner
-widened the project's profile; a refused scheduled run is recorded as failed with the reason and
-moves on to its next time. A task saved before this record, or with no entry, runs as before, as the
-owner's; its first save records who made it. A task whose row changed after its record (a save
-stopped half-way) is refused until it is saved again, and a record file that cannot be read refuses
-saves and runs that start a new thread until it is fixed or removed. Runs into a bound thread keep
-that thread's profile and are not held up. Entries of deleted tasks are dropped at each start.
-Saving the task in the app makes it the owner's.
+Each save records who made it: the owner (the app, or an MCP client of this machine with no
+thread), a thread here and its profile then, or another machine. Another machine does not say the
+profile of its thread, so its save records none. The record is `scheduled-task-mcp-profiles.json` in
+the server's state folder (the fork changes no database schema). A scheduled run,
+`run_scheduled_task_now` or a webhook run that starts a new thread is refused when that thread would
+get more than the recorded profile, for example after the owner widened the project's profile. It
+is also refused when the task was saved from another machine, and when an agent made it and it has no
+entry (saved before this record, or the file was lost or an older copy put back). The owner saves
+the task once in the app to allow it; a task the owner made with no entry runs as before. A
+webhook delivery that waited for an agent slot is checked again as it starts. A refused scheduled run
+is recorded as failed with the reason and moves on to its next time; a one-time task then has no
+next time, so after the owner's save it is run now or given a new time (the reason says so). A task
+whose row changed after its record (a save stopped half-way) is refused until it is saved again, and
+a record file that cannot be read refuses saves and runs that start a new thread until it is fixed
+or removed. Runs into a bound thread keep that thread's profile and are not held up. Entries of
+deleted tasks are dropped at each start.
 `t3_thread_transfer`'s fork is refused when the fork would get more than the caller's profile: a
 fork gets its source's profile cut to the source's, so forking the caller itself always goes through, and a fork of a thread whose parent cannot be read is refused. On
 another machine, a fork, a change to a scheduled task and `run_scheduled_task_now` are refused for

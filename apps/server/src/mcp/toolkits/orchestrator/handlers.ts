@@ -111,7 +111,7 @@ const handlers = {
       ({ scheduledTaskId, prompt, title, schedule, enabled, freshSession, bindToCurrentThread }) =>
         Effect.gen(function* () {
           if (scheduledTaskId === undefined) return yield* Effect.die("unreachable");
-          yield* LaunchMcpProfile.checkScheduleEditMcpProfile(scheduledTaskId, bindToCurrentThread); // Fork: MCP profile launch
+          yield* LaunchMcpProfile.checkEditMcpProfile(scheduledTaskId, bindToCurrentThread, prompt); // Fork: MCP profile launch
           const scope = yield* McpInvocationContext.McpInvocationContext;
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           return yield* service.updateScheduledTask(scope, {

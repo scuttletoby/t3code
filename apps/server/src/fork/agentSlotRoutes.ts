@@ -476,6 +476,9 @@ export const makeScheduledRunSlots = Effect.fnUntraced(function* <W>(
       yield* Effect.sleep(WEBHOOK_SLOT_RETRY);
       const gone = yield* webhookGone(task).pipe(Effect.orElseSucceed(() => null));
       if (gone !== null) return yield* Effect.fail(new WebhookSkipped({ reason: gone }));
+      // Checked again as it would start: the owner may have widened the project meanwhile.
+      const refused = task.threadId === null ? yield* profiles.runRefusal(task) : null;
+      if (refused !== null) return yield* Effect.fail(new WebhookSkipped({ reason: refused }));
       const target = yield* targetOf(task);
       if (target.queuesOnly) return allowed(task, () => Effect.void);
       const slot = yield* take(target.instanceId);

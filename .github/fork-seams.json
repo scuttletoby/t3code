@@ -258,11 +258,11 @@
       ]
     },
     "apps/server/src/mcp/toolkits/orchestrator/handlers.ts": {
-      "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693).",
+      "why": "schedule_task from a thread whose MCP profile is narrower than \"all\" is refused when the task's runs would start a thread with more than the caller's profile, on create and on a change to a task whose runs start new threads (fork/launchMcpProfile.ts, #693). A change from such a thread to the prompt or thread of a task bound to a wider thread is refused there too, before the service uses up a webhook secretRef (#699).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkScheduleMcpProfile(input); // Fork: MCP profile launch",
-        "yield* LaunchMcpProfile.checkScheduleEditMcpProfile(scheduledTaskId, bindToCurrentThread); // Fork: MCP profile launch"
+        "yield* LaunchMcpProfile.checkEditMcpProfile(scheduledTaskId, bindToCurrentThread, prompt); // Fork: MCP profile launch"
       ]
     },
     "apps/server/src/mcp/toolkits/thread/handlers.ts": {

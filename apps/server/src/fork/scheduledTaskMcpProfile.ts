@@ -1,7 +1,8 @@
 /**
- * Fork: who saved each scheduled task (the owner, or a thread and its MCP profile), in a JSON file
- * in the state folder, not a column (the fork changes no schema). A run that starts a new thread is
- * refused when that thread would get more than the recorded profile.
+ * Fork: who saved each scheduled task (the owner, a thread and its MCP profile, or another machine
+ * whose caller's profile is not known here), in a JSON file in the state folder, not a column (the
+ * fork changes no schema). A run that starts a new thread is refused when that thread would get
+ * more than the recorded profile, and when no profile is known for a task an agent made.
  */
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- The digest must be deterministic, not random bytes.
 import * as NodeCrypto from "node:crypto";
@@ -39,16 +40,30 @@ const SCHEDULED_TASK_MCP_PROFILES_FILE = "scheduled-task-mcp-profiles.json";
 
 const VERSION = 1;
 
-/** Who saved a task: `profile` is `null` for the owner (the app, or a client with no thread). */
+/**
+ * Who saved a task: the owner (the app, or an MCP client of this machine with no thread), a thread
+ * here (`threadId` and its `profile`), or a linked machine, which does not say its caller's profile
+ * (`linked`: no thread or profile here, so its runs that start a new thread wait for an owner save).
+ */
+export type SavedByWhom = "owner" | "thread" | "linked";
+
 export interface SavedBy {
   /** {@link savedDigest} of the row the save wrote. */
   readonly digest: string;
+  readonly by: SavedByWhom;
   readonly threadId: ThreadId | null;
   readonly profile: McpProfileCarried | null;
   readonly recordedAt: string;
 }
 
-const ENTRY_FIELDS: ReadonlySet<string> = new Set(["digest", "threadId", "profile", "recordedAt"]);
+const ENTRY_FIELDS: ReadonlySet<string> = new Set([
+  "digest",
+  "by",
+  "threadId",
+  "profile",
+  "recordedAt",
+]);
+const WHOM: ReadonlySet<string> = new Set<SavedByWhom>(["owner", "thread", "linked"]);
 
 /** What a run that starts a new thread does with: its prompt, in its project. */
 const savedDigest = (task: Pick<ScheduledTask, "prompt" | "projectId">): string =>
@@ -93,6 +108,19 @@ function decodeSavedBy(text: string): Loaded {
     if (entry.threadId !== null && typeof entry.threadId !== "string") {
       return bad("its threadId is not a string or null");
     }
+    if (typeof entry.by !== "string" || !WHOM.has(entry.by)) {
+      return bad("its `by` is not owner, thread or linked");
+    }
+    const by = entry.by as SavedByWhom;
+    // A thread's save names the thread and its profile; the others name neither.
+    const names = [entry.threadId !== null, entry.profile !== null];
+    if (by === "thread" ? !names.every(Boolean) : names.some(Boolean)) {
+      return bad(
+        by === "thread"
+          ? "it is a thread's save with no thread or profile"
+          : `it is a ${by} save that names a thread or profile`,
+      );
+    }
     let profile: McpProfileCarried | null = null;
     if (entry.profile !== null) {
       const read = readCarried(entry.profile);
@@ -101,6 +129,7 @@ function decodeSavedBy(text: string): Loaded {
     }
     tasks.set(taskId, {
       digest: entry.digest,
+      by,
       threadId: entry.threadId === null ? null : ThreadId.make(entry.threadId),
       profile,
       recordedAt: entry.recordedAt,
@@ -123,6 +152,57 @@ const scheduledRun = (projectId: ProjectId): LineageThread => {
     lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: id },
   };
 };
+
+type ProfileFor = (thread: LineageThread) => Effect.Effect<McpProfileResolved, { reason: string }>;
+
+/**
+ * A narrowed thread may not change the prompt, thread or project of a task bound to a thread wider
+ * than it (that thread would run its words): the refusal's text, or `null`. Checked by the save,
+ * and by the `schedule_task` handler before a webhook secretRef is used up.
+ */
+export const boundToWiderRefusal = Effect.fnUntraced(function* (input: {
+  readonly profileFor: ProfileFor;
+  readonly threads: Pick<
+    ThreadManagementService.ThreadManagementService["Service"],
+    "getThreadShell"
+  >;
+  readonly own: McpProfileResolved;
+  readonly callerId: ThreadId;
+  readonly existing: Pick<ScheduledTask, "prompt" | "threadId" | "projectId"> | null;
+  readonly next: Pick<ScheduledTask, "prompt" | "threadId" | "projectId">;
+}) {
+  const { existing, next, own } = input;
+  if (isEveryMcpTool(own.profile)) return null;
+  const boundTo = existing?.threadId ?? null;
+  if (existing === null || boundTo === null || boundTo === input.callerId) return null;
+  const changesWhatRuns =
+    existing.prompt !== next.prompt ||
+    existing.threadId !== next.threadId ||
+    existing.projectId !== next.projectId;
+  if (!changesWhatRuns) return null;
+  const bound = yield* input.threads.getThreadShell(boundTo).pipe(Effect.orElseSucceed(() => null));
+  const theirs =
+    bound === null ? null : yield* input.profileFor(bound).pipe(Effect.orElseSucceed(() => null));
+  if (theirs !== null && isWithinMcpProfile(theirs.profile, own.profile)) return null;
+  const what =
+    theirs === null
+      ? `thread ${boundTo}, whose MCP profile cannot be worked out`
+      : `thread ${boundTo}, whose MCP profile ${named(theirs.name)} keeps MCP servers or T3 tools ${named(own.name)} does not`;
+  return `This thread's MCP profile is ${named(own.name)}, and this task runs in ${what}, so its prompt and where it runs cannot be changed from here (reading it, pausing it or changing its schedule can). Ask the owner to change it, or delete_scheduled_task removes it.`;
+});
+
+/**
+ * A one-time task refused at its time has no next time, and a save that keeps its schedule keeps
+ * that: after the save that allows it, it is run now or given a new time.
+ */
+const afterSave = (task: Pick<ScheduledTask, "schedule">) =>
+  task.schedule.type === "once"
+    ? " If its time has passed, run it now or give it a new time after that save: a one-time task refused at its time does not come due again."
+    : "";
+
+/** What the owner does so a refused run can start. */
+const ownerSaves = (task: Pick<ScheduledTask, "schedule">) =>
+  `The owner saves it once in the T3 app to allow it.${afterSave(task)}`;
 
 /**
  * Built inside `ScheduledTaskService` (from `makeScheduledRunSlots`). Without the server's config
@@ -149,7 +229,7 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
       : undefined;
   if (store === undefined) {
     yield* Effect.logWarning(
-      "Scheduled task MCP profiles: no state folder here, so a thread's save of a task is refused and every task runs as the owner's",
+      "Scheduled task MCP profiles: no state folder here, so a save by a thread or another machine is refused and every task runs as the owner's",
     );
   } else {
     // The production wiring has the file; a boot test looks for this span.
@@ -158,8 +238,9 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
 
   const where = `${SCHEDULED_TASK_MCP_PROFILES_FILE} in the server's state folder`;
 
-  // No file, or no entry (saved before this record): the owner's. A file that cannot be read, or
-  // that this version does not know, refuses saves and runs that start a new thread.
+  // No file, or no entry (saved before this record, or the file was lost): an agent-made task's
+  // runs that start a new thread are refused, the owner's run. A file that cannot be read, or that
+  // this version does not know, refuses saves and runs that start a new thread.
   const load: Effect.Effect<Loaded> =
     store === undefined
       ? Effect.succeed({ ok: true, tasks: new Map() })
@@ -176,7 +257,7 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
         );
 
   const unreadable = (issue: string) =>
-    `The MCP profiles scheduled tasks were saved with (${where}) cannot be read: ${issue}. Fix that file (removing it lets every task run as the owner's).`;
+    `The MCP profiles scheduled tasks were saved with (${where}) cannot be read: ${issue}. Fix that file (removing it lets the owner's tasks run; a task an agent made then waits until the owner saves it once in the T3 app).`;
 
   /** Read, change and write the file as one step (one save at a time in this server). */
   const update = (change: (tasks: Map<string, SavedBy>) => boolean) =>
@@ -245,6 +326,10 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
   ) {
     const scope = yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext);
     const callerId = Option.isSome(scope) ? scope.value.thread?.threadId : undefined;
+    // Another machine's call: it does not say its caller's profile, so none is recorded and the
+    // task's runs that start a new thread wait for an owner save (never taken as the owner's).
+    const linked =
+      callerId === undefined && Option.isSome(scope) && scope.value.client?.linked === true;
     const recordedAt = DateTime.formatIso(DateTime.toUtc(yield* DateTime.now));
     const record = (savedBy: Omit<SavedBy, "digest" | "recordedAt">) =>
       update((tasks) => {
@@ -255,13 +340,17 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
           written.ok ? Effect.void : Effect.fail(refuse(task, written.issue)),
         ),
       );
-    if (callerId === undefined) return yield* record({ threadId: null, profile: null });
+    if (callerId === undefined && !linked) {
+      return yield* record({ by: "owner", threadId: null, profile: null });
+    }
     if (store === undefined) {
       return yield* refuse(
         task,
         "This server cannot record the MCP profile of the thread that saves a scheduled task, so the task was not saved.",
       );
     }
+    if (callerId === undefined)
+      return yield* record({ by: "linked", threadId: null, profile: null });
     const caller = yield* threads.getThreadShell(callerId).pipe(Effect.orElseSucceed(() => null));
     if (caller === null || caller.deletedAt !== null) {
       return yield* refuse(task, "The calling thread was not found, so the task was not saved.");
@@ -274,27 +363,15 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
     const profileFor = yield* Effect.mapError(reads, (refusal) => unknown(refusal.reason));
     const own = yield* Effect.mapError(profileFor(caller), (refusal) => unknown(refusal.reason));
     if (!isEveryMcpTool(own.profile)) {
-      const boundTo = existing?.threadId ?? null;
-      const changesWhatRuns =
-        existing !== null &&
-        (existing.prompt !== task.prompt ||
-          existing.threadId !== task.threadId ||
-          existing.projectId !== task.projectId);
-      if (boundTo !== null && boundTo !== callerId && changesWhatRuns) {
-        const bound = yield* threads.getThreadShell(boundTo).pipe(Effect.orElseSucceed(() => null));
-        const theirs =
-          bound === null ? null : yield* profileFor(bound).pipe(Effect.orElseSucceed(() => null));
-        if (theirs === null || !isWithinMcpProfile(theirs.profile, own.profile)) {
-          const what =
-            theirs === null
-              ? `thread ${boundTo}, whose MCP profile cannot be worked out`
-              : `thread ${boundTo}, whose MCP profile ${named(theirs.name)} keeps MCP servers or T3 tools ${named(own.name)} does not`;
-          return yield* refuse(
-            task,
-            `This thread's MCP profile is ${named(own.name)}, and this task runs in ${what}, so its prompt and where it runs cannot be changed from here (reading it, pausing it or changing its schedule can). Ask the owner to change it, or delete_scheduled_task removes it.`,
-          );
-        }
-      }
+      const bound = yield* boundToWiderRefusal({
+        profileFor,
+        threads,
+        own,
+        callerId,
+        existing,
+        next: task,
+      });
+      if (bound !== null) return yield* refuse(task, bound);
       if (task.threadId === null) {
         const theirs = yield* runProfile(profileFor, task.projectId).pipe(
           Effect.mapError((refusal) =>
@@ -312,24 +389,33 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
         }
       }
     }
-    return yield* record({ threadId: callerId, profile: carryMcpProfile(own) });
+    return yield* record({ by: "thread", threadId: callerId, profile: carryMcpProfile(own) });
   });
 
   /**
    * Why a run of `task` that starts a new thread is refused, or `null` when it may start. A task
-   * with no entry runs as the owner's (saved before this record); one saved by the owner, or by a
-   * thread on `all`, is not checked.
+   * with no entry (saved before this record, or the file was lost) runs only if the owner made it;
+   * one an agent made waits until the owner saves it once. A task saved from another machine waits
+   * the same way. One saved by the owner, or by a thread on `all`, is not checked further.
    */
   const runRefusal = Effect.fn("ScheduledTaskMcpProfiles.runRefusal")(function* (
     task: ScheduledTask,
   ) {
+    // A test of the service alone: nothing is recorded, so nothing is checked (see above).
+    if (store === undefined) return null;
     const loaded = yield* load;
     if (!loaded.ok) return `Not run: ${unreadable(loaded.issue)}`;
     const savedBy = loaded.tasks.get(task.id);
-    if (savedBy === undefined) return null;
+    if (savedBy === undefined) {
+      if (task.createdBy !== "agent") return null;
+      return `Not run: an agent made this task, and no MCP profile is recorded for it (it was saved before this server recorded them, or ${SCHEDULED_TASK_MCP_PROFILES_FILE} lost it), so a run that starts a new thread is not allowed. ${ownerSaves(task)}`;
+    }
     // Changed since its record (a save stopped half-way, two saves at once): writer not known.
     if (savedBy.digest !== savedDigest(task)) {
-      return "Not run: this task changed after the MCP profile it was saved with was recorded, so who wrote it is not known. Save the task again (in the T3 app, or from the thread that should own it) to run it.";
+      return `Not run: this task changed after the MCP profile it was saved with was recorded, so who wrote it is not known. Save the task again (in the T3 app, or from the thread that should own it) to run it.${afterSave(task)}`;
+    }
+    if (savedBy.by === "linked") {
+      return `Not run: this task was saved from another machine, which does not say the MCP profile of the thread that saved it, so a run that starts a new thread here is not allowed. ${ownerSaves(task)}`;
     }
     const recorded = savedBy.profile;
     if (recorded === null || isEveryMcpTool(recorded)) return null;
@@ -341,7 +427,7 @@ export const makeScheduledTaskMcpProfiles = Effect.fnUntraced(function* (
       return `Not run: the MCP profile of the thread this run would start cannot be worked out. ${theirs.failure.reason}`;
     }
     if (isWithinMcpProfile(theirs.success.profile, recorded)) return null;
-    return `Not run: this task was saved by a thread whose MCP profile is ${named(recorded.name)}, and the thread this run would start in its project gets ${named(theirs.success.name)}, which keeps MCP servers or T3 tools ${named(recorded.name)} does not. Bind the task to a thread, move it to a project whose MCP profile is within ${named(recorded.name)}, or save it in the T3 app to run it as the owner's.`;
+    return `Not run: this task was saved by a thread whose MCP profile is ${named(recorded.name)}, and the thread this run would start in its project gets ${named(theirs.success.name)}, which keeps MCP servers or T3 tools ${named(recorded.name)} does not. Bind the task to a thread, move it to a project whose MCP profile is within ${named(recorded.name)}, or save it in the T3 app to run it as the owner's.${afterSave(task)}`;
   });
 
   return { saving, runRefusal };
