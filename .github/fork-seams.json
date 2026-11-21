@@ -48,7 +48,7 @@
       ]
     },
     "apps/server/src/serverSettings.ts": {
-      "why": "Every settings write goes through upstream's patch and write paths here. The fork swaps in its patch (fork/serverSettingsPatch.ts, under upstream's name, so a project's MCP profile a client left out is kept) and calls its save check (fork/serverSettingsWriteCheck.ts) once in each write path. The load decodes the file after fork/settingsFileRead.ts (old auto-update names renamed, an unusable interval left out so it reads as its default). The lines from \"import { renameRetiredAutoUpdateKeys }\" on predate this list (#277): the load's decode of the file, which the fork report shares and which needs upstream's private decoders here, and the fallback when the file cannot be read. Each listed copy is one the fork adds over upstream; the run from upstream refuses a spare one (#311).",
+      "why": "Every settings write goes through upstream's patch and write paths here. The fork swaps in its patch (fork/serverSettingsPatch.ts, under upstream's name, so a project's MCP profile a client left out is kept) and calls its save check (fork/serverSettingsWriteCheck.ts) once in each write path. The load decodes the file after fork/settingsFileRead.ts (old auto-update names renamed, an unusable interval left out so it reads as its default). The lines from \"import { renameRetiredAutoUpdateKeys }\" on predate this list (#277): the load's decode of the file, which the fork report shares and which needs upstream's private decoders here, and the fallback when the file cannot be read. When the file fails to load, upstream runs on its defaults, whose model policy is off; the fork reads the policy from the file on its own and fails closed (enforce, nothing allowed) when the file does not parse, so a broken file never turns an enforced policy off (fork/modelPolicyFile.ts, #731). Each listed copy is one the fork adds over upstream; the run from upstream refuses a spare one (#311).",
       "added": [
         "// Fork: upstream's patch keeping a project's MCP profile a client left out, and the save check.",
         "import { applyServerSettingsPatchKeepingForkProjectKeys as applyServerSettingsPatch } from \"./fork/serverSettingsPatch.ts\";",
@@ -81,7 +81,14 @@
         "// The file may hold an opt-out we can no longer read; never resume threads or update on a",
         "// guess, even when an admin policy defaults them on (a locked policy value still applies).",
         "automaticUpdates: false,"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ForkPolicy from \"./fork/modelPolicyFile.ts\"; // Fork: model policy",
+          "modelPolicy: ForkPolicy.afterLoadFailure(decoded, raw, managed.defaults), // Fork: model policy"
+        ]
+      }
     },
     "packages/shared/src/AgentScope.ts": {
       "why": "The slot observer (apps/server/src/slots/SlotObserver.ts) reads an agent's memory from its own systemd scope; one optional method on upstream's interface asks for it.",
@@ -236,13 +243,20 @@
       ]
     },
     "apps/server/src/mcp/toolkits/project/handlers.ts": {
-      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706).",
+      "why": "t3_thread_launch from a thread whose MCP profile is narrower than \"all\" is refused when the new thread would get more than the launcher's profile (fork/launchMcpProfile.ts, #681); a launch that starts a run takes a slot from the agent slot gate, or is refused slots_full (fork/agentSlotRoutes.ts, #706). An agent's t3_thread_launch (from a calling thread) is checked against the model policy once its model is known, before the slot gate: refused in enforce when the launch names no model, a model in no row, or an effort off its row (fork/modelPolicyCheck.ts, #731).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkLaunchMcpProfile(caller, { threadId, projectId }); // Fork: MCP profile launch",
         "import { checkLaunchSlot } from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
         "yield* checkLaunchSlot(caller, { threadId, modelSelection, replaying, input, attachments }); // Fork: agent slots"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ModelPolicyCheck from \"../../../fork/modelPolicyCheck.ts\"; // Fork: model policy",
+          "yield* ModelPolicyCheck.checkLaunch(caller, modelSelection, input, replaying); // Fork: model policy"
+        ]
+      }
     },
     "apps/server/src/scheduledTasks/ScheduledTaskService.ts": {
       "why": "A scheduled run (on its schedule, run now, webhook) takes a slot from the agent slot gate delegate_task uses; refused, a run on its schedule stays due and is tried again at the next poll, run now fails, a webhook delivery waits for a slot (a direct one is stored for the stored-delivery worker on its first refusal, so a restart keeps it; one whose task is saved while it waits is not started on its old copy, and the stored-delivery worker keeps its row and runs it again on the task as saved, #719); a run that fails before its dispatch ends frees its slot (fork/agentSlotRoutes.ts, #706). A save records the MCP profile of the thread that made it, and refuses a narrower thread's change that would let the task's runs get more than its own profile; a run that starts a new thread is refused when that thread would get more than the recorded profile (fork/scheduledTaskMcpProfile.ts, #699).",
@@ -276,7 +290,7 @@
       ]
     },
     "apps/server/src/mcp/toolkits/thread/handlers.ts": {
-      "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693); run_scheduled_task_now refused by the agent slot gate answers slots_full (fork/agentSlotRoutes.ts, #706; the prettier-ignore keeps upstream's run_scheduled_task_now lines as they are, since a second pipe step would make the formatter reflow them).",
+      "why": "t3_thread_transfer's fork from a thread whose MCP profile is narrower than \"all\" is refused when the fork would get more than the caller's profile, and run_scheduled_task_now on a task whose runs would start such a thread (fork/launchMcpProfile.ts, #693); run_scheduled_task_now refused by the agent slot gate answers slots_full (fork/agentSlotRoutes.ts, #706; the prettier-ignore keeps upstream's run_scheduled_task_now lines as they are, since a second pipe step would make the formatter reflow them). An agent's t3_thread_configure that changes a thread's model is checked against the model policy before it is dispatched; the owner's client is not (fork/modelPolicyCheck.ts, #731).",
       "added": [
         "import * as LaunchMcpProfile from \"../../../fork/launchMcpProfile.ts\"; // Fork: MCP profile launch",
         "yield* LaunchMcpProfile.checkForkMcpProfile(projection.thread, targetThreadId); // Fork: MCP profile launch",
@@ -284,7 +298,14 @@
         "import * as AgentSlotRoutes from \"../../../fork/agentSlotRoutes.ts\"; // Fork: agent slots",
         "// prettier-ignore",
         "Effect.mapError(AgentSlotRoutes.runNowSlotRefusal), // Fork: agent slots"
-      ]
+      ],
+      "announced": {
+        "since": "2026-11-21",
+        "added": [
+          "import * as ModelPolicyCheck from \"../../../fork/modelPolicyCheck.ts\"; // Fork: model policy",
+          "yield* ModelPolicyCheck.checkConfigure(modelSelection); // Fork: model policy"
+        ]
+      }
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",
@@ -385,6 +406,7 @@
     "packages/contracts/src/handoff.test.ts",
     "packages/contracts/src/handoff.ts",
     "packages/contracts/src/mcpProfile*",
+    "packages/contracts/src/modelPolicy*",
     "packages/contracts/src/playtest*",
     "packages/contracts/src/reviewRules*",
     "packages/contracts/src/usagePacing.ts",
