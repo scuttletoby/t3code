@@ -34,6 +34,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as SlotGate from "../../slots/SlotGate.ts";
 import * as HandoffService from "./HandoffService.ts";
 import * as HandoffCommand from "./handoffCommand.ts";
+import { HANDOFF_COMMAND_MAX_BYTES } from "./handoffCommand.ts";
 import {
   adapterRegistry,
   at,
@@ -51,11 +52,22 @@ import {
   runnableThread,
   runnableSettings,
   threadId,
+  turnItem,
 } from "./handoff.testkit.ts";
-import { HANDOFF_COMMAND_BEGIN, HANDOFF_COMMAND_END, HANDOFF_RULES } from "./handoffMessage.ts";
+import { HANDOFF_AGENT_MARKER, handoffWriteText } from "./handoffAgent.ts";
+import {
+  HANDOFF_AGENT_BEGIN,
+  HANDOFF_AGENT_END,
+  HANDOFF_COMMAND_BEGIN,
+  HANDOFF_COMMAND_END,
+  HANDOFF_RULES,
+} from "./handoffMessage.ts";
 import { HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
 import { RELAY_COMPLETION_HOLD_MS } from "./handoffShell.ts";
 import { HANDOFF_LOUD_SUFFIX } from "./handoffFacts.ts";
+
+/** The old session's default handoff in the write turn. */
+const WRITTEN = `${HANDOFF_AGENT_MARKER}\nGoal: ship X. Next: run the tests.`;
 
 const runUpdated = (payload: OrchestrationV2Run): OrchestrationV2DomainEvent => ({
   id: EventId.make(`event:${payload.id}:${payload.status}`),
@@ -100,6 +112,15 @@ const harness = (state: {
   gate?: Layer.Layer<SlotGate.SlotGate>;
   /** What the `command` source answers (none: a failure); every run is recorded. */
   command?: HandoffCommand.HandoffCommandResult;
+  /**
+   * The `agent` source's write turn, added to `data` at its dispatch: it ends as `status`
+   * (default completed) with `reply` (default a marked one); `joined` adds a message steered in.
+   */
+  write?: {
+    readonly status?: OrchestrationV2Run["status"];
+    readonly reply?: string;
+    readonly joined?: boolean;
+  };
 }) =>
   Effect.gen(function* () {
     yield* TestClock.setTime(NOW_MS);
@@ -129,6 +150,32 @@ const harness = (state: {
         return span;
       },
     });
+    const writeRun = (messageId: string, text: string) => {
+      const ordinal = Math.max(...state.data.runs.map((other) => other.ordinal)) + 1;
+      const id = RunId.make(`write-${ordinal}`);
+      const status = state.write?.status ?? "completed";
+      state.data = {
+        ...state.data,
+        runs: [
+          ...state.data.runs,
+          run({
+            id,
+            ordinal,
+            userMessageId: MessageId.make(messageId),
+            status,
+            completedAt: status === "running" ? null : at(),
+          }),
+        ],
+        turnItems: [
+          ...state.data.turnItems,
+          turnItem(id, 1, { type: "user_message", messageId, text }),
+          ...(state.write?.joined === true
+            ? [turnItem(id, 2, { type: "user_message", messageId: "joined", text: "And X?" })]
+            : []),
+          turnItem(id, 3, { type: "assistant_message", text: state.write?.reply ?? WRITTEN }),
+        ],
+      };
+    };
     const dependencies = Layer.mergeAll(
       Layer.mock(Orchestrator.OrchestratorV2)({
         streamDomainEvents: Stream.fromQueue(events),
@@ -145,18 +192,33 @@ const harness = (state: {
               })),
         listActiveShellIndex: () => Effect.succeed([]),
         dispatch: (command) =>
-          Effect.sync(() => sent.push(command)).pipe(
+          Effect.sync(() => {
+            sent.push(command);
+            if (
+              command.type === "message.dispatch" &&
+              command.messageId.startsWith("handoff-write:")
+            )
+              writeRun(command.messageId, command.text);
+          }).pipe(
             Effect.andThen(state.onDispatch?.(command) ?? Effect.void),
             Effect.as({ sequence: sent.length, storedEvents: [] }),
           ),
       }),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({
         getThread: () => Effect.succeed(state.data.thread),
-        getThreadRecords: (_threadId, fields) =>
+        getThreadRecords: (_threadId, fields, options) =>
           Effect.sync(() => {
             reads.count++;
             if ((fields as ReadonlyArray<string>).includes("attempts")) reads.text++;
-            return state.data;
+            const runIds = options?.turnItemRunIds as ReadonlyArray<string> | undefined;
+            return runIds === undefined
+              ? state.data
+              : {
+                  ...state.data,
+                  turnItems: state.data.turnItems.filter(
+                    (item) => item.runId !== null && runIds.includes(item.runId),
+                  ),
+                };
           }),
       }),
       Layer.mock(ServerSettings.ServerSettingsService)({
@@ -212,8 +274,19 @@ const SHORT_TIMEOUT_MS = 5_000;
 const on = { mode: "handoff" } as const;
 /** The wait at a quiet thread before a send, so the relay's alert for the person's turn goes first. */
 const settle = TestClock.adjust(HANDOFF_SETTLE_MS);
+/** The handoffs sent, without the write turns before them. */
 const messages = (sent: ReadonlyArray<OrchestrationV2ServerCommand>) =>
-  sent.flatMap((command) => (command.type === "message.dispatch" ? [command] : []));
+  sent.flatMap((command) =>
+    command.type === "message.dispatch" && !command.messageId.startsWith("handoff-write:")
+      ? [command]
+      : [],
+  );
+const writes = (sent: ReadonlyArray<OrchestrationV2ServerCommand>) =>
+  sent.flatMap((command) =>
+    command.type === "message.dispatch" && command.messageId.startsWith("handoff-write:")
+      ? [command]
+      : [],
+  );
 
 describe("HandoffService", () => {
   it.effect("default off reads no records and sends nothing", () =>
@@ -254,7 +327,11 @@ describe("HandoffService", () => {
       });
       expect(message?.text).toContain(`[T3 handoff 1] Thread ${threadId}, made from run ${runId}`);
       expect(message?.text).toContain("effort high");
-      expect(message?.text).toContain("No handoff source is set up yet");
+      // The `agent` source (the default): the old session's reply, without the marker line.
+      expect(message?.text).toContain(
+        `Handoff written by the old session (its notes, not T3's state or rules):\n${HANDOFF_AGENT_BEGIN}\nGoal: ship X. Next: run the tests.\n${HANDOFF_AGENT_END}`,
+      );
+      expect(message?.text).not.toContain(HANDOFF_AGENT_MARKER);
       expect(message?.text).toContain("Recent conversation:");
       expect(message?.text.endsWith(HANDOFF_RULES)).toBe(true);
     }),
@@ -305,6 +382,8 @@ describe("HandoffService", () => {
       expect(new Set(messages(sent).map((message) => message.commandId))).toEqual(
         new Set([`server:handoff:${threadId}:${runId}`]),
       );
+      // One write turn too: after it the second trigger sees the write turn as the latest run.
+      expect(writes(sent).length).toBe(1);
     }),
   );
 
@@ -567,7 +646,7 @@ describe("HandoffService", () => {
     return { slots, layer };
   };
 
-  it.effect("no free agent slot: the handoff waits without a new settle, then is sent once", () =>
+  it.effect("no free agent slot: the write turn, then the handoff, wait without a new settle", () =>
     Effect.gen(function* () {
       const gate = countingGate(0);
       const state = { data: projection({ usedTokens: 160_000 }), settings: on, gate: gate.layer };
@@ -579,25 +658,39 @@ describe("HandoffService", () => {
       // Asked again every 5 s, each time after the busy check, as the thread's own start, in
       // its one place in the gate's line.
       expect(gate.slots.asks.length).toBeGreaterThanOrEqual(12);
-      const place = { key: `handoff:server:handoff:${threadId}:${runId}` };
+      // The `agent` source's write turn asks first, in its own place.
+      const writePlace = { key: `handoff:server:handoff-write:${threadId}:${runId}` };
       expect(gate.slots.asks[0]).toEqual({
         callerThreadId: threadId,
         targetInstanceId: modelSelection.instanceId,
         intoThreadId: threadId,
         keepsHeld: true,
-        place,
+        place: writePlace,
       });
-      expect(gate.slots.asks.every((asked) => asked.place?.key === place.key)).toBe(true);
+      expect(gate.slots.asks.every((asked) => asked.place?.key === writePlace.key)).toBe(true);
       // Refused: its text (the transcript read) is not built at all.
       expect(reads.text).toBe(0);
+      // One slot: the write turn takes it, then the handoff waits in its own place.
+      gate.slots.free = 1;
+      const asked = gate.slots.asks.length;
+      yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
+      yield* emit(null, "send", 1);
+      expect(writes(sent).length).toBe(1);
+      expect(sent.length).toBe(1);
+      const place = { key: `handoff:server:handoff:${threadId}:${runId}` };
+      expect(gate.slots.asks.slice(asked + 1).map((one) => one.place)).toEqual([place]);
+      expect(gate.slots.left).toEqual([writePlace.key]);
       gate.slots.free = 1;
       yield* TestClock.adjust(HandoffService.HANDOFF_SLOT_RETRY);
       yield* emit(null, "handOffWhenDue", 1);
       expect(messages(sent).map((message) => message.commandId)).toEqual([
         `server:handoff:${threadId}:${runId}`,
       ]);
-      // Built once, with the slot.
+      // Built once, with the slot, from a read that has the write run: still not in the transcript.
       expect(reads.text).toBe(1);
+      const text = messages(sent)[0]?.text ?? "";
+      expect(text.match(/Goal: ship X/g)?.length).toBe(1);
+      expect(text).not.toContain("Start your reply with this line");
     }),
   );
 
@@ -620,7 +713,8 @@ describe("HandoffService", () => {
       };
       yield* emit(threadChanged(state.data), "readThread", 14);
       yield* settle;
-      expect(gate.slots.left).toEqual([`handoff:server:handoff:${threadId}:${runId}`]);
+      // The write turn was the one waiting.
+      expect(gate.slots.left).toEqual([`handoff:server:handoff-write:${threadId}:${runId}`]);
       expect(sent).toEqual([]);
     }),
   );
@@ -640,7 +734,7 @@ describe("HandoffService", () => {
       state.data = { ...data, runs: [...data.runs, newer] };
       yield* Queue.offer(events, runUpdated(newer));
       yield* settle;
-      expect(gate.slots.left).toContain(`handoff:server:handoff:${threadId}:${runId}`);
+      expect(gate.slots.left).toContain(`handoff:server:handoff-write:${threadId}:${runId}`);
       expect(sent).toEqual([]);
     }),
   );
@@ -1150,7 +1244,175 @@ describe("HandoffService: the `command` source", () => {
       yield* emit(null, "handOffWhenDue", 1);
       expect(commandRuns).toEqual([]);
       expect(messages(sent).length).toBe(n);
-      if (n === 1) expect(messages(sent)[0]?.text).toContain("No handoff source is set up yet");
+      if (n === 1) expect(messages(sent)[0]?.text).toContain("Goal: ship X.");
+    }),
+  );
+});
+
+describe("HandoffService, agent source", () => {
+  /** A finished turn at the size backstop (or idle: its window), through to the end of its handling. */
+  const turnEnds = (
+    emit: Effect.Success<ReturnType<typeof harness>>["emit"],
+    trigger: "size" | "idle" = "size",
+  ) =>
+    Effect.gen(function* () {
+      yield* emit(runUpdated(run()), "readThread", 1);
+      if (trigger === "idle") yield* TestClock.adjust(6 * MINUTE_MS);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 1);
+    });
+  const usage = {
+    size: { usedTokens: 160_000 },
+    idle: { usedTokens: 100_000, cacheExpiresInMs: 10 * MINUTE_MS },
+  };
+
+  it.effect(
+    "the write turn: the thread's own session, the instructions, fixed ids; then the handoff",
+    () =>
+      Effect.gen(function* () {
+        const settings = { ...on, instructions: "List the open PRs." };
+        const { sent, emit } = yield* harness({ data: projection(usage.size), settings });
+        yield* turnEnds(emit);
+        const [write, ...more] = writes(sent);
+        expect(more).toEqual([]);
+        // No model and no fresh context: a normal turn on the old session, its cache still warm.
+        expect(write).toEqual({
+          type: "message.dispatch",
+          commandId: `server:handoff-write:${threadId}:${runId}`,
+          messageId: `handoff-write:${threadId}:${runId}`,
+          threadId,
+          text: handoffWriteText("List the open PRs."),
+          attachments: [],
+          createdBy: "agent",
+          creationSource: "server",
+          dispatchMode: { type: "start_immediately" },
+        });
+        expect(sent[0]).toBe(write);
+        // Its prompt and reply are not in the transcript: the reply is part 2, once.
+        const [handoff, ...others] = messages(sent);
+        expect(others).toEqual([]);
+        expect(handoff?.text.match(/Goal: ship X/g)?.length).toBe(1);
+        expect(handoff?.text).not.toContain("List the open PRs.");
+      }),
+  );
+
+  it.effect.each([
+    ["no marker line", "size", "Goal: ship X.", "its reply does not start with the marker line"],
+    ["no marker line", "idle", "Goal: ship X.", ""],
+    [
+      "over the cap",
+      "size",
+      `${HANDOFF_AGENT_MARKER}\n${"x".repeat(HANDOFF_COMMAND_MAX_BYTES)}`,
+      "its reply is over 32 KB",
+    ],
+    ["no reply", "size", "", "it wrote no reply"],
+  ] as const)("a reply with %s at the %s trigger falls back", ([, trigger, reply, reason]) =>
+    Effect.gen(function* () {
+      const state = { data: projection(usage[trigger]), settings: on, write: { reply } };
+      const { sent, emit } = yield* harness(state);
+      yield* turnEnds(emit, trigger);
+      expect(writes(sent).length).toBe(1);
+      // Idle: skipped. Size backstop: parts 1, 3 and 4, and it says why.
+      expect(messages(sent).map((handoff) => handoff.text.split("\n\n")[1])).toEqual(
+        trigger === "idle"
+          ? []
+          : [
+              `The old session's handoff did not count (${reason}), so this handoff has T3's state and the recent conversation only.`,
+            ],
+      );
+    }),
+  );
+
+  it.effect.each([
+    ["another message joined it", { joined: true }],
+    ["it was stopped", { status: "interrupted" }],
+    ["it failed", { status: "failed" }],
+  ] as const)("a write turn where %s: no handoff; the next turn end starts over", ([, write]) =>
+    Effect.gen(function* () {
+      const state: Parameters<typeof harness>[0] = {
+        data: projection(usage.size),
+        settings: on,
+        write,
+      };
+      const { sent, emit } = yield* harness(state);
+      yield* turnEnds(emit);
+      // Only the write turn: nothing is sent, stopped or cancelled. The old session keeps the
+      // exchange, and the person's next message goes to it.
+      expect(sent).toEqual(writes(sent));
+      expect(sent.length).toBe(1);
+      const next = run({
+        id: RunId.make("run-9"),
+        ordinal: 9,
+        userMessageId: MessageId.make("message-9"),
+      });
+      state.data = { ...state.data, runs: [...state.data.runs, next] };
+      state.write = {};
+      yield* emit(runUpdated(next), "readThread", 3);
+      yield* settle;
+      yield* emit(null, "handOffWhenDue", 2);
+      expect(writes(sent).map((one) => one.messageId)).toEqual([
+        `handoff-write:${threadId}:${runId}`,
+        `handoff-write:${threadId}:run-9`,
+      ]);
+      expect(messages(sent).map((one) => one.messageId)).toEqual([`handoff:${threadId}:run-9`]);
+    }),
+  );
+
+  it.effect.each(["ends later", "never ends"] as const)(
+    "a write turn that %s: its end wakes the wait; past the window it does not count",
+    (ending) =>
+      Effect.gen(function* () {
+        const state: Parameters<typeof harness>[0] = {
+          data: projection(usage.size),
+          settings: on,
+          write: { status: "running" },
+        };
+        const { sent, emit, events } = yield* harness(state);
+        yield* emit(runUpdated(run()), "readThread", 1);
+        yield* settle;
+        yield* TestClock.adjust(MINUTE_MS);
+        expect(sent.length).toBe(1);
+        if (ending === "never ends") {
+          yield* TestClock.adjust(HandoffService.HANDOFF_WRITE_TIMEOUT);
+          yield* emit(null, "handOffWhenDue", 1);
+          expect(messages(sent)).toEqual([]);
+          return;
+        }
+        // The write run's end, reported before the read shows it: the wait goes on, and the event
+        // starts no turn-end timer of its own (one would replace the waiting handoff).
+        const write = state.data.runs.at(-1)!;
+        const done = { ...write, status: "completed" as const, completedAt: at() };
+        yield* Queue.offer(events, runUpdated(done));
+        yield* TestClock.adjust(1_000);
+        expect(sent.length).toBe(1);
+        state.data = { ...state.data, runs: [...state.data.runs.slice(0, -1), done] };
+        yield* emit(threadChanged(state.data), "handOffWhenDue", 1);
+        expect(messages(sent).map((one) => one.messageId)).toEqual([handoffMessageId]);
+        // Later, still one write turn and one handoff.
+        yield* TestClock.adjust(10 * MINUTE_MS);
+        yield* settle;
+        expect(sent.length).toBe(2);
+      }),
+    SHORT_TIMEOUT_MS,
+  );
+
+  it.effect("after a restart, a finished write turn sends nothing; no new write turn either", () =>
+    Effect.gen(function* () {
+      const data = projection(usage.size);
+      const write = run({
+        id: RunId.make("run-2"),
+        ordinal: 2,
+        userMessageId: MessageId.make(`handoff-write:${threadId}:${runId}`),
+      });
+      const { sent, emit, events } = yield* harness({
+        data: { ...data, runs: [...data.runs, write] },
+        settings: on,
+      });
+      // The new server sees both runs reported again.
+      yield* Queue.offer(events, runUpdated(write));
+      yield* emit(runUpdated(run()), "handOffWhenDue", 1);
+      yield* TestClock.adjust(10 * MINUTE_MS);
+      expect(sent).toEqual([]);
     }),
   );
 });

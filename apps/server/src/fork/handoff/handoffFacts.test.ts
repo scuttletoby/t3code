@@ -17,7 +17,13 @@ import {
   runId,
   threadId,
 } from "./handoff.testkit.ts";
-import { handoffBlockers, handoffThreadFacts, parseHandoffMessageId } from "./handoffFacts.ts";
+import {
+  handoffBlockers,
+  handoffThreadFacts,
+  handoffWriteIds,
+  parseHandoffMessageId,
+  parseHandoffWriteMessageId,
+} from "./handoffFacts.ts";
 import { handoffMessageText } from "./handoffMessage.ts";
 
 const base = projection({ usedTokens: 160_000 });
@@ -56,6 +62,21 @@ describe("parseHandoffMessageId", () => {
     expect(parseHandoffMessageId(ThreadId.make("other"), handoffMessageId)).toBeNull();
     expect(parseHandoffMessageId(threadId, "message-1")).toBeNull();
     expect(parseHandoffMessageId(threadId, `handoff:${threadId}:`)).toBeNull();
+  });
+});
+
+describe("parseHandoffWriteMessageId", () => {
+  it("reads the source run of a write turn's id, and nothing else", () => {
+    const ids = handoffWriteIds(threadId, runId);
+    expect(ids).toEqual({
+      commandId: `server:handoff-write:${threadId}:${runId}`,
+      messageId: `handoff-write:${threadId}:${runId}`,
+    });
+    expect(parseHandoffWriteMessageId(threadId, ids.messageId)).toBe(runId);
+    expect(parseHandoffWriteMessageId(threadId, `handoff-write:${threadId}:`)).toBeNull();
+    expect(parseHandoffWriteMessageId(ThreadId.make("other"), ids.messageId)).toBeNull();
+    expect(parseHandoffWriteMessageId(threadId, handoffMessageId)).toBeNull();
+    expect(parseHandoffMessageId(threadId, ids.messageId)).toBeNull();
   });
 });
 
@@ -160,6 +181,11 @@ describe("handoffThreadFacts", () => {
     expect(handoffThreadFacts(compacted).lastRun?.kind).toBe("compact");
     const handedOff = { ...base, runs: [run({ userMessageId: handoffMessageId })] };
     expect(handoffThreadFacts(handedOff).lastRun?.kind).toBe("handoff");
+    const written = {
+      ...base,
+      runs: [run({ userMessageId: MessageId.make(handoffWriteIds(threadId, runId).messageId) })],
+    };
+    expect(handoffThreadFacts(written).lastRun?.kind).toBe("handoff-write");
     // A removed queued message leaves a cancelled run that never started: it is not the latest.
     const removed = {
       ...base,
