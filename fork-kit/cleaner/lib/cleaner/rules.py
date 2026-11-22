@@ -18,7 +18,7 @@ DAY = 86400
 # login session owns, and agent scratch folders (the agent-scratch rule's, never the tmp rule's).
 TMP_NEVER = ('.*', 'claude-*', 'tmux-*', 'ssh-*', 'systemd-private-*', 'snap-private-tmp', 'snap.*', 'lost+found')
 ANONYMOUS = re.compile(r'^[0-9a-f]{64}$')       # the name Docker gives a volume nobody named
-EMPTY_PRS = {'merged': [], 'open': []}
+EMPTY_PRS = {'merged': [], 'closed': [], 'open': []}
 GITHUB_URL = re.compile(r'^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?$')
 # In a worktree's own git folder: files the commands of somebody working in it write (`fetch` writes FETCH_HEAD).
 USE_MARKS = ('HEAD', 'index', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG')
@@ -940,29 +940,36 @@ def tree_refusal(cfg, facts, repo, path, kind, prs, out):
     based = [row for row in prs['open'] + prs['merged'] if row['baseRefName'] == branch]
     if based:
         return Refusal('base branch', f'pull requests merge into {branch}: {numbers(based)}')
-    # Only a pull request from this repository: a fork's "main" is not this repository's main.
-    merged = [row for row in prs['merged'] if row['headRefName'] == branch and not row['isCrossRepository']]
-    if not merged:
-        return Refusal('no merged PR', f'no merged pull request of this repository has the branch {branch}')
-    here = present(path, [row['headRefOid'] for row in prs['merged'] + prs['open']])
+    # Only a pull request from this repository: a fork's "main" is not this repository's main. One closed without a
+    # merge finishes it too (#982): its head stays on GitHub (refs/pull/<n>/head) and `git worktree remove` leaves the
+    # branch in the clone; every check below still keeps what is only here.
+    ended = [(row, word) for word in ('merged', 'closed') for row in prs[word]
+             if row['headRefName'] == branch and not row['isCrossRepository']]
+    if not ended:
+        return Refusal('no merged PR', f'no merged or closed pull request of this repository has the branch {branch}')
+    here = present(path, [row['headRefOid'] for row in prs['merged'] + prs['closed'] + prs['open']])
     holding = []
-    for row in merged:
+    for row, word in ended:
         oid = row['headRefOid']
         if oid != head:
             if oid not in here:
                 continue                # GitHub's head is a commit this folder does not have: nothing to compare
             if git_code(path, 'merge-base', '--is-ancestor', head, oid) != 0:
                 continue
-        holding.append(row)
+        holding.append((row, word))
     if not holding:
-        return Refusal('commits not in the merged PR', f'HEAD is not in {numbers(merged)}')
-    times = [merged_seconds(row) for row in holding]
+        word = 'merged' if any(w == 'merged' for _, w in ended) else 'closed'
+        return Refusal(f'commits not in the {word} PR', f'HEAD is not in {numbers([r for r, _ in ended])}')
+    times = [merged_seconds(row, 'mergedAt' if word == 'merged' else 'closedAt') for row, word in holding]
     if None in times:
-        return Refusal('could not read', f'GitHub (no merge time for {numbers([r for r, t in zip(holding, times) if t is None])})')
+        late = [(r, w) for (r, w), t in zip(holding, times) if t is None]
+        what = 'merge' if late[0][1] == 'merged' else 'close'
+        return Refusal('could not read', f'GitHub (no {what} time for {numbers([r for r, _ in late])})')
+    rows, word = [r for r, _ in holding], holding[times.index(max(times))][1]
     age = facts.now - max(times)
     if age < cfg.merged_hours * 3600:
-        return Refusal(f'merged under {cfg.merged_hours} h ago', f'{numbers(holding)} merged {int(max(age, 0) // 3600)} h ago')
-    out['why'] = f'{numbers(holding)} merged {days_text(int(age // DAY))} ago, nothing in it that is only here'
+        return Refusal(f'{word} under {cfg.merged_hours} h ago', f'{numbers(rows)} {word} {int(max(age, 0) // 3600)} h ago')
+    out['why'] = f'{numbers(rows)} {word} {days_text(int(age // DAY))} ago, nothing in it that is only here'
 
     changed, ignored = [], []
     fields = git(path, 'status', '--porcelain', '-z', '--untracked-files=normal', '--ignored=matching').split('\0')

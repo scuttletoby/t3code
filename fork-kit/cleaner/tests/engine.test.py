@@ -796,9 +796,10 @@ class Config(Case):
             | {f'daily.{k}' for k in cf.DAILY_SPEC} | {f'compare.{k}' for k in cf.COMPARE_SPEC} \
             | {f'compressCold.{k}' for k in cf.COMPRESS_SPEC} | {f'folders.{k}' for k in cf.FOLDER_SPEC} \
             | {f'agentScratch.{k}' for k in cf.SCRATCH_SPEC} | {f'keepFirst.{k}' for k in cf.KEEP_FIRST_SPEC} \
-            | {f'dedupe.{k}' for k in cf.DEDUPE_SPEC}
+            | {f'dedupe.{k}' for k in cf.DEDUPE_SPEC} | {f'report.{k}' for k in cf.REPORT_SPEC}
         self.assertEqual(set(cf.KEY_KINDS), keys)
-        self.assertLessEqual(set(cf.KEY_KINDS.values()), {'own file', 'floor', 'keeps more', 'picks', 'loosens', 'compare only'})
+        self.assertLessEqual(set(cf.KEY_KINDS.values()), {'own file', 'floor', 'keeps more', 'picks', 'loosens', 'compare only',
+                                                          'report only'})
         self.assertEqual([k for k, v in cf.KEY_KINDS.items() if v == 'loosens'], ['repos.regenerable', 'folders.layered'])
 
     def test_the_launcher_runs(self):
