@@ -65,8 +65,12 @@ class Case(fx.Case):
             self.settle()
         return super().facts(cfg, **over)
 
-    def dd_cfg(self, days=30, folders=None, **section):
-        return self.cfg(dedupe={'folders': folders or [{'path': self.dd, 'days': days}]}, **section)
+    def dd_cfg(self, days=30, folders=None, in_place=(), **section):
+        """A dedupe section for the test's folder; `in_place` is `dedupe.writtenInPlace` (None leaves it out)."""
+        dedupe = {'folders': folders or [{'path': self.dd, 'days': days}]}
+        if in_place is not None:
+            dedupe['writtenInPlace'] = list(in_place)
+        return self.cfg(dedupe=dedupe, **section)
 
     def put(self, *parts, data=None, days=40, mode=0o644):
         path = os.path.join(self.dd, *parts)
@@ -464,7 +468,7 @@ class Refused(Case):
                 f.write(body())
             self.age(os.path.join(real, name), 40)
         os.symlink(self.path('real'), self.path('via'))
-        cfg = self.cfg(dedupe={'folders': [{'path': self.path('via', 'dd'), 'days': 30}]})
+        cfg = self.dd_cfg(folders=[{'path': self.path('via', 'dd'), 'days': 30}])
         self.assertKept(self.plan(cfg), self.path('via', 'dd'), 'symbolic link')
         self.run_cleaner(cfg)
         self.assertNotEqual(self.ino(os.path.join(real, 'a.bin')), self.ino(os.path.join(real, 'b.bin')))
@@ -720,7 +724,7 @@ class Writes(Case):
         """A program's own kinds (a game's save files) are named in the machine file, not in the code."""
         a, b = self.put('r.0.0.MCA', days=50), self.put('r.0.1.mca')
         c, d = self.put('x.bin', days=50), self.put('y.bin')
-        kinds = lambda value: self.cfg(dedupe={'folders': [{'path': self.dd, 'days': 30}], 'writtenInPlace': value})
+        kinds = lambda value: self.dd_cfg(in_place=value)
         plan = self.plan(kinds(['*.mca', 'world.dat']))
         for path in (a, b):
             self.assertKept(plan, path, 'written in place')
@@ -728,6 +732,37 @@ class Writes(Case):
         for bad in (['saves/*.mca'], [''], ['..'], [5], '*.mca'):
             with self.subTest(bad=bad), self.assertRaises(machine_file.MachineFileError):
                 kinds(bad)
+
+    def test_an_older_machine_file_without_written_in_place_links_nothing(self):
+        """An older machine file has no `dedupe.writtenInPlace`, and an older cleaner refused kinds the built-in list
+        no longer has: with the key missing the rule links nothing and says why, every run, until the owner adds it
+        (an explicit [] links as before). The other rules still run."""
+        a, b = self.put('one.sav', days=50), self.put('two.sav')
+        c, d = self.put('x.bin', days=50), self.put('y.bin')
+        gone = self.old_dir('job-1', 3)
+        older = self.dd_cfg(in_place=None, tmp={'root': self.tmp, 'patterns': {'job-*': 1}})
+        for again in (False, True):
+            with self.subTest(again=again):
+                code, lines = self.run_cleaner(older)
+                self.assertEqual(code, 1, lines)
+                said = [line for line in lines if 'dedupe.writtenInPlace is missing' in line]
+                self.assertEqual(len(said), 1, lines)
+                self.assertTrue(said[0].startswith(f'kept {self.dd} (dedupe: could not read: '), said)
+                self.assertEqual(len({self.ino(p) for p in (a, b, c, d)}), 4)
+                self.assertFalse(os.path.exists(gone))
+        plan = self.plan(older)
+        self.assertEqual((self.items(plan), [(k.path, k.code) for k in plan.kept]), ([], [(self.dd, 'could not read')]))
+        # The owner names the kinds: those stay, the rest is linked, and a second run has nothing to do.
+        for again in (False, True):
+            code, lines = self.run_cleaner(self.dd_cfg(in_place=['*.sav']))
+            self.assertEqual(code, 0, lines)
+            self.assertNotEqual(self.ino(a), self.ino(b))
+            self.assertEqual(self.ino(c), self.ino(d))
+            self.assertEqual(len([line for line in lines if line.startswith('linked ')]), 0 if again else 1, lines)
+        # [] is the owner's word that no program here writes in place: every copy is linked.
+        code, lines = self.run_cleaner(self.dd_cfg(in_place=[]))
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(self.ino(a), self.ino(b))
 
     def test_files_with_other_chattr_flags_are_not_linked(self):
         a, b = self.put('a.bin', days=50), self.put('b.bin')
@@ -1388,6 +1423,12 @@ MUTATIONS = {
     'more kinds written in place': ('dedupe', "'*.pid', '*.qcow2',", "'*.pid',", Writes, 'test_more_kinds_written_in_place'),
     'kinds the machine file names': ('dedupe', 'matches(name, IN_PLACE + cfg.dedupe_in_place)', 'matches(name, IN_PLACE)',
                                      Writes, 'test_the_machine_file_adds_kinds_written_in_place'),
+    'an older machine file links nothing': ('dedupe', '    if cfg.dedupe_in_place is None:\n        for folder in cfg.dedupe_folders:',
+                                            '    if False:\n        for folder in cfg.dedupe_folders:',
+                                            Writes, 'test_an_older_machine_file_without_written_in_place_links_nothing'),
+    'a missing writtenInPlace is not []': ('config', 'None if listed is None else tuple(v.lower() for v in listed)',
+                                           'tuple(v.lower() for v in listed or ())',
+                                           Writes, 'test_an_older_machine_file_without_written_in_place_links_nothing'),
     'the plan warns': ('dedupe', '        plan.notes.append(WARNING)', '        pass', Writes, 'test_the_readme_and_the_plan_say_so'),
     'the cache needs an unchanged stamp': ('dedupe', 'if cached is not None and tuple(cached[:3]) == stamp:', 'if cached is not None:',
                                            Cached, 'test_a_changed_file_is_read_again'),

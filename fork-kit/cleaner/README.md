@@ -609,7 +609,8 @@ stays, each reads the same bytes as before, and the disk holds them once. Withou
   "folders": [
     { "path": "~/mirrors", "days": 30 },
     { "path": "/srv/build-output/releases", "days": 14 }
-  ]
+  ],
+  "writtenInPlace": []
 }
 ```
 
@@ -618,7 +619,7 @@ stays, each reads the same bytes as before, and the disk holds them once. Withou
 | `dedupe.folders[].path`    | required | a folder; files at any depth in it are looked at                       |
 | `dedupe.folders[].days`    | required | days without a change (7 or more): newer files are not looked at       |
 | `dedupe.folders[].layered` | false    | the folder may be on a filesystem that is not local (as compress-cold) |
-| `dedupe.writtenInPlace`    | none     | more name patterns (no `/`) never linked: one program's own kinds      |
+| `dedupe.writtenInPlace`    | required | more name patterns (no `/`) never linked: one program's own kinds      |
 
 **The risk it takes: read this before you name a folder.** Names of one hard-linked file are one file, so any
 write **into** one name changes every name, and the other names' old bytes are gone. Most ways of writing a file do
@@ -633,8 +634,9 @@ images, no working copies. The rule refuses the kinds it knows are written in pl
 `*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`; disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`,
 `*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`; mail boxes `mbox`, `*.mbox`; partial downloads a client resumes
 in place `*.part`, `*.crdownload`, `*.partial`, `*.!qb`), plus the name patterns in `dedupe.writtenInPlace` (one
-program's own kinds, such as a game's save files), but such a list can never be complete. Every plan and run that links says it again in one line (`dedupe: names of one file
-share every later write ...`). On btrfs or XFS a tool that shares blocks with a reflink (`FIDEDUPERANGE`) is the
+program's own kinds, such as a game's save files; `[]` when the folders hold none), but such a list can never be
+complete. Every plan and run that links says it again in one line (`dedupe: names of one file share every later
+write ...`). On btrfs or XFS a tool that shares blocks with a reflink (`FIDEDUPERANGE`) is the
 safer choice: later writes do not reach the other copies. This rule makes hard links because the hosts it was made
 for are ext4, which has no reflinks.
 
@@ -723,8 +725,18 @@ the rename)`. The report has a class
 - **the cache is missing, broken or cannot be written:** files are read again; a cache that cannot be written is
   named in one line and the run goes on.
 - **the machine file is older and has no `dedupe`:** the rule does nothing.
+- **the machine file is older and has no `dedupe.writtenInPlace`:** older cleaners refused some kinds themselves
+  (game region files) that the built-in list no longer has, so with folders named and this key missing the rule
+  links nothing. Each folder is kept with `could not read: dedupe.writtenInPlace is missing ...` and every run
+  exits 1 until the key is there; the other rules run as usual. `[]` is the owner's word that no program writes
+  its own kinds in place in these folders.
 - **the cleaner is older than the machine file:** an older cleaner refuses the unknown `dedupe` key and every daily
   run exits 2. Install this cleaner on a machine first, then add the key.
+- **upgrading a machine whose `dedupe` section has no `writtenInPlace`:** add the key first (the kinds a program
+  there writes in place, or `[]`), then install this cleaner. Until the new cleaner is in, the older one refuses
+  the machine file (`unknown key 'writtenInPlace'`) and every rule stops, every daily run exits 2, nothing is
+  touched. The other order is safe too, only noisier: the new cleaner links nothing and exits 1 until the key is
+  added.
 
 ## The machine file
 

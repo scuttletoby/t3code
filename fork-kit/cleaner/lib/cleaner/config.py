@@ -245,7 +245,10 @@ FOLDER_SPEC = {
 # become hard links of one of them. Each folder is a FOLDER_SPEC. Without folders the rule does nothing.
 DEDUPE_SPEC = {
     'folders': (list, (), None),
-    'writtenInPlace': (list, (), _name_globs),          # more name patterns never linked, on top of dedupe.IN_PLACE
+    # More name patterns never linked, on top of dedupe.IN_PLACE. Missing (an older machine file) is not `[]`: with
+    # folders named, the rule then links nothing (dedupe.plan_dedupe), so an upgrade never links a kind an older
+    # cleaner refused.
+    'writtenInPlace': (list, None, _name_globs),
 }
 COMPARE_SPEC = {
     'name': (str, machine_file.REQUIRED, None),
@@ -505,7 +508,8 @@ class Config:
         to a must-keep path or name (the same guard as every rule: dedupe changes how files are stored), never in or
         above the cleaner's own files, a folder another rule deletes from or compresses in, or another of its own."""
         values = machine_file.fields(section, DEDUPE_SPEC, where)
-        self.dedupe_in_place = tuple(v.lower() for v in values['writtenInPlace'])
+        listed = values['writtenInPlace']
+        self.dedupe_in_place = None if listed is None else tuple(v.lower() for v in listed)
         folders = []
         for i, entry in enumerate(values['folders']):
             at = f'{where}.folders[{i}]'

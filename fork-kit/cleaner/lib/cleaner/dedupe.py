@@ -70,6 +70,10 @@ SIDECARS = ('-wal', '-shm', '-journal')
 # other's).
 FS_VERITY_FL, FS_DAX_FL = 0x00100000, 0x02000000
 FLAGS_MASK = 0x000380FF | 0x00004000 | 0x00800000 | FS_VERITY_FL | FS_DAX_FL
+# A machine file older than `dedupe.writtenInPlace`: kinds that an older cleaner refused (and that are not in IN_PLACE
+# any more) may be in the folders, so nothing is linked until the owner names them, or `[]`.
+MISSING_KINDS = ('dedupe.writtenInPlace is missing from the machine file: nothing here is linked until it lists the '
+                 'kinds a program writes in place in these folders, or is [] when there are none')
 WARNING = ('dedupe: names of one file share every later write into any of them (cp onto an existing file, shell >, '
            'downloads, most programs): name only folders of copies written once and then only read')
 
@@ -460,6 +464,10 @@ def _walk(cfg, facts, folder, plan, measure, files, parts, run):
 def plan_dedupe(cfg, facts, plan, measure):
     from .rules import Item, Kept
     if not cfg.dedupe_folders:
+        return
+    if cfg.dedupe_in_place is None:
+        for folder in cfg.dedupe_folders:
+            plan.kept.append(Kept(folder.path, RULE, 'could not read', MISSING_KINDS))
         return
     run = Run(Cache.load(cfg))
     plan.after.append(lambda: run.cache.save(run.seen))

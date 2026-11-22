@@ -622,7 +622,7 @@ class Jobs(Repo):
                 self.assertEqual(jobs['core'], runs, out)
 
     def test_a_registry_entry_of_another_kind_does_not_run_the_job(self):
-        self.pr({'plugins/site/README.md': 'y'})   # an input of a "plugin", not of an "core-module"
+        self.pr({'plugins/site/README.md': 'y'})   # an input of a "plugin", not of a "core-module"
         self.assertEqual(self.scope()[1]['core'], 'false')
 
 

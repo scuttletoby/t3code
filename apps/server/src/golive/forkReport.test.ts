@@ -1081,10 +1081,9 @@ describe("__fork-report settings", () => {
       expect(cleared.featuresOn).toEqual(featuresOn);
       expect(Object.values(cleared.featuresWhere).flat()).toEqual(featuresOn.map(() => "server"));
     }
-    // Pinned: playtest with a key this build does not know stays on.
-    expect(settingsReport({ playtest: { ...playtest, laterKey: 1 } }).fork.featuresOn).toEqual([
-      "playtest",
-    ]);
+    // A playtest value with a key this build does not know reads as off, as the load does: the key
+    // may be a newer build's limit, so this build must not run playtest without it.
+    expect(settingsReport({ playtest: { ...playtest, laterKey: 1 } }).fork.featuresOn).toEqual([]);
   });
 
   it("names the model policy by its mode, and reads an invalid one as enforce, as the load does", () => {
