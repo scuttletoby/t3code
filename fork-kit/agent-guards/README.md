@@ -46,15 +46,16 @@ well inside its 10 s.
 **Nested agent sessions.** Managed hooks run in every Claude Code session, a nested `claude -p` too, whatever its
 own settings say (`disableAllHooks` in a user's or a `--settings` file does not turn managed hooks off). A bare
 session (`claude --bare`, `CLAUDE_CODE_SIMPLE`) and Codex (`codex`, `codex exec`, `codex review` ...) run none of
-them, so `actions-disable-guard` refuses starting one (`codex login`, `logout`, `help`, `completion` and
-`--version` pass). `claude --safe-mode` is refused too: it runs managed hooks, but not hooks a user wired by hand in
-user settings (the `agent-guards hooks` route, below). The guard knows claude and codex by name, by their program
-path (`.../claude/versions/<v>`, the `@anthropic-ai/claude-code` and `@openai/codex` packages), as a link to or a
-copy of the installed program, through `npx`, `bunx`, `pnpm dlx`, `npm exec`, `bun x` and `node <their cli>`, behind
-`$(which claude)`, and inside `python -c`, `node -e`, `at`, `systemd-run` and the other wrappers it reads for `gh`.
-It sees `CLAUDE_CODE_SIMPLE` in the command, through `env -S`, in a file the command sources, in `BASH_ENV` or
-`--rcfile`, and in the agents' user's shell start files (`~/.bashrc` ...; files those read in turn are not
-followed). This is a list of forms, so it is not complete: see the next section.
+them, so `actions-disable-guard` refuses starting one (`codex login`, `logout`, `help`, `completion`, `mcp` (setup,
+not a session; `mcp-server` is refused) and `--version` pass). `claude --safe-mode` is refused too: it runs managed
+hooks, but not hooks a user wired by hand in user settings (the `agent-guards hooks` route, below). The guard knows
+claude and codex by name, by their program path (`.../claude/versions/<v>`, the `@anthropic-ai/claude-code` and
+`@openai/codex` packages), as a link to or a copy of the installed program, through `npx`, `bunx`, `pnpm dlx`, `npm
+exec`, `bun x` and `node <their cli>`, behind `$(which claude)`, and inside `python -c`, `node -e`, `at`,
+`systemd-run` and the other wrappers it reads for `gh`. It sees `CLAUDE_CODE_SIMPLE` in the command, through `env
+-S`, in a file the command sources, in `BASH_ENV` or `--rcfile`, and in the agents' user's shell start files
+(`~/.bashrc` ...; files those read in turn are not followed). This is a list of forms, so it is not complete: see
+the next section.
 
 **The owner's approval.** Only the owner can let one refused command through, as root, in the folder the command
 will run in (or with `--cwd DIR`):

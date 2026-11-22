@@ -2123,6 +2123,18 @@ class LensSecurityR2Test(Case):
                             '.bashrc names CLAUDE_CODE_SIMPLE')
         self.assert_passed(['claude --version', 'claude mcp list', 'bash -lc \'ls\''])
 
+    def test_r2_nit_codex_arguments_name_the_right_subcommand_mcp_passes_npx_refused(self):
+        # an option's value is not the subcommand: the message names `codex exec`, not `codex o3`
+        for cmd in ('codex -m o3 exec x', 'codex --model o3 -C /tmp exec x', 'codex -c a=b -s read-only exec x'):
+            with self.subTest(cmd):
+                why = self.decide(cmd)
+                self.assertIsNotNone(why, cmd)
+                self.assertIn('`codex exec`', why)
+        # `codex mcp ...` sets up MCP servers; it starts no agent session
+        self.assert_passed(['codex mcp list', 'codex mcp add x -- y', 'codex -p work mcp list'])
+        # `codex mcp-server` runs codex as a server for another agent: still refused
+        self.assert_refused(['codex mcp-server', 'npx -y @openai/codex exec x', 'npx -y @openai/codex mcp-server'])
+
 
 class FastExitTest(Case):
     """#1752 fix point 1: plain commands pass before any file is read or the clock matters, and nothing the full

@@ -127,7 +127,7 @@ look dangerous.
 Nested agents: a command that starts an agent session this machine's hooks do not reach is refused, since that
 session could do what this guard refuses: `claude --bare` / `--safe-mode` (safe mode runs managed hooks, but not
 hooks a user wired by hand in user settings), `claude` with CLAUDE_CODE_SIMPLE set, and `codex` with anything but
-login/logout/help/completion/--version (codex runs no Claude Code hooks). claude and codex count by name, by
+login/logout/help/completion/mcp/--version (codex runs no Claude Code hooks). claude and codex count by name, by
 their program path (.../claude/versions/<v>, @anthropic-ai/claude-code, @openai/codex), as a link to or a copy of
 the installed program, as a name the same command gives one (ln -s), through npx/bunx/pnpm dlx/npm exec/bun x and
 `node <their cli>`, behind `$(which claude)`, and as text in python -c, node -e, at, systemd-run .. (the same token
@@ -2663,7 +2663,7 @@ def flag_values(toks, h):
     return [i for i in range(1, end) if toks[i - 1] in ARG_FLAGS and not toks[i].startswith('-')]
 
 
-CODEX_SAFE = {'login', 'logout', 'help', 'completion', '--version', '-V', '--help', '-h'}
+CODEX_SAFE = {'login', 'logout', 'help', 'completion', 'mcp', '--version', '-V', '--help', '-h'}
 # codex's options that take a value (codex --help): `codex -m o3 exec x` runs `exec`, not `o3`
 CODEX_VALUE = {'-c', '--config', '--enable', '--disable', '--remote', '--remote-auth-token-env', '-i', '--image',
                '-m', '--model', '--local-provider', '-p', '--profile', '-s', '--sandbox', '-C', '--cd', '--add-dir',
