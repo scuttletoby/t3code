@@ -238,17 +238,19 @@ describe("makeClaudeMcpProfiles", () => {
         });
         const reads = [lean(["threads"]), lean(["threads"]), lean(["threads", "orchestration"])];
         const service = yield* ServerSettingsService.ServerSettingsService;
-        let next = 0;
+        // Each query opens on the settings of its round (the model policy reads them too).
+        let current: object = {};
         const plan = yield* makeClaudeMcpProfiles.pipe(
           Effect.provideService(ServerSettingsService.ServerSettingsService, {
             ...service,
-            getSettings: Effect.suspend(() => Effect.succeed(fromFile(reads[next++] ?? {}))),
+            getSettings: Effect.suspend(() => Effect.succeed(fromFile(current))),
           }),
         );
         const self = thread("t");
         const keys: Array<string | undefined> = [];
         const sets: Array<unknown> = [];
-        for (const _ of reads) {
+        for (const read of reads) {
+          current = read;
           const overrides = {};
           // The adapter reads the options only as it opens the query's process.
           void (yield* plan(self, overrides)).options;
@@ -293,7 +295,13 @@ describe("makeClaudeMcpProfiles", () => {
         assert.deepStrictEqual(planned.servers, "all");
         assert.strictEqual(T3ToolSets.t3ToolSetFor("t"), before);
         // The new process opens: its options are read, and the new set applies from then.
-        assert.deepStrictEqual(planned.options, {});
+        // The lean profile adds no options of its own: only the model policy's Agent and Skill hook.
+        const options = planned.options;
+        assert.deepStrictEqual(Object.keys(options), ["hooks"]);
+        assert.deepStrictEqual(
+          options.hooks?.PreToolUse?.map((matcher) => matcher.matcher),
+          ["^(Agent|Task|Skill)$"],
+        );
         const set = T3ToolSets.t3ToolSetFor("t");
         assert.deepStrictEqual(set?._tag === "Groups" ? [...(set.groups as Set<string>)] : set, []);
       }).pipe(
