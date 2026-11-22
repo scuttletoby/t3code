@@ -281,8 +281,9 @@ describe("calmPartition", () => {
     expect(calmPartition([plain], toArchived, true).kind).toBe("no-roles");
   });
 
-  it("gives an empty list for a new install with no threads", () => {
-    expect(calmPartition([], resolved, true)).toEqual({ kind: "no-roles", threads: [] });
+  it("gives an empty list without the hint for a new install with no threads", () => {
+    expect(calmPartition([], resolved, true)).toEqual({ kind: "off", threads: [] });
+    expect(calmPartition([], new Map(), true)).toEqual({ kind: "off", threads: [] });
     expect(calmPartition([], new Map(), false)).toEqual({ kind: "off", threads: [] });
   });
 

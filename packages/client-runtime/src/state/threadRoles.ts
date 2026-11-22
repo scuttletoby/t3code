@@ -124,7 +124,10 @@ export interface CalmWaitingInput {
   readonly pendingGuestMessageCount?: number;
 }
 
-/** Waits on the person: an approval, a question or user-only card, or a guest message. */
+/**
+ * Waits on the person: an approval, a question or user-only card, or a guest message. A usage-limit
+ * stop is left out on purpose: it clears without the person.
+ */
 export function isWaitingOnPerson(thread: CalmWaitingInput): boolean {
   return (
     thread.hasPendingApprovals ||
@@ -140,8 +143,8 @@ export interface CalmRoleRow<T> {
 }
 
 /**
- * `off`: the list as given. `no-roles`: on, but no row holds a role; the list as given plus a hint,
- * never all folded. `calm`: role rows on top (assistants, then orchestrators, in list order), every
+ * `off`: the list as given (calm off, or no threads). `no-roles`: no row holds a role; the list as
+ * given plus a hint, never all folded. `calm`: role rows on top (assistants, then orchestrators, in list order), every
  * other thread in `otherThreads` in list order, and how many of those wait on the person.
  */
 export type CalmPartition<T> =
@@ -166,7 +169,7 @@ export function calmPartition<
   rolesByEnvironment: ReadonlyMap<EnvironmentId, ResolvedThreadRoles>,
   enabled: boolean,
 ): CalmPartition<T> {
-  if (!enabled) return { kind: "off", threads };
+  if (!enabled || threads.length === 0) return { kind: "off", threads };
   const assistants: Array<CalmRoleRow<T>> = [];
   const orchestrators: Array<CalmRoleRow<T>> = [];
   const otherThreads: Array<T> = [];
