@@ -619,6 +619,58 @@ def capacity_settings(mf, section_spec, path=None, owner_uid=0):
     return {'holds': holds}
 
 
+DISK_FLOOR_GB = 25     # #982: below this much free disk on the work filesystem t3-capacity says NOT OK
+
+
+def _disk_path(value):
+    return None if value == '~' or value.startswith(('/', '~/')) else 'must be an absolute folder (or ~, ~/...)'
+
+
+DISK_SPEC = {'floorGb': (int, DISK_FLOOR_GB, lambda v: None if 0 <= v <= 1 << 20 else 'must be 0 (off) to 1048576'),
+             'path': (str, '~', _disk_path)}
+
+
+def disk_settings(mf, section_spec, path=None, owner_uid=0):
+    """heavy.disk of the machine file: {'floorGb', 'path'}, the defaults when the file, section or key is missing.
+    Anything broken raises mf.MachineFileError naming the key."""
+    where = path or mf.default_path()
+    section = mf.read_section('heavy', path, owner_uid, optional=True)
+    section = mf.fields(section or {}, section_spec, f'{where}: heavy')
+    return mf.fields(section.get('disk') or {}, DISK_SPEC, f'{where}: heavy.disk')
+
+
+def disk_free_mb(folder):
+    """MB this user may still write on the filesystem of folder (statvfs f_bavail: root's reserve left out). Tests
+    set HEAVY_FACTS_DISK_FREE_MB (with HEAVY_TESTING=1). Raises OSError when it cannot be read."""
+    fake = test_env('HEAVY_FACTS_DISK_FREE_MB')
+    if fake:
+        return int(fake)
+    vfs = os.statvfs(folder)
+    return vfs.f_bavail * vfs.f_frsize // MIB
+
+
+def disk_check(hq):
+    """t3-capacity's disk floor (#982): (the token for its first line, why it is NOT OK or None). Free disk below
+    heavy.disk.floorGb on the filesystem of heavy.disk.path is NOT OK; so is a disk or a setting it cannot read.
+    A floor of 0 is off: the disk is not read at all (`disk=off`)."""
+    mf = hq.machine_file
+    try:
+        s = disk_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None, os.getuid() if ROOT else 0)
+    except Exception as e:
+        return 'disk=?', f'{e.__class__.__name__}: {e}'
+    if s['floorGb'] == 0:
+        return 'disk=off', None
+    folder = os.path.expanduser(s['path'])
+    try:
+        free = disk_free_mb(folder)
+    except OSError as e:
+        return 'disk=?', f'cannot read the free space of {folder} ({e.strerror or e})'
+    gb, floor = free // 1024, s['floorGb']
+    if free < floor * 1024:
+        return f'disk={gb}GB<{floor}GB', f'{gb} GB free on {folder}, under the floor of {floor} GB (heavy.disk.floorGb)'
+    return f'disk={gb}GB', None
+
+
 def user_name():
     try:
         return pwd.getpwuid(os.getuid()).pw_name
