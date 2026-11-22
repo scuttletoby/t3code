@@ -4,6 +4,7 @@
  * follows (environment, exit codes); docs/fork/playtest.md. Off by default.
  */
 import * as Effect from "effect/Effect";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
@@ -139,10 +140,13 @@ export type PlaytestSettings = typeof PlaytestSettings.Type;
 /** Off, no steps, the default limits. */
 export const DEFAULT_PLAYTEST_SETTINGS: PlaytestSettings = Schema.decodeSync(PlaytestSettings)({});
 
-const decodePlaytestSettingsOption = Schema.decodeUnknownOption(PlaytestSettings);
+const decodePlaytestSettingsResult = Schema.decodeUnknownResult(PlaytestSettings);
 /** Also refuses an unknown field, nested ones too: it may be a newer build's limit. */
-const isStrictPlaytestSettings = (raw: unknown) =>
-  decodePlaytestSettingsOption(raw, { onExcessProperty: "error" })._tag === "Some";
+const strictPlaytestSettingsProblem = (raw: unknown): string | undefined => {
+  const decoded = decodePlaytestSettingsResult(raw, { onExcessProperty: "error" });
+  return Result.isFailure(decoded) ? decoded.failure.message : undefined;
+};
+const isStrictPlaytestSettings = (raw: unknown) => strictPlaytestSettingsProblem(raw) === undefined;
 
 /** A save's value: refused when bad, also for a field this build does not know (never dropped). */
 export const PlaytestSettingsPatch = Schema.Unknown.check(
@@ -173,11 +177,12 @@ export const PlaytestSettingsFromSettingsFile = Schema.Unknown.pipe(
     PlaytestSettings,
     SchemaTransformation.transformEffect({
       decode: Effect.fn("PlaytestSettingsFromSettingsFile.decode")(function* (raw: unknown) {
-        if (isStrictPlaytestSettings(raw)) {
+        const problem = strictPlaytestSettingsProblem(raw);
+        if (problem === undefined) {
           return raw as typeof PlaytestSettings.Encoded;
         }
         yield* Effect.logWarning(
-          "settings: invalid playtest settings read as off; the next settings save replaces them",
+          `settings: invalid playtest settings read as off (${problem.replace(/\s+/g, " ").trim()}); the next settings save replaces them`,
         );
         return {};
       }),

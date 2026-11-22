@@ -21,11 +21,11 @@ import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
 import { migrationManifest, skippedV2Migrations } from "../persistence/Migrations.ts";
 import { reconciledV2PreviewHistory } from "../persistence/reconcileV2PreviewMigration.ts";
 import {
-  decodeSettingsFileText,
+  decodePersistedSettings,
   parseSettingsFileText,
   settingsFileLegacyKeysUnreadable,
 } from "../serverSettings.ts";
-import { readSettingsFile } from "../fork/settingsFileRead.ts";
+import { decodeSettingsFileSilently, readSettingsFile } from "../fork/settingsFileRead.ts";
 import { type ManagedSettings, unmanagedSettings } from "../policy/managedSettings.ts";
 import { isProcessAlive } from "../serverRuntimeState.ts";
 
@@ -103,6 +103,8 @@ export interface ForkReport {
       readonly modelPolicy: "off" | "advise" | "enforce";
       /** The read-only "is T3 busy?" route (`__fork-report --activity` asks it). */
       readonly activityProbe: "on" | "off";
+      /** Stopping a finished delegated child's idle provider process. */
+      readonly stopFinishedChildren: "on" | "off";
     };
     readonly featuresOn: ReadonlyArray<string>;
     /**
@@ -459,7 +461,10 @@ function readSettings(
       : raw !== undefined && raw.trim() === ""
         ? "empty"
         : "present";
-  const decoded = raw === undefined ? undefined : decodeSettingsFileText(raw, managed.withDefaults);
+  const decoded =
+    raw === undefined
+      ? undefined
+      : decodeSettingsFileSilently(raw, managed.withDefaults, decodePersistedSettings);
   let parseWarning: string | null = null;
   if (readError !== null) {
     parseWarning = `settings.json could not be read: ${readError}`;
@@ -524,6 +529,7 @@ function readSettings(
     playtest: onOff("playtest"),
     modelPolicy: settings.modelPolicy.mode,
     activityProbe: onOff("activityProbe"),
+    stopFinishedChildren: onOff("stopFinishedChildren"),
   } as const;
   return {
     settings: {
@@ -564,6 +570,7 @@ function readSettings(
         waitFor: settings.waitFor,
         waitCheckNames: Object.keys(settings.waitChecks).toSorted(),
         agentSlots: settings.agentSlots,
+        stopFinishedChildren: settings.stopFinishedChildren,
         headlessUsageRefreshIntervalMs: Duration.toMillis(settings.headlessUsageRefreshInterval),
       },
     },

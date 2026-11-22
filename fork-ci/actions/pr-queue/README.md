@@ -676,6 +676,24 @@ first, and acts on the first one it can:
   merged with the base. Anything else leaves it off with a comment that names
   the way out.
 
+Why off first: GitHub keeps auto-merge on after a plain push by someone with
+write access, also when it was armed with `--match-head-commit` for an older
+head (measured once on this repository, issue 924: armed for one head, a plain
+push of the next, auto-merge still on 20 seconds later and no event that turned
+it off). So the queue turns auto-merge off before its own push
+(`gh pr update-branch`), and a person's push leaves the pull request armed:
+only `head_check` keeps that head from merging ("Use it").
+
+The queue merges with `git merge-tree` and `merge.directoryRenames=false`, as
+GitHub's update merges (measured once the same way, issue 924, with a base that
+renamed folder `d` to `m`). A pull request that adds `d/f3` is updated cleanly
+with the file left in `d`: the tree that merge gives, so it is re-armed (git's
+default calls it a conflict, and `true`, used until then, moved the file to `m`
+and left the pull request off). A pull request that renames `d` to `p` is shown
+mergeable and is updated cleanly too, with both `m` and `p` in the new head.
+git calls that a rename/rename conflict, so the queue leaves it off with its
+usual comment, and a person looks at the doubled folder.
+
 Right after the update GitHub can refuse to turn auto-merge back on only
 because the new head's required checks have not started
 (`Required status check "..." is queued`, or `in progress`, `expected`,
@@ -1031,8 +1049,10 @@ the red says nothing about the pull request, and nothing runs the check again
 on a newer base. With `update_when_base_was_red`, a behind pull request with
 red required checks is therefore updated when, for every red required check:
 
-- the job of the check's newest run names the base commit it tested (the
-  `tested-base` action's note);
+- the job of the check's red run names the base commit it tested (the
+  `tested-base` action's note). That is its newest run, or for a red that only
+  cancelled runs followed ("The queue"), that red: a cancelled run may stop
+  before it writes the note (issue 924);
 - that base commit has a real failure of the same check (`FAILURE` or
   `ERROR`: a cancel, a time-out, a skip or no result says nothing about the
   base's code); and
