@@ -13,6 +13,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
+  MODEL_POLICY_DRIVER_ALIASES,
   MODEL_POLICY_EFFORT_OPTION_IDS,
   MODEL_POLICY_START_ROWS,
   modelPolicyPickEfforts,
@@ -46,6 +47,12 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
+import {
+  OPTION_CASE_PROVIDERS,
+  OPTION_CASE_ROWS,
+  OPTION_CASES,
+  type OptionCase,
+} from "./modelPolicyOptions.testkit.ts";
 
 const OPUS = "claude-opus-5-5";
 const FABLE = "claude-fable-5-2";
@@ -267,23 +274,36 @@ describe("a selection as the policy reads it", () => {
   } as unknown as ServerProvider;
 
   it("reads the driver from the instance and a reasoning select", () => {
+    const options = [
+      { id: "effort", value: "high" },
+      { id: "level", value: "high" },
+    ];
     const pick = ModelPolicyCheck.pickOfSelection(
       [provider],
-      { instanceId: INSTANCE, model: OPUS, options: [{ id: "level", value: "high" }] },
+      { instanceId: INSTANCE, model: OPUS, options },
       true,
     );
     assert.deepStrictEqual(pick, {
       driver: "claudeAgent",
       model: OPUS,
-      options: [{ id: "level", value: "high" }],
+      options,
       effortOptionIds: ["level"],
+      driverEffortIds: { claudeAgent: ["level"] },
+      describedOptionIds: ["level"],
     });
     assert.isUndefined(refusal(policy("enforce"), pick));
+    // The select alone: Claude reads its effort under `effort` only.
+    const alone = ModelPolicyCheck.pickOfSelection(
+      [provider],
+      { instanceId: INSTANCE, model: OPUS, options: [{ id: "level", value: "high" }] },
+      true,
+    );
+    assert.include(refusal(policy("enforce"), alone), `${OPUS} names no effort under effort`);
   });
 
   it("an alias is read as given, not as its model: refused with the full id to name", () => {
-    // Local and remote agree: an alias here is not widened to its model (a provider may move an
-    // alias to a new model), and a remote pick has no model list to look it up in.
+    // Local and remote agree: an alias is not widened to its model (a provider may move an alias
+    // to a new model). A remote pick looks it up in this machine's lists too, for the hint only.
     for (const alias of ["Opus", "opus"]) {
       const pick = ModelPolicyCheck.pickOfSelection(
         [provider],
@@ -300,7 +320,12 @@ describe("a selection as the policy reads it", () => {
         model: alias,
         options: [{ id: "effort", value: "high" }],
       } as never);
-      assert.include(refusal(policy("enforce"), remote), "is in no row");
+      assert.strictEqual(remote.model, alias);
+      const remoteText = refusal(policy("enforce"), remote);
+      assert.include(remoteText, `${alias} is in no row`);
+      // The same full-id hint as a pick here.
+      assert.include(remoteText, `(${alias} is an alias of ${OPUS}; an alias is not read`);
+      assert.include(remoteText, "name the full id");
     }
   });
 
@@ -448,10 +473,14 @@ describe("a selection as the policy reads it", () => {
       ],
     } as never);
     assert.include(refusal(policy("enforce", rows), decoy), "does not allow effort high + max");
+    // Each row's driver reads its own id, so the pick names the effort under both.
     const inside = ModelPolicyCheck.pickOfRemoteTarget([], {
       driverKind: "codex",
       model: "shared",
-      options: [{ id: "reasoningEffort", value: "high" }],
+      options: [
+        { id: "reasoningEffort", value: "high" },
+        { id: "effort", value: "high" },
+      ],
     } as never);
     assert.isUndefined(refusal(policy("enforce", rows), inside));
   });
@@ -516,6 +545,166 @@ describe("a selection as the policy reads it", () => {
       options: [{ id: "variant", value: DEFAULT_VARIANT_CHOICE_ID }],
     };
     assert.deepStrictEqual(modelPolicyPickEfforts(pick), []);
+  });
+});
+
+describe("an effort named only under a driver's own option id (#780)", () => {
+  const acpRows: ReadonlyArray<ModelPolicyRow> = [
+    { driver: ProviderDriverKind.make("acpRegistry"), model: ACP_MODEL, efforts: ["high"] },
+  ];
+  const remote = (
+    providers: ReadonlyArray<ServerProvider>,
+    model: string,
+    options: ReadonlyArray<{ readonly id: string; readonly value: unknown }>,
+  ) => ModelPolicyCheck.pickOfRemoteTarget(providers, { model, options } as never);
+  /** An ACP provider here that lists Opus with its own `thought_level` control (lens A's probe). */
+  const acpOpus = {
+    ...ACP_PROVIDER,
+    models: [{ ...ACP_PROVIDER.models[0]!, slug: OPUS }],
+  } as unknown as ServerProvider;
+  /** The ACP provider with the model listed but no option read yet (an old or empty catalog). */
+  const acpUnprobed = {
+    ...ACP_PROVIDER,
+    models: [{ ...ACP_PROVIDER.models[0]!, capabilities: { optionDescriptors: [] } }],
+  } as unknown as ServerProvider;
+
+  it("sent to a linked machine: an id the row's driver does not read names no effort there", () => {
+    // Lens A's probes: both were inside before. Claude (the Opus row's driver) reads only `effort`.
+    const probes = [
+      remote([acpOpus], OPUS, [{ id: ACP_REASONING_ID, value: "high" }]),
+      remote([], OPUS, [{ id: "reasoning", value: "high" }]),
+    ];
+    for (const pick of probes) {
+      assert.include(
+        refusal(policy("enforce"), pick),
+        `${OPUS} names no effort under effort, the option claudeAgent reads it from`,
+      );
+    }
+    assert.isUndefined(
+      refusal(policy("enforce"), remote([acpOpus], OPUS, [{ id: "effort", value: "high" }])),
+    );
+  });
+
+  it("sent to a linked machine: a driver whose id this machine does not know refuses (old, empty or missing catalog)", () => {
+    // The agent's own id at max beside an allowed general one: before, read as `high` alone.
+    const decoy = [
+      { id: "effort", value: "high" },
+      { id: ACP_REASONING_ID, value: "max" },
+    ];
+    for (const providers of [[], [acpUnprobed]]) {
+      // Runs again: the same refusal.
+      for (const _ of [1, 2]) {
+        assert.include(
+          refusal(policy("enforce", acpRows), remote(providers, ACP_MODEL, decoy)),
+          `the option id acpRegistry reads ${ACP_MODEL}'s effort from is not known here`,
+        );
+      }
+    }
+    // With the catalog here: the agent's own id at an allowed level is inside.
+    assert.isUndefined(
+      refusal(
+        policy("enforce", acpRows),
+        remote([ACP_PROVIDER], ACP_MODEL, [{ id: ACP_REASONING_ID, value: "high" }]),
+      ),
+    );
+  });
+
+  it("checked here (the receiver): read with this machine's own catalog for the instance", () => {
+    const ACP_INSTANCE = ACP_PROVIDER.instanceId;
+    const read = (
+      provider: ServerProvider,
+      options: ReadonlyArray<{ id: string; value: string }>,
+    ) =>
+      ModelPolicyCheck.pickOfSelection(
+        [provider],
+        { instanceId: ACP_INSTANCE, model: ACP_MODEL, options },
+        true,
+      );
+    // The general id only: the agent never reads it and runs its own default.
+    assert.include(
+      refusal(policy("enforce", acpRows), read(ACP_PROVIDER, [{ id: "effort", value: "high" }])),
+      `${ACP_MODEL} names no effort under ${ACP_REASONING_ID}, the option acpRegistry reads it from`,
+    );
+    // The model listed with no option read yet: its id is not known, refused.
+    assert.include(
+      refusal(
+        policy("enforce", acpRows),
+        read(acpUnprobed, [
+          { id: "effort", value: "high" },
+          { id: ACP_REASONING_ID, value: "max" },
+        ]),
+      ),
+      "is not known here",
+    );
+    assert.isUndefined(
+      refusal(
+        policy("enforce", acpRows),
+        read(ACP_PROVIDER, [{ id: ACP_REASONING_ID, value: "high" }]),
+      ),
+    );
+  });
+
+  it("sent to a linked machine: the model's ultracode default counts both ways", () => {
+    const ultracodeByDefault = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      models: [
+        {
+          slug: OPUS,
+          name: "Opus",
+          isCustom: false,
+          capabilities: withUltracodeToggle({
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Effort",
+                type: "select",
+                currentValue: "ultracode",
+                options: ["medium", "high", "xhigh", "ultracode"].map((id) => ({ id, label: id })),
+              },
+            ],
+          }),
+        },
+      ],
+    } as unknown as ServerProvider;
+    const pick = remote([ultracodeByDefault], OPUS, [{ id: "effort", value: "high" }]);
+    assert.isTrue(pick.ultracodeMaybeDefault);
+    // Before: read as `high` and sent, though the model there may run ultracode by default.
+    assert.include(refusal(policy("enforce"), pick), "does not allow effort ultracode + high");
+    // A row allowing ultracode but not xhigh: the reading without the default still refuses.
+    const ultracodeOnly: ReadonlyArray<ModelPolicyRow> = [
+      { driver: ProviderDriverKind.make("claudeAgent"), model: OPUS, efforts: ["ultracode"] },
+    ];
+    assert.include(
+      refusal(
+        policy("enforce", ultracodeOnly),
+        remote([ultracodeByDefault], OPUS, [{ id: "effort", value: "xhigh" }]),
+      ),
+      "does not allow effort ultracode + xhigh",
+    );
+    // The pick names the option: its own value stands. No catalog here: no default read.
+    const off = remote([ultracodeByDefault], OPUS, [
+      { id: "effort", value: "high" },
+      { id: "ultracode", value: false },
+    ]);
+    assert.isUndefined(off.ultracodeMaybeDefault);
+    assert.isUndefined(refusal(policy("enforce"), off));
+    assert.isUndefined(
+      refusal(policy("enforce"), remote([], OPUS, [{ id: "effort", value: "high" }])),
+    );
+  });
+
+  it("the aliases a driver resolves by itself are Claude Code's own", () => {
+    const source = NodeFS.readFileSync(
+      new URL("../claudeModelOptions.ts", import.meta.url),
+      "utf8",
+    );
+    const list = /const CLAUDE_CODE_MODEL_ALIASES = new Set\(\[([^\]]*)\]\)/.exec(source)?.[1];
+    assert.isDefined(list);
+    assert.deepStrictEqual(
+      [...(list ?? "").matchAll(/"([^"]+)"/g)].map((match) => match[1]).toSorted(),
+      [...(MODEL_POLICY_DRIVER_ALIASES.claudeAgent ?? [])].toSorted(),
+    );
   });
 });
 
@@ -647,6 +836,93 @@ const configureHarness = (
   return { dispatched, forwarded, configure };
 };
 
+describe("an option the policy cannot read (#793 review, lens A majors)", () => {
+  const optionPolicy = (mode: "advise" | "enforce") => policy(mode, OPTION_CASE_ROWS);
+  const picks = (testCase: OptionCase, options: ReadonlyArray<{ id: string; value: string }>) => ({
+    // Checked here: an agent's launch or configure here, or one a linked agent sent here.
+    here: ModelPolicyCheck.pickOfSelection(
+      OPTION_CASE_PROVIDERS,
+      { instanceId: testCase.instanceId, model: testCase.model, options },
+      true,
+    ),
+    // Sent to a linked machine: the driver there is not known, every list here is read.
+    sent: ModelPolicyCheck.pickOfRemoteTarget(OPTION_CASE_PROVIDERS, {
+      model: testCase.model,
+      options,
+    } as never),
+  });
+
+  it("enforce refuses it with the fix, here and before it is sent; advise runs it and says so", () => {
+    for (const testCase of OPTION_CASES) {
+      for (const [side, pick] of Object.entries(
+        picks(testCase, [testCase.allowed, testCase.extra]),
+      )) {
+        const name = `${testCase.name} (${side})`;
+        // Runs again: the same refusal.
+        for (const _ of [1, 2]) {
+          const refused = refusal(optionPolicy("enforce"), pick);
+          assert.include(refused, `Model policy refused this pick: ${testCase.why}`, name);
+          assert.include(refused, testCase.fix, name);
+          assert.notInclude(refused, "Name one of these models", name);
+        }
+        const advised = answer(optionPolicy("advise"), pick);
+        assert.deepStrictEqual("refuse" in advised, false, name);
+        assert.include("note" in advised ? advised.note : "", testCase.why, name);
+      }
+      // The allowed effort alone: inside on both sides.
+      for (const [side, pick] of Object.entries(picks(testCase, [testCase.allowed]))) {
+        assert.isUndefined(refusal(optionPolicy("enforce"), pick), `${testCase.name} (${side})`);
+      }
+    }
+  });
+
+  it("old, empty or missing catalog: only the ids the policy reads pass, nothing else", () => {
+    const [kiro] = OPTION_CASES;
+    const options = [kiro!.allowed, kiro!.extra];
+    const emptied = OPTION_CASE_PROVIDERS.map(
+      (provider) =>
+        ({
+          ...provider,
+          models: provider.models.map((model) => ({ ...model, capabilities: null })),
+        }) as unknown as ServerProvider,
+    );
+    for (const providers of [[], emptied]) {
+      for (const pick of [
+        ModelPolicyCheck.pickOfSelection(
+          providers,
+          { instanceId: kiro!.instanceId, model: kiro!.model, options },
+          true,
+        ),
+        ModelPolicyCheck.pickOfRemoteTarget(providers, { model: kiro!.model, options } as never),
+      ]) {
+        assert.include(refusal(policy("enforce", OPTION_CASE_ROWS), pick), kiro!.why);
+        // Kiro's fixed id alone is still read without a catalog.
+        assert.isUndefined(
+          refusal(policy("enforce", OPTION_CASE_ROWS), { ...pick, options: [kiro!.allowed] }),
+        );
+      }
+    }
+  });
+
+  it("the unknown effort id refusal says how to fix it", () => {
+    const acpRows = [{ driver: "acpRegistry", model: ACP_MODEL, efforts: ["high"] }] as never;
+    const refused = refusal(
+      policy("enforce", acpRows),
+      // No ACP agent here: its own id is not known, and the general one names an allowed effort.
+      ModelPolicyCheck.pickOfRemoteTarget([], {
+        model: ACP_MODEL,
+        options: [{ id: "effort", value: "high" }],
+      } as never),
+    );
+    assert.include(refused, "no acpRegistry model list here marks an effort control");
+    assert.include(
+      refused,
+      "Start that agent on this machine once so its model list shows the effort control, or pick a model whose driver has a fixed effort id.",
+    );
+    assert.notInclude(refused, "Name one of these models");
+  });
+});
+
 describe("t3_thread_configure through upstream's handler", () => {
   const effort = (value: string) => [{ id: "effort", value }];
   const enforce = { modelPolicy: { mode: "enforce", allow: ROWS } } as never;
@@ -689,6 +965,59 @@ describe("t3_thread_configure through upstream's handler", () => {
       assert.isUndefined(yield* owner.configure({ model: "claude-haiku-5-5" }));
       assert.lengthOf(owner.dispatched, 1);
     }),
+  );
+
+  it.effect(
+    "a change a linked agent sent here: an effort under an id the driver here does not read is refused (#780)",
+    () =>
+      Effect.gen(function* () {
+        const ACP_INSTANCE = ACP_PROVIDER.instanceId;
+        const unprobed = {
+          ...ACP_PROVIDER,
+          instanceId: ProviderInstanceId.make("acp-unprobed"),
+          models: [{ ...ACP_PROVIDER.models[0]!, capabilities: { optionDescriptors: [] } }],
+        } as unknown as ServerProvider;
+        const rows = [...ROWS, { driver: "acpRegistry", model: ACP_MODEL, efforts: ["high"] }];
+        const { dispatched, configure } = configureHarness(
+          { modelPolicy: { mode: "enforce", allow: rows } } as never,
+          { caller: "linked agent", providers: [ACP_PROVIDER, unprobed] },
+        );
+        // Runs again: refused each time, nothing changed.
+        for (const _ of [1, 2]) {
+          // Claude here reads only `effort`: before, `reasoning: high` ran Claude's default unchecked.
+          assert.include(
+            yield* configure({ model: OPUS, options: [{ id: "reasoning", value: "high" }] }),
+            `${OPUS} names no effort under effort, the option claudeAgent reads it from`,
+          );
+          // The ACP agent here reads `thought_level`: a general id only runs its own default.
+          assert.include(
+            yield* configure({
+              instanceId: ACP_INSTANCE,
+              model: ACP_MODEL,
+              options: effort("high"),
+            } as never),
+            `${ACP_MODEL} names no effort under ${ACP_REASONING_ID}, the option acpRegistry reads it from`,
+          );
+          // An instance whose catalog has no option read yet: the agent's own id is not known.
+          assert.include(
+            yield* configure({
+              instanceId: unprobed.instanceId,
+              model: ACP_MODEL,
+              options: [...effort("high"), { id: ACP_REASONING_ID, value: "max" }],
+            } as never),
+            "is not known here",
+          );
+        }
+        assert.deepStrictEqual(dispatched, []);
+        assert.isUndefined(
+          yield* configure({
+            instanceId: ACP_INSTANCE,
+            model: ACP_MODEL,
+            options: [{ id: ACP_REASONING_ID, value: "high" }],
+          } as never),
+        );
+        assert.lengthOf(dispatched, 1);
+      }),
   );
 
   it.effect("advise and off: the change goes through", () =>
@@ -780,6 +1109,81 @@ describe("t3_thread_configure through upstream's handler", () => {
         "sent there",
       );
       assert.lengthOf(forwarded, 1);
+    }),
+  );
+});
+
+describe("t3_thread_configure: an option the policy cannot read (#793 review)", () => {
+  const settings = (mode: string) => ({ modelPolicy: { mode, allow: OPTION_CASE_ROWS } }) as never;
+  const THERE = EnvironmentId.make("environment-there");
+  const selection = (testCase: OptionCase, withExtra: boolean) =>
+    ({
+      instanceId: testCase.instanceId,
+      model: testCase.model,
+      options: withExtra ? [testCase.allowed, testCase.extra] : [testCase.allowed],
+    }) as never;
+  const routes = [
+    { route: "an agent here", caller: true, environmentId: undefined },
+    {
+      route: "a linked agent's change received here",
+      caller: "linked agent",
+      environmentId: undefined,
+    },
+    { route: "an agent's change sent to a linked machine", caller: true, environmentId: THERE },
+  ] as const;
+
+  it.effect("enforce: refused on each route, nothing changed or sent; without it, it goes", () =>
+    Effect.gen(function* () {
+      for (const { route, caller, environmentId } of routes) {
+        for (const testCase of OPTION_CASES) {
+          const name = `${route}: ${testCase.name}`;
+          const { dispatched, forwarded, configure } = configureHarness(settings("enforce"), {
+            caller,
+            providers: OPTION_CASE_PROVIDERS,
+          });
+          // Runs again: refused each time.
+          for (const _ of [1, 2]) {
+            const refused = yield* configure(selection(testCase, true), environmentId);
+            assert.include(
+              refused,
+              `model_unavailable: Model policy refused this pick: ${testCase.why}`,
+              name,
+            );
+            assert.include(refused, testCase.fix, name);
+            assert.include(refused, "modelSelection.", name);
+          }
+          assert.deepStrictEqual([dispatched.length, forwarded.length], [0, 0], name);
+          const allowed = yield* configure(selection(testCase, false), environmentId);
+          if (environmentId === undefined) {
+            assert.isUndefined(allowed, name);
+            assert.lengthOf(dispatched, 1, name);
+          } else {
+            assert.include(allowed, "sent there", name);
+            assert.lengthOf(forwarded, 1, name);
+          }
+        }
+      }
+    }),
+  );
+
+  it.effect("advise: the change goes through as today (the log says enforce would refuse it)", () =>
+    Effect.gen(function* () {
+      for (const { route, caller, environmentId } of routes) {
+        const { dispatched, forwarded, configure } = configureHarness(settings("advise"), {
+          caller,
+          providers: OPTION_CASE_PROVIDERS,
+        });
+        for (const testCase of OPTION_CASES) {
+          const result = yield* configure(selection(testCase, true), environmentId);
+          if (environmentId === undefined) assert.isUndefined(result, route);
+          else assert.include(result, "sent there", route);
+        }
+        assert.lengthOf(
+          environmentId === undefined ? dispatched : forwarded,
+          OPTION_CASES.length,
+          route,
+        );
+      }
     }),
   );
 });

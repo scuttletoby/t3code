@@ -8,6 +8,7 @@ import {
   CommandId,
   MessageId,
   type OrchestrationV2Run,
+  type OrchestrationV2TurnItem,
   type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -29,8 +30,17 @@ import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapter
 import { forkParked } from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SlotGate from "../../slots/SlotGate.ts";
+import {
+  HANDOFF_AGENT_MARKER,
+  HANDOFF_WRITE_STOP_REASON,
+  type HandoffAgentResult,
+  handoffAgentReply,
+  handoffWriteJoined,
+  handoffWriteText,
+  handoffWriteTimedOut,
+} from "./handoffAgent.ts";
 import * as HandoffCommand from "./handoffCommand.ts";
-import { type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
+import { HANDOFF_IDLE_LEAD_MS, type HandoffTrigger, handoffDecision } from "./handoffDecision.ts";
 import { leaveLine } from "../agentSlotRoutes.ts";
 import {
   dispatchHandoff,
@@ -40,9 +50,14 @@ import {
 } from "./handoffDispatch.ts";
 import {
   HANDOFF_LOUD_SUFFIX,
+  HANDOFF_MESSAGE_PREFIX,
   HANDOFF_RETRY_SUFFIX,
   handoffThreadFacts,
+  handoffWriteIds,
+  latestStartedRun,
   parseHandoffMessageId,
+  parseHandoffWrite,
+  parseHandoffWriteMessageId,
 } from "./handoffFacts.ts";
 import { handoffMessageText } from "./handoffMessage.ts";
 import { HANDOFF_SETTLE_CHECK_MS, HANDOFF_SETTLE_MS } from "./handoffQuiet.ts";
@@ -54,6 +69,39 @@ const TRANSCRIPT_RUNS = 20;
 
 /** A handoff refused a slot asks again after this (or at the thread's next event). */
 export const HANDOFF_SLOT_RETRY = Duration.seconds(5);
+
+/**
+ * A write turn not ended this long after it was requested (the idle window the agent source starts
+ * in) is stopped, and does not count. From its request, so a restart does not give it more time.
+ */
+export const HANDOFF_WRITE_TIMEOUT = Duration.millis(HANDOFF_IDLE_LEAD_MS.agent);
+/** After T3 asked it to stop, how long the wait goes on for the write turn to end. */
+export const HANDOFF_WRITE_STOP_WAIT = Duration.minutes(1);
+const WRITE_ENDED = new Set(["completed", "interrupted", "failed", "cancelled", "rolled_back"]);
+
+/**
+ * The write turns' own items left out of part 3: the prompt and the notes are not conversation.
+ * A write turn a person steered into keeps that exchange: only its prompt and a marked reply go.
+ */
+function withoutWriteTurns(
+  writes: ReadonlyArray<OrchestrationV2Run>,
+  items: ReadonlyArray<OrchestrationV2TurnItem>,
+): ReadonlyArray<OrchestrationV2TurnItem> {
+  const drop = new Set<string>();
+  for (const write of writes) {
+    const own = items.filter((item) => item.runId === write.id);
+    const joined = handoffWriteJoined(write, own);
+    for (const item of own) {
+      if (
+        !joined ||
+        (item.type === "user_message" && item.messageId === write.userMessageId) ||
+        (item.type === "assistant_message" && item.text.trim().startsWith(HANDOFF_AGENT_MARKER))
+      )
+        drop.add(item.id);
+    }
+  }
+  return drop.size === 0 ? items : items.filter((item) => !drop.has(item.id));
+}
 
 const waitsForSlot = (outcome: unknown): outcome is HandoffWaitsForSlot =>
   typeof outcome === "object" && outcome !== null && "type" in outcome;
@@ -108,6 +156,7 @@ export const make = Effect.gen(function* () {
     ids: { readonly commandId: string; readonly messageId: string },
     read: NonNullable<Effect.Success<ReturnType<typeof readThread>>>,
     command: HandoffCommand.HandoffCommandResult | undefined,
+    agent?: HandoffAgentResult,
   ) {
     const firstSends = new Set(
       read.records.runs.flatMap((other) => {
@@ -125,22 +174,31 @@ export const make = Effect.gen(function* () {
         threadId,
         // Built only with a slot: a refused handoff asks again every 5 s and reads nothing more.
         text: Effect.gen(function* () {
-          const recent = read.records.runs
-            .toSorted((left, right) => right.ordinal - left.ordinal)
-            .slice(0, TRANSCRIPT_RUNS)
-            .map((recentRun) => recentRun.id);
+          // The latest runs, write turns not counted; the write turns among them are read too.
+          const isWrite = (other: OrchestrationV2Run) =>
+            parseHandoffWriteMessageId(threadId, other.userMessageId) !== null;
+          const newest = read.records.runs.toSorted((left, right) => right.ordinal - left.ordinal);
+          const oldest = newest.filter((other) => !isWrite(other)).at(TRANSCRIPT_RUNS - 1);
+          const recent = newest.filter(
+            (other) => oldest === undefined || other.ordinal >= oldest.ordinal,
+          );
           const more = yield* projections.getThreadRecords(
             threadId,
             ["attempts", "subagents", "turnItems"],
-            { turnItemRunIds: recent, omitSettledSubagents: true },
+            { turnItemRunIds: recent.map((recentRun) => recentRun.id), omitSettledSubagents: true },
           );
           return handoffMessageText({
-            records: { ...read.records, ...more },
+            records: {
+              ...read.records,
+              ...more,
+              turnItems: withoutWriteTurns(recent.filter(isWrite), more.turnItems),
+            },
             sourceRunId: run.id,
             number: firstSends.size + 1,
             nowIso: DateTime.formatIso(yield* DateTime.now),
             modelSelection,
             command,
+            agent,
           });
         }),
         attachments: [],
@@ -163,6 +221,216 @@ export const make = Effect.gen(function* () {
       waiting.key = undefined;
       return key === undefined ? Effect.void : leaveLine(gate, [key]);
     });
+
+  /** Sends a handoff, asking again for a slot until one is free or the check drops it. */
+  const sendWithSlot = Effect.fn("HandoffService.sendWithSlot")(function* (
+    threadId: ThreadId,
+    run: OrchestrationV2Run,
+    ids: { readonly commandId: string; readonly messageId: string },
+    first: NonNullable<Effect.Success<ReturnType<typeof readThread>>>,
+    agent: HandoffAgentResult,
+    waiting: Waiting,
+  ) {
+    let outcome = yield* send(threadId, run, ids, first, undefined, agent);
+    if (waitsForSlot(outcome)) yield* logSlotWait(threadId, outcome);
+    while (waitsForSlot(outcome)) {
+      waiting.key = handoffPlace(ids.commandId).key;
+      const wake = yield* Deferred.make<void>();
+      wakes.set(threadId, wake);
+      yield* Deferred.await(wake).pipe(
+        Effect.timeoutOrElse({ duration: HANDOFF_SLOT_RETRY, orElse: () => Effect.void }),
+      );
+      // Read again at each try: part 1 is T3's state at the send, and a thread off now sends nothing.
+      const again = yield* readThread(threadId);
+      if (again === null) return "dropped" as const;
+      outcome = yield* send(threadId, run, ids, again, undefined, agent);
+    }
+    return outcome;
+  });
+
+  /** Write turns this server started or took on, until their handoff is decided. */
+  const carrying = new Set<string>();
+  /**
+   * Whether a loop that finds this write turn as the latest run carries it on: always one this
+   * server has in hand; after a restart, one still running or that ended within its timeout. One
+   * that ended long before (reported again after a restart) is left, and the next turn end decides.
+   */
+  const carriesOn = (write: OrchestrationV2Run, nowMs: number) =>
+    carrying.has(write.id) ||
+    write.completedAt === null ||
+    nowMs - DateTime.toEpochMillis(write.completedAt) <= Duration.toMillis(HANDOFF_WRITE_TIMEOUT);
+
+  /**
+   * A write turn, from wherever it is, to its handoff: waits for its end, stops it at its timeout,
+   * judges the reply and sends (fixed ids: at most once). Any loop that finds a write turn as the
+   * latest run comes here. `reason`: the trigger that started it; else the size decides.
+   */
+  const finishWrite = Effect.fn("HandoffService.finishWrite")(
+    function* (
+      threadId: ThreadId,
+      found: OrchestrationV2Run,
+      waiting: Waiting,
+      reason?: "size" | "idle" | "asked",
+    ) {
+      const parsed = parseHandoffWrite(threadId, found.userMessageId);
+      if (parsed === null) return;
+      carrying.add(found.id);
+      yield* leavePlace(waiting);
+      let write = found;
+      const deadlineMs =
+        DateTime.toEpochMillis(write.requestedAt) + Duration.toMillis(HANDOFF_WRITE_TIMEOUT);
+      const stopWaitMs = Duration.toMillis(HANDOFF_WRITE_STOP_WAIT);
+      let stopAsked = false;
+      while (true) {
+        // Set before the read, so the run's end between the read and the wait is not missed.
+        const wake = yield* Deferred.make<void>();
+        wakes.set(threadId, wake);
+        const { runs } = yield* projections.getThreadRecords(threadId, ["runs"], {
+          runIds: [write.id],
+        });
+        const now = runs.find((candidate) => candidate.id === write.id);
+        if (now === undefined) return;
+        write = now;
+        if (WRITE_ENDED.has(write.status)) break;
+        const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+        if (!stopAsked && nowMs >= deadlineMs) {
+          stopAsked = true;
+          yield* Effect.logWarning("handoff write turn did not end in time; T3 stops it", {
+            threadId,
+            runId: write.id,
+          });
+          yield* orchestrator
+            .dispatch({
+              type: "run.interrupt",
+              commandId: CommandId.make(`server:handoff-write-stop:${write.userMessageId}`),
+              threadId,
+              runId: write.id,
+              reason: HANDOFF_WRITE_STOP_REASON,
+            })
+            .pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("handoff write turn stop refused", { threadId, cause }),
+              ),
+            );
+          continue;
+        }
+        if (stopAsked && nowMs >= deadlineMs + stopWaitMs) {
+          // Kept in hand: its end, whenever it comes, carries on from here (the event handler).
+          yield* Effect.logWarning("handoff write turn did not stop; nothing sent yet", {
+            threadId,
+            runId: write.id,
+          });
+          return "kept" as const;
+        }
+        const untilMs = stopAsked ? deadlineMs + stopWaitMs : deadlineMs;
+        yield* Deferred.await(wake).pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.millis(untilMs - nowMs),
+            orElse: () => Effect.void,
+          }),
+        );
+      }
+      const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"], {
+        turnItemRunIds: [write.id],
+        turnItemTypes: ["user_message", "assistant_message", "run_interrupt_request"],
+      });
+      const agent = handoffAgentReply(
+        write,
+        turnItems.filter((item) => item.runId === write.id),
+      );
+      // Read now: part 1 is T3's state at the send, not before the write turn.
+      const read = yield* readThread(threadId);
+      if (read === null) return;
+      const latest = latestStartedRun(read.records.runs);
+      if (latest?.id !== write.id) {
+        // Sent already (a loop replaced after its send), or the thread moved on.
+        if (parseHandoffMessageId(threadId, latest?.userMessageId ?? "")?.runId === parsed.runId) {
+          return;
+        }
+        return yield* Effect.logWarning(
+          "handoff write turn spent, nothing sent: the thread moved on",
+          {
+            threadId,
+            runId: write.id,
+          },
+        );
+      }
+      const size = handoffThreadFacts(read.records).usedTokens;
+      const trigger =
+        reason ??
+        (size !== undefined && Number.isFinite(size) && size >= read.settings.sizeTokens
+          ? "size"
+          : "idle");
+      if (!agent.ok) {
+        yield* Effect.logWarning("handoff write turn did not count", {
+          threadId,
+          reason: agent.reason,
+          trigger,
+        });
+        // Stopped by a person or joined: the old session carries on. Else, at the idle trigger
+        // nothing is sent; at the size backstop parts 1, 3 and 4 are.
+        if ("noHandoff" in agent || trigger === "idle") return;
+      }
+      const source = read.records.runs.find((candidate) => candidate.id === parsed.runId);
+      if (source === undefined) return;
+      const outcome = yield* sendWithSlot(
+        threadId,
+        source,
+        {
+          commandId: `server:${HANDOFF_MESSAGE_PREFIX}${threadId}:${source.id}`,
+          messageId: `${HANDOFF_MESSAGE_PREFIX}${threadId}:${source.id}${parsed.loud ? HANDOFF_LOUD_SUFFIX : ""}`,
+        },
+        read,
+        agent,
+        waiting,
+      );
+      if (outcome !== "sent") {
+        yield* Effect.logWarning("handoff write turn spent, nothing sent: the thread moved on", {
+          threadId,
+          runId: write.id,
+        });
+      }
+    },
+    (effect, _threadId, found) =>
+      // Decided (sent, judged or left): no longer in hand. A loop replaced mid-way keeps it, so the
+      // loop that replaces it carries it on.
+      effect.pipe(
+        Effect.tap((kept) =>
+          Effect.sync(() => {
+            if (kept !== "kept") carrying.delete(found.id);
+          }),
+        ),
+      ),
+  );
+
+  /**
+   * At the size backstop after a write turn T3 had to stop (and no handoff since): the fallback at
+   * once, so a slow provider cannot keep the thread growing behind write turn after write turn.
+   */
+  const lastWriteTimedOut = Effect.fn("HandoffService.lastWriteTimedOut")(function* (
+    threadId: ThreadId,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+  ) {
+    const last = runs
+      .filter(
+        (candidate) =>
+          parseHandoffWriteMessageId(threadId, candidate.userMessageId) !== null ||
+          parseHandoffMessageId(threadId, candidate.userMessageId) !== null,
+      )
+      .reduce<OrchestrationV2Run | undefined>(
+        (newest, candidate) =>
+          newest === undefined || candidate.ordinal > newest.ordinal ? candidate : newest,
+        undefined,
+      );
+    if (last === undefined || parseHandoffWriteMessageId(threadId, last.userMessageId) === null)
+      return false;
+    if (last.status !== "interrupted") return false;
+    const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"], {
+      turnItemRunIds: [last.id],
+      turnItemTypes: ["run_interrupt_request"],
+    });
+    return handoffWriteTimedOut(turnItems.filter((item) => item.runId === last.id));
+  });
 
   const handOffLoop = Effect.fn("HandoffService.handOffWhenDue")(
     function* (threadId: ThreadId, sourceRunId: RunId, waiting: Waiting) {
@@ -204,6 +472,18 @@ export const make = Effect.gen(function* () {
         wakes.set(threadId, wake);
         const read = yield* readThread(threadId);
         if (read === null) return;
+        // A write turn is the latest run: the loop that started it was replaced (a late update of
+        // its source run) or lost (a restart). Carry it on to its handoff, never skip it.
+        const latestRun = latestStartedRun(read.records.runs);
+        if (
+          latestRun !== undefined &&
+          parseHandoffWriteMessageId(threadId, latestRun.userMessageId) !== null
+        ) {
+          yield* endSettle;
+          if (!carriesOn(latestRun, DateTime.toEpochMillis(yield* DateTime.now))) return;
+          yield* finishWrite(threadId, latestRun, waiting);
+          return;
+        }
         const latest = handoffThreadFacts(read.records).lastRun;
         // A late update of an earlier run replaced the latest run's timer or wait: take it over, as
         // upstream's idle compaction does. That run's turn end decides again, with the same ids, and
@@ -293,27 +573,79 @@ export const make = Effect.gen(function* () {
             if (decision.reason === "idle") return;
           }
         }
-        const outcome = yield* send(
-          threadId,
-          run,
-          {
-            commandId: decision.commandId,
-            messageId: settle.loud
-              ? `${decision.messageId}${HANDOFF_LOUD_SUFFIX}`
-              : decision.messageId,
-          },
-          read,
-          commandResult,
-        );
+        const ids = {
+          commandId: decision.commandId,
+          messageId: settle.loud
+            ? `${decision.messageId}${HANDOFF_LOUD_SUFFIX}`
+            : decision.messageId,
+        };
+        // The command waiting for a slot: the handoff, or the write turn before it.
+        let place = decision.commandId;
+        let outcome: Effect.Success<ReturnType<typeof send>> | undefined;
+        let agentResult: HandoffAgentResult | undefined;
+        if (source === "agent") {
+          if (
+            decision.reason === "size" &&
+            (yield* lastWriteTimedOut(threadId, read.records.runs))
+          ) {
+            agentResult = { ok: false, reason: "the last write turn did not end in time" };
+            yield* Effect.logWarning("handoff sent without a write turn", {
+              threadId,
+              reason: agentResult.reason,
+            });
+          } else {
+            // The `agent` source: one normal turn on the old session (its model, no fresh
+            // context), with the same check before it as the handoff.
+            const writeIds = handoffWriteIds(threadId, run.id, settle.loud);
+            const written = yield* withStores(
+              dispatchHandoff({
+                type: "message.dispatch",
+                commandId: CommandId.make(writeIds.commandId),
+                messageId: MessageId.make(writeIds.messageId),
+                threadId,
+                text: handoffWriteText(read.settings.instructions),
+                attachments: [],
+                createdBy: "agent",
+                creationSource: "server",
+                dispatchMode: { type: "start_immediately" },
+              }),
+            );
+            if (written === "sent") {
+              const { runs } = yield* projections.getThreadRecords(threadId, ["runs"], {});
+              const write = runs.find(
+                (candidate) => candidate.userMessageId === writeIds.messageId,
+              );
+              if (write === undefined) return;
+              yield* endSettle;
+              yield* finishWrite(threadId, write, waiting, decision.reason);
+              return;
+            }
+            // Dropped or queued behind a newer run: that run's turn end decides.
+            if (written === "dropped" || written === "cancelled") return;
+            place = writeIds.commandId;
+            outcome = written;
+          }
+        }
+        outcome ??= yield* send(threadId, run, ids, read, commandResult, agentResult);
+        while (waitsForSlot(outcome)) {
+          if (waiting.key !== handoffPlace(place).key) yield* leavePlace(waiting);
+          waiting.key = handoffPlace(place).key;
+          // Settled already: it decides again and checks the relay's view, without a new settle.
+          if (!slotWaitLogged) yield* logSlotWait(threadId, outcome);
+          slotWaitLogged = true;
+          // The loop's own wake decides again; a send again waits on a fresh one each time.
+          const slotWake = agentResult === undefined ? wake : yield* Deferred.make<void>();
+          wakes.set(threadId, slotWake);
+          yield* Deferred.await(slotWake).pipe(
+            Effect.timeoutOrElse({ duration: HANDOFF_SLOT_RETRY, orElse: () => Effect.void }),
+          );
+          // Decides again (the write turn too); only the fallback without a write turn sends again.
+          if (agentResult === undefined) break;
+          const again = yield* readThread(threadId);
+          if (again === null) return;
+          outcome = yield* send(threadId, run, ids, again, undefined, agentResult);
+        }
         if (!waitsForSlot(outcome)) return;
-        if (waiting.key !== handoffPlace(decision.commandId).key) yield* leavePlace(waiting);
-        waiting.key = handoffPlace(decision.commandId).key;
-        // Settled already: it decides again and checks the relay's view, without a new settle.
-        if (!slotWaitLogged) yield* logSlotWait(threadId, outcome);
-        slotWaitLogged = true;
-        yield* Deferred.await(wake).pipe(
-          Effect.timeoutOrElse({ duration: HANDOFF_SLOT_RETRY, orElse: () => Effect.void }),
-        );
       }
     },
     (effect, threadId) =>
@@ -452,6 +784,21 @@ export const make = Effect.gen(function* () {
               run.status === "interrupted"
             )
               yield* FiberSet.run(followUps, handoffRunEnded(run, handoff));
+            return;
+          }
+          // The write turn's update wakes its wait (above); it is no turn end of its own. With no
+          // loop on the thread (a restart mid write turn, or a loop that gave up waiting for its
+          // stop) it starts one, which carries the write turn on (`carriesOn`).
+          const write = parseHandoffWriteMessageId(run.threadId, run.userMessageId);
+          if (write !== null) {
+            yield* FiberMap.run(
+              timers,
+              event.threadId,
+              handOffWhenDue(event.threadId, write as RunId),
+              {
+                onlyIfMissing: true,
+              },
+            );
             return;
           }
           if (run.status === "completed") {

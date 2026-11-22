@@ -6,6 +6,7 @@ No root, no systemd, no network.
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CAPACITY = os.path.join(os.path.dirname(os.path.dirname(KIT)), 'packages', 'shared', 'src', 'capacity')
 SHA1, SHA2 = 'a' * 40, 'b' * 40
 OLD_WRAPPER = b'#!/bin/sh\nexec systemd-run --user --scope --quiet --slice=heavy.slice --collect -- "$@"\n'
 
@@ -158,6 +159,7 @@ class Install(unittest.TestCase):
         shutil.copytree(KIT, src, ignore=shutil.ignore_patterns('__pycache__'))
         shutil.copytree(os.path.join(os.path.dirname(KIT), 'common'), os.path.join(self.root, 'common'),
                         ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(CAPACITY, os.path.join(src, 'capacity'))
         with open(os.path.join(src, 'bin', 'heavy'), 'w') as f:
             f.write('this is not python\n')
         code, _, err = self.install(sha=SHA2, source=src)
@@ -225,7 +227,7 @@ class Install(unittest.TestCase):
         notes = [os.path.join(base, 'heavy', 'labelled', leaf) for base in
                  (f'/run/user/{os.getuid()}', os.path.join(home, '.local', 'state'))] if leaf.endswith('.scope') else []
         before = [n for n in notes if os.path.lexists(n)]
-        for args in (['sweep', '--help'], ['docker-label', '--value', '--owner-pid', str(os.getpid())]):
+        for args in (['sweep', '--help'], ['facts', '--help'], ['docker-label', '--value', '--owner-pid', str(os.getpid())]):
             r = subprocess.run([sys.executable, '-I', '-B', os.path.join(moved, 'bin', 'heavy'), *args],
                                capture_output=True, text=True, timeout=60, env=dict(os.environ, HOME=home))
             self.assertEqual(r.returncode, 0, r.stderr)

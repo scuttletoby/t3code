@@ -24,6 +24,8 @@ import * as HandoffOwner from "./handoff/handoffOwner.ts";
 import * as HandoffService from "./handoff/HandoffService.ts";
 import * as McpProfileTurnCheck from "./mcpProfileTurnCheck.ts";
 import * as PullRequestWatchSlot from "./pullRequestWatchSlot.ts";
+import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
+import * as RemoteTaskPromptWakes from "./remoteTaskPromptWakes.ts";
 import * as RunRecorder from "./runRecords/RunRecorder.ts";
 import * as WorkerWakeSlots from "./workerWakeSlots.ts";
 
@@ -70,10 +72,9 @@ export const handoffThreadsSkipIdleCompaction = PullRequestWatchSlot.layer.pipe(
 );
 
 /**
- * Right below upstream's orchestration layer in server.ts, so every turn reads its adapter from it:
- * upstream's provider instance registry, except that a provider that cannot apply MCP profiles
- * refuses a turn whose profile is narrower than `all` (fork/mcpProfileTurnCheck.ts). The real boot
- * test (holdWork.boot.test.ts) checks that the orchestration layer's reads go through it.
+ * Right below upstream's orchestration layer in server.ts, so every turn reads its adapter from it
+ * (fork/mcpProfileTurnCheck.ts): off Claude it refuses a profile that leaves out an outside server
+ * and fixes the turn's T3 tool groups. holdWork.boot.test.ts checks the reads go through it.
  */
 export const mcpProfileTurnCheck = McpProfileTurnCheck.layer;
 
@@ -97,6 +98,10 @@ export const layerRoutes = Layer.mergeAll(
   ForkFeatures.layer,
   // Linked threads a parent here launched but whose task the last stop lost: one reminder each.
   DelegatedOrphanScan.layer,
+  // GET /api/fork/task-prompts: a task's open prompts here, for its parent's machine; its token only.
+  RemoteTaskPrompts.layer,
+  // A parent here whose task on a linked machine waits there on a prompt: woken once per prompt.
+  RemoteTaskPromptWakes.layer,
 );
 
 /**

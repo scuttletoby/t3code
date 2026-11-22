@@ -42,9 +42,9 @@ const McpProfileChoice = McpProfileName.check(
 );
 
 /**
- * Groups of T3's own tools, one per toolkit (`preview` has the preview and preview-controls
- * toolkits). The tools in {@link MCP_T3_UNGROUPED_TOOLS} are in no group. The server's
- * apps/server/src/fork/mcpProfile.ts maps every toolkit to its group, and a test checks every tool.
+ * Groups of T3's own tools: one per toolkit (`preview` has two), and `playtest`, a waits tool that
+ * runs build and deploy steps, so keeping `waits` does not give it. {@link MCP_T3_UNGROUPED_TOOLS}
+ * are in no group; apps/server/src/fork/mcpProfile.ts maps each tool, and a test checks them all.
  */
 export const MCP_T3_TOOL_GROUPS = [
   "orchestration",
@@ -60,13 +60,14 @@ export const MCP_T3_TOOL_GROUPS = [
   "theme",
   "html",
   "waits",
+  "playtest",
 ] as const;
 export type McpT3ToolGroup = (typeof MCP_T3_TOOL_GROUPS)[number];
 
 /**
  * T3 tools every profile keeps, in no group: the two message tools, and `tool_search`, which only
- * finds tools the thread may already use (the T3 tool filter, a later PR, leaves the others out of
- * its results).
+ * finds tools the thread may already use (the server's T3 tool filter leaves the others out of its
+ * results).
  */
 export const MCP_T3_UNGROUPED_TOOLS: ReadonlyArray<string> = [
   "request_secret",

@@ -8,16 +8,19 @@ import {
   isProviderWorkspaceSnapshotPending,
   type ModelSelection,
   type OrchestratorMcpDelegateTaskInput,
+  type OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpFailure,
   type OrchestratorMcpCreateThreadRequest,
   type OrchestratorMcpTarget,
   PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   type ProviderOptionSelection,
   type RuntimeMode,
   type ServerProvider,
   type ThreadId,
 } from "@t3tools/contracts";
+import { kindOfRole } from "@t3tools/shared/slotObserve";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -35,11 +38,14 @@ import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
 import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
 import * as LaunchMcpProfile from "./launchMcpProfile.ts";
 import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
+import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
 
 /** A checked delegation target (the same shape as the service's resolved target). */
 export interface DelegateTarget {
   readonly modelSelection: ModelSelection;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
+  /** The slot gate's capacity kind, from the task's `role` (`kindOfRole`); absent: a writer. */
+  readonly agentKind?: string;
 }
 
 type Parent = Pick<OrchestrationV2ThreadProjection, "thread">;
@@ -66,7 +72,10 @@ export interface BeforeWorkspaceInput {
   /** A retry of a delegation that was accepted: it starts no work, so nothing is checked. */
   readonly isRetry: boolean;
   readonly parent: Parent;
-  readonly requested: OrchestratorMcpTarget | undefined;
+  /** The task's target, with its `role` (the slot gate's kind; the caller may lie about it). */
+  readonly requested:
+    | (OrchestratorMcpTarget & { readonly role?: OrchestratorMcpDelegateTaskInput["role"] })
+    | undefined;
   readonly runtimeMode: OrchestratorMcpDelegateTaskInput["runtimeMode"];
   /**
    * The parent's folder, as the target lookup reads it, or none. The checks read the providers
@@ -146,6 +155,14 @@ export interface DelegateChecks {
   readonly remoteTarget: <Target extends OrchestratorMcpTarget>(
     target: Target,
   ) => Effect.Effect<Target, OrchestratorMcpFailure>;
+  /**
+   * A remote task's status: what its thread on the linked machine waits on, read from that
+   * machine (fork/remoteTaskPrompts.ts). Spread over upstream's fixed `false`/`null`.
+   */
+  readonly remotePrompts: (
+    task: OrchestrationV2Subagent,
+    status: OrchestratorMcpDelegateTaskResult["status"],
+  ) => Effect.Effect<Partial<RemoteTaskPrompts.StatusReport>>;
 }
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
@@ -278,6 +295,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
   const launchMcpProfile = yield* LaunchMcpProfile.makeLaunchMcpProfileCheck;
   const checkPick = yield* ModelPolicyCheck.makePickCheck;
+  const remoteStatus = yield* RemoteTaskPrompts.makeStatusReport();
   /**
    * The model policy's check of the agent's pick on a resolved target (`modelPolicyCheck.ts`): a
    * call that names no model inherits one, which reads as no model.
@@ -488,6 +506,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
         .acquire({
           callerThreadId: input.callerThreadId,
           targetInstanceId: input.target.modelSelection.instanceId,
+          kind: input.target.agentKind,
         })
         .pipe(
           Effect.flatMap((outcome) =>
@@ -510,8 +529,8 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
     // the target the pacer moved the task to or lowered its effort on: what runs is inside too. An
     // effort the pacer lowers off the row keeps the checked one (the agent cannot fix that pick).
     beforeWorkspace: (input) =>
-      input.isRetry
-        ? Effect.succeed({ target: input.target })
+      (input.isRetry
+        ? Effect.succeed<BeforeWorkspaceResult>({ target: input.target })
         : Effect.gen(function* () {
             const target = yield* ownTarget(input.target, input.requested);
             const policyNote = yield* policyCheck("delegate_task", target, input.requested);
@@ -546,7 +565,19 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
             ];
             const note = notes.filter((text) => text !== undefined).join(" ");
             return { target: paced.target, ...(note === "" ? {} : { note }) };
-          }),
+          })
+      ).pipe(
+        // The task's kind rides on the final target to the slot gate (`afterWorkspace`); a retry
+        // holds no slot, so its target stays as it came.
+        Effect.map((result) =>
+          input.isRetry
+            ? result
+            : {
+                ...result,
+                target: { ...result.target, agentKind: kindOfRole(input.requested?.role) },
+              },
+        ),
+      ),
     afterWorkspace: (input) =>
       input.isRetry || Option.isNone(slotGate)
         ? Effect.succeed(NO_HOLD)
@@ -600,6 +631,14 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
             ),
           ),
         ),
+      ),
+    remotePrompts: (task, status) =>
+      remoteStatus(
+        task,
+        status === "completed" ||
+          status === "failed" ||
+          status === "cancelled" ||
+          status === "interrupted",
       ),
   };
   return checks;

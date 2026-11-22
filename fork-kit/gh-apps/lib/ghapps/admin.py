@@ -65,6 +65,9 @@ def raw_repo(name):
 def add_key(ops, name, app_id, repo, installation_id=None, key_text=None):
     if not c.NAME_RE.match(name or ''):
         raise Refused(f'bad app name {name!r} (lower-case letters, digits, - and _)')
+    if name == 'gh':
+        raise Refused("the app name 'gh' is not allowed: gh-as reads 'gh-as gh -- gh ...' as the gh command, so the "
+                      'app could not be picked by name; choose another name')
     if not (isinstance(app_id, int) and app_id > 0):
         raise Refused('--app-id must be the App\'s number')
     if not c.REPO_RE.match(repo or ''):

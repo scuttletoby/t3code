@@ -45,6 +45,7 @@ const MIXED =
   "The selected environments or projects have different handoff settings. Select one to edit them.";
 
 const SOURCE_LABELS: Record<HandoffSource, string> = {
+  none: "No one",
   agent: "The old session",
   command: "A command",
 };
@@ -292,7 +293,7 @@ export function HandoffSettings({ isProjectScope }: { readonly isProjectScope: b
             ["source", "command"],
             "Reset the handoff writer to the environment's",
           )}
-          description="Who writes the handoff: the old session in one turn, or a read-only program (one argument per line, its full path first). Today it sets how early an idle handoff starts."
+          description="Who writes the handoff: no one (T3's state and the recent conversation only), the old session in one turn, or a read-only program (one argument per line, its full path first)."
           control={
             <Select
               value={shown.source}

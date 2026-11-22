@@ -33,11 +33,14 @@ upstream, so its old commits disappear. `ci/v1` is such a main commit: it is kep
 do not use it.
 
 A release commit holds only what consumers use: `LICENSE`, `fork-ci/`, the host kits in `fork-kit/`
-(installed only from a release commit, [fork-kit/README.md](../fork-kit/README.md)), the scripts an action runs from
-outside `fork-ci/` (fleet-route runs `.github/scripts/fork-fleet.py`) and the reusable workflows that start
-only on `workflow_call` (the list is `paths` in
+(installed only from a release commit, [fork-kit/README.md](../fork-kit/README.md)) and the files their installers
+read from outside `fork-kit/` (the desk kit's fleet scripts and units, the heavy kit's capacity rule files in
+`packages/shared/src/capacity/`), the scripts an action runs from outside `fork-ci/` (fleet-route runs
+`.github/scripts/fork-fleet.py`) and the reusable workflows that start only on `workflow_call` (the list is `paths` in
 [`.github/fork-ci-release.json`](../.github/fork-ci-release.json)). The paths are the same as on main.
-Release commits contain no symlinks and no workflow that starts by itself.
+Release commits contain no symlinks and no workflow that starts by itself. `fork-ci-release.test.py` writes this
+commit's release files to a folder and runs each kit installer's file check on it, so a kit that reads a file outside
+the paths fails CI.
 
 ## Using the actions
 
@@ -55,20 +58,21 @@ Each action's README has a full example, every input and output, and what happen
   run: ./build.sh
 ```
 
-| Action                                             | What it answers or does                                                           | Key inputs                               | Outputs                                           | Config file (in the project)                             |
-| -------------------------------------------------- | --------------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------- | -------------------------------------------------------- |
-| [docs-scope](actions/docs-scope/README.md)         | is this change docs-only, and which jobs does it reach                            | `config`, `base`                         | `docs_only`, `jobs`, `reason`                     | `.github/docs-scope.json` (rules)                        |
-| [job-changed](actions/job-changed/README.md)       | can the change alter what one job of a workflow does                              | `workflow`, `base`, `job`, `paths`       | `changed`, `workflow`, `reason`                   | none                                                     |
-| [test-select](actions/test-select/README.md)       | which test files can this pull request's change reach; `trace/` checks it         | `config`                                 | `all`, `count`, `total`, `list`, `reason`         | `.github/test-select.json` (tests, always-all)           |
-| [gradle-cache](actions/gradle-cache/README.md)     | stages the Maven files a lock lists, sha256-checked, from release assets          | `lock`, `out`, `token`                   | `maven-repo-local`                                | the lock file                                            |
-| [fleet-route](actions/fleet-route/README.md)       | which runner each job of a run gets: the project's self-hosted pools or hosted    | `config`, `vars`, `mode`, `gates`        | `runners`, `mode`, `attempt`, `fallback`, `watch` | the fleet config (e.g. `.github/fleet.json`)             |
-| [fleet-watch](actions/fleet-watch/README.md)       | re-runs, once, a run that a dispatcher pool's runner cut off                      | `config`, `verb`, `run-id`, `attempt`    | `rerun`, `pending`                                | the fleet config (its `watch` section)                   |
-| [handoff-put](actions/handoff-put/README.md)       | hands a file to a later job of the same run, keyed on the commit                  | `name`, `path`, `retention-days`         | `ok`, `artifact`, `sha`, `reason`                 | none                                                     |
-| [handoff-get](actions/handoff-get/README.md)       | takes that file only when the commit inside it is this checkout's HEAD            | `name`, `path`                           | `ok`, `sha`, `reason`                             | none                                                     |
-| [git-clean](actions/git-clean/README.md)           | empties a reused self-hosted workspace, refuses a .git config it does not know    | `path`                                   | none                                              | none                                                     |
-| [head-check](actions/head-check/README.md)         | fails a pull request head that is not the change its review read                  | `config`, `required-lenses`, `token`     | `result`                                          | the pr-queue config                                      |
-| [pr-queue](actions/pr-queue/README.md)             | a merge queue for an up-to-date-required repository (also a reusable workflow)    | `config`, `state-file`, `cache`, `token` | none                                              | the pr-queue config                                      |
-| [weakened-tests](actions/weakened-tests/README.md) | reports (never fails) the existing tests a pull request deletes, skips or weakens | `config`, `token`                        | `status`, `count`, `missing_why`                  | `.github/weakened-tests.json` (optional: added patterns) |
+| Action                                             | What it answers or does                                                                 | Key inputs                               | Outputs                                           | Config file (in the project)                             |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------- | -------------------------------------------------------- |
+| [docs-scope](actions/docs-scope/README.md)         | is this change docs-only, and which jobs does it reach                                  | `config`, `base`                         | `docs_only`, `jobs`, `reason`                     | `.github/docs-scope.json` (rules)                        |
+| [job-changed](actions/job-changed/README.md)       | can the change alter what one job of a workflow does                                    | `workflow`, `base`, `job`, `paths`       | `changed`, `workflow`, `reason`                   | none                                                     |
+| [test-select](actions/test-select/README.md)       | which test files can this pull request's change reach; `trace/` checks it               | `config`                                 | `all`, `count`, `total`, `list`, `reason`         | `.github/test-select.json` (tests, always-all)           |
+| [gradle-cache](actions/gradle-cache/README.md)     | stages the Maven files a lock lists, sha256-checked, from release assets                | `lock`, `out`, `token`                   | `maven-repo-local`                                | the lock file                                            |
+| [fleet-route](actions/fleet-route/README.md)       | which runner each job of a run gets: the project's self-hosted pools or hosted          | `config`, `vars`, `mode`, `gates`        | `runners`, `mode`, `attempt`, `fallback`, `watch` | the fleet config (e.g. `.github/fleet.json`)             |
+| [fleet-watch](actions/fleet-watch/README.md)       | re-runs, once, a run that a dispatcher pool's runner cut off                            | `config`, `verb`, `run-id`, `attempt`    | `rerun`, `pending`                                | the fleet config (its `watch` section)                   |
+| [handoff-put](actions/handoff-put/README.md)       | hands a file to a later job of the same run, keyed on the commit                        | `name`, `path`, `retention-days`         | `ok`, `artifact`, `sha`, `reason`                 | none                                                     |
+| [handoff-get](actions/handoff-get/README.md)       | takes that file only when the commit inside it is this checkout's HEAD                  | `name`, `path`                           | `ok`, `sha`, `reason`                             | none                                                     |
+| [git-clean](actions/git-clean/README.md)           | empties a reused self-hosted workspace, refuses a .git config it does not know          | `path`                                   | none                                              | none                                                     |
+| [head-check](actions/head-check/README.md)         | fails a pull request head that is not the change its review read                        | `config`, `required-lenses`, `token`     | `result`                                          | the pr-queue config                                      |
+| [pr-queue](actions/pr-queue/README.md)             | a merge queue for an up-to-date-required repository (also a reusable workflow)          | `config`, `state-file`, `cache`, `token` | none                                              | the pr-queue config                                      |
+| [doc-check](actions/doc-check/README.md)           | fails instruction files over budget, history in them, broken links, added dated reports | `config`, `base`, `mode`                 | none                                              | `.github/doc-check.json` (optional: budgets, rules)      |
+| [weakened-tests](actions/weakened-tests/README.md) | reports (never fails) the existing tests a pull request deletes, skips or weakens       | `config`, `token`                        | `status`, `count`, `missing_why`                  | `.github/weakened-tests.json` (optional: added patterns) |
 
 Two habits every action expects:
 
@@ -79,6 +83,13 @@ Two habits every action expects:
 
 To move to a new release, change the SHA and the comment together; read the new tag's release notes first
 ([RELEASE-NOTES.md](RELEASE-NOTES.md): what changed, and what to do before or after the move).
+
+### Review rules
+
+The queue and the head gate can also judge which lenses a change needs, its findings and its review rounds, from a
+`review` block in the project's queue config. Turn it on in this order: release, pin, then config
+([pr-queue README](actions/pr-queue/README.md#turning-it-on-release-pin-then-config)), in `shadow` first: a release
+that does not know the key refuses the whole config.
 
 ### Outside a workflow
 
