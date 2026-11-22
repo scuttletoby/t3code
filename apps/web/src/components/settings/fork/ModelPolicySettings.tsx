@@ -30,7 +30,7 @@ import { SettingResetButton, SettingsSection } from "../settingsLayout";
 import { useSearchableSetting } from "../settingsSearch";
 import { useScopedSettings, useUpdateScopedSettings } from "../useScopedSettings";
 import { targetsDiffer } from "../waitsAndSlotsSettings.logic";
-import { ForkRow, useSelectedProviders } from "./ForkRow";
+import { ForkRow, useSelectedProvidersByEnvironment } from "./ForkRow";
 import {
   aliasModelPolicyRows,
   MODEL_POLICY_MODE_OPTIONS,
@@ -199,7 +199,7 @@ export function ModelPolicySettings() {
   const [editing, setEditing] = useState(false);
   const unreadableText = mixed ? null : unreadableModelPolicyText(shown);
   const option = MODEL_POLICY_MODE_OPTIONS.find((candidate) => candidate.value === shown.mode);
-  const providers = useSelectedProviders();
+  const providers = useSelectedProvidersByEnvironment();
   // One read per pick, each a stored value: a selector building a new object would never settle.
   const picks = {
     defaultModelSelection: useScopedSettings((settings) => settings.defaultModelSelection),
@@ -326,9 +326,11 @@ export function ModelPolicySettings() {
                         <code>{modelPolicyRowLine(row)}</code>
                         {aliasOf === undefined ? null : (
                           <span role="note" className="text-destructive-foreground">
-                            {row.model} is an alias of {aliasOf.join(" or ")}; name the full id. A
-                            row naming an alias follows it when a provider moves it to a new model,
-                            and does not allow a pick of the full id.
+                            {aliasOf.length === 0
+                              ? `${row.model} is an alias ${row.driver} resolves by itself`
+                              : `${row.model} is an alias of ${aliasOf.join(" or ")}`}
+                            ; name the full id. A row naming an alias follows it when a provider
+                            moves it to a new model, and does not allow a pick of the full id.
                           </span>
                         )}
                       </span>

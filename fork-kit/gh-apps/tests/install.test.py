@@ -493,6 +493,8 @@ class Admin(Base):
         for name, app_id, repo in (('Bad', 11, 'octo/x'), ('x', 0, 'octo/x'), ('x', 11, 'octo'), ('x', 11, 'a/b/c')):
             with self.subTest(name=name, app_id=app_id, repo=repo), self.assertRaises(Refused):
                 admin.add_key(self.ops, name, app_id, repo, 5, FAKE_PEM)
+        with self.assertRaisesRegex(Refused, "app name 'gh' is not allowed"):   # gh-as gh -- gh ... = the command
+            admin.add_key(self.ops, 'gh', 11, 'octo/x', 5, FAKE_PEM)
 
     def test_key_on_stdin_must_be_a_private_key(self):
         def read(data):

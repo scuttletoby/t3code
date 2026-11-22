@@ -206,7 +206,14 @@ class RealHost(unittest.TestCase):
         self.assertEqual(lines, [f'({c.RUN_USER}) NOPASSWD: {c.PRIV_AS}'], proc.stdout)
 
     def test_7_environment_does_not_pass(self):
-        for proc in (self.wrapper('pr', 'list', env=ATTACK_ENV),
+        # The wrapper refuses a GH_HOST other than github.com (loud, not silently swapped); everything else in
+        # ATTACK_ENV it passes over, and sudo must drop it. A direct sudo call gets all of it, GH_HOST too.
+        refused = self.wrapper('pr', 'list', env=ATTACK_ENV)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("GH_HOST='evil.example' is not github.com", refused.stderr)
+        self.assertNotIn('"env"', refused.stdout)   # gh never ran
+        no_host = {k: v for k, v in ATTACK_ENV.items() if k != 'GH_HOST'}
+        for proc in (self.wrapper('pr', 'list', env=no_host),
                      as_agent([c.SUDO, '-n', '-u', c.RUN_USER, c.PRIV_AS, '--app', 'demo', '--repo', 'octo/demo',
                                '--', 'gh', 'pr', 'list'], env=ATTACK_ENV)):
             self.assertEqual(proc.returncode, 0, proc.stderr)
