@@ -13,6 +13,7 @@ import { useSearchableSetting } from "../settingsSearch";
 import { WaitsAndSlotsSettings } from "../WaitsAndSlotsSettings";
 import { forkFeatureStatuses } from "./forkStatus.logic";
 import { HandoffSettings } from "./HandoffSettings";
+import { McpProfileSettings } from "./McpProfileSettings";
 import { PlaytestSettings } from "./PlaytestSettings";
 import { UpdatesSettings } from "./UpdatesSettings";
 import { ModelPolicySettings } from "./ModelPolicySettings";
@@ -47,7 +48,7 @@ export function ForkSettingsPanel() {
       {isProjectScope ? null : <UpdatesSettings />}
       <HandoffSettings isProjectScope={isProjectScope} />
       <PlaytestSettings isProjectScope={isProjectScope} />
-      {/* MCP profiles (server.mcpProfiles and the profile picks) get their section here. */}
+      <McpProfileSettings isProjectScope={isProjectScope} />
     </SettingsPageContainer>
   );
 }

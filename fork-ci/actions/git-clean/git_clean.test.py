@@ -1081,8 +1081,8 @@ class Actions(unittest.TestCase):
             first = ('\n' + steps).split('\n    - ')[1]
             self.assertIn('git-clean/git_clean.py" check --path', first, f'{path}: the first step must be the check')
             self.assertIn('--require', first, path)
-        self.assertEqual(sorted(seen), ['docs-scope', 'handoff-get', 'handoff-put', 'head-check', 'job-changed',
-                                        'pr-queue/tested-base', 'test-select', 'weakened-tests'])
+        self.assertEqual(sorted(seen), ['doc-check', 'docs-scope', 'handoff-get', 'handoff-put', 'head-check',
+                                        'job-changed', 'pr-queue/tested-base', 'test-select', 'weakened-tests'])
 
     def test_git_clean_action_runs_prepare(self):
         with open(os.path.join(HERE, 'action.yml'), encoding='utf-8') as fh:
