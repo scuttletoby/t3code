@@ -54,7 +54,12 @@ is a small sample, and 1-2 bugs between settings is noise, but three results sha
    mechanism.
 5. **Scores:** `review_eval.py cost` reads tokens, $ (from `prices`, $ per million tokens; check the current price
    list) and active minutes (gaps over `idle_gap_seconds` dropped) from the transcripts that `transcripts` globs
-   find, matching each to its run by the `RUN-ID:` first line of the session's first message. `review_eval.py
+   find, matching each to its run by the `RUN-ID:` first line of the session's first message. A run started as a
+   sub-agent has its transcript under `<session>/subagents/` or `<session>/subagents/workflows/wf_*/` (the example
+   config globs those too). The sub-agents a run starts count toward that run: for a run that is the session, every
+   transcript under `<session>/subagents/`; for a run that is a sub-agent, those whose `agent-<id>.meta.json` names
+   it (or one of them) as `parentAgentId`. Each message is priced at its own model, so a sub-agent on another model
+   needs that model under `prices` too. `review_eval.py
    analyze` gives per config the blocker and major recall (mean and worst run), recall of all findings, false
    positives, $ and minutes, the union of every pair of configs, and which known bugs each config missed.
 6. **Rule:** use the cheapest setting whose worst-case blocker and major recall equals the best setting's. Check it

@@ -90,9 +90,10 @@ class Machine:
         with open(full, 'w') as f:
             f.write(text)
 
-    def agent(self, name, demand_mb):
+    def agent(self, name, demand_mb, pids=()):
         folder = f'{AGENTS}/t3code-{name}-0a1b2c3d.scope'
         self.write(folder + '/memory.stat', f'anon {demand_mb * MB}\nfile 999999999\nshmem 0\n')
+        self.write(folder + '/cgroup.procs', ''.join(f'{p}\n' for p in pids))
         for box in (MANAGER + '/app.slice/app-t3code.slice', AGENTS):   # every v2 cgroup has one (PSI on)
             self.write(box + '/memory.pressure', CALM)
 
@@ -215,10 +216,87 @@ class Ledger(Case):
             code, d = self.facts(*args)
             self.assertEqual((code, d['free'], set(d['fits'].values())), (75, False, {0}), args)
             self.assertIn('basic tier', d['reason'])
-        self.m.write('/sys/fs/cgroup/cgroup.controllers', 'memory\n')      # cgroup v2 but no user manager
-        shutil.rmtree(self.m.root + MANAGER)
+        self.m.write('/sys/fs/cgroup/cgroup.controllers', 'memory\n')      # cgroup v2, no user manager, no user.slice
+        shutil.rmtree(self.m.root + '/sys/fs/cgroup/user.slice')           # (a cgroup namespace, say)
         code, d = self.facts('--kind', WRITER, '--fresh')
         self.assertEqual((code, d['tier'], set(d['fits'].values())), (75, 'basic', {0}))
+
+    def test_no_user_manager_gets_the_machine_wide_answer(self):
+        # #844: a CI runner's user (no lingering, no login session) has no user manager; every other user's agents
+        # and heavy jobs are still read from user.slice, so it gets the answer a caller with a manager gets
+        self.m.write(OTHER + '/heavy.slice/run-x1.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
+        self.m.write(OTHER + '/heavy.slice/memory.pressure', CALM)
+        self.m.write(OTHER + '/app.slice/app-t3code.slice/t3code-z-1.scope/memory.stat', f'anon {10 * MB}\nshmem 0\n')
+        answers = {}
+        for tier in ('full', 'machine'):
+            if tier == 'machine':
+                shutil.rmtree(self.m.root + MANAGER)
+            answers[tier] = [self.facts(*args, '--fresh') for args in (('--kind', WRITER), ('--mb', '1024'))]
+        for (code, d), (full_code, full) in zip(answers['machine'], answers['full']):
+            self.assertEqual((code, d['free'], d['tier'], d['level']), (0, True, 'machine', 'ok'), d.get('reason'))
+            self.assertEqual((full_code, full['tier']), (0, 'full'))
+            for key in ('memory', 'queue', 'fits'):
+                self.assertEqual(d[key], full[key], key)
+            self.assertEqual(d['queue'], {'running': 1, 'waiting': 0, 'agents': 1})
+            self.assertIn(hf.MACHINE_WHY, d['notes'])
+            self.assertNotIn(hf.BASIC_WHY, d['notes'])
+        code, d = self.facts('--mb', '99999', '--fresh')
+        self.assertEqual((code, d['tier']), (75, 'machine'))
+        self.assertIn('machine-wide numbers', d['reason'])
+        self.m.write(OTHER + '/app.slice/app-t3code.slice/t3code-z-2.scope/memory.stat', 'anon 0\nshmem 0\n')
+        d = self.facts('--kind', WRITER, '--fresh')[1]
+        self.assertEqual(d['queue']['agents'], 2, 'still counts every user\'s agents')
+
+    def test_the_machine_tier_sees_every_person_s_reservations(self):
+        # #945: a caller with no user manager is often another user (a CI runner, root) with another home: it reads
+        # every person's reserve.d, so it never takes the room the owner keeps; one it cannot read: never free
+        owner_home = '/home/owner'
+        uid = 4000000001
+        self.m.write('/etc/login.defs', 'UID_MIN 1000\nUID_MAX 4294967294\n')
+        self.m.write('/etc/passwd', f'root:x:0:0::/root:/bin/sh\nowner:x:{uid}:{uid}::{owner_home}:/bin/sh\n'
+                                    f'me:x:{UID}:{UID}::/home/me:/bin/sh\n')
+        os.chmod(self.m.root + '/etc', 0o755)        # the machine file's folders: no one else can write them
+        game = os.path.join(self.tmp, 'game')
+        conf = owner_home + '/.config/t3-capacity/reserve.d'      # in the fake machine
+        owner_reserve = self.m.root + conf
+        self.m.write(conf + '/game.conf', f'1536 {game}/\n')
+        self.m.write('/root/.config/t3-capacity/reserve.d/x.conf', '9999 /x/\n')       # root: not read
+        self.m.write('/home/me/.config/t3-capacity/reserve.d/x.conf', '9999 /x/\n')    # the caller's: its own dir
+        self.m.process(4001, game, 300)             # the caller's process in the owner's folder: not the owner's use
+        os.makedirs(self.m.root + OTHER)
+        full = self.facts('--mb', '64')[1]
+        self.assertEqual((full['tier'], full['memory']['holdMb']), ('full', 0), 'full tier: as before')
+        shutil.rmtree(self.m.root + MANAGER)
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual((code, d['tier']), (0, 'machine'), d.get('reason'))
+        self.assertEqual(d['memory']['holdMb'], 1536, (d['reservations'], d['notes']))
+        self.assertEqual([(r['name'], r['mb'], r['useMb']) for r in d['reservations']], [('owner:game', 1536, 0)])
+        room = d['memory']['freeMb']
+        os.unlink(owner_reserve + '/game.conf')
+        free = self.facts('--mb', '64', '--fresh')[1]['memory']['freeMb']
+        self.assertEqual(free, room + 1536)
+        self.m.write(conf + '/game.conf', f'1536 {game}/\n')
+        code, d = self.facts('--mb', str(room + 1), '--fresh', cwd=self.work)
+        self.assertEqual(code, 75, 'it fits only in the owner\'s reserved room')
+        code, d = self.facts('--mb', str(room + 1), '--fresh', cwd=game)
+        self.assertEqual(code, 0, 'a caller working in the reserved folder is the work it is kept for')
+        os.mkfifo(owner_reserve + '/pipe.conf')     # never waits on a FIFO; not a plain file: cannot be read
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual((code, d['tier'], set(d['fits'].values())), (75, 'basic', {0}))
+        self.assertTrue(any(n.startswith('reservation owner:pipe.conf cannot be read') for n in d['notes']), d['notes'])
+        os.unlink(owner_reserve + '/pipe.conf')
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['tier'], 'machine')
+        if os.geteuid() != 0:                       # root reads every folder
+            os.chmod(owner_reserve, 0)              # a home closed to others (mode 750 or 700)
+            self.addCleanup(os.chmod, owner_reserve, 0o755)
+            code, d = self.facts('--mb', '64', '--fresh')
+            self.assertEqual((code, d['tier']), (75, 'basic'))
+            self.assertTrue(any('reservations of user owner cannot be read' in n for n in d['notes']), d['notes'])
+            os.chmod(owner_reserve, 0o755)
+        os.makedirs(self.m.root + '/sys/fs/cgroup/user.slice/user-4000000002.slice')   # a session, no home known
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual((code, d['tier']), (75, 'basic'))
+        self.assertTrue(any('user 4000000002 has a session' in n for n in d['notes']), d['notes'])
 
     def test_an_unreadable_signal_is_elevated_never_ok(self):
         self.m.write('/proc/pressure/memory', 'some garbage\nfull avg10=x\n')
@@ -309,6 +387,112 @@ class Reservations(Case):
         self.assertEqual(d['memory']['holdMb'], 1000)
         self.assertEqual([n.split(' ')[1] for n in d['notes']], ['half.conf:2'])
 
+    def test_an_agent_or_job_working_in_the_folder_is_counted_once(self):
+        # #923: one idle 300 MB agent under a 1536 MB reservation holds 1536 MB in all (its use and its debt to the
+        # rule together), not its debt on top of the reservation's 1536 - 300
+        other = os.path.join(self.tmp, 'other')
+        with open(os.path.join(self.m.reserve, 'game.conf'), 'w') as f:
+            f.write(f'1536 {other}/\n')
+        self.m.process(4001, other + '/sub', 300)
+        self.m.agent('a', 300, pids=(4001,))
+        code, d = self.facts('--mb', '64')
+        owed = self.cost(WRITER) - 300
+        self.assertLessEqual(self.cost(WRITER), 1536, 'the example needs a writer that fits the reservation')
+        self.assertEqual(d['memory']['owedMb'], owed)
+        self.assertEqual(d['memory']['holdMb'], 1536 - 300 - owed)
+        self.assertEqual(d['memory']['owedMb'] + d['memory']['holdMb'] + 300, 1536)
+        self.assertEqual([(r['useMb'], r['owedMb']) for r in d['reservations']], [(300, owed)])
+        self.m.agent('b', 100, pids=(4002,))         # an agent working elsewhere: its debt is its own
+        self.m.process(4002, os.path.join(self.tmp, 'elsewhere'), 100)
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual((d['memory']['holdMb'], d['memory']['owedMb']),
+                         (1536 - 300 - owed, owed + self.cost(WRITER) - 100))
+        build = 'job-build' if 'job-build' in RULE['kinds'] else RULE['unknownKinds']['job']
+        self.m.job('build', 3072, demand_mb=200)    # a heavy job started in the folder: never held twice either
+        self.m.write(f'{MANAGER}/heavy.slice/run-j1.scope/sub/cgroup.procs', '4003\n')
+        self.m.process(4003, other, 200)
+        d = self.facts('--mb', '64', '--fresh')[1]
+        job_owed = self.cost(build) - 200
+        self.assertEqual(d['memory']['holdMb'], max(0, 1536 - 500 - owed - job_owed))
+        self.assertEqual(d['reservations'][0]['owedMb'], owed + job_owed)
+
+    def reserve(self, name, *lines):
+        with open(os.path.join(self.m.reserve, f'{name}.conf'), 'w') as f:
+            f.write(''.join(f'{mb} {folder}/\n' for mb, folder in lines))
+
+    def spanning(self):
+        """Two reserved folders a (4096) and b (2048), one folder of b's reserved again below it (b/y, 1024), and
+        work across them: an agent (demand 400) with a 300 MB process in a and a 100 MB one in b/y, and a heavy
+        build (demand 200) with 150 MB in a and 50 MB in b. (reserved MB in all, MB its processes use, debts)."""
+        a, b = os.path.join(self.tmp, 'a'), os.path.join(self.tmp, 'b')
+        self.reserve('a', (4096, a))
+        self.reserve('b', (2048, b), (1024, b + '/y'))
+        self.m.agent('w', 400, pids=(4001, 4002))
+        self.m.process(4001, a + '/src', 300)
+        self.m.process(4002, b + '/y/z', 100)
+        self.m.job('build', 3072, demand_mb=200)
+        self.m.write(f'{MANAGER}/heavy.slice/run-j1.scope/cgroup.procs', '4003\n4004\n')
+        self.m.process(4003, a, 150)
+        self.m.process(4004, b, 50)
+        build = 'job-build' if 'job-build' in RULE['kinds'] else RULE['unknownKinds']['job']
+        return 4096 + 2048 + 1024, 600, (self.cost(WRITER) - 400, self.cost(build) - 200)
+
+    def test_two_folders_nested_folders_and_work_across_them_count_each_debt_once(self):
+        # #945: a piece with processes in two reserved folders, or in nested ones, had its whole debt taken off each,
+        # so it was counted zero times. Now every process counts toward one reservation (the deepest), and a piece's
+        # debt is split over its processes by their use: held + owed + used is exactly what is reserved
+        total, used, (agent, job) = self.spanning()
+        self.assertTrue(agent % 4 == 0 and job % 4 == 0, 'the shares below are whole MB')
+        code, d = self.facts('--mb', '64')
+        mem = d['memory']
+        self.assertEqual(mem['owedMb'], agent + job)
+        self.assertEqual(mem['holdMb'] + mem['owedMb'] + used, total, d['reservations'])
+        got = {r['mb']: (r['useMb'], r['owedMb']) for r in d['reservations']}
+        self.assertEqual(got, {4096: (450, agent * 3 // 4 + job * 3 // 4), 2048: (50, job // 4),
+                               1024: (100, agent // 4)})
+        # the same folder in two files: the first by name takes it, never both
+        shutil.rmtree(self.m.reserve)
+        os.makedirs(self.m.reserve)
+        a = os.path.join(self.tmp, 'a')
+        self.reserve('a', (4096, a))
+        self.reserve('a2', (4096, a))
+        d = self.facts('--mb', '64', '--fresh')[1]
+        got = [(r['name'], r['useMb'], r['owedMb']) for r in d['reservations']]
+        self.assertEqual(got, [('a', 450, agent * 3 // 4 + job * 3 // 4), ('a2', 0, 0)])
+        self.assertEqual(d['memory']['holdMb'] + sum(r['owedMb'] for r in d['reservations']) + 450, 8192)
+
+    def test_never_looser_than_main_beyond_counting_each_debt_once(self):
+        # main held each reservation's MB less every matching process's use, and counted every debt again on top.
+        # For the same facts the answer here may only be looser by the debts of the pieces working in reserved
+        # folders (now counted once, #923), each piece once; with no piece working in one it is never looser at all
+        a, b = os.path.join(self.tmp, 'a'), os.path.join(self.tmp, 'b')
+        self.reserve('a', (2048, a))
+        self.reserve('b', (2048, b), (1024, b + '/y'))
+        self.m.process(4101, b + '/y', 300)         # not an agent's or a job's: in b/y and (as main saw it) in b
+        self.m.process(4102, a, 200)
+
+        def main_hold(procs):
+            """main's hold: each reservation's MB less every matching process's use."""
+            res = [(2048, a), (2048, b), (1024, b + '/y')]
+            return sum(max(0, mb - sum(rss for cwd, rss in procs if (cwd + '/').startswith(f + '/')))
+                       for mb, f in res)
+        base = [(b + '/y', 300), (a, 200)]
+        d = self.facts('--mb', '64')[1]
+        main_free = d['memory']['freeMb'] + d['memory']['holdMb'] - main_hold(base)
+        self.assertLessEqual(d['memory']['freeMb'], main_free)
+        code, d = self.facts('--mb', str(main_free + 1), '--fresh')
+        self.assertEqual(code, 75, 'main said NOT OK: so does this')
+        # an agent working across a and b/y: looser than main by at most its debt, once
+        self.m.agent('w', 400, pids=(4001, 4002))
+        self.m.process(4001, a + '/src', 300)
+        self.m.process(4002, b + '/y/z', 100)
+        d = self.facts('--mb', '64', '--fresh')[1]
+        procs = base + [(a + '/src', 300), (b + '/y/z', 100)]
+        main_free = d['memory']['freeMb'] + d['memory']['holdMb'] - main_hold(procs)
+        self.assertLessEqual(d['memory']['freeMb'], main_free + self.cost(WRITER) - 400)
+        code, d = self.facts('--mb', str(main_free + self.cost(WRITER) - 400 + 1), '--fresh')
+        self.assertEqual(code, 75)
+
     def test_a_reservation_whose_processes_are_gone_still_holds_it_all(self):
         other = os.path.join(self.tmp, 'other')
         self.m.process(4001, other, 300)
@@ -368,6 +552,10 @@ class Holds(Case):
         self.assertEqual(self.held()[2], {}, 'a hold is never held back from its own users')
         self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
         shutil.rmtree(self.m.root + self.CG)
+        code, d, held = self.held()
+        self.assertEqual((code, d['level'], held), (75, 'elevated', {}), 'other settings: the cached level is not '
+                         'carried over, so it starts "elevated" (#945), never ok straight away')
+        os.unlink(self.m.cache)                     # no cache at all: a first call
         code, d, held = self.held()
         self.assertEqual((code, held), (0, {}), 'no cgroup: nothing runs in it (also a machine without cgroup v2)')
         self.runners(2000, limit=None)              # memory.max cannot be read: the hold's budgetMb
@@ -592,17 +780,130 @@ class State(Case):
         with open(self.m.cache) as f:
             data = json.load(f)
         self.assertEqual(hf.read_cache(self.m.cache, data['atMs'], data['key'])[0]['queue']['agents'], 1)
-        self.assertEqual(hf.read_cache(self.m.cache, data['atMs'], 'another key'), (None, None))
+        self.assertEqual(hf.read_cache(self.m.cache, data['atMs'], 'another key'), (None, hf.no_carry()))
 
     def test_without_a_cache_folder_the_level_never_drops_straight_to_ok(self):
-        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')):
+        tmp_root = os.path.join(self.tmp, 'tmp')
+        os.makedirs(os.path.join(tmp_root, f'heavy-facts-{UID}'), mode=0o700)
+        os.chmod(os.path.join(tmp_root, f'heavy-facts-{UID}'), 0o777)    # planted first, open to others: no cache
+        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')), \
+                mock.patch.object(hf, 'TMP_ROOT', tmp_root):
             for i in range(3):                      # a calm machine, called again and again: every call starts over
                 code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(minutes=i * 10),
                                      env={'HEAVY_FACTS_CACHE': ''})
                 self.assertEqual((code, d['level']), (75, 'elevated'), i)
             code, d = self.facts('--kind', WRITER, env={'HEAVY_FACTS_CACHE': ''})
             self.assertEqual((code, d['level']), (0, 'elevated'), 'the floor still admits')
+            self.assertTrue(any(n.startswith('no cache: ') for n in d['notes']), d['notes'])
         self.assertFalse(os.path.exists(self.m.cache))
+        self.assertEqual(os.listdir(os.path.join(tmp_root, f'heavy-facts-{UID}')), [])
+
+    def test_a_cache_of_another_version_never_skips_the_hold_down(self):
+        # #945: a cache file that is there but cannot be used (once per user after a version change, or while an
+        # old heavy writes it too) carried nothing, so the level went straight to the raw one, past the hold-down.
+        # Now it starts "elevated", as with no cache folder; a missing or old (> 5 min) one carries nothing, as before
+        self.facts('--mb', '64')
+        with open(self.m.cache) as f:
+            good = json.loads(f.read())
+        for name, text in (('old version', json.dumps(dict(good, v=hf.CACHE_VERSION - 1))),
+                           ('other settings', json.dumps(dict(good, key='other'))), ('broken', '{"v": 2')):
+            with self.subTest(cache=name):
+                with open(self.m.cache, 'w') as f:
+                    f.write(text)
+                code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=10))
+                self.assertEqual((code, d['level']), (75, 'elevated'))
+        later = NOW + datetime.timedelta(seconds=10 + RULE['pressure']['elevatedClearSeconds'])
+        self.assertEqual(self.facts('--mb', '64', now=later)[0], 0, 'calm long enough: ok again')
+        os.unlink(self.m.cache)
+        self.assertEqual(self.facts('--mb', '64', now=later)[1]['level'], 'ok', 'no cache file yet: as before')
+        with open(self.m.cache) as f:
+            good = json.loads(f.read())
+        with open(self.m.cache, 'w') as f:
+            f.write(json.dumps(dict(good, atMs=good['atMs'] + 60000)))
+        self.assertEqual(self.facts('--mb', '64', now=later)[1]['level'], 'elevated', 'from the future')
+
+    def test_without_a_temporary_folder_it_can_write_there_is_no_cache(self):
+        # #945: tempfile.gettempdir() ends in the working folder when no temporary folder can be written, so a
+        # read-only sandbox got a heavy-facts-<uid>/ folder in the job's tree. Now: $TMPDIR, else /tmp, else none
+        if os.geteuid() == 0:
+            self.skipTest('root can write every folder')
+        closed = os.path.join(self.tmp, 'closed')
+        os.makedirs(closed)
+        os.chmod(closed, 0o555)
+        self.addCleanup(os.chmod, closed, 0o755)
+        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')), \
+                mock.patch.object(hf, 'TMP_DIRS', (closed,), create=True), mock.patch.object(tempfile, 'tempdir', None), \
+                mock.patch.object(tempfile, '_candidate_tempdir_list', lambda: [closed, os.getcwd()]):
+            code, d = self.facts('--mb', '64', env={'HEAVY_FACTS_CACHE': '', 'TMPDIR': closed})
+        self.assertEqual(os.listdir(self.work), [], 'a cache folder was made in the working folder')
+        self.assertEqual((code, d['level']), (75, 'elevated'))
+        self.assertTrue(any(n.startswith('no cache: no temporary folder') for n in d['notes']), d['notes'])
+
+    def test_without_run_user_the_cache_is_a_private_temporary_folder(self):
+        # #844: a user with no user manager has no /run/user/<uid>; without a cache every call would start
+        # "elevated" and a --mb ask would never be OK. A folder only it can use in the temporary folder keeps it
+        tmp_root = os.path.join(self.tmp, 'tmp')
+        os.makedirs(tmp_root)
+        folder = os.path.join(tmp_root, f'heavy-facts-{UID}')
+        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')), \
+                mock.patch.object(hf, 'TMP_ROOT', tmp_root):
+            code, d = self.facts('--mb', '64', env={'HEAVY_FACTS_CACHE': ''})
+            self.assertEqual((code, d['level']), (0, 'ok'), 'as with /run/user: a calm machine is free')
+            self.m.write('/proc/meminfo', self.m.meminfo(16384, 6000))
+            again = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=4), env={'HEAVY_FACTS_CACHE': ''})
+            self.assertEqual(again[1]['memory'], d['memory'], 'a second call within 5 s is answered from the cache')
+            self.assertEqual(os.lstat(folder).st_mode & 0o777, 0o700)
+            self.assertEqual(len(os.listdir(folder)), 1)
+            self.assertRegex(os.listdir(folder)[0], r'^heavy-facts-v%d-[0-9a-f]{16}\.json$' % hf.CACHE_VERSION)
+            for planted in ('link', 'file', 'open'):     # a folder that is not one only this user can use: no cache
+                with self.subTest(planted=planted):
+                    shutil.rmtree(folder)
+                    if planted == 'link':
+                        os.makedirs(os.path.join(self.tmp, 'elsewhere'), mode=0o700, exist_ok=True)
+                        os.symlink(os.path.join(self.tmp, 'elsewhere'), folder)
+                    elif planted == 'file':
+                        open(folder, 'w').close()
+                    else:
+                        os.mkdir(folder)
+                        os.chmod(folder, 0o755)
+                    code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=30),
+                                         env={'HEAVY_FACTS_CACHE': ''})
+                    self.assertEqual((code, d['level']), (75, 'elevated'))
+                    self.assertTrue(any(n.startswith('no cache: ') for n in d['notes']), d['notes'])
+                    self.assertEqual(os.listdir(os.path.join(self.tmp, 'elsewhere')) if planted == 'link' else [], [])
+                    if planted == 'open':
+                        os.rmdir(folder)
+                    else:
+                        os.unlink(folder)
+                    os.mkdir(folder, 0o700)
+
+    def test_callers_with_other_settings_taking_turns_each_reach_ok(self):
+        # #945: two callers of one user with other settings (here another reservations folder) shared one cache file
+        # and each read the other's as unusable, so every call started "elevated": NOT OK on a calm machine for as
+        # long as they took turns. Now each has its own file: the first call beside another caller's recent file
+        # starts "elevated" (never straight to ok), then each one's own hold-down steps down
+        run = os.path.join(self.tmp, 'run')
+        os.makedirs(os.path.join(run, str(UID)), mode=0o700)
+        other = os.path.join(self.tmp, 'reserve-b.d')
+        os.makedirs(other)
+        callers = ({'HEAVY_FACTS_CACHE': ''}, {'HEAVY_FACTS_CACHE': '', 'T3_CAPACITY_RESERVE_DIR': other})
+        seen = []
+        with mock.patch.object(hf, 'RUN_USER', run):
+            for i in range(12):                     # A and B take turns every 20 s on a calm machine
+                code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=20 * i), env=callers[i % 2])
+                seen.append((code, d['level']))
+        self.assertEqual(seen[:2], [(0, 'ok'), (75, 'elevated')], 'B starts "elevated" beside A\'s fresh file')
+        self.assertEqual(seen[-6:], [(0, 'ok')] * 6, seen)
+        files = sorted(os.listdir(os.path.join(run, str(UID))))
+        self.assertEqual(len(files), 2, files)
+        # a cache file of other settings past the carry window carries nothing and is removed on the next write
+        stale = os.path.join(run, str(UID), 'heavy-facts.json')     # an older kit's
+        open(stale, 'w').close()
+        os.utime(stale, (time.time() - hf.CARRY_SECONDS - 60,) * 2)
+        with mock.patch.object(hf, 'RUN_USER', run):
+            self.facts('--mb', '64', '--fresh', now=NOW + datetime.timedelta(seconds=240), env=callers[0])
+        self.assertFalse(os.path.exists(stale))
+        self.assertEqual(sorted(os.listdir(os.path.join(run, str(UID)))), files)
 
 
 def fake_heavy(tmp, body):
@@ -646,6 +947,23 @@ class T3Capacity(Case):
         code, out, _ = self.cli([T3CAP, '64'], cwd=other)
         self.assertEqual(out.splitlines()[1], 'reservations: game:own')
         self.assertIn('available=12288MB', out.splitlines()[0])
+
+    def test_reserved_and_available_count_each_once(self):
+        # #923: available= already has the reservations' hold taken off; reserved= is only what agents and jobs may
+        # still grow into, so available - reserved counts each once. The agent working in the reserved folder owes
+        # its debt there, so the reservation holds the rest
+        other = os.path.join(self.tmp, 'other')
+        with open(os.path.join(self.m.reserve, 'game.conf'), 'w') as f:
+            f.write(f'1536 {other}/\n')
+        self.m.process(4001, other, 300)
+        self.m.agent('a', 300, pids=(4001,))
+        owed = self.cost(WRITER) - 300
+        code, out, _ = self.cli([T3CAP, '64'])
+        first, second = out.splitlines()[:2]
+        self.assertRegex(first, self.FIRST)
+        self.assertIn(f' reserved={owed}MB ', first)
+        self.assertIn(f'available={12288 - (1536 - 300 - owed)}MB ', first)
+        self.assertEqual(second, f'reservations: game:1536MB(using 300,holding {1536 - 300 - owed},owed {owed})')
 
     def test_available_counts_every_reservation_even_those_trimmed_from_the_answer(self):
         with open(os.path.join(self.m.reserve, 'many.conf'), 'w') as f:
@@ -915,6 +1233,62 @@ class RedCheck(Case):
             mod = self.broken(line, '            pass\n')
             self.assertGreater(self.failing(Holds, name, mod), 0, line)
             self.assertEqual(self.failing(Holds, name, hf), 0, name)
+
+    def test_without_the_923_and_844_fixes_their_tests_fail(self):
+        for line, instead, cls, name in (
+                ("                r['owedMb'] += debts[i] * (kb / total if total else 1 / len(pids))\n",
+                 "                pass\n", Reservations, 'test_an_agent_or_job_working_in_the_folder_is_counted_once'),
+                ("    res = [{'mb': r['mb'], 'useMb': r['useMb'] + r['owedMb']}",
+                 "    res = [{'mb': r['mb'], 'useMb': r['useMb']}", Reservations,
+                 'test_an_agent_or_job_working_in_the_folder_is_counted_once'),
+                ("    tier = 'full' if mine else 'machine' if v2 and os.path.isdir(ROOT + USERS) else 'basic'\n",
+                 "    tier = 'full' if mine else 'basic'\n", Ledger,
+                 'test_no_user_manager_gets_the_machine_wide_answer'),
+                ("    basic = readings['tier'] not in ('full', 'machine')\n",
+                 "    basic = readings['tier'] != 'full'\n", Ledger,
+                 'test_no_user_manager_gets_the_machine_wide_answer'),
+                ("        return None, f'no cache: {folder} is not a folder only this user can use: every call starts "
+                 "\"elevated\"'\n", "        pass\n", State,
+                 'test_without_run_user_the_cache_is_a_private_temporary_folder'),
+                ("    if os.path.isdir(run):\n        return os.path.join(run, cache_name(key)), None\n",
+                 "    return (os.path.join(run, cache_name(key)), None) if os.path.isdir(run) else (None, 'no cache')\n",
+                 State,
+                 'test_without_run_user_the_cache_is_a_private_temporary_folder')):
+            with self.subTest(line=line[:60]):
+                self.assertGreater(self.failing(cls, name, self.broken(line, instead)), 0, line)
+                self.assertEqual(self.failing(cls, name, hf), 0, name)
+
+    def test_without_each_945_fix_its_test_fails(self):
+        for line, instead, cls, name in (
+                # the whole debt to each reservation one of its processes works in (the PR's first version)
+                ("                r['owedMb'] += debts[i] * (kb / total if total else 1 / len(pids))\n",
+                 "                r['owedMb'] += debts[i] * len(pids) / len(pids)\n", Reservations,
+                 'test_two_folders_nested_folders_and_work_across_them_count_each_debt_once'),
+                # every reservation that holds a process's folder (main), not the deepest one
+                ("        r = best(res, uid, cwd) if cwd else None\n        if r:\n            r['useMb'] += kb / 1024\n",
+                 "        for r in [r for r in res if cwd and r['uid'] == uid and under(cwd, r['prefixes'])]:\n"
+                 "            r['useMb'] += kb / 1024\n", Reservations,
+                 'test_two_folders_nested_folders_and_work_across_them_count_each_debt_once'),
+                ("        if d > depth:\n", "        if d >= 0 and found is None:\n", Reservations,
+                 'test_two_folders_nested_folders_and_work_across_them_count_each_debt_once'),
+                ("    if tier == 'machine':\n        # #945", "    if False:\n        # #945", Ledger,
+                 'test_the_machine_tier_sees_every_person_s_reservations'),
+                ("            blind += cannot\n", "            pass\n", Ledger,
+                 'test_the_machine_tier_sees_every_person_s_reservations'),
+                ("        return None, no_carry()\n    age = now_ms", "        return None, None\n    age = now_ms", State,
+                 'test_a_cache_of_another_version_never_skips_the_hold_down'),
+                # one cache file for every setting and version (the round-2 file): callers keep each other elevated
+                ("    return f'heavy-facts-v{CACHE_VERSION}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json'\n",
+                 "    return 'heavy-facts.json'\n", State, 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
+                ("    for old in other_caches(path, recent=False):", "    for old in []:", State,
+                 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
+                ("        return None, (no_carry() if other_caches(path, recent=True) else None)\n",
+                 "        return None, None\n", State, 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
+                ("    root = TMP_ROOT or temp_root()\n", "    root = TMP_ROOT or __import__('tempfile').gettempdir()\n",
+                 State, 'test_without_a_temporary_folder_it_can_write_there_is_no_cache')):
+            with self.subTest(line=line[:60]):
+                self.assertGreater(self.failing(cls, name, self.broken(line, instead)), 0, line)
+                self.assertEqual(self.failing(cls, name, hf), 0, name)
 
     def test_without_each_913_fix_its_hold_test_fails(self):
         for line, instead, name in (

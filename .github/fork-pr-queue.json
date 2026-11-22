@@ -33,6 +33,7 @@
           ".github/fork-owned-paths.txt",
           ".github/fork-pr-queue.json",
           ".github/fork-removed-workflows.txt",
+          ".github/fork-review-kit.json",
           ".github/fork-secret-sweep-gone-tips.txt",
           ".github/fork-tests-upstream.json",
           ".github/fork-upstream.json",

@@ -22,7 +22,8 @@ names are all gone holds the only copy of its content and stays (named in the pl
 What it never takes: links (never followed), other filesystems and mount points (a hard link cannot cross one
 either), other owners' files, credential and lock names, must-keep names, folders with a KEEP file and git folders,
 in or above a configured folder up to `/` (git needs its files as they are), kinds written in place (IN_PLACE:
-databases and their journals, logs, game region files, disk images, mail boxes, partial downloads), files changed in the last `days`, files in use (open, locked, named by a process or a
+databases and their journals, logs, disk images, mail boxes, partial downloads; and the machine file's
+`dedupe.writtenInPlace`), files changed in the last `days`, files in use (open, locked, named by a process or a
 systemd unit), immutable or append-only files, files with more than one name already (linking one of their names
 frees nothing), and files under MIN_BYTES. A file that changes while it is read or compared is kept as it is.
 config.py refuses folders in or holding a must-keep path and folders another rule takes.
@@ -55,12 +56,13 @@ MIN_BYTES = 64 * 1024               # a smaller file frees too little to be wort
 PART = '.cleaner-link'
 PART_NAME = re.compile(r'^\.(.+)\.[0-9a-f]{8}' + re.escape(PART) + '$')
 NAME_MAX = 255
-# Names programs write in place: databases and their journals, logs, append-only records, Minecraft region and
-# chunk files, virtual machine and disk images, swap files, mail boxes, partial downloads a client resumes. Never complete: the README says to name only folders of
+# Names programs write in place: databases and their journals, logs, append-only records, virtual machine and disk
+# images, swap files, mail boxes, partial downloads a client resumes. One program's own kinds (a game's save files)
+# go in the machine file (`dedupe.writtenInPlace`). Never complete: the README says to name only folders of
 # write-once copies.
 IN_PLACE = ('*.db', '*.db-*', '*.db3', '*.sqlite', '*.sqlite3', '*.sqlite-*', '*.sqlite3-*', '*-wal', '*-shm',
             '*-journal', '*.journal', '*.wal', '*.mdb', '*.ldb', '*.ibd', '*.log', '*.log.*', '*.jsonl', '*.ndjson',
-            '*.pid', '*.mca', '*.mcr', '*.mcc', '*.qcow2', '*.img', '*.raw', '*.vmdk', '*.vdi', '*.vhd', '*.vhdx',
+            '*.pid', '*.qcow2', '*.img', '*.raw', '*.vmdk', '*.vdi', '*.vhd', '*.vhdx',
             '*.swp', '*.swap', 'mbox', '*.mbox', '*.part', '*.crdownload', '*.partial', '*.!qb')
 SIDECARS = ('-wal', '-shm', '-journal')
 # chattr flags a person can set (linux/fs.h FS_FL_USER_MODIFIABLE) plus data journalling, no-copy-on-write, verity
@@ -68,6 +70,10 @@ SIDECARS = ('-wal', '-shm', '-journal')
 # other's).
 FS_VERITY_FL, FS_DAX_FL = 0x00100000, 0x02000000
 FLAGS_MASK = 0x000380FF | 0x00004000 | 0x00800000 | FS_VERITY_FL | FS_DAX_FL
+# A machine file older than `dedupe.writtenInPlace`: kinds that an older cleaner refused (and that are not in IN_PLACE
+# any more) may be in the folders, so nothing is linked until the owner names them, or `[]`.
+MISSING_KINDS = ('dedupe.writtenInPlace is missing from the machine file: nothing here is linked until it lists the '
+                 'kinds a program writes in place in these folders, or is [] when there are none')
 WARNING = ('dedupe: names of one file share every later write into any of them (cp onto an existing file, shell >, '
            'downloads, most programs): name only folders of copies written once and then only read')
 
@@ -318,9 +324,9 @@ def _name_refusal(cfg, facts, folder, path, st, names):
         return Refusal('credential name', name)
     if matches(name, LOCK_NAMES):
         return Refusal('lock file', name)
-    if matches(name, IN_PLACE) or any(name + s in names for s in SIDECARS):
-        return Refusal('written in place', 'a kind written in place (a database, journal, log, region file or '
-                                           'disk image): a hard link would share its next write')
+    if matches(name, IN_PLACE + cfg.dedupe_in_place) or any(name + s in names for s in SIDECARS):
+        return Refusal('written in place', 'a kind written in place (a database, journal, log, disk image or a '
+                                           'kind the machine file names): a hard link would share its next write')
     if guard.owner(st) != os.getuid():
         return Refusal('another owner', f'uid {guard.owner(st)}')
     if not st.st_mode & stat.S_IRUSR:
@@ -458,6 +464,10 @@ def _walk(cfg, facts, folder, plan, measure, files, parts, run):
 def plan_dedupe(cfg, facts, plan, measure):
     from .rules import Item, Kept
     if not cfg.dedupe_folders:
+        return
+    if cfg.dedupe_in_place is None:
+        for folder in cfg.dedupe_folders:
+            plan.kept.append(Kept(folder.path, RULE, 'could not read', MISSING_KINDS))
         return
     run = Run(Cache.load(cfg))
     plan.after.append(lambda: run.cache.save(run.seen))
