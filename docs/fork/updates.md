@@ -128,6 +128,15 @@ watches; it changes nothing on the machine, and `0` turns it off.
   (fork-follow lowers a count after a rebase, but never raises one). A pull request may drop a seam
   file's listed seam lines (no more copies than listed) but lose no other line, and may not move a
   seam line: a moved copy of `}` looks the same as upstream's (move one with two pull requests).
+  A seam file with a `lost` entry may get upstream's lines back (#968): a pull request that lowers
+  that entry in its own list (neither count raised) may add one line per `gone` it lowers, and lose
+  one line of main's file per `lines` it lowers beyond those (a line moved or re-indented back). A
+  line put back where upstream has it is in order again, so it lowers both: an entry that lowers
+  `gone` more than `lines` puts a line back out of place (a fork change to upstream's order) and
+  allows nothing. Its run counts the lowered entry from upstream exactly, so a fork line in place of
+  upstream's is refused there. With `lost` left as main's, a line put back or moved back is refused
+  as an unlisted one, and the refusal says to lower the entry (or, when main's entry changed since
+  the branch's merge-base, to update the branch from main).
   A seam's `added` lists only the copies the fork adds: the run from upstream refuses a listed copy
   the fork does not add over upstream (a spare one would let a later change add that line
   unannounced), and right after a rebase that took the line word for word fork-follow drops it in
@@ -195,7 +204,10 @@ watches; it changes nothing on the machine, and `0` turns it off.
 A pull request is judged by main's list, so a change that adds a line to an upstream file and its
 seam entry together is refused. It takes two pull requests, each green:
 
-1. **Announce** (list only, reviewed like any gate change): add the lines under `announced` in the
+1. **Announce** (list only, reviewed like any gate change: the `gate` rule of
+   [`.github/fork-pr-queue.json`](../../.github/fork-pr-queue.json) lists `.github/fork-seams.json`,
+   so a change to the list needs the merge-path and state lenses, and the code lens too when it
+   also changes a file that no `gate` path matches): add the lines under `announced` in the
    file's entry, with the day: `{"since": "YYYY-MM-DD", "added": [lines]}`. Set `since` to the day
    this pull request merges (refresh it if the reviews took days): its run warns when the
    announcement it adds would be refused within 3 days. A file with no entry yet gets one with

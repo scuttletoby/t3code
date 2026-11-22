@@ -4281,3 +4281,271 @@ test("a change that drops another change's in-date announcement is refused, unle
     assert.doesNotMatch(result.stderr, /drops the announced line/);
   });
 });
+
+// A seam file with a "lost" entry may get upstream's lines back. Each line the pull
+// request's own "lost" lowers allows one put-back line, and the run from upstream holds that entry
+// to the head's lost lines exactly, so a fork line added in its place is refused there.
+test('a pull request that lowers a seam file\'s "lost" entry may put those upstream lines back', () => {
+  withRepo(({ git, commit, run, fromUpstream, publish }) => {
+    const UPSTREAM_P = "a();\nb(x);\nc();\nif (y) {\n  d();\n}\n";
+    const upstream = commit({ "p.ts": UPSTREAM_P }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    const entry = (...added) => ({ "p.ts": { why: "w", added } });
+    const list = (added, lost) => ({ files: entry(...added), pending: {}, lost });
+    // The fork changed b(x) (1 line gone) and re-indented d() (moved, its text kept).
+    const main = commit(
+      {
+        ...seams(list(["b(x, fork);", "forkHook();"], { "p.ts": { lines: 2, gone: 1 } })),
+        "p.ts": "a();\nb(x, fork);\nc();\nif (y) {\n    d();\n}\nforkHook();\n",
+      },
+      "main",
+    );
+    publish(upstream);
+    assert.equal(fromUpstream(upstream, main).status, 0);
+    const pr = (name, own, text) => {
+      git("checkout", "-q", "-f", "-B", name, main);
+      return commit({ ...seams(own), "p.ts": text }, name);
+    };
+    const passes = (head) => {
+      for (const args of [
+        [main, head],
+        ["--no-upstream", main, head],
+      ]) {
+        const result = run(...args);
+        assert.equal(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
+      }
+      assert.equal(fromUpstream(upstream, head).status, 0);
+    };
+    // Both lines back, "lost" dropped; only b(x) back, "lost" lowered to the re-indented line.
+    passes(pr("both", list(["forkHook();"], {}), `${UPSTREAM_P}forkHook();\n`));
+    passes(
+      pr(
+        "gone",
+        list(["forkHook();"], { "p.ts": { lines: 1, gone: 0 } }),
+        "a();\nb(x);\nc();\nif (y) {\n    d();\n}\nforkHook();\n",
+      ),
+    );
+    // Half-way: the lines are back but "lost" is main's. Refused as before, naming the way out.
+    const halfway = run(
+      main,
+      pr(
+        "halfway",
+        list(["forkHook();"], { "p.ts": { lines: 2, gone: 1 } }),
+        `${UPSTREAM_P}forkHook();\n`,
+      ),
+    );
+    assert.equal(halfway.status, 1);
+    assert.match(
+      halfway.stderr,
+      /- p\.ts: adds `b\(x\);` \(if it puts back an upstream line counted in "lost", lower that entry in this change's \.github\/fork-seams\.json\)/,
+    );
+    assert.match(
+      halfway.stderr,
+      /- p\.ts: 1 upstream line deleted, moved or re-indented by this change/,
+    );
+    // "lost" lowered, but a fork line in place of upstream's: main's tree cannot tell, upstream can.
+    const swap = run(
+      main,
+      pr(
+        "swap",
+        list(["forkHook();"], {}),
+        "a();\nforkZ();\nc();\nif (y) {\n  d();\n}\nforkHook();\n",
+      ),
+    );
+    assert.equal(swap.status, 1, swap.stdout);
+    assert.match(
+      swap.stderr,
+      /"added" lists `forkZ\(\);` not at all, but the fork adds it over upstream/,
+    );
+    assert.match(
+      swap.stderr,
+      /- p\.ts: dropped from "lost" .*\(no entry\), but the fork loses 1 upstream line over upstream \([0-9a-f]{12}\) .*1 of them gone/,
+    );
+    // A line put back in place lowers both counts: no room to move a line too (a moved seam line
+    // looks like upstream's, so upstream's count would not see it).
+    const moved = run(
+      main,
+      pr(
+        "moved",
+        list(["forkHook();"], { "p.ts": { lines: 1, gone: 0 } }),
+        "forkHook();\na();\nb(x);\nc();\nif (y) {\n    d();\n}\n",
+      ),
+    );
+    assert.equal(moved.status, 1, moved.stdout);
+    assert.match(
+      moved.stderr,
+      /- p\.ts: 1 upstream line deleted, moved or re-indented by this change/,
+    );
+    // Raising one count while lowering the other allows nothing.
+    const raised = run(
+      main,
+      pr(
+        "raised",
+        list(["forkHook();"], { "p.ts": { lines: 3, gone: 0 } }),
+        "a();\nb(x);\nc();\nif (y) {\n    d();\n}\nforkHook();\n",
+      ),
+    );
+    assert.equal(raised.status, 1);
+    assert.match(raised.stderr, /- p\.ts: adds `b\(x\);`/);
+  });
+});
+
+// A line put back where upstream has it is in order again, so it lowers "lost" `lines` with `gone`.
+// One put back elsewhere lowers `gone` alone: a fork change to the order of upstream's lines, which
+// the count from upstream (exact either way) cannot see, so the pull request's run refuses it.
+test('a line put back out of place is refused, though "lost" is lowered to its exact count', () => {
+  withRepo(({ git, commit, run, fromUpstream, publish }) => {
+    const UPSTREAM_Q = "lock();\nwork();\nunlock();\n";
+    const upstream = commit({ "q.ts": UPSTREAM_Q }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    const list = (lost) => ({ files: { "q.ts": { why: "w", added: [] } }, pending: {}, lost });
+    // The fork dropped unlock(): 1 line not in order, its text gone.
+    const main = commit(
+      { ...seams(list({ "q.ts": { lines: 1, gone: 1 } })), "q.ts": "lock();\nwork();\n" },
+      "main",
+    );
+    publish(upstream);
+    assert.equal(fromUpstream(upstream, main).status, 0);
+    const pr = (name, own, text) => {
+      git("checkout", "-q", "-f", "-B", name, main);
+      return commit({ ...seams(own), "q.ts": text }, name);
+    };
+    const runs = (head) => [run(main, head), run("--no-upstream", main, head)];
+    // In place: "lost" dropped, all three runs pass.
+    const inPlace = pr("in-place", list({}), UPSTREAM_Q);
+    for (const result of runs(inPlace)) assert.equal(result.status, 0, result.stderr);
+    assert.equal(fromUpstream(upstream, inPlace).status, 0);
+    // Out of place: {"lines": 1, "gone": 0} is the head's exact count (fork-follow passes it), but
+    // unlock() now runs before work().
+    const outOfPlace = pr(
+      "out-of-place",
+      list({ "q.ts": { lines: 1, gone: 0 } }),
+      "lock();\nunlock();\nwork();\n",
+    );
+    assert.equal(fromUpstream(upstream, outOfPlace).status, 0);
+    for (const result of runs(outOfPlace)) {
+      assert.equal(result.status, 1, result.stdout);
+      assert.match(
+        result.stderr,
+        /- q\.ts: adds `unlock\(\);` \(this change's \.github\/fork-seams\.json lowers its "lost" gone by 1 but lines by only 0: put each upstream line back where upstream has it, in order, which lowers both\)/,
+      );
+    }
+  });
+});
+
+// Only an own "lost" entry the pull request edits from its merge-base's list is counted from
+// upstream, so only that one allows lines back: an entry left as the merge-base's, below main's
+// newer one, is not checked by anyone and allows nothing.
+test("an own \"lost\" entry left as the merge-base's allows no line back, though main's is higher", () => {
+  withRepo(({ git, commit, run, fromUpstream, publish }) => {
+    const upstream = commit({ "p.ts": "a();\nb();\nc();\n" }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    const list = (lost) => ({
+      files: { "p.ts": { why: "w", added: ["b(fork);"] } },
+      pending: {},
+      lost,
+    });
+    const before = commit(
+      { ...seams(list({ "p.ts": { lines: 1, gone: 1 } })), "p.ts": "a();\nb(fork);\nc();\n" },
+      "fork changes b",
+    );
+    // Main drops c() after the branch's merge-base: its entry rises to {2, 2}.
+    const main = commit(
+      { ...seams(list({ "p.ts": { lines: 2, gone: 2 } })), "p.ts": "a();\nb(fork);\n" },
+      "main",
+    );
+    publish(upstream);
+    assert.equal(fromUpstream(upstream, main).status, 0);
+    // The branch keeps its merge-base's list ({1, 1}, below main's) and adds only a fork line.
+    git("checkout", "-q", "-f", "-B", "unedited", before);
+    const head = commit({ "p.ts": "a();\nb(fork);\nc();\nforkZ();\n" }, "unedited");
+    for (const args of [
+      [main, head],
+      ["--no-upstream", main, head],
+    ]) {
+      const result = run(...args);
+      assert.equal(result.status, 1, `${args.join(" ")}: ${result.stdout}`);
+      assert.match(
+        result.stderr,
+        /- p\.ts: adds `forkZ\(\);` \(if it puts back an upstream line counted in "lost", lower that entry in this change's \.github\/fork-seams\.json\) \(this branch's merge-base has another "lost" entry for it than main: update the branch from main, whose list changed since\)/,
+      );
+    }
+  });
+});
+
+// Main lowered a "lost" entry since the branch's merge-base (another change put a line back): the
+// branch's own entry, counted from its merge-base's, gets no room or no longer matches its head over
+// upstream. Both refusals name the way out: update the branch from main.
+test('a "lost" entry main changed since the merge-base names updating the branch', () => {
+  withRepo(({ git, commit, run, publish }) => {
+    const upstream = commit({ "p.ts": "a();\nb();\nc();\nd();\n" }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    const list = (lost) => ({
+      files: { "p.ts": { why: "w", added: ["b(fork);"] } },
+      pending: {},
+      lost,
+    });
+    const before = commit(
+      { ...seams(list({ "p.ts": { lines: 3, gone: 3 } })), "p.ts": "a();\nb(fork);\n" },
+      "fork changes b, drops c and d",
+    );
+    const main = commit(
+      { ...seams(list({ "p.ts": { lines: 2, gone: 2 } })), "p.ts": "a();\nb(fork);\nc();\n" },
+      "main puts c back",
+    );
+    publish(upstream);
+    const update =
+      / \(this branch's merge-base has another "lost" entry for it than main: update the branch from main, whose list changed since\)/;
+    const pr = (name, lost) => {
+      git("checkout", "-q", "-f", "-B", name, before);
+      return commit({ ...seams(list(lost)), "p.ts": "a();\nb(fork);\nd();\n" }, name);
+    };
+    // The branch puts d() back and lowers its merge-base's {3, 3} to main's {2, 2}: no room.
+    const same = run(main, pr("as-main", { "p.ts": { lines: 2, gone: 2 } }));
+    assert.equal(same.status, 1, same.stdout);
+    assert.match(
+      same.stderr,
+      new RegExp(
+        `- p\\.ts: adds \`d\\(\\);\` \\(if it puts back an upstream line counted in "lost", lower that entry in this change's \\.github/fork-seams\\.json\\)${update.source}`,
+      ),
+    );
+    // It lowers main's {2, 2} by one: room for d(), but its head loses 2 over upstream (c() too).
+    const lowered = run(main, pr("below-main", { "p.ts": { lines: 1, gone: 1 } }));
+    assert.equal(lowered.status, 1, lowered.stdout);
+    assert.doesNotMatch(lowered.stderr, /adds `d\(\);`/);
+    assert.match(
+      lowered.stderr,
+      new RegExp(
+        `- p\\.ts: set in "lost" .*set it to \\{"lines": 2, "gone": 2\\} \\(a count above the lines lost is room to swap one for a fork line later\\)${update.source}`,
+      ),
+    );
+  });
+});
+
+// A line moved or re-indented back with "lost" left as main's is refused, naming the way out.
+test('a line re-indented back with "lost" left as main\'s is refused, naming the entry to lower', () => {
+  withRepo(({ git, commit, run, fromUpstream, publish }) => {
+    const UPSTREAM_R = "if (y) {\n  d();\n}\n";
+    const upstream = commit({ "r.ts": UPSTREAM_R }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    const list = (lost) => ({ files: { "r.ts": { why: "w", added: [] } }, pending: {}, lost });
+    const main = commit(
+      { ...seams(list({ "r.ts": { lines: 1, gone: 0 } })), "r.ts": "if (y) {\n    d();\n}\n" },
+      "main",
+    );
+    publish(upstream);
+    assert.equal(fromUpstream(upstream, main).status, 0);
+    const pr = (name, own) => {
+      git("checkout", "-q", "-f", "-B", name, main);
+      return commit({ ...seams(own), "r.ts": UPSTREAM_R }, name);
+    };
+    const kept = run(main, pr("kept", list({ "r.ts": { lines: 1, gone: 0 } })));
+    assert.equal(kept.status, 1, kept.stdout);
+    assert.match(
+      kept.stderr,
+      /- r\.ts: 1 upstream line deleted, moved or re-indented by this change \(.*\) \(if it moves or re-indents back an upstream line counted in "lost", lower that entry in this change's \.github\/fork-seams\.json\)\./,
+    );
+    const dropped = run(main, pr("dropped", list({})));
+    assert.equal(dropped.status, 0, dropped.stderr);
+  });
+});
