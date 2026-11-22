@@ -100,8 +100,9 @@ state: an old config without the new key is read with the default
 findings: none
 ```
 
-A quick check of a nit-only fix (SKILL.md, "Order", step 7). The `nit-only:` line is for the orchestrator; the gate
-reads the report as any other, and counts it as a round (a read of a new head).
+A quick check of a nit-only fix (SKILL.md, "Order", step 7). The `nit-only:` line is for the orchestrator: on `yes` it
+still posts the override for the fix head, because the other lenses still name the old head. The gate reads the report
+as any other, and counts it as a round (a read of a new head).
 
 The gate reads: `lens quick-check, read, clean, state`
 

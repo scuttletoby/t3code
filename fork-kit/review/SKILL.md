@@ -79,22 +79,29 @@ Each step is done by another agent than the author.
 7. **Rounds:** at most `lens_rounds` (default **2**): round 1 lenses, one fix round, round 2 lenses on the fix (only
    those whose area the fix touches, and every lens that reported a blocker or major: the gate holds the head until
    that lens reads a fixed head). Stop early when a round finds no blocker and no major.
-   - **How the gate counts rounds:** every lens comment that reads a different change of the pull request is one more
-     round (a head that only merges the base in is the same change; a `r3` marker in a lens name counts too). From
-     round `rounds.approach_at` of the review block (3 in review.recommended.json; `plan` prints the project's) the
-     gate requires one more lens, `rounds.approach_lens`, on the same head as the others; past `rounds.max` it fails
-     the head (in `enforce`; `shadow` only reports both).
+   - **How the gate counts rounds:** the round is the number of different changes of the pull request the lenses read
+     (a head that only merges the base in is the same change) or the highest `r2`, `r3` marker in a lens name,
+     whichever is higher. From round `rounds.approach_at` of the review block (3 in review.recommended.json; `plan`
+     prints the project's) the gate requires one more lens, `rounds.approach_lens`, on the same head as the others;
+     past `rounds.max` it fails the head (in `enforce`; `shadow` only reports both).
+   - **Which head passes:** the gate passes a head only when every lens's newest read names that head, or an override
+     comment newer than a lens's read covers it (`<override prefix> <full sha>: <what was read, why no lens>`,
+     COMMENTS.md; it counts only from the account with the queue config's `override.author_association`). So after a
+     fix the lenses of the last round still name the old head, and the fix head passes only when every lens reads it
+     again (a new round) or the orchestrator posts the override for it (no new round).
    - **Nit-only fix:** a fix diff that touches only tests, docs, comments, message text or names (judged by the diff,
-     not by the findings' severity) may get one quick check: one lens on the fix head whose comment has a line
-     `nit-only: yes` or `nit-only: no`. On `no` the fix goes to the next round. The quick check is a lens read of a
-     new head, so **the gate counts it as a round**. When that round reaches `rounds.approach_at`, run the approach
-     lens too: one more independent read-only agent with the prompt file the review block names for that lens, on
-     the same head, posting its own report under that lens name; or skip the quick check and use the override below,
-     which adds no round.
-   - The rest the orchestrator checks itself from the fix diff and the lenses' proof tests, then posts the override
-     comment (`<override prefix> <full sha>: <what was read, why no lens>`, COMMENTS.md). An override covers lens
-     reads; it clears a blocker or major, and waives a required approach lens, only when its author is in the review
-     block's `override_authors` (empty by default). An orchestrator's override never replaces the approach lens.
+     not by the findings' severity) needs no new lens round: the orchestrator checks the fix diff and the lenses' proof
+     tests itself and posts the override for the fix head. Before that it may ask for one quick check: one lens on the
+     fix head whose comment has a line `nit-only: yes` or `nit-only: no`. The quick check only adds an independent
+     read; **it does not replace the override**: it is one lens on a new head while the other lenses still name the
+     old one. It is a lens read of a new head, so **the gate counts it as a round**. On `nit-only: yes` the
+     orchestrator still posts the override for the fix head; on `no` the fix goes to the next round. When the quick
+     check's round reaches `rounds.approach_at`, run the approach lens too: one more independent read-only agent with
+     the prompt file the review block names for that lens, on the same head, posting its own report under that lens
+     name. The override alone, with no quick check, adds no round.
+   - An override covers lens reads; it clears a blocker or major, and waives a required approach lens, only when its
+     author is in the review block's `override_authors` (empty by default). An orchestrator's override never replaces
+     the approach lens.
    - A note between rounds that is no lens report starts with `not a lens:` (COMMENTS.md).
    - **No round past the limit.** A pull request still stuck (a blocker or major left) gets one audit by the
      `audit_runner` ("good enough to merge, or what next"), posted as a `not a lens:` comment; then a person decides.

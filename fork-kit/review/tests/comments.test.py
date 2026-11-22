@@ -16,6 +16,7 @@ DOC = os.path.join(KIT, 'COMMENTS.md')
 sys.path.insert(0, os.path.join(KIT, 'lib'))
 import review_kit  # noqa: E402
 import review_config  # noqa: E402  (the gate's, on the path review_kit set)
+import review_glob  # noqa: E402  (the gate's too)
 review_judge = review_kit.review_judge
 
 SHA = '0123456789abcdef0123456789abcdef01234567'
@@ -252,6 +253,30 @@ def recommended():
         return review_config.parse_review(json.load(f))
 
 
+PROTECTED_PROBES = ('.github/actions/x/action.yml', '.github/CODEOWNERS', '.github/dependabot.yml',
+                    '.github/pr-queue.example.json', '.github/scripts/x.cjs', '.github/workflows', '.github/workflow/x.yml',
+                    'github/workflows/x.yml', 'x/.github/workflows/ci.yml', '.gitattributes', '.gitignore', 'package.json',
+                    'Dockerfile', 'Makefile', 'scripts/release.sh', 'docs/review.md', 'fork-ci/actions/pr-queue/lens.py',
+                    'fork-kit/review/SKILL.md', 'fork-kit/review/eval/lens.md', 'review/x.md', 'lenses/new.md')
+
+
+def repo_paths():
+    """Every file git tracks in this repository (none when git cannot say, and the probes still run)."""
+    try:
+        out = subprocess.run(['git', '-C', REPO, 'ls-files', '-z'], capture_output=True, check=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [p for p in out.decode('utf-8', 'replace').split('\0') if p]
+
+
+def lens_pr(*posts):
+    """A pull request whose comments are `posts` ((body), oldest first) as the gate reads them: written by the owner,
+    never edited, not hidden."""
+    return {'comments': [{'body': body, 'createdAt': f'2026-01-01T00:00:{i:02d}Z', 'authorAssociation': 'OWNER',
+                          'includesCreatedEdit': False, 'author': {'login': 'someone'}}
+                         for i, body in enumerate(posts)]}
+
+
 def templates(text):
     """Every fenced block whose first line is a lens header with a `<placeholder>`: the report shapes the docs tell a
     lens to write (the checked examples of COMMENTS.md hold real shas, so they are not templates)."""
@@ -351,6 +376,15 @@ class SkillFormat(unittest.TestCase):
         self.assertEqual(review_judge.protected_paths(rv, cfg), {cfg, *(x.prompt for x in rv.lenses)})
         used = set(re.findall(r'\b[A-Z][A-Z_]{2,}\b', inspect.getsource(review_judge.is_protected)))
         self.assertEqual(used, {'WORKFLOWS'}, 'is_protected reads another list: name it in SKILL.md, "Always critical"')
+        # The gate's answer, not its source: on every file of this repository and on probe paths next to the listed
+        # ones, is_protected says exactly what the skill's list says. A new rule of any form (a constant, an inline
+        # prefix, a suffix) that makes one more path protected fails here until the skill names it.
+        exact = review_judge.protected_paths(rv, cfg)
+        skill_says = lambda p: p in exact or review_glob.matches(review_judge.WORKFLOWS, p)  # noqa: E731
+        for path in sorted(set(repo_paths()) | set(PROTECTED_PROBES) | exact):
+            with self.subTest(probe=path):
+                self.assertEqual(review_judge.is_protected(path, exact), skill_says(path),
+                                 'is_protected and SKILL.md "Always critical" disagree on this path')
         skill = ' '.join(kit_text('SKILL.md').split())
         line = re.search(r'\*\*Always critical\*\*.*?\.(?= |$)', skill)   # to the sentence's end
         self.assertTrue(line, 'SKILL.md no longer lists the always-critical paths')
@@ -389,6 +423,58 @@ class SkillFormat(unittest.TestCase):
         after = review_judge.judge_rounds(rv, history, {})
         self.assertEqual((after.round, after.approach), (n, True))
         self.assertFalse(review_judge.judge_rounds(rv, history, {}, decided=True).approach)
+
+    def test_the_skill_says_what_passes_a_fix_head_after_a_quick_check(self):
+        """The gate passes a head only when every lens's newest read names it, or a newer override covers them
+        (lens.Review.reviewed_head). The history: round 1 `code` at A, round 2 `code r2` at B, then a nit-only fix C
+        with a quick check: the quick check alone holds C, the override for C passes it, and the override alone adds
+        no round. The skill must say so: the quick check never replaces the override."""
+        rv = recommended()
+        a, b, c = (f'{n:040x}' for n in (0xa, 0xb, 0xc))
+        prefix = 'tool ready --head'
+        review = review_kit.reader(prefix)
+
+        def report(name, sha):
+            return f'lens: {name} · reviewer: a · read at: {sha}\nstate: nothing is stored\nblocker: none\nmajor: none\n'
+
+        override = f'{prefix} {c}: read the fix diff and its tests'
+        approach = rv.rounds.approach_lens
+        rounds = [report('code', a), report('code r2', b)]
+        cases = (
+            ('quick check alone', rounds + [report('quick-check', c)], None),
+            ('quick check and the approach lens', rounds + [report('quick-check', c), report(approach, c)], None),
+            ('quick check, approach lens, override', rounds + [report('quick-check', c), report(approach, c), override],
+             c),
+            ('override alone', rounds + [override], c),
+        )
+        for name, posts, passes in cases:
+            with self.subTest(history=name):
+                reviewed, sha, why = review.reviewed_head(lens_pr(*posts))
+                self.assertTrue(reviewed)
+                self.assertEqual(sha, passes, why)
+        with_quick = review_judge.judge_rounds(rv, [('code', a), ('code r2', b), ('quick-check', c)], {})
+        self.assertEqual((with_quick.round, with_quick.approach), (3, rv.rounds.approach_at <= 3))
+        alone = review_judge.judge_rounds(rv, [('code', a), ('code r2', b)], {})
+        self.assertEqual((alone.round, alone.approach), (2, rv.rounds.approach_at <= 2))
+        skill = ' '.join(kit_text('SKILL.md').split())
+        for words in ('the gate passes a head only when every lens\'s newest read names that head, or an override',
+                      'the fix head passes only when every lens reads it again (a new round) or the orchestrator posts '
+                      'the override for it (no new round)',
+                      '**it does not replace the override**',
+                      'On `nit-only: yes` the orchestrator still posts the override for the fix head',
+                      'The override alone, with no quick check, adds no round'):
+            with self.subTest(says=words):
+                self.assertIn(words, skill)
+        self.assertNotIn('skip the quick check', skill)
+        comments = ' '.join(kit_text('COMMENTS.md').split())
+        self.assertIn('on `yes` it still posts the override for the fix head', comments)
+
+    def test_the_skill_says_whichever_is_higher(self):
+        """review_round takes the higher of the change count and the round marker, never the sum."""
+        self.assertEqual(review_judge.review_round([('code', 'a' * 40), ('code r3', 'a' * 40)]), 3)
+        self.assertEqual(review_judge.review_round([('code', 'a' * 40), ('code', 'b' * 40), ('code r2', 'c' * 40)]), 3)
+        skill = ' '.join(kit_text('SKILL.md').split())
+        self.assertIn('the highest `r2`, `r3` marker in a lens name, whichever is higher', skill)
 
 
 class RedCheck(unittest.TestCase):
