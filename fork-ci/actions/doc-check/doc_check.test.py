@@ -1,5 +1,6 @@
 """doc_check.py: budgets, history, links and dated reports, on real git repositories; config missing, empty, broken
-or loosened by the change itself; and the fork's own general agent rules page (docs/fork/agent-rules.md) passes.
+or loosened by the change itself; docs removed while still linked; symlinks, bytes that are not UTF-8 and CRLF; and
+the fork's own general agent rules page (docs/fork/agent-rules.md) passes.
 Run: python3 fork-ci/actions/doc-check/doc_check.test.py
 """
 import contextlib, importlib.util, io, json, os, re, subprocess, sys, tempfile, unittest
@@ -241,14 +242,92 @@ class Links(Repo):
         self.assertNotIn('vendor/x.md', out)
         self.assertIn('rules from .github/doc-check.json', out)
 
-    def test_not_utf8_warns_and_rerun_is_identical(self):
+    def test_link_in_inline_code_or_with_a_query_and_a_fence_in_a_list_item(self):
+        text = ('Write `[x](nowhere.md)` or ``[y](`gone`.md)``; see [b](b.md?plain=1#L3).\n\n'
+                '- a step:\n\n    ```md\n    [z](missing.md)\n    ```\n\n[real](missing.md)\n')
+        base = self.branch({'docs/a.md': text, 'docs/b.md': 'b\n'})
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  docs/a.md:9: broken link missing.md', out)
+        self.assertIn('1 problem(s)', out)   # not the inline code, the query or the fenced one
+
+
+class Removed(Repo):
+    """#908: a change that deletes or renames a doc another file links to fails, though it did not touch that file."""
+
+    def test_renamed_or_deleted_doc_still_linked_from_an_untouched_file(self):
+        self.commit({'docs/a.md': 'See [b](b.md) and [guide](guide/).\n', 'docs/b.md': 'b\n',
+                     'docs/guide/one.md': '1\n', 'docs/c.md': '[ok](a.md)\n'})
+        self.git('checkout', '-q', '-b', 'change')
+        self.git('mv', 'docs/b.md', 'docs/b2.md')
+        self.git('rm', '-q', 'docs/guide/one.md')
+        self.git('commit', '-q', '-m', 'rename and delete')
+        code, out = self.run_check('--base', 'main')
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  docs/a.md:1: broken link b.md: this change removed docs/b.md', out)
+        self.assertIn('DOC  docs/a.md:1: broken link guide/: this change removed docs/guide', out)
+        self.assertIn('2 problem(s)', out)
+
+    def test_an_old_broken_link_in_an_untouched_file_is_not_this_change(self):
+        self.commit({'docs/old.md': '[gone](never.md)\n', 'docs/b.md': 'b\n'})
+        base = self.branch({'docs/b.md': None})
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 0, out)
+
+
+class FailClosed(Repo):
+    """#908: what used to pass unchecked now fails: a symlink to a large file, a byte that is not UTF-8, CRLF size."""
+
+    def test_agents_md_turned_into_a_symlink_to_a_large_file_is_checked_as_that_file(self):
+        self.commit({'AGENTS.md': 'short\n', 'docs/big.md': lines(200)})
+        self.git('checkout', '-q', '-b', 'change')
+        os.remove('AGENTS.md')
+        os.symlink('docs/big.md', 'AGENTS.md')
+        self.commit({})
+        code, out = self.run_check('--base', 'main')
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  AGENTS.md: 200 lines / 2200 B, budget 150 lines', out)
+
+    def test_a_symlink_out_of_the_repository_or_to_no_file_fails(self):
+        with open(os.path.join(self.tmp.name, 'outside.md'), 'w') as f:
+            f.write('x\n')
+        self.git('checkout', '-q', '-b', 'change')
+        os.symlink('../outside.md', 'AGENTS.md')
+        os.symlink('missing.md', 'CLAUDE.md')
+        self.commit({})
+        code, out = self.run_check('--base', 'main')
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  AGENTS.md: a symlink that points outside the repository', out)
+        self.assertIn('DOC  CLAUDE.md: a symlink that points to no file', out)
+
+    def test_a_byte_that_is_not_utf8_fails_and_the_size_is_still_checked(self):
         base = self.branch({'a.md': 'ok\n'})
-        with open(os.path.join(self.root, 'a.md'), 'wb') as f:
-            f.write(b'\xff\xfe bad\n')
+        with open('AGENTS.md', 'wb') as f:
+            f.write(b'\xff\n' + lines(200).encode())
+        with open('a.md', 'wb') as f:
+            f.write(b'\xfe bad\n')
+        self.commit({})
         first = self.run_check('--base', base)
-        self.assertEqual(first[0], 0, first[1])
-        self.assertIn('WARN a.md: cannot read it', first[1])
-        self.assertEqual(first, self.run_check('--base', base))
+        self.assertEqual(first[0], 1, first[1])
+        self.assertIn('DOC  AGENTS.md: not UTF-8 text (byte 0)', first[1])
+        self.assertIn('DOC  AGENTS.md: 201 lines / 2202 B', first[1])
+        self.assertIn('DOC  a.md: not UTF-8 text', first[1])
+        self.assertEqual(first, self.run_check('--base', base))   # a re-run gives the same output
+
+    def test_crlf_is_measured_as_its_bytes_on_disk(self):
+        base = self.branch({})
+        with open('AGENTS.md', 'wb') as f:
+            f.write(b''.join(b'x' * 118 + b'\r\n' for _ in range(100)))   # 12000 B on disk; 11900 read as LF
+        self.commit({})
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 0, out)
+        self.assertIn('WARN AGENTS.md: 100 lines / 12000 B = 100%', out)
+        with open('AGENTS.md', 'ab') as f:
+            f.write(b'x\r\n')
+        self.commit({})
+        code, out = self.run_check('--base', base)
+        self.assertEqual(code, 1, out)
+        self.assertIn('DOC  AGENTS.md: 101 lines / 12003 B, budget 150 lines / 12000 B', out)
 
 
 class AgentRulesPage(unittest.TestCase):

@@ -7,8 +7,11 @@ action fails a pull request that:
 - puts an instruction file over its **size budget** (lines or bytes; above `warn_at` of a budget it only warns, and
   says when this change moved the file past it);
 - writes **history** into an instruction file (a changelog block, an "is live on" claim, a dated "Updated" banner);
-- has a **broken relative link** in a Markdown file it adds or changes (code fences skipped; `/x` is from the
-  repository root, as GitHub reads it; a link that leaves the repository is broken);
+- has a **broken relative link** in a Markdown file it adds or changes (code fences and inline code skipped; `/x` is
+  from the repository root, as GitHub reads it; a link that leaves the repository is broken), or deletes or renames a
+  file that another Markdown file still links to;
+- has a checked file that is **not UTF-8** or cannot be read, or is a **symlink** out of the repository or to no
+  file (a symlink is checked as the file it points to; sizes are the bytes on disk, CRLF included);
 - **adds** a file whose name looks like a dated report, handoff or review (those go in the pull request or an issue).
 
 The general rules this enforces, and the rest of the agent rules, are in
@@ -76,11 +79,12 @@ comments. An unknown key, a value of the wrong type or a pattern that is not a r
 - `links`: `false` turns link checks off.
 
 The config is read at the base commit, never from the checkout, so a pull request cannot loosen the rules that judge
-it: a change to the config applies from the next pull request. `mode: all` and `--files` read it from the checkout.
+it through the config: a change to the config applies from the next pull request. `mode: all` and `--files` read it
+from the checkout. The workflow that calls this action is not covered by that: GitHub runs a pull request's own
+workflow file, so a change that edits the step or removes it is stopped only by review of `.github/workflows/`.
 
 ## Not covered
 
-- A deleted or renamed file breaks the links that point to it from files the change did not touch; `mode: all`
+- Anchors (`#section`) and queries (`?plain=1`) are not checked, and neither are backticked paths in the text.
+- A broken link that was already on the base in a file the change does not touch is not this change's: `mode: all`
   finds those.
-- Anchors (`#section`) are not checked, and neither are backticked paths in the text.
-- A symlinked Markdown file is listed as a warning and not checked.

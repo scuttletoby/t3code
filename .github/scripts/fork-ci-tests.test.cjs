@@ -269,6 +269,49 @@ test("the list ignores comments and blank lines and reads `run by` and weights",
     "a.test.py Unittest",
   ])
     assert.throws(() => readList(`${bad}\n`), /cannot read/, bad);
+  assert.throws(
+    () => readList("a.test.py unittest ~12s\n"),
+    /"; a Python test's line then ends in its format: "unittest" or "ok lines"\)$/,
+  );
+  // One line per test: a second line for a file is refused, whatever it says (#789).
+  for (const twice of [
+    "a.test.sh\nb.test.sh\na.test.sh\n",
+    "a.test.py unittest\na.test.py ok lines\n",
+    "a.test.py ~40s unittest\na.test.py run by c.yml unittest\n",
+  ])
+    assert.throws(
+      () => readList(twice),
+      /"a\.test\.(sh|py)" is listed twice \(one line per test\)/,
+      twice,
+    );
+});
+
+// A Python test the runner never runs (upstream's, which a plain step runs) leaves no record, so the runner never reads
+// its format word: its word is checked here against its source instead (#789).
+test("a listed Python test the runner does not judge says the format its source has", () => {
+  const root = path.resolve(__dirname, "../..");
+  const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
+  const entries = readList(read(".github/fork-ci-tests.txt"));
+  const present = entries.map((e) => e.file).filter((file) => fs.existsSync(path.join(root, file)));
+  const keys = expectedKeys(entries, present, read);
+  const unjudged = entries.filter(
+    (e) =>
+      e.format &&
+      present.includes(e.file) &&
+      !keys.some((key) => key === e.file || key.startsWith(`${e.file} --run`)),
+  );
+  assert.ok(unjudged.some((e) => e.file === ".github/scripts/stage-preview-bundle.test.py"));
+  for (const { file, format } of unjudged) {
+    const text = read(file);
+    const unittest = /\bunittest\.main\(|\bunittest\.TestCase\b|\bTextTestRunner\b/.test(text);
+    const okLines = /all passed: /.test(text);
+    assert.equal(unittest !== okLines, true, `${file}: its source shows no single format`);
+    assert.equal(
+      format,
+      unittest ? "unittest" : "ok lines",
+      `${file}: its source is ${unittest ? "unittest" : "ok lines"}`,
+    );
+  }
 });
 
 test("the heaviest tests start first, tests without a weight before them, ties in list order", () => {
