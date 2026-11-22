@@ -3,6 +3,8 @@ No root, no systemd, no network.
 
   python3 -I -B fork-kit/heavy/tests/install.test.py
 """
+# CI's checkout is shallow without tags, so the test that runs an older release's installer skips there (it runs locally):
+# fork-ci: may skip Install.test_older_installers_install_and_uninstall_keep_the_hosts_t3_capacity
 import contextlib, importlib.machinery, importlib.util, io, json, os, shutil, subprocess, sys, tempfile, unittest
 
 OLDER_RELEASE = 'ci/v22'   # a released installer from before the t3-capacity link (its uninstall is run below)
