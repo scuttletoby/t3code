@@ -79,6 +79,9 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                continue-on-error, a checkout with its own timeout, and a job timeout that holds the worst
                case: the checkout's timeout, the wait cap (or the script's git calls, if longer) and one
                last poll, from the script's own limits, with a minute to spare for the job's set-up.
+  windows      fork-windows-tests.yml (a nightly report, never in the merge path) runs on schedule and by
+               hand only, reads only, cancels an older run, hides no red result, and keeps upstream's
+               windows-tests.yml steps (names and pinned actions) and 45-minute limit on hosted Windows.
 
   review-kit   the review kit (fork-kit/review) reads the fork's kit settings
                (.github/fork-review-kit.json, given with --settings) and through them the fork's queue
@@ -5196,6 +5199,68 @@ for label, change in {
     "a slower last poll than the budget holds": {"API_TIMEOUT": 200},
 }.items():
     check(f"policies: {label} fails", *policy_mutant(lambda p, w, t: None, {**POLICY_LIMITS, **change}))
+
+# --- windows -------------------------------------------------------------------------------------
+# fork-windows-tests.yml: a nightly report of upstream's windows-tests.yml on GitHub-hosted Windows, never in the
+# merge path. Its job keeps upstream's steps (names and pinned actions, in order); fork-tests-drift.cjs follows
+# upstream's file itself.
+WINDOWS_FILE = "fork-windows-tests.yml"
+WINDOWS_LIMIT = 45  # upstream's timeout-minutes
+
+
+def windows_problems(wf, upstream):
+    problems = []
+    if triggers(wf) != {"schedule", "workflow_dispatch"}:
+        problems.append(f"{WINDOWS_FILE}: triggers are not exactly schedule and workflow_dispatch")
+    if wf.get("permissions") != {"contents": "read"}:
+        problems.append(f"{WINDOWS_FILE}: permissions are not exactly contents: read")
+    if (wf.get("concurrency") or {}).get("cancel-in-progress") is not True:
+        problems.append(f"{WINDOWS_FILE}: a newer run does not cancel an older one (cancel-in-progress)")
+    jobs = wf.get("jobs") or {}
+    up_steps = [(s.get("name"), s.get("uses")) for s in (upstream.get("jobs") or {}).get("test", {}).get("steps") or []]
+    if not up_steps:
+        problems.append("windows-tests.yml: no test job with steps (upstream renamed it? follow it)")
+    for job_id, job in jobs.items():
+        limit = job.get("timeout-minutes")
+        if not (type(limit) is int and 0 < limit <= WINDOWS_LIMIT):
+            problems.append(f"{WINDOWS_FILE}/{job_id}: timeout-minutes is not 1 to {WINDOWS_LIMIT}")
+        if not str(job.get("runs-on", "")).startswith("windows-"):
+            problems.append(f"{WINDOWS_FILE}/{job_id}: runs-on is not a GitHub-hosted Windows image")
+        if job.get("continue-on-error") or any(s.get("continue-on-error") for s in job.get("steps") or []):
+            problems.append(f"{WINDOWS_FILE}/{job_id}: a red result is hidden (continue-on-error)")
+        mine = [(s.get("name"), s.get("uses")) for s in job.get("steps") or []]
+        if mine != up_steps:
+            problems.append(f"{WINDOWS_FILE}/{job_id}: steps differ from upstream's windows-tests.yml: {mine} != {up_steps}")
+    if not jobs:
+        problems.append(f"{WINDOWS_FILE}: no jobs")
+    return problems
+
+
+windows_wf, windows_up = real.get(WINDOWS_FILE, {}), load(workflows_dir / "windows-tests.yml")
+problems = windows_problems(windows_wf, windows_up)
+check("windows: fork-windows-tests.yml runs nightly and by hand only, cancels an older run, keeps upstream's steps "
+      "and 45-minute limit on hosted Windows", not problems, "; ".join(problems))
+for label, mutate in {
+    "a pull_request trigger": lambda w, u: w[True].__setitem__("pull_request", None),
+    "a push trigger": lambda w, u: w[True].__setitem__("push", None),
+    "no cancel-in-progress": lambda w, u: w["concurrency"].__setitem__("cancel-in-progress", False),
+    "a write permission": lambda w, u: w["permissions"].__setitem__("actions", "write"),
+    "a longer limit": lambda w, u: w["jobs"]["test"].__setitem__("timeout-minutes", 90),
+    "upstream's Blacksmith runner": lambda w, u: w["jobs"]["test"].__setitem__("runs-on", "blacksmith-8vcpu-windows-2025"),
+    "a step dropped": lambda w, u: w["jobs"]["test"]["steps"].pop(1),
+    "upstream adding a step": lambda w, u: u["jobs"]["test"]["steps"].append({"name": "New"}),
+    "an action pin that differs from upstream's": lambda w, u: w["jobs"]["test"]["steps"][0].__setitem__(
+        "uses", "actions/checkout@v6"),
+    "continue-on-error": lambda w, u: w["jobs"]["test"].__setitem__("continue-on-error", True),
+}.items():
+    w, u = copy.deepcopy(windows_wf), copy.deepcopy(windows_up)
+    try:
+        mutate(w, u)
+        caught = bool(windows_problems(w, u))
+    except Exception as e:
+        caught = False
+        label += f" (crashed: {e!r})"
+    check(f"windows: {label} fails", caught)
 
 # --- review-kit (#957) ---------------------------------------------------------------------------
 # The fork keeps its kit settings under its own name, so the general kit's tests do not name them (#957 item 5).

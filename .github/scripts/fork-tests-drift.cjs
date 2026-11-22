@@ -1,7 +1,8 @@
-// Fork only: fails when upstream's ci.yml or release.yml test jobs or TOP_LEVEL keys changed since
-// .github/fork-tests-upstream.json recorded them (comments ignored). It compares upstream with its
-// record, not with fork-tests.yml: `--record` prints the changes and saves them, and its commit and
-// PR must say per change what was ported or why it does not apply. Run: `node <this> [--record]`.
+// Fork only: fails when upstream's ci.yml or release.yml test jobs, its windows-tests.yml, or their
+// TOP_LEVEL keys changed since .github/fork-tests-upstream.json recorded them (comments ignored). It
+// compares upstream with its record, not with the fork's copy (COPY): `--record` prints the changes
+// and saves them, and its commit and PR must say per change what was ported or why it does not
+// apply. Run: `node <this> [--record]`.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -13,7 +14,22 @@ const recordPath = path.join(root, ".github/fork-tests-upstream.json");
 const TRACKED = {
   ".github/workflows/ci.yml": null,
   ".github/workflows/release.yml": ["quality", "test", "test_web", "test_server"],
+  ".github/workflows/windows-tests.yml": null,
 };
+
+// Upstream file -> the fork workflow that copies it (fork-tests.yml unless named here).
+const COPY = {
+  ".github/workflows/windows-tests.yml": "fork-windows-tests.yml",
+};
+const copyOf = (file) => COPY[file] ?? "fork-tests.yml";
+const copiesOf = (changes) =>
+  [
+    ...new Set(
+      Object.keys(TRACKED)
+        .filter((file) => changes.some((c) => c.startsWith(`${file}:`)))
+        .map(copyOf),
+    ),
+  ].join(" and ") || "fork-tests.yml";
 
 // Top-level keys digested as the pseudo-job TOP (job ids cannot contain parentheses).
 const TOP_LEVEL = ["env", "defaults", "concurrency", "permissions"];
@@ -188,13 +204,13 @@ function readRecord(file) {
   }
 }
 
-// Refuses while a tracked job is missing: the copy in fork-tests.yml then follows
+// Refuses while a tracked job is missing: the fork's copy (COPY) then follows
 // a job upstream no longer has, and TRACKED must be updated first.
 function record(now, missing, file = recordPath) {
   if (missing.length) {
     console.error(
       `Not recorded: tracked jobs missing upstream: ${missing.join(", ")}.\n` +
-        "Find what replaced them, port that into fork-tests.yml and update TRACKED in " +
+        `Find what replaced them, port that into ${copiesOf(missing)} and update TRACKED in ` +
         "fork-tests-drift.cjs, then record again.",
     );
     process.exitCode = 1;
@@ -211,7 +227,7 @@ function record(now, missing, file = recordPath) {
     `\nUpstream changes this record accepts (${changes.length}):\n` +
       changes.map((c) => `- ${c}`).join("\n") +
       "\n\nSay in the commit message and the PR body, for each line, what was ported " +
-      "into fork-tests.yml or why it does not apply. The check cannot tell; reviewers rely on it.",
+      `into ${copiesOf(changes)} or why it does not apply. The check cannot tell; reviewers rely on it.`,
   );
 }
 
@@ -222,16 +238,16 @@ function main() {
   const changes = compare(recorded, now);
   const summary = process.env.GITHUB_STEP_SUMMARY;
   if (changes.length === 0) {
-    const msg = "Upstream test jobs match the copy in fork-tests.yml (recorded digest).";
+    const msg = "Upstream test jobs match the fork's copies (recorded digest).";
     console.log(msg);
     if (summary) fs.appendFileSync(summary, `### Upstream drift\n\n${msg}\n`);
     return;
   }
   const report =
     "### Upstream drift\n\n" +
-    "Upstream's test jobs changed since `.github/workflows/fork-tests.yml` last followed them:\n\n" +
+    `Upstream's test jobs changed since ${copiesOf(changes)} last followed them:\n\n` +
     changes.map((c) => `- ${c}`).join("\n") +
-    "\n\nPort the change into fork-tests.yml (or decide it does not apply and say why in the PR), then run " +
+    `\n\nPort the change into ${copiesOf(changes)} (or decide it does not apply and say why in the PR), then run ` +
     "`node .github/scripts/fork-tests-drift.cjs --record` and commit `.github/fork-tests-upstream.json`.\n";
   console.error(report);
   if (summary) fs.appendFileSync(summary, report);
@@ -239,6 +255,6 @@ function main() {
   process.exitCode = 1;
 }
 
-module.exports = { parseJobs, compare, record, TOP };
+module.exports = { parseJobs, compare, record, copiesOf, TOP, TRACKED };
 
 if (require.main === module) main();

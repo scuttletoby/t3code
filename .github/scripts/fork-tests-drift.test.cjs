@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { parseJobs, compare, record } = require("./fork-tests-drift.cjs");
+const { parseJobs, compare, record, copiesOf, TRACKED } = require("./fork-tests-drift.cjs");
 
 const base = `name: CI
 on: push
@@ -118,4 +118,14 @@ test("--record refuses while a tracked job is missing and writes nothing", () =>
     process.exitCode = undefined;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("names the fork copy that follows each changed upstream file", () => {
+  assert.ok(".github/workflows/windows-tests.yml" in TRACKED);
+  const win = '.github/workflows/windows-tests.yml: job `test`: step "Test" changed';
+  const ci = ".github/workflows/ci.yml: job `lint` added upstream";
+  assert.equal(copiesOf([win]), "fork-windows-tests.yml");
+  assert.equal(copiesOf([ci]), "fork-tests.yml");
+  assert.equal(copiesOf([ci, win]), "fork-tests.yml and fork-windows-tests.yml");
+  assert.equal(copiesOf([]), "fork-tests.yml");
 });
