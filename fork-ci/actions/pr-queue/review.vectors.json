@@ -1,5 +1,5 @@
 {
-  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a lens report, one with the lens marker, that is not one valid read is a `comment without a first-line lens header` entry that reads nothing; `not_lens`, when there is one: [where, why] of each post that looks like a report but has no lens marker, so is no lens report, as lens.Review.not_lens_reports names them). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). `reads`: posts as in `scans` (each by its `author`, else `someone`; an override comment is `<override_prefix> <sha>: ...`), the `head`, the reads that are its change merged with the base (`same`) and `override_authors`, under the `basic` rules in enforce with findings judged: lens.Review.lens_reads (each lens key's sha), the keys head_check.review_rounds fails until that lens posts again (`again`: UNREAD, or a report with no findings section) and whether head_check.verdict with the `required` lenses and the rounds pass (`passes`); T3's lens_start reads the same (lensStart.ts), and its vectors hold no finding and stay under the round cap. `unicode`: `refused` is what T3 refuses on a runtime that assigns those code points (a letter, number, mark, format character or space there): a new symbol reads alike on both sides. Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
+  "about": "Shared test vectors of the review rules (README.md, \"Review rules\"). The Python tests (review_glob.test.py, review_judge.test.py) read this file, and the TypeScript side reads the same file: a change to the matching or the judge that updates one side only fails the other side's tests. Paths are made up. `globs`: [glob, path, matches]. `cases`: a config from `configs` (a whole `review` block, which must parse), the changed paths as `git diff --name-status -M` prints them ([status, path] or [R<score>|C<score>, old, new]), and the expected weight, required lenses (in order), rules hit (in rule order) and protected paths (in diff order). The config file is `config_path`. `findings`: a lens report body and what review_judge.read_findings reads in it ([kind, line] of each blocker or major, and whether it has a findings section); `group` says which rule it shows. `scans`: counted posts (by the lens author association, in order, one second apart, `edited` and `hidden` as GitHub records them) and what lens.Review.lens_scan reads with `override_prefix` (the history of [name, sha] and each lens key's newest [sha, why]; a lens report, one with the lens marker, that is not one valid read is a `comment without a first-line lens header` entry that reads nothing, and so is a post without the marker that looks like a report and holds an open finding (a blocker or major, or NOT SAFE, as review_judge.read_findings reads it); `not_lens`, when there is one: [where, why] of each post that looks like a report but has no lens marker, so is no lens report, as lens.Review.not_lens_reports names them). `rounds`: review_judge.judge_rounds on a history, each lens key's newest entry [how, body], `decided`, and `changes` (sha -> what the pull request changes at it; a sha not listed is its own change). `reads`: posts as in `scans` (each by its `author`, else `someone`; an override comment is `<override_prefix> <sha>: ...`), the `head`, the reads that are its change merged with the base (`same`) and `override_authors`, under the `basic` rules in enforce with findings judged: lens.Review.lens_reads (each lens key's sha), the keys head_check.review_rounds fails until that lens posts again (`again`: UNREAD, or a report with no findings section) and whether head_check.verdict with the `required` lenses and the rounds pass (`passes`); T3's lens_start reads the same (lensStart.ts), and its vectors hold no finding in a report that counts and stay under the round cap. `unicode`: `refused` is what T3 refuses on a runtime that assigns those code points (a letter, number, mark, format character or space there): a new symbol reads alike on both sides. Every section is run by both sides: a test fails if one side meets a section or a vector it does not run. How a vector is made: README.md, \"Review rules\".",
   "config_path": ".github/pr-queue.json",
   "override_prefix": "override for head",
   "globs": [
@@ -2295,13 +2295,13 @@
       ]
     },
     {
-      "name": "a report edited to drop its marker counts as deleted",
+      "name": "a report with no open finding edited to drop its marker counts as deleted",
       "posts": [
         {
           "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
         },
         {
-          "body": "## Code lens\nmajor: x is cut",
+          "body": "## Code lens\nblocker: none\nmajor: none",
           "edited": true
         }
       ],
@@ -2315,6 +2315,26 @@
           "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Code lens'"
         ]
       ]
+    },
+    {
+      "name": "a report with an open major edited to drop its marker still holds",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Code lens\nmajor: x is cut",
+          "edited": true
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open major: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Code lens')": [
+          null,
+          null
+        ]
+      }
     },
     {
       "name": "a report edited with its marker kept reads nothing",
@@ -2367,6 +2387,137 @@
           null
         ]
       }
+    },
+    {
+      "name": "a clean read then a newer unmarked report with an open blocker holds the head (issue 865)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Lens code, round 2\nblocker: a re-run loses data\nmajor: none"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a clean read then a newer unmarked NOT SAFE verdict holds the head",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Lens code, round 2\nverdict: not safe to merge"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an unmarked report with an open major holds the head",
+      "posts": [
+        {
+          "body": "Code lens, round 2\nsafe to merge: no\nmajor: the retry drops a row"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open major: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with 'Code lens, round 2')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an unmarked report with an open blocker posted twice holds twice",
+      "posts": [
+        {
+          "body": "## Lens code, round 2\nblocker: a re-run loses data\nmajor: none"
+        },
+        {
+          "body": "## Lens code, round 2\nblocker: a re-run loses data\nmajor: none"
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2')": [
+          null,
+          null
+        ],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2')": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an unmarked report with an open blocker still holds when edited or hidden",
+      "posts": [
+        {
+          "body": "## Lens code, round 2\nblocker: a re-run loses data\nmajor: none",
+          "edited": true
+        },
+        {
+          "body": "## Lens code, round 2\nblocker: a re-run loses data\nmajor: none",
+          "hidden": true
+        }
+      ],
+      "history": [],
+      "entries": {
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2')": [
+          null,
+          null
+        ],
+        "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2', hidden)": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a clean read then a newer unmarked note with no open finding leaves the read and is named",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Lens code, round 2\nblocker: none\nmajor: none\nminor: a typo"
+        }
+      ],
+      "history": [["code", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]],
+      "entries": {
+        "code": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", null]
+      },
+      "not_lens": [
+        [
+          "by someone at 2026-01-01T00:00:01Z",
+          "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha); it looks like one: starts with '## Lens code, round 2'"
+        ]
+      ]
+    },
+    {
+      "name": "an unmarked report with an open blocker edited to start with not a lens is no report",
+      "posts": [
+        {
+          "body": "not a lens: round 2 notes\n## Lens code, round 2\nblocker: a re-run loses data\nmajor: none",
+          "edited": true
+        }
+      ],
+      "history": [],
+      "entries": {}
     }
   ],
   "rounds": [
@@ -3426,6 +3577,110 @@
         },
         "again": ["code"],
         "passes": false
+      }
+    },
+    {
+      "name": "a clean read then a newer unmarked report with an open blocker fails (issue 865)",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Lens code, round 2\nblocker: a re-run loses data\nmajor: none"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2')": null
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a clean read then a newer unmarked NOT SAFE verdict fails",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Lens code, round 2\nverdict: not safe to merge"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "comment without a first-line lens header (by someone at 2026-01-01T00:00:01Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2')": null
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "a clean read then an unmarked heading-only note passes",
+      "posts": [
+        {
+          "body": "lens: code · reviewer: x · read at: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nstate: fine\nblocker: none\nmajor: none"
+        },
+        {
+          "body": "## Code lens\nAll fine."
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": ["code"],
+      "expect": {
+        "reads": {
+          "code": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "again": [],
+        "passes": true
+      }
+    },
+    {
+      "name": "no required lens and only an unmarked report with an open blocker fails",
+      "posts": [
+        {
+          "body": "## Lens code, round 2\nblocker: a re-run loses data\nmajor: none"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": [],
+      "expect": {
+        "reads": {
+          "comment without a first-line lens header (by someone at 2026-01-01T00:00:00Z, no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha), but it holds an open blocker: post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker into an old comment does not count), and delete this one or start it with `not a lens:`; it looks like one: starts with '## Lens code, round 2')": null
+        },
+        "again": [],
+        "passes": false
+      }
+    },
+    {
+      "name": "no required lens and only an unmarked note with no open finding passes",
+      "posts": [
+        {
+          "body": "## Lens code, round 2\nblocker: none\nmajor: none\nminor: a typo"
+        }
+      ],
+      "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "same": [],
+      "override_authors": [],
+      "required": [],
+      "expect": {
+        "reads": {},
+        "again": [],
+        "passes": true
       }
     }
   ],

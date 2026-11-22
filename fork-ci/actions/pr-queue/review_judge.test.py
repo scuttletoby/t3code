@@ -391,7 +391,7 @@ def vector_pr(posts):
 
 
 def scan(posts):
-    found, history, notes = SCAN.scan_posts(vector_pr(posts))
+    found, history, notes, _ = SCAN.scan_posts(vector_pr(posts))
     return [list(h) for h in history], {k: [v[1], v[2]] for k, v in found.items()}, [list(n) for n in notes]
 
 

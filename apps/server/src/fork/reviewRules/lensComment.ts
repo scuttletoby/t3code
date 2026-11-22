@@ -1,9 +1,12 @@
 /**
  * Port of lens.py's lens rules (fork-ci/actions/pr-queue), held to the shared vectors and the gate's corpus. A lens
- * report (one with the lens marker) that is not one valid read is a NO_HEADER entry; a look-alike without the marker
- * is no report (notLens). The caller picks the posts that count, in the gate's order.
+ * report (one with the lens marker) that is not one valid read is a NO_HEADER entry, and so is a look-alike without
+ * the marker that holds an open finding; one with no open finding is no report (notLens). The caller picks the posts
+ * that count, in the gate's order.
  */
 import * as Schema from "effect/Schema";
+
+import { readFindings } from "./findings.ts";
 
 import {
   ALNUM,
@@ -65,6 +68,15 @@ const FLAGS_UNREAD =
 export const EMBEDDED = "holds a lens header line";
 export const NO_MARKER =
   "no lens marker (no line starts with `lens:`, and no `read at` or lens field names a sha)";
+/** How a lens fixes a report without the marker (lens.REPOST): every reason that names a look-alike says it. */
+export const REPOST =
+  "post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>` (editing the " +
+  "marker into an old comment does not count)";
+/**
+ * reportProblem's kinds (lens.BROKEN, HELD, NOT_LENS): a lens report (with the marker) that is not one valid read; a
+ * comment without the marker that holds an open finding (both block); one without either (no report, never blocks).
+ */
+export type ReportKind = "broken" | "held" | "notLens";
 const OPT_OUT_READ =
   "says on its first line that it is no lens report, but holds a hex read-at sha outside a `>` quote";
 
@@ -261,18 +273,44 @@ function readProblem(body: string, narrow: boolean): string | null {
 }
 
 /**
- * lens.Review.lens_problem: why a lens report (a comment with the lens marker) is not one valid read, so it blocks;
- * null when it is one, carries no marker, or does not look like a report.
+ * lens.Review.report_problem: [why, kind] for a look-alike (looksProblem), null otherwise. Blocks with the marker
+ * (broken), or without it when readFindings sees an open finding (held: an older clean read must not win). Otherwise
+ * no lens report (notLens): named, never blocking.
  */
-export function lensProblem(body: string, overridePrefix?: string): string | null {
+export function reportProblem(
+  body: string,
+  overridePrefix?: string,
+): [why: string, kind: ReportKind] | null {
   const problem = looksProblem(body, overridePrefix);
-  return problem && hasMarker(body) ? problem : null;
+  if (!problem) return null;
+  if (hasMarker(body)) return [problem, "broken"];
+  const found = readFindings(body)[0];
+  if (found.length > 0) {
+    return [
+      `${NO_MARKER}, but it holds an open ${found[0]![0]}: ${REPOST}, and delete this one or start it with ` +
+        `\`not a lens:\`; it looks like one: ${problem}`,
+      "held",
+    ];
+  }
+  return [`${NO_MARKER}; it looks like one: ${problem}`, "notLens"];
 }
 
-/** lens.Review.not_lens_report: why a comment that looks like a lens report is none (no lens marker), or null. */
+/**
+ * lens.Review.lens_problem: why a comment that looks like a lens report blocks (reportProblem kind broken or held), or
+ * null: it is one valid read, does not look like a report, or is no lens report (notLensReport).
+ */
+export function lensProblem(body: string, overridePrefix?: string): string | null {
+  const got = reportProblem(body, overridePrefix);
+  return got && got[1] !== "notLens" ? got[0] : null;
+}
+
+/**
+ * lens.Review.not_lens_report: why a comment that looks like a lens report is none (no lens marker and no open
+ * finding: reportProblem kind notLens), or null.
+ */
 export function notLensReport(body: string, overridePrefix?: string): string | null {
-  const problem = looksProblem(body, overridePrefix);
-  return problem && !hasMarker(body) ? `${NO_MARKER}; it looks like one: ${problem}` : null;
+  const got = reportProblem(body, overridePrefix);
+  return got && got[1] === "notLens" ? got[0] : null;
 }
 
 /**
@@ -346,7 +384,10 @@ export interface LensScan {
   readonly history: Array<[string, string | null]>;
   /** Each lens key's newest [sha or null, why it reads nothing or null]. */
   readonly entries: Record<string, [string | null, string | null]>;
-  /** [where, why] of each post that looks like a report but has no lens marker (lens.Review.not_lens_reports). */
+  /**
+   * [where, why] of each post that looks like a report, has no lens marker and no open finding
+   * (lens.Review.not_lens_reports).
+   */
   readonly notLens: Array<[string, string]>;
 }
 
@@ -372,26 +413,24 @@ export function lensEntries(
     const at: PostAt = [post.when, i];
     const { body } = post;
     const hidden = !post.unread && post.hidden;
-    let problem: string | null;
-    let marked: boolean;
+    let got: [string, ReportKind] | null;
     let header: [string, string | null] | null;
     let key: string;
     try {
-      problem = looksProblem(body, overridePrefix);
-      marked = problem !== null && hasMarker(body);
-      header = problem ? null : lensHeader(body);
+      got = reportProblem(body, overridePrefix);
+      header = got ? null : lensHeader(body);
       key = header ? lensKey(header[0]) : "";
     } catch (error) {
       if (isPyTextError(error) && error.where === undefined)
         throw new PyTextError({ codePoints: error.codePoints, where: post.where });
       throw error;
     }
-    if (problem && !marked) {
-      notLens.push([post.where, `${NO_MARKER}; it looks like one: ${problem}`]);
+    if (got?.[1] === "notLens") {
+      notLens.push([post.where, got[0]]);
       return;
     }
-    if (problem) {
-      key = `${NO_HEADER} (${post.where}, ${problem}${hidden ? ", hidden" : ""})`;
+    if (got) {
+      key = `${NO_HEADER} (${post.where}, ${got[0]}${hidden ? ", hidden" : ""})`;
       entries.set(key, { at, sha: null, why: null, name: null, body });
       return;
     }

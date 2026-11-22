@@ -14,6 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import config  # noqa: E402
 import lens  # noqa: E402
+import review_judge  # noqa: E402
 
 CORPUS = os.path.join(HERE, 'testdata', 'lens-corpus.jsonl')
 SOURCE = lens.Review(('coderabbitai', 'github-actions', 'copilot'), 'proj ready --head', 'OWNER', ('OWNER',))
@@ -67,7 +68,7 @@ class Corpus(unittest.TestCase):
                'override_sha': SOURCE.override_sha, 'lens_header': lens.lens_header, 'no_lens_text': lens.no_lens_text,
                'latest_checks': lens.latest_checks, 'check_state': lens.check_state, 'lens_key': lens.lens_key}
         self.assertEqual({c['fn'] for c in cases}, set(fns) | {'full_sha'})
-        wrong, changed, opt_out, no_marker = [], 0, 0, []
+        wrong, changed, opt_out, no_marker, held = [], 0, 0, [], []
         for c in (c for c in cases if c['fn'] in fns):
             got = json.loads(json.dumps(fns[c['fn']](*c['args'])))
             if got == c['out']:
@@ -90,12 +91,19 @@ class Corpus(unittest.TestCase):
                     and SOURCE.looks_problem(*c['args']) == c['out']:
                 no_marker.append(body)   # issue #865: no lens marker, no lens report (named, never blocking)
                 continue
+            if c['fn'] == 'lens_problem' and SOURCE.report_problem(*c['args'])[1] == lens.HELD \
+                    and got.endswith(f'; it looks like one: {c["out"]}'):
+                held.append(body)   # issue #865: no lens marker but an open finding: it blocks as before, with the fix
+                continue
             wrong.append(f'{c["fn"]}{json.dumps(c["args"])[:160]}: got {got!r}, source {c["out"]!r}')
         self.assertEqual(wrong, [], f'{len(wrong)} of {len(cases)} differ; first: {wrong[:3]}')
         self.assertEqual(changed, 54, 'answers changed on purpose (a short read or an edited lens comment)')
         self.assertEqual(opt_out, 2, 'answers changed on purpose (a hex read at below not a lens:, issue #77)')
-        self.assertEqual(len(no_marker), 7 + 3, 'answers changed on purpose (no lens marker, issue #865)')
-        for body in (b for b in no_marker if isinstance(b, str)):   # a lens heading, `safe to merge`, report fields: never a `lens:` line or a read
+        self.assertEqual(len(no_marker), 6 + 3, 'answers changed on purpose (no lens marker, issue #865)')
+        self.assertEqual(len(held), 1, 'old state: a report with an open finding and no marker blocks as before')
+        self.assertIn('finding: major', held[0])
+        # a lens heading, `safe to merge`, report fields: never a `lens:` line or a read
+        for body in (b for b in no_marker if isinstance(b, str)):
             self.assertNotRegex(body, r'(?im)^\W*lens\s*:|read[\s-]*at\b\W*[0-9a-f]{7}')
 
 
@@ -256,12 +264,19 @@ class NotALens(unittest.TestCase):
 class Marker(unittest.TestCase):
     """Issue #865: a comment is a lens report only when it carries the lens marker (lens.has_marker: a line starting
     `lens:`, a lens field naming a sha, or `read at <hex>`). One that only looks like a report without it is no lens
-    report: it neither reads nor blocks, and not_lens_reports names it (the head check's summary). A lens report that
-    is not one valid read still blocks."""
+    report: it neither reads nor blocks, and not_lens_reports names it (the head check's summary), unless it holds an
+    open finding (a blocker or major that is not none, or NOT SAFE): then it blocks, as a NO_HEADER entry whose reason
+    names the missing marker and the fix (report_problem kind HELD). A lens report that is not one valid read still
+    blocks."""
     READ = f'lens: correctness · reviewer: x · read at: {SHA_B}\nstate: fine\nblocker: none\nmajor: none'
     NEAR = ('## Lens A\nblocker: none\nmajor: none', '## Lens correctness\nsafe to merge: yes', 'lgtm, safe to merge',
             'covered: a.py\nchecks: ran the tests', 'The merge-path lens: nothing found',
-            '**Lens correctness** (round 2)\nverdict: not safe to merge')
+            '## Lens A, round 2\nblocker: none\nmajor: none\nminor: a typo')
+    HELD = ('## Lens correctness, round 2\nblocker: a re-run loses data\nmajor: none',
+            '**Lens correctness** (round 2)\nverdict: not safe to merge',
+            'NOT SAFE to merge (code lens, round 2)\nmore below',
+            'Code lens, round 2\nsafe to merge: no\nmajor: the retry drops a row', '## Lens A\nmajor: x is cut',
+            'covered: a.py\nchecks: ran them\nfinding: blocker a.py:3 loses data')
     BROKEN = (f'Here is my review.\n{READ}',                                   # the header not on the first line
               f'{READ}\nlens: state · reviewer: x · read at: {SHA_B}',         # two lenses in one comment
               'lens: <name> · reviewer: x · read at: <sha>\nmajor: none',     # a placeholder name: names no lens
@@ -306,11 +321,61 @@ class Marker(unittest.TestCase):
         self.assertEqual((self.r.lens_problem(post(opt_out)), self.r.not_lens_report(post(opt_out))), (None, None))
 
     def test_every_problem_with_the_marker_is_the_old_answer(self):   # the marker only ever drops a block
-        for body in self.NEAR + self.BROKEN + (self.READ, 'Thanks', f'not a lens: x\nread at: {SHA_B}'):
+        for body in self.NEAR + self.HELD + self.BROKEN + (self.READ, 'Thanks', f'not a lens: x\nread at: {SHA_B}'):
             with self.subTest(body=body):
                 looks, now = self.r.looks_problem(post(body)), self.r.lens_problem(post(body))
-                self.assertEqual(now, looks if lens.has_marker(body) else None)
+                if lens.has_marker(body):
+                    self.assertEqual(now, looks)
+                elif looks and review_judge.findings(body):   # an open finding without the marker blocks as before
+                    self.assertTrue(now.startswith(lens.NO_MARKER) and now.endswith(f'; it looks like one: {looks}'))
+                else:
+                    self.assertIsNone(now)
                 self.assertEqual(self.r.not_lens_report(post(body)) is not None, looks is not None and now is None)
+
+    def test_an_unmarked_report_with_an_open_finding_blocks_and_names_the_fix(self):   # issue #865 round 1
+        for body in self.HELD:
+            with self.subTest(body=body):
+                self.assertFalse(lens.has_marker(body))
+                why = self.r.lens_problem(post(body))
+                self.assertTrue(why.startswith(lens.NO_MARKER), why)
+                self.assertIn(lens.REPOST, why)
+                self.assertEqual(self.r.report_problem(post(body))[1], lens.HELD)
+                self.assertIsNone(self.r.not_lens_report(post(body)))
+                alone = pr(post(body, url='https://github.test/c2'))
+                self.assertEqual(self.r.reviewed_head(alone)[:2], (True, None), 'no required lens: still held')
+                self.assertEqual([w for w, _ in self.r.unmarked_held(alone)], ['https://github.test/c2'])
+                for older, newer in ((post(self.READ), post(body, when='2026-01-02T00:00:00Z')),
+                                     (post(body), post(self.READ, when='2026-01-02T00:00:00Z'))):
+                    p = pr(older, newer)   # newest wins never lets an older clean read through, and a newer one
+                    reviewed, sha, why = self.r.reviewed_head(p)   # does not clear it (keyed by the comment)
+                    self.assertEqual((reviewed, sha), (True, None))
+                    self.assertIn(lens.NO_MARKER, why)
+                    self.assertEqual(self.r.reviewed_head(p), (reviewed, sha, why), 'run again: the same answer')
+                    self.assertEqual(self.r.not_lens_reports(p), [])
+                    self.assertEqual(self.r.lens_scan(p)[1], [('correctness', SHA_B)], 'no round of its own')
+                self.assertEqual(self.lines, [], 'a blocking entry is in the verdict, not only in the log')
+
+    def test_an_unmarked_report_with_an_open_finding_posted_twice_holds_twice(self):
+        p = pr(post(self.READ), post(self.HELD[0], url='https://github.test/c2', when='2026-01-02T00:00:00Z'),
+               post(self.HELD[0], url='https://github.test/c3', when='2026-01-03T00:00:00Z'))
+        self.assertEqual([w for w, _ in self.r.unmarked_held(p)], ['https://github.test/c2', 'https://github.test/c3'])
+        self.assertEqual(sum(k.startswith(lens.NO_HEADER) for k in self.r.lens_scan(p)[0]), 2)
+
+    def test_the_ways_out_of_an_unmarked_report_with_an_open_finding(self):
+        held = self.HELD[0]
+        gone = pr(post(self.READ))   # deleted: GitHub no longer lists it
+        self.assertEqual(self.r.reviewed_head(gone), (True, SHA_B, 'every lens read it'))
+        opted = post(f'not a lens: round 2 notes\n{held}', when='2026-01-02T00:00:00Z', includesCreatedEdit=True)
+        self.assertEqual(self.r.reviewed_head(pr(post(self.READ), opted)), (True, SHA_B, 'every lens read it'))
+        marked = post(f'lens: correctness · reviewer: x · read at: {SHA_B}\n{held}', when='2026-01-02T00:00:00Z',
+                      includesCreatedEdit=True)   # the marker edited in: an edited report reads nothing, post anew
+        reviewed, sha, why = self.r.reviewed_head(pr(post(self.READ), marked))
+        self.assertEqual((reviewed, sha), (True, None))
+        self.assertIn(lens.EDITED, why)
+        for flags in ({'includesCreatedEdit': True}, {'isMinimized': True}):   # edited or hidden: still holds
+            with self.subTest(flags=flags):
+                p = pr(post(self.READ), post(held, when='2026-01-02T00:00:00Z', **flags))
+                self.assertEqual(self.r.reviewed_head(p)[:2], (True, None))
 
     def test_the_marker_is_read_both_ways_and_in_any_markdown(self):
         for body in ('**Lens:** a', '## lens: a', '- lens: a', '> lens: a', '    lens: a', f'| read at | {SHA_B} |',
@@ -333,6 +398,8 @@ class Marker(unittest.TestCase):
         dropped = post(self.NEAR[0].replace('Lens A', 'Lens correctness'), when='2026-01-02T00:00:00Z',
                        includesCreatedEdit=True)
         self.assertEqual(self.r.reviewed_head(pr(post(self.READ), dropped)), (True, SHA_B, 'every lens read it'))
+        dropped = post(self.HELD[0], when='2026-01-02T00:00:00Z', includesCreatedEdit=True)   # but an open finding
+        self.assertEqual(self.r.reviewed_head(pr(post(self.READ), dropped))[:2], (True, None))
         kept = post(self.READ.replace(SHA_B, SHA_A), when='2026-01-02T00:00:00Z', includesCreatedEdit=True)
         reviewed, sha, why = self.r.reviewed_head(pr(post(self.READ), kept))
         self.assertEqual((reviewed, sha), (True, None), 'an edited report with its marker still reads nothing')

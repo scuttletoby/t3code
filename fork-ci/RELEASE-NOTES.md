@@ -19,13 +19,19 @@ A comment counts as a lens report only when it carries the lens marker: a line t
 (`lens:`, `lens=`, `lens —`, `lens –`), names a read (`read at` and a hex sha), or has a lens field with a hex sha after
 it (Markdown stripped, in code blocks and quotes too). A lens report that is not exactly one valid read still blocks, as
 before. A comment that only looks like one without the marker (a `## Lens A` heading, `safe to merge`, `covered:` and
-`checks:` lines) no longer blocks: the run log and the head check's summary name it as `not a lens report` with the
-reason. Comments with the marker read exactly as before. T3's copy (`apps/server/src/fork/reviewRules`) and the review
+`checks:` lines) and holds no open finding no longer blocks: the run log and the head check's summary name it as
+`not a lens report` (a `WARN` row) with the reason. One without the marker that holds an open finding (a `blocker:` or
+`major:` line that is not `none`, or NOT SAFE, as the findings rules read them) still blocks, as before, whatever an
+older or newer read of that lens says: it is most likely a real report with a broken header. Its reason, first in the
+head check's, says to post a NEW comment whose first line is `lens: <name> · reviewer: <who> · read at: <sha>`
+(editing the marker in does not count) and to delete the old one or start it with `not a lens:`. Comments with the
+marker read exactly as before. T3's copy (`apps/server/src/fork/reviewRules`) and the review
 kit's `check` read the same rule from the shared vectors.
 
 **Upgrade:** a lens report written without the marker now counts for nothing, so a lens that posts one has not
 reported: list required lenses (`required-lenses`, or a `review` block in `enforce`) so a missing read still fails the
-head check, and have lenses run the kit's `check` before posting.
+head check, and have lenses run the kit's `check` before posting. An old comment without the marker that holds an
+open finding blocks as it did before this release; one that holds none stops blocking.
 
 ### pr-queue: what counts as a `state:` line is gate code (#797)
 

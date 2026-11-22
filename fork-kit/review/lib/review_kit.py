@@ -305,9 +305,12 @@ def verdict(body, override_prefix, head=None):
     post = {'body': body, 'authorAssociation': 'OWNER', 'includesCreatedEdit': False, 'createdAt': '1'}
     if review.override_sha(post):
         return ['override']
-    if review.lens_problem(post):
+    kind = review.report_problem(post)[1]   # the gate's one rule for a comment that looks like a report (issue #865)
+    if kind == lens.BROKEN:
         return ['reads nothing']
-    if review.not_lens_report(post):   # looks like a report, but without the lens marker it is none (issue #865)
+    if kind == lens.HELD:   # no lens marker, but an open finding: it blocks until deleted or `not a lens:`
+        return ['reads nothing', 'no lens marker']
+    if kind == lens.NOT_LENS:   # no lens marker and no open finding: no report, never a read or a block
         return ['not a lens', 'no lens marker']
     header = lens.lens_header(body)
     if not header:

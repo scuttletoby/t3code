@@ -399,14 +399,41 @@ class Rules(unittest.TestCase):
                 ok, why, rows = self.verdict([self.p.lens('correctness', A), self.p.post(body)])
                 self.assertTrue(ok, why)
                 self.assertEqual([(name.split(' (')[0], good) for name, good, _ in rows],
-                                 [('correctness', True), (lens.NOT_LENS, True)])
+                                 [('correctness', True), (lens.NOT_LENS, H.WARN)])   # passes, but never green
                 self.assertIn(lens.NO_MARKER, rows[1][2])
                 ok, why, rows = self.verdict([self.p.post(body)])   # alone: no lens comments, still named
                 self.assertTrue(ok, why)
-                self.assertEqual([(name.split(' (')[0], good) for name, good, _ in rows], [(lens.NOT_LENS, True)])
+                self.assertEqual([(name.split(' (')[0], good) for name, good, _ in rows], [(lens.NOT_LENS, H.WARN)])
                 ok, why, rows = self.verdict([self.p.post(body)], required='correctness')   # fail closed
                 self.assertFalse(ok)
-                self.assertIn('carry no lens marker', why)
+                self.assertTrue(why.startswith(H.marker_hint(1)), why)   # the fix first, with the header line
+                self.assertIn(lens.REPOST, why)
+                self.assertNotIn('required-lenses', why, 'no config hint when a look-alike is there')
+        ok, why, _ = self.verdict([self.p.post('Thanks')], required='correctness')   # no look-alike: the config hint
+        self.assertFalse(ok)
+        self.assertIn('check it in required-lenses', why)
+        self.assertNotIn(lens.REPOST, why)
+
+    def test_an_unmarked_look_alike_with_an_open_finding_still_fails(self):   # issue #865 round 1
+        for body in (f'## {LENS.title()} correctness, round 2\nblocker: a re-run loses data\nmajor: none',
+                     f'## {LENS.title()} correctness, round 2\nverdict: not safe to merge',
+                     'covered: all\nchecks: ran the tests\nmajor: the retry drops a row'):
+            with self.subTest(body=body):
+                for comments in ([self.p.lens('correctness', A), self.p.post(body)],
+                                 [self.p.post(body), self.p.lens('correctness', A)]):
+                    ok, why, rows = self.verdict(comments, required='correctness')
+                    self.assertFalse(ok, 'an older or newer clean read never lets it through')
+                    self.assertTrue(why.startswith(H.marker_hint(1)), why)
+                    self.assertEqual([good for _, good, _ in rows], [False, False], 'no one head while it holds')
+                    self.assertEqual(sum(lens.NO_MARKER in name for name, _, _ in rows), 1, rows)
+                ok, why, rows = self.verdict([self.p.post(body)])   # no required lens: still held
+                self.assertFalse(ok, why)
+                self.assertTrue(why.startswith(H.marker_hint(1)), why)
+                self.assertEqual([name.split(' (')[0] for name, _, _ in rows], [lens.NO_HEADER])
+                ok, why, _ = self.verdict([self.p.post(body)], required='correctness')
+                self.assertFalse(ok)
+                self.assertTrue(why.startswith(H.marker_hint(1)), why)
+                self.assertNotIn('required-lenses', why)
 
     def test_a_deleted_comment_counts_no_more(self):   # deleted: GitHub no longer lists it
         look_alike = self.p.post(f'read at: {A[:7]}')
@@ -2263,7 +2290,8 @@ class Runs(unittest.TestCase):
                                head=self.read))
         code, out = run_cli(self.path, fake_gh((0, answer)), env=self.env)
         self.assertEqual(code, 0, out)
-        self.assertRegex(self.read_file('summary.md'), rf'\| {lens.NOT_LENS} \([^|]*\) \| ok \| no lens marker')
+        self.assertRegex(self.read_file('summary.md'), rf'\| {lens.NOT_LENS} \([^|]*\) \| warn \| no lens marker')
+        self.assertIn(f'WARN {lens.NOT_LENS}', out)
 
     def test_pass_and_fail_reach_the_exit_code_summary_and_output(self):
         code, out = run_cli(self.path, fake_gh((0, self.good)), env=self.env)

@@ -12,6 +12,7 @@ import {
   HIDDEN,
   NO_HEADER,
   NO_MARKER,
+  REPOST,
   hasMarker,
   lensHeader,
   lensKey,
@@ -19,6 +20,7 @@ import {
   lensScan,
   looksProblem,
   notLensReport,
+  reportProblem,
 } from "./lensComment.ts";
 import { ReviewPlanError, globMatches, planReview, type ReviewBlock } from "./plan.ts";
 import { PyTextError } from "./pyText.ts";
@@ -323,6 +325,34 @@ describe("rounds meet old, repeated, edited, deleted and empty state", () => {
       assert.isNotNull(looks, body);
       assert.strictEqual(lensProblem(body), hasMarker(body) ? looks : null, body);
       assert.strictEqual(notLensReport(body) !== null, !hasMarker(body), body);
+    }
+  });
+  it("a look-alike without the marker that holds an open finding blocks, names the fix, and an older read does not win (#865 round 1)", () => {
+    for (const body of [
+      "## Code lens\nblocker: a re-run loses data\nmajor: none",
+      "covered: a\nchecks: b\nmajor: the retry drops a row",
+      "NOT SAFE to merge (code lens, round 2)\nmore below",
+    ]) {
+      const got = reportProblem(body);
+      assert.strictEqual(got?.[1], "held", body);
+      assert.strictEqual(lensProblem(body), got![0], body);
+      assert.isNull(notLensReport(body), body);
+      assert.isTrue(got![0].startsWith(`${NO_MARKER}, but it holds an open `), got![0]);
+      assert.include(got![0], REPOST);
+    }
+    assert.strictEqual(reportProblem("## Code lens\nAll fine.")?.[1], "notLens");
+    assert.strictEqual(reportProblem("Here.\nread at: 1234567")?.[1], "broken");
+    assert.isNull(reportProblem(`lens: code · reviewer: a · read at: ${"a".repeat(40)}`));
+    for (const name of [
+      "a clean read then a newer unmarked report with an open blocker holds the head (issue 865)",
+      "a clean read then a newer unmarked NOT SAFE verdict holds the head",
+    ]) {
+      const got = scan(named("scans", name));
+      assert.deepStrictEqual(got.entries.code, ["a".repeat(40), null], name);
+      const held = Object.keys(got.entries).filter((key) => key.startsWith(NO_HEADER));
+      assert.lengthOf(held, 1, name);
+      assert.include(held[0], REPOST);
+      assert.deepStrictEqual(got.notLens, [], name);
     }
   });
   it("an override comment never reads as a lens report, with the repository's prefix only", () => {

@@ -2,8 +2,11 @@
 
 A lens posts its report as one pull request comment. The merge gate (`fork-ci/actions/pr-queue`) reads that comment
 with fixed rules. A comment that carries the lens marker (below) is a lens report, and the gate fails closed on it: one
-that is not exactly one valid read blocks the head. A comment without the marker is no lens report however much it
-looks like one: it never reads and never blocks, and the gate's summary names it `not a lens report` with the reason.
+that is not exactly one valid read blocks the head. A comment without the marker that looks like a report is no lens
+report and never reads. It blocks only when it holds an open finding (a `blocker:` or `major:` line that is not
+`none`, or NOT SAFE): then it is most likely a real report with a broken header, so it holds the head whatever an older
+or newer read of that lens says, until it is deleted or starts with `not a lens:`. One with no open finding never
+blocks, and the gate's summary names it `not a lens report` with the reason.
 This page shows the format with examples. The rules themselves are the gate's code and its README (sections
 [Lens comments](../../fork-ci/actions/pr-queue/README.md#lens-comments) and
 [Review rules](../../fork-ci/actions/pr-queue/README.md#review-rules)); the gate's test vectors
@@ -28,7 +31,10 @@ list and heading marks), in a code block or quote too:
 A real report has it on its first line, the header. The marker decides only whether a comment is a lens report; the
 rest of this page decides whether that report is one valid read. A heading such as `## Lens A`, `safe to merge`, or
 `covered:` and `checks:` lines are no marker: such a comment is `not a lens`, `no lens marker`, and a lens whose report
-reads that way has posted nothing the gate counts (a required lens then still has no read).
+reads that way has posted nothing the gate counts (a required lens then still has no read). If it holds an open finding
+it is `reads nothing`, `no lens marker` and blocks. Either way the fix is a NEW comment whose first line is
+`lens: <name> · reviewer: <who> · read at: <sha>`: editing the marker into the old comment does not count (an edited
+comment reads nothing).
 
 ## The shape
 
@@ -66,20 +72,20 @@ minor: <a small thing>; <another>
 
 Each example says, on the line before it, what the gate reads, as words:
 
-| Words                 | Meaning                                                                                                            |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `lens <key>`          | a lens header naming this lens (`lens_key`: lowercased, a trailing round marker dropped)                           |
-| `round <n>`           | the header carries round marker `r<n>`                                                                             |
-| `read`                | the header names a full sha: this is a read of that head                                                           |
-| `short sha`, `no sha` | the header's sha is short or missing: no read                                                                      |
-| `clean`               | a findings section with no blocker and no major                                                                    |
-| `blocker`, `major`    | an open blocker or major: the gate holds the head until a new read on a fixed head, or a person                    |
-| `no findings section` | no blocker and major labels: with `findings` on, the gate does not take the read                                   |
-| `state`, `no state`   | a `state:` line with an answer, or none                                                                            |
-| `reads nothing`       | carries the lens marker but is not one valid read: the gate counts it as a blocking problem                        |
-| `no lens marker`      | looks like a lens report but carries no lens marker: no lens report, never a read or a block, named in the summary |
-| `not a lens`          | not a lens report at all (a plain comment, or one that opts out with `not a lens:`): ignored                       |
-| `override`            | an override comment for that sha (counts only from the configured author association, never edited and not hidden) |
+| Words                 | Meaning                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `lens <key>`          | a lens header naming this lens (`lens_key`: lowercased, a trailing round marker dropped)                            |
+| `round <n>`           | the header carries round marker `r<n>`                                                                              |
+| `read`                | the header names a full sha: this is a read of that head                                                            |
+| `short sha`, `no sha` | the header's sha is short or missing: no read                                                                       |
+| `clean`               | a findings section with no blocker and no major                                                                     |
+| `blocker`, `major`    | an open blocker or major: the gate holds the head until a new read on a fixed head, or a person                     |
+| `no findings section` | no blocker and major labels: with `findings` on, the gate does not take the read                                    |
+| `state`, `no state`   | a `state:` line with an answer, or none                                                                             |
+| `reads nothing`       | not one valid read that the gate counts as a blocking problem: it carries the lens marker, or holds an open finding |
+| `no lens marker`      | looks like a lens report but carries no lens marker: never a read; a block only with `reads nothing` (open finding) |
+| `not a lens`          | not a lens report at all (a plain comment, or one that opts out with `not a lens:`): ignored                        |
+| `override`            | an override comment for that sha (counts only from the configured author association, never edited and not hidden)  |
 
 ## Good reports
 
@@ -226,7 +232,7 @@ major: none
 ## Comments that read nothing or are no report
 
 A comment with the lens marker that is not one valid read blocks the head (`reads nothing`). One without the marker
-is no report, however much it looks like one (`no lens marker`).
+is no report, however much it looks like one (`no lens marker`), and it blocks only when it holds an open finding.
 
 No findings section: only a major label, no blocker label. The gate sees no section and does not take the read.
 
@@ -302,6 +308,18 @@ The gate reads: `not a lens, no lens marker`
 ```text
 ## Lens A
 blocker: none
+major: none
+```
+
+A lens-like heading with no marker that holds an open finding: most likely a real report with a broken header, so it
+blocks, whatever another read of that lens says. Delete it or start it with `not a lens:`, and post a new comment with
+the header.
+
+The gate reads: `reads nothing, no lens marker`
+
+```text
+## Lens A
+blocker: a second run loses the saved rows
 major: none
 ```
 

@@ -174,6 +174,13 @@ class Check(unittest.TestCase):
                 self.assertEqual(self.verdict(body), 'not a lens, no lens marker')
                 self.assertEqual(self.m.check(body, 'tool ready --head', SHA), (1, 'not a lens, no lens marker'))
 
+    def test_a_look_alike_without_the_lens_marker_with_an_open_finding_blocks(self):   # issue #865 round 1
+        for body in ('## Lens A\nblocker: a re-run loses data\nmajor: none', 'covered: a\nchecks: b\nmajor: a dropped row',
+                     'NOT SAFE to merge (lens A)\nmore below'):
+            with self.subTest(body=body):
+                self.assertEqual(self.verdict(body), 'reads nothing, no lens marker')
+                self.assertEqual(self.m.check(body, 'tool ready --head', SHA), (1, 'reads nothing, no lens marker'))
+
 
 class Cli(unittest.TestCase):
     def setUp(self):
@@ -239,10 +246,13 @@ MUTATIONS = {
                                "words.append('state')", (Check, 'test_a_missing_state_line_fails')),
     'a short sha is no read': ("if not lens.FULL_SHA.fullmatch(sha or ''):", 'if not sha:',
                                (Doc, 'test_every_example_reads_as_it_says')),
-    'the gate flags a looking comment': ('if review.lens_problem(post):', 'if False:',
+    'the gate flags a looking comment': ('if kind == lens.BROKEN:', 'if False:',
                                          (Check, 'test_a_looking_comment_reads_nothing')),
-    'a look-alike without the marker is named': ('if review.not_lens_report(post):', 'if False:',
+    'a look-alike without the marker is named': ('if kind == lens.NOT_LENS:', 'if False:',
                                                  (Check, 'test_a_look_alike_without_the_lens_marker_is_no_lens')),
+    'a look-alike with an open finding blocks': (
+        'if kind == lens.HELD:', 'if False:',
+        (Check, 'test_a_look_alike_without_the_lens_marker_with_an_open_finding_blocks')),
     'every example is compared': ('if got != said:', 'if False:', (Doc, 'test_a_broken_example_fails')),
     'the head is lowercased': ("sha != head.lower()", 'sha != head',
                                (Check, 'test_the_head_is_matched_whatever_its_case')),

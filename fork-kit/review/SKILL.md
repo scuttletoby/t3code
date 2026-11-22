@@ -196,8 +196,8 @@ python3 -I fork-kit/review/lib/review_kit.py check --root <checkout> [--settings
 Exit 0 only for a read of that head with a findings section, no blocker or major, and a state line; otherwise exit 1,
 and it prints how the gate reads it. A report with a real blocker or major exits 1 **by design**: post it when the
 words read `read, blocker, state` or `read, major, state`. Never soften or drop a finding to get exit 0. Words
-`not a lens, no lens marker` mean the gate would not see a report at all (COMMENTS.md, "The lens marker"): fix the
-header, never post it that way. A project may
+`not a lens, no lens marker` mean the gate would not see a report at all, and `reads nothing, no lens marker` mean it
+blocks the head without reading it (COMMENTS.md, "The lens marker"): fix the header, never post it that way. A project may
 also have a check of the posted comment (who wrote it, edits): run it right after posting. A comment is never edited
 or hidden (an edited or hidden lens comment reads nothing): post a new one. A comment the gate reads as
 `reads nothing` keeps blocking the head even after a new post: delete it, or edit its first line to start with

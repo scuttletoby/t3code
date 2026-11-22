@@ -215,10 +215,18 @@ labels or changed paths, say) and pass it in.
 The log and the job summary list each lens with `ok` or `fail` and a short
 reason (the sha it read, an override, edited, hidden, a short sha, required
 but missing). A comment that looks like a lens report but carries no lens
-marker (the pr-queue README, "Lens comments") is no lens report: it gets a row
-`not a lens report (<where>)`, `ok`, with the reason, and never fails the
-check; a required lens it was meant to be still fails as missing, and the
-reason says how many such comments there are.
+marker (the pr-queue README, "Lens comments") is no lens report. If it holds no
+open finding it gets a row `not a lens report (<where>)`, `WARN` (`warn` in the
+summary: it passes, but is not green), with the reason, and never fails the
+check on its own. If it holds an open finding (a `blocker:` or `major:` line
+that is not `none`, or NOT SAFE) it blocks, as a `fail` row, whether or not a
+lens is required and whatever another read of that lens says. A required lens
+such a comment was meant to be still fails as missing. In both cases the
+failure reason starts with the fix: how many comments look like a lens report
+without the marker, and to post a NEW comment whose first line is
+`lens: <name> · reviewer: <who> · read at: <sha>` (editing the marker in does
+not count). The hint to check the names in `required-lenses` appears only when
+no such comment exists.
 
 | Exit | Meaning                                                                          |
 | ---- | -------------------------------------------------------------------------------- |
