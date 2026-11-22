@@ -146,6 +146,103 @@ const personOnlyKeysIn = (tool: Tool.Any): ReadonlyArray<string> =>
     return key === undefined ? [] : [key];
   });
 
+/** Keys that give a schema a shape; a node with none of them takes any value. */
+const SHAPED = ["type", "$ref", "anyOf", "oneOf", "allOf", "enum", "const", "properties", "items"];
+
+/**
+ * Where a JSON schema takes keys it does not name: a record, an object open to more keys, or a value
+ * of any shape. A person-only setting could pass there under no name the check above sees.
+ * Paths are dotted from `$`; `*` is a record's value, `[]` an array's item.
+ */
+const openKeyPaths = (schema: unknown, at = "$"): ReadonlyArray<string> => {
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return [];
+  const node = schema as Record<string, unknown>;
+  const open =
+    // A struct says `additionalProperties: true`, but a call's decode drops a key it does not name
+    // (the test below): only a record, whose value has a schema here, keeps one.
+    (node.additionalProperties !== null && typeof node.additionalProperties === "object") ||
+    node.patternProperties !== undefined ||
+    !SHAPED.some((key) => key in node);
+  const children = (value: unknown): ReadonlyArray<readonly [string, unknown]> =>
+    value !== null && typeof value === "object" ? Object.entries(value) : [];
+  const inner = Object.entries(node).flatMap(([key, value]) => {
+    switch (key) {
+      case "properties":
+        return children(value).flatMap(([name, child]) => openKeyPaths(child, `${at}.${name}`));
+      case "$defs":
+      case "definitions":
+        return children(value).flatMap(([name, child]) => openKeyPaths(child, `#${name}`));
+      case "patternProperties":
+        return children(value).flatMap(([, child]) => openKeyPaths(child, `${at}.*`));
+      case "additionalProperties":
+        return openKeyPaths(value, `${at}.*`);
+      case "type":
+        // An array with no item schema takes items of any shape.
+        return value === "array" && node.items === undefined && node.prefixItems === undefined
+          ? [`${at}[]`]
+          : [];
+      case "items":
+        return Array.isArray(value)
+          ? value.flatMap((child) => openKeyPaths(child, `${at}[]`))
+          : openKeyPaths(value, `${at}[]`);
+      case "prefixItems":
+        return children(value).flatMap(([, child]) => openKeyPaths(child, `${at}[]`));
+      case "anyOf":
+      case "oneOf":
+      case "allOf":
+        return children(value).flatMap(([, child]) => openKeyPaths(child, at));
+      // A JSON string the call decodes to a value.
+      case "contentSchema":
+        return openKeyPaths(value, at);
+      default:
+        return [];
+    }
+  });
+  return [...(open ? [at] : []), ...inner];
+};
+
+/** Each T3 tool's open places, as `tool $.path`. */
+const openKeysIn = (tool: Tool.Any): ReadonlyArray<string> => [
+  ...new Set(
+    openKeyPaths(
+      withoutMachineOnlyFields(Tool.getJsonSchema(tool) as { [key: string]: unknown }),
+    ).map((path) => `${tool.name} ${path}`),
+  ),
+];
+
+/**
+ * Every place a T3 tool's input takes keys it does not name, each with why a person-only setting
+ * sent there never reaches the settings. A new one fails the test below until it is reviewed here.
+ */
+/** ModelSelection reads its fields leniently, then decodes to a closed shape. */
+const MODEL_SELECTION =
+  "upstream's ModelSelection (contracts modelSelection.ts) decodes these to a string instance id, a model name and options as id/value pairs; nothing else is kept";
+/** A child's model options. */
+const TARGET_OPTIONS =
+  "model options for the new thread, each checked against its model's options (an unknown id is refused); they go to that thread's model selection only";
+
+const OPEN_KEYS_REVIEWED: Readonly<Record<string, string>> = {
+  "create_threads $.threads[].target.options": TARGET_OPTIONS,
+  "delegate_task $.target.options": TARGET_OPTIONS,
+  "list_issues $.cursors": "paging cursors handed back to the issue tracker; read only",
+  "t3_project_create $.defaultModelSelection.instanceId": MODEL_SELECTION,
+  "t3_project_create $.defaultModelSelection.model": MODEL_SELECTION,
+  "t3_project_create $.defaultModelSelection.options": MODEL_SELECTION,
+  "t3_project_create $.defaultModelSelection.provider": MODEL_SELECTION,
+  "t3_project_update $.defaultModelSelection.instanceId": MODEL_SELECTION,
+  "t3_project_update $.defaultModelSelection.model": MODEL_SELECTION,
+  "t3_project_update $.defaultModelSelection.options": MODEL_SELECTION,
+  "t3_project_update $.defaultModelSelection.provider": MODEL_SELECTION,
+  "t3_thread_configure $.modelSelection.instanceId": MODEL_SELECTION,
+  "t3_thread_configure $.modelSelection.model": MODEL_SELECTION,
+  "t3_thread_configure $.modelSelection.options": MODEL_SELECTION,
+  "t3_thread_configure $.modelSelection.provider": MODEL_SELECTION,
+  "t3_thread_launch $.modelSelection.instanceId": MODEL_SELECTION,
+  "t3_thread_launch $.modelSelection.model": MODEL_SELECTION,
+  "t3_thread_launch $.modelSelection.options": MODEL_SELECTION,
+  "t3_thread_launch $.modelSelection.provider": MODEL_SELECTION,
+};
+
 describe("person-only fork settings", () => {
   it("lists every fork setting but the agent-writable ones", () => {
     expect(FORK_PERSON_ONLY_KEYS).toEqual(
@@ -241,6 +338,34 @@ describe("person-only fork settings", () => {
       });
       expect(personOnlyKeysIn(tool), field).toEqual([key]);
     }
+  });
+
+  it("lists every place a T3 tool's input takes keys it does not name, each reviewed (#785)", () => {
+    const found = [...tools.values()].flatMap(openKeysIn).toSorted();
+    expect(found).toEqual(Object.keys(OPEN_KEYS_REVIEWED).toSorted());
+  });
+
+  it("catches a record, an open object or a value of any shape in a tool's input", () => {
+    const tool = Tool.make("fake_open", {
+      parameters: Schema.Struct({
+        threadId: Schema.String,
+        patch: Schema.Record(Schema.String, Schema.String),
+        options: Schema.Struct({ extra: Schema.Unknown, list: Schema.Array(Schema.Unknown) }),
+        either: Schema.Union([Schema.String, Schema.Record(Schema.String, Schema.Number)]),
+      }),
+    });
+    expect(openKeysIn(tool).toSorted()).toEqual(
+      [
+        "fake_open $.patch",
+        "fake_open $.options.extra",
+        "fake_open $.options.list[]",
+        "fake_open $.either",
+      ].toSorted(),
+    );
+    const closed = Tool.make("fake_closed", {
+      parameters: Schema.Struct({ threadId: Schema.String, n: Schema.optionalKey(Schema.Number) }),
+    });
+    expect(openKeysIn(closed)).toEqual([]);
   });
 
   it("catches a person-only key at the end of a settings patch path", () => {

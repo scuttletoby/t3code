@@ -17,14 +17,14 @@ import {
   lensScan,
 } from "./lensComment.ts";
 import { ReviewPlanError, globMatches, planReview, type ReviewBlock } from "./plan.ts";
-import { repr, splitlines } from "./pyText.ts";
+import { PyTextError } from "./pyText.ts";
+import { PY_ASSIGNED, PY_UNICODE } from "./pyUnicode.ts";
+import { vectorPosts } from "./vectors.testkit.ts";
 import {
   CLEARED,
-  LOOSE,
   REPORT,
   judgeRounds,
   requiredLenses,
-  roundMarker,
   roundsText,
   type EntryHow,
 } from "./rounds.ts";
@@ -48,6 +48,11 @@ const FIELDS: Record<string, ReadonlyArray<string> | null> = {
   cases: ["name", "config", "changes", "weight", "lenses", "hits", "protected"],
   findings: ["name", "group", "body", "findings", "section"],
   scans: ["name", "posts", "history", "entries"],
+  linear: ["name", "fn", "parts", "expect", "ms"],
+  py_unicode: null,
+  unicode: ["name", "body", "findings", "section", "unassigned", "refused"],
+  // Run by lensStart.test.ts: lens_start's copy of lens_reads, review_rounds and verdict.
+  reads: ["name", "posts", "head", "same", "override_authors", "required", "expect"],
   rounds: [
     "name",
     "config",
@@ -87,17 +92,7 @@ function replayRound(v: any) {
   };
 }
 
-// Each post as the Python side's scan() posts it: by `someone`, one second apart, so the gate names it the same way.
-const at = (i: number) =>
-  `2026-01-01T00:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z`;
-const posts = (v: any) =>
-  (v.posts as Array<{ body: string; edited?: boolean; hidden?: boolean }>).map((p, i) => ({
-    body: p.body,
-    edited: p.edited ?? false,
-    hidden: p.hidden ?? false,
-    where: `by someone at ${at(i)}`,
-  }));
-const scan = (v: any) => lensScan(posts(v), V.override_prefix);
+const scan = (v: any) => lensScan(vectorPosts(v.posts), V.override_prefix);
 
 describe("the shared vectors", () => {
   it("runs every section and every field, each vector name once", () => {
@@ -156,6 +151,56 @@ describe("the shared vectors", () => {
   it("every round", () => {
     assert.isAtLeast(V.rounds.length, 28);
     for (const r of V.rounds) assert.deepStrictEqual(replayRound(r), r.expect, r.name);
+  });
+
+  // Each with its own time bound: the server's test timeout is 120 s, so a slow but not hanging path would pass it.
+  it("every linear-time vector, in its time", () => {
+    assert.isAtLeast(V.linear.length, 17);
+    const fns: Record<string, (body: string) => unknown> = {
+      read_findings: (body) => readFindings(body),
+      lens_problem: (body) => lensProblem(body, V.override_prefix),
+    };
+    for (const v of V.linear) {
+      const body = (v.parts as Array<[string, number]>).map(([text, n]) => text.repeat(n)).join("");
+      assert.property(fns, v.fn, v.name);
+      // oxlint-disable-next-line t3code/no-wall-clock-in-tests -- a linear-time bound, as the gate's own test has
+      const t = performance.now();
+      const got = fns[v.fn]!(body);
+      // oxlint-disable-next-line t3code/no-wall-clock-in-tests -- the same bound
+      assert.isBelow(performance.now() - t, v.ms, v.name);
+      assert.deepStrictEqual(got, v.expect, v.name);
+    }
+  });
+
+  it("the gate's Unicode table, and text whose code points this runtime assigns otherwise is refused", () => {
+    assert.deepStrictEqual(
+      [PY_UNICODE, PY_ASSIGNED],
+      [V.py_unicode.version, V.py_unicode.assigned],
+    );
+    assert.isAtLeast(V.unicode.length, 3);
+    let refused = 0;
+    for (const v of V.unicode) {
+      // Unassigned in the gate's Unicode and assigned here as a letter, number, mark, format character or space: those
+      // read differently. A new symbol (an emoji) reads alike.
+      const drift = (v.refused as string[]).filter(
+        (u) => !/^\p{Cn}$/u.test(String.fromCodePoint(Number.parseInt(u.slice(2), 16))),
+      );
+      if (drift.length === 0) {
+        assert.deepStrictEqual(readFindings(v.body), [v.findings, v.section], v.name);
+        continue;
+      }
+      refused++;
+      for (const read of [readFindings, lensProblem, lensHeader, lensKey, fold]) {
+        assert.throws(() => read(v.body), PyTextError, undefined, `${v.name}: ${read.name}`);
+        try {
+          read(v.body);
+        } catch (error) {
+          assert.deepStrictEqual((error as PyTextError).codePoints, drift, v.name);
+        }
+      }
+    }
+    // This runtime's Unicode is newer than 15.0 (Node 24: 16 or later), so the new letter is refused.
+    assert.isAtLeast(refused, 1);
   });
 
   it("every recorded lens_header and lens_key call of the gate's corpus", () => {
@@ -300,102 +345,5 @@ describe("the T3 side's own edges", () => {
       true,
     );
     assert.deepStrictEqual([...requiredLenses(review, plan, decided).values()], ["code"]);
-  });
-
-  // Each answer below is the gate's (review_judge.py), where JavaScript's own rules would differ.
-  it("reads as Python's regex and int rules do", () => {
-    const none = `${HEAD}blocker: none\nmajor: none\n`;
-    assert.deepStrictEqual(readFindings(`${none}block\u0130ng: x`), [
-      [["blocker", "block\u0130ng: x"]],
-      true,
-    ]);
-    assert.deepStrictEqual(readFindings(`${none}verdict: not safe\u00e9`), [[], true]);
-    assert.deepStrictEqual(readFindings(`${none}verdict: not safe!`), [
-      [["blocker", "the report says NOT SAFE: verdict: not safe!"]],
-      true,
-    ]);
-    assert.deepStrictEqual(readFindings(`${HEAD}blocker: none\n### Major\n## Next section\nnone`), [
-      [["major", "Major (nothing under it)"]],
-      true,
-    ]);
-    assert.strictEqual(roundMarker("code r\u0663"), 3);
-    assert.strictEqual(roundMarker("code r\u0661\u0662"), 12);
-    const review: ReviewBlock = { ...basic, override_authors: [] };
-    const keys = judgeRounds(review, [], {
-      "\u{1F600}": [LOOSE, "major: x"],
-      "\uff42": [LOOSE, "major: y"],
-    });
-    assert.deepStrictEqual(
-      keys.findings.map(([key]) => key),
-      ["\uff42", "\u{1F600}"],
-    );
-  });
-
-  it("reads Python's text rules", () => {
-    assert.strictEqual(roundMarker("code r３"), 3);
-    assert.strictEqual(roundMarker("code **r12**"), 12);
-    assert.strictEqual(fold("ma&#106;or\\: x"), "major: x");
-    assert.strictEqual(fold("majоr"), "major");
-    assert.deepStrictEqual(splitlines("a\r\nb\u2028c\n"), ["a", "b", "c"]);
-    assert.strictEqual(repr('it\'s "x" \\'), `'it\\'s "x" \\\\'`);
-    assert.deepStrictEqual(readFindings(`${HEAD}blocker: none\nMAJOR: x`)[0], [
-      ["major", "MAJOR: x"],
-    ]);
-    assert.deepStrictEqual(readFindings(`${HEAD}blocker: none\nmajor: x`)[0], [
-      ["major", "major: x"],
-    ]);
-    assert.deepStrictEqual(readFindings(`${HEAD}blocker: none\nmajor: İx`)[0], [
-      ["major", "major: İx"],
-    ]);
-  });
-
-  // The gate's linear-time lines and its answers (review_judge.test.py), each with its own time bound: the server's
-  // test timeout is 120 s, so a slow but not hanging path would pass without one.
-  const timed = (f: () => unknown, ms: number) => {
-    // oxlint-disable-next-line t3code/no-wall-clock-in-tests -- a linear-time bound, as the gate's own test has
-    const t = performance.now();
-    f();
-    // oxlint-disable-next-line t3code/no-wall-clock-in-tests -- the same bound
-    return assert.isBelow(performance.now() - t, ms);
-  };
-  it("reads a long run of spaces in linear time, as the gate does", () => {
-    const n = 200_000;
-    const sp = " ".repeat(n);
-    const cases: Array<[string, Array<[string, string]>]> = [
-      [`major${sp}x`, []],
-      [`blocker: none${sp}x`, [["blocker", "blocker: none x"]]],
-      [`| a | b |\n${sp}x`, []],
-      [`| a | b |\n|${sp}x`, []],
-      [`| a | b |\n|-${sp}x`, []],
-      [`not${sp}safe`, [["blocker", "the report says NOT SAFE: not safe"]]],
-      [`finding:${sp}x`, []],
-      [`major: none${" \t".repeat(n / 2)}x`, [["major", "major: none x"]]],
-    ];
-    for (const [line, want] of cases)
-      timed(() => assert.deepStrictEqual(readFindings(HEAD + line), [want, false]), 2000);
-  });
-
-  it("reads a wide table row in linear time, as the gate does", () => {
-    // The old per-cell read took 39.5 s at 4,000 cells. Each about one full-size comment (65,536 characters).
-    const rows = [
-      "| " + "major | ".repeat(8000),
-      "| " + "major | ".repeat(4000) + "x | ".repeat(4000),
-      "| " + "major | ".repeat(3000) + "\n|" + "---|".repeat(3000) + "\n| " + "x | ".repeat(3000),
-      "| major |" + " |".repeat(30_000) + " x |",
-      "|" + "---|".repeat(16_000) + "x",
-    ];
-    for (const row of rows) timed(() => readFindings(HEAD + row), 2000);
-    assert.deepStrictEqual(readFindings(HEAD + rows[0]!)[0], [["major", "major ".repeat(20)]]);
-  });
-
-  it("reads a full-size comment's lens problem in linear time", () => {
-    const n = 16_000;
-    for (const body of [
-      `${HEAD}${"lens: x read at 1234567\n".repeat(n / 8)}`,
-      `${HEAD}${"> ".repeat(n)}lens: code · read at: ${"a".repeat(40)}`,
-      `x\n${" ".repeat(n * 4)}read at 1234567`,
-      `not a lens: x\n${"> read at: 1234567\n".repeat(n / 8)}`,
-    ])
-      timed(() => lensProblem(body), 2000);
   });
 });
