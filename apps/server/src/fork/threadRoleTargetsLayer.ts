@@ -1,7 +1,8 @@
 /**
  * Fork (calm sidebar): {@link ThreadRoleTargets} read from upstream's orchestrator, for the
  * `threadRoles` save check (threadRoleTargets.ts). Kept apart from that file so the settings file
- * never imports orchestration code. Wired in forkLayers.ts (`layerRuntimeServices`).
+ * never imports orchestration code. Wired in forkLayers.ts (`layerRuntimeServices`); its make span
+ * shows holdWork.boot.test.ts the real server builds it.
  */
 import { isListedThreadLineage, type ThreadId } from "@t3tools/contracts";
 import { Effect, Layer } from "effect";
@@ -26,5 +27,5 @@ export const layer = Layer.effect(
             };
       }),
     }),
-  ),
+  ).pipe(Effect.withSpan("ThreadRoleTargets.make")),
 );

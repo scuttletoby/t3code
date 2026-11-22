@@ -10,6 +10,7 @@ import {
   type HookCallbackMatcher,
   type HookEvent,
   type McpServerStatus,
+  type PreToolUseHookInput,
   type Settings as ClaudeSettings,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -138,14 +139,14 @@ export function claudeMcpProfilePlan(
 /**
  * Refuses a call to any tool but an MCP server's; hooks run in every mode and in sub-agents. Fails
  * closed: a tool name that is not a string, or any error while checking, refuses the call (a hook
- * that throws would count as a non-blocking error and let the call through).
+ * that throws would count as a non-blocking error and let the call through). It never trusts
+ * `hook_event_name`: whatever it says (missing, empty, another event), only an `mcp__` tool passes.
  */
 const claudeBuiltinToolsGuard =
   (name: string): HookCallback =>
   async (input) => {
     try {
-      if (input.hook_event_name !== "PreToolUse") return {};
-      const toolName: unknown = input.tool_name;
+      const toolName: unknown = (input as { tool_name?: unknown }).tool_name;
       if (typeof toolName === "string" && toolName.startsWith("mcp__")) return {};
       const shown = typeof toolName === "string" ? `the built-in tool "${toolName}"` : "a tool";
       return builtinToolDenial(
@@ -264,10 +265,10 @@ export function claudeMcpCallOutsideProfile(
 }
 
 /**
- * Refuses, at the moment of the call, a tool call to an MCP server the profile leaves out. The
- * options keep such servers from loading; this covers what loads anyway (a managed policy that
- * drops T3's allowlist, an agent file's servers, a server added mid-session). Hooks run in every
- * permission mode and inside sub-agents.
+ * Refuses, at the call, a tool of an MCP server the profile leaves out but that loaded anyway (a
+ * managed policy that drops T3's allowlist, an agent file's servers, one added mid-session). Hooks
+ * run in every permission mode and in sub-agents. It never trusts `hook_event_name`: whatever it
+ * says (missing, empty, another event), a left-out server's tool is refused.
  */
 const claudeMcpProfileGuard =
   (
@@ -276,8 +277,9 @@ const claudeMcpProfileGuard =
     t3ServerNames: ReadonlyArray<string>,
   ): HookCallback =>
   async (input) => {
-    if (input.hook_event_name !== "PreToolUse") return {};
-    const server = claudeMcpCallOutsideProfile(servers, t3ServerNames, input);
+    // Registered only under PreToolUse, so the input is read as one whatever its event name.
+    const call = input as PreToolUseHookInput;
+    const server = claudeMcpCallOutsideProfile(servers, t3ServerNames, call);
     if (server === undefined) return {};
     return {
       hookSpecificOutput: {
