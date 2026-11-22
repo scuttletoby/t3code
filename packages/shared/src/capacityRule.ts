@@ -259,12 +259,12 @@ function costOf(
   declaredMb: unknown,
 ): Cost {
   const spec = rule.kinds[kind]!;
+  const sane =
+    isFiniteNumber(declaredMb) && declaredMb > 0 && declaredMb <= rule.readingBounds.maxTotalMb
+      ? Math.ceil(declaredMb)
+      : null;
   if (spec.plusDeclared === true) {
-    const declared =
-      isFiniteNumber(declaredMb) && declaredMb > 0 && declaredMb <= rule.readingBounds.maxTotalMb
-        ? Math.ceil(declaredMb)
-        : (spec.declaredFallbackMb ?? 0);
-    const mb = spec.startMb + declared;
+    const mb = spec.startMb + (sane ?? spec.declaredFallbackMb ?? 0);
     return { mb, centiCores: spec.startCentiCores, unlearnedMb: mb };
   }
   const { minPercent, maxPercent } = rule.learnedBounds;
@@ -276,10 +276,13 @@ function costOf(
         )
       : start;
   const own = learned !== undefined && Object.hasOwn(learned, kind) ? learned[kind] : undefined;
+  // A declared size is a floor of any other kind's cost: a piece that says it needs more (heavy's
+  // reservation for a job: its --mb or its kind's learned peak) owes that, never only its kind's cost.
+  const floor = sane ?? 0;
   return {
-    mb: clamp(own?.mb, spec.startMb),
+    mb: Math.max(clamp(own?.mb, spec.startMb), floor),
     centiCores: clamp(own?.centiCores, spec.startCentiCores),
-    unlearnedMb: spec.startMb,
+    unlearnedMb: Math.max(spec.startMb, floor),
   };
 }
 

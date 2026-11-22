@@ -48,6 +48,7 @@ import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
 import { DESKTOP_RENDERER_ORIGINS } from "../httpCors.ts";
+import * as ForkAuthUnavailable from "../fork/authUnavailable.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedLimits from "../policy/managedLimits.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
@@ -1633,6 +1634,7 @@ export const make = Effect.gen(function* () {
           } satisfies McpClientSession;
         }),
       ),
+      Effect.catchIf(isServerAuthInternalError, ForkAuthUnavailable.answerUnavailable),
       Effect.withSpan("EnvironmentAuth.authenticateMcpClient"),
     );
   };

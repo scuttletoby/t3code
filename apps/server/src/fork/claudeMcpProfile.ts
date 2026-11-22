@@ -42,6 +42,7 @@ import {
   type McpProfileThread,
   resolveMcpProfile,
 } from "./mcpProfile.ts";
+import { makeClaudeAgentModelPolicyHook } from "./claudeAgentModelPolicy.ts";
 import {
   MAX_T3_TOOL_SETS,
   type T3ToolSet,
@@ -705,6 +706,21 @@ export const makeThreadMcpProfilesById = Effect.gen(function* () {
   });
 });
 
+/** A plan with the model policy's Agent and Skill tool hook first among its PreToolUse hooks. */
+const withAgentModelPolicy = (
+  plan: ClaudeMcpProfilePlan,
+  agentPolicy: HookCallbackMatcher,
+): ClaudeMcpProfilePlan => ({
+  ...plan,
+  options: {
+    ...plan.options,
+    hooks: {
+      ...plan.options.hooks,
+      PreToolUse: [agentPolicy, ...(plan.options.hooks?.PreToolUse ?? [])],
+    },
+  },
+});
+
 /**
  * The plan key each thread's Claude process last opened with. Its T3 tool groups are part of the
  * key, so a later plan with the same key has the same set as that process. Memory only, bounded
@@ -746,6 +762,8 @@ const fixedWhenOpened = (
 /** The thread's Claude plan, or a refusal, from {@link makeThreadMcpProfiles}. */
 export const makeClaudeMcpProfiles = Effect.gen(function* () {
   const profileFor = yield* makeThreadMcpProfiles;
+  // Every query also gets the model policy's check of Claude's own Agent and Skill tools.
+  const agentPolicy = yield* makeClaudeAgentModelPolicyHook;
   const planFor = Effect.fn("ClaudeMcpProfile.planFor")(function* (
     thread: LineageThread,
     overrides: McpOverrides,
@@ -770,7 +788,8 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
     if (openedPlanKeys.has(thread.id) && openedPlanKeys.get(thread.id) === planKey(plan)) {
       fixT3ToolSet(thread.id, set);
     }
-    return fixedWhenOpened(plan, thread.id, set);
+    // The policy hook goes in before the options are made lazy, so adding it reads nothing early.
+    return fixedWhenOpened(withAgentModelPolicy(plan, yield* agentPolicy), thread.id, set);
   });
 
   return Effect.fn("ClaudeMcpProfile.plan")(function* (

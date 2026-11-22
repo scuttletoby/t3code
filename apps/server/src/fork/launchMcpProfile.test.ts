@@ -693,6 +693,7 @@ describe("the model policy on a launch sent to a linked machine (#731)", () => {
     model: "claude-opus",
     options: [{ id: "effort", value: effort }],
   });
+  const ULTRACODE_OFF = { id: "ultracode", value: false };
 
   it.effect("enforce: an agent's launch there off the rows, or naming no model, is not sent", () =>
     Effect.gen(function* () {
@@ -724,10 +725,11 @@ describe("the model policy on a launch sent to a linked machine (#731)", () => {
       }
       expect(forwarded).toHaveLength(0);
       expect(launched).toHaveLength(0);
-      // Inside the rows: sent.
-      expect(
-        refusal(yield* launch({ environmentId: THERE, modelSelection: opus("high") })),
-      ).toContain("sent there");
+      // Inside the rows, naming ultracode (a Claude pick sent there must): sent.
+      const inside = { ...opus("high"), options: [...opus("high").options, ULTRACODE_OFF] };
+      expect(refusal(yield* launch({ environmentId: THERE, modelSelection: inside }))).toContain(
+        "sent there",
+      );
       expect(forwarded).toHaveLength(1);
     }),
   );

@@ -12,8 +12,9 @@ unknownKinds.job. "fits" says for every kind how many more pieces of it the rule
 The ledger comes from the kernel only, so the answer stands with T3 down or not installed. Memory, swap, PSI, cores
 and container limits come from lib/capacity_readings.py (the shared reader's port: the same answers as
 capacityReadings.ts). Pieces: heavy's admitted jobs (its live queue tickets; every ticket is a job, of the rule's
-kind for its name or else unknownKinds.job; demand from the job's scope) and T3's agent scopes (`t3code-*.scope`
-under an `app-t3code*` slice; a scope has no kind label, so it counts as unknownKinds.other: a writer), plus the
+kind for its name or else unknownKinds.job; demand from the job's scope) and T3's agent scopes (any scope right below
+an `app-t3code*` slice, a `t3code-*.scope` elsewhere with a note; a scope has no kind label, so it counts as
+unknownKinds.other: a writer), plus the
 other users' heavy jobs and agent scopes read from their user managers' cgroups (unknownKinds.job and writers).
 Full tier: cgroup v2 and this user's systemd user manager. Machine tier: cgroup v2 and user.slice, but no user
 manager of this user's (a CI runner's user: no lingering, no login session): it has no agent or heavy job scopes of
@@ -24,15 +25,16 @@ agents and other users' work cannot be counted, so the answer is never free (a n
 there but unreadable is "elevated": then only the rule's floors admit, never the budget; facts that cannot be read
 admit nothing.
 
-Reservations: lines `<MB> <folder> [until=YYYY-MM-DD]` in *.conf files of $T3_CAPACITY_RESERVE_DIR, else
+Reservations: lines `<MB or kind> <folder> [until=YYYY-MM-DD] [ttl=DUR] [idle=DUR]` (#861: reservation_files,
+release_idle) in *.conf files of $T3_CAPACITY_RESERVE_DIR, else
 ~/.config/t3-capacity/reserve.d. A folder matches itself and what is below it, never a sibling that shares its
 first letters (`/x/app` is not `/x/app-x`); its real path (links resolved) matches too. Each holds MB less what
 its user's processes working in the folder use (RssAnon + RssShmem + VmSwap), and less what the agents and heavy
 jobs with a process working in it still owe the rule (their cost less their demand: that room is held as their debt
 already, so it is counted once, #923). A process counts toward one reservation only (the deepest folder holding it,
 then the first by name), and a piece's debt is split over its processes by their use, so no debt is taken off two
-reservations (#945). It does not hold back a caller whose working folder is in it; past its until date, or broken,
-it holds nothing (a note says so).
+reservations (#945). It does not hold back a caller whose working folder is in it; past its until date or ttl, or
+broken, it holds nothing (a note says so). Every person's readable reservations count in the full tier too (#800).
 
 Readings are kept 5 seconds in /run/user/<uid>/heavy-facts-v<version>-<hash of the settings>.json, one file per
 version and settings, so callers of one user with other settings (slice, queue, reservations folder) or another
@@ -46,15 +48,16 @@ hysteresis) while the last one is at most 5 minutes old; without a cache folder,
 cannot be used, or with no file of its own yet but another caller's written in the last 5 minutes beside it (another
 version after an update, other settings), nothing can carry, so the level starts "elevated" (it never drops straight
 to ok). Cache files of other settings or versions older than 5 minutes are removed. Learned
-job costs: heavy's peaks (lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost,
-not heavy's own reservation for it (heavy's queue holds that one back itself).
+job costs: heavy's peaks (lib/heavy_queue.py reservation(); missing or broken: start). A job owes its kind's cost, or
+heavy's own reservation for it when that is more (its ticket's mb is the piece's declared size, a floor of its cost
+in the rule, #800).
 """
 import datetime, errno, fcntl, fnmatch, hashlib, json, math, os, pwd, re, signal, stat, subprocess, sys, time
 
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
 CACHE_VERSION = 3                               # 3: reservations carry owedMb (#923)
-AGENT_SCOPE_RE = re.compile(r'^t3code-[A-Za-z0-9_.:-]+\.scope\Z')
+AGENT_SCOPE_RE = re.compile(r'^t3code-[A-Za-z0-9_.:\\-]+\.scope\Z')
 SCOPE_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\.scope\Z')
 TICKET_RE = re.compile(r'^t-[0-9]{1,15}-[0-9]{1,10}\.json\Z')
 KIND_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,59}\Z')
@@ -68,7 +71,16 @@ USERS = '/sys/fs/cgroup/user.slice'
 RUN_USER = '/run/user'                          # the cache's folder: /run/user/<uid>
 TMP_ROOT = None                                 # without it: <TMP_ROOT>/heavy-facts-<uid> (None: temp_root())
 TMP_DIRS = ('/tmp',)                            # temp_root() after $TMPDIR
-ROOT = os.environ.get('HEAVY_FACTS_ROOT', '')     # tests: /proc and /sys are read under this folder
+
+
+def test_env(name):
+    """A test-only setting (#800): read only while HEAVY_TESTING=1 is set too, so one that leaks into an agent's or a
+    service's environment (HEAVY_FACTS_ROOT, AGENT_SLOTS_ALIVE, T3_CAPACITY_HEAVY, AGENT_SLOTS_HEAVY) changes
+    nothing a real caller sees."""
+    return os.environ.get(name) if os.environ.get('HEAVY_TESTING') == '1' else None
+
+
+ROOT = test_env('HEAVY_FACTS_ROOT') or ''       # tests: /proc and /sys are read under this folder
 BASIC_WHY = 'basic tier: no cgroup v2, or neither a systemd user manager for this user nor user.slice, so agents and ' \
             'other users\' work cannot be counted: never free here'
 MACHINE_WHY = 'machine tier: no systemd user manager for this user, so it has no agents or heavy jobs of its own; ' \
@@ -100,19 +112,26 @@ def slice_path(name):
 
 
 def agent_scopes(manager):
-    """(T3's agent scope folders, the outermost app-t3code slice folder or None) under the user manager's cgroup."""
-    scopes, box = [], None
+    """(T3's agent scope folders, the outermost app-t3code slice folder or None, notes) under the user manager's
+    cgroup. Every scope right below an `app-t3code*` slice is an agent, whatever its name (an escaped label, `\x2d`,
+    too); a `t3code-*.scope` anywhere else below the manager (T3 run under a slice of another name) counts as one too,
+    with a note, so a scope outside the usual place is never left out (#800)."""
+    scopes, box, notes = [], None, []
     for dirpath, dirs, _files in os.walk(ROOT + manager):
         rel = dirpath[len(ROOT):]
         name = os.path.basename(rel)
+        parent = os.path.basename(os.path.dirname(rel))
         if name.startswith('app-t3code') and name.endswith('.slice') and (box is None or len(rel) < len(box)):
             box = rel
-        if AGENT_SCOPE_RE.match(name) and '/app-t3code' in rel[len(manager):]:
+        if name.endswith('.scope') and rel != manager and (
+                parent.startswith('app-t3code') and parent.endswith('.slice') or AGENT_SCOPE_RE.match(name)):
             scopes.append(rel)
+            if not (parent.startswith('app-t3code') and parent.endswith('.slice')):
+                notes.append(f'agent scope {name[:80]} is not below an app-t3code slice: counted as an agent')
             dirs[:] = []
         else:
             dirs[:] = [d for d in dirs if d.endswith(('.slice', '.scope', '.service'))]
-    return sorted(scopes), box
+    return sorted(scopes), box, notes
 
 
 def tickets(queue_dir):
@@ -180,11 +199,27 @@ def under(cwd, prefixes):
     return any(c.startswith(p) for p in prefixes)
 
 
-def reservation_files(cfg_dir, today, owner=None):
-    """The reservations in one reserve.d: ([{name, prefixes, mb, useMb, owedMb, uid}], notes, blind). owner: None
-    for the caller's own folder (missing or unreadable files hold nothing, as before); (name, uid) for another
-    user's (the machine tier): a folder or file that is there but cannot be read is 'blind' (never free), and only
-    plain files are read (no FIFO can stop the reading)."""
+DURATION_RE = re.compile(r'^([0-9]{1,6})([smhd])\Z')
+
+
+def duration(text):
+    """Seconds of `30m`, `2h`, `1d`, `90s`; ValueError for anything else."""
+    m = DURATION_RE.match(text)
+    if not m:
+        raise ValueError(f'{text!r} is not a duration like 30m, 2h, 1d')
+    return int(m.group(1)) * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[m.group(2)]
+
+
+def reservation_files(cfg_dir, now, owner=None, size=None):
+    """The reservations in one reserve.d: ([{name, prefixes, mb, useMb, owedMb, uid, idleAt, procs}], notes, blind).
+    owner: None for the caller's own folder (missing or unreadable files hold nothing, as before); (name, uid) for
+    another user's (the machine tier): a folder or file that is there but cannot be read is 'blind' (never free),
+    and only plain files are read (no FIFO can stop the reading). A line is `<MB or kind> <folder> [until=DATE]
+    [ttl=DUR] [idle=DUR]` (#861): a kind is sized by size(kind), the rule's cost for it (learned from heavy's peaks);
+    ttl ends it DUR after its file was last written (touch it to renew); idle (see release_idle) lets it hold
+    nothing once nobody works in its folder and its file was not written for DUR. An unknown word is ignored with a
+    note, never read as a smaller size."""
+    today = now.date()
     out, notes, blind = [], [], []
     tag = f'{owner[0]}:' if owner else ''
     try:
@@ -200,7 +235,8 @@ def reservation_files(cfg_dir, today, owner=None):
             fd = os.open(os.path.join(cfg_dir, f), os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK |
                          (os.O_NOFOLLOW if owner else 0))
             try:
-                if owner and not stat.S_ISREG(os.fstat(fd).st_mode):
+                st = os.fstat(fd)
+                if owner and not stat.S_ISREG(st.st_mode):
                     raise OSError(errno.EINVAL, 'not a plain file')
                 data = os.read(fd, 1 << 16)
                 if len(data) == 1 << 16:            # longer than that: its whole lines only
@@ -220,16 +256,34 @@ def reservation_files(cfg_dir, today, owner=None):
                 continue
             until = [w[6:] for w in words[2:] if w.startswith('until=')]
             try:
-                if not (words[0].isdigit() and len(words) >= 2 and words[1].startswith('/')):
-                    raise ValueError('not "<MB> <absolute folder>"')
+                if not (len(words) >= 2 and words[1].startswith('/')
+                        and (words[0].isdigit() or size is not None and KIND_RE.match(words[0]))):
+                    raise ValueError('not "<MB or kind> <absolute folder>"')
                 if until and datetime.date.fromisoformat(until[0]) < today:
                     notes.append(f'reservation {tag}{f}:{n} ended {until[0]}: holds nothing')
                     continue
+                mb = int(words[0]) if words[0].isdigit() else size(words[0])
             except ValueError as e:
                 notes.append(f'reservation {tag}{f}:{n} ignored ({e})')
                 continue
-            out.append({'name': tag + f[:-5], 'prefixes': folder_prefixes(words[1]), 'mb': int(words[0]),
-                        'useMb': 0, 'owedMb': 0, 'uid': owner[1] if owner else os.getuid()})
+            # ttl= and idle= only ever let a line hold less once they are read whole: a bad one is a note and the
+            # line holds as if it were not there (never less than before #861)
+            ends = {}
+            for w in words[2:]:
+                key, _eq, value = w.partition('=')
+                if key in ('ttl', 'idle'):
+                    try:
+                        ends[key] = st.st_mtime + duration(value)
+                    except ValueError as e:
+                        notes.append(f'reservation {tag}{f}:{n}: {key}= not read ({e}): it holds as without it')
+            if ends.get('ttl') is not None and ends['ttl'] < now.timestamp():
+                notes.append(f'reservation {tag}{f}:{n} ended: its ttl= since its file was last written is over; '
+                             f'holds nothing (touch the file to renew it)')
+                continue
+            idle_at = ends.get('idle')
+            out.append({'name': tag + f[:-5], 'prefixes': folder_prefixes(words[1]), 'mb': mb,
+                        'useMb': 0, 'owedMb': 0, 'uid': owner[1] if owner else os.getuid(), 'idleAt': idle_at,
+                        'procs': 0})
     return out, notes, blind
 
 
@@ -322,6 +376,9 @@ def count_in_reservations(res, owners, debts):
         r = best(res, uid, cwd) if cwd else None
         if r:
             r['useMb'] += kb / 1024
+        for o in res if cwd else ():                # works in every folder of that user's that holds cwd: an outer
+            if o['uid'] == uid and under(cwd, o['prefixes']):   # one with idle= is not idle (its use goes to one)
+                o['procs'] = o.get('procs', 0) + 1
     members = {}
     for pid, i in owners.items():
         if pid in procs:
@@ -335,6 +392,23 @@ def count_in_reservations(res, owners, debts):
             r = best(res, uid, cwd) if cwd else None
             if r:
                 r['owedMb'] += debts[i] * (kb / total if total else 1 / len(pids))
+
+
+def release_idle(res, now_s):
+    """#861: a reservation with idle=DUR holds nothing once no process of its user works in its folder and its file
+    was not written for DUR (the room is kept for work that comes back soon, not for good). Only where the processes
+    can be seen: its user's own, or any for root; another user's processes in it cannot be seen by a caller that is
+    not root, so their idle= is not applied there (it holds, stricter). Returns notes."""
+    notes = []
+    for r in res:
+        if r.get('idleAt') is None or r['procs'] or now_s < r['idleAt']:
+            continue
+        if r['uid'] != os.getuid() and os.geteuid() != 0:
+            continue
+        notes.append(f'reservation {r["name"]} is idle (nobody works in its folder, its file not written since '
+                     f'{int(now_s - r["idleAt"])} s past its idle=): holds nothing')
+        r['mb'] = 0
+    return notes
 
 
 def _hold_cgroup(value):
@@ -466,15 +540,15 @@ def scope_demand(host, folder):
 
 def other_users(rule, host, uid, heavy_rel, owners, base):
     """The other users' heavy jobs and T3 agent scopes, from their user managers' cgroups (readable by every user):
-    (pieces, jobs, agents, notes). A folder that exists but cannot be listed is a note and 'blind'. owners gets
+    (pieces, jobs, agents, blind, notes). A folder that exists but cannot be listed is a note and 'blind'. owners gets
     {pid: base + the piece's index} for their processes (count_in_reservations)."""
-    pieces, jobs, agents, blind = [], 0, 0, []
+    pieces, jobs, agents, blind, notes = [], 0, 0, [], []
     try:
         names = sorted(os.listdir(ROOT + USERS))
     except FileNotFoundError:
-        return pieces, jobs, agents, blind
+        return pieces, jobs, agents, blind, notes
     except OSError as e:
-        return pieces, jobs, agents, [f'{USERS} cannot be listed ({e.strerror})']
+        return pieces, jobs, agents, [f'{USERS} cannot be listed ({e.strerror})'], notes
     for name in names:
         m = USER_RE.match(name)
         if not m or int(m.group(1)) == uid:
@@ -494,13 +568,15 @@ def other_users(rule, host, uid, heavy_rel, owners, base):
                 owners.update(dict.fromkeys(scope_pids(f'{box}/{n}'), base + len(pieces)))
                 pieces.append({'kind': rule['unknownKinds']['job'], 'demandMb': demand})
                 jobs += 1
-        for s in agent_scopes(manager)[0]:
+        found, _box, more = agent_scopes(manager)
+        notes += [f'user {m.group(1)}: {n}' for n in more]
+        for s in found:
             demand = scope_demand(host, s)
             if demand is not False:
                 owners.update(dict.fromkeys(scope_pids(s), base + len(pieces)))
                 pieces.append({'kind': rule['unknownKinds']['other'], 'demandMb': demand})
                 agents += 1
-    return pieces, jobs, agents, blind
+    return pieces, jobs, agents, blind, notes
 
 
 def read_machine(rule, where, carry, now):
@@ -517,8 +593,10 @@ def read_machine(rule, where, carry, now):
     full = tier != 'basic'
     heavy_rel = '/' + slice_path(where['slice'])
     heavy_box = manager + heavy_rel
-    pieces, running, waiting, owners = [], 0, 0, {}
+    pieces, running, waiting, owners, ticketed = [], 0, 0, {}, set()
     for t in tickets(where['queueDir']):
+        if isinstance(t.get('scope'), str):
+            ticketed.add(t['scope'])
         if t['state'] == 'waiting':
             waiting += 1
             continue
@@ -530,10 +608,28 @@ def read_machine(rule, where, carry, now):
             demand = rd.read_piece_demand(host, 'v2', cg(heavy_box + '/' + scope)).get('demandMb')
             owners.update(dict.fromkeys(scope_pids(heavy_box + '/' + scope), len(pieces)))
         pieces.append({'kind': ticket_kind(rule, t['kind']), 'demandMb': demand, 'declaredMb': t.get('mb')})
+    if mine:
+        # a plain heavy (no --kind: no ticket) and a kept scope are jobs too: every scope in this user's heavy slice
+        # that no live ticket names is one of the rule's unknownKinds.job, as another user's are (other_users)
+        try:
+            plain = sorted(n for n in os.listdir(ROOT + heavy_box) if SCOPE_RE.match(n) and n not in ticketed)
+        except FileNotFoundError:
+            plain = []
+        except OSError as e:
+            plain = []
+            notes.append(f'{heavy_box} cannot be listed ({e.strerror}): plain heavy jobs not counted')
+            full, tier = False, 'basic'
+        for n in plain:
+            demand = scope_demand(host, f'{heavy_box}/{n}')
+            if demand is not False:
+                owners.update(dict.fromkeys(scope_pids(f'{heavy_box}/{n}'), len(pieces)))
+                pieces.append({'kind': rule['unknownKinds']['job'], 'demandMb': demand})
+                running += 1
     own_jobs = running
     agents, agent_box = 0, None
     if mine:
-        scopes, agent_box = agent_scopes(manager)
+        scopes, agent_box, more = agent_scopes(manager)
+        notes += more
         for s in scopes:
             demand = scope_demand(host, s)
             if demand is not False:
@@ -541,7 +637,8 @@ def read_machine(rule, where, carry, now):
                 pieces.append({'kind': rule['unknownKinds']['other'], 'demandMb': demand})   # no kind label: a writer
                 agents += 1
     if full:
-        more, jobs, other_agents, blind = other_users(rule, host, uid, heavy_rel, owners, len(pieces))
+        more, jobs, other_agents, blind, more_notes = other_users(rule, host, uid, heavy_rel, owners, len(pieces))
+        notes += more_notes
         pieces += more
         running, agents = running + jobs, agents + other_agents
         if jobs or other_agents:
@@ -551,22 +648,30 @@ def read_machine(rule, where, carry, now):
             notes += blind
     learned_notes = []
     learned = where['learned'](learned_notes)
-    res, more, _ = reservation_files(where['reserveDir'], now.date())
+    def size(kind):        # a reservation by kind (#861): the rule's cost of one piece of it, learned from peaks
+        return cr.cost_of(rule, ask_kind(rule, kind), learned, None)['mb']
+    res, more, _ = reservation_files(where['reserveDir'], now, size=size)
     notes += more
-    if tier == 'machine':
+    if tier != 'basic':
         # #945: a caller with no user manager is often another user (a CI runner, root), whose own reserve.d is not
         # the owner's: read every person's, so it never takes the room they keep. One it cannot read: never free.
+        # #800: the full tier reads them too, so one person's reservation holds against every other person's work;
+        # there one it cannot read (a home closed to others, as most are by default) is a note, as before #800 it
+        # was not read at all: a person who wants it seen makes ~/.config/t3-capacity/reserve.d readable to others.
         dirs, blind = other_reserve_dirs(uid)
         for name, u, folder in dirs:
-            more_res, more, cannot = reservation_files(folder, now.date(), (name, u))
+            more_res, more, cannot = reservation_files(folder, now, (name, u), size)
             res += more_res
             notes += more
             blind += cannot
-        if blind:
+        if blind and tier == 'machine':
             full, tier = False, 'basic'
             notes += blind
+        elif blind:
+            notes += [b.replace(': never free here', '') + ': not counted' for b in blind[:8]]
     # #923, #945: a piece working in a reservation's folder owes its debt once, not there too, and never in two
     count_in_reservations(res, owners, {i: debt(rule, learned, pieces[i], m['totalMb']) for i in set(owners.values())})
+    notes += release_idle(res, now.timestamp())
     held, more = held_cgroups(host, where['holds'], where['user'])
     notes += [f'reservation {n}.conf has the name of a machine-file hold: both hold; rename the file'
               for n in sorted({r['name'] for r in res} & {h['label'] for h in where['holds']})]
@@ -698,8 +803,10 @@ def answer(rule, readings, kind=None, need_mb=None, cwds=()):
         ask['declaredMb'] = need_mb
     d = cr.decision(rule, facts_for(readings, group, cwds), ask, learned, carry.get(group), now_ms)
     basic = readings['tier'] not in ('full', 'machine')
-    free = not basic and (d['admit'] if kind else d['level'] == 'ok') and (
-        need_mb is None or d['freeMb'] is not None and need_mb <= d['freeMb'])
+    # with a kind the rule alone decides (its floor too: a declared size is already a floor of the cost); MB alone
+    # asks only whether they fit the free budget at level ok
+    free = not basic and (d['admit'] if kind else d['level'] == 'ok' and d['freeMb'] is not None
+                          and need_mb <= d['freeMb'])
     fits = {}
     for k, spec in rule['kinds'].items():
         g = spec['group']
@@ -787,6 +894,109 @@ def cache_path(run, key):
     return os.path.join(folder, cache_name(key)), None
 
 
+HOLD_SECONDS = 20                               # #861: a NOT OK holds this long for the same question
+HOLD_FILE = 't3-capacity-hold.json'
+HOLD_LOCK = 't3-capacity-hold.lock'           # one hold at a time (its read, then its write)
+HOLD_LOCK_SECONDS = 2
+
+
+def state_folder():
+    """(the folder of heavy facts' cache, None) or (None, why there is none): $HEAVY_FACTS_CACHE's folder, else
+    /run/user/<uid>, else this user's private folder in the temporary folder (cache_path)."""
+    if os.environ.get('HEAVY_FACTS_CACHE'):
+        return os.path.dirname(os.path.abspath(os.environ['HEAVY_FACTS_CACHE'])), None
+    path, why = cache_path(f'{RUN_USER}/{os.getuid()}', '')
+    return (os.path.dirname(path), None) if path else (None, why)
+
+
+def _hold_lock(folder):
+    """The hold's own lock (#861 round 1: two callers' read-modify-write of the hold file must not lose a NOT OK):
+    (fd or None, a note or None). Waits HOLD_LOCK_SECONDS at most, never blocking in flock; without it the hold goes
+    on unlocked, with a note (a hold is never a reason not to answer)."""
+    path = os.path.join(folder, HOLD_LOCK)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        return None, f'the hold lock {path} cannot be opened ({e.strerror}): held without it'
+    deadline = time.monotonic() + HOLD_LOCK_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd, None
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN) or time.monotonic() >= deadline:
+                os.close(fd)
+                return None, f'the hold lock {path} stayed taken {HOLD_LOCK_SECONDS:g} s: held without it'
+        time.sleep(0.01)
+
+
+def hold(question, verdict, now_ms=None, folder=None):
+    """#861: hysteresis for a capacity check that flips between OK and NOT OK within seconds, so a "check, then
+    start" never starts work just before the answer turns NOT OK again. A NOT OK for a question (kind and MB) holds
+    HOLD_SECONDS: within that time the same question answers NOT OK, however the machine reads. The time starts at
+    each NOT OK read from the machine (a held one does not extend it). (verdict, why it was held or None, a note or
+    None). One caller at a time (the hold lock), so two NOT OKs at once are both kept. A hold file that cannot be
+    read (broken, an older format, another owner's, a link, open to others) holds the question asked HOLD_SECONDS from
+    when that file last changed (its ctime, which no caller can set), and is written again; so a broken file in a
+    folder that cannot be written holds for HOLD_SECONDS, never for good. One that cannot even be looked at is
+    ignored, with a note. A time in the future (a clock that went back) holds and starts again. No folder to keep it
+    in: no hold, with a note (as before #861)."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if folder is None:
+        folder, why = state_folder()
+        if folder is None:
+            return verdict, None, f'no hold of a NOT OK ({why})'
+    lock, lock_note = _hold_lock(folder)
+    try:
+        verdict, why, note = _hold(question, verdict, now_ms, os.path.join(folder, HOLD_FILE))
+    finally:
+        if lock is not None:
+            os.close(lock)
+    return verdict, why, '; '.join(n for n in (lock_note, note) if n) or None
+
+
+def _hold(question, verdict, now_ms, path):
+    busy, broken, notes = {}, None, []
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if st.st_uid != os.getuid() or st.st_mode & 0o077 or not stat.S_ISREG(st.st_mode):
+                raise ValueError('not a private file of this user')
+            data = cr.loads(os.read(fd, 1 << 16).decode('utf-8'))
+        finally:
+            os.close(fd)
+        if not (isinstance(data, dict) and data.get('v') == 1 and isinstance(data.get('busy'), dict)
+                and all(type(v) is int for v in data['busy'].values())):
+            raise ValueError('not a hold file of this version')
+        busy = data['busy']
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        try:
+            broken = int(os.lstat(path).st_ctime * 1000)    # when it last changed: what it may still hold from
+        except OSError as e:
+            notes.append(f'the hold file {path} cannot be read or looked at ({e.strerror}): ignored')
+        else:
+            busy = {question: broken}
+    at = busy.get(question)
+    why = None
+    if verdict == 'free' and at is not None and (at > now_ms or now_ms - at < HOLD_SECONDS * 1000):
+        why = (f'held: the hold file {path} cannot be read, so a NOT OK of the last {HOLD_SECONDS} s may be in it'
+               if broken is not None else
+               f'held: NOT OK {max(0, now_ms - at) // 1000} s ago for this question; OK needs {HOLD_SECONDS} s '
+               f'without one (a check that flips must not let work start just before it turns NOT OK)')
+    if verdict != 'free' or (at is not None and at > now_ms):
+        busy[question] = now_ms                     # a NOT OK read now (or a future state): start again
+    keep = {k: v for k, v in busy.items() if 0 <= now_ms - v < HOLD_SECONDS * 1000}
+    if keep != busy or broken is not None or verdict != 'free':
+        try:
+            write_cache(path, {'v': 1, 'busy': keep})  # whole or not at all; old temporary files go too
+        except OSError as e:
+            notes.append(f'the hold of a NOT OK was not written ({e.strerror or e})')
+    return ('busy' if why else verdict), why, '; '.join(notes) or None
+
+
 def facts_main(argv, slice_name, queue_root, hq, now=None):
     """The `heavy facts` verb. slice_name, queue_root: heavy's settings; hq: lib/heavy_queue.py (learned costs)."""
     if argv in (['--help'], ['-h']):            # also the installer's self-test: the rule must load from this copy
@@ -852,11 +1062,14 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
     return code
 
 
-def ask(heavy, kind=None, mb=None, timeout=ANSWER_SECONDS):
-    """For the callers (t3-capacity, agent-slots): run `heavy facts`, at most `timeout` seconds, and judge the answer
-    with free/v1's one reader. (verdict 'free', 'busy' or 'unavailable', reason, the object or None)."""
+def ask(heavy, kind=None, mb=None, timeout=ANSWER_SECONDS, fresh=False):
+    """For the callers (t3-capacity, agent-slots, heavy's own start, #866): run `heavy facts`, at most `timeout`
+    seconds, and judge the answer with free/v1's one reader. (verdict 'free', 'busy' or 'unavailable', reason, the
+    object or None). fresh: read the machine now, not the 5 s cache (heavy's start: a job admitted a second ago must
+    count)."""
     fc = load('free_contract', 'common/free_contract.py')
-    argv = [heavy, 'facts'] + (['--kind', kind] if kind else []) + (['--mb', str(mb)] if mb is not None else [])
+    argv = [heavy, 'facts'] + (['--kind', kind] if kind else []) + (['--mb', str(mb)] if mb is not None else []) + \
+        (['--fresh'] if fresh else [])
     try:
         p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              start_new_session=True)
@@ -880,6 +1093,35 @@ def ask(heavy, kind=None, mb=None, timeout=ANSWER_SECONDS):
         last = err.decode('utf-8', 'replace').strip().splitlines()[-1:]
         why = f'heavy facts: {why}' + (f' ({last[0][:200]})' if last else '')
     return verdict, why, obj
+
+
+def question(kind, mb):
+    """The hold's key for one question: the same kind and MB is the same question for every caller."""
+    return f'{kind or ""}:{"" if mb is None else mb}'
+
+
+def checked(heavy, kind=None, mb=None, fresh=False, timeout=ANSWER_SECONDS):
+    """The one capacity check of t3-capacity and of heavy's own start (#866): ask(), then hold() for the same
+    question, so a NOT OK holds HOLD_SECONDS for each of them alike (#861). (verdict, why, the object or None); a
+    note of the hold goes into the object's notes."""
+    verdict, why, d = ask(heavy, kind, mb, timeout, fresh)
+    verdict, held, note = hold(question(kind, mb), verdict)
+    if note and d is not None and isinstance(d.get('notes'), list):     # another script's object may have none
+        d['notes'].append(note)
+    return verdict, held or why, d
+
+
+def ready(hq):
+    """None when this kit's `heavy facts` can answer at all, else why not: what no wait would fix (the capacity rule
+    not shipped with the kit, a machine file whose heavy section is broken). heavy asks this before it waits for
+    capacity, so a kit that can never answer refuses at once instead of waiting --wait (7200 s) for nothing."""
+    try:
+        cr.shipped_rule()
+        mf = hq.machine_file
+        capacity_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None, os.getuid() if ROOT else 0)
+    except Exception as e:
+        return f'{e.__class__.__name__}: {e}'
+    return None
 
 
 def load(name, rel):
