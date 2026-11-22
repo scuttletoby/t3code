@@ -1,0 +1,15 @@
+# Fork only: runs t3code-fleet-refresh.service every hour, at a random minute in its first 10 (so fleet hosts do not
+# all ask GitHub at once), and at boot when a run was missed (a desktop that was off). A run with nothing new is one
+# API call and no download. Hourly, because the dispatcher closes the pool as soon as it reads (hourly) a newer
+# release than the template's: the pool is closed for about an hour at most after a release, and a failed run (no
+# network yet at boot, a GitHub error or rate limit) is tried again within the hour.
+[Unit]
+Description=t3code fork fleet: hourly runner template refresh
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

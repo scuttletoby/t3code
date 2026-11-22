@@ -33,11 +33,14 @@ upstream, so its old commits disappear. `ci/v1` is such a main commit: it is kep
 do not use it.
 
 A release commit holds only what consumers use: `LICENSE`, `fork-ci/`, the host kits in `fork-kit/`
-(installed only from a release commit, [fork-kit/README.md](../fork-kit/README.md)), the scripts an action runs from
-outside `fork-ci/` (fleet-route runs `.github/scripts/fork-fleet.py`) and the reusable workflows that start
-only on `workflow_call` (the list is `paths` in
+(installed only from a release commit, [fork-kit/README.md](../fork-kit/README.md)) and the files their installers
+read from outside `fork-kit/` (the desk kit's fleet scripts and units, the heavy kit's capacity rule files in
+`packages/shared/src/capacity/`), the scripts an action runs from outside `fork-ci/` (fleet-route runs
+`.github/scripts/fork-fleet.py`) and the reusable workflows that start only on `workflow_call` (the list is `paths` in
 [`.github/fork-ci-release.json`](../.github/fork-ci-release.json)). The paths are the same as on main.
-Release commits contain no symlinks and no workflow that starts by itself.
+Release commits contain no symlinks and no workflow that starts by itself. `fork-ci-release.test.py` writes this
+commit's release files to a folder and runs each kit installer's file check on it, so a kit that reads a file outside
+the paths fails CI.
 
 ## Using the actions
 

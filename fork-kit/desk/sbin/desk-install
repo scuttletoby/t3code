@@ -508,6 +508,12 @@ def lock(stack):
         raise Refused('another desk-install install or uninstall is running: wait for it and run again') from None
 
 
+def missing_sources(source):
+    """The files (and the walls folder) of a release that install reads and SOURCE lacks; [] when it has them all.
+    .github/scripts/fork-ci-release.test.py runs it on the files a release commit holds."""
+    return [s for s in [*FILES.values(), *UNITS.values(), WALLS] if not os.path.exists(os.path.join(source, s))]
+
+
 def install(a, stop_after=None, stack=None):
     def done(step):
         if step == stop_after:
@@ -519,7 +525,7 @@ def install(a, stop_after=None, stack=None):
         raise Refused('--fleet-config and --release-fleet-config: one or the other')
     if not SHA.fullmatch(a.sha or ''):
         raise Refused('--sha must be the full 40-character release commit')
-    missing = [s for s in [*FILES.values(), *UNITS.values(), WALLS] if not os.path.exists(os.path.join(a.source, s))]
+    missing = missing_sources(a.source)
     if missing:
         raise Refused(f'--source {a.source}: {missing[0]} is missing (point it at the release\'s top folder)')
     if a.fleet_config and not os.path.isfile(a.fleet_config):
