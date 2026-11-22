@@ -165,7 +165,10 @@ function parseRemoved(text = "") {
  * in-date copies go to `late`. `atTip` (a PR's run: the base tip) spends the allowance too, so two branches
  * from one merge-base cannot each add the one listed copy once the first has merged.
  */
-function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, today, late }) {
+function findSeamBreaches(
+  files,
+  { atBase, atHead, atTip, upstream = false, today, late, restorable, lost },
+) {
   const reasons = [];
   const lateReasons = late ?? reasons;
   for (const [file, seam] of Object.entries(files)) {
@@ -199,6 +202,18 @@ function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, toda
       const allowance = counts.get(line) ?? 0;
       return upstream ? allowance : Math.max(0, allowance - spent(line));
     };
+    // `restorable` (restorableLost): lines put back for the own "lost" entry's lowered `gone`. With
+    // none, main's "lost" (`lost`) names the way out for a line that may be one put back.
+    let restore = upstream ? 0 : (restorable?.get(file)?.gone ?? 0);
+    const putBack =
+      !upstream &&
+      restore === 0 &&
+      lost !== undefined &&
+      Object.hasOwn(lost, file) &&
+      lost[file].gone > 0
+        ? ` (if it puts back an upstream line counted in "lost", lower that entry in this change's ${CONFIG})`
+        : "";
+
     // The hint only where the base branch's newer copies alone make these too many: judged from
     // the merge-base (the copies the announcement allows in date), the branch would pass.
     // `counts` is the allowance the copies are judged by: in date for `late`, else `allowed` (an
@@ -209,10 +224,12 @@ function findSeamBreaches(files, { atBase, atHead, atTip, upstream = false, toda
         added <= (counts.get(line) ?? 0) - (baseCounts.get(line) ?? 0)
           ? " (the base branch has more copies than this branch's merge-base: update the branch from its base)"
           : ""
-      }`;
+      }${putBack}`;
     for (const [line, added] of addedLines(base, head)) {
       const left = leftOf(allowed, line);
-      const extra = added - left;
+      const back = Math.min(Math.max(added - left, 0), restore);
+      restore -= back;
+      const extra = added - left - back;
       if (extra <= 0) continue;
       // Only the copies the announcement would allow in date are its to fix; the rest are refused
       // either way.
@@ -475,7 +492,10 @@ function findUnlistedChanges(
  * `rises`. On a PR only "added" lines may go: an announced line in main's file is upstream's.
  * `lowered.lost` gets each entry a run from upstream finds too high: its counts ({0, 0}: remove it).
  */
-function findLostLines(config, { atBase, atHead, upstream, afterRebase = false, lowered }) {
+function findLostLines(
+  config,
+  { atBase, atHead, upstream, afterRebase = false, lowered, restorable },
+) {
   const reasons = [];
   const ceilings = [];
   const rises = [];
@@ -504,7 +524,8 @@ function findLostLines(config, { atBase, atHead, upstream, afterRebase = false, 
         (sum, [line, copies]) => sum + Math.min(copies, listed.get(line) ?? 0),
         0,
       );
-      const count = lines - dropped;
+      // And lines moved or re-indented back for the own "lost" entry (restorableLost).
+      const count = lines - dropped - (restorable?.get(file)?.lines ?? 0);
       if (count > 0) {
         reasons.push(
           `${file}: ${say(count, what.lines)} by this change (only its listed seam lines may go, and none may move: a moved copy looks like upstream's line).`,
@@ -610,6 +631,27 @@ function findSpareSeamLines(
  * The "pending" files this change's own list moves to "files" (main's list has them in "pending",
  * this change's in "files" and not in "pending"): main's list cannot tell which lines they hold.
  */
+/**
+ * Main's seam files whose "lost" entry the own list lowers (neither raised), among `counted` (held exact
+ * from upstream): `gone` lowered allows that many lines put back; `lines` lowered beyond it, that many
+ * moved or re-indented back. A fork line in their place lowers neither count, so upstream's run refuses it.
+ */
+function restorableLost(config, ownLost, counted) {
+  const restorable = new Map();
+  if (ownLost === undefined) return restorable;
+  const of = (lost, file) =>
+    lost !== undefined && Object.hasOwn(lost, file) ? lost[file] : { lines: 0, gone: 0 };
+  for (const file of counted) {
+    if (!Object.hasOwn(config.files, file)) continue;
+    const [main, own] = [of(config.lost, file), of(ownLost, file)];
+    if (own.lines > main.lines || own.gone > main.gone) continue;
+    const gone = main.gone - own.gone;
+    const lines = Math.max(0, main.lines - own.lines - gone);
+    if (gone > 0 || lines > 0) restorable.set(file, { gone, lines });
+  }
+  return restorable;
+}
+
 const promotedFiles = (config, ownFiles = {}, ownPending = {}) =>
   Object.keys(config.pending ?? {}).filter(
     (file) => Object.hasOwn(ownFiles, file) && !Object.hasOwn(ownPending, file),
@@ -1556,12 +1598,19 @@ function main(argv) {
     ownLost,
     lowered,
   });
+  // The own list's edits that only upstream can check, counted below.
+  const edits =
+    upstream || ownConfig === undefined
+      ? { files: [], pending: [], lost: [], forkFiles: false }
+      : { files: listEditedFiles(baseFiles, ownFiles), ...listEditedCounts(baseList, ownConfig) };
+  const restorable = restorableLost(config, ownLost, edits.lost);
   const lost = findLostLines(config, {
     atBase,
     atHead,
     upstream,
     afterRebase: parsed.afterRebase,
     lowered,
+    restorable,
   });
   const spare = findSpareSeamLines(config.files, {
     atBase,
@@ -1576,10 +1625,6 @@ function main(argv) {
   // and the pending files' text changes main's list cannot check: only upstream can. Every way the count cannot run refuses (fail
   // closed); fork-tests' run on the merge commit passes --no-upstream, as fork-checks' run counts.
   const promoted = upstream ? [] : promotedFiles(config, ownFiles, ownPending);
-  const edits =
-    upstream || ownConfig === undefined
-      ? { files: [], pending: [], lost: [], forkFiles: false }
-      : { files: listEditedFiles(baseFiles, ownFiles), ...listEditedCounts(baseList, ownConfig) };
   // The "pending" files whose text this change edits. Main's tree cannot tell which line it drops
   // is upstream's: a swapped upstream line (one out, one in) keeps every count it sees, and
   // fork-follow then refuses main. Counted from upstream as fork-follow counts them: fork
@@ -1711,6 +1756,8 @@ function main(argv) {
       today,
       late,
       atTip: upstream ? undefined : (file) => textAt(base, file),
+      restorable,
+      lost: config.lost,
     }),
     ...lost.reasons,
     ...unlisted.reasons,
@@ -1867,6 +1914,7 @@ module.exports = {
   parseConfig,
   parseRemoved,
   promotedFiles,
+  restorableLost,
   sameLines,
   UPSTREAM_FILE,
   UPSTREAM_REF,

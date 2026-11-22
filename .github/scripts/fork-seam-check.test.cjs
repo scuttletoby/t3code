@@ -4281,3 +4281,111 @@ test("a change that drops another change's in-date announcement is refused, unle
     assert.doesNotMatch(result.stderr, /drops the announced line/);
   });
 });
+
+// A seam file with a "lost" entry may get upstream's lines back. Each line the pull
+// request's own "lost" lowers allows one put-back line, and the run from upstream holds that entry
+// to the head's lost lines exactly, so a fork line added in its place is refused there.
+test('a pull request that lowers a seam file\'s "lost" entry may put those upstream lines back', () => {
+  withRepo(({ git, commit, run, fromUpstream, publish }) => {
+    const UPSTREAM_P = "a();\nb(x);\nc();\nif (y) {\n  d();\n}\n";
+    const upstream = commit({ "p.ts": UPSTREAM_P }, "upstream");
+    git("checkout", "-q", "-b", "fork");
+    const entry = (...added) => ({ "p.ts": { why: "w", added } });
+    const list = (added, lost) => ({ files: entry(...added), pending: {}, lost });
+    // The fork changed b(x) (1 line gone) and re-indented d() (moved, its text kept).
+    const main = commit(
+      {
+        ...seams(list(["b(x, fork);", "forkHook();"], { "p.ts": { lines: 2, gone: 1 } })),
+        "p.ts": "a();\nb(x, fork);\nc();\nif (y) {\n    d();\n}\nforkHook();\n",
+      },
+      "main",
+    );
+    publish(upstream);
+    assert.equal(fromUpstream(upstream, main).status, 0);
+    const pr = (name, own, text) => {
+      git("checkout", "-q", "-f", "-B", name, main);
+      return commit({ ...seams(own), "p.ts": text }, name);
+    };
+    const passes = (head) => {
+      for (const args of [
+        [main, head],
+        ["--no-upstream", main, head],
+      ]) {
+        const result = run(...args);
+        assert.equal(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
+      }
+      assert.equal(fromUpstream(upstream, head).status, 0);
+    };
+    // Both lines back, "lost" dropped; only b(x) back, "lost" lowered to the re-indented line.
+    passes(pr("both", list(["forkHook();"], {}), `${UPSTREAM_P}forkHook();\n`));
+    passes(
+      pr(
+        "gone",
+        list(["forkHook();"], { "p.ts": { lines: 1, gone: 0 } }),
+        "a();\nb(x);\nc();\nif (y) {\n    d();\n}\nforkHook();\n",
+      ),
+    );
+    // Half-way: the lines are back but "lost" is main's. Refused as before, naming the way out.
+    const halfway = run(
+      main,
+      pr(
+        "halfway",
+        list(["forkHook();"], { "p.ts": { lines: 2, gone: 1 } }),
+        `${UPSTREAM_P}forkHook();\n`,
+      ),
+    );
+    assert.equal(halfway.status, 1);
+    assert.match(
+      halfway.stderr,
+      /- p\.ts: adds `b\(x\);` \(if it puts back an upstream line counted in "lost", lower that entry in this change's \.github\/fork-seams\.json\)/,
+    );
+    assert.match(
+      halfway.stderr,
+      /- p\.ts: 1 upstream line deleted, moved or re-indented by this change/,
+    );
+    // "lost" lowered, but a fork line in place of upstream's: main's tree cannot tell, upstream can.
+    const swap = run(
+      main,
+      pr(
+        "swap",
+        list(["forkHook();"], {}),
+        "a();\nforkZ();\nc();\nif (y) {\n  d();\n}\nforkHook();\n",
+      ),
+    );
+    assert.equal(swap.status, 1, swap.stdout);
+    assert.match(
+      swap.stderr,
+      /"added" lists `forkZ\(\);` not at all, but the fork adds it over upstream/,
+    );
+    assert.match(
+      swap.stderr,
+      /- p\.ts: dropped from "lost" .*\(no entry\), but the fork loses 1 upstream line over upstream \([0-9a-f]{12}\) .*1 of them gone/,
+    );
+    // A line put back in place lowers both counts: no room to move a line too (a moved seam line
+    // looks like upstream's, so upstream's count would not see it).
+    const moved = run(
+      main,
+      pr(
+        "moved",
+        list(["forkHook();"], { "p.ts": { lines: 1, gone: 0 } }),
+        "forkHook();\na();\nb(x);\nc();\nif (y) {\n    d();\n}\n",
+      ),
+    );
+    assert.equal(moved.status, 1, moved.stdout);
+    assert.match(
+      moved.stderr,
+      /- p\.ts: 1 upstream line deleted, moved or re-indented by this change/,
+    );
+    // Raising one count while lowering the other allows nothing.
+    const raised = run(
+      main,
+      pr(
+        "raised",
+        list(["forkHook();"], { "p.ts": { lines: 3, gone: 0 } }),
+        "a();\nb(x);\nc();\nif (y) {\n    d();\n}\nforkHook();\n",
+      ),
+    );
+    assert.equal(raised.status, 1);
+    assert.match(raised.stderr, /- p\.ts: adds `b\(x\);`/);
+  });
+});
