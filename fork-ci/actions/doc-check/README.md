@@ -7,12 +7,15 @@ action fails a pull request that:
 - puts an instruction file over its **size budget** (lines or bytes; above `warn_at` of a budget it only warns, and
   says when this change moved the file past it);
 - writes **history** into an instruction file (a changelog block, an "is live on" claim, a dated "Updated" banner);
-- has a **broken relative link** in a Markdown file it adds or changes (code fences, opened as CommonMark does, and inline code
-  skipped; `/x` is from the repository root, as GitHub reads it; a link that leaves the repository is broken), or deletes or renames a
-  file that another Markdown file still links to;
+- has a **broken relative link** in a Markdown file it adds or changes (code blocks, fenced or indented, read as
+  CommonMark does, and inline code skipped; `/x` is from the repository root, as GitHub reads it; a link that leaves
+  the repository is broken), or deletes or renames a file, or removes or retargets a symlink, so that a link in
+  another Markdown file no longer resolves (through folder symlinks too);
 - has a checked file that is **not UTF-8** or cannot be read, or is a **symlink** out of the repository, into
   `.git` or to no file (a symlink is checked as the file it points to and reported once when its target is checked
-  too; sizes are the bytes on disk, CRLF included), or deletes, renames or moves away the file a symlink points to;
+  too; sizes are the bytes on disk, CRLF included), or deletes, renames or moves away the file a symlink points to
+  (or a folder or symlink on its way). An untouched symlink is checked again, under its own budget, when the change
+  touches the file it reads, so `--base` and `--all` agree on it;
 - **adds** a file whose name looks like a dated report, handoff or review (those go in the pull request or an issue).
 
 The general rules this enforces, and the rest of the agent rules, are in
@@ -87,5 +90,5 @@ workflow file, so a change that edits the step or removes it is stopped only by 
 ## Not covered
 
 - Anchors (`#section`) and queries (`?plain=1`) are not checked, and neither are backticked paths in the text.
-- A broken link that was already on the base in a file the change does not touch is not this change's: `mode: all`
-  finds those.
+- A broken link or a symlink to no file (a loop too) that was already on the base in a file the change does not
+  touch is not this change's: `mode: all` finds those.
