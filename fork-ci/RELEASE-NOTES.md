@@ -13,6 +13,20 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue and head-check: every rule hit gives its lenses (#82)
+
+With a `review` block in `enforce`, the required lenses are now the lenses of every rule a changed path counted for,
+whatever its weight, not only those of the rules of the heaviest weight hit. An app change plus one critical file needs
+the app rule's lens and the critical lenses; before, the critical lenses alone passed it and no lens read the app code.
+The weight is still the heaviest hit. T3's copy of the rules (`apps/server/src/fork/reviewRules`) plans the same lenses.
+First in the release after `ci/v22`.
+
+**Upgrade:** a config in `enforce` needs more lens reads on mixed changes after the move, and a built-in protected path
+(the config, a lens prompt, a workflow) under a lighter rule also needs that rule's lenses. To keep the protected paths
+at the critical lenses only, put them in a critical rule. In `shadow` only the summary row changes. `ci/v21` and `ci/v22`
+accept the same config but judge mixed changes the old, looser way, so a caller of a config in `enforce` pins this release
+or a later one (pr-queue README, "Turning it on: release, pin, then config", step 1).
+
 ### pr-queue and head-check: review findings, rounds and `override_authors` (#740)
 
 With a `review` block, the gate also judges the review itself from the lens comments. With `findings: true`, a lens's
