@@ -40,6 +40,7 @@ import {
 } from "../../cloud/config.ts";
 import * as EnvironmentKeys from "../../cloud/environmentKeys.ts";
 import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
+import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import type { AgentAwarenessThread } from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
@@ -204,6 +205,11 @@ const world = Effect.fnUntraced(function* (usage: {
         adapterRegistry(),
         Layer.mock(HandoffCommand.HandoffCommand)({
           run: () => Effect.succeed({ ok: true as const, text: "STATE" }),
+        }),
+        // No restart continuation is owed here.
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          get: () => Effect.succeedNone,
+          awaitSettled: () => Effect.void,
         }),
       ),
     ),
