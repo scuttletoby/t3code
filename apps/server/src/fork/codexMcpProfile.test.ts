@@ -1478,6 +1478,150 @@ describe("follow-ups: holds, sub-agents, unknown threads, per-call checks (fork 
 const drive = <A, E>(fiber: Fiber.Fiber<A, E>, millis: number) =>
   TestClock.adjust(millis).pipe(Effect.andThen(Fiber.join(fiber)));
 
+describe("a newer turn's T3 tool set is never overwritten by an older one (fork issue #986)", () => {
+  /**
+   * The thread's profile reads, in order: each is `all` once the queue is empty, or waits for its
+   * gate and then gives its profile.
+   */
+  const scripted = () => {
+    const queue: Array<Effect.Effect<McpProfileResolved>> = [];
+    const profileFor: ProfileById = () => queue.shift() ?? Effect.succeed(ALL);
+    const gated = (profile: McpProfileResolved) =>
+      Effect.gen(function* () {
+        const reached = yield* Deferred.make<void>();
+        const open = yield* Deferred.make<void>();
+        queue.push(
+          Deferred.succeed(reached, undefined).pipe(
+            Effect.andThen(Deferred.await(open)),
+            Effect.as(profile),
+          ),
+        );
+        return { reached, open };
+      });
+    const next = (profile: McpProfileResolved) => void queue.push(Effect.succeed(profile));
+    return { profileFor, gated, next };
+  };
+  /**
+   * The thread's hold, for its `done`: done once every check holding it has released, which each
+   * does after fixing (or not) its set. A check whose profile read is not gated runs inside `emit`
+   * (forked to start at once, nothing to wait on), so only a gated read's end needs awaiting.
+   */
+  const holdOf = (threadId: string) => T3ToolSets.t3ToolSetHold(threadId, 0)!.done;
+  const TIMED_OUT = T3ToolSets.refusedT3ToolSet("timed out");
+  /** What the T3 tool rule does as a request's wait on the hold reaches its bound. */
+  const dropAtBound = (threadId: string) =>
+    T3ToolSets.dropT3ToolSetHold(
+      threadId,
+      T3ToolSets.t3ToolSetHold(threadId, Number.MAX_SAFE_INTEGER)!,
+      TIMED_OUT,
+    );
+  const LEAN = resolved("lean", "all", ["waits"]);
+
+  it.effect("two checks finishing out of order: the later turn's set stands", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const { profileFor, gated, next } = scripted();
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+      const id = (yield* start(client, "t")).thread.id;
+      // goal-2's check reads `all` slowly; the profile is narrowed; goal-3's check reads lean.
+      const slow = yield* gated(ALL);
+      next(LEAN);
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      yield* Deferred.await(slow.reached);
+      yield* fake.emit("turn/started", turnStarted(id, "goal-3"));
+      assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+      // goal-2's check finishes last: it must not widen the thread back to `all`.
+      const done = holdOf("t");
+      yield* Deferred.succeed(slow.open, undefined);
+      yield* Deferred.await(done);
+      assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+      assert.isUndefined(T3ToolSets.__testing.asked("t"));
+      // Runs again: the thread's next turn fixes its set as usual.
+      next(resolved("threads", "all", ["threads"]));
+      yield* fake.emit("turn/started", turnStarted(id, "goal-4"));
+      assert.deepStrictEqual(groupsOf("t"), ["threads"]);
+    }),
+  );
+
+  it.effect("a joining turn fixed its set while the first is stuck: the drop keeps it", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const { profileFor, gated, next } = scripted();
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+      const id = (yield* start(client, "t")).thread.id;
+      const stuck = yield* gated(ALL);
+      next(LEAN);
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      yield* Deferred.await(stuck.reached);
+      // goal-3 joins goal-2's hold (and its bound), and fixes its set; goal-2's check still runs.
+      yield* fake.emit("turn/started", turnStarted(id, "goal-3"));
+      assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+      assert.isDefined(T3ToolSets.__testing.asked("t"));
+      // The bound passes: the hold goes, but goal-3's set stands (not Refused over it).
+      const done = holdOf("t");
+      assert.isFalse(dropAtBound("t"));
+      assert.isUndefined(T3ToolSets.__testing.asked("t"));
+      assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+      // goal-2's late check gives nothing either.
+      yield* Deferred.succeed(stuck.open, undefined);
+      yield* Deferred.await(done);
+      assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+    }),
+  );
+
+  it.effect(
+    "a turn T3 starts itself while a Codex turn's hold is stuck: the drop keeps its set",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        const fake = makeFakeCodex({ servers: ["alpha"] });
+        const { profileFor, gated, next } = scripted();
+        const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+        const id = (yield* start(client, "t")).thread.id;
+        const stuck = yield* gated(ALL);
+        yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+        yield* Deferred.await(stuck.reached);
+        // T3's own turn does not touch the hold, but it is later than goal-2: its set stands.
+        next(LEAN);
+        assert.strictEqual(yield* outcome(turn(client, id)), "ok");
+        assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+        const done = holdOf("t");
+        assert.isFalse(dropAtBound("t"));
+        assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+        yield* Deferred.succeed(stuck.open, undefined);
+        yield* Deferred.await(done);
+        assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+      }),
+  );
+
+  it.effect("a hold whose check never fixes a set: the drop still refuses (fails closed)", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      const fake = makeFakeCodex({ servers: ["alpha"] });
+      const { profileFor, gated } = scripted();
+      const client = yield* withCodexMcpProfiles(fake.client, profileFor);
+      const id = (yield* start(client, "t")).thread.id;
+      T3ToolSets.fixT3ToolSet(
+        "t",
+        { _tag: "Groups", name: "all", groups: "all" },
+        T3ToolSets.nextT3ToolSetTurn(),
+      );
+      const stuck = yield* gated(LEAN);
+      yield* fake.emit("turn/started", turnStarted(id, "goal-2"));
+      yield* Deferred.await(stuck.reached);
+      const done = holdOf("t");
+      assert.isTrue(dropAtBound("t"));
+      assert.strictEqual(groupsOf("t"), "Refused");
+      // The stuck check is that turn's: when it finishes late, its set replaces the refusal.
+      yield* Deferred.succeed(stuck.open, undefined);
+      yield* Deferred.await(done);
+      assert.deepStrictEqual(groupsOf("t"), ["waits"]);
+    }),
+  );
+});
+
 describe("profiledClientFactory (settings and thread store)", () => {
   const NOW = DateTime.makeUnsafe("2026-11-21T00:00:00.000Z");
   const PROJECT = ProjectId.make("project");

@@ -874,7 +874,7 @@ is `/` or ends in `..`, a config error, or a git older than 2.43
 (`merge-tree --write-tree` that honours `GIT_ATTR_SOURCE`). A `/` or `/.` at
 the end of `--state-file`, `--cache` or `--lock-file` is dropped: the queue
 names its other files (`CACHE.merge`, `CACHE.new`, `CACHE.old-*`, `STATE.lock`,
-`STATE.fsck-known`) by adding to those paths, and they belong beside the cache
+`STATE.fsck-known`, `STATE.bad`, `STATE.bad-*`, `STATE.told-bad`) by adding to those paths, and they belong beside the cache
 and the plan, not inside.
 
 `--state-file` (`STATE`) holds the plan of the run that turned auto-merge off:
@@ -893,8 +893,19 @@ whose `repo` is another repository ends the run with exit 1 and stays as it
 was: give each queue its own `--state-file`. A plan without `repo` (the source
 queue's format) is this repository's. An unreadable plan, or one another user
 could have written (not this user's, or writable by its group or others), is
-kept as `STATE.bad`, the run fails, and every later run warns while that file
-exists. A plan does not say who turned auto-merge off after the queue's own
+kept as `STATE.bad` and the run fails. A later one never replaces it: it is
+kept as `STATE.bad-<time in ns>`, so each lost plan stays for a person to read.
+The new name is made empty first and the plan moved onto it, so no file is
+ever overwritten, and a name `STATE.told-bad` holds is never given to a new
+one, even after its file is deleted. Every later run names each of these files in a `::warning::` (shown on the
+run's page) while it exists, and with `notify_command` the queue runs that
+command once for each new one (kind `bad-plan`, section "Notify"). Which ones
+it told is kept in `STATE.told-bad`, written before the command runs: a run
+stopped between the two tells no one, and none is told twice. Once a person
+has deleted every one of them the record goes too, so a later one is told
+again. A `STATE.bad` an older release kept (it only logged a line) is told
+once by the first run of this one. A run that fails while finishing a plan
+still names the kept ones. A plan does not say who turned auto-merge off after the queue's own
 disarm: a pull request a person armed and disarmed again since then (while
 the run waited for the new head, after a stopped run, or after a run that saw
 it armed again right before the update) is re-armed too, if its head holds the
@@ -921,20 +932,21 @@ An armed pull request the queue passes over (section "The queue": a conflict, a
 red check, a check that ended without passing or never reported) is told on the
 pull request. That comment alone wakes nobody whose GitHub notifications are
 off. With `notify_command` the queue also runs that command, once for each
-notice it posts, with six arguments after the ones in the config:
+notice it posts (and once for each unreadable plan it keeps, kind `bad-plan`:
+section "The queue"), with six arguments after the ones in the config:
 
 ```
 <command> [config arguments...] <repo> <pr> <head> <kind> <reason> <link>
 ```
 
-| Argument | Meaning                                                                                                                                                                                                                                                                                                                                                                                           |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `repo`   | `owner/name`.                                                                                                                                                                                                                                                                                                                                                                                     |
-| `pr`     | The pull request number.                                                                                                                                                                                                                                                                                                                                                                          |
-| `head`   | The full 40-hex head sha the notice is for.                                                                                                                                                                                                                                                                                                                                                       |
-| `kind`   | `conflict` (merge state `DIRTY`), `red` (a required check failed), `stuck` (one ended without passing, or never reported) or `base-red` (it failed as on its base, and the queue updates it by itself once the base is green).                                                                                                                                                                    |
-| `reason` | The notice's own words, such as `required check build is red`.                                                                                                                                                                                                                                                                                                                                    |
-| `link`   | The page of the check's newest run, or the pull request's page when there is none (a conflict, a check that never reported) or it is not plainly a page of the repository on `https://github.com/` (a status can link any host): printable ASCII only, and no backslash, `.` or `..` path segment (also percent-encoded) or encoded `/` or `\` that a browser would follow to another repository. |
+| Argument | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `repo`   | `owner/name`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `pr`     | The pull request number; `0` for `bad-plan` (which pull request the lost plan named is not known).                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `head`   | The full 40-hex head sha the notice is for; empty for `bad-plan`.                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `kind`   | `conflict` (merge state `DIRTY`), `red` (a required check failed), `stuck` (one ended without passing, or never reported), `base-red` (it failed as on its base, and the queue updates it by itself once the base is green) or `bad-plan` (an unreadable plan was kept beside `STATE`: a pull request may still have auto-merge off).                                                                                                                                                              |
+| `reason` | The notice's own words, such as `required check build is red`.                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `link`   | The repository's pull request list (`https://github.com/<repo>/pulls`) for `bad-plan`. Otherwise the page of the check's newest run, or the pull request's page when there is none (a conflict, a check that never reported) or it is not plainly a page of the repository on `https://github.com/` (a status can link any host): printable ASCII only, and no backslash, `.` or `..` path segment (also percent-encoded) or encoded `/` or `\` that a browser would follow to another repository. |
 
 What the command does is the project's: wake the agent thread that armed the
 pull request, send a message, write a file. The fork holds no such command;
@@ -981,6 +993,8 @@ a project names its own in its own config, for example
   comment and the command, does not run it again later: the comment says the
   pull request was told, and the queue keeps no state of its own for this. The
   notice on the pull request still stands, and the run log names the failure.
+  A `bad-plan` has no pull request: its record is `STATE.told-bad`, and the
+  `::warning::` of every run names the file.
 - **No token in its environment, but not a sandbox.** The command gets the
   queue's environment without any variable whose name holds `TOKEN` (the
   queue's read and write tokens, `GH_TOKEN`, `ACTIONS_RUNTIME_TOKEN`, ...), no

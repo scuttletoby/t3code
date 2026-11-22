@@ -171,8 +171,12 @@ is listed with **Remove**).
 
 Without the list, `burnFirst` spends every window first (as before the list existed). A name that is
 not a window kind is ignored on load (that window keeps its pace; a warning is logged) and refused by
-a save. Only `settings.json` sets the list so far; `__fork-report` shows the kinds each account spends
-first under `usagePacingBurnFirstWindows`.
+a save. In the app, an account with **Spend first** on shows one box per window kind; its summary
+names the kinds it spends first. `__fork-report` shows them under `usagePacingBurnFirstWindows`.
+
+A key an entry does not know (a typo such as `burnFirstWindow`) is ignored on load with a warning
+that names it; with `burnFirst` on and the list lost that way, every window burns first. The next
+settings save writes the entry back as it was read: unknown keys and names are gone from the file.
 
 ### `server.usagePacingGate`
 
@@ -317,17 +321,18 @@ the machine's half. Nothing reads it yet: the review runner comes in a later pul
 `preset` is `off` (nothing is listed, changed or checked) or `recommended`, which fills in the
 fork's defaults: Claude (`claudeAgent`) with `claude-opus-5-5` at `high` effort, the `approach`
 lens on `claude-fable-5-2` at `high`, the state question "What happens when this runs again, stops
-half-way, or meets existing, old or empty state?", small findings left after round 2 filed as
-issues (`minors: "issue"`), the config at `.github/pr-queue.json` and reports of at most 60000
-characters. A field written out wins over the preset's (`lensRunners` per lens); a field written
-out while `preset` is `off` does nothing. A fork update may change the preset's values; write the
-fields out to keep them fixed. Efforts an agent may not use are the model policy's, not this
-setting's.
+half-way, or meets existing, old or empty state?", small findings fixed in the pull request or
+dropped (`minors: "same-round"`, the review kit's default), the config at `.github/pr-queue.json`
+and reports of at most 60000 characters. A field written out wins over the preset's (`lensRunners`
+per lens); a field written out while `preset` is `off` does nothing. A fork update may change the
+preset's values; write the fields out to keep them fixed. Efforts an agent may not use are the model
+policy's, not this setting's.
 
 Fields: `runner` and each `lensRunners` entry are `{driver, model, effort}` (a driver kind, not a
 provider instance), and a lens name is not a built-in object key such as `constructor`;
-`stateQuestion` is 20 to 600 characters; `minors` is `same-round`, `issue` or
-`free`; `configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
+`stateQuestion` is 20 to 600 characters; `minors` is `same-round` (the review kit's default and
+rule, written once in `MINORS` in `fork-kit/review/lib/review_kit.py`), `issue` or `free`;
+`configPath` is relative to the repository, without `..`; `reportMaxChars` is a whole number
 from 1000 to 65000.
 
 Only the person can change it; agents cannot. A save must name `preset` (it replaces the stored
