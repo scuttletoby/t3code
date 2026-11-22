@@ -21,6 +21,7 @@ export const FORK_FEATURES = [
   "playtest",
   "modelPolicy",
   "activityProbe",
+  "stopFinishedChildren",
 ] as const;
 export type ForkFeature = (typeof FORK_FEATURES)[number];
 
@@ -68,6 +69,7 @@ export function forkFeaturesWhere(
     ...perProject,
     modelPolicy: server(settings.modelPolicy.mode !== "off"),
     activityProbe: server(settings.activityProbe),
+    stopFinishedChildren: server(settings.stopFinishedChildren.enabled),
   };
 }
 

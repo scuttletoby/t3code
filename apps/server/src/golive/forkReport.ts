@@ -103,6 +103,8 @@ export interface ForkReport {
       readonly modelPolicy: "off" | "advise" | "enforce";
       /** The read-only "is T3 busy?" route (`__fork-report --activity` asks it). */
       readonly activityProbe: "on" | "off";
+      /** Stopping a finished delegated child's idle provider process. */
+      readonly stopFinishedChildren: "on" | "off";
     };
     readonly featuresOn: ReadonlyArray<string>;
     /**
@@ -527,6 +529,7 @@ function readSettings(
     playtest: onOff("playtest"),
     modelPolicy: settings.modelPolicy.mode,
     activityProbe: onOff("activityProbe"),
+    stopFinishedChildren: onOff("stopFinishedChildren"),
   } as const;
   return {
     settings: {
@@ -567,6 +570,7 @@ function readSettings(
         waitFor: settings.waitFor,
         waitCheckNames: Object.keys(settings.waitChecks).toSorted(),
         agentSlots: settings.agentSlots,
+        stopFinishedChildren: settings.stopFinishedChildren,
         headlessUsageRefreshIntervalMs: Duration.toMillis(settings.headlessUsageRefreshInterval),
       },
     },

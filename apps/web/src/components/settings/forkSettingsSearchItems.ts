@@ -252,6 +252,22 @@ export const FORK_SETTINGS_SEARCH_ITEMS = [
     scope: "environment-defaults",
   },
   {
+    id: "stop-finished-children",
+    title: "Stop finished children",
+    to: FORK_PAGE,
+    searchTerms: ["stop finished delegated task child process memory idle reap"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
+    id: "stop-finished-children-grace",
+    title: "Grace time",
+    to: FORK_PAGE,
+    searchTerms: ["finished child grace seconds stop process"],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
     id: "assistant",
     title: "Assistant",
     to: FORK_PAGE,

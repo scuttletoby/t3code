@@ -84,6 +84,9 @@ describe("agent turn start paths stay behind the work gate", () => {
     [
       "ProviderSessionManagerV2",
       [
+        // Fork: only reads `isLive`/`get` and calls `releaseUnlessBusy` on a finished delegated
+        // child's idle session; never starts a session or a turn.
+        "fork/stopFinishedChildren.ts",
         // Reads pending app requests of a live session.
         "mcpApps/McpAppRequests.ts",
         // Signs an MCP server in through a live session; never starts one.

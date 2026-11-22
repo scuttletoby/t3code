@@ -698,6 +698,7 @@ describe("__fork-report on old, newer and empty state", () => {
       playtest: "off",
       modelPolicy: "off",
       activityProbe: "off",
+      stopFinishedChildren: "off",
     });
     expect(report.ok).toBe(true);
   });
@@ -1482,6 +1483,7 @@ describe("__fork-report contract", () => {
       "modelPolicy",
       "playtest",
       "reviewRules",
+      "stopFinishedChildren",
       "usagePacingGate",
       "waitFor",
     ]);
@@ -1492,6 +1494,7 @@ describe("__fork-report contract", () => {
         "automaticUpdates",
         "automaticUpdatesQuietCommandSet",
         "headlessUsageRefreshIntervalMs",
+        "stopFinishedChildren",
         "usagePacing",
         "usagePacingBurnFirstWindows",
         "usagePacingGate",
