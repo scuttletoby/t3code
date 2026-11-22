@@ -303,6 +303,24 @@ class Ledger(Case):
         wide = -(-max(m['minMb'] * 100, 16384 * m['totalPercent']) * m['noSwapOrNoCapsPercent'] // 10000)
         self.assertEqual(d['memory']['marginMb'], wide, 'the caller\'s own work runs in no heavy scope: no piece caps')
 
+    def test_a_cgroup_path_outside_the_namespace_root_is_busy_not_uncapped(self):
+        # #996 item 5: /proc/self/cgroup names a path above the cgroup namespace's root (`0::/..`) for a process
+        # outside it. That path cannot be read, so its caps are unknown: busy for every kind, never "no cap" as for
+        # the root itself
+        shutil.rmtree(self.m.root + MANAGER)                        # the machine tier: the caller's own cgroup
+        for line in ('0::/..', '0::/../other.slice', '0::/system.slice/../..', '0::/./x'):
+            with self.subTest(line=line):
+                self.m.write('/proc/self/cgroup', line + '\n')
+                for _ in range(2):                                  # runs again: the same answer
+                    code, d = self.facts('--mb', '64', '--fresh')
+                    self.assertEqual((code, d['memory']['availableMb']), (75, None), d['notes'])
+                    self.assertTrue(any('cannot be used' in n for n in d['notes']), d['notes'])
+        for line in ('0::/', '0:://'):                              # the root (a namespace's): the shared reader's
+            with self.subTest(line=line):
+                self.m.write('/proc/self/cgroup', line + '\n')
+                code, d = self.facts('--mb', '64', '--fresh')
+                self.assertEqual((code, d['memory']['availableMb']), (0, 12288), d['notes'])
+
     def test_ready_refuses_a_basic_tier_machine_at_once(self):
         # #981 leftover 2: a basic tier is never free, so a plain heavy there waited its whole --wait (7200 s) for an
         # answer that never comes; ready() (asked before any wait) names it, as it names a kit that cannot answer
@@ -458,9 +476,75 @@ class Ledger(Case):
             self.m.write('/proc/self/mountinfo', broken)
             d = self.facts('--mb', '64', '--fresh')[1]
             self.assertEqual(sorted(r['name'] for r in d['reservations']), ['far:r', 'near:r'], (broken, d['notes']))
-        os.unlink(self.m.root + '/proc/self/mountinfo')
+
+    def automount_people(self, far_home='/net/home/far', near_home='/net/home/near'):
+        """far and near (no session), homes behind the autofs /net/home, each with a reservation; their uids."""
+        far, near = 4000000003, 4000000004
+        self.m.write('/etc/login.defs', 'UID_MIN 1000\nUID_MAX 4294967294\n')
+        self.m.write('/etc/passwd', f'far:x:{far}:{far}::{far_home}:/bin/sh\n'
+                                    f'near:x:{near}:{near}::{near_home}:/bin/sh\n')
+        os.chmod(self.m.root + '/etc', 0o755)
+        for name, home in (('far', far_home), ('near', near_home)):
+            self.m.write(f'{home}/.config/t3-capacity/reserve.d/r.conf', f'512 /{name}/\n')
+        return far, near
+
+    def test_a_mounted_home_with_a_non_ascii_name_is_read(self):
+        # #996 item 4: the mount table was decoded as ASCII and its octal escapes made one character per byte, so a
+        # mounted home with a non-ASCII name (/net/home/jürgen: \303\274 in the table) did not match its passwd
+        # line and read as "behind an unmounted autofs": the reservation of that person was not read
+        self.automount_people(near_home='/net/home/jürgen')
+        self.m.write('/proc/self/mountinfo', '22 1 0:20 / / rw - ext4 /dev/vda1 rw\n'
+                                             '40 22 0:40 / /net/home rw - autofs systemd-1 rw,fd=5\n'
+                                             '41 40 0:41 / /net/home/j\\303\\274rgen rw - nfs4 srv:/j rw\n')
+        shutil.rmtree(self.m.root + MANAGER)        # the machine tier
+        for _ in range(2):                          # runs again: the same answer
+            d = self.facts('--mb', '64', '--fresh')[1]
+            self.assertEqual([r['name'] for r in d['reservations']], ['near:r'], d['notes'])
+            self.assertIn('reservations not read for 1 people without a session whose home is not mounted (autofs): '
+                          'far', d['notes'])
+
+    def test_a_mount_table_cut_at_its_limit_is_named_and_reads_every_home(self):
+        # #996 item 4: the mount table was cut at 4 MiB without a note, so a home whose mount line fell past the cut
+        # read as "behind an unmounted autofs" and was skipped. A table longer than the limit is read as unreadable
+        # (every home read, as before #951), with a note
+        self.automount_people()
+        head = '22 1 0:20 / / rw - ext4 /dev/vda1 rw\n40 22 0:40 / /net/home rw - autofs systemd-1 rw,fd=5\n'
+        filler = ''.join(f'{100 + i} 22 0:99 / /mnt/filler-{i:06d} rw - tmpfs tmpfs rw\n' for i in range(90000))
+        self.assertGreater(len(head + filler), hf.MOUNTS_LIMIT)
+        self.m.write('/proc/self/mountinfo', head + filler + '41 40 0:41 / /net/home/near rw - nfs4 srv:/near rw\n')
+        shutil.rmtree(self.m.root + MANAGER)        # the machine tier
         d = self.facts('--mb', '64', '--fresh')[1]
         self.assertEqual(sorted(r['name'] for r in d['reservations']), ['far:r', 'near:r'], d['notes'])
+        self.assertTrue(any('mount table' in n and 'every home is read' in n for n in d['notes']), d['notes'])
+
+    def test_sessions_that_cannot_be_listed_never_skip_a_home(self):
+        # #996 item 6: when user.slice could not be listed, no one had a session, so the automount rule skipped the
+        # homes of people who are logged in too. Sessions that cannot be known: every home is read (as with an
+        # unreadable mount table), with a note. (heavy facts answers busy then anyway, as other_users is blind; the
+        # list of homes is asked here directly so the rule holds on its own.)
+        far, near = self.automount_people()
+        self.m.write('/proc/self/mountinfo', '22 1 0:20 / / rw - ext4 /dev/vda1 rw\n'
+                                             '40 22 0:40 / /net/home rw - autofs systemd-1 rw,fd=5\n')
+        os.makedirs(self.m.root + f'/sys/fs/cgroup/user.slice/user-{far}.slice')     # far is logged in
+        users = self.m.root + '/sys/fs/cgroup/user.slice'
+
+        def homes():
+            with mock.patch.object(hf, 'ROOT', self.m.root):
+                dirs, blind, notes = hf.other_reserve_dirs(UID)
+            return [n for n, _, _ in dirs], blind, notes
+        self.assertEqual(homes(), (['far'], [], ['reservations not read for 1 people without a session whose home is '
+                                                 'not mounted (autofs): near']))
+        os.chmod(users, 0o300)                      # cannot be listed (its folders can still be reached)
+        self.addCleanup(os.chmod, users, 0o755)
+        for _ in range(2):                          # runs again: the same answer
+            names, blind, notes = homes()
+            self.assertEqual((names, blind), (['far', 'near'], []))
+            self.assertEqual(len(notes), 1, notes)
+            self.assertIn('sessions cannot be known', notes[0])
+        os.chmod(users, 0o755)                      # listed again: back to the rule
+        self.assertEqual(homes()[0], ['far'])
+        os.unlink(self.m.root + '/proc/self/mountinfo')   # no mount table either: every home, as before #951
+        self.assertEqual(homes(), (['far', 'near'], [], []))
 
     def test_an_unreadable_signal_is_elevated_never_ok(self):
         self.m.write('/proc/pressure/memory', 'some garbage\nfull avg10=x\n')
@@ -1229,8 +1313,8 @@ class State(Case):
             shutil.rmtree(fallback())
             self.assertEqual(self.facts('--mb', '64', now=NOW + datetime.timedelta(hours=1), env=env)[0], 0)
             fallback()
-            # the hold of a NOT OK is kept there too
-            with mock.patch.dict(os.environ, dict(env, HOME=self.m.home)):
+            # the hold of a NOT OK is kept there too (the same root as facts(): its machine id names the folder)
+            with mock.patch.dict(os.environ, dict(env, HOME=self.m.home)), mock.patch.object(hf, 'ROOT', self.m.root):
                 self.assertEqual(hf.hold('k:1', 'busy', 1_000_000)[:2], ('busy', None))
                 self.assertEqual(hf.hold('k:1', 'free', 1_000_001)[0], 'busy', 'held in the fallback folder')
             self.assertIn(hf.HOLD_FILE, os.listdir(fallback()))
@@ -1261,6 +1345,46 @@ class State(Case):
                         os.unlink(cache_root)
                     else:
                         os.rmdir(cache_root)
+
+    def test_two_machines_with_one_home_and_one_host_name_never_share_the_home_cache(self):
+        # #996 item 3: the home cache folder was named by the host name only, so two machines that share a home and
+        # a host name (clones, cloud images) read each other's 5 s readings. Now the machine id is in the name too
+        tmp_root = os.path.join(self.tmp, 'tmp')
+        os.makedirs(tmp_root)
+        open(os.path.join(tmp_root, f'heavy-facts-{UID}'), 'w').close()     # the temporary name taken: the home
+        cache_root = os.path.join(self.m.home, '.cache')
+        env = {'HEAVY_FACTS_CACHE': ''}
+        one, two = '0123456789abcdef' * 2, 'fedcba9876543210' * 2
+
+        def on(machine, avail, at):
+            self.m.write('/etc/machine-id', machine + '\n')
+            os.chmod(self.m.root + '/etc', 0o755)           # (the machine file's folder must be closed to others)
+            self.m.write('/proc/meminfo', self.m.meminfo(16384, avail))
+            return self.facts('--mb', '64', now=at, env=env)[1]['memory']['availableMb']
+        with self.no_run_user(tmp_root):
+            self.assertEqual(on(one, 12000, NOW), 12000)
+            self.assertEqual(on(one, 6000, NOW + datetime.timedelta(seconds=1)), 12000, 'runs again: the cache')
+            self.assertEqual(on(two, 6000, NOW + datetime.timedelta(seconds=2)), 6000, 'never the other one\'s')
+            folders = sorted(os.listdir(cache_root))
+            self.assertEqual(len(folders), 2, folders)
+            self.assertTrue(all(f.startswith(f'heavy-facts-{hf.host_name()}-') for f in folders), folders)
+            # the previous kit's folder (host name only) is never read and never removed: another machine of this
+            # home may still run that kit
+            old = os.path.join(cache_root, f'heavy-facts-{hf.host_name()}')
+            os.rename(os.path.join(cache_root, folders[0]), old)
+            before = {n: os.stat(os.path.join(old, n)).st_mtime_ns for n in os.listdir(old)}
+            self.assertEqual(on(one, 3000, NOW + datetime.timedelta(seconds=3)), 3000, 'the old cache was read')
+            self.assertEqual({n: os.stat(os.path.join(old, n)).st_mtime_ns for n in os.listdir(old)}, before)
+        # no machine id (or an unset one, "uninitialized" on a first boot): the boot id; neither: the host name
+        with mock.patch.object(hf, 'ROOT', self.m.root):
+            self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-{one[:16]}')
+            os.unlink(self.m.root + '/etc/machine-id')
+            self.m.write('/proc/sys/kernel/random/boot_id', '01234567-89ab-cdef-0123-456789abcdef\n')
+            self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-0123456789abcdef')
+            self.m.write('/etc/machine-id', 'uninitialized\n')
+            self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-0123456789abcdef')
+            os.unlink(self.m.root + '/proc/sys/kernel/random/boot_id')
+            self.assertEqual(hf.machine_tag(), hf.host_name())
 
     def test_the_cache_folder_swapped_after_its_check_is_not_followed(self):
         # #951 point 3: the private temporary folder was checked, then used by its path, so a swap between the two
@@ -1888,6 +2012,38 @@ class Container(Case):
         self.assertEqual(self.facts('--kind', 'build')[1]['memory']['owedMb'], self.cost('job-build') - 1000)
         self.m.write(f'{MANAGER}/heavy.slice/run-j1.scope/memory.stat', f'anon {1000 * MB}\nfi')
         self.assertEqual(self.facts('--kind', 'build', '--fresh')[1]['memory']['owedMb'], self.cost('job-build'))
+
+
+class OneRule(unittest.TestCase):
+    """#996 item 2: one rule, "someone else could swap a part of this path", in three copies: bin/heavy and
+    lib/heavy_sweep.py others_can_swap (plain heavy loads no lib, the sweep runs alone) and lib/heavy_facts.py
+    swappable. Each copy is asked about every owner and mode a folder above a home can have; all three agree."""
+
+    def test_the_three_copies_of_the_swap_rule_agree(self):
+        heavy = load_module('heavy_bin', HEAVY)
+        sweep = load_module('heavy_sweep', os.path.join(KIT, 'lib', 'heavy_sweep.py'))
+        me = os.geteuid()
+        safe = os.stat_result((stat.S_IFDIR | 0o755, 2, 1, 1, 0, 0, 0, 0, 0, 0))     # / : root's, 755
+        seen = set()
+        for owner in (0, me, me + 1):
+            for mode in (0o700, 0o750, 0o755, 0o775, 0o757, 0o777, 0o1777, 0o1775, 0o1757, 0o1700, 0o2775, 0o3777):
+                st = os.stat_result((stat.S_IFDIR | mode, 3, 1, 1, owner, owner, 0, 0, 0, 0))
+                with self.subTest(owner=owner, mode=oct(mode)), mock.patch.object(
+                        os, 'lstat', lambda p, *a, **k: st if p == '/parent' else safe):
+                    answers = (hf.swappable(st, me), heavy.others_can_swap('/parent/home'),
+                               sweep.others_can_swap('/parent/home'))
+                    self.assertEqual(len(set(answers)), 1, f'facts, heavy, sweep: {answers}')
+                    seen.add((owner == me + 1, bool(mode & 0o022), bool(mode & 0o1000), answers[0]))
+        # the rule itself, so the three cannot agree on a wrong one
+        self.assertIn((True, False, False, True), seen, 'another user\'s folder')
+        self.assertIn((False, True, False, True), seen, 'open to others, not sticky')
+        self.assertIn((False, True, True, False), seen, 'open to others, sticky (/tmp)')
+        self.assertIn((False, False, False, False), seen, 'root\'s or this user\'s, closed')
+        # a folder on the way that cannot be looked at: both path copies say "can be swapped" (facts' walk opens
+        # each part, so that one is refused there)
+        with mock.patch.object(os, 'lstat', side_effect=PermissionError(13, 'denied')):
+            self.assertEqual((heavy.others_can_swap('/parent/home'), sweep.others_can_swap('/parent/home')),
+                             (True, True))
 
 
 class RedCheck(Case):
