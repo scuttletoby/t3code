@@ -15,7 +15,7 @@ never free). Expected numbers come from capacity-rule.json, never copied
 here. RedCheck takes fix lines out of a copy of lib/heavy_facts.py and shows their tests fail.
 """
 import contextlib, datetime, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, stat, subprocess
-import sys, tempfile, time, types, unittest
+import pwd, sys, tempfile, time, types, unittest
 from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -72,6 +72,7 @@ class Machine:
             os.makedirs(d)
         os.makedirs(self.root, mode=0o755)
         os.chmod(self.root, 0o755)      # the machine file's folders on the way: never group-writable (umask 002)
+        os.chmod(self.home, 0o700)      # a home others cannot write (umask 002 would make it 775: #951 refuses it)
         self.write('/proc/meminfo', self.meminfo(16384, 12288))
         self.write('/proc/pressure/memory', CALM)
         self.write('/proc/loadavg', '1.50 1.00 0.50 2/300 4000\n')
@@ -137,6 +138,14 @@ class Case(unittest.TestCase):
         self.addCleanup(self.m.close)
         self.work = os.path.join(self.tmp, 'work')
         os.makedirs(self.work)
+        real = pwd.getpwuid                         # #951: never this user's real home (the cache's last folder)
+
+        def entry(uid):
+            e = real(uid)
+            return pwd.struct_passwd(e[:5] + (self.m.home,) + e[6:]) if uid == UID else e
+        for patch in (mock.patch.object(pwd, 'getpwuid', entry), mock.patch.dict(os.environ, {'HOME': self.m.home})):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def facts(self, *args, now=NOW, cwd=None, mod=None, env=None):
         """In-process `heavy facts` at a fixed time: (exit code, object or None)."""
@@ -238,6 +247,96 @@ class Ledger(Case):
         code, d = self.facts('--kind', WRITER, '--fresh')
         self.assertEqual((code, d['tier'], set(d['fits'].values())), (75, 'basic', {0}))
 
+    def test_the_memory_cap_the_work_runs_under_is_its_room(self):
+        # #951 point 1: the shared reader caps only the cgroup root; a CI runner's service with MemoryMax= (machine
+        # tier: its work runs in its own cgroup) or a user-<uid>.slice with one (full tier: heavy jobs and agents
+        # start under the user manager) was told OK for a size that fits the machine but not that cap
+        mib = 1024 * 1024
+        def cap(folder, high='max', mx='max', current=None, inactive=0):
+            for name, v in (('memory.high', high), ('memory.max', mx)):
+                self.m.write(f'{folder}/{name}', v if isinstance(v, str) else f'{v * mib}\n')
+            if current is not None:
+                self.m.write(folder + '/memory.current', f'{current * mib}\n')
+                self.m.write(folder + '/memory.stat', f'anon 1\ninactive_file {inactive * mib}\n')
+        self.assertEqual(self.facts('--mb', '64')[1]['memory']['availableMb'], 12288)
+        user = f'/sys/fs/cgroup/user.slice/user-{UID}.slice'
+        cap(user, mx=4096, current=1536, inactive=512)              # 1 GB used, 512 MB clean cache that can go
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual((code, d['tier'], d['memory']['availableMb']), (0, 'full', 3072), d.get('reason'))
+        self.assertTrue(any(n.startswith(f'memory cap of {user[len("/sys/fs/cgroup"):]}: 4096 MB')
+                            for n in d['notes']), d['notes'])
+        self.assertEqual(self.facts('--mb', '3500', '--fresh')[0], 75, 'fits the machine, not the cap')
+        self.assertEqual(self.facts('--mb', '64')[1]['memory']['availableMb'], 3072, 'runs again: the cache')
+        cap(user, high=2048, mx=4096, current=1536, inactive=512)  # memory.high below memory.max: the tighter one
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['availableMb'], 1024)
+        cap(MANAGER, mx=512, current=0)                             # the manager's own cap, below the slice's
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['availableMb'], 512)
+        for path in (MANAGER + '/memory.high', MANAGER + '/memory.max'):
+            os.unlink(self.m.root + path)                           # no memory controller there: no cap
+        cap(user, high='max', mx='max', current=1536)
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['availableMb'], 12288, '"max": none')
+        cap(user, mx='garbage\n')                                   # a cap that cannot be read: busy for every kind
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual((code, d['memory']['availableMb']), (75, None))
+        self.assertTrue(any('cannot be read' in n for n in d['notes']), d['notes'])
+        cap(user, mx=4096)
+        os.unlink(self.m.root + user + '/memory.current')           # its use cannot be read: no room known
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['availableMb'], None)
+        shutil.rmtree(self.m.root + user)                           # (user.slice stays: the machine tier)
+        # the machine tier: the caller's own cgroup and every one above it
+        runner = '/sys/fs/cgroup/system.slice/runner.service'
+        self.m.write('/proc/self/cgroup', '0::/system.slice/runner.service\n')
+        cap(runner, mx=8192, current=512)
+        code, d = self.facts('--mb', '64', '--fresh')
+        self.assertEqual((code, d['tier'], d['memory']['availableMb']), (0, 'machine', 7680), d.get('reason'))
+        self.assertEqual(self.facts('--mb', '7000', '--fresh')[0], 75, 'fits the machine, not the cap')
+        cap('/sys/fs/cgroup/system.slice', mx=4096, current=256)
+        self.assertEqual(self.facts('--mb', '64', '--fresh')[1]['memory']['availableMb'], 3840)
+        self.m.write('/proc/self/cgroup', '0::/system.slice/other.service\n')   # another caller, not capped itself
+        d = self.facts('--mb', '64')[1]                             # the cached machine readings, its own caps
+        self.assertEqual(d['memory']['availableMb'], 3840, 'its parent\'s cap holds it too')
+        self.m.write('/proc/self/cgroup', '0::/user.slice/x.scope\n')            # no cap on its way
+        self.assertEqual(self.facts('--mb', '64')[1]['memory']['availableMb'], 12288, 'never another\'s cached cap')
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual((d['tier'], d['memory']['availableMb']), ('machine', 12288))
+        m = RULE['margin']
+        wide = -(-max(m['minMb'] * 100, 16384 * m['totalPercent']) * m['noSwapOrNoCapsPercent'] // 10000)
+        self.assertEqual(d['memory']['marginMb'], wide, 'the caller\'s own work runs in no heavy scope: no piece caps')
+
+    def test_ready_refuses_a_basic_tier_machine_at_once(self):
+        # #981 leftover 2: a basic tier is never free, so a plain heavy there waited its whole --wait (7200 s) for an
+        # answer that never comes; ready() (asked before any wait) names it, as it names a kit that cannot answer
+        def ready(slice_name='heavy.slice'):
+            with mock.patch.dict(os.environ, self.m.env(), clear=True), mock.patch.object(hf, 'ROOT', self.m.root):
+                return hf.ready(hq, slice_name)
+        self.assertIsNone(ready())
+        self.assertIsNone(ready(), 'runs again: the same answer')
+        box = self.m.root + MANAGER + '/heavy.slice'
+        shutil.rmtree(box)                                          # no heavy job ran yet: no box, still fine
+        self.assertIsNone(ready())
+        controllers = self.m.root + '/sys/fs/cgroup/cgroup.controllers'
+        os.unlink(controllers)                                      # no cgroup v2
+        self.assertIn('basic tier', ready() or '')
+        self.assertIn('no cgroup v2', ready())
+        self.m.write('/sys/fs/cgroup/cgroup.controllers', '')       # v2, empty: still v2
+        self.assertIsNone(ready())
+        shutil.rmtree(self.m.root + MANAGER)                        # no manager, user.slice: the machine tier
+        self.assertIsNone(ready())
+        shutil.rmtree(self.m.root + '/sys/fs/cgroup/user.slice')    # neither
+        self.assertIn('basic tier', ready() or '')
+        os.makedirs(box)
+        if os.geteuid() != 0:                                       # root lists every folder
+            os.chmod(controllers, 0)                                # unreadable: not known to be v2
+            self.addCleanup(os.chmod, controllers, 0o644)
+            self.assertIn('basic tier', ready() or '')
+            os.chmod(controllers, 0o644)
+            os.chmod(box, 0)                                        # a heavy box that cannot be listed
+            self.addCleanup(os.chmod, box, 0o755)
+            self.assertIn('cannot be listed', ready() or '')
+            os.chmod(box, 0o755)
+            self.assertIsNone(ready())
+        self.assertIsNone(ready(None), 'no slice named (another caller): no box to list')
+
     def test_no_user_manager_gets_the_machine_wide_answer(self):
         # #844: a CI runner's user (no lingering, no login session) has no user manager; every other user's agents
         # and heavy jobs are still read from user.slice, so it gets the answer a caller with a manager gets
@@ -249,11 +348,20 @@ class Ledger(Case):
             if tier == 'machine':
                 shutil.rmtree(self.m.root + MANAGER)
             answers[tier] = [self.facts(*args, '--fresh') for args in (('--kind', WRITER), ('--mb', '1024'))]
+        m = RULE['margin']
+        wide = -(-max(m['minMb'] * 100, 16384 * m['totalPercent']) * m['noSwapOrNoCapsPercent'] // 10000)
         for (code, d), (full_code, full) in zip(answers['machine'], answers['full']):
             self.assertEqual((code, d['free'], d['tier'], d['level']), (0, True, 'machine', 'ok'), d.get('reason'))
             self.assertEqual((full_code, full['tier']), (0, 'full'))
-            for key in ('memory', 'queue', 'fits'):
-                self.assertEqual(d[key], full[key], key)
+            self.assertEqual(d['queue'], full['queue'])
+            # #951: the caller's own work runs in no heavy scope, so no piece caps: the rule's wider margin
+            self.assertEqual(d['memory']['marginMb'], wide)
+            self.assertGreater(wide, full['memory']['marginMb'])
+            same = ('availableMb', 'reservedMb', 'owedMb', 'holdMb', 'costMb', 'swapFreeMb', 'swapUsedPercent')
+            self.assertEqual({k: d['memory'][k] for k in same}, {k: full['memory'][k] for k in same})
+            self.assertEqual(d['memory']['freeMb'], full['memory']['freeMb'] - (wide - full['memory']['marginMb']))
+            for k in d['fits']:
+                self.assertLessEqual(d['fits'][k], full['fits'][k], k)
             self.assertEqual(d['queue'], {'running': 1, 'waiting': 0, 'agents': 1})
             self.assertIn(hf.MACHINE_WHY, d['notes'])
             self.assertNotIn(hf.BASIC_WHY, d['notes'])
@@ -320,6 +428,39 @@ class Ledger(Case):
         code, d = self.facts('--mb', '64', '--fresh')
         self.assertEqual((code, d['tier']), (75, 'basic'))
         self.assertTrue(any('user 4000000002 has a session' in n for n in d['notes']), d['notes'])
+
+    def test_a_home_behind_an_automount_is_read_only_for_a_person_with_a_session(self):
+        # #951: the machine tier read every passwd home on every call, so an autofs /home mounted them all; a home
+        # behind a trigger that is not mounted is read only while its person has a session (then it is mounted)
+        far, near = 4000000003, 4000000004
+        self.m.write('/etc/login.defs', 'UID_MIN 1000\nUID_MAX 4294967294\n')
+        self.m.write('/etc/passwd', f'far:x:{far}:{far}::/net/home/far:/bin/sh\n'
+                                    f'near:x:{near}:{near}::/net/home/near/:/bin/sh\n')
+        os.chmod(self.m.root + '/etc', 0o755)
+        for name, mb in (('far', 1024), ('near', 512)):
+            self.m.write(f'/net/home/{name}/.config/t3-capacity/reserve.d/r.conf', f'{mb} /{name}/\n')
+        mounts = ('22 1 0:20 / / rw - ext4 /dev/vda1 rw\n'
+                  '40 22 0:40 / /net/home rw,relatime - autofs systemd-1 rw,fd=5\n'
+                  '41 40 0:41 / /net/home/near rw - nfs4 srv:/near rw\n')
+        self.m.write('/proc/self/mountinfo', mounts)
+        shutil.rmtree(self.m.root + MANAGER)        # the machine tier
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual(d['tier'], 'machine', d.get('reason'))
+        self.assertEqual([r['name'] for r in d['reservations']], ['near:r'], d['notes'])
+        self.assertIn('reservations not read for 1 people without a session whose home is not mounted (autofs): far',
+                      d['notes'])
+        os.makedirs(self.m.root + f'/sys/fs/cgroup/user.slice/user-{far}.slice')     # far logs in: it is mounted
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual(sorted(r['name'] for r in d['reservations']), ['far:r', 'near:r'], d['notes'])
+        self.assertFalse(any('autofs' in n for n in d['notes']), d['notes'])
+        os.rmdir(self.m.root + f'/sys/fs/cgroup/user.slice/user-{far}.slice')
+        for broken in ('', 'not a mount table\n'):  # empty or unreadable mount table: every home read, as before
+            self.m.write('/proc/self/mountinfo', broken)
+            d = self.facts('--mb', '64', '--fresh')[1]
+            self.assertEqual(sorted(r['name'] for r in d['reservations']), ['far:r', 'near:r'], (broken, d['notes']))
+        os.unlink(self.m.root + '/proc/self/mountinfo')
+        d = self.facts('--mb', '64', '--fresh')[1]
+        self.assertEqual(sorted(r['name'] for r in d['reservations']), ['far:r', 'near:r'], d['notes'])
 
     def test_an_unreadable_signal_is_elevated_never_ok(self):
         self.m.write('/proc/pressure/memory', 'some garbage\nfull avg10=x\n')
@@ -904,20 +1045,23 @@ class State(Case):
         self.assertEqual(os.listdir(os.path.dirname(self.m.cache)), [os.path.basename(self.m.cache)])
         with open(self.m.cache) as f:
             data = json.load(f)
-        self.assertEqual(hf.read_cache(self.m.cache, data['atMs'], data['key'])[0]['queue']['agents'], 1)
-        self.assertEqual(hf.read_cache(self.m.cache, data['atMs'], 'another key'), (None, hf.no_carry()))
+        folder = hf.given_folder(os.path.dirname(self.m.cache))[0]
+        self.addCleanup(folder.close)
+        name = os.path.basename(self.m.cache)
+        self.assertEqual(hf.read_cache(folder, name, data['atMs'], data['key'])[0]['queue']['agents'], 1)
+        self.assertEqual(hf.read_cache(folder, name, data['atMs'], 'another key'), (None, hf.no_carry()))
 
     def test_without_a_cache_folder_the_level_never_drops_straight_to_ok(self):
         tmp_root = os.path.join(self.tmp, 'tmp')
         os.makedirs(os.path.join(tmp_root, f'heavy-facts-{UID}'), mode=0o700)
-        os.chmod(os.path.join(tmp_root, f'heavy-facts-{UID}'), 0o777)    # planted first, open to others: no cache
-        with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')), \
-                mock.patch.object(hf, 'TMP_ROOT', tmp_root):
+        os.chmod(os.path.join(tmp_root, f'heavy-facts-{UID}'), 0o777)    # planted first, open to others
+        home = self.loose_home()                                            # and no home that can hold one (#951)
+        env = {'HEAVY_FACTS_CACHE': '', 'HOME': home}
+        with self.no_run_user(tmp_root, self.passwd_home(home)):
             for i in range(3):                      # a calm machine, called again and again: every call starts over
-                code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(minutes=i * 10),
-                                     env={'HEAVY_FACTS_CACHE': ''})
+                code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(minutes=i * 10), env=env)
                 self.assertEqual((code, d['level']), (75, 'elevated'), i)
-            code, d = self.facts('--kind', WRITER, env={'HEAVY_FACTS_CACHE': ''})
+            code, d = self.facts('--kind', WRITER, env=env)
             self.assertEqual((code, d['level']), (0, 'elevated'), 'the floor still admits')
             self.assertTrue(any(n.startswith('no cache: ') for n in d['notes']), d['notes'])
         self.assertFalse(os.path.exists(self.m.cache))
@@ -956,13 +1100,22 @@ class State(Case):
         os.makedirs(closed)
         os.chmod(closed, 0o555)
         self.addCleanup(os.chmod, closed, 0o755)
+        home = self.loose_home()
         with mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')), \
                 mock.patch.object(hf, 'TMP_DIRS', (closed,), create=True), mock.patch.object(tempfile, 'tempdir', None), \
                 mock.patch.object(tempfile, '_candidate_tempdir_list', lambda: [closed, os.getcwd()]):
-            code, d = self.facts('--mb', '64', env={'HEAVY_FACTS_CACHE': '', 'TMPDIR': closed})
+            with self.passwd_home(home):
+                code, d = self.facts('--mb', '64', env={'HEAVY_FACTS_CACHE': '', 'TMPDIR': closed, 'HOME': home})
+            self.assertEqual(os.listdir(self.work), [], 'a cache folder was made in the working folder')
+            self.assertEqual((code, d['level']), (75, 'elevated'))
+            self.assertTrue(any(n.startswith('no cache: no temporary folder') for n in d['notes']), d['notes'])
+            # #951: a home that can hold it: the cache goes there instead, with a note
+            code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(hours=1),
+                                 env={'HEAVY_FACTS_CACHE': '', 'TMPDIR': closed})
         self.assertEqual(os.listdir(self.work), [], 'a cache folder was made in the working folder')
-        self.assertEqual((code, d['level']), (75, 'elevated'))
-        self.assertTrue(any(n.startswith('no cache: no temporary folder') for n in d['notes']), d['notes'])
+        self.assertEqual((code, d['level']), (0, 'ok'), d['notes'])
+        self.assertTrue(any(n.startswith('no temporary folder') and os.path.join(self.m.home, '.cache') in n
+                            for n in d['notes']), d['notes'])
 
     def test_without_run_user_the_cache_is_a_private_temporary_folder(self):
         # #844: a user with no user manager has no /run/user/<uid>; without a cache every call would start
@@ -991,8 +1144,10 @@ class State(Case):
                     else:
                         os.mkdir(folder)
                         os.chmod(folder, 0o755)
-                    code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=30),
-                                         env={'HEAVY_FACTS_CACHE': ''})
+                    home = self.loose_home()        # and no home that can hold one (#951: else it goes there)
+                    with self.passwd_home(home):
+                        code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(seconds=30),
+                                             env={'HEAVY_FACTS_CACHE': '', 'HOME': home})
                     self.assertEqual((code, d['level']), (75, 'elevated'))
                     self.assertTrue(any(n.startswith('no cache: ') for n in d['notes']), d['notes'])
                     self.assertEqual(os.listdir(os.path.join(self.tmp, 'elsewhere')) if planted == 'link' else [], [])
@@ -1001,6 +1156,144 @@ class State(Case):
                     else:
                         os.unlink(folder)
                     os.mkdir(folder, 0o700)
+
+    def no_run_user(self, tmp_root, *more):
+        """No /run/user/<uid>, and <tmp_root> as the temporary folder (with more patches)."""
+        stack = contextlib.ExitStack()
+        for p in (mock.patch.object(hf, 'RUN_USER', os.path.join(self.tmp, 'no-run')),
+                  mock.patch.object(hf, 'TMP_ROOT', tmp_root)) + more:
+            stack.enter_context(p)
+        return stack
+
+    def loose_home(self):
+        """A home in a folder others can write that is not sticky: no cache may go there (#951). Its path."""
+        loose = os.path.join(self.tmp, 'loose')
+        home = os.path.join(loose, 'home')
+        os.makedirs(home, 0o700, exist_ok=True)
+        os.chmod(loose, 0o777)
+        return home
+
+    def passwd_home(self, home):
+        """pwd.getpwuid with this user's home as `home` (other users' as they are)."""
+        import pwd
+        real = pwd.getpwuid
+
+        def entry(uid):
+            e = real(uid)
+            return types.SimpleNamespace(pw_name=e.pw_name, pw_dir=home, pw_uid=e.pw_uid) if uid == UID else e
+        return mock.patch.object(pwd, 'getpwuid', entry)
+
+    def test_a_taken_temporary_cache_name_falls_back_to_a_private_folder_in_the_home(self):
+        # #951 point 2: another user can make <tmp>/heavy-facts-<uid> (or a file of that name) before this user
+        # does; heavy refused it and ran without a cache, so every call started "elevated" and a --mb ask was never
+        # OK. Now the cache goes in a folder only this user can use in its home (~/.cache) instead
+        tmp_root = os.path.join(self.tmp, 'tmp')
+        os.makedirs(tmp_root)
+        taken = os.path.join(tmp_root, f'heavy-facts-{UID}')
+        elsewhere = os.path.join(self.tmp, 'elsewhere')
+        os.makedirs(elsewhere, 0o700)
+        cache_root = os.path.join(self.m.home, '.cache')
+        env = {'HEAVY_FACTS_CACHE': ''}
+
+        def fallback():
+            names = os.listdir(cache_root)
+            self.assertEqual(len(names), 1, names)
+            self.assertTrue(names[0].startswith('heavy-facts'), names)
+            return os.path.join(cache_root, names[0])
+        with self.no_run_user(tmp_root):
+            for i, planted in enumerate(('file', 'open', 'link')):
+                with self.subTest(planted=planted):
+                    if planted == 'file':
+                        open(taken, 'w').close()
+                    elif planted == 'open':
+                        os.unlink(taken)
+                        os.mkdir(taken)
+                        os.chmod(taken, 0o777)
+                    else:
+                        os.rmdir(taken)
+                        os.symlink(elsewhere, taken)
+                    at = NOW + datetime.timedelta(minutes=10 * i)      # past the carry window of the call before
+                    self.m.write('/proc/meminfo', self.m.meminfo(16384, 12000))
+                    code, d = self.facts('--mb', '64', now=at, env=env)
+                    self.assertEqual((code, d['level']), (0, 'ok'), d['notes'])
+                    self.assertTrue(any(taken in n for n in d['notes']), d['notes'])
+                    self.m.write('/proc/meminfo', self.m.meminfo(16384, 6000))
+                    again = self.facts('--mb', '64', now=at + datetime.timedelta(seconds=4), env=env)
+                    self.assertEqual(again[1]['memory'], d['memory'], 'runs again: answered from the cache')
+                    folder = fallback()
+                    self.assertEqual(os.lstat(folder).st_mode & 0o777, 0o700)
+                    self.assertEqual(len(os.listdir(folder)), 1, os.listdir(folder))
+                    self.assertRegex(os.listdir(folder)[0], r'^heavy-facts-v%d-[0-9a-f]{16}\.json$' % hf.CACHE_VERSION)
+                    self.assertEqual(os.listdir(elsewhere), [], 'nothing was written through the planted link')
+            # stopped half-way: the fallback folder gone (or never made past ~/.cache): made again
+            shutil.rmtree(fallback())
+            self.assertEqual(self.facts('--mb', '64', now=NOW + datetime.timedelta(hours=1), env=env)[0], 0)
+            fallback()
+            # the hold of a NOT OK is kept there too
+            with mock.patch.dict(os.environ, dict(env, HOME=self.m.home)):
+                self.assertEqual(hf.hold('k:1', 'busy', 1_000_000)[:2], ('busy', None))
+                self.assertEqual(hf.hold('k:1', 'free', 1_000_001)[0], 'busy', 'held in the fallback folder')
+            self.assertIn(hf.HOLD_FILE, os.listdir(fallback()))
+            # a ~/.cache that is a link or open to others, or a home in a folder others can write: no cache, as before
+            shutil.rmtree(cache_root)
+            for bad in ('link', 'open', 'home'):
+                with self.subTest(bad=bad):
+                    home = self.m.home
+                    if bad == 'link':
+                        os.symlink(elsewhere, cache_root)
+                    elif bad == 'open':
+                        os.mkdir(cache_root)
+                        os.chmod(cache_root, 0o777)
+                    else:
+                        loose = os.path.join(self.tmp, 'loose')
+                        os.makedirs(os.path.join(loose, 'home'), 0o700)
+                        os.chmod(loose, 0o777)          # not sticky: another user could swap home for theirs
+                        home = os.path.join(loose, 'home')
+                    with self.passwd_home(home):
+                        code, d = self.facts('--mb', '64', now=NOW + datetime.timedelta(hours=2),
+                                             env=dict(env, HOME=home))
+                    self.assertEqual((code, d['level']), (75, 'elevated'), d['notes'])
+                    self.assertTrue(any(n.startswith('no cache: ') for n in d['notes']), d['notes'])
+                    self.assertEqual(os.listdir(elsewhere), [])
+                    if bad == 'home':
+                        self.assertEqual(os.listdir(home), [], 'nothing made in a home others can swap')
+                    elif bad == 'link':
+                        os.unlink(cache_root)
+                    else:
+                        os.rmdir(cache_root)
+
+    def test_the_cache_folder_swapped_after_its_check_is_not_followed(self):
+        # #951 point 3: the private temporary folder was checked, then used by its path, so a swap between the two
+        # (a $TMPDIR that others can write and that is not sticky) pointed the cache and the hold at another folder.
+        # Now it is opened once (O_DIRECTORY | O_NOFOLLOW) and every later step goes through that handle
+        tmp_root = os.path.join(self.tmp, 'tmp')
+        os.makedirs(tmp_root)
+        folder = os.path.join(tmp_root, f'heavy-facts-{UID}')
+        elsewhere = os.path.join(self.tmp, 'elsewhere')
+        os.makedirs(elsewhere, 0o700)
+
+        def swap():
+            if not os.path.islink(folder):
+                os.rename(folder, folder + '.moved')
+                os.symlink(elsewhere, folder)
+
+        def after_swap(real):
+            def call(*a, **k):
+                swap()
+                return real(*a, **k)
+            return call
+        with self.no_run_user(tmp_root, mock.patch.object(hf, 'read_machine', after_swap(hf.read_machine))):
+            code, d = self.facts('--mb', '64', env={'HEAVY_FACTS_CACHE': ''})
+        self.assertEqual(code, 0, d)
+        self.assertEqual(os.listdir(elsewhere), [], 'the cache was written in the swapped-in folder')
+        self.assertEqual(len(os.listdir(folder + '.moved')), 1, 'written in the folder that was checked')
+        for f in (folder, folder + '.moved'):           # again for the hold, stopped by nothing: a fresh folder
+            os.unlink(f) if os.path.islink(f) else shutil.rmtree(f)
+        with self.no_run_user(tmp_root, mock.patch.object(hf, '_hold_lock', after_swap(hf._hold_lock))), \
+                mock.patch.dict(os.environ, {'HEAVY_FACTS_CACHE': ''}):
+            self.assertEqual(hf.hold('k:1', 'busy', 1_000_000)[:2], ('busy', None))
+        self.assertEqual(os.listdir(elsewhere), [], 'the hold was kept in the swapped-in folder')
+        self.assertEqual(sorted(os.listdir(folder + '.moved')), sorted([hf.HOLD_FILE, hf.HOLD_LOCK]))
 
     def test_callers_with_other_settings_taking_turns_each_reach_ok(self):
         # #945: two callers of one user with other settings (here another reservations folder) shared one cache file
@@ -1137,7 +1430,8 @@ class T3Capacity(Case):
         self.assertEqual(json.load(open(path))['busy'], {}, 'an ended hold is dropped')
         self.assertEqual(hf.hold('k:1', 'unavailable', t, folder)[0], 'unavailable')
         self.assertEqual(hf.hold('k:1', 'free', t - 5_000, folder)[0], 'busy', 'a clock that went back: held')
-        self.assertEqual(hf.hold('k:1', 'free', t + 15_000, folder)[0], 'busy', 'and started again then')
+        self.assertEqual(hf.hold('k:1', 'free', t + 14_999, folder)[0], 'busy', 'and started again then')
+        self.assertEqual(hf.hold('k:1', 'free', t + 15_000, folder)[0], 'free', '20 s from then, not from t (#981)')
         for bad in ('{broken', '', '{"v": 2, "busy": {}}', '{"v": 1, "busy": {"k:1": "x"}}', '[]'):
             with self.subTest(bad=bad):
                 with open(path, 'w') as f:
@@ -1178,15 +1472,48 @@ class T3Capacity(Case):
                     self.assertEqual(hf.hold('k:1', 'busy', changed + 3_600_000, folder)[0], 'busy')
         lstat = os.lstat
 
+        real_open = os.open
+
         def blind(p, *a, **k):                      # it cannot even be looked at: ignored, with a note
-            if p == path:
+            if p in (path, hf.HOLD_FILE):           # by its path, or by its name in the open folder (#951)
                 raise PermissionError(13, 'Permission denied', p)
             return lstat(p, *a, **k)
-        with mock.patch('os.lstat', blind), mock.patch('os.open', side_effect=PermissionError(13, 'denied')), \
+
+        def closed(p, *a, **k):
+            if p in (path, hf.HOLD_FILE):
+                raise PermissionError(13, 'denied')
+            return real_open(p, *a, **k)
+        with mock.patch('os.lstat', blind), mock.patch('os.open', closed), \
                 mock.patch.object(hf, '_hold_lock', return_value=(None, None)):
             verdict, why, note = hf.hold('k:1', 'free', int(time.time() * 1000), folder)
         self.assertEqual((verdict, why), ('free', None))
         self.assertIn('ignored', note)
+
+    def test_a_future_hold_time_that_cannot_be_written_again_does_not_hold(self):
+        # #981 leftover 4: a time in the future (the clock went back) holds and starts again from now; when the folder
+        # cannot be written it never starts again, so it held every OK until the clock came back: an hour back, an
+        # hour held. Without a write it cannot be bounded to 20 s, so it does not hold (with a note).
+        folder = os.path.join(self.tmp, 'hold')
+        os.makedirs(folder, mode=0o700)
+        path = os.path.join(folder, hf.HOLD_FILE)
+        t = 1_000_000_000_000
+        for content, before in (('{broken', None),                                      # a broken file's ctime
+                                (json.dumps({'v': 1, 'busy': {'k:1': t + 3_600_000}}), t)):  # a kept time
+            with self.subTest(content=content):
+                with open(path, 'w') as f:
+                    f.write(content)
+                if content == '{broken':
+                    before = int(os.lstat(path).st_ctime * 1000) - 3_600_000
+                with mock.patch.object(hf, 'write_cache', side_effect=PermissionError(13, 'Permission denied')):
+                    for _ in range(2):                                              # runs again: the same
+                        verdict, why, note = hf.hold('k:1', 'free', before, folder)
+                        self.assertEqual((verdict, why), ('free', None), note)
+                        self.assertIn('in the future', note)
+                    self.assertEqual(hf.hold('k:1', 'busy', before, folder)[0], 'busy', 'a NOT OK is still one')
+                self.assertEqual(hf.hold('k:1', 'free', before, folder)[0], 'busy', 'written: held, started again')
+                with open(path) as f:
+                    self.assertEqual(json.load(f)['busy'], {'k:1': before}, 'started again on disk too')
+                self.assertEqual(hf.hold('k:1', 'free', before + hf.HOLD_SECONDS * 1000, folder)[0], 'free')
 
     def test_two_not_oks_at_once_are_both_kept(self):
         # the hold is a read, then a write: without a lock the second caller's write would drop the first's NOT OK
@@ -1198,10 +1525,10 @@ import importlib.machinery, importlib.util, os, sys, time
 loader = importlib.machinery.SourceFileLoader('hf', {FACTS!r})
 hf = importlib.util.module_from_spec(importlib.util.spec_from_loader('hf', loader)); loader.exec_module(hf)
 real = hf.write_cache
-def slow_write(path, data):
+def slow_write(*a):
     open({read!r}, 'w').close()             # it has read the file and decided: the other caller comes now
     time.sleep(1.5)
-    real(path, data)
+    real(*a)
 hf.write_cache = slow_write
 print(hf.hold('a:1', 'busy', None, {folder!r}))
 """
@@ -1618,18 +1945,17 @@ class RedCheck(Case):
                 ("    res = [{'mb': r['mb'], 'useMb': r['useMb'] + r['owedMb']}",
                  "    res = [{'mb': r['mb'], 'useMb': r['useMb']}", Reservations,
                  'test_an_agent_or_job_working_in_the_folder_is_counted_once'),
-                ("    tier = 'full' if mine else 'machine' if v2 and os.path.isdir(ROOT + USERS) else 'basic'\n",
-                 "    tier = 'full' if mine else 'basic'\n", Ledger,
+                ("    return 'machine' if os.path.isdir(ROOT + USERS) else 'basic'\n",
+                 "    return 'basic'\n", Ledger,
                  'test_no_user_manager_gets_the_machine_wide_answer'),
+                ("    if tier == 'basic':\n        what =", "    if False:\n        what =", Ledger,
+                 'test_ready_refuses_a_basic_tier_machine_at_once'),
                 ("    basic = readings['tier'] not in ('full', 'machine')\n",
                  "    basic = readings['tier'] != 'full'\n", Ledger,
                  'test_no_user_manager_gets_the_machine_wide_answer'),
-                ("        return None, f'no cache: {folder} is not a folder only this user can use: every call starts "
-                 "\"elevated\"'\n", "        pass\n", State,
+                ("    if private and (st.st_uid != os.getuid() or st.st_mode & 0o077):\n", "    if False:\n", State,
                  'test_without_run_user_the_cache_is_a_private_temporary_folder'),
-                ("    if os.path.isdir(run):\n        return os.path.join(run, cache_name(key)), None\n",
-                 "    return (os.path.join(run, cache_name(key)), None) if os.path.isdir(run) else (None, 'no cache')\n",
-                 State,
+                ("    else:\n        whys = []\n", "    else:\n        return None, 'no cache'\n", State,
                  'test_without_run_user_the_cache_is_a_private_temporary_folder')):
             with self.subTest(line=line[:60]):
                 self.assertGreater(self.failing(cls, name, self.broken(line, instead)), 0, line)
@@ -1660,9 +1986,9 @@ class RedCheck(Case):
                 # one cache file for every setting and version (the round-2 file): callers keep each other elevated
                 ("    return f'heavy-facts-v{CACHE_VERSION}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json'\n",
                  "    return 'heavy-facts.json'\n", State, 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
-                ("    for old in other_caches(path, recent=False):", "    for old in []:", State,
+                ("    for old in other_caches(folder, base, recent=False):", "    for old in []:", State,
                  'test_callers_with_other_settings_taking_turns_each_reach_ok'),
-                ("        return None, (no_carry() if other_caches(path, recent=True) else None)\n",
+                ("        return None, (no_carry() if other_caches(folder, name, recent=True) else None)\n",
                  "        return None, None\n", State, 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
                 ("    root = TMP_ROOT or temp_root()\n", "    root = TMP_ROOT or __import__('tempfile').gettempdir()\n",
                  State, 'test_without_a_temporary_folder_it_can_write_there_is_no_cache')):

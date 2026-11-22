@@ -614,7 +614,9 @@ class Queue:
                         t.data.update(state='admitted', admittedAt=self.now())
                         self.write(t)
                         self.log(kind, mb, waited, 'admitted')
-                        if waited >= 1:
+                        # said only after a look that said not now (#981): a slow first look is no wait, and a
+                        # job that waited for nothing prints nothing of the queue's
+                        if waited >= 1 and last is not None:
                             self.out(f'admitted {kind} ({mb} MB) after waiting {_dur(waited)} for memory')
                         admitted = True
                         return t
@@ -772,8 +774,8 @@ def capacity_wait(check, limit, poll_s, out=say, monotonic=time.monotonic, sleep
                 ok, why = False, f'{e.__class__.__name__}: {e}'
             waited = monotonic() - start
             if ok is True:
-                if waited >= 1:
-                    out(f'the capacity check says free after waiting {_dur(waited)}')
+                if waited >= 1 and last is not None:    # only after an answer that was not free (#981): a slow
+                    out(f'the capacity check says free after waiting {_dur(waited)}')     # first ask is no wait
                 held = True
                 return waited
             if lock is not None:

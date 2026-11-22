@@ -40,8 +40,11 @@ Readings are kept 5 seconds in /run/user/<uid>/heavy-facts-v<version>-<hash of t
 version and settings, so callers of one user with other settings (slice, queue, reservations folder) or another
 kit version never read each other's file and each one's hold-down steps down on its own (#945) ($HEAVY_FACTS_CACHE
 names one file instead; --fresh reads again; a user without /run/user/<uid>, as one with no user manager, uses
-$TMPDIR or /tmp /heavy-facts-<uid>/, a folder only it can use: one that is not, or no such temporary folder, is no
-cache), written whole through a rename; a cache that is old, from the future, broken, of another version, of other
+$TMPDIR or /tmp /heavy-facts-<uid>/, a folder only it can use; when that name is taken (someone else made it first)
+or there is no temporary folder it can write, ~/.cache/heavy-facts-<host>/ in a home only it can change and that no
+one else could swap; none of these is no cache, #951). The folder is opened once (O_DIRECTORY|O_NOFOLLOW) and every
+file is reached through that handle, so a folder swapped for a link after its check is never followed (#951). The
+file is written whole through a rename; a cache that is old, from the future, broken, of another version, of other
 settings or not this user's own is read again. The pressure level (and the swap free its trend needs; a state
 without it waits one more read before it can step down) carries from one reading to the next (the rule's
 hysteresis) while the last one is at most 5 minutes old; without a cache folder, with a cache file that is there but
@@ -56,7 +59,7 @@ import datetime, errno, fcntl, fnmatch, hashlib, json, math, os, pwd, re, signal
 
 CACHE_SECONDS, CARRY_SECONDS, ANSWER_SECONDS, STALE_TMP_SECONDS = 5, 300, 5, 60
 EXIT_FREE, EXIT_BUSY, EXIT_ERROR = 0, 75, 1
-CACHE_VERSION = 3                               # 3: reservations carry owedMb (#923)
+CACHE_VERSION = 4                               # 3: reservations owedMb (#923); 4: full-tier pieceCaps (#951)
 AGENT_SCOPE_RE = re.compile(r'^t3code-[A-Za-z0-9_.:\\-]+\.scope\Z')
 SCOPE_RE = re.compile(r'^[A-Za-z0-9_.:@-]{1,200}\.scope\Z')
 TICKET_RE = re.compile(r'^t-[0-9]{1,15}-[0-9]{1,10}\.json\Z')
@@ -80,6 +83,7 @@ def test_env(name):
     return os.environ.get(name) if os.environ.get('HEAVY_TESTING') == '1' else None
 
 
+MIB = 1024 * 1024
 ROOT = test_env('HEAVY_FACTS_ROOT') or ''       # tests: /proc and /sys are read under this folder
 BASIC_WHY = 'basic tier: no cgroup v2, or neither a systemd user manager for this user nor user.slice, so agents and ' \
             'other users\' work cannot be counted: never free here'
@@ -160,6 +164,8 @@ def tickets(queue_dir):
                         and data.get('state') in ('waiting', 'admitted')):
                     raise ValueError
             except ValueError:
+                # #981: it names no scope, so read_machine counts its job's scope again as a plain job (no ticket
+                # names it): counted twice, the safe side; it cannot be told which scope is its own
                 data = {'kind': '', 'state': 'admitted'}
             out.append(data)
         finally:
@@ -300,10 +306,40 @@ def login_range():
     return lo, hi
 
 
+def autofs_points():
+    """The automount trigger points (fstype autofs) of this machine's mount table, for on_autofs(); [] when it
+    cannot be read (then every home is read, as before #951)."""
+    try:
+        text = _read('/proc/self/mountinfo', 1 << 22)
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        left, sep, right = line.partition(' - ')
+        f = left.split()
+        if sep and len(f) >= 5:
+            point = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), f[4])
+            out.append((point, right.split()[0] if right.split() else ''))
+    return out
+
+
+def on_autofs(home, mounts):
+    """True when the deepest mount covering `home` is an automount trigger: reading it would mount it (#951, an autofs
+    home that is mounted already is its own deeper mount and is read)."""
+    deepest = None
+    for point, fstype in mounts:
+        if home == point or home.startswith(point.rstrip('/') + '/'):
+            if deepest is None or len(point) >= len(deepest[0]):
+                deepest = (point, fstype)
+    return deepest is not None and deepest[1] == 'autofs'
+
+
 def other_reserve_dirs(uid):
-    """For the machine tier (#844): every other person's reserve.d, ([(user name, uid, folder)], blind). The people
-    are the /etc/passwd entries in login_range() and every user.slice user in it; a user with a session but no home
-    that can be found is 'blind'. Root and system users are not read (their homes are closed to others)."""
+    """For the machine tier (#844): every other person's reserve.d, ([(user name, uid, folder)], blind, notes). The
+    people are the /etc/passwd entries in login_range() and every user.slice user in it; a user with a session but no
+    home that can be found is 'blind'. Root and system users are not read (their homes are closed to others). A
+    person without a session whose home is behind an automount trigger is not read (#951: each read would mount
+    every home); one with a session is, so a reservation counts again from their next login, as with NSS users."""
     lo, hi = login_range()
     homes, blind = {}, []
     try:
@@ -327,9 +363,19 @@ def other_reserve_dirs(uid):
             homes[u] = (pw.pw_name, pw.pw_dir)
         except KeyError:
             blind.append(f'user {u} has a session but no home that can be found: its reservations cannot be read')
-    out = [(n, u, os.path.join(ROOT + h, '.config', 't3-capacity', 'reserve.d'))
-           for u, (n, h) in sorted(homes.items()) if os.path.isabs(h) and h != '/']
-    return out, blind
+    sessions = {int(m.group(1)) for m in map(USER_RE.match, names) if m}
+    mounts = autofs_points()
+    out, skipped = [], []
+    for u, (n, h) in sorted(homes.items()):
+        if not os.path.isabs(h) or h == '/':
+            continue
+        if u not in sessions and mounts and on_autofs(os.path.normpath(h), mounts):
+            skipped.append(n)
+            continue
+        out.append((n, u, os.path.join(ROOT + h, '.config', 't3-capacity', 'reserve.d')))
+    notes = [f'reservations not read for {len(skipped)} people without a session whose home is not mounted (autofs): '
+             f'{", ".join(skipped[:5])}{" ..." if len(skipped) > 5 else ""}'] if skipped else []
+    return out, blind, notes
 
 
 def best(res, uid, cwd):
@@ -579,6 +625,111 @@ def other_users(rule, host, uid, heavy_rel, owners, base):
     return pieces, jobs, agents, blind, notes
 
 
+def _small_text(path):
+    """(text, None) or (None, 'missing') or (None, why it cannot be read): one small cgroup or /proc file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, 'missing'
+    except OSError as e:
+        return None, e.strerror or str(e)
+    try:
+        return os.read(fd, 1 << 16).decode('utf-8', 'replace'), None
+    except OSError as e:
+        return None, e.strerror or str(e)
+    finally:
+        os.close(fd)
+
+
+def own_caps(uid):
+    """#951: the memory caps of the cgroups the caller's work starts under, below the cgroup root (the shared
+    reader caps the root itself): with this user's manager (the full tier: heavy jobs and agents start below it) the
+    manager and the slices above it, else (the machine tier: work runs where the caller runs) the caller's own
+    cgroup (/proc/self/cgroup) and every one above it. Only capped ones, in order from the root: {'path', 'limitMb'
+    (the smaller of memory.max and memory.high; None: it cannot be read), 'roomMb' (the limit less its use not
+    counting clean cache that can go, as the shared reader counts the root; None: its use cannot be read), 'why'}.
+    A cgroup without the files (no memory controller there) has no cap."""
+    manager = f'{USERS}/user-{uid}.slice/user@{uid}.service'
+    if os.path.isdir(ROOT + manager):
+        own = manager[len(rd.CGROUP):]
+    else:
+        text, err = _small_text(ROOT + '/proc/self/cgroup')
+        if err == 'missing':                        # no /proc (a test machine): nothing below the root to cap it
+            return []
+        if err:
+            return [{'path': '/proc/self/cgroup', 'limitMb': None, 'roomMb': None, 'why': f'cannot be read ({err})'}]
+        own = next((line[3:] for line in text.splitlines() if line.startswith('0::')), None)
+        if own is None:                             # cgroup v1 alone: the basic tier
+            return []
+    path = rd.cgroup_path(own)
+    if path is None:                                # the root (a namespace's): the shared reader's
+        return []
+    caps, parts = [], path.split('/')[1:]
+    for i in range(1, len(parts) + 1):
+        rel = '/' + '/'.join(parts[:i])
+        folder = ROOT + rd.CGROUP + rel
+        limit = why = None
+        for name in ('memory.max', 'memory.high'):
+            text, err = _small_text(f'{folder}/{name}')
+            if err == 'missing':
+                continue
+            value = None if err else text.strip()
+            if value == 'max':
+                continue
+            if err or not re.fullmatch(r'[0-9]{1,19}', value or '', re.ASCII):
+                why = f'{name} cannot be read ({err or "not a number"})'
+                break
+            limit = int(value) if limit is None else min(limit, int(value))
+        if why:
+            caps.append({'path': rel, 'limitMb': None, 'roomMb': None, 'why': why})
+            continue
+        if limit is None:
+            continue
+        current, err = _small_text(f'{folder}/memory.current')
+        stat, err2 = _small_text(f'{folder}/memory.stat')
+        used = None
+        if not err and not err2 and re.fullmatch(r'[0-9]{1,19}\n?', current, re.ASCII):
+            inactive = re.search(r'^inactive_file ([0-9]{1,19})$', stat, re.M | re.ASCII)
+            used = None if inactive is None else max(0, int(current) - int(inactive.group(1)))
+        caps.append({'path': rel, 'limitMb': limit // MIB, 'why': None if used is not None else
+                     'its use cannot be read', 'roomMb': None if used is None else max(0, limit - used) // MIB})
+    return caps
+
+
+def apply_caps(m, caps):
+    """#951: the machine's total and available memory held to the caps the work starts under (own_caps); notes."""
+    notes = []
+    for c in caps:
+        if c['limitMb'] is None:
+            m['availableMb'] = None
+            notes.append(f'memory cap of {c["path"]}: {c["why"]}: no room known (busy for every kind)')
+            continue
+        if m['totalMb'] is not None:
+            m['totalMb'] = min(m['totalMb'], c['limitMb'])
+        if c['roomMb'] is None:
+            m['availableMb'] = None
+            notes.append(f'memory cap of {c["path"]}: {c["limitMb"]} MB; {c["why"]}: no room known (busy for every '
+                         f'kind)')
+        else:
+            if m['availableMb'] is not None:
+                m['availableMb'] = min(m['availableMb'], c['roomMb'])
+            notes.append(f'memory cap of {c["path"]}: {c["limitMb"]} MB, {c["roomMb"]} MB of it free (the work '
+                         f'starts under it)')
+    return notes
+
+
+def cgroup_tier(cgroup, uid):
+    """The tier the machine's cgroups allow, from their structure alone (one source for read_machine and ready):
+    'full' with cgroup v2 and this user's own manager; 'machine' with cgroup v2 and user.slice but no manager of its
+    own (#844: a CI runner's user: nothing of its own to count, everyone else's as usual); else 'basic'. cgroup is
+    capacity_readings' version ('v2', 'v1', 'unreadable' or None)."""
+    if cgroup != 'v2':
+        return 'basic'
+    if os.path.isdir(ROOT + f'{USERS}/user-{uid}.slice/user@{uid}.service'):
+        return 'full'
+    return 'machine' if os.path.isdir(ROOT + USERS) else 'basic'
+
+
 def read_machine(rule, where, carry, now):
     """This machine's readings now: what the cache keeps (the same for every caller with these settings)."""
     notes = []
@@ -586,10 +737,8 @@ def read_machine(rule, where, carry, now):
     host = rd.RealHost(ROOT)
     m = rd.read_machine(host)
     manager = f'{USERS}/user-{uid}.slice/user@{uid}.service'
-    v2 = m['cgroup'] == 'v2'
-    mine = v2 and os.path.isdir(ROOT + manager)     # this user's own agents and heavy jobs can be read
-    # #844: no user manager of its own (a CI runner's user): nothing of its own to count, everyone else's as usual
-    tier = 'full' if mine else 'machine' if v2 and os.path.isdir(ROOT + USERS) else 'basic'
+    tier = cgroup_tier(m['cgroup'], uid)
+    mine = tier == 'full'                           # this user's own agents and heavy jobs can be read
     full = tier != 'basic'
     heavy_rel = '/' + slice_path(where['slice'])
     heavy_box = manager + heavy_rel
@@ -658,7 +807,8 @@ def read_machine(rule, where, carry, now):
         # #800: the full tier reads them too, so one person's reservation holds against every other person's work;
         # there one it cannot read (a home closed to others, as most are by default) is a note, as before #800 it
         # was not read at all: a person who wants it seen makes ~/.config/t3-capacity/reserve.d readable to others.
-        dirs, blind = other_reserve_dirs(uid)
+        dirs, blind, more = other_reserve_dirs(uid)
+        notes += more
         for name, u, folder in dirs:
             more_res, more, cannot = reservation_files(folder, now, (name, u), size)
             res += more_res
@@ -690,7 +840,7 @@ def read_machine(rule, where, carry, now):
     return {'v': CACHE_VERSION, 'key': where['key'], 'atMs': int(now.timestamp() * 1000),
             'tier': tier,
             'facts': {'totalMb': m['totalMb'], 'availableMb': m['availableMb'], 'cpuCores': m['cpuCores'],
-                      'pieceCaps': full, 'swap': m['swap'], 'psi': m['psi'], 'osLevel': m['osLevel'],
+                      'pieceCaps': tier == 'full', 'swap': m['swap'], 'psi': m['psi'], 'osLevel': m['osLevel'],
                       'pieces': pieces},
             'boxPsi': box_psi, 'reservations': res, 'learned': learned, 'carry': carry,
             'notes': notes, 'load1': load1(), 'queue': {'running': running, 'waiting': waiting, 'agents': agents}}
@@ -702,17 +852,18 @@ def no_carry():
     return {g: {'level': 'elevated', 'calmSinceMs': None} for g in ('agent', 'job')}
 
 
-def read_cache(path, now_ms, key):
-    """(readings while fresh, else None; the pressure state to carry on, else None). Anything odd is not trusted. No
+def read_cache(folder, name, now_ms, key):
+    """(readings while fresh, else None; the pressure state to carry on, else None) from the file `name` in the open
+    `folder` (a Folder: never its path again, #951). Anything odd is not trusted. No
     file, or one older than CARRY_SECONDS: nothing to carry (None). A file that is there but cannot be used (another
     version, as once after an update or while an old heavy writes it too; other settings, broken, from the future,
     not this user's own): no_carry(), so the hold-down is never skipped (#945). No file of its own yet, but another
     cache file of this user's beside it written in the last CARRY_SECONDS (another version just after an update, or
     other settings): no_carry() too; from its own file on, it steps down by its own hold-down."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=folder.fd)
     except FileNotFoundError:
-        return None, (no_carry() if other_caches(path, recent=True) else None)
+        return None, (no_carry() if other_caches(folder, name, recent=True) else None)
     except OSError:
         return None, no_carry()
     try:
@@ -735,12 +886,12 @@ def read_cache(path, now_ms, key):
     return (data if age < CACHE_SECONDS * 1000 and carry is not None else None), carry
 
 
-def other_caches(path, recent):
-    """The other cache files of this user's (any version or settings, an older kit's heavy-facts.json too) beside
-    `path`, written in the last CARRY_SECONDS (recent) or before (not recent). A file from the future is recent."""
-    folder, own_name = os.path.split(path)
+def other_caches(folder, own_name, recent):
+    """The names of the other cache files of this user's (any version or settings, an older kit's heavy-facts.json
+    too) beside `own_name` in the open `folder`, written in the last CARRY_SECONDS (recent) or before (not recent). A
+    file from the future is recent."""
     try:
-        names = os.listdir(folder or '.')
+        names = os.listdir(folder.fd)
     except OSError:
         return []
     out = []
@@ -748,39 +899,40 @@ def other_caches(path, recent):
         if name == own_name or not CACHE_FILE_RE.match(name):
             continue
         try:
-            st = os.lstat(os.path.join(folder, name))
+            st = os.lstat(name, dir_fd=folder.fd)
         except OSError:
             continue
         if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and \
                 (time.time() - st.st_mtime <= CARRY_SECONDS) == recent:
-            out.append(os.path.join(folder, name))
+            out.append(name)
     return out
 
 
-def write_cache(path, data):
-    """Whole or not at all: a unique temporary file renamed over the cache. A temporary file left by a writer that
-    stopped half-way is removed once it is a minute old, and this user's cache files of other settings or versions
-    once they are past the carry window (they can carry nothing then), so they do not pile up."""
-    folder, base = os.path.split(path)
-    for name in os.listdir(folder or '.'):
+def write_cache(folder, base, data):
+    """Whole or not at all: a unique temporary file renamed over the file `base` in the open `folder` (every step
+    through its handle, #951). A temporary file left by a writer that stopped half-way is removed once it is a minute
+    old, and this user's cache files of other settings or versions once they are past the carry window (they can
+    carry nothing then), so they do not pile up."""
+    fd_dir = folder.fd
+    for name in os.listdir(fd_dir):
         if name.startswith(base + '.') and name.endswith('.tmp'):
             try:
-                if time.time() - os.lstat(os.path.join(folder, name)).st_mtime > STALE_TMP_SECONDS:
-                    os.unlink(os.path.join(folder, name))
+                if time.time() - os.lstat(name, dir_fd=fd_dir).st_mtime > STALE_TMP_SECONDS:
+                    os.unlink(name, dir_fd=fd_dir)
             except OSError:
                 pass
-    for old in other_caches(path, recent=False):    # other settings or versions, past the carry window: no use
+    for old in other_caches(folder, base, recent=False):    # other settings or versions, past the carry window
         try:
-            os.unlink(old)
+            os.unlink(old, dir_fd=fd_dir)
         except OSError:
             pass
-    tmp = f'{path}.{os.getpid()}.{os.urandom(4).hex()}.tmp'
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    tmp = f'{base}.{os.getpid()}.{os.urandom(4).hex()}.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd_dir)
     try:
         os.write(fd, json.dumps(data, separators=(',', ':')).encode())
     finally:
         os.close(fd)
-    os.replace(tmp, path)
+    os.replace(tmp, base, src_dir_fd=fd_dir, dst_dir_fd=fd_dir)
 
 
 def own(r, cwds):
@@ -871,27 +1023,155 @@ def cache_name(key):
     return f'heavy-facts-v{CACHE_VERSION}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json'
 
 
-def cache_path(run, key):
-    """(the cache file, None) or (None, why there is none). /run/user/<uid> when it is there; else (#844: a user with
-    no user manager and no login session has none) a folder only this user can use in the temporary folder, made if
-    missing: one that is a link, another user's or open to others (planted first) is no cache, and so no carry."""
+O_FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class Folder:
+    """A folder held open (#951): every later step in it goes through its handle (dir_fd), never its path again, so
+    a folder swapped for another (or for a link) after its check is never followed. path: for notes only."""
+
+    def __init__(self, fd, path):
+        self.fd, self.path = fd, path
+
+    def at(self, name):
+        return os.path.join(self.path, name)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def open_folder(name, shown, parent=None, make=False, private=True):
+    """(Folder, None) or (None, why): the folder `name` (in the open folder fd `parent`, else a path), opened once
+    with O_DIRECTORY | O_NOFOLLOW (a link or a file is refused), made with mode 700 when missing (make); private: it
+    must be this user's and closed to everyone else (one planted first by another user is refused)."""
+    fd = None
+    try:
+        if make:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+        fd = os.open(name, O_FOLDER, dir_fd=parent)
+        st = os.fstat(fd)
+    except OSError as e:
+        if fd is not None:
+            os.close(fd)
+        return None, f'{shown} cannot be made or opened as a folder ({e.strerror or e})'
+    if private and (st.st_uid != os.getuid() or st.st_mode & 0o077):
+        os.close(fd)
+        return None, f'{shown} is not a folder only this user can use'
+    return Folder(fd, shown), None
+
+
+def swappable(st, uid):
+    """True when someone else could swap what is in a folder with this stat: not root's or this user's, or a group or
+    others can write it and it is not sticky (in a sticky one only an entry's owner can rename or remove it)."""
+    return st.st_uid not in (0, uid) or bool(st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX)
+
+
+def open_home():
+    """(fd of this user's home, its path) or (None, why) (#951 points 2 and 4): $HOME, else the password database's
+    home, links resolved once, then opened one part at a time from / with O_NOFOLLOW (a part swapped for a link
+    after that is refused). Every folder above it must be root's or this user's and, when others can write it,
+    sticky: no one else can swap a part. The home itself must be this user's, closed to writes by others, not /."""
+    uid = os.getuid()
+    homes = [os.environ.get('HOME') or '']
+    try:
+        homes.append(pwd.getpwuid(uid).pw_dir)
+    except KeyError:
+        pass
+    whys = []
+    for home in dict.fromkeys(h for h in homes if h and os.path.isabs(h)):
+        home = os.path.realpath(home)
+        parts = [p for p in home.split('/') if p]
+        if not parts:
+            whys.append('the home is /')
+            continue
+        fd, at = None, '/'
+        try:
+            fd = os.open('/', O_FOLDER)
+            for part in parts:
+                if swappable(os.fstat(fd), uid):
+                    raise PermissionError(f'{at} can be changed by others (not sticky)')
+                nxt = os.open(part, O_FOLDER, dir_fd=fd)
+                os.close(fd)
+                fd, at = nxt, os.path.join(at, part)
+            st = os.fstat(fd)
+            if st.st_uid != uid or st.st_mode & 0o022:
+                raise PermissionError(f'{home} is not this user\'s, or others can write it')
+            fd, out = None, fd
+            return out, home
+        except OSError as e:
+            whys.append(e.args[0] if isinstance(e.args[0], str) else f'{at}: {e.strerror or e}')
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return None, '; '.join(whys) or 'no home folder'
+
+
+def host_name():
+    """This machine's name for a cache folder in the home, which other machines may share (one cache per machine)."""
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', os.uname().nodename)[:64] or 'host'
+
+
+def home_cache():
+    """(Folder, None) or (None, why): ~/.cache/heavy-facts-<host>, a folder only this user can use in its home
+    (open_home), each folder made when missing. ~/.cache must be this user's and closed to writes by others."""
+    home, where = open_home()
+    if home is None:
+        return None, f'no home for it ({where})'
+    try:
+        cache, why = open_folder('.cache', os.path.join(where, '.cache'), parent=home, make=True, private=False)
+    finally:
+        os.close(home)
+    if cache is None:
+        return None, why
+    try:
+        st = os.fstat(cache.fd)
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            return None, f'{cache.path} is not this user\'s, or others can write it'
+        return open_folder(f'heavy-facts-{host_name()}', cache.at(f'heavy-facts-{host_name()}'), parent=cache.fd,
+                           make=True)
+    finally:
+        cache.close()
+
+
+def cache_folder(run):
+    """(Folder, a note or None) or (None, why there is none), held open (#951). /run/user/<uid> when it is there;
+    else (#844: a user with no user manager and no login session has none) a folder only this user can use in the
+    temporary folder, made if missing; one that is a link, another user's or open to others (planted first) or no
+    temporary folder at all: a folder only this user can use in its home (home_cache, #951: a name taken by another
+    user no longer denies the cache), with a note; neither: no cache, and so no carry."""
     if os.path.isdir(run):
-        return os.path.join(run, cache_name(key)), None
+        folder, why = open_folder(run, run)
+        if folder:
+            return folder, None
+        whys = [why]
+    else:
+        whys = []
     root = TMP_ROOT or temp_root()
     if not root:
-        return None, 'no cache: no temporary folder this user can write ($TMPDIR, /tmp): every call starts "elevated"'
-    folder = os.path.join(root, f'heavy-facts-{os.getuid()}')
-    try:
+        whys.append('no temporary folder this user can write ($TMPDIR, /tmp)')
+    else:
+        name = f'heavy-facts-{os.getuid()}'
         try:
-            os.mkdir(folder, 0o700)
-        except FileExistsError:
-            pass
-        st = os.lstat(folder)
-    except OSError as e:
-        return None, f'no cache: {folder} cannot be made ({e.strerror or e}): every call starts "elevated"'
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-        return None, f'no cache: {folder} is not a folder only this user can use: every call starts "elevated"'
-    return os.path.join(folder, cache_name(key)), None
+            parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as e:
+            whys.append(f'{root} cannot be opened ({e.strerror or e})')
+        else:
+            try:
+                folder, why = open_folder(name, os.path.join(root, name), parent=parent, make=True)
+            finally:
+                os.close(parent)
+            if folder:
+                return folder, None
+            whys.append(why)
+    folder, why = home_cache()
+    if folder:
+        return folder, f'{"; ".join(whys)}: the cache is in {folder.path}'
+    return None, f'no cache: {"; ".join(whys + [why])}: every call starts "elevated"'
 
 
 HOLD_SECONDS = 20                               # #861: a NOT OK holds this long for the same question
@@ -900,22 +1180,30 @@ HOLD_LOCK = 't3-capacity-hold.lock'           # one hold at a time (its read, th
 HOLD_LOCK_SECONDS = 2
 
 
+def given_folder(path):
+    """(Folder, None) or (None, why): a folder named by the caller ($HEAVY_FACTS_CACHE's, a test's), opened once."""
+    try:
+        return Folder(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC), path), None
+    except OSError as e:
+        return None, f'{path} cannot be opened ({e.strerror or e})'
+
+
 def state_folder():
-    """(the folder of heavy facts' cache, None) or (None, why there is none): $HEAVY_FACTS_CACHE's folder, else
-    /run/user/<uid>, else this user's private folder in the temporary folder (cache_path)."""
+    """(the open folder of heavy facts' cache, None) or (None, why there is none): $HEAVY_FACTS_CACHE's folder, else
+    cache_folder()'s."""
     if os.environ.get('HEAVY_FACTS_CACHE'):
-        return os.path.dirname(os.path.abspath(os.environ['HEAVY_FACTS_CACHE'])), None
-    path, why = cache_path(f'{RUN_USER}/{os.getuid()}', '')
-    return (os.path.dirname(path), None) if path else (None, why)
+        return given_folder(os.path.dirname(os.path.abspath(os.environ['HEAVY_FACTS_CACHE'])))
+    folder, why = cache_folder(f'{RUN_USER}/{os.getuid()}')
+    return (folder, None) if folder else (None, why)
 
 
 def _hold_lock(folder):
     """The hold's own lock (#861 round 1: two callers' read-modify-write of the hold file must not lose a NOT OK):
     (fd or None, a note or None). Waits HOLD_LOCK_SECONDS at most, never blocking in flock; without it the hold goes
     on unlocked, with a note (a hold is never a reason not to answer)."""
-    path = os.path.join(folder, HOLD_LOCK)
+    path = folder.at(HOLD_LOCK)
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        fd = os.open(HOLD_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=folder.fd)
     except OSError as e:
         return None, f'the hold lock {path} cannot be opened ({e.strerror}): held without it'
     deadline = time.monotonic() + HOLD_LOCK_SECONDS
@@ -939,26 +1227,29 @@ def hold(question, verdict, now_ms=None, folder=None):
     read (broken, an older format, another owner's, a link, open to others) holds the question asked HOLD_SECONDS from
     when that file last changed (its ctime, which no caller can set), and is written again; so a broken file in a
     folder that cannot be written holds for HOLD_SECONDS, never for good. One that cannot even be looked at is
-    ignored, with a note. A time in the future (a clock that went back) holds and starts again. No folder to keep it
-    in: no hold, with a note (as before #861)."""
+    ignored, with a note. A time in the future (a clock that went back) holds and starts again; one that cannot start
+    again (its folder cannot be written) does not hold, with a note, so no hold lasts past HOLD_SECONDS (#981). No
+    folder to keep it in: no hold, with a note (as before #861)."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    folder, why = state_folder() if folder is None else given_folder(folder)
     if folder is None:
-        folder, why = state_folder()
-        if folder is None:
-            return verdict, None, f'no hold of a NOT OK ({why})'
-    lock, lock_note = _hold_lock(folder)
-    try:
-        verdict, why, note = _hold(question, verdict, now_ms, os.path.join(folder, HOLD_FILE))
+        return verdict, None, f'no hold of a NOT OK ({why})'
+    try:                                        # the folder is opened once: the lock and the file are in the same one
+        lock, lock_note = _hold_lock(folder)
+        try:
+            verdict, why, note = _hold(question, verdict, now_ms, folder)
+        finally:
+            if lock is not None:
+                os.close(lock)
     finally:
-        if lock is not None:
-            os.close(lock)
+        folder.close()
     return verdict, why, '; '.join(n for n in (lock_note, note) if n) or None
 
 
-def _hold(question, verdict, now_ms, path):
-    busy, broken, notes = {}, None, []
+def _hold(question, verdict, now_ms, folder):
+    busy, broken, notes, path = {}, None, [], folder.at(HOLD_FILE)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        fd = os.open(HOLD_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=folder.fd)
         try:
             st = os.fstat(fd)
             if st.st_uid != os.getuid() or st.st_mode & 0o077 or not stat.S_ISREG(st.st_mode):
@@ -974,7 +1265,8 @@ def _hold(question, verdict, now_ms, path):
         pass
     except (OSError, ValueError):
         try:
-            broken = int(os.lstat(path).st_ctime * 1000)    # when it last changed: what it may still hold from
+            # when it last changed: what it may still hold from
+            broken = int(os.lstat(HOLD_FILE, dir_fd=folder.fd).st_ctime * 1000)
         except OSError as e:
             notes.append(f'the hold file {path} cannot be read or looked at ({e.strerror}): ignored')
         else:
@@ -986,14 +1278,20 @@ def _hold(question, verdict, now_ms, path):
                if broken is not None else
                f'held: NOT OK {max(0, now_ms - at) // 1000} s ago for this question; OK needs {HOLD_SECONDS} s '
                f'without one (a check that flips must not let work start just before it turns NOT OK)')
-    if verdict != 'free' or (at is not None and at > now_ms):
+    future = at is not None and at > now_ms
+    if verdict != 'free' or future:
         busy[question] = now_ms                     # a NOT OK read now (or a future state): start again
     keep = {k: v for k, v in busy.items() if 0 <= now_ms - v < HOLD_SECONDS * 1000}
-    if keep != busy or broken is not None or verdict != 'free':
+    if keep != busy or broken is not None or verdict != 'free' or future:     # a future one starts again on disk
         try:
-            write_cache(path, {'v': 1, 'busy': keep})  # whole or not at all; old temporary files go too
+            write_cache(folder, HOLD_FILE, {'v': 1, 'busy': keep})  # whole or not at all; old temporary files go too
         except OSError as e:
             notes.append(f'the hold of a NOT OK was not written ({e.strerror or e})')
+            if future and verdict == 'free':
+                # #981: a future time that cannot start again would hold until the clock comes back (an hour back:
+                # an hour held); with nothing written it cannot be bounded to HOLD_SECONDS, so it does not hold
+                why = None
+                notes.append('a NOT OK in the future (the clock went back) cannot start again here: not held')
     return ('busy' if why else verdict), why, '; '.join(notes) or None
 
 
@@ -1035,24 +1333,39 @@ def facts_main(argv, slice_name, queue_root, hq, now=None):
         where['user'] = user_name()
         where['key'] = '\n'.join((slice_name, where['queueDir'], where['reserveDir'], where['user'],
                                   json.dumps(where['holds'], sort_keys=True)))
-        cache, why = (os.environ['HEAVY_FACTS_CACHE'], None) if os.environ.get('HEAVY_FACTS_CACHE') else \
-            cache_path(run, where['key'])
-        now = now or datetime.datetime.now(datetime.timezone.utc)
-        now_ms = int(now.timestamp() * 1000)
-        # Without a cache folder nothing carries the pressure level from one call to the next: start every call
-        # "elevated" (the rule's floors only) so the level never drops straight to ok past the hold-down.
-        readings, carry = read_cache(cache, now_ms, where['key']) if cache else (None, no_carry())
-        if readings is None or opts.get('--fresh'):
-            readings = read_machine(rule, where, carry, now)
-            readings['pressure'] = {g: cr.level(rule, dict(readings['facts'], boxPsi=readings['boxPsi'][g]),
-                                                (carry or {}).get(g), now_ms)[1] for g in ('agent', 'job')}
-            if cache:
-                try:
-                    write_cache(cache, readings)
-                except OSError as e:
-                    readings['notes'].append(f'cache not written ({e.strerror or e})')
-            elif why:
-                readings['notes'].append(why)
+        given = os.environ.get('HEAVY_FACTS_CACHE')
+        if given:
+            name = os.path.basename(given)
+            folder, why = given_folder(os.path.dirname(os.path.abspath(given)))
+        else:
+            name = cache_name(where['key'])
+            folder, why = cache_folder(run)
+        try:
+            now = now or datetime.datetime.now(datetime.timezone.utc)
+            now_ms = int(now.timestamp() * 1000)
+            # Without a cache folder nothing carries the pressure level from one call to the next: start every call
+            # "elevated" (the rule's floors only) so the level never drops straight to ok past the hold-down.
+            readings, carry = read_cache(folder, name, now_ms, where['key']) if folder else (None, no_carry())
+            if readings is None or opts.get('--fresh'):
+                readings = read_machine(rule, where, carry, now)
+                readings['pressure'] = {g: cr.level(rule, dict(readings['facts'], boxPsi=readings['boxPsi'][g]),
+                                                    (carry or {}).get(g), now_ms)[1] for g in ('agent', 'job')}
+                if why:
+                    readings['notes'].append(why)
+                if folder:
+                    try:
+                        write_cache(folder, name, readings)
+                    except OSError as e:
+                        readings['notes'].append(f'cache not written ({e.strerror or e})')
+        finally:
+            if folder:
+                folder.close()
+        # #951: the caps the caller's work starts under, per call (callers in other cgroups share the cache, which
+        # keeps the machine's readings and pressure carry: a key per cap would start each new one "elevated")
+        caps = own_caps(os.getuid())
+        if caps:
+            readings = dict(readings, facts=dict(readings['facts']), notes=list(readings['notes']))
+            readings['notes'] += apply_caps(readings['facts'], caps)
         code, out = answer(rule, readings, opts.get('--kind'), int(opts['--mb']) if '--mb' in opts else None,
                            (os.getcwd(),))
     except Exception as e:      # a reading this code did not expect: no answer, never "free"
@@ -1111,16 +1424,33 @@ def checked(heavy, kind=None, mb=None, fresh=False, timeout=ANSWER_SECONDS):
     return verdict, held or why, d
 
 
-def ready(hq):
+def ready(hq, slice_name=None):
     """None when this kit's `heavy facts` can answer at all, else why not: what no wait would fix (the capacity rule
-    not shipped with the kit, a machine file whose heavy section is broken). heavy asks this before it waits for
-    capacity, so a kit that can never answer refuses at once instead of waiting --wait (7200 s) for nothing."""
+    not shipped with the kit, a machine file whose heavy section is broken, a basic tier machine: #981). heavy asks
+    this before it waits for capacity, so a kit or machine that can never answer free refuses at once instead of
+    waiting --wait (7200 s) for nothing. slice_name: heavy's slice, whose folder in this user's manager must be
+    listable when it is there (read_machine's other structural cause of the basic tier). The basic tier from
+    reservations or sessions that cannot be read is not refused here: a person can fix those while a job waits."""
     try:
         cr.shipped_rule()
         mf = hq.machine_file
         capacity_settings(mf, hq.SECTION, ROOT + mf.default_path() if ROOT else None, os.getuid() if ROOT else 0)
     except Exception as e:
         return f'{e.__class__.__name__}: {e}'
+    uid = os.getuid()
+    cgroup = rd.read_machine(rd.RealHost(ROOT))['cgroup']
+    tier = cgroup_tier(cgroup, uid)
+    if tier == 'basic':
+        what = 'no cgroup v2' if cgroup != 'v2' else 'neither a systemd user manager for this user nor user.slice'
+        return f'basic tier ({what}): heavy facts is never free on this machine'
+    if tier == 'full' and slice_name:
+        box = f'{USERS}/user-{uid}.slice/user@{uid}.service/{slice_path(slice_name)}'
+        try:
+            os.listdir(ROOT + box)
+        except FileNotFoundError:
+            pass                                    # no heavy job ran yet: its first scope makes it
+        except OSError as e:
+            return f'basic tier ({box} cannot be listed: {e.strerror}): heavy facts is never free on this machine'
     return None
 
 

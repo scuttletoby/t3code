@@ -1247,10 +1247,26 @@ RUNTIME_ROOT = '/run/user'
 STATE_ROOT = ''         # '' = ~/.local/state (bin/heavy STATE_ROOT)
 
 
+def others_can_swap(path):
+    """True when a folder above `path` (links resolved) is not root's or this user's, or a group or others can write it
+    and it is not sticky: someone else could swap a part of the path after it was checked (#951; bin/heavy
+    others_can_swap and lib/heavy_facts.py swappable, the same rule)."""
+    uid, at = os.geteuid(), path
+    while at != '/':
+        at = os.path.dirname(at)
+        try:
+            st = os.lstat(at)
+        except OSError:
+            return True
+        if st.st_uid not in (0, uid) or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX):
+            return True
+    return False
+
+
 def state_base():
     """<home>/.local/state for the second notes folder (bin/heavy state_base, the same rule), or '' for none: $HOME,
     else the password database's home; only an absolute folder this user owns, that no group or other user can write,
-    and not /."""
+    not /, and in no folder someone else could swap it in (others_can_swap, #951)."""
     if STATE_ROOT:
         return STATE_ROOT
     homes = [os.environ.get('HOME') or '']
@@ -1264,7 +1280,8 @@ def state_base():
             st = os.lstat(home)
         except OSError:
             continue
-        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022 and home != '/':
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o022 and home != '/' \
+                and not others_can_swap(home):
             return os.path.join(home, '.local', 'state')
     return ''
 
