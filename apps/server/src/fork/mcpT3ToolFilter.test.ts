@@ -633,6 +633,52 @@ describe("the T3 tool sets in memory", () => {
       expect(T3ToolSets.t3ToolSetFor(`thread-${T3ToolSets.MAX_T3_TOOL_SETS}`)).toBeDefined();
     }),
   );
+
+  it.effect("a check that finishes after a later turn's fixes nothing (fork issue #986)", () =>
+    Effect.sync(() => {
+      T3ToolSets.__testing.clear();
+      const older = T3ToolSets.nextT3ToolSetTurn();
+      const newer = T3ToolSets.nextT3ToolSetTurn();
+      T3ToolSets.fixT3ToolSet("t", groups("newer"), newer);
+      T3ToolSets.fixT3ToolSet("t", groups("older"), older);
+      expect(T3ToolSets.t3ToolSetFor("t")).toEqual(groups("newer"));
+      // The same turn fixing again (a refusal after its set, as Claude's plan does) still writes.
+      T3ToolSets.fixT3ToolSet("t", groups("newer again"), newer);
+      expect(T3ToolSets.t3ToolSetFor("t")).toEqual(groups("newer again"));
+    }),
+  );
+
+  it.effect("stopped half-way: an older turn's stop leaves a newer set; its own clears it", () =>
+    Effect.sync(() => {
+      T3ToolSets.__testing.clear();
+      const older = T3ToolSets.nextT3ToolSetTurn();
+      const newer = T3ToolSets.nextT3ToolSetTurn();
+      T3ToolSets.fixT3ToolSet("t", groups("newer"), newer);
+      T3ToolSets.forgetT3ToolSet("t", older);
+      expect(T3ToolSets.t3ToolSetFor("t")).toEqual(groups("newer"));
+      const stopped = T3ToolSets.nextT3ToolSetTurn();
+      T3ToolSets.forgetT3ToolSet("t", stopped);
+      expect(T3ToolSets.t3ToolSetFor("t")).toBeUndefined();
+      // No set stands, but the older turn's late check still may not write one.
+      T3ToolSets.fixT3ToolSet("t", groups("older"), older);
+      expect(T3ToolSets.t3ToolSetFor("t")).toBeUndefined();
+      // A request may remember the one it works out; a later turn replaces it.
+      expect(T3ToolSets.rememberT3ToolSet("t", groups("request"))).toEqual(groups("request"));
+      T3ToolSets.fixT3ToolSet("t", groups("older"), older);
+      expect(T3ToolSets.t3ToolSetFor("t")).toEqual(groups("request"));
+      T3ToolSets.fixT3ToolSet("t", groups("next"), T3ToolSets.nextT3ToolSetTurn());
+      expect(T3ToolSets.t3ToolSetFor("t")).toEqual(groups("next"));
+    }),
+  );
+
+  it.effect("empty state (after a restart, or a thread dropped at the cap): any check writes", () =>
+    Effect.sync(() => {
+      T3ToolSets.__testing.clear();
+      const older = T3ToolSets.nextT3ToolSetTurn();
+      T3ToolSets.fixT3ToolSet("t", groups("older"), older);
+      expect(T3ToolSets.t3ToolSetFor("t")).toEqual(groups("older"));
+    }),
+  );
 });
 
 describe("the hold bound, without a socket (fork issue #918)", () => {
@@ -705,5 +751,43 @@ describe("the hold bound, without a socket (fork issue #918)", () => {
         release();
         expect(yield* Fiber.join(second)).toEqual([[PR_TOOL, true]]);
       }),
+  );
+
+  it.effect(
+    "a check fixed its set but has not released yet as the bound passes: its set stands (#986)",
+    () =>
+      Effect.gen(function* () {
+        T3ToolSets.__testing.clear();
+        McpT3ToolRule.__testing.clearRefused();
+        T3ToolSets.fixT3ToolSet("thread-prs", { _tag: "Groups", name: "all", groups: "all" });
+        T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis);
+        const waiting = yield* Effect.forkChild(checkAll("prs", "tools/call", [PR_TOOL]));
+        yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
+        // The turn's check fixes its set; the wait ends before it releases.
+        T3ToolSets.fixT3ToolSet("thread-prs", prs);
+        expect(yield* drive(waiting, McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS)).toEqual([
+          [PR_TOOL, true],
+        ]);
+        expect(T3ToolSets.t3ToolSetFor("thread-prs")).toEqual(prs);
+        expect(T3ToolSets.__testing.asked("thread-prs")).toBeUndefined();
+      }),
+  );
+
+  it.effect("the hold's own turn fixes its set as the bound passes: the drop keeps it (#986)", () =>
+    Effect.gen(function* () {
+      T3ToolSets.__testing.clear();
+      McpT3ToolRule.__testing.clearRefused();
+      const turn = T3ToolSets.nextT3ToolSetTurn();
+      const release = T3ToolSets.holdT3ToolSet("thread-prs", yield* Clock.currentTimeMillis, turn);
+      const waiting = yield* Effect.forkChild(checkAll("prs", "tools/call", [PR_TOOL]));
+      yield* Deferred.await(T3ToolSets.__testing.asked("thread-prs")!);
+      T3ToolSets.fixT3ToolSet("thread-prs", prs, turn);
+      expect(yield* drive(waiting, McpT3ToolRule.T3_TOOL_SET_HOLD_WAIT_MS)).toEqual([
+        [PR_TOOL, true],
+      ]);
+      // The release that comes after the drop does nothing.
+      release();
+      expect(T3ToolSets.t3ToolSetFor("thread-prs")).toEqual(prs);
+    }),
   );
 });

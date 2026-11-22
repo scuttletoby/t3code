@@ -627,6 +627,91 @@ describe("mcpProfileTurnCheck", () => {
     }),
   );
 
+  /**
+   * Settings whose first read takes what they hold as it starts and gives it only once released,
+   * so the turn reading them finishes after a later turn's.
+   */
+  const slowFirstRead = Effect.gen(function* () {
+    const reading = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let reads = 0;
+    const layer = Layer.effect(
+      ServerSettingsService.ServerSettingsService,
+      Effect.gen(function* () {
+        const service = yield* ServerSettingsService.ServerSettingsService;
+        return ServerSettingsService.ServerSettingsService.of({
+          ...service,
+          getSettings: Effect.suspend(() =>
+            reads++ === 0
+              ? service.getSettings.pipe(
+                  Effect.tap(() => Deferred.succeed(reading, undefined)),
+                  Effect.tap(() => Deferred.await(release)),
+                )
+              : service.getSettings,
+          ),
+        });
+      }),
+    ).pipe(Layer.provide(ServerSettingsService.ServerSettingsService.layerTest()));
+    return { reading, release, layer };
+  });
+  /** The thread's profile narrowed to the threads group. */
+  const LEAN = {
+    mcpProfile: "lean",
+    mcpProfiles: { lean: { servers: "all", t3Tools: ["threads"] } },
+  } as never;
+
+  it.effect("two turns' checks finishing out of order: the later turn's set stands (#986)", () =>
+    Effect.gen(function* () {
+      const slow = yield* slowFirstRead;
+      yield* withCheck(
+        {},
+        [],
+        ({ start }) =>
+          Effect.gen(function* () {
+            T3ToolSets.__testing.clear();
+            const own = appThread("own");
+            // The first turn reads `all`, then is slow; the profile is narrowed meanwhile.
+            const first = yield* Effect.forkChild(start(own, OPENCODE));
+            yield* Deferred.await(slow.reading);
+            const settings = yield* ServerSettingsService.ServerSettingsService;
+            yield* settings.updateSettings(LEAN);
+            assert.strictEqual(yield* start(own, OPENCODE), "ok");
+            assert.deepStrictEqual(groupsOf(own.id), ["threads"]);
+            // The first turn's check finishes last: it does not widen the thread back to all.
+            yield* Deferred.succeed(slow.release, undefined);
+            assert.strictEqual(yield* Fiber.join(first), "ok");
+            assert.deepStrictEqual(groupsOf(own.id), ["threads"]);
+          }),
+        slow.layer,
+      );
+    }),
+  );
+
+  it.effect("stopped half-way after a later turn fixed its set: that set stands (#986)", () =>
+    Effect.gen(function* () {
+      const slow = yield* slowFirstRead;
+      yield* withCheck(
+        {},
+        [],
+        ({ start }) =>
+          Effect.gen(function* () {
+            T3ToolSets.__testing.clear();
+            const own = appThread("own");
+            const settings = yield* ServerSettingsService.ServerSettingsService;
+            yield* settings.updateSettings(LEAN);
+            const first = yield* Effect.forkChild(start(own, OPENCODE));
+            yield* Deferred.await(slow.reading);
+            assert.strictEqual(yield* start(own, OPENCODE), "ok");
+            assert.deepStrictEqual(groupsOf(own.id), ["threads"]);
+            // The first turn's start is stopped: the later turn's set is not cleared.
+            yield* Fiber.interrupt(first);
+            assert.deepStrictEqual(groupsOf(own.id), ["threads"]);
+          }),
+        slow.layer,
+      );
+    }),
+  );
+
   it.effect("a failed settings read: own threads get all, a narrower carried task refuses", () =>
     Effect.gen(function* () {
       const failing = Layer.effect(
