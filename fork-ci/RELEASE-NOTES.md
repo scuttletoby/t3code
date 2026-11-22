@@ -13,6 +13,19 @@ nothing.
 
 ## After ci/v14
 
+### pr-queue, head-check: merge as GitHub's update does; a cancelled re-run no longer hides an old base's red (#924, #1033)
+
+The queue and head-check now merge with `merge.directoryRenames=false` (was `true`), which is how GitHub's update branch
+merges (measured): a file added in a folder the other side renamed stays where it was added. So the queue re-arms a
+pull request that adds a file in a folder its base renamed after the update, where it was left off with a comment, and
+head-check (its same-change test calls the queue's `holds`) now accepts that updated head, where it refused it as not
+the change read. Two renames of one folder are still left off. head-check's merged-config check merges the same way: a
+base that adds the config in a folder the head renamed now keeps it at its path and is judged on it, where it was
+refused as "deletes the config". With `update_when_base_was_red`, a red that only cancelled runs followed is judged by
+the base its red run tested, not by the cancelled run's job, which may have no note: such a pull request is now updated
+when its base was red and is green now, and the red notice (and `notify_command`'s link) points at that red run, not
+the cancelled one.
+
 ### pr-queue: every unreadable plan is kept and told once; the cache never raises (#934)
 
 An unreadable or untrusted plan no longer replaces an earlier `STATE.bad`: a later one is kept as
