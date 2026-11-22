@@ -68,6 +68,7 @@ BASE_RED = ('FAILURE', 'ERROR')   # "the base was red": a real failure. CANCELLE
 UPDATES = 3   # holds() follows at most this many queue updates in a row
 GIT_MIN = (2, 43)   # merge-tree --write-tree (2.38) with GIT_ATTR_SOURCE (2.41; merge-tree crashed with it until 2.43)
 REFUSED, SILENT = 2, 3
+PASSED = 'passed over'   # update(): this PR cannot move and was told why; the sweep goes on to the next one
 READ_TOKEN, WRITE_TOKEN = 'PR_QUEUE_READ_TOKEN', 'PR_QUEUE_WRITE_TOKEN'
 READ_LOGIN = f"{READ_TOKEN} (the run's read token: contents read)"
 # Never passed on: each gh and git gets exactly one token, as GH_TOKEN (gh_env).
@@ -1705,8 +1706,8 @@ class Queue:
         backticks, a `<sha>` placeholder), keeps its markdown unless it holds one (lens.no_lens_text). 0, or SILENT when
         the comment failed (the caller keeps STATE, so the next run says it)."""
         # One line: a multi-line gh error could start a line with `covered:`, `checks:` or a heading naming a lens.
-        why = lens.no_lens_text(' '.join(why.split()))
-        why += ' ' + lens.no_lens_text(advice, keep_markdown=True) if advice else ''
+        why = self.no_lens_text(n, ' '.join(why.split()))
+        why += ' ' + self.no_lens_text(n, advice, keep_markdown=True) if advice else ''
         print(f'#{n}: auto-merge left OFF: {why}')
         r = self.gh_write('pr', 'comment', str(n), '--repo', self.repo, '--body',
                           f'pr_queue turned auto-merge OFF: {why}\nNeeds a lens read of any new commits, then '
@@ -1715,6 +1716,30 @@ class Queue:
             print(f'#{n}: could not comment either: {r.stderr.strip()[:300]}')
             return SILENT
         return 0
+
+    @staticmethod
+    def no_lens_text(n, text, keep_markdown=False):
+        """lens.no_lens_text, or a note in its place when the text holds code points this runner's Python reads
+        otherwise than the review rules (lens.UnicodeDrift): the comment is still posted, without that text."""
+        try:
+            return lens.no_lens_text(text, keep_markdown)
+        except lens.UnicodeDrift as e:
+            print(f'#{n}: {e}')
+            return (f'(text left out: it holds code points this runner\'s Python reads otherwise than the review '
+                    f'rules, {", ".join(e.code_points)})')
+
+    def unicode_drift(self, n, head, e, dry):
+        """update() cannot read PR n's review on this runner's Python (lens.UnicodeDrift): print it, tell the PR once
+        per head (tell) and pass over it, so the queue goes on. Nothing changed: it stays armed as it was."""
+        print(f'skip #{n}: its review cannot be read on this runner: {e}')
+        if not dry:
+            self.tell(n, head, 'its lens comments cannot be read on this runner',
+                      f'They hold code points ({", ".join(e.code_points)}) that this runner\'s Python (Unicode '
+                      f'{lens.UNIDATA}) reads otherwise than the review rules (Unicode {lens.PY_UNICODE}). Run the '
+                      f'queue on a Python with Unicode {lens.PY_UNICODE}, or delete or edit the comment that holds '
+                      'them.',
+                      kind='unicode')
+        return PASSED
 
     def leave_unsure(self, n):
         """Auto-merge is OFF and the queue cannot tell whether it or a person turned it off (its disarm reported an
@@ -1776,7 +1801,8 @@ class Queue:
         return why
 
     def update(self, n, dry=False):
-        """Bring PR n up to date with its base and re-arm only the change the review read (steps 1-4)."""
+        """Bring PR n up to date with its base and re-arm only the change the review read (steps 1-4). PASSED: its
+        review cannot be read on this Python (unicode_drift), and the sweep goes on."""
         cur = self.view(n, reviews=True)
         if cur is None:
             print(f'#{n}: gh cannot show it now: nothing changed, the next run tries again')
@@ -1786,7 +1812,10 @@ class Queue:
             print(f'#{n} changed meanwhile (not open, armed and behind any more): left alone')
             return 0
         old, base = (cur.get('headRefOid') or '').lower(), cur.get('baseRefName') or ''
-        reviewed, read, why = self.review.reviewed_head(cur)
+        try:
+            reviewed, read, why = self.review.reviewed_head(cur)
+        except lens.UnicodeDrift as e:
+            return self.unicode_drift(n, old, e, dry)
         read = read if reviewed else old
         if dry:   # writes nothing, not even the cache: it does not fetch
             print(f'#{n}: would fetch {(read or "?")[:12]} into {self.cache}, turn auto-merge off, update from {base} '
@@ -2028,9 +2057,16 @@ class Queue:
         head, base = (cur.get('headRefOid') or '').lower(), cur.get('baseRefName') or ''
         open_off = cur.get('state') == 'OPEN' and not cur.get('autoMergeRequest')
         # The review as it is now, not the read the stopped run stored: a lens posted since then counts. No lens
-        # comments: the stored read, the head that run started from.
-        reviewed, read, why = self.review.reviewed_head(cur)
-        read = read if reviewed else st.get('read')
+        # comments: the stored read, the head that run started from. A review this Python cannot read reads nothing:
+        # the PR is left OFF with the comment (never the stored read: a newer comment may block), and the queue goes on.
+        try:
+            reviewed, read, why = self.review.reviewed_head(cur)
+            read = read if reviewed else st.get('read')
+        except lens.UnicodeDrift as e:
+            print(f'#{n}: its review cannot be read on this runner: {e}')
+            read, why = None, (f'its lens comments hold code points ({", ".join(e.code_points)}) that this runner\'s '
+                               f'Python (Unicode {lens.UNIDATA}) reads otherwise than the review rules (Unicode '
+                               f'{lens.PY_UNICODE})')
         unsure = st.get('unsure') is True   # a plan without it (older queues) is the queue's own disarm
         same = self.same_change(base, n, head, read) if open_off and not cur.get('isDraft') and read and not unsure \
             else False
@@ -2146,7 +2182,9 @@ class Queue:
                     reds = ', '.join(sorted(self.red_checks(p)))
                     print(f'update #{n} {(p.get("title") or "")[:70]}: required check {reds} failed on a {base} '
                           f'commit where it failed too, and it is green on {base} now')
-                    return self.update(n, dry)
+                    if (code := self.update(n, dry)) != PASSED:
+                        return code
+                    continue
                 bad = check or bad   # the notice names the check that decided, and is keyed by it
                 print(f'skip #{n}: required check {bad} failed and an update would not fix it yet: {why}')
                 if base_red:
@@ -2182,7 +2220,8 @@ class Queue:
                 print(f'#{n} is up to date and waiting for its checks: queue is moving')
                 return 0
             print(f'update #{n} {(p.get("title") or "")[:70]}')
-            return self.update(n, dry)
+            if (code := self.update(n, dry)) != PASSED:
+                return code
         print('queue empty')
         return 0
 
