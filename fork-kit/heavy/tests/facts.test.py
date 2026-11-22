@@ -379,6 +379,69 @@ class Holds(Case):
         self.assertEqual(held, {'ci-slice': (6144, 0)}, 'use not known: the whole budget is held')
         self.assertTrue(any('memory.stat cannot be read' in n for n in d['notes']), d['notes'])
 
+    def test_a_cgroup_without_a_memory_controller_holds_its_whole_budget(self):
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice', 'budgetMb': 5000})
+        os.makedirs(self.m.root + self.CG)          # there, but no memory.stat: the controller is off for it
+        code, d, held = self.held()
+        self.assertEqual((code, held), (0, {'ci-slice': (5000, 0)}), 'it fails closed, not open')
+        self.assertEqual(d['memory']['holdMb'], 5000)
+        self.assertTrue(any(n.startswith('hold ci-slice: no memory controller') for n in d['notes']), d['notes'])
+
+    def test_a_cgroup_that_ends_between_the_two_looks_holds_nothing(self):
+        self.runners(2000)
+        hold = dict(label='ci-slice', cgroup='ci.slice/ci-runners.slice', inUseFromMb=1024, budgetMb=6144, users=[])
+
+        def ended(host, version, scope):
+            shutil.rmtree(self.m.root + self.CG)
+            return {'gone': True}
+        with mock.patch.object(hf, 'ROOT', self.m.root), mock.patch.object(hf.rd, 'read_piece_demand', ended):
+            self.assertEqual(hf.held_cgroups(hf.rd.RealHost(self.m.root), [hold], 'someone'), ([], []))
+
+    def test_its_swap_is_not_counted_as_ram_it_uses(self):
+        # memory.max limits RAM only: with max 4096, anon 3000 and 1500 swapped out it can still take 1096 MB of RAM
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
+        self.runners(3000)
+        self.m.write(self.CG + '/memory.swap.current', f'{1500 * MB}\n')
+        code, d, held = self.held()
+        self.assertEqual((held, d['memory']['holdMb']), ({'ci-slice': (4096, 3000)}, 1096))
+        self.runners(500)                           # mostly swapped out: in use (1500 > 1024), RAM use 500
+        self.m.write(self.CG + '/memory.swap.current', f'{1000 * MB}\n')
+        self.assertEqual(self.held()[2], {'ci-slice': (4096, 500)})
+
+    def test_memory_max_of_max_is_no_limit_not_an_unreadable_file(self):
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
+        self.runners(2000, 'max')
+        code, d, held = self.held()
+        self.assertEqual(held, {'ci-slice': (6144, 2000)})
+        self.assertFalse([n for n in d['notes'] if 'memory.max' in n], d['notes'])
+
+    def test_at_most_8_holds(self):
+        many = [{'label': f'r{i}', 'cgroup': f'r{i}.slice'} for i in range(9)]   # 9 distinct labels and cgroups
+        self.holds(*many[:8])
+        self.assertEqual(self.facts('--fresh')[0], 0)
+        self.holds(*many)
+        self.assertEqual(self.facts('--fresh'), (1, None), 'a 9th hold is refused')
+
+    def test_nested_holds_are_refused(self):
+        a = {'label': 'ci', 'cgroup': 'ci.slice'}
+        b = {'label': 'ci-runners', 'cgroup': 'ci.slice/ci-runners.slice'}
+        for holds in ((a, b), (b, a), (b, dict(a, cgroup=b['cgroup']))):
+            self.holds(*holds)
+            self.assertEqual(self.facts('--fresh'), (1, None), holds)
+        self.holds({'label': 'x', 'cgroup': 'ci.slice/a'}, {'label': 'y', 'cgroup': 'ci.slice/ab'})
+        self.assertEqual(self.facts('--fresh')[0], 0, 'siblings sharing first letters are not nested')
+
+    def test_a_reservation_file_with_a_holds_name_gets_a_note(self):
+        self.holds({'label': 'ci-slice', 'cgroup': 'ci.slice/ci-runners.slice'})
+        self.runners(2000)
+        with open(os.path.join(self.m.reserve, 'ci-slice.conf'), 'w') as f:
+            f.write('1000 /x/app\n1000 /x/web\n')
+        code, d, _ = self.held()
+        self.assertEqual(sorted((r['name'], r['mb']) for r in d['reservations']),
+                         [('ci-slice', 1000), ('ci-slice', 1000), ('ci-slice', 4096)], 'all of them still hold')
+        self.assertEqual([n for n in d['notes'] if 'name of a machine-file hold' in n],
+                         ['reservation ci-slice.conf has the name of a machine-file hold: both hold; rename the file'])
+
     def test_the_machine_file_missing_empty_or_broken(self):
         self.runners(2000)
         for data in (None, {'version': 1}, {'version': 1, 'heavy': {}}, {'version': 1, 'heavy': {'queue': {}}},
@@ -396,7 +459,6 @@ class Holds(Case):
                            ({'version': 1, 'heavy': {'capacity': {'holds': [dict(hold, cgroup='a/../b')]}}}, 0o644),
                            ({'version': 1, 'heavy': {'capacity': {'holds': [dict(hold, budget=1)]}}}, 0o644),
                            ({'version': 1, 'heavy': {'capacity': {'holds': [{'label': 'x'}]}}}, 0o644),
-                           ({'version': 1, 'heavy': {'capacity': {'holds': [hold] * 9}}}, 0o644),
                            ({'version': 1, 'heavy': {'capacity': {'slots': 2}}}, 0o644)):
             self.machine_file(data, mode)
             self.assertEqual(self.facts('--fresh'), (1, None), data)    # never free on a broken machine file
@@ -745,11 +807,11 @@ class Folders(Case):
 
     def setUp(self):
         super().setUp()
-        self.base = os.path.join(self.tmp, 'kotoba')
+        self.base = os.path.join(self.tmp, 'app')
         self.sib = self.base + '-x'
         os.makedirs(self.base + '/sub')
         os.makedirs(self.sib)
-        self.m.process(4001, self.sib, 300)               # a sibling's process uses nothing of kotoba
+        self.m.process(4001, self.sib, 300)               # a sibling's process uses nothing of app
         self.m.process(4002, self.base + '/sub', 100)
 
     def check(self, written):
@@ -853,6 +915,26 @@ class RedCheck(Case):
             mod = self.broken(line, '            pass\n')
             self.assertGreater(self.failing(Holds, name, mod), 0, line)
             self.assertEqual(self.failing(Holds, name, hf), 0, name)
+
+    def test_without_each_913_fix_its_hold_test_fails(self):
+        for line, instead, name in (
+                ("        if use.get('gone'):\n", "        if use.get('gone'):\n            continue\n",
+                 'test_a_cgroup_without_a_memory_controller_holds_its_whole_budget'),
+                ("                continue                            # ended between the two looks: nothing runs "
+                 "in it\n", '                pass\n', 'test_a_cgroup_that_ends_between_the_two_looks_holds_nothing'),
+                ("        ram = None if use['demandMb'] is None else max(0, use['demandMb'] - swap)\n",
+                 "        ram = use['demandMb']\n", 'test_its_swap_is_not_counted_as_ram_it_uses'),
+                ("mb = h['budgetMb'] if raw == 'max' else int(raw) // (1 << 20)", "mb = int(raw) // (1 << 20)",
+                 'test_memory_max_of_max_is_no_limit_not_an_unreadable_file'),
+                ("    if len(cap['holds']) > MAX_HOLDS:\n", '    if False:\n', 'test_at_most_8_holds'),
+                ("            if (b + '/').startswith(a + '/'):\n", '            if False:\n',
+                 'test_nested_holds_are_refused'),
+                ("              for n in sorted({r['name'] for r in res} & {h['label'] for h in where['holds']})]\n",
+                 '              for n in []]\n', 'test_a_reservation_file_with_a_holds_name_gets_a_note')):
+            with self.subTest(name=name):
+                self.assertGreater(self.failing(Holds, name, self.broken(line, instead)), 0, line)
+                self.assertEqual(self.failing(Holds, name, hf), 0, name)
+
 
 if __name__ == '__main__':
     unittest.main()

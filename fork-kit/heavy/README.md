@@ -552,16 +552,18 @@ after another, up to the group's ceiling), the memory budget, the queue and note
   `memory.stat` is cut short or broken owes its whole cost.
 - **Reservations:** files `~/.config/t3-capacity/reserve.d/*.conf` (or `$T3_CAPACITY_RESERVE_DIR`), lines
   `<MB> <absolute folder> [until=YYYY-MM-DD]`. The folder matches itself and what is below it, with or without a
-  trailing `/`, never a sibling sharing its first letters (`/x/kotoba` is not `/x/kotoba-x`); its real path (links
+  trailing `/`, never a sibling sharing its first letters (`/x/app` is not `/x/app-x`); its real path (links
   resolved) matches too. A reservation holds back its MB less what this user's processes working in that folder
   already use; a caller working inside the folder (its real working folder) is not held back by its own
   reservation. Ended, broken or unreadable lines hold nothing and give a note. Limit: another user's reservations
   are not seen.
 - **Holds (machine file):** a cgroup outside the user managers, such as a CI runners' slice, is not in the ledger.
-  `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` keeps its budget (its
-  `memory.max`, or `budgetMb` when it has none) less what it uses (anon + shmem + swap), as a reservation named by
-  its `label`, for every user except its own (`users`). Not there: nothing runs in it. Its use cannot be read: the
-  whole budget is held, with a note.
+  `heavy.capacity.holds` names such cgroups; one that uses more than `inUseFromMb` (anon + shmem + swap) keeps its
+  budget (its `memory.max`, or `budgetMb` when it has none) less the RAM it uses (anon + shmem: `memory.max` limits
+  RAM only, so swap is left out), as a reservation named by its `label`, for every user except its own (`users`).
+  Not there: nothing runs in it. There without a memory controller (no `memory.stat`): its whole `budgetMb` is held,
+  with a note. Its use cannot be read: the whole budget is held, with a note. A reservation file named like a hold
+  (`<label>.conf`) gives a note; both hold.
 - **Cache:** `/run/user/<uid>/heavy-facts.json` (or `$HEAVY_FACTS_CACHE`), 0600, read again after 5 s (`--fresh`:
   now). Pressure levels carry from it (at most 5 minutes old) so calm must last before a level drops. Without a
   cache folder nothing carries, so every call starts "elevated" (only the rule's floors admit; never straight to
@@ -591,7 +593,8 @@ either caller.
   A reservation whose processes are all gone still holds all its MB (the room is kept for them), until its
   `until=` date or until the line is removed.
 - **Machine file** missing, or without `heavy` or `capacity`: no holds. Broken (not JSON, an unknown key, a wrong
-  value, a `user.slice` cgroup, a label twice, writable by others): `heavy facts` gives no answer, so
+  value, a `user.slice` cgroup, a label twice, a cgroup in or the same as another hold's, more than 8 holds,
+  writable by others): `heavy facts` gives no answer, so
   `t3-capacity` says `NOT OK` naming the key. A changed file is read again at once (the cache key holds it).
 
 ### Settings: the machine file's `heavy.capacity`
@@ -611,10 +614,11 @@ Optional, in `/etc/fork-kit/machine.json` (`fork-kit/common/README.md`):
 | `label`       | required | the name in `reservations:` (lower-case letters, digits, `_ . -`; at most 40)    |
 | `cgroup`      | required | its folder below the cgroup root; never below `user.slice` (counted already)     |
 | `inUseFromMb` | 1024     | held only while it uses more than this                                           |
-| `budgetMb`    | 6144     | its budget when its `memory.max` is `max` or cannot be read                      |
+| `budgetMb`    | 6144     | its budget when its `memory.max` is `max`, cannot be read or is not there        |
 | `users`       | `[]`     | user name patterns (`fnmatch`) whose own budget it is: never held back from them |
 
-At most 8 holds. The sweep and the queue accept the `capacity` key and leave it to `heavy facts`.
+At most 8 holds, none in another's cgroup (it would hold the same room twice). The sweep and the queue accept the
+`capacity` key and leave it to `heavy facts`.
 
 ## Settings
 
