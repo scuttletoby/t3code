@@ -80,6 +80,10 @@ copies that must fail (so a check that stops seeing its problem goes red too):
                case: the checkout's timeout, the wait cap (or the script's git calls, if longer) and one
                last poll, from the script's own limits, with a minute to spare for the job's set-up.
 
+  review-kit   the review kit (fork-kit/review) reads the fork's kit settings
+               (.github/fork-review-kit.json, given with --settings) and through them the fork's queue
+               config in enforce; without --settings its plan names that file.
+
     python3 .github/scripts/fork-contracts.test.py
 
 Needs PyYAML, git and bash. Each check prints ok/FAIL; any FAIL exits 1.
@@ -4936,6 +4940,25 @@ for label, change in {
     "a slower last poll than the budget holds": {"API_TIMEOUT": 200},
 }.items():
     check(f"policies: {label} fails", *policy_mutant(lambda p, w, t: None, {**POLICY_LIMITS, **change}))
+
+# --- review-kit (#957) ---------------------------------------------------------------------------
+# The fork keeps its kit settings under its own name, so the general kit's tests do not name them (#957 item 5).
+
+
+def review_plan(*args):
+    changes = work / "review-kit-changes.bin"
+    changes.write_bytes(b"M\0fork-kit/review/SKILL.md\0")
+    r = subprocess.run([sys.executable, "-I", "-B", str(root / "fork-kit/review/lib/review_kit.py"), "plan", "--root",
+                        str(root), *args, "--changes", str(changes)], capture_output=True, text=True, timeout=120)
+    return r.returncode, r.stdout, r.stderr
+
+
+code, out, err = review_plan("--settings", ".github/fork-review-kit.json")
+check("review-kit: the fork's settings point the kit at the fork's queue config, in enforce, with no note",
+      (code, err) == (0, "") and "note:" not in out and "weight: critical" in out, out + err)
+code, out, err = review_plan()
+check("review-kit: without --settings the plan names the fork's settings file",
+      code == 0 and "pass --settings .github/fork-review-kit.json" in out, out + err)
 
 shutil.rmtree(work, ignore_errors=True)
 if failures:
