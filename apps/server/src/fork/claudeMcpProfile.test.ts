@@ -238,17 +238,19 @@ describe("makeClaudeMcpProfiles", () => {
         });
         const reads = [lean(["threads"]), lean(["threads"]), lean(["threads", "orchestration"])];
         const service = yield* ServerSettingsService.ServerSettingsService;
-        let next = 0;
+        // Each query opens on the settings of its round (the model policy reads them too).
+        let current: object = {};
         const plan = yield* makeClaudeMcpProfiles.pipe(
           Effect.provideService(ServerSettingsService.ServerSettingsService, {
             ...service,
-            getSettings: Effect.suspend(() => Effect.succeed(fromFile(reads[next++] ?? {}))),
+            getSettings: Effect.suspend(() => Effect.succeed(fromFile(current))),
           }),
         );
         const self = thread("t");
         const keys: Array<string | undefined> = [];
         const sets: Array<unknown> = [];
-        for (const _ of reads) {
+        for (const read of reads) {
+          current = read;
           const overrides = {};
           yield* plan(self, overrides);
           keys.push(planKeyFor(overrides));

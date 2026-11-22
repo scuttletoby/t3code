@@ -382,6 +382,31 @@ describe("one pick against the rows", () => {
     ).toBe(false);
   });
 
+  it("a pick read as a full id from the name it gave (namedAs) matches a row naming either", () => {
+    const high = [{ id: "effort", value: "high" }];
+    const aliasRow = [{ ...rows[0]!, model: "opus" }];
+    const asOpus = { ...pick("claude-opus-5-5", high), namedAs: "opus" };
+    // A row saved with the alias matches the alias the call gave; a full-id row the id it is read as.
+    expect(checkModelPolicyPick(aliasRow, asOpus)).toMatchObject({
+      inside: true,
+      row: { model: "opus" },
+    });
+    expect(checkModelPolicyPick(rows, asOpus)).toMatchObject({
+      inside: true,
+      row: { model: "claude-opus-5-5" },
+    });
+    // Still at the row's efforts, and only the names given: no other alias or id matches.
+    expect(
+      checkModelPolicyPick(aliasRow, { ...asOpus, options: [{ id: "effort", value: "max" }] })
+        .inside,
+    ).toBe(false);
+    expect(checkModelPolicyPick(aliasRow, pick("claude-opus-5-5", high)).inside).toBe(false);
+    expect(
+      checkModelPolicyPick(aliasRow, { ...pick("claude-sonnet-5-5", high), namedAs: "sonnet" })
+        .inside,
+    ).toBe(false);
+  });
+
   it("reads an unreadable value as enforce, or advise when its own text says advise", () => {
     const bad = (raw: unknown) => decodeFile(raw);
     expect(modelPolicyStance(bad({ mode: "advise", allow: "x" }))).toEqual({

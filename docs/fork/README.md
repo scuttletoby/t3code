@@ -362,20 +362,35 @@ says. An agent is
 a caller whose session is bound to a thread; the owner's client has none, and anything that reaches
 the server without such a session counts as a person, so the model guard hook is the backstop.
 Claude's own Agent tool (Task in older Claude Code) is checked too, as each call is made (#128): T3
-gives every Claude session it opens a PreToolUse hook that reads the policy on each call. The call
-must name a model and, for a row with `efforts`, its `effort`; the model alias the call names
-(`opus`) is read as the full id this machine's Claude model list maps it to, the same id T3 shows for
-the sub-agent, and a name the list does not map is read as given (so it matches no row). A built-in
-sub-agent type that names no model (one that would run on its own, often smaller, model) is refused
-in `enforce`. A `fork` call is read the same way, as the owner decided for every call and as the
-model guard reads it, although Claude runs a fork on the session's own model and ignores the one it
-names. `enforce` refuses with the rows, `advise` runs it with a note to the agent, an
-inside pick gets its row's `useFor`, and each call is logged as "model policy pick" with route
-`Agent`. A check that fails refuses the call. The hook is fixed when the Claude process opens: a
-process started before this version runs without it until T3 opens a new one (a new profile, a
-restart). Workflow `agent()` calls are not read here (the script is code); the model guard reads them. A pick is inside when it
-names a model by its full id (#128; an alias such as `opus` is not read as its model, and the
-refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
+gives every Claude session it opens one PreToolUse hook that reads the policy on each call. The call
+must name a model and, for a row with `efforts`, its `effort`. The Agent tool names only aliases
+(`sonnet`, `opus`, `haiku`, `fable`): the alias is read as the full id this machine's Claude model
+list maps it to, the same id T3 shows for the sub-agent, and a row matches when it names either the
+alias (as `delegate_task` reads a row saved as `opus`) or that full id. The refusal says which alias
+and effort pass, or that none does and the row's model can still run through `delegate_task`. The
+mapping is T3's list for Claude, shared by every Claude instance on the machine; a Claude Code whose
+own mapping differs (an older binary, or an alias override in its environment) runs a model the
+check did not read. A name the list does not map is read as given (so it matches no row). A
+built-in sub-agent type that names no model (one that would run on its own, often smaller, model) is
+refused in `enforce`. A `fork` call is read the same way, as the owner decided for every call and
+as the model guard reads it, although Claude runs a fork on the session's own model and effort and
+ignores the model and effort it names. A skill that starts a sub-agent is checked too, on Claude's
+Skill tool: a skill whose frontmatter says `context: fork`, or names `model` or `effort`, must name a
+model from the rows in `model` (and its effort in `effort`), read like an Agent call (an alias or a
+full id); a skill that runs inline and names neither runs on the session's model and is not checked.
+T3 finds the skill as it lists Claude's skills (managed, the config folder's, the project's, and
+plugin skills; first name wins). A skill it cannot find or read (one bundled with Claude Code, an MCP
+server's, a command, one in another folder or with frontmatter it cannot parse) is refused in
+`enforce` and runs with a note in `advise`. `enforce` refuses with the rows, `advise` runs it with a
+note to the agent, an inside pick gets its row's `useFor`, and each call is logged as "model policy
+pick" with route `Agent` or `Skill`. A check that fails refuses the call; while a policy is on when
+the process opens, so does a hook that times out (`onFailure: "block"`, Claude Code 2.1.295 or
+newer; with the policy off it is left out, so an older Claude Code still opens). The hook is fixed
+when the Claude process opens: a process started before this version runs without it until T3
+opens a new one (a new profile, a restart). Workflow `agent()` calls are not read here (the script
+is code); the model guard reads them. On the MCP routes, a pick is inside when it
+names a model as a row names it (#128; an alias such as `opus` is not read as its model there, and
+the refusal names the id to use) that a row of its provider's driver lists (#127) and, for a row with
 `efforts`, names one of them (`ultracode` counts as its own effort; a row without `efforts` allows
 none) under the option id that driver reads it from (#780): a built-in driver's own id (`effort` for
 Claude and FX, `reasoningEffort` for Codex, Grok, Kiro and Muse, `variant` for OpenCode, `thinking`

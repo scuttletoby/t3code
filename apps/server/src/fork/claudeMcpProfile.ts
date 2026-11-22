@@ -696,7 +696,7 @@ export const makeThreadMcpProfilesById = Effect.gen(function* () {
   });
 });
 
-/** A plan with the model policy's Agent-tool hook first among its PreToolUse hooks. */
+/** A plan with the model policy's Agent and Skill tool hook first among its PreToolUse hooks. */
 const withAgentModelPolicy = (
   plan: ClaudeMcpProfilePlan,
   agentPolicy: HookCallbackMatcher,
@@ -714,7 +714,7 @@ const withAgentModelPolicy = (
 /** The thread's Claude plan, or a refusal, from {@link makeThreadMcpProfiles}. */
 export const makeClaudeMcpProfiles = Effect.gen(function* () {
   const profileFor = yield* makeThreadMcpProfiles;
-  // Every query also gets the model policy's check of Claude's own Agent tool.
+  // Every query also gets the model policy's check of Claude's own Agent and Skill tools.
   const agentPolicy = yield* makeClaudeAgentModelPolicyHook;
   const planFor = Effect.fn("ClaudeMcpProfile.planFor")(function* (
     thread: LineageThread,
@@ -739,7 +739,7 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
     thread: LineageThread,
     overrides: McpOverrides,
   ) {
-    const plan = withAgentModelPolicy(yield* planFor(thread, overrides), agentPolicy);
+    const plan = withAgentModelPolicy(yield* planFor(thread, overrides), yield* agentPolicy);
     PLAN_KEYS.set(overrides, { key: planKey(plan) });
     return plan;
   });

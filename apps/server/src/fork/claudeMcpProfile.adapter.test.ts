@@ -231,7 +231,7 @@ describe("ClaudeAdapterV2 MCP profile", () => {
     }),
   );
 
-  it.effect("every query carries the model policy's check of Claude's Agent tool (#128)", () =>
+  it.effect("every query carries the model policy's check of Claude's Agent tool once (#128)", () =>
     Effect.gen(function* () {
       const modelPolicy = {
         mode: "enforce",
@@ -244,38 +244,51 @@ describe("ClaudeAdapterV2 MCP profile", () => {
         { modelPolicy, mcpProfile: "t3-only" },
         { modelPolicy, mcpProfile: "bare", mcpProfiles: { bare } },
       ] as ReadonlyArray<McpSettings>) {
+        // Runs again: a second turn on the same thread.
         const { opened, refusal } = yield* runTurns(
           settings,
           settings.mcpProfile === "t3-only" ? [] : "unexpected",
+          [settings],
         );
         assert.isUndefined(refusal);
+        assert.isAtLeast(opened.length, 1);
         const reasons = (answers: ReadonlyArray<unknown>) =>
           answers.map(
             (answer) =>
               (answer as { hookSpecificOutput?: { permissionDecisionReason?: string } })
                 .hookSpecificOutput?.permissionDecisionReason,
           );
-        const refused = yield* preToolUse(opened[0], "Agent", undefined, {
-          model: "sonnet",
-          effort: "high",
-        });
-        assert.isTrue(
-          reasons(refused).some((text) =>
-            text?.startsWith(
-              "Model policy refused this pick: claude-sonnet-5-5 (claudeAgent) is in no row.",
+        for (const options of opened) {
+          // Once per query, first, refusing when it cannot answer: never stacked.
+          const policyHooks = (options.hooks?.PreToolUse ?? []).filter(
+            (matcher) => matcher.matcher === "^(Agent|Task|Skill)$",
+          );
+          assert.lengthOf(policyHooks, 1, JSON.stringify(settings));
+          assert.strictEqual(options.hooks?.PreToolUse?.[0], policyHooks[0]);
+          assert.strictEqual(policyHooks[0]?.onFailure, "block");
+          const refused = yield* preToolUse(options, "Agent", undefined, {
+            model: "sonnet",
+            effort: "high",
+          });
+          assert.lengthOf(
+            reasons(refused).filter((text) =>
+              text?.startsWith(
+                "Model policy refused this pick: claude-sonnet-5-5 (claudeAgent) is in no row.",
+              ),
             ),
-          ),
-          JSON.stringify(settings),
-        );
-        // Inside the rows: the policy's hook lets it run (builtinTools "none" refuses Agent anyway).
-        const inside = yield* preToolUse(opened[0], "Agent", undefined, {
-          model: "opus",
-          effort: "high",
-        });
-        assert.isFalse(
-          reasons(inside).some((text) => text?.startsWith("Model policy")),
-          JSON.stringify(settings),
-        );
+            1,
+            JSON.stringify(settings),
+          );
+          // Inside the rows: the policy's hook lets it run (builtinTools "none" refuses Agent anyway).
+          const inside = yield* preToolUse(options, "Agent", undefined, {
+            model: "opus",
+            effort: "high",
+          });
+          assert.isFalse(
+            reasons(inside).some((text) => text?.startsWith("Model policy")),
+            JSON.stringify(settings),
+          );
+        }
       }
     }),
   );

@@ -13,7 +13,6 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
-  MODEL_POLICY_AGENT_OPTION_IDS,
   MODEL_POLICY_DRIVER_ALIASES,
   MODEL_POLICY_EFFORT_OPTION_IDS,
   MODEL_POLICY_SESSION_MODE_OPTION_ID,
@@ -744,20 +743,9 @@ describe("an effort named only under a driver's own option id (#780)", () => {
     assert.include("note" in advised ? (advised.note ?? "") : "", "the option agent picks");
   });
 
-  it("the agent-picking options are the model guard's and ACP's session mode", () => {
-    const guard = NodeFS.readFileSync(
-      new URL("../../../../fork-kit/model-guard/lib/model_guard.py", import.meta.url),
-      "utf8",
-    );
-    const line = /^DRIVER_MODEL_OPTION_IDS = (\{.*\})$/m.exec(guard)?.[1];
-    assert.isDefined(line);
-    const guardIds = Object.fromEntries(
-      [...(line ?? "").matchAll(/'([^']+)': \(([^)]*)\)/g)].map((match) => [
-        match[1],
-        [...match[2]!.matchAll(/'([^']+)'/g)].map((id) => id[1]),
-      ]),
-    );
-    assert.deepStrictEqual(guardIds, MODEL_POLICY_AGENT_OPTION_IDS);
+  it("the session mode the policy refuses is ACP's own", () => {
+    // The agent-picking ids are the model guard's: fork-kit/model-guard/tests/guard.test.py keeps
+    // the two lists in step (app code reads no fork-owned file).
     assert.strictEqual(MODEL_POLICY_SESSION_MODE_OPTION_ID, ACP_SESSION_MODE_OPTION_ID);
   });
 

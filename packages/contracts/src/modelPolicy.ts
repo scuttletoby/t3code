@@ -175,9 +175,9 @@ const MODEL_POLICY_ULTRACODE_DRIVER = "claudeAgent";
 /**
  * Options that pick an agent or a mode (own prompt, tools, settings, maybe model): refused while a
  * policy is on, even when described. The model guard's `DRIVER_MODEL_OPTION_IDS` and ACP's
- * `ACP_SESSION_MODE_OPTION_ID`; a server test keeps them in step.
+ * `ACP_SESSION_MODE_OPTION_ID`; the model guard's test and a server test keep them in step.
  */
-export const MODEL_POLICY_AGENT_OPTION_IDS: Readonly<Record<string, ReadonlyArray<string>>> = {
+const MODEL_POLICY_AGENT_OPTION_IDS: Readonly<Record<string, ReadonlyArray<string>>> = {
   kiro: ["mode"],
   opencode: ["agent"],
 };
@@ -216,6 +216,12 @@ export interface ModelPolicyPick {
    * `effortLevel`, a hidden `_t3/session-mode`, a `model` option). Unset (Settings): not checked.
    */
   readonly describedOptionIds?: ReadonlyArray<string> | undefined;
+  /**
+   * The name the call gave, when the check reads it as another id in `model`: Claude's Agent tool
+   * names only aliases (`opus`), read as the full id this machine maps it to. A row naming either
+   * matches, so a row naming the alias matches it as on the MCP routes, which read a name as given.
+   */
+  readonly namedAs?: string | undefined;
 }
 
 /**
@@ -451,7 +457,9 @@ export function checkModelPolicyPick(
     return { inside: false, why: `${model}'s effort option ${unnamed.id} holds no effort name` };
   }
   const rows = allow.filter(
-    (row) => row.model === model && (pick.driver === undefined || row.driver === pick.driver),
+    (row) =>
+      (row.model === model || (pick.namedAs !== undefined && row.model === pick.namedAs)) &&
+      (pick.driver === undefined || row.driver === pick.driver),
   );
   if (rows.length === 0) {
     return {
