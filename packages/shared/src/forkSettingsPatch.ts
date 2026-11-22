@@ -104,6 +104,15 @@ function applyRule(rule: ForkPatchRule, stored: unknown, patch: unknown): unknow
     }
     return next;
   }
+  if ("fields" in rule) {
+    // Each named field by its own rule; a field the patch leaves out keeps its value.
+    const next: Record<string, unknown> = isRecord(stored) ? { ...stored } : {};
+    for (const [field, value] of Object.entries(isRecord(patch) ? patch : {})) {
+      if (value === undefined) continue;
+      next[field] = applyRule(rule.fields[field] ?? "replace", next[field], value);
+    }
+    return next;
+  }
   const next = new Map(Object.entries(isRecord(stored) ? stored : {}));
   if ("replaceEntries" in rule) {
     for (const [id, entry] of Object.entries(patch as Record<string, unknown>)) {

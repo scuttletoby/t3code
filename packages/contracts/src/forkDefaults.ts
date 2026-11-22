@@ -213,6 +213,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     decidedIn: "#640",
   },
   {
+    scope: "server",
+    key: "threadRoles",
+    default: { assistant: null, orchestrators: {} },
+    off: true,
+    reason: "No thread holds a role, so every thread is shown as upstream shows it.",
+    decidedIn: "#138",
+  },
+  {
     scope: "projectOverride",
     key: "mcpProfile",
     default: undefined,
@@ -267,6 +275,14 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     off: true,
     reason: "A project without its own needs uses the server's.",
     decidedIn: "#134",
+  },
+  {
+    scope: "client",
+    key: "calmSidebarEnabled",
+    default: false,
+    off: true,
+    reason: "Each device shows upstream's thread list until its owner turns the calm view on.",
+    decidedIn: "#139",
   },
 ];
 
