@@ -1538,6 +1538,134 @@ class FindingsAndRoundsBare(FindingsAndRounds):
     BARE = True
 
 
+# --- the fork's own config: .github/fork-pr-queue.json in enforce (#82, #99, #100; no override author, #78) ---------
+FORK_ROOT = os.path.join(HERE, '..', '..', '..')
+FORK_CONFIG_PATH = '.github/fork-pr-queue.json'
+with open(os.path.join(FORK_ROOT, FORK_CONFIG_PATH), encoding='utf-8') as _f:
+    FORK_RAW = json.load(_f)
+
+
+def fork_prompts():
+    out = {}
+    for x in FORK_RAW['review']['lenses'].values():
+        with open(os.path.join(FORK_ROOT, x['prompt']), encoding='utf-8') as f:
+            out[x['prompt']] = f.read()
+    return out
+
+
+class ForkConfigRules(unittest.TestCase):
+    """The gate on a base that holds the fork's real config and lens prompts: each rule the owner decided blocks when it
+    should and passes when it should, and the same config in shadow only reports. A test that fails here after a
+    config change means the change alters what the fork's gate decides."""
+    BARE = False
+    FILES = {'apps/server/src/x.ts': lines(), '.github/workflows/ci.yml': lines(), 'fork-ci/actions/x.py': lines(),
+             '.github/fork-seams.json': lines(), '.github/fork-ci-tests.txt': lines()}
+
+    def setUp(self):
+        self.w = World(self.BARE)
+        self.addCleanup(self.w.close)
+        self.p = Posts()
+
+    def pair(self, *changed, mode=None):
+        """A base with the fork's config (its mode replaced by `mode`) and a head on it that changes `changed`."""
+        raw = json.loads(json.dumps(FORK_RAW))
+        if mode:
+            raw['review']['mode'] = mode
+        tree = {FORK_CONFIG_PATH: json.dumps(raw, indent=2) + '\n', **fork_prompts(), **self.FILES}
+        base = self.w.commit(tree)
+        return base, self.w.commit({**tree, **{p: lines(30, ['x'], 3) for p in changed or ('apps/server/src/x.ts',)}},
+                                   [base])
+
+    def check(self, base, head, comments):
+        path = self.w.checkout(base, head)
+        return run_cli(path, fake_gh((0, json.dumps(pr(comments, head=head)))), config_path=FORK_CONFIG_PATH)
+
+    def said(self, name, sha, *lines):
+        return FindingsAndRounds.said(self, name, sha, *lines)
+
+    def override(self, sha):   # from the owner's login, which agents post from too (#78)
+        return self.p.post(f"{FORK_RAW['override']['prefix']} {sha}: read it myself")
+
+    def test_it_is_in_enforce(self):
+        self.assertEqual(FORK_RAW['review']['mode'], 'enforce')
+        self.assertNotIn('override_authors', FORK_RAW['review'])   # #78: no person posts from a login of their own yet
+
+    def test_a_workflow_or_gate_change_needs_the_extra_review(self):   # #82
+        for changed in ('.github/workflows/ci.yml', 'fork-ci/actions/x.py'):
+            with self.subTest(changed):
+                base, head = self.pair(changed)
+                code, out = self.check(base, head, [self.said('code', head)])
+                self.assertEqual(code, 1, out)
+                self.assertIn('required lens without a read: merge-path, state', out)
+                code, out = self.check(base, head, [self.said('merge-path', head), self.said('state', head)])
+                self.assertEqual(code, 0, out)
+                code, out = self.check(base, head, [self.said('merge-path', head)])   # one review is not enough
+                self.assertEqual(code, 1, out)
+
+    def test_an_app_change_that_adds_a_seam_or_a_test_line_needs_the_code_lens(self):   # the dry run's wrong refusals
+        for extra in ('.github/fork-seams.json', '.github/fork-ci-tests.txt'):
+            with self.subTest(extra):
+                base, head = self.pair('apps/server/src/x.ts', extra)
+                code, out = self.check(base, head, [self.said('code', head)])
+                self.assertEqual(code, 0, out)
+                self.assertIn('path rules (enforce): the path rules decide: normal, lenses code (', out)
+                code, out = self.check(base, head, [self.said('merge-path', head), self.said('state', head)])
+                self.assertEqual(code, 1, out)   # the gate lenses alone never read app code
+                self.assertIn('required lens without a read: code', out)
+
+    def test_a_blocker_or_major_fails_and_the_owners_login_does_not_clear_it(self):   # #99, #78
+        base, head = self.pair()
+        self.assertEqual(self.check(base, head, [self.said('code', head)])[0], 0)
+        for line in ('major: two writers race', 'blocker: data lost on restart'):
+            with self.subTest(line):
+                code, out = self.check(base, head, [self.said('code', head, line)])
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"that no later round cleared (issue #99): '{line}'", out)
+                code, out = self.check(base, head, [self.said('code', head, line), self.override(head)])
+                self.assertEqual(code, 1, out)
+        code, out = self.check(base, head, [self.said('code', head, 'Looks good to me.')])   # no findings section
+        self.assertEqual(code, 1, out)
+        self.assertIn('has no findings section', out)
+
+    def test_round_three_needs_the_approach_lens_and_round_five_is_past_the_cap(self):   # #100
+        base, head = self.pair()
+        two = [self.said('code', OLD[0]), self.said('code r2', head)]
+        self.assertEqual(self.check(base, head, two)[0], 0)
+        three = [self.said('code', OLD[0]), self.said('code r2', OLD[1]), self.said('code r3', head)]
+        code, out = self.check(base, head, three)
+        self.assertEqual(code, 1, out)
+        self.assertIn('required lens without a read: approach', out)
+        code, out = self.check(base, head, three + [self.said('approach', head)])
+        self.assertEqual(code, 0, out)
+        self.assertIn('round 3 of 4, approach lens approach required from round 3', out)
+        five = [self.said('code', sha) for sha in OLD] + [self.said('code', head), self.said('approach', head)]
+        code, out = self.check(base, head, five)
+        self.assertEqual(code, 1, out)
+        self.assertIn('review round 5 is past the cap of 4 rounds (issue #100)', out)
+        code, out = self.check(base, head, five + [self.override(head)])   # no override author: no person decides
+        self.assertEqual(code, 1, out)
+        self.assertIn('no one is listed in review.override_authors yet, so no override is accepted', out)
+
+    def test_shadow_only_reports_what_enforce_refuses(self):   # the rollback: the same config in shadow
+        base, head = self.pair('.github/workflows/ci.yml', mode='shadow')
+        code, out = self.check(base, head, [self.said('code', head)])
+        self.assertEqual(code, 0, out)
+        self.assertIn('path rules (shadow): the path rules would have said: critical, lenses merge-path, state', out)
+        base, head = self.pair(mode='shadow')
+        code, out = self.check(base, head, [self.said('code', head, 'major: two writers race')])
+        self.assertEqual(code, 0, out)
+        self.assertIn('findings and rounds (shadow): they would have said: round 1 of 4; lens code reported a major',
+                      out)
+        five = [self.said('code', sha) for sha in OLD] + [self.said('code', head)]
+        code, out = self.check(base, head, five)
+        self.assertEqual(code, 0, out)
+        self.assertIn('findings and rounds (shadow): they would have said: round 5 of 4', out)
+
+
+class ForkConfigRulesBare(ForkConfigRules):
+    BARE = True
+
+
 class FetchTimeout(unittest.TestCase):   # #740 round 2, B minor 4: a hung fetch of a read commit never hangs the check
     def test_a_fetch_that_takes_too_long_failed(self):
         timeouts = []

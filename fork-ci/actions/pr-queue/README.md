@@ -342,9 +342,7 @@ pull request of its own on the default branch.
    request. Keep the caller's `required-lenses` as it is: in `shadow` it
    still decides. This pull request is judged by the old rules (the gate
    reads the config from the base tip), and its merged config must parse, or
-   the gate refuses it. The fork's own config,
-   [`.github/fork-pr-queue.json`](../../../.github/fork-pr-queue.json), is at
-   this step.
+   the gate refuses it.
 4. **Read the results.** From now on every gate run adds rows to the
    summary of the gate App's check run on the head ("Details" on the pull
    request, or
@@ -400,6 +398,23 @@ pull request of its own on the default branch.
      "lenses": ["code"]
    }
    ```
+
+   The fork's own config,
+   [`.github/fork-pr-queue.json`](../../../.github/fork-pr-queue.json), is at
+   this step (owner decisions in issues
+   [82](https://github.com/scuttletoby/t3code/issues/82),
+   [99](https://github.com/scuttletoby/t3code/issues/99) and
+   [100](https://github.com/scuttletoby/t3code/issues/100)), with no
+   `override_authors` while agents post from the owner's login
+   ([issue 78](https://github.com/scuttletoby/t3code/issues/78)). Its critical
+   rule names the workflow and gate-setting files under `.github` one by one
+   instead of `.github/**`: the seam list and the test list, which most pull
+   requests add a line to, stay normal, or plain app changes would need the
+   gate lenses and no `code` lens. A test in `review_judge.test.py` fails when
+   a new file under `.github` is in neither list. The fork runs no gate on
+   its own pull requests yet (no caller, App or ruleset,
+   [issue 81](https://github.com/scuttletoby/t3code/issues/81)), so the block
+   decides nothing there until one exists.
 
 6. **Roll back** in the reverse order: lens names back into an emptied
    input, then `mode` back to `shadow` (or the block out), and only then a
