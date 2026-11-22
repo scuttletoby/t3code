@@ -5,6 +5,8 @@
  * The adapters, the turn check and the T3 tool filter (mcpT3ToolFilter.ts) use it.
  */
 import {
+  MCP_BUILTIN_TOOLS_NONE,
+  MCP_PROFILE_ALL,
   MCP_T3_UNGROUPED_TOOLS,
   type McpT3ToolGroup,
   ProviderDriverKind,
@@ -116,6 +118,14 @@ export const MCP_PROFILE_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set([
   ProviderDriverKind.make("claudeAgent"),
   ProviderDriverKind.make("codex"),
 ]);
+
+/**
+ * The refusal of a turn whose profile has `builtinTools: "none"` on a driver that cannot drop its
+ * built-in tools: only Claude does (claudeMcpProfile.ts), so every other driver refuses, never
+ * runs the thread with its shell, file and web tools.
+ */
+export const builtinToolsNoneRefusal = (profileName: string, driver: string): string =>
+  `This thread's MCP profile "${profileName}" has builtinTools "${MCP_BUILTIN_TOOLS_NONE}" (no shell, file or web tools), and ${driver} cannot run a thread without its built-in tools (only Claude can), so this turn was not started. Switch the thread to a Claude instance, or pick a profile without builtinTools "${MCP_BUILTIN_TOOLS_NONE}" (such as "${MCP_PROFILE_ALL}") for this thread in Settings.`;
 
 /**
  * The drivers a delegation sends a narrower profile to on another machine

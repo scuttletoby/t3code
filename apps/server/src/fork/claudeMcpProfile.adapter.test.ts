@@ -272,6 +272,40 @@ describe("ClaudeAdapterV2 MCP profile", () => {
     }),
   );
 
+  it.effect(
+    'builtinTools "none" opens Claude with no built-in tools and refuses any at the call',
+    () =>
+      Effect.gen(function* () {
+        const bare = { servers: "all", t3Tools: "all", builtinTools: "none" } as const;
+        // Narrowing a running thread to it opens a new process: the old one still has its tools.
+        const { opened, refusal } = yield* runTurns(
+          {},
+          [],
+          [{ mcpProfile: "bare", mcpProfiles: { bare } }],
+        );
+        assert.isUndefined(refusal);
+        assert.lengthOf(opened, 2);
+        assert.notDeepEqual(opened[0]?.tools, []);
+        assert.deepStrictEqual(opened[1]?.tools, []);
+        assert.includeMembers(opened[1]?.disallowedTools ?? [], [
+          "Bash",
+          "Read",
+          "Write",
+          "WebFetch",
+        ]);
+        const [refused] = yield* preToolUse(opened[1], "Bash");
+        assert.deepNestedInclude(refused, {
+          "hookSpecificOutput.permissionDecision": "deny",
+        });
+        assert.include(
+          (refused as { hookSpecificOutput: { permissionDecisionReason: string } })
+            .hookSpecificOutput.permissionDecisionReason,
+          'MCP profile "bare" has builtinTools "none", so T3 refused the built-in tool "Bash"',
+        );
+        assert.deepStrictEqual(yield* preToolUse(opened[1], "mcp__t3-code__t3_thread_list"), [{}]);
+      }),
+  );
+
   it.effect("refuses the turn, without opening Claude, when the profile is missing", () =>
     Effect.gen(function* () {
       const { opened, refusal } = yield* runTurns({ mcpProfile: "lean" }, []);

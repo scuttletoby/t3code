@@ -4,15 +4,17 @@
  * the groups fixed as each query opens. A profile that cannot be applied refuses the turn instead
  * of starting it with every tool: the owner chose refusing over warning.
  */
-import type {
-  HookCallback,
-  HookCallbackMatcher,
-  HookEvent,
-  McpServerStatus,
-  Settings as ClaudeSettings,
+import {
+  BUILTIN_TOOL_NAMES,
+  type HookCallback,
+  type HookCallbackMatcher,
+  type HookEvent,
+  type McpServerStatus,
+  type Settings as ClaudeSettings,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   DEFAULT_SERVER_SETTINGS,
+  MCP_BUILTIN_TOOLS_NONE,
   MCP_CARRIED_PROFILES_REFUSE,
   MCP_PROFILE_ALL,
   type OrchestrationV2AppThread,
@@ -69,10 +71,14 @@ export interface ClaudeMcpProfilePlan {
     readonly strictMcpConfig?: true;
     readonly managedSettings?: ClaudeSettings;
     readonly hooks?: Partial<Record<HookEvent, Array<HookCallbackMatcher>>>;
+    /** `builtinTools: "none"`: `[]`, after (so over) the adapter's own tool set. */
+    readonly tools?: Array<string>;
+    readonly disallowedTools?: Array<string>;
   };
   readonly servers: McpProfileSet["servers"];
   /** T3's own tool groups; the T3 MCP server applies them (mcpT3ToolFilter.ts). */
   readonly t3Tools: McpProfileSet["t3Tools"];
+  readonly builtinTools?: McpProfileSet["builtinTools"];
 }
 
 export type LineageThread = Pick<
@@ -92,10 +98,53 @@ const START_LEAKS =
   "A managed Claude policy on this machine or --mcp-config in the Claude launch arguments can add servers T3's list does not drop";
 
 /**
+ * `builtinTools: "none"`: Claude starts with no built-in tool (`tools: []`), every one the SDK
+ * names is also disallowed (so an `allowedTools` entry cannot bring one back), and a call to any
+ * tool but an MCP server's is refused as it is made (what a launch argument adds). With no
+ * `ToolSearch`, Claude lists MCP tools directly.
+ */
+export function claudeMcpProfilePlan(
+  name: string,
+  profile: McpProfileSet,
+  t3ServerNames: ReadonlyArray<string>,
+): ClaudeMcpProfilePlan | ClaudeMcpProfileError {
+  const plan = claudeMcpServersPlan(name, profile, t3ServerNames);
+  if (isRefusal(plan) || profile.builtinTools !== MCP_BUILTIN_TOOLS_NONE) return plan;
+  const preToolUse = [
+    ...(plan.options.hooks?.PreToolUse ?? []),
+    { hooks: [claudeBuiltinToolsGuard(name)] },
+  ];
+  return {
+    ...plan,
+    builtinTools: MCP_BUILTIN_TOOLS_NONE,
+    options: {
+      ...plan.options,
+      tools: [],
+      disallowedTools: [...BUILTIN_TOOL_NAMES],
+      hooks: { ...plan.options.hooks, PreToolUse: preToolUse },
+    },
+  };
+}
+
+/** Refuses a call to any tool but an MCP server's; hooks run in every mode and in sub-agents. */
+const claudeBuiltinToolsGuard =
+  (name: string): HookCallback =>
+  async (input) => {
+    if (input.hook_event_name !== "PreToolUse" || input.tool_name.startsWith("mcp__")) return {};
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `MCP profile "${name}" has builtinTools "${MCP_BUILTIN_TOOLS_NONE}", so T3 refused the built-in tool "${input.tool_name}": this thread has only MCP tools. To use it, ${FIX}.`,
+      },
+    };
+  };
+
+/**
  * `t3-only` and an empty list ignore every server Claude would load itself; a list keeps those named.
  * `t3Tools` adds no option: T3's own server hides and refuses the tools it leaves out.
  */
-export function claudeMcpProfilePlan(
+function claudeMcpServersPlan(
   name: string,
   profile: McpProfileSet,
   t3ServerNames: ReadonlyArray<string>,
@@ -335,15 +384,16 @@ export const planKeyFor = (mcpOverrides: object): string | undefined =>
 
 /**
  * The plan's key part, or `undefined` for `all`. NUL keeps the joined names apart. A change of T3
- * tool groups changes it too, so the next turn's fresh process lists T3's tools again.
+ * tool groups or built-in tools changes it too, so the next turn's fresh process lists them again.
  */
 const planKey = (plan: ClaudeMcpProfilePlan): string | undefined =>
-  plan.servers === "all" && plan.t3Tools === "all"
+  plan.servers === "all" && plan.t3Tools === "all" && plan.builtinTools === undefined
     ? undefined
     : [
         "mcp",
         ...(plan.servers === "all" ? ["*"] : plan.servers),
         ...(plan.t3Tools === "all" ? [] : ["\u0001t3", ...plan.t3Tools]),
+        ...(plan.builtinTools === undefined ? [] : ["\u0002builtin", plan.builtinTools]),
       ].join("\u0000");
 
 /** settings.json as this read found it. */

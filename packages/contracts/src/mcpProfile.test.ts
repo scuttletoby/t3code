@@ -29,7 +29,7 @@ describe("MCP profile settings file", () => {
   it("loads a file whose profile this build cannot read, and keeps it on save", () => {
     // Written by a newer build: an unknown field, an unknown group, a missing field.
     const profiles = {
-      future: { servers: [], t3Tools: ["mail"], builtinTools: "none" },
+      future: { servers: [], t3Tools: ["mail"], hosts: ["a"] },
       half: { servers: ["docs"] },
       odd: "not a profile",
     };
@@ -121,6 +121,25 @@ describe("MCP profile settings patch", () => {
     }
   });
 
+  it('takes builtinTools "none" or "all"; a profile without it is as before', () => {
+    const patch = decodePatch({
+      mcpProfiles: {
+        bare: { servers: "all", t3Tools: "all", builtinTools: "none" },
+        full: { servers: "all", t3Tools: "all", builtinTools: "all" },
+      },
+    });
+    expect(patch.mcpProfiles?.bare).toEqual({
+      servers: "all",
+      t3Tools: "all",
+      builtinTools: "none",
+    });
+    expect(patch.mcpProfiles?.full).toEqual({
+      servers: "all",
+      t3Tools: "all",
+      builtinTools: "all",
+    });
+  });
+
   it("takes null under a built-in name, so a hand-edited entry with that name can be removed", () => {
     expect(decodePatch({ mcpProfiles: { all: null, "t3-only": null } }).mcpProfiles).toEqual({
       all: null,
@@ -135,6 +154,10 @@ describe("MCP profile settings patch", () => {
     ["the name `inherit`", { mcpProfiles: { inherit: { servers: [], t3Tools: [] } } }],
     ["a bad name", { mcpProfiles: { "Bad Name": { servers: [], t3Tools: [] } } }],
     ["an unknown field", { mcpProfiles: { lean: { servers: [], t3Tools: [], extra: 1 } } }],
+    [
+      "a bad builtinTools",
+      { mcpProfiles: { lean: { servers: [], t3Tools: [], builtinTools: "x" } } },
+    ],
     ["a missing field", { mcpProfiles: { lean: { servers: [] } } }],
     ["an unknown group", { mcpProfiles: { lean: { servers: [], t3Tools: ["mail"] } } }],
     ["a blank server", { mcpProfiles: { lean: { servers: [" "], t3Tools: [] } } }],
