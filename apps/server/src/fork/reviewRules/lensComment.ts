@@ -126,9 +126,16 @@ function cleanInline(text: string, narrow = false): string {
   return t.replace(/[*`]/gu, "").replaceAll("|", " ").replace(EDGE_UNDERSCORES, "");
 }
 
-/** One line cleaned, its leading quote, list, heading and fence markers gone. */
+/**
+ * lens.nfkc: a compatibility form reads as the plain one it renders like (`：` U+FF1A as `:`, `ｌｅｎｓ` as `lens`), as
+ * the findings rules fold it. Without it such a header was no header, no marker and no look-alike: it silently
+ * counted for nothing.
+ */
+const nfkc = (text: string): string => text.normalize("NFKC");
+
+/** One line in NFKC, cleaned, its leading quote, list, heading and fence markers gone (lens.norm_line). */
 export const normLine = (line: string, narrow = false): string =>
-  strip(cleanInline(line, narrow).replace(LEADING_MARKERS, ""));
+  strip(cleanInline(nfkc(line), narrow).replace(LEADING_MARKERS, ""));
 
 const opensPlain = (line: string) => !/^(?: {4}|\t| {0,3}(?:>|`{3}|~{3}))/u.test(line);
 
@@ -268,7 +275,7 @@ function readProblem(body: string, narrow: boolean): string | null {
   if (
     normed.some((line) => READ_AT_RE.test(line)) ||
     plain.some((line) => LOOKS_RE.test(norm(line))) ||
-    plain.slice(0, TOP_LINES).some((line) => LOOKS_HEADING_RE.test(line))
+    plain.slice(0, TOP_LINES).some((line) => LOOKS_HEADING_RE.test(nfkc(line)))
   )
     return start;
   return null;
