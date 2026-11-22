@@ -120,6 +120,8 @@ export function planReview(
   const paths: string[] = [];
   const seen = new Set<string>();
   for (const [status = "", ...named] of changes) {
+    // review_judge.parse_name_status takes `status[1:].isdigit()`, which also holds `²` or `٣`; git writes a score in
+    // ASCII digits only, so this reads every status git writes alike, and refuses (no plan, no lens) the rest.
     const two = /^[CR][0-9]{1,3}$/u.test(status);
     if (!two && !/^[ADMT]$/u.test(status))
       refuse(`unknown change status ${JSON.stringify(status)}`);

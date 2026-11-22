@@ -303,6 +303,7 @@ describe("fork settings save check (MCP profile references)", () => {
     ["a built-in default", { mcpProfile: "t3-only" }],
     ["inherit as the sub-agent rule", { mcpSubagentProfile: "inherit" }],
     ["a pick of a built-in", { mcpThreadProfiles: { "thread-1": "all" } }],
+    ["a pick of the assistant's built-in", { mcpThreadProfiles: { "thread-1": "assistant" } }],
     [
       "a default added in the same save",
       { mcpProfiles: { docs: { servers: ["docs"], t3Tools: "all" } }, mcpProfile: "docs" },
