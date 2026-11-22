@@ -5,6 +5,7 @@
  * from the owner's per-instance setting (`usagePacing[id].noLimits`), never from a reading.
  */
 import {
+  burnFirstWindowKinds,
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   type ProviderInstanceId,
   type ServerProvider,
@@ -12,6 +13,7 @@ import {
   type ServerSettings,
   type ServerSettingsError,
   type UsagePacingInstanceSettings,
+  type UsagePacingWindowKind,
 } from "@t3tools/contracts";
 import { elapsedShare, paceOfShares } from "@t3tools/shared/usageLimits";
 import * as Clock from "effect/Clock";
@@ -108,7 +110,10 @@ export interface WindowPace {
   readonly pacePercent: number | null;
   /** reserve × min(1, hours left / 12). */
   readonly effectiveReservePercent: number | null;
-  /** What `usedPercent` is held to: min(pace, 100 − reserve), or 100 − reserve to burn first. */
+  /**
+   * What `usedPercent` is held to: min(pace, 100 − reserve), or 100 − reserve when its kind burns
+   * first (`InstancePace.burnFirstWindows`).
+   */
   readonly targetPercent: number | null;
   /** Points per hour over the recent span, within the current window; null when unknown. */
   readonly burnPercentPerHour: number | null;
@@ -126,6 +131,8 @@ export interface InstancePace {
   readonly unknownReason?: PaceUnknownReason;
   readonly reservePercent: number;
   readonly burnFirst: boolean;
+  /** The window kinds that drop the even pace: none without `burnFirst`, all without a list. */
+  readonly burnFirstWindows: ReadonlyArray<UsagePacingWindowKind>;
   /** The owner's setting: this instance has no limits (verdict `unknown`, reason `noLimits`). */
   readonly noLimits: boolean;
   /** The stamp of the newest usage reading (live, or recorded after the live one was taken). */
@@ -338,6 +345,7 @@ function paceWindow(
   input: PaceInput,
 ): WindowPace {
   const { nowMs, pacing } = input;
+  const burnFirst = burnFirstWindowKinds(pacing).includes(window.kind);
   // Confirmations start again at a detected reset: one of the window before confirms nothing.
   const confirmed = track?.confirmed.at(-1);
   const confirmedMs = confirmed?.ms;
@@ -375,7 +383,7 @@ function paceWindow(
   const targetPercent =
     ceiling === null
       ? null
-      : pacing.burnFirst
+      : burnFirst
         ? ceiling
         : pacePercent === null
           ? null
@@ -387,7 +395,7 @@ function paceWindow(
   // Upstream's band (±5 points) is for the even pace only. The owner's reserve is a hard line: at
   // or over the ceiling is ahead, and while the ceiling is the target, anything under it is room.
   // So a full window is never on pace, and burning first with reserve R stops at 100 − R.
-  const ceilingBinds = pacing.burnFirst || pacePercent === null || ceiling < pacePercent;
+  const ceilingBinds = burnFirst || pacePercent === null || ceiling < pacePercent;
   const verdict: PaceVerdict =
     window.usedPercent >= ceiling
       ? "ahead"
@@ -437,6 +445,7 @@ export function paceInstance(input: PaceInput): InstancePace {
     instanceId,
     reservePercent: pacing.reservePercent,
     burnFirst: pacing.burnFirst,
+    burnFirstWindows: burnFirstWindowKinds(pacing),
     noLimits: pacing.noLimits,
   };
   if (provider === undefined) {

@@ -156,6 +156,23 @@ The key is the provider instance id, for example `codex` or `codex_work`. In the
 Fork**, section Usage pacing, one row per account by its name (an entry for an account that is gone
 is listed with **Remove**).
 
+`burnFirstWindows` limits `burnFirst` to some window kinds (`session`, `weekly`, `monthly`,
+`other`); the rest keep the even pace. An extra account that may spend its week fast but keeps its
+5-hour windows paced:
+
+```json
+{
+  "usagePacing": {
+    "<instance id>": { "burnFirst": true, "burnFirstWindows": ["weekly", "monthly"] }
+  }
+}
+```
+
+Without the list, `burnFirst` spends every window first (as before the list existed). A name that is
+not a window kind is ignored on load (that window keeps its pace; a warning is logged) and refused by
+a save. Only `settings.json` sets the list so far; `__fork-report` shows the kinds each account spends
+first under `usagePacingBurnFirstWindows`.
+
 ### `server.usagePacingGate`
 
 What happens when an agent starts a task with `delegate_task`. `"off"`: nothing, as upstream.
