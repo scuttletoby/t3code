@@ -127,6 +127,11 @@ export class PeerLinks extends Context.Service<
       environmentId: EnvironmentId,
       outcome: { readonly error: string | null },
     ) => Effect.Effect<void>;
+    /**
+     * Ends `link` here once the peer turns its token away, as an expired link:
+     * only a new pairing code brings it back. A link made again since is kept.
+     */
+    readonly recordRevoked: (link: PeerLink) => Effect.Effect<void>;
     /** Records a later end the peer gives the link's session: using a link renews it there. */
     readonly recordExpiry: (
       environmentId: EnvironmentId,
@@ -758,6 +763,20 @@ const make = Effect.gen(function* () {
       Effect.ignoreCause({ log: true }),
     );
 
+  const recordRevoked: PeerLinks["Service"]["recordRevoked"] = (link) =>
+    DateTime.now.pipe(
+      Effect.flatMap(
+        (now) => sql`
+          UPDATE peer_environment_links SET expires_at = ${DateTime.formatIso(now)}
+          WHERE environment_id = ${link.environmentId}
+            AND linked_at = ${DateTime.formatIso(link.linkedAt)}
+            AND expires_at > ${DateTime.formatIso(now)}
+        `,
+      ),
+      Effect.asVoid,
+      Effect.ignoreCause({ log: true }),
+    );
+
   const recordExpiry: PeerLinks["Service"]["recordExpiry"] = (environmentId, expiresAt) =>
     sql`
       UPDATE peer_environment_links SET expires_at = ${DateTime.formatIso(expiresAt)}
@@ -774,6 +793,7 @@ const make = Effect.gen(function* () {
     unlink,
     resolve,
     recordOutcome,
+    recordRevoked,
     recordExpiry,
   });
 });

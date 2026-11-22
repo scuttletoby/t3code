@@ -644,6 +644,33 @@ it.effect(
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("a refusal of a token replaced since leaves the new link standing", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const a = yield* makeA(laptop);
+      const now = yield* DateTime.now;
+      const relinkedAt = DateTime.add(now, { minutes: 1 });
+      yield* a.sql`
+        INSERT INTO peer_environment_links (
+          environment_id, secret_name, label, urls_json, access, linked_at, expires_at,
+          last_reached_at, last_error, fenced
+        ) VALUES (
+          ${box.environmentId}, 'peer-link-new', 'Box', '[]', 'auto',
+          ${DateTime.formatIso(relinkedAt)}, ${DateTime.formatIso(DateTime.add(now, { days: 30 }))},
+          NULL, NULL, 1
+        )
+      `;
+      const relinked = Option.getOrThrow(yield* a.links.get(box.environmentId));
+      // A call that resolved the link before it was made again hears the old token refused.
+      yield* a.links.recordRevoked({ ...relinked, linkedAt: now });
+      expect(yield* a.links.names).toEqual([{ environmentId: box.environmentId, label: "Box" }]);
+
+      yield* a.links.recordRevoked(relinked);
+      expect((yield* a.links.list).map((link) => link.status)).toEqual(["expired"]);
+    }),
+  ),
+);
+
 it.effect("tells the agent to link again once the peer revokes the link or it expires", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -658,6 +685,9 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       const revoked = yield* probe(a).pipe(Effect.flip);
       expect(revoked.code).toBe("capability_denied");
       expect(revoked.message).toContain("revoked there");
+      // Turned away there, the link is over here too, as an expired one.
+      expect((yield* a.links.list).map((link) => link.status)).toEqual(["expired"]);
+      expect(yield* a.links.names).toEqual([]);
 
       yield* a.links.link({
         url: b.url,
