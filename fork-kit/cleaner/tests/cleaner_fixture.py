@@ -190,7 +190,7 @@ class Case(unittest.TestCase):
         for name in [n for n in os.environ if n.startswith('GIT_') and n not in ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM')]:
             del os.environ[name]
         self.section = {'logFile': self.path('state', 'cleaner.log'), 'daily': {'outDir': self.path('state', 'daily')}}
-        self.merged, self.open = [], []
+        self.merged, self.closed, self.open = [], [], []
         self.busy, self.unit_names, self.locks, self.texts = set(), set(), set(), []
         self.words, self.transcript_times = set(), {}     # process environments' words; {session id: time}
         self.mount_points = {'/'}
@@ -302,7 +302,7 @@ class Case(unittest.TestCase):
 
     def facts(self, cfg, **over):
         readers = {'processes': self.processes, 'units': lambda: set(self.unit_names),
-                   'prs': lambda repo: {'merged': list(self.merged), 'open': list(self.open)},
+                   'prs': lambda repo: {'merged': list(self.merged), 'closed': list(self.closed), 'open': list(self.open)},
                    'dangling': lambda: [], 'now': self.now, 'transcripts': lambda: dict(self.transcript_times),
                    'mounts': lambda: self.c.facts.Mounts(self.mount_points, self.mount_lines, self.bind_sources, self.mount_options,
                                                          self.fstab_points, self.mount_whole, self.mount_ids,
@@ -391,12 +391,13 @@ class Case(unittest.TestCase):
         self.git(tree, 'push', '-q', '-u', 'origin', 'HEAD')
 
     def pr(self, tree, number=7, hours=48, oid=None, state='merged', base='main', fork=False, branch=None):
-        """A pull request row for the tree's branch as `gh pr list --json` prints it: merged `hours` ago, or open;
-        `fork`: its head branch is in a fork (isCrossRepository)."""
+        """A pull request row for the tree's branch as `gh pr list --json` prints it: merged `hours` ago, closed
+        without a merge `hours` ago, or open; `fork`: its head branch is in a fork (isCrossRepository)."""
         when = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self.now - hours * HOUR))
         row = {'number': number, 'headRefName': branch or self.branch(tree), 'headRefOid': oid or self.head(tree),
-               'mergedAt': when if state == 'merged' else None, 'baseRefName': base, 'isCrossRepository': fork}
-        (self.merged if state == 'merged' else self.open).append(row)
+               'mergedAt': when if state == 'merged' else None, 'baseRefName': base, 'isCrossRepository': fork,
+               'state': state.upper(), 'closedAt': None if state == 'open' else when}
+        {'merged': self.merged, 'closed': self.closed, 'open': self.open}[state].append(row)
         return row
 
     def finished(self, name='fix-1', clone=None, number=7, hours=48):

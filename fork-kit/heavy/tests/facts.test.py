@@ -120,10 +120,11 @@ class Machine:
         self.write(f'/proc/{pid}/status', f'Name:\tx\nRssAnon:\t{rss_mb * 1024} kB\nRssShmem:\t0 kB\n')
 
     def env(self, **more):
-        return dict(os.environ, HEAVY_TESTING='1', HEAVY_FACTS_ROOT=self.root, HEAVY_FACTS_CACHE=self.cache,
-                    HEAVY_QUEUE_ROOT=self.queue,
-                    HEAVY_CONFIG=os.path.join(self.tmp, 'no-config.json'), HOME=self.home,
-                    T3_CAPACITY_RESERVE_DIR=self.reserve, **more)
+        # HEAVY_FACTS_DISK_FREE_MB: the free disk t3-capacity reads (#982), 100 GB unless a test says otherwise
+        return dict(dict(os.environ, HEAVY_TESTING='1', HEAVY_FACTS_ROOT=self.root, HEAVY_FACTS_CACHE=self.cache,
+                         HEAVY_QUEUE_ROOT=self.queue,
+                         HEAVY_CONFIG=os.path.join(self.tmp, 'no-config.json'), HOME=self.home,
+                         T3_CAPACITY_RESERVE_DIR=self.reserve, HEAVY_FACTS_DISK_FREE_MB=str(100 * 1024)), **more)
 
     def close(self):
         for fd in self.held:
@@ -171,6 +172,15 @@ class Case(unittest.TestCase):
 
     def cost(self, kind):
         return RULE['kinds'][kind]['startMb']
+
+    def machine_file(self, data, mode=0o644):
+        path = self.m.root + '/etc/fork-kit/machine.json'
+        for folder in ('/etc', '/etc/fork-kit'):
+            os.makedirs(self.m.root + folder, exist_ok=True)
+            os.chmod(self.m.root + folder, 0o755)
+        with open(path, 'w') as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+        os.chmod(path, mode)
 
 
 class Ledger(Case):
@@ -899,15 +909,6 @@ class Holds(Case):
     is in use keeps its budget less its use for every other user."""
     CG = '/sys/fs/cgroup/ci.slice/ci-runners.slice'
 
-    def machine_file(self, data, mode=0o644):
-        path = self.m.root + '/etc/fork-kit/machine.json'
-        for folder in ('/etc', '/etc/fork-kit'):
-            os.makedirs(self.m.root + folder, exist_ok=True)
-            os.chmod(self.m.root + folder, 0o755)
-        with open(path, 'w') as f:
-            f.write(data if isinstance(data, str) else json.dumps(data))
-        os.chmod(path, mode)
-
     def holds(self, *holds):
         self.machine_file({'version': 1, 'heavy': {'capacity': {'holds': list(holds)}}})
 
@@ -1587,7 +1588,7 @@ def fake_heavy(tmp, body):
 
 class T3Capacity(Case):
     FIRST = r'^available=\d+MB swapfree=\d+MB load=[0-9.]+/\d+cores agents=\d+ jobs=\d+ waiting=\d+ ' \
-            r'reserved=\d+MB need=\d+MB free=-?\d+MB level=\w+ tier=\w+$'
+            r'reserved=\d+MB need=\d+MB free=-?\d+MB level=\w+ tier=\w+ disk=\d+GB(<\d+GB)?$'
 
     def test_the_mb_argument_first_line_and_exit_codes(self):
         code, out, err = self.cli([T3CAP, '1536'])
@@ -1623,6 +1624,54 @@ class T3Capacity(Case):
         self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'))
         for bad in (['x'], ['1', '2'], ['--kind']):
             self.assertEqual(self.cli([T3CAP] + bad)[0], 2, bad)
+
+    def test_free_disk_under_the_floor_is_not_ok_with_the_reason_in_the_first_line(self):
+        # #982: a disk at 97% failed a CI job with "disk full" while t3-capacity said OK. The floor is 25 GB unless
+        # the machine file's heavy.disk.floorGb says otherwise; free disk is read on the home folder's filesystem
+        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB=str(26 * 1024))
+        self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'), out)
+        self.assertTrue(out.splitlines()[0].endswith(' disk=26GB'), out)
+        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB=str(24 * 1024))
+        self.assertEqual(code, 1, out)
+        first, last = out.splitlines()[0], out.splitlines()[-1]
+        self.assertTrue(first.endswith(' disk=24GB<25GB'), first)
+        self.assertEqual(last, f'NOT OK: disk: 24 GB free on {self.m.home}, under the floor of 25 GB '
+                               '(heavy.disk.floorGb)')
+        # the same with the machine file's floor and folder; a floor of 0 is off
+        self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 40, 'path': self.work}}})
+        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB=str(30 * 1024))
+        self.assertEqual(code, 1, out)
+        self.assertTrue(out.splitlines()[0].endswith(' disk=30GB<40GB'), out)
+        self.assertIn(f'30 GB free on {self.work}, under the floor of 40 GB', out.splitlines()[-1])
+        self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 0}}})
+        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB='1')
+        self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'), out)
+
+    def test_a_disk_it_cannot_read_or_a_broken_disk_setting_is_never_ok(self):
+        self.machine_file({'version': 1, 'heavy': {'disk': {'path': os.path.join(self.tmp, 'not-there')}}})
+        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB='')
+        self.assertEqual(code, 1, out)
+        self.assertTrue(out.splitlines()[0].endswith(' disk=?'), out)
+        self.assertRegex(out.splitlines()[-1], r'^NOT OK: disk: cannot read the free space of .*not-there')
+        for bad in ({'floorGb': -1}, {'floorGb': '25'}, {'path': 'relative/folder'}, {'floor': 25}):
+            with self.subTest(bad=bad):
+                self.machine_file({'version': 1, 'heavy': {'disk': bad}})
+                code, out, _ = self.cli([T3CAP, '64'])
+                self.assertEqual(code, 1, out)
+                self.assertIn('heavy.disk', out.splitlines()[-1])
+
+    def test_a_floor_of_0_is_off_and_reads_no_disk(self):
+        # floorGb 0 turns the floor off: the disk is not read, so a path it cannot read is no NOT OK either
+        missing = os.path.join(self.tmp, 'not-there')
+        self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 0, 'path': missing}}})
+        code, out, _ = self.cli([T3CAP, '64'], HEAVY_FACTS_DISK_FREE_MB='')
+        self.assertEqual((code, out.splitlines()[-1]), (0, 'OK'), out)
+        self.assertTrue(out.splitlines()[0].endswith(' disk=off'), out)
+
+    def test_a_disk_setting_is_no_unknown_key_for_the_rest_of_the_kit(self):
+        self.machine_file({'version': 1, 'heavy': {'disk': {'floorGb': 25}}})
+        self.assertEqual(self.facts('--fresh')[0], 0, 'heavy facts accepts the section with a disk key')
+        self.assertIsNone(hf.ready(hq), 'heavy\'s own check before a job too')
 
     def test_a_not_ok_holds_20_s_for_the_same_question(self):
         # #861: the check flipped OK / NOT OK within seconds, so "check, then start" could start work just before it

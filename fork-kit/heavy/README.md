@@ -667,7 +667,12 @@ Two thin callers come with it:
 - `bin/t3-capacity [--kind KIND] [MB]`: the older host check's output (first line `available=..MB swapfree=..MB
   load=..`, available less the rule's whole reservation hold, `reserved=` what admitted jobs and agents may still
   grow into (so `available - reserved` counts each once), last line `OK` or `NOT OK: why`, exit 0 or 1), now
-  from `heavy facts`. MB defaults to 3072. The installer links `/usr/local/bin/t3-capacity` to it, so the command
+  from `heavy facts`. MB defaults to 3072. **Disk floor (#982):** the first line ends with `disk=<GB>GB`, the free
+  disk of the work filesystem (`heavy.disk.path`, the home folder by default; what this user may still write). Under
+  `heavy.disk.floorGb` (25 GB by default; 0 turns it off: the disk is not read at all and the first line ends with
+  `disk=off`) it is NOT OK, and the reason is in the first line too (`disk=12GB<25GB`) as well as the last
+  (`NOT OK: disk: 12 GB free on /home/u, under the floor of 25 GB (heavy.disk.floorGb)`, the memory's reason after it when that is NOT OK as well). A disk it cannot read
+  (`disk=?`) or a broken `heavy.disk` is NOT OK too, naming it. The disk is read on each call: no hold, no cache. The installer links `/usr/local/bin/t3-capacity` to it, so the command
   has one source, the release in use (a host's own plain copy there only with `--replace-t3-capacity`: Install,
   below); `heavy --self-check` warns when the `t3-capacity` found on PATH is another copy (its readings can differ:
   an older copy, for one, counts no reservations). **A NOT OK holds 20 s** for the same question (kind and MB): an
@@ -714,6 +719,21 @@ for one and not for the other. A machine with the kit from before the swap trend
   value, a `user.slice` cgroup, a label twice, a cgroup in or the same as another hold's, more than 8 holds,
   writable by others): `heavy facts` gives no answer, so
   `t3-capacity` says `NOT OK` naming the key. A changed file is read again at once (the cache key holds it).
+
+### Settings: the machine file's `heavy.disk`
+
+```json
+"heavy": { "disk": { "floorGb": 25, "path": "~" } }
+```
+
+| Key       | Default | What                                                                                   |
+| --------- | ------- | -------------------------------------------------------------------------------------- |
+| `floorGb` | 25      | `t3-capacity` is NOT OK with less free disk than this (GB); 0: no floor, disk not read |
+| `path`    | `~`     | a folder on the work filesystem (absolute, or `~` / `~/...`: the caller's home folder) |
+
+Runs again: each call reads the disk afresh, so a freed disk is OK on the next call. Old or empty state: a machine
+file without `disk` gets the defaults; the sweep, the queue and `heavy facts` accept the key and leave it to
+`t3-capacity`.
 
 ### Settings: the machine file's `heavy.capacity`
 

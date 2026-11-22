@@ -98,6 +98,40 @@ class Worktrees(Case):
         with self.assertRaises(machine_file.MachineFileError):
             self.cfg(worktrees={'mergedHours': 23})
 
+    def closed_tree(self, name='fix-1', number=7, hours=48):
+        """A worktree whose one commit is pushed and whose pull request was closed without a merge `hours` ago."""
+        clone = self.path('trees', 'base') if os.path.isdir(self.path('trees', 'base')) else self.clone('base')
+        tree = self.worktree(clone, name)
+        self.commit(tree)
+        self.push(tree)
+        self.pr(tree, number, hours, state='closed')
+        return tree
+
+    def test_a_pull_request_closed_without_a_merge_finishes_it_too(self):
+        # #982: a closed pull request's head stays on GitHub (refs/pull/N/head) and the branch stays in the clone, so
+        # its worktree holds nothing that is only here once the same checks pass
+        tree = self.closed_tree()
+        cfg = self.repo_cfg()
+        item = self.assertDeletes(self.plan(cfg), tree, 'worktrees')
+        self.assertIn('#7 closed 2 days ago', item.why)
+        code, lines = self.run_cleaner(cfg)
+        self.assertEqual(code, 0, lines)
+        self.assertFalse(os.path.exists(tree))
+        code, lines = self.run_cleaner(cfg)                     # runs again: nothing left to do
+        self.assertEqual((code, [line for line in lines if line.startswith('deleted ')]), (0, []))
+
+    def test_a_closed_pull_request_keeps_what_a_merged_one_keeps(self):
+        young, later = self.closed_tree('young', number=1, hours=23), self.closed_tree('later', number=2)
+        changed, fork = self.closed_tree('changed', number=3), self.closed_tree('fork', number=4)
+        self.commit(later, 'after-the-close.txt')
+        self.file(os.path.join(changed, 'README.md'), 'half done\n')
+        self.closed[-1]['isCrossRepository'] = True
+        plan = self.planned()
+        self.assertKept(plan, young, 'closed under 24 h ago', '#1')
+        self.assertKept(plan, later, 'commits not in the closed PR', '#2')
+        self.assertKept(plan, changed, 'uncommitted or untracked')
+        self.assertKept(plan, fork, 'no merged PR', 'no merged or closed pull request')
+
     def test_a_merge_time_it_cannot_read_keeps_it(self):
         tree = self.finished()
         self.merged[0]['mergedAt'] = 'yesterday'
@@ -401,7 +435,7 @@ class Worktrees(Case):
 
         def prs(repo):
             reads.append(repo)
-            return {'merged': list(self.merged), 'open': list(self.open)}
+            return {'merged': list(self.merged), 'closed': list(self.closed), 'open': list(self.open)}
         code, lines = self.run_cleaner(cfg, prs=prs)
         self.assertEqual(code, 0, lines)
         self.assertEqual(reads, [fx.REPO] * 3)                  # the plan, then the last check of each of the two
@@ -816,6 +850,19 @@ class Clones(Case):
         self.assertEqual(code, 0, lines)
         self.assertFalse(os.path.exists(clone))
 
+    def test_a_closed_pull_request_whose_branch_github_deleted_finishes_the_clone(self):
+        # #982: a pull request closed without a merge keeps its head on GitHub (refs/pull/N/head) after its branch is
+        # deleted there, so that head counts as on GitHub: the clone holds nothing that is only here
+        clone = self.clone('base')
+        self.git(clone, 'checkout', '-q', '-b', 'base-work')
+        self.commit(clone)
+        self.push(clone)
+        self.pr(clone, 20, state='closed')
+        self.git(self.origin(), 'branch', '-q', '-D', 'base-work')
+        item = self.assertDeletes(self.planned(), clone, 'worktrees')
+        self.assertEqual(item.kind, 'clone')
+        self.assertIn('#20 closed 2 days ago', item.why)
+
     def test_a_clone_goes_only_after_its_worktrees(self):
         clone = self.finished_clone()
         tree = self.finished(clone=clone)
@@ -983,10 +1030,14 @@ class Clones(Case):
 
 class GitHub(Case):
     """The reader of the pull request lists (facts.github_prs), against a stub `gh`."""
-    ROWS = {'merged': [{'number': 7, 'headRefName': 'fix-1', 'headRefOid': 'a' * 40, 'mergedAt': '2026-01-02T03:04:05Z',
-                        'baseRefName': 'main', 'isCrossRepository': False}],
+    MERGED = {'number': 7, 'headRefName': 'fix-1', 'headRefOid': 'a' * 40, 'mergedAt': '2026-01-02T03:04:05Z',
+              'baseRefName': 'main', 'isCrossRepository': False, 'state': 'MERGED', 'closedAt': '2026-01-02T03:04:05Z'}
+    CLOSED = {'number': 9, 'headRefName': 'fix-3', 'headRefOid': 'c' * 40, 'mergedAt': None,
+              'baseRefName': 'main', 'isCrossRepository': False, 'state': 'CLOSED', 'closedAt': '2026-01-03T03:04:05Z'}
+    # what `gh pr list --state closed` prints: the merged and the closed ones (#982)
+    ROWS = {'closed': [MERGED, CLOSED],
             'open': [{'number': 8, 'headRefName': 'fix-2', 'headRefOid': 'b' * 40, 'mergedAt': None,
-                      'baseRefName': 'main', 'isCrossRepository': True}]}
+                      'baseRefName': 'main', 'isCrossRepository': True, 'state': 'OPEN', 'closedAt': None}]}
 
     def gh(self, state):
         exe, self.state = self.stub('gh', fx.STUB_GH, state)
@@ -994,21 +1045,27 @@ class GitHub(Case):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def test_it_reads_merged_and_open_pull_requests_of_the_listed_repository(self):
+    def test_it_reads_merged_closed_and_open_pull_requests_of_the_listed_repository(self):
         self.gh(self.ROWS)
-        self.assertEqual(self.c.facts.github_prs(fx.REPO), self.ROWS)
+        self.assertEqual(self.c.facts.github_prs(fx.REPO),
+                         {'merged': [self.MERGED], 'closed': [self.CLOSED], 'open': self.ROWS['open']})
         calls = self.calls(self.state)
-        self.assertEqual(sorted(c[c.index('--state') + 1] for c in calls), ['merged', 'open'])
+        self.assertEqual(sorted(c[c.index('--state') + 1] for c in calls), ['closed', 'open'], 'still two lists')
+        self.assertTrue(all('state' in c[c.index('--json') + 1].split(',') for c in calls))
         for call in calls:
             self.assertEqual(call[:2], ['pr', 'list'])
             self.assertEqual(call[call.index('-R') + 1], fx.REPO)
 
     def test_no_answer_or_a_strange_answer_means_keep(self):
         for state in ({'fail': True}, {'raw': 'not json'}, {'raw': '{"message": "rate limited"}'},
-                      {'merged': [{'number': 7}], 'open': []}, {'merged': [], 'open': ['x']},
-                      {'merged': [{**self.ROWS['merged'][0], 'headRefOid': 'HEAD; rm'}], 'open': []},
-                      {'merged': [{**self.ROWS['merged'][0], 'isCrossRepository': 'no'}], 'open': []},
-                      {'merged': [{**self.ROWS['merged'][0], 'baseRefName': None}], 'open': []}):
+                      {'closed': [{'number': 7}], 'open': []}, {'closed': [], 'open': ['x']},
+                      {'closed': [{**self.MERGED, 'headRefOid': 'HEAD; rm'}], 'open': []},
+                      {'closed': [{**self.MERGED, 'isCrossRepository': 'no'}], 'open': []},
+                      {'closed': [{**self.MERGED, 'baseRefName': None}], 'open': []},
+                      {'closed': [{**self.MERGED, 'mergedAt': None}], 'open': []},
+                      {'closed': [{**self.CLOSED, 'closedAt': None}], 'open': []},
+                      {'closed': [{**self.CLOSED, 'state': 'OPEN'}], 'open': []},
+                      {'closed': [], 'open': [{**self.ROWS['open'][0], 'state': 'MERGED'}]}):
             with self.subTest(state=state):
                 self.gh(state)
                 with self.assertRaises(self.c.facts.Unreadable):
@@ -1017,7 +1074,7 @@ class GitHub(Case):
         self.assertKept(self.planned(prs=self.c.facts.github_prs), tree, 'could not read', 'GitHub')
 
     def test_a_list_that_may_be_cut_off_means_keep(self):
-        self.gh({'merged': self.ROWS['merged'], 'open': self.ROWS['open'] * 3})
+        self.gh({'closed': self.ROWS['closed'], 'open': self.ROWS['open'] * 3})
         with mock.patch.object(self.c.facts, 'PR_LIMIT', 3):
             with self.assertRaises(self.c.facts.Unreadable):
                 self.c.facts.github_prs(fx.REPO)
@@ -1029,7 +1086,12 @@ MUTATIONS = {
     'open PR': ('rules', 'if opened:', 'if False:', Worktrees, 'test_an_open_pull_request_keeps_it'),
     'orphaned worktree': ('rules', "gone = orphaned_worktree(path) if kind == 'worktree' else None", 'gone = None',
                           Worktrees, 'test_a_worktree_whose_main_repository_is_gone_is_kept_as_orphaned'),
-    'no merged PR': ('rules', 'if not merged:', 'if False:', Worktrees, 'test_no_merged_pull_request_keeps_it'),
+    'no merged PR': ('rules', 'if not ended:', 'if False:', Worktrees, 'test_no_merged_pull_request_keeps_it'),
+    'closed PR: finishes it': ('rules', "if row['headRefName'] == branch and not row['isCrossRepository']]\n    if not ended",
+                               "if row['headRefName'] == branch and not row['isCrossRepository'] and word == 'merged']\n    if not ended",
+                               Worktrees, 'test_a_pull_request_closed_without_a_merge_finishes_it_too'),
+    'closed PR: under a day': ('rules', "return Refusal(f'{word} under", "return None and (f'{word} under", Worktrees,
+                               'test_a_closed_pull_request_keeps_what_a_merged_one_keeps'),
     'merged under 24 h ago': ('rules', 'if age < cfg.merged_hours * 3600:', 'if False:', Worktrees, 'test_merged_less_than_a_day_ago_keeps_it'),
     'the 24 h floor': ('config', "'mergedHours': (int, MIN_MERGED_HOURS, _at_least(MIN_MERGED_HOURS))", "'mergedHours': (int, MIN_MERGED_HOURS, None)",
                        Worktrees, 'test_merged_less_than_a_day_ago_keeps_it'),
@@ -1082,6 +1144,9 @@ MUTATIONS = {
     'clone: a live answer, not tracking refs': ('rules', 'has = sorted(here | present(path, refs.values()))',
                                                 "has = sorted(here | present(path, refs.values())) + ['--remotes']",
                                                 Clones, 'test_a_commit_only_a_stale_tracking_ref_names_keeps_the_clone'),
+    'clone: a closed PR head is on GitHub': ('rules', "for row in prs['merged'] + prs['closed'] + prs['open']]",
+                                             "for row in prs['merged'] + prs['open']]", Clones,
+                                             'test_a_closed_pull_request_whose_branch_github_deleted_finishes_the_clone'),
     'clone: tags': ('rules', 'if missing:', 'if False:', Clones, 'test_tags_github_does_not_have_keep_the_clone'),
     'clone: reflog commits': ('rules', "lonely(path, ['--all', '--reflog'], has)", "lonely(path, ['--all'], has)", Clones, 'test_a_commit_only_a_reflog_still_has_keeps_the_clone'),
     'delete: a worktree still the one the last check judged': ('rules', 'if item.look is None or (st.st_dev, st.st_ino) != item.look.ident:',
@@ -1108,7 +1173,7 @@ MUTATIONS = {
     'the default branch: GitHub HEAD only': ('facts', "and line.endswith('\\tHEAD')", '', Clones,
                                                    'test_only_githubs_own_head_names_the_default_branch'),
     'GitHub: a failed gh': ('facts', 'if done.returncode != 0:  # gh', 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
-    'GitHub: a strange row': ('facts', 'if not valid_pr(row, state):', 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
+    'GitHub: a strange row': ('facts', "if not (isinstance(row, dict) and row.get('state') in PR_STATES[state] and valid_pr(row, row['state'])):", 'if False:', GitHub, 'test_no_answer_or_a_strange_answer_means_keep'),
     'used: kept when used': ('rules', 'if age < cfg.used_hours * 3600:', 'if False:', Used, 'test_a_worktree_used_in_the_last_day_is_kept'),
     'used: the git files a command writes': ('rules', 'for name in USE_MARKS:', 'for name in ():', Used, 'test_each_sign_of_use_keeps_it'),
     'used: the reflog lines': ('rules', "when = reflog_newest(os.path.join(git_dir, 'logs', 'HEAD'))", 'when = 0.0', Used,

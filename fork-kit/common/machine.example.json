@@ -19,7 +19,8 @@
     },
     "capacity": {
       "holds": [{ "label": "ci-slice", "cgroup": "ci.slice/ci-runners.slice", "users": ["ci-*"] }]
-    }
+    },
+    "disk": { "floorGb": 25, "path": "~" }
   },
   "golive": {
     "home": "/srv/example/t3-home",
@@ -94,6 +95,7 @@
     "agentScratch": { "enabled": true, "days": 3 },
     "compressCold": { "folders": [{ "path": "~/.codex/sessions", "days": 30 }] },
     "dedupe": { "folders": [{ "path": "~/mirrors", "days": 30 }], "writtenInPlace": [] },
+    "report": { "warnFreeGB": 60 },
     "daily": {
       "mode": "compare",
       "oldTimers": ["example-retention.timer"],
