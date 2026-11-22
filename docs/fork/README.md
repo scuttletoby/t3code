@@ -779,11 +779,39 @@ servers it names, written as Claude lists them (`claude.ai Calendar`). T3's own 
 thread whose profile cannot be applied does not start its turn and says why: a missing or broken
 profile, a parent thread that cannot be read, a `settings.json` T3 cannot read (when only a
 provider secret cannot be read, the profile comes from `settings.json` alone and the server log
-says so; with no profile set there, the thread gets `all` as before), a profile whose
-`t3Tools` is not `"all"` (the T3 tool filter comes in a later pull request), or a session that
+says so; with no profile set there, the thread gets `all` as before), or a session that
 still shows a server the profile leaves out, or does not list its servers within 5 minutes. A
 managed Claude policy on the machine or `--mcp-config` in the Claude launch arguments can make
 Claude load a server T3's list leaves out.
+
+Every thread applies the profile's `t3Tools`, on any provider: T3's own MCP server judges each
+request of the thread's MCP credential. A T3 tool outside the profile's groups is left out of
+`tools/list`, left out of `tool_search`'s results, and refused when called, with a plain reason and
+its fix (the call gets a JSON-RPC error: ask the owner to add the group to the profile, or to pick
+a profile that has it). The server matches a call by the tool's exact name, and refuses a JSON-RPC
+batch whole, so no other way reaches it. `request_secret`, `send_to_user` and `tool_search` stay in
+every profile, and `[]` keeps only them. A tool in no group is refused by any profile but `all`,
+and the refusal says that is a T3 bug to report (no setting fixes it); a test keeps every T3 tool
+in exactly one group, and every group with a toolkit. The groups are fixed as each turn starts (as a Claude query opens, or as a turn
+on another provider starts, also a resumed turn and a compaction): a running turn, and a message
+sent into it, keep the set it started with, and a change applies from the thread's next turn. A
+Claude thread whose groups changed starts a fresh Claude process for its next turn (resumed), so
+Claude lists T3's tools again; that costs one prompt-cache miss. Another provider may keep the
+list it read before: a tool it still shows is refused when called, and one newly kept is there the
+next time it lists. The sets live in the server's memory, one per thread, not per credential (a
+credential reused after a change gets the thread's new set from its next turn): after a restart, or for a thread
+whose session lists its tools before its first turn, the set is worked out from the settings at
+the first request. A thread whose profile cannot be worked out (a missing or broken profile, a
+parent that cannot be read, settings that cannot be read, a thread T3 cannot read because it was
+deleted) keeps only the tools every profile keeps and is told why, never `all`. A delegated child
+is cut down to its parent's groups like its servers, so it never gets more. Clients from outside
+a thread (signed in with OAuth) have no profile.
+
+Profiles are not a sandbox. Only requests that come from a thread are filtered: a request with no
+thread (an OAuth client, the `t3 thread` CLI, a script run from a shell with the owner's access)
+gets every T3 tool. So a profile limits what an agent is offered and may call as its thread, not
+what an agent with a shell can reach. A thread that keeps the `orchestration` group can also ask a
+wider thread to act for it (`t3_thread_send`).
 
 A thread whose profile is narrower than `all` cannot start a top-level thread on this machine that
 gets more than its own profile ([#681](https://github.com/scuttletoby/t3code/issues/681)).
@@ -859,9 +887,9 @@ forwards it. A thread bound while a save is being made (the task's first run bin
 made, or another thread binding the task to itself) is kept by that save and not checked against
 it ([#719](https://github.com/scuttletoby/t3code/issues/719)): the first run's thread gets the
 project's profile the save was checked on, and a thread that binds the task to itself is one a
-narrowed thread can already send words to (`t3_thread_send`, as T3's own tools cannot be cut yet).
-A change that lets profiles cut T3's own tools (today `claudeMcpProfile.ts` refuses `t3Tools`
-other than `all`) must revisit this: then such a bind is a way to a wider run.
+narrowed thread can already send words to: `schedule_task` and `t3_thread_send` are both in the
+`orchestration` T3 tool group, so a profile that keeps one keeps the other, and a profile without
+it can do neither.
 An owner-made task that a narrowed thread changed runs as the owner's again if its entry is dropped
 from the file, which takes owner-level access to the state folder. Entries of deleted tasks are
 dropped at each start.
@@ -888,8 +916,7 @@ fails is stopped, the goal is paused, and the turn ends failed with the reason. 
 check when the profile was narrowed while Codex had the thread loaded (Codex reads a thread's
 config only as it loads it, so the change counts once it loads the thread again: after it has been
 idle a while, or after T3 restarts) and for a server a Codex plugin adds, which T3 cannot switch off
-this way. A turn is also refused when the profile is missing or broken, its `t3Tools` is not
-`"all"`, Codex's servers cannot be listed, a server's name cannot be written as a config key, the
+this way. A turn is also refused when the profile is missing or broken, Codex's servers cannot be listed, a server's name cannot be written as a config key, the
 thread is not in T3's store, or (once any thread on that app-server has a narrower profile) Codex
 asks to load or run a thread T3 cannot match to one of its own. Codex answers the server list only
 once the thread's servers have started, and T3 waits up to 30 seconds for each read: a kept server
@@ -898,14 +925,18 @@ refused (for example a read failed once), T3 does not move the thread to a fresh
 which would lose its history: the turn fails, and sending it again resumes the thread. A thread on
 `all` sends Codex nothing extra, but T3 still works out its profile from the settings and the
 thread store at each load and turn, so a thread missing from the store refuses there too. A turn already running when the profile is narrowed keeps its servers
-until it ends.
+until it ends. A Codex thread's T3 tool groups are cut on T3's own server, as on every provider
+(above); each Codex turn fixes them as it starts, also one Codex starts on its own (a goal's next
+turn, a sub-agent's turn, which uses its parent's T3 thread).
 
-Only Claude and Codex threads apply profiles. A thread on any other provider would get every
-MCP server and every T3 tool whatever its profile says. So its turn is not started when its profile
-is narrower than `all` ([#672](https://github.com/scuttletoby/t3code/issues/672)): the machine that
+Only Claude and Codex threads apply a profile's outside servers. A thread on any other provider
+would get every outside MCP server whatever its profile says (T3's own tool groups apply on every
+provider, above). So its turn is not started when its profile leaves out any outside server
+([#672](https://github.com/scuttletoby/t3code/issues/672)): the machine that
 runs the turn checks the thread's profile as the turn starts (also a resumed turn, and a compaction,
 which some providers run as a `/compact` prompt) and refuses it, saying why and how to go on (switch
-the thread to a Claude or Codex instance, or pick `all` for it). That covers every way a thread gets there: a
+the thread to a Claude or Codex instance, or pick `all`, or a profile whose servers are `"all"`, for
+it). A profile whose `servers` is `"all"` and whose `t3Tools` is a list runs on every provider. That covers every way a thread gets there: a
 thread switched to another provider (`t3_thread_configure`, or in the app), a thread made by
 `t3_thread_launch` in a project whose profile is narrower, a task delegated on this machine (a child
 gets its parent's profile, or `mcpSubagentProfile`), and a task another machine sent, also one from
@@ -918,7 +949,8 @@ reads as the provider keeps it (its status and capabilities stay live). One chan
 thread: a turn on another provider refuses when the profile cannot be worked out (the cases above),
 where it used to run, and the settings are read for each such turn. A delegation also refuses,
 before anything is sent, a narrower profile to a Codex (or other non-Claude) instance on another
-machine (see below), so the task is not made only to be refused there.
+machine (see below), so the task is not made only to be refused there; that holds also for a
+profile that only cuts T3 tools, as the other machine may run a T3 from before the T3 tool filter.
 
 Each tool call is checked too: a call to an MCP server the profile leaves out (also one an agent
 file declares, or one added while the session runs) is refused at the moment of the call: Claude

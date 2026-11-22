@@ -66,8 +66,8 @@ export type McpT3ToolGroup = (typeof MCP_T3_TOOL_GROUPS)[number];
 
 /**
  * T3 tools every profile keeps, in no group: the two message tools, and `tool_search`, which only
- * finds tools the thread may already use (the T3 tool filter, a later PR, leaves the others out of
- * its results).
+ * finds tools the thread may already use (the server's T3 tool filter leaves the others out of its
+ * results).
  */
 export const MCP_T3_UNGROUPED_TOOLS: ReadonlyArray<string> = [
   "request_secret",
