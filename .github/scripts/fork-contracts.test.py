@@ -1613,6 +1613,12 @@ SWEEP_WITH = {"reset_record": "${{ inputs.reset_record == true }}"}
 SWEEP_CONCURRENCY = {"group": "fork-secret-sweep-${{ github.ref }}", "cancel-in-progress": False}
 
 
+def same_group(group, *others):
+    """True when GROUP is one of OTHERS, spaces aside (`${{ github.ref }}` and `${{github.ref}}` are one group)."""
+    key = lambda g: re.sub(r"\s+", "", str(g))
+    return any(o is not None and key(group) == key(o) for o in others)
+
+
 def sweep_problems(wfs):
     """fork-secret-sweep.yml: the daily and manual sweep, a call of the scan workflow that only
     reads, and one alert job after it, whatever its result, that hands that result to
@@ -1669,6 +1675,11 @@ def sweep_problems(wfs):
         conc = job.get("concurrency")
         if not (isinstance(conc, dict) and conc.get("group") and conc.get("cancel-in-progress") is False):
             problems.append(f"{SWEEP_FILE}/{j}: no concurrency group that queues (two sweeps at once would each open an issue)")
+        elif same_group(conc["group"], SWEEP_CONCURRENCY["group"], (sweep.get("concurrency") or {}).get("group")):
+            # A job group equal to its own run's workflow group: GitHub sees a deadlock and cancels the
+            # job, so a failed sweep would alert no one (#791).
+            problems.append(f"{SWEEP_FILE}/{j}: its concurrency group is the workflow's (GitHub cancels the alert "
+                            "as a deadlock)")
         for step in job.get("steps") or []:
             run = " ".join(str(step.get("run", "")).split())
             if "fork-run-alert.sh" not in run:
@@ -1980,6 +1991,10 @@ for label, mutate in {
         "group", "fork-secret-sweep-${{ github.run_id }}"),
     "a sweep whose concurrency group is the alert's": lambda w: w[SWEEP_FILE]["concurrency"].__setitem__(
         "group", "fork-secret-sweep-alert"),
+    "an alert whose concurrency group is the sweep's (a deadlock: GitHub cancels the alert)": lambda w: w[SWEEP_FILE][
+        "jobs"]["alert"]["concurrency"].__setitem__("group", "fork-secret-sweep-${{ github.ref }}"),
+    "an alert whose concurrency group is the sweep's, spaced otherwise": lambda w: w[SWEEP_FILE][
+        "jobs"]["alert"]["concurrency"].__setitem__("group", "fork-secret-sweep-${{github.ref}}"),
     "an alert whose concurrency cancels a running one": lambda w: w[SWEEP_FILE]["jobs"]["alert"]["concurrency"].__setitem__(
         "cancel-in-progress", True),
     "an alert that may fail quietly": lambda w: w[SWEEP_FILE]["jobs"]["alert"].__setitem__("continue-on-error", True),
