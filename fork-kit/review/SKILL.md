@@ -35,7 +35,7 @@ A project with its own tier names maps them onto these three in its rules (for e
 critical). A project with **no CI** (no queue config) has no gate: every change is normal with one lens, by hand.
 
 ```
-python3 -I fork-kit/review/lib/review_kit.py plan --root <checkout> --base origin/main
+python3 -I fork-kit/review/lib/review_kit.py plan --root <checkout> [--settings <file>] --base origin/main
 ```
 
 Run the kit from a fork checkout at the release the project's gate pins (README.md, "Which fork version"). A project
@@ -155,8 +155,9 @@ A lens with no prompt file of its own (the fallback lens `review`) uses this tex
 > full and what they call into. Find bugs at their root: the unhappy branch of every `if`, error paths, empty and
 > bounds, and where else the same pattern occurs. Answer the state question on a `state:` line: _<state question>_
 > Every finding needs file:line and inputs or state leading to the wrong result. Post one comment in the format of
-> §6, the header first. Check it with `review_kit.py check --head <sha>` before posting (a blocker or major exits 1 by
-> design: post it as found, never softened); never edit a posted comment (post a new one).
+> §6, the header first. Check it with `review_kit.py check [--settings <file>] --head <sha>` before posting (a
+> blocker or major exits 1 by design: post it as found, never softened); never edit a posted comment (post a new
+> one).
 
 ## 5. Who runs what
 
@@ -189,7 +190,7 @@ but every report keeps the `state:` line. The sha is `git rev-parse HEAD` of the
 Templates in briefs write `<sha>`, never a real one. Check before posting:
 
 ```
-python3 -I fork-kit/review/lib/review_kit.py check --root <checkout> --head <sha> comment.md
+python3 -I fork-kit/review/lib/review_kit.py check --root <checkout> [--settings <file>] --head <sha> comment.md
 ```
 
 Exit 0 only for a read of that head with a findings section, no blocker or major, and a state line; otherwise exit 1,

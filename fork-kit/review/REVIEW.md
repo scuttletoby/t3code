@@ -68,8 +68,8 @@ Optional: `.github/review-kit.json`. No file means the defaults. Every key is op
 
 [review-kit.example.json](review-kit.example.json) shows one. An empty file, an unknown key or a wrong value is
 refused with a plain message naming every problem, so a typo never turns into a silent default. A project that keeps
-the file under another name (the fork: `.github/fork-review-kit.json`, beside its `.github/fork-pr-queue.json`) gives
-it with `--settings <file>` to every `plan` and `check`.
+the file under another name gives it with `--settings <file>` to every `plan` and `check`; without it, a plan that
+finds no queue config names any `.github/*review-kit*.json` it sees as the likely missing `--settings`.
 
 **This file or T3's review rules setting:** T3 has a per-machine setting for the same runners (`server.reviewRules`
 and `projectOverride.reviewRules`, docs/fork/README.md). Nothing in T3 reads it yet, so today this file decides. Once

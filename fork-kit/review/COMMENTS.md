@@ -9,7 +9,8 @@ page shows the format with examples. The rules themselves are the gate's code an
 
 Every example below is checked: `tests/comments.test.py` feeds each one through the gate's own parser (`lens.py`,
 `review_judge.py`) and fails when the gate reads it differently from what the line above it says. To check a comment
-of your own before posting it: `python3 -I fork-kit/review/lib/review_kit.py check --head <sha> comment.md`.
+of your own before posting it: `python3 -I fork-kit/review/lib/review_kit.py check [--settings <file>] --head <sha>
+comment.md` (`--settings` when the project's kit settings are not at `.github/review-kit.json`).
 
 The examples use the override prefix `tool ready --head`. A project's prefix is `override.prefix` in its queue config.
 
