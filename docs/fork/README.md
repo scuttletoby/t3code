@@ -772,19 +772,32 @@ file (light 384 MB, writer 768 MB), and an agent's kind comes from its task `rol
 `review` and `design` are light, anything else or no role is a writer). A role can be wrong: a
 running agent that uses more than a light cost counts as a writer, and so does one whose memory
 cannot be read, whatever its role (it is taken to use a light cost already, so it is never counted
-twice). The floors (2 agents, 1 job) always start, whatever the readings, unless real readings say
+twice). So where agent memory cannot be read, every agent counts as a writer (768 MB, of which 384
+are taken as in use): on macOS, Windows and Linux without systemd, and for Codex threads, which
+share one scope, that caps writers at about 2 to 4 on a small machine. It is the strict side, by
+design. The floors (2 agents, 1 job) always start, whatever the readings, unless real readings say
 "severe". The agent ceiling is 3 per core, at most 64, only on Linux with cgroup v2, agents in their
 own scopes and the kernel's OOM counter; anywhere else it stays at 10 agents and 4 jobs. After an
-OOM kill (`oom_kill` in `/proc/vmstat` rises) or with swap under 10% free and filling, the gate falls
-back to at most 10 agents and 4 jobs. A kill inside an agents' slice also raises each agent cost by
-25% (a kill elsewhere, such as a build box at its own cap, does not; where the slices cannot be
-read, at most 2 raises). Ten minutes of calm, whole readings lift the fallback and take one raise
-off; each further calm spell takes off one more. The gate reads the machine every 30 seconds as
-well as at each ask. A restarted server starts in the fallback and at "elevated", which lifts
-after about a minute of calm readings (no stall, memory above the margin, swap not filling: swap
-that is full of old pages does not count). Readings that fail count as "elevated": the floors still
-start, and after 2 minutes without a whole reading agents are counted against the fixed 10 until one
-comes back. Settings that cannot be read give the fixed 10 too (with a warning), never no limit.
+OOM kill (`oom_kill` in `/proc/vmstat` rises) or with swap under 10% free and filling, the gate
+falls back to at most 10 agents and 4 jobs. Swap is "filling" when its free MB fell by more than the
+rule's `swapFillingMb` since the reading it compares with: that reading is kept, and replaced by a
+newer one only once it is at least 25 seconds old, so a burst of asks a second apart never hides
+slow filling. Only the kernel's own OOM kills count: a killer that runs as a program (earlyoom,
+systemd-oomd) moves no counter, so its kills trip nothing and raise nothing (the next readings still
+see the memory it freed). A kill inside an agents' slice also raises each agent cost by 25% (a kill
+elsewhere, such as a build box at its own cap, does not; where the slices cannot be read, at most 2
+raises). Ten minutes of calm, whole readings lift the fallback and keep the raises (so kills about
+11 minutes apart keep their raise); each further calm spell takes off one. The gate reads the
+machine every 30 seconds as well as at each ask. A restarted server starts in the fallback and at
+"elevated", which lifts after about a minute of calm readings (no stall, memory above the margin,
+swap not filling: swap that is full of old pages does not count). Readings that fail count as
+"elevated": the floors still start, and after 2 minutes without a whole reading agents are counted
+against the fixed 10 until one comes back. A reading that fails, or one with a part that cannot be
+read (a box's pressure file), after the level was "ok" lifts again like a start (memory above the
+margin, not 150 % of it), so it never keeps the gate "elevated" for good; while the level is up from
+pressure seen, such a reading keeps the 150 % bar. A reading of the 30-second timer that fails or
+crashes is logged and the timer goes on. Settings that cannot be read give the fixed 10 too (with a
+warning), never no limit.
 Typed limits (`maxPerMachine`, ...) still apply while `enabled`. Without `mode`, a
 switched-on gate is `"fixed"` (a file from an older build decides exactly as before) and a
 switched-off one is `"enforce"`; a mode this build does not know (from a newer build) is `"fixed"`.
@@ -833,11 +846,17 @@ Claude thread whose groups changed starts a fresh Claude process for its next tu
 Claude lists T3's tools again; that costs one prompt-cache miss. Another provider may keep the
 list it read before: a tool it still shows is refused when called, and one newly kept is there the
 next time it lists. The sets live in the server's memory, one per thread, not per credential (a
-credential reused after a change gets the thread's new set from its next turn): after a restart, or for a thread
+credential reused after a change gets the thread's new set from its next turn), at most 4096 of
+them: past that, the thread that went longest without a turn loses its set, and its next request
+works it out again from the settings as they are then, so a change made since applies to it within
+its running turn (never wider than the settings). After a restart, or for a thread
 whose session lists its tools before its first turn, the set is worked out from the settings at
 the first request. A thread whose profile cannot be worked out (a missing or broken profile, a
 parent that cannot be read, settings that cannot be read, a thread T3 cannot read because it was
-deleted) keeps only the tools every profile keeps and is told why, never `all`. A delegated child
+deleted) keeps only the tools every profile keeps and is told why, never `all`. Such a refusal
+worked out by a request (not by a turn) is reused for 5 seconds, so a list request reads the
+settings once, and is never kept as the thread's set: once the read works, the next request gets
+the real set. A delegated child
 is cut down to its parent's groups like its servers, so it never gets more. Clients from outside
 a thread (signed in with OAuth) have no profile.
 
@@ -940,7 +959,9 @@ for the thread's folder (Codex's `config.toml`, a project's `.codex/config.toml`
 by `-c mcp_servers…` in the Codex launch arguments) and gives that thread
 `mcp_servers.<name>.enabled = false` for each one the profile leaves out, and `features.apps = false`
 unless the profile names `codex_apps` (Codex's connectors server, which it adds with a ChatGPT
-sign-in and which that list never shows). T3's own servers stay. Other threads on the same
+sign-in and which that list never shows). T3's own servers stay: the `t3-code` and
+`t3-code-direct` entries T3 sends with the load. A server of the owner's own config that has one of
+those names but that T3 did not send is switched off like any other. Other threads on the same
 app-server keep their own sets. Codex's own sub-agents copy their parent's loaded config, these
 settings included. Before each turn (and before a goal is set running) T3 reads the thread's live
 servers from Codex and does not start the turn, saying why and how to go on (pick `all` for the
@@ -951,7 +972,8 @@ check when the profile was narrowed while Codex had the thread loaded (Codex rea
 config only as it loads it, so the change counts once it loads the thread again: after it has been
 idle a while, or after T3 restarts) and for a server a Codex plugin adds, which T3 cannot switch off
 this way. A turn is also refused when the profile is missing or broken, Codex's servers cannot be listed, a server's name cannot be written as a config key, the
-thread is not in T3's store, or (once any thread on that app-server has a narrower profile) Codex
+thread is not in T3's store (read 4 times over about 2 seconds first, as a thread T3 has just
+made can reach the store a moment after Codex asks for it), or (once any thread on that app-server has a narrower profile) Codex
 asks to load or run a thread T3 cannot match to one of its own. Codex answers the server list only
 once the thread's servers have started, and T3 waits up to 30 seconds for each read: a kept server
 slower to start than that refuses the turn, which can be sent again once it is up. When a resume is
@@ -961,7 +983,35 @@ which would lose its history: the turn fails, and sending it again resumes the t
 thread store at each load and turn, so a thread missing from the store refuses there too. A turn already running when the profile is narrowed keeps its servers
 until it ends. A Codex thread's T3 tool groups are cut on T3's own server, as on every provider
 (above); each Codex turn fixes them as it starts, also one Codex starts on its own (a goal's next
-turn, a sub-agent's turn, which uses its parent's T3 thread).
+turn). A sub-agent's turn, and a goal set while a turn may run, are checked but never fix the set:
+the sub-agent uses its parent's T3 thread, and must not change the set of the parent's running
+turn. While a goal's turn has its set fixed, T3's server holds that thread's requests, so the turn's
+first T3 tool call already gets the new set. The hold covers only working out the T3 tool set: the
+check of the thread's outside servers runs after it, so T3's own tools already carry the new set
+while that check runs. A hold lasts 10 seconds at most from when the turn started (a list request
+waits once, not once per tool); one still there then is dropped, and the thread keeps only the T3
+tools every profile keeps, with a "try again" reason, until the late check or the thread's next
+turn fixes its set. A hold is taken only by a check that runs, and released however it ends.
+
+Codex is checked at each call too, where it lets T3 see one
+([#814](https://github.com/scuttletoby/t3code/issues/814)). A request the app sends to one MCP
+server of a thread (`mcpServer/tool/call`, `mcpServer/resource/read`, for MCP Apps) is refused when
+the thread's profile leaves that server out, and an MCP server's elicitation (also Codex's
+approval of an MCP tool call, when its approval policy asks for one) is declined then, with a
+warning in the server log. `mcpServerStatus/list` is not refused: it only reads which servers are
+on. Once any thread on an app-server has a narrower profile, those requests on a Codex thread T3
+cannot match to one of its own are refused too. A Codex sub-agent T3 did not see spawned (for
+example one from before an app-server restart) is matched by asking Codex for its parent, at its
+resume and at its turn; a turn on a thread T3 still cannot match waits up to 5 seconds for the
+spawn to show, then is stopped like a refused turn.
+
+Edges of the Codex turn check. It runs as Codex reports the turn started, so a turn Codex starts on
+its own can run briefly (a model step, possibly a call to an outside MCP server when no approval
+is asked) before it is stopped; T3's own tools already get the turn's set. A turn that ends before
+its check does is not stopped: its goal is still paused, without a message. Requests to T3's server
+that come from no thread get every T3 tool, as above (a known limit, fork issue #918). A server a Codex plugin adds is not switched off: every turn is refused while it
+is on. Switching it off through the plugin's own config key is not done, as a key Codex does not
+accept can make it refuse to load the thread at all.
 
 Only Claude and Codex threads apply a profile's outside servers. A thread on any other provider
 would get every outside MCP server whatever its profile says (T3's own tool groups apply on every

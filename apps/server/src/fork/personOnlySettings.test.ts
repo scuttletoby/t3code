@@ -19,7 +19,7 @@ import * as Schema from "effect/Schema";
 import { beforeAll, describe, expect, it } from "vite-plus/test";
 
 import { withoutMachineOnlyFields } from "./advertisedMachineFields.ts";
-import { T3_TOOL_GROUPS } from "./mcpT3ToolFilter.ts";
+import { T3_TOOL_GROUPS } from "./mcpT3ToolRule.ts";
 import {
   MCP_T3_TOOLKIT_GROUPS,
   MCP_T3_TOOL_NOT_ALLOWED,
@@ -520,7 +520,7 @@ describe("MCP profile T3 tool groups", () => {
   });
 
   it("gives the T3 tool filter's table exactly the toolkit folders' tools, each in its group", () => {
-    // The filter (mcpT3ToolFilter.ts) lists its toolkits by hand. A toolkit it leaves out would have
+    // The filter (mcpT3ToolRule.ts) lists its toolkits by hand. A toolkit it leaves out would have
     // every tool refused by any profile but `all`, and no profile setting could fix that.
     const fromFolders = new Map<string, string>();
     for (const [folder, names] of toolsByFolder) {
