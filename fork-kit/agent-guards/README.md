@@ -36,9 +36,10 @@ g=/usr/local/bin/capacity-pipe-guard; [ -r "$g" ] || { echo "capacity-pipe-guard
 ```
 
 A hook that runs past its timeout is ended by Claude Code. For the open hooks the call then goes on. The
-`actions-disable-guard` entry sets `"onFailure": "block"`, so a timeout or a hook that cannot start refuses the call.
-It also answers by itself within 5 s of its start (it refuses when it runs out of time with a guarded word unread),
-well inside its 10 s.
+`actions-disable-guard` entry sets `"onFailure": "block"`, so a timeout or a hook that cannot start refuses the
+call. Claude Code honours `onFailure` from version 2.1.295 on; an older one ignores it, and there a hook that fails
+or times out lets the call run, so run 2.1.295 or later. The guard also answers by itself within 5 s of its start (it
+refuses when it runs out of time with a guarded word unread), well inside its 10 s.
 
 **Tools.** The Bash and Monitor tools both run shell text (`tool_input.command`), so the command hooks match both.
 `agent-guards check` fails a hook that is wired for Bash only (MISSING ... Monitor).
@@ -101,9 +102,11 @@ These are the values the hooks had before. The file is `/etc/fork-kit/machine.js
 ([common/machine_file.py](../common/machine_file.py): owned by root, not writable by others, so an agent cannot
 change a guard's facts). Each hook reads only its own part (`actionsDisable`, `capacityPipe`, ...). A key in it that
 is broken (a wrong type, a bad path) keeps its default; an unknown key is ignored; a bad `refuseScripts` row is
-dropped and the good rows kept. The hook says so to the agent (a `systemMessage`, and context for PreToolUse) and
-on stderr. A broken or unknown part of another hook changes nothing for it. `agent-guards self-check` checks the
-whole section strictly and names every problem.
+dropped and the good rows kept. The hook says so to the agent (a `systemMessage`, and context for PreToolUse) and on
+stderr, on every call it handles, until the file is fixed: loud on purpose. A Bash call can carry the note more than
+once, once from each hook that has a problem in its part (`actionsDisable` and `capacityPipe` before it,
+`memoryIndex` after it). A broken or unknown part of another hook changes nothing for it. `agent-guards self-check`
+checks the whole section strictly and names every problem.
 
 | Key                            | Default                                | What it is                                                                                                                                            |
 | ------------------------------ | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
