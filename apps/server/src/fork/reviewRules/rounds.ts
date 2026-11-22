@@ -5,13 +5,13 @@
 import { lensKey } from "./lensComment.ts";
 import { fold, readFindings, type FindingKind } from "./findings.ts";
 import type { ReviewBlock, ReviewPlan } from "./plan.ts";
-import { digitValue, repr, split, stripChars } from "./pyText.ts";
+import { byCodePoint, digitValue, repr, split, stripChars } from "./pyText.ts";
 
 const ROUND_RE = /^r(\p{Nd}{1,9})$/u;
 
 /** How each lens's newest entry is read (the gate's head_check.review_rounds says which one it is). */
 export const REPORT = "report";
-export const LOOSE = "loose";
+const LOOSE = "loose";
 const UNREAD = "unread";
 export const CLEARED = "cleared";
 const NOT_JUDGED = "skip";
@@ -21,14 +21,6 @@ export type EntryHow =
   | typeof UNREAD
   | typeof CLEARED
   | typeof NOT_JUDGED;
-
-/** Python's sorted() on strings: by code point, not by UTF-16 unit. */
-function byCodePoint(a: string, b: string): number {
-  const x = Array.from(a, (c) => c.codePointAt(0)!);
-  const y = Array.from(b, (c) => c.codePointAt(0)!);
-  for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
-  return x.length - y.length;
-}
 
 /** The highest round marker (`r3`, also `**r3**` or `r３`) among a lens name's words after its first, or 0. */
 export function roundMarker(name: string): number {
