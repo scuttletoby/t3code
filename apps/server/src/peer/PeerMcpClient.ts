@@ -18,6 +18,7 @@ import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
 
+import * as ForkLinkRevoke from "../fork/peerLinkRevoke.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 
@@ -145,6 +146,8 @@ const make = Effect.gen(function* () {
       },
     );
 
+  const revokes = ForkLinkRevoke.makeRefusals({ links, post, sessions, recordLinkExpiry });
+
   const openSession = Effect.fn("PeerMcpClient.openSession")(
     function* (
       { link, url, token }: PeerLinks.ResolvedPeerLink,
@@ -166,6 +169,7 @@ const make = Effect.gen(function* () {
         limitHeader,
       );
       const sessionId = initialized.headers["mcp-session-id"];
+      if (initialized.status === 401) return yield* revokes.reopen(link, url, token, limitHeader);
       if (initialized.status === 403) return yield* linkedEnvironmentsOffThere;
       if (initialized.status !== 200 || sessionId === undefined) {
         return yield* new OrchestratorMcpFailure({
@@ -241,6 +245,8 @@ const make = Effect.gen(function* () {
         yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, renewed));
         response = yield* callOnce(renewed);
       }
+      const fresh = openSession(resolved, limitHeader);
+      if (response.status === 401) response = yield* revokes.retry(sessionKey, fresh, callOnce);
       if (response.status === 401) {
         return yield* new OrchestratorMcpFailure({
           code: "capability_denied",
