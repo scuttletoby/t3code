@@ -140,11 +140,31 @@ export type PlaytestSettings = typeof PlaytestSettings.Type;
 export const DEFAULT_PLAYTEST_SETTINGS: PlaytestSettings = Schema.decodeSync(PlaytestSettings)({});
 
 const decodePlaytestSettingsOption = Schema.decodeUnknownOption(PlaytestSettings);
+/** Also refuses an unknown field, nested ones too: it may be a newer build's limit. */
+const isStrictPlaytestSettings = (raw: unknown) =>
+  decodePlaytestSettingsOption(raw, { onExcessProperty: "error" })._tag === "Some";
+
+/** A save's value: refused when bad, also for a field this build does not know (never dropped). */
+export const PlaytestSettingsPatch = Schema.Unknown.check(
+  Schema.makeFilter(isStrictPlaytestSettings, {
+    expected: "playtest settings with only the fields this build knows",
+  }),
+).pipe(
+  Schema.decodeTo(
+    PlaytestSettings,
+    // The value is already checked; the settings writer saves it sparse.
+    SchemaTransformation.transformEffect({
+      decode: (raw: unknown) => Effect.succeed(raw as typeof PlaytestSettings.Encoded),
+      encode: (settings: typeof PlaytestSettings.Encoded) => Effect.succeed(settings as unknown),
+    }),
+  ),
+);
 
 /**
  * The settings file's value. A bad one reads as off with a warning (fail closed; the rest of the
- * file still loads), and the next save writes the default in its place. In a project's overrides
- * it reads as off too, never as the server's adapter.
+ * file still loads), and the next save writes the default in its place. So does a field this build
+ * does not know: it may be a newer build's limit that this build would not apply. In a project's
+ * overrides it reads as off too, never as the server's adapter.
  */
 export const PlaytestSettingsFromSettingsFile = Schema.Unknown.pipe(
   Schema.decodeTo(
@@ -153,7 +173,7 @@ export const PlaytestSettingsFromSettingsFile = Schema.Unknown.pipe(
     PlaytestSettings,
     SchemaTransformation.transformEffect({
       decode: Effect.fn("PlaytestSettingsFromSettingsFile.decode")(function* (raw: unknown) {
-        if (decodePlaytestSettingsOption(raw)._tag === "Some") {
+        if (isStrictPlaytestSettings(raw)) {
           return raw as typeof PlaytestSettings.Encoded;
         }
         yield* Effect.logWarning(
