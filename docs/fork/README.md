@@ -733,11 +733,29 @@ memory readings and only records what it would have answered: one log line per d
 last result with counts under `slotRule` in `wait_list`. It never changes or delays a decision; a
 reading that fails or takes over 2 seconds counts as "unreadable". While switched off the gate keeps
 no records of new agents, so the rule counts each agent allowed in the last `startGraceSeconds` as
-starting. Without `mode`, a switched-on
-gate is `"fixed"` (a file from an older build decides exactly as before) and a switched-off one is
-`"observe"`; a mode this build does not know (from a newer build) is `"fixed"`. Not "off" for that
-reason: with the default the server reads memory files at each `delegate_task`; `"mode": "fixed"`
-stops it.
+starting. `"enforce"`: the capacity rule decides. Every agent still starting owes its full cost
+(two starts in one second both count, and a held slot owes a writer's), costs come from the rule
+file (light 384 MB, writer 768 MB), and an agent's kind comes from its task `role` (`research`,
+`review` and `design` are light, anything else or no role is a writer). A role can be wrong: a
+running agent that uses more than a light cost counts as a writer, and so does one whose memory
+cannot be read, whatever its role (it is taken to use a light cost already, so it is never counted
+twice). The floors (2 agents, 1 job) always start, whatever the readings, unless real readings say
+"severe". The agent ceiling is 3 per core, at most 64, only on Linux with cgroup v2, agents in their
+own scopes and the kernel's OOM counter; anywhere else it stays at 10 agents and 4 jobs. After an
+OOM kill (`oom_kill` in `/proc/vmstat` rises) or with swap under 10% free and filling, the gate falls
+back to at most 10 agents and 4 jobs. A kill inside an agents' slice also raises each agent cost by
+25% (a kill elsewhere, such as a build box at its own cap, does not; where the slices cannot be
+read, at most 2 raises). Ten minutes of calm, whole readings lift the fallback and take one raise
+off; each further calm spell takes off one more. The gate reads the machine every 30 seconds as
+well as at each ask. A restarted server starts in the fallback and at "elevated", which lifts
+after about a minute of calm readings (no stall, memory above the margin, swap not filling: swap
+that is full of old pages does not count). Readings that fail count as "elevated": the floors still
+start, and after 2 minutes without a whole reading agents are counted against the fixed 10 until one
+comes back. Settings that cannot be read give the fixed 10 too (with a warning), never no limit.
+Typed limits (`maxPerMachine`, ...) still apply while `enabled`. Without `mode`, a
+switched-on gate is `"fixed"` (a file from an older build decides exactly as before) and a
+switched-off one is `"enforce"`; a mode this build does not know (from a newer build) is `"fixed"`.
+`"mode": "fixed"` turns the rule off and stops the memory reads at each `delegate_task`.
 
 ### `server.headlessUsageRefreshInterval`
 

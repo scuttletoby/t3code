@@ -8,7 +8,7 @@ packages/shared/src/capacity (one source: no number is copied here).
 A changed rule value must turn the vectors red (each number of the rule, one at a time), so both evaluators are held
 to the numbers, not only to each other.
 """
-import copy, importlib.machinery, importlib.util, json, os, unittest
+import copy, importlib.machinery, importlib.util, json, os, shutil, tempfile, unittest
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHARED = os.path.join(os.path.dirname(os.path.dirname(KIT)), 'packages', 'shared', 'src', 'capacity')
@@ -93,6 +93,26 @@ class Files(unittest.TestCase):
                          ['format file: not capacity-format/1'])
         self.assertRaises(ValueError, cr.loads, '{"a": NaN}')
 
+
+    def test_a_rule_from_before_the_swap_trend_or_an_empty_or_missing_one_is_refused(self):
+        """A kit copy of the rule written before swap counted by its trend (calm.swapFreeAtLeastPercent, no
+        swapFillingMb) is refused by name, never read half-way into a KeyError; so are an empty and a missing file
+        (heavy facts then answers "not available", never free)."""
+        old = copy.deepcopy(RULE_JSON)
+        old['pressure']['calm']['swapFreeAtLeastPercent'] = 30
+        del old['pressure']['swapFillingMb']
+        self.assertEqual(sorted(cr.parse_rule(old, FORMAT)[1]),
+                         ['rule.pressure.calm.swapFreeAtLeastPercent: unknown key',
+                          'rule.pressure.swapFillingMb: missing'])
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(os.path.join(SHARED, 'capacity-format.json'), d)
+            with open(os.path.join(d, 'capacity-rule.json'), 'w') as f:
+                json.dump(old, f)
+            self.assertRaisesRegex(ValueError, 'swapFillingMb: missing', cr.shipped_rule, d)
+            open(os.path.join(d, 'capacity-rule.json'), 'w').close()
+            self.assertRaises(ValueError, cr.shipped_rule, d)
+            os.unlink(os.path.join(d, 'capacity-rule.json'))
+            self.assertRaises(OSError, cr.shipped_rule, d)
 
 class Vectors(unittest.TestCase):
     rule = cr.parse_rule(RULE_JSON, FORMAT)[0]

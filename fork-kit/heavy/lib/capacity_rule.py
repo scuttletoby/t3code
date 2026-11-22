@@ -170,29 +170,34 @@ def read_psi(value):
     return {'someAvg10Pct': some, 'fullAvg10Pct': full} if ok else 'unreadable'
 
 
-def raw_level(prule, r, margin):
+def raw_level(prule, r, margin, previous_swap_free=None):
+    """(level, calm, trend known). Swap counts by its trend, not its level: nearly full and filling is elevated,
+    filling is never calm; with no previous swap read the trend is unknown (see next_pressure)."""
     el, sev, calm = prule['elevated'], prule['severe'], prule['calm']
     reads = [p for p in (r['psi'], r['boxPsi']) if isinstance(p, dict)]
     avail100 = r['availableMb'] * 100
     if (any(p['fullAvg10Pct'] >= sev['psiFullAvg10Pct'] for p in reads)
             or avail100 < margin * sev['availableBelowMarginPercent'] or r['osLevel'] == 'severe'):
-        return 'severe', False
+        return 'severe', False, True
     swap = r['swap'] if isinstance(r['swap'], dict) else None
+    trend_known = swap is None or is_num(previous_swap_free)
+    filling = (swap is not None and is_num(previous_swap_free)
+               and previous_swap_free - swap['freeMb'] > prule['swapFillingMb'])
     if ('unreadable' in (r['psi'], r['boxPsi'], r['swap'], r['osLevel']) or r['osLevel'] == 'elevated'
             or any(p['someAvg10Pct'] >= el['psiSomeAvg10Pct'] or p['fullAvg10Pct'] >= el['psiFullAvg10Pct']
                    for p in reads)
             or avail100 < margin * el['availableBelowMarginPercent']
-            or (swap is not None and swap['freeMb'] * 100 < swap['totalMb'] * el['swapFreeBelowPercent'])):
-        return 'elevated', False
+            or (filling and swap['freeMb'] * 100 < swap['totalMb'] * el['swapFreeBelowPercent'])):
+        return 'elevated', False, True
     quiet = (all(p['someAvg10Pct'] < calm['psiSomeAvg10Pct'] and p['fullAvg10Pct'] < calm['psiFullAvg10Pct']
                  for p in reads)
              and avail100 >= margin * calm['availableAtLeastMarginPercent']
-             and (swap is None or swap['freeMb'] * 100 >= swap['totalMb'] * calm['swapFreeAtLeastPercent']))
-    return 'ok', quiet
+             and not filling)
+    return 'ok', quiet, trend_known
 
 
 def next_pressure(prule, raw, previous, now_ms):
-    level, calm = raw
+    level, calm, trend_known = raw
     if level == 'severe':
         return {'level': 'severe', 'calmSinceMs': None}
     if previous is None or previous.get('level') == 'ok':
@@ -210,6 +215,11 @@ def next_pressure(prule, raw, previous, now_ms):
         return step_down('elevated', prule['severeClearSeconds'])
     if level == 'elevated' or not calm:
         return {'level': 'elevated', 'calmSinceMs': None}
+    if not trend_known:       # an unknown swap trend starts or keeps the wait but never ends it
+        since = previous.get('calmSinceMs')
+        if not (is_num(since) and (not is_num(now_ms) or since <= now_ms)):
+            since = now_ms if is_num(now_ms) else None
+        return {'level': previous['level'], 'calmSinceMs': since}
     return step_down('ok', prule['elevatedClearSeconds'])
 
 
@@ -299,13 +309,20 @@ def _unreadable_level(previous):
     return level, {'level': level, 'calmSinceMs': None}
 
 
+def _pressure_of(rule, r, margin, previous, now_ms):
+    """capacityRule.ts pressureOf: the next pressure state, with this read's swap free for the next read's trend."""
+    prev_swap = previous.get('swapFreeMb') if isinstance(previous, dict) else None
+    p = next_pressure(rule['pressure'], raw_level(rule['pressure'], r, margin, prev_swap), previous, now_ms)
+    return dict(p, swapFreeMb=r['swap']['freeMb'] if isinstance(r['swap'], dict) else None)
+
+
 def level(rule, facts, previous=None, now_ms=None):
     """capacityLevel: (level, pressure state to keep, margin or None)."""
     r = _read_facts(rule, facts)
     if r is None:
         return (*_unreadable_level(previous), None)
     margin = _margin(rule, r, facts.get('pieceCaps') is True)
-    p = next_pressure(rule['pressure'], raw_level(rule['pressure'], r, margin), previous, now_ms)
+    p = _pressure_of(rule, r, margin, previous, now_ms)
     return p['level'], p, margin
 
 
@@ -327,7 +344,7 @@ def decision(rule, facts, ask, learned=None, previous=None, now_ms=None):
                      'cost': cost_of(rule, pk, learned, p['declaredMb']), 'demandMb': p['demandMb']})
     owed = sum(max(0, p['cost']['mb'] - p['demandMb']) for p in live)
     free = r['availableMb'] - margin - owed - r['reservedMb']
-    pressure = next_pressure(rule['pressure'], raw_level(rule['pressure'], r, margin), previous, now_ms)
+    pressure = _pressure_of(rule, r, margin, previous, now_ms)
 
     def result(admit, reason):
         return {'admit': admit, 'reason': reason, 'kind': kind, 'level': pressure['level'], 'pressure': pressure,

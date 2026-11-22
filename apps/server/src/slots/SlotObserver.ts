@@ -22,6 +22,7 @@ import {
 import {
   capacityFactsOf,
   nodeCapacityHost,
+  readBoxOomKills,
   readBoxPsi,
   readMachine,
   readPieceDemand,
@@ -29,6 +30,7 @@ import {
 } from "@t3tools/shared/capacityReadings";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
+  type EnforceTier,
   OBSERVE_START_PRESSURE,
   observeSlotAnswers,
   slotRuleObservation,
@@ -141,10 +143,11 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
    */
   const startedThreads = new Map<string, number>();
 
-  const readFacts = async (pieces: ReadonlyArray<OwnPiece>): Promise<CapacityFacts> => {
+  /** The machine and each piece; `boxes`: the slices of the pieces whose scope reads live. */
+  const readAll = async (pieces: ReadonlyArray<OwnPiece>) => {
     const machine = await readMachine(host);
     const read: Array<CapacityPiece> = [];
-    let box: string | null = null;
+    const boxes = new Set<string>();
     for (const piece of pieces) {
       const path =
         piece.scope === undefined || userRoot === null
@@ -155,31 +158,46 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
         continue;
       }
       const demand = await readPieceDemand(host, machine.cgroup, `${path}/${piece.scope.unit}`);
-      // The gate's records say this agent runs, so a scope that reads as gone keeps the piece,
-      // owing its full cost. Only the records end a piece.
+      // The gate's records say this agent runs, so a scope that reads as gone keeps the piece
+      // (its memory unread). Only the records end a piece.
       read.push({ kind, demandMb: demand.gone ? null : demand.demandMb });
-      if (!demand.gone) box = path;
+      if (!demand.gone) boxes.add(path);
     }
     // A box with no live piece of its own passes no box pressure.
-    const boxPsi = box === null ? null : await readBoxPsi(host, machine, box);
-    return capacityFactsOf(machine, { pieceCaps: false, pieces: read, boxPsi });
+    const box = [...boxes].at(-1);
+    const boxPsi = box === undefined ? null : await readBoxPsi(host, machine, box);
+    const facts = capacityFactsOf(machine, { pieceCaps: false, pieces: read, boxPsi });
+    return { machine, facts, boxes };
+  };
+  const readFacts = async (pieces: ReadonlyArray<OwnPiece>): Promise<CapacityFacts> =>
+    (await readAll(pieces)).facts;
+
+  /** The kernel's OOM kill counter (Linux); `null` where there is none. */
+  const readOomKills = async (): Promise<number | null | "unreadable"> => {
+    if (host.platform !== "linux") return null;
+    const read = await host.readFile("/proc/vmstat");
+    const match = "text" in read ? /^oom_kill (\d+)$/m.exec(read.text) : null;
+    return match === null ? "unreadable" : Number(match[1]);
   };
 
   /** Never fails, never waits past the time limit, never piles up hanging reads. */
-  const readings = (pieces: ReadonlyArray<OwnPiece>) =>
+  const timed = <A>(read: () => Promise<A>) =>
     Effect.suspend(() => {
       if (hanging >= OBSERVE_MAX_HANGING) {
         return Effect.succeed({ facts: null, readings: "busy" as SlotReadings });
       }
       hanging += 1;
       const promise = Promise.resolve()
-        .then(() => readFacts(pieces))
+        .then(read)
         .finally(() => {
           hanging -= 1;
         });
       return Effect.tryPromise({ try: () => promise, catch: () => "failed" as const }).pipe(
         Effect.timeout(OBSERVE_READ_TIMEOUT),
-        Effect.map((facts) => ({ facts, readings: "ok" as SlotReadings })),
+        Effect.map((facts): { facts: A | null; readings: SlotReadings } => ({
+          facts,
+          readings: "ok",
+        })),
         Effect.catch((error) =>
           Effect.succeed({
             facts: null,
@@ -188,6 +206,50 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
         ),
       );
     });
+  const readings = (pieces: ReadonlyArray<OwnPiece>) => timed(() => readFacts(pieces));
+
+  /**
+   * `enforce`, on the decision path and on the gate's timer: the machine, the demand of each agent
+   * that shows a run (by thread; `null` when its scope is unknown or gone), the OOM kill counters
+   * (the kernel's, and each agents' slice's: those of the running agents and `knownSlices`) and the
+   * tier, within the time limit. `null`: nothing could be read (busy, slow or failed).
+   */
+  const enforceRead = Effect.fn("SlotObserver.enforceRead")(function* (
+    threadIds: ReadonlyArray<string>,
+    knownSlices: ReadonlyArray<string> = [],
+  ) {
+    const scopes = yield* Effect.forEach(threadIds, (threadId) =>
+      agentScope.ownScope === undefined ? Effect.undefined : agentScope.ownScope(threadId),
+    );
+    const read = yield* timed(async () => {
+      const { machine, facts, boxes } = await readAll(scopes.map((scope) => ({ scope })));
+      const demand = new Map(
+        threadIds.map((threadId, index) => [threadId, facts.pieces?.[index]?.demandMb ?? null]),
+      );
+      const oomKills = await readOomKills();
+      const agentKills: Record<string, number> = {};
+      for (const slice of new Set([...boxes, ...knownSlices])) {
+        const kills = await readBoxOomKills(host, machine.cgroup, slice);
+        if (kills !== null) agentKills[slice] = kills;
+      }
+      // Full: the gate can see each agent's memory and every OOM kill; anything else is basic.
+      const tier: EnforceTier =
+        machine.cgroup === "v2" &&
+        agentScope.ownScope !== undefined &&
+        userRoot !== null &&
+        typeof oomKills === "number"
+          ? "full"
+          : "basic";
+      return {
+        facts,
+        demand,
+        oomKills,
+        agentKills: Object.keys(agentKills).length === 0 ? null : agentKills,
+        tier,
+      };
+    });
+    return read.facts;
+  });
 
   const run = Effect.fn("SlotObserver.run")(function* (
     input: SlotObserveInput,
@@ -322,6 +384,7 @@ export const makeSlotObserver = Effect.fn("makeSlotObserver")(function* (
 
   return {
     observe,
+    enforceRead,
     /** The gate's `started` with one of the rule's own tokens: the child that start names. */
     started: (token: number, childThreadId: string) =>
       Effect.sync(() => {
