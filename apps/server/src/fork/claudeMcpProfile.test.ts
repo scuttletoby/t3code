@@ -295,7 +295,13 @@ describe("makeClaudeMcpProfiles", () => {
         assert.deepStrictEqual(planned.servers, "all");
         assert.strictEqual(T3ToolSets.t3ToolSetFor("t"), before);
         // The new process opens: its options are read, and the new set applies from then.
-        assert.deepStrictEqual(planned.options, {});
+        // The lean profile adds no options of its own: only the model policy's Agent and Skill hook.
+        const options = planned.options;
+        assert.deepStrictEqual(Object.keys(options), ["hooks"]);
+        assert.deepStrictEqual(
+          options.hooks?.PreToolUse?.map((matcher) => matcher.matcher),
+          ["^(Agent|Task|Skill)$"],
+        );
         const set = T3ToolSets.t3ToolSetFor("t");
         assert.deepStrictEqual(set?._tag === "Groups" ? [...(set.groups as Set<string>)] : set, []);
       }).pipe(
