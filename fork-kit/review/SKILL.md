@@ -38,6 +38,9 @@ critical). A project with **no CI** (no queue config) has no gate: every change 
 python3 -I fork-kit/review/lib/review_kit.py plan --root <checkout> --base origin/main
 ```
 
+Run the kit from a fork checkout at the release the project's gate pins (README.md, "Which fork version"). A project
+whose kit settings are not at `.github/review-kit.json` adds `--settings <its file>` to every `plan` and `check`.
+
 The plan judges the change with the gate's own rules and prints the tier, the lenses (each with its prompt file and
 its runner), why, the state question, the round limit and the minors rule. Do what it says; never pick fewer lenses
 by hand. Unsure, or a path the rules do not cover: take the heavier tier. Two independent reads miss different bugs;
@@ -86,7 +89,8 @@ Each step is done by another agent than the author.
      past `rounds.max` it fails the head (in `enforce`; `shadow` only reports both).
    - **Which head passes:** the gate passes a head only when every lens's newest read names that head, or an override
      comment newer than a lens's read covers it (`<override prefix> <full sha>: <what was read, why no lens>`,
-     COMMENTS.md; it counts only from the account with the queue config's `override.author_association`). So after a
+     COMMENTS.md; it counts only from the configured author association, the queue config's
+     `override.author_association`, and only while it is never edited and not hidden). So after a
      fix the lenses of the last round still name the old head, and the fix head passes only when every lens reads it
      again (a new round) or the orchestrator posts the override for it (no new round).
    - **Nit-only fix:** a fix diff that touches only tests, docs, comments, message text or names (judged by the diff,
@@ -103,8 +107,11 @@ Each step is done by another agent than the author.
      author is in the review block's `override_authors` (empty by default). An orchestrator's override never replaces
      the approach lens.
    - A note between rounds that is no lens report starts with `not a lens:` (COMMENTS.md).
-   - **No round past the limit.** A pull request still stuck (a blocker or major left) gets one audit by the
-     `audit_runner` ("good enough to merge, or what next"), posted as a `not a lens:` comment; then a person decides.
+   - **No round past the limit.** A fix after the last lens round (`lens_rounds` used up) that is not nit-only, for
+     example a minor of the last round fixed in code with `minors: same-round`, gets no new lens round: the
+     orchestrator checks that fix diff itself and posts the override for the fix head. A blocker or major left over
+     counts as stuck. A pull request still stuck gets one audit by the `audit_runner` ("good enough to merge, or what
+     next"), posted as a `not a lens:` comment; then a person decides.
 8. **Minors** (`minors`, default `issue`): minors and anything left when the pull request stops go into **one**
    follow-up issue, with the project's labels, linked on the pull request. With `same-round`, minors are fixed in the
    round that found them and any left at the last round are listed in the pull request description with a reason
