@@ -2997,7 +2997,7 @@ const make = Effect.gen(function* () {
       const { target: pacedTarget, note: usagePacingNote } = yield* delegateChecks.beforeWorkspace({
         isRetry: isRetryOfAcceptedDelegation,
         parent,
-        requested: input.target,
+        requested: { ...input.target, role: input.role },
         runtimeMode: input.runtimeMode,
         cwd: yield* parentWorkspaceCwd(parent),
         target,
