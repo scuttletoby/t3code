@@ -45,6 +45,10 @@ import {
 import { ThreadRolesFromSettingsFile, ThreadRolesPatch } from "./threadRoles.ts";
 import { AssistantSettingsFromSettingsFile, AssistantSettingsPatch } from "./assistant.ts";
 import {
+  StopFinishedChildrenSettingsFromSettingsFile,
+  StopFinishedChildrenSettingsPatch,
+} from "./stopFinishedChildren.ts";
+import {
   DEFAULT_USAGE_PACING_INSTANCE_SETTINGS,
   UsagePacingGateMode,
   UsagePacingInstanceSettings,
@@ -70,6 +74,7 @@ export * from "./modelPolicy.ts";
 export * from "./placement.ts";
 export * from "./playtest.ts";
 export * from "./reviewRules.ts";
+export * from "./stopFinishedChildren.ts";
 export * from "./threadRoles.ts";
 export * from "./usagePacing.ts";
 
@@ -143,6 +148,8 @@ export const ForkServerSettingsFields = {
   threadRoles: ThreadRolesFromSettingsFile,
   /** Offers "Make assistant"; off. A bad value reads as off. */
   assistant: AssistantSettingsFromSettingsFile,
+  /** Stops a finished delegated child's provider session after a grace time; off. A bad value reads as off. */
+  stopFinishedChildren: StopFinishedChildrenSettingsFromSettingsFile,
 };
 
 /** A key of {@link ForkServerSettingsFields}. */
@@ -190,6 +197,8 @@ export const ForkServerSettingsPatchFields = {
   threadRoles: Schema.optionalKey(ThreadRolesPatch),
   /** Strict: a save refuses a bad value or an unknown field. */
   assistant: Schema.optionalKey(AssistantSettingsPatch),
+  /** Strict: a save refuses a bad value or an unknown field. */
+  stopFinishedChildren: Schema.optionalKey(StopFinishedChildrenSettingsPatch),
 } satisfies Record<ForkServerSettingKey, unknown>;
 
 /**
@@ -242,6 +251,7 @@ export const FORK_PATCH_RULES: { readonly [K in ForkServerSettingKey]: ForkPatch
   // saves of the same project, the last one wins.
   threadRoles: { fields: { assistant: "replace", orchestrators: { replaceEntries: {} } } },
   assistant: "merge-fields",
+  stopFinishedChildren: "merge-fields",
 };
 
 /**
