@@ -4,7 +4,8 @@
   t3-capacity [--kind KIND] [MB]
 
 MB alone (default 3072): do MB fit the free budget at pressure level "ok". --kind: does the capacity rule admit one
-piece of KIND (agent-writer, job-build, build, ...); with MB too, that piece declares MB and they must fit as well.
+piece of KIND (agent-writer, job-build, build, ...); with MB too, that piece declares MB (a floor of its cost), and
+the rule alone decides (its job floor too).
 
 Output, kept as the older t3-capacity had it so hooks and scripts that read it keep working:
   line 1   available=<MB>MB swapfree=<MB>MB load=<load>/<n>cores agents=<n> jobs=<n> waiting=<n> reserved=<MB>MB
@@ -14,14 +15,26 @@ Output, kept as the older t3-capacity had it so hooks and scripts that read it k
   then     reservations: <name>:<MB>MB(using <MB>,holding <MB>) or <name>:own (a reservation of the caller's folder;
            holding is what is left after its use and the debts of agents and jobs working in it, ", owed <MB>")
            note: <text>, fits: <kind>=<n> ..., and last "NOT OK: <why>" or "OK".
-Exit 0 OK, 1 NOT OK (busy, or heavy facts did not answer within 5 s: never OK), 2 a wrong call. A NOT OK with stdout
+Exit 0 OK, 1 NOT OK (busy, or heavy facts did not answer within 5 s: never OK), 2 a wrong call. A NOT OK holds 20 s
+for the same question (kind and MB): an OK read within that time is "NOT OK: held: ..." (#861; heavy facts'
+cache folder keeps it in t3-capacity-hold.json). A NOT OK with stdout
 not a terminal also says on stderr that a pipe would hide the exit status.
 """
 import os, sys
 
 
-def kit_file(rel):
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), rel)
+KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def facts_module():
+    """lib/heavy_facts.py of this kit, imported from the kit's own lib folder (root's once installed); it loads the
+    rest with its own loader, the one copy (#800). Called inside the caller's try: a kit that cannot load is no
+    answer, never a traceback."""
+    lib = os.path.join(KIT, 'lib')
+    if sys.path[:1] != [lib]:
+        sys.path.insert(0, lib)
+    import heavy_facts
+    return heavy_facts
 
 
 def main(argv):
@@ -41,8 +54,9 @@ def main(argv):
             return usage()
     need = 3072 if need is None and kind is None else need
     try:
-        hf = load(kit_file('lib/heavy_facts.py'))
-        verdict, why, d = hf.ask(os.environ.get('T3_CAPACITY_HEAVY') or kit_file('bin/heavy'), kind, need)
+        hf = facts_module()
+        # ask, then the 20 s hold: the same check heavy makes before a job starts (#866, one source)
+        verdict, why, d = hf.checked(hf.test_env('T3_CAPACITY_HEAVY') or os.path.join(KIT, 'bin', 'heavy'), kind, need)
     except Exception as e:      # the caller itself cannot run: never OK
         verdict, why, d = 'unavailable', f'{e.__class__.__name__}: {e}', None
     if d is None:
@@ -87,14 +101,6 @@ def owed(r):
 def usage():
     print('usage: t3-capacity [--kind KIND] [MB]', file=sys.stderr)
     return 2
-
-
-def load(path):
-    import importlib.machinery, importlib.util
-    loader = importlib.machinery.SourceFileLoader('heavy_facts', path)
-    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('heavy_facts', loader))
-    loader.exec_module(mod)
-    return mod
 
 
 if __name__ == '__main__':

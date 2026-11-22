@@ -10,6 +10,7 @@ admission and clean-up rule in a copy of lib/heavy_queue.py and shows the test f
 """
 import contextlib, fcntl, importlib.machinery, importlib.util, io, json, os, shutil, signal, subprocess, sys
 import tempfile, threading, time, types, unittest
+from unittest import mock
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUEUE = os.path.join(KIT, 'lib', 'heavy_queue.py')
@@ -390,6 +391,199 @@ class QueueTests(unittest.TestCase):
         with self.assertRaises(self.hq().GaveUp):
             q.enter('gradle', 2048, 's.scope', 'x', 30)
         self.assertEqual(calls, [])
+
+    # ---------- #866: the machine's capacity rule, asked by heavy itself ----------
+
+    def checked(self, answers, **cfg):
+        """A queue whose capacity check is a fake: it answers from the list (the last answer repeats)."""
+        calls = []
+
+        def capacity(kind, mb):
+            calls.append((kind, mb))
+            answer = answers[min(len(calls), len(answers)) - 1]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        q = self.hq().Queue(self.host.box, dict(self.cfg, **cfg), now=self.clock.now, sleep=self.clock.sleep,
+                            monotonic=self.clock.monotonic, out=self.lines.append, capacity=capacity)
+        return q, calls
+
+    def test_a_queued_job_waits_while_the_capacity_check_says_not_free(self):
+        q, calls = self.checked([(False, 'job-build: budget (900 MB free, 3072 MB needed, level ok)'),
+                                 (False, 'heavy facts gave no answer within 5 s'), (True, 'free')])
+        self.other('ahead', 100)                    # another waiter: its share is kept, this one still fits
+        t = q.enter('build', 3072, 's.scope', 'x', 600)
+        self.assertEqual(t.state, 'admitted')
+        self.assertEqual(calls, [('build', 3072)] * 3, 'asked with the kind and the reservation, on each look')
+        self.assertIn('the capacity check says not now (job-build: budget (900 MB free', self.lines[0])
+        self.hq().release(q, t)
+
+    def test_a_check_that_fails_or_answers_oddly_is_never_a_yes(self):
+        for answer in (OSError('no heavy'), (1, 'free'), ('yes', 'free'), (None, 'x')):
+            with self.subTest(answer=answer):
+                q, calls = self.checked([answer])
+                with self.assertRaises(self.hq().GaveUp) as e:
+                    q.enter('build', 1024, 's.scope', 'x', 10)
+                self.assertIn('the capacity check says not now', str(e.exception))
+                self.assertEqual(self.host.files(), [], 'no ticket left behind')
+
+    def test_the_capacity_check_is_asked_after_the_queue_rule_and_before_the_admit_command(self):
+        self.host.set_slice(used_mb=4500)
+        q, calls = self.checked([(True, 'free')])
+        with self.assertRaises(self.hq().GaveUp):
+            q.enter('gradle', 2048, 's.scope', 'x', 30)
+        self.assertEqual(calls, [], 'the queue said no: not asked')
+        self.host.set_slice(used_mb=0)
+        hooks = []
+        q, calls = self.checked([(False, 'busy')], admitCommand=['/bin/true'])
+        q.hook = lambda argv, timeout: hooks.append(argv) or (0, '')
+        with self.assertRaises(self.hq().GaveUp):
+            q.enter('gradle', 2048, 's.scope', 'x', 30)
+        self.assertGreater(len(calls), 0)
+        self.assertEqual(hooks, [], 'the capacity rule said no: the admit command is not asked')
+
+    def test_a_waiter_the_capacity_check_refuses_keeps_no_room_for_itself(self):
+        q, _calls = self.checked([(False, 'busy')])
+        me = self.other('me', 2048)
+        with q:
+            ok, _why, _fig = q.look(me)
+        self.assertFalse(ok)
+        self.assertIs(me.data['hookNo'], True, 'the jobs behind it do not keep its room (as for the admit command)')
+
+    def test_capacity_check_off_in_the_machine_file_is_not_asked(self):
+        q, calls = self.checked([(False, 'busy')], capacityCheck=False)
+        t = q.enter('build', 1024, 's.scope', 'x', 10)
+        self.assertEqual((t.state, calls), ('admitted', []))
+        self.hq().release(q, t)
+        hq = self.hq()
+        self.assertIs(hq.machine_file.fields({}, hq.SETTINGS, 'test')['capacityCheck'], True, 'on by default')
+        for bad in (0, 1, 'false', None):
+            with self.subTest(bad=bad), self.assertRaises(hq.machine_file.MachineFileError):
+                hq.machine_file.fields({'capacityCheck': bad}, hq.SETTINGS, 'test')
+
+    def test_a_job_without_kind_waits_for_capacity_then_runs(self):
+        hq = self.hq()
+        answers = iter([(False, 'level elevated'), (False, 'level elevated'), (True, 'free')])
+        waited = hq.capacity_wait(lambda: next(answers), 600, 2, out=self.lines.append,
+                                  monotonic=self.clock.monotonic, sleep=self.clock.sleep)
+        self.assertEqual(waited, 4)
+        self.assertEqual(len([x for x in self.lines if x.startswith('waiting for capacity: level elevated')]), 1,
+                         'said once while the reason stays the same')
+
+    def test_a_job_without_kind_gives_up_and_a_broken_check_is_not_free(self):
+        hq = self.hq()
+
+        def broken():
+            raise ValueError('garbled')
+        for check, why in ((lambda: (False, 'busy'), 'busy'), (broken, 'ValueError: garbled'),
+                           (lambda: ('free', 'free'), 'free')):
+            with self.subTest(why=why), self.assertRaises(hq.GaveUp) as e:
+                hq.capacity_wait(check, 10, 2, out=self.lines.append, monotonic=self.clock.monotonic,
+                                 sleep=self.clock.sleep)
+            self.assertIn('gave up after waiting', str(e.exception))
+            self.assertIn(why, str(e.exception))
+
+    def test_a_stop_signal_while_waiting_for_capacity_ends_the_wait(self):
+        hq = self.hq()
+
+        def check():
+            os.kill(os.getpid(), signal.SIGTERM)    # blocked meanwhile: taken only between asks
+            return False, 'busy'
+        with self.assertRaises(hq.Stopped) as e:
+            hq.capacity_wait(check, 600, 2, out=self.lines.append, monotonic=self.clock.monotonic,
+                             sleep=self.clock.sleep)
+        self.assertEqual(e.exception.sig, signal.SIGTERM)
+        self.assertNotIn(signal.SIGTERM, signal.pthread_sigmask(signal.SIG_BLOCK, []), 'the mask is given back')
+
+    def lock_taken(self):
+        """Whether someone holds the queue lock: tried from another open file, as another process would."""
+        fd = os.open(os.path.join(self.host.box.queue_dir, 'lock'), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+
+    def test_a_job_without_kind_asks_under_the_queue_lock_and_keeps_it_once_free(self):
+        """Two plain waiters are admitted one at a time (#866): each ask is made under the lock, the lock is let go
+        between asks, and a "free" returns with it held, for the caller to drop once its scope can be counted."""
+        hq = self.hq()
+        answers = iter([(False, 'busy'), (True, 'free')])
+        held = []
+
+        def check():
+            held.append(self.lock_taken())
+            return next(answers)
+        self.lines.clear()
+        orig_sleep = self.clock.sleep
+        between = []
+        self.clock.sleep = lambda s: (between.append(self.lock_taken()), orig_sleep(s))
+        try:
+            hq.capacity_wait(check, 600, 2, out=self.lines.append, monotonic=self.clock.monotonic,
+                             sleep=self.clock.sleep, lock=self.q)
+        finally:
+            self.clock.sleep = orig_sleep
+        self.assertEqual((held, between), ([True, True], [False]))
+        self.assertTrue(self.lock_taken(), 'still held once free')
+        self.assertIsNone(self.q.sigs, 'the lock no longer ends a wait with Stopped')
+        self.q.drop()
+        self.assertFalse(self.lock_taken())
+
+    def test_a_queue_lock_that_stays_taken_gives_up_on_time_without_asking(self):
+        hq = self.hq()
+        with self.q:
+            pass                                    # makes the folder and the lock file
+        fd = os.open(os.path.join(self.host.box.queue_dir, 'lock'), os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)              # another open file: to the queue, another process
+        asked = []
+        for limit in (0, 30):
+            with self.subTest(limit=limit), self.assertRaises(hq.GaveUp) as cm:
+                start = self.clock.t
+                hq.capacity_wait(lambda: asked.append(1) or (True, 'free'), limit, 2, out=self.lines.append,
+                                 monotonic=self.clock.monotonic, sleep=self.clock.sleep, lock=self.q)
+            self.assertIn('queue lock', str(cm.exception))
+            self.assertGreaterEqual(self.clock.t - start, max(limit, hq.LOCK_MIN))   # --wait 0 still tries LOCK_MIN
+            self.assertLessEqual(self.clock.t - start, max(limit, hq.LOCK_MIN) + 1)
+        self.assertEqual(asked, [])
+        self.assertIsNone(self.q.lock_fd)
+
+    def test_a_busy_check_a_stop_or_a_give_up_lets_the_queue_lock_go(self):
+        hq = self.hq()
+
+        def stop():
+            os.kill(os.getpid(), signal.SIGTERM)
+            return False, 'busy'
+        for check, error in ((lambda: (False, 'busy'), hq.GaveUp), (stop, hq.Stopped)):
+            with self.subTest(error=error.__name__), self.assertRaises(error):
+                hq.capacity_wait(check, 10, 2, out=self.lines.append, monotonic=self.clock.monotonic,
+                                 sleep=self.clock.sleep, lock=self.q)
+            self.assertIsNone(self.q.lock_fd)
+            self.assertFalse(self.lock_taken())
+
+    def test_a_plain_waiter_killed_while_it_holds_the_queue_lock_frees_it(self):
+        """Stops half-way: the lock is an flock, so a waiter killed with -9 while it holds it loses it with its file
+        (no lock file to clean up), and the next waiter goes on at once."""
+        hq = self.hq()
+        with self.q:
+            pass
+        path = os.path.join(self.host.box.queue_dir, 'lock')
+        code = ('import fcntl, os, sys, time; fd = os.open(sys.argv[1], os.O_RDWR); fcntl.flock(fd, fcntl.LOCK_EX); '
+                'print("held", flush=True); time.sleep(300)')
+        p = subprocess.Popen([sys.executable, '-I', '-c', code, path], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait(timeout=60), p.stdout.close()))
+        self.assertEqual(read_line(p), 'held\n')
+        self.assertTrue(self.lock_taken())
+        p.kill()
+        p.wait(timeout=60)
+        q = hq.Queue(self.host.box, self.cfg, out=self.lines.append)    # the real clock: a real lock wait
+        start = time.monotonic()
+        hq.capacity_wait(lambda: (True, 'free'), 30, 2, out=self.lines.append, lock=q)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertTrue(self.lock_taken())
+        q.drop()
 
     def test_a_real_admit_command_that_hangs_is_cut_off(self):
         hq = self.hq()
@@ -977,10 +1171,88 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(jo(['--kind', 'gradle', '--mb', '2048', '--', 'gw']),
                          ({'kind': 'gradle', 'mb': 2048, 'wait': 7200.0}, ['--', 'gw']))
         self.assertEqual(jo(['--kind=tsc', '--wait=60', 'tsc'])[0], {'kind': 'tsc', 'mb': 3072, 'wait': 60.0})
+        # #866: --wait alone is how long a job without --kind waits for capacity
+        self.assertEqual(jo(['--wait', '30', 'ls'])[0], {'kind': None, 'mb': 3072, 'wait': 30.0})
         for bad in (['--kind', 'x'], ['--mb', '10', 'ls'], ['--kind', 'x', '--kind', 'y', 'ls'],
                     ['--kind', 'x', '--mb', 'lots', 'ls'], ['--kind', 'x', '--mb', '1', 'ls'], ['--kind']):
             with self.subTest(bad=bad):
                 self.assertEqual(jo(bad)[0], 'usage')
+
+    def started(self, argv, job=None, nested=False, check_on=True, answers=((True, 'free'),), broken=None):
+        """bin/heavy's run() up to the scope, with fakes for systemd and the capacity check: (exit code, the checks
+        asked, whether the command was started, what heavy said). broken: why the machine file's heavy.queue is
+        refused (hq.settings raises Refused). The queue (the plain wait's lock) is a private one."""
+        heavy, hq = self.heavy, load_module('heavy_queue_wired', QUEUE)
+        hq.Refused = heavy.Refused          # one Refused, as heavy's queue_module() wires it
+        root = tempfile.mkdtemp(prefix='heavy-queue-root-')
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        patch = mock.patch.dict(os.environ, {'HEAVY_QUEUE_ROOT': root})
+        patch.start()
+        self.addCleanup(patch.stop)
+        asked, ran, said = [], [], []
+        answers = list(answers)
+
+        def check(kind, mb):
+            asked.append((kind, mb))
+            return answers[min(len(asked), len(answers)) - 1]
+
+        def settings(*a):
+            if broken:
+                raise heavy.Refused(broken)
+            return hq.machine_file.fields({'capacityCheck': check_on, 'pollSeconds': 0.2}, hq.SETTINGS, 'test')
+        hq.settings = settings
+        heavy.queue_module = lambda: hq
+        heavy.capacity_check = lambda: check
+        heavy.tool = lambda name: '/bin/false'
+        heavy.check_slice = lambda *a: '/user.slice/heavy.slice'
+        heavy.in_heavy_scope = lambda *a: nested
+        heavy.say = said.append
+        heavy.run_scope = lambda *a, **k: ran.append(a[0]) or 0
+        code = heavy.run(argv, {'slice': 'heavy.slice', 'grace_seconds': 30}, job)
+        return code, asked, ran, said
+
+    def test_heavy_without_kind_asks_the_capacity_rule_before_it_starts(self):
+        # #866: a test started right after a NOT OK (`check ; test`) still waits: heavy asks the rule itself
+        code, asked, ran, _ = self.started(['make', 'test'], answers=[(False, 'busy'), (True, 'free')])
+        self.assertEqual((code, asked, ran), (0, [(None, None)] * 2, [['make', 'test']]))
+        code, asked, ran, said = self.started(['make', 'test'], job={'kind': None, 'mb': 3072, 'wait': 0.5},
+                                              answers=[(False, 'job-default: budget')])
+        self.assertEqual((code, ran), (76, []))
+        self.assertTrue(any('gave up after waiting' in x and 'not running make' in x for x in said), said)
+
+    def test_a_broken_queue_section_warns_and_a_job_without_kind_still_waits_by_the_defaults(self):
+        why = '/etc/fork-kit/machine.json: heavy.queue.pollSeconds: must be a number'
+        code, asked, ran, said = self.started(['make'], answers=[(False, 'busy'), (True, 'free')], broken=why)
+        self.assertEqual((code, asked, ran), (0, [(None, None)] * 2, [['make']]), said)
+        self.assertEqual(said[0], f'{why}; a job without --kind goes on with the default queue settings')
+        hq = load_module('heavy_queue_defaults', QUEUE)
+        self.assertEqual(hq.default_settings(), hq.machine_file.fields({}, hq.SETTINGS, 'x'))
+        # a queued job's admission depends on them: it is refused (exit 1 in main)
+        with self.assertRaises(self.heavy.Refused):
+            self.started(['gradle'], job={'kind': 'build', 'mb': 2048, 'wait': 10}, broken=why)
+
+    def test_a_queued_job_gets_the_capacity_check_in_its_queue(self):
+        got = []
+
+        class Stop(Exception):
+            pass
+
+        def queue_for(*a, capacity=None):
+            got.append(capacity)
+            raise Stop()
+        self.heavy.queue_for = queue_for
+        with self.assertRaises(Stop):
+            self.started(['gradle'], job={'kind': 'build', 'mb': 2048, 'wait': 10}, answers=[(False, 'busy')])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]('build', 2048), (False, 'busy'), 'the queue asks the rule through it')
+
+    def test_a_nested_heavy_or_the_check_turned_off_does_not_ask(self):
+        code, asked, ran, _ = self.started(['make'], answers=[(False, 'busy')], check_on=False)
+        self.assertEqual((code, asked, ran), (0, [], [['make']]))
+        execs = []
+        with mock.patch.object(self.heavy.os, 'execvpe', lambda *a: execs.append(a[1]) or 0):
+            code, asked, ran, _ = self.started(['make'], answers=[(False, 'busy')], nested=True)
+        self.assertEqual((asked, execs), ([], [['make']]), 'the outer heavy holds the capacity for it')
 
     def test_usage_errors_exit_2_before_anything_runs(self):
         r = subprocess.run([sys.executable, '-I', '-B', HEAVY, '--kind', 'x'], capture_output=True, text=True,
@@ -1055,6 +1327,19 @@ MUTATIONS = {
                               'test_a_garbled_or_old_live_ticket_counts_as_admitted_at_3072'),
     'the queue folder is checked': ('or st.st_mode & 0o022:', 'or False:',
                                     'test_a_queue_folder_others_can_change_is_refused'),
+    # #866: two plain waiters are admitted one at a time
+    'a plain ask is made under the queue lock': ('                    lock.take(start + max(limit, LOCK_MIN))\n',
+                                                 '                    pass\n',
+                                                 'test_a_job_without_kind_asks_under_the_queue_lock_and_keeps_it_once_free'),
+    'a free plain ask keeps the queue lock': ('                held = True\n', '                pass\n',
+                                              'test_a_job_without_kind_asks_under_the_queue_lock_and_keeps_it_once_free'),
+    'the queue lock is let go between asks': ('            if lock is not None:\n                lock.drop()\n'
+                                              '            if waited >= limit:',
+                                              '            if waited >= limit:',
+                                              'test_a_job_without_kind_asks_under_the_queue_lock_and_keeps_it_once_free'),
+    'a plain waiter tries the lock LOCK_MIN even with --wait 0': (
+        'start + max(limit, LOCK_MIN)', 'start + limit',
+        'test_a_queue_lock_that_stays_taken_gives_up_on_time_without_asking'),
 }
 
 
