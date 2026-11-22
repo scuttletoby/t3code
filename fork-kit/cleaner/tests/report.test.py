@@ -10,6 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cleaner_fixture as fx  # noqa: E402
+import machine_file  # noqa: E402
 
 MB = 1024 * 1024
 GB = 1024 ** 3
@@ -46,12 +47,15 @@ class Case(fx.Case):
         raise AssertionError('Docker was asked')
 
     def report(self, cfg, docker=None, disk=(100 * GB, 200 * GB, None), mounts=lambda: {'/'}, **options):
-        """(exit code, lines) of one report. `disk` is (used, size, device) of the home folder's disk; device None
-        means the home folder's own. `mounts` gives the mount points. `options`: out, mark."""
-        used, size, dev = disk
+        """(exit code, lines) of one report. `disk` is (used, size, device[, free]) of the home folder's disk; device
+        None means the home folder's own; free (what this user may write) is size - used unless given. `mounts` gives
+        the mount points. `options`: out, mark."""
+        used, size, dev = disk[:3]
+        free = disk[3] if len(disk) > 3 else size - used
         lines = []
         code = self.c.report.report(cfg, lines.append, docker=docker or self.no_docker, host=HOST, mounts=mounts,
-                                    disk_of=lambda cfg: (used, size, dev if dev is not None else os.stat(cfg.home).st_dev),
+                                    disk_of=lambda cfg: (used, size, dev if dev is not None else os.stat(cfg.home).st_dev,
+                                                         free),
                                     **options)
         return code, lines
 
@@ -546,6 +550,49 @@ class Freed(Case):
         self.assertEqual(code, 0, lines)
         self.assertIn('freed 0.0 GB (no delete in the log yet)', lines[0])
         self.assertEqual((open(old).read(), os.stat(old).st_mtime), before)
+
+
+class LowDisk(Case):
+    """#982: the daily report warns when the home folder's disk has less than cleaner.report.warnFreeGB free (60 GB
+    unless the machine file says otherwise), and names the largest folders in the home folder."""
+
+    def test_under_the_warning_the_line_names_the_largest_folders_in_the_home(self):
+        self.big(self.path('home', 'work', 'a', 'a.bin'), 3)
+        self.big(self.path('home', '.cache', 'b.bin'), 2)
+        for i in range(5):
+            self.big(self.path('home', f'small-{i}', 'c.bin'), 1)
+        self.big(self.path('home', 'notes.bin'), 4)          # a file, not a folder
+        os.symlink(self.path('home', 'work'), self.path('home', 'work-link'))     # a link is not followed
+        code, lines = self.report(self.cfg(), disk=(150 * GB, 200 * GB, None, 50 * GB))
+        self.assertEqual(code, 0, lines)
+        tail = lines[0].split('; ')[-1]
+        self.assertTrue(tail.startswith(f'LOW DISK: 50.0 GB free, under 60 GB: largest folders in {self.home}: '
+                                        'work 3.0 MB, .cache 2.0 MB, small-'), tail)
+        self.assertEqual(tail.count(' MB'), 5, 'the five largest')
+        self.assertNotIn('notes.bin', tail)
+        self.assertNotIn('work-link', tail)
+        # above it: no warning, and the home is not walked for it
+        code, lines = self.report(self.cfg(), disk=(100 * GB, 200 * GB, None, 61 * GB))
+        self.assertNotIn('LOW DISK', lines[0])
+
+    def test_the_machine_file_sets_the_warning_and_0_turns_it_off(self):
+        code, lines = self.report(self.cfg(report={'warnFreeGB': 40}), disk=(150 * GB, 200 * GB, None, 50 * GB))
+        self.assertNotIn('LOW DISK', lines[0])
+        code, lines = self.report(self.cfg(report={'warnFreeGB': 100}), disk=(150 * GB, 200 * GB, None, 50 * GB))
+        self.assertIn('LOW DISK: 50.0 GB free, under 100 GB', lines[0])
+        code, lines = self.report(self.cfg(report={'warnFreeGB': 0}), disk=(199 * GB, 200 * GB, None, 0))
+        self.assertNotIn('LOW DISK', lines[0])
+        for bad in ({'warnFreeGB': -1}, {'warnFreeGB': '60'}, {'warn': 60}):
+            with self.subTest(bad=bad), self.assertRaises(machine_file.MachineFileError):
+                self.cfg(report=bad)
+
+    @unittest.skipIf(os.geteuid() == 0, 'root reads every folder')
+    def test_a_folder_it_cannot_read_in_full_says_at_least(self):
+        self.big(self.path('home', 'locked', 'inner', 'a.bin'), 2)
+        os.chmod(self.path('home', 'locked', 'inner'), 0)
+        self.addCleanup(os.chmod, self.path('home', 'locked', 'inner'), 0o700)
+        code, lines = self.report(self.cfg(), disk=(150 * GB, 200 * GB, None, 50 * GB))
+        self.assertIn('locked at least ', lines[0].split('; ')[-1])
 
 
 class Command(Case):
