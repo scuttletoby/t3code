@@ -124,7 +124,8 @@ SETTINGS = {
     'admitTimeoutSeconds': ((int, float), 20, _at_least(1, 300)),
     'capacityCheck': (bool, True, None),                    # heavy facts must say free too (#866); false: off
 }
-SECTION = {'sweep': (dict, None, None), 'queue': (dict, None, None), 'capacity': (dict, None, None)}  # heavy_facts.py
+SECTION = {'sweep': (dict, None, None), 'queue': (dict, None, None), 'capacity': (dict, None, None),  # heavy_facts.py
+           'disk': (dict, None, None)}                                     # t3-capacity (heavy_facts.disk_check)
 
 
 class Refused(Exception):
