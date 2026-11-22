@@ -1,8 +1,7 @@
-// Fork only: fails when upstream's ci.yml or release.yml test jobs, its windows-tests.yml, or their
-// TOP_LEVEL keys changed since .github/fork-tests-upstream.json recorded them (comments ignored). It
-// compares upstream with its record, not with the fork's copy (COPY): `--record` prints the changes
-// and saves them, and its commit and PR must say per change what was ported or why it does not
-// apply. Run: `node <this> [--record]`.
+// Fork only: fails when upstream's tracked workflows (TRACKED) or their TOP_LEVEL keys changed since
+// .github/fork-tests-upstream.json recorded them (comments ignored); compares upstream with its record.
+// `--record` prints and saves the changes; its commit and PR say per change what was ported or why not.
+// Run: `node <this> [--record]`.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
