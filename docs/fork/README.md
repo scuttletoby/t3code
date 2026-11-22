@@ -385,8 +385,10 @@ server's, a command, one in another folder or with frontmatter it cannot parse) 
 `enforce` and runs with a note in `advise`. `enforce` refuses with the rows, `advise` runs it with a
 note to the agent, an inside pick gets its row's `useFor`, and each call is logged as "model policy
 pick" with route `Agent` or `Skill`. A check that fails refuses the call; while a policy is on when
-the process opens, so does a hook that times out (`onFailure: "block"`, Claude Code 2.1.295 or
-newer; with the policy off it is left out, so an older Claude Code still opens). The hook is fixed
+the process opens, so does a hook that times out (`onFailure: "block"`). So while a policy is on,
+in `advise` too, Claude Code 2.1.295 or newer is required: an older one refuses to open every new
+query, with an error that asks to remove `onFailure: "block"` from the hooks (a person cannot; turn
+the policy off or update Claude Code). With the policy off it is left out. The hook is fixed
 when the Claude process opens: a process started before this version runs without it until T3
 opens a new one (a new profile, a restart). Workflow `agent()` calls are not read here (the script
 is code); the model guard reads them. On the MCP routes, a pick is inside when it

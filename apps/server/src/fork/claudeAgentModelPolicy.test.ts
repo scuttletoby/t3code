@@ -340,6 +340,12 @@ describe("a skill that starts a sub-agent under the model policy (#128)", () => 
     // Frontmatter that does not start the file: Claude Code may still read it.
     yield* write(user, "late", "\n---\ncontext: fork\nmodel: sonnet\n---\n");
     yield* write(user, "bad-yaml", "---\ncontext: fork\ncontext: inline\n---\n");
+    // An unquoted ": " in a value: Claude Code and T3's skill list read it (its repair step).
+    const colon = "description: Review the code: bugs and style";
+    yield* write(user, "inline-colon", `---\n${colon}\n---\nInline.`);
+    yield* write(user, "fork-colon", `---\n${colon}\ncontext: fork\nmodel: sonnet\n---\n`);
+    // Still broken after that repair (it leaves a value starting with "[" alone).
+    yield* write(user, "colon-broken", `---\n${colon}\ncontext: fork\nmodel: [opus\n---\n`);
     yield* write(own, "project-fork", "---\ncontext: fork\nmodel: haiku\neffort: high\n---\n");
     yield* write(
       own,
@@ -367,14 +373,16 @@ describe("a skill that starts a sub-agent under the model policy (#128)", () => 
         }
       }
       // Runs inline and names no model: it runs on the session's own model, nothing to check.
-      for (const name of ["inline", "no-frontmatter"]) {
+      for (const name of ["inline", "no-frontmatter", "inline-colon"]) {
         assert.deepStrictEqual(yield* skill(ENFORCE, name, session), {}, name);
+        assert.deepStrictEqual(yield* skill(ADVISE, name, session), {}, name);
       }
       for (const [name, why] of [
         ["fork-sonnet", "claude-sonnet-5-5 (claudeAgent) is in no row"],
         ["fork-none", "the call names no model"],
         ["fork-inherit", "the call names no model"],
         ["inline-model", "claude-sonnet-5-5 (claudeAgent) is in no row"],
+        ["fork-colon", "claude-sonnet-5-5 (claudeAgent) is in no row"],
         ["project-fork", "claude-haiku-5-5 (claudeAgent) is in no row"],
       ] as const) {
         // Runs again: the same answer.
@@ -397,6 +405,7 @@ describe("a skill that starts a sub-agent under the model policy (#128)", () => 
         [3, session, "the Skill call names no skill"],
         ["late", session, "T3 cannot read the frontmatter of the skill late"],
         ["bad-yaml", session, "T3 does not find the skill bad-yaml"],
+        ["colon-broken", session, "T3 does not find the skill colon-broken"],
         [
           "fork-opus",
           { ...session, transcript: "/elsewhere/t.jsonl" },

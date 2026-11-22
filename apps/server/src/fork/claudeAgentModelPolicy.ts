@@ -22,7 +22,6 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import { parse as parseYaml } from "yaml";
 
 import {
   BUNDLED_CLAUDE_MODEL_CATALOG,
@@ -30,7 +29,7 @@ import {
   resolveClaudeModelCatalog,
   resolveClaudeModelSlug,
 } from "../provider/ClaudeModelCatalog.ts";
-import { discoverClaudeSkills } from "../provider/Drivers/ClaudeSkills.ts";
+import { discoverClaudeSkills, parseSkillFrontmatter } from "../provider/Drivers/ClaudeSkills.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makePickCheck, type PolicyRoute, type ServerPick } from "./modelPolicyCheck.ts";
 
@@ -136,23 +135,15 @@ export function claudeConfigDirOfTranscript(
   return path.basename(projects) === "projects" ? path.dirname(projects) : undefined;
 }
 
-const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
-
-/** A SKILL.md's frontmatter as Claude Code reads it; `undefined` when it cannot be read. */
+/**
+ * A SKILL.md's frontmatter as T3's skill list reads it (`parseSkillFrontmatter`, which repairs the
+ * unquoted `: ` in a value that Claude Code accepts); `undefined` when it cannot be read.
+ */
 function skillFrontmatter(text: string): Record<string, unknown> | undefined {
-  const match = FRONTMATTER.exec(text);
+  const read = parseSkillFrontmatter(text);
   // Something that looks like frontmatter but is not read as such here may be read by Claude Code.
-  if (match === null) return /^﻿?\s*---/.test(text) ? undefined : {};
-  try {
-    const parsed: unknown = parseYaml(match[1] ?? "");
-    return parsed === null || parsed === undefined
-      ? {}
-      : typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : undefined;
-  } catch {
-    return undefined;
-  }
+  if (read.kind === "missing") return /^\uFEFF?\s*---/.test(text) ? undefined : {};
+  return read.kind === "parsed" && !Array.isArray(read.record) ? read.record : undefined;
 }
 
 const unreadableSkill = (why: string): ServerPick => ({
