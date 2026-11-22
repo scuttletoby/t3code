@@ -407,6 +407,8 @@ class Install(Base):
         for rel in install.SOURCE_FILES[:-1]:
             os.makedirs(os.path.dirname(os.path.join(src, rel)), exist_ok=True)
             shutil.copyfile(os.path.join(kf.KIT, rel), os.path.join(src, rel))
+        self.assertEqual(install.missing_sources(src), ['README.md'])
+        self.assertEqual(install.missing_sources(kf.KIT), [])
         with self.assertRaisesRegex(Refused, 'README.md is missing'):
             self.quiet(install.install, src, SHA_A, 'agent', ops=self.ops)
 
