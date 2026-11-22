@@ -192,9 +192,22 @@ class Releases(unittest.TestCase):
         first = re.search(r'First in the release after `(ci/v\d+)`', entry)
         self.assertIsNotNone(first, entry)
         text = ' '.join(guide().split())
-        self.assertIn(f'Findings, rounds and `override_authors` are in the first release after `{first[1]}`', text)
+        after = f'ci/v{int(first[1][len("ci/v"):]) + 1}'   # the release after it (ReleaseTags checks the tags)
+        self.assertIn(f'Findings, rounds and `override_authors` are in `{after}` and later', text)
         self.assertIn(f'`{first[1]}` or older for `override_authors`', text)
         self.assertIn(f'`{first[1]}` and older refuse a config with `override_authors`', entry)
+
+    def test_a_caller_in_enforce_pins_the_release_with_every_rule_hit(self):   # #82: the floor, in step with the notes
+        entry = self.entry(82)
+        first = re.search(r'First in the release after `(ci/v\d+)`', entry)
+        self.assertIsNotNone(first, entry)
+        older = f'ci/v{int(first[1][len("ci/v"):]) - 1}'
+        floor = f'pins the first release after `{first[1]}` or a later one'
+        self.assertIn(f'Every rule hit gives its lenses from the first release after `{first[1]}` (#82)', flat(step(1)))
+        self.assertIn(f'So a caller of a config in `enforce` {floor}: `{older}` and `{first[1]}` accept the config but '
+                      'judge mixed changes the old, looser way', flat(step(1)))
+        self.assertIn(f'A caller of this config {floor} (step 1)', flat(step(5)))   # the fork's own caller (#81)
+        self.assertIn(f'a caller of a config in `enforce` pins this release or a later one', entry)
 
     def test_the_release_notes_upgrade_points_to_the_guide(self):
         self.assertIn(f'pr-queue README, "{HEADING}"', self.entry(740))
@@ -407,10 +420,14 @@ class StoppedHalfWay(unittest.TestCase):
 
     def test_the_enforce_pull_request_needs_only_the_input_lenses(self):
         """Step 5: the pull request that sets enforce is judged under the base's shadow, so the gate requires only the
-        input's lenses, not the critical ones its own change (the config, a protected path) would need in enforce."""
-        self.assertIn('so ask for the critical lenses: the gate does not require them yet', step(5))
+        input's lenses, not the ones its own change would need in enforce: the critical lenses (the config is a
+        protected path) plus the lenses of the rule the config sits under (here the `code` catch-all, #82)."""
+        self.assertIn('so ask for the critical lenses plus the lenses of every other rule its paths hit (a config '
+                      "under a normal catch-all also needs that rule's lens): the gate does not require them yet",
+                      flat(step(5)))
         judgement = review_judge.judge(parsed('shadow').review, [('M', (CONFIG_PATH,))], CONFIG_PATH)
-        self.assertEqual((judgement.weight, judgement.lenses), ('critical', ('data-1', 'data-2')))
+        self.assertEqual((judgement.weight, judgement.lenses), ('critical', ('data-1', 'data-2', 'code')))
+        self.assertEqual([h.rule for h in judgement.hits], ['data', 'code'])
         for mode, want in (('shadow', {'code'}), ('enforce', {'code', 'data-1', 'data-2'})):
             seen = []
             run_decide(mode, rounds=(review_judge.Rounds(1, False, False, (), ()), None), judgement=judgement,

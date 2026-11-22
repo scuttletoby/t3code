@@ -96,8 +96,11 @@ class Plan(Project):
         code, out, err = self.plan(changes(('M', 'src/storage/wallet.ts'), ('M', 'src/app.ts')))
         self.assertEqual((code, err), (0, ''))
         self.assertIn('weight: critical\n', out)
-        self.assertIn('lenses: data-1, data-2 (independent: one new read-only agent each, no shared context', out)
+        # every rule hit gives its lenses: the two critical reads, and the app file's own `code` read (issue 82)
+        self.assertIn('lenses: data-1, data-2, code (independent: one new read-only agent each, no shared context', out)
         self.assertIn('  data-1: prompt .github/lenses/data.md; runner claude-opus-5-5 high\n', out)
+        self.assertIn('  data-2: prompt .github/lenses/data.md; runner claude-opus-5-5 high\n', out)
+        self.assertIn('  code: prompt .github/lenses/code.md; runner claude-opus-5-5 high\n', out)
         self.assertIn('note: the review block is in shadow', out)
 
     def test_a_normal_path_needs_one_lens(self):
