@@ -346,7 +346,7 @@ The gate reads: `not a lens`
 
 ```text
 not a lens: fix round 1 checked
-head 0123456789abcdef0123456789abcdef01234567 fixes the round 1 major; minors filed as a follow-up issue
+head 0123456789abcdef0123456789abcdef01234567 fixes the round 1 major and its minors; one nit dropped, reason under Left
 ```
 
 A plain comment.
@@ -363,5 +363,5 @@ when its author is listed in the review block's `override_authors`.
 The gate reads: `override`
 
 ```text
-tool ready --head 0123456789abcdef0123456789abcdef01234567: fix diff checked, the round 1 minors are in a follow-up issue
+tool ready --head 0123456789abcdef0123456789abcdef01234567: fix diff checked, the round 1 minors are fixed in this head
 ```

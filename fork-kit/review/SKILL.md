@@ -112,10 +112,11 @@ Each step is done by another agent than the author.
      orchestrator checks that fix diff itself and posts the override for the fix head. A blocker or major left over
      counts as stuck. A pull request still stuck gets one audit by the `audit_runner` ("good enough to merge, or what
      next"), posted as a `not a lens:` comment; then a person decides.
-8. **Minors** (`minors`, default `issue`): minors and anything left when the pull request stops go into **one**
-   follow-up issue, with the project's labels, linked on the pull request. With `same-round`, minors are fixed in the
-   round that found them and any left at the last round are listed in the pull request description with a reason
-   each.
+8. **Minors** (`minors`, default `same-round`): do what the plan's `minors:` line says; the rule is written once, in
+   `MINORS` in [lib/review_kit.py](lib/review_kit.py). With the default, a minor or nit is fixed in the pull request
+   or dropped with a reason under "Left", and becomes an issue (with the project's labels) only as a real bug outside
+   the pull request's scope. Blockers and majors are not minors: they are fixed before merge or the pull request is
+   stuck. A project that sets `issue` files the leftovers as **one** follow-up issue linked on the pull request.
 9. **Ready:** the project's ready command (the queue config's `ready_command`) arms the head every lens read. Push
    nothing after it; a new head needs the lenses again.
 

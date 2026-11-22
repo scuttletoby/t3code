@@ -126,8 +126,24 @@ class Plan(Project):
         self.assertIn('lens rounds: at most 2; after that the orchestrator checks each fix diff itself; the gate caps '
                       'rounds at 4', out)
         self.assertIn('stuck after the last lens round: one audit, claude-fable-5-2 high', out)
-        self.assertIn('minors: minors not fixed when the pull request stops go into one follow-up issue', out)
+        self.assertIn(f'minors: {review_kit.MINORS["same-round"]}\n', out)
         self.assertIn('state line: required by config, not enforced by the gate yet', out)
+
+    def test_minors_default_to_same_round_and_issue_still_works(self):
+        # #1006: with no `minors` key the plan says the same-round rule; a project that sets `issue` keeps it.
+        self.assertEqual(review_kit.DEFAULTS['minors'], 'same-round')
+        self.assertIn('never become an issue', review_kit.MINORS['same-round'])
+        self.config()
+        for settings, want, other in ((None, 'same-round', 'issue'), ({'version': 1}, 'same-round', 'issue'),
+                                      ({'version': 1, 'minors': 'issue'}, 'issue', 'same-round')):
+            with self.subTest(settings=settings):
+                if settings is not None:   # None runs first: no settings file at all
+                    self.put('.github/review-kit.json', settings)
+                code, out, err = self.plan(changes(('M', 'src/app.ts')))
+                self.assertEqual(code, 0, err)
+                self.assertIn(f'minors: {review_kit.MINORS[want]}\n', out)
+                self.assertNotIn(review_kit.MINORS[other], out)
+        self.assertIn('minors: minors not fixed when the pull request stops go into one follow-up issue', out)
 
     def test_settings_change_runners_rounds_and_minors(self):
         self.config()
@@ -139,7 +155,7 @@ class Plan(Project):
         self.assertIn('  data-2: prompt .github/lenses/data.md; runner m-2 xhigh\n', out)
         self.assertIn('  data-1: prompt .github/lenses/data.md; runner claude-opus-5-5 high\n', out)
         self.assertIn('note: lens_rounds 5 is above the gate\'s rounds.max 4', out)
-        self.assertIn('minors: minors are fixed in the same round', out)
+        self.assertIn(f'minors: {review_kit.MINORS["same-round"]}\n', out)
         self.assertIn('Does it survive a second run and a crash half-way?', out)
         self.assertNotIn(review_kit.STATE_QUESTION, out)
 
@@ -365,15 +381,17 @@ class States(Project):
         self.assertIn("unknown key 'runers'", self.plain(self.plan(changes(('M', 'a')))))
 
     def test_wrong_settings_values_are_all_named(self):
-        self.put('.github/review-kit.json', {'version': 1, 'runner': {'model': 'm', 'effort': 'max'},
-                                             'audit_runner': 'fable', 'lens_rounds': 0, 'minors': 'later',
-                                             'state_question': ' ', 'queue_config': '',
-                                             'lens_runners': {'x': {'model': 'm', 'effort': 'low'}}})
-        err = self.plain(self.plan(changes(('M', 'a'))))
-        for part in ("runner has effort 'max'", 'audit_runner must be', 'lens_rounds must be', 'minors must be one of',
-                     'state_question must be', 'queue_config must be', "lens_runners.x has effort 'low'"):
-            with self.subTest(part=part):
-                self.assertIn(part, err)
+        for minors in ('later', None, ['issue'], {'issue': True}):
+            self.put('.github/review-kit.json', {'version': 1, 'runner': {'model': 'm', 'effort': 'max'},
+                                                 'audit_runner': 'fable', 'lens_rounds': 0, 'minors': minors,
+                                                 'state_question': ' ', 'queue_config': '',
+                                                 'lens_runners': {'x': {'model': 'm', 'effort': 'low'}}})
+            err = self.plain(self.plan(changes(('M', 'a'))))
+            for part in ("runner has effort 'max'", 'audit_runner must be', 'lens_rounds must be',
+                         'minors must be one of', 'state_question must be', 'queue_config must be',
+                         "lens_runners.x has effort 'low'"):
+                with self.subTest(minors=minors, part=part):
+                    self.assertIn(part, err)
 
     def test_settings_that_are_no_object_or_no_json(self):
         for text in ('[1]', '{', 'true'):

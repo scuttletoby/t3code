@@ -35,7 +35,7 @@ export const ReviewRunner = Schema.Struct({
 });
 export type ReviewRunner = typeof ReviewRunner.Type;
 
-/** Small findings left after the review: fixed in the same round, filed as issues, or free. */
+/** Small findings: fixed in the pull request or dropped, filed as issues, or free. */
 export const ReviewMinors = Schema.Literals(["same-round", "issue", "free"]);
 export type ReviewMinors = typeof ReviewMinors.Type;
 
@@ -111,8 +111,8 @@ export const REVIEW_RULES_RECOMMENDED: ReviewRulesValues = {
   lensRunners: { approach: { driver: CLAUDE, model: "claude-fable-5-2", effort: "high" } },
   stateQuestion:
     "What happens when this runs again, stops half-way, or meets existing, old or empty state?",
-  // Small findings left after review round 2 become follow-up issues.
-  minors: "issue",
+  // Small findings are fixed in the same pull request or dropped (the review kit's default).
+  minors: "same-round",
   configPath: ".github/pr-queue.json",
   reportMaxChars: 60000,
 };
