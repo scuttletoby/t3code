@@ -43,10 +43,12 @@ import {
   resolveMcpProfile,
 } from "./mcpProfile.ts";
 import { makeClaudeAgentModelPolicyHook } from "./claudeAgentModelPolicy.ts";
+import { decodeSettingsFileSilently } from "./settingsFileRead.ts";
 import {
   MAX_T3_TOOL_SETS,
   type T3ToolSet,
   fixT3ToolSet,
+  nextT3ToolSetTurn,
   refusedT3ToolSet,
   t3ToolSetOf,
 } from "./mcpT3ToolSets.ts";
@@ -454,7 +456,11 @@ const settingsFileReader = Effect.gen(function* () {
       return { kind: "missing", settings: managed.applyLocks(managed.defaults) };
     }
     const raw = yield* fs.readFileString(settingsPath);
-    const decoded = ServerSettingsService.decodeSettingsFileText(raw, managed.withDefaults);
+    const decoded = decodeSettingsFileSilently(
+      raw,
+      managed.withDefaults,
+      ServerSettingsService.decodePersistedSettings,
+    );
     if (Exit.isSuccess(decoded) && !ServerSettingsService.settingsFileLegacyKeysUnreadable(raw)) {
       return { kind: "decoded", settings: managed.applyLocks(decoded.value) };
     }
@@ -728,6 +734,7 @@ const withAgentModelPolicy = (
  */
 const openedPlanKeys = new Map<ThreadId, string | undefined>();
 
+/** Keeps the thread's key as its most recently used; beyond the cap, the least recently used goes. */
 const keepOpenedPlanKey = (threadId: ThreadId, key: string | undefined) => {
   openedPlanKeys.delete(threadId);
   openedPlanKeys.set(threadId, key);
@@ -735,6 +742,15 @@ const keepOpenedPlanKey = (threadId: ThreadId, key: string | undefined) => {
     if (openedPlanKeys.size <= MAX_T3_TOOL_SETS) break;
     openedPlanKeys.delete(oldest);
   }
+};
+
+export const __testing = {
+  /** Forgets every process's plan key, as after a restart. */
+  clearOpenedPlanKeys: () => openedPlanKeys.clear(),
+  /** Records that the thread's process opened with `key`, as its options read does. */
+  keepOpenedPlanKey,
+  /** True while the thread's opened plan key is kept. */
+  hasOpenedPlanKey: (threadId: ThreadId) => openedPlanKeys.has(threadId),
 };
 
 /**
@@ -747,12 +763,13 @@ const fixedWhenOpened = (
   plan: ClaudeMcpProfilePlan,
   threadId: ThreadId,
   set: T3ToolSet,
+  turn: number,
 ): ClaudeMcpProfilePlan => {
   const { options, ...rest } = plan;
   return Object.defineProperty({ ...rest }, "options", {
     enumerable: true,
     get: () => {
-      fixT3ToolSet(threadId, set);
+      fixT3ToolSet(threadId, set, turn);
       keepOpenedPlanKey(threadId, planKey(plan));
       return options;
     },
@@ -768,28 +785,33 @@ export const makeClaudeMcpProfiles = Effect.gen(function* () {
     thread: LineageThread,
     overrides: McpOverrides,
   ) {
+    // Drawn before the read: a later turn's set stands over this one's, whichever finishes first.
+    const turn = nextT3ToolSetTurn();
     // A profile that cannot apply refuses the turn and keeps only the tools every profile keeps,
     // at once: narrowing never waits. A profile that applies is fixed as its process opens.
     const resolved: McpProfileResolved = yield* profileFor(thread).pipe(
       Effect.tapError((refusal) =>
-        Effect.sync(() => fixT3ToolSet(thread.id, refusedT3ToolSet(refusal.reason))),
+        Effect.sync(() => fixT3ToolSet(thread.id, refusedT3ToolSet(refusal.reason), turn)),
       ),
     );
     const t3ServerNames = Object.keys(overrides.mcpServers ?? {});
     const plan = claudeMcpProfilePlan(resolved.name, resolved.profile, t3ServerNames);
     if (isRefusal(plan)) {
-      fixT3ToolSet(thread.id, refusedT3ToolSet(plan.reason));
+      fixT3ToolSet(thread.id, refusedT3ToolSet(plan.reason), turn);
       return yield* plan;
     }
     const set = t3ToolSetOf(resolved);
     // The same plan as the thread's process opened with: the adapter keeps that process without
     // reading the options, so its set is fixed here, the one that process has (never wider). This
     // is how a good turn after a refused one gets its set back on the process the refusal kept.
-    if (openedPlanKeys.has(thread.id) && openedPlanKeys.get(thread.id) === planKey(plan)) {
-      fixT3ToolSet(thread.id, set);
+    // The thread counts as just used, so the cap drops threads not used for longest first.
+    const key = planKey(plan);
+    if (openedPlanKeys.has(thread.id) && openedPlanKeys.get(thread.id) === key) {
+      keepOpenedPlanKey(thread.id, key);
+      fixT3ToolSet(thread.id, set, turn);
     }
     // The policy hook goes in before the options are made lazy, so adding it reads nothing early.
-    return fixedWhenOpened(withAgentModelPolicy(plan, yield* agentPolicy), thread.id, set);
+    return fixedWhenOpened(withAgentModelPolicy(plan, yield* agentPolicy), thread.id, set, turn);
   });
 
   return Effect.fn("ClaudeMcpProfile.plan")(function* (
