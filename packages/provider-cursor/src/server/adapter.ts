@@ -2656,6 +2656,8 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             ...input.context.input.providerThread,
             providerSessionId: session.id,
             status: "active",
+            // Fork: settled like the run's final write, since later shell updates re-send this.
+            ...(input.threadDisposition === "broken" ? {} : { status: "idle" as const }),
             firstRunOrdinal:
               input.context.input.providerThread.firstRunOrdinal ?? input.context.input.runOrdinal,
             lastRunOrdinal: input.context.input.runOrdinal,
