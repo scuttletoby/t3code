@@ -10,9 +10,11 @@ import {
   placementFactsCommandSaveProblem,
   playtestProgramProblem,
 } from "@t3tools/shared/forkSettingsPatch";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { Effect } from "effect";
 
+import { handoffCommandSaveProblem } from "./handoff/handoffCommandSaveCheck.ts";
 import { threadRolesSaveProblem } from "./threadRoleTargets.ts";
 
 /** Fails when saving `next` over `current` would bring in a fork setting or interval that cannot apply. */
@@ -26,6 +28,10 @@ export const check = Effect.fn("ForkSettingsWrite.check")(function* (
     forkSettingsWriteProblem(current, next) ??
     playtestProgramProblem(current, next, platform) ??
     placementFactsCommandSaveProblem(current, next, platform) ??
+    // Reads the files a new handoff command names (fork/handoff/handoffCommandSaveCheck.ts).
+    (yield* handoffCommandSaveProblem(current, next, platform).pipe(
+      Effect.provide(NodeServices.layer),
+    )) ??
     // Reads the threads a new role pointer names, so it runs last (fork/threadRoleTargets.ts).
     (yield* threadRolesSaveProblem(current, next));
   if (problem === undefined) return;

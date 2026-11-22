@@ -157,6 +157,23 @@ The key is the provider instance id, for example `codex` or `codex_work`. In the
 Fork**, section Usage pacing, one row per account by its name (an entry for an account that is gone
 is listed with **Remove**).
 
+`burnFirstWindows` limits `burnFirst` to some window kinds (`session`, `weekly`, `monthly`,
+`other`); the rest keep the even pace. An extra account that may spend its week fast but keeps its
+5-hour windows paced:
+
+```json
+{
+  "usagePacing": {
+    "<instance id>": { "burnFirst": true, "burnFirstWindows": ["weekly", "monthly"] }
+  }
+}
+```
+
+Without the list, `burnFirst` spends every window first (as before the list existed). A name that is
+not a window kind is ignored on load (that window keeps its pace; a warning is logged) and refused by
+a save. Only `settings.json` sets the list so far; `__fork-report` shows the kinds each account spends
+first under `usagePacingBurnFirstWindows`.
+
 ### `server.usagePacingGate`
 
 What happens when an agent starts a task with `delegate_task`. `"off"`: nothing, as upstream.
@@ -263,11 +280,12 @@ In the app: **Settings → Fork**, section Playtest: the switch (it stays off un
 set), the steps as JSON under **Edit steps** (checked as a save is), and the limits under Advanced.
 
 Only the person can change it; agents cannot. A save that is on without all four steps, repeats a
-push step's name (or names one `claim`, `renew` or `release`), or names a program by anything but
-its full path on the server's OS is refused. A hand-edited
-value that is not valid reads as off (with a warning in the server log), and the next save of any
-setting writes the default in its place; fields a newer build added are dropped the same way (as for
-`waitChecks`). Other fields: how often a claim is renewed (`renewMinutes`), when an idle
+push step's name (or names one `claim`, `renew` or `release`), names a program by anything but its
+full path on the server's OS, or has a field this build does not know is refused. A hand-edited
+value that is not valid, or has a field this build does not know (a newer build's limit, a typo),
+reads as off (with a warning in the server log), and the next save of any setting writes the default
+in its place. So after moving back to an older build, copy the playtest value first: the older
+build's next save replaces a newer build's value. Other fields: how often a claim is renewed (`renewMinutes`), when an idle
 session ends (`idleMinutes`) and the longest session (`maxHours`).
 
 ```json
@@ -1142,7 +1160,12 @@ existed have no `source` and read as `none`, so they start no write turns until 
 smallest idle thread handed off before its cache expires, and `modelSelection` the new session's
 model (not set: the thread's current one). A save with a bad value, a field T3 does not know (a
 typo), or `source: command` without a command, is refused; a hand-edited value that is not valid reads as off (with a warning in the
-server log), never as `handoff`.
+server log), never as `handoff`. The server also refuses a save that sets a new `command` (here or
+in a project's `handoff`) whose program is not a full path to a file on the server, or lies inside a
+git checkout an agent could edit; the script it hands a known interpreter, a module by name, a
+program `env` finds on the `PATH`, and runners such as `make` or `npm` are refused too. It guards
+against mistakes, not attacks: [handoff.md](handoff.md) lists what it does not catch. A command
+already stored is not checked again. The command gets a short list of the server's environment.
 
 In the app: **Settings → Fork**, section Handoff: the mode, each thread's own mode (added by thread
 id, shown with its title where this client knows the thread), and under Advanced the sizes, who
