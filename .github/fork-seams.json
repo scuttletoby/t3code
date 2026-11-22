@@ -443,48 +443,32 @@
     },
     "packages/provider-acp/src/server/adapter.ts": {
       "why": "Fix for #846 (an upstream bug, not reported upstream). At a turn's end the ACP adapter caches the provider thread as active; usage and session info an agent (Kiro, Kimi) sends after the prompt settles re-send that snapshot session-scoped, which the server writes unguarded, so a race with the run's final write can leave an ended thread active. The cached snapshot is settled (idle) like the server's final write; a broken thread keeps upstream's error. One override line after upstream's status line, so no upstream line changes.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "// Fork: settled like the run's final write, since later usage updates re-send this.",
-          "...(threadDisposition === \"broken\" ? {} : { status: \"idle\" as const }),"
-        ]
-      }
+      "added": [
+        "// Fork: settled like the run's final write, since later usage updates re-send this.",
+        "...(threadDisposition === \"broken\" ? {} : { status: \"idle\" as const }),"
+      ]
     },
     "packages/provider-cursor/src/server/adapter.ts": {
       "why": "Fix for #846, the same race as the ACP adapter: at a turn's end the Cursor adapter caches the provider thread as active, and background-shell updates after the turn re-send it session-scoped. The cached snapshot is settled (idle) like the server's final write. One override line after upstream's status line, so no upstream line changes.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "// Fork: settled like the run's final write, since later shell updates re-send this.",
-          "...(input.threadDisposition === \"broken\" ? {} : { status: \"idle\" as const }),"
-        ]
-      }
+      "added": [
+        "// Fork: settled like the run's final write, since later shell updates re-send this.",
+        "...(input.threadDisposition === \"broken\" ? {} : { status: \"idle\" as const }),"
+      ]
     },
     "apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.test.ts": {
       "why": "Fix for #846: upstream's late usage_update test also checks that the re-sent snapshot is idle, not active.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "assert.equal(late.providerThread.status, \"idle\"); // Fork: not busy after the turn"
-        ]
-      }
+      "added": [
+        "assert.equal(late.providerThread.status, \"idle\"); // Fork: not busy after the turn"
+      ]
     },
     "packages/provider-cursor/src/server/adapter.test.ts": {
       "why": "Fix for #846: upstream's background-shell test also checks that the snapshot later shell updates re-send is idle, not active.",
-      "added": [],
-      "announced": {
-        "since": "2026-11-22",
-        "added": [
-          "// Fork: later shell updates re-send this snapshot, so it must not say busy.",
-          "const settled = events.findLast((event) => event.type === \"provider_thread.updated\");",
-          "assert.ok(settled?.type === \"provider_thread.updated\");",
-          "assert.equal(settled.providerThread.status, \"idle\");"
-        ]
-      }
+      "added": [
+        "// Fork: later shell updates re-send this snapshot, so it must not say busy.",
+        "const settled = events.findLast((event) => event.type === \"provider_thread.updated\");",
+        "assert.ok(settled?.type === \"provider_thread.updated\");",
+        "assert.equal(settled.providerThread.status, \"idle\");"
+      ]
     }
   },
   "//pending": "Upstream files whose fork lines predate counting every upstream file, each with its ceiling: the most fork lines it may hold against upstream (counted from upstream, as fork-follow runs the check). To move into fork files or pin as seams; lower a ceiling when lines move out and take a file off when none are left. A pull request may change them but not grow them.",

@@ -8652,6 +8652,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             ...context.input.providerThread,
             providerSessionId: input.providerSessionId,
             status: threadDisposition === "broken" ? "error" : "active",
+            // Fork: settled like the run's final write, since later usage updates re-send this.
+            ...(threadDisposition === "broken" ? {} : { status: "idle" as const }),
             lastRunOrdinal: context.input.runOrdinal,
             firstRunOrdinal:
               context.input.providerThread.firstRunOrdinal ?? context.input.runOrdinal,
