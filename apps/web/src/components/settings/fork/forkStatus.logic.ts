@@ -33,6 +33,7 @@ const LABELS: Record<ForkFeature, string> = {
   reviewRules: "Review rules",
   automaticUpdates: "Automatic updates",
   activityProbe: "Activity probe",
+  stopFinishedChildren: "Stop finished children",
   handoff: "Handoff",
   playtest: "Playtest",
 };
@@ -43,6 +44,7 @@ const ORDER: ReadonlyArray<ForkFeature> = [
   "agentSlots",
   "usagePacingGate",
   "modelPolicy",
+  "stopFinishedChildren",
   "reviewRules",
   "automaticUpdates",
   "activityProbe",
