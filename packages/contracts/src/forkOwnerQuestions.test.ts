@@ -5,6 +5,7 @@ import {
   isOwnerDecision,
   isOwnerQuestion,
   ownerQuestionStatus,
+  ownerQuestionTitleForms,
 } from "./forkOwnerQuestions.ts";
 
 const issue = (
@@ -52,12 +53,34 @@ describe("isOwnerDecision", () => {
     ["Owner decision: yes.", true],
     ["Owner decision (in chat, 2026-11-22): a version of C.", true],
     ["**Owner decision:** keep it.", true],
+    ["**Owner decision**: keep it.", true],
+    // An agent's status note names the decision without giving it.
+    ["Owner decision needed before PR 2 lands.", false],
+    ["Owner decision pending: asked in chat.", false],
+    ["Owner decision - yes", false],
+    ["Owner decision", false],
     ["  \n owner decision: lower case", true],
     ["> Owner decision: a quote of one is not one", false],
     ["Waiting on the owner decision for this", false],
     ["", false],
   ] as const)("%j -> %s", (body, expected) => {
     expect(isOwnerDecision(body, DEFAULT_OWNER_QUESTION_RULE)).toBe(expected);
+  });
+});
+
+describe("ownerQuestionTitleForms", () => {
+  it("names the title forms the rule asks by, so the page's help text has no copy of them", () => {
+    expect(ownerQuestionTitleForms(DEFAULT_OWNER_QUESTION_RULE)).toEqual([
+      "Owner question",
+      "<Topic> Q<n>:",
+    ]);
+    const renamed = {
+      label: "needs-decision",
+      titlePrefixes: ["Decision needed", "Ask"],
+      topicQuestionTitles: false,
+      decisionPrefix: "Decided",
+    };
+    expect(ownerQuestionTitleForms(renamed)).toEqual(["Decision needed", "Ask"]);
   });
 });
 

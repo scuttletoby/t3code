@@ -13,7 +13,10 @@ export interface OwnerQuestionRule {
   readonly titlePrefixes: ReadonlyArray<string>;
   /** A title like `<Topic> Q<n>: ...` (`Issues page Q1: ...`) asks the owner too. */
   readonly topicQuestionTitles: boolean;
-  /** A comment starting with this answers the question (`Owner decision: ...`). */
+  /**
+   * A comment starting with this, then `:` or ` (`, answers the question (`Owner decision: ...`,
+   * `Owner decision (in chat): ...`). `Owner decision needed` does not.
+   */
   readonly decisionPrefix: string;
 }
 
@@ -33,6 +36,15 @@ export interface OwnerQuestionIssue {
 
 // A topic of a few words, then ` Q<n>:`. Bounded, so a long title costs nothing.
 const TOPIC_QUESTION = /^[^\s:][^:\n]{0,80} Q\d{1,3}:/;
+/** How the help text writes the topic-question form that `TOPIC_QUESTION` matches. */
+const TOPIC_QUESTION_FORM = "<Topic> Q<n>:";
+
+/** The title forms the rule asks by, as help text names them: the prefixes, then the topic form. */
+export function ownerQuestionTitleForms(rule: OwnerQuestionRule): ReadonlyArray<string> {
+  return rule.topicQuestionTitles
+    ? [...rule.titlePrefixes, TOPIC_QUESTION_FORM]
+    : rule.titlePrefixes;
+}
 
 const startsWithWord = (text: string, prefix: string): boolean => {
   const head = text.slice(0, prefix.length);
@@ -50,10 +62,16 @@ export function isOwnerQuestion(issue: OwnerQuestionIssue, rule: OwnerQuestionRu
   return rule.topicQuestionTitles && TOPIC_QUESTION.test(title);
 }
 
-/** True when the comment answers an owner question; markdown bold around the prefix is allowed. */
+/**
+ * True when the comment answers an owner question: the prefix, then `:` or ` (`. Markdown bold
+ * around the prefix is allowed. A status note (`Owner decision needed ...`) is not an answer.
+ */
 export function isOwnerDecision(body: string, rule: OwnerQuestionRule): boolean {
   const text = body.trimStart().replace(/^\*\*|^__/, "");
-  return startsWithWord(text, rule.decisionPrefix);
+  const prefix = rule.decisionPrefix;
+  if (text.slice(0, prefix.length).toLowerCase() !== prefix.toLowerCase()) return false;
+  const rest = text.slice(prefix.length).replace(/^\*\*|^__/, "");
+  return rest.startsWith(":") || rest.startsWith(" (");
 }
 
 /**

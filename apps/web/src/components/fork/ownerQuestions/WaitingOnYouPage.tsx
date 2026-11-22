@@ -6,9 +6,8 @@
 /* oxlint-disable t3code/no-untranslated-copy -- Fork: this page is the fork's own and its text is English only; upstream's translation catalogs hold no fork keys. */
 import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentIssueEntry } from "@t3tools/client-runtime/issue-list";
-import { selectEnvironmentQueryData } from "@t3tools/client-runtime/state/runtime";
 import { DEFAULT_OWNER_QUESTION_RULE, type IssueComment } from "@t3tools/contracts";
-import { AsyncResult, Atom } from "effect/reactivity";
+import { Atom } from "effect/reactivity";
 import { CircleCheckIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
@@ -34,7 +33,17 @@ import { useLiveRefresh } from "~/hooks/useLiveRefresh";
 import { useEnvironments, useIssuesSupported } from "~/state/environments";
 import { issueEnvironment, useIssueList } from "~/state/issues";
 
-import { ownerQuestionCandidates, ownerQuestionTargets, waitingOnYou } from "./waitingOnYou.logic";
+import {
+  commentsOfDetail,
+  type CutScope,
+  listingGaps,
+  OWNER_QUESTION_LIST_LIMIT,
+  ownerQuestionCandidates,
+  ownerQuestionRuleText,
+  ownerQuestionTargets,
+  readInFull,
+  waitingOnYou,
+} from "./waitingOnYou.logic";
 
 const RULE = DEFAULT_OWNER_QUESTION_RULE;
 
@@ -46,26 +55,25 @@ type CandidateRef = Pick<
 
 // The comments of each candidate, read through the detail query the issue panel shares, in one
 // atom per candidate list: React cannot subscribe to a list of atoms whose length changes. A read
-// that failed counts as no answer, so the question shows rather than hiding behind the error.
+// that failed counts as no answer (commentsOfDetail), so the question shows.
 const candidateComments = Atom.family((key: string) =>
   Atom.make((get): CommentsByCandidate =>
-    (JSON.parse(key) as ReadonlyArray<CandidateRef>).map((candidate) => {
-      const result = get(
-        issueEnvironment.detail({
-          environmentId: candidate.environmentId,
-          input: {
-            projectId: candidate.projectId,
-            tracker: candidate.tracker,
-            host: candidate.host,
-            scope: candidate.scope,
-            key: candidate.key,
-          },
-        }),
-      );
-      const comments = selectEnvironmentQueryData(result)?.comments;
-      if (comments !== undefined) return comments;
-      return AsyncResult.isFailure(result) && !result.waiting ? [] : null;
-    }),
+    (JSON.parse(key) as ReadonlyArray<CandidateRef>).map((candidate) =>
+      commentsOfDetail(
+        get(
+          issueEnvironment.detail({
+            environmentId: candidate.environmentId,
+            input: {
+              projectId: candidate.projectId,
+              tracker: candidate.tracker,
+              host: candidate.host,
+              scope: candidate.scope,
+              key: candidate.key,
+            },
+          }),
+        ),
+      ),
+    ),
   ).pipe(Atom.withLabel(`fork:owner-questions:comments:${key}`)),
 );
 
@@ -82,6 +90,26 @@ function candidatesKey(candidates: ReadonlyArray<EnvironmentIssueEntry>): string
   );
 }
 
+function uniqueErrors<E extends { readonly projectId: string; readonly message: string }>(
+  errors: ReadonlyArray<E>,
+): ReadonlyArray<E> {
+  const seen = new Set<string>();
+  return errors.filter((error) => {
+    const id = `${error.projectId}\u0000${error.message}`;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+/** Says which repository was cut and what that may hide. */
+function cutText(cut: CutScope): string {
+  const where = cut.host === "" ? cut.scope : `${cut.scope} (${cut.host})`;
+  return cut.labelled
+    ? `${where}: only the ${OWNER_QUESTION_LIST_LIMIT} most recently updated open issues labelled ${RULE.label} were read; an older labelled question there is not listed.`
+    : `${where}: only the ${OWNER_QUESTION_LIST_LIMIT} most recently updated open issues were read; an older question there is listed only if it carries the label ${RULE.label}.`;
+}
+
 export function WaitingOnYouPage() {
   const { environments } = useEnvironments();
   const issuesSupported = useIssuesSupported();
@@ -91,17 +119,40 @@ export function WaitingOnYouPage() {
     environments
       .filter((environment) => environment.serverConfig?.environment.capabilities.issues === true)
       .map((environment) => environment.environmentId),
+    RULE,
   );
-  const list = useIssueList(targets);
+  const allList = useIssueList(targets.all);
+  const labelledList = useIssueList(targets.labelled);
+  const isPending = allList.isPending || labelledList.isPending;
+  const listError = allList.error ?? labelledList.error;
   // Refreshing a list still loading would cancel it and start over, losing the scopes already read.
   useLiveRefresh(
     () => {
-      if (!list.isPending) list.reload();
+      if (!allList.isPending) allList.reload();
+      if (!labelledList.isPending) labelledList.reload();
     },
     { key: JSON.stringify(targets) },
   );
+  const refresh = () => {
+    allList.refresh();
+    labelledList.refresh();
+  };
+  const retry = () => {
+    allList.retry();
+    labelledList.retry();
+  };
 
-  const candidates = ownerQuestionCandidates(list.answers, RULE);
+  const answers = [...allList.answers, ...labelledList.answers];
+  const gaps = listingGaps({
+    all: { targets: targets.all, answers: allList.answers, error: allList.error },
+    labelled: {
+      targets: targets.labelled,
+      answers: labelledList.answers,
+      error: labelledList.error,
+    },
+  });
+  const complete = readInFull(gaps);
+  const candidates = ownerQuestionCandidates(answers, RULE);
   const comments = useAtomValue(candidateComments(candidatesKey(candidates)));
   const commentsOf = new Map(candidates.map((candidate, index) => [candidate, comments[index]]));
   const view = waitingOnYou(
@@ -110,40 +161,49 @@ export function WaitingOnYouPage() {
     RULE,
   );
   const environmentLabels = new Map(environments.map((e) => [e.environmentId, e.label] as const));
-  const showEnvironment = targets.length > 1;
-  const errors = list.answers.flatMap(([, answer]) => answer.errors);
+  const showEnvironment = targets.all.length > 1;
+  // Both listings read the same projects, so a project that failed fails in both.
+  const errors = uniqueErrors(answers.flatMap(([, answer]) => answer.errors));
 
   const open = (entry: IssueRowTarget) => {
     void openLink(entry.url).catch((error: unknown) => console.error(error));
   };
 
-  const noneAnswered = list.answers.length === 0;
+  const noneAnswered = answers.length === 0;
+  const ruleText = ownerQuestionRuleText(RULE);
   const body: ReactNode = !issuesSupported ? (
     <PullRequestsUnavailableState
       title="Issues unavailable"
       error="Update this environment's T3 Code server to browse issues."
     />
-  ) : noneAnswered && list.isPending ? (
+  ) : noneAnswered && isPending ? (
     <PullRequestListGhost />
-  ) : noneAnswered && list.error ? (
-    <PullRequestsUnavailableState
-      error={list.error}
-      onRetry={list.retry}
-      refreshing={list.isPending}
-    />
+  ) : noneAnswered && listError ? (
+    <PullRequestsUnavailableState error={listError} onRetry={retry} refreshing={isPending} />
   ) : view.waiting.length === 0 && view.checking === 0 ? (
-    <Empty>
-      <EmptyMedia variant="icon">
-        <CircleCheckIcon />
-      </EmptyMedia>
-      <EmptyHeader>
-        <EmptyTitle>Nothing is waiting on you</EmptyTitle>
-        <EmptyDescription>
-          No open owner question in any project's repository. An issue asks you when its title
-          starts with "Owner question" or "Topic Q1:", or it carries the label {RULE.label}.
-        </EmptyDescription>
-      </EmptyHeader>
-    </Empty>
+    complete ? (
+      <Empty>
+        <EmptyMedia variant="icon">
+          <CircleCheckIcon />
+        </EmptyMedia>
+        <EmptyHeader>
+          <EmptyTitle>Nothing is waiting on you</EmptyTitle>
+          <EmptyDescription>
+            No open owner question in any project's repository. {ruleText}
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    ) : (
+      <Empty>
+        <EmptyHeader>
+          <EmptyTitle>No owner question found in what was read</EmptyTitle>
+          <EmptyDescription>
+            Not every repository was read in full (see above), so a question may still be waiting.{" "}
+            {ruleText}
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    )
   ) : (
     <div className="flex flex-col gap-1">
       {view.waiting.map((entry) => (
@@ -190,17 +250,31 @@ export function WaitingOnYouPage() {
                 size="icon"
                 variant="outline"
                 aria-label="Refresh owner questions"
-                onClick={list.refresh}
-                disabled={list.isPending}
+                onClick={refresh}
+                disabled={isPending}
               >
-                <RefreshIcon size="md" refreshing={list.isPending} />
+                <RefreshIcon size="md" refreshing={isPending} />
               </Button>
             </div>
-            {list.error && !noneAnswered ? (
+            {listError && !noneAnswered ? (
               <p className="text-xs text-muted-foreground">
-                {list.error} Showing the questions that loaded.
+                {listError} Showing the questions that loaded.
               </p>
             ) : null}
+            {gaps.unread.length > 0 && isPending && !noneAnswered ? (
+              <p className="text-xs text-muted-foreground">
+                Still reading{" "}
+                {gaps.unread.map((id) => environmentLabels.get(id) ?? "a server").join(", ")}…
+              </p>
+            ) : null}
+            {gaps.cut.map((cut) => (
+              <p
+                key={`${cut.labelled ? "labelled" : "all"}\u0000${cut.host}\u0000${cut.scope}`}
+                className="text-xs text-muted-foreground"
+              >
+                {cutText(cut)}
+              </p>
+            ))}
             {errors.map((error) => (
               <p
                 key={`${error.projectId}\u0000${error.message}`}

@@ -5,9 +5,19 @@ import {
   type IssueListResult,
   ProjectId,
 } from "@t3tools/contracts";
+import { AsyncResult } from "effect/reactivity";
+import { Cause } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
-import { ownerQuestionCandidates, ownerQuestionTargets, waitingOnYou } from "./waitingOnYou.logic";
+import {
+  commentsOfDetail,
+  listingGaps,
+  ownerQuestionCandidates,
+  ownerQuestionRuleText,
+  ownerQuestionTargets,
+  readInFull,
+  waitingOnYou,
+} from "./waitingOnYou.logic";
 
 const laptop = EnvironmentId.make("laptop");
 const server = EnvironmentId.make("server");
@@ -34,21 +44,162 @@ const entry = (key: string, title: string, overrides: Partial<IssueListEntry> = 
     ...overrides,
   }) as IssueListEntry;
 
-const answer = (entries: ReadonlyArray<IssueListEntry>): IssueListResult => ({
+const answer = (
+  entries: ReadonlyArray<IssueListEntry>,
+  overrides: Partial<IssueListResult> = {},
+): IssueListResult => ({
   viewers: {},
   trackers: [],
   entries,
   errors: [],
   nextCursors: {},
+  ...overrides,
 });
 
 describe("ownerQuestionTargets", () => {
   it("lists the open issues of every project on each server, with no repository named", () => {
-    const targets = ownerQuestionTargets([laptop, server]);
-    expect(targets.map((target) => target.environmentId)).toEqual([laptop, server]);
-    for (const target of targets) {
+    const targets = ownerQuestionTargets([laptop, server], DEFAULT_OWNER_QUESTION_RULE);
+    expect(targets.all.map((target) => target.environmentId)).toEqual([laptop, server]);
+    for (const target of targets.all) {
       expect(target.input).toEqual({ state: "open", limit: 200, sort: "updated" });
     }
+  });
+
+  it("also lists the issues carrying the rule's label, so a labelled question is never cut", () => {
+    const targets = ownerQuestionTargets([laptop, server], DEFAULT_OWNER_QUESTION_RULE);
+    expect(targets.labelled.map((target) => target.environmentId)).toEqual([laptop, server]);
+    for (const target of targets.labelled) {
+      expect(target.input).toEqual({
+        state: "open",
+        limit: 200,
+        sort: "updated",
+        labels: ["status:needs-owner-decision"],
+      });
+    }
+  });
+});
+
+describe("listingGaps", () => {
+  const targets = ownerQuestionTargets([laptop, server], DEFAULT_OWNER_QUESTION_RULE);
+  const listing = (
+    which: "all" | "labelled",
+    answers: ReadonlyArray<readonly [typeof laptop, IssueListResult]>,
+    error: string | null = null,
+  ) => ({ targets: targets[which], answers, error });
+  const everyServer = (result: IssueListResult = answer([])) =>
+    [
+      [laptop, result],
+      [server, result],
+    ] as const;
+
+  it("is read in full once every server answered both listings and none was cut", () => {
+    const gaps = listingGaps({
+      all: listing("all", everyServer()),
+      labelled: listing("labelled", everyServer()),
+    });
+    expect(gaps).toEqual({ unread: [], failed: false, cut: [] });
+    expect(readInFull(gaps)).toBe(true);
+  });
+
+  it("names the repository whose listing was cut, so the page never claims nothing waits", () => {
+    // 200 open issues and more: the owner question that waited longest is past the cut.
+    const cutAnswer = answer([entry("9", "A bug")], {
+      nextCursors: { "github.com acme/app": "page-2" },
+    });
+    const gaps = listingGaps({
+      all: listing("all", [
+        [laptop, cutAnswer],
+        [server, cutAnswer],
+      ]),
+      labelled: listing("labelled", everyServer()),
+    });
+    expect(gaps.cut).toEqual([{ host: "github.com", scope: "acme/app", labelled: false }]);
+    expect(readInFull(gaps)).toBe(false);
+  });
+
+  it("names a repository whose labelled listing was cut too", () => {
+    const gaps = listingGaps({
+      all: listing("all", everyServer()),
+      labelled: listing(
+        "labelled",
+        everyServer(answer([], { nextCursors: { "github.com acme/app": "page-2" } })),
+      ),
+    });
+    expect(gaps.cut).toEqual([{ host: "github.com", scope: "acme/app", labelled: true }]);
+    expect(readInFull(gaps)).toBe(false);
+  });
+
+  it("is not read in full while a server has not answered yet", () => {
+    const gaps = listingGaps({
+      all: listing("all", [[laptop, answer([])]]),
+      labelled: listing("labelled", everyServer()),
+    });
+    expect(gaps.unread).toEqual([server]);
+    expect(readInFull(gaps)).toBe(false);
+  });
+
+  it("is not read in full after a server or a project failed", () => {
+    const serverFailed = listingGaps({
+      all: listing("all", [[laptop, answer([])]], "Server offline"),
+      labelled: listing("labelled", everyServer()),
+    });
+    expect(serverFailed.failed).toBe(true);
+    expect(readInFull(serverFailed)).toBe(false);
+    const projectFailed = listingGaps({
+      all: listing(
+        "all",
+        everyServer(
+          answer([], {
+            errors: [
+              { projectId: ProjectId.make("app"), projectTitle: "App", message: "No access" },
+            ],
+          }),
+        ),
+      ),
+      labelled: listing("labelled", everyServer()),
+    });
+    expect(readInFull(projectFailed)).toBe(false);
+  });
+});
+
+describe("commentsOfDetail", () => {
+  const detail = { comments: [{ body: "Owner decision: yes." }] };
+
+  it("gives the comments a read returned", () => {
+    expect(commentsOfDetail(AsyncResult.success(detail))).toEqual(detail.comments);
+  });
+
+  it("is not known yet while the first read runs", () => {
+    expect(commentsOfDetail(AsyncResult.initial(true))).toBeNull();
+    expect(commentsOfDetail(AsyncResult.failure(Cause.fail("offline"), { waiting: true }))).toBe(
+      null,
+    );
+  });
+
+  it("counts a read that failed as no answer, so the question shows rather than hides", () => {
+    const comments = commentsOfDetail<{ body: string }>(AsyncResult.failure(Cause.fail("offline")));
+    expect(comments).toEqual([]);
+    const question = { ...entry("1", "Owner question: still there?"), environmentId: laptop };
+    const view = waitingOnYou([question], () => comments ?? undefined, DEFAULT_OWNER_QUESTION_RULE);
+    expect(view.waiting).toEqual([question]);
+  });
+});
+
+describe("ownerQuestionRuleText", () => {
+  it("is built from the rule, so a renamed rule renames the help text", () => {
+    expect(ownerQuestionRuleText(DEFAULT_OWNER_QUESTION_RULE)).toBe(
+      'An issue asks you when its title starts with "Owner question" or "<Topic> Q<n>:", or it carries the label status:needs-owner-decision.',
+    );
+    expect(
+      ownerQuestionRuleText({
+        label: "needs-decision",
+        titlePrefixes: ["Decision needed", "Ask", "Pick"],
+        topicQuestionTitles: false,
+        decisionPrefix: "Decided",
+      }),
+    ).toBe(
+      'An issue asks you when its title starts with "Decision needed", "Ask" or "Pick", or it carries the label needs-decision.',
+    );
   });
 });
 
