@@ -942,8 +942,27 @@ const endedDelivery = (
     `delivery ${deliveryId} ended`,
   ).pipe(Effect.andThen(deliveryOf(service, id, deliveryId)));
 
-it.effect("a webhook run is refused when it starts, and again after it waited for a slot", () =>
-  held(
+/** A stored delivery's worker run of `taskId` is in its slot wait (it logged so). */
+const inSlotWait = (logs: ReadonlyArray<Logger.Options<unknown>>, taskId: string) =>
+  Effect.sync(() =>
+    logs.some((entry) => {
+      const [text, fields] = entry.message as ReadonlyArray<unknown>;
+      return (
+        text === "Webhook delivery waits for an agent slot" &&
+        (fields as { readonly taskId?: unknown } | undefined)?.taskId === taskId
+      );
+    }),
+  );
+
+/** Every log line, for `inSlotWait`. */
+const logInto = (logs: Array<Logger.Options<unknown>>) =>
+  Effect.provide(
+    Logger.layer([Logger.make((entry) => logs.push(entry))], { mergeWithExisting: false }),
+  );
+
+it.effect("a webhook run is refused when it starts, and again after it waited for a slot", () => {
+  const logs: Array<Logger.Options<unknown>> = [];
+  return held(
     Effect.gen(function* () {
       const slots = slotWorld();
       const world = newWorld(slots);
@@ -967,7 +986,13 @@ it.effect("a webhook run is refused when it starts, and again after it waited fo
           slots.running = [ThreadId.make("thread:busy")];
           const stored = yield* service.triggerWebhook(webhookRequest(waiting));
           if (stored._tag !== "accepted") return assert.fail(`not accepted: ${stored._tag}`);
-          yield* workerRounds(world, 3);
+          // The widening must land while the worker's run waits for a slot (the check this test
+          // is about), so wait for that state, not for a number of rounds.
+          yield* settleUntil(
+            inSlotWait(logs, "task:hook-wait"),
+            "the delivery waits in its slot wait",
+            workerRounds(world, 1),
+          );
           expect(world.launched).toHaveLength(0);
           expect((yield* deliveryOf(service, "task:hook-wait", stored.deliveryId)).outcome).toBe(
             "accepted",
@@ -1016,23 +1041,74 @@ it.effect("a webhook run is refused when it starts, and again after it waited fo
         }),
       );
     }),
-  ),
+  ).pipe(logInto(logs));
+});
+
+it.effect(
+  "a stored delivery refused for its profile as its worker starts it leaves its place in line (#911)",
+  () =>
+    held(
+      Effect.gen(function* () {
+        const slots = slotWorld();
+        const world = newWorld(slots);
+        yield* withService(NARROWED, world, (service, serverSettings) =>
+          Effect.gen(function* () {
+            const hook = { schedule: { type: "webhook" } as const, createdBy: "agent" as const };
+            const { task: waiting } = yield* asCaller(service.upsert(task("task:hook-wait", hook)));
+            const { task: owners } = yield* service.upsert(
+              task("task:hook-owner", { schedule: { type: "webhook" } }),
+            );
+            const sql = yield* SqlClient.SqlClient;
+            // The slot is full: the agent's delivery asks for it, is refused, and is stored with
+            // its place in line from that ask.
+            slots.running = [ThreadId.make("thread:busy")];
+            const stored = yield* service.triggerWebhook(webhookRequest(waiting));
+            if (stored._tag !== "accepted") return assert.fail(`not accepted: ${stored._tag}`);
+            yield* settleUntil(
+              sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-wait'`.pipe(
+                Effect.map((rows) => rows.length === 1),
+                Effect.orDie,
+              ),
+              "the delivery is stored",
+            );
+            // Before the worker starts it, the owner widens the project and the slot frees. The
+            // worker's run is refused for its profile as it starts, never asking for the slot.
+            yield* serverSettings.updateSettings({
+              projectSettingsOverrides: { [NARROW_PROJECT]: { mcpProfile: "wider" } },
+            } as never);
+            slots.running = [];
+            yield* settleUntil(
+              deliveryOf(service, "task:hook-wait", stored.deliveryId).pipe(
+                Effect.map((delivery) => delivery.outcome !== "accepted"),
+                Effect.orDie,
+              ),
+              "the stored delivery ended",
+              workerRounds(world, 1),
+            );
+            const ended = yield* deliveryOf(service, "task:hook-wait", stored.deliveryId);
+            expect(ended.outcome).toBe("dispatch_failed");
+            expect(ended.error).toContain('MCP profile is "docs"');
+            // Its place left with it: the owner's delivery takes the free slot as it comes in,
+            // not stored behind a delivery that already ended.
+            const ran = yield* service.triggerWebhook(webhookRequest(owners));
+            if (ran._tag !== "accepted") return assert.fail(`not accepted: ${ran._tag}`);
+            yield* settleUntil(
+              Effect.sync(() => world.launched.length === 1),
+              "the owner's task ran",
+            );
+            expect(
+              yield* sql`SELECT 1 FROM scheduled_task_webhook_pending WHERE task_id = 'task:hook-owner'`,
+            ).toHaveLength(0);
+          }),
+        );
+      }),
+    ),
 );
 
 it.effect(
   "a webhook delivery saved while it waited runs once on the task as saved, checked on it (#719)",
   () => {
     const logs: Array<Logger.Options<unknown>> = [];
-    /** The stored-delivery worker's run is in its slot wait, on the copy of the task it took. */
-    const inSlotWait = Effect.sync(() =>
-      logs.some((entry) => {
-        const [text, fields] = entry.message as ReadonlyArray<unknown>;
-        return (
-          text === "Webhook delivery waits for an agent slot" &&
-          (fields as { readonly taskId?: unknown } | undefined)?.taskId === "task:hook-saved"
-        );
-      }),
-    );
     return held(
       Effect.gen(function* () {
         const slots = slotWorld();
@@ -1049,7 +1125,7 @@ it.effect(
             // The save must land after the worker took its copy (it takes the prompt saved at
             // that moment), so wait for that state, not for a number of rounds.
             yield* settleUntil(
-              inSlotWait,
+              inSlotWait(logs, "task:hook-saved"),
               "the delivery waits in its slot wait",
               workerRounds(world, 1),
             );
@@ -1093,11 +1169,7 @@ it.effect(
           }),
         );
       }),
-    ).pipe(
-      Effect.provide(
-        Logger.layer([Logger.make((entry) => logs.push(entry))], { mergeWithExisting: false }),
-      ),
-    );
+    ).pipe(logInto(logs));
   },
 );
 
