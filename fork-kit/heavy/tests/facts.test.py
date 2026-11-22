@@ -321,6 +321,27 @@ class Ledger(Case):
                 code, d = self.facts('--mb', '64', '--fresh')
                 self.assertEqual((code, d['memory']['availableMb']), (0, 12288), d['notes'])
 
+    def test_ready_refuses_a_cgroup_outside_the_namespace_at_once(self):
+        # #998 item 2: a caller outside its cgroup namespace (`0::/..`, no user manager) is busy for every kind, and
+        # that never clears; ready() let heavy wait its whole --wait (7200 s) for it. Now ready() refuses it at once
+        def ready():
+            with mock.patch.dict(os.environ, self.m.env(), clear=True), mock.patch.object(hf, 'ROOT', self.m.root):
+                return hf.ready(hq, 'heavy.slice')
+        shutil.rmtree(self.m.root + MANAGER)                        # the machine tier: the caller's own cgroup
+        for line in ('0::/..', '0::/../other.slice', '0::/system.slice/../..', '0::/./x'):
+            with self.subTest(line=line):
+                self.m.write('/proc/self/cgroup', line + '\n')
+                for _ in range(2):                                  # runs again: the same answer
+                    why = ready() or ''
+                    self.assertIn('outside this cgroup namespace', why)
+                    self.assertIn('never free', why)
+        for text in ('0::/\n', '0::/user.slice/x.scope\n', '', '1:memory:/x\n'):    # root, plain, empty, v1 alone
+            with self.subTest(text=text):
+                self.m.write('/proc/self/cgroup', text)
+                self.assertIsNone(ready())
+        os.unlink(self.m.root + '/proc/self/cgroup')                # no /proc: nothing above the root to refuse
+        self.assertIsNone(ready())
+
     def test_ready_refuses_a_basic_tier_machine_at_once(self):
         # #981 leftover 2: a basic tier is never free, so a plain heavy there waited its whole --wait (7200 s) for an
         # answer that never comes; ready() (asked before any wait) names it, as it names a kit that cannot answer
@@ -487,6 +508,42 @@ class Ledger(Case):
         for name, home in (('far', far_home), ('near', near_home)):
             self.m.write(f'{home}/.config/t3-capacity/reserve.d/r.conf', f'512 /{name}/\n')
         return far, near
+
+    def test_a_hung_home_is_given_up_in_time_and_never_counts_as_free(self):
+        # #998 item 4: every person's reserve.d was read with no time limit, so one hung network or autofs home
+        # stalled every `heavy facts` call (and so every heavy start, t3-capacity and agent-slots). Each home now has
+        # HOME_SECONDS: one not read in time is unread, as a home that cannot be read is (never free in the machine
+        # tier, a note in the full tier); the homes after it are still read
+        self.automount_people()                     # far and near, each with a reservation
+        self.m.write('/proc/self/mountinfo', '22 1 0:20 / / rw - ext4 /dev/vda1 rw\n')    # no automount: all read
+        hung = self.m.root + '/net/home/far/.config/t3-capacity/reserve.d'
+        real = hf.reservation_files
+
+        def slow(cfg_dir, *args, **kw):
+            if cfg_dir == hung:
+                time.sleep(8)                       # (a hung NFS read never returns; this one ends the test's wait)
+            return real(cfg_dir, *args, **kw)
+
+        def facts():
+            start = time.monotonic()
+            with mock.patch.object(hf, 'HOME_SECONDS', 0.5, create=True), \
+                    mock.patch.object(hf, 'reservation_files', slow):
+                code, d = self.facts('--mb', '64', '--fresh')
+            self.assertLess(time.monotonic() - start, 4, 'it waited for the hung home')
+            return code, d
+        for tier in ('full', 'machine'):
+            with self.subTest(tier=tier):
+                if tier == 'machine':
+                    shutil.rmtree(self.m.root + MANAGER)
+                for _ in range(2):                  # runs again: the same answer, never the whole wait
+                    code, d = facts()
+                    self.assertEqual([r['name'] for r in d['reservations']], ['near:r'], d['notes'])
+                    self.assertTrue(any(n.startswith('reservations of user far cannot be read (not read within 0.5 s')
+                                        for n in d['notes']), d['notes'])
+                    self.assertEqual((code, d['tier']), (75, 'basic') if tier == 'machine' else (0, 'full'))
+        d = self.facts('--mb', '64', '--fresh')[1]  # the home answers again: both read
+        self.assertEqual((d['tier'], sorted(r['name'] for r in d['reservations'])), ('machine', ['far:r', 'near:r']))
+        self.assertFalse(any('not read within' in n for n in d['notes']), d['notes'])
 
     def test_a_mounted_home_with_a_non_ascii_name_is_read(self):
         # #996 item 4: the mount table was decoded as ASCII and its octal escapes made one character per byte, so a
@@ -1380,11 +1437,83 @@ class State(Case):
             self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-{one[:16]}')
             os.unlink(self.m.root + '/etc/machine-id')
             self.m.write('/proc/sys/kernel/random/boot_id', '01234567-89ab-cdef-0123-456789abcdef\n')
-            self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-0123456789abcdef')
+            # #998 item 3: a boot id is marked "boot" (its stale folders are removed: their names are this kit's)
+            self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-boot-0123456789abcdef')
             self.m.write('/etc/machine-id', 'uninitialized\n')
-            self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-0123456789abcdef')
+            self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-boot-0123456789abcdef')
+            self.m.write('/var/lib/dbus/machine-id', two + '\n')     # D-Bus's own machine id: steady, before the boot id
+            self.assertEqual(hf.machine_tag(), f'{hf.host_name()}-{two[:16]}')
+            os.unlink(self.m.root + '/var/lib/dbus/machine-id')
             os.unlink(self.m.root + '/proc/sys/kernel/random/boot_id')
             self.assertEqual(hf.machine_tag(), hf.host_name())
+
+    def test_stale_boot_id_cache_folders_of_this_kit_are_removed(self):
+        # #998 item 3: without a machine id the home cache folder is named by the boot id, so each boot made a new one
+        # and nothing removed the old ones. A "boot" folder of this host name (not this boot's) whose files were not
+        # written for STALE_BOOT_SECONDS is removed; the old kit's host-only folder, machine-id folders, other hosts'
+        # and anything not a plain folder of plain files are never touched
+        tmp_root = os.path.join(self.tmp, 'tmp')
+        os.makedirs(tmp_root)
+        open(os.path.join(tmp_root, f'heavy-facts-{UID}'), 'w').close()     # the temporary name taken: the home
+        cache_root = os.path.join(self.m.home, '.cache')
+        host = hf.host_name()
+        one, two = '0123456789abcdef', 'fedcba9876543210'
+
+        def boot(ident):
+            return f'heavy-facts-{host}-boot-{ident}'
+
+        def on(ident, at=NOW):
+            self.m.write('/proc/sys/kernel/random/boot_id', ident * 2 + '\n')
+            code, d = self.facts('--mb', '64', now=at, env={'HEAVY_FACTS_CACHE': ''})
+            self.assertEqual(code, 0, d)
+            return sorted(os.listdir(cache_root))
+
+        def age(path):
+            old = time.time() - 2 * 86400
+            for name in os.listdir(path) if os.path.isdir(path) else ():
+                os.utime(os.path.join(path, name), (old, old), follow_symlinks=False)
+            os.utime(path, (old, old), follow_symlinks=False)
+
+        def made(name, files=('heavy-facts-v4-0123456789abcdef.json',), folder=True):
+            path = os.path.join(cache_root, name)
+            if folder:
+                os.makedirs(path, 0o700)
+                for f in files:                     # a/: a folder; @a: a link; else a plain file
+                    if f.endswith('/'):
+                        os.makedirs(os.path.join(path, f))
+                    elif f.startswith('@'):
+                        os.symlink(os.path.join(self.tmp, 'elsewhere'), os.path.join(path, f))
+                    else:
+                        open(os.path.join(path, f), 'w').close()
+            else:
+                open(path, 'w').close()
+            age(path)
+            return name
+        with self.no_run_user(tmp_root):
+            self.assertEqual(on(one), [boot(one)])
+            self.assertEqual(on(two, NOW + datetime.timedelta(seconds=1)), [boot(one), boot(two)],
+                             'a boot folder written just now is kept (a clone of this host name may use it)')
+            age(os.path.join(cache_root, boot(one)))
+            kept = [made(f'heavy-facts-{host}'),                    # the old kit's host-only folder
+                    made(f'heavy-facts-{host}-{one}'),              # a machine-id folder (another machine's)
+                    made(f'heavy-facts-other-host-boot-{one}'),     # another host name's
+                    made(boot('0' * 16), folder=False),             # not a folder
+                    made(boot('1' * 16), files=('sub/',)),          # holds a folder
+                    made(boot('6' * 16), files=('a.json', '@link')),  # holds a link
+                    made(boot('2' * 15))]                           # not a name this kit makes
+            for i in range(2):                                      # runs again: the same answer
+                self.assertEqual(on(two, NOW + datetime.timedelta(seconds=2 + i)), sorted(kept + [boot(two)]))
+            # stopped half-way: a stale folder that lost some of its files (its own time is new) and an empty one
+            half = made(boot('3' * 16), files=('a.json', 'b.lock'))
+            os.unlink(os.path.join(cache_root, half, 'a.json'))
+            empty = made(boot('4' * 16), files=())
+            self.assertEqual(on(two, NOW + datetime.timedelta(seconds=5)), sorted(kept + [boot(two)]))
+            self.assertFalse(os.path.exists(os.path.join(cache_root, empty)))
+            if os.geteuid() != 0:                                   # root reads every folder
+                shut = made(boot('5' * 16))
+                os.chmod(os.path.join(cache_root, shut), 0)         # cannot be read: kept, the answer unchanged
+                self.addCleanup(os.chmod, os.path.join(cache_root, shut), 0o700)
+                self.assertEqual(on(two, NOW + datetime.timedelta(seconds=6)), sorted(kept + [boot(two), shut]))
 
     def test_the_cache_folder_swapped_after_its_check_is_not_followed(self):
         # #951 point 3: the private temporary folder was checked, then used by its path, so a swap between the two
@@ -2148,6 +2277,24 @@ class RedCheck(Case):
                  "        return None, None\n", State, 'test_callers_with_other_settings_taking_turns_each_reach_ok'),
                 ("    root = TMP_ROOT or temp_root()\n", "    root = TMP_ROOT or __import__('tempfile').gettempdir()\n",
                  State, 'test_without_a_temporary_folder_it_can_write_there_is_no_cache')):
+            with self.subTest(line=line[:60]):
+                self.assertGreater(self.failing(cls, name, self.broken(line, instead)), 0, line)
+                self.assertEqual(self.failing(cls, name, hf), 0, name)
+
+    def test_without_each_998_fix_its_test_fails(self):
+        for line, instead, cls, name in (
+                ("    if outside:\n        return f'this cgroup", "    if False:\n        return f'this cgroup", Ledger,
+                 'test_ready_refuses_a_cgroup_outside_the_namespace_at_once'),
+                ("        for more_res, more, cannot in read_homes(dirs, now, size):\n",
+                 "        for more_res, more, cannot in [reservation_files(f, now, (n, u), size) for n, u, f in dirs]:\n",
+                 Ledger, 'test_a_hung_home_is_given_up_in_time_and_never_counts_as_free'),
+                ("        drop_stale_boot_folders(cache, name)\n", "", State,
+                 'test_stale_boot_id_cache_folders_of_this_kit_are_removed'),
+                ("                continue                            # written lately: a machine with this host name "
+                 "may use it\n", "                pass\n", State,
+                 'test_stale_boot_id_cache_folders_of_this_kit_are_removed'),
+                ("            if any(not stat.S_ISREG(f.st_mode) for _, f in files):\n                continue\n",
+                 "", State, 'test_stale_boot_id_cache_folders_of_this_kit_are_removed')):
             with self.subTest(line=line[:60]):
                 self.assertGreater(self.failing(cls, name, self.broken(line, instead)), 0, line)
                 self.assertEqual(self.failing(cls, name, hf), 0, name)

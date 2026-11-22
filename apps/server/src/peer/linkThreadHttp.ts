@@ -76,6 +76,7 @@ const admitLink = Effect.gen(function* () {
         schedule: Schedule.spaced(ACCESS_RECHECK_INTERVAL),
         until: ([current, enabled]) => current._tag === "None" || !enabled,
       }),
+      Effect.catchDefect(() => Effect.void), // Fork: a store failure ends the stream cleanly
     ),
   };
 });
