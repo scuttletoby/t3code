@@ -618,6 +618,7 @@ stays, each reads the same bytes as before, and the disk holds them once. Withou
 | `dedupe.folders[].path`    | required | a folder; files at any depth in it are looked at                       |
 | `dedupe.folders[].days`    | required | days without a change (7 or more): newer files are not looked at       |
 | `dedupe.folders[].layered` | false    | the folder may be on a filesystem that is not local (as compress-cold) |
+| `dedupe.writtenInPlace`    | none     | more name patterns (no `/`) never linked: one program's own kinds      |
 
 **The risk it takes: read this before you name a folder.** Names of one hard-linked file are one file, so any
 write **into** one name changes every name, and the other names' old bytes are gone. Most ways of writing a file do
@@ -629,10 +630,10 @@ So name **only folders of copies written once and then only read** (mirrors, rel
 never a folder where anything writes into files: no build caches, no game or server worlds, no virtual machine
 images, no working copies. The rule refuses the kinds it knows are written in place (databases `*.db`, `*.db3`,
 `*.sqlite*`, `*.mdb`, `*.ldb`, `*.ibd`, `*.wal`, and every file with a `-wal`, `-shm` or `-journal` beside it; logs
-`*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`; Minecraft region files `*.mca`, `*.mcr`, `*.mcc`;
-disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`, `*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`; mail boxes
-`mbox`, `*.mbox`; partial downloads a client resumes in place `*.part`, `*.crdownload`, `*.partial`, `*.!qb`), but
-such a list can never be complete. Every plan and run that links says it again in one line (`dedupe: names of one file
+`*.log`, `*.log.*`, `*.jsonl`, `*.ndjson`, `*.journal`, `*.pid`; disk images `*.qcow2`, `*.img`, `*.raw`, `*.vmdk`,
+`*.vdi`, `*.vhd`, `*.vhdx`; swap `*.swp`, `*.swap`; mail boxes `mbox`, `*.mbox`; partial downloads a client resumes
+in place `*.part`, `*.crdownload`, `*.partial`, `*.!qb`), plus the name patterns in `dedupe.writtenInPlace` (one
+program's own kinds, such as a game's save files), but such a list can never be complete. Every plan and run that links says it again in one line (`dedupe: names of one file
 share every later write ...`). On btrfs or XFS a tool that shares blocks with a reflink (`FIDEDUPERANGE`) is the
 safer choice: later writes do not reach the other copies. This rule makes hard links because the hosts it was made
 for are ext4, which has no reflinks.

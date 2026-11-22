@@ -40,14 +40,24 @@ export const collectTail = <E>(stream: Stream.Stream<Uint8Array, E>, maxBytes: n
   );
 
 /**
- * True when `error` (or a cause under it) is EPIPE: the child closed its stdin before the runner
+ * Node's codes for a write to a child's stdin that is already closed: EPIPE when the child closed
+ * it first, the other two when Node saw the child exit and closed it itself.
+ */
+const CLOSED_STDIN_CODES: ReadonlySet<unknown> = new Set([
+  "EPIPE",
+  "ERR_STREAM_DESTROYED",
+  "ERR_STREAM_PREMATURE_CLOSE",
+]);
+
+/**
+ * True when `error` (or a cause under it) says the child's stdin was closed before the runner
  * wrote it, e.g. `timeout` exiting 127 at once for a missing program. Not a failure to run it;
  * its exit code and output say how it ended.
  */
 export function isClosedStdin(error: unknown): boolean {
   let current: unknown = error;
   for (let depth = 0; depth < 6 && typeof current === "object" && current !== null; depth += 1) {
-    if ((current as { readonly code?: unknown }).code === "EPIPE") return true;
+    if (CLOSED_STDIN_CODES.has((current as { readonly code?: unknown }).code)) return true;
     const reason = (current as { readonly reason?: unknown }).reason;
     current =
       typeof reason === "object" && reason !== null && "cause" in reason

@@ -709,12 +709,25 @@ class Writes(Case):
         self.assertIn('cp onto an existing file', self.c.dedupe.WARNING)
 
     def test_more_kinds_written_in_place(self):
-        names = ('r.0.0.mca', 'disk.qcow2', 'disk.img', 'disk.vmdk', 'disk.vdi', 'disk.raw', 'x.wal', 'x.ldb')
+        names = ('disk.qcow2', 'disk.img', 'disk.vmdk', 'disk.vdi', 'disk.raw', 'x.wal', 'x.ldb')
         for name in names:
             self.put(name)
         plan = self.plan(self.dd_cfg())
         for name in names:
             self.assertKept(plan, os.path.join(self.dd, name), 'written in place')
+
+    def test_the_machine_file_adds_kinds_written_in_place(self):
+        """A program's own kinds (a game's save files) are named in the machine file, not in the code."""
+        a, b = self.put('r.0.0.MCA', days=50), self.put('r.0.1.mca')
+        c, d = self.put('x.bin', days=50), self.put('y.bin')
+        kinds = lambda value: self.cfg(dedupe={'folders': [{'path': self.dd, 'days': 30}], 'writtenInPlace': value})
+        plan = self.plan(kinds(['*.mca', 'world.dat']))
+        for path in (a, b):
+            self.assertKept(plan, path, 'written in place')
+        self.assertEqual(self.items(plan), [d])
+        for bad in (['saves/*.mca'], [''], ['..'], [5], '*.mca'):
+            with self.subTest(bad=bad), self.assertRaises(machine_file.MachineFileError):
+                kinds(bad)
 
     def test_files_with_other_chattr_flags_are_not_linked(self):
         a, b = self.put('a.bin', days=50), self.put('b.bin')
@@ -1350,7 +1363,7 @@ MUTATIONS = {
                                                               InUse, 'test_a_file_opened_while_it_is_compared_stays'),
     'credential names': ('dedupe', "if matches(name, CREDENTIAL_NAMES):\n        return Refusal('credential name', name)", "if False:\n        return Refusal('credential name', name)",
                          Refused, 'test_what_it_never_takes'),
-    'written in place': ('dedupe', 'if matches(name, IN_PLACE) or any(name + s in names for s in SIDECARS):', 'if False:',
+    'written in place': ('dedupe', 'if matches(name, IN_PLACE + cfg.dedupe_in_place) or any(name + s in names for s in SIDECARS):', 'if False:',
                          Refused, 'test_what_it_never_takes'),
     'must-keep names': ('dedupe', "if guard.kept_name(cfg, name):\n            return Refusal('must keep', name)", "if False:\n            return Refusal('must keep', name)",
                         Refused, 'test_what_it_never_takes'),
@@ -1372,7 +1385,9 @@ MUTATIONS = {
                                          Writes, 'test_a_file_open_at_the_link_stays'),
     'chattr flags count': ('dedupe', 'return (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, attrs, _flags(fd))',
                            'return (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, attrs, 0)', Writes, 'test_files_with_other_chattr_flags_are_not_linked'),
-    'more kinds written in place': ('dedupe', "'*.pid', '*.mca',", "'*.pid',", Writes, 'test_more_kinds_written_in_place'),
+    'more kinds written in place': ('dedupe', "'*.pid', '*.qcow2',", "'*.pid',", Writes, 'test_more_kinds_written_in_place'),
+    'kinds the machine file names': ('dedupe', 'matches(name, IN_PLACE + cfg.dedupe_in_place)', 'matches(name, IN_PLACE)',
+                                     Writes, 'test_the_machine_file_adds_kinds_written_in_place'),
     'the plan warns': ('dedupe', '        plan.notes.append(WARNING)', '        pass', Writes, 'test_the_readme_and_the_plan_say_so'),
     'the cache needs an unchanged stamp': ('dedupe', 'if cached is not None and tuple(cached[:3]) == stamp:', 'if cached is not None:',
                                            Cached, 'test_a_changed_file_is_read_again'),

@@ -168,6 +168,9 @@ describe("playtest settings in the settings file", () => {
       { ...ADAPTER, claim: step(["game"]) },
       { ...ADAPTER, push: [ADAPTER.push[0], ADAPTER.push[0]] },
       { ...ADAPTER, enabled: "yes" },
+      // A newer build's field (a limit this build would not apply), at the top or in a step.
+      { ...ADAPTER, onlyBranches: ["playtest/*"] },
+      { ...ADAPTER, claim: { ...ADAPTER.claim, maxRuns: 1 } },
       "on",
       null,
       [],

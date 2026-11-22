@@ -118,6 +118,11 @@ def _names(value):
     return f'every entry must be a plain name, without / or a wildcard (not {bad[0]!r})' if bad else None
 
 
+def _name_globs(value):
+    bad = [v for v in value if not _name_glob(v)]
+    return f'every entry must be a name pattern without / (not {bad[0]!r})' if bad else None
+
+
 def _patterns(value):
     for pattern, days in value.items():
         if not _name_glob(pattern):
@@ -240,6 +245,7 @@ FOLDER_SPEC = {
 # become hard links of one of them. Each folder is a FOLDER_SPEC. Without folders the rule does nothing.
 DEDUPE_SPEC = {
     'folders': (list, (), None),
+    'writtenInPlace': (list, (), _name_globs),          # more name patterns never linked, on top of dedupe.IN_PLACE
 }
 COMPARE_SPEC = {
     'name': (str, machine_file.REQUIRED, None),
@@ -271,7 +277,7 @@ KEY_KINDS = {
     'folders.path': 'picks', 'folders.days': 'floor', 'folders.layered': 'loosens',
     # dedupe deletes no content either (every name keeps its bytes and metadata); its folders never are or hold a
     # must-keep path, and every refusal holds in them (dedupe.py).
-    'dedupe': 'picks', 'dedupe.folders': 'picks',
+    'dedupe': 'picks', 'dedupe.folders': 'picks', 'dedupe.writtenInPlace': 'keeps more',
     # agentScratch: on, its folder and its days pick what it looks at. keepFirst only adds a copy before a delete:
     # more patterns copy more; maxFileBytes has a floor; a session with more than maxSessionBytes to copy stays
     # whole, so the cap picks which sessions the rule may take at all (every refusal still holds for them). The
@@ -499,6 +505,7 @@ class Config:
         to a must-keep path or name (the same guard as every rule: dedupe changes how files are stored), never in or
         above the cleaner's own files, a folder another rule deletes from or compresses in, or another of its own."""
         values = machine_file.fields(section, DEDUPE_SPEC, where)
+        self.dedupe_in_place = tuple(v.lower() for v in values['writtenInPlace'])
         folders = []
         for i, entry in enumerate(values['folders']):
             at = f'{where}.folders[{i}]'

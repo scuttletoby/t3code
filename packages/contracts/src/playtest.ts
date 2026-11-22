@@ -143,8 +143,9 @@ const decodePlaytestSettingsOption = Schema.decodeUnknownOption(PlaytestSettings
 
 /**
  * The settings file's value. A bad one reads as off with a warning (fail closed; the rest of the
- * file still loads), and the next save writes the default in its place. In a project's overrides
- * it reads as off too, never as the server's adapter.
+ * file still loads), and the next save writes the default in its place. So does a field this build
+ * does not know: it may be a newer build's limit that this build would not apply. In a project's
+ * overrides it reads as off too, never as the server's adapter.
  */
 export const PlaytestSettingsFromSettingsFile = Schema.Unknown.pipe(
   Schema.decodeTo(
@@ -153,7 +154,7 @@ export const PlaytestSettingsFromSettingsFile = Schema.Unknown.pipe(
     PlaytestSettings,
     SchemaTransformation.transformEffect({
       decode: Effect.fn("PlaytestSettingsFromSettingsFile.decode")(function* (raw: unknown) {
-        if (decodePlaytestSettingsOption(raw)._tag === "Some") {
+        if (decodePlaytestSettingsOption(raw, { onExcessProperty: "error" })._tag === "Some") {
           return raw as typeof PlaytestSettings.Encoded;
         }
         yield* Effect.logWarning(
