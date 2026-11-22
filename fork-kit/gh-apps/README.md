@@ -20,9 +20,13 @@ agent user                 ghrun (sudo, one fixed command)           ghkeys (sud
                             the token out of the output
 ```
 
-- **The agent** runs `gh-as [--repo OWNER/NAME | --app NAME] gh <command>`. Without `--repo` the wrapper reads
-  the `origin` remote with `/usr/bin/git` (never a `git` found in `PATH`). A file flag (`-F body.md`,
-  `--body-file`, `--input`, `-F key=@file`) is opened by the wrapper **as the agent**, so only files the agent
+- **The agent** runs `gh-as [--repo OWNER/NAME | --app NAME] gh <command>` (also `--repo=…`, `--app=…`, and
+  `gh-as NAME -- gh <command>`, the form of the older per-user gh-as; `gh-as --help`). Without `--repo` the wrapper
+  reads the `origin` remote with `/usr/bin/git` (never a `git` found in `PATH`). gh always gets the App's own
+  repository on github.com; a `GH_REPO` in the agent's environment that names another repository, or a `GH_HOST`
+  other than `github.com`, is refused, not silently replaced (an empty one counts as unset). Other `GH_*` variables
+  (such as `GH_ENTERPRISE_HOST` or `GH_ENTERPRISE_TOKEN`) are not checked: sudo drops them and gh never sees them. A
+  file flag (`-F body.md`, `--body-file`, `--input`, `-F key=@file`) is opened by the wrapper **as the agent**, so only files the agent
   could read anyway can be sent; gh then reads them from stdin.
 - **ghrun** runs the privileged `gh-as` and `gh`. It refuses every file path (only stdin), every command that is
   not on the list in `lib/ghapps/policy.py`, unknown flags, full URLs, `--hostname`, `--verbose`, jq that reads
@@ -115,7 +119,12 @@ Placeholders in CAPITALS. As root, in a shell no agent sees.
    gh-apps-admin add-key APP_NAME --app-id AGENT_APP_ID --repo OWNER/REPO < DOWNLOADED_KEY.pem
    ```
 
+   The key must never sit where an agent user can read it (an agent's home, a shared Downloads folder): pipe it
+   from the machine that downloaded it straight into the root shell, for example
+   `ssh root@HOST 'gh-apps-admin add-key ...' < DOWNLOADED_KEY.pem`, then delete the download there.
    It stores the key, finds the installation, and makes one test token. Run it again with a new key to rotate.
+   `APP_NAME` is lower-case letters, digits, `-` and `_`, and not `gh` (`gh-as gh -- gh ...` would read it as the
+   gh command).
    One App per repository: `add-key` refuses a second App for a repository, and also while a broken app file that
    is (or may be) for it exists. `gh-as` (with `--app` or `--repo`) refuses while any other app file is, or could
    be, for the same repository, and a broken app file could be for any: one broken file stops every `gh-as` call
