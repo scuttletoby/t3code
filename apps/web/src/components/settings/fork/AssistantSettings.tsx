@@ -9,10 +9,11 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   type EnvironmentId,
+  type ServerSettingsPatch,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { newThreadId } from "~/lib/utils";
 import { useScratchProject } from "../../../hooks/useScratchProject";
@@ -30,9 +31,10 @@ import { useUpdateScopedSettings } from "../useScopedSettings";
 import { ForkRow } from "./ForkRow";
 import {
   assistantModelSelection,
+  assistantProfilePatch,
+  assistantRolePatch,
   assistantThreadState,
   assistantThreadText,
-  makeAssistantPatch,
 } from "./assistantSetup.logic";
 
 export function AssistantSettings() {
@@ -46,6 +48,7 @@ export function AssistantSettings() {
   const shells = useThreadShells();
   const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
+  const running = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
   const target = targets.length === 1 ? targets[0]! : null;
@@ -71,14 +74,28 @@ export function AssistantSettings() {
   );
   const modelSelection = assistantModelSelection(providers.get(environmentId) ?? []);
 
+  // Resolves once the save settled: true when every target saved it.
+  const save = (patch: ServerSettingsPatch) =>
+    new Promise<boolean>((resolve) =>
+      updateSettings(patch, { onFailed: () => resolve(false), onSaved: () => resolve(true) }),
+    );
+
   const makeAssistant = async () => {
-    if (modelSelection === null) return;
+    // A ref, not only the state: a double click arrives before the disabled button re-renders.
+    if (modelSelection === null || running.current) return;
+    running.current = true;
     setBusy(true);
     setError(null);
     try {
       const project = await openScratchProject(environmentId);
       if (project === null) return;
       const threadId = newThreadId();
+      // The pick first: a stop at any later point leaves no thread, or a thread already narrowed.
+      // A pick for a thread that never gets made does nothing.
+      if (!(await save(assistantProfilePatch(threadId)))) {
+        setError("The server refused the assistant profile. Nothing was made.");
+        return;
+      }
       const created = await createThread({
         environmentId,
         input: {
@@ -96,7 +113,7 @@ export function AssistantSettings() {
         setError("Could not make the assistant's thread. Try again.");
         return;
       }
-      // An empty thread the save did not name is removed; one that got a message stays.
+      // An empty thread the role save did not name is removed; one that got a message stays.
       const discard = () =>
         void deleteThread({ environmentId, input: { threadId, onlyIfUnused: true } });
       const ref = scopeThreadRef(environmentId, threadId);
@@ -105,15 +122,14 @@ export function AssistantSettings() {
         discard();
         return;
       }
-      updateSettings(makeAssistantPatch(threadId), {
-        onFailed: () => {
-          setError("The server refused to name the new thread the assistant. Nothing was changed.");
-          discard();
-        },
-        onSaved: () =>
-          void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(ref) }),
-      });
+      if (!(await save(assistantRolePatch(threadId)))) {
+        setError("The server refused to name the new thread the assistant. It was removed.");
+        discard();
+        return;
+      }
+      void navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(ref) });
     } finally {
+      running.current = false;
       setBusy(false);
     }
   };
@@ -141,7 +157,7 @@ export function AssistantSettings() {
           serverScoped
           {...searchableSetting("assistant-thread")}
           settingKeys={["threadRoles"]}
-          lockPaths={["threadRoles"]}
+          lockPaths={["threadRoles", "mcpThreadProfiles"]}
           status={error}
           description={`${assistantThreadText(state)} Make assistant makes a new thread in the Scratch project and names it the assistant; an earlier one stays as it is.${
             modelSelection === null ? " It needs a Claude provider that is on and available." : ""

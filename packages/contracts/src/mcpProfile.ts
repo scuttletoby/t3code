@@ -14,8 +14,8 @@ export const MCP_PROFILE_ALL = "all";
 /** No outside servers, every T3 tool. */
 export const MCP_PROFILE_T3_ONLY = "t3-only";
 /**
- * The assistant's: no outside servers, no built-in tools, and only the T3 tools that find, start
- * and message threads and projects (docs/fork/assistant.md).
+ * The assistant's: no outside servers, no built-in tools, and the T3 groups `orchestration`,
+ * `threads` and `projects` (docs/fork/assistant.md lists what they can do).
  */
 export const MCP_PROFILE_ASSISTANT = "assistant";
 /** The profiles every build knows; `mcpProfiles` cannot redefine them. */

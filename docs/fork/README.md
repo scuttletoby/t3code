@@ -1189,7 +1189,8 @@ file after the next save of any setting, since the save writes the settings as r
 
 `enabled` offers **Make assistant** in **Settings → Fork**, section Assistant: it makes a thread in
 the Scratch project, picks the built-in MCP profile `assistant` for it and points
-`threadRoles.assistant` at it, in one save from the person. Off (the default): no such button; a
+`threadRoles.assistant` at it, in two saves from the person (the pick first, before the thread
+exists). Off (the default): no such button; a
 thread already named the assistant stays as it is. Only the person can change it. Anything but
 `{"enabled": true}` in the file reads as off; a save with a bad value is refused. More in
 [assistant.md](assistant.md).

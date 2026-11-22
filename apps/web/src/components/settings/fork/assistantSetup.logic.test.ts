@@ -13,8 +13,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   assistantModelSelection,
+  assistantProfilePatch,
+  assistantRolePatch,
   assistantThreadState,
-  makeAssistantPatch,
 } from "./assistantSetup.logic";
 
 const provider = (
@@ -58,25 +59,26 @@ describe("Make assistant", () => {
     expect(assistantModelSelection([off, gone])).toBeNull();
   });
 
-  it("one save names the thread the assistant and gives it the assistant profile", () => {
+  it("picks the profile first, before the thread exists, then names the assistant", () => {
     const decode = Schema.decodeUnknownSync(ServerSettings);
     const before = decode({ mcpThreadProfiles: { old: "t3-only" } });
     const thread = ThreadId.make("thread-new");
-    const after = applyServerSettingsPatch(before, makeAssistantPatch(thread));
-    expect(after.threadRoles.assistant).toBe("thread-new");
-    expect(after.mcpThreadProfiles).toEqual({ old: "t3-only", "thread-new": "assistant" });
-    expect(forkSettingsWriteProblem(before, after)).toBeUndefined();
-    const resolved = resolveMcpProfile(after, [{ threadId: thread, delegated: false }]);
+    // Saved before the thread is made: if setup stops here, no wide "Assistant" thread exists.
+    const picked = applyServerSettingsPatch(before, assistantProfilePatch(thread));
+    expect(forkSettingsWriteProblem(before, picked)).toBeUndefined();
+    expect(picked.threadRoles.assistant).toBeNull();
+    const resolved = resolveMcpProfile(picked, [{ threadId: thread, delegated: false }]);
     expect(resolved._tag === "Resolved" && resolved.profile.builtinTools).toBe("none");
+    const named = applyServerSettingsPatch(picked, assistantRolePatch(thread));
+    expect(forkSettingsWriteProblem(picked, named)).toBeUndefined();
+    expect(named.threadRoles.assistant).toBe("thread-new");
+    expect(named.mcpThreadProfiles).toEqual({ old: "t3-only", "thread-new": "assistant" });
   });
 
-  it("shows a deleted or archived assistant thread as gone or archived", () => {
-    const threads = [{ id: "a", title: "Assistant", archivedAt: null }];
-    expect(assistantThreadState(null, threads)).toEqual({ kind: "none" });
-    expect(assistantThreadState("a", threads)).toMatchObject({ kind: "ok", title: "Assistant" });
-    expect(assistantThreadState("b", threads)).toEqual({ kind: "gone", threadId: "b" });
-    expect(
-      assistantThreadState("a", [{ ...threads[0]!, archivedAt: "2026-01-01T00:00:00Z" }]).kind,
-    ).toBe("archived");
+  it("shows an assistant thread that is not active (archived or deleted) as none", () => {
+    const active = [{ id: "a", title: "Assistant" }];
+    expect(assistantThreadState(null, active)).toEqual({ kind: "none" });
+    expect(assistantThreadState("a", active)).toMatchObject({ kind: "ok", title: "Assistant" });
+    expect(assistantThreadState("b", active)).toEqual({ kind: "inactive", threadId: "b" });
   });
 });

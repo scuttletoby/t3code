@@ -40,45 +40,46 @@ export function assistantModelSelection(
   return model === undefined ? null : createModelSelection(pick.instanceId, model.slug);
 }
 
-/** The one save that makes `threadId` the assistant: its profile pick and the role pointer. */
-export const makeAssistantPatch = (threadId: ThreadId): ServerSettingsPatch => ({
+/**
+ * The first save: the thread's profile pick, made before the thread exists, so a thread named
+ * "Assistant" never runs with a wider profile, even when the setup stops half-way.
+ */
+export const assistantProfilePatch = (threadId: ThreadId): ServerSettingsPatch => ({
   mcpThreadProfiles: { [threadId]: MCP_PROFILE_ASSISTANT },
+});
+
+/** The second save, once the thread exists: the role pointer (the server's role check decides). */
+export const assistantRolePatch = (threadId: ThreadId): ServerSettingsPatch => ({
   threadRoles: { assistant: threadId },
 });
 
-/** The thread `threadRoles.assistant` names, as Settings shows it. */
+/**
+ * The thread `threadRoles.assistant` names, as Settings shows it. The client's thread list holds
+ * active threads only, so an archived one reads as not active, like a deleted one.
+ */
 export type AssistantThreadState =
   | { readonly kind: "none" }
-  | { readonly kind: "gone"; readonly threadId: string }
-  | { readonly kind: "archived" | "ok"; readonly threadId: string; readonly title: string };
+  | { readonly kind: "inactive"; readonly threadId: string }
+  | { readonly kind: "ok"; readonly threadId: string; readonly title: string };
 
 /** Readers treat a deleted or archived assistant thread as no assistant (threadRoles docs). */
 export function assistantThreadState(
   assistant: string | null,
-  threads: ReadonlyArray<{
-    readonly id: string;
-    readonly title: string;
-    readonly archivedAt: string | null;
-  }>,
+  activeThreads: ReadonlyArray<{ readonly id: string; readonly title: string }>,
 ): AssistantThreadState {
   if (assistant === null) return { kind: "none" };
-  const thread = threads.find((candidate) => candidate.id === assistant);
-  if (thread === undefined) return { kind: "gone", threadId: assistant };
-  return {
-    kind: thread.archivedAt === null ? "ok" : "archived",
-    threadId: assistant,
-    title: thread.title,
-  };
+  const thread = activeThreads.find((candidate) => candidate.id === assistant);
+  return thread === undefined
+    ? { kind: "inactive", threadId: assistant }
+    : { kind: "ok", threadId: assistant, title: thread.title };
 }
 
 export function assistantThreadText(state: AssistantThreadState): string {
   switch (state.kind) {
     case "none":
       return "No thread is the assistant yet.";
-    case "gone":
-      return `The assistant was thread ${state.threadId}, which is deleted or not on this server. Make a new one.`;
-    case "archived":
-      return `The assistant is "${state.title}", which is archived, so it counts as none. Unarchive it or make a new one.`;
+    case "inactive":
+      return `The assistant was thread ${state.threadId}, which is archived, deleted or not on this server, so there is none. Unarchive it or make a new one.`;
     case "ok":
       return `The assistant is "${state.title}".`;
   }
