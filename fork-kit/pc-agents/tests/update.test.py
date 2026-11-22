@@ -47,7 +47,7 @@ class Update(Case):
         self.ready()
         # The fleet's wsl2 walls hold on this machine and no test here changes what they read (a wall that fails an
         # update here is one of the kit's own, which still runs every time): looked at once, then that answer.
-        self.same_wsl2_walls()
+        self.same_fleet_walls()
         self.releases(release('1.2.3'))
 
     def releases(self, *items):

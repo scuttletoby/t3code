@@ -1,9 +1,10 @@
-# pc-agents: run T3's agents on a Windows PC, walled in a WSL2 distro of their own
+# pc-agents: run T3's agents on a Windows PC (in a WSL2 distro of their own) or a plain Linux box, walled in
 
 A PC can take agent work from another T3 (a linked environment, with **Full access**). Full access runs as the PC
 T3's user, so the link is not the wall: the distro is. This kit makes a fresh WSL2 distro into that wall and runs
 T3 in it as `agent`, a user with no sudo, under a root-owned system unit. Everything that holds the wall is root's,
-so the agent cannot undo it:
+so the agent cannot undo it. The same kit sets up a plain Linux box too (the machine file's `platform`, see
+[Plain Linux box](#plain-linux-box-platform-linux)); the table is the WSL2 one:
 
 | Wall                    | What the kit does                                                                                                                                                                                                                                                                                                                                  |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -16,8 +17,9 @@ so the agent cannot undo it:
 | Locked T3 settings      | `/etc/t3code/policy.json` (managed policy): linked environments on, updates off (`limits.updates`), Connect, webhook tasks and browser cookie import off, `maxRuntimeMode` and your `lockedSettings` locked; T3 itself is root's (under `/opt/pc-agents/t3`)                                                                                       |
 | Checked, not trusted    | `pc-agents check` runs before every start of T3 (the unit refuses to start on a failed wall) and every 2 minutes (a failed wall stops T3; a check that cannot run or crashes stops it too)                                                                                                                                                         |
 
-`pc-agents check` is the fleet's WSL2 walls check (`.github/scripts/fork-fleet-walls.py` with
-`fork-fleet-walls/wsl2`, from the same release, not a copy) plus this kit's own walls:
+`pc-agents check` is the fleet's walls check for this machine's OS (`.github/scripts/fork-fleet-walls.py` with
+`fork-fleet-walls/wsl2` or `fork-fleet-walls/linux`, from the same release, not a copy; the check tells the OS itself,
+and its `platform` wall fails when that is not the machine file's `platform`) plus this kit's own walls:
 
 - every file above is root's, mode 644 and exactly what the kit writes (and recorded in the root-owned
   `/etc/pc-agents/installed.tsv`);
@@ -25,16 +27,18 @@ so the agent cannot undo it:
   `system.attached`, the generators, `/run`, `/usr/lib`, prefix drop-ins like `t3code-.service.d`), and
   `systemctl show` agrees (the kit's file, no drop-in, no pending reload, T3 and both timers enabled);
 - the masks are in place, no user lingers, the agent has no systemd user units, the walls and update timers run;
-- `agent` is the only login user, its login shell is `/usr/sbin/nologin`, and no sudo rule (`/etc/sudoers`,
-  `/etc/sudoers.d`) names it, its group or uid, or every user;
+- `agent` is the only login user (WSL2; on a plain box it is the kit's, see below), its login shell is `/usr/sbin/nologin`, and no sudo rule (`/etc/sudoers`,
+  `/etc/sudoers.d`) names it, its group or uid, or every user (but for allow-listed helpers, `sudoHelpers`);
+- no container engine's root socket (`/run/docker.sock`, `/var/run/docker.sock`, containerd's, podman's) is the
+  agent's, in the agent's group or open to every user (being in the `docker` group is already refused above);
 - the kit's code (`/opt/pc-agents`, the release folder it runs) and T3's runtime are root's, and T3's `t3` is the one
   setup installed (its hash is in the record). Setup downloads the release itself (the files `scripts/install.sh`
   takes, checked against `SHA256SUMS`), unpacks it with no links out of its folder and makes it root's alone, never
   running any of it; it installs again a runtime an older setup left otherwise;
-- no Windows drive is mounted;
+- no Windows drive is mounted (WSL2);
 - the loaded firewall table is the one from the kit's `firewall.nft`: `pc-agents load-firewall` saves the file's hash
   and what the kernel then lists, and any later change, or an older file left loaded, differs;
-- the default gateway (the Windows host) is in a blocked range, and no `allow` or `peers` entry lets it through;
+- the default gateway (the Windows host, or a plain box's router) is in a blocked range, and no `allow` or `peers` entry lets it through;
 - no T3 runs that started before setup's last change: while setup's marker `/etc/pc-agents/restart-pending` is there
   (see "Runs again" below), a T3 process started before the time in it fails this wall, and so does a marker or a
   start time it cannot read. So the 2-minute check stops a T3 that a stopped or failed setup left running with old
@@ -44,7 +48,7 @@ The fleet's `mounts`, `sockets` and `userns` walls are
 about the CI launcher's job units, so they are not reported here; the unit's own sandbox is checked instead (it must
 be the kit's file, byte for byte, with no drop-in).
 
-Linux (WSL2, systemd, Debian or Ubuntu) only. Python 3 standard library only.
+Linux (WSL2 or a plain box; systemd, Debian or Ubuntu) only. Python 3 standard library only.
 
 ## Config
 
@@ -86,6 +90,8 @@ The kit reads the `pc-agents` section of the machine file `/etc/fork-kit/machine
 | `peers`                 | the linking T3's Tailscale address(es) (CIDR list, 1 to 16): the only private addresses the unit talks to                                   |
 | `tailscaleTag`          | the tag this PC's Tailscale node gets (`tag:name`)                                                                                          |
 | `autoUpdate`            | optional: `{"enabled": true, "follow": "OWNER/NAME"}` installs that fork's new releases by itself (see "Automatic updates"); off by default |
+| `platform`              | optional: `wsl2` (the default, so a machine file from before the key reads as before) or `linux` (a plain Linux box, see below)             |
+| `sudoHelpers`           | optional: up to 8 commands the agent may run through sudo, as the sudo rule names them (see "Plain Linux box"); none by default             |
 
 `t3Version` must be 0.1.7 or newer: older releases have no managed policy, so they would run with none of the kit's
 locks and with updates on. A 0.1.7 pre-release counts as older (some 0.1.7 nightlies were built before the policy),
@@ -114,7 +120,7 @@ A wall that fails stops T3, and nothing starts it again by itself: fix what `pc-
 check first and refuses on a failed wall). If it says `start request repeated too quickly`, run
 `systemctl reset-failed t3code-agents.service` first.
 
-## Owner steps (once per PC)
+## Owner steps (once per PC, WSL2)
 
 Commands are for Windows PowerShell unless a step says otherwise. `<distro>` is a name of your choice (for example
 `t3-agents`); `<fork>` is the fork's `OWNER/NAME`, `<sha>` a commit of its `ci-release` branch.
@@ -302,6 +308,62 @@ With no grant whose `src` is `tag:pc-agents`, the PC starts no connection into t
 reach any tailnet address anyway (100.64.0.0/10 and `fc00::/7` are dropped for it). Replies to the linking T3 are
 allowed (connection tracking).
 
+## Plain Linux box (`"platform": "linux"`)
+
+A machine of its own (a spare PC or laptop, a VM) with systemd and Debian 12 or Ubuntu 22.04 or newer. Here no
+distro is around the agent: the box is also yours, so the kit walls in one user, `agent`, and leaves the rest of
+the box as it is. Same kit, same files and walls, but for these:
+
+| On WSL2                                                                        | On a plain Linux box                                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/etc/wsl.conf`, the interop binfmt mask, the `automount` wall                 | none of them                                                                                                                                                                                                                                                                                       |
+| `agent` is the only login user                                                 | your own users stay; `agent` must be the kit's: its uid (`agentUid`), home `/home/agent`, its own group as its primary group and no other group, no login shell                                                                                                                                    |
+| cron, at and ssh masked                                                        | left running for you; the agent cannot use them: it has no login shell, sshd refuses it (`DenyUsers agent` in `/etc/ssh/sshd_config.d/pc-agents.conf`, the `ssh` wall checks sshd reads that folder), and in T3's unit `crontab` and `at` cannot write (`ProtectSystem=strict`, `NoNewPrivileges`) |
+| other homes read-only (`ProtectHome=read-only`)                                | other homes are not there at all (`ProtectHome=tmpfs`, only `/home/agent` bound in)                                                                                                                                                                                                                |
+| the kit writes `/etc/resolv.conf` with `nameservers`                           | the box's `/etc/resolv.conf` stays yours; T3's unit sees the kit's `/etc/pc-agents/resolv.conf` (the same `nameservers`) in its place, since the box's own stub (`127.0.0.53`) is on the agent's blocked localhost                                                                                 |
+| hidden: `/mnt`, `/run/WSL`, `/usr/lib/wsl`, `/tmp/.X11-unix`, `/run/tailscale` | hidden: `/mnt`, `/media`, `/run/media` (your drives), `/tmp/.X11-unix`, `/run/tailscale`, `/run/docker.sock`, `/run/containerd`                                                                                                                                                                    |
+| the gateway wall: the Windows host                                             | the gateway wall: the router                                                                                                                                                                                                                                                                       |
+
+**Sudo helpers.** A sudo rule for the agent fails the `sudoers` wall, on both kinds, but for one exact form: the
+line `agent ALL=(root) NOPASSWD: <command>[, <command>]` in `/etc/sudoers` or `/etc/sudoers.d`, every command named
+word for word in `sudoHelpers`, and each helper's file and every folder above it root's alone. No other user, group,
+uid, alias, run-as or tag on the line, no wildcard, no `ALL`, and no `Defaults` line for the agent or for a helper.
+sudo lets a command named without arguments run with any, so list the arguments too (`"/usr/local/sbin/agent-gpu on"`),
+or `""` for none (`"/usr/local/sbin/agent-gpu \"\""`). A rule the kit finds is kept as it is, never widened; one
+wider than this is a failed wall, which you fix (the kit never edits a sudo rule). Inside T3's unit sudo does not run
+at all (`NoNewPrivileges`), and the agent has no login, so the helper is yours to run for it, not the agent's.
+
+**Docker.** Rootless Docker (yours, its socket under `/run/user/<your uid>`) is out of the agent's reach: that
+folder is yours alone, and `ProtectHome=tmpfs` empties `/run/user` in T3's unit too. A rootful engine's socket must be root's and its group's alone (mode 660) and the agent in no
+group but its own; the unit hides `/run/docker.sock` and `/run/containerd` as well.
+
+**Steps**, as root on the box (`sudo -i`); `<fork>` and `<sha>` as in the WSL2 steps:
+
+1. **Write the machine file:** `mkdir -p /etc/fork-kit && nano /etc/fork-kit/machine.json`, the example above with
+   your values and `"platform": "linux"` in the `pc-agents` section (an `agentUid` that no user of the box has).
+2. **Run the setup:**
+   `curl -fsSL https://raw.githubusercontent.com/<fork>/ci-release/fork-kit/pc-agents/bootstrap.sh -o /root/pc-agents-bootstrap.sh && sh /root/pc-agents-bootstrap.sh --repo <fork> --sha <sha>`.
+   One run is enough: every wall holds and T3 starts (no restart, no second run). An `agent` user that is not the
+   kit's is refused before anything is written; a wider sudo rule, an open Docker socket or an sshd that does not
+   read `sshd_config.d` fails a wall, and T3 does not start: fix what it names and run the setup again.
+3. **Join Tailscale** with the tag: install it (`curl -fsSL https://tailscale.com/install.sh | sh`), then
+   `tailscale up --advertise-tags=<tag> --accept-dns=false`, as in WSL2 step 6. If the box is already on the tailnet
+   as you, the tag makes it a tagged node: your own logins to it then go through the ACL too.
+4. **Log in to Claude, Codex and GitHub as the agent** as in WSL2 steps 7 and 8, each command as root on the box:
+   `/opt/pc-agents/current/sbin/pc-agents as-agent -- claude` (and the others). Never `su agent` or `sudo -u agent`:
+   that runs outside T3's walls.
+5. **Pair, then link from the other T3:** `/opt/pc-agents/current/sbin/pc-agents pair` and link as in WSL2 step 10.
+
+The box runs T3 from its start (the unit is enabled): no logon task. Run step 2 again for a new release or a changed
+machine file; T3 restarts only when something changed.
+
+**The way back** (as root): `systemctl disable --now t3code-agents.service pc-agents-walls.timer pc-agents-update.timer`,
+`nft delete table inet pc_agents`, then remove the kit's files (`/etc/systemd/system/t3code-agents.service`, the two
+timers and their services, the mask `/etc/systemd/system/user@<agentUid>.service`, `/etc/ssh/sshd_config.d/pc-agents.conf`, `/etc/t3code`, `/etc/pc-agents`,
+`/opt/pc-agents`, `/var/lib/pc-agents`), run `systemctl daemon-reload` and `systemctl try-reload-or-restart ssh.service`,
+and `userdel -r agent` (its home and everything the agents left in it). `/etc/fork-kit/machine.json` is shared with
+the fleet's other kits: remove its `pc-agents` section, or the file if nothing else uses it.
+
 ## Runs again, stops half-way, meets old or empty state
 
 - **Again:** every file is compared before it is written; an unchanged file is not touched, and T3 restarts only
@@ -364,10 +426,17 @@ allowed (connection tracking).
 - **Unsafe folders:** setup refuses a distro whose `/`, `/opt`, `/opt/pc-agents`, `/etc`, `/etc/systemd`,
   `/etc/systemd/system`, `/etc/pc-agents` or `/etc/t3code` is not root's alone.
 - **No or a broken machine file:** setup and check refuse, naming the key; the unit does not start.
+- **A machine file from before `platform`:** read as `wsl2`, so a WSL2 distro gets the same files byte for byte and
+  T3 does not restart. A `wsl2` file on a plain box (or `linux` in WSL2) fails the `platform` wall, naming the key.
+- **A plain Linux box:** each run reloads sshd (`try-reload-or-restart`: none running is fine), so a run stopped
+  right after writing `pc-agents.conf` is finished by the next. An `agent` user made by hand is kept when it is the
+  kit's (its uid, home and own group, then its shell narrowed to `nologin`), refused otherwise; a sudo rule is kept
+  as it is and checked, never widened or removed; Docker is checked, never changed. Your own users, crontabs, sshd
+  and mounts are left alone.
 
 ## Limits
 
-- **One VM for all distros.** WSL2 runs every distro in one VM: one kernel, one network namespace, one memory cap.
+- **One VM for all distros (WSL2).** WSL2 runs every distro in one VM: one kernel, one network namespace, one memory cap.
   The firewall table is therefore global and matches the agent's uid in every distro (keep `agentUid` apart from
   the other distros' users); `localhost` is shared, so a server another distro runs on localhost is reachable on
   T3's port or `devPorts` (the agent's other localhost traffic is dropped). **Run no localhost servers in other
@@ -419,7 +488,10 @@ allowed (connection tracking).
 - **Sigstore's keys are pinned** (`lib/sigstore-trust.json`): when Sigstore rotates its Fulcio root or Rekor key, or
   GitHub's attestations move to another log format, every new release is refused (an alert on every PC). Then
   install a kit with the new keys (step 3 again) and run `pc-agents auto-update --clear`.
-- **No uninstall** but removing the distro; the distro holds nothing else.
+- **No uninstall** but removing the distro; the distro holds nothing else. A plain box: by hand ("The way back").
+- **A plain box is shared with you:** the walls keep the agent out of your files, users, mounts and LAN, but the
+  kernel, `/dev/shm`, the system D-Bus and abstract unix sockets are shared with your programs, as with other
+  distros in WSL2. Not yet tried on a real plain box when this was written: the tests use a fake box.
 - **No code hash manifest yet:** the kit's code is checked for root ownership and its written files byte for byte,
   but the code files are not hashed (T3's `t3` is). The bootstrap duplicates the heavy kit's (a shared bootstrap is
   a follow-up).
@@ -430,6 +502,7 @@ allowed (connection tracking).
 python3 -I -B fork-kit/pc-agents/tests/setup.test.py
 python3 -I -B fork-kit/pc-agents/tests/check.test.py
 python3 -I -B fork-kit/pc-agents/tests/update.test.py
+python3 -I -B fork-kit/pc-agents/tests/linux.test.py
 ```
 
 A fake distro in a temporary folder (`PC_AGENTS_ROOT`, refused for root; `tests/fake_distro.py`), with fake
@@ -444,4 +517,7 @@ release on the stable track is taken; it waits while T3 runs an agent's process;
 rolled back and not tried again; a run again changes nothing; a run stopped before or after the machine file, in
 setup, before the check or in a rollback is finished or rolled back; no journal, a bad one, a bad machine file, an
 empty release list or an API error do nothing and say so; old versions are pruned to three; one run at a time.
+A fake plain Linux box (`linux.test.py`): one run serves, a run again changes nothing, a run stopped half-way is
+finished, the WSL steps are skipped and every other wall holds, a hand-made agent, a sudo rule (allow-listed or
+wider), a Docker socket and sshd's config are checked, and an old machine file still reads as `wsl2`.
 `apps/server/src/policy/managedSettings.forkKeys.test.ts` proves the managed policy locks the fork's settings.
