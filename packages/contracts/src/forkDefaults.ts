@@ -229,6 +229,16 @@ export const FORK_SETTING_DEFAULTS: ReadonlyArray<ForkSettingDefault> = [
     decidedIn: "#879",
   },
   {
+    scope: "server",
+    key: "stopFinishedChildren",
+    default: { enabled: false },
+    fields: true,
+    off: true,
+    reason:
+      "A finished delegated child keeps its provider process until upstream's own idle release.",
+    decidedIn: "#925",
+  },
+  {
     scope: "projectOverride",
     key: "mcpProfile",
     default: undefined,

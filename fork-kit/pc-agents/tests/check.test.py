@@ -26,7 +26,7 @@ class Walls(Case):
         walls = [line.split()[1] for line in out.splitlines()]
         for wall in ('wsl2:interop', 'wsl2:resolv', 'wsl2:windows-path', 'wsl2:networking', 'wsl2:os', 'masks',
                      'record', 'linger', 'user-units', 'drop-ins', 'units', 'agent', 'sudoers', 'restart', 'kit-code',
-                     'runtime',
+                     'runtime', 'gpu',
                      'automount', 'firewall', 'gateway', 'file:policy.json', 'file:t3code-agents.service',
                      'file:firewall.nft', 'file:wsl.conf', 'file:pc-agents-walls.timer',
                      'file:pc-agents-update.service', 'file:pc-agents-update.timer'):
@@ -305,6 +305,92 @@ class Restart(Case):
         self.mark()
         code, out = self.call(cli.check, False, True)
         self.assertNotIn('restart', [line.split()[1] for line in out.splitlines() if line.startswith(('PASS', 'FAIL'))])
+
+
+class Gpu(Case):
+    """The `gpu` wall (#1024): it says whether the machine file turns GPU access on, and fails when the unit on disk
+    says otherwise (the unit's own file wall fails with it: it differs from what the kit writes)."""
+    GPU = 'DeviceAllow=/dev/dxg rw'
+    UNIT = '/etc/systemd/system/t3code-agents.service'
+
+    def gpu_line(self, out):
+        return next(line for line in out.splitlines() if line.split()[1:2] == ['gpu'])
+
+    def test_off_by_default(self):
+        self.walled()
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.gpu_line(out).startswith('PASS  gpu  GPU access is off'), out)
+        self.assertNotIn(self.GPU, self.read(self.UNIT))
+
+    def test_on(self):
+        self.machine({**CONFIG, 'gpu': True})
+        self.walled()
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        line = self.gpu_line(out)
+        self.assertTrue(line.startswith('PASS  gpu  GPU access is on'), out)
+        for path in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers'):
+            self.assertIn(path, line)
+        # The fake distro has none of the three: each is named, a note, not a failure (T3 still runs, "-" skips it)
+        for path in ('/dev/dxg', '/usr/lib/wsl/lib', '/usr/lib/wsl/drivers'):
+            self.assertIn('no ' + path, line)
+        self.write('/dev/dxg', '')
+        self.write('/usr/lib/wsl/lib/', '')
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        line = self.gpu_line(out)
+        self.assertNotIn('no /dev/dxg', line)
+        self.assertNotIn('no /usr/lib/wsl/lib', line)
+        self.assertIn('no /usr/lib/wsl/drivers', line)   # e.g. a WSL update moved the driver store
+        self.write('/usr/lib/wsl/drivers/', '')
+        self.assertNotIn('this distro has no', self.gpu_line(self.check()[1]))
+
+    def test_unit_differs_from_the_setting(self):
+        for written, now in ((False, True), (True, False)):
+            with self.subTest(unit_written_with=written, machine_file_says=now):
+                shutil.rmtree(self.root)
+                self.setUp()
+                self.machine({**CONFIG, 'gpu': written})
+                self.walled()
+                self.machine({**CONFIG, 'gpu': now})   # changed, setup not run again
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertEqual({line.split()[1] for line in out.splitlines() if line.startswith('FAIL')},
+                                 {'gpu', 'file:t3code-agents.service'}, out)
+                self.assertIn(f'the unit has GPU access {"on" if written else "off"}', self.gpu_line(out))
+                self.assertIn('pc-agents setup', self.gpu_line(out))
+
+    def test_half_a_gpu_unit_fails(self):
+        """A unit with only some of the GPU lines (an edit) is neither: it fails, with the setting on or off. So does
+        the default unit without its InaccessiblePaths= line (/usr/lib/wsl no longer hidden), and the GPU unit with
+        that default line added back."""
+        edits = (('gpu unit without BindPaths', True, lambda t: t.replace('BindPaths=-/dev/dxg\n', '')),
+                 ('default unit without the hidden line', False, lambda t: t.replace(k.HIDDEN + '\n', '')),
+                 ('default unit with that line changed', False,
+                  lambda t: t.replace(k.HIDDEN, k.HIDDEN.replace('-/mnt ', ''))),
+                 ('gpu unit with the hidden line added', True, lambda t: t.replace(k.GPU[0], k.HIDDEN + '\n' + k.GPU[0])))
+        for (name, written, edit), setting in [(e, s) for e in edits for s in (True, False)]:
+            with self.subTest(name, gpu=setting):
+                shutil.rmtree(self.root)
+                self.setUp()
+                self.machine({**CONFIG, 'gpu': written})
+                self.walled()
+                text = self.read(self.UNIT)
+                self.assertTrue(edit(text) != text, name)   # the edit applies
+                self.write(self.UNIT, edit(text))
+                self.machine({**CONFIG, 'gpu': setting})
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn('FAIL  gpu', out)
+                self.assertIn('only some of the GPU lines', self.gpu_line(out))
+
+    def test_unreadable_unit_fails(self):
+        self.walled()
+        os.unlink(self.path(self.UNIT))
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAIL  gpu', out)
 
 
 class Unit(Case):

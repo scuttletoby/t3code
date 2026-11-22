@@ -21,6 +21,7 @@ describe("forkFeatureStatuses", () => {
       "Agent slots: Off",
       "Usage pacing: Off",
       "Model policy: Off",
+      "Stop finished children: Off",
       "Review rules: Off",
       "Automatic updates: Off",
       "Activity probe: Off",
@@ -39,6 +40,7 @@ describe("forkFeatureStatuses", () => {
         reviewRules: { preset: "recommended" },
         automaticUpdates: true,
         activityProbe: true,
+        stopFinishedChildren: { enabled: true },
         handoff: { mode: "compact", threads: { "thread-1": "handoff", "thread-2": "compact" } },
       }),
     );
@@ -47,6 +49,7 @@ describe("forkFeatureStatuses", () => {
       "Agent slots: On",
       "Usage pacing: On: advise",
       "Model policy: On: enforce",
+      "Stop finished children: On",
       "Review rules: On",
       "Automatic updates: On",
       "Activity probe: On",

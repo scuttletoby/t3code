@@ -659,8 +659,7 @@ def _merged_config_problem(checkout, path, base, head):
     merged = 'HEAD'
     if checkout.bare:
         try:
-            m = checkout.git('-c', 'merge.directoryRenames=true', 'merge-tree', '--write-tree', base, head,
-                             errors='surrogateescape', timeout=MERGE_TREE_SECONDS)
+            m = pr_queue.merge_tree(checkout.git, base, head, errors='surrogateescape', timeout=MERGE_TREE_SECONDS)
         except subprocess.TimeoutExpired:
             return (f'git merge-tree of the base {base[:12]} and the head {head[:12]} took over {MERGE_TREE_SECONDS} '
                     'seconds, so the config it would merge is unknown')

@@ -9,9 +9,11 @@ the rule alone decides (its job floor too).
 
 Output, kept as the older t3-capacity had it so hooks and scripts that read it keep working:
   line 1   available=<MB>MB swapfree=<MB>MB load=<load>/<n>cores agents=<n> jobs=<n> waiting=<n> reserved=<MB>MB
-           need=<MB>MB free=<MB>MB level=<level> tier=<tier>   (available: after the reservations that hold back
-           this caller; reserved: what admitted jobs and agents may still grow into, so available - reserved
-           counts each once; tier full, machine (no user manager: machine-wide numbers) or basic (never OK))
+           need=<MB>MB free=<MB>MB level=<level> tier=<tier> disk=<GB>GB   (available: after the reservations
+           that hold back this caller; reserved: what admitted jobs and agents may still grow into, so available -
+           reserved counts each once; tier full, machine (no user manager: machine-wide numbers) or basic (never OK);
+           disk: free GB on the work filesystem, `disk=<GB>GB<<floor>GB` when under the floor (NOT OK, #982),
+           `disk=?` when it cannot be read (NOT OK))
   then     reservations: <name>:<MB>MB(using <MB>,holding <MB>) or <name>:own (a reservation of the caller's folder;
            holding is what is left after its use and the debts of agents and jobs working in it, ", owed <MB>")
            note: <text>, fits: <kind>=<n> ..., and last "NOT OK: <why>" or "OK".
@@ -59,8 +61,12 @@ def main(argv):
         verdict, why, d = hf.checked(hf.test_env('T3_CAPACITY_HEAVY') or os.path.join(KIT, 'bin', 'heavy'), kind, need)
     except Exception as e:      # the caller itself cannot run: never OK
         verdict, why, d = 'unavailable', f'{e.__class__.__name__}: {e}', None
+    disk, disk_why = disk_answer()
+    if disk_why is not None:    # #982: the disk's reason first, the memory's after it when that is NOT OK too
+        why = f'disk: {disk_why}' + ('' if verdict == 'free' else f'; {why}')
+        verdict = 'busy' if verdict == 'free' else verdict
     if d is None:
-        print(f'available=0MB swapfree=0MB load=0/0cores need={need or 0}MB facts=unavailable')
+        print(f'available=0MB swapfree=0MB load=0/0cores need={need or 0}MB facts=unavailable {disk}')
         lines = [f'NOT OK: {why} (not free)']
     else:
         m, q, c = d['memory'], d['queue'], d['cpu']
@@ -69,7 +75,7 @@ def main(argv):
         print(f'available={avail}MB swapfree={m["swapFreeMb"]}MB load={c["load1"]}/{c["cores"]}cores '
               f'agents={q["agents"]} jobs={q["running"]} waiting={q["waiting"]} reserved={m["owedMb"]}MB '
               f'need={need if need is not None else m["costMb"]}MB free={m["freeMb"]}MB level={d["level"]} '
-              f'tier={d["tier"]}')
+              f'tier={d["tier"]} {disk}')
         lines = []
         if d['reservations']:
             lines.append('reservations: ' + ' '.join(
@@ -85,6 +91,17 @@ def main(argv):
     if not sys.stdout.isatty():
         print(not_ok_line(), file=sys.stderr)
     return 1
+
+
+def disk_answer():
+    """(the first line's disk token, why NOT OK or None): free disk on the work filesystem against heavy.disk.floorGb
+    (#982). A kit or setting that cannot be read is never OK."""
+    try:
+        hf = facts_module()
+        import heavy_queue
+        return hf.disk_check(heavy_queue)
+    except Exception as e:
+        return 'disk=?', f'{e.__class__.__name__}: {e}'
 
 
 def not_ok_line():

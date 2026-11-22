@@ -68,6 +68,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`server.handoff`](#serverhandoff)                                           | `{"mode":"off"}`                        | yes | [#215](https://github.com/scuttletoby/t3code/issues/215) |
 | [`server.threadRoles`](#serverthreadroles)                                   | `{"assistant":null,"orchestrators":{}}` | yes | [#138](https://github.com/scuttletoby/t3code/issues/138) |
 | [`server.assistant`](#serverassistant)                                       | `{"enabled":false}`                     | yes | [#879](https://github.com/scuttletoby/t3code/issues/879) |
+| [`server.stopFinishedChildren`](#serverstopfinishedchildren)                 | `{"enabled":false}`                     | yes | [#925](https://github.com/scuttletoby/t3code/issues/925) |
 | [`projectOverride.waitChecks`](#projectoverridewaitchecks)                   | not set                                 | yes | [#84](https://github.com/scuttletoby/t3code/issues/84)   |
 | [`projectOverride.playtest`](#projectoverrideplaytest)                       | not set                                 | yes | [#260](https://github.com/scuttletoby/t3code/issues/260) |
 | [`projectOverride.reviewRules`](#projectoverridereviewrules)                 | not set                                 | yes | [#291](https://github.com/scuttletoby/t3code/issues/291) |
@@ -77,7 +78,7 @@ no section below. "Off" means the default leaves the machine as upstream's would
 | [`projectOverride.placementNeeds`](#projectoverrideplacementneeds)           | not set                                 | yes | [#134](https://github.com/scuttletoby/t3code/issues/134) |
 | [`client.calmSidebarEnabled`](#clientcalmsidebarenabled)                     | `false`                                 | yes | [#139](https://github.com/scuttletoby/t3code/issues/139) |
 
-For `waitFor`, `agentSlots` and `playtest` only the `enabled` switch is pinned, and for `handoff`
+For `waitFor`, `agentSlots`, `playtest` and `stopFinishedChildren` only the `enabled` switch is pinned, and for `handoff`
 and `placement` only `mode`; their other fields are tuning that does nothing while the switch is off.
 
 ## Each setting
@@ -287,8 +288,8 @@ Only the person can change it; agents cannot. A save that is on without all four
 push step's name (or names one `claim`, `renew` or `release`), names a program by anything but its
 full path on the server's OS, or has a field this build does not know is refused. A hand-edited
 value that is not valid, or has a field this build does not know (a newer build's limit, a typo),
-reads as off (with a warning in the server log), and the next save of any setting writes the default
-in its place. So after moving back to an older build, copy the playtest value first: the older
+reads as off (with a warning in the server log that names what is wrong, such as the unknown
+field), and the next save of any setting writes the default in its place. So after moving back to an older build, copy the playtest value first: the older
 build's next save replaces a newer build's value. Other fields: how often a claim is renewed (`renewMinutes`), when an idle
 session ends (`idleMinutes`) and the longest session (`maxHours`).
 
@@ -528,7 +529,11 @@ wiring). Fields, each with its default:
   for `labels`; a line that is not one label is skipped, at most 64); any other exit, a program that
   cannot start, or no answer within 5 seconds means not available, with the reason. The machine
   that runs it checks the path again on its own OS first and runs it with no arguments; on Windows
-  only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell. The runner is in the fork
+  only an `.exe` runs, since a `.cmd`, `.bat` or script needs a shell, and that holds for the file
+  the server's lookup would start, not only the text. A Windows server whose PATHEXT has no `.EXE`
+  refuses every `factsCommand`: its lookup would try `facts.exe` plus each PATHEXT ending, so a
+  `facts.exe.CMD` planted after the check could run through a shell. A failed run's reason is the
+  first line of its error output, else of its output. The runner is in the fork
   (`apps/server/src/fork/factsCommand.ts`); placement row P4 wires it into the facts read.
 - `never`: `[]`. Label groups that must not meet on one machine, such as
   `[["ci-runner", "owner-logins"]]`; each group has at least two different labels after
@@ -1332,6 +1337,34 @@ thread already named the assistant stays as it is. Only the person can change it
 managed policy that owns `mcpThreadProfiles` can drop the pick). More in
 [assistant.md](assistant.md).
 
+### `server.stopFinishedChildren`
+
+Stops a finished delegated child's provider process (a Claude process holds about 150-300 MB) once
+its thread has been idle for `graceSeconds` (default 60), instead of keeping it until upstream's own
+idle release 30 minutes later. The stop is upstream's idle release, so the thread keeps its history
+and the next message to it (a follow-up from its parent, `t3_thread_send`, a person) starts a new
+process as any resumed thread does.
+
+- When: the child's task ends (`delegate_task` here) or the child's run ends, then `graceSeconds`
+  of quiet. A run that starts in that time cancels it; that run's end starts it again. Nothing
+  polls: a child found busy is checked again at its next run end, request change or background-work
+  change.
+- Never stopped: a thread with a run (also a queued or silent one), a pending question or approval,
+  background work, a task still open (its own, or one it delegated itself), or a `wait_for` wait
+  that would wake it (or a wait store that cannot be read). The last check runs in the same step as upstream's release, which also keeps a
+  session a turn just started on.
+- Only a child's own process: one provider process per thread (Claude, and others that run one per
+  thread). A shared process (Codex, OpenCode) serves other threads and is left to upstream. A
+  provider's own subagent (not `delegate_task`) shares its parent's process and is never touched.
+- A child a linked machine delegated here is stopped by this machine's setting when its run is over
+  (the process runs here); the parent's machine stops nothing there.
+- Timers live in memory. A restart ends every provider session anyway; after it, a child's next run
+  end arms again. A second stop of the same child finds nothing live and does nothing.
+
+Switch on: **Settings → Fork**, section Finished children, or in `settings.json`:
+`"stopFinishedChildren": { "enabled": true, "graceSeconds": 60 }`. Anything but `"enabled": true`
+reads as off, and a bad `graceSeconds` as 60; a save with a bad value is refused.
+
 ### `projectOverride.waitChecks`
 
 A project's own list of wait checks. It replaces the server's list for that project as a whole (a
@@ -1454,7 +1487,8 @@ the account at launch (the gate does). The fields are part of the tool's result,
 list an agent loads, so the tool context budget is unchanged.
 
 When placement reads a linked machine's answer (`factsFromAnswer` in the same file), it decodes it
-with these schemas: neither field is "no facts", as above; an answer they refuse is "facts not
+with these schemas: no answer (the machine did not answer) or neither field is "no facts", as
+above; an answer they refuse is "facts not
 valid", and the machine is refused, even when it is named. This machine with no CPU and memory
 sample (no sampler, or one that cannot measure CPU) is still a place for work when every other
 rule passes, ranked last; a linked machine without them is not. Its weight still counts (`manual`

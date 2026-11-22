@@ -18,6 +18,7 @@ const WHOLE_ONLY = [
   "placementNeeds",
   "playtest",
   "reviewRules",
+  "stopFinishedChildren",
   "threadRoles",
 ] as const satisfies ReadonlyArray<ForkServerSettingKey>;
 
