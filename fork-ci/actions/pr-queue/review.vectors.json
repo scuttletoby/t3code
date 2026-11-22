@@ -255,7 +255,7 @@
       "protected": []
     },
     {
-      "name": "one critical file among normal ones needs the critical lenses only",
+      "name": "one critical file among normal ones needs the critical lenses and the code lens",
       "config": "basic",
       "changes": [
         ["M", "src/storage/db.py"],
@@ -263,7 +263,7 @@
         ["M", "src/app/b.py"]
       ],
       "weight": "critical",
-      "lenses": ["data-1", "data-2"],
+      "lenses": ["data-1", "data-2", "code"],
       "hits": ["data", "code"],
       "protected": []
     },
@@ -272,7 +272,7 @@
       "config": "basic",
       "changes": [["R100", "src/storage/old.py", "src/app/new.py"]],
       "weight": "critical",
-      "lenses": ["data-1", "data-2"],
+      "lenses": ["data-1", "data-2", "code"],
       "hits": ["data", "code"],
       "protected": []
     },
@@ -281,7 +281,7 @@
       "config": "basic",
       "changes": [["R087", "src/app/a.sql", "migrations/0007.sql"]],
       "weight": "critical",
-      "lenses": ["data-1", "data-2"],
+      "lenses": ["data-1", "data-2", "code"],
       "hits": ["data", "code"],
       "protected": []
     },
@@ -299,7 +299,7 @@
       "config": "basic",
       "changes": [["C075", "src/storage/a.py", "src/app/a.py"]],
       "weight": "critical",
-      "lenses": ["data-1", "data-2"],
+      "lenses": ["data-1", "data-2", "code"],
       "hits": ["data", "code"],
       "protected": []
     },
@@ -320,7 +320,7 @@
       "config": "basic",
       "changes": [["M", ".github/pr-queue.json"]],
       "weight": "critical",
-      "lenses": ["data-1", "data-2"],
+      "lenses": ["data-1", "data-2", "code"],
       "hits": ["data", "code"],
       "protected": [".github/pr-queue.json"]
     },
@@ -332,7 +332,7 @@
         ["M", "docs/guide.md"]
       ],
       "weight": "critical",
-      "lenses": ["data-1", "data-2"],
+      "lenses": ["data-1", "data-2", "code"],
       "hits": ["data", "docs", "code"],
       "protected": [".github/pr-queue.json"]
     },
@@ -371,7 +371,7 @@
         ["M", ".github/workflows/sub/inner.yml"]
       ],
       "weight": "critical",
-      "lenses": ["data-1", "data-2"],
+      "lenses": ["data-1", "data-2", "code"],
       "hits": ["data", "code"],
       "protected": [".github/workflows/deploy.yml", ".github/workflows/sub/inner.yml"]
     },
@@ -409,7 +409,7 @@
       "protected": []
     },
     {
-      "name": "two critical rules hit: the lenses of both",
+      "name": "two critical rules and a normal one hit: the lenses of all three",
       "config": "two-critical",
       "changes": [
         ["M", "src/auth/login.py"],
@@ -417,7 +417,7 @@
         ["M", "src/api/users.py"]
       ],
       "weight": "critical",
-      "lenses": ["security-1", "security-2", "data-1", "data-2"],
+      "lenses": ["security-1", "security-2", "data-1", "data-2", "api", "code"],
       "hits": ["auth", "data", "api"],
       "protected": []
     },
@@ -486,7 +486,7 @@
         ["M", "db/x.sql"]
       ],
       "weight": "critical",
-      "lenses": ["security-1", "security-2", "data-1", "data-2"],
+      "lenses": ["security-1", "security-2", "data-1", "data-2", "code"],
       "hits": ["auth", "data", "rest"],
       "protected": ["review/data.md"]
     },
@@ -498,7 +498,7 @@
         ["M", ".github/pr-queue.json"]
       ],
       "weight": "critical",
-      "lenses": ["security-1", "security-2"],
+      "lenses": ["security-1", "security-2", "code"],
       "hits": ["auth", "notes", "rest"],
       "protected": [".github/pr-queue.json"]
     },
