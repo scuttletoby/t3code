@@ -1414,7 +1414,10 @@ def api_reason(args, ctx, top=False):
         gql = any(may_be_graphql(a) for a in pos) if exact else path is None or may_be_graphql(path)
         if gql and any(GQL_RE.search(x) for x in seen):
             return reason('a GraphQL mutation that deletes branch protection or a ruleset')
-        if gql and any(GQL_UPDATE.search(x) for x in seen) and (unread or any(OFF_WORD.search(x) for x in seen)):
+        # the off word may stand alone in a variable (-F e=EVALUATE, `"variables": {"e": "EVALUATE"}`): read without
+        # the cue words, as for a ruleset body (canon() blanks text that names no guarded word)
+        if gql and any(GQL_UPDATE.search(x) for x in seen) and (unread or any(
+                OFF_WORD.search(canon(x, cue=False)) for x in list(args) + bodies)):
             return reason('a GraphQL updateRepositoryRuleset that switches the ruleset off (enforcement: DISABLED '
                           'or EVALUATE), '
                           'or one with a body the guard cannot read')

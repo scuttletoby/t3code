@@ -1948,6 +1948,26 @@ QUICK_REFUSED = [
 ]
 
 
+class LensSecurityR2Test(Case):
+    """PR 847, lens B round 2 (security boundary): each test names the finding it closes."""
+
+    def test_r2_minor1_graphql_update_with_evaluate_in_a_variable_is_refused(self):
+        mut = ('mutation($e: RuleEnforcement!) { updateRepositoryRuleset(input: {repositoryRulesetId: \\"x\\", '
+               'enforcement: $e}) { clientMutationId } }')
+        mut_i = 'mutation($i: UpdateRepositoryRulesetInput!) { updateRepositoryRuleset(input: $i) { clientMutationId } }'
+        self.write('vars.json', json.dumps({'query': mut, 'variables': {'e': 'EVALUATE'}}) + '\n', 0o644)
+        for cmd in (f"gh api graphql -f query='{mut}' -F e=EVALUATE",
+                    f"gh api graphql -f query='{mut}' -f e=evaluate",
+                    f"gh api graphql -f query='{mut}' --raw-field e=EVALUATE",
+                    f"gh api graphql -f query='{mut}' --field=e=EVALUATE",
+                    f"gh api graphql -f query='{mut_i}' -F i[repositoryRulesetId]=x -F i[enforcement]=EVALUATE",
+                    'gh api graphql --input vars.json'):
+            with self.subTest(cmd):
+                self.assertIsNotNone(self.decide(cmd), cmd)
+        # the same call that keeps the ruleset on passes
+        self.assertIsNone(self.decide(f"gh api graphql -f query='{mut}' -F e=ACTIVE"))
+
+
 class FastExitTest(Case):
     """#1752 fix point 1: plain commands pass before any file is read or the clock matters, and nothing the full
     reading refuses takes that way out."""
