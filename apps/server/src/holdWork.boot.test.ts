@@ -394,6 +394,9 @@ const FORK_LAYER_SPANS = [
   "AgentSlotRoutes.scheduledRunsGated",
   // The record of who saved each scheduled task, which needs the server's state folder.
   "ScheduledTaskMcpProfiles.stored",
+  // The `threadRoles` save check's thread lookup in `ForkLayers.layerRuntimeServices`. Without it
+  // the app refuses every new role ("cannot be checked here") and nothing else fails.
+  "ThreadRoleTargets.make",
 ];
 
 const missingForkLayers = (spans: ReadonlySet<string>) =>
