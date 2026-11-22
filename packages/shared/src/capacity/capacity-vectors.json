@@ -2405,6 +2405,43 @@
         "admitted": [4],
         "stoppedBy": ["ceiling"]
       }
+    },
+    {
+      "name": "job core share: default jobs on 2.78 cores",
+      "why": "2.78 cores are 278 centi-cores, 90% of them 250: one default job (250 centi-cores) fits exactly, a second would need 500. The job floor is 0 here, so it does not admit the second either.",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 2.78 },
+      "floors": { "agent": 2, "job": 0 },
+      "fill": [{ "kind": "job-default", "count": 3 }],
+      "expect": { "admitted": [1], "stoppedBy": ["cores"] }
+    },
+    {
+      "name": "job core share: servers on 1.12 cores",
+      "why": "1.12 cores are 112 centi-cores, 90% of them 100: one server (100 centi-cores) fits exactly, a second would need 200.",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 1.12 },
+      "floors": { "agent": 2, "job": 0 },
+      "fill": [{ "kind": "job-server", "count": 3 }],
+      "expect": { "admitted": [1], "stoppedBy": ["cores"] }
+    },
+    {
+      "name": "job core share: a typecheck on 0.34 cores with its cost free exactly",
+      "why": "0.34 cores are 34 centi-cores, 90% of them 30: a typecheck (30 centi-cores) fits exactly. Margin 1209, so 4281 MB available leave 3072 MB free: its whole start cost. One more centi-core or MB and it waits (job floor 0 here).",
+      "facts": "host-12gb-idle",
+      "patch": { "cpuCores": 0.34, "availableMb": 4281 },
+      "floors": { "agent": 2, "job": 0 },
+      "ask": { "kind": "job-typecheck" },
+      "expect": { "admit": true, "reason": "fits", "freeMb": 3072, "costMb": 3072 }
+    },
+    {
+      "name": "calm needs available at 150% of the margin",
+      "why": "Margin 1209: calm needs 1813.5 MB available, so 1813 MB is not calm (though above the elevated line, the margin): after elevated the 60 s wait does not start.",
+      "facts": "host-12gb-idle",
+      "patch": { "availableMb": 1813 },
+      "previous": { "level": "elevated", "calmSinceMs": null },
+      "nowMs": 1000000,
+      "ask": { "kind": "agent-light" },
+      "expect": { "level": "elevated", "calmSinceMs": null }
     }
   ]
 }

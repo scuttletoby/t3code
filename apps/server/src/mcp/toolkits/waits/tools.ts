@@ -4,6 +4,7 @@
  * client lists them only after `tool_search` finds them.
  */
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
+import { PlaytestFailure, PlaytestToolInput, PlaytestToolResult } from "@t3tools/contracts";
 import {
   WaitCancelInput,
   WaitCancelResult,
@@ -19,6 +20,7 @@ import { McpSchema, Tool, Toolkit } from "effect/ai";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
+import { Playtest } from "../../../playtest/PlaytestLayer.ts";
 import { Waits } from "../../../waits/WaitWorker.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import { TaskListInput, TaskListResult } from "./taskList.ts";
@@ -101,4 +103,31 @@ const TaskListTool = Tool.make("task_list", {
   .annotate(Tool.OpenWorld, false)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
-export const WaitsToolkit = Toolkit.make(WaitForTool, WaitListTool, WaitCancelTool, TaskListTool);
+// Fork (playtest): one tool, four actions, on the calling thread's session (docs/fork/playtest.md).
+const PlaytestTool = Tool.make("playtest", {
+  description:
+    "Let a person try this thread's work on a test target, round by round. start (target, optional note) claims it; push runs one round of the project's steps on this thread's worktree and returns when it ends; status shows the session; end releases the target. One session per thread; only a person can switch playtest on.",
+  parameters: PlaytestToolInput,
+  success: PlaytestToolResult,
+  failure: Schema.Union([PlaytestFailure, OrchestratorMcpFailure]),
+  failureMode: "return",
+  dependencies: [
+    McpInvocationContext.McpInvocationContext,
+    ThreadManagementService.ThreadManagementService,
+    Playtest,
+  ],
+})
+  .annotate(Tool.Title, "Playtest session")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.Idempotent, false)
+  .annotate(Tool.OpenWorld, true)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
+export const WaitsToolkit = Toolkit.make(
+  WaitForTool,
+  WaitListTool,
+  WaitCancelTool,
+  TaskListTool,
+  PlaytestTool,
+);

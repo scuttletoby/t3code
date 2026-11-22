@@ -8,10 +8,12 @@ import {
   isProviderWorkspaceSnapshotPending,
   type ModelSelection,
   type OrchestratorMcpDelegateTaskInput,
+  type OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpFailure,
   type OrchestratorMcpCreateThreadRequest,
   type OrchestratorMcpTarget,
   PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   type ProviderOptionSelection,
   type RuntimeMode,
@@ -36,6 +38,7 @@ import * as UsagePacingGate from "../usage/UsagePacingGate.ts";
 import * as AgentSlotRoutes from "./agentSlotRoutes.ts";
 import * as LaunchMcpProfile from "./launchMcpProfile.ts";
 import * as ModelPolicyCheck from "./modelPolicyCheck.ts";
+import * as RemoteTaskPrompts from "./remoteTaskPrompts.ts";
 
 /** A checked delegation target (the same shape as the service's resolved target). */
 export interface DelegateTarget {
@@ -152,6 +155,14 @@ export interface DelegateChecks {
   readonly remoteTarget: <Target extends OrchestratorMcpTarget>(
     target: Target,
   ) => Effect.Effect<Target, OrchestratorMcpFailure>;
+  /**
+   * A remote task's status: what its thread on the linked machine waits on, read from that
+   * machine (fork/remoteTaskPrompts.ts). Spread over upstream's fixed `false`/`null`.
+   */
+  readonly remotePrompts: (
+    task: OrchestrationV2Subagent,
+    status: OrchestratorMcpDelegateTaskResult["status"],
+  ) => Effect.Effect<Partial<RemoteTaskPrompts.StatusReport>>;
 }
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
@@ -284,6 +295,7 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
   const slotGate = yield* Effect.serviceOption(SlotGate.SlotGate);
   const launchMcpProfile = yield* LaunchMcpProfile.makeLaunchMcpProfileCheck;
   const checkPick = yield* ModelPolicyCheck.makePickCheck;
+  const remoteStatus = yield* RemoteTaskPrompts.makeStatusReport();
   /**
    * The model policy's check of the agent's pick on a resolved target (`modelPolicyCheck.ts`): a
    * call that names no model inherits one, which reads as no model.
@@ -619,6 +631,14 @@ export const make = Effect.fnUntraced(function* (host: DelegateChecksHost) {
             ),
           ),
         ),
+      ),
+    remotePrompts: (task, status) =>
+      remoteStatus(
+        task,
+        status === "completed" ||
+          status === "failed" ||
+          status === "cancelled" ||
+          status === "interrupted",
       ),
   };
   return checks;
