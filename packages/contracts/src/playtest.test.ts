@@ -168,6 +168,9 @@ describe("playtest settings in the settings file", () => {
       { ...ADAPTER, claim: step(["game"]) },
       { ...ADAPTER, push: [ADAPTER.push[0], ADAPTER.push[0]] },
       { ...ADAPTER, enabled: "yes" },
+      // A newer build's field (a limit this build would not apply), at the top or in a step.
+      { ...ADAPTER, onlyBranches: ["playtest/*"] },
+      { ...ADAPTER, claim: { ...ADAPTER.claim, maxRuns: 1 } },
       "on",
       null,
       [],
@@ -226,6 +229,17 @@ describe("playtest settings in a save", () => {
     expect(project(ADAPTER).projectSettingsOverrides?.[PROJECT]?.playtest?.enabled).toBe(true);
     expect(() => project(without("release"))).toThrow();
     expect(() => project({ ...ADAPTER, push: [{ name: "x", argv: ["guard"] }] })).toThrow();
+  });
+
+  it.each([
+    ["a field from a newer build", { ...ADAPTER, onlyBranches: ["playtest/*"] }],
+    ["a typo", { ...ADAPTER, timeoutSecond: 30 }],
+    ["a newer field in a step", { ...ADAPTER, claim: { ...ADAPTER.claim, maxRuns: 1 } }],
+  ])("refuses %s, never drops it and saves the rest as on", (_name, value) => {
+    expect(() => decodePatch({ playtest: value })).toThrow();
+    expect(() =>
+      decodePatch({ projectSettingsOverrides: { [PROJECT]: { playtest: value } } }),
+    ).toThrow();
   });
 });
 

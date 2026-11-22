@@ -21,8 +21,8 @@ ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 
 REGISTRY_PATH = 'tools/registry.json'
 REGISTRY = {'modules': [
     {'id': 'site', 'kind': 'plugin', 'inputs': ['plugins/site/README.md']},
-    {'id': 'content-locale', 'kind': 'engine-module', 'inputs': ['plugins/locale/common/src/main/java/Wire.java']},
-    {'id': 'content-travel', 'kind': 'engine-module', 'inputs': ['plugins/travel/common/src/main/java']},
+    {'id': 'alpha', 'kind': 'core-module', 'inputs': ['plugins/alpha/common/src/main/java/Api.java']},
+    {'id': 'beta', 'kind': 'core-module', 'inputs': ['plugins/beta/common/src/main/java']},
 ]}
 # A project's rules, as a caller would write them (the general half of a docs-only gate).
 CONFIG = {
@@ -36,14 +36,14 @@ CONFIG = {
         {'glob': '**/test/**', 'why': 'inside a test folder'},
         {'glob': '**/fixtures/**', 'why': 'inside a fixture folder'},
         {'glob': 'skills/review/SKILL.md', 'why': 'read by a tooling test'},
-        {'glob': 'plugins/RELEASE-CLAIMS.md', 'why': 'read by the release tool'},
+        {'glob': 'plugins/RELEASE-NOTES.md', 'why': 'read by the release tool'},
     ],
     'never_docs_from': [{'file': REGISTRY_PATH, 'list': 'modules', 'field': 'inputs', 'label': 'id',
                          'why': 'listed in the registry'}],
     'jobs': {
         'plugins': {'paths': ['plugins/**']},
-        'engine': {'paths': ['engine/**', 'plugins/items/**'],
-                   'paths_from': [{'file': REGISTRY_PATH, 'list': 'modules', 'where': {'kind': 'engine-module'},
+        'core': {'paths': ['core/**', 'plugins/shared/**'],
+                   'paths_from': [{'file': REGISTRY_PATH, 'list': 'modules', 'where': {'kind': 'core-module'},
                                    'field': 'inputs', 'label': 'id'}]},
     },
 }
@@ -206,7 +206,7 @@ class BuildAndTestInputs(Repo):
         self.check('skills/review/SKILL.md')
 
     def test_a_named_file_read_by_a_tool(self):
-        self.check('plugins/RELEASE-CLAIMS.md')
+        self.check('plugins/RELEASE-NOTES.md')
 
     def test_an_md_listed_in_the_registry(self):
         self.check('plugins/site/README.md')
@@ -222,7 +222,7 @@ class RegistryAtTheBase(Repo):
     itself does not decide (it is docs, or a job's own path), so only the registry read can (an entry the PR adds
     counts too: never_docs_from is read at the head as well)."""
     config = {'docs': ['**'], 'never_docs_from': CONFIG['never_docs_from'],
-              'jobs': {'plugins': {'paths': ['plugins/**', 'tools/**']}, 'engine': CONFIG['jobs']['engine']}}
+              'jobs': {'plugins': {'paths': ['plugins/**', 'tools/**']}, 'core': CONFIG['jobs']['core']}}
 
     def drop(self, module_id):
         return json.dumps({'modules': [m for m in REGISTRY['modules'] if m['id'] != module_id]})
@@ -234,15 +234,15 @@ class RegistryAtTheBase(Repo):
         self.assertIn('site inputs: plugins/site/README.md', out)
 
     def test_a_pr_that_drops_a_jobs_entry_still_runs_the_job(self):
-        self.pr({REGISTRY_PATH: self.drop('content-locale'), 'plugins/locale/common/src/main/java/Wire.java': 'x'})
-        self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'true'})
+        self.pr({REGISTRY_PATH: self.drop('alpha'), 'plugins/alpha/common/src/main/java/Api.java': 'x'})
+        self.assertEqual(self.scope()[1], {'plugins': 'true', 'core': 'true'})
 
     def test_a_pr_that_adds_a_never_docs_entry_counts_it_at_the_head(self):   # never_docs_from read at both sides
         self.pr({REGISTRY_PATH: json.dumps({'modules': REGISTRY['modules'] + [{'id': 'manual',
                                                                                 'inputs': ['docs/manual.md']}]}),
                  'docs/manual.md': 'y'})
         docs, jobs, out = self.scope()
-        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'core': 'true'}), out)
         self.assertIn('manual inputs: docs/manual.md', out)
 
 
@@ -251,25 +251,25 @@ class RegistryAtTheHead(Repo):
     judge a PR come from the base. The registry sits in a job's paths (the common case), so its change alone does not
     run every job."""
     config = {**CONFIG, 'jobs': {'plugins': {'paths': ['plugins/**']},
-                                 'engine': {**CONFIG['jobs']['engine'], 'paths': ['engine/**', 'tools/**']}}}
+                                 'core': {**CONFIG['jobs']['core'], 'paths': ['core/**', 'tools/**']}}}
 
     def add(self, *modules):
         return json.dumps({'modules': REGISTRY['modules'] + list(modules)})
 
     def test_a_head_only_entry_cannot_claim_a_file_no_job_names(self):   # even innocently: a new module lists it
-        self.pr({REGISTRY_PATH: self.add({'id': 'root', 'kind': 'engine-module', 'inputs': ['build.gradle']}),
+        self.pr({REGISTRY_PATH: self.add({'id': 'root', 'kind': 'core-module', 'inputs': ['build.gradle']}),
                  'build.gradle': 'x'})
         docs, jobs, out = self.scope()
-        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'core': 'true'}), out)
         self.assertIn('full run: build.gradle is not a docs file', out.splitlines()[0])
         self.assertIn('which no job names at the base: every job runs', out.splitlines()[0])
 
     def test_a_head_only_entry_still_adds_its_job(self):
-        self.pr({REGISTRY_PATH: self.add({'id': 'new', 'kind': 'engine-module', 'inputs': ['plugins/new/X.java']}),
+        self.pr({REGISTRY_PATH: self.add({'id': 'new', 'kind': 'core-module', 'inputs': ['plugins/new/X.java']}),
                  'plugins/new/X.java': 'x'})
         docs, jobs, out = self.scope()
-        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)
-        self.assertIn('job engine: run (plugins/new/X.java matches new inputs', out)
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'core': 'true'}), out)
+        self.assertIn('job core: run (plugins/new/X.java matches new inputs', out)
 
 
 class Submodules(Repo):
@@ -366,8 +366,8 @@ class FailsClosed(Repo):
                 ('no object of the kind a job keeps', None)):
             with self.subTest(name):
                 self.reset()
-                engine = [m for m in REGISTRY['modules'] if m['kind'] == 'engine-module'] if modules else []
-                modules = [{k: v for k, v in m.items() if v is not None} for m in modules or [site]] + engine
+                core = [m for m in REGISTRY['modules'] if m['kind'] == 'core-module'] if modules else []
+                modules = [{k: v for k, v in m.items() if v is not None} for m in modules or [site]] + core
                 self.base = self.commit('registry', {REGISTRY_PATH: json.dumps({'modules': modules})})
                 self.pr({'plugins/site/README.md': 'y'})
                 docs, jobs, out = self.scope()
@@ -397,7 +397,7 @@ class MergeCommit(Repo):
 
     def test_the_real_merge_commit_is_a_full_run(self):   # the check does not refuse the right checkout
         self.git('checkout', '-q', '--detach', self.github_sha)
-        self.assertEqual(self.scope(head_sha=self.pr_head)[:2], (False, {'plugins': 'true', 'engine': 'true'}))
+        self.assertEqual(self.scope(head_sha=self.pr_head)[:2], (False, {'plugins': 'true', 'core': 'true'}))
 
     def test_a_pr_head_checkout_is_a_full_run(self):
         docs, jobs, out = self.scope(sha=self.github_sha, head_sha=self.pr_head)
@@ -473,7 +473,7 @@ class OddNames(Repo):
     def test_a_newline_name_in_a_job_folder_runs_that_job_by_its_paths(self):
         self.pr({'plugins/x\ny.java': 'x'})
         docs, jobs, out = self.scope()
-        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'false'}, out)
+        self.assertEqual(jobs, {'plugins': 'true', 'core': 'false'}, out)
         self.assertIn('matches its paths', out)
 
     def test_a_name_cannot_inject_a_workflow_command_or_an_output(self):   # scope() checks every line
@@ -488,9 +488,9 @@ class ConfigAtTheBase(Repo):
     loosen what judges it (the general half of a gate that ran the PR's own copy)."""
 
     def test_a_pr_that_loosens_its_own_config_still_runs_in_full(self):
-        self.pr({CONFIG_PATH: json.dumps({'docs': ['**'], 'jobs': {}}), 'engine/A.java': 'class A {}'})
+        self.pr({CONFIG_PATH: json.dumps({'docs': ['**'], 'jobs': {}}), 'core/A.java': 'class A {}'})
         docs, jobs, out = self.scope()
-        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)   # the base's jobs, all
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'core': 'true'}), out)   # the base's jobs, all
 
     def test_no_config_at_the_base(self):   # the PR that adds the config runs in full
         self.git('rm', '-q', CONFIG_PATH)
@@ -536,14 +536,14 @@ class ConfigAtTheBase(Repo):
                 self.assertIn(why, out)
 
     def test_an_unknown_key_in_a_paths_from_entry(self):   # "wehre" would drop the kind filter: the job runs more
-        engine = CONFIG['jobs']['engine']
-        source = {**{k: v for k, v in engine['paths_from'][0].items() if k != 'where'}, 'wehre': {'kind': 'x'}}
+        core = CONFIG['jobs']['core']
+        source = {**{k: v for k, v in core['paths_from'][0].items() if k != 'where'}, 'wehre': {'kind': 'x'}}
         self.commit('typo', {CONFIG_PATH: json.dumps(
-            {**CONFIG, 'jobs': {**CONFIG['jobs'], 'engine': {**engine, 'paths_from': [source]}}})})
+            {**CONFIG, 'jobs': {**CONFIG['jobs'], 'core': {**core, 'paths_from': [source]}}})})
         self.pr({'README.md': 'y'})
         docs, jobs, out = self.scope()
         self.assertEqual((docs, jobs), (False, {}), out)
-        self.assertIn('jobs.engine.paths_from entry', out)
+        self.assertIn('jobs.core.paths_from entry', out)
 
 
 class LooseConfig(Repo):
@@ -566,12 +566,12 @@ class Jobs(Repo):
     def test_a_job_runs_for_its_paths_and_skips_otherwise(self):
         self.pr({'plugins/a/src/main/java/A.java': 'class A {}'})
         docs, jobs, out = self.scope()
-        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'false'}), out)
-        self.assertIn('job engine: skip', out)
+        self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'core': 'false'}), out)
+        self.assertIn('job core: skip', out)
 
-    def test_docs_in_a_job_folder_do_not_run_it(self):   # code elsewhere makes it a full run, not an engine build
-        self.pr({'engine/README.md': 'y', 'plugins/a/A.java': 'class A {}'})
-        self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'false'})
+    def test_docs_in_a_job_folder_do_not_run_it(self):   # code elsewhere makes it a full run, not an core build
+        self.pr({'core/README.md': 'y', 'plugins/a/A.java': 'class A {}'})
+        self.assertEqual(self.scope()[1], {'plugins': 'true', 'core': 'false'})
 
     def test_a_file_no_job_names_runs_every_job(self):   # unclear which job it reaches: all of them
         for path in ('app/Main.java', '.github/workflows/ci.yml', CONFIG_PATH):
@@ -579,63 +579,63 @@ class Jobs(Repo):
                 self.reset()
                 self.pr({path: json.dumps(CONFIG) + ' '})
                 docs, jobs, out = self.scope()
-                self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'engine': 'true'}), out)
+                self.assertEqual((docs, jobs), (False, {'plugins': 'true', 'core': 'true'}), out)
                 self.assertIn('every job runs', out.splitlines()[0])
 
     def test_a_config_change_runs_every_job_even_if_a_job_names_it(self):
         cfg = {**CONFIG, 'jobs': {**CONFIG['jobs'], 'plugins': {'paths': ['plugins/**', '.github/**']}}}
         self.base = self.commit('a job names .github', {CONFIG_PATH: json.dumps(cfg)})
         self.pr({CONFIG_PATH: json.dumps(cfg) + ' '})
-        self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'true'})
+        self.assertEqual(self.scope()[1], {'plugins': 'true', 'core': 'true'})
 
     def test_an_md_input_in_a_job_folder_runs_it(self):
-        self.pr({'engine/core/src/main/resources/help.md': 'y'})
-        self.assertEqual(self.scope()[1]['engine'], 'true')
+        self.pr({'core/util/src/main/resources/help.md': 'y'})
+        self.assertEqual(self.scope()[1]['core'], 'true')
 
     def test_a_scoped_run_says_so_and_a_full_run_says_full(self):   # the reason matches what the jobs do
-        self.pr({'engine/A.java': 'class A {}'})
+        self.pr({'core/A.java': 'class A {}'})
         docs, jobs, out = self.scope()
-        self.assertEqual(jobs, {'plugins': 'false', 'engine': 'true'}, out)
-        self.assertTrue(out.startswith('scoped run: engine/A.java is not a docs file; only the jobs'), out)
+        self.assertEqual(jobs, {'plugins': 'false', 'core': 'true'}, out)
+        self.assertTrue(out.startswith('scoped run: core/A.java is not a docs file; only the jobs'), out)
         self.reset()
-        self.pr({'engine/A.java': 'class A {}', 'app/Main.java': 'x'})
+        self.pr({'core/A.java': 'class A {}', 'app/Main.java': 'x'})
         docs, jobs, out = self.scope()
-        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'true'}, out)
+        self.assertEqual(jobs, {'plugins': 'true', 'core': 'true'}, out)
         self.assertTrue(out.startswith('full run: app/Main.java is not a docs file and 1 more, which no job'), out)
 
     def test_docs_only_skips_every_job(self):
         self.pr({'README.md': 'y'})
-        self.assertEqual(self.scope()[:2], (True, {'plugins': 'false', 'engine': 'false'}))
+        self.assertEqual(self.scope()[:2], (True, {'plugins': 'false', 'core': 'false'}))
 
     def test_a_folder_added_to_a_jobs_paths_runs_it(self):   # a shared folder another job builds against
-        self.pr({'plugins/items/common/Item.java': 'class Item {}'})
-        self.assertEqual(self.scope()[1]['engine'], 'true')
+        self.pr({'plugins/shared/common/Shared.java': 'class Shared {}'})
+        self.assertEqual(self.scope()[1]['core'], 'true')
 
     def test_a_jobs_paths_from_a_registry_filtered_by_kind(self):   # the registry names what a module compiles
-        for path, runs in (('plugins/locale/common/src/main/java/Wire.java', 'true'),
-                           ('plugins/locale/common/src/main/java/Other.java', 'false'),
-                           ('plugins/travel/common/src/main/java/a/Leg.java', 'true')):
+        for path, runs in (('plugins/alpha/common/src/main/java/Api.java', 'true'),
+                           ('plugins/alpha/common/src/main/java/Other.java', 'false'),
+                           ('plugins/beta/common/src/main/java/a/Step.java', 'true')):
             with self.subTest(path=path):
                 self.reset()
                 self.pr({path: 'class X {}'})
                 docs, jobs, out = self.scope()
-                self.assertEqual(jobs['engine'], runs, out)
+                self.assertEqual(jobs['core'], runs, out)
 
     def test_a_registry_entry_of_another_kind_does_not_run_the_job(self):
-        self.pr({'plugins/site/README.md': 'y'})   # an input of a "plugin", not of an "engine-module"
-        self.assertEqual(self.scope()[1]['engine'], 'false')
+        self.pr({'plugins/site/README.md': 'y'})   # an input of a "plugin", not of a "core-module"
+        self.assertEqual(self.scope()[1]['core'], 'false')
 
 
 class OtherEvents(Repo):
     def test_a_push_with_a_base_reads_its_jobs_and_is_never_docs_only(self):
-        self.commit('code', {'engine/A.java': 'class A {}'})
+        self.commit('code', {'core/A.java': 'class A {}'})
         docs, jobs, out = self.scope('push', self.base)
-        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'engine': 'true'}), out)
+        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'core': 'true'}), out)
 
     def test_a_docs_push_skips_every_job_but_is_not_docs_only(self):
         self.commit('docs', {'plugins/README.md': 'y'})
         docs, jobs, out = self.scope('push', self.base)
-        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'engine': 'false'}), out)
+        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'core': 'false'}), out)
         self.assertIn('not in docs_only_events', out)
 
     def test_docs_only_events_can_name_push(self):
@@ -645,7 +645,7 @@ class OtherEvents(Repo):
         self.assertTrue(self.scope('push', self.base)[0])
 
     def test_a_base_off_the_first_parent_line_is_a_full_run(self):   # a merged fork PR's head was never tested
-        self.commit('code A (its run went red)', {'engine/A.java': 'class A {}'})
+        self.commit('code A (its run went red)', {'core/A.java': 'class A {}'})
         self.git('checkout', '-q', '-b', 'fork-main')
         fork_pr_head = self.commit('docs (its pull_request run passed)', {'README.md': 'y'})
         self.git('checkout', '-q', 'main')
@@ -654,7 +654,7 @@ class OtherEvents(Repo):
         docs, jobs, out = self.scope('push', fork_pr_head)
         self.assertEqual((docs, jobs), (False, {}), out)
         self.assertIn('not on the first-parent line', out)
-        self.assertEqual(self.scope('push', self.base)[1], {'plugins': 'false', 'engine': 'true'})   # main's green
+        self.assertEqual(self.scope('push', self.base)[1], {'plugins': 'false', 'core': 'true'})   # main's green
 
     def test_a_base_that_is_not_a_commit(self):
         self.commit('docs', {'README.md': 'y'})
@@ -671,7 +671,7 @@ class NoBuild(Repo):
     def test_a_no_build_path_runs_no_job_and_is_logged(self):
         self.pr({'tools/lint.py': 'x', 'scratch.txt': 'y'})
         docs, jobs, out = self.scope()
-        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'engine': 'false'}), out)
+        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'core': 'false'}), out)
         self.assertTrue(out.startswith('scoped run: scratch.txt is not a docs file and 1 more'), out)
         self.assertIn('no_build: scratch.txt builds nothing (matches scratch.txt) and 1 more', out)
         self.assertNotIn('every job', out)
@@ -679,22 +679,22 @@ class NoBuild(Repo):
     def test_it_is_never_a_job_output(self):
         self.pr({'tools/lint.py': 'x', 'app/Main.java': 'y'})
         docs, jobs, out = self.scope()
-        self.assertEqual(set(jobs), {'plugins', 'engine'}, out)
-        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'true'}, out)   # app/ is named by nothing: every job
+        self.assertEqual(set(jobs), {'plugins', 'core'}, out)
+        self.assertEqual(jobs, {'plugins': 'true', 'core': 'true'}, out)   # app/ is named by nothing: every job
 
     def test_a_path_a_job_also_names_runs_that_job_and_is_not_logged_as_nothing(self):
-        cfg = {**self.config, 'no_build': ['tools/**', 'engine/docs/**']}
-        self.base = self.commit('engine/docs is no-build', {CONFIG_PATH: json.dumps(cfg)})
-        self.pr({'engine/docs/gen.py': 'x'})
+        cfg = {**self.config, 'no_build': ['tools/**', 'core/docs/**']}
+        self.base = self.commit('core/docs is no-build', {CONFIG_PATH: json.dumps(cfg)})
+        self.pr({'core/docs/gen.py': 'x'})
         docs, jobs, out = self.scope()
-        self.assertEqual(jobs, {'plugins': 'false', 'engine': 'true'}, out)
+        self.assertEqual(jobs, {'plugins': 'false', 'core': 'true'}, out)
         self.assertNotIn('no_build:', out)
 
     def test_a_registry_entry_beats_no_build(self):   # paths_from names it: the job runs
         self.pr({REGISTRY_PATH: json.dumps({'modules': REGISTRY['modules'] + [
-            {'id': 't', 'kind': 'engine-module', 'inputs': ['tools/gen']}]}), 'tools/gen/A.java': 'x'})
+            {'id': 't', 'kind': 'core-module', 'inputs': ['tools/gen']}]}), 'tools/gen/A.java': 'x'})
         docs, jobs, out = self.scope()
-        self.assertEqual(jobs['engine'], 'true', out)
+        self.assertEqual(jobs['core'], 'true', out)
 
     def test_docs_stay_docs(self):   # no_build never makes a docs file anything else
         self.pr({'tools/README.md': 'y'})
@@ -703,19 +703,19 @@ class NoBuild(Repo):
     def test_a_never_docs_md_in_a_no_build_folder_builds_nothing(self):
         self.pr({'tools/tests/case.md': 'y'})
         docs, jobs, out = self.scope()
-        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'engine': 'false'}), out)
+        self.assertEqual((docs, jobs), (False, {'plugins': 'false', 'core': 'false'}), out)
         self.assertIn('no_build: tools/tests/case.md builds nothing', out)
 
     def test_the_config_runs_every_job_even_inside_no_build(self):
         self.pr({CONFIG_PATH: json.dumps(self.config) + ' '})
         docs, jobs, out = self.scope()
-        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'true'}, out)
+        self.assertEqual(jobs, {'plugins': 'true', 'core': 'true'}, out)
         self.assertNotIn('no_build:', out)
 
     def test_it_is_judged_at_the_base(self):   # a PR cannot add itself a no_build glob
         cfg = {**self.config, 'no_build': self.config['no_build'] + ['app/**']}
         self.pr({CONFIG_PATH: json.dumps(cfg), 'app/Main.java': 'y'})
-        self.assertEqual(self.scope()[1], {'plugins': 'true', 'engine': 'true'})
+        self.assertEqual(self.scope()[1], {'plugins': 'true', 'core': 'true'})
 
     def test_a_wrong_type_is_a_full_run_that_names_it(self):
         for bad in ('tools/**', [''], [1], {'paths': ['tools/**']}):
@@ -734,7 +734,7 @@ class NoBuildOldConfig(Repo):
         self.assertNotIn('no_build', CONFIG)
         self.pr({'tools/lint.py': 'x'})
         docs, jobs, out = self.scope()
-        self.assertEqual(jobs, {'plugins': 'true', 'engine': 'true'}, out)
+        self.assertEqual(jobs, {'plugins': 'true', 'core': 'true'}, out)
         self.assertNotIn('no_build:', out)
 
 
@@ -746,7 +746,7 @@ class NoBuildBesideAFakeJob(Repo):
     def test_both_stop_the_full_run(self):
         self.pr({'docs/gen.py': 'x', 'tools/lint.py': 'y'})
         docs, jobs, out = self.scope()
-        self.assertEqual(jobs, {'plugins': 'false', 'engine': 'false', 'no-build': 'true'}, out)
+        self.assertEqual(jobs, {'plugins': 'false', 'core': 'false', 'no-build': 'true'}, out)
         self.assertIn('job no-build: run (docs/gen.py matches its paths)', out)
         self.assertIn('no_build: tools/lint.py builds nothing (matches tools/**)', out)
         self.assertNotIn('docs/gen.py builds nothing', out)
@@ -756,11 +756,11 @@ class PythonApi(Repo):
     """docs_rule, job_rule and rules (#1508): the action's own rule about one path, for tools outside a workflow.
     The agreement tests run the action on a PR of each sample path and ask the helpers the same question."""
     config = {**CONFIG, 'no_build': ['tools/**']}
-    SAMPLE = ('README.md', 'plugins/a/README.md', 'engine/README.md', 'plugins/a/src/main/resources/x.md',
-              'skills/review/SKILL.md', 'plugins/RELEASE-CLAIMS.md', 'plugins/site/README.md', 'engine/A.java',
-              'plugins/a/A.java', 'plugins/items/common/Item.java', 'app/Main.java', 'tools/lint.py',
-              'tools/tests/x.md', CONFIG_PATH, 'plugins/locale/common/src/main/java/Wire.java',
-              'plugins/locale/common/src/main/java/Other.java', 'plugins/travel/common/src/main/java/a/Leg.java',
+    SAMPLE = ('README.md', 'plugins/a/README.md', 'core/README.md', 'plugins/a/src/main/resources/x.md',
+              'skills/review/SKILL.md', 'plugins/RELEASE-NOTES.md', 'plugins/site/README.md', 'core/A.java',
+              'plugins/a/A.java', 'plugins/shared/common/Shared.java', 'app/Main.java', 'tools/lint.py',
+              'tools/tests/x.md', CONFIG_PATH, 'plugins/alpha/common/src/main/java/Api.java',
+              'plugins/alpha/common/src/main/java/Other.java', 'plugins/beta/common/src/main/java/a/Step.java',
               'notes/line\nbreak.md', 'notes/plain.md')
 
     def show(self, ref):
@@ -800,7 +800,7 @@ class PythonApi(Repo):
         mods = REGISTRY['modules']
         for path, entry in (('build.gradle', 'build.gradle'), ('plugins/new/X.java', 'plugins/new/X.java')):
             with self.subTest(path=path):
-                added = {'modules': mods + [{'id': 'n', 'kind': 'engine-module', 'inputs': [entry]}]}
+                added = {'modules': mods + [{'id': 'n', 'kind': 'core-module', 'inputs': [entry]}]}
                 self.agree(path, {REGISTRY_PATH: json.dumps(added), path: 'x'})
 
     def test_they_agree_on_a_never_docs_entry_at_the_head(self):
@@ -814,15 +814,15 @@ class PythonApi(Repo):
         self.assertTrue(is_docs('README.md'))
         self.assertFalse(is_docs('plugins/site/README.md'))
         self.assertFalse(is_docs('.github/docs-scope.json'), 'the default config path is never docs')
-        engine = DS.job_rule(self.config, 'engine', read)
-        self.assertTrue(engine('plugins/locale/common/src/main/java/Wire.java'))
-        self.assertFalse(engine('tools/lint.py'))
-        self.assertTrue(engine('app/Main.java'), 'a path no job names runs every job')
+        core = DS.job_rule(self.config, 'core', read)
+        self.assertTrue(core('plugins/alpha/common/src/main/java/Api.java'))
+        self.assertFalse(core('tools/lint.py'))
+        self.assertTrue(core('app/Main.java'), 'a path no job names runs every job')
         self.assertTrue(DS.job_rule(self.config, 'renamed', read)('README.md'),
                         'a job the config does not have runs, even for docs (the action leaves it out of jobs)')
         r = DS.rules(self.config, read)
         self.assertEqual(r.builds_nothing('tools/lint.py'), 'tools/**')
-        self.assertIsNone(r.builds_nothing('engine/A.java'))
+        self.assertIsNone(r.builds_nothing('core/A.java'))
         self.assertEqual(r.not_docs('README.md', plain=False), 'a symlink or submodule, not a plain file')
         self.assertEqual(self.config, {**CONFIG, 'no_build': ['tools/**']}, "the caller's dict is not changed")
         self.assertNotIn('docs_only_events', CONFIG, "nor the caller's nested values")
@@ -837,7 +837,7 @@ class PythonApi(Repo):
                 self.assertTrue(DS.job_rule(config, 'plugins', read)('README.md'))
                 with self.assertRaises(DS.Unclear):
                     DS.rules(config, read)
-        self.assertTrue(DS.job_rule(self.config, 'nope', lambda name: reg)('engine/A.java'),
+        self.assertTrue(DS.job_rule(self.config, 'nope', lambda name: reg)('core/A.java'),
                         'a job the config does not have reads as "run", as a missing job output does')
         with self.assertRaisesRegex(DS.Unclear, 'tools/registry.json is not in the tree'):
             DS.rules(self.config, lambda name: None)
@@ -847,9 +847,9 @@ class PythonApi(Repo):
         src = CONFIG['never_docs_from'][0]
         per = DS.read_entries(src, (self.base,), run)
         self.assertEqual(DS.union(per), {'plugins/site/README.md': 'site inputs',
-                                         'plugins/locale/common/src/main/java/Wire.java': 'content-locale inputs',
-                                         'plugins/travel/common/src/main/java': 'content-travel inputs'})
-        self.assertTrue(DS.entry_match('plugins/travel/common/src/main/java/a/B.java', DS.union(per)))
+                                         'plugins/alpha/common/src/main/java/Api.java': 'alpha inputs',
+                                         'plugins/beta/common/src/main/java': 'beta inputs'})
+        self.assertTrue(DS.entry_match('plugins/beta/common/src/main/java/a/B.java', DS.union(per)))
 
 
 class Globs(CleanEnv):
