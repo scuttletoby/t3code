@@ -63,7 +63,7 @@ Optional: `.github/review-kit.json`. No file means the defaults. Every key is op
 | `audit_runner`      | `{"model": "claude-fable-5-2", "effort": "high"}`: the one audit of a pull request still stuck |
 | `forbidden_efforts` | `["low", "max"]`: a runner with one of these is refused                                        |
 | `lens_rounds`       | `2`: lens rounds before the orchestrator checks fix diffs itself and stuck means an audit      |
-| `minors`            | `issue` (one follow-up issue) or `same-round` (fixed in the round; leftovers named in the PR)  |
+| `minors`            | `same-round` (fixed in the PR or dropped; see `MINORS` in lib/review_kit.py) or `issue`        |
 | `state_question`    | _What happens when this runs again, stops half-way, or meets existing, old or empty state?_    |
 
 [review-kit.example.json](review-kit.example.json) shows one. An empty file, an unknown key or a wrong value is
@@ -91,7 +91,7 @@ rule order would let a lighter rule take a heavier rule's paths.
 | its lens prompts, with its domain's typical bugs and attacks     | the lens prompt files the block names                          |
 | who runs each lens, rounds, minors, the state question           | `.github/review-kit.json`                                      |
 | the override prefix, ready and push commands, lens authors       | the queue config (`override`, `ready_command`, `push_command`) |
-| outside reviewers, follow-up issue labels, its own checks        | the project's adapter skill or docs                            |
+| outside reviewers, labels for a filed issue, its own checks      | the project's adapter skill or docs                            |
 
 The general rules (tiers by path, the state question and the failure table, one or two independent lenses, twin lens
 names, rounds and the nit-only quick check, minors, attacks with tests, the comment format) are the kit's, so a
