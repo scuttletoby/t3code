@@ -113,6 +113,13 @@ REFUSED = [
     "su --session-command='t3-capacity 1 | tail' someone",
     "su --session-command 't3-capacity 1 | tail' someone",
     "sudo runuser -u someone --command='t3-capacity 1 | tail'",
+    # PR 1041 round 1: the value of -s / --shell (also glued at the end of a cluster) is no shell of its own
+    "su -s /bin/sh -c't3-capacity 1 | tail' someone",
+    "su -s /bin/sh -c 't3-capacity 1 | tail' someone",
+    "su -ls/bin/sh -c't3-capacity 1 | tail' someone",
+    "su -ls /bin/sh -c't3-capacity 1 | tail' someone",
+    "su --shell /bin/bash -c't3-capacity 1 | tail' someone",
+    "runuser -u someone -s /bin/sh -c't3-capacity 1 | tail'",
     'heavy t3-capacity 1 | tail',
     'heavy --wait 60 t3-capacity 1 | tail',
     'heavy --kind test --mb 512 -- t3-capacity 1 | tail',
@@ -248,6 +255,7 @@ ALLOWED = [
     "su --command='t3-capacity 1 > f && x' someone | tail",
     "runuser -s'/bin/sh' --shell=t3-capacity someone | tail",   # values of -s / --shell, no text to read
     "su --session-command='echo t3-capacity | tail'",
+    "su -s /bin/sh -c'grep t3-capacity x | tail' someone",       # PR 1041: still read as text, nothing piped
     'heavy sweep --dry-run | tail',
     'taskset -p 1234 | tail',
     'python3 -I scripts/dev/run_tests.py scripts/dev/tests/test_t3_capacity.py 2>&1 | tail -5',

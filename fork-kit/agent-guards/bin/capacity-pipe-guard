@@ -177,18 +177,38 @@ def shell_text(shell, w, rest):
     return None
 
 
+GETOPT_LONG = ('shell', 'group', 'supp-group', 'whitelist-environment', 'user')   # su/runuser long flags with a value
+
+
+def takes_value(shell, w):
+    """Whether the flag word w of su/runuser takes the next word as its value: -s, -g, -G, -w (runuser -u) alone or
+    last in a cluster (-ls), --shell and any start of the long flags that take one."""
+    if shell not in GETOPT_SHELLS or not w.startswith('-') or w == '-':
+        return False
+    if w.startswith('--'):
+        name, eq, _ = w[2:].partition('=')
+        return not eq and len(name) > 1 and any(f.startswith(name) for f in GETOPT_LONG)
+    for j, ch in enumerate(w[1:], 1):
+        if ch in GETOPT_SHELLS[shell]:
+            return j == len(w) - 1
+    return False
+
+
 def handed_on(ws, depth):
     """Read the shell text a simple command hands on. True when a shell is among its words (its heredoc is commands)."""
     ws, k = command_at(ws)   # first: env -S TEXT puts the words of TEXT in place
-    shell = None
+    shell, skip = None, False
     for n, w in enumerate(ws):
-        if base(w) in SHELLS:
+        if skip:   # su -s /bin/sh -c ..: the value of a flag is no shell of its own
+            skip = False
+        elif base(w) in SHELLS and not w.startswith('-'):   # -ls/bin/sh is a flag cluster, not sh
             shell = base(w)
         elif shell:
             text = shell_text(shell, w, ws[n + 1:])
             if text is not None:
                 read(text, depth=depth + 1)
                 break
+            skip = takes_value(shell, w)
     if k < len(ws):
         word, args = base(ws[k]), ws[k + 1:]
         if word == 'eval':

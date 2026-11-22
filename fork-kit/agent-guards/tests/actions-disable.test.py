@@ -3510,5 +3510,125 @@ class Issue999Test(Case):
         self.assertIsNone(self.decide(''))
 
 
+class Pr1041Round1Test(Case):
+    """The lens findings of PR 1041 round 1, from the lenses' own examples: each is red on the round-0 head. The new
+    passes of #999 (a data reader, a compressor's file, a filter, a sed/awk -f script) trust only a short allow-list
+    and fail closed: nothing origin/main refused may pass."""
+    refused = Issue930Test.refused
+    passes = Issue930Test.passes
+    T = Issue930Test.T
+
+    def files(self):
+        Issue999Test.files(self)
+        D = self.dir
+        self.write('qpy.txt', f"import os\nos.system('python3 {GARDEN['name']} {GARDEN['flag']}')\n", 0o644)
+        self.write('p.txt', 'bash run.sh\n', 0o644)
+        self.write('run.sh', self.T + '\n')
+        self.write('b/ls', 'echo hi\n')
+        self.write('run.awk', '{system($0)}\n', 0o644)
+        self.write('run.pl', 'system $_ while <>;\n', 0o644)
+        self.write('list.txt', 'p.txt\n', 0o644)
+        self.write('ok.awk', '{print $1}\n', 0o644)
+        self.write('ok.sed', 's/a/b/\n', 0o644)
+        return dict(self.env, PATH=f'{D}/b:/usr/bin:/bin')
+
+    def test_1_a_data_reader_is_a_real_file_or_an_allow_listed_module(self):
+        """Major 1 (merge path) and code item E: stdin as the script through any spelling of /dev or /proc, `-m` of
+        anything but json.tool, `deno run -`, `bun run -`, a long flag before `-`."""
+        self.files()
+        self.refused('cat q.txt | python3 -m code', 'cat q.txt | python3 -m asyncio',
+                     'cat q.txt | python3 -m pdb tools/check.py', 'cat q.txt | python3 -m runpy /dev/stdin',
+                     'cat q.txt | python3 -m trace --trace /dev/stdin', 'cat qpy.txt | python3 //dev/stdin',
+                     'cat qpy.txt | python3 /dev/./stdin', 'cat qpy.txt | python3 /proc/self/fd//0',
+                     'cat qpy.txt | python3 /proc/thread-self/fd/0', 'cat qpy.txt | python3 /dev/fd/../fd/0',
+                     'cat qpy.txt | node /dev/./stdin', 'cat qpy.txt | python3 --check-hash-based-pycs never -',
+                     'cat qpy.txt | deno run -', 'cat qpy.txt | deno run /dev/stdin', 'cat qpy.txt | bun run -',
+                     'ln -s /dev/stdin s.py; cat qpy.txt | python3 s.py', 'cat q.txt | python3 -i tools/check.py',
+                     'printf x > tools/check.py; cat q.txt | python3 tools/check.py',
+                     'cp run.pl tools/check.py; cat q.txt | python3 tools/check.py',
+                     'cat q.txt | PYTHONPATH=. python3 tools/check.py', 'cat q.txt | node --require ./x.js tools/check.py',
+                     'cat q.txt | bash ../../../../../../dev/stdin', 'cat q.txt | sort | python3 -m code')
+        self.passes('cat msg.md | python3 -m json.tool', 'cat msg.md | python3 tools/check.py',
+                    'cat msg.md | sort | python3 tools/check.py', 'cat msg.md | python3 -I tools/check.py',
+                    'gh pr view 1 --json body | python3 -m json.tool', 'python3 tools/check.py < msg.md')
+
+    def test_2_a_compressed_file_that_the_same_command_unpacks_and_runs(self):
+        """Major 2 (merge path): a compressor may write its file only when nothing later in the command unpacks and
+        runs it, or runs any file."""
+        env = self.files()
+        self.refused('cat q.txt | gzip > y.gz; gunzip y.gz; bash y', 'cat q.txt | xz > y.xz; unxz y.xz; . y',
+                     'cat q.txt | gzip -c > y.gz; gzip -df y.gz; source y', 'cat q.txt | gzip > y.gz; zcat y.gz | sh',
+                     'cat q.txt | gzip > y.gz; f() { gunzip y.gz; bash y; }; f', 'cat q.txt | gzip --decomp',
+                     "cat q.txt | gzip > y.gz; alias ls='gunzip y.gz; bash y'; ls", env=env)
+        self.passes('cat msg.md | gzip > m.gz', 'cat msg.md | xz -9 | wc -c', env=env)
+
+    def test_3_any_filter_into_a_shell_hands_on_its_input(self):
+        """Major 3 (code): awk and perl filters, also with the input on `<`, are filters like sort and grep."""
+        self.files()
+        self.refused("awk 'NR>1' d.txt | bash", 'awk 1 d.txt | bash', "awk '{print}' d.txt | bash", 'gawk 1 d.txt | bash',
+                     "perl -pe '' q.txt | bash", 'awk 1 < q.txt | bash', 'sort q.txt | at now', 'sort q.txt | batch',
+                     'sort q.txt | flock L sh', 'sort q.txt | sudo su', 'sort q.txt | su', 'sort q.txt | make -f -',
+                     'sort q.txt > r.sh; bash r.sh', 'sort -o r.sh q.txt; bash r.sh', 'su - x < q.txt')
+        self.passes('awk 1 notes.md | bash', 'sort notes.md | bash', "awk '{print $1}' q.txt", 'sed -n 1p q.txt',
+                    'grep -n fix q.txt', 'git log --oneline | head', 'sort -u ids.txt -o ids.txt')
+
+    def test_4_rsync_into_a_path_folder_like_cp_r(self):
+        """Major 4 (code): the rsync line in data_gate was dead; rsync of a folder into a PATH folder is refused."""
+        env = self.files()
+        D = self.dir
+        self.refused(f'rsync -a ./ {D}/b/; ls', f'rsync -a . {D}/b; ls', f'rsync --files-from=list.txt . {D}/b/; ls',
+                     f'cp -r ./ {D}/b/; ls', env=env)
+        self.passes('rsync -a ./ out/', env=env)
+
+    def test_5_a_script_file_the_same_command_writes_first_is_not_trusted(self):
+        """Major 5 (state): sed -f / awk -f read a file an earlier part of the command writes or replaces: unknown,
+        like a file that does not exist yet."""
+        env = self.files()
+        D = self.dir
+        self.refused(f"printf 'w {D}/b/ls\\n' > ids.txt; sed -n -f ids.txt p.txt; ls",
+                     f"printf '{{print > \"{D}/b/ls\"}}\\n' > ids.txt; awk -f ids.txt p.txt; ls",
+                     'cp run.awk ids.txt; awk -f ids.txt q.txt',
+                     f"printf 's/x/y/w {D}/b/ls\\n' | tee ids.txt; sed -f ids.txt p.txt; ls",
+                     f"sed -i 's/1/w {D}\\/b\\/ls/' ids.txt; sed -n -f ids.txt p.txt; ls", env=env)
+        self.passes('awk -f ok.awk q.txt', 'sed -f ok.sed q.txt', 'awk -f ok.awk q.txt > out.txt',
+                    'sed -f ok.sed notes.md > out.txt; cat out.txt', 'sed -i -f ok.sed notes.md', env=env)
+
+    def test_6_the_minors(self):
+        """gawk -E/-i program files, perl readpipe/open2, xargs and parallel argument files, awk and perl input
+        through `<`/getline/a script file, awk pipes past the first command and joined write targets,
+        `$(cat < f)`, a `while read` loop that runs its lines."""
+        env = self.files()
+        D = self.dir
+        self.refused('gawk -E run.awk q.txt', 'gawk --exec=run.awk q.txt', 'gawk -i run.awk q.txt',
+                     'gawk --include run.awk q.txt', 'gawk --ex run.awk q.txt', 'awk -bf run.awk q.txt',
+                     "perl -ne 'readpipe $_' q.txt", "perl -MIPC::Open2 -ne 'open2(my $o, my $i, $_)' q.txt",
+                     'xargs --arg-file q.txt -L1 env', 'xargs -aq.txt -L1 env', 'xargs -L1 env < q.txt',
+                     'sort q.txt | xargs -L1 env', "awk '{system($0)}' < q.txt",
+                     "awk 'BEGIN{while ((getline l < \"d.txt\") > 0) system(l)}'", 'perl run.pl q.txt',
+                     "perl -e 'system $_ for <STDIN>' < q.txt", "awk '{print | \"true; sh\"}' q.txt",
+                     "awk '{print | \"sort\" \";sh\"}' q.txt", 'bash -c "$(cat < q.txt)"', 'parallel -a d.txt',
+                     'parallel :::: d.txt', 'parallel -aq.txt', 'cat q.txt | parallel',
+                     'while read -r l; do $l; done < d.txt', 'while read l; do eval "$l"; done < d.txt',
+                     'while read l; do bash -c "$l"; done < q.txt', env=env)
+        self.refused(f"awk '{{print > \"{D}/b/\" \"ls\"}}' p.txt; ls", f"awk -v d={D}/b/ '{{print > d \"ls\"}}' p.txt; ls",
+                     env=env)
+        self.passes("awk '{print > \"out.txt\"}' p.txt", "awk '{print | \"sort\"}' p.txt", "perl -i -pe 's/a/b/' notes.md",
+                    "perl -pi -e 's/a/b/' notes.md", "sed -i 's/a/b/' notes.md", "awk -F, '{print $2}' notes.md",
+                    'gh api repos/o/r/pulls?per_page=5', "gh api graphql -f query='query { viewer { login } }'",
+                    'xargs gh pr view < ids.txt', "find . -name '*.py' | xargs grep x", 'cat ids.txt | xargs -n1 echo',
+                    env=env)
+
+    def test_7_the_new_checks_answer_the_same_twice(self):
+        """State question: the new checks read files each time and keep no text in the cache, so a second run (the
+        cache warm) answers the same as the first; an empty command passes."""
+        env = self.files()
+        for cmd in ('cat qpy.txt | python3 /dev/./stdin', 'cat q.txt | gzip > y.gz; gunzip y.gz; bash y',
+                    'awk 1 d.txt | bash', 'cp run.awk ids.txt; awk -f ids.txt q.txt', 'cat msg.md | python3 -m json.tool',
+                    'awk -f ok.awk q.txt'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd, env) is None, self.decide(cmd, env) is None)
+        self.assertIsNone(self.decide('', env))
+
+
 if __name__ == '__main__':
     unittest.main()
