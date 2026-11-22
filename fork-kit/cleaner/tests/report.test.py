@@ -16,8 +16,14 @@ GB = 1024 ** 3
 HOST = 'host-1'
 
 
+NOW = time.time()
+
+
 def stamp(seconds_ago=0):
-    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - seconds_ago))
+    """One clock for the whole run: the same line built twice is the same text, as in the real append-only log,
+    where a line is written once. The mark names a line by its text, so a line rebuilt a second later would not be
+    the line the mark names."""
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(NOW - seconds_ago))
 
 
 class Case(fx.Case):
@@ -400,11 +406,12 @@ class Freed(Case):
     def test_two_reports_at_once_the_second_waits_its_turn(self):
         """A second report while one runs says so, exits 1 and leaves the mark: the deletes are counted once."""
         cfg = self.cfg()
-        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB')])
+        a = self.deleted('/tmp/a', '2.0 GB')
+        self.write_log(cfg, [a])
         self.assertIn(' 2.0 GB (1 delete)', self.report(cfg)[1][0])
         with open(cfg.report_file) as f:
             mark = f.read()
-        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB'), self.deleted('/tmp/b', '3.0 GB')])
+        self.write_log(cfg, [a, self.deleted('/tmp/b', '3.0 GB')])
         fd = os.open(cfg.report_lock_file, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)              # the first report, still running
@@ -430,9 +437,10 @@ class Freed(Case):
 
     def test_a_line_still_being_written_waits_for_the_next_report(self):
         cfg = self.cfg()
-        self.write_log(cfg, [self.deleted('/tmp/a', '1.0 GB'), self.deleted('/tmp/b', '4.0 GB')[:30]], end='')
+        a, b = self.deleted('/tmp/a', '1.0 GB'), self.deleted('/tmp/b', '4.0 GB')
+        self.write_log(cfg, [a, b[:30]], end='')
         self.assertIn(' 1.0 GB (1 delete)', self.report(cfg)[1][0])
-        self.write_log(cfg, [self.deleted('/tmp/a', '1.0 GB'), self.deleted('/tmp/b', '4.0 GB')])
+        self.write_log(cfg, [a, b])
         self.assertIn(' 4.0 GB (1 delete)', self.report(cfg)[1][0])
 
     def test_a_log_that_is_not_the_cleaners_is_could_not_read(self):
@@ -466,7 +474,8 @@ class Freed(Case):
         """#491: a line that went nowhere must be counted again. With --out the line is appended to the file (and
         synced) first; when that fails the mark stays, so the next report counts the same deletes."""
         cfg = self.cfg()
-        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB')])
+        a = self.deleted('/tmp/a', '2.0 GB')
+        self.write_log(cfg, [a])
         out = self.path('state', 'daily', 'report.log')
         code, lines = self.report(cfg, out=out)
         self.assertEqual(code, 0, lines)
@@ -474,7 +483,7 @@ class Freed(Case):
             self.assertEqual(f.read(), lines[0] + '\n')
         self.assertIn('2.0 GB (1 delete)', lines[0])
         self.assertTrue(os.path.isfile(cfg.report_file))
-        self.write_log(cfg, [self.deleted('/tmp/a', '2.0 GB'), self.deleted('/tmp/b', '3.0 GB')])
+        self.write_log(cfg, [a, self.deleted('/tmp/b', '3.0 GB')])
         os.remove(out)
         os.mkdir(out)                                          # the line cannot be written
         mark = open(cfg.report_file).read()

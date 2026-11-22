@@ -1,0 +1,115 @@
+#!/usr/bin/python3 -IB
+"""agent-slots: a Claude Code hook for orchestrator sessions, "agent slots free + ready queue not empty = don't stop
+yet". A thin caller of `heavy facts`: the free slots are what both the process limit and the machine allow.
+
+UserPromptSubmit: adds one line of context: live agent processes, free slots, the first items of the ready queue.
+Stop: if slots are free and the ready queue has items, blocks the stop once (not again while stop_hook_active).
+Acts only for the session ids in sessions_file; every other session exits at once.
+
+Config (~/.config/agent-slots/config.json, or $AGENT_SLOTS_CONFIG):
+  {"sessions_file": "<one session id per line, # comments>", "queue": "<markdown file>", "ready_heading": "## Ready",
+   "max_alive": 10, "process_name": "claude", "kind": "agent-writer", "note": "<extra text for the context line>"}
+free = min(max_alive - live processes, the machine's "fits" for kind). heavy facts that does not answer within 5 s
+or cannot answer: the machine has no free slot (the line says why). The ready list is the "- " lines under
+ready_heading. Never fails a call because of its own error.
+"""
+import json, os, subprocess, sys
+
+DEFAULTS = {'sessions_file': '', 'queue': '', 'ready_heading': '## Ready', 'max_alive': 10, 'process_name': 'claude',
+            'kind': 'agent-writer', 'note': ''}
+
+
+def kit_file(rel):
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), rel)
+
+
+def config():
+    c = dict(DEFAULTS)
+    try:
+        with open(os.path.expanduser(os.environ.get('AGENT_SLOTS_CONFIG', '~/.config/agent-slots/config.json'))) as f:
+            c.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return c
+
+
+def lines(path):
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return f.read().split('\n')
+    except OSError:
+        return []
+
+
+def ready_items(c):
+    out, on = [], False
+    for line in lines(c['queue']):
+        if line.startswith('## '):
+            on = line.strip().lower() == c['ready_heading'].strip().lower()
+        elif on and line.startswith('- '):
+            out.append(line[2:].strip())
+    return out
+
+
+def alive(c):
+    if 'AGENT_SLOTS_ALIVE' in os.environ:       # tests
+        return int(os.environ['AGENT_SLOTS_ALIVE'])
+    r = subprocess.run(['pgrep', '-c', '-x', c['process_name']], capture_output=True, text=True)
+    return int((r.stdout or '0').strip() or 0)
+
+
+def machine(kind):
+    """(slots the machine has for kind, the words for the line)."""
+    try:
+        hf = load(kit_file('lib/heavy_facts.py'))
+        verdict, why, d = hf.ask(os.environ.get('AGENT_SLOTS_HEAVY') or kit_file('bin/heavy'), kind)
+    except Exception as e:
+        verdict, why, d = 'unavailable', f'{e.__class__.__name__}: {e}', None
+    fits = d.get('fits') if isinstance(d, dict) else None
+    n = fits.get(d.get('kind')) if isinstance(fits, dict) else None
+    if type(n) is not int or n < 0:
+        return 0, f'machine: no answer ({why}), so none free'
+    return n, f'machine fits {n} more {d["kind"]}'
+
+
+def decide(data, c):
+    sessions = {s.strip() for s in lines(c['sessions_file']) if s.strip() and not s.startswith('#')}
+    if not c['sessions_file'] or data.get('session_id') not in sessions:
+        return None
+    event = data.get('hook_event_name', '')
+    n, mx = alive(c), int(c['max_alive'])
+    fits, said = machine(c['kind'])
+    free = min(max(0, mx - n), fits)
+    ready = ready_items(c)
+    head = '; '.join(ready[:3])
+    msg = (f'Agent slots: {n}/{mx} {c["process_name"]} processes alive, {free} free ({said}'
+           + (f'; {c["note"]}' if c['note'] else '') + '). '
+           f'Ready queue ({c["queue"]}): {len(ready)} item(s){": " + head if head else ""}.')
+    if event == 'UserPromptSubmit':
+        return {'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': msg}}
+    if event == 'Stop' and not data.get('stop_hook_active') and free and ready:
+        return {'decision': 'block', 'reason': msg + ' Fill the free slots from the ready queue before ending the '
+                'turn. If an item cannot start now, move it out of the ready list with the reason.'}
+    return None
+
+
+def load(path):
+    import importlib.machinery, importlib.util
+    loader = importlib.machinery.SourceFileLoader('heavy_facts', path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('heavy_facts', loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def main():
+    try:
+        out = decide(json.load(sys.stdin), config())
+    except Exception:       # never break a call because of this hook
+        return 0
+    if out:
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
